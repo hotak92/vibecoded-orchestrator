@@ -204,13 +204,63 @@ if ($VcoRt.state -ne "resolved") {
     # binary exists ($VcoRt.installed) - with nothing installed there is
     # nothing to start.
     if ($VcoRt.installed) {
+        # FINAL2 L-2 (parity with the .sh sibling): the CLI records its own
+        # outcome in <vct_root>\logs\engine-start.log, but a venv too broken
+        # to even IMPORT vco_lib writes nothing anywhere, and a detached
+        # Start-Process discards the child's output. Send the child's stderr
+        # to the SAME log through the ONE guarded spawn home
+        # (_lib/resolve-powershell.ps1, the pattern stop-codegraph-drain.ps1
+        # uses for codegraph_extras_refresh.log): the inner pwsh command
+        # appends with 2>>, the path resolved exactly like the Python home
+        # (vco_lib.paths.vct_root_dir + container_engine_start
+        # .engine_start_log_path: $env:VCT_STATE_DIR or %USERPROFILE%\.vct,
+        # then logs\engine-start.log — must match the .sh sibling and the
+        # Rust spawner). Bounded: the CLI trims the file to its last 500
+        # lines on its next healthy run, and stderr here is at most a small
+        # broken-import traceback. When the lib, the interpreter or the log
+        # is unavailable, fall back to the old direct discard spawn — a log
+        # problem must never stop an engine start or fail the hook.
+        $EngineRoot = if ($env:VCT_STATE_DIR) { $env:VCT_STATE_DIR }
+                      elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".vct" }
+                      else { Join-Path $HOME ".vct" }
+        $EngineLogDir = Join-Path $EngineRoot "logs"
+        $EngineLog = Join-Path $EngineLogDir "engine-start.log"
+        $EngineSpawned = $false
         try {
-            $startArgs = @{ FilePath = $RunPy
-                            ArgumentList = @('-m', 'vco_lib.container_engine_start', 'ensure')
-                            WindowStyle = 'Hidden' }
-            if ($IsWindows -eq $false) { $startArgs.Remove('WindowStyle') }
-            Start-Process @startArgs | Out-Null
-        } catch { }
+            $EnginePsLib = Join-Path $ScriptDir "_lib\resolve-powershell.ps1"
+            if (Test-Path $EnginePsLib) { . $EnginePsLib }
+            if (Get-Command Start-VcoDetachedPwsh -ErrorAction SilentlyContinue) {
+                try {
+                    New-Item -ItemType Directory -Path $EngineLogDir -Force -ErrorAction Stop | Out-Null
+                } catch { }
+                # Append-probe with the same open mode the child writes with.
+                $EngineProbe = $null
+                try {
+                    $EngineProbe = [System.IO.File]::Open($EngineLog, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+                } catch { $EngineProbe = $null }
+                if ($EngineProbe) {
+                    $EngineProbe.Close()
+                    # PowerShell single quotes are LITERAL ('' escapes a
+                    # quote), so a path with $, spaces or backticks cannot
+                    # re-parse here (the same quoting stop-codegraph-drain.ps1
+                    # uses). 2>> = append the child's stderr ONLY, matching
+                    # the .sh sibling (stdout stays discarded).
+                    $q = { param($v) "'" + ($v -replace "'", "''") + "'" }
+                    $EngineInner = "& " + (& $q $RunPy) + " -m vco_lib.container_engine_start ensure 2>> " + (& $q $EngineLog)
+                    Start-VcoDetachedPwsh -Command $EngineInner -PowerShellExe $PsExe
+                    $EngineSpawned = $true
+                }
+            }
+        } catch { $EngineSpawned = $false }
+        if (-not $EngineSpawned) {
+            try {
+                $startArgs = @{ FilePath = $RunPy
+                                ArgumentList = @('-m', 'vco_lib.container_engine_start', 'ensure')
+                                WindowStyle = 'Hidden' }
+                if ($IsWindows -eq $false) { $startArgs.Remove('WindowStyle') }
+                Start-Process @startArgs | Out-Null
+            } catch { }
+        }
     }
     exit 0
 }

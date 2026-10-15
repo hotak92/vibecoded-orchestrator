@@ -12,7 +12,9 @@
 //! (`src/lib.rs`, beside `ensure_hub_running`). This module is that one
 //! spawn, so the two cannot drift in argv or detach semantics.
 //!
-//! The spawn is fire-and-forget by contract: stdio is null, nothing is
+//! The spawn is fire-and-forget by contract: stdin/stdout are null, stderr
+//! is appended best-effort to the outcome log the CLI itself writes (see
+//! [`ENGINE_START_LOG`]; review FINAL2 L-2), nothing is
 //! waited on, and the child is detached from the caller's process group
 //! (POSIX `setsid` via the pre-exec hook; Windows `CREATE_NO_WINDOW`
 //! only — never `DETACHED_PROCESS`, which flashes a console), so a kill aimed at the caller
@@ -69,6 +71,40 @@ pub fn pref_enabled(db: &crate::db::Db) -> bool {
 /// constant so the hub and the launcher spawn the identical command.
 pub fn engine_start_argv() -> [&'static str; 3] {
     ["-m", "vco_lib.container_engine_start", "ensure"]
+}
+
+/// The basename of the outcome log the Python CLI itself writes.
+/// MUST MATCH `vco_lib.container_engine_start.engine_start_log_path`
+/// (`<vct_root_dir>/logs/engine-start.log`) and the two hook siblings
+/// (`templates/hooks/ensure-containers.{sh,ps1}`), which append the
+/// child's stderr to the SAME file (review FINAL2 L-2: a venv too broken
+/// to import vco_lib leaves its traceback nowhere unless the SPAWNER
+/// captures it). Pinned by `tests/test_container_engine_start.py`.
+pub const ENGINE_START_LOG: &str = "engine-start.log";
+
+/// Where this spawner appends the child's stderr: the SAME outcome log the
+/// Python CLI writes, resolved through the one root resolver
+/// `crate::paths::vct_root_dir` (the mirror of `vco_lib.paths::vct_root_dir`).
+/// The file stays bounded: the CLI trims it to its last 500 lines on its
+/// next healthy run, and stderr here is at most a small broken-import
+/// traceback (a working CLI emits a few short lines).
+fn engine_start_log_path() -> PathBuf {
+    crate::paths::vct_root_dir().join("logs").join(ENGINE_START_LOG)
+}
+
+/// Best-effort append handle to [`engine_start_log_path`] for the child's
+/// stderr. Creates the logs dir if missing. An unopenable log degrades to
+/// [`Stdio::null`] — a log problem must never fail the spawn (the engine
+/// start matters more than its traceback).
+fn engine_start_log_stdio() -> Stdio {
+    let path = engine_start_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file.into(),
+        Err(_) => Stdio::null(),
+    }
 }
 
 /// Resolve the vco_lib-capable interpreter (the canonical RT-4 ladder) and
@@ -141,8 +177,9 @@ pub const WINDOWS_CREATION_FLAGS: u32 = 0x0800_0000 | 0x0000_0200;
 
 /// Build and spawn the detached CLI for a GIVEN interpreter — the testable
 /// core of [`spawn_engine_start_cli`]. Returns the child's pid without
-/// waiting, collecting stdin/stdout/stderr to null and detaching the child
-/// from this process's session/group (see the module doc).
+/// waiting: stdin/stdout are null, stderr is appended best-effort to
+/// [`ENGINE_START_LOG`] (see [`engine_start_log_stdio`]), and the child is
+/// detached from this process's session/group (see the module doc).
 ///
 /// The exited child is REAPED on a detached thread (R19 F6): `setsid`
 /// detaches the session, not the parentage, so an unwaited child would
@@ -159,7 +196,7 @@ pub fn spawn_engine_start_cli_with(python: &Path) -> io::Result<u32> {
     cmd.args(engine_start_argv())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(engine_start_log_stdio());
 
     #[cfg(windows)]
     {
@@ -312,6 +349,47 @@ mod tests {
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_child_stderr_is_appended_to_the_engine_start_log() {
+        // FINAL2 L-2: a venv too broken to import vco_lib dies with its
+        // traceback on stderr — the spawn must append it to the SAME log
+        // the Python CLI writes (engine_start_log_stdio), never null it
+        // away. Fire-and-forget is unchanged: the spawn returns at once
+        // and the log line is polled for afterwards.
+        let dir = std::env::temp_dir()
+            .join(format!("vco-engine-autostart-stderr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = "#!/bin/sh\necho 'fake broken venv: No module named vco_lib' >&2\nexit 1\n";
+        let python = fake_python(&dir, "fake-python", body);
+
+        // Point the one root resolver at a scratch dir through the SANCTIONED
+        // helper (sets VCT_STATE_DIR under GLOBAL_ENV_MUTEX and restores the
+        // PRIOR value on Drop — a bare set_var/remove_var pair is banned by
+        // tests/state_dir_env_lint.rs and would clobber an outer redirect).
+        // The spawn AND the poll stay inside the guard: the log lives in the
+        // guard's tempdir, which its Drop deletes.
+        let sd = crate::test_env::state_dir_guard();
+        let pid = spawn_engine_start_cli_with(&python).expect("spawn must succeed");
+        let log = sd.path().join("logs").join(ENGINE_START_LOG);
+        let needle = "fake broken venv: No module named vco_lib";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&log) {
+                if text.contains(needle) {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child's stderr never reached {log:?} — a broken-import traceback would be lost"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        drop(sd);
+        let _ = pid;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

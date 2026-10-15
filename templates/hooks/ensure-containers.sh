@@ -208,7 +208,27 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
     # starter; only when a runtime binary exists ($VCO_RUNTIME_INSTALLED) —
     # with nothing installed there is nothing to start.
     if [ -n "${VCO_RUNTIME_INSTALLED:-}" ]; then
-        ( "$RUN_PY" -m vco_lib.container_engine_start ensure </dev/null >/dev/null 2>&1 & )
+        # FINAL2 L-2: the CLI records its own outcome in
+        # <vct_root>/logs/engine-start.log, but a venv too broken to even
+        # IMPORT vco_lib writes nothing anywhere — its traceback used to
+        # die in the >/dev/null 2>&1 below. Give the child's stderr the
+        # SAME log, resolving the path exactly like the Python home
+        # (vco_lib.paths.vct_root_dir + container_engine_start
+        # .engine_start_log_path: $VCT_STATE_DIR or ~/.vct, then
+        # logs/engine-start.log — must match the .ps1 sibling and the Rust
+        # spawner). Bounded: the CLI trims the file to its last 500 lines
+        # on its next healthy run, and stderr here is at most a small
+        # broken-import traceback (a working CLI emits a few short lines).
+        # If the log cannot be opened, spawn exactly as before (discard) —
+        # a log problem must never stop an engine start or fail the hook.
+        __vct_engine_log_dir="${VCT_STATE_DIR:-$HOME/.vct}/logs"
+        __vct_engine_log="$__vct_engine_log_dir/engine-start.log"
+        if mkdir -p "$__vct_engine_log_dir" 2>/dev/null && : >>"$__vct_engine_log" 2>/dev/null; then
+            ( "$RUN_PY" -m vco_lib.container_engine_start ensure </dev/null >/dev/null 2>>"$__vct_engine_log" & )
+        else
+            ( "$RUN_PY" -m vco_lib.container_engine_start ensure </dev/null >/dev/null 2>&1 & )
+        fi
+        unset __vct_engine_log_dir __vct_engine_log
     fi
     exit 0
 fi

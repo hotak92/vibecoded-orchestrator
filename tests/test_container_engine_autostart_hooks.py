@@ -46,8 +46,11 @@ IS_WINDOWS = os.name == "nt"
 #:   * ``vco_lib.service_lifecycle run-detached ... -- <cmd>`` — the session
 #:     lock's detached re-exec: exec the command with the detached markers
 #:     set (both siblings' gate variables — the real relay sets both);
-#:   * everything else (``container_engine_start ensure``,
-#:     ``runtime_reconcile record-boot-refusal``) — record argv, exit 0.
+#:   * ``vco_lib.container_engine_start ensure`` — record argv, exit 0; with
+#:     ``FAKE_ENGINE_STDERR`` set, first write that text to stderr and exit 1
+#:     (the FINAL2 L-2 "venv too broken to import vco_lib" leg);
+#:   * everything else (``runtime_reconcile record-boot-refusal``) — record
+#:     argv, exit 0.
 FAKE_PY = """\
 #!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$FAKE_PY_LOG"
@@ -69,6 +72,14 @@ case "$verb" in
     done
     export VCO_SESSION_LOCK_HELD=1 VCO_SESSION_DETACHED=1
     exec "$@" ;;
+  vco_lib.container_engine_start)
+    # FINAL2 L-2 leg: with FAKE_ENGINE_STDERR set, behave like a venv too
+    # broken to import vco_lib — traceback text on stderr, exit 1.
+    if [ -n "${FAKE_ENGINE_STDERR:-}" ]; then
+      printf '%s\\n' "$FAKE_ENGINE_STDERR" >&2
+      exit 1
+    fi
+    exit 0 ;;
 esac
 exit 0
 """
@@ -104,6 +115,10 @@ RESOLVE_JSON_NOT_INSTALLED["reason"] = "fake: no container runtime installed"
 RESOLVE_JSON_NOT_INSTALLED = json.dumps(RESOLVE_JSON_NOT_INSTALLED)
 
 ENGINE_LINE = "-m vco_lib.container_engine_start ensure"
+
+#: What the fake "broken venv" writes on stderr (FINAL2 L-2 leg): the hook
+#: spawners must append it to the outcome log, not discard it.
+ENGINE_STDERR_TEXT = "Traceback (most recent call last): No module named vco_lib"
 
 
 def _wait_for_line(log: Path, needle: str, timeout_s: float = 15.0) -> bool:
@@ -167,6 +182,17 @@ class _HookCase(unittest.TestCase):
         return self.log.exists() and any(
             ln.strip() == ENGINE_LINE for ln in self.log.read_text().splitlines())
 
+    def _engine_log(self) -> Path:
+        """The outcome log the Python CLI writes and the spawners must
+        append the child's stderr to (FINAL2 L-2): resolved under the same
+        ``VCT_STATE_DIR`` the test sets for the hook."""
+        return Path(self._env()["VCT_STATE_DIR"]) / "logs" / "engine-start.log"
+
+    def _engine_stderr_captured(self, wait_s: float = 15.0) -> bool:
+        engine_log = self._engine_log()
+        _wait_for_line(engine_log, ENGINE_STDERR_TEXT, timeout_s=wait_s)
+        return engine_log.exists() and ENGINE_STDERR_TEXT in engine_log.read_text()
+
 
 @unittest.skipIf(
     IS_WINDOWS,
@@ -190,6 +216,18 @@ class BashHookWiringTests(_HookCase):
                          "nothing installed: no engine start may be spawned; "
                          f"log:\n{self.log.read_text() if self.log.exists() else '<none>'}")
 
+    def test_a_broken_venv_traceback_lands_in_the_outcome_log(self):
+        # FINAL2 L-2: a venv too broken to import vco_lib writes nothing to
+        # the outcome log itself — the hook's spawn must append the child's
+        # stderr to the SAME log instead of discarding it.
+        proc = self._run_sh(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_DOWN,
+                            FAKE_RESOLVE_JSON=RESOLVE_JSON_DOWN,
+                            FAKE_ENGINE_STDERR=ENGINE_STDERR_TEXT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(self._engine_stderr_captured(),
+                        "the broken-venv traceback must reach "
+                        f"{self._engine_log()}; it was discarded by the spawn")
+
 
 @unittest.skipIf(not PWSH, "pwsh not available")
 class Ps1HookWiringTests(_HookCase):
@@ -208,6 +246,18 @@ class Ps1HookWiringTests(_HookCase):
         self.assertFalse(self._engine_started(wait_s=2.0),
                          "nothing installed: no engine start may be spawned; "
                          f"log:\n{self.log.read_text() if self.log.exists() else '<none>'}")
+
+    def test_a_broken_venv_traceback_lands_in_the_outcome_log(self):
+        # FINAL2 L-2 (parity with the .sh sibling): Start-Process discards
+        # the child's output, so the spawn must route the child's stderr
+        # into the SAME outcome log the Python CLI writes.
+        proc = self._run_ps1(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_DOWN,
+                             FAKE_RESOLVE_JSON=RESOLVE_JSON_DOWN,
+                             FAKE_ENGINE_STDERR=ENGINE_STDERR_TEXT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(self._engine_stderr_captured(),
+                        "the broken-venv traceback must reach "
+                        f"{self._engine_log()}; it was discarded by the spawn")
 
 
 if __name__ == "__main__":  # pragma: no cover

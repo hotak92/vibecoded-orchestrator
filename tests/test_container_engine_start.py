@@ -489,6 +489,22 @@ class PrefEnabledTests(unittest.TestCase):
         self.assertIn(f'"{ces.APP_STATE_ENGINE_AUTOSTART}"', launcher_rs)
         self.assertIn(f'"{ces.APP_STATE_ENGINE_AUTOSTART}"', core_rs)
 
+    def test_the_outcome_log_tail_matches_the_rust_and_hook_spawners(self):
+        """FINAL2 L-2 cross-language pin: the Rust spawner and the two hook
+        siblings append the spawned CLI's stderr to the SAME outcome log
+        this module writes (a venv too broken to import vco_lib leaves its
+        traceback nowhere unless the SPAWNER captures it) — the relative
+        tail ``logs/engine-start.log`` cannot drift."""
+        repo = Path(__file__).resolve().parents[1]
+        core_rs = (repo / "launcher" / "src-tauri" / "vct-launcher-core" / "src"
+                   / "services" / "engine_autostart.rs").read_text(encoding="utf-8")
+        self.assertIn('pub const ENGINE_START_LOG: &str = "engine-start.log"', core_rs)
+        self.assertIn('.join("logs").join(ENGINE_START_LOG)', core_rs)
+        for name in ("ensure-containers.sh", "ensure-containers.ps1"):
+            body = (repo / "templates" / "hooks" / name).read_text(encoding="utf-8")
+            self.assertIn("engine-start.log", body,
+                          f"{name} must append the child's stderr to the same log")
+
 
 class InstallSkippedContainersTests(unittest.TestCase):
     """R19 F1: reading the persisted --no-containers choice."""
