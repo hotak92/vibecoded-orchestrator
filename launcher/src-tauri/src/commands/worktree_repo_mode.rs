@@ -5,14 +5,15 @@
 //! subagent-git modal (v0.2.71 Track T-WT).
 //!
 //! ## What this is
-//! When a project's workspace ROOT is not inside any git repo, the
-//! closed-source Claude Code harness's `git worktree add` (driven by the 9
-//! agents that declare `isolation: worktree`) fails the subagent spawn. VCO
-//! cannot intercept that spawn, so its only levers are: detect/use an
-//! enclosing repo, offer to `git init` a local-only repo, or strip the
-//! `isolation: worktree` frontmatter so the harness never attempts a
-//! worktree. The subagent-git modal surfaces those choices; this setting
-//! records the user's decision per-project.
+//! When a project's workspace ROOT is not inside any git repo, agents that
+//! declare `isolation: worktree` get no isolated worktree: VCO's WorktreeCreate
+//! hook (`worktree-guard`, since v0.2.102 W6-Q) returns the folder itself and
+//! the agent runs in place with isolation OFF. (A repo with no commits yet is
+//! fine — the hook detaches the worktree at a snapshot commit.) The levers
+//! are: detect/use an enclosing repo, `git init` a local-only repo (automatic
+//! at add / bundle update since v0.2.103 when nothing pre-exists), connect an
+//! existing repo, or opt out. The subagent-git modal surfaces the choices
+//! that remain the user's; this setting records the decision per-project.
 //!
 //! Five modes (a string, NOT a bool):
 //!   * `"use_existing"` — an enclosing repo was detected (root or a parent
@@ -80,7 +81,9 @@ const SETTING_KEY: &str = "worktree_repo_mode";
 const SOURCE_SETTING_KEY: &str = "worktree_repo_source";
 
 /// The five valid modes. Any other value is rejected by the setter so a
-/// GUI bug can't persist garbage the modal then can't interpret.
+/// GUI bug can't persist garbage the modal then can't interpret. The Python
+/// reader `vco_lib/local_repo_pending.py` mirrors this set (and SETTING_KEY /
+/// MODULE_ID); both sides pin tests/fixtures/worktree_repo_mode_parity.json.
 const VALID_MODES: [&str; 5] = [
     "use_existing",
     "local_init",
@@ -744,7 +747,7 @@ pub(crate) enum AutoLocalRepoOutcome {
 /// GUI wiring test, so the wording the owner asked for cannot drift.
 pub(crate) const CREATED_LOCAL_REPO_NOTICE: &str =
     "Created a local git repository (no remote, nothing committed). \
-     Isolated subagent worktrees need a first commit.";
+     Subagents now work in isolated worktrees (snapshots of your files until your first commit).";
 
 impl AutoLocalRepoOutcome {
     /// Informational notice for the GUI (success/info toast), if any.
@@ -761,8 +764,8 @@ impl AutoLocalRepoOutcome {
         match self {
             AutoLocalRepoOutcome::GitUnavailable { detail } => Some(format!(
                 "git could not be run ({}), so VCO did not create a local git repository \
-                 for this project: subagents that use worktree isolation cannot start \
-                 until there is one. Install git, then run Update bundle — VCO creates \
+                 for this project: subagents that use worktree isolation run in the \
+                 project folder itself, without isolation, until there is one. Install git, then run Update bundle — VCO creates \
                  the repository then.",
                 detail
             )),
@@ -1089,6 +1092,43 @@ mod tests {
                 "verdict mismatch for {url:?}"
             );
         }
+    }
+
+    /// v0.2.103 (review R15): the mode contract is shared with the Python
+    /// reader (`vco_lib/local_repo_pending.py`) through
+    /// tests/fixtures/worktree_repo_mode_parity.json — a new or renamed mode
+    /// fails here until the fixture says so, then fails the Python test
+    /// (tests/test_local_repo_pending.py) until Python knows it.
+    #[test]
+    fn worktree_repo_mode_parity_fixture() {
+        #[derive(serde::Deserialize)]
+        struct ModeFixture {
+            #[serde(rename = "_format_version")]
+            format_version: u32,
+            module_id: String,
+            setting_key: String,
+            valid_modes: Vec<String>,
+        }
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("two parents above CARGO_MANIFEST_DIR")
+            .join("tests")
+            .join("fixtures")
+            .join("worktree_repo_mode_parity.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let fix: ModeFixture = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parse {}: {}", path.display(), e));
+        assert_eq!(fix.format_version, 1);
+        assert_eq!(fix.module_id, MODULE_ID);
+        assert_eq!(fix.setting_key, SETTING_KEY);
+        let mut ours: Vec<&str> = VALID_MODES.to_vec();
+        let mut theirs: Vec<&str> = fix.valid_modes.iter().map(String::as_str).collect();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(ours, theirs, "VALID_MODES and the parity fixture diverged");
     }
 
     #[tokio::test]
@@ -1572,7 +1612,7 @@ mod tests {
         assert!(out.warning().is_none());
         assert!(
             CREATED_LOCAL_REPO_NOTICE
-                == "Created a local git repository (no remote, nothing committed). Isolated subagent worktrees need a first commit.",
+                == "Created a local git repository (no remote, nothing committed). Subagents now work in isolated worktrees (snapshots of your files until your first commit).",
             "owner-facing wording pinned"
         );
 
@@ -1792,7 +1832,10 @@ mod tests {
         assert_eq!(out, AutoLocalRepoOutcome::Created { record_error: None });
         let notice = out.notice().unwrap();
         assert!(notice.contains("nothing committed"), "{notice}");
-        assert!(notice.contains("need a first commit"), "{notice}");
+        assert!(
+            notice.contains("snapshots of your files until your first commit"),
+            "{notice}"
+        );
         assert!(tmp.path().join(".git").is_dir());
         assert!(
             !w(&["rev-parse", "--verify", "-q", "HEAD"], tmp.path()).status.success(),
