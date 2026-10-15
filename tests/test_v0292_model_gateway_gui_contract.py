@@ -540,10 +540,30 @@ def test_no_gateway_means_no_word_about_vendor_models():
 def test_gateway_active_renders_the_routing_section():
     out = render({"some_module", "model_gateway"})
     assert "## Model routing" in out
-    assert "claude-gw/glm-5.3" in out
     assert "CLAUDE_CODE_SUBAGENT_MODEL" in out, (
         "the no-slot-remap rule has to name the keys it forbids"
     )
+    assert "{{#if_module" not in out and "{{/if_module" not in out
+    # v0.2.103 (plan item 12): the vendor-lane prose is provider-conditional
+    # — with no vendor key the gateway section carries the shared rules and
+    # the grid placeholder, but no lane and no GLM routing rule. (The window
+    # mechanics paragraph keeps its glm/qwen spellings: they are the shipped
+    # seed table's rows cited as id-spelling EXAMPLES, applicable to every
+    # vendor's `[1m]` suffix, not model-selection guidance.)
+    assert "- **The z.ai lane**" not in out
+    assert "When you route to GLM" not in out
+
+
+def test_gateway_with_a_vendor_key_renders_that_vendor_s_lane():
+    """The provider-conditional prose follows the keys the user holds
+    (owner ruling 2026-10-14: guidance names only callable models)."""
+    out = render({"some_module", "model_gateway", "provider_zai",
+                  "provider_glm"})
+    assert "claude-gw/glm-5.3" in out
+    assert "- **The z.ai lane**" in out
+    assert "When you route to GLM" in out
+    assert "The qwen-vendor lane" not in out
+    assert "The kimi-vendor lane" not in out
     assert "{{#if_module" not in out and "{{/if_module" not in out
 
 
@@ -706,15 +726,24 @@ def test_the_definition_name_guidance_renders_inside_the_gate_only():
     """The spawn-by-definition-name sentence ships with the routing section:
     present when model_gateway is active, absent otherwise (the existing
     no-vendor-words test catches the leak half; this pins the presence
-    half, so the guidance cannot be dropped from the gated render either)."""
+    half, so the guidance cannot be dropped from the gated render either).
+
+    v0.2.103 (plan item 12): the @names live in the provider-conditional
+    lane bullets — the presence half now renders with the provider features
+    on, exactly the set a machine whose keys all resolve produces."""
     at_names = [f"@{n.removesuffix('.md')}" for n in MODULE_GATEWAY_AGENT_FILES]
-    on = render({"some_module", "model_gateway"})
+    on = render({"some_module", "model_gateway", "provider_zai",
+                 "provider_qwen", "provider_kimi", "provider_glm"})
     for at_name in at_names:
         assert at_name in on
     assert "cannot carry `claude-gw/*` ids" in on
     off = render({"some_module"})
     for at_name in at_names:
         assert at_name not in off
+    # And with the gateway on but no vendor key, no @name renders either.
+    gateway_only = render({"some_module", "model_gateway"})
+    for at_name in at_names:
+        assert at_name not in gateway_only
 
 
 # ---------------------------------------------------------------------------

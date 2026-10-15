@@ -105,6 +105,11 @@ pub mod manifest;
 // to `python -m vco_lib.vscode_settings`, which owns the byte layout of that
 // user-owned file.
 pub mod model_gateway;
+// v0.2.103 (plan item 12): the model-guidance refresh triggers (launcher
+// startup, Secrets-panel key changes) and the GUI status read. The refresh
+// itself is Python (`python -m vco_lib.model_guidance`); this module only
+// fires it and transports its payload.
+pub mod model_guidance;
 // v0.2.97: after an update, "is the running gateway still on the previous
 // release's code?" and the Continue that restarts it. Never automatic — a
 // restart ends every agent session routed through the gateway. The verdict

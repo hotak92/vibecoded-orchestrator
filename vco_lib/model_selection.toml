@@ -8,8 +8,10 @@
 # is copied from the maintainer's "Model selection — which model for which
 # task" grid (2026-10-03, re-scored at medium effort the same day), with the
 # owner-approved 2026-10-08 revision (Haiku 5.5 replaces Haiku 4.5, GLM-5.3
-# Review 8, DeepSeek V4.1 Flash Docs 7, the GLM-implementer bullet and the
-# measured Kimi budget). Scores are copied EXACTLY and are pinned by
+# Review 8, DeepSeek V4.1 Flash Docs 7, the GLM-implementer bullet) and the
+# 2026-10-14 owner ruling that machine-local budget/quota facts (the measured
+# Kimi subscription budget) live only in the maintainer's own memory, never
+# in the shipped grid. Scores are copied EXACTLY and are pinned by
 # tests/test_model_selection_grid.py — edit both together.
 #
 # `reach_via` names only agents that SHIP in templates/agents/: the gateway
@@ -41,7 +43,7 @@ columns = [
 intro = [
   "Delegate to subagents and **always name the model** — the gateway agents below pin it in their own file, so dispatch them without a `model` param; for the Claude rows, name the model on the Agent call (`model: opus` and so on).",
   "Scores are 1–10 within this set, **at medium effort** (what this setup runs), from effort-matched benchmarks, vendor model cards and head-to-head user comparisons. **`*`** = assumed (no benchmark and fewer than 3 comparison reports); **`†`** = this model has only xhigh/max benchmark results (no medium/high data) — weaker evidence.",
-  "Only the rows for model providers reachable on this machine at render time are listed — add a vendor key in the launcher's Secrets panel and re-run the update to add its rows.",
+  "Only the rows for model providers whose key resolves on this machine are listed — add a vendor key in the launcher's Secrets panel and its rows appear by themselves: the guidance refreshes automatically at launcher startup, on every key change, and at every install/update.",
 ]
 
 # The column legend, rendered after the table.
@@ -185,7 +187,7 @@ text = "**GLM-5.3 as implementer** — strong on bounded lanes whose brief names
 
 [[note]]
 models = ["kimi-k3"]
-text = "**Kimi K3** — near-frontier code quality on real repos and strong long-context retrieval, but the slowest and most verbose lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about twice the median output tokens), so queue its work and review it later. Its measured subscription budget is ≈ one substantial lane per 5h window and ≈1–2% of the month per lane, so give it small, bounded lanes or audits. It always reasons; it can repeat the same tool call or stop on reasoning with no answer, and it guesses confidently when unsure (51% hallucination rate on uncertain questions), so demand quoted evidence in its reviews."
+text = "**Kimi K3** — near-frontier code quality on real repos and strong long-context retrieval, but the slowest and most verbose lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about twice the median output tokens), so queue its work and review it later. Give it small, bounded lanes or audits. It always reasons; it can repeat the same tool call or stop on reasoning with no answer, and it guesses confidently when unsure (51% hallucination rate on uncertain questions), so demand quoted evidence in its reviews."
 
 [[note]]
 models = ["glm-5.3-flash"]

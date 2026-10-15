@@ -1139,6 +1139,31 @@ pub fn run() {
                 crate::deferral_ledger::run_boot_doctor_and_retries(root).await;
             });
 
+            // v0.2.103 (plan item 12): re-render the provider-dependent
+            // model guidance (the {{MODEL_SELECTION_GRID}} and the
+            // provider-conditional CLAUDE.md sections) at launcher startup,
+            // so the guidance follows the vendor keys the user actually
+            // holds without waiting for the next install/update. The work is
+            // Python (`python -m vco_lib.model_guidance refresh`, spawned
+            // detached by the trigger); it writes only when the rendered
+            // output changes and soft-fails to one log line. Same BOOT
+            // DISCIPLINE as the probes above: `tauri::async_runtime::spawn`,
+            // never inline, nothing blocks the `setup complete` marker. The
+            // DB-backed install-root resolver covers a launcher running
+            // outside the clone (the v0.2.37 seed path), which the bare
+            // exe walk-up cannot.
+            {
+                let guidance_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let db = guidance_handle.state::<crate::db::Db>();
+                    commands::model_guidance::spawn_model_guidance_refresh(
+                        db.inner(),
+                        commands::model_guidance::REFRESH_TRIGGER_STARTUP,
+                    );
+                });
+            }
+
             // v0.2.37 (Agent V37-E, 2026-05-27): consume the
             // install_path seed file that install.py may have written
             // alongside the orchestrator clone (see
@@ -3493,6 +3518,7 @@ pub fn run() {
             commands::embedding_catalog::get_code_embed_model_status,
             commands::embedding_catalog::get_kg_embed_model_status,
             commands::embedding_catalog::validate_model_against_catalog,
+            commands::model_guidance::get_model_guidance_status,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,
