@@ -286,6 +286,11 @@ export const PREF_LOADERS = {
     section: 'Startup (launcher session autostart)',
     load: () => invoke<boolean>('get_launcher_session_autostart'),
   },
+  engineAutostart: {
+    eager: false,
+    section: 'Startup (container engine autostart)',
+    load: () => invoke<boolean>('get_container_engine_autostart'),
+  },
   services: {
     eager: false,
     slow: true,

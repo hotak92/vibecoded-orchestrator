@@ -60,6 +60,11 @@
     sessionAutostartHint,
   } from '$lib/session-autostart';
   import {
+    DEFAULT_ENGINE_AUTOSTART,
+    resolveEngineAutostart,
+    engineAutostartHint,
+  } from '$lib/engine-autostart';
+  import {
     resolveModuleUpdateAutoCheck,
     moduleUpdateAutoCheckHint,
     DEFAULT_MODULE_UPDATE_AUTO_CHECK,
@@ -1755,6 +1760,44 @@
     }
   }
 
+  // v0.2.103 (review R19 F4): "Start the container engine automatically".
+  // The launcher.db switch for the engine auto-start whose one home is
+  // `vco_lib/container_engine_start.py` — the readers are the session hooks,
+  // the hub and this launcher's own setup, none of which see `.claude/env`,
+  // so the env override alone was unreachable for them.
+  let engineAutostart = $state(DEFAULT_ENGINE_AUTOSTART);
+  let engineAutostartBusy = $state(false);
+  let engineAutostartError = $state<string | null>(null);
+
+  async function loadEngineAutostart() {
+    try {
+      engineAutostart = resolveEngineAutostart(
+        await PREF_LOADERS.engineAutostart.load(),
+      );
+    } catch (e) {
+      // Unreachable command (browser mode / partial install): show the
+      // SHIPPED default, because that is what the starter will do.
+      engineAutostart = resolveEngineAutostart(null);
+      console.warn('get_container_engine_autostart failed', e);
+    }
+  }
+
+  async function toggleEngineAutostart(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const enable = target.checked;
+    engineAutostartBusy = true;
+    engineAutostartError = null;
+    try {
+      await invoke('set_container_engine_autostart', { enabled: enable });
+      engineAutostart = enable;
+    } catch (e) {
+      engineAutostartError = e instanceof Error ? e.message : String(e);
+      target.checked = engineAutostart;
+    } finally {
+      engineAutostartBusy = false;
+    }
+  }
+
   // ── Module updates: the 24 h automatic check (v0.2.100) ───────────────
   // Opt-out for `spawn_module_update_check_loop`. The shipped default is ON;
   // the switch renders that default while the read is in flight or fails.
@@ -2228,6 +2271,7 @@
     hardwareSnapshot: loadInitialHardwareSnapshot,
     bootAutostart: loadBootAutostart,
     sessionAutostart: loadSessionAutostart,
+    engineAutostart: loadEngineAutostart,
     moduleUpdateAutoCheck: loadModuleUpdateAutoCheck,
     services: refreshServices,
     activeEmbedding: loadActiveEmbedding,
@@ -3734,7 +3778,7 @@
     <!-- Startup: two independent switches — the background hub's OS boot
          registration (login), and the launcher's own tray-only start with
          a Claude Code session / VS Code folder open (v0.2.95, R2). -->
-    <section class="pr-section" use:lazySection={{ loaders, keys: ['bootAutostart', 'sessionAutostart'] }} aria-labelledby="pr-startup-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['bootAutostart', 'sessionAutostart', 'engineAutostart'] }} aria-labelledby="pr-startup-title">
       <h2 class="pr-section-title" id="pr-startup-title">Startup</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
@@ -3778,6 +3822,25 @@
           checked={sessionAutostart}
           disabled={sessionAutostartBusy}
           onchange={toggleSessionAutostart}
+        />
+      </div>
+
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Start the container engine automatically</strong>
+          <span class="pr-onboarding-hint">
+            {engineAutostartHint(engineAutostart)}
+          </span>
+          {#if engineAutostartError}
+            <span class="pr-onboarding-hint pr-startup-error">{engineAutostartError}</span>
+          {/if}
+        </div>
+        <input
+          type="checkbox"
+          data-testid="container-engine-autostart"
+          checked={engineAutostart}
+          disabled={engineAutostartBusy}
+          onchange={toggleEngineAutostart}
         />
       </div>
     </section>

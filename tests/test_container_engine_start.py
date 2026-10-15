@@ -21,6 +21,12 @@ pre-fix tree (see the lane report).
 """
 from __future__ import annotations
 
+import io
+import json
+import os
+import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -85,13 +91,20 @@ class EnsureEngineTests(unittest.TestCase):
         self.heal_podman = mock.MagicMock(
             return_value=_cp.HealResult(True, ["systemctl --user start podman.socket"],
                                         "socket started"))
+        # R19 F1: starting requires a RECORDED runtime — the default
+        # resolution carries one (docker, recorded and installed).
         self.resolve_fn = mock.MagicMock(
-            return_value=_resolution(_c.RuntimeState.ABSENT, installed="docker"))
+            return_value=_resolution(_c.RuntimeState.ABSENT, installed="docker",
+                                     requested="docker", requested_installed=True))
+        self.manifest_reader = mock.MagicMock(return_value=False)
 
     def _ensure(self, **kw):
         kw.setdefault("resolve_fn", self.resolve_fn)
         kw.setdefault("start_docker", self.start_docker)
         kw.setdefault("heal_podman", self.heal_podman)
+        kw.setdefault("manifest_reader", self.manifest_reader)
+        kw.setdefault("pref_reader", lambda key: None)
+        kw.setdefault("update_in_progress", lambda: False)
         return ces.ensure_engine(**kw)
 
     def test_opt_out_is_a_noop_before_any_probe(self):
@@ -124,16 +137,49 @@ class EnsureEngineTests(unittest.TestCase):
         self.assertIn("unknown", detail)
         self.start_docker.assert_not_called()
 
-    def test_nothing_installed_starts_nothing(self):
-        self.resolve_fn.return_value = _resolution(_c.RuntimeState.ABSENT, installed=None)
+    def test_no_recorded_runtime_starts_nothing(self):
+        """R19 F1: with NO pin at all (fresh pre-runtime.txt install, both
+        runtimes on PATH) NOTHING is started — never the first binary on
+        PATH, never an unattended podman machine init."""
+        self.resolve_fn.return_value = _resolution(_c.RuntimeState.ABSENT, installed="podman")
         ok, detail = self._ensure()
         self.assertFalse(ok)
-        self.assertIn("no container engine installed", detail)
+        self.assertIn("no runtime recorded", detail)
         self.start_docker.assert_not_called()
         self.heal_podman.assert_not_called()
 
-    def test_installed_podman_takes_the_podman_branch(self):
-        self.resolve_fn.return_value = _resolution(_c.RuntimeState.ABSENT, installed="podman")
+    def test_install_manifest_no_containers_starts_nothing(self):
+        """R19 F1: the persisted --no-containers choice (state/
+        install-manifest.json skipped.containers) refuses outright, even
+        with a recorded runtime that is down."""
+        self.manifest_reader.return_value = True
+        ok, detail = self._ensure()
+        self.assertFalse(ok)
+        self.assertIn("--no-containers", detail)
+        self.resolve_fn.assert_not_called()
+        self.start_docker.assert_not_called()
+        self.heal_podman.assert_not_called()
+
+    def test_preferences_toggle_off_is_a_noop_before_any_probe(self):
+        """R19 F4: the launcher.db toggle off disables the starter — the
+        surface a GUI-started launcher/hub can actually reach."""
+        ok, detail = self._ensure(pref_reader=lambda key: "false")
+        self.assertFalse(ok)
+        self.assertIn("Preferences toggle", detail)
+        self.assertIn(ces.APP_STATE_ENGINE_AUTOSTART, detail)
+        self.resolve_fn.assert_not_called()
+        self.start_docker.assert_not_called()
+
+    def test_an_update_in_progress_skips(self):
+        """R19 F7: the SAME update-in-progress gate the hooks honour."""
+        ok, detail = self._ensure(update_in_progress=lambda: True)
+        self.assertFalse(ok)
+        self.assertIn("update is in progress", detail)
+        self.start_docker.assert_not_called()
+
+    def test_recorded_podman_takes_the_podman_branch(self):
+        self.resolve_fn.return_value = _resolution(_c.RuntimeState.ABSENT, installed="docker",
+                                                   requested="podman", requested_installed=True)
         ok, _ = self._ensure()
         self.assertTrue(ok)
         self.heal_podman.assert_called_once_with()
@@ -238,6 +284,44 @@ class TryStartDockerDaemonTests(unittest.TestCase):
         self.assertEqual(detail, "daemon responsive")
         self.assertEqual(runs, [["open", "-a", "Docker"]])
 
+    def test_the_default_binary_lookup_is_the_resolvers(self):
+        """R19 F5: one lookup home — the default `which` is the resolver's
+        tool_search_dirs.which (PATH + the usual install locations), so a
+        short-PATH graphical launch the resolver calls "installed" is not
+        refused here as "not on PATH"."""
+        seen = {}
+        monkey_which = lambda name: seen.setdefault(name, f"/opt/big/{name}")  # noqa: E731
+        with mock.patch.object(ces._tsd, "which", monkey_which):
+            ok, detail = ces.try_start_docker_daemon(
+                system="Darwin", run=lambda argv, **kw: mock.Mock(returncode=0, stderr=""),
+                reachable=lambda: False, monotonic=lambda: 0.0, sleep=lambda s: None,
+                wait_s=0.0)
+        self.assertTrue(ok)
+        self.assertEqual(seen, {"docker": "/opt/big/docker"})
+
+    def test_unset_localappdata_never_probes_a_cwd_relative_exe(self):
+        """R19 F8: an unset LOCALAPPDATA used to turn the second candidate
+        into a cwd-relative `Docker/Docker Desktop.exe` — skipped now."""
+        with tempfile.TemporaryDirectory() as td:
+            # A decoy at the cwd-relative location must never be picked:
+            # run from a temp cwd that HOLDS one.
+            decoy_dir = Path(td) / "cwd"
+            (decoy_dir / "Docker").mkdir(parents=True)
+            (decoy_dir / "Docker" / "Docker Desktop.exe").write_bytes(b"x")
+            prev_cwd = os.getcwd()
+            os.chdir(decoy_dir)
+            try:
+                ok, detail = ces.try_start_docker_daemon(
+                    system="Windows", which=lambda n: f"/bin/{n}" if n == "docker" else None,
+                    env={"ProgramFiles": str(Path(td) / "none"), "LOCALAPPDATA": ""},
+                    popen=lambda *a, **kw: (_ for _ in ()).throw(
+                        AssertionError("no spawn expected")),
+                    reachable=lambda: False, wait_s=0.0)
+            finally:
+                os.chdir(prev_cwd)
+        self.assertFalse(ok)
+        self.assertIn("not found at the canonical install locations", detail)
+
     def test_linux_is_not_automated(self):
         ok, detail = ces.try_start_docker_daemon(
             system="Linux", which=lambda n: f"/bin/{n}" if n == "docker" else None)
@@ -249,7 +333,7 @@ class TryStartDockerDaemonTests(unittest.TestCase):
             system="Windows", which=lambda n: None,
             env={"ProgramFiles": "/none", "LOCALAPPDATA": ""})
         self.assertFalse(ok)
-        self.assertIn("not on PATH", detail)
+        self.assertIn("docker binary not found", detail)
 
     def test_the_wait_is_bounded_liveness_only(self):
         # reachable flips True after one poll: the loop must stop polling and
@@ -283,6 +367,113 @@ class TryStartDockerDaemonTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(clock.slept, [])
         self.assertIn("launch attempted", detail)
+
+
+class PrefEnabledTests(unittest.TestCase):
+    """R19 F4: the launcher.db Preferences toggle, launcher_ensure's shape."""
+
+    def test_absent_row_and_errors_read_as_the_default_on(self):
+        self.assertTrue(ces.pref_enabled(lambda key: None))
+
+        def boom(key):
+            raise RuntimeError("db locked")
+
+        self.assertTrue(ces.pref_enabled(boom))
+
+    def test_truthiness_rule_matches_the_rust_writer(self):
+        self.assertTrue(ces.pref_enabled(lambda key: "true"))
+        self.assertTrue(ces.pref_enabled(lambda key: "1"))
+        self.assertFalse(ces.pref_enabled(lambda key: "false"))
+        self.assertFalse(ces.pref_enabled(lambda key: "0"))
+        self.assertFalse(ces.pref_enabled(lambda key: ""))
+
+    def test_the_app_state_key_matches_the_rust_sides(self):
+        """Cross-language pin: the launcher WRITES the row (commands/
+        engine_autostart_pref.rs), the core pre-check and this module READ
+        it — the three literals cannot drift."""
+        repo = Path(__file__).resolve().parents[1]
+        launcher_rs = (repo / "launcher" / "src-tauri" / "src" / "commands"
+                       / "engine_autostart_pref.rs").read_text(encoding="utf-8")
+        core_rs = (repo / "launcher" / "src-tauri" / "vct-launcher-core" / "src"
+                   / "services" / "engine_autostart.rs").read_text(encoding="utf-8")
+        self.assertIn(f'"{ces.APP_STATE_ENGINE_AUTOSTART}"', launcher_rs)
+        self.assertIn(f'"{ces.APP_STATE_ENGINE_AUTOSTART}"', core_rs)
+
+
+class InstallSkippedContainersTests(unittest.TestCase):
+    """R19 F1: reading the persisted --no-containers choice."""
+
+    def _manifest(self, tmp_path, payload):
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "install-manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+        return tmp_path
+
+    def test_true_when_the_install_skipped_containers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._manifest(Path(td), {"skipped": {"containers": True}})
+            self.assertTrue(ces.install_skipped_containers(root))
+
+    def test_false_when_containers_were_installed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self._manifest(Path(td), {"skipped": {"containers": False}})
+            self.assertFalse(ces.install_skipped_containers(root))
+
+    def test_false_when_missing_or_unreadable(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertFalse(ces.install_skipped_containers(Path(td)))  # no manifest
+            root = self._manifest(Path(td), {})  # no skipped block
+            self.assertFalse(ces.install_skipped_containers(root))
+            (root / "state" / "install-manifest.json").write_text("{ not json", encoding="utf-8")
+            self.assertFalse(ces.install_skipped_containers(root))
+
+
+class SingleFlightTests(unittest.TestCase):
+    """R19 F2: ONE per-user claim — concurrent callers produce ONE starter."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._patcher = mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(Path(self._tmp.name))})
+        self._patcher.start()
+
+    def test_the_lock_path_is_per_user_under_the_state_root(self):
+        self.assertEqual(ces.engine_start_lock_path(),
+                         Path(self._tmp.name) / "state" / "engine-start.lock")
+
+    def test_a_held_claim_makes_the_loser_stand_down(self):
+        from vco_lib.atomic import exclusive_file_lock
+
+        with mock.patch.object(ces, "ensure_engine") as ensure:
+            with exclusive_file_lock(ces.engine_start_lock_path(), timeout_s=5):
+                # Another CLI run holds the claim right now.
+                buf = io.StringIO()
+                with mock.patch("sys.stdout", buf):
+                    rc = ces.main(["ensure", "--wait", "0"])
+        self.assertEqual(rc, 0)
+        ensure.assert_not_called()
+        self.assertIn("already in progress", buf.getvalue())
+
+    def test_two_racing_runs_start_the_engine_exactly_once(self):
+        started = []
+        barrier = threading.Barrier(2)
+
+        def slow_ensure(**kw):
+            started.append("once")
+            time.sleep(0.4)  # the "engine boot" window
+            return True, "daemon responsive"
+
+        def run_cli():
+            barrier.wait()  # both threads reach main() together
+            with mock.patch.object(ces, "ensure_engine", side_effect=slow_ensure):
+                ces.main(["ensure", "--wait", "0", "--json"])
+
+        threads = [threading.Thread(target=run_cli) for _ in range(2)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=30)
+        self.assertEqual(started, ["once"])
 
 
 class CliTests(unittest.TestCase):

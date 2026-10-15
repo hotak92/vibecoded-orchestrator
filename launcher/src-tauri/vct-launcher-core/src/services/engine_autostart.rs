@@ -25,11 +25,22 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// The opt-out knob. MUST MATCH `vco_lib.container_engine_start
-/// .VCT_CONTAINER_ENGINE_AUTOSTART` (env name + falsy set — a data-only
-/// mirror so an opted-out machine never pays the Python spawn; the CLI
-/// re-checks it authoritatively). Documented in `docs/CONFIGURATION.md`.
+/// The opt-out knob 1 (env override). MUST MATCH `vco_lib
+/// .container_engine_start.VCT_CONTAINER_ENGINE_AUTOSTART` (env name + falsy
+/// set — a data-only mirror so an opted-out machine never pays the Python
+/// spawn; the CLI re-checks it authoritatively). Documented in
+/// `docs/CONFIGURATION.md`.
 pub const ENV_AUTOSTART: &str = "VCT_CONTAINER_ENGINE_AUTOSTART";
+
+/// The opt-out knob 2 (review R19 F4): the Preferences toggle row in
+/// launcher.db `app_state`. MUST MATCH `vco_lib.container_engine_start
+/// .APP_STATE_ENGINE_AUTOSTART` and the launcher's writer
+/// (`commands::engine_autostart_pref`). Pinned by
+/// `tests/test_container_engine_start.py`.
+pub const APP_STATE_ENGINE_AUTOSTART: &str = "engine.autostart";
+
+/// Shipped default: ON. MUST MATCH the Python `DEFAULT_ENGINE_AUTOSTART`.
+pub const DEFAULT_ENGINE_AUTOSTART: bool = true;
 
 /// The falsy values that disable auto-start (lowercase). Kept in step with
 /// the Python `_FALSY` set.
@@ -43,6 +54,17 @@ pub fn autostart_enabled() -> bool {
     }
 }
 
+/// The Preferences toggle (review R19 F4): an absent row, an unreadable
+/// launcher.db (fresh install, never booted) or any DB error all read as
+/// the shipped default rather than as "off" — the same soft-fail rule
+/// `vco_lib.container_engine_start::pref_enabled` applies. `None`-row
+/// semantics MUST MATCH the Python reader.
+pub fn pref_enabled(db: &crate::db::Db) -> bool {
+    db.app_state_get_bool(APP_STATE_ENGINE_AUTOSTART)
+        .unwrap_or(None)
+        .unwrap_or(DEFAULT_ENGINE_AUTOSTART)
+}
+
 /// The argv (after the interpreter) of the engine auto-start CLI. One
 /// constant so the hub and the launcher spawn the identical command.
 pub fn engine_start_argv() -> [&'static str; 3] {
@@ -51,15 +73,29 @@ pub fn engine_start_argv() -> [&'static str; 3] {
 
 /// Resolve the vco_lib-capable interpreter (the canonical RT-4 ladder) and
 /// spawn the engine auto-start CLI detached. Returns the child's pid, or
-/// `None` when auto-start is opted out, no interpreter resolves (a BROKEN
-/// install — logged, never patched over) or the spawn failed (soft-fail
-/// with one log line). Never blocks on the child.
+/// `None` when auto-start is opted out (env override, Preferences toggle,
+/// or the launcher.db read failing open to the default with no DB
+/// discoverable), no interpreter resolves (a BROKEN install — logged,
+/// never patched over) or the spawn failed (soft-fail with one log line).
+/// Never blocks on the child.
+///
+/// The update-in-progress gate (R19 F7) is enforced INSIDE the CLI
+/// (`vco_lib.update_gate.is_update_in_progress`), so every Rust surface
+/// that spawns it — hub, launcher — honours the same lockfile the hooks
+/// honour without a second Rust copy of the freshness rule.
 pub fn spawn_engine_start_cli() -> Option<u32> {
     if !autostart_enabled() {
         // Not a warning: an explicit user choice, and the hub/launcher
         // start path is far too early for log noise about it.
         return None;
     }
+    if let Ok(db) = crate::db::Db::open() {
+        if !pref_enabled(&db) {
+            return None;
+        }
+    }
+    // An unopenable launcher.db is NOT an opt-out (the Python CLI re-reads
+    // the row and applies the same default) — fall through and spawn.
     let python = resolve_python();
     let Some(python) = python else {
         tracing::warn!(
@@ -90,10 +126,27 @@ fn resolve_python() -> Option<PathBuf> {
     crate::python_resolve::resolve_python_for_vco_lib()
 }
 
+/// Win32 creation flags for the CLI child (review R19 F3).
+///
+/// `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` — deliberately NOT
+/// `DETACHED_PROCESS`: Win32 ignores `CREATE_NO_WINDOW` when
+/// `DETACHED_PROCESS` is set, and a child with NO console gives every
+/// console grandchild it spawns (`cmd`, `docker info` polling, `podman`)
+/// a NEW VISIBLE console — a window flash every 2 s of a Docker Desktop
+/// boot. `CREATE_NO_WINDOW` alone gives the CLI a HIDDEN console its
+/// children inherit; `CREATE_NEW_PROCESS_GROUP` keeps it immune to the
+/// caller's Ctrl-C. The repo's own convention (`hub_launcher.rs:173`,
+/// `projects_v2.rs`) is `CREATE_NO_WINDOW` alone for the same reason.
+pub const WINDOWS_CREATION_FLAGS: u32 = 0x0800_0000 | 0x0000_0200;
+
 /// Build and spawn the detached CLI for a GIVEN interpreter — the testable
 /// core of [`spawn_engine_start_cli`]. Returns the child's pid without
 /// waiting, collecting stdin/stdout/stderr to null and detaching the child
 /// from this process's session/group (see the module doc).
+///
+/// The exited child is REAPED on a detached thread (R19 F6): `setsid`
+/// detaches the session, not the parentage, so an unwaited child would
+/// linger as a zombie for the hub's lifetime.
 pub fn spawn_engine_start_cli_with(python: &Path) -> io::Result<u32> {
     let mut cmd = Command::new(python);
     cmd.args(engine_start_argv())
@@ -120,12 +173,18 @@ pub fn spawn_engine_start_cli_with(python: &Path) -> io::Result<u32> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NO_WINDOW — no console, no conhost.exe
-        // flash when the caller is a GUI-subsystem process.
-        cmd.creation_flags(0x0000_0008 | 0x0800_0000);
+        cmd.creation_flags(WINDOWS_CREATION_FLAGS);
     }
 
-    cmd.spawn().map(|child| child.id())
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    // Reap the exited child so it never lingers as a zombie under the hub /
+    // launcher (R19 F6). The CLI is short-lived (bounded --wait); the thread
+    // parks until then and exits with it.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
 }
 
 #[cfg(test)]
@@ -152,6 +211,38 @@ mod tests {
     }
 
     #[test]
+    fn windows_flags_hide_the_console_and_never_detach_it() {
+        // R19 F3: CREATE_NO_WINDOW must be effective, which requires that
+        // DETACHED_PROCESS (0x8) is NOT set (Win32 ignores CREATE_NO_WINDOW
+        // when it is), and CREATE_NEW_PROCESS_GROUP (0x200) keeps the child
+        // immune to the caller's Ctrl-C.
+        assert_ne!(WINDOWS_CREATION_FLAGS & 0x0800_0000, 0, "CREATE_NO_WINDOW must be set");
+        assert_ne!(WINDOWS_CREATION_FLAGS & 0x0000_0200, 0, "CREATE_NEW_PROCESS_GROUP must be set");
+        assert_eq!(WINDOWS_CREATION_FLAGS & 0x0000_0008, 0, "DETACHED_PROCESS must NOT be set");
+    }
+
+    #[test]
+    fn pref_toggle_default_on_absent_row_off_when_disabled() {
+        // R19 F4: absent row → shipped default (ON); an explicit "false"
+        // row opts out; an unreadable DB (Err) also reads as the default.
+        let db = crate::db::Db::open_in_memory().expect("in-memory db");
+        assert!(pref_enabled(&db), "no row means the shipped default, which is on");
+
+        db.app_state_set_bool(APP_STATE_ENGINE_AUTOSTART, false).unwrap();
+        assert!(!pref_enabled(&db), "an explicit off must be honoured");
+
+        db.app_state_set_bool(APP_STATE_ENGINE_AUTOSTART, true).unwrap();
+        assert!(pref_enabled(&db), "an explicit on stays on");
+    }
+
+    #[test]
+    fn the_app_state_key_matches_the_python_home() {
+        // Cross-language pin; the Python side asserts the same literal
+        // against this file (tests/test_container_engine_start.py).
+        assert_eq!(APP_STATE_ENGINE_AUTOSTART, "engine.autostart");
+    }
+
+    #[test]
     fn opt_out_env_disables() {
         // The process env is shared by every test in the binary — hold THE
         // lock for the whole mutation window (test_env::GLOBAL_ENV_MUTEX,
@@ -165,6 +256,17 @@ mod tests {
         assert!(autostart_enabled());
         std::env::remove_var(ENV_AUTOSTART);
         assert!(autostart_enabled());
+    }
+
+    #[test]
+    fn the_env_opt_out_stands_down_before_any_spawn() {
+        // The full entry point: opted out via the env override → None, no
+        // Db open, no interpreter resolution, no child.
+        let _lock = crate::test_env::env_lock();
+        std::env::set_var(ENV_AUTOSTART, "0");
+        let spawned = spawn_engine_start_cli();
+        std::env::remove_var(ENV_AUTOSTART);
+        assert!(spawned.is_none(), "the env opt-out must produce no spawn");
     }
 
     #[test]

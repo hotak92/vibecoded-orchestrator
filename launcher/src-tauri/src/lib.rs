@@ -3648,6 +3648,10 @@ pub fn run() {
             // have to branch internally on which service it means.
             commands::session_autostart::get_launcher_session_autostart,
             commands::session_autostart::set_launcher_session_autostart,
+            // v0.2.103 (review R19 F4): the GUI switch for the container-engine
+            // auto-start (read by the Python home + the core Rust pre-check).
+            commands::engine_autostart_pref::get_container_engine_autostart,
+            commands::engine_autostart_pref::set_container_engine_autostart,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,
