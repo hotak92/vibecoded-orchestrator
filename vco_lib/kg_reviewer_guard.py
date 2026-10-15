@@ -766,19 +766,25 @@ class _Backups:
                                             / "kg-reviewer")
                 dest = self.dir / rel
             except ValueError:
-                if key.is_file() and key.stat().st_size > _link_target_cap():
+                if (not key.is_symlink()
+                        and key.stat().st_size > _link_target_cap()):
                     return False, None  # too large to copy; never modified
                 if self.outside_dir is None:
                     self.outside_dir = _stamped_dir(_outside_backups_base())
                 dest = self.outside_dir / str(key).lstrip("/\\").replace(":", "")
             dest.parent.mkdir(parents=True, exist_ok=True)
             if key.is_symlink():
-                dest.with_name(dest.name + ".symlink").write_text(
-                    os.readlink(key), encoding="utf-8")
-                if key.is_file():
-                    shutil.copyfile(key, dest)
-            else:
-                shutil.copyfile(key, dest)
+                # A link is backed up as its LINK TEXT only — never followed
+                # (review R15): restoring a link replaces the link, not its
+                # target, so the target's bytes are never at risk here, and
+                # following it would copy a target of any size (or one
+                # outside the project) into the backups. A target the guard
+                # does restore is backed up on its own, under the snapshot's
+                # size cap (_restore_symlink).
+                link_note = dest.with_name(dest.name + ".symlink")
+                link_note.write_text(os.readlink(key), encoding="utf-8")
+                return True, link_note
+            shutil.copyfile(key, dest, follow_symlinks=False)
             return True, dest
         except OSError:
             return False, None
@@ -876,8 +882,21 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
         under_knowledge = rel is not None and rel.startswith(KNOWLEDGE_DIR + "/")
         if under_knowledge and rel is not None and is_derived_sidecar(rel):
             continue
+        if key.is_symlink():
+            # A write named a symlink that is NOT a knowledge/ symlink from the
+            # snapshot (those took the branch above). Restoring "its bytes"
+            # would replace the link with a regular file, and its target's
+            # pre-run bytes were never captured — so it is never modified and
+            # never kept: logged for the user, the link text backed up.
+            name = rel if rel is not None else str(key)
+            _ok, saved = backups.save(key)
+            reason = "a write through a symlink outside the snapshot"
+            log(f"REVERT-IMPOSSIBLE {name}: {reason} (link text backed up: "
+                f"{saved}) - inspect its target by hand")
+            res.unrestorable.append((name, reason))
+            continue
         known, pre = snap.pre_bytes_key(key)
-        cur = None if key.is_symlink() and not key.exists() else _read_bytes(key)
+        cur = _read_bytes(key)  # not a symlink here (handled above)
         if known and _same(pre, cur):
             continue
         name = rel if rel is not None else str(key)

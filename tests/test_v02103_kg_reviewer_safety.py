@@ -853,6 +853,50 @@ def test_r11_outside_target_backup_goes_to_the_vco_state_dir(
         snap.cleanup()
 
 
+# ── R15: a backup never follows a symlink ────────────────────────────────
+
+
+def test_r15_in_project_symlink_to_a_huge_target_backs_up_link_text_only(repo):
+    """RED before R15: copyfile followed the link and copied the whole
+    target into the project's backups; the revert also replaced the link
+    with a regular file."""
+    cap = model_mod.config()["guard"]["link_target_max_bytes"]
+    big = repo / "data" / "big.bin"
+    big.parent.mkdir()
+    big.write_bytes(b"y" * (cap * 2))
+    link = repo / "notes-link.md"
+    link.symlink_to(big)
+    snap = guard.take_snapshot(repo)
+    try:
+        # the target is still huge when the guard runs: a backup that
+        # followed the link would copy all of it
+        w = {_key(repo, "notes-link.md"): [("write", "reviewer\n")]}
+        res, lines, _ = _validate(repo, w, snap)
+        assert link.is_symlink() and link.resolve() == big.resolve()
+        assert res.kept == [] and res.reverted == []
+        assert any("through a symlink outside the snapshot" in ln for ln in lines)
+        backed = [p for p in (repo / ".claude/backups").rglob("*") if p.is_file()]
+        assert all(p.stat().st_size < 4096 for p in backed), backed
+        assert any(p.name == "notes-link.md.symlink" for p in backed)
+        assert (res.backup_dir / "notes-link.md.symlink").read_text() == str(big)
+    finally:
+        snap.cleanup()
+
+
+def test_r15_a_large_regular_project_file_is_still_fully_backed_up(repo):
+    cap = model_mod.config()["guard"]["link_target_max_bytes"]
+    big_text = "z" * (cap * 2)
+    snap = guard.take_snapshot(repo)
+    try:
+        w: dict = {}
+        _reviewer_write(repo, w, "docs/adr/0001.md", big_text)
+        res, _l, _ = _validate(repo, w, snap)
+        assert (repo / "docs/adr/0001.md").read_text() == ADR  # reverted
+        assert _backup_of(res, "docs/adr/0001.md") == big_text  # full copy
+    finally:
+        snap.cleanup()
+
+
 # ── R11 A1: backups are never stageable ──────────────────────────────────
 
 
