@@ -66,10 +66,13 @@ STEP_LAUNCH = "launch"
 STEP_BUILD = "build"
 STEP_ASK = "ask"
 
-#: verify-sha256 exit codes.
+#: verify-sha256 exit codes. MISMATCH is a code nothing else produces: 1 is a
+#: Python crash (traceback, broken venv, failed vco_lib import) and 2 is an
+#: argparse error, and neither may be reported to the user as a mismatch.
+#: download-launcher-asset.ps1 maps these codes — must match it.
 VERIFY_OK = 0
-VERIFY_MISMATCH = 1
 VERIFY_UNVERIFIABLE = 2  # sidecar missing / unreadable / malformed
+VERIFY_MISMATCH = 3
 
 #: pick-asset exit codes.
 PICK_OK = 0

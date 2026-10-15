@@ -294,6 +294,20 @@ def test_missing_sidecar_exits_6_and_lands_nothing(tmp_path: Path) -> None:
 
 
 @pwsh_required
+def test_crashed_verifier_is_unverified_not_a_mismatch(tmp_path: Path) -> None:
+    """A verifier that dies with exit 1 (traceback, broken venv, failed
+    vco_lib import) must not be reported as a checksum mismatch (R22 N1)."""
+    crash = tmp_path / "crashing-python"
+    crash.write_text("#!/bin/sh\necho 'Traceback: ModuleNotFoundError' >&2\nexit 1\n")
+    crash.chmod(0o755)
+    out, dest = _verify_case(tmp_path, sidecar=_sidecar, python_exe=str(crash))
+    assert out.returncode == 6, f"stdout={out.stdout}\nstderr={out.stderr}"
+    assert "UNVERIFIED" in out.stdout
+    assert "CHECKSUM_MISMATCH" not in out.stdout
+    assert not (dest / "vct-launcher.exe").exists()
+
+
+@pwsh_required
 def test_no_verifier_interpreter_exits_6_and_lands_nothing(tmp_path: Path) -> None:
     """Without -PythonExe nothing can be verified, so nothing is run."""
     out, dest = _verify_case(tmp_path, sidecar=_sidecar, python_exe=None)

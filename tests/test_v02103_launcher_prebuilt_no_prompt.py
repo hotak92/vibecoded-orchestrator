@@ -319,6 +319,8 @@ def test_verify_sha256_cli_exit_codes(tmp_path):
     argv = ["verify-sha256", "--file", str(f), "--sidecar", str(side), "--name", LINUX_ZIP]
     assert la.main(argv) == 0
     side.write_text(f"{'2' * 64}  {LINUX_ZIP}\n")
-    assert la.main(argv) == 1
+    # Never 1 (a crashed interpreter) nor 2 (argparse): a crash must not read
+    # as a mismatch in download-launcher-asset.ps1 (review R22 N1).
+    assert la.main(argv) == la.VERIFY_MISMATCH == 3
     side.unlink()
     assert la.main(argv) == 2

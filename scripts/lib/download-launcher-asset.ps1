@@ -115,7 +115,9 @@ function Test-LauncherDownload {
         Write-Host ('Checksum verified for ' + $Asset.name)
         return 0
     }
-    if ($rc -eq 1) {
+    # 3 = VERIFY_MISMATCH in vco_lib/launcher_acquire.py (must match). Exit 1
+    # is a crashed verifier and falls through to UNVERIFIED below.
+    if ($rc -eq 3) {
         Write-Host ('CHECKSUM_MISMATCH: ' + $Asset.name + ' does not match ' + $sidecarName + ' - the download is discarded, never run')
         return 5
     }
