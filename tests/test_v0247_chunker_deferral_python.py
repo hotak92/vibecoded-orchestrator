@@ -16,9 +16,9 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+from vco_lib.codegraph_extractor_generation import crosses_version_boundary
 from vco_lib.project_init import (
     _CHUNKER_BUMP_VERSION,
-    _crosses_chunker_boundary,
     _emit_chunker_resync_deferral,
     _parse_semver,
 )
@@ -45,7 +45,10 @@ class TestParseSemver:
 
 
 # ----------------------------------------------------------------------
-# 2. _crosses_chunker_boundary — the gating decision
+# 2. The boundary arithmetic — the shared primitive
+#    (`_crosses_chunker_boundary`, the retired chunker binding of this
+#    rule, was deleted in v0.2.103: superseded by chunker_revision.gate,
+#    zero production callers. The arithmetic lives here.)
 # ----------------------------------------------------------------------
 
 
@@ -54,29 +57,29 @@ class TestCrossesBoundary:
         assert _CHUNKER_BUMP_VERSION == "0.2.46"
 
     def test_pre_to_post_crosses(self) -> None:
-        assert _crosses_chunker_boundary("0.2.45", "0.2.46") is True
-        assert _crosses_chunker_boundary("0.2.45", "0.2.47") is True
-        assert _crosses_chunker_boundary("0.2.40", "0.3.0") is True
+        assert crosses_version_boundary("0.2.45", "0.2.46", _CHUNKER_BUMP_VERSION) is True
+        assert crosses_version_boundary("0.2.45", "0.2.47", _CHUNKER_BUMP_VERSION) is True
+        assert crosses_version_boundary("0.2.40", "0.3.0", _CHUNKER_BUMP_VERSION) is True
 
     def test_pre_to_pre_does_not_cross(self) -> None:
-        assert _crosses_chunker_boundary("0.2.40", "0.2.45") is False
-        assert _crosses_chunker_boundary("0.2.44", "0.2.45") is False
+        assert crosses_version_boundary("0.2.40", "0.2.45", _CHUNKER_BUMP_VERSION) is False
+        assert crosses_version_boundary("0.2.44", "0.2.45", _CHUNKER_BUMP_VERSION) is False
 
     def test_post_to_post_does_not_cross(self) -> None:
-        assert _crosses_chunker_boundary("0.2.46", "0.2.47") is False
-        assert _crosses_chunker_boundary("0.2.46", "0.3.0") is False
-        assert _crosses_chunker_boundary("0.2.47", "0.2.48") is False
+        assert crosses_version_boundary("0.2.46", "0.2.47", _CHUNKER_BUMP_VERSION) is False
+        assert crosses_version_boundary("0.2.46", "0.3.0", _CHUNKER_BUMP_VERSION) is False
+        assert crosses_version_boundary("0.2.47", "0.2.48", _CHUNKER_BUMP_VERSION) is False
 
     def test_same_version_does_not_cross(self) -> None:
         # The boundary helper is symmetric in the trivial case.
-        assert _crosses_chunker_boundary("0.2.46", "0.2.46") is False
-        assert _crosses_chunker_boundary("0.2.45", "0.2.45") is False
+        assert crosses_version_boundary("0.2.46", "0.2.46", _CHUNKER_BUMP_VERSION) is False
+        assert crosses_version_boundary("0.2.45", "0.2.45", _CHUNKER_BUMP_VERSION) is False
 
     def test_malformed_versions_return_false(self) -> None:
         # Soft-fail: never trigger the deferral on bad input.
-        assert _crosses_chunker_boundary("garbage", "0.2.46") is False
-        assert _crosses_chunker_boundary("0.2.45", "garbage") is False
-        assert _crosses_chunker_boundary("", "0.2.46") is False
+        assert crosses_version_boundary("garbage", "0.2.46", _CHUNKER_BUMP_VERSION) is False
+        assert crosses_version_boundary("0.2.45", "garbage", _CHUNKER_BUMP_VERSION) is False
+        assert crosses_version_boundary("", "0.2.46", _CHUNKER_BUMP_VERSION) is False
 
 
 # ----------------------------------------------------------------------

@@ -772,7 +772,7 @@ pub fn build_volume_arg(
 /// Build the full `podman run` argv (without the leading `podman`).
 ///
 /// Layout:
-///   `run -d --name <name> [--restart=unless-stopped] [gpu flags] -p ... -v ... -e ... <image> <command> <args...>`
+///   `run -d --name <name> [--restart=unless-stopped] [gpu flags] -p ... -v ... -e ... [--entrypoint <command>] <image> [<command remainder + args...>]`
 ///
 /// Accepts both `runtime.type = "container"` and `runtime.type = "service"`
 /// — both declare a long-running daemon backed by a container.
@@ -1027,9 +1027,6 @@ pub fn build_podman_run_args_with_env(
         args.push(k.clone());
     }
 
-    // Positional: image, then optional command + args (override of image CMD).
-    args.push(image.to_string());
-
     // v0.2.49: Bug E — pre-v0.2.49 manifests had `command: "podman"` +
     // `args: ["run", "--rm", "-p", "11450:11450", "{module_image}"]` (the
     // launcher-side podman invocation mistakenly authored as the
@@ -1037,7 +1034,7 @@ pub fn build_podman_run_args_with_env(
     // `<entrypoint> podman run --rm -p 11450:11450 {module_image}`
     // and argparse-failed. Declarative manifests leave `command` empty
     // and rely on the image-baked ENTRYPOINT. When `command` is empty,
-    // skip the CMD override entirely so podman uses the image's default.
+    // skip the override entirely so podman uses the image's default.
     // Placeholders still apply when `command` is non-empty (legacy
     // override authors can use `{project_slug}` etc.).
     //
@@ -1046,12 +1043,48 @@ pub fn build_podman_run_args_with_env(
     // legacy image that ships the broken manifest still produces a
     // working container. See `is_runtime_pathological` for the full
     // list of indicators. When the runtime is pathological, log a
-    // warning and DROP the CMD override (fall back to the image's
+    // warning and DROP the override (fall back to the image's
     // ENTRYPOINT) — same effect as the v0.2.49 empty-command branch.
+    //
+    // v0.2.103 (Fix 5): a non-empty, non-pathological `command` now
+    // REPLACES the image's ENTRYPOINT via `--entrypoint` instead of
+    // being appended after the image as CMD. podman/docker APPEND the
+    // CMD to the image's ENTRYPOINT, so the old form made an image with
+    // ENTRYPOINT `python -m rl_server.rl_server` and manifest
+    // `command: "python", args: ["-m", "rl_server.rl_server", …]` run
+    // `python -m rl_server.rl_server python -m rl_server.rl_server …`
+    // (argparse exit 2, crash loop). `--entrypoint` gives `command`
+    // its documented meaning — the executable to spawn — for every
+    // image, with or without a baked ENTRYPOINT: the invocation is
+    // always `<command> <args>`. Container runtimes exec without a
+    // shell, so a multi-word `command` is split on whitespace: the
+    // first word is the `--entrypoint`, the remaining words lead the
+    // CMD ahead of `runtime.args`. The split happens on the RAW
+    // template, BEFORE placeholder resolution (v0.2.103 review R3
+    // LOW-1): a `{HOME}` that resolves to a path containing spaces
+    // must stay ONE argv element — splitting after resolution broke
+    // such paths mid-word.
     let runtime_skip_cmd = runtime.command.is_empty()
         || is_runtime_pathological(&runtime.command, &runtime.args, Some(&manifest.id));
+    let mut command_words: Vec<String> = Vec::new();
     if !runtime_skip_cmd {
-        args.push(resolve_value(&runtime.command, ctx, &placeholders));
+        command_words = runtime
+            .command
+            .split_whitespace()
+            .map(|w| resolve_value(w, ctx, &placeholders))
+            .collect();
+        if let Some(first) = command_words.first() {
+            args.push("--entrypoint".into());
+            args.push(first.clone());
+        }
+    }
+
+    // Positional: image, then optional command remainder + args as CMD.
+    args.push(image.to_string());
+    if !runtime_skip_cmd {
+        for w in command_words.iter().skip(1) {
+            args.push(w.clone());
+        }
         for a in &runtime.args {
             args.push(resolve_value(a, ctx, &placeholders));
         }
@@ -1222,21 +1255,47 @@ pub fn build_podman_run_args_global_inheriting(
         args.push(k.clone());
     }
 
-    args.push(image.to_string());
-
-    // v0.2.49 Bug E (mirrored from build_podman_run_args): only push a
-    // CMD override when the manifest declares a non-empty `command`.
-    // Declarative manifests with empty command let the image's
-    // ENTRYPOINT run unmolested.
+    // v0.2.49 Bug E (mirrored from build_podman_run_args): only honour
+    // the command override when the manifest declares a non-empty
+    // `command`. Declarative manifests with empty command let the
+    // image's ENTRYPOINT run unmolested.
     //
-    // v0.2.52 V52-D.1: also drop the CMD override when the manifest
+    // v0.2.52 V52-D.1: also drop the override when the manifest
     // declares a pathological runtime (`command: "podman"` /
     // unsubstituted `{module_image}` in args / etc.). See
     // `is_runtime_pathological` for the full indicator set.
+    //
+    // v0.2.103 (Fix 5, mirrored from build_podman_run_args): a
+    // non-empty, non-pathological `command` replaces the image's
+    // ENTRYPOINT via `--entrypoint` instead of being appended after
+    // the image as CMD — podman APPENDS CMD to the image ENTRYPOINT,
+    // so the CMD form doubled the invocation on ENTRYPOINT-bearing
+    // images (argparse exit 2, crash loop). Multi-word commands split
+    // on whitespace: first word is the `--entrypoint`, the rest lead
+    // the CMD ahead of `runtime.args`. The split runs on the RAW
+    // template BEFORE placeholder resolution (v0.2.103 review R3
+    // LOW-1): a `{HOME}` resolving to a path with spaces must stay
+    // ONE argv element — splitting after resolution broke such paths.
     let runtime_skip_cmd = runtime.command.is_empty()
         || is_runtime_pathological(&runtime.command, &runtime.args, Some(&manifest.id));
+    let mut command_words: Vec<String> = Vec::new();
     if !runtime_skip_cmd {
-        args.push(resolve_value(&runtime.command, ctx, &placeholders));
+        command_words = runtime
+            .command
+            .split_whitespace()
+            .map(|w| resolve_value(w, ctx, &placeholders))
+            .collect();
+        if let Some(first) = command_words.first() {
+            args.push("--entrypoint".into());
+            args.push(first.clone());
+        }
+    }
+
+    args.push(image.to_string());
+    if !runtime_skip_cmd {
+        for w in command_words.iter().skip(1) {
+            args.push(w.clone());
+        }
         for a in &runtime.args {
             args.push(resolve_value(a, ctx, &placeholders));
         }
@@ -5893,6 +5952,223 @@ mod tests {
             args,
         );
         assert!(args.iter().all(|a| !a.contains("{module_image}")));
+    }
+
+    // ─── v0.2.103 Fix 5: runtime.command replaces the image ENTRYPOINT ──
+
+    /// The empirical crash-loop shape: an image with ENTRYPOINT
+    /// `python -m rl_server.rl_server` plus a manifest
+    /// `command: "python", args: ["-m", "rl_server.rl_server", …]`.
+    /// Appending the command as CMD made podman run
+    /// `python -m rl_server.rl_server python -m rl_server.rl_server …`
+    /// (argparse exit 2). The command must now REPLACE the image's
+    /// ENTRYPOINT via `--entrypoint`, with `args` as the CMD — the
+    /// invocation is `<command> <args>` exactly once.
+    #[test]
+    fn v02103_fix5_command_replaces_image_entrypoint_not_appended_as_cmd() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.command = "python".into();
+        manifest.runtime.args = vec![
+            "-m".into(),
+            "rl_server.rl_server".into(),
+            "--port".into(),
+            "11450".into(),
+        ];
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.10",
+            "podman",
+            None,
+        )
+        .expect("build args");
+        let image_pos = args
+            .iter()
+            .position(|a| a == "ghcr.io/hotak92/vct-rl-reranker:0.2.10")
+            .expect("image in argv");
+        // `--entrypoint python` sits BEFORE the image and is the last
+        // flag pair ahead of it.
+        assert_eq!(
+            args.get(image_pos - 2).map(String::as_str),
+            Some("--entrypoint"),
+            "command must be passed as --entrypoint before the image; got {:?}",
+            args,
+        );
+        assert_eq!(
+            args.get(image_pos - 1).map(String::as_str),
+            Some("python"),
+            "the --entrypoint value is the command's first word; got {:?}",
+            args,
+        );
+        // After the image: exactly `runtime.args` as CMD — the command
+        // word is NOT repeated after the image (the doubled-CMD bug).
+        assert_eq!(
+            args[image_pos + 1..],
+            ["-m", "rl_server.rl_server", "--port", "11450"],
+            "CMD after the image must be exactly runtime.args, not the \
+             command repeated; got {:?}",
+            args,
+        );
+    }
+
+    /// A multi-word `command` (authors that paste the full invocation
+    /// into one string) splits on whitespace: first word is the
+    /// `--entrypoint`, the remaining words lead the CMD ahead of
+    /// `runtime.args`. Container runtimes exec without a shell, so a
+    /// single argv element containing spaces never resolved to an
+    /// executable under either the old CMD form or a bare `--entrypoint`.
+    #[test]
+    fn v02103_fix5_multiword_command_splits_entrypoint_plus_cmd() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.command = "python -m rl_server.rl_server".into();
+        manifest.runtime.args = vec!["--port".into(), "11450".into()];
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.10",
+            "podman",
+            None,
+        )
+        .expect("build args");
+        let image_pos = args
+            .iter()
+            .position(|a| a == "ghcr.io/hotak92/vct-rl-reranker:0.2.10")
+            .expect("image in argv");
+        assert_eq!(
+            args.get(image_pos - 2).map(String::as_str),
+            Some("--entrypoint")
+        );
+        assert_eq!(args.get(image_pos - 1).map(String::as_str), Some("python"));
+        assert_eq!(
+            args[image_pos + 1..],
+            ["-m", "rl_server.rl_server", "--port", "11450"],
+            "multi-word command remainder leads the CMD; got {:?}",
+            args,
+        );
+    }
+
+    /// v0.2.103 review R3 LOW-1: the whitespace split runs on the RAW
+    /// template, BEFORE placeholder resolution — a `{HOME}` that
+    /// resolves to a path containing a space must stay ONE argv
+    /// element. The resolve-then-split order used to break
+    /// "/Users/John Smith/…" mid-path into two bogus argv words.
+    #[test]
+    fn v02103_fix5_placeholder_resolving_to_a_spaced_path_stays_one_word() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.command = "{HOME}/bin/tool".into();
+        manifest.runtime.args = vec!["--port".into(), "11450".into()];
+        let project = make_project();
+        let mut ctx = PlaceholderCtx::new(&manifest.id);
+        ctx.home = std::path::PathBuf::from("/home/test user");
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.10",
+            "podman",
+            None,
+        )
+        .expect("build args");
+        let image_pos = args
+            .iter()
+            .position(|a| a == "ghcr.io/hotak92/vct-rl-reranker:0.2.10")
+            .expect("image in argv");
+        assert_eq!(
+            args.get(image_pos - 2).map(String::as_str),
+            Some("--entrypoint")
+        );
+        assert_eq!(
+            args.get(image_pos - 1).map(String::as_str),
+            Some("/home/test user/bin/tool"),
+            "a resolved placeholder path with spaces must stay ONE argv \
+             element (split the raw template, then resolve each word); got {:?}",
+            args,
+        );
+        assert_eq!(
+            args[image_pos + 1..],
+            ["--port", "11450"],
+            "no command residue after the image; got {:?}",
+            args,
+        );
+    }
+
+    /// Empty `command` (the declarative form) must keep producing NO
+    /// `--entrypoint` flag — the image's baked ENTRYPOINT runs
+    /// unmolested.
+    #[test]
+    fn v02103_fix5_empty_command_emits_no_entrypoint_flag() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.command = String::new();
+        manifest.runtime.args = vec![];
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.10",
+            "podman",
+            None,
+        )
+        .expect("build args");
+        assert!(
+            !args.iter().any(|a| a == "--entrypoint"),
+            "declarative form must not override the image ENTRYPOINT; got {:?}",
+            args,
+        );
+    }
+
+    /// Global builder mirrors the per-project fix: `command` replaces
+    /// the image ENTRYPOINT, `args` stay as CMD, pathological shapes
+    /// still drop everything.
+    #[test]
+    fn v02103_fix5_global_builder_command_replaces_image_entrypoint() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.command = "python".into();
+        manifest.runtime.args = vec!["-m".into(), "rl_server.rl_server".into()];
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.10",
+            "podman",
+            None,
+            &[],
+        )
+        .expect("build args global");
+        let image_pos = args
+            .iter()
+            .position(|a| a == "ghcr.io/hotak92/vct-rl-reranker:0.2.10")
+            .expect("image in argv");
+        assert_eq!(
+            args.get(image_pos - 2).map(String::as_str),
+            Some("--entrypoint"),
+            "global builder must pass command as --entrypoint; got {:?}",
+            args,
+        );
+        assert_eq!(args.get(image_pos - 1).map(String::as_str), Some("python"));
+        assert_eq!(
+            args[image_pos + 1..],
+            ["-m", "rl_server.rl_server"],
+            "global builder CMD must be exactly runtime.args; got {:?}",
+            args,
+        );
     }
 
     // ─── v0.2.67: shared pull chokepoint (`bounded_authed_pull`) ─────────

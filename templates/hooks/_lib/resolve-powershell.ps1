@@ -75,11 +75,75 @@ $PsExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { '
 # seconds. Start-Process spawns an independent OS process that survives, which
 # is what the POSIX siblings get from `( ... ) &` / setsid. Same reasoning as
 # `_lib/kg-sync-debounce.ps1`'s flusher.
+#
+# QUIRK 4 (v0.2.103; redesigned same release after review R3 HIGH-1): on
+# POSIX, a child spawned with NO stream redirects INHERITS the hook's own
+# stdout/stderr pipes - the harness then waits for EOF while a detached
+# 30-second job holds the write end open. But fixing that with
+# `Start-Process -RedirectStandard*` is WORSE: on Unix pwsh implements
+# those parameters by handing the child PIPES back to the parent and
+# copying them into the files; when the hook exits nobody drains them, so
+# the child's first write after hook-exit hits EPIPE and it dies having
+# logged nothing (verified: `Start-Process python3 -RedirectStandardOutput
+# /dev/null -RedirectStandardError <log>` -> BrokenPipeError(32) on both
+# streams, log left empty). So on POSIX the wrapper never uses
+# Start-Process at all: it launches `/bin/sh -c 'exec "$0" "$@"
+# </dev/null >/dev/null 2>><log>'` with a ProcessStartInfo whose
+# ArgumentList carries the script and argv as SEPARATE elements (no
+# re-splitting), making the redirection a kernel-level fd duplication the
+# child owns outright - exactly what the .sh siblings do. Caller-provided
+# redirect paths are folded into the same exec line (which also fixes the
+# pre-existing EPIPE on explicit-redirect callers such as
+# stop-drain-citations.ps1). The default stderr log lives under
+# $VCT_STATE_DIR/logs (default ~/.vct/logs) with a size bound, not /tmp,
+# so it cannot accumulate unbounded. Windows behaviour is unchanged:
+# hidden window, Start-Process, caller-provided redirects honoured
+# exactly as before.
 
 # True when this edition accepts `-WindowStyle`. $IsWindows is undefined on
 # PowerShell 5.1 (which only exists on Windows), so "unset" means Windows.
 function Test-VcoHiddenWindowSupported {
     return (($null -eq $IsWindows) -or $IsWindows)
+}
+
+# Bound for the shared detached-children stderr log (same diagnostic-tail
+# bound the kg-sync-debounce log uses). Past it the log is restarted
+# rather than grown without limit.
+$script:VcoDetachedErrLogMaxBytes = 262144
+
+# Default stderr target for POSIX detached children:
+# <state>/logs/detached-children.log, where <state> is $VCT_STATE_DIR or
+# ~/.vct (the same two-branch rule `_lib/metrics-dir.ps1` resolves; kept
+# inline because this lib must stay loadable without metrics-dir.ps1).
+# "" when the path is unusable - the caller then falls back to /dev/null.
+function Get-VcoDetachedErrLog {
+    try {
+        $home_ = [System.Environment]::GetFolderPath('UserProfile')
+        if (-not $home_) { $home_ = $env:USERPROFILE }
+        if (-not $home_) { $home_ = $env:HOME }
+        $stateRoot = if ($env:VCT_STATE_DIR) { $env:VCT_STATE_DIR }
+                     elseif ($home_) { Join-Path $home_ ".vct" }
+                     else { "" }
+        if (-not $stateRoot) { return "" }
+        $dir = Join-Path $stateRoot "logs"
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+        }
+        $log = Join-Path $dir "detached-children.log"
+        if (Test-Path -LiteralPath $log -PathType Leaf) {
+            if ((Get-Item -LiteralPath $log -ErrorAction Stop).Length -gt $script:VcoDetachedErrLogMaxBytes) {
+                Set-Content -LiteralPath $log -Value "" -NoNewline -ErrorAction SilentlyContinue
+            }
+        }
+        return $log
+    } catch { return "" }
+}
+
+# Quote $Path for embedding in the POSIX `exec` line (single quotes, with
+# embedded single quotes escaped per POSIX sh).
+function ConvertTo-VcoShQuoted {
+    param([string]$Path)
+    return "'" + ($Path -replace "'", "'\''") + "'"
 }
 
 # Generic guarded Start-Process. Returns the process object when -PassThru is
@@ -97,6 +161,85 @@ function Start-VcoDetachedProcess {
     $spawn = @{
         FilePath    = $FilePath
         ErrorAction = 'SilentlyContinue'
+    }
+    # QUIRK 2 diversion first: identical redirect targets are rejected by
+    # Start-Process on every edition (Windows branch below) and would leave
+    # two fd offsets interleaving on one file (POSIX branch below) - divert
+    # either way.
+    $errPath = $RedirectStandardError
+    if ($RedirectStandardOutput -and $errPath -and ($errPath -eq $RedirectStandardOutput)) {
+        $errPath = "$RedirectStandardError.err"
+    }
+    # QUIRK 4 above: on POSIX NEVER hand the child pipes through
+    # Start-Process -Redirect* (the hook exits, nobody drains the pipes,
+    # the child's first write gets EPIPE). Launch /bin/sh with a
+    # kernel-level fd redirection instead; caller-supplied redirect paths
+    # are folded into the same exec line (which also fixes the pre-existing
+    # EPIPE on explicit-redirect callers such as stop-drain-citations.ps1).
+    if ($null -ne $IsWindows -and -not $IsWindows) {
+        $proc = $null
+        $failure = ''
+        try {
+            $inT = if ($RedirectStandardInput) { $RedirectStandardInput } else { '/dev/null' }
+            $outT = if ($RedirectStandardOutput) { $RedirectStandardOutput } else { '/dev/null' }
+            $errT = '/dev/null'
+            if ($errPath) {
+                $errT = $errPath
+            } else {
+                $errT = Get-VcoDetachedErrLog
+                if (-not $errT) { $errT = '/dev/null' }
+            }
+            # Pre-validate in the PARENT what Start-Process used to validate
+            # itself: a bad -WorkingDirectory or an unwritable redirect
+            # target must soft-fail WITH a diagnostic, not die silently in
+            # the child's sh (nothing would report it once the hook is gone).
+            if ($WorkingDirectory -and -not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+                throw "WorkingDirectory '$WorkingDirectory' does not exist"
+            }
+            foreach ($t in @($inT, $outT, $errT)) {
+                if ($t -and $t -ne '/dev/null') {
+                    $tparent = Split-Path -Parent $t
+                    if (-not (Test-Path -LiteralPath $tparent -PathType Container)) {
+                        throw "cannot redirect to '$t' - directory '$tparent' does not exist"
+                    }
+                }
+            }
+            # Redirection semantics: caller-supplied targets TRUNCATE
+            # (`>`), matching Start-Process -Redirect* on Windows; the
+            # shared default stderr log APPENDS (`2>>`) - it is one bounded
+            # diagnostic tail for every detached child, not a per-spawn
+            # snapshot.
+            $errOp = if ($errPath) { '2>' } else { '2>>' }
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = '/bin/sh'
+            $psi.UseShellExecute = $false
+            if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+            # ONE -c script element + one element per argv: ArgumentList
+            # passes each element as its own argv slot, so "$0"/"$@" keep
+            # spaces, quotes, newlines and empty elements intact (no QUIRK-3
+            # re-splitting on this path).
+            [void]$psi.ArgumentList.Add('-c')
+            [void]$psi.ArgumentList.Add(('exec "$0" "$@" <{0} >{1} {2}{3}' -f `
+                (ConvertTo-VcoShQuoted $inT), (ConvertTo-VcoShQuoted $outT), `
+                $errOp, (ConvertTo-VcoShQuoted $errT)))
+            [void]$psi.ArgumentList.Add($FilePath)
+            if ($ArgumentList) {
+                foreach ($el in $ArgumentList) {
+                    if ($null -ne $el) { [void]$psi.ArgumentList.Add([string]$el) }
+                }
+            }
+            $proc = [System.Diagnostics.Process]::Start($psi)
+        } catch {
+            $failure = $_.Exception.Message
+        }
+        if ($failure) {
+            try {
+                [Console]::Error.WriteLine(
+                    "[vco] detached spawn FAILED for '$FilePath': $failure")
+            } catch { }
+        }
+        if ($PassThru) { return $proc }
+        return
     }
     # PowerShell 5.1 rejects an EMPTY -ArgumentList (ValidateNotNullOrEmpty),
     # so omit the parameter entirely rather than passing @().
@@ -117,14 +260,9 @@ function Start-VcoDetachedProcess {
     if ($WorkingDirectory) { $spawn['WorkingDirectory'] = $WorkingDirectory }
     if ($RedirectStandardInput) { $spawn['RedirectStandardInput'] = $RedirectStandardInput }
     if ($RedirectStandardOutput) { $spawn['RedirectStandardOutput'] = $RedirectStandardOutput }
-    if ($RedirectStandardError) {
-        $errPath = $RedirectStandardError
-        # QUIRK 2 above: identical paths abort the spawn. Divert rather than lose it.
-        if ($RedirectStandardOutput -and ($errPath -eq $RedirectStandardOutput)) {
-            $errPath = "$RedirectStandardError.err"
-        }
-        $spawn['RedirectStandardError'] = $errPath
-    }
+    # QUIRK 2 diversion already applied to $errPath above (shared with the
+    # POSIX branch).
+    if ($errPath) { $spawn['RedirectStandardError'] = $errPath }
     if (Test-VcoHiddenWindowSupported) { $spawn['WindowStyle'] = 'Hidden' }
     # SOFT-FAIL, BUT NOT SILENT. A spawn that cannot start must never break
     # the hook (these are all best-effort background paths), but swallowing

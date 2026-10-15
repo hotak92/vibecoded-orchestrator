@@ -727,18 +727,23 @@ class TestChunkerRevisionGate(unittest.TestCase):
 
     def test_superseded_semver_gate_is_pinned_inert_on_sha_inputs(self) -> None:
         """The retired call site's arithmetic, pinned BOTH ways so the
-        supersession is documented in code, not folklore: the helper still
-        answers semver questions correctly, and still returns False on the
-        SHA inputs real manifests carried — the structural inertness that
-        made the per-project flow blind for its entire life (v0.2.47→91).
+        supersession is documented in code, not folklore: the shared
+        primitive answers semver questions correctly, and still returns
+        False on the SHA inputs real manifests carried — the structural
+        inertness that made the per-project flow blind for its entire
+        life (v0.2.47→91). (The ``_crosses_chunker_boundary`` wrapper was
+        deleted in v0.2.103; the rule lives in
+        ``codegraph_extractor_generation.crosses_version_boundary``.)
         """
+        from vco_lib.codegraph_extractor_generation import crosses_version_boundary
+
         # Correct on semver inputs (kept for the shared-rule binding):
         self.assertTrue(
-            project_init._crosses_chunker_boundary("0.2.45", "0.2.92")
+            crosses_version_boundary("0.2.45", "0.2.92", "0.2.46")
         )
         # Structurally inert on every real pre-v0.2.92 manifest:
         self.assertFalse(
-            project_init._crosses_chunker_boundary("5155a553", "0.2.92")
+            crosses_version_boundary("5155a553", "0.2.92", "0.2.46")
         )
 
     def _prune_ledger(self) -> None:
