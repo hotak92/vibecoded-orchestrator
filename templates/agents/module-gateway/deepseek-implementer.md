@@ -1,6 +1,6 @@
 ---
 name: deepseek-implementer
-description: DeepSeek V4.1 Flash implementation lane via the claude-gw gateway (qwen vendor) for bounded, well-specified fixes needing real reasoning, not mechanical application. Worktree lane — report lands in it; read-only → deepseek-researcher.
+description: DeepSeek V4.1 Flash implementation lane via the claude-gw gateway for bounded, well-specified fixes needing real reasoning; not open-ended design, not a reviewer. Worktree lane — research → deepseek-researcher, review → glm-reviewer.
 model: claude-gw/qwen/deepseek-v4.1-flash[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
@@ -42,8 +42,8 @@ Worktree lane: you carry `isolation: worktree`, so EVERYTHING you write —
 the edits AND your report — lands inside your own worktree, never in the
 main checkout. Never write your report to a path outside the worktree;
 return it as your final message as well, because the coordinator reviews
-and merges the worktree branch rather than reading files in place. A task
-whose only output is a report — read-only research, a survey, a review
-with no edits — should be dispatched to deepseek-researcher instead; it
-runs without isolation, so its report file lands in the main tree at the
-path the brief named.
+and merges the worktree branch rather than reading files in place.
+Read-only research or a survey belongs to deepseek-researcher (research);
+a review belongs to glm-reviewer (review) or kimi-reviewer (review) — no
+deepseek-vendor review lane ships. They run without isolation, so their
+report files land in the main tree at the path the brief named.

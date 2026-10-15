@@ -40,10 +40,12 @@ the shipped ``files.exclude``: performance is already covered by
 ``files.watcherExclude`` and ``search.exclude`` (which KEEP the entries),
 so hiding them in the explorer only hides the user's outputs. The three
 entries left the canonical block, and the backfill PRUNES them from
-existing projects — but only an entry whose value is exactly the boolean
-``true`` VCO wrote. An entry the user changed (``false``, a ``when``
-clause) or a key the user added is theirs, never touched; the per-key
-user-wins contract of the add pass is the prune's contract too.
+existing projects — but only from a block that is recognisably the one
+VCO wrote: every legacy canonical entry still present at the value VCO
+wrote (R18 m2 — VCO only ever wrote ``files.exclude`` when the key was
+absent, so a partial block or one with a changed value is the user's and
+keeps ALL its entries, including a bare ``true`` the user typed). The
+per-key user-wins contract of the add pass is the prune's contract too.
 
 Coordination with the Rust writer:
 
@@ -68,11 +70,10 @@ Coordination with the Rust writer:
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 from vco_lib import jsonc_edit
-from vco_lib.atomic import atomic_write_bytes
+from vco_lib.atomic import atomic_write_bytes, warn_symlink_redirect
 
 _VSCODE_EXCLUDE_DEFAULTS: dict[str, object] = {
     # Watcher: prevent inotify / FSEvents / ReadDirectoryChangesW from
@@ -148,11 +149,30 @@ _VSCODE_EXCLUDE_KEYS: tuple[str, ...] = (
     "python.analysis.indexing",
 )
 
+# The exact `files.exclude` block VCO shipped from v0.2.11 through
+# v0.2.102 — the WRITE SIGNATURE the prune requires (R18 m2). VCO only
+# ever wrote this block when the `files.exclude` key was absent
+# (user-wins add pass), so a block that does not carry every one of these
+# entries at this value is one VCO never wrote: the user authored or
+# edited it, and it keeps ALL its entries.
+_LEGACY_FILES_EXCLUDE_BLOCK: dict[str, bool] = {
+    "**/.git": True,
+    "**/node_modules": True,
+    "**/__pycache__": True,
+    "**/.pytest_cache": True,
+    "**/.ruff_cache": True,
+    "**/.mypy_cache": True,
+    "**/.venv": True,
+    "**/dist": True,
+    "**/build": True,
+    "**/target": True,
+}
+
 # The `files.exclude` entries VCO shipped through v0.2.102 and retired in
 # v0.2.103 (Item 25): they hid the user's own build outputs from the
 # explorer while `files.watcherExclude` / `search.exclude` already covered
-# the performance. Pruned from existing projects — ONLY at the exact
-# boolean `true` VCO wrote, so a user-set value or key is never touched.
+# the performance. Pruned from existing projects ONLY when the block
+# matches `_LEGACY_FILES_EXCLUDE_BLOCK`'s write signature — see above.
 _RETIRED_FILES_EXCLUDE_ENTRIES: tuple[str, ...] = (
     "**/dist",
     "**/build",
@@ -164,20 +184,28 @@ def _prune_retired_files_exclude_entries(data: dict) -> list[str]:
     """Remove the retired build-output entries from ``files.exclude`` in
     ``data`` (in place). Returns the ``"<key>:<pattern>"`` removals.
 
-    User-wins, per entry: an entry is removed only when its value ``is
-    True`` — the exact boolean the canonical block wrote. ``false``, a
-    ``when``-clause object or any other user-chosen shape stays, and every
-    other key in the block stays. A ``files.exclude`` that is not a
-    mapping (user's own shape) is left entirely alone.
+    User-wins, per BLOCK (R18 m2): the retire-arm runs only when the
+    ``files.exclude`` mapping carries every legacy canonical entry at the
+    value VCO wrote — recognisably VCO's block, so removing the three
+    retired entries is undoing VCO's own write. Anything else (an entry
+    missing, a value changed to ``false`` or a ``when`` clause, a block
+    the user typed themselves) is the user's and keeps every entry, even a
+    bare ``true`` that collides with VCO's spelling. Keys the user ADDED
+    to an otherwise-VCO block stay; only the three retired entries go. A
+    ``files.exclude`` that is not a mapping is left entirely alone.
     """
     block = data.get("files.exclude")
     if not isinstance(block, dict):
         return []
+    if any(
+        block.get(pattern) is not value
+        for pattern, value in _LEGACY_FILES_EXCLUDE_BLOCK.items()
+    ):
+        return []  # not recognisably VCO's block — the user's, untouched
     removed: list[str] = []
     for pattern in _RETIRED_FILES_EXCLUDE_ENTRIES:
-        if block.get(pattern) is True:
-            del block[pattern]
-            removed.append(f"files.exclude:{pattern}")
+        del block[pattern]  # presence + value proven by the check above
+        removed.append(f"files.exclude:{pattern}")
     return removed
 
 
@@ -211,8 +239,10 @@ def backfill_in_project(folder: Path) -> dict:
       - Top-level key already present → user-wins, leave alone (covers
         the "user set `files.watcherExclude: {}` to explicitly disable
         the feature" case the addendum calls out). The retired-entry prune
-        applies the same user-wins rule PER ENTRY: only a value that is
-        exactly the boolean `true` VCO wrote is removed.
+        applies the same user-wins rule PER BLOCK (R18 m2): the three
+        entries go only when `files.exclude` still carries every legacy
+        canonical entry at the value VCO wrote — a block the user authored
+        or edited keeps all its entries.
       - Top-level key missing → add it with the canonical value.
 
     Args:
@@ -262,14 +292,7 @@ def backfill_in_project(folder: Path) -> dict:
                 fsync=False, symlink_safe=True,
             )
             if redirect is not None:
-                sys.stderr.write(
-                    f"[vct] NEW-8 symlink-blocking: refusing to write "
-                    f"through symlink at {settings_file}; redirecting to "
-                    f"{redirect}. The .vco-new sibling holds the "
-                    f"orchestrator's intended content; the symlink and "
-                    f"its destination are untouched. Merge manually "
-                    f"when ready.\n"
-                )
+                warn_symlink_redirect(settings_file, redirect)
         except OSError as e:
             result["action"] = f"write_failed:{type(e).__name__}"
             return result
@@ -304,14 +327,7 @@ def backfill_in_project(folder: Path) -> dict:
             fsync=False, symlink_safe=True,
         )
         if redirect is not None:
-            sys.stderr.write(
-                f"[vct] NEW-8 symlink-blocking: refusing to write "
-                f"through symlink at {settings_file}; redirecting to "
-                f"{redirect}. The .vco-new sibling holds the "
-                f"orchestrator's intended content; the symlink and "
-                f"its destination are untouched. Merge manually "
-                f"when ready.\n"
-            )
+            warn_symlink_redirect(settings_file, redirect)
     except OSError as e:
         result["action"] = f"write_failed:{type(e).__name__}"
         return result

@@ -1,6 +1,6 @@
 ---
 name: kimi-implementer
-description: Kimi K3 implementation lane via the claude-gw gateway (kimi vendor) for bounded multi-file, long-context or visual/frontend fixes where quality beats speed. Worktree lane — report lands in it; read-only → kimi-reviewer.
+description: Kimi K3 implementation lane via the claude-gw gateway for bounded multi-file, long-context or visual/frontend fixes where quality beats speed; not a reviewer. Worktree lane — review → kimi-reviewer, research → deepseek-researcher.
 model: claude-gw/kimi/k3[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
@@ -56,8 +56,8 @@ Worktree lane: you carry `isolation: worktree`, so EVERYTHING you write —
 the edits AND your report — lands inside your own worktree, never in the
 main checkout. Never write your report to a path outside the worktree;
 return it as your final message as well, because the coordinator reviews
-and merges the worktree branch rather than reading files in place. A task
-whose only output is a report — read-only research, a survey, a review
-with no edits — should be dispatched to kimi-reviewer instead; it runs
-without isolation, so its report file lands in the main tree at the path
-the brief named.
+and merges the worktree branch rather than reading files in place. A
+review belongs to kimi-reviewer (review); read-only research or a survey
+belongs to deepseek-researcher (research) or glm-flash-researcher
+(research) — no kimi-vendor researcher ships. They run without isolation,
+so their report files land in the main tree at the path the brief named.

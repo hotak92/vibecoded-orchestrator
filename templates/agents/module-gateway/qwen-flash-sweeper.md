@@ -60,5 +60,6 @@ never in the main checkout. Never write the table to a path outside the
 worktree; return it as your final message as well, because the coordinator
 reviews and merges the worktree branch rather than reading files in place.
 A sweep whose only output is a report (no edits to apply) should be
-dispatched to deepseek-researcher instead; it runs without isolation, so
-its report file lands in the main tree at the path the brief named.
+dispatched to deepseek-researcher (research) instead; it runs without
+isolation, so its report file lands in the main tree at the path the
+brief named.

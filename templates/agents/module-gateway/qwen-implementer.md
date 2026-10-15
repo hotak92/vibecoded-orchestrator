@@ -1,6 +1,6 @@
 ---
 name: qwen-implementer
-description: Qwen3.8-Max lane via the claude-gw gateway for bounded multi-file/multi-step fixes — top qwen-vendor rung above deepseek-implementer; hardest go to qwen-implementer-high. Worktree lane — report lands in it; read-only → deepseek-researcher.
+description: Qwen3.8-Max lane via the claude-gw gateway for bounded multi-file/multi-step fixes — top qwen-vendor rung above deepseek-implementer; not a reviewer. Worktree lane — research → deepseek-researcher, review → glm-reviewer/kimi-reviewer.
 model: claude-gw/qwen/qwen3.8-max[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
@@ -43,8 +43,9 @@ Worktree lane: you carry `isolation: worktree`, so EVERYTHING you write —
 the edits AND your report — lands inside your own worktree, never in the
 main checkout. Never write your report to a path outside the worktree;
 return it as your final message as well, because the coordinator reviews
-and merges the worktree branch rather than reading files in place. A task
-whose only output is a report — read-only research, a survey, a review
-with no edits — should be dispatched to deepseek-researcher instead (the
-qwen-vendor research lane); it runs without isolation, so its report file
-lands in the main tree at the path the brief named.
+and merges the worktree branch rather than reading files in place.
+Read-only research or a survey belongs to deepseek-researcher (research),
+the qwen-vendor gateway lane; a review belongs to glm-reviewer (review)
+or kimi-reviewer (review) — no qwen-vendor read-only review lane ships.
+They run without isolation, so their report files land in the main tree
+at the path the brief named.

@@ -1,6 +1,6 @@
 ---
 name: glm-implementer-high
-description: High-effort glm-implementer sibling on GLM 5.3 via the claude-gw gateway — the most difficult bounded implementations only, ~4x the medium lane's tokens. Worktree lane — report lands in it; read-only → glm-flash-researcher / glm-reviewer.
+description: High-effort glm-implementer sibling on GLM 5.3 via the claude-gw gateway — the most difficult bounded implementations only, ~4x the medium lane's tokens. Worktree lane — research → glm-flash-researcher, review → glm-reviewer.
 model: claude-gw/glm-5.3[1m]
 effort: high
 tools: Read, Write, Edit, Grep, Glob, Bash

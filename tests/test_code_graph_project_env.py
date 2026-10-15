@@ -427,14 +427,15 @@ class VscodeExcludesBackfillTests(unittest.TestCase):
 
 
 class VscodeExcludesRetireBuildOutputsTests(unittest.TestCase):
-    """v0.2.103 (field report, Item 25): `files.exclude` must NOT hide the
-    user's own build outputs. Hiding `**/dist` / `**/build` / `**/target`
-    from the explorer only hides the PDFs and binaries the user just built —
-    performance is already covered by `files.watcherExclude` and
-    `search.exclude`, which KEEP the entries. New projects get a
-    `files.exclude` without them; existing projects get the three entries
-    VCO wrote pruned — only when the value is exactly the boolean VCO
-    wrote, never a user-changed value and never any other key.
+    """v0.2.103 (field report, Item 25; R18 m2 tightening): `files.exclude`
+    must NOT hide the user's own build outputs. Hiding `**/dist` /
+    `**/build` / `**/target` from the explorer only hides the PDFs and
+    binaries the user just built — performance is already covered by
+    `files.watcherExclude` and `search.exclude`, which KEEP the entries.
+    New projects get a `files.exclude` without them; existing projects get
+    the three entries pruned ONLY when the block is recognisably the one
+    VCO wrote (every legacy canonical entry still present at the value VCO
+    wrote) — a block the user authored or edited keeps its entries.
     """
 
     RETIRED = ("**/dist", "**/build", "**/target")
@@ -512,11 +513,15 @@ class VscodeExcludesRetireBuildOutputsTests(unittest.TestCase):
             self.assertEqual(data["search.exclude"], payload["search.exclude"])
 
     def test_user_changed_or_user_added_values_are_untouched(self):
+        # R18 m2: the prune requires the block to be RECOGNISABLY VCO's —
+        # every legacy canonical entry present at the value VCO wrote. A
+        # block the user wrote or edited (a value changed, an entry
+        # missing) keeps ALL its entries, including a bare `true` one.
         files_exclude = {
             "**/.git": True,
             "**/dist": False,                      # user turned it OFF
             "**/build": {"when": "never"},         # user's conditional form
-            "**/target": True,                     # VCO-written → pruned
+            "**/target": True,                     # user's own `true`
             "**/my-output": True,                  # user's own key
         }
         payload = {
@@ -530,25 +535,78 @@ class VscodeExcludesRetireBuildOutputsTests(unittest.TestCase):
             folder = Path(td)
             self._write_vscode(folder, payload)
             result = project_init._backfill_vscode_excludes_in_project(folder)
-            self.assertEqual(result["action"], "pruned")
-            self.assertEqual(result["removed_entries"], ["files.exclude:**/target"])
+            self.assertEqual(result["action"], "noop")
+            self.assertEqual(result["removed_entries"], [])
             data = json.loads(
                 (folder / ".vscode" / "settings.json").read_text(encoding="utf-8")
             )
-            self.assertIs(data["files.exclude"]["**/dist"], False)
-            self.assertEqual(data["files.exclude"]["**/build"], {"when": "never"})
+            self.assertEqual(data["files.exclude"], files_exclude)
+
+    def test_user_authored_partial_block_keeps_its_entries(self):
+        # R18 m2: VCO only ever wrote `files.exclude` when the key was
+        # ABSENT, so a pre-existing block holding a bare `"**/build":
+        # true` is one VCO never wrote. A partial block (not the full
+        # legacy canonical set) is the user's — nothing is pruned, even
+        # at exactly the boolean VCO used.
+        user_block = {"**/dist": True, "**/build": True, "**/mine": True}
+        payload = {
+            "files.watcherExclude": {"**/target/**": True},
+            "files.exclude": user_block,
+            "search.exclude": {},
+            "python.analysis.exclude": ["**/.venv/**"],
+            "python.analysis.indexing": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            self._write_vscode(folder, payload)
+            result = project_init._backfill_vscode_excludes_in_project(folder)
+            self.assertEqual(result["action"], "noop")
+            self.assertEqual(result["removed_entries"], [])
+            data = json.loads(
+                (folder / ".vscode" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(data["files.exclude"], user_block)
+
+    def test_vco_block_with_user_added_keys_prunes_only_the_retired(self):
+        # The full legacy canonical block at VCO's values, plus keys the
+        # user added afterwards: still recognisably VCO's block, so the
+        # three retired entries go and every user key stays.
+        block = self._legacy_files_exclude()
+        block["**/my-output"] = True
+        payload = {
+            "files.watcherExclude": {"**/target/**": True},
+            "files.exclude": block,
+            "search.exclude": {},
+            "python.analysis.exclude": ["**/.venv/**"],
+            "python.analysis.indexing": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            self._write_vscode(folder, payload)
+            result = project_init._backfill_vscode_excludes_in_project(folder)
+            self.assertEqual(result["action"], "pruned")
+            self.assertEqual(set(result["removed_entries"]),
+                             {"files.exclude:" + p for p in self.RETIRED})
+            data = json.loads(
+                (folder / ".vscode" / "settings.json").read_text(encoding="utf-8")
+            )
+            for pattern in self.RETIRED:
+                self.assertNotIn(pattern, data["files.exclude"])
             self.assertIs(data["files.exclude"]["**/my-output"], True)
-            self.assertNotIn("**/target", data["files.exclude"])
+            self.assertIs(data["files.exclude"]["**/.venv"], True)
 
     def test_prune_runs_inside_a_jsonc_file_preserving_comments(self):
+        legacy = self._legacy_files_exclude()
+        lines = ",\n".join(
+            f'    "{k}": true' if i < len(legacy) - 1 else f'    "{k}": true'
+            for i, k in enumerate(legacy)
+        )
         raw = (
             "{\n"
             "  // my notes\n"
             '  "editor.tabSize": 2,\n'
             '  "files.exclude": {\n'
-            '    "**/.git": true,\n'
-            '    "**/dist": true,\n'
-            '    "**/mine": true\n'
+            f"{lines}\n"
             "  }\n"
             "}\n"
         )
@@ -565,7 +623,7 @@ class VscodeExcludesRetireBuildOutputsTests(unittest.TestCase):
             from vco_lib import jsonc_edit
             data = jsonc_edit.loads(text)
             self.assertNotIn("**/dist", data["files.exclude"])
-            self.assertIs(data["files.exclude"]["**/mine"], True)
+            self.assertIs(data["files.exclude"]["**/.git"], True)
             self.assertEqual(data["editor.tabSize"], 2)
 
 

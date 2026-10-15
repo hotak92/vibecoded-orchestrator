@@ -4413,7 +4413,7 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
     ``.claude/context/audits/project-bundle-install-audit-2026-06-10.md``
     §6.7 / B3.
     """
-    from vco_lib.atomic import atomic_write_bytes
+    from vco_lib.atomic import atomic_write_bytes, warn_symlink_redirect
 
     # chmod is a documented no-op on Windows inside the shared writer; a
     # chmod OSError never fails the write.
@@ -4421,13 +4421,7 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
         target, data, fsync=False, mode=mode, symlink_safe=True,
     )
     if redirect_target is not None:
-        sys.stderr.write(
-            f"[vct] NEW-8 symlink-blocking: refusing to write through symlink "
-            f"at {target}; redirecting to {redirect_target}. "
-            f"The .vco-new sibling holds the orchestrator's intended content; "
-            f"the symlink and its destination are untouched. Merge manually "
-            f"when ready.\n"
-        )
+        warn_symlink_redirect(target, redirect_target)
     return redirect_target
 
 
@@ -10147,11 +10141,11 @@ def install_project_bundle(
             )
 
     # PR-7 (v0.2.11, addendum-4): backfill VS Code watcher / search /
-    # Pylance exclude blocks into the project's `.vscode/settings.json`.
-    # Without these excludes, large workspaces (>10 GB / >50k files —
-    # typical ML projects with venvs + cargo target/) OOM-kill VS Code
-    # via systemd-oomd during initial indexing. Idempotent: skipped
-    # entirely if every canonical key is already present (user-wins).
+    # Pylance exclude blocks into the project's `.vscode/settings.json`
+    # (large workspaces OOM-kill VS Code without them). Idempotent: adds
+    # only missing keys (user-wins per key) and, since v0.2.103, prunes
+    # the retired files.exclude build outputs from a block still matching
+    # VCO's legacy write signature (vco_lib/vscode_excludes.py).
     if not dry_run:
         try:
             vscode_backfill = _backfill_vscode_excludes_in_project(folder)

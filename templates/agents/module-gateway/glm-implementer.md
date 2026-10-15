@@ -1,6 +1,6 @@
 ---
 name: glm-implementer
-description: Bounded, well-specified code fixes on GLM 5.3 via the claude-gw gateway; the brief names files and acceptance criteria; hardest go to glm-implementer-high. Worktree lane — report lands in it; read-only → glm-flash-researcher / glm-reviewer.
+description: Bounded, well-specified code fixes on GLM 5.3 via the claude-gw gateway; brief names files and acceptance criteria; not open-ended design or adversarial review. Worktree lane — research → glm-flash-researcher, review → glm-reviewer.
 model: claude-gw/glm-5.3[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
