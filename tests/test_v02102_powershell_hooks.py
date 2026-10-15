@@ -317,25 +317,37 @@ class TestWaitGuard:
         assert "tail --pid" not in reason, "a PowerShell caller gets PowerShell advice"
 
     @pytest.mark.parametrize("cmd", [
+        "while ($true) { }",
+        "while (-not (Test-Path done.txt)) { }",
+        "do { Write-Output . } until (Test-Connection h -Quiet)",
+        "do { } until (Test-Path x)",
+        "for (;;) { }",
+        "foreach ($i in 1..[int]::MaxValue) { }",
+    ])
+    def test_powershell_busy_wait_loops_are_denied_without_a_sleep(self, cmd, tmp_path):
+        """W5D-2 + R10 parity: a loop keyword can match no `if` rule, so the
+        guard runs on every PowerShell call and judges the loop itself. A
+        loop whose BODY does no real work is a busy-wait — sleep or not —
+        exactly like its Bash twin; a loop doing real work passes now."""
+        reason = wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path)
+        assert reason, cmd
+        assert "PowerShell command" in reason and "loop" in reason
+        assert "WHY:" in reason and "WHAT TO DO INSTEAD" in reason
+        assert "VCO_WAIT_GUARD=off" in reason
+
+    @pytest.mark.parametrize("cmd", [
+        # R10 parity: a loop doing real work is allowed, Bash-twin rule.
         "while ($true) { Get-Date }",
         "do { Get-Process } until ($false)",
         "do { Get-Job } while ($true)",
         "for (;;) { Get-Date }",
         "foreach ($i in 1..[int]::MaxValue) { Get-Date }",
         "foreach ($i in 1..10000000) { Test-Path x }",
-        "while (-not (Test-Path done.txt)) { }",
-    ])
-    def test_powershell_loops_are_denied_without_a_sleep(self, cmd, tmp_path):
-        """W5D-2: a loop keyword can match no `if` rule, so the guard runs on
-        every PowerShell call and judges the loop itself — sleep or not."""
-        reason = wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path)
-        assert reason, cmd
-        assert "PowerShell command" in reason and "loop" in reason
-        assert "WHY:" in reason and "WHAT TO DO INSTEAD" in reason
-        assert "while ($true)" in reason, "the teaching names the loop shape to avoid"
-        assert "VCO_WAIT_GUARD=off" in reason
-
-    @pytest.mark.parametrize("cmd", [
+        "foreach ($f in Get-ChildItem) { ruff check $f }",
+        # A condition that consumes input bounds the loop (`while read`
+        # twin) — whatever the body does with the lines.
+        "while (($l = $r.ReadLine()) -ne $null) { $l }",
+        "while (Read-Host q) { }",
         "foreach ($f in $files) { Get-Content $f }",
         "foreach ($i in 1..10) { $i }",
         "for ($i = 0; $i -lt 5; $i++) { $i }",
@@ -380,7 +392,7 @@ class TestWaitGuard:
     @pytest.mark.skipif(BASH is None, reason="no bash")
     @pytest.mark.parametrize("wrapper", [
         "sh", pytest.param("ps1", marks=pytest.mark.skipif(PWSH_FOUND is None, reason="pwsh absent"))])
-    @pytest.mark.parametrize("cmd", ["Start-Sleep 45", "while ($true) { Get-Date }"])
+    @pytest.mark.parametrize("cmd", ["Start-Sleep 45", "while ($true) { Start-Sleep 1 }"])
     def test_wrappers_deny_a_powershell_sleep(self, wrapper, cmd, tmp_path):
         env = child_env()
         env.update(VCT_STATE_DIR=str(tmp_path / "state"), PYTHONPATH=str(REPO_ROOT),

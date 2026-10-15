@@ -50,15 +50,25 @@ whose BODY does no real work is denied as a ``busy-wait loop`` even when
 it contains no sleep at all — it spins on its condition with no pause,
 re-checking as fast as the shell allows (``until curl -s localhost:8080;
 do :; done``). "No real work" is precise: every body segment is empty,
-``:``, ``true``, or a bare ``echo``/``printf`` with NO redirection or
-pipe (an ``echo "$l" >> out`` ACCUMULATES output — that is work). A body
+``:``, ``true``, or a bare ``echo``/``printf`` with no OUTPUT redirection
+and no pipe — an ``echo "$l" >> out`` ACCUMULATES output (work), while an
+fd duplication or a ``/dev/null`` sink (``printf . >&2``,
+``echo x 2>/dev/null``) writes nowhere and is NOT work (R10 F2). A body
 segment doing anything else — a real command, a ``read``, a redirected
 ``echo``, an embedded loop — is work and the loop stays allowed
-(``while read l; do echo "$l" >> out; done < in``,
-``for f in *.py; do ruff check $f; done`` — ``for``/``select`` iterate a
-finite word list and are never busy-waits). Position and loop membership
-come from the ONE chain walker
-(:func:`vco_lib.bash_command_walk.walk_segments`).
+(``for f in *.py; do ruff check $f; done``; ``for``/``select`` over a
+word list iterate a finite list and are never busy-waits — the EXCEPTION
+is the arithmetic ``for ((;;))`` with an empty middle clause, which is
+``while true`` in disguise and is judged like one, R10 F3). And a loop
+whose CONDITION consumes input — ``read``/``mapfile``/``readarray``,
+``while IFS= read -r l`` — is bounded by that input (it ends at EOF) and
+is NEVER a busy-wait, whatever the body does with the lines (R10 F1).
+Position and loop membership come from the ONE chain walker
+(:func:`vco_lib.bash_command_walk.walk_segments`); the PowerShell side
+applies the SAME rule through
+:func:`vco_lib.powershell_command.loop_pattern` (R10 parity: a loop with
+a wait inside, or an unbounded loop with a no-work body, denies; a loop
+doing real work — or reading input in its condition — passes).
 
 Shape (A>B>C, like the v0.2.101 injection surfaces): this module is the
 pure classifier + a small ephemeral-state helper; the ``.sh`` / ``.ps1``
@@ -158,7 +168,11 @@ from vco_lib.bash_command_walk import (
     tokenize,
     walk_segments,
 )
-from vco_lib.bash_write_targets import command_has_write_shape, strip_heredocs
+from vco_lib.bash_write_targets import (
+    _REDIRECT_NOISE,
+    collect_candidates,
+    strip_heredocs,
+)
 from vco_lib.powershell_command import (
     POWERSHELL_TOOL,
     loop_pattern,
@@ -449,8 +463,14 @@ def _scan_wrapped(tokens: List[str], depth: int,
 _NOWORK_VERBS = frozenset({":", "true", "echo", "printf"})
 
 #: Redirection / pipe tokens that make an ``echo``/``printf`` body real
-#: work (it writes a file or feeds a downstream command).
-_REDIRECT_TOKENS = frozenset({">", ">>", "<", "|", "&>", "&>>"})
+#: work (it writes a file or feeds a downstream command). An INPUT
+#: redirect is not output (R10 F7): ``echo x < f`` writes nothing.
+_REDIRECT_TOKENS = frozenset({">", ">>", "|", "&>", "&>>"})
+
+#: Condition verbs that CONSUME INPUT (R10 F1): a loop whose condition
+#: reads terminates at EOF — it is bounded by its input, never a spin.
+#: ``read``/``mapfile``/``readarray`` (and their ``IFS=``-prefixed forms).
+_INPUT_CONDITION_VERBS = frozenset({"read", "mapfile", "readarray"})
 
 
 def _is_redirect_token(tok: str) -> bool:
@@ -460,11 +480,45 @@ def _is_redirect_token(tok: str) -> bool:
             or (tok.endswith(">") and tok[:-1].isdigit()))
 
 
+def _is_noise_redirect(tok: str) -> bool:
+    """An fd duplication or glued ``/dev/null`` sink — output that goes
+    nowhere (R10 F2): it makes no file and feeds nothing, so it is NOT
+    work. The token list is the write-target module's
+    :data:`_REDIRECT_NOISE` (one home), extended with the ``>&N`` /
+    ``N>&M`` duplication shapes. The SPACED ``> /dev/null`` pair is
+    handled by :func:`_real_output_tokens`."""
+    return (tok in _REDIRECT_NOISE
+            or re.fullmatch(r"&?>\d+", tok) is not None
+            or re.fullmatch(r"\d*>&\d+", tok) is not None)
+
+
+def _real_output_tokens(tokens: List[str]) -> List[str]:
+    """The tokens that could be real OUTPUT: fd duplications and
+    ``/dev/null`` sinks (glued or spaced operator+target pair) removed."""
+    out: List[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        t = tokens[i]
+        if _is_noise_redirect(t) or t == "/dev/null":
+            i += 1
+            continue
+        if (t in (">", ">>", "&>", "&>>") and i + 1 < n
+                and tokens[i + 1] == "/dev/null"):
+            i += 2
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
 def _segment_does_real_work(tokens: List[str]) -> bool:
     """The busy-wait rule's work test for ONE loop-body segment: empty,
     ``:``, ``true``, the ``done`` terminator, or a bare ``echo``/``printf``
-    (no redirection, no pipe) do no work; anything else — a real command,
-    a ``read``, a redirected echo, an embedded loop opener — does."""
+    (no OUTPUT redirection, no pipe — fd duplications and ``/dev/null``
+    sinks dropped first, R10 F2) do no work; anything else — a real
+    command, a ``read``, a redirected echo, an embedded loop opener —
+    does."""
     body = tokens
     while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
         body = body[1:]
@@ -477,17 +531,48 @@ def _segment_does_real_work(tokens: List[str]) -> bool:
     if first in _NOWORK_VERBS and first not in ("echo", "printf"):
         return False
     if first in ("echo", "printf"):
-        return any(_is_redirect_token(t) for t in body[1:])
+        return any(_is_redirect_token(t) for t in _real_output_tokens(body[1:]))
     return True
+
+
+def _infinite_for_header(tokens: List[str], start: int) -> bool:
+    """True when ``tokens[start:]`` opens an arithmetic ``for`` whose
+    MIDDLE clause is empty — ``for ((;;))``, ``for ((i=0;;))`` — the
+    arithmetic infinite loop (R10 F3). ``for ((i=0; i<n; i++))`` has a
+    bound and is finite."""
+    rest = tokens[start + 1:]
+    if not rest or not rest[0].startswith("(("):
+        return False
+    inner = rest[0].strip("()")
+    parts = inner.split(";")
+    return len(parts) >= 2 and parts[1].strip() == ""
+
+
+def _condition_reads_input(opener_tokens: List[str]) -> bool:
+    """True when the loop CONDITION's first verb consumes input —
+    ``read`` / ``mapfile`` / ``readarray``, behind ``!``, ``IFS=``-style
+    assignments and keywords (R10 F1). Such a loop is bounded by its
+    input (it ends at EOF) and is never a busy-wait, whatever its
+    body does with the lines."""
+    cond = opener_tokens
+    while cond and os.path.basename(cond[0]).lower() in _LEADING_KEYWORDS:
+        cond = cond[1:]
+    cond = strip_env_assignments(cond)
+    cond = strip_subshell_parens(cond)
+    return bool(cond) and os.path.basename(cond[0]).lower() in _INPUT_CONDITION_VERBS
 
 
 def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
     """The busy-wait rule (owner ruling 2026-10-15): a ``while``/``until``
     loop whose BODY does no real work — every body segment empty, ``:``,
     ``true``, or a bare ``echo``/``printf`` — is a spin with no pause and
-    is denied as ``busy-wait loop`` even with no sleep in it. ``for`` /
-    ``select`` iterate a finite word list and are never busy-waits; a body
-    with real work (a redirected ``echo`` included) stays allowed.
+    is denied as ``busy-wait loop`` even with no sleep in it. A body with
+    real work (a redirected ``echo`` included) stays allowed. A condition
+    that consumes input (``while read …``) is bounded by that input and is
+    never a busy-wait (R10 F1). ``for`` over a word list and ``select``
+    iterate a finite list and are never busy-waits — EXCEPT the arithmetic
+    ``for ((;;))`` with an empty middle clause, which is ``while true`` in
+    disguise and is judged like one (R10 F3).
 
     ``segments[i]`` is the opener (or a segment with a mid-segment opener
     behind a ``{``/``(`` header); the body is the following ``in_loop``
@@ -498,7 +583,11 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
     while body0 and os.path.basename(body0[0]).lower() in _LEADING_KEYWORDS:
         body0 = body0[1:]
     body0 = strip_subshell_parens(body0)
-    has_opener = bool(body0) and os.path.basename(body0[0]).lower() in CONDITION_OPENERS
+    first0 = os.path.basename(body0[0]).lower() if body0 else ""
+    has_opener = first0 in CONDITION_OPENERS
+    if not has_opener and first0 == "for" and _infinite_for_header(body0, 0):
+        has_opener = True  # for ((;;)): the arithmetic infinite loop
+    cond_toks = body0[1:] if has_opener and first0 in CONDITION_OPENERS else []
     if not has_opener and seg.in_loop:
         # A loop opener sitting MID-SEGMENT behind a function/group header
         # (`f() { while true; …` — same shape as _pattern_of_segment).
@@ -506,15 +595,24 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
             kw = os.path.basename(toks[j]).lower()
             if kw in CONDITION_OPENERS:
                 has_opener = True
+                cond_toks = toks[j + 1:]
+                break
+            if kw == "for" and _infinite_for_header(toks, j):
+                has_opener = True
                 break
             if kw in LOOP_OPENERS:
-                return None  # for/select: never a busy-wait
+                return None  # a finite for/select: never a busy-wait
     if not has_opener:
         return None
-    # Skip the loop's condition segments, then take the `do`..`done` run.
+    if _condition_reads_input(cond_toks):
+        return None  # bounded by input: `while read -r l; …` ends at EOF
+    # Multi-segment conditions (`while a && read l; do …`): any input
+    # consumer among them bounds the loop too.
     j = i + 1
     while (j < len(segments) and segments[j].in_loop
            and not (segments[j].tokens and segments[j].tokens[0] == "do")):
+        if _condition_reads_input(segments[j].tokens):
+            return None
         j += 1
     if not (j < len(segments) and segments[j].in_loop
             and segments[j].tokens and segments[j].tokens[0] == "do"):
@@ -573,12 +671,15 @@ def static_pattern(command: str, depth: int = 0, *,
 def bash_repeat_key(command: str, prefix: str = "bash") -> Optional[str]:
     """The normalized repeat key for a Bash STATUS CHECK, or ``None`` when
     the command is not one (first peeled verb outside :data:`REPEAT_VERBS`),
-    or when the command WRITES: a command with an output redirection to a
-    file, a heredoc-to-file, ``sed -i``, ``tee`` or kin is never a poll
-    (field case 2026-10-15: ``cat > f <<'EOF' …`` keyed as a "status
-    check" on ``cat``). The write test is the ONE write-shape predicate
-    (:func:`vco_lib.bash_write_targets.command_has_write_shape`), not a
-    second scanner here. Pure reads (``cat log``) still accumulate.
+    or when the command WRITES: a command with a real write target is never
+    a poll (field case 2026-10-15: ``cat > f <<'EOF' …`` keyed as a "status
+    check" on ``cat``). The write test is the ONE write-target parser
+    (:func:`vco_lib.bash_write_targets.collect_candidates`) with the
+    non-file sinks dropped — NOT the cheap write-shape predicate, which
+    over-approximates (``| tee /dev/null``, ``| python3 -c …`` and a
+    ``# >`` comment would let a pure-read poll escape the detector, R10
+    F4; ``/dev/null`` and fd duplications write nothing). Pure reads
+    (``cat log``) still accumulate.
 
     The key is the full token-joined command — quoting/whitespace variants
     of the same check normalize together, while a different target or flag
@@ -594,7 +695,8 @@ def bash_repeat_key(command: str, prefix: str = "bash") -> Optional[str]:
         return None
     if os.path.basename(first[0]).lower() not in REPEAT_VERBS:
         return None
-    if command_has_write_shape(command):
+    if any(t not in ("/dev/null", "stdout", "stderr")
+           for t in collect_candidates(command)):
         return None
     return prefix + ":" + " ".join(tokens)
 

@@ -563,10 +563,14 @@ def collect_candidates(command: str) -> List[str]:
     lines = stripped.split("\n")
     if len(lines) > 1 and all(tokenize(line) is not None for line in lines):
         # Walk line by line, sharing the collector so `cd` state still
-        # flows forward. (v0.2.103 made the walker itself treat an
-        # unquoted newline as a separator, so this split is now a
-        # belt-and-braces equivalence — kept because it also bounds each
-        # walk to one line.)
+        # flows forward. NOT equivalent to one whole-string walk any more
+        # (v0.2.103 R10 F5): when a line holds a MULTI-LINE QUOTED string
+        # this branch is skipped and the whole command goes through the
+        # walker, which now splits unquoted newlines itself — the fallback
+        # path then finds the same targets the per-line walk would (and
+        # better ones than before, when a quoted newline glued words
+        # across lines). Pinned by the fallback tests in
+        # tests/test_v0295_bash_write_sync.py.
         raw: List[str] = []
         for line in lines:
             raw.extend(walk_command(line, collector))

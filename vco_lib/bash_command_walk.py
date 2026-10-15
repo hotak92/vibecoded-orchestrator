@@ -72,7 +72,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from typing import Callable, List, NamedTuple, Optional
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 # --- Verb / separator vocabulary (shared by every consumer) --------------
 
@@ -426,27 +426,87 @@ def _tail_quoted(raw_token: str) -> bool:
     return raw_token.endswith(("'", '"'))
 
 
+def _backslash_run_before(command: str, i: int) -> int:
+    """The number of consecutive backslashes immediately before position
+    ``i`` — an ODD run means the character at ``i`` is escaped."""
+    j = i
+    while j > 0 and command[j - 1] == "\\":
+        j -= 1
+    return i - j
+
+
+def _ansi_c_body(command: str, start: int) -> Tuple[str, int]:
+    """``(decoded_body, end_index)`` of the ``$'…'`` ANSI-C string whose
+    opening quote is at ``start``. Escapes are decoded exactly as far as
+    tokenisation needs (``\\'`` and ``\\\\``; other ``\\X`` stay two
+    characters — the walk never inspects ANSI-C escapes beyond quotes);
+    an unterminated string consumes the rest."""
+    out: List[str] = []
+    i = start
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n and command[i + 1] in ("'", "\\"):
+            out.append(command[i + 1])
+            i += 2
+            continue
+        if ch == "'" and _backslash_run_before(command, i) % 2 == 0:
+            return "".join(out), i
+        out.append(ch)
+        i += 1
+    return "".join(out), n
+
+
+def _double_quoted_literal(body: str) -> str:
+    """``body`` as one shlex-parseable double-quoted token."""
+    escaped = (body.replace("\\", "\\\\").replace('"', '\\"')
+               .replace("$", "\\$").replace("`", "\\`"))
+    return '"' + escaped + '"'
+
+
 def _newlines_as_separators(command: str) -> str:
     """An UNQUOTED newline is a command separator, exactly like ``;``
     (v0.2.103): ``make\\nsleep 5`` is judged like ``make; sleep 5``, and a
     multi-line loop/condition like its one-line form. A newline inside a
-    single/double-quoted string is data; a backslash directly before a
-    newline is a line continuation and also stays. Quote-aware character
-    scan — the one home for this rule (every :func:`tokenize` consumer,
-    including the wait guard, gets it)."""
+    single/double-quoted string is data; an unquoted ``\\<newline>`` is a
+    line continuation and is DELETED, both characters (bash removes it;
+    keeping it made shlex fold the newline into the next token). An
+    unquoted ``#`` at word start starts a comment that runs to the end of
+    the line (shlex is called with comments disabled, so this is the one
+    place comments are stripped — a ``# it's fine`` line must not open a
+    quote). ``$'…'`` (ANSI-C quoting, escape-aware) is re-emitted as a
+    plain quoted token — shlex does not know the form, so an apostrophe
+    inside one would look like an unbalanced quote. A closing quote is
+    real only when the backslash run before it is EVEN (``\\\\"`` is a
+    backslash then a CLOSE, ``\\\\"`` … an odd run escapes it). Quote-aware
+    character scan — the one home for this rule (every :func:`tokenize`
+    consumer, including the wait guard, gets it)."""
     out: List[str] = []
     quote: Optional[str] = None
     i = 0
     n = len(command)
+    word_start = True
     while i < n:
         ch = command[i]
         if quote is not None:
             out.append(ch)
-            if ch == quote and not (quote == '"' and i and command[i - 1] == "\\"):
+            if ch == quote and (
+                quote == "'" or _backslash_run_before(command, i) % 2 == 0
+            ):
                 quote = None
+        elif ch == "#" and word_start:
+            while i < n and command[i] != "\n":
+                i += 1
+            continue  # the newline (if any) is handled on the next pass
+        elif ch == "$" and i + 1 < n and command[i + 1] == "'":
+            body, end = _ansi_c_body(command, i + 2)
+            out.append(_double_quoted_literal(body))
+            i = end
         elif ch in ("'", '"'):
             quote = ch
             out.append(ch)
+        elif ch == "\\" and i + 1 < n and command[i + 1] == "\n":
+            i += 1  # line continuation: consume the newline too (both vanish)
         elif ch == "\\" and i + 1 < n:
             out.append(ch)
             i += 1
@@ -455,6 +515,7 @@ def _newlines_as_separators(command: str) -> str:
             out.append(" ; ")
         else:
             out.append(ch)
+        word_start = ch.isspace() or ch in ";|&()<>{"
         i += 1
     return "".join(out)
 

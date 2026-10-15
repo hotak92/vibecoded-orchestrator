@@ -303,6 +303,40 @@ class TestWriteIsNeverAStatusCheck:
         )
         assert reason and "4th" in reason
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # R10 F4: these have NO write target (a /dev/null sink, an
+            # opaque interpreter, a comment) — the old write-shape
+            # predicate excluded them and a pure-read poll escaped. The
+            # write-target parser sees no target, so they KEY again.
+            "tail -5 log | tee /dev/null",
+            'tail -n 5 log | python3 -c "print()"',
+            "cat log # > x",
+            "cat log > /dev/null",
+        ],
+    )
+    def test_reads_without_a_write_target_still_key(self, command):
+        from vco_lib.wait_guard import bash_repeat_key
+
+        assert bash_repeat_key(command) is not None, command
+
+    def test_dev_null_read_poll_denies_at_threshold(self, tmp_path):
+        from vco_lib import wait_guard as wg
+
+        cmd = "tail -5 /tmp/build.log | tee /dev/null"
+        for n in (1, 2, 3):
+            assert wg.evaluate(
+                _bash(cmd, tool_use_id=f"toolu_v{n}"),
+                env=dict(ENV_DEFAULT), state_root=tmp_path,
+                now=1000.0 + n * 10.0,
+            ) is None
+        reason = wg.evaluate(
+            _bash(cmd, tool_use_id="toolu_v4"),
+            env=dict(ENV_DEFAULT), state_root=tmp_path, now=1040.0,
+        )
+        assert reason and "4th" in reason
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # No tool_use_id → sub-second collapse (fallback)

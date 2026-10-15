@@ -993,3 +993,128 @@ class TestBusyWaitLoops:
     def test_sleep_in_body_still_names_the_sleep(self, tmp_path):
         reason = _deny(tmp_path, "while ! check; do echo x; sleep 2; done")
         assert "sleep" in reason and "busy-wait" not in reason
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# R10 review fixes (Opus, MERGE-AFTER-FIXES; 2026-10-15)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestR10InputConsumingLoops:
+    """F1 MAJOR: a loop whose CONDITION consumes input (read/mapfile/
+    readarray) is bounded by that input — it ends at EOF — and is never a
+    busy-wait, whatever the body does with the lines."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "while read -r l; do echo \"$l\"; done < f",
+            "while read -r l; do printf \"%s\\n\" \"$l\"; done < f",
+            "cat f | while read -r l; do echo \"$l\"; done",
+            "while IFS= read -r line; do\n echo \"$line\"\ndone < in.txt",
+            "while mapfile -t lines; do :; done < f",
+            "while readarray -t arr; do true; done < f",
+            # A chained condition: ANY input consumer among the condition
+            # segments bounds the loop.
+            "while ! read -r l; do echo x; done",
+        ],
+    )
+    def test_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+    def test_file_existence_poll_still_denied(self, tmp_path):
+        # The review's contrast: an existence check is a real poll.
+        reason = _deny(tmp_path, "until [ -f x ]; do :; done")
+        assert "busy-wait loop" in reason
+
+
+class TestR10ProgressOutputIsNotWork:
+    """F2: fd duplications and /dev/null sinks write nowhere — progress
+    dots on stderr are NOT work, so those loops are busy-waits."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "until nc -z h p; do printf . >&2; done",
+            "while c; do echo . 2>&1; done",
+            "while c; do echo x 2>/dev/null; done",
+            "while c; do echo x > /dev/null; done",
+            "while c; do echo x &> /dev/null; done",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        assert "busy-wait loop" in _deny(tmp_path, command)
+
+    def test_real_output_redirect_is_still_work(self, tmp_path):
+        _allow(tmp_path, "while read l; do echo \"$l\" >> out; done < in")
+        _allow(tmp_path, "while c; do echo x | gzip >> log.gz; done")
+
+
+class TestR10ArithmeticFor:
+    """F3: `for ((;;))` (empty middle clause) is the arithmetic infinite
+    loop — `while true` in disguise, judged like one. A bounded arithmetic
+    `for` stays finite."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "for ((;;)); do :; done",
+            "for ((;;)); do echo .; done",
+            "for ((i=0;;)); do true; done",  # init but no bound
+        ],
+    )
+    def test_infinite_denied(self, tmp_path, command):
+        assert "busy-wait loop" in _deny(tmp_path, command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "for ((i=0; i<3; i++)); do :; done",
+            "for ((i=0; i<3; i++)); do echo $i; done",
+            "for i in 1 2 3; do echo $i; done",
+        ],
+    )
+    def test_bounded_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+
+class TestR10InputRedirectIsNotOutput:
+    """F7: an INPUT redirect writes nothing — `echo x < f` is not work."""
+
+    def test_denied(self, tmp_path):
+        assert "busy-wait loop" in _deny(tmp_path, "while c; do echo x < f; done")
+
+
+class TestR10NewlineScannerHardening:
+    """F6: the newline-as-separator scanner is the one place comments are
+    stripped (shlex runs with comments disabled); `\\"` closes the string
+    (even backslash run); `$'…'` is ANSI-C quoting; a backslash-newline
+    continuation vanishes entirely."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "# it's fine\nsleep 30",
+            "echo pre\n# comment with ' quote\nsleep 5",
+            'echo "a\\\\"\nsleep 5',
+            "echo $'it\\'s'\nsleep 5",
+        ],
+    )
+    def test_guard_not_blinded(self, tmp_path, command):
+        assert "sleep" in _deny(tmp_path, command)
+
+    def test_comment_is_not_part_of_the_command(self, tmp_path):
+        from vco_lib.bash_command_walk import tokenize
+
+        assert tokenize("cat log # > x") == ["cat", "log"]
+        # A mid-word `#` is data, not a comment start.
+        assert tokenize("echo x#y\nsleep 5") == ["echo", "x#y", ";", "sleep", "5"]
+
+    def test_continuation_vanishes_entirely(self, tmp_path):
+        from vco_lib.bash_command_walk import tokenize
+        from vco_lib.bash_write_targets import collect_candidates
+
+        assert tokenize("cp a \\\n dest.txt") == ["cp", "a", "dest.txt"]
+        assert collect_candidates("cp a \\\n dest.txt") == ["dest.txt"]
+        # The command keeps its shape: a between-actions pause stays one.
+        _allow(tmp_path, "make \\\n && sleep 5 && make")
