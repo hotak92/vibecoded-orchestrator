@@ -28,9 +28,11 @@ pub mod codegraph_reanalyze;
 // per-project `.claude/`-index toggle (module_settings). Command fns are
 // wired into `generate_handler!` by the integrator.
 pub mod codegraph_settings;
-// v0.2.47 RL-7.5 (2026-06-04): chunker-revision deferral. Writes an
-// UPDATE_DEFERRED.md row when an upgrade crosses the v0.2.46 chunker
-// boundary so the user re-syncs KG / codegraph against the new presets.
+// v0.2.47 RL-7.5 (2026-06-04), revision-keyed since v0.2.92 R2-4:
+// chunker-revision deferral. Writes an UPDATE_DEFERRED.md row when the
+// `_CHUNKER_REVISION` sentinel changes so the user re-syncs KG / codegraph
+// against the new chunk boundaries. (The one-off v0.2.46 semver-boundary
+// half was retired in v0.2.103.)
 pub mod chunker_revision_deferral;
 // v0.2.92 WP-11: the version-keyed chat-model context table (migration 043)
 // plus its seed loader and its export to

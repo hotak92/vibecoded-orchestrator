@@ -1335,37 +1335,16 @@ pub fn run() {
                         commands::module_catalog_client::bust_cache_if_launcher_version_changed(
                             db.inner(),
                         );
-                    // v0.2.47 RL-7.5: chunker-revision deferral — when the
-                    // running launcher version crosses the v0.2.46 boundary
-                    // (any pre-v0.2.46 → v0.2.46+), append a re-sync notice
-                    // to the orchestrator-root project's
-                    // .claude/context/UPDATE_DEFERRED.md. The new chunker
-                    // presets in claude_mcp_servers/weaviate_mcp/chunking.py
-                    // produce different chunk boundaries; existing Weaviate
-                    // rows are stale and search recall degrades on long
-                    // answers until the user re-syncs.
-                    // Soft-fails: any write error logs to stderr and proceeds.
-                    if let commands::module_catalog_client::VersionBustOutcome::VersionChanged {
-                        ref prev,
-                        ref running,
-                        ..
-                    } = bust_outcome
-                    {
-                        let _ = commands::chunker_revision_deferral::write_chunker_deferral_if_crossing_boundary(
-                            db.inner(),
-                            prev,
-                            running,
-                        );
-                    }
-                    // R2-4: chunker-REVISION deferral. Independent of the semver
-                    // boundary above (which only fired across the one-off v0.2.46
-                    // launcher-version crossing and never again). This compares
-                    // the live `_CHUNKER_REVISION` sentinel from chunking.py
-                    // against the persisted last-seen value and, on change, writes
-                    // the same re-sync deferral — the consumer the sentinel's own
+                    // R2-4: chunker-REVISION deferral. Compares the live
+                    // `_CHUNKER_REVISION` sentinel from chunking.py against
+                    // the persisted last-seen value and, on change, writes
+                    // the re-sync deferral — the consumer the sentinel's own
                     // contract comment always promised. Runs every boot (not
                     // gated on VersionChanged) so a chunking.py revision bump
                     // shipped without a launcher-version bump is still detected.
+                    // (The one-off v0.2.46 semver-boundary hook this sat beside
+                    // was retired in v0.2.103, superseded by this revision-keyed
+                    // path — owner decision 2026-10-15.)
                     // Soft-fails: any read/DB/python error Skips without blocking
                     // boot.
                     let _ = commands::chunker_revision_deferral::write_chunker_deferral_if_revision_changed(

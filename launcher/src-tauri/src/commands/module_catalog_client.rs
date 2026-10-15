@@ -579,8 +579,8 @@ pub enum VersionBustOutcome {
     /// Different version detected. Cache wiped (rows_deleted = number of
     /// `module_catalog.cache*` rows removed). ``prev`` and ``running``
     /// carry the version strings so downstream consumers (e.g. the
-    /// chunker-revision deferral hook in `chunker_revision_deferral.rs`)
-    /// can react to specific upgrade-pair patterns.
+    /// post-version-change L0 catalog refresh in `lib.rs::setup`) can react
+    /// to specific upgrade-pair patterns.
     VersionChanged {
         rows_deleted: usize,
         prev: String,

@@ -5789,122 +5789,6 @@ def _emit_bash_env_cleanup_deferral(
 
 
 # ---------------------------------------------------------------------------
-# v0.2.47 RL-7.5 (2026-06-04): chunker-preset overhaul
-# ---------------------------------------------------------------------------
-
-
-# Version (inclusive lower bound on the NEW side) at which the chunker-preset
-# overhaul lands. Anyone whose prior manifest's `vco_version` was strictly
-# less than this needs to re-sync KG + codegraph against the new presets.
-# Mirrors `CHUNKER_BUMP_VERSION` in
-# `launcher/src-tauri/src/commands/chunker_revision_deferral.rs`.
-_CHUNKER_BUMP_VERSION = "0.2.46"
-
-
-def _parse_semver(version: str) -> "tuple[int, int, int] | None":
-    """Parse "X.Y.Z" into (major, minor, patch). None on malformed input.
-
-    v0.2.92: delegates to
-    :func:`vco_lib.codegraph_extractor_generation.parse_semver` — ONE parser
-    for both boundary questions this file asks (chunker preset, extractor
-    generation). The name is kept because existing call sites + tests import
-    it. Loud-fail on the import is deliberate: vco_lib is part of every healthy
-    install, and a silent inline-copy degrade would re-create the very
-    duplication this delegation removes.
-    """
-    from vco_lib.codegraph_extractor_generation import parse_semver
-
-    return parse_semver(version)
-
-
-def _emit_chunker_resync_deferral(
-    folder: Path,
-    prev_version: str,
-    running_version: str,
-) -> None:
-    """Emit `chunker_preset_overhaul_pending`: KG + codegraph need re-syncing
-    after an upgrade across the v0.2.46 chunker-preset boundary.
-
-    **SUPERSEDED for the bundle flow in v0.2.92 (WP-D)** — the live
-    per-project emitter is :func:`_emit_chunker_revision_resync_deferral`
-    (same condition_id, same commands, keyed on the state-keyed
-    ``_CHUNKER_REVISION`` sentinel instead of a semver boundary). Retained
-    because the LAUNCHER's Rust-side semver hook still routes here:
-    ``launcher/src-tauri/src/commands/chunker_revision_deferral.rs::
-    write_deferral_for_project`` spawns this emitter via ``python -c``
-    when the launcher binary itself crosses the v0.2.46 boundary
-    (``lib.rs::setup`` → ``write_chunker_deferral_if_crossing_boundary``).
-    Its gating twin ``_crosses_chunker_boundary`` was deleted in v0.2.103
-    (owner removal ruling #26: superseded by
-    :func:`vco_lib.chunker_revision.gate`, zero production callers); the
-    boundary arithmetic it bound lives on in
-    :func:`vco_lib.codegraph_extractor_generation.crosses_version_boundary`.
-
-    Post-v0.2.46 the chunker uses MUCH larger chunks for qwen3-embedding
-    (target_tokens 9500 vs. legacy 1000) and a five-tier preset routing
-    (xsmall/small/medium/large/xlarge). Existing Weaviate rows synced under
-    the legacy presets have stale chunk boundaries: relevant content lives
-    in chunk N+1 that the new preset would have folded into chunk N. Search
-    recall degrades on long answers until the user re-syncs.
-
-    Per-project entry: each project's KG + codegraph are independent
-    Weaviate collections, so each gets its own deferral entry.
-
-    Severity is `info` — searches still WORK, they just return less
-    relevant top-k results. The user can defer the re-sync indefinitely.
-    """
-    from vco_lib.deferral_report import DeferralEntry
-    from vco_lib import chunker_revision as _chunker_revision
-    from vco_lib import deferral_emit as _de
-
-    detected = (
-        f"This project's `.vco-manifest.json` recorded `vco_version="
-        f"{prev_version}`; the current orchestrator is `{running_version}`. "
-        f"The chunker presets in `claude_mcp_servers/weaviate_mcp/chunking.py` "
-        f"changed at v{_CHUNKER_BUMP_VERSION} (target chunk size for qwen3 "
-        f"jumped from ~1000 tokens to ~9500). Existing Weaviate rows in this "
-        f"project's KG + code graph were chunked under the LEGACY presets — "
-        f"search recall degrades on long answers because relevant content "
-        f"lives in chunk N+1 that the new preset would have folded into "
-        f"chunk N."
-    )
-    # v0.2.75 (C-10 family fix): the previous commands named flags the target
-    # CLIs reject or ignore — `kg-sync --force` does not exist (kg-sync's
-    # manual argv loop silently ignored it) and `code-graph-analyze --force`
-    # is rejected by argparse ("unrecognized arguments"), so the remediation
-    # could never run as written. `--force-recreate` is the real drop+rebuild
-    # flag, which is exactly the "re-chunk everything" this deferral wants.
-    # Guarded by tests/test_deferral_command_argparse_sweep.py.
-    cmd = _chunker_revision.resync_commands(
-        folder,
-        "# Both commands are heavy I/O (re-embeds every chunk via Ollama).\n"
-        "# Consider running them when you're not actively coding.",
-    )
-
-    entry = DeferralEntry(
-        condition_id="chunker_preset_overhaul_pending",
-        title="KG + codegraph re-sync recommended (chunker presets changed)",
-        detected=detected,
-        why_deferred=(
-            "Auto-rechunking every KG row and code-graph entity at install "
-            "time would block the bundle update for minutes and consume "
-            "significant Ollama GPU time. We defer the decision so the user "
-            "can pick a quiet moment. Searches WORK in the meantime — they "
-            "just return less relevant top-k results than they would under "
-            "the new presets. Once you run the re-sync commands below, "
-            "this deferral self-resolves on the next bundle update."
-        ),
-        command_to_apply=cmd,
-        severity="info",
-        kg_node_refs=[
-            "knowledge/concepts/score-driven-retrieval-tiers.md",
-        ],
-    )
-    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-    _de.emit(folder, entry)
-
-
-# ---------------------------------------------------------------------------
 # v0.2.92: extractor-generation re-index trigger (per-project bundle update)
 # ---------------------------------------------------------------------------
 
@@ -6161,12 +6045,12 @@ def _emit_chunker_revision_resync_deferral(
 ) -> None:
     """Emit the chunker re-sync deferral keyed on a REVISION change (R2-4).
 
-    Parallel to ``_emit_chunker_resync_deferral`` (which keys on the v0.2.46
-    SEMVER boundary and therefore never fires again for current installs). This
-    variant fires whenever the ``_CHUNKER_REVISION`` sentinel string changes
-    across an update — the mechanism the sentinel's own contract comment always
-    promised but nothing consumed. Same condition_id + commands so the two paths
-    dedup to a single deferral entry and self-resolve identically.
+    Fires whenever the ``_CHUNKER_REVISION`` sentinel string changes across an
+    update — the mechanism the sentinel's own contract comment always promised.
+    (The v0.2.47 semver-boundary sibling ``_emit_chunker_resync_deferral`` —
+    keyed on the one-off v0.2.46 launcher-version crossing — was retired in
+    v0.2.103, owner decision 2026-10-15, as superseded by this revision-keyed
+    path and the per-project gate in :mod:`vco_lib.chunker_revision`.)
     """
     from vco_lib.deferral_report import DeferralEntry
     from vco_lib import chunker_revision as _chunker_revision
