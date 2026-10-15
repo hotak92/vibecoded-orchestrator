@@ -907,11 +907,11 @@ def enumerate_kg_collections(
     Strategy:
       * If `project_name` is provided, return the canonical KG + Dev +
         Shared KG triple for that project (from
-        `vco_lib.project_init.derive_project_collection_names`). The
-        shared KG name is the LOCKED constant
-        `VibeCodedOrchestrator_KnowledgeGraph` (since v0.2.23 B1 / brand
-        casing flip; was `VibecodedOrchestrator_KnowledgeGraph` v0.2.12–
-        v0.2.22 — kept as a legacy alias below).
+        `vco_lib.project_init.derive_project_collection_names`), PLUS this
+        machine's shared class as resolved by
+        `project_init._resolve_shared_kg_name` (v0.2.103: the root's
+        folder-derived name, which may differ only by case from the
+        `VibeCodedOrchestrator_KnowledgeGraph` default).
       * If `project_name` is None, list every class on the server and
         return those that end in `_KnowledgeGraph` or `_Development`
         (per-project) PLUS the shared KG class
@@ -946,6 +946,11 @@ def enumerate_kg_collections(
             derived["development_collection"],
             derived["shared_kg_collection"],
         ]
+        # v0.2.103: also this machine's shared class (the root's decided
+        # name, which can be the folder-derived case-variant of the constant).
+        machine_shared = _pi._resolve_shared_kg_name(None)
+        if machine_shared and machine_shared not in candidates:
+            candidates.append(machine_shared)
         return [c for c in candidates if c in listed]
 
     # All projects path.

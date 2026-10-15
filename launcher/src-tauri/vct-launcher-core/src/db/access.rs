@@ -873,6 +873,23 @@ impl Db {
         self.reconcile_kg_collection_access(&existing_classes)
     }
 
+    /// v0.2.103 (R24 HIGH-1 sweep): the boot-time NEW-12 migration aimed at
+    /// THIS machine's shared class — the persisted orchestrator-root pointer
+    /// (`app_state['orchestrator_root_kg_collection']`, which install.py writes
+    /// from `vco_lib/root_kg_identity.py`'s decision) — never the shipped
+    /// constant. On a clone whose root owns the folder-derived
+    /// `VibecodedOrchestrator_KnowledgeGraph` that name IS the shared class,
+    /// so rewriting it to the capital-C constant retargeted every project's
+    /// shared grant at a class that does not exist, on every launcher boot.
+    /// Returns `(canonical, renamed)`.
+    pub fn migrate_legacy_shared_kg_collection_names_to_root_pointer(
+        &self,
+    ) -> Result<(String, usize), String> {
+        let canonical = self.get_orchestrator_root_kg_collection()?;
+        let renamed = self.migrate_legacy_shared_kg_collection_names(&canonical)?;
+        Ok((canonical, renamed))
+    }
+
     /// Init-time migration: rewrite legacy shared-KG collection names in
     /// `kg_collection_access` to the current canonical name.
     ///
@@ -1140,6 +1157,12 @@ impl Db {
     /// matches the same suffix. Auto-adopt is safe because there's
     /// exactly one populated `*_KnowledgeGraph` candidate.
     ///
+    /// v0.2.103 (owner ruling 2026-10-15): that root-shaped fixture is no
+    /// longer adopted here — rows of the orchestrator root (`projects.host =
+    /// 'orchestrator_root'`) are excluded, because a class the root did not
+    /// write is adopted only with consent (`vco_lib.root_kg_identity adopt`).
+    /// Every other project's rows keep this heal.
+    ///
     /// Algorithm:
     /// 1. Fetch Weaviate schema → set of existing class names
     ///    (`/v1/schema`).
@@ -1248,9 +1271,17 @@ impl Db {
         let rows: Vec<BindingRow> = {
             let guard = self.lock();
             let mut stmt = guard
+                // v0.2.103 (owner ruling 2026-10-15): the orchestrator
+                // root's rows are never adopted onto another class — its
+                // name is `vco_lib/root_kg_identity.py`'s decision and
+                // adopting an existing class is the explicit consent CLI.
+                // Must match `vco_lib/kg_binding_heal.py`
+                // (`_prefix_adopt_kg_bindings_pass(skip_project_ids=...)`).
                 .prepare(
-                    "SELECT project_id, role, collection_name \
-                     FROM project_kg_bindings",
+                    "SELECT b.project_id, b.role, b.collection_name \
+                     FROM project_kg_bindings b \
+                     LEFT JOIN projects p ON p.id = b.project_id \
+                     WHERE COALESCE(p.host, '') != 'orchestrator_root'",
                 )
                 .map_err(|e| format!("adopt_populated: prepare: {}", e))?;
             let mapped = stmt
@@ -2494,6 +2525,43 @@ mod migrate_shared_kg_tests {
             .unwrap();
         assert_eq!(second, 0, "second call must be a no-op");
     }
+
+    /// v0.2.103 (R24 HIGH-1 sweep) — the boot entry aims at the ROOT POINTER.
+    /// A machine whose root owns the folder-derived lowercase-c class keeps
+    /// every grant on it (that IS its shared class), and a pre-v0.2.12 legacy
+    /// grant is renamed to it — never to the capital-C constant. Red-proof:
+    /// make the entry pass `CANONICAL` instead of the pointer → the lowercase-c
+    /// grant is rewritten and this fails.
+    #[test]
+    fn boot_entry_targets_the_root_pointer_not_the_constant() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_orchestrator_root_kg_collection(LEGACY_LOWERCASE_C).unwrap();
+        seed(&db, "p1", LEGACY_LOWERCASE_C, "write");
+        seed(&db, "p2", LEGACY_TOOLS, "read");
+
+        let (canonical, renamed) = db
+            .migrate_legacy_shared_kg_collection_names_to_root_pointer()
+            .unwrap();
+        assert_eq!(canonical, LEGACY_LOWERCASE_C);
+        assert_eq!(renamed, 1);
+        assert_eq!(count(&db, "p1", LEGACY_LOWERCASE_C), 1, "the root's shared grant is kept");
+        assert_eq!(count(&db, "p1", CANONICAL), 0);
+        assert_eq!(count(&db, "p2", LEGACY_LOWERCASE_C), 1, "legacy grant renamed to the pointer");
+        assert_eq!(count(&db, "p2", CANONICAL), 0);
+    }
+
+    /// The migration-028 default pointer (the constant) keeps the historical
+    /// behaviour: a lowercase-c grant is renamed to the capital-C constant.
+    #[test]
+    fn boot_entry_with_the_default_pointer_keeps_the_legacy_rename() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", LEGACY_LOWERCASE_C, "write");
+        let (canonical, renamed) = db
+            .migrate_legacy_shared_kg_collection_names_to_root_pointer()
+            .unwrap();
+        assert_eq!((canonical.as_str(), renamed), (CANONICAL, 1));
+        assert_eq!(count(&db, "p1", CANONICAL), 1);
+    }
 }
 
 // ─── Tests: sync_shared_to_primary_for_orchestrator_root (v0.2.46 Decision A boot backfill) ─────────
@@ -3720,6 +3788,32 @@ mod adopt_populated_tests {
 
         let result = db.adopt_populated_collections_at_boot(&dead_url).await;
         assert!(result.is_err(), "expected Err on unreachable Weaviate, got {:?}", result);
+    }
+
+    /// T8 (v0.2.103, owner ruling 2026-10-15) — the ORCHESTRATOR ROOT's row
+    /// is never prefix-adopted at boot, even in the T2 shape (its class is
+    /// missing and exactly one populated same-suffix class exists): adopting
+    /// a class the root did not write needs the user's consent
+    /// (`python -m vco_lib.root_kg_identity adopt --yes`). Red-proof: drop
+    /// the `orchestrator_root` filter in the SELECT → `adopted: 1`.
+    #[tokio::test]
+    async fn t8_orchestrator_root_row_is_never_adopted() {
+        let db = Db::open_in_memory().unwrap();
+        seed_binding(&db, "root", "primary", "Vibecodedorchestrator_KnowledgeGraph", json!({}));
+        {
+            let guard = db.lock();
+            guard
+                .execute("UPDATE projects SET host = 'orchestrator_root' WHERE id = 'root'", [])
+                .unwrap();
+        }
+        let mock = MockWeaviate::spawn(
+            vec!["Other_KnowledgeGraph".to_string()],
+            HashMap::from([("Other_KnowledgeGraph".to_string(), 500_u64)]),
+        );
+        let report = db.adopt_populated_collections_at_boot(&mock.url).await.unwrap();
+        assert_eq!(report, AdoptionReport { adopted: 0, deferred: 0, no_change: 0 });
+        let (name, _cfg) = read_binding(&db, "root", "primary");
+        assert_eq!(name, "Vibecodedorchestrator_KnowledgeGraph");
     }
 }
 

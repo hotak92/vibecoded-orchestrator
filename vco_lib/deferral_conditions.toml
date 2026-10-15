@@ -179,6 +179,50 @@ emit_surfaces = ["ledger"]
 notes = """The re-probe pass also re-checks reachability every --update; the \
 SIDE-EFFECTFUL `podman start` remediation stays behind --apply-deferred."""
 
+[conditions.install_python_env_broken]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103. The Weaviate collection bootstrap / KG seed \
+(`vco_lib.install_weaviate.collections_and_seed`) raised ImportError: the \
+interpreter running install.py lacks a module VCO's requirements ship. Before \
+v0.2.103 that read as `weaviate_unreachable_at_update` and restarted a healthy \
+container. action_required: the exit is an install/update run that repairs the \
+venv. Owned/drop-when-absent: every run re-attempts the seed, and a run whose \
+seed imports cleanly does not re-emit it. No dismiss_key — a broken install is \
+a real break, not a machine description to acknowledge."""
+
+[conditions.kg_seed_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103. The Weaviate collection bootstrap / KG seed raised an \
+exception that is neither a connection failure (→ weaviate_unreachable_at_update) \
+nor an ImportError (→ install_python_env_broken); the entry names its type and \
+message. No container start — the database was not the problem. \
+action_required (a non-transient error a human must read); owned/drop-when-absent: \
+the next run re-attempts the seed and a success does not re-emit it."""
+
+[conditions.root_kg_blocked_by_case_sibling]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (owner ruling 2026-10-15). The orchestrator root's KG name \
+(`vco_lib.root_kg_identity`'s decision: the white-label override, the populated \
+bound class it keeps, else the folder-derived name) cannot be created because \
+Weaviate holds a class differing from it only in case. VCO never adopts such a \
+class on its own (it may be another install's data or another model's vectors) \
+and never drops it; the seed is skipped. The exits are the user's: \
+`python -m vco_lib.root_kg_identity adopt --collection <sibling> --yes` (refused \
+unless written with the current embedding model) or removing the sibling. \
+Owned/drop-when-absent: step 7b (collection bootstrap) and step 7c (seed) both \
+re-decide and both emit it, so a run whose seed leg returns early still reports a \
+still-blocked root; the run after either exit does not re-emit it. A run that \
+skips BOTH steps (--skip-seed / --skip-collections) does not decide at all."""
+
 [conditions.rebuild_pending_seed]
 class = "action_required"
 owner = "install.py"
@@ -1617,7 +1661,11 @@ class = "action_required"
 owner = "vco_lib.project_init"
 clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "A clean migrate-collections dry-run clears it (project_init)."
+notes = """A clean migrate-collections dry-run clears it (project_init). Emitted by \
+the migrate-collections dry-run gate (vco_lib.migrate_deferral) and, since v0.2.103, \
+by the collection bootstrap for a schema-incompatible class that holds objects \
+(vco_lib.bootstrap_schema_guard — never dropped; an empty class is still rebuilt). \
+A shared-KG entry goes to the orchestrator root's ledger, whose dry-run covers it."""
 
 [conditions.chunker_preset_overhaul_pending]
 class = "action_required"
@@ -2110,6 +2158,24 @@ class = "informational_record"
 owner = "vco_lib.collection_repair"
 clear_probe = "manual-dismiss"
 emit_surfaces = ["ledger"]
+
+[conditions.collection_blocked_by_case_sibling]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (R24 HIGH-1). bootstrap_collections met a target (the \
+project's KG / Development class, or the machine's shared KG) that Weaviate \
+refuses to create because a class differing only in case exists, and that class \
+holds objects (or its count could not be read). Before v0.2.103 the case-conflict \
+recovery dropped the sibling and recreated it empty — on a clone whose root owns \
+the folder-derived name that destroyed the shared KG on the first project add. \
+It is never dropped now: the user binds it (root/shared: `python -m \
+vco_lib.root_kg_identity adopt --collection <sibling> --yes`; a project KG: the \
+launcher's Identity tab) or removes it, then re-runs bootstrap-collections. \
+Paired: the bootstrap run that meets no blocked target resolves it \
+(vco_lib.bootstrap_case_sibling.settle). An EMPTY case-sibling keeps the \
+pre-existing drop-and-recreate (nothing to lose)."""
 
 [conditions.weaviate_unreachable_at_bootstrap]
 class = "auto_retryable"

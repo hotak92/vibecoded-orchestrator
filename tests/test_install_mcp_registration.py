@@ -295,7 +295,10 @@ class BuildEntriesTests(unittest.TestCase):
             self.assertEqual(entry["env"]["WEAVIATE_URL"], "http://localhost:8081")
             self.assertEqual(entry["env"]["OLLAMA_URL"], "http://localhost:11435")
             self.assertEqual(entry["env"]["GRPC_PORT"], "50052")
-            self.assertEqual(entry["env"]["ACTIVE_EMBEDDING"], "qwen3")
+            # v0.2.103: ACTIVE_EMBEDDING is NOT written here any more — a
+            # global copy in ~/.claude.json overrode the launcher's embedding
+            # profile projected into .claude/settings.json env.
+            self.assertNotIn("ACTIVE_EMBEDDING", entry["env"])
             self.assertEqual(entry["env"]["CODE_EMBED_SERVICE_URL"], "http://localhost:11440")
             # Per-project keys MUST be absent (Claude Code's
             # ~/.claude.json mcpServers.*.env wins against
@@ -500,6 +503,37 @@ class RegisterMcpsOrchestrationTests(unittest.TestCase):
             )
             self.assertIn("--browser", data["mcpServers"]["playwright"]["args"])
             self.assertEqual(data["mcpServers"]["mine"], mine)
+
+    def test_update_drops_a_legacy_global_active_embedding(self):
+        """v0.2.103 — an existing weaviate-kg registration written by an older
+        VCO carries ``ACTIVE_EMBEDDING=qwen3`` in ~/.claude.json, which Claude
+        Code applies AFTER .claude/settings.json env and so overrode the
+        launcher's global embedding profile in every MCP subprocess. The
+        ordinary registration pass must rewrite the entry without it, and the
+        key must not be allowlisted for the global file. Red-proof: put
+        ``"ACTIVE_EMBEDDING": "qwen3"`` back into ``_build_python_mcp_entries``
+        and the allowlist → this fails."""
+        from vco_lib import install_mcp
+        self.assertNotIn("ACTIVE_EMBEDDING", install_mcp._ALLOWED_GLOBAL_ENV_KEYS)
+        with tempfile.TemporaryDirectory() as td:
+            root = _make_pseudo_install_root(Path(td))
+            fake_home = Path(td) / "fake_home"
+            fake_home.mkdir()
+            target = fake_home / ".claude.json"
+            target.write_text(json.dumps({"mcpServers": {
+                "weaviate-kg": {"type": "stdio", "command": "/old/python",
+                                "args": ["server.py"],
+                                "env": {"ACTIVE_EMBEDDING": "qwen3",
+                                        "WEAVIATE_URL": "http://localhost:8081"}},
+            }}), encoding="utf-8")
+            self._run_with_overrides(
+                root, fake_home,
+                bundled_binary=False, allow_download=False, allow_cargo=False,
+            )
+            data = json.loads(target.read_text(encoding="utf-8"))
+            env = data["mcpServers"]["weaviate-kg"]["env"]
+            self.assertNotIn("ACTIVE_EMBEDDING", env)
+            self.assertIn("WEAVIATE_URL", env)
 
     def test_no_venv_emits_critical_deferral_and_does_not_crash(self):
         """No venv-python anywhere → soft-fail + critical deferral entry."""

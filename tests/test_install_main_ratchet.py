@@ -70,7 +70,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # v0.2.100 WP-12: re-pinned DOWN (1645 → 1473). The collections/seed block
 # with its Weaviate-down recovery and the migrate-error deferral loop moved to
 # `vco_lib.install_weaviate` (`collections_and_seed`, `migrate_errors_to_entries`).
-_MAIN_SPAN_MAX = 1473
+# v0.2.103 item 31: re-pinned DOWN (1473 -> 1442, measured; base 721bec80
+# measured 1462 under the stale pin). The A-2 seed and the storage prompt moved
+# to `_seed_run_report` / `_storage_choice_step`; the post-venv hand-off is one
+# call (`_continue_in_venv_after_deps`).
+_MAIN_SPAN_MAX = 1442
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -400,7 +404,12 @@ _MAIN_SPAN_MAX = 1473
 # Measured with `wc -l`.
 # v0.2.100 WP-15 — re-pinned DOWN 22153 -> 22082: the zero-entry
 # UPDATE_DEFERRED.md stub writer was retired (owner rule F-W2-08(c)).
-_TOTAL_LINES_MAX = 22082
+# v0.2.103 item 31 — re-pinned DOWN 22082 -> 21826 (measured with `wc -l`;
+# base 721bec80 measured 21856 under the stale pin). The V44-G1 root-KG
+# tiebreak `_resolve_orchestrator_root_canonical` was superseded by
+# `vco_lib.root_kg_identity`; the post-venv hand-off record lives in
+# `vco_lib.install_companions`.
+_TOTAL_LINES_MAX = 21826
 
 
 def _measure() -> tuple:

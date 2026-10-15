@@ -520,6 +520,11 @@ _RESUME_ENABLED: bool = True
 # so no eviction needed.
 _PENDING_EVENTS: list[str] = []
 
+# v0.2.103: the record of the post-venv hand-off this run IS (a child the
+# install.py that finished step 5 continued as — `_continue_in_venv_after_deps`),
+# loaded once at the top of main(); the empty record in every other run.
+_HANDOFF = _install_companions.PostVenvHandoff()
+
 # v0.2.44 V44-H/H5: set True when _seed_weaviate detects a dual-clone
 # situation (PROJECT_ROOT has all orchestrator-root file markers but
 # launcher.db's orchestrator_root project_id points at a DIFFERENT
@@ -4663,6 +4668,76 @@ def _ensure_running_under_mcp_venv() -> None:
     _install_companions.hand_off(str(target), [str(target), *sys.argv], env)  # exec; Windows: wait
 
 
+
+def _adopt_post_venv_handoff() -> None:
+    """v0.2.103: load this run's post-venv hand-off record (see
+    ``vco_lib.install_companions.continue_in_venv``) into ``_HANDOFF`` and
+    re-buffer the log lines its parent wrote before step 8 existed, so they
+    reach ``install.jsonl`` ahead of this run's own. A no-op in every run that
+    is not such a child."""
+    global _HANDOFF
+    _HANDOFF = _install_companions.load_post_venv_handoff()
+    if _HANDOFF.pending_events:
+        _PENDING_EVENTS[:0] = _HANDOFF.pending_events
+
+
+def _continue_in_venv_after_deps(venv_python: Path, args: argparse.Namespace,
+                                 adopt_project_mode: str | None, storage_choice: dict,
+                                 flow: InstallDeferralFlow) -> None:
+    """v0.2.103 — once step 5 filled the venv, continue the run AS that venv's
+    python, so every later in-process step imports what step 5 installed.
+    Without it a fresh install (no ``.venv`` when `_ensure_running_under_mcp_venv`
+    ran) finished on the launching interpreter. The record carries this run's
+    buffered log lines, the answers it already has and its deferral entries;
+    the singleton lock is released just before the hop (the child takes it
+    again). A no-op when this run already runs in that venv or is the child."""
+    _install_companions.continue_in_venv(venv_python, sys.argv, {
+        "pending_events": list(_PENDING_EVENTS),
+        "decisions": {
+            "adopt_project_mode": adopt_project_mode,
+            "storage_choice": storage_choice,
+            "env_secret_offer_made": True,
+            "lean_ctx_offer_made": True,
+            "conflict_strategy_applied": bool(getattr(args, "conflict_strategy", None)),
+        },
+        "deferral_entries": flow.carried_state(),
+    }, before_hand_off=_release_main_entry_lock_atexit)
+
+
+def _seed_run_report(flow: InstallDeferralFlow) -> None:
+    """A-2 (v0.2.73): seed the run's report FROM DISK so the end-of-run write
+    cannot clobber entries other writer families persisted (project_init,
+    Rust emitters, background resync children). Only FOREIGN entries merge;
+    owned condition IDs keep their drop-when-absent self-cleaning semantics.
+    Soft-fail: a seed failure degrades to the pre-A-2 behaviour, never blocks
+    the install. v0.2.103: then take a hand-off parent's entries as this run's
+    own (``InstallDeferralFlow.adopt_carried``)."""
+    try:
+        seeded = flow.seed()
+        if seeded:
+            _log_install_event(
+                "deferral_report", "ok",
+                f"preserved {seeded} foreign deferral entr"
+                f"{'y' if seeded == 1 else 'ies'} from disk (A-2 seed)",
+            )
+    except Exception as exc:  # noqa: BLE001 — seeding is best-effort
+        _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
+    flow.adopt_carried(_HANDOFF.deferral_entries)
+
+
+def _storage_choice_step(args: argparse.Namespace) -> dict:
+    """Step 3b: prompt for the storage layout, persist and record it (moved
+    out of main(), v0.2.103 — a hand-off child replays its parent's answer
+    instead of calling this)."""
+    choice = _prompt_storage_location(PROJECT_ROOT, args)
+    if choice.get("mode") != "deferred":
+        _persist_storage_choice(choice, PROJECT_ROOT)
+        _record_install_choice(
+            "storage_mode", choice["mode"],
+            {"bind_paths": list((choice.get("bind_paths") or {}).keys())},
+        )
+    return choice
+
 # ---------------------------------------------------------------------------
 # V47-C (v0.2.46 Part 2 Gap C): .env secret detection + keychain migration.
 #
@@ -4747,6 +4822,8 @@ def _audit_and_offer_env_secret_migration(
     install starts. Soft-fails on any exception — secrets handling must
     never block the install (the user can re-run with secrets later).
     """
+    if _HANDOFF.done("env_secret_offer_made"):
+        return  # v0.2.103: the hand-off parent already made this offer (its entries were carried)
     try:
         env_path = project_root / ".env"
         candidates = _secrets_audit.audit_env_secrets(env_path)
@@ -5221,6 +5298,7 @@ def main() -> int:
     # A relaunch record counts only if THIS run's parent made it (argv token);
     # then (Windows) a kill of that waiting parent stops this run too.
     _install_companions.adopt_relaunch(sys.argv)
+    _adopt_post_venv_handoff()  # v0.2.103: a child of the step-5 hand-off replays its parent
     # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
     # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
     # probe is usable on a freshly cloned repo with no .venv. The bootstrap
@@ -5764,22 +5842,7 @@ def main() -> int:
     _deferral_report = _deferral_flow.report
     _deferral_folder = _deferral_flow.folder
 
-    # A-2 (v0.2.73): seed the run's report FROM DISK so the end-of-run write
-    # cannot clobber entries other writer families persisted (project_init,
-    # Rust emitters, background resync children). Only FOREIGN entries merge;
-    # owned condition IDs keep their drop-when-absent self-cleaning
-    # semantics. Soft-fail: a seed failure degrades to the pre-A-2
-    # behaviour, never blocks the install.
-    try:
-        _seeded = _deferral_flow.seed()
-        if _seeded:
-            _log_install_event(
-                "deferral_report", "ok",
-                f"preserved {_seeded} foreign deferral entr"
-                f"{'y' if _seeded == 1 else 'ies'} from disk (A-2 seed)",
-            )
-    except Exception as exc:  # noqa: BLE001 — seeding is best-effort
-        _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
+    _seed_run_report(_deferral_flow)  # A-2 disk seed (+ a hand-off parent's entries)
 
     # PR-11: warn early when global lean-ctx hooks are present in
     # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
@@ -5798,7 +5861,7 @@ def main() -> int:
     # subsequent steps see the post-resolution file tree. Best-effort
     # logging — the install log dir may not exist yet, in which case
     # _log_install_event() silently skips (matches Rust contract).
-    if args.conflict_strategy:
+    if args.conflict_strategy and not _HANDOFF.done("conflict_strategy_applied"):
         if not args.conflict_source_path:
             print("ERROR: --conflict-strategy requires --conflict-source-path")
             return 2
@@ -5843,7 +5906,8 @@ def main() -> int:
     # functions. V47-G-final's detection heuristic + interactive prompt fires
     # here when no explicit flag is set AND PROJECT_ROOT shows existing-
     # project signals (CLAUDE.md, .env, .venv/, .claude/, knowledge/).
-    adopt_project_mode = _resolve_adopt_project_mode(args, install_path=PROJECT_ROOT)
+    adopt_project_mode = _HANDOFF.replay(
+        "adopt_project_mode", lambda: _resolve_adopt_project_mode(args, install_path=PROJECT_ROOT))
     if adopt_project_mode == "no-adopt":
         print(
             "Adopt-project mode explicitly refused via --no-adopt-project. "
@@ -5880,7 +5944,9 @@ def main() -> int:
     # at least once (i.e. on second+ install attempts on this checkout).
     global _RESUME_ENABLED, _RESUME_SESSION
     _RESUME_ENABLED = not args.no_resume
-    _RESUME_SESSION = _install_resume.load_session(_install_log_path(), enabled=_RESUME_ENABLED)
+    _RESUME_SESSION = _install_resume.load_session(  # a hand-off child resumes its parent's steps
+        _install_log_path(), enabled=_RESUME_ENABLED or _HANDOFF.active,
+        extra_lines=_HANDOFF.pending_events)
 
     print()
     print("=" * 62)
@@ -5944,24 +6010,18 @@ def main() -> int:
     # BEFORE the container-runtime detection so a user with 110 GB of
     # legacy Ollama models doesn't end up with empty named volumes after
     # `_start_services`. Silently skipped on --quiet / --yes / non-TTY
-    # stdin / when no legacy data is detected. Result persisted via the
-    # launcher binary CLI (preferred) or a direct Python write of
-    # ~/.vct/storage.toml (fallback). See
-    # `.claude/context/volume-binding-fix-2026-05-16.md` for the silent-
-    # data-loss footgun this closes.
-    _storage_choice = _prompt_storage_location(PROJECT_ROOT, args)
-    if _storage_choice.get("mode") != "deferred":
-        _persist_storage_choice(_storage_choice, PROJECT_ROOT)
-        _record_install_choice(
-            "storage_mode", _storage_choice["mode"],
-            {"bind_paths": list((_storage_choice.get("bind_paths") or {}).keys())},
-        )
+    # stdin / when no legacy data is detected. Persisted via the launcher
+    # CLI or ~/.vct/storage.toml (`_persist_storage_choice`); see
+    # `.claude/context/volume-binding-fix-2026-05-16.md`.
+    _storage_choice = _HANDOFF.replay("storage_choice", lambda: _storage_choice_step(args))
 
     # Step 4: Create virtual environment
     venv_python = _create_venv(PROJECT_ROOT)
 
     # Step 5: Install/update Python dependencies
     _install_requirements(venv_python, dev=args.dev)
+    _continue_in_venv_after_deps(venv_python, args, adopt_project_mode, _storage_choice,
+                                 _deferral_flow)  # v0.2.103: the rest runs under the venv
     _run_machine_migrations(_deferral_report)  # needs the venv (v0.2.97)
 
     # Step 5b (v0.2.85, PLAN-v0285 D1/D2): install the orchestrator-self runtime
@@ -6137,7 +6197,7 @@ def main() -> int:
         # crash, never an unbounded hang (v0.2.89 FIX 1 readiness gate). A seed
         # the write gate refused is SKIPPED, not a success (L1-F18).
         _seed_succeeded = _install_weaviate.collections_and_seed(
-            lambda: _ensure_collections(embed_config, decisions=decisions, args=args),
+            lambda: _ensure_collections(embed_config, decisions=decisions, args=args, deferral_report=_deferral_report),
             lambda: _seed_weaviate(args, deferral_report=_deferral_report),
             report=_deferral_report, rebuild_performed=_rebuild_was_performed,
             runtime=lambda: _detect_container_runtime() or _runtime_preference_from_env() or "podman",
@@ -6611,12 +6671,9 @@ def main() -> int:
     # an out-of-band hint for the binary-outside-clone case.
     _seed_launcher_install_path(PROJECT_ROOT, _deferral_report)
 
-    # v0.2.49 access-matrix Phase 1 (item #2): persist the orchestrator-
-    # root KG collection canonical name from
-    # `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env (if set). When unset,
-    # migration 028's default is authoritative — this call is a no-op.
-    # See `_persist_orchestrator_root_kg_collection` docstring for the
-    # resolution priority + soft-fail semantics.
+    # Persist the root's decided KG name (`root_kg_identity`) into launcher.db
+    # — after the hub start above, so a fresh DB has it before the launcher's
+    # first boot seeds the root binding from it (v0.2.103).
     _persist_orchestrator_root_kg_collection(_deferral_report)
     # v0.2.91 WP-B (#5) re-probe + WP-D doctor phase — v0.2.95 F1: runs AFTER
     # the hub restart (rationale in the helper; order pinned in test_v0295).
@@ -9155,7 +9212,8 @@ def _detect_optional_companions(args: argparse.Namespace) -> None:
     # PATH (see its docstring for the ~/.cargo/bin rationale); auto-install
     # via cargo / brew when available.
     lean_ctx_path = _find_lean_ctx_binary()
-    if not lean_ctx_path and not args.quiet and not args.no_lean_ctx:
+    if (not lean_ctx_path and not args.quiet and not args.no_lean_ctx
+            and not _HANDOFF.done("lean_ctx_offer_made")):  # v0.2.103: never offered twice in one run
         # Try auto-install via the most appropriate package manager.
         lean_ctx_path = _maybe_install_lean_ctx(args)
     if lean_ctx_path:
@@ -10294,6 +10352,7 @@ def _converge_orchestrator_root_kg_pointer(canonical: str) -> None:
 # ---------------------------------------------------------------------------
 
 from vco_lib import install_weaviate as _install_weaviate  # noqa: E402
+from vco_lib import root_kg_identity as _root_kg_identity  # noqa: E402
 
 # Re-export the pure content-hash helper under its original name so tests
 # that call `install._compute_on_disk_content_hashes` keep resolving.
@@ -12364,7 +12423,7 @@ def _wait_for_weaviate_ready(
 
 def _ensure_collections(embed_config: dict,
                         decisions: dict | None = None,
-                        args: argparse.Namespace | None = None) -> None:
+                        args: argparse.Namespace | None = None, deferral_report: "DeferralReport | None" = None) -> None:
     """Detect existing Weaviate collections and create only the ones missing.
 
     Code-graph collections (CodeModule / CodeClass / CodeFunction / CodeAPI /
@@ -12442,6 +12501,11 @@ def _ensure_collections(embed_config: dict,
         kg_name = env_kg
     else:
         kg_name = _derive_project_kg_name(PROJECT_ROOT)
+    # v0.2.103 (owner ruling 2026-10-15): on the orchestrator root the KG name
+    # (== the shared name: one class serves both roles) is `root_kg_identity`'s
+    # decision — the folder-derived name, or the populated bound class it
+    # keeps — never an env value and never a case-sibling adopted on the fly.
+    is_root = _is_orchestrator_root_install()
 
     # Per-project Development collection: same logic.
     env_dev = os.environ.get("DEVELOPMENT_COLLECTION")
@@ -12454,15 +12518,8 @@ def _ensure_collections(embed_config: dict,
     # with the diagrams integrations — the install no longer creates or
     # projects `<Project>_Diagrams`. Existing collections stay untouched.
 
-    # Cross-project shared KG. All vibecoded installs read from the same shared
-    # collection name (default "VibeCodedOrchestrator_KnowledgeGraph" since
-    # v0.2.23 B1 — was lowercase-c "VibecodedOrchestrator_KnowledgeGraph"
-    # v0.2.12–v0.2.22, itself renamed from "VibeCodedTools_KnowledgeGraph"
-    # pre-v0.2.12); the projects only differ in their per-project KG.
-    # Bootstrapped once per Weaviate instance — re-runs are no-ops thanks
-    # to the existing-class detection (which is case-insensitive since
-    # v0.2.23 B1, so the lowercase-c class on existing installs is adopted
-    # in place without recreate).
+    # Cross-project shared KG: the env pin, else the shipped last-resort constant. On the ROOT this is
+    # replaced below by `root_kg_identity`'s decision (one class, both roles; never case-adopted).
     shared_name = os.environ.get(
         "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
     ) or ""
@@ -12543,10 +12600,16 @@ def _ensure_collections(embed_config: dict,
             return actual
         return name
 
-    kg_name = _resolve_existing_casing(kg_name)
+    # v0.2.103 (owner ruling 2026-10-15): the ROOT and SHARED names are never
+    # case-adopted — a case-sibling is another class, adopted only with consent
+    # (`python -m vco_lib.root_kg_identity adopt --yes`). The per-project
+    # primary (non-root runs) and the development name keep the legacy rebind.
+    root_kg = _root_kg_decision(existing_names=existing) if is_root else None
+    if root_kg is not None:
+        kg_name = shared_name = root_kg.name
+    else:
+        kg_name = _resolve_existing_casing(kg_name)
     dev_name = _resolve_existing_casing(dev_name)
-    if shared_name:
-        shared_name = _resolve_existing_casing(shared_name)
 
     # Note: we deliberately do NOT auto-adopt existing cross-project KGs
     # (e.g. `ClaudeKnowledgeGraph` from another install). The orchestrator
@@ -12573,13 +12636,25 @@ def _ensure_collections(embed_config: dict,
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
     ]
+    if root_kg is not None and root_kg.blocked_by:
+        # A case-only sibling makes the root's class uncreatable: the consent deferral is recorded
+        # here too, since 7c may return before deciding (R24 LOW-1; same cid → idempotent).
+        if deferral_report is not None:
+            deferral_report.add_entry(_root_kg_blocked_entry(root_kg))
+        print(f"  ! not creating {kg_name}: '{root_kg.blocked_by}' differs only in case")
+        required = [(dev_name, _development_class_definition)]
     # Shared cross-project KG. Same schema as the per-project KG (the MCP
     # server reads them with the same shape). Created once per Weaviate
     # instance — the existing-class check above means concurrent installs
     # don't double-create. Skip if shared_name resolved to an existing class
     # (we already adopted it above).
     if shared_name and shared_name != kg_name:
-        required.append((shared_name, _kg_class_definition))
+        shared_sibling = (None if shared_name in existing
+                          else _root_kg_identity.case_sibling(shared_name, existing))
+        if shared_sibling:  # v0.2.103: never case-adopted, and uncreatable beside it
+            print(f"  ! not creating {shared_name}: '{shared_sibling}' differs only in case")
+        else:
+            required.append((shared_name, _kg_class_definition))
 
     # NOTE: do NOT skip our `_development` collection just because other
     # projects on the host have their own. Each project's docs live in
@@ -13190,11 +13265,11 @@ def _seed_weaviate_shared_kg_only(
     # SHARED_KG_COLLECTION points at
     # the canonical VibeCodedOrchestrator_KnowledgeGraph).
     #
-    # Strategy: pick SHARED_KG_COLLECTION as canonical (predictable, matches
-    # public-shipping convention). Rebind both project_kg_bindings rows
-    # (primary + shared) and both env keys (KG_COLLECTION + SHARED_KG_COLLECTION)
-    # to that canonical name. Skip the shared-seed sync step — one collection
-    # serves both roles.
+    # Strategy: the canonical name is the caller's `root_kg_identity` decision
+    # (v0.2.103 — `_seed_weaviate_impl` passes it as BOTH names; it was "SHARED
+    # wins" before). Rebind both project_kg_bindings rows (primary + shared)
+    # and both env keys (KG_COLLECTION + SHARED_KG_COLLECTION) to that name.
+    # Skip the shared-seed sync step — one collection serves both roles.
     #
     # No re-embedding. No re-syncing. No collection renaming. Just rebind
     # pointers + update app_state.
@@ -13207,10 +13282,9 @@ def _seed_weaviate_shared_kg_only(
 
         # v0.2.44 V44-H/H2: orphan-detection must compare the PRE-resolution
         # KG name (the one this install replaced) against canonical, NOT the
-        # post-V44-G1 reassigned current_kg_collection. Otherwise once G1
-        # picks the same value for both env and resolved, the orphan check
-        # always sees canonical == current_kg_collection and the notice is
-        # silently masked (Reader-4 FN1 against the maintainer install's actual state).
+        # reassigned current_kg_collection (v0.2.103: the root_kg_identity
+        # decision sets both to the same value, which would always mask the
+        # notice — Reader-4 FN1 against the maintainer install's actual state).
         orphan_kg = orphan_candidate_kg or current_kg_collection
 
         # Diagnostic: report row counts on both physical collections.
@@ -13231,11 +13305,9 @@ def _seed_weaviate_shared_kg_only(
             f"primary={orphan_kg or '(unset)'}={primary_count} rows, "
             f"shared={current_shared_kg or '(unset)'}={shared_count} rows"
         )
-        # v0.2.44 V44-H/H8: removed misleading "(SHARED_KG_COLLECTION wins)"
-        # tail. The V44-G1 hybrid-SoT rationale line printed upstream already
-        # names the actual decision source — appending an unconditional
-        # "SHARED wins" was a lie when G1 picked via Weaviate-existence or
-        # the first-install heuristic.
+        # v0.2.44 V44-H/H8: no "(SHARED_KG_COLLECTION wins)" tail — the
+        # decision line printed upstream (v0.2.103: `root_kg_identity`, printed
+        # by `_root_kg_decision`) already names the actual decision source.
         print(f"  → canonical = {canonical}")
 
         # v0.2.44 fix-now-3 (+ V44-H/H2): notify user about orphan collection
@@ -13341,129 +13413,6 @@ def _seed_weaviate_shared_kg_only(
     return seed_errors
 
 
-def _resolve_orchestrator_root_canonical(
-    env_kg: str,
-    env_shared: str,
-    db_primary: "Optional[str]",
-    db_shared: "Optional[str]",
-    weaviate_url: str,
-) -> "tuple[str, str, str]":
-    """v0.2.44 V44-G1: hybrid env-vs-DB conflict resolution.
-
-    User directive (2026-06-01): when env and DB disagree on the canonical
-    KG collection name for orchestrator-root, resolve via this priority chain:
-
-      1. CHECK WEAVIATE first. If exactly ONE candidate collection actually
-         exists, pick it (preferring an extant-with-data candidate over an
-         extant-empty one when only one of each kind exists).
-      2. If MULTIPLE candidates exist (true tie), apply the first-install
-         heuristic: env wins on fresh install (``app_state.last_installed_
-         kg_collection`` unset), DB wins on subsequent update (key SET).
-      3. If NEITHER candidate exists, env wins (bootstrap case — nothing
-         in Weaviate to anchor on).
-
-    Replaces V44-F's silent "env-wins / DB-wins via WARNING print" behavior
-    with an explicit, observable decision logged via the returned rationale.
-
-    Args:
-        env_kg: KG_COLLECTION from process env (may be empty).
-        env_shared: SHARED_KG_COLLECTION from process env (may be empty).
-        db_primary: launcher.db primary binding for orchestrator-root (or None).
-        db_shared: launcher.db shared binding for orchestrator-root (or None).
-        weaviate_url: Weaviate base URL for existence checks.
-
-    Returns:
-        (canonical_kg, canonical_shared, rationale)
-        rationale is a short human-readable string naming which branch fired.
-        Suitable for direct ``print()`` into install logs.
-
-        v0.2.44 V44-H: when ``rationale.startswith("deferred:")`` the caller
-        MUST NOT trigger ``_rebind_orchestrator_root_to_canonical`` — the
-        resolver was unable to obtain authoritative existence signals (e.g.
-        Weaviate unreachable) and the returned values are the existing
-        bindings unchanged. Rebinding on a deferred signal would clobber
-        the last-known-good state with possibly-stale env values. See H1.
-    """
-    # v0.2.44 V44-H/H4: all-empty guard. When none of the four inputs are set
-    # we have nothing to resolve — this is a true bootstrap before any env or
-    # DB binding has been recorded. Returning empty strings here is correct
-    # (downstream callers already handle the empty-collection case) but we
-    # tag the rationale so observers can distinguish "bootstrap" from
-    # "no-conflict-empty".
-    if not (env_kg or env_shared or db_primary or db_shared):
-        return "", "", "no canonical resolvable; bootstrap path"
-
-    # No-conflict fast path: when env and DB agree (or DB has no value),
-    # fill empties from DB and preserve env where set. This matches the
-    # pre-V44-G1 V44-B "fill empties only" behavior.
-    env_disagreement_kg = bool(db_primary and env_kg and db_primary != env_kg)
-    env_disagreement_shared = bool(db_shared and env_shared and db_shared != env_shared)
-    if not env_disagreement_kg and not env_disagreement_shared:
-        out_kg = env_kg or (db_primary or "")
-        out_shared = env_shared or (db_shared or "")
-        return out_kg, out_shared, "no conflict (env wins when set, DB fills empties)"
-
-    # Disagreement — apply hybrid algorithm.
-    # Step 1: Weaviate existence check. Build the candidate set from all four
-    # values (env_kg, env_shared, db_primary, db_shared), excluding empties.
-    candidates = {env_kg, env_shared, db_primary or "", db_shared or ""} - {""}
-    counts: "dict[str, Optional[int]]" = {}
-    for c in candidates:
-        try:
-            n = _count_weaviate_class_objects(weaviate_url, c)
-            # n is int (>=0) on success, None on error/nonexistent.
-            counts[c] = n if isinstance(n, int) and n >= 0 else None
-        except Exception:
-            counts[c] = None  # treat as nonexistent on any error
-    extant_with_data = [c for c, n in counts.items() if n is not None and n > 0]
-    extant_any = [c for c, n in counts.items() if n is not None]
-    # v0.2.44 V44-H/H1: distinguish "all unreachable" (every count is None,
-    # i.e. Weaviate down or transient failure on every candidate) from
-    # "all empty" (every count is 0, candidates exist but have no rows).
-    # When unreachable, we have NO authoritative signal — rebinding would
-    # gamble the last-known-good state on a transient outage. Return a
-    # deferred rationale and prefer the DB-recorded names (last known good)
-    # so the caller can short-circuit the rebind.
-    all_unreachable = bool(counts) and all(c is None for c in counts.values())
-    if all_unreachable and candidates:
-        return (
-            (db_primary or env_kg),
-            (db_shared or env_shared),
-            "deferred: Weaviate unreachable; preserving existing bindings",
-        )
-
-    if len(extant_with_data) == 1:
-        winner = extant_with_data[0]
-        return winner, winner, (
-            f"weaviate (only '{winner}' has rows; counts={counts})"
-        )
-    if len(extant_any) == 1:
-        winner = extant_any[0]
-        return winner, winner, (
-            f"weaviate (only '{winner}' exists; rowcount=0)"
-        )
-    if len(extant_any) == 0:
-        # Neither exists in Weaviate (and we DID get reachable answers, so this
-        # isn't a transient outage) → genuine bootstrap; env wins.
-        return env_kg, env_shared, "env (no candidates exist in Weaviate yet)"
-
-    # Step 2: multiple candidates exist (true tie). Apply first-install heuristic.
-    try:
-        last_kg = _read_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION)
-    except Exception:
-        last_kg = None
-    if not last_kg:
-        return env_kg, env_shared, (
-            "env (fresh install; app_state.last_installed_kg_collection unset)"
-        )
-    # Subsequent update → DB wins (bindings are authoritative once recorded).
-    return (
-        (db_primary or env_kg),
-        (db_shared or env_shared),
-        "db (subsequent update; bindings authoritative)",
-    )
-
-
 def _enrich_slot_change(
     venv_py: Path,
     profile: str,
@@ -13512,6 +13461,45 @@ def _enrich_slot_change(
 _SEED_OWED_WORK_CONDITION_ID = _install_weaviate.SEED_OWED_WORK_CONDITION_ID
 
 
+def _root_kg_decision(existing_names=None) -> "_root_kg_identity.RootKgDecision | None":
+    """v0.2.103: the orchestrator root's KG name for this run
+    (``vco_lib.root_kg_identity`` — the ONE decision, printed and logged).
+    ``existing_names`` is a schema the caller already fetched. Recomputed at
+    each step rather than cached: the rule is deterministic over live state,
+    and a step-7b creation does not change its answer. None when this is not
+    a root install or the decision itself failed (logged)."""
+    if not _is_orchestrator_root_install():
+        return None
+    try:
+        decision = _root_kg_identity.gather(PROJECT_ROOT, live_names=existing_names)
+    except Exception as exc:  # noqa: BLE001 — never block the install on it
+        _log_install_event("root_kg_identity", "warn", f"decision failed: {type(exc).__name__}: {exc}")
+        return None
+    print(f"  → orchestrator-root KG: {decision.name} ({decision.source}: {decision.reason})")
+    _log_install_event("root_kg_identity", "ok", decision.name, data=decision.to_dict())
+    return decision
+
+
+def _root_kg_blocked_entry(decision) -> DeferralEntry:
+    """The consent deferral for a root KG name a case-only sibling blocks."""
+    return DeferralEntry(
+        condition_id="root_kg_blocked_by_case_sibling",
+        title="Orchestrator-root KG name blocked by a case-only sibling",
+        detected=(f"The orchestrator root's KG is '{decision.name}' ({decision.reason}), but "
+                  f"Weaviate holds '{decision.blocked_by}', which differs only in case, so "
+                  f"'{decision.name}' cannot be created. Nothing was created or rebound."),
+        why_deferred=("Adopting an existing class is your decision: it may hold another "
+                      "install's data, or vectors from another embedding model. VCO never "
+                      "drops it and never adopts it on its own."),
+        command_to_apply=(f"python -m vco_lib.root_kg_identity adopt --collection "
+                          f"{decision.blocked_by} --yes   # if it holds this root's knowledge "
+                          f"(refused unless written with the current embedding model); "
+                          f"otherwise remove '{decision.blocked_by}' yourself and re-run the update"),
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+
 def _seed_weaviate(
     args: argparse.Namespace,
     deferral_report: "DeferralReport | None" = None,
@@ -13543,7 +13531,7 @@ def _seed_weaviate(
 def _seed_weaviate_impl(
     args: argparse.Namespace,
     deferral_report: "DeferralReport | None" = None,
-) -> None:
+) -> "Optional[str]":
     """Seed Weaviate with bundled knowledge/ + docs/.
 
     v0.2.42 CI-10: on ``--update`` runs (not fresh install), gate the sync
@@ -13650,18 +13638,6 @@ def _seed_weaviate_impl(
     current_shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
     weaviate_url = _wh.weaviate_url_default()
 
-    # v0.2.44 V44-G1: hybrid env-vs-DB SoT resolution (replaces V44-B fill-only
-    # + V44-F disagreement-WARNING). Per user directive (2026-06-01): when env
-    # and DB disagree, check Weaviate first (pick the collection that actually
-    # exists), then fall back to "env wins on fresh install / DB wins on
-    # subsequent update". See _resolve_orchestrator_root_canonical for the full
-    # priority chain.
-    try:
-        from vco_lib.launcher_db_reader import get_orchestrator_root_bindings
-        _db_primary, _db_shared = get_orchestrator_root_bindings()
-    except Exception:
-        _db_primary, _db_shared = (None, None)
-
     # v0.2.44 V44-G2: dual-clone WARNING. Fires when launcher.db's
     # orchestrator-root project_id points at a folder different from
     # PROJECT_ROOT. User directive 2026-06-01: warn but proceed; the
@@ -13704,35 +13680,24 @@ def _seed_weaviate_impl(
     _rebind_deferred = False
     _rebind_deferred_rationale = ""
 
-    if _is_orchestrator_root_install():
-        if _db_primary or _db_shared:
-            resolved_kg, resolved_shared, rationale = (
-                _resolve_orchestrator_root_canonical(
-                    env_kg=current_kg_collection,
-                    env_shared=current_shared_kg,
-                    db_primary=_db_primary,
-                    db_shared=_db_shared,
-                    weaviate_url=weaviate_url,
-                )
-            )
-            if rationale.startswith("deferred:"):
-                _rebind_deferred = True
-                _rebind_deferred_rationale = rationale
-            if (
-                resolved_kg != current_kg_collection
-                or resolved_shared != current_shared_kg
-            ):
-                print(
-                    f"  → hybrid SoT resolution: KG={resolved_kg!r}, "
-                    f"SHARED={resolved_shared!r} ({rationale})"
-                )
-                current_kg_collection = resolved_kg
-                current_shared_kg = resolved_shared
-            else:
-                print(f"  → hybrid SoT: no disagreement ({rationale})")
-        else:
-            print("  WARNING: orchestrator-root install but launcher.db unavailable; "
-                  "falling back to env for KG collection resolution")
+    # v0.2.103 (owner ruling 2026-10-15): the root's KG — and the shared name,
+    # one class serving both roles — is `root_kg_identity`'s decision. It
+    # superseded the V44-G1 env-vs-DB-vs-Weaviate tiebreak, which could pick a
+    # case-sibling or another install's populated class. A blind read (Weaviate
+    # state unknown) keeps the bound name and defers the rebind (V44-H/H1).
+    root_kg = _root_kg_decision()
+    if root_kg is not None and root_kg.blocked_by:
+        if deferral_report is not None:
+            deferral_report.add_entry(_root_kg_blocked_entry(root_kg))
+        print(f"  Skipped: the root's KG '{root_kg.name}' cannot be created "
+              f"('{root_kg.blocked_by}' differs only in case) — deferral entry written.")
+        _log_install_event("7c/10", "skip", "root KG blocked by a case-only sibling",
+                           data=root_kg.to_dict())
+        return _install_weaviate.SKIPPED
+    if root_kg is not None:
+        if not root_kg.state_known:
+            _rebind_deferred, _rebind_deferred_rationale = True, f"deferred: {root_kg.reason}"
+        current_kg_collection = current_shared_kg = root_kg.name
 
     if is_update and sync_kg.exists():
         stored_embedding = _read_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
@@ -15165,6 +15130,9 @@ def _self_heal_kg_bindings_on_update(
          deferral entry (severity=info) per row rebound, naming each
          (project_id, role, old_name → new_name) so the user has an audit
          trail.
+      v0.2.103: the orchestrator root's own rows are never case-rebound or
+      prefix-adopted (owner ruling 2026-10-15 — its name is
+      `vco_lib.root_kg_identity`'s decision; adoption needs consent).
       5. For each binding row where `collection_name not in existing` AND
          no case-different sibling exists, LEAVE ALONE. That's a true
          missing-class state — the orphan-prune sync recreates the class
@@ -15675,19 +15643,17 @@ def _persist_orchestrator_root_kg_collection(
     name of the orchestrator-root shared KG collection into launcher.db
     `app_state['orchestrator_root_kg_collection']`.
 
-    Migration 028 (in vct-launcher-core) writes a default value of
-    `VibeCodedOrchestrator_KnowledgeGraph` via INSERT-OR-IGNORE on
-    every fresh DB. This helper provides the white-label / dev-clone
-    override path: when an env var `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION`
-    is set at install time, the launcher.db row is upserted to that
-    value (overriding the migration's default).
-
-    Resolution priority (highest → lowest):
-        1. `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env var (white-label
-           or dev-clone override). Trimmed; empty / whitespace-only
-           values are ignored.
-        2. Migration 028's default (`VibeCodedOrchestrator_
-           KnowledgeGraph`). Already written; nothing to do.
+    v0.2.103 (owner ruling 2026-10-15): the value is ALWAYS written — it is
+    `vco_lib.root_kg_identity`'s decision (the white-label override
+    `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` first, else the populated bound class
+    it keeps, else the folder-derived name). Migration 028 seeds a constant
+    default on every fresh DB, and for a clone whose folder-derived name
+    differs from that constant (even only in case) the launcher then seeded
+    the root binding with a class install never created. main() calls this
+    AFTER the hub has started, so a fresh install's just-created launcher.db
+    gets the decided name before the launcher's first boot reads it. A
+    decision resting on a blind read (Weaviate down) or blocked by a
+    case-only sibling is not persisted.
 
     Idempotent: re-running with the same env value is a no-op (the
     INSERT-OR-REPLACE writes the same row). Re-running with a CHANGED
@@ -15707,15 +15673,14 @@ def _persist_orchestrator_root_kg_collection(
     import sqlite3  # local import: matches the pattern used by other
                      # launcher.db touch sites in this file.
 
-    override = os.environ.get("VCT_ORCHESTRATOR_ROOT_KG_COLLECTION", "").strip()
-    if not override:
-        # No override → migration 028's default is authoritative.
-        # Skip the write to avoid touching launcher.db unnecessarily
-        # (matches the Bug N RO-first discipline: don't open RW unless
-        # we have something to do).
+    decision = _root_kg_decision()
+    value = decision.name if decision is not None and decision.persistable else ""
+    if not value:
         _log_install_event(
             "orchestrator_root_kg_collection", "skip",
-            "no override set; migration 028 default is canonical",
+            "no persistable root KG decision this run (not a root install, Weaviate "
+            "state unknown, or blocked by a case-only sibling)",
+            data=decision.to_dict() if decision is not None else None,
         )
         return
 
@@ -15723,18 +15688,18 @@ def _persist_orchestrator_root_kg_collection(
     if not db_path.is_file():
         # launcher.db missing — fresh first-install before vct-hub
         # has bootstrapped the schema. Migration 028 will write the
-        # default on first launcher boot; this run can't override it
+        # default on first launcher boot; this run can't write it
         # because there's no DB to write to yet. Log + defer.
         _log_install_event(
             "orchestrator_root_kg_collection", "skip",
             f"launcher.db not found at {db_path}; "
-            f"override deferred to first launcher boot",
-            data={"db_path": str(db_path), "override": override},
+            f"value deferred to first launcher boot",
+            data={"db_path": str(db_path), "override": value},
         )
         return
 
     # Open RO first per the Bug N discipline: check whether the
-    # current row already equals the override (no-op), and check that
+    # current row already equals the value (no-op), and check that
     # the app_state table actually exists (older launcher.db schemas
     # that pre-date migration 008 won't have it — soft-fail).
     try:
@@ -15761,7 +15726,7 @@ def _persist_orchestrator_root_kg_collection(
                     _log_install_event(
                         "orchestrator_root_kg_collection", "skip",
                         "app_state table absent (pre-migration-008 schema); "
-                        "override deferred to next install.py run",
+                        "value deferred to next install.py run",
                     )
                     return
                 raise
@@ -15775,12 +15740,12 @@ def _persist_orchestrator_root_kg_collection(
         )
         return
 
-    if existing_row is not None and existing_row[0] == override:
+    if existing_row is not None and existing_row[0] == value:
         # Idempotent path: the row already matches.
         _log_install_event(
             "orchestrator_root_kg_collection", "ok",
             "value already matches override; no write needed",
-            data={"value": override},
+            data={"value": value},
         )
         return
 
@@ -15797,15 +15762,15 @@ def _persist_orchestrator_root_kg_collection(
                 "ON CONFLICT(key) DO UPDATE SET "
                 "  value = excluded.value, "
                 "  updated_at = excluded.updated_at",
-                ("orchestrator_root_kg_collection", override, now_ms),
+                ("orchestrator_root_kg_collection", value, now_ms),
             )
             rw_conn.commit()
         finally:
             rw_conn.close()
         _log_install_event(
             "orchestrator_root_kg_collection", "ok",
-            f"set orchestrator-root KG collection to {override}",
-            data={"value": override},
+            f"set orchestrator-root KG collection to {value}",
+            data={"value": value},
         )
     except sqlite3.OperationalError as oe:
         # Most likely "database is locked" — vct-hub holds it.
@@ -15813,8 +15778,8 @@ def _persist_orchestrator_root_kg_collection(
         if "locked" in msg or "busy" in msg:
             _log_install_event(
                 "orchestrator_root_kg_collection", "warn",
-                "launcher.db is locked; deferring override write",
-                data={"db_path": str(db_path), "override": override},
+                "launcher.db is locked; deferring value write",
+                data={"db_path": str(db_path), "override": value},
             )
             try:
                 deferral_report.add_entry(
@@ -15822,17 +15787,17 @@ def _persist_orchestrator_root_kg_collection(
                         condition_id="orchestrator_root_kg_collection_locked",
                         title=(
                             "Could not persist orchestrator-root KG "
-                            "collection override (launcher.db locked)"
+                            "collection value (launcher.db locked)"
                         ),
                         detected=(
                             f"install.py tried to set the orchestrator-root "
-                            f"KG collection to '{override}' but launcher.db "
+                            f"KG collection to '{value}' but launcher.db "
                             f"at {db_path} was locked (vct-hub likely "
                             f"holds the writer lock as a detached service). "
-                            f"The override has NOT been applied."
+                            f"The value has NOT been applied."
                         ),
                         why_deferred=(
-                            "Override application requires exclusive write "
+                            "Writing it requires exclusive write "
                             "access. The current row remains at its "
                             "previous value (likely migration 028's "
                             "default 'VibeCodedOrchestrator_KnowledgeGraph')."
@@ -15854,7 +15819,7 @@ def _persist_orchestrator_root_kg_collection(
         _log_install_event(
             "orchestrator_root_kg_collection", "warn",
             f"sqlite operational error: {oe}",
-            data={"db_path": str(db_path), "override": override},
+            data={"db_path": str(db_path), "override": value},
         )
     except sqlite3.Error as se:
         _log_install_event(

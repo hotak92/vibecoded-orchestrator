@@ -2604,15 +2604,30 @@ def collections_and_seed(
 
     ``SKIPPED`` = the write gate refused (``seed`` returned :data:`SKIPPED`):
     the steps after it must not treat the collections as ready (L1-F18).
-    A Weaviate that raised gets ONE ``<runtime> start <container>`` and a
-    retry (PR 6); still down → ``weaviate_unreachable_at_update`` (+
-    ``rebuild_pending_seed`` when this run dropped a collection, HIGH-4).
+
+    A failure is classified into exactly one of three arms (v0.2.103 — before
+    it, every exception was reported as "Weaviate unreachable" and answered
+    with a container start, so a broken venv or a seed bug read as a database
+    outage and restarted a healthy container):
+
+    * connection-class (:func:`_is_unreachable`) — ONE ``<runtime> start
+      <container>`` and a retry (PR 6); still down →
+      ``weaviate_unreachable_at_update`` (+ ``rebuild_pending_seed`` when this
+      run dropped a collection, HIGH-4).
+    * ``ImportError`` — a BROKEN install (the venv lacks a module VCO ships):
+      one loud stderr line naming the module and the repair, an
+      ``install_python_env_broken`` row, NO container start.
+    * anything else — "KG seed failed: <type>: <msg>" and a ``kg_seed_failed``
+      row, NO container start (the database was not the problem).
     """
     try:
         ensure()
         return _seed_status(seed())
-    except Exception as exc:  # noqa: BLE001 — Weaviate down → deferral, not a crash
-        down_msg = str(exc)
+    except Exception as exc:  # noqa: BLE001 — classified below, never a crash
+        first = exc
+    if not _is_unreachable(first):
+        return _record_non_connection_failure(report, first, rebuild_performed)
+    down_msg = str(first)
     import subprocess
     import time as _time
 
@@ -2628,12 +2643,125 @@ def collections_and_seed(
         # raises (→ deferral) instead of hanging the re-embed.
         ensure()
         return _seed_status(seed())
-    except Exception:  # noqa: BLE001 — recovery is best-effort
-        pass
+    except Exception as retry_exc:  # noqa: BLE001 — recovery is best-effort
+        if not _is_unreachable(retry_exc):
+            # Weaviate came back and the RETRY hit a different failure: report
+            # that failure, not an outage that is no longer true.
+            return _record_non_connection_failure(report, retry_exc, rebuild_performed)
     hint = container if found else " | ".join(all_known_names("weaviate"))
     print(f"WARNING: Weaviate unreachable after restart attempt ({down_msg}). "
           "Collections not bootstrapped. Deferral entry written.")
     _record_weaviate_down(report, down_msg, rt, container, hint, rebuild_performed)
+    return FAILED
+
+
+# Message markers (lowercased) of a transport failure whose exception type
+# carries no "connect"/"timeout" in its name — e.g. the weaviate client's
+# ``WeaviateStartUpError("Could not connect to Weaviate ...")``. Extends
+# ``retry_after.is_connection_error``'s marker set; that helper deliberately
+# excludes timeouts (an embed timeout is a wedge guard), while HERE the
+# readiness gate's ``TimeoutError`` IS the "Weaviate is down" signal.
+_UNREACHABLE_MESSAGE_MARKERS: tuple[str, ...] = (
+    "could not connect",
+    "unreachable",
+    "timed out",
+    "name or service not known",
+    "nodename nor servname",
+)
+
+
+def _is_unreachable(exc: BaseException) -> bool:
+    """True when ``exc`` says Weaviate could not be REACHED (refused, reset,
+    timed out, DNS) — the only arm that earns a container start.
+
+    ``ImportError`` is never a connection error, and neither is a
+    ``FileNotFoundError`` / ``PermissionError`` (an ``OSError`` raised by a
+    missing script or an unreadable file, not by a socket)."""
+    import socket
+    import urllib.error
+
+    from vco_lib.retry_after import is_connection_error
+
+    if isinstance(exc, ImportError):
+        return False
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror,
+                        urllib.error.URLError)):
+        return True
+    if is_connection_error(exc):
+        return True
+    if any("timeout" in k.__name__.lower() for k in type(exc).__mro__):
+        return True
+    # R24 LOW-4: the message markers exist for client exceptions whose TYPE
+    # says nothing (``WeaviateStartUpError("Could not connect …")``). A
+    # builtin programming-error type is never a transport failure, whatever
+    # its text — ``ValueError("embed timed out waiting for batch")`` is a seed
+    # bug, not an outage. Residual (accepted): a generic ``Exception`` /
+    # ``RuntimeError`` whose message carries a marker still reads as an outage
+    # and costs one container start.
+    if isinstance(exc, _PROGRAMMING_ERROR_TYPES):
+        return False
+    text = str(exc).lower()
+    return any(m in text for m in _UNREACHABLE_MESSAGE_MARKERS)
+
+
+#: Builtin exception types that signal a bug in the caller, never a socket
+#: failure (``_is_unreachable``'s message-marker leg does not apply to them).
+_PROGRAMMING_ERROR_TYPES: tuple[type, ...] = (
+    ValueError, TypeError, LookupError, AttributeError, AssertionError,
+    NotImplementedError, ArithmeticError,
+)
+
+
+def _record_non_connection_failure(report, exc: BaseException,
+                                   rebuild_performed: bool) -> str:
+    """Report a NON-connection failure of the collections/seed step honestly
+    (no container start — the database was not the problem) and return
+    :data:`FAILED`. ``rebuild_pending_seed`` still rides along when this run
+    dropped a collection: the drop is owed a re-seed whatever the cause."""
+    import sys
+
+    from vco_lib.deferral_report import DeferralEntry
+
+    if isinstance(exc, ImportError):
+        mod = getattr(exc, "name", None) or str(exc)
+        remedy = ("re-run the orchestrator update (`python install.py --update` from the "
+                  "orchestrator root), which installs VCO's Python requirements into the "
+                  "venv; if it repeats, recreate the venv (delete `.venv` and re-run "
+                  "install.py)")
+        line = (f"broken install: the KG seed could not import `{mod}` "
+                f"({type(exc).__name__}: {exc}) — {remedy}")
+        print(f"ERROR: {line}", file=sys.stderr)
+        report.add_entry(DeferralEntry(
+            condition_id="install_python_env_broken",
+            title="Broken install: a Python module VCO ships is missing",
+            detected=(f"The Weaviate collection bootstrap / KG seed could not import "
+                      f"`{mod}` ({type(exc).__name__}: {exc}). The interpreter running "
+                      f"install.py lacks a package VCO's requirements provide."),
+            why_deferred=("Collections and the KG seed need that module; the run continued "
+                          "without them. Weaviate itself was not restarted — it was not "
+                          "the problem."),
+            command_to_apply="python install.py --update",
+            severity="critical",
+            kg_node_refs=[],
+        ))
+    else:
+        line = f"KG seed failed: {type(exc).__name__}: {exc}"
+        print(f"ERROR: {line}. Collections/seed not completed; deferral entry written.",
+              file=sys.stderr)
+        report.add_entry(DeferralEntry(
+            condition_id="kg_seed_failed",
+            title="KG seed failed",
+            detected=(f"The Weaviate collection bootstrap / KG seed raised "
+                      f"{type(exc).__name__}: {exc}"),
+            why_deferred=("The error is not a connection failure, so restarting Weaviate "
+                          "would not help and was not attempted. The knowledge/ sources are "
+                          "intact; the next successful run seeds them."),
+            command_to_apply="python install.py --update --skip-rebuild-prompt",
+            severity="warning",
+            kg_node_refs=[],
+        ))
+    if rebuild_performed:
+        _record_rebuild_pending_seed(report, "python install.py --update --skip-rebuild-prompt")
     return FAILED
 
 
@@ -2659,6 +2787,12 @@ def _record_weaviate_down(report, down_msg: str, rt: str, container: str, hint: 
     ))
     if not rebuild_performed:
         return
+    _record_rebuild_pending_seed(report, retry)
+
+
+def _record_rebuild_pending_seed(report, retry: str) -> None:
+    from vco_lib.deferral_report import DeferralEntry
+
     report.add_entry(DeferralEntry(
         condition_id="rebuild_pending_seed",
         title="Rebuild dropped collections; seed pending",

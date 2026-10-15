@@ -46,6 +46,9 @@ RECORD = {
     ic.ENV_BASE_PYTHON_VERSION: "3.99",
     ic.ENV_PARENT_WAITS: "4242",
     ic.ENV_RELAUNCH_TOKEN: "feedfacecafebeef",
+    # v0.2.103: the post-venv hand-off record's path — inherited by a later,
+    # unrelated run it would replay a stale run's answers.
+    ic.ENV_POST_VENV_HANDOFF: "/tmp/vco-install-handoff-stale.json",
 }
 
 
