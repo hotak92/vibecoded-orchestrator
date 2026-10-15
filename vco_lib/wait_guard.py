@@ -60,15 +60,35 @@ segment doing anything else — a real command, a ``read``, a redirected
 word list iterate a finite list and are never busy-waits — the EXCEPTION
 is the arithmetic ``for ((;;))`` with an empty middle clause, which is
 ``while true`` in disguise and is judged like one, R10 F3). And a loop
-whose CONDITION consumes input — ``read``/``mapfile``/``readarray``,
-``while IFS= read -r l`` — is bounded by that input (it ends at EOF) and
-is NEVER a busy-wait, whatever the body does with the lines (R10 F1).
+whose condition is a single input consumer — ``while read``,
+``while IFS= read -r l``, ``while mapfile`` — is bounded by that input
+(it ends at EOF) and is never a busy-wait (R10 F1, NARROWED by R14 A2:
+``until read`` and ``while ! read`` spin at EOF, ``read -t <n>`` waits
+by polling, and a piped producer (``while curl | read``) re-runs every
+pass — none is exempt).
+
+Condition-refresh polls (coordinator ruling 2026-10-15, R14 A3, both
+shells): a loop whose ONLY work is re-fetching the value its own
+condition tests is a poll and is denied as ``condition-refresh poll`` —
+``until [ "$r" = 200 ]; do r=$(curl -s u); done``. Precisely: the
+condition reads at least one variable, and every body segment is either
+no-work or a FETCH assignment to one of those variables (a command
+substitution — arithmetic ``i=$((i+1))`` and literals are NOT fetches,
+so counted loops stay allowed), with at least one fetch. A body doing
+anything else — real work, an assignment to a different variable — is
+ordinary work and the loop passes. Known limit: the fetch is recognised
+where the walker keeps its assignment head — glued to the ``do``
+(``do r=$(curl u)``, every specified shape). A fetch statement later in
+the body (``do echo .; x=$(curl u)``) has its head consumed by the
+walker's env-prefix strip, reads as its tail only, and the loop is
+judged as ordinary work.
 Position and loop membership come from the ONE chain walker
 (:func:`vco_lib.bash_command_walk.walk_segments`); the PowerShell side
 applies the SAME rule through
 :func:`vco_lib.powershell_command.loop_pattern` (R10 parity: a loop with
-a wait inside, or an unbounded loop with a no-work body, denies; a loop
-doing real work — or reading input in its condition — passes).
+a wait inside, an unbounded loop with a no-work body, or a
+condition-refresh poll denies; a loop doing real work — or reading input
+in its condition — passes).
 
 Shape (A>B>C, like the v0.2.101 injection surfaces): this module is the
 pure classifier + a small ephemeral-state helper; the ``.sh`` / ``.ps1``
@@ -169,7 +189,7 @@ from vco_lib.bash_command_walk import (
     walk_segments,
 )
 from vco_lib.bash_write_targets import (
-    _REDIRECT_NOISE,
+    REDIRECT_NOISE,
     collect_candidates,
     strip_heredocs,
 )
@@ -484,10 +504,10 @@ def _is_noise_redirect(tok: str) -> bool:
     """An fd duplication or glued ``/dev/null`` sink — output that goes
     nowhere (R10 F2): it makes no file and feeds nothing, so it is NOT
     work. The token list is the write-target module's
-    :data:`_REDIRECT_NOISE` (one home), extended with the ``>&N`` /
+    :data:`REDIRECT_NOISE` (one home), extended with the ``>&N`` /
     ``N>&M`` duplication shapes. The SPACED ``> /dev/null`` pair is
     handled by :func:`_real_output_tokens`."""
-    return (tok in _REDIRECT_NOISE
+    return (tok in REDIRECT_NOISE
             or re.fullmatch(r"&?>\d+", tok) is not None
             or re.fullmatch(r"\d*>&\d+", tok) is not None)
 
@@ -537,29 +557,114 @@ def _segment_does_real_work(tokens: List[str]) -> bool:
 
 def _infinite_for_header(tokens: List[str], start: int) -> bool:
     """True when ``tokens[start:]`` opens an arithmetic ``for`` whose
-    MIDDLE clause is empty — ``for ((;;))``, ``for ((i=0;;))`` — the
-    arithmetic infinite loop (R10 F3). ``for ((i=0; i<n; i++))`` has a
-    bound and is finite."""
-    rest = tokens[start + 1:]
-    if not rest or not rest[0].startswith("(("):
+    MIDDLE clause is empty — ``for ((;;))``, ``for ((i=0;;))``,
+    ``for (( ; ; ))`` — the arithmetic infinite loop (R10 F3, A5).
+    ``for ((i=0; i<n; i++))`` has a bound and is finite. Known limit: a
+    SPACED header with a non-empty clause (``for (( i=0 ; ; ))``) loses
+    its ``;`` separators to the chain split and reads as bounded."""
+    header = " ".join(tokens[start + 1:])
+    s = header.strip()
+    if not (s.startswith("(") and s.endswith(")")):
         return False
-    inner = rest[0].strip("()")
-    parts = inner.split(";")
+    inner = s[1:-1]
+    if inner.startswith("(") and inner.endswith(")"):
+        inner = inner[1:-1]
+    core = inner.replace("(", "").replace(")", "").strip()
+    if not core:
+        return True  # `(( ; ; ))`: every clause empty
+    parts = core.split(";")
     return len(parts) >= 2 and parts[1].strip() == ""
 
 
-def _condition_reads_input(opener_tokens: List[str]) -> bool:
-    """True when the loop CONDITION's first verb consumes input —
-    ``read`` / ``mapfile`` / ``readarray``, behind ``!``, ``IFS=``-style
-    assignments and keywords (R10 F1). Such a loop is bounded by its
-    input (it ends at EOF) and is never a busy-wait, whatever its
-    body does with the lines."""
+#: A Bash loop condition's variable references (`[ "$r" = 200 ]` → ``r``).
+_COND_VAR_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+#: A bare assignment shape: `name=`, `name+=`, `name-=`.
+_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\+?=")
+
+#: A timed-read flag (`read -t 1 x`, `read -t0`): a wait-for-input by
+#: polling, never an input-consuming condition (R14 A2).
+_TIMED_READ_RE = re.compile(r"^-t\d*$")
+
+
+def _condition_reads_input(opener_word: str, opener_tokens: List[str]) -> bool:
+    """True when the loop CONDITION is a single input consumer — the
+    first verb is ``read``/``mapfile``/``readarray`` behind ``IFS=``-style
+    assignments and keywords, in a ``while`` (never ``until``), not
+    negated (``!``), without a ``-t`` timeout flag on ``read``, and with
+    no pipe producer in front (R10 F1, narrowed by R14 A2). Such a loop
+    is bounded by its input (it ends at EOF) and is never a busy-wait;
+    ``until read`` and ``while ! read`` SPIN at EOF, a timed ``read -t``
+    waits by polling, and ``while curl | read`` re-runs the producer
+    every pass — none of them is exempt."""
+    if opener_word != "while":
+        return False  # `until read` loops forever once read fails at EOF
     cond = opener_tokens
-    while cond and os.path.basename(cond[0]).lower() in _LEADING_KEYWORDS:
-        cond = cond[1:]
+    if cond and os.path.basename(cond[0]).lower() == "!":
+        return False  # `while ! read` succeeds at EOF and spins
     cond = strip_env_assignments(cond)
     cond = strip_subshell_parens(cond)
-    return bool(cond) and os.path.basename(cond[0]).lower() in _INPUT_CONDITION_VERBS
+    if not cond:
+        return False
+    verb = os.path.basename(cond[0]).lower()
+    if verb not in _INPUT_CONDITION_VERBS:
+        return False
+    if "|" in cond:
+        return False  # a pipeline producer (curl | read) re-runs per pass
+    if verb == "read" and any(_TIMED_READ_RE.match(t) for t in cond):
+        return False  # `read -t <n>` is a timed wait, not consumption
+    return True
+
+
+def _condition_refresh_fetch(tokens: List[str], cond_vars: set) -> bool:
+    """True when ONE body segment is a FETCH assignment: it assigns a
+    variable the condition reads, and the value comes from OUTSIDE the
+    shell — a command substitution (``r=$(curl -s u)``, ``x=`cat f```)
+    — as opposed to arithmetic (``i=$((i+1))``, a counted loop's step)
+    or a literal (which satisfies the condition and exits)."""
+    body = list(tokens)
+    while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
+        body = body[1:]
+    if not body:
+        return False
+    m = _ASSIGN_RE.match(body[0])
+    if m is None or m.group(1) not in cond_vars:
+        return False
+    text = " ".join(body)
+    if "$((" in text:
+        text = text.replace("$((", "")  # arithmetic is not a fetch
+    return "$(" in text or "`" in text
+
+
+def _condition_refresh_poll(cond_tokens: List[str],
+                            body_segments: List[List[str]]) -> Optional[tuple]:
+    """The condition-refresh poll rule (coordinator ruling 2026-10-15,
+    both shells): a loop whose ONLY work is re-fetching the value its own
+    condition tests is a poll — it re-issues the fetch as fast as the
+    shell allows, exactly the shape the wait guard exists to stop.
+    Precisely: the condition reads at least one variable, and EVERY body
+    segment is either no-work (empty, ``:``, ``true``, a bare
+    ``echo``/``printf``) or a FETCH assignment to one of those variables
+    (see :func:`_condition_refresh_fetch`), with at least one fetch.
+    A body statement doing anything else — real work, an assignment to a
+    DIFFERENT variable, arithmetic on the condition variable (a counted
+    loop) — makes the loop ordinary work and it stays allowed."""
+    cond_vars = set()
+    for tok in cond_tokens:
+        cond_vars.update(_COND_VAR_RE.findall(tok))
+    if not cond_vars:
+        return None
+    saw_fetch = False
+    for tokens in body_segments:
+        if not _segment_does_real_work(tokens):
+            continue  # a no-work statement never rescues a poll
+        if _condition_refresh_fetch(tokens, cond_vars):
+            saw_fetch = True
+            continue
+        return None  # real work that is not a condition refresh
+    if saw_fetch:
+        return ("condition-refresh poll", " ".join(cond_tokens[:6])[:80])
+    return None
 
 
 def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
@@ -567,12 +672,17 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
     loop whose BODY does no real work — every body segment empty, ``:``,
     ``true``, or a bare ``echo``/``printf`` — is a spin with no pause and
     is denied as ``busy-wait loop`` even with no sleep in it. A body with
-    real work (a redirected ``echo`` included) stays allowed. A condition
-    that consumes input (``while read …``) is bounded by that input and is
-    never a busy-wait (R10 F1). ``for`` over a word list and ``select``
-    iterate a finite list and are never busy-waits — EXCEPT the arithmetic
-    ``for ((;;))`` with an empty middle clause, which is ``while true`` in
-    disguise and is judged like one (R10 F3).
+    real work stays allowed — EXCEPT the condition-refresh poll
+    (coordinator ruling 2026-10-15): a body whose only work is fetch
+    assignments to the variables the condition reads
+    (``until [ "$r" = 200 ]; do r=$(curl -s u); done``) is a poll, not
+    work. A ``while`` whose single-segment condition consumes input
+    (``while IFS= read -r l``) is bounded by that input and is never a
+    busy-wait (R10 F1, narrowed by R14 A2: ``until``/negated/``-t``/
+    piped read conditions are NOT exempt). ``for`` over a word list and
+    ``select`` iterate a finite list and are never busy-waits — EXCEPT
+    the arithmetic ``for ((;;))`` with an empty middle clause, which is
+    ``while true`` in disguise and is judged like one (R10 F3).
 
     ``segments[i]`` is the opener (or a segment with a mid-segment opener
     behind a ``{``/``(`` header); the body is the following ``in_loop``
@@ -584,6 +694,7 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
         body0 = body0[1:]
     body0 = strip_subshell_parens(body0)
     first0 = os.path.basename(body0[0]).lower() if body0 else ""
+    opener_word = first0
     has_opener = first0 in CONDITION_OPENERS
     if not has_opener and first0 == "for" and _infinite_for_header(body0, 0):
         has_opener = True  # for ((;;)): the arithmetic infinite loop
@@ -595,6 +706,7 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
             kw = os.path.basename(toks[j]).lower()
             if kw in CONDITION_OPENERS:
                 has_opener = True
+                opener_word = kw
                 cond_toks = toks[j + 1:]
                 break
             if kw == "for" and _infinite_for_header(toks, j):
@@ -604,24 +716,31 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
                 return None  # a finite for/select: never a busy-wait
     if not has_opener:
         return None
-    if _condition_reads_input(cond_toks):
+    if _condition_reads_input(opener_word, cond_toks):
         return None  # bounded by input: `while read -r l; …` ends at EOF
-    # Multi-segment conditions (`while a && read l; do …`): any input
-    # consumer among them bounds the loop too.
+    # Multi-segment conditions (`while a && b; do …`) belong to the loop
+    # but never carry the input exemption (R14 A2); skip them to the do.
     j = i + 1
     while (j < len(segments) and segments[j].in_loop
            and not (segments[j].tokens and segments[j].tokens[0] == "do")):
-        if _condition_reads_input(segments[j].tokens):
-            return None
+        cond_toks = cond_toks + segments[j].tokens
         j += 1
     if not (j < len(segments) and segments[j].in_loop
             and segments[j].tokens and segments[j].tokens[0] == "do"):
         return None  # no `do`: malformed, not our business
+    body_all: List[List[str]] = []
+    body_stmts: List[List[str]] = []
     while j < len(segments) and segments[j].in_loop:
-        if _segment_does_real_work(segments[j].tokens):
-            return None
+        body_all.append(segments[j].tokens)
+        # Substitution / bash -c bodies (depth > the opener's) are part of
+        # their parent STATEMENT's value, not statements of their own —
+        # the poll rule classifies statements only.
+        if segments[j].depth == seg.depth:
+            body_stmts.append(segments[j].tokens)
         j += 1
-    return ("busy-wait loop", " ".join(toks[:6])[:80])
+    if all(not _segment_does_real_work(t) for t in body_all):
+        return ("busy-wait loop", " ".join(toks[:6])[:80])
+    return _condition_refresh_poll(cond_toks, body_stmts)
 
 
 def static_pattern(command: str, depth: int = 0, *,

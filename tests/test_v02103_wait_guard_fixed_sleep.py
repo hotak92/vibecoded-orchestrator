@@ -1014,9 +1014,6 @@ class TestR10InputConsumingLoops:
             "while IFS= read -r line; do\n echo \"$line\"\ndone < in.txt",
             "while mapfile -t lines; do :; done < f",
             "while readarray -t arr; do true; done < f",
-            # A chained condition: ANY input consumer among the condition
-            # segments bounds the loop.
-            "while ! read -r l; do echo x; done",
         ],
     )
     def test_allowed(self, tmp_path, command):
@@ -1118,3 +1115,69 @@ class TestR10NewlineScannerHardening:
         assert collect_candidates("cp a \\\n dest.txt") == ["dest.txt"]
         # The command keeps its shape: a between-actions pause stays one.
         _allow(tmp_path, "make \\\n && sleep 5 && make")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# R14 review fixes (Opus part A; 2026-10-15)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestR14InputExemptionNarrowing:
+    """A2: the `while read` exemption is for a loop BOUNDED at EOF only —
+    `until read`, `while ! read` spin at EOF, a timed `read -t` waits by
+    polling, and a piped producer re-runs every pass. None is exempt."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "until read -r x; do :; done < f",
+            "while ! read -r x; do :; done < f",
+            "until read -t 1 x; do :; done",
+            "while read -t 0; do :; done",
+            "while curl -s u | read x; do :; done",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        reason = _deny(tmp_path, command)
+        assert "busy-wait loop" in reason
+
+    def test_plain_while_read_still_exempt(self, tmp_path):
+        _allow(tmp_path, "while read -r l; do echo \"$l\"; done < f")
+
+
+class TestR14ConditionRefreshPoll:
+    """A3 (coordinator ruling 2026-10-15): a loop whose ONLY work is
+    re-fetching the value its own condition tests is a poll — denied with
+    its own message. Counted loops (arithmetic on the condition variable)
+    and bodies with real work stay allowed."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "until [ \"$r\" = 200 ]; do r=$(curl -s u); done",
+            "while [ -z \"$x\" ]; do x=$(cat f 2>/dev/null); done",
+            "until [ \"$r\" = 200 ]; do r=`curl -s u`; done",
+            # A no-work statement beside the fetch changes nothing.
+            "while [ -z \"$x\" ]; do x=$(stat -c %s f); echo .; done",
+        ],
+    )
+    def test_polls_denied(self, tmp_path, command):
+        reason = _deny(tmp_path, command)
+        assert "condition-refresh poll" in reason
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # Arithmetic on the condition variable: a counted loop.
+            "i=0; while [ $i -lt 5 ]; do i=$((i+1)); done",
+            "while [ -z \"$x\" ]; do x=200; done",       # literal: exits
+            # Assigns a variable the condition never reads.
+            "while [ -z \"$x\" ]; do y=$(cat f); done",
+            # Real work beside the refresh.
+            "until [ \"$r\" = 200 ]; do r=$(curl -s u); other; done",
+            # The Bash twin of the PowerShell A1 shapes.
+            "while [ $q -gt 0 ]; do item=$(dequeue); done",
+        ],
+    )
+    def test_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)

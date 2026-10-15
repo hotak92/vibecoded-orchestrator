@@ -196,7 +196,7 @@ _OPAQUE_WRITER_RE = re.compile(
 # two decide whether this module is spawned at all, so a shape they reject can
 # never reach these predicates. `tests/test_v0295_bash_write_sync.py` pins all
 # three against one corpus.
-_REDIRECT_NOISE = (
+REDIRECT_NOISE = (
     "2>&1", "1>&2", ">&2", "&>/dev/null", "2>/dev/null",
     "1>/dev/null", ">/dev/null", "> /dev/null",
 )
@@ -222,7 +222,7 @@ def command_has_write_shape(command: str) -> bool:
     if not command:
         return False
     stripped = command
-    for noise in _REDIRECT_NOISE:
+    for noise in REDIRECT_NOISE:
         stripped = stripped.replace(noise, "")
     if ">" in stripped or "<<" in command:
         return True
