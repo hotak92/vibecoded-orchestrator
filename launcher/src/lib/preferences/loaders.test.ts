@@ -158,7 +158,10 @@ describe('the registry holds every loader exactly once', () => {
     // + `openAiEmbeddingsConsent` (v0.2.102 W6-B2, owner ruling 2026-10-10):
     // the OpenAI EMBEDDINGS consent, separate from the summaries one.
     expect(PREF_LOADER_KEYS).toContain('openAiEmbeddingsConsent');
-    expect(PREF_LOADER_KEYS.length).toBe(Object.keys(BEFORE).length + 5);
+    // + `kgReviewerModel` (v0.2.103, owner ruling 2026-10-15): the machine-wide
+    // post-commit KG reviewer model, lazy.
+    expect(PREF_LOADER_KEYS).toContain('kgReviewerModel');
+    expect(PREF_LOADER_KEYS.length).toBe(Object.keys(BEFORE).length + 6);
   });
 
   it('every lazy key is attached to a section of the page', () => {
@@ -216,6 +219,7 @@ describe('every toggle still reaches its command (set_*/get_* census)', () => {
     ['set_logging_level', 'get_logging_level'],
     ['set_volumes_config_dry_run', 'get_volumes_config'],
     ['migrate_volumes', 'get_volumes_config'],
+    ['set_kg_reviewer_model', 'get_kg_reviewer_model'],
   ];
 
   it('each write is invoked from the page and its read lives in the registry', () => {

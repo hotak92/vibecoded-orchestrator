@@ -3246,6 +3246,8 @@ pub fn run() {
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
             commands::claude_env::set_claude_env_value,
+            commands::kg_reviewer_model::get_kg_reviewer_model,
+            commands::kg_reviewer_model::set_kg_reviewer_model,
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,

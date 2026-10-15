@@ -18,6 +18,9 @@
   the reviewer spawned.
 * LOW-5: the turn-budget knob parses identically in Python, ``.sh`` and
   ``.ps1`` (digits only, no sign / blanks / underscores, int64 range).
+  v0.2.103: the two shell mirrors are retired with the unguarded no-python
+  spawn they fed, so only the Python grammar remains pinned here; the
+  large-commit (MEDIUM-3) capture now runs inside the chain.
 * NIT-6: the before-edit NOTE block is charged to the per-turn budget and
   capped like every other injected block.
 """
@@ -33,6 +36,7 @@ import pytest
 from tests.test_v02102_w6n_kg_reviewer_fixes import (
     SCRIPTS_DIR,
     _argv_and_prompt,
+    _install_chain,
     _load,
     _run_hook,
     _scratch_repo,
@@ -80,18 +84,30 @@ _NOISY_META = {
 
 def _run(chain, monkeypatch, tmp_path, *, exit_code: int, stdout: str,
          stderr: str = "") -> dict:
-    """One ``run`` through the REAL breaker; returns the breaker file."""
-    def _fake_run(cmd, **kw):
-        import subprocess
+    """One ``run`` through the REAL breaker; returns the breaker file. Only
+    the ``claude`` spawn is faked — v0.2.103's run reads the commit and
+    guards the tree with real git, so it runs in a scratch repo."""
+    import subprocess
+    import types
+    real_run = subprocess.run
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (["init", "-q"], ["-c", "user.name=t", "-c",
+                                  "user.email=t@e.invalid", "commit", "-q",
+                                  "--allow-empty", "-m", "c"]):
+        real_run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    def _fake_run(cmd, *a, **kw):
+        if not (cmd and cmd[0] == "claude"):
+            return real_run(cmd, *a, **kw)
         return subprocess.CompletedProcess(cmd, exit_code, stdout=stdout,
                                            stderr=stderr)
     monkeypatch.setattr(chain, "select_reviewer_backend",
-                        lambda log=None: HAIKU)
-    monkeypatch.setattr(chain.subprocess, "run", _fake_run)
+                        lambda log=None, model=None: HAIKU)
+    monkeypatch.setattr(chain, "subprocess", types.SimpleNamespace(
+        run=_fake_run, TimeoutExpired=subprocess.TimeoutExpired))
     monkeypatch.delenv("VCO_SUMMARY_BREAKER", raising=False)
-    pf = tmp_path / "prompt.txt"
-    pf.write_text("review", encoding="utf-8")
-    chain.main(["run", "--prompt-file", str(pf),
+    chain.main(["run", "--project-root", str(repo),
                 "--log", str(tmp_path / "review.log")])
     path = tmp_path / "breaker.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -175,9 +191,11 @@ def test_high1_success_clears_the_tier(chain, monkeypatch, tmp_path):
 def test_medium3_large_commit_still_spawns_the_reviewer(tmp_path, sibling):
     """RED on the .sh before the fix: ``git diff | head -300`` on a diff far
     bigger than the 64 KiB pipe buffer died of SIGPIPE, pipefail made the
-    capture fail and ``set -e`` exited before the spawn."""
+    capture fail and ``set -e`` exited before the spawn. v0.2.103: the
+    capture moved into the chain (read incrementally, cut at the cap)."""
     import subprocess
     repo, env = _scratch_repo(tmp_path, commits=1)
+    _install_chain(repo, env)
     big = repo / "big_file.txt"
     big.write_text("".join(f"large-diff-line-{i:06d}-" + "x" * 60 + "\n"
                            for i in range(20000)), encoding="utf-8")
@@ -213,19 +231,9 @@ def test_low5_python_accepts_plain_digits(chain, monkeypatch, raw, expected):
     assert chain.resolve_max_turns() == expected
 
 
-@pytest.mark.parametrize("sibling", ["sh", "ps1"])
-@pytest.mark.parametrize("raw", ["+5", " 5 ", "1_000"])
-def test_low5_hook_mirrors_agree_with_python(tmp_path, sibling, raw, chain,
-                                             monkeypatch):
-    """Parity pin: the no-python branch of each sibling resolves the SAME
-    budget Python does for a value Python's int() alone would accept."""
-    monkeypatch.setenv("VCO_KG_REVIEW_MAX_TURNS", raw)
-    expected = str(chain.resolve_max_turns())
-    repo, env = _scratch_repo(tmp_path, commits=1)
-    env["VCO_KG_REVIEW_MAX_TURNS"] = raw
-    _run_hook(sibling, repo, env)
-    argv, _ = _argv_and_prompt(_wait_capture(env))
-    assert argv[argv.index("--max-turns") + 1] == expected == "30", argv
+# test_low5_hook_mirrors_agree_with_python is retired (v0.2.103) with the
+# shell mirrors it pinned: neither hook sibling parses the budget any more —
+# the chain (resolve_max_turns, pinned above) is the only parser.
 
 
 # ── MEDIUM-2 ─────────────────────────────────────────────────────────────

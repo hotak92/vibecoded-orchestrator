@@ -1,57 +1,54 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Model/backend selection for the post-commit KG reviewer (v0.2.102 W6-K).
+"""The post-commit KG reviewer: backend chain, run and guard (v0.2.103).
 
 The reviewer is the background ``claude -p`` session ``post-git-commit-kg-sync``
-spawns after every successful commit. It ran Haiku unconditionally; when
-Haiku's tokens were exhausted the spawn failed silently into
-``kg-commit-review.log`` and the commit went un-reviewed.
+spawns after every successful commit. The hook pair is a thin wrapper; this
+script owns everything else (one home): the commit capture and prompt
+(:mod:`vco_lib.kg_reviewer_prompt`), the model choice and fallback chain
+(below + :mod:`vco_lib.kg_reviewer_model`), and the hard boundaries around a
+run (:mod:`vco_lib.kg_reviewer_guard`: snapshot, post-run validator, isolated
+``kg-sync:`` commit).
 
-Owner ruling 2026-10-11 — keep it, and fall back, in this order:
+Model chain (owner rulings 2026-10-11, revised 2026-10-15):
 
-1. ``haiku`` via the local ``claude`` CLI (the default; unavailable = the
-   CLI is absent, or its tier is breaker-latched for a REAL signal —
-   quota / 429 / auth — recorded by the ``record`` subcommand below);
-2. GLM-5.3-Flash (z.ai) → DeepSeek-V4.1-Flash (QwenCloud) →
-   Qwen3.8-Flash (QwenCloud) — each ONLY when the local model gateway
-   actually serves it (the catalogue is ASKED via ``GET /v1/models``,
-   authenticated with the daemon's host token; availability is never
-   hard-coded), its tier is not latched, and the ``claude`` CLI the rung
-   spawns is on PATH. The gateway spelling of each id
-   (``claude-gw/glm-5.3-flash[1m]``, ``claude-gw/qwen/qwen3.8-flash[1m]``
-   …) is DERIVED from model_router's vendor table, never hand-written
-   (W6-N F-1: a hand-written ``claude-gw/qwen3.8-flash`` never matched);
+1. the CHOSEN Claude model — ONE machine-wide setting, default ``sonnet``
+   (Haiku / Sonnet / Opus): ``VCO_KG_REVIEW_MODEL``, else launcher
+   Preferences -> KG commit reviewer, else the default. Unavailable = no
+   ``claude`` CLI, or its tier is breaker-latched for a REAL signal (quota /
+   429 / auth), recorded by the ``record`` subcommand below;
+2. a gateway model of COMPARABLE capability — ``[fallback] gateway_rungs``
+   in ``vco_lib/kg_reviewer_config.toml`` (GLM-5.3, then Kimi K3) — ONLY
+   when the local model gateway actually serves it (the catalogue is ASKED
+   via ``GET /v1/models``, authenticated with the daemon's host token), its
+   tier is not latched, and the ``claude`` CLI the rung spawns is on PATH.
+   Flash models are deliberately not rungs: too weak for this job, so the
+   chain never degrades to one. The gateway spelling of each id is DERIVED
+   from model_router's vendor table, never hand-written;
 3. OpenAI — only when the user enabled OpenAI for SUMMARIES (the
    ``kg_summary_openai_consent`` gate from :mod:`summary_backends`); this
    rung is DEGRADED: an API call reviews the diff and proposes node edits
-   into the log, but cannot use the weaviate-kg MCP tools to apply them.
+   into the log, but cannot write anything;
+4. otherwise the review is SKIPPED with a log line.
 
-One chain, one home: the failure classification, the strike-gated breaker
-file and the OpenAI consent/key resolution all come from
-``templates/scripts/summary_backends.py`` — this module only adds the
-reviewer's rung table and the gateway catalogue probe.
-
-Every skipped rung is LOGGED with its reason (absent / not served by the
-gateway / latched <reason>). The spawn env for a gateway model carries the
-gateway's loopback host token (read from the token FILE inside this
-process, exported only into the child's environment — never argv, never a
-log line).
+The failure classification, the strike-gated breaker file and the OpenAI
+consent/key resolution come from ``templates/scripts/summary_backends.py``.
+Every skipped rung is LOGGED with its reason. The spawn env for a gateway
+model carries the gateway's loopback host token (read from the token FILE
+inside this process, exported only into the child's environment — never
+argv, never a log line).
 
 Usage (from the hook, both OS siblings)::
 
     kg_reviewer_backend.py select                 # JSON decision on stdout
-    kg_reviewer_backend.py run --prompt-file P --log L [--max-turns N]
+    kg_reviewer_backend.py run --project-root R --commit C --log L [--max-turns N]
     kg_reviewer_backend.py record --model M --exit N --text-file T
-
-``run`` selects, executes and records the outcome in one process so the
-hook stays a thin wrapper (no JSON parsing in shell).
 
 The turn budget is ONE knob (W6-N F-4): :data:`DEFAULT_MAX_TURNS`,
 overridden by ``VCO_KG_REVIEW_MAX_TURNS`` (documented in
 ``docs/CONFIGURATION.md``) and read through :func:`resolve_max_turns` for
-every rung's spawn; ``--max-turns`` is an explicit per-run override. The
-hooks' broken-install branch (no python) mirrors the default.
+every rung's spawn; ``--max-turns`` is an explicit per-run override.
 """
 from __future__ import annotations
 
@@ -84,21 +81,25 @@ for _candidate in (
 
 import summary_backends as _sb  # noqa: E402 — sibling in .claude/scripts/
 
-#: The fallback rungs (owner order, 2026-10-11) as ``(vendor row id, bare
-#: model id)`` — the vendor-neutral facts. The id the gateway publishes is
-#: DERIVED (:func:`gateway_rungs`) from model_router's vendor table, the one
-#: home of every gateway namespace: z.ai rides ``claude-gw/``, QwenCloud
-#: ``claude-gw/qwen/``. W6-N F-1 (2026-10-12): the W6-K table hand-wrote
-#: ``claude-gw/deepseek-v4.1-flash`` / ``claude-gw/qwen3.8-flash`` and
-#: compared without the ``[1m]`` window spelling, so no rung ever matched
-#: the live catalogue. Only these three flash models — the ruling names
-#: them, and the catalogue check keeps the chain honest when the gateway
-#: cannot serve one.
-GATEWAY_RUNG_MODELS: "tuple[tuple[str, str], ...]" = (
-    ("zai", "glm-5.3-flash"),
-    ("qwen", "deepseek-v4.1-flash"),
-    ("qwen", "qwen3.8-flash"),
-)
+# vco_lib is a shipped dependency (the orchestrator venv imports it from the
+# checkout): failing to import it is a BROKEN install, said loudly — never a
+# silent fallback to an unguarded reviewer.
+try:
+    from vco_lib import kg_reviewer_guard as _guard  # noqa: E402
+    from vco_lib import kg_reviewer_model as _model  # noqa: E402
+    from vco_lib import kg_reviewer_prompt as _prompt  # noqa: E402
+except ImportError as _exc:  # pragma: no cover — exercised by the hook tests
+    print(f"kg_reviewer_backend: BROKEN INSTALL - vco_lib is not importable "
+          f"({_exc}); the KG reviewer cannot run its guarded review. Repair "
+          f"it with the orchestrator update.", file=sys.stderr)
+    raise SystemExit(3)
+
+#: The fallback rungs as ``(vendor row id, bare model id)`` — from the
+#: shared rule table (``[fallback] gateway_rungs``), non-flash models of
+#: comparable capability only (owner ruling 2026-10-15). The id the gateway
+#: publishes is DERIVED (:func:`gateway_rungs`) from model_router's vendor
+#: table, the one home of every gateway namespace.
+GATEWAY_RUNG_MODELS: "tuple[tuple[str, str], ...]" = _model.gateway_rung_models()
 
 #: The reviewer's turn budget — ONE knob for every rung's spawn (W6-N F-4).
 #: 10 (the pre-W6-N value) truncated 46 of 89 logged runs in the maintainer
@@ -173,15 +174,12 @@ def _served_id(rung: str, ids: frozenset) -> "Optional[str]":
     return matches[0] if matches else None
 
 
-_TIER_HAIKU = "kg_reviewer:haiku"
-
-
 def _tier_for(model: str) -> str:
-    """Breaker tier key. A gateway model keys on its id WITHOUT the
-    ``[1m]`` hint, so a change of published spelling cannot split one
-    model's breaker in two."""
-    if model == "haiku":
-        return _TIER_HAIKU
+    """Breaker tier key (``kg_reviewer:<model>``). A gateway model keys on
+    its id WITHOUT the ``[1m]`` hint, so a change of published spelling
+    cannot split one model's breaker in two."""
+    if model in _model.model_choices() or model == "openai":
+        return f"kg_reviewer:{model}"
     _v, _a, strip_1m = _model_router()
     return f"kg_reviewer:{strip_1m(model)}"
 
@@ -255,13 +253,13 @@ def gateway_catalogue(
     return None, frozenset(), refusal
 
 
-def _haiku_available(log: Callable[[str], None]) -> bool:
+def _claude_model_available(model: str, log: Callable[[str], None]) -> bool:
     if shutil.which("claude") is None:
-        log("rung haiku: unavailable (no `claude` CLI on PATH)")
+        log(f"rung {model}: unavailable (no `claude` CLI on PATH)")
         return False
-    latched = _sb.breaker_state(_TIER_HAIKU)
+    latched = _sb.breaker_state(_tier_for(model))
     if latched:
-        log(f"rung haiku: latched ({latched.get('reason')}), "
+        log(f"rung {model}: latched ({latched.get('reason')}), "
             f"{latched.get('remaining')}s remaining")
         return False
     return True
@@ -310,18 +308,24 @@ def _openai_available(log: Callable[[str], None]) -> bool:
 
 def select_reviewer_backend(
     log: Optional[Callable[[str], None]] = None,
+    model: Optional[str] = None,
 ) -> "dict[str, Any]":
     """Walk the chain; return the decision dict for the hook.
 
     Shape: ``{"mode": "claude" | "openai" | "skip", "model": str,
     "base_url": str | None, "reason": str}``. A gateway rung additionally
-    carries ``base_url`` (the hook exports the auth token itself, from the
+    carries ``base_url`` (the run exports the auth token itself, from the
     gateway's token FILE — it never transits this process's stdout).
+    ``model`` overrides the resolved choice (tests); production passes none.
     """
     log = log or _log
-    if _haiku_available(log):
-        return {"mode": "claude", "model": "haiku", "base_url": None,
-                "reason": "default"}
+    if model is None:
+        model, source = _model.resolve(log=log)
+    else:
+        source = "explicit"
+    if _claude_model_available(model, log):
+        return {"mode": "claude", "model": model, "base_url": None,
+                "reason": f"chosen model ({source})"}
     try:
         rungs = gateway_rungs()
     except Exception as exc:  # noqa: BLE001 — a broken install, said so
@@ -342,15 +346,16 @@ def select_reviewer_backend(
             served = _gateway_model_available(rung, base, ids, log, refusal)
             if served:
                 return {"mode": "claude", "model": served, "base_url": base,
-                        "reason": "haiku unavailable; gateway serves this "
-                                  "model"}
+                        "reason": f"{model} unavailable; the gateway serves "
+                                  f"this comparable model"}
     if _openai_available(log):
         return {"mode": "openai", "model": _sb._openai_model(),
                 "base_url": None,
                 "reason": "no claude/gateway rung available; OpenAI "
                           "summaries consent granted (degraded: review "
                           "only, no KG writes)"}
-    log("every rung unavailable — commit not reviewed this time")
+    log("every rung unavailable — commit not reviewed this time (no "
+        "flash-model fallback, by design)")
     return {"mode": "skip", "model": "", "base_url": None,
             "reason": "no rung available"}
 
@@ -385,13 +390,27 @@ _TEXT_MAX_TURNS_RE = re.compile(r"(?m)^Error: Reached max turns \(\d+\)\s*$")
 
 
 def parse_run_result(stdout: str) -> "Optional[dict]":
-    """The ``--output-format json`` result object, or None when the output
-    is not one (an older CLI, a crash, text mode)."""
+    """The run's result object, or None when the output carries none (an
+    older CLI, a crash, text mode). Accepts ``--output-format json`` (one
+    object) and ``stream-json`` (one event per line; the LAST
+    ``type == "result"`` event is that same object)."""
     try:
         result = json.loads(stdout or "")
     except ValueError:
-        return None
-    return result if isinstance(result, dict) else None
+        result = None
+    if isinstance(result, dict):
+        return result
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return event
+    return None
 
 
 def run_failure_evidence(stdout: str, stderr: str) -> "tuple[bool, str]":
@@ -430,7 +449,7 @@ def _record_outcome(model: str, exit_code: "Optional[int]", text: str,
     ladder uses). ``served`` (see :func:`run_failure_evidence`) marks a run
     the backend answered in full that ended on the client's turn budget: it
     clears the tier like a success instead of striking it."""
-    tier = _tier_for(model) if model != "openai" else "kg_reviewer:openai"
+    tier = _tier_for(model)
     if exit_code == 0 or served:
         _sb.clear_backend_trip(tier)
         if exit_code != 0:
@@ -462,31 +481,96 @@ def _cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
-def _consume_prompt_file(path: str) -> str:
-    """Read the reviewer prompt file and unlink it once read.
+#: Tools the reviewer may use. Write/Edit carry a PATH-scoped permission rule
+#: (Claude Code permission-rule syntax: a pattern without a leading ``/`` is
+#: relative to the working directory, which :func:`_cmd_run` pins to the
+#: project root), so the CLI itself refuses a write outside ``knowledge/``.
+#: The post-run validator (:mod:`vco_lib.kg_reviewer_guard`) is the second,
+#: independent layer — it also covers ``store_knowledge_node``, whose
+#: ``file_path`` argument no permission rule can scope.
+ALLOWED_TOOLS: "tuple[str, ...]" = (
+    "Read", "Glob", "Grep",
+    "mcp__weaviate-kg__hybrid_search",
+    "mcp__weaviate-kg__store_knowledge_node",
+    "Edit(knowledge/**)", "Write(knowledge/**)",
+)
+#: Explicit denials (deny rules win over any allow rule a project's own
+#: settings grant): no shell, no notebook/web/agent tools, and no edits of
+#: the paths an earlier reviewer damaged or that git owns.
+DISALLOWED_TOOLS: "tuple[str, ...]" = (
+    "Bash", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent",
+    "Edit(docs/**)", "Write(docs/**)",
+    "Edit(.claude/**)", "Write(.claude/**)",
+    "Edit(.git/**)", "Write(.git/**)",
+)
 
-    W6-K review F2 (2026-10-11): the ``.sh`` sibling stages the prompt
-    through ``mktemp`` and nothing else ever removed it — one leaked file
-    per commit until the tmp reaper. The consumer owns the cleanup: read
-    into memory, then best-effort unlink (the ``.ps1`` sibling's log-dir
-    staging file is consumed the same way; it is rewritten per commit).
+
+def build_claude_cmd(model: str, max_turns: int) -> "list[str]":
+    """The reviewer's ``claude -p`` argv (the prompt rides on stdin).
+
+    ``--permission-mode dontAsk`` overrides a project's ``defaultMode`` (an
+    ``acceptEdits`` / ``bypassPermissions`` default would otherwise
+    auto-approve edits anywhere): every tool not pre-approved is denied
+    without a prompt — the right mode for a session nobody watches (the
+    CLI's choices are acceptEdits / auto / bypassPermissions / manual /
+    dontAsk / plan; there is no ``default``). ``stream-json`` (which ``-p`` only emits
+    with ``--verbose``) carries every tool call, which is how the guard
+    attributes the writes to the reviewer; its last event is the same result
+    object ``--output-format json`` prints, so the turn count is still read.
     """
-    file = Path(path)
-    text = file.read_text(encoding="utf-8")
-    try:
-        file.unlink()
-    except OSError:
-        pass  # best-effort: a leftover staging file never fails the review
-    return text
+    return [
+        "claude", "-p",
+        "--model", model,
+        "--max-turns", str(max_turns),
+        "--output-format", "stream-json", "--verbose",
+        "--no-session-persistence",
+        "--permission-mode", "dontAsk",
+        "--allowedTools", ",".join(ALLOWED_TOOLS),
+        "--disallowedTools", ",".join(DISALLOWED_TOOLS),
+    ]
+
+
+def _file_logger(log_path: str) -> Callable[[str], None]:
+    """Append ``[kg-reviewer <utc>] <line>`` to the reviewer log (the hook
+    runs detached, so the log is where a user finds what happened)."""
+    def _write(line: str) -> None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"[kg-reviewer {stamp}] {line}\n")
+        except OSError:
+            print(f"[kg-reviewer] {line}", file=sys.stderr)
+    return _write
+
+
+def _project_root(raw: "Optional[str]") -> Path:
+    if raw:
+        return Path(raw).resolve()
+    proc = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                          capture_output=True, text=True)
+    top = proc.stdout.strip()
+    return Path(top).resolve() if proc.returncode == 0 and top else Path.cwd()
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    prompt = _consume_prompt_file(args.prompt_file)
-    decision = select_reviewer_backend()
+    log = _file_logger(args.log)
+    root = _project_root(args.project_root)
+    try:
+        commit = _prompt.collect_commit(root, args.commit or "HEAD")
+    except Exception as exc:  # noqa: BLE001 — nothing to review, said so
+        log(f"cannot read commit {args.commit or 'HEAD'} in {root}: {exc}")
+        return 1
+    if _guard.is_reviewer_commit_subject(commit.subject):
+        # Recursion guard: the reviewer never reviews its own kg-sync commit.
+        log(f"{commit.short} is a reviewer commit ({commit.subject!r}) - "
+            f"not reviewed")
+        return 0
+    decision = select_reviewer_backend(log=log)
     model = decision["model"]
     started = time.time()
     if decision["mode"] == "skip":
         return 0
+    prompt = _prompt.build_prompt(commit, root)
     if decision["mode"] == "openai":
         try:
             answer = _sb.call_openai(
@@ -499,72 +583,69 @@ def _cmd_run(args: argparse.Namespace) -> int:
             exit_code, tail = 0, answer
         except Exception as exc:  # noqa: BLE001
             exit_code, tail = 1, str(exc)
-        _record_outcome("openai", exit_code, tail, _log)
+        _record_outcome("openai", exit_code, tail, log)
         with open(args.log, "a", encoding="utf-8") as fh:
             fh.write(f"\n[openai rung {started:.0f}] exit={exit_code}\n")
             if exit_code == 0:
-                fh.write(tail)
+                fh.write(tail + "\n")
         return exit_code
 
     env = dict(os.environ)
     if decision["base_url"]:
         env.update(_gateway_auth_env(decision["base_url"]))
-    # The prompt rides on STDIN, never argv (the same shape
-    # summary_backends.call_cli adopted): the Windows `claude` shim is a
-    # .cmd re-parsed by the shell, and the prompt embeds `git diff` output
-    # whose `---` tokens would be parsed as options; the command line is
-    # also capped at 32 767 chars there. ``claude -p`` with no prompt
-    # argument reads the prompt from stdin.
-    # ``--output-format json`` so the run line can record the turns used
-    # (W6-N F-4: the text output carried no count, so the turn budget could
-    # not be read from the logs); the answer text is unpacked for the log.
-    cmd = [
-        "claude", "-p",
-        "--model", model,
-        "--max-turns", str(resolve_max_turns(args.max_turns)),
-        "--output-format", "json",
-        "--no-session-persistence",
-        "--allowedTools",
-        "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,"
-        "mcp__weaviate-kg__store_knowledge_node,Write,Edit",
-    ]
+    # The prompt rides on STDIN, never argv (the Windows `claude` shim is a
+    # .cmd re-parsed by the shell, the prompt embeds `git diff` output whose
+    # `---` tokens would parse as options, and the command line is capped at
+    # 32 767 chars there).
+    cmd = build_claude_cmd(model, resolve_max_turns(args.max_turns))
+    snap = _guard.take_snapshot(root)
     try:
-        proc = subprocess.run(cmd, input=prompt, env=env, capture_output=True,
-                              text=True, timeout=args.timeout_s)
-    except subprocess.TimeoutExpired as exc:
-        # W6-K review F4 (2026-10-11): a hung reviewer must not dump a raw
-        # TimeoutExpired traceback into the detached log — classify it
-        # (summary_backends reads "timeout" as a capacity strike), log it
-        # and exit non-zero (124, the conventional timeout code).
-        def _text(maybe: "Any") -> str:
-            if isinstance(maybe, bytes):
-                return maybe.decode("utf-8", errors="replace")
-            return maybe or ""
+        try:
+            proc = subprocess.run(cmd, input=prompt, env=env, cwd=root,
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  timeout=args.timeout_s)
+            stdout, stderr, exit_code = proc.stdout or "", proc.stderr or "", proc.returncode
+            served, evidence = run_failure_evidence(stdout, stderr)
+            _record_outcome(model, exit_code, evidence, log, served=served)
+            with open(args.log, "ab") as fh:
+                fh.write(_run_log_text(model, exit_code, stdout, started)
+                         .encode("utf-8", errors="replace"))
+                if stderr:
+                    fh.write(stderr.encode("utf-8", errors="replace"))
+        except subprocess.TimeoutExpired as exc:
+            # A hung reviewer must not dump a raw traceback into the detached
+            # log — classify it ("timeout" is a capacity strike), log it,
+            # exit 124. The breaker reads only "timeout" plus the parsed
+            # evidence, never str(exc) (its argv echo carries digits the
+            # substring classifier could misread, W6-N review HIGH-1).
+            def _text(maybe: "Any") -> str:
+                if isinstance(maybe, bytes):
+                    return maybe.decode("utf-8", errors="replace")
+                return maybe or ""
 
-        out, err = _text(exc.stdout), _text(exc.stderr)
-        # The breaker reads "timeout" plus the parsed evidence only — not
-        # str(exc), whose argv echo (turn budget, model id) and the timeout
-        # seconds are digits the substring classifier could misread
-        # (W6-N review HIGH-1). The log keeps the full detail.
-        _served, evidence = run_failure_evidence(out, err)
-        _record_outcome(model, 124, f"timeout\n{evidence}", _log)
-        tail = (f"timeout after {args.timeout_s}s\n{exc}\n"
-                + out + err)[-4000:]
-        with open(args.log, "a", encoding="utf-8") as fh:
-            fh.write(f"\n[kg-reviewer {started:.0f}] TIMED OUT after "
-                     f"{args.timeout_s}s on {model}\n{tail}\n")
-        return 124
-    # Classify on the parsed ``result`` + stderr only, never the raw JSON
-    # (W6-N review HIGH-1 — see run_failure_evidence).
-    served, evidence = run_failure_evidence(proc.stdout or "",
-                                            proc.stderr or "")
-    _record_outcome(model, proc.returncode, evidence, _log, served=served)
-    with open(args.log, "ab") as fh:
-        fh.write(_run_log_text(model, proc.returncode, proc.stdout or "",
-                               started).encode("utf-8", errors="replace"))
-        if proc.stderr:
-            fh.write(proc.stderr.encode("utf-8", errors="replace"))
-    return proc.returncode
+            stdout, err = _text(exc.stdout), _text(exc.stderr)
+            _served, evidence = run_failure_evidence(stdout, err)
+            _record_outcome(model, 124, f"timeout\n{evidence}", log)
+            exit_code = 124
+            log(f"TIMED OUT after {args.timeout_s}s on {model}; its completed "
+                f"writes are still validated below")
+        # Every completed write is judged, whatever the exit: each Write/Edit
+        # call lands whole, and leaving it unjudged in the tree is the worse
+        # outcome (it is what `git commit -a` swept up before).
+        attributed = _guard.attributed_paths(stdout, root)
+        if attributed is None:
+            log("writes not attributable (no stream-json events in the "
+                "output) - every knowledge/ change is judged as the "
+                "reviewer's and nothing is committed")
+        result = _guard.validate(snap, attributed, log,
+                                 resync=_guard.resync_with(root, log))
+        _guard.commit_reviewer_changes(
+            snap, result.kept, short=commit.short, subject=commit.subject,
+            model=model, attributed=attributed is not None, log=log)
+    finally:
+        snap.cleanup()
+    return exit_code
 
 
 def _run_log_text(model: str, exit_code: int, stdout: str,
@@ -585,14 +666,21 @@ def _run_log_text(model: str, exit_code: int, stdout: str,
             f"subtype={result.get('subtype', '?')}\n")
 
 
+
+
 def main(argv: "Optional[list[str]]" = None) -> int:
     ap = argparse.ArgumentParser(
         prog="kg_reviewer_backend.py",
-        description="Post-commit KG reviewer backend chain (v0.2.102 W6-K)")
+        description="Post-commit KG reviewer: backend chain, guarded run")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("select", help="print the chain decision as JSON")
-    p_run = sub.add_parser("run", help="select + execute + record")
-    p_run.add_argument("--prompt-file", required=True)
+    p_run = sub.add_parser("run", help="review one commit: select, run, "
+                                       "validate, commit the KG nodes")
+    p_run.add_argument("--project-root", default=None,
+                       help="the project (default: the git top level of "
+                            "the working directory)")
+    p_run.add_argument("--commit", default=None,
+                       help="the commit to review (default: HEAD)")
     p_run.add_argument("--log", required=True)
     p_run.add_argument("--max-turns", type=int, default=None,
                        help=f"turn budget (default: ${MAX_TURNS_ENV}, "
