@@ -154,8 +154,10 @@ def entry(owners: list, *, weaviate_url: str):
                       "its nodes may exist nowhere else (shared-KG nodes other projects wrote, "
                       "nodes written straight to Weaviate). `migrate-collections` preserves "
                       "vectors via copy where it can and rebuilds only legacy single-vector "
-                      "collections — run it when you are ready. Read paths keep working on "
-                      "the existing schema."),
+                      "collections — run it when you are ready. Until then a collection marked "
+                      "copy or additive keeps serving reads on its existing schema; one marked "
+                      "rebuild (legacy single-vector) may return no search results under the "
+                      "current code until it is migrated."),
         command_to_apply="\n\n".join(cmds),
         severity="warning",
         kg_node_refs=["knowledge/concepts/weaviate-schema-evolution.md"],

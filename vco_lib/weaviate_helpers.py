@@ -698,12 +698,10 @@ def count_objects_v4(name: str, weaviate_url: Optional[str] = None) -> int:
     vectors). Returns ``0`` on connection failure OR missing collection.
 
     SEMANTICS — 0-on-failure: this variant collapses "unreachable" and
-    "empty" into 0. Use it ONLY where a conservative "treat as empty" is the
-    safe decision (e.g. the migrate crash-recovery classifier, where a
-    connection failure means "can't classify, don't act destructively" and 0
-    routes to the leave-alone branch). When you need to DISTINGUISH
-    unreachable from genuinely-empty, use :func:`http_count_objects` instead
-    (it returns None on failure). See the count-semantics note in
+    "empty" into 0. Never gate a drop on it: 0 reads as "empty", and an empty
+    class is exactly what destructive branches are allowed to drop. Where an
+    unreadable count must stop the action, use :func:`count_objects_v4_or_none`
+    (same iterator, None on failure) or :func:`http_count_objects`. See
     ``knowledge/concepts/silent-zero-fallback-antipattern.md``.
     """
     try:
@@ -722,6 +720,23 @@ def count_objects_v4(name: str, weaviate_url: Optional[str] = None) -> int:
         # Collection might not exist yet, or the v4 client raises on a missing
         # class; missing → 0.
         return 0
+    finally:
+        client.close()
+
+
+def count_objects_v4_or_none(name: str, weaviate_url: Optional[str] = None) -> Optional[int]:
+    """:func:`count_objects_v4` with None-on-failure: a connection failure or
+    any iterator error (a missing class included) returns ``None``, never 0.
+    Callers check the class exists first, so None means "could not count" and
+    must be handled as "may hold objects" — never as empty."""
+    try:
+        client = connect_v4(weaviate_url=weaviate_url)
+    except Exception:
+        return None
+    try:
+        return sum(1 for _ in client.collections.get(name).iterator(include_vector=False))
+    except Exception:
+        return None
     finally:
         client.close()
 

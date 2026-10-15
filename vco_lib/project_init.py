@@ -1381,17 +1381,11 @@ def _delete_class(name: str, weaviate_url: Optional[str] = None) -> None:
         raise RuntimeError(f"DELETE /v1/schema/{name} → HTTP {status}: {body[:300]!r}")
 
 
-def _count_objects(name: str, weaviate_url: Optional[str] = None) -> int:
-    """Count objects in a collection via v4 iterator. Lightweight: yields
-    object metadata only (no vectors) so it scales for the recovery
-    classification check. Returns 0 if collection missing or empty.
-
-    Delegates to :func:`vco_lib.weaviate_helpers.count_objects_v4` (v0.2.77
-    Part 7a convergence — the 0-on-failure variant). Kept as a module-level
-    delegator so ``mock.patch.object(project_init, "_count_objects", ...)``
-    keeps working.
-    """
-    return _wh.count_objects_v4(name, weaviate_url=weaviate_url)
+def _count_objects(name: str, weaviate_url: Optional[str] = None) -> Optional[int]:
+    """Object count for the staging-recovery classifier; None = could not count
+    (never 0 — an unreadable count must not read as "empty, safe to drop").
+    Module-level so tests can ``mock.patch.object(project_init, "_count_objects")``."""
+    return _wh.count_objects_v4_or_none(name, weaviate_url=weaviate_url)
 
 
 def _recover_or_drop_orphan_staging(
@@ -1447,6 +1441,11 @@ def _recover_or_drop_orphan_staging(
     name_present = _fetch_schema(name, weaviate_url=weaviate_url) is not None
     name_count = _count_objects(name, weaviate_url=weaviate_url) if name_present else 0
     staging_count = _count_objects(staging, weaviate_url=weaviate_url)
+    if name_count is None or staging_count is None:  # unreadable = may hold objects: touch neither
+        _log("7b.recover", "error", f"cannot count {name} / {staging}; both RETAINED",
+             data={"collection": name, "staging": staging, "name_count": name_count,
+                   "staging_count": staging_count, "branch": "ambiguous_uncountable"})
+        return "ambiguous"
 
     # RECOVER — staging is the only surviving copy.
     if (not name_present) or name_count == 0:
