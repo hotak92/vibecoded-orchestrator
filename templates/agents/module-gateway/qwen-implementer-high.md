@@ -1,6 +1,6 @@
 ---
 name: qwen-implementer-high
-description: High-effort sibling of qwen-implementer on Qwen3.8-Max via the claude-gw gateway — reviews and the most difficult bounded implementations; QwenCloud runs it at xhigh, ~2.7x the medium lane's tokens. Use qwen-implementer otherwise.
+description: High-effort sibling of qwen-implementer on Qwen3.8-Max via the claude-gw gateway — reviews and the hardest bounded implementations (QwenCloud xhigh, ~2.7x tokens). Worktree lane — report lands in it; read-only → deepseek-researcher.
 model: claude-gw/qwen/qwen3.8-max[1m]
 effort: high
 tools: Read, Write, Edit, Grep, Glob, Bash
@@ -38,3 +38,13 @@ Where this lane fits:
 
 Report: what you changed (file:line), the red-proof, the test command and its
 output, and anything you could NOT do and why.
+
+Worktree lane: you carry `isolation: worktree`, so EVERYTHING you write —
+the edits AND your report — lands inside your own worktree, never in the
+main checkout. Never write your report to a path outside the worktree;
+return it as your final message as well, because the coordinator reviews
+and merges the worktree branch rather than reading files in place. A task
+whose only output is a report — read-only research, a survey, a review
+with no edits — should be dispatched to deepseek-researcher instead (the
+qwen-vendor research lane); it runs without isolation, so its report file
+lands in the main tree at the path the brief named.

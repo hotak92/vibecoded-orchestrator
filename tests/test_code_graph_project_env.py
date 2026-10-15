@@ -426,6 +426,149 @@ class VscodeExcludesBackfillTests(unittest.TestCase):
             self.assertEqual(data["python.analysis.indexing"], False)
 
 
+class VscodeExcludesRetireBuildOutputsTests(unittest.TestCase):
+    """v0.2.103 (field report, Item 25): `files.exclude` must NOT hide the
+    user's own build outputs. Hiding `**/dist` / `**/build` / `**/target`
+    from the explorer only hides the PDFs and binaries the user just built —
+    performance is already covered by `files.watcherExclude` and
+    `search.exclude`, which KEEP the entries. New projects get a
+    `files.exclude` without them; existing projects get the three entries
+    VCO wrote pruned — only when the value is exactly the boolean VCO
+    wrote, never a user-changed value and never any other key.
+    """
+
+    RETIRED = ("**/dist", "**/build", "**/target")
+
+    def _write_vscode(self, folder: Path, payload: dict) -> Path:
+        f = folder / ".vscode" / "settings.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return f
+
+    def _legacy_files_exclude(self) -> dict:
+        """What VCO <= v0.2.102 wrote (the pre-retirement canonical block)."""
+        return {
+            "**/.git": True,
+            "**/node_modules": True,
+            "**/__pycache__": True,
+            "**/.pytest_cache": True,
+            "**/.ruff_cache": True,
+            "**/.mypy_cache": True,
+            "**/.venv": True,
+            "**/dist": True,
+            "**/build": True,
+            "**/target": True,
+        }
+
+    def test_fresh_create_keeps_build_outputs_visible(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            project_init._backfill_vscode_excludes_in_project(folder)
+            data = json.loads(
+                (folder / ".vscode" / "settings.json").read_text(encoding="utf-8")
+            )
+            for pattern in self.RETIRED:
+                self.assertNotIn(
+                    pattern, data["files.exclude"],
+                    f"files.exclude must not hide {pattern} (the user's own "
+                    "build output) from the explorer",
+                )
+            # Performance stays covered: watcher + search still exclude them.
+            for pattern in self.RETIRED:
+                self.assertIn(pattern + "/**", data["files.watcherExclude"])
+                self.assertIn(pattern, data["search.exclude"])
+
+    def test_existing_vco_written_entries_are_pruned(self):
+        # Every canonical key present exactly as VCO <= v0.2.102 wrote it,
+        # so nothing to add — the ONLY change is pruning the three entries.
+        payload = {
+            "files.watcherExclude": {"**/dist/**": True, "**/build/**": True,
+                                     "**/target/**": True},
+            "files.exclude": self._legacy_files_exclude(),
+            "search.exclude": {"**/dist": True, "**/build": True,
+                               "**/target": True},
+            "python.analysis.exclude": ["**/.venv/**"],
+            "python.analysis.indexing": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            self._write_vscode(folder, payload)
+            result = project_init._backfill_vscode_excludes_in_project(folder)
+            self.assertEqual(result["action"], "pruned")
+            self.assertEqual(result["added_keys"], [])
+            self.assertEqual(set(result["removed_entries"]),
+                             {"files.exclude:" + p for p in self.RETIRED})
+            data = json.loads(
+                (folder / ".vscode" / "settings.json").read_text(encoding="utf-8")
+            )
+            for pattern in self.RETIRED:
+                self.assertNotIn(pattern, data["files.exclude"])
+            # The entries VCO did NOT retire stay.
+            self.assertIs(data["files.exclude"]["**/.venv"], True)
+            self.assertIs(data["files.exclude"]["**/.git"], True)
+            # watcher / search exclusions are untouched (still performance).
+            self.assertEqual(data["files.watcherExclude"],
+                             payload["files.watcherExclude"])
+            self.assertEqual(data["search.exclude"], payload["search.exclude"])
+
+    def test_user_changed_or_user_added_values_are_untouched(self):
+        files_exclude = {
+            "**/.git": True,
+            "**/dist": False,                      # user turned it OFF
+            "**/build": {"when": "never"},         # user's conditional form
+            "**/target": True,                     # VCO-written → pruned
+            "**/my-output": True,                  # user's own key
+        }
+        payload = {
+            "files.watcherExclude": {"**/target/**": True},
+            "files.exclude": files_exclude,
+            "search.exclude": {"**/dist": True},
+            "python.analysis.exclude": ["**/.venv/**"],
+            "python.analysis.indexing": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            self._write_vscode(folder, payload)
+            result = project_init._backfill_vscode_excludes_in_project(folder)
+            self.assertEqual(result["action"], "pruned")
+            self.assertEqual(result["removed_entries"], ["files.exclude:**/target"])
+            data = json.loads(
+                (folder / ".vscode" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertIs(data["files.exclude"]["**/dist"], False)
+            self.assertEqual(data["files.exclude"]["**/build"], {"when": "never"})
+            self.assertIs(data["files.exclude"]["**/my-output"], True)
+            self.assertNotIn("**/target", data["files.exclude"])
+
+    def test_prune_runs_inside_a_jsonc_file_preserving_comments(self):
+        raw = (
+            "{\n"
+            "  // my notes\n"
+            '  "editor.tabSize": 2,\n'
+            '  "files.exclude": {\n'
+            '    "**/.git": true,\n'
+            '    "**/dist": true,\n'
+            '    "**/mine": true\n'
+            "  }\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            f = folder / ".vscode" / "settings.json"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(raw, encoding="utf-8")
+            result = project_init._backfill_vscode_excludes_in_project(folder)
+            self.assertEqual(result["action"], "backfilled")  # adds + prune
+            self.assertIn("files.exclude:**/dist", result["removed_entries"])
+            text = f.read_text(encoding="utf-8")
+            self.assertIn("// my notes", text)
+            from vco_lib import jsonc_edit
+            data = jsonc_edit.loads(text)
+            self.assertNotIn("**/dist", data["files.exclude"])
+            self.assertIs(data["files.exclude"]["**/mine"], True)
+            self.assertEqual(data["editor.tabSize"], 2)
+
+
 class PostFileEditHookEnvResolutionTests(unittest.TestCase):
     """Functional check on `post-file-edit.sh`: the resolved
     CODE_GRAPH_PROJECT_RESOLVED value is what the hook would pass as
