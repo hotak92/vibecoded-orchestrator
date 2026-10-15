@@ -805,13 +805,18 @@ def test_printed_remedy_resolves_the_entry(tmp_path):
     conn.commit()
 
     # 3. Re-run `python install.py --update` → its step 7e/10 heal runs on a
-    #    still-drifted DB (the pick did not touch the compared keys).
+    #    still-drifted DB (the pick did not touch the compared keys). The
+    #    production caller passes root_kg_identity.live_pick_ok(url); this
+    #    unit call injects the "verified same-model pick" verdict directly
+    #    (the profile rule itself is pinned in
+    #    tests/test_v02103_n5_n8b_pick_profile_rule.py).
     assert pointer_drift_needs_rw(cur) is True  # RW pass is still owed
     sink2 = _Sink()
     logs, log = _log_collector()
     changed = heal_shared_kg_pointer_drift(
         cur, existing_classes={OLD, OTHER, NEW, DEAD}, log_event=log,
         deferral_report=sink2, deferral_entry_cls=_Entry,
+        pick_ok=lambda _name: True,
     )
     conn.commit()
 
@@ -943,6 +948,7 @@ def test_pick_equals_ptr_converges_last_and_binding(tmp_path):
     changed = heal_shared_kg_pointer_drift(
         cur, existing_classes={PICK, OLD}, log_event=_log_collector()[1],
         deferral_report=sink, deferral_entry_cls=_Entry,
+        pick_ok=lambda _name: True,  # verified same-model pick (see N-8b tests)
     )
     conn.commit()
     assert sink.entries == []

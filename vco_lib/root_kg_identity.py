@@ -31,7 +31,11 @@ The rule (:func:`decide`, pure):
    reports it in ``picked_refused`` and install records the
    ``root_kg_pick_wrong_embedding`` deferral. A pick that holds no rows has
    no vectors to mismatch and is followed (blocked by a case-only sibling like
-   any other name).
+   any other name). The rule itself is ONE function,
+   :func:`pick_follows_profile` — ``kg_binding_heal``'s pick convergence
+   (``heal_shared_kg_pointer_drift``'s ``pick_ok``) applies the same
+   predicate, so the decision and the heal cannot flip the pointers back and
+   forth across runs (review V02103-R29 N-8b).
 2. The root's existing PRIMARY binding is KEPT when that exact class holds rows
    — unless it was positively written with a different embedding model than
    the current profile (the recorded model, else one read off live objects)
@@ -102,6 +106,11 @@ class RootKgDecision:
     #: An Identity-tab pick that was NOT followed because it holds vectors
     #: from another embedding model (the profile rule); None otherwise.
     picked_refused: Optional[str] = None
+    #: True when ``picked_refused`` was set while the current embedding
+    #: profile could not be resolved (unknown target model). The refusal
+    #: stands — symmetric with ``adopt`` — but the deferral is worded for an
+    #: UNVERIFIABLE pick, not a wrong-model one (review V02103-R29 N-5).
+    profile_unresolved: bool = False
 
     @property
     def persistable(self) -> bool:
@@ -135,6 +144,29 @@ def _same_model(a: str, b: str) -> bool:
     return same_text_model(a, b)
 
 
+def pick_follows_profile(*, rows: Optional[int], picked_model: Optional[str],
+                         target_model: Optional[str],
+                         pending_fill: bool) -> bool:
+    """The ONE pick-profile rule (review V02103-R29 N-8b): may the Identity-tab
+    pick be followed? Used by :func:`decide` AND by the heal's pick convergence
+    (``heal_shared_kg_pointer_drift``'s ``pick_ok`` predicate), so the two
+    cannot disagree.
+
+    A pick holding no rows has no vectors to mismatch → followable. A
+    populated pick is followable only when it was written with the current
+    profile's model, or a fill toward that model is pending. An unknown row
+    count (``rows=None``) or an unresolvable profile (empty ``target_model``)
+    is NOT followable — symmetric with ``adopt``'s refusal: VCO never binds
+    the root (or converges the machine's shared pointers) onto vectors it
+    cannot prove are searchable with the current profile."""
+    if rows is None:
+        return False
+    if rows == 0 or pending_fill:
+        return True
+    return bool(picked_model and target_model
+                and _same_model(picked_model, target_model))
+
+
 def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Optional[int]]],
            record_model: Optional[str], target_model: Optional[str],
            override: Optional[str], *, pending_fill: bool = False,
@@ -155,6 +187,7 @@ def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Option
                               f"{OVERRIDE_ENV} is set", True, blocked)
     pk = (picked or "").strip()
     refused: Optional[str] = None
+    profile_unresolved = False
     prefix = ""
     if pk:
         if not known:
@@ -165,19 +198,22 @@ def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Option
         if p_rows is None:
             return RootKgDecision(pk, SOURCE_UNKNOWN, derived,
                                   f"could not count the Identity-tab pick '{pk}' — keeping it", False)
-        same = bool(picked_model and target_model and _same_model(picked_model, target_model))
-        if p_rows == 0 or same or picked_pending:
+        if pick_follows_profile(rows=p_rows, picked_model=picked_model,
+                                target_model=target_model,
+                                pending_fill=picked_pending):
             blocked = case_sibling(pk, names) if pk not in names else None
             return RootKgDecision(pk, SOURCE_PICKED, derived,
                                   "the Identity-tab pick (your explicit choice)", True, blocked)
         refused = pk
+        profile_unresolved = not (target_model or "").strip()
         prefix = (f"the Identity-tab pick '{pk}' was written with "
                   f"{picked_model or 'an unknown model'}, the profile is "
                   f"{target_model or 'unknown'} — not followed; ")
     decision = _decide_unpicked(derived, bound, live_counts, names, known,
                                 record_model, target_model, pending_fill, prefix)
     if refused:
-        decision = replace(decision, picked_refused=refused)
+        decision = replace(decision, picked_refused=refused,
+                           profile_unresolved=profile_unresolved)
     return decision
 
 
@@ -380,29 +416,87 @@ def gather(root, *, weaviate_url: Optional[str] = None,
                   picked=pk, picked_model=picked_model, picked_pending=picked_pending)
 
 
+def live_pick_ok(weaviate_url: str) -> Callable[[str], bool]:
+    """Build the heal's ``pick_ok`` predicate from LIVE facts — the same
+    gathers :func:`gather` uses (rows via ``kg_binding_heal``'s Aggregate,
+    model via ``kg_embed_model`` record/live, fill pending), answering
+    :func:`pick_follows_profile`. One home for the rule: the heal that
+    converges the machine's shared-KG pointers onto an Identity-tab pick and
+    the :func:`decide` that follows (or refuses) the same pick cannot diverge
+    (review V02103-R29 N-8b).
+
+    Unknown facts refuse, never guess: an unreadable row count, or a profile
+    that cannot be resolved while the pick holds rows, is a refusal — the
+    heal then leaves the pointer alone and defers, which is recoverable,
+    where a blind convergence silently re-points every project's shared KG."""
+    from vco_lib.kg_binding_heal import _count_weaviate_class_objects
+
+    def _ok(name: str) -> bool:
+        rows = _count_weaviate_class_objects(weaviate_url, name)
+        if rows is None:
+            return False
+        if rows == 0:
+            return True  # no vectors to mismatch — same as decide
+        try:
+            from vco_lib.kg_embed_model import target_text_model
+
+            target: Optional[str] = target_text_model()
+        except Exception:  # noqa: BLE001 — unresolvable profile = refuse
+            target = ""
+        model, pending = _model_facts(name, target, weaviate_url)
+        return pick_follows_profile(rows=rows, picked_model=model,
+                                    target_model=target, pending_fill=pending)
+
+    return _ok
+
+
 PICK_REFUSED_CONDITION_ID = "root_kg_pick_wrong_embedding"
 
 
 def pick_refused_entry(decision: RootKgDecision):
     """The deferral for an Identity-tab pick the profile rule did not follow
-    (install steps 7b and 7c record it; same condition id → idempotent)."""
+    (install steps 7b and 7c record it; same condition id → idempotent).
+
+    Two wordings, both TRUE (review V02103-R29 N-5): when the profile was
+    resolved the pick is stated to hold another model's vectors; when the
+    profile could NOT be resolved (``decision.profile_unresolved``) the pick
+    is stated to be unverifiable — not wrong. The refusal itself is the same
+    in both corners, symmetric with ``adopt``."""
     from vco_lib.deferral_report import DeferralEntry
 
     pick = decision.picked_refused or ""
+    if decision.profile_unresolved:
+        title = ("Identity-tab shared-KG pick not followed: the embedding profile "
+                 "could not be resolved")
+        detected = (f"The shared KG picked in the launcher's Identity tab is '{pick}', but the "
+                    f"current embedding profile could not be resolved, so VCO cannot verify the "
+                    f"pick's vectors are searchable with it; the orchestrator root keeps "
+                    f"'{decision.name}' ({decision.reason}). The hub and the launcher still "
+                    f"serve '{pick}' as every project's shared KG until you choose.")
+        command_to_apply = (
+            "Resolve the embedding profile (launcher Preferences → Embedding profile "
+            "(global)), then re-run the update; or in the launcher: Identity tab → "
+            "Manage shared KG collection → pick a class written with the current "
+            f"embedding profile (e.g. '{decision.name}'), then re-run the update")
+    else:
+        title = "Identity-tab shared-KG pick holds another embedding model's vectors"
+        detected = (f"The shared KG picked in the launcher's Identity tab is '{pick}', but it was "
+                    f"written with a different embedding model than the current profile, so the "
+                    f"orchestrator root keeps '{decision.name}' ({decision.reason}). The hub and "
+                    f"the launcher still serve '{pick}' as every project's shared KG until you "
+                    f"choose.")
+        command_to_apply = (
+            "In the launcher: Identity tab → Manage shared KG collection → pick a "
+            f"class written with the current embedding profile (e.g. "
+            f"'{decision.name}'), or switch Preferences → Embedding profile (global) "
+            f"to the model '{pick}' was written with; then re-run the update")
     return DeferralEntry(
         condition_id=PICK_REFUSED_CONDITION_ID,
-        title="Identity-tab shared-KG pick holds another embedding model's vectors",
-        detected=(f"The shared KG picked in the launcher's Identity tab is '{pick}', but it was "
-                  f"written with a different embedding model than the current profile, so the "
-                  f"orchestrator root keeps '{decision.name}' ({decision.reason}). The hub and "
-                  f"the launcher still serve '{pick}' as every project's shared KG until you "
-                  f"choose."),
+        title=title,
+        detected=detected,
         why_deferred=("Searching a class with the wrong model's vectors returns wrong results; "
                       "VCO never re-embeds, drops or rebinds it on its own."),
-        command_to_apply=("In the launcher: Identity tab → Manage shared KG collection → pick a "
-                          f"class written with the current embedding profile (e.g. "
-                          f"'{decision.name}'), or switch Preferences → Embedding profile (global) "
-                          f"to the model '{pick}' was written with; then re-run the update"),
+        command_to_apply=command_to_apply,
         severity="warning",
         kg_node_refs=[],
     )

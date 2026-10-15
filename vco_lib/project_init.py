@@ -13068,11 +13068,11 @@ def _bundle_update_pointer_heal() -> None:
     lock. Never raises — a bundle update must always exit on its own result.
     """
     import sqlite3
-    # `urllib.request` is already imported unconditionally at module scope
-    # (line 53); a second function-local import shadowed it for no reason.
+    # `urllib.request` is already imported at module scope — no local shadow.
 
     try:
         from vco_lib.kg_binding_heal import heal_shared_kg_pointer_drift
+        from vco_lib.root_kg_identity import live_pick_ok
     except Exception:
         return
 
@@ -13094,11 +13094,9 @@ def _bundle_update_pointer_heal() -> None:
         schema = json.loads(resp.read())
     except Exception:
         return  # Weaviate unreachable → can't verify existence → skip.
-    # v0.2.96: the ONE home (`weaviate_helpers.schema_class_names`). The
-    # walrus + isinstance dance this replaces existed because repeating
-    # `c.get("class")` in the element expression re-widens to `str | None`
-    # (CI caught exactly that on the v0.2.76 push) — a narrowing trick five
-    # call-sites had each rediscovered differently, and three had got wrong.
+    # v0.2.96: the ONE home (`weaviate_helpers.schema_class_names`); the
+    # hand-rolled narrowing tricks five call-sites had each got differently
+    # wrong were removed.
     from vco_lib.weaviate_helpers import schema_class_names
     existing_classes = schema_class_names(schema)
 
@@ -13126,6 +13124,8 @@ def _bundle_update_pointer_heal() -> None:
                 log_event=_log,
                 deferral_report=_Sink(),
                 deferral_entry_cls=_Entry,
+                # N-8b: root_kg_identity's pick rule + live facts (as decide).
+                pick_ok=live_pick_ok(weaviate_url),
             )
             if changed:
                 conn.commit()
