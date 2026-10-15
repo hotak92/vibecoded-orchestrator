@@ -4413,7 +4413,7 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
     ``.claude/context/audits/project-bundle-install-audit-2026-06-10.md``
     §6.7 / B3.
     """
-    from vco_lib.atomic import atomic_write_bytes
+    from vco_lib.atomic import atomic_write_bytes, warn_symlink_redirect
 
     # chmod is a documented no-op on Windows inside the shared writer; a
     # chmod OSError never fails the write.
@@ -4421,13 +4421,7 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
         target, data, fsync=False, mode=mode, symlink_safe=True,
     )
     if redirect_target is not None:
-        sys.stderr.write(
-            f"[vct] NEW-8 symlink-blocking: refusing to write through symlink "
-            f"at {target}; redirecting to {redirect_target}. "
-            f"The .vco-new sibling holds the orchestrator's intended content; "
-            f"the symlink and its destination are untouched. Merge manually "
-            f"when ready.\n"
-        )
+        warn_symlink_redirect(target, redirect_target)
     return redirect_target
 
 
@@ -10147,11 +10141,11 @@ def install_project_bundle(
             )
 
     # PR-7 (v0.2.11, addendum-4): backfill VS Code watcher / search /
-    # Pylance exclude blocks into the project's `.vscode/settings.json`.
-    # Without these excludes, large workspaces (>10 GB / >50k files —
-    # typical ML projects with venvs + cargo target/) OOM-kill VS Code
-    # via systemd-oomd during initial indexing. Idempotent: skipped
-    # entirely if every canonical key is already present (user-wins).
+    # Pylance exclude blocks into the project's `.vscode/settings.json`
+    # (large workspaces OOM-kill VS Code without them). Idempotent: adds
+    # only missing keys (user-wins per key) and, since v0.2.103, prunes
+    # the retired files.exclude build outputs from a block still matching
+    # VCO's legacy write signature (vco_lib/vscode_excludes.py).
     if not dry_run:
         try:
             vscode_backfill = _backfill_vscode_excludes_in_project(folder)
@@ -12263,225 +12257,19 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
 # ---------------------------------------------------------------------------
 # .vscode/settings.json exclude-block backfill (PR-7 / v0.2.11)
 # ---------------------------------------------------------------------------
-#
-# Forensic context (00:56 live OOM-kill incident, 2026-05-16):
-#   Opening a large workspace (>10 GB / >50k files — common for ML
-#   projects with venvs, model weights, cargo target/) in VS Code with
-#   the Pylance extension active triggered:
-#     - file watcher scanning every file under the workspace root
-#     - Pylance indexing every Python file it discovered (including
-#       .venv/lib/python3.x/site-packages which is multi-GB of stdlib
-#       wheels)
-#     - Chromium renderer holding the full DOM for the file tree
-#   Result: systemd-oomd killed VS Code's Chromium scope at 86.46%
-#   memory pressure. Reproduced across multiple multi-GB project trees
-#   (47 GB scientific stack, 32 GB / 76k-file legacy clone, 33 GB cargo
-#   target). Local fix in each case
-#   was to add the canonical files.watcherExclude + python.analysis.*
-#   blocks. PR-7 ships those as launcher-managed defaults so every
-#   project the launcher registers (and `install-bundle --update`s)
-#   gets them automatically.
-#
-# Cross-OS notes:
-#   - JSON path patterns use forward slashes; VS Code normalizes on
-#     Windows, no per-OS branch needed.
-#   - `python.analysis.indexing: false` disables Pylance's persistent
-#     index — the in-memory analysis still works, just doesn't write
-#     a multi-GB cache under ~/.cache/. Users who want indexing back
-#     can override per-project.
-#
-# Coordination with the Rust writer:
-#   Pre-PR-27, the launcher's Rust env writer (retired v0.2.97; at
-#   commands/projects_v2.rs) wrote a `claude-code.env` sub-object
-#   inside `.vscode/settings.json`. That write was removed in PR-27
-#   (v0.2.12, 2026-05-16) because the key did NOT propagate to MCP
-#   subprocesses on Linux as of Claude Code 2.1.143 — empirical
-#   sentinel testing confirmed (.claude/settings.json env is the
-#   channel that actually reaches MCPs). See PR-27 commit message and
-#   docs/CLAUDE_CODE_COMPATIBILITY.md → "Per-project env files" for
-#   the full trace.
-#
-#   After PR-27 the Rust writer does not touch `.vscode/settings.json`
-#   at all from the env-write code path, so this Python helper is the
-#   ONLY writer of that file across the launcher's project-init flow.
-#   It still adds only top-level keys (files.watcherExclude, etc.) so
-#   any pre-existing `claude-code.env` block authored by the user (or
-#   by a pre-PR-27 launcher) is preserved verbatim — the by-key
-#   backfill never touches a key it doesn't own.
-
-_VSCODE_EXCLUDE_DEFAULTS: dict[str, object] = {
-    # Watcher: prevent inotify / FSEvents / ReadDirectoryChangesW from
-    # firing for these dirs. Heavy churn (cargo target/, node_modules/)
-    # otherwise saturates the watcher queue.
-    "files.watcherExclude": {
-        "**/.git/objects/**": True,
-        "**/.git/subtree-cache/**": True,
-        "**/node_modules/**": True,
-        "**/__pycache__/**": True,
-        "**/.pytest_cache/**": True,
-        "**/.ruff_cache/**": True,
-        "**/.mypy_cache/**": True,
-        "**/.venv/**": True,
-        "**/venv/**": True,
-        "**/site-packages/**": True,
-        "**/dist/**": True,
-        "**/build/**": True,
-        "**/target/**": True,
-        "**/state/**": True,
-        "**/.claude/logs/**": True,
-        "**/.claude/worktrees/**": True,
-    },
-    # File tree: hide noise from the explorer (still searchable via
-    # `search.exclude` carve-out below if user removes it).
-    "files.exclude": {
-        "**/.git": True,
-        "**/node_modules": True,
-        "**/__pycache__": True,
-        "**/.pytest_cache": True,
-        "**/.ruff_cache": True,
-        "**/.mypy_cache": True,
-        "**/.venv": True,
-        "**/dist": True,
-        "**/build": True,
-        "**/target": True,
-    },
-    # Quick-search exclude (Cmd/Ctrl+P, full-text find): skip the heavy
-    # build / cache / log dirs so search latency stays sub-second.
-    "search.exclude": {
-        "**/node_modules": True,
-        "**/__pycache__": True,
-        "**/.venv": True,
-        "**/dist": True,
-        "**/build": True,
-        "**/target": True,
-        "**/state": True,
-        "**/.claude/logs": True,
-        "**/.claude/worktrees": True,
-        "**/*.lock": True,
-    },
-    # Pylance: skip these dirs from type-analysis. Indexing OFF avoids
-    # the persistent multi-GB cache under ~/.cache.
-    "python.analysis.exclude": [
-        "**/.venv/**",
-        "**/venv/**",
-        "**/__pycache__/**",
-        "**/.pytest_cache/**",
-        "**/.mypy_cache/**",
-        "**/.claude/worktrees/**",
-    ],
-    "python.analysis.indexing": False,
-}
-
-# Keys the backfill helpers consider — exposed for tests + the
-# orchestrator-side mirror in install.py.
-_VSCODE_EXCLUDE_KEYS: tuple[str, ...] = (
-    "files.watcherExclude",
-    "files.exclude",
-    "search.exclude",
-    "python.analysis.exclude",
-    "python.analysis.indexing",
+# v0.2.103 (Item 25): the whole block — defaults, keys and the backfill —
+# moved to `vco_lib/vscode_excludes.py` (this module is ratchet-capped and
+# the backfill gained a retire-arm: `files.exclude` no longer hides the
+# user's dist/build/target outputs, and the entries VCO wrote into
+# existing projects are pruned at exactly the boolean it wrote). The names
+# stay here as the aliases the bundle tests and install.py's mirror
+# (`install._backfill_vscode_excludes`, which routes to the same helper)
+# use.
+from vco_lib.vscode_excludes import (  # noqa: E402
+    _VSCODE_EXCLUDE_DEFAULTS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (install.py + tests read it off this module)
+    _VSCODE_EXCLUDE_KEYS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (install.py docstring + tests)
+    backfill_in_project as _backfill_vscode_excludes_in_project,
 )
-
-
-def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
-    """Idempotent: add VS Code watcher/search/Pylance exclude blocks to
-    a per-project `.vscode/settings.json` when keys are missing.
-
-    PR-7 (v0.2.11): without these excludes, opening a large workspace
-    (>10 GB / >50k files — typical for ML projects with venvs, cargo
-    target/, model weights) in VS Code triggers OOM kills (verified
-    live on multiple large project trees on 2026-05-16). The launcher now
-    ships the canonical exclude block as a backfill — existing projects
-    catch up on `install-bundle --update`.
-
-    Idempotency contract:
-      - Missing settings file → create it with just the exclude block
-        + a marker comment. `_template_origin: "vibecoded-orchestrator
-        v0.2.11+ — vscode-excludes backfill"` so the file is identifiable.
-      - File not valid JSON or JSONC → action="unparseable" (no-op,
-        preserves user file untouched). A JSONC file (comments, trailing
-        commas — the common hand-edited case) is READ and the missing keys
-        are inserted into its text, comments kept (v0.2.97); an insertion
-        that cannot be verified is action="jsonc_edit_refused", untouched.
-      - Top-level key already present → user-wins, leave alone (covers
-        the "user set `files.watcherExclude: {}` to explicitly disable
-        the feature" case the addendum calls out).
-      - Top-level key missing → add it with the canonical value.
-
-    Args:
-        folder: target user-project folder.
-
-    Returns:
-        `{"action": str, "added_keys": [str, ...], "path": str}`. Action
-        is one of:
-          - "created"     — file didn't exist, written from canonical defaults
-          - "backfilled"  — file existed; added one or more missing keys
-          - "noop"        — file existed; every canonical key already present
-          - "unparseable" — file existed but couldn't be parsed; left alone
-          - "jsonc_edit_refused" — JSONC file whose edit could not be
-            verified; left alone
-          - "write_failed:<ErrorClass>" — atomic write raised
-    """
-    settings_file = folder / ".vscode" / "settings.json"
-    result: dict = {
-        "action": "noop",
-        "added_keys": [],
-        "path": str(settings_file),
-    }
-
-    if not settings_file.exists():
-        # Fresh write: include just the exclude block (no claude-code.env
-        # — PR-27 (v0.2.12, 2026-05-16) removed the Rust launcher's
-        # write of that block from `.vscode/settings.json` because it
-        # didn't propagate to MCP subprocesses on Linux. The canonical
-        # channel for per-project MCP env is `.claude/settings.json`
-        # env, written by the launcher's config_projection apply.)
-        payload: dict = {
-            "_template_origin": (
-                "vibecoded-orchestrator v0.2.11+ — vscode-excludes backfill"
-            ),
-        }
-        for key, value in _VSCODE_EXCLUDE_DEFAULTS.items():
-            payload[key] = value
-        try:
-            settings_file.parent.mkdir(parents=True, exist_ok=True)
-            text = json.dumps(payload, indent=2) + "\n"
-            _write_file_atomic(settings_file, text.encode("utf-8"))
-        except OSError as e:
-            result["action"] = f"write_failed:{type(e).__name__}"
-            return result
-        result["action"] = "created"
-        result["added_keys"] = list(_VSCODE_EXCLUDE_DEFAULTS.keys())
-        return result
-
-    loaded = _jsonc_edit.load_object(settings_file)
-    if loaded is None:
-        result["action"] = "unparseable"
-        return result
-    data, raw = loaded
-
-    added: list[str] = []
-    for key, value in _VSCODE_EXCLUDE_DEFAULTS.items():
-        if key not in data:
-            data[key] = value
-            added.append(key)
-
-    if not added:
-        return result  # action stays "noop"
-
-    payload_text = _jsonc_edit.dumps_preserving(raw, data, indent=2)
-    if payload_text is None:
-        result["action"] = "jsonc_edit_refused"
-        return result
-    try:
-        _write_file_atomic(settings_file, payload_text.encode("utf-8"))
-    except OSError as e:
-        result["action"] = f"write_failed:{type(e).__name__}"
-        return result
-
-    result["action"] = "backfilled"
-    result["added_keys"] = added
-    return result
 
 
 # ---------------------------------------------------------------------------

@@ -375,5 +375,63 @@ class DescriptionBudgetTests(unittest.TestCase):
             self.assertEqual(_budget_problems(root), [])
 
 
+class GatewayRoutingTargetsTests(unittest.TestCase):
+    """R18 M1/m1 — a worktree implementer may only route work to a lane
+    whose OWN description accepts it. The implementer bodies tag each
+    routing target with its role in parentheses — ``<agent> (research)``,
+    ``<agent> (review)`` — and this pin reads those tags against the
+    shipped catalogue: every named target must exist in
+    ``templates/agents/module-gateway/``, a target routed for REVIEW must
+    not be a lane that says it is NOT a reviewer, and a target routed for
+    RESEARCH must be a lane whose description says it researches (a
+    review-only lane named "(research)" is the same lie one direction
+    over). The implementers themselves run ``isolation: worktree`` — they
+    are the lanes whose reports land in a worktree, so their routing
+    pointers are the ones a coordinator actually follows.
+    """
+
+    _ROLE_TAG = re.compile(r"\b([a-z][a-z0-9-]+) \((research|review)\)")
+
+    def test_every_role_tagged_routing_target_exists_and_accepts_the_role(self):
+        gateway = REPO_ROOT / "templates" / "agents" / "module-gateway"
+        problems: list[str] = []
+        for path in sorted(gateway.glob("*.md")):
+            frontmatter = _frontmatter_mapping(path)
+            if frontmatter.get("isolation") != "worktree":
+                continue  # read-only lanes are destinations, not routers
+            body = path.read_text(encoding="utf-8")
+            targets = self._ROLE_TAG.findall(body)
+            self.assertTrue(
+                targets,
+                f"{path.name}: worktree lane names no role-tagged routing "
+                "target — the body must say where read-only work goes")
+            for name, role in targets:
+                target_path = gateway / f"{name}.md"
+                if not target_path.exists():
+                    problems.append(
+                        f"{path.name} routes {role} to unshipped {name!r}")
+                    continue
+                desc = str(
+                    _frontmatter_mapping(target_path).get("description", ""))
+                if role == "review":
+                    if "NOT a reviewer" in desc:
+                        problems.append(
+                            f"{path.name} routes reviews to {name}, whose "
+                            "description says NOT a reviewer")
+                    if "review" not in desc.lower():
+                        problems.append(
+                            f"{path.name} routes reviews to {name}, whose "
+                            "description never mentions review")
+                else:  # research
+                    if "research" not in desc.lower():
+                        problems.append(
+                            f"{path.name} routes research to {name}, whose "
+                            "description never mentions research")
+        self.assertEqual(
+            problems, [],
+            "routing targets that do not accept the routed role: "
+            + "; ".join(problems))
+
+
 if __name__ == "__main__":
     unittest.main()

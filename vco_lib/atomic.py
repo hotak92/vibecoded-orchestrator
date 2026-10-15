@@ -85,6 +85,7 @@ import contextlib
 import errno
 import json
 import os
+import sys
 import shutil
 import stat
 import tempfile
@@ -141,6 +142,22 @@ def atomic_rewrite_text(path: Path, body: str, *, encoding: str = "utf-8") -> No
     except OSError:
         mode = None
     atomic_write_text(path, body, encoding=encoding, mode=mode)
+
+
+def warn_symlink_redirect(target, redirect) -> None:
+    """Tell the install log that a symlink-safe write was redirected (NEW-8).
+
+    The ONE wording of the notice every symlink-safe writer prints when
+    :func:`atomic_write_bytes` (``symlink_safe=True``) refused to write
+    through a symlink and wrote the ``.vco-new`` sibling instead.
+    """
+    sys.stderr.write(
+        f"[vct] NEW-8 symlink-blocking: refusing to write through symlink "
+        f"at {target}; redirecting to {redirect}. "
+        f"The .vco-new sibling holds the orchestrator's intended content; "
+        f"the symlink and its destination are untouched. Merge manually "
+        f"when ready.\n"
+    )
 
 
 def atomic_write_bytes(

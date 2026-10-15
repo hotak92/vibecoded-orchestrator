@@ -6304,13 +6304,22 @@ def main() -> int:
     #     exclude block (the existing `.vscode/settings.json.example` is
     #     templated for the `claude-code.env` block, which the launcher
     #     writes on registration — the excludes are an orthogonal concern).
-    #   - Update: adds missing exclude keys only; user-set values
-    #     preserved verbatim (user-wins).
+    #   - Update: adds missing exclude keys; user-set values preserved
+    #     verbatim (user-wins). Since v0.2.103 it also PRUNES the retired
+    #     `files.exclude` build-output entries (dist/build/target) — only
+    #     from a block that still matches VCO's legacy write signature.
     _vscode_excludes_result = _backfill_vscode_excludes()
     if _vscode_excludes_result["action"] in ("created", "backfilled"):
         print(
             f"  VS Code excludes: {_vscode_excludes_result['action']} "
             f"({len(_vscode_excludes_result['added_keys'])} key(s))"
+        )
+    elif _vscode_excludes_result["action"] == "pruned":
+        print(
+            f"  VS Code excludes: pruned "
+            f"({len(_vscode_excludes_result['removed_entries'])} retired "
+            f"files.exclude entry/entries: "
+            f"{', '.join(_vscode_excludes_result['removed_entries'])})"
         )
     _log_install_event(
         "9/10", "info",
@@ -12148,7 +12157,10 @@ def _backfill_vscode_excludes(settings_file: Path | None = None) -> dict:
       - OOM kills (verified live 2026-05-16 on multiple workspaces).
 
     Idempotency contract matches the per-project version: only ADDS
-    missing keys, never overwrites. Returns the same dict shape.
+    missing keys, never overwrites — and since v0.2.103 also PRUNES the
+    retired `files.exclude` build-output entries (dist/build/target) from
+    a block that still matches VCO's legacy write signature. Returns the
+    same dict shape.
 
     Args:
         settings_file: path to `.vscode/settings.json`. Defaults to
@@ -12159,8 +12171,9 @@ def _backfill_vscode_excludes(settings_file: Path | None = None) -> dict:
 
     # Delegate to the project_init helper using the parent folder of
     # `.vscode/`. This keeps the canonical exclude block in ONE place
-    # (project_init._VSCODE_EXCLUDE_DEFAULTS) so the orchestrator and
-    # per-project surfaces never drift.
+    # (vco_lib/vscode_excludes.py — `_VSCODE_EXCLUDE_DEFAULTS` is
+    # re-exported by project_init) so the orchestrator and per-project
+    # surfaces never drift.
     if settings_file.parent.name == ".vscode":
         parent = settings_file.parent.parent
     else:
