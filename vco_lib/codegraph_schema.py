@@ -266,6 +266,70 @@ def ensure_analyzer_properties(analyzer: Any, props: Iterable[str]) -> List[str]
     return added
 
 
+#: The file-anchored classes that carry ``file_path`` (born analyzer-side in
+#: v0.2.52; shared here in v0.2.103 so the resync metadata backfill can ensure
+#: it BEFORE its first run — see :func:`ensure_codegraph_file_path`).
+CODEGRAPH_FILE_PATH_CLASSES: Tuple[str, ...] = (
+    "CodeFunction", "CodeClass", "CodeAPI", "CodeInteraction",
+)
+
+_FILE_PATH_DESC = (
+    "Repo-relative POSIX path of the source file (mirrors CodeModule.path)"
+)
+
+
+def ensure_codegraph_file_path(client: Any, prefix: str) -> Dict[str, str]:
+    """Ensure the ``file_path`` property exists on the file-anchored classes.
+
+    v0.2.103 (defect 6): the resync spawns the metadata backfill as a detached
+    child that races the analyzer walk, and the walk's analyzer is what used to
+    be the ONLY ensure home for ``file_path`` — so the FIRST backfill after the
+    property shipped always probed/patched a class that lacked it (WARNING,
+    nothing updated). This is the client+prefix twin of the analyzer's
+    ``_ensure_file_path_property`` (same spec, same soft-fail posture: a config
+    read or ``add_property`` failure on one class logs and continues — the
+    backfill halves already soft-degrade per collection).
+
+    ``file_path`` deliberately stays OUT of :data:`CODEGRAPH_PROPERTY_SPECS`:
+    that table is scoped to properties with an OWNING migration edge (the
+    parity lock asserts the analyzer's edge-scoped helpers equal it exactly),
+    and ``file_path`` predates the edge system (analyzer-born, v0.2.52). The
+    spec lives here so there is still ONE home for the ensure loop itself.
+
+    Returns ``{full_class_name: "absent" | "ensured" | "error"}``.
+    """
+    from weaviate.classes.config import DataType, Property  # local: only when running
+
+    results: Dict[str, str] = {}
+    for suffix in CODEGRAPH_FILE_PATH_CLASSES:
+        class_name = f"{prefix}_{suffix}"
+        try:
+            if not client.collections.exists(class_name):
+                results[class_name] = "absent"
+                continue
+            coll = client.collections.get(class_name)
+            existing = {p.name for p in coll.config.get().properties}
+            if "file_path" not in existing:
+                coll.config.add_property(
+                    Property(
+                        name="file_path",
+                        data_type=DataType.TEXT,
+                        description=_FILE_PATH_DESC,
+                        skip_vectorization=True,
+                    )
+                )
+                logger.info(
+                    "codegraph ensure: added file_path to %s", class_name,
+                )
+            results[class_name] = "ensured"
+        except Exception as exc:  # noqa: BLE001 — soft-fail per class
+            results[class_name] = "error"
+            logger.warning(
+                "codegraph ensure: file_path on %s skipped: %s", class_name, exc
+            )
+    return results
+
+
 def backfill_missing_property(coll: Any, prop: str, value: str) -> Tuple[int, int]:
     """Set ``prop = value`` on every row of ``coll`` where it is NULL / empty.
     Returns ``(updated, failures)``.

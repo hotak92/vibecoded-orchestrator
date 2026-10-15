@@ -479,6 +479,8 @@ try:
         reconcile_walked_file_rows as _reconcile_walked_file_rows,
         open_walked_file_scope as _open_scope,
         commit_walked_file_scope as _commit_scope,
+        # v0.2.103 (defect 7): the orphan provability primitive.
+        resolve_codegraph_anchor as _resolve_codegraph_anchor,
     )
     # v0.2.77 Part 5 (CG-2): ONE facade for cross-language call extraction.
     # Dependency-free to import (tree-sitter grammars are lazy-loaded inside
@@ -488,8 +490,10 @@ try:
     # preserve exemption from the 2026-07-15 wipe incident) lives in vco_lib
     # so the analyzer monolith stays flat (P2f ratchet). `_prune_collection`
     # is a thin shim over it.
-    from vco_lib.codegraph_prune import (
-        prune_collection as _prune_collection_impl, expand_preserve_entries as _expand_preserve)
+    from vco_lib.codegraph_prune import (  # v0.2.103: + failure ledger + remedy lines
+        prune_collection as _prune_collection_impl, expand_preserve_entries as _expand_preserve,
+        record_prune_failures as _record_prune_failures,
+        format_prune_remedy_lines as _format_prune_remedy_lines)
     from vco_lib import codegraph_source_scope as _src_scope  # W6-CGD: stamp + ownership + preserve keys
     from vco_lib.codegraph_extra_overlap import classify as _extra_overlap  # W6-CGD D-4
     from vco_lib.codegraph_schema import (  # v0.2.102: one ensure loop + backfill
@@ -3517,8 +3521,11 @@ class CodeGraphAnalyzer:
         # feed it — the --prune-stale pass, the drain's deleted-file prune,
         # and the stale-file probe's orphan-clear (which runs on ANY walk) —
         # so a stale value from a prior analyze_repository call in the same
-        # process must never leak into this run's stats.
+        # process must never leak into this run's stats. v0.2.103 (plan item
+        # 24): the per-collection ledger resets with it (the PRUNE_FAILURES
+        # remedy names the REAL failing classes).
         self._prune_failures = 0
+        self._prune_failure_collections = {}
         self._policy_skipped = {}  # S16-3: per-run policy-skip record (flushed per walk)
         # v0.2.100 (--as-extra-path): repo_path IS an extra path → only rows PROVABLY
         # stamped with it are ever judged/deleted (source_is_owned strict).
@@ -3961,6 +3968,8 @@ class CodeGraphAnalyzer:
         # never as a clean success. Read via getattr because the attribute
         # may be absent if a future path skips the per-run reset.
         stats['prune_failures'] = int(getattr(self, "_prune_failures", 0))
+        # v0.2.103 (plan item 24): per-collection map for the remedy block.
+        stats['prune_failure_collections'] = dict(getattr(self, "_prune_failure_collections", None) or {})
         _gd = self._git_deleted_report
         stats.update(deleted_files=_gd.files, deleted_file_entities=_gd.deleted,
                      deleted_file_prune_failures=_gd.failures)
@@ -4012,16 +4021,13 @@ class CodeGraphAnalyzer:
             collections. Printed per-collection on stdout so the
             launcher's log shows what happened.
 
-        Side effect (v0.2.73, C-11 / RT-3): accumulates the total number of
-        per-row delete failures across all collections into
-        ``self._prune_failures`` so ``analyze_repository`` can propagate it
-        into ``stats`` and main() can flip the build status success→partial
-        when it is non-zero. v0.2.75 (P1b-3): ADDS onto the accumulator
-        instead of overwriting it — the stale-file probe's orphan-clear and
-        the drain's deleted-file prune may already have recorded failures
-        earlier in the SAME run, and clobbering them silently un-reported
-        those rows (the per-run reset lives at the top of
-        ``analyze_repository``).
+        Side effect (v0.2.73 C-11/RT-3; v0.2.103 plan item 24): per-collection
+        delete failures are recorded through ``record_prune_failures`` into
+        ``self._prune_failures`` (total) AND ``self._prune_failure_collections``
+        (per-class ledger) — ADD-only, never clobbering the failures earlier
+        producers in the SAME run already recorded (per-run reset lives at
+        the top of ``analyze_repository``) — so ``stats``/main() can flip the
+        build success→partial and the remedy can name the REAL classes.
         """
         if not self._track_visited:
             # Defensive: should never happen (caller gates on
@@ -4032,7 +4038,6 @@ class CodeGraphAnalyzer:
             return 0
 
         total_pruned = 0
-        total_failures = 0
         per_collection_visited: Dict[str, Set[str]] = {}
         for coll_name, uid in self.visited_uuids:
             per_collection_visited.setdefault(coll_name, set()).add(uid)
@@ -4066,6 +4071,10 @@ class CodeGraphAnalyzer:
                 f"language={scope_lang!r} entries not visited this run"
             )
 
+        # v0.2.103 (defect 7): the orphan provability hook — FULL walks only
+        # (a scoped prune is partial) and the CodeInteraction class only.
+        orphan_resolver = None if scope_lang else _resolve_codegraph_anchor
+
         for coll in collections:
             if coll is None:
                 continue
@@ -4074,26 +4083,22 @@ class CodeGraphAnalyzer:
                 coll, visited, language_scope=scope_lang,
                 preserve_paths=preserve_paths,
                 preserve_sources=getattr(self, "_refused_extra_sources", None),
+                orphan_resolver=orphan_resolver if coll.name.endswith("_CodeInteraction") else None,
             )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
                 total_pruned += pruned
             if failures:
                 # v0.2.73 (C-11 / RT-3): a per-collection failure count so the
-                # launcher log shows WHICH collection couldn't be pruned (the
-                # Weaviate-500 prop-length signature is per-shard, so it tends
-                # to hit one collection heavily).
+                # launcher log shows WHICH collection couldn't be pruned. The
+                # same site feeds the per-collection ledger the end-of-run
+                # remedy names the REAL class from (v0.2.103, plan item 24).
                 print(
                     f"⚠️  {failures} prune deletes FAILED on {coll.name} "
                     f"(stale rows remain — see warnings above)"
                 )
-                total_failures += failures
+                _record_prune_failures(self, coll.name, failures)
 
-        # v0.2.75 (P1b-3): accumulate — never clobber earlier producers
-        # (orphan-clear / drain prune) in the same run.
-        self._prune_failures = (
-            int(getattr(self, "_prune_failures", 0)) + total_failures
-        )
         return total_pruned
 
     def _prune_collection(
@@ -4103,6 +4108,7 @@ class CodeGraphAnalyzer:
         language_scope: str = "",
         preserve_paths: Optional[Set[Any]] = None,
         preserve_sources: Optional[Set[str]] = None,
+        orphan_resolver=None,
     ) -> Tuple[int, int]:
         """Thin shim over ``vco_lib.codegraph_prune.prune_collection`` (the
         v0.2.82 extraction — full semantics, history and the 2026-07-15
@@ -4117,6 +4123,7 @@ class CodeGraphAnalyzer:
             language_scope=language_scope,
             preserve_paths=preserve_paths,
             preserve_sources=preserve_sources,
+            orphan_resolver=orphan_resolver,
         )
 
     def _single_file_dispatch(
@@ -4756,6 +4763,7 @@ class CodeGraphAnalyzer:
                 )
                 orphans_cleared += deleted
                 orphan_failures += failures
+                _record_prune_failures(self, coll.name, failures)  # plan item 24
                 # A path just deleted must leave the stale set (built from the
                 # pre-delete scan): drop every key whose path is now unreachable.
                 if deleted:
@@ -4789,23 +4797,14 @@ class CodeGraphAnalyzer:
                 )
                 orphans_cleared += swept
                 orphan_failures += sweep_failures
+                # v0.2.103 (plan item 24): per-collection attribution, recorded
+                # at the one site that knows the collection (ADD-only).
+                _record_prune_failures(self, coll.name, sweep_failures)
 
         if orphans_cleared or orphan_failures:
             print(
                 f"   🧹 cleared {orphans_cleared} orphan (deleted-file) "
                 f"row(s){f'; {orphan_failures} delete(s) failed' if orphan_failures else ''}"
-            )
-        if orphan_failures:
-            # v0.2.75 (P1b-3): fold orphan-clear delete failures into the
-            # EXISTING accounting chain (self._prune_failures → stats →
-            # main()'s PRUNE_FAILURES=N line → codegraph.rs reader →
-            # success→partial → GUI banner). Pre-fix the count was only
-            # PRINTED above — a run whose purge failed still reported a
-            # clean success while the purgeable rows silently survived (and,
-            # correctly, no longer counted as owed: a false "converged").
-            # No new plumbing — same signal the --prune-stale pass uses.
-            self._prune_failures = (
-                int(getattr(self, "_prune_failures", 0)) + orphan_failures
             )
         if not determinable:
             return None
@@ -6881,6 +6880,9 @@ def main():
             # auto-drop — the code graph is derived data but a drop is still a
             # user-consent action, mirroring the ReanalysisModal / drop-collection
             # deferral discipline used elsewhere (never auto-destroy user data).
+            # v0.2.103 (plan item 24): one curl line per collection that
+            # ACTUALLY had a prune failure, with the real class name and the
+            # real --project — a printed command is shipped code.
             print(
                 f"⚠️  {prune_failures} stale row(s) could not be deleted. If these "
                 "are Weaviate-500 'subtract prop lengths: property not found' "
@@ -6889,10 +6891,9 @@ def main():
                 "This is upstream shard state, not a VCO logic bug. To clear it, "
                 "rebuild the affected collection from scratch via the launcher's "
                 "Reanalyze (drop-and-rebuild) consent flow, e.g.:\n"
-                "   curl -X DELETE \"${WEAVIATE_URL:-http://localhost:8081}"
-                "/v1/schema/<Prefix>_CodeFunction\"   # then re-run analysis\n"
-                "   .claude/scripts/code-graph-analyze . --project <name> --prune-stale\n"
-                "The code graph is derived data, so a rebuild is cheap and "
+                + "\n".join(_format_prune_remedy_lines(
+                    stats.get("prune_failure_collections"), project_name))
+                + "\nThe code graph is derived data, so a rebuild is cheap and "
                 "definitive — but it is NEVER done automatically.",
                 file=sys.stderr,
             )

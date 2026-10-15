@@ -190,6 +190,15 @@ from vco_lib.codegraph_guards import (  # noqa: E402 — grouped with the notes 
 
 from vco_lib.kg_vector_slot import collection_vector_slots as _collection_vector_slots  # noqa: E402
 from vco_lib import codegraph_one_time_audits as _audits  # noqa: E402
+# v0.2.103 (defect 6): the backfill ensures its target properties through the
+# ONE property-spec home BEFORE it probes/patches them (the analyzer walk it
+# races used to be the only ensure home — first run after a property shipped
+# always warned and backfilled nothing).
+from vco_lib.codegraph_schema import (  # noqa: E402 — grouped with the notes above
+    CodegraphPropertyEnsureError as _PropertyEnsureError,
+    ensure_codegraph_file_path as _ensure_file_path_props,
+    ensure_codegraph_properties as _ensure_spec_props,
+)
 
 #: Backwards-compat alias (pre-v0.2.75 module-local name).
 _path_reachable_on_disk = path_reachable_on_disk
@@ -1995,6 +2004,142 @@ def _resolve_anchor_from_refs(obj, ref_specs) -> str:
     return ""
 
 
+def resolve_codegraph_anchor(collection, uuid, base: str = "CodeInteraction") -> Optional[str]:
+    """v0.2.103 (defect 7): resolve ONE row's anchor from its stored references.
+
+    Fetches the row by id with its :data:`_ANCHOR_BACKFILL_REFS` references
+    inline (ONE query) and resolves the target path via
+    :func:`_resolve_anchor_from_refs`. Returns:
+
+    * a non-empty path — the row IS anchored by reference; the anchor
+      backfill will PATCH ``file_path`` from it (never delete on this
+      evidence);
+    * ``""`` — POSITIVELY unresolvable: the query succeeded and no reference
+      resolves to a path (the anchor-backfill's own "unresolvable" verdict);
+    * ``None`` — UNKNOWN (fetch/query failure): never a delete authorization.
+
+    Never raises. This is the provability primitive BOTH defect-7 consumers
+    share — the full-walk stale prune's orphan reaping and the convergence
+    probe :func:`count_orphan_interaction_rows` — so they cannot disagree
+    about which rows count as orphans.
+    """
+    ref_specs = _ANCHOR_BACKFILL_REFS.get(base) or []
+    if not ref_specs:
+        return None
+    try:
+        from weaviate.classes.query import QueryReference
+
+        obj = collection.query.fetch_object_by_id(
+            uuid=uuid,
+            return_references=[
+                QueryReference(link_on=ref_prop, return_properties=[target_prop])
+                for ref_prop, target_prop in ref_specs
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001 — unknown, never an orphan verdict
+        logger.debug("codegraph orphan-resolve: fetch %s failed: %s", uuid, exc)
+        return None
+    if obj is None:
+        # Row already gone (concurrent delete): nothing to preserve, nothing
+        # to resolve — treat as unresolvable; a delete of a vanished row is a
+        # no-op either way.
+        return ""
+    return _resolve_anchor_from_refs(obj, ref_specs)
+
+
+def count_orphan_interaction_rows(
+    project_name: str,
+    *,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[int]:
+    """v0.2.103 (defect 7): count unanchored orphan CodeInteraction rows.
+
+    The immortal residue the v0.2.82 anchor backfill reports as
+    "unresolvable": rows written before ``file_path`` existed, with
+    ``file_path`` NULL and NO ``source_function``/``source_module``
+    reference that resolves to a path. ``count_stale_rows`` classifies
+    pathless rows ``"purgeable"`` (correctly — no re-walk converges them),
+    so the convergence verdict read "0 stale rows" over rows that also
+    survive every prune (each prune keys on file_path / the walked file
+    set and preserves anchor-less rows while any file was skipped).
+
+    Counts EXACTLY the rows the full-walk stale prune's orphan reaping
+    deletes (``resolve_codegraph_anchor`` → ``""``), so probe and purge
+    agree by construction — the ``count_cleanup_owed_rows`` principle.
+    Per-row UNKNOWN verdicts are skipped (under-count, never a wrong
+    "converged"): the rows stay for the next probe.
+
+    Returns the count (``>= 0``), or ``None`` when undeterminable (Weaviate
+    down / prefix unresolvable / the collection cannot be enumerated) — the
+    caller must NOT treat that as zero.
+    """
+    if not project_name:
+        return None
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+    with _probe_client(client, weaviate_url, grpc_port) as client:
+        if client is None:
+            return None
+        coll, status = _open_collection(
+            client, f"{prefix}_CodeInteraction", "orphan-interaction probe",
+        )
+        if status == _COLL_ABSENT:
+            return 0
+        if status == _COLL_ERROR:
+            return None
+        try:
+            orphans = 0
+            for obj in coll.iterator(return_properties=["file_path"]):
+                props = getattr(obj, "properties", None) or {}
+                if props.get("file_path"):
+                    continue  # anchored — not an orphan
+                if resolve_codegraph_anchor(coll, str(obj.uuid)) == "":
+                    orphans += 1
+            return orphans
+        except Exception as exc:  # noqa: BLE001 — undeterminable, never zero
+            logger.warning(
+                "codegraph orphan-interaction probe: scan failed: %s", exc
+            )
+            return None
+
+
+def _ensure_backfill_schema(client, prefix: str) -> None:
+    """v0.2.103 (defect 6): ensure the backfill's target properties exist
+    BEFORE the pass probes/patches them — through the ONE property-spec home.
+
+    WHY here (and not "move the backfill after the walk"): the backfill is
+    spawned as a detached child that races the analyzer walk, and the walk's
+    analyzer is what adds missing properties — so the FIRST backfill after a
+    property shipped (``is_test`` via the spec table, ``file_path`` on
+    CodeAPI/CodeInteraction) always warned and updated nothing. Moving it
+    after the walk would not fix the OTHER caller (the WP-3 post-build
+    backfill rider runs on every non-root update with NO walk at all) and
+    would serialize a metadata-only pass behind an hours-long walk. Making
+    the backfill self-sufficient through ``vco_lib.codegraph_schema`` keeps
+    one ensure home and fixes every caller at once.
+
+    Soft-fail (the backfill's own posture): an ensure failure logs and the
+    run continues — the per-collection halves then soft-degrade exactly as
+    they did pre-fix on a genuinely un-ensurable class.
+    """
+    try:
+        _ensure_spec_props(client, prefix)
+    except _PropertyEnsureError as exc:
+        logger.warning(
+            "codegraph backfill: property ensure failed on %s: %s "
+            "(continuing; the affected halves soft-degrade)", exc.class_name, exc,
+        )
+    except Exception as exc:  # noqa: BLE001 — never wedge the backfill on ensure
+        logger.warning("codegraph backfill: property ensure unavailable: %s", exc)
+    try:
+        _ensure_file_path_props(client, prefix)
+    except Exception as exc:  # noqa: BLE001 — soft-fail per class inside; belt
+        logger.warning("codegraph backfill: file_path ensure unavailable: %s", exc)
+
+
 def backfill_codegraph_metadata(
     project_name: str,
     *,
@@ -2017,6 +2162,10 @@ def backfill_codegraph_metadata(
     at the cost of one iterator row). is_test rules (M1): only when stored
     is NULL and a path is present (fail-safe: no path → leave NULL, the
     query-time derive treats it as not-a-test).
+
+    v0.2.103 (defect 6): ensures the schema first (:func:`_ensure_backfill_schema`)
+    — an old-schema collection no longer fails the whole pass on a missing
+    ``is_test`` / ``file_path`` property.
     """
     counts: dict = {}
     if not project_name:
@@ -2043,6 +2192,9 @@ def backfill_codegraph_metadata(
     with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return counts
+        # v0.2.103 (defect 6): properties first — the probes/patches below
+        # 422 on a class that lacks them (the walk adds them too late).
+        _ensure_backfill_schema(client, prefix)
         try:
             from weaviate.classes.query import Filter
         except Exception as exc:  # noqa: BLE001
@@ -3757,6 +3909,34 @@ def _run_resync_and_verify_slotted(
         counts = None
 
     resume_cmd = " ".join(shlex.quote(p) for p in argv)
+    # v0.2.103 (defect 7): "0 stale rows" must not be declared over unanchored
+    # orphan CodeInteraction rows — count_stale_rows classifies pathless rows
+    # purgeable (no re-walk converges them), and pre-fix they also survived
+    # every prune, so convergence silently ignored them. A positive orphan
+    # count blocks the converged verdict; the remedy is the consented
+    # full-walk prune (the orphan reaping only runs under --prune-stale).
+    # None (undeterminable) is conservative: fall through to the ordinary
+    # converged branch — the next walk's post-walk probe re-checks, and the
+    # prune itself never deletes on uncertainty.
+    orphan_interactions = None
+    try:
+        orphan_interactions = count_orphan_interaction_rows(project_name)
+    except Exception as exc:  # noqa: BLE001 — probe must never crash the child
+        print(f"[resync-driver] orphan-interaction probe raised: {exc}", flush=True)
+    if counts is not None and sum(counts.values()) == 0 and orphan_interactions:
+        print(
+            f"[resync-driver] NOT converged: {orphan_interactions} unanchored "
+            "orphan CodeInteraction row(s) (no file_path, no resolvable "
+            "source reference) survive every walk — only a full-walk "
+            "--prune-stale run removes them",
+            flush=True,
+        )
+        _record_unconverged_deferral(
+            repo_root, project_name,
+            {"CodeInteraction_orphans": orphan_interactions},
+            resume_cmd + " --prune-stale",
+        )
+        return 0
     if counts is not None and sum(counts.values()) == 0:
         # The probe is authoritative for the ledger's "owed" semantic —
         # converged even when the analyzer exit code was non-zero (rc is
