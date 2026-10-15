@@ -3430,11 +3430,8 @@ class CodeGraphAnalyzer:
         # v0.2.74 (D1 orphan-clear): record the resolved repo root so the
         # per-run stale-file probe (`_build_stale_file_set`) can test whether a
         # stale row's stored path still exists on disk and delete genuine
-        # orphans (deleted-file rows) instead of pinning their path in the
-        # stale set forever (the C-1 convergence gap). Set on EVERY analyze
-        # entry (whole-tree, single-file, only-files-from) so the gate always
-        # has the relativization root. Stub/older callers that reach
-        # `_get_existing_module` without going through here leave this unset →
+        # orphans instead of pinning its path forever (the C-1 gap). Set on
+        # EVERY analyze entry; stub callers that skip this leave it unset →
         # the orphan-clear fails open (skips, never deletes on uncertainty).
         self._analyze_repo_root = repo_path.resolve()
         # v0.2.74 (B1): keep the UNRESOLVED primary root too — rows are stamped
@@ -4086,11 +4083,15 @@ class CodeGraphAnalyzer:
 
         # R14-B1: after a reaping-enabled full walk, re-count through the SAME
         # probe and clear the pending-orphan deferral on a positive zero.
+        # R16-B-N1: the RAW root form — rows are STAMPED with it; the resolved
+        # root's primary set misses raw-stamped rows on a symlinked repo.
         if _reap_orphans and self.interactions_collection is not None:
+            _raw_root = getattr(self, "_analyze_repo_root_raw", "") or ""
             try:
                 _clear_orphan_deferral_if_zero(
                     self.project_name or "",
-                    repo_root=getattr(self, "_analyze_repo_root", None),
+                    repo_root=(Path(_raw_root) if _raw_root
+                               else getattr(self, "_analyze_repo_root", None)),
                     client=getattr(self, "client", None),
                 )
             except Exception as exc:  # noqa: BLE001 — never wedge the prune
