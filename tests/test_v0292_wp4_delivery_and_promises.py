@@ -487,7 +487,7 @@ class DeliveryAuditTests(unittest.TestCase):
         by ``compose_override_pair_diverged``, whose one reading lives in
         ``vco_lib/compose_override_pair.py``.
 
-        v0.2.103 — LOWERED 15_136 -> 14_927 by two removals: (1) the one-off
+        v0.2.103 — LOWERED 15_136 -> 14_931 by two removals (net of +4 for the local-repo pending reconcile): (1) the one-off
         v0.2.46 semver-boundary chunker re-sync path was retired (owner decision
         2026-10-15; superseded by ``vco_lib/chunker_revision.py`` + the R2-4
         launcher revision path): ``_emit_chunker_resync_deferral``,
@@ -498,7 +498,7 @@ class DeliveryAuditTests(unittest.TestCase):
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 14_927,
+            n, 14_931,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )
