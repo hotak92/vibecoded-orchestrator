@@ -68,12 +68,23 @@ the reviewer.
      ``[guard] new_node_required_keys`` key (title, type, tags, created,
      updated, status), or whose title duplicates an existing node's
      (case/whitespace-normalised) — the log points at the node to extend;
+   * a NEW node on the SAME SUBJECT as an existing node under another title
+     or folder: title (or filename slug) content tokens overlapping an
+     existing node's with a Jaccard similarity >= ``[guard]
+     duplicate_title_jaccard`` (:func:`same_subject_node`) — the log names
+     the node to extend (field 2026-10-16: a second node on one subject);
    * a node that GAINS a backticked ``--flag`` appearing verbatim nowhere
      the reviewer read (its ``Read`` / ``Grep`` results and the commit diff
      it was given) — the field showed invented CLI flags. Invented numbers,
      defaults and sample output are forbidden by the prompt only: unlike a
      flag token they have no reliable lexical shape to check without
-     reverting most legitimate prose.
+     reverting most legitimate prose;
+   * a node that GAINS a line raising an evidence level — a ``[guard]
+     evidence_markers`` word (CONFIRMED, VERIFIED, ...) the reviewer read
+     nowhere, or a run/test id / commit hash it read nowhere cited on such a
+     line (:func:`unsourced_evidence`; the field showed "CONFIRMED ... via
+     test run <stamp>" over sources that said "inferred, untested"). Lines
+     that already carried the marker are not judged.
 
    A deleted node is never the reviewer's doing (none of its tools deletes
    — the shell is denied — and every write leaves bytes), so a vanished
@@ -139,6 +150,10 @@ __all__ = [
     "expected_bytes",
     "transcript_sources",
     "unsourced_flags",
+    "unsourced_evidence",
+    "evidence_ids",
+    "subject_tokens",
+    "same_subject_node",
     "new_node_violation",
     "removed_lines",
     "validate",
@@ -273,6 +288,9 @@ class Snapshot:
     dirty_copied: Set[str] = field(default_factory=set)
     #: normalised frontmatter ``title`` -> rel path, for every existing node.
     titles: Dict[str, str] = field(default_factory=dict)
+    #: rel path -> normalised frontmatter title ('' when none), for every
+    #: existing ``*.md`` node (the same-subject duplicate rule).
+    nodes: Dict[str, str] = field(default_factory=dict)
 
     def copy_of(self, rel: str) -> Path:
         return self.copy_dir / "files" / rel
@@ -420,6 +438,7 @@ def take_snapshot(root: Path) -> Snapshot:
             snap.knowledge[rel] = _sha(data)
             if rel.endswith(".md"):
                 title = _node_title(data.decode("utf-8", errors="replace"))
+                snap.nodes[rel] = title
                 if title:
                     snap.titles.setdefault(title, rel)
     budget = _DIRTY_COPY_BUDGET
@@ -761,10 +780,61 @@ def _node_title(text: str) -> str:
     return _norm_title(fm.get("title")) if fm else ""
 
 
-def new_node_violation(text: str, titles: Dict[str, str]) -> Optional[str]:
+_TITLE_TOKEN = re.compile(r"[0-9a-z]+")
+
+
+def subject_tokens(text: str) -> Set[str]:
+    """The content tokens of a title or filename slug, for the same-subject
+    duplicate rule: lower-cased runs of letters/digits, a plural ``s``
+    folded (length > 3, not ``ss``), single-character, all-digit (dates,
+    counters) and ``[guard] title_stopwords`` tokens dropped."""
+    stop = {w.casefold() for w in _guard()["title_stopwords"]}
+    out: Set[str] = set()
+    for tok in _TITLE_TOKEN.findall(text.casefold()):
+        if len(tok) < 2 or tok.isdigit() or tok in stop:
+            continue
+        if len(tok) > 3 and tok.endswith("s") and not tok.endswith("ss"):
+            tok = tok[:-1]
+        out.add(tok)
+    return out
+
+
+def _jaccard(a: Set[str], b: Set[str]) -> float:
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def _slug(rel: str) -> str:
+    return PurePosixPath(rel).stem
+
+
+def same_subject_node(title: str, rel: Optional[str],
+                      nodes: Dict[str, str]) -> "Optional[Tuple[str, float]]":
+    """The existing node (rel path, similarity) a new node with ``title`` at
+    ``rel`` duplicates by subject, or ``None``: the highest Jaccard
+    similarity of title-vs-title or slug-vs-slug :func:`subject_tokens`, when
+    it reaches ``[guard] duplicate_title_jaccard``."""
+    threshold = float(_guard()["duplicate_title_jaccard"])
+    new_title = subject_tokens(title)
+    new_slug = subject_tokens(_slug(rel)) if rel else set()
+    best: Optional[Tuple[str, float]] = None
+    for other, other_title in sorted(nodes.items()):
+        if other == rel:
+            continue
+        score = max(_jaccard(new_title, subject_tokens(other_title)),
+                    _jaccard(new_slug, subject_tokens(_slug(other))))
+        if score >= threshold and (best is None or score > best[1]):
+            best = (other, score)
+    return best
+
+
+def new_node_violation(text: str, titles: Dict[str, str], *,
+                       rel: Optional[str] = None,
+                       nodes: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Why a NEW node breaks a rule (``None`` = allowed): it must carry
-    every ``[guard] new_node_required_keys`` frontmatter key, non-empty, and
-    its title must not duplicate an existing node's."""
+    every ``[guard] new_node_required_keys`` frontmatter key, non-empty, its
+    title must not duplicate an existing node's, and (given ``nodes``, rel ->
+    normalised title of every existing node) it must not be about the same
+    subject as an existing node (:func:`same_subject_node`)."""
     raw, _body = _split_frontmatter(text)
     if raw is None:
         return "a new node without YAML frontmatter"
@@ -779,6 +849,13 @@ def new_node_violation(text: str, titles: Dict[str, str]) -> Optional[str]:
     if existing:
         return (f"a new node duplicating the title of {existing} - extend "
                 f"the existing node instead")
+    if nodes:
+        hit = same_subject_node(str(fm.get("title") or ""), rel, nodes)
+        if hit:
+            return (f"a new node on the same subject as {hit[0]} (title/slug "
+                    f"similarity {hit[1]:.2f} >= "
+                    f"{float(_guard()['duplicate_title_jaccard']):.2f}) - "
+                    f"extend {hit[0]} instead")
     return None
 
 
@@ -821,6 +898,88 @@ def unsourced_flags(pre: Optional[str], post: str, sources: str) -> List[str]:
     added = _backticked_flags(post) - (_backticked_flags(pre) if pre else set())
     return sorted(f for f in added
                   if not re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", sources))
+
+
+#: Lexical shapes of a cited run/test id or commit hash on an evidence line
+#: (documented in ``[guard] evidence_markers``'s comment): an 8+ digit stamp
+#: with an optional ``-``/``_``/``T`` time part; the digit-bearing token after
+#: run/test/build/job/pipeline; a 7-40 char hex token mixing digits and a-f.
+_RUN_WORD_ID = re.compile(
+    r"(?<![0-9A-Za-z])(?:run|test|build|job|pipeline)(?![0-9A-Za-z])"
+    r"\s*(?:id(?![0-9A-Za-z])\s*)?[#:]?\s*([A-Za-z0-9][\w.-]*)", re.IGNORECASE)
+_STAMP_ID = re.compile(r"(?<![0-9A-Za-z])\d{8,}(?:[-_T]\d{4,}Z?)?(?![0-9A-Za-z])")
+_HEX_ID = re.compile(r"(?<![0-9A-Za-z])(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])"
+                     r"[0-9a-fA-F]{7,40}(?![0-9A-Za-z])")
+
+
+def _word(term: str) -> "re.Pattern[str]":
+    """``term`` as a whole word (letters/digits around it break the match),
+    case-insensitive."""
+    return re.compile(rf"(?<![0-9A-Za-z]){re.escape(term)}(?![0-9A-Za-z])",
+                      re.IGNORECASE)
+
+
+def evidence_ids(text: str) -> List[str]:
+    """The run/test ids and commit hashes ``text`` cites, in order."""
+    hits: List[Tuple[int, str]] = []
+    for m in _RUN_WORD_ID.finditer(text):
+        tok = m.group(1).rstrip(".-_")
+        if any(c.isdigit() for c in tok):
+            hits.append((m.start(1), tok))
+    hits += [(m.start(), m.group(0)) for m in _STAMP_ID.finditer(text)]
+    hits += [(m.start(), m.group(0)) for m in _HEX_ID.finditer(text)]
+    found = [tok for _pos, tok in sorted(hits)]
+    out: List[str] = []
+    for tok in found:  # de-duplicated, a token inside a longer one dropped
+        if not any(tok != o and tok in o for o in found) and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _id_sourced(ident: str, sources: str) -> bool:
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", ident):
+        # A shortened sha matches the full one: left boundary only.
+        return re.search(rf"(?<![0-9A-Za-z]){re.escape(ident)}", sources,
+                         re.IGNORECASE) is not None
+    return _word(ident).search(sources) is not None
+
+
+def unsourced_evidence(pre: Optional[str], post: str, sources: str
+                       ) -> "List[Tuple[str, List[str]]]":
+    """Evidence-level labels the write ADDED without a source.
+
+    For every line of ``post`` that is not an unchanged ``pre`` line, the
+    text it added (an original line it extends in place — its text, list
+    marker aside, as in :func:`removed_lines` — is cut out first) is checked
+    for a ``[guard] evidence_markers`` word. Such a line must find that word
+    in ``sources`` (what the reviewer read) and every run/test id or commit
+    hash it cites (:func:`evidence_ids`) verbatim there too. Returns
+    ``[(line, [missing evidence, ...]), ...]``; a pre-existing marker line
+    is never judged."""
+    markers = [(m, _word(m)) for m in _guard()["evidence_markers"]]
+    pre_lines = [ln.strip() for ln in _body_lines(pre)] if pre else []
+    pre_set = {ln for ln in pre_lines if ln}
+    needles = sorted({_LINE_MARKER.sub("", ln, count=1).strip()
+                      for ln in pre_set} - {""}, key=len, reverse=True)
+    out: List[Tuple[str, List[str]]] = []
+    for line in _body_lines(post):
+        text = line.strip()
+        if not text or text in pre_set:
+            continue
+        added = text
+        for needle in needles:
+            if needle in added:
+                added = added.replace(needle, " \x00 ")
+        hits = [m for m, rx in markers if rx.search(added)]
+        if not hits:
+            continue
+        missing = [f"marker '{m}'" for m in hits
+                   if not _word(m).search(sources)]
+        missing += [f"id '{i}'" for i in evidence_ids(added)
+                    if not _id_sourced(i, sources)]
+        if missing:
+            out.append((text, missing))
+    return out
 
 
 def _link_target_cap() -> int:
@@ -974,8 +1133,10 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
     """Revert every rule-breaking change the reviewer PROVABLY made; return
     what survives. ``writes`` is :func:`attributed_writes`; ``None``
     (unattributable run) judges, reverts and keeps NOTHING. ``sources`` is
-    what the reviewer read (:func:`transcript_sources` plus the commit diff
-    it was given): a backticked ``--flag`` a node gains must appear there."""
+    what the reviewer read (:func:`transcript_sources` plus the commit diff,
+    stat, sha and parent sha it was given): a backticked ``--flag``, an
+    evidence-level word or a cited run/commit id a node gains must appear
+    there."""
     res = ValidationResult()
     if writes is None:
         res.unattributed = True
@@ -1036,7 +1197,8 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
             post_text = _lf_text(cur)
             pre_text = _lf_text(pre) if pre is not None else None
             if pre_text is None:
-                reason = new_node_violation(post_text, snap.titles)
+                reason = new_node_violation(post_text, snap.titles, rel=rel,
+                                            nodes=snap.nodes)
             else:
                 reason = edit_violation(pre_text, post_text)
             if reason is None:
@@ -1044,6 +1206,17 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
                 if bad:
                     reason = (f"wrote CLI flags found in no file it read: "
                               f"{', '.join(bad)}")
+            if reason is None:
+                inflated = unsourced_evidence(pre_text, post_text, sources)
+                if inflated:
+                    shown = "; ".join(
+                        f"{_clip(line)!r} (missing: {', '.join(miss)})"
+                        for line, miss in inflated[:3])
+                    more = (f" (+{len(inflated) - 3} more)"
+                            if len(inflated) > 3 else "")
+                    reason = (f"raised an evidence/confidence label or cited a "
+                              f"run/commit found in no file it read: "
+                              f"{shown}{more}")
         if reason is None:
             assert rel is not None and cur is not None
             res.kept.append(rel)

@@ -7,7 +7,9 @@
 # Readers:
 #   * Python — `vco_lib/kg_reviewer_model.py` (model choice + fallback rungs)
 #     and `vco_lib/kg_reviewer_guard.py` (the post-run validator's locked-node
-#     rules, the derived sidecars, the commit subject prefix). The reviewer
+#     rules, the same-subject duplicate and evidence-level rules, the derived
+#     sidecars, the commit subject prefix). The Rust loader deserialises only
+#     `format_version` and `[model]`; other tables are ignored there. The reviewer
 #     itself is `templates/scripts/kg_reviewer_backend.py`, spawned by the
 #     `post-git-commit-kg-sync` hook pair.
 #   * Rust — `launcher/src-tauri/src/commands/kg_reviewer_model.rs`
@@ -85,6 +87,38 @@ frontmatter_mutable_keys = ["updated"]
 # `title` (case- and whitespace-normalised) equals an existing node's title
 # is reverted too — extend that node instead.
 new_node_required_keys = ["title", "type", "tags", "created", "updated", "status"]
+# SAME-SUBJECT duplicates (beyond the exact-title rule above): a NEW node is
+# reverted when its title tokens — or its filename-slug tokens — overlap an
+# existing node's title (or slug) tokens with a Jaccard similarity >=
+# `duplicate_title_jaccard`; the log names the existing node to extend.
+# Tokens: lower-cased runs of letters/digits, a plural "s" folded (length > 3,
+# not "ss"), and dropped when single-character, all-digit (dates, counters)
+# or in `title_stopwords`. 0.6 is the boundary the fixtures pin
+# (tests/test_v02103_kg_reviewer_evidence.py): "Weaviate backups" vs
+# "Weaviate backup procedure" (2/3 = 0.67) is the same subject and must be
+# caught, while "Embedding model selection" vs "Embedding model migration"
+# (2/4 = 0.5) and "Docker auto-start" vs "Docker networking" (1/4) are
+# different subjects that must be kept — 0.5 would revert the former, 0.7
+# would let the duplicate through.
+duplicate_title_jaccard = 0.6
+title_stopwords = ["a", "an", "the", "and", "or", "of", "for", "in", "on", "to",
+                   "with", "via", "by", "at", "from", "about", "into", "vs",
+                   "is", "are", "how", "what", "why", "when"]
+# EVIDENCE-LEVEL inflation: a line the reviewer ADDED (or extended in place —
+# only the text it added is judged) containing one of these words
+# (case-insensitive, whole word; "untested" does not match "tested") is
+# reverted unless the same word occurs, as a whole word, somewhere in what the
+# reviewer read (its Read/Grep results, the commit diff and stat, the commit's
+# sha and its parent's). Multi-word forms ("confirmed in", "verified in",
+# "tested in") are covered by their first word. Such a line that also cites a
+# run/test id or a commit hash must find that id verbatim in the same corpus.
+# Id shapes (the guard's `_EVIDENCE_ID_PATTERNS`): a stamp of 8+ digits,
+# optionally followed by -/_/T and 4+ digits (`20261015-221000`); the token
+# after "run", "test", "build", "job" or "pipeline" (optionally "#"/"id")
+# when it contains a digit (`run 42`, `job #a7`); and a 7-40 character hex
+# token mixing digits and a-f letters (a commit sha; a shortened sha matches
+# a full one in the corpus).
+evidence_markers = ["confirmed", "verified", "tested", "proven", "validated"]
 # The largest knowledge/ symlink TARGET the snapshot copies (bytes). A larger
 # target is recorded as "too large - not restorable": a write through that
 # link is logged REVERT-IMPOSSIBLE and nothing through it is committed.
