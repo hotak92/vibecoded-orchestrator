@@ -2152,6 +2152,20 @@ pub fn run() {
                 let _ = hub_launcher::ensure_hub_running();
             });
 
+            // v0.2.103 (owner ruling 2026-10-15): auto-start the container
+            // ENGINE this install uses (Docker Desktop / the podman machine
+            // or socket) when it is down — the same ONE Python home the
+            // session hooks and the hub spawn
+            // (`python -m vco_lib.container_engine_start ensure`, detached,
+            // idempotent, soft-fail; `VCT_CONTAINER_ENGINE_AUTOSTART=0`
+            // opts out). Opening the launcher is one of the moments the
+            // engine may simply not be running yet; this never blocks the
+            // GUI — the spawn is fire-and-forget.
+            tauri::async_runtime::spawn_blocking(|| {
+                let _ =
+                    vct_launcher_core::services::engine_autostart::spawn_engine_start_cli();
+            });
+
             // v0.2.33 (Agent C, architecture review §10.b): startup
             // reconciler. Walks every `module_installs` row with
             // status='installed' and verifies that the extracted
@@ -3634,6 +3648,10 @@ pub fn run() {
             // have to branch internally on which service it means.
             commands::session_autostart::get_launcher_session_autostart,
             commands::session_autostart::set_launcher_session_autostart,
+            // v0.2.103 (review R19 F4): the GUI switch for the container-engine
+            // auto-start (read by the Python home + the core Rust pre-check).
+            commands::engine_autostart_pref::get_container_engine_autostart,
+            commands::engine_autostart_pref::set_container_engine_autostart,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,

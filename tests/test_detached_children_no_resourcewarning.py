@@ -150,8 +150,11 @@ class TestSpawnSitesRouteThroughKeepAlive(unittest.TestCase):
     def test_install_py_spawn_sites(self):
         src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
         self.assertIn("_DETACHED_CHILDREN: list = []", src)
-        # 2 detached children: Docker Desktop launch + stage-1 updater.
-        self.assertGreaterEqual(src.count("_DETACHED_CHILDREN.append("), 2)
+        # 1 detached child left in install.py: the stage-1 updater. (The
+        # Docker Desktop launch moved to vco_lib/container_engine_start.py
+        # in v0.2.103, which keeps its own keep-alive list — see the
+        # sibling test below.)
+        self.assertGreaterEqual(src.count("_DETACHED_CHILDREN.append("), 1)
         # Ratchet: any NEW bare `subprocess.Popen(` line in install.py must
         # either be waited on or parked. Today exactly one Popen call is
         # NOT wrapped by an append (the waited dot-cycle runner:
@@ -165,9 +168,19 @@ class TestSpawnSitesRouteThroughKeepAlive(unittest.TestCase):
             ln for ln in popen_lines if "proc = subprocess.Popen(" in ln
         ]
         self.assertEqual(
-            len(popen_lines) - len(unparked), 2,
+            len(popen_lines) - len(unparked), 1,
             f"unexpected install.py Popen call sites: {popen_lines}",
         )
+
+    def test_container_engine_start_spawn_sites(self):
+        """v0.2.103: the moved Docker Desktop launch keeps the same
+        keep-alive discipline at its new ONE home."""
+        src = (REPO_ROOT / "vco_lib" / "container_engine_start.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("_DETACHED_CHILDREN: list = []", src)
+        # 1 detached child: the Docker Desktop launch.
+        self.assertGreaterEqual(src.count("_DETACHED_CHILDREN.append("), 1)
 
 
 if __name__ == "__main__":

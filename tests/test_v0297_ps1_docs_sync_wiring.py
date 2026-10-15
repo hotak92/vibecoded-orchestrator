@@ -104,8 +104,13 @@ def _run_hook(exe: str, project: Path, edited: Path) -> subprocess.CompletedProc
 def _await_marker(marker: Path) -> str | None:
     deadline = time.monotonic() + MARKER_TIMEOUT_S
     while time.monotonic() < deadline:
+        # Set-Content creates the file before it writes the line, so an
+        # existing-but-empty marker is a write still in flight: keep waiting
+        # until the terminating newline lands (a loaded machine hit this).
         if marker.exists():
-            return marker.read_text(encoding="utf-8", errors="replace")
+            body = marker.read_text(encoding="utf-8", errors="replace")
+            if body.endswith("\n"):
+                return body
         time.sleep(0.25)
     return None
 

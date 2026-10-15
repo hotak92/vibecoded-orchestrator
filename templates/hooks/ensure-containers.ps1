@@ -191,6 +191,27 @@ if ($VcoRt.state -ne "resolved") {
             [void](& $RunPy -m vco_lib.runtime_reconcile record-boot-refusal --source session --reason ($VcoRt.reason) 2>$null)
         } catch { }
     }
+    # v0.2.103 (owner 2026-10-15; parity with the .sh sibling): the engine
+    # itself may just be DOWN - the resolver's "absent" is often "installed
+    # but not running" (Docker Desktop not launched after a reboot, podman
+    # machine stopped, socket down). Start it in the background through the
+    # ONE home, `python -m vco_lib.container_engine_start ensure`:
+    # idempotent (an engine that answers is a no-op), starts ONLY the
+    # runtime this install uses (a refused pin is started, never swapped),
+    # soft-fail, honours VCT_CONTAINER_ENGINE_AUTOSTART=0. Start-Process
+    # returns immediately (never blocks the hook); -WindowStyle applies on
+    # Windows only, so it is dropped on other OSes. Only when a runtime
+    # binary exists ($VcoRt.installed) - with nothing installed there is
+    # nothing to start.
+    if ($VcoRt.installed) {
+        try {
+            $startArgs = @{ FilePath = $RunPy
+                            ArgumentList = @('-m', 'vco_lib.container_engine_start', 'ensure')
+                            WindowStyle = 'Hidden' }
+            if ($IsWindows -eq $false) { $startArgs.Remove('WindowStyle') }
+            Start-Process @startArgs | Out-Null
+        } catch { }
+    }
     exit 0
 }
 $Runtime = $VcoRt.runtime

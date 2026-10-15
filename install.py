@@ -151,6 +151,7 @@ from vco_lib import deferral_dismissal as _deferral_dismissal  # noqa: E402
 from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
 from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
 from vco_lib import doctor as _doctor  # noqa: E402
+from vco_lib import container_engine_start as _container_engine_start  # noqa: E402
 from vco_lib import playwright_mcp as _playwright_mcp  # noqa: E402
 from vco_lib import install_companions as _install_companions  # noqa: E402
 from vco_lib import manifest_paths as _manifest_paths  # noqa: E402
@@ -8229,19 +8230,13 @@ def _container_runtime_reachable(container_cmd: str) -> bool:
 #: vco_lib.compose_provider in v0.2.100.
 _podman_machine_auto_init_and_start = _compose_provider.podman_machine_init_and_start
 
-
-def _heal_podman_reachability():
-    """Start / heal podman's reachability — thin over
-    :func:`vco_lib.compose_provider.heal_socket`: Linux `systemctl --user
-    restart podman.socket` when the unit is active but the socket FILE is gone,
-    `start` when it is down; macOS / Windows `_podman_machine_auto_init_and_start`.
-    Then `podman info` must answer (folded into the REAL HealResult, W1R-03)."""
-    from vco_lib.compose_recovery import CID_SOCKET_HEAL_FAILED
-    res = _compose_provider.heal_socket("podman", machine_start=_podman_machine_auto_init_and_start)
-    if res.healed and _containers.daemon_responsive("podman") is not True:
-        return _compose_provider.HealResult(False, res.actions, f"{res.reason}, but `podman info` still "
-                                            "does not answer", CID_SOCKET_HEAL_FAILED, res.details)
-    return res
+#: v0.2.103: the engine starters moved to their ONE home,
+#: :mod:`vco_lib.container_engine_start`, so the SessionStart hooks, the hub
+#: and the launcher spawn the SAME logic (`python -m vco_lib.container_engine_start
+#: ensure`) that the install pre-flight runs here. These module-level aliases
+#: (not `from … import` at the call-sites) keep ``install.<name>`` patchable —
+#: the Step5 wiring below looks the names up at call time.
+_heal_podman_reachability = _container_engine_start.heal_podman_reachability
 
 
 def _try_start_podman_daemon() -> tuple[bool, str]:
@@ -8252,78 +8247,12 @@ def _try_start_podman_daemon() -> tuple[bool, str]:
 
 def _try_start_docker_daemon() -> tuple[bool, str]:
     """v0.2.54 (container-scout C-RT-7): best-effort auto-start of the
-    Docker daemon — closes the auto-heal asymmetry where Podman got
-    socket auto-start (v0.2.51) + machine auto-init/start (v0.2.53)
-    while Docker users only got a printed hint.
-
-    OS matrix:
-      - macOS:   ``open -a Docker`` — launches Docker Desktop. No sudo,
-                 no GUI prompt beyond Docker Desktop's own startup.
-      - Windows: shell-start ``Docker Desktop.exe`` from its canonical
-                 install locations.
-      - Linux:   NOT automated. ``sudo systemctl start docker`` needs an
-                 interactive password we don't shoulder in a pre-flight
-                 (same rationale as the original hint). Returns False
-                 with the manual recipe.
-
-    After a successful launch attempt, polls ``docker info`` for up to
-    60s (Docker Desktop's VM boot is slow). Soft-fail throughout — the
-    caller falls back to the printed hint.
-    """
-    os_name = platform.system()
-    if not shutil.which("docker"):
-        return False, "docker binary not on PATH"
-
-    if os_name == "Darwin":
-        try:
-            result = subprocess.run(
-                ["open", "-a", "Docker"],
-                capture_output=True, text=True, timeout=15,
-            )
-        except (subprocess.TimeoutExpired, OSError) as e:
-            return False, f"`open -a Docker` failed: {e}"
-        if result.returncode != 0:
-            return False, (
-                f"`open -a Docker` exited {result.returncode}: "
-                f"{(result.stderr or '').strip()[:200]}"
-            )
-    elif os_name == "Windows":
-        candidates = [
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-            / "Docker" / "Docker" / "Docker Desktop.exe",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Docker" / "Docker Desktop.exe",
-        ]
-        exe = next((c for c in candidates if c.is_file()), None)
-        if exe is None:
-            return False, (
-                "Docker Desktop.exe not found at the canonical install "
-                "locations; start Docker Desktop from the Start Menu."
-            )
-        try:
-            # Detached start — Docker Desktop is a GUI app; don't block.
-            # Handle kept in _DETACHED_CHILDREN: suppresses the Popen
-            # destructor's ResourceWarning for a child that outlives us.
-            _DETACHED_CHILDREN.append(
-                subprocess.Popen(
-                    ["cmd", "/c", "start", "", str(exe)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    env=_install_companions.detached_child_env(),
-                )
-            )
-        except OSError as e:
-            return False, f"could not launch Docker Desktop: {e}"
-    else:
-        return False, (
-            "Docker daemon auto-start is not automated on Linux "
-            "(requires sudo): run `sudo systemctl start docker`."
-        )
-
-    deadline = time.monotonic() + 60.0
-    while time.monotonic() < deadline:
-        if _container_runtime_reachable("docker"):
-            return True, "daemon responsive"
-        time.sleep(2.0)
-    return False, "docker daemon did not become responsive within 60s"
+    Docker daemon. v0.2.103: the BODY lives in
+    :func:`vco_lib.container_engine_start.try_start_docker_daemon` (the ONE
+    home, shared with the session hooks / hub / launcher); install.py keeps
+    this delegating name so the Step5 hooks and the tests that patch
+    ``install._try_start_docker_daemon`` keep working."""
+    return _container_engine_start.try_start_docker_daemon()
 
 
 def _emit_podman_daemon_start_failed_deferral(

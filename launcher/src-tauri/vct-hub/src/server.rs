@@ -437,6 +437,25 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // /modules/{id}/status. `VCT_HUB_MODULE_HEALTH=0` disables it.
     super::module_health::spawn_module_health_poller(launcher_state.clone());
 
+    // v0.2.103 (owner ruling 2026-10-15): auto-start the container ENGINE
+    // this install uses (Docker Desktop / the podman machine or socket)
+    // when it is down — the same ONE Python home the session hooks and the
+    // launcher spawn (`python -m vco_lib.container_engine_start ensure`),
+    // spawned DETACHED so hub startup never blocks on an engine boot (the
+    // CLI is idempotent: an engine that answers is a no-op, and
+    // `VCT_CONTAINER_ENGINE_AUTOSTART=0` opts out). The hub starts on
+    // session start, launcher start and boot — each of those is a moment
+    // the engine may simply not be running yet.
+    //
+    // spawn_blocking (R21 L1), matching the launcher's own call site
+    // (`src/lib.rs`): the CLI spawn's launcher.db pre-check is a
+    // synchronous `Db::open()` (migrations, a 5 s busy_timeout) that must
+    // never block a tokio async worker under startup DB contention — the
+    // blocking pool is exactly for such work.
+    tokio::task::spawn_blocking(|| {
+        vct_launcher_core::services::engine_autostart::spawn_engine_start_cli();
+    });
+
     // E-2: log the ACTUAL bind host, not a hardcoded "127.0.0.1" (the prior
     // string drifted from the real 0.0.0.0 bind). Loopback is always reachable
     // as 127.0.0.1 regardless of the bind IP, so print that for the all-

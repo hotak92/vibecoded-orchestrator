@@ -260,6 +260,11 @@ pub mod upstream_fetch;
 // its reader is `vco_lib/launcher_ensure.py`, running when this process is by
 // definition not.
 pub mod session_autostart;
+// v0.2.103 (review R19 F4): Preferences → Startup "Start the container
+// engine automatically" — the launcher.db switch for the engine auto-start
+// whose logic lives in `vco_lib/container_engine_start.py` and whose
+// readers are the hub, the launcher setup and the session hooks.
+pub mod engine_autostart_pref;
 // v0.2.91 decision #26: named process-wide single-flight guard. Refuses (does
 // NOT queue) a second concurrent run of a long-running destructive command —
 // `update_all_projects` and the orchestrator update (`run_orchestrator_update`
