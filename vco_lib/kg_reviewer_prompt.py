@@ -28,13 +28,20 @@ hybrid_search, and nothing recorded which revision a node reflected):
 * :func:`citing_nodes` — a DETERMINISTIC lookup handed to the prompt as
   "Nodes that cite files this commit changed": a plain-text match of the
   commit's changed project-relative paths inside ``knowledge/**/*.md``
-  (Windows-style ``\\`` separators matched too, on path boundaries only so
-  ``install.py`` does not match ``first-install.py``), grouped per changed
-  path, capped per path and overall (``[prompt] citing_nodes_max``) with
-  UNLOCKED nodes listed before locked/archived ones (the guard's own
-  ``lock_reason`` decides), the prompt reporting the truncation per path;
-  symlinks, non-regular files and files over ``citing_nodes_max_bytes``
-  are skipped, and a shallow clone reports "changed paths unknown";
+  (Windows-style ``\\`` separators, leading ``./``/``../`` link prefixes,
+  the absolute ``project_root/…`` spelling and — in a project nested in a
+  parent repo — the REPO-relative spelling all matched too, on path
+  boundaries only so ``install.py`` does not match ``first-install.py``),
+  grouped per changed path, capped per path and overall
+  (``[prompt] citing_nodes_max``) with UNLOCKED nodes listed before
+  locked/archived ones (the guard's own ``lock_reason`` decides), the
+  prompt reporting the truncation per path; changed paths left with no
+  slot after the overall cap fold into ONE capped summary line, never one
+  line each; frontmatter parsing and lock state are computed only for
+  MATCHED nodes (a plain substring pre-check runs before the boundary
+  regex), symlinks, non-regular files and files over
+  ``citing_nodes_max_bytes`` are skipped, and a shallow clone reports
+  "changed paths unknown";
 * prompt rules — a node created or extended from a document records its
   source path and commit ("``Source: <path> @ <short-sha>``"), and a
   summary of a document visibly in progress is marked a snapshot of that
@@ -134,7 +141,17 @@ def collect_commit(root: Path, rev: str = "HEAD") -> CommitInfo:
                       diff=diff, diff_truncated=truncated, diff_lines=kept)
 
 
-def changed_paths(root: Path, sha: str) -> "List[str]":
+def _show_prefix(root: Path) -> str:
+    """The project's path prefix inside its parent repo (``""`` at a repo
+    root) — ONE home for every caller that needs it."""
+    try:
+        return _git(root, "rev-parse", "--show-prefix").strip()
+    except (RuntimeError, OSError):
+        return ""
+
+
+def changed_paths(root: Path, sha: str,
+                  has_parent: Optional[bool] = None) -> "List[str]":
     """The paths ``sha`` changed, PROJECT-relative.
 
     First-parent diff, like the diff the prompt embeds; a root commit
@@ -142,10 +159,14 @@ def changed_paths(root: Path, sha: str) -> "List[str]":
     project nested in a parent repo (v0.2.103 final review M-1) gets the
     prefix stripped — nodes cite project-relative paths — and a changed path
     elsewhere in the parent repo is dropped (not the project's, the same
-    rule the guard's ``project_rel`` applies to git path output)."""
-    has_parent = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{sha}~1"], cwd=root,
-        capture_output=True).returncode == 0
+    rule the guard's ``project_rel`` applies to git path output).
+    ``has_parent`` (does ``sha~1`` resolve?) may be passed by a caller that
+    already probed it — :func:`citing_nodes` does, so the probe runs once
+    per commit, not twice."""
+    if has_parent is None:
+        has_parent = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{sha}~1"],
+            cwd=root, capture_output=True).returncode == 0
     if has_parent:
         args = ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
                 f"{sha}~1", sha]
@@ -153,10 +174,7 @@ def changed_paths(root: Path, sha: str) -> "List[str]":
         args = ["diff-tree", "--root", "--no-commit-id", "--name-only",
                 "-r", "-z", sha]
     out = _git(root, *args)
-    try:
-        prefix = _git(root, "rev-parse", "--show-prefix").strip()
-    except (RuntimeError, OSError):
-        prefix = ""
+    prefix = _show_prefix(root)
     paths: List[str] = []
     for top_rel in out.split("\0"):
         if not top_rel:
@@ -200,18 +218,39 @@ def _is_shallow(root: Path) -> bool:
         return False
 
 
-def _citer_pattern(rel: str) -> "re.Pattern[str]":
-    """The matcher for one changed path: the path (and its ``\\``-separated
-    twin, node text written on Windows) on PATH BOUNDARIES only - a
-    non-path character (or the string's edge) before, and after it neither
-    a path character nor a dot starting more path text, so ``install.py``
-    does not match ``first-install.py``, ``docs/report.md`` does not match
-    ``mydocs/report.md.bak``, and a sentence-ending period still matches."""
+def _citer_needles(rel: str, project_root: Path, prefix: str) -> "List[str]":
+    """Every spelling of one changed path a node may cite, in addition to
+    the optional ``./``/``../`` prefix the PATTERN matches: the
+    project-relative path and its ``\\``-separated twin (node text written
+    on Windows), the REPO-relative form in a project nested in a parent
+    repo (a ``Source:`` line the reviewer writes carries the diff's
+    repo-relative spelling), and the absolute path anchored at the project
+    root — as given and resolved, so a symlinked root's spelling matches
+    too (v0.2.103 review N2)."""
     needles = [rel]
     if "/" in rel:
         needles.append(rel.replace("/", "\\"))
+    if prefix:
+        needles.append(prefix + rel)
+    for root in dict.fromkeys((project_root, project_root.resolve())):
+        form = str(Path(root) / rel)
+        if form not in needles:
+            needles.append(form)
+    return needles
+
+
+def _citer_pattern(needles: "List[str]") -> "re.Pattern[str]":
+    """The matcher for one changed path: any of its spellings
+    (:func:`_citer_needles`) on PATH BOUNDARIES only, each optionally
+    preceded by ``./``/``../`` segments (a relative Markdown link) - a
+    non-path character (or the string's edge) before the whole match, and
+    after the path neither a path character nor a dot starting more path
+    text, so ``install.py`` does not match ``first-install.py``,
+    ``docs/report.md`` does not match ``mydocs/report.md.bak``, and a
+    sentence-ending period still matches."""
     alts = "|".join(re.escape(n) for n in needles)
-    return re.compile(rf"(?<![\w./\\-])(?:{alts})(?![\w/\\-])(?!\.[\w/\\-])")
+    return re.compile(rf"(?<![\w./\\-])(?:\.{{1,2}}[\\/])*(?:{alts})"
+                      rf"(?![\w/\\-])(?!\.[\w/\\-])")
 
 
 def citing_nodes(project_root: Path, sha: str) -> CitingScan:
@@ -219,11 +258,18 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
     changed, GROUPED per changed path (:class:`CitingScan`).
 
     A plain-text match on path boundaries - the changed project-relative
-    path, and the same path with ``\\`` separators (node text written on
-    Windows cites it that way) - so it is deterministic and cheap: no
-    embedding, no KG query, no similarity ordering. That determinism is
-    the point (source tracking, v0.2.103): hybrid_search alone missed the
-    node summarising a report whose later revisions superseded it.
+    path, and its other spellings (``\\`` separators, a leading ``./`` or
+    ``../`` link prefix, the absolute ``project_root/…`` form and, in a
+    nested project, the REPO-relative form - :func:`_citer_needles`) - so
+    it is deterministic and cheap: no embedding, no KG query, no
+    similarity ordering. That determinism is the point (source tracking,
+    v0.2.103): hybrid_search alone missed the node summarising a report
+    whose later revisions superseded it.
+
+    Cheap on big trees too (v0.2.103 review N1): a plain substring
+    pre-check runs before the boundary regex, and frontmatter parsing +
+    lock state are computed only for nodes that MATCHED at least one path -
+    the output is identical to the eager scan either way.
 
     A hot path cannot starve the others (v0.2.103 review H1): the cap
     (``[prompt] citing_nodes_max``) applies PER PATH and to the total, the
@@ -243,14 +289,17 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
         cwd=project_root, capture_output=True).returncode == 0
     if not has_parent and _is_shallow(project_root):
         return CitingScan(entries=(), unknown=True)
-    patterns = [(rel, _citer_pattern(rel))
-                for rel in changed_paths(project_root, sha)]
+    prefix = _show_prefix(project_root)
+    patterns = []
+    for rel in changed_paths(project_root, sha, has_parent=has_parent):
+        needles = _citer_needles(rel, project_root, prefix)
+        patterns.append((rel, needles, _citer_pattern(needles)))
     if not patterns:
         return CitingScan(entries=(), unknown=False)
     kdir = project_root / "knowledge"
     if not kdir.is_dir():
         return CitingScan(entries=(), unknown=False)
-    found: Dict[str, List[str]] = {rel: [] for rel, _ in patterns}
+    found: Dict[str, List[str]] = {rel: [] for rel, _p, _n in patterns}
     locked: Dict[str, bool] = {}
     for path in sorted(kdir.rglob("*.md")):
         try:
@@ -267,13 +316,22 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
         except OSError:
             continue
         rel_node = path.relative_to(project_root).as_posix()
-        fm_block, body = _split_frontmatter(text)
-        fm = _parse_fm(fm_block) if fm_block is not None else None
-        locked[rel_node] = lock_reason(fm, body) is not None
-        for rel, pattern in patterns:
-            if pattern.search(text):
-                found[rel].append(rel_node)
-    order = [rel for rel, _ in patterns if found[rel]]
+        node_locked: Optional[bool] = None  # only MATCHED nodes pay for it
+        for rel, needles, pattern in patterns:
+            # cheap substring pre-check first; the regex then only runs on
+            # candidate nodes (N1) - it cannot match what none of its
+            # needles is a substring of
+            if not any(n in text for n in needles):
+                continue
+            if not pattern.search(text):
+                continue
+            if node_locked is None:
+                fm_block, body = _split_frontmatter(text)
+                fm = _parse_fm(fm_block) if fm_block is not None else None
+                node_locked = lock_reason(fm, body) is not None
+                locked[rel_node] = node_locked
+            found[rel].append(rel_node)
+    order = [rel for rel, _p, _n in patterns if found[rel]]
     if not order:
         return CitingScan(entries=(), unknown=False)
     ranked = {rel: sorted(found[rel], key=lambda n: (locked[n], n))
@@ -301,12 +359,19 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
         for rel in order), unknown=False)
 
 
+#: Unicode characters that render as a line/paragraph break even though
+#: they are not ASCII control characters (v0.2.103 review N4) - NEL,
+#: LINE SEPARATOR, PARAGRAPH SEPARATOR.
+_LINE_SEPS = "\x85  "
+
+
 def _inline(path: str) -> str:
     """A path rendered so it cannot inject prompt structure: control
-    characters (newlines included) replaced by spaces, backticks defused
-    (so the inline-code quoting holds)."""
-    return ("".join(" " if ord(c) < 32 or ord(c) == 127 else c
-                    for c in path).replace("`", "'").strip())
+    characters and line/paragraph separators - newlines, U+0085, U+2028,
+    U+2029 included - replaced by spaces, backticks defused (so the
+    inline-code quoting holds)."""
+    return ("".join(" " if ord(c) < 32 or ord(c) == 127 or c in _LINE_SEPS
+                    else c for c in path).replace("`", "'").strip())
 
 
 def build_prompt(commit: CommitInfo, project_root: Path,
@@ -326,10 +391,7 @@ def build_prompt(commit: CommitInfo, project_root: Path,
     else:
         diff_note = ("The diff below is complete, but it shows only the "
                      "changed hunks: Read the full files for context.")
-    try:
-        prefix = _git(project_root, "rev-parse", "--show-prefix").strip()
-    except (RuntimeError, OSError):
-        prefix = ""
+    prefix = _show_prefix(project_root)
     if prefix:
         # A project nested in a parent repo (v0.2.103 final review M-1):
         # git prints paths from the REPO root, the reviewer works from here.
@@ -348,19 +410,33 @@ def build_prompt(commit: CommitInfo, project_root: Path,
             "changed and Diff above; hybrid_search in step 2 is still the "
             "way to find nodes by TOPIC.")
     elif scan.entries:
+        # N3 (v0.2.103 review): a changed path the overall cap left with
+        # nothing to show gets no line of its own - all of them fold into
+        # ONE capped summary line, so a commit touching thousands of cited
+        # files cannot add thousands of lines to the prompt.
+        shown_entries = [e for e in scan.entries if e.nodes]
+        folded = [e for e in scan.entries if not e.nodes]
         cite_lines = "\n".join(
             "- `{path}`: {nodes}{more}".format(
                 path=_inline(entry.path),
                 nodes=", ".join(f"`{_inline(n)}`" for n in entry.nodes),
                 more=(f" ({entry.more} more citing node(s) of this path "
                       f"not shown)" if entry.more else ""))
-            for entry in scan.entries)
+            for entry in shown_entries)
+        if folded:
+            fold_cap = int(config()["prompt"]["citing_nodes_max"])
+            named = ", ".join(f"`{_inline(e.path)}`" for e in folded[:fold_cap])
+            further = (f" (+{len(folded) - fold_cap} further)"
+                       if len(folded) > fold_cap else "")
+            cite_lines += (f"\n- (+{len(folded)} more changed paths with "
+                           f"citing nodes not shown: {named}{further})")
         citing_block = (
             "A deterministic text scan (not hybrid_search) found these "
             "knowledge/ nodes citing a path this commit changed - what they "
             "say about that path may be stale after this commit (grouped by "
             "changed path, a cap per path and overall; nodes not locked or "
-            "archived listed first):\n"
+            "archived listed first; changed paths left with no slot by the "
+            "overall cap are named once on a single summary line):\n"
             f"{cite_lines}")
     else:
         citing_block = (
