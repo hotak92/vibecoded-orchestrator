@@ -7,6 +7,7 @@ import {
   copyText,
   summaryLine,
   eventLine,
+  eventKey,
   TAIL_SIZE,
   type InstallLogView,
 } from './install-log-panel';
@@ -74,6 +75,37 @@ describe('copyText (W5-B C8)', () => {
 
   it('empty string for a null log', () => {
     expect(copyText(null)).toBe('');
+  });
+});
+
+describe('eventKey (v0.2.103)', () => {
+  // Fixture verbatim from the owner's real state/logs/install.jsonl
+  // (2026-10-13 session): four events where the (ts, step, phase) triple
+  // repeats within a single second — two different actors finishing the
+  // same step, and the same actor emitting twice for one step. This is
+  // NORMAL log content, not corruption.
+  const duplicateTripleEvents: InstallLogView['events'] = [
+    { ts: '2026-10-13T23:51:07Z', actor: 'install.py', step: '8/10', phase: 'ok', detail: 'vct-hub binary swapped' },
+    { ts: '2026-10-13T23:51:07Z', actor: 'install.py', step: '8/10', phase: 'ok', detail: 'vct-hub /health responded' },
+    { ts: '2026-10-13T23:51:18Z', actor: 'post-install-launcher.sh', step: 'desktop-icon', phase: 'ok', detail: 'Linux desktop entry created' },
+    { ts: '2026-10-13T23:51:18Z', actor: 'install.py', step: 'desktop-icon', phase: 'ok', detail: 'shortcut helper completed' },
+  ];
+
+  it('the naive (ts, step, phase) key COLLIDES on real logs — the defect this pins', () => {
+    const naive = duplicateTripleEvents.map((e) => `${e.ts}${e.step}${e.phase}`);
+    expect(new Set(naive).size, 'fixture must contain duplicate triples').toBeLessThan(naive.length);
+  });
+
+  it('eventKey is unique for every event, including duplicate (ts, step, phase) triples', () => {
+    const keys = duplicateTripleEvents.map((e, i) => eventKey(e, i));
+    expect(new Set(keys).size).toBe(duplicateTripleEvents.length);
+  });
+
+  it('eventKey embeds the event identity (reads as "this event" in devtools)', () => {
+    const e = duplicateTripleEvents[0]!;
+    expect(eventKey(e, 0)).toContain(e.ts);
+    expect(eventKey(e, 0)).toContain(e.step);
+    expect(eventKey(e, 0)).toContain(e.phase);
   });
 });
 

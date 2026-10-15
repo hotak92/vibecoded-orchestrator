@@ -54,6 +54,7 @@
     copyText,
     summaryLine,
     eventLine,
+    eventKey,
     type InstallLogView,
   } from './install-log-panel';
 
@@ -121,6 +122,11 @@
   let showRegenerateModal = $state(false);
 
   let project = $state<ProjectView | null>(null);
+  // v0.2.103: a failed `get_project_v2` used to leave this tab on a
+  // silent, infinite "Loading…" (the catch only toasted). The error is
+  // now state, rendered inline with a Retry — never a timeout, so a
+  // slow-but-valid load is never cut off.
+  let loadError = $state<string | null>(null);
   let newName = $state('');
   let saving = $state(false);
   let maintenanceBusy = $state(false);
@@ -175,10 +181,12 @@
   );
 
   async function load() {
+    loadError = null;
     try {
       project = await invoke<ProjectView>('get_project_v2', { id: projectId });
       newName = project?.name ?? '';
     } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
       toast.error(e);
     }
   }
@@ -570,7 +578,19 @@
 </script>
 
 {#if !project}
-  <p class="ps-empty">Loading…</p>
+  {#if loadError}
+    <!-- v0.2.103: a load failure is never a silent infinite "Loading…".
+         The Retry re-runs the same load; no timeout, so a slow load that
+         would have succeeded is never cut off. -->
+    <div class="ps-load-error">
+      <p class="ps-empty">
+        Couldn't load this project's settings: {loadError}
+      </p>
+      <button class="ps-btn-primary" onclick={() => void load()}>Retry</button>
+    </div>
+  {:else}
+    <p class="ps-empty">Loading…</p>
+  {/if}
 {:else}
   <div class="ps-main">
     <section class="ps-section">
@@ -934,7 +954,7 @@
               Last {tailEvents(installLog).length} of {installLog.events.length} event(s):
             </p>
             <div class="ps-install-log">
-              {#each tailEvents(installLog) as e (e.ts + e.step + e.phase)}
+              {#each tailEvents(installLog) as e, i (eventKey(e, i))}
                 <div class="ps-install-log-line phase-{e.phase}" title={e.detail}>
                   <span class="ps-log-ts">{e.ts}</span>
                   <span class="ps-log-actor">{e.actor}</span>
@@ -1049,6 +1069,14 @@
 
 <style>
   .ps-empty { padding: 40px; text-align: center; color: #888; }
+  /* v0.2.103: the load-failure block — error line + Retry, centred like
+     the loading paragraph it replaces. Brand failure accent (pink) on the
+     error text, per VCO_BRAND_REFERENCE.md; no new tokens. */
+  .ps-load-error {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    padding: 40px 16px;
+  }
+  .ps-load-error .ps-empty { padding: 0; color: var(--color-pink, #ff4fa0); }
   .ps-main { max-width: 720px; margin: 0 auto; padding: 16px; }
   .ps-section { background: rgba(255,255,255,0.03); padding: 14px; border-radius: 6px; margin-bottom: 14px; }
   .ps-section h2 { font-size: 13px; margin: 0 0 8px; color: #c4b3ff; }

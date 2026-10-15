@@ -112,6 +112,16 @@
     border-bottom: 1px solid transparent;
     font-size: 13px;
     line-height: 1.4;
+    /* v0.2.103: every tone below layers its translucent wash over this
+       SOLID brand surface. The tones used to be bare rgba() washes —
+       readable only while whatever sat behind the banner painted navy.
+       Wherever that did not hold, the wash read as a near-WHITE box
+       carrying light text (owner report: the "Code graph: build failed"
+       banner's title/detail unreadable, the detail line invisible). A
+       solid token base makes the banner self-contained: same colours on
+       the app navy, guaranteed dark everywhere else. */
+    background: var(--color-bg2, #080f28);
+    color: var(--color-text, #f1f5f9);
   }
   .bg-row {
     display: flex;
@@ -145,7 +155,10 @@
   .bg-label { font-weight: 600; }
   .bg-label.strong { font-weight: 700; }
   .bg-phase { font-size: 12.5px; margin-top: 1px; }
-  .bg-detail { font-size: 12px; color: rgba(255,255,255,0.55); margin-top: 2px; }
+  /* v0.2.103: solid brand secondary text — the old 55%-transparent white
+     relied on a dark backdrop and vanished on any lighter one (the
+     owner-reported invisible failure detail line). */
+  .bg-detail { font-size: 12px; color: var(--color-mid, #94a3b8); margin-top: 2px; }
   .bg-actions {
     display: flex;
     gap: 8px;
@@ -214,27 +227,36 @@
     color: rgba(255,255,255,0.85);
   }
 
-  /* ── Tones. One palette for every banner in the launcher. ── */
+  /* ── Tones. One palette for every banner in the launcher. ──
+     v0.2.103: each tone is its wash LAYERED over the solid token base
+     set on `.bg-banner` (see there for why) — identical colours on the
+     app navy, self-contained anywhere else. */
   .tone-pending {
-    background: rgba(255,255,255,0.04);
+    background:
+      linear-gradient(rgba(255,255,255,0.04), rgba(255,255,255,0.04)),
+      var(--color-bg2, #080f28);
     border-bottom-color: rgba(255,255,255,0.10);
-    color: var(--color-mid, #999);
+    color: var(--color-mid, #94a3b8);
   }
   .tone-pending .bg-glyph {
     background: rgba(255,255,255,0.06);
-    color: #999;
+    color: var(--color-mid, #94a3b8);
   }
   .tone-running {
-    background: rgba(0,191,166,0.08);
+    background:
+      linear-gradient(rgba(0,191,166,0.08), rgba(0,191,166,0.08)),
+      var(--color-bg2, #080f28);
     border-bottom-color: rgba(0,191,166,0.30);
-    color: rgb(0,191,166);
+    color: var(--color-teal, #00bfa6);
   }
   .tone-running .bg-glyph {
     background: rgba(0,191,166,0.15);
-    color: rgb(0,191,166);
+    color: var(--color-teal, #00bfa6);
   }
   .tone-success {
-    background: rgba(70, 200, 120, 0.08);
+    background:
+      linear-gradient(rgba(70, 200, 120, 0.08), rgba(70, 200, 120, 0.08)),
+      var(--color-bg2, #080f28);
     border-bottom-color: rgba(70, 200, 120, 0.30);
     color: rgb(120, 220, 160);
   }
@@ -244,7 +266,9 @@
   }
   /* Amber: informational — skipped work, a deferral, a partial prune. */
   .tone-warning {
-    background: rgba(245, 179, 66, 0.08);
+    background:
+      linear-gradient(rgba(245, 179, 66, 0.08), rgba(245, 179, 66, 0.08)),
+      var(--color-bg2, #080f28);
     border-bottom-color: rgba(245, 179, 66, 0.30);
     color: rgb(245, 179, 66);
   }
@@ -253,7 +277,9 @@
     color: rgb(245, 179, 66);
   }
   .tone-failed {
-    background: rgba(255, 79, 160, 0.10);
+    background:
+      linear-gradient(rgba(255, 79, 160, 0.10), rgba(255, 79, 160, 0.10)),
+      var(--color-bg2, #080f28);
     border-bottom-color: rgba(255, 79, 160, 0.35);
     color: rgb(255, 130, 180);
   }
