@@ -69,7 +69,7 @@ knowledge/
 Supporting files at `knowledge/` root:
 - `TAG_HIERARCHY.md` — a reference tag list with hierarchy for authors choosing tags. Nothing reads or enforces it: a node's tags are exactly its frontmatter `tags:` list, and no tag is inferred from links
 - `VOCABULARY.md` — project-specific terminology definitions
-- `.node_formats.json` — auto-generated sidecar with per-node titles, descriptions, summaries (see [[KG-Summary Three-Tier Generation Pipeline]])
+- `.node_formats.json` — auto-generated sidecar with per-node titles, descriptions, summaries (see [[KG-Summary Generation Pipeline — Backend Ladder]])
 
 ## Sync Pipeline
 

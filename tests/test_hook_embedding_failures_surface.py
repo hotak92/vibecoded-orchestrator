@@ -276,3 +276,29 @@ def test_hook_registered_in_windows_template():
         "Hook must be registered in templates/settings.json.windows.template "
         "(SessionStart) for cross-OS parity."
     )
+
+
+def test_hook_reads_the_nested_projects_own_hint_without_claude_project_dir(tmp_path):
+    """A VCO project nested inside a parent git repo, with CLAUDE_PROJECT_DIR
+    unset: the hook must resolve the PROJECT (its .claude/ marker), not the
+    parent repo's toplevel — otherwise the notice is looked up under the
+    parent's .claude/ and the project never surfaces its embedding failures
+    (v0.2.103 review R17-1, the M-1 class)."""
+    mono = tmp_path / "mono"
+    proj = mono / "apps" / "foo"
+    (proj / ".claude" / "context").mkdir(parents=True)
+    (proj / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+    hint_file = proj / ".claude" / "context" / "EMBEDDING_FAILURES.md"
+    hint_file.write_text("# Embedding backend failure\n\n- **ollama**: nested-marker\n",
+                         encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(mono)], check=True, capture_output=True)
+
+    env = os.environ.copy()
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    env.pop("VCT_DISABLE_HOOKS", None)
+    env["VCT_VENV"] = str(_venv_stub(proj))
+    result = subprocess.run(["bash", str(HOOK_SH)], env=env, cwd=str(proj),
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert "nested-marker" in result.stdout, (
+        f"the nested project's own hint was not surfaced:\n{result.stdout}")

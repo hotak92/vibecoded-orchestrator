@@ -80,9 +80,13 @@ if [ -f "$SCRIPT_DIR/_lib/metrics-dir.sh" ]; then
     vco_metrics_migrate_once "$SCRIPT_DIR" 2>/dev/null || true
 fi
 
-# Discover install root — same anchor convention as ensure-containers.sh.
-# $CLAUDE_PROJECT_DIR is set by Claude Code; git toplevel is the fallback.
-INSTALL_ROOT="${CLAUDE_PROJECT_DIR:-}"
+# Discover the project root through the ONE hook rule (_lib/project-root.sh:
+# $CLAUDE_PROJECT_DIR, else the nearest folder carrying a .claude/ marker), so
+# a VCO project nested inside a parent git repo reads ITS OWN .claude/ — the
+# git toplevel (the parent repo) is only the last-resort fallback.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/project-root.sh"
+INSTALL_ROOT="$(vco_project_root "$PWD" || true)"
 if [ -z "$INSTALL_ROOT" ]; then
     INSTALL_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
 fi

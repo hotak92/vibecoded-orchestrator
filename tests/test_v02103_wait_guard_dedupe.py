@@ -447,6 +447,8 @@ def _spawn_batch(state_dir: Path, payload: dict, n: int):
         assert p.stdout is not None and p.stderr is not None
         stdout = p.stdout.read()
         stderr = p.stderr.read()
+        p.stdout.close()  # read to EOF: close, never leave it to the GC
+        p.stderr.close()
         p.wait(timeout=120)
         out.append((p.returncode, stdout, stderr))
     return out

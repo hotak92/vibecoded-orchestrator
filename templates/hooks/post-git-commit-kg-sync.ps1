@@ -42,7 +42,21 @@ if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 # can still reach the consent-gated OpenAI rung; an early silent exit here
 # made that rung dead and left no log line or ledger row.
 
-$ProjectRoot = (& git rev-parse --show-toplevel 2>$null | Out-String).Trim()
+# The project root is the VCO PROJECT folder (the one that owns .claude/),
+# resolved by the ONE hook rule (_lib/project-root.ps1, mirror of
+# vco_lib.project_root) - must match the .sh sibling. It is NOT `git
+# rev-parse --show-toplevel`: a project may live inside a parent repo, where
+# the toplevel is the PARENT and has no .claude/ (v0.2.103 final review
+# M-1). Git commands below run inside the project folder, so git itself
+# still finds the enclosing repo. Only a folder with no VCO marker at all
+# (never an installed project: the hook is registered in its
+# .claude/settings.json) falls back to the repo toplevel, then the current
+# location - the pre-v0.2.103 behaviour.
+. "$PSScriptRoot/_lib/project-root.ps1"
+$ProjectRoot = Get-VcoProjectRoot -Start (Get-Location).Path
+if (-not $ProjectRoot) {
+    $ProjectRoot = (& git rev-parse --show-toplevel 2>$null | Out-String).Trim()
+}
 if (-not $ProjectRoot) { $ProjectRoot = (Get-Location).Path }
 $LogDir = Join-Path $ProjectRoot ".claude/logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }

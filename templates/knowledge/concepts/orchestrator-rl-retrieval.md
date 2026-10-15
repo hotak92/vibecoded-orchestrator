@@ -111,7 +111,7 @@ Prevents repetitive context bloat when the same pattern nodes match multiple sim
 
 ## Node Summaries
 
-KG node metadata (descriptions, summaries, chunk summaries) is generated on-write and stored in `knowledge/.node_formats.json` (see [[KG-Summary Three-Tier Generation Pipeline]]):
+KG node metadata (descriptions, summaries, chunk summaries) is generated on-write and stored in `knowledge/.node_formats.json` (see [[KG-Summary Generation Pipeline — Backend Ladder]]):
 
 ```json
 {

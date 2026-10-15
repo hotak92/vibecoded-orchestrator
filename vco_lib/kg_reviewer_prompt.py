@@ -121,6 +121,17 @@ def build_prompt(commit: CommitInfo, project_root: Path,
     else:
         diff_note = ("The diff below is complete, but it shows only the "
                      "changed hunks: Read the full files for context.")
+    try:
+        prefix = _git(project_root, "rev-parse", "--show-prefix").strip()
+    except (RuntimeError, OSError):
+        prefix = ""
+    if prefix:
+        # A project nested in a parent repo (v0.2.103 final review M-1):
+        # git prints paths from the REPO root, the reviewer works from here.
+        diff_note += (f" This project is the folder `{prefix}` of a larger "
+                      f"git repository: the paths in the diff and the file "
+                      f"list are relative to that repository's root, so a "
+                      f"path `{prefix}x` is the file `x` here.")
     locked_tags = ", ".join(guard["locked_tags"])
     locked_statuses = ", ".join(guard["locked_statuses"])
     return f"""You are the post-commit knowledge-graph (KG) reviewer for this project.

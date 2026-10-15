@@ -444,7 +444,12 @@ class InstallUpdateSeedPathPruneTest(unittest.TestCase):
              mock.patch.object(urllib.request, "urlopen", urlopen), \
              mock.patch("subprocess.run", side_effect=_fake_run), \
              mock.patch.object(install, "run_child_logged",
-                               side_effect=_fake_run):
+                               side_effect=_fake_run), \
+             mock.patch(
+                 # The whole-tree seed leaves via this detached spawn: never
+                 # start a real retry driver from a test (it outlived the
+                 # run — v0.2.103 final review I-3's ResourceWarnings).
+                 "vco_lib.deferral_retry.spawn_detached", return_value=True):
             install._seed_weaviate(args)
 
     def test_update_on_root_shared_identity_prunes_nothing(self) -> None:

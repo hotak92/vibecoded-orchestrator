@@ -22,20 +22,26 @@ generation model on the GPU beside the code-embedding re-index and OOMed in
 the field); every LLM call in BOTH modes goes through the shared summary
 ladder below.
 
-Four-tier model selection (in order):
+Backend ladder (in order; one home: templates/scripts/summary_backends.py):
   1. `claude` CLI on PATH      → best quality, requires CLI install (Max sub or API key)
                                  v0.2.23 C10: gated by a smoke-test, not just --version,
                                  so an installed-but-unauthenticated CLI doesn't get picked.
-  2. Ollama (local, FREE)      → http://localhost:11435, no extra dep beyond what
-                                 the orchestrator already requires for embeddings
-  3. OpenAI API (opt-in)       → gated by `kg_summary_openai_consent` app_state key
-                                 (default false). Set via launcher Preferences → KG
-                                 Summaries. Bypass via `--force-api`. Costs apply.
-  4. ANTHROPIC_API_KEY direct  → legacy opt-in fallback. Cost warning logged.
-  5. Silent skip               → friendly log line, exits 0
+  2. z.ai GLM                  → only when the vendor key resolves through the gateway
+                                 registry (subscription — no consent gate).
+  3. QwenCloud                 → same rule as z.ai (subscription — no consent gate).
+  4. Ollama (local, FREE)      → http://localhost:11435; skipped when the model is not
+                                 pulled (never pulled at runtime); deferred while a
+                                 code-graph walk runs or free VRAM is below the floor
+                                 sized from the model (not applied when already loaded).
+  5. OpenAI API (opt-in)       → the ONLY consent-gated tier: `kg_summary_openai_consent`
+                                 app_state key (default false; launcher Preferences → KG
+                                 Summaries). Bypass via `--force-api`. Costs apply.
+  6. ANTHROPIC_API_KEY direct  → legacy opt-in fallback. Cost warning logged.
+  7. Silent skip               → friendly log line, exits 0
+A model refusal is FINAL (never re-asked on a lower tier).
 
 Env overrides:
-  KG_SUMMARY_BACKEND        → force "cli" | "ollama" | "api" | "openai" | "skip"
+  KG_SUMMARY_BACKEND        → force "cli" | "zai" | "qwen" | "ollama" | "openai" | "api" | "skip"
                               (auto-detect default; "api" = Anthropic, "openai" = OpenAI).
                               Unset: the launcher Preferences backend pin
   KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag. Unset: the machine's generation

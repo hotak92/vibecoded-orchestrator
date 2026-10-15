@@ -55,20 +55,26 @@ EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
 #: The "What changes the pick:" bullets that belong to ONE model, transcribed
 #: verbatim as (row id, note text) pairs, in the source's order. A list, not
 #: a dict: one row may carry more than one bullet (GLM-5.3 has a reviewer and
-#: an implementer bullet since the 2026-10-08 revision).
+#: an implementer bullet since the 2026-10-08 revision). A TUPLE of row ids
+#: is an ``all_of`` comparison note: it renders only when every named row
+#: does (v0.2.103 final review L-3).
 EXPECTED_NOTES = [
     ("opus", "**Opus 5.5** leads at medium on almost every axis and costs less "
              "per task than Fable 5.1 (≈$1.3 vs ≈$3.0); keep Fable for final "
              "reviews, plans and the hardest debugging."),
     ("sonnet", "**Sonnet 5.5** is the most effort-sensitive model: near Opus at "
-               "max, but at medium it trails GLM-5.3 and DeepSeek V4.1 Flash on "
-               "coding. Not a default choice."),
+               "max, but well behind it on coding at medium. Not a default "
+               "choice."),
+    (("sonnet", "glm-5.3", "deepseek-v4.1-flash"),
+     "At medium, **Sonnet 5.5** also trails GLM-5.3 and DeepSeek V4.1 Flash on "
+     "coding."),
     ("haiku", "**Haiku 5.5** — the fastest and cheapest Claude (≈165 tok/s, "
               "≈$0.05 per task at medium) with a 1M window: good for bulk, "
               "classification, extraction and routing. Its headline vendor "
-              "scores are at effort max; at medium it sits below the flash-tier "
-              "vendor lanes on code, so keep coding, planning and review on "
-              "larger models."),
+              "scores are at effort max; at medium its code scores are low, so "
+              "keep coding, planning and review on larger models."),
+    (("haiku", "deepseek-v4.1-flash"),
+     "At medium, **Haiku 5.5** sits below the flash-tier vendor lanes on code."),
     ("deepseek-v4.1-flash", "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s "
                             "to first token) and cheapest per task: default for "
                             "research, surveys, bulk and bounded implementation. "
@@ -234,8 +240,10 @@ class TestGridData:
         source grid's "What changes the pick" bullets, verbatim — so a
         regeneration cannot silently drop a guardrail or a caveat."""
         grid = model_selection.load_grid()
-        assert [(list(n.models), n.text) for n in grid.notes] == [
-            ([rid], text) for rid, text in EXPECTED_NOTES
+        assert [(list(n.models), n.all_of, n.text) for n in grid.notes] == [
+            ((list(rid), True, text) if isinstance(rid, tuple)
+             else ([rid], False, text))
+            for rid, text in EXPECTED_NOTES
         ]
         assert list(grid.general_notes) == EXPECTED_GENERAL_NOTES
 
@@ -252,6 +260,35 @@ class TestGridData:
             assert "What changes the pick:" in md
             for note in EXPECTED_GENERAL_NOTES:
                 assert note in md, (providers, note)
+
+    def test_comparison_notes_never_name_a_model_the_grid_lacks(self):
+        """L-3: an Anthropic-only (or partial-vendor) grid renders the
+        vendor-neutral Sonnet/Haiku notes but never a sentence comparing
+        them with rows it does not show; the full grid renders both."""
+        claude_only = model_selection.render_grid(providers=frozenset({"anthropic"}))
+        assert "Sonnet 5.5** is the most effort-sensitive" in claude_only
+        assert "fastest and cheapest Claude" in claude_only
+        for absent in ("GLM-5.3", "DeepSeek", "flash-tier vendor lanes"):
+            assert absent not in claude_only, absent
+        # z.ai only: GLM rows render, DeepSeek does not -> still no comparison
+        zai_only = model_selection.render_grid(
+            providers=frozenset({"anthropic", "zai"}))
+        assert "also trails GLM-5.3" not in zai_only
+        assert "flash-tier vendor lanes" not in zai_only
+        every = frozenset(p for row in model_selection.load_grid().rows
+                          for p in row.providers)
+        full = model_selection.render_grid(providers=every)
+        assert "also trails GLM-5.3 and DeepSeek V4.1 Flash" in full
+        assert "sits below the flash-tier vendor lanes" in full
+
+    def test_all_of_must_be_a_boolean(self, tmp_path):
+        src = model_selection.GRID_PATH.read_text(encoding="utf-8")
+        bad = src.replace("\nall_of = true\n", '\nall_of = "yes"\n', 1)
+        assert bad != src
+        path = tmp_path / "grid.toml"
+        path.write_text(bad, encoding="utf-8")
+        with pytest.raises(model_selection.GridError):
+            model_selection.load_grid(path)
 
     def test_reach_via_names_shipped_agents_or_model_values(self):
         """Every gateway reach-via names agents that actually SHIP in

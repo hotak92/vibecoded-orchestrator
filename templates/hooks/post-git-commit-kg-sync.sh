@@ -42,8 +42,25 @@ set -euo pipefail
 # consent-gated OpenAI rung; an early silent exit here made that rung dead
 # and left no log line or ledger row.
 
-# Auto-detect project root from cwd (the project being committed to)
-PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The project root is the VCO PROJECT folder (the one that owns .claude/),
+# resolved by the ONE hook rule (_lib/project-root.sh, mirror of
+# vco_lib.project_root): CLAUDE_PROJECT_DIR, else the nearest folder with
+# .claude/settings.json or .claude/env. It is NOT `git rev-parse
+# --show-toplevel`: a project may live inside a parent repo (the add flow's
+# "use the existing repo" layout), where the toplevel is the PARENT and has
+# no .claude/ (v0.2.103 final review M-1). Git commands below run inside the
+# project folder, so git itself still finds the enclosing repo. Only a
+# folder with no VCO marker at all (never an installed project: the hook is
+# registered in its .claude/settings.json) falls back to the repo toplevel,
+# then the cwd - the pre-v0.2.103 behaviour.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/project-root.sh"
+PROJECT_ROOT="$(vco_project_root "$PWD" || true)"
+if [ -z "$PROJECT_ROOT" ]; then
+    PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+fi
 LOG_DIR="$PROJECT_ROOT/.claude/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/kg-commit-review.log"
@@ -71,7 +88,6 @@ fi
 echo "$COMMIT_HASH" > "$LAST_REVIEWED_FILE"
 
 REVIEWER_CHAIN="$PROJECT_ROOT/.claude/scripts/kg_reviewer_backend.py"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 # Loud-fail rule: a missing python or a missing shipped reviewer script is a

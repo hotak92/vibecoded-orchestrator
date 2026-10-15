@@ -36,6 +36,11 @@ Guards (binding, from the 2026-07-30 wave-2 plan §7.3):
   INSIDE :func:`prune_foreign_rows`, so no caller can pass
   ``is_shared_identity=False`` past a root clone or an
   empty/unresolved shared name.
+* **Registered-owner gate** (v0.2.103; in this home since the final
+  review M-2): the pruned tree must BE the registered launcher.db owner of
+  the collection (:func:`collection_owner_refusal`) — a lane worktree or a
+  second clone resolves the same names but must never prune against its
+  own, different tree. Applies to both legs and every caller.
 * The Development leg has no shared variant, but keeps the root skip for
   symmetry.
 * ``file_path`` values that are absolute or contain ``..`` (after ``\\`` →
@@ -160,6 +165,79 @@ def is_shared_identity_collection(
     if project_root is None:
         return False
     return is_orchestrator_clone(Path(project_root))
+
+
+def collection_owner_refusal(
+    project_root: "Path | str", collection: "str | None",
+) -> Optional[str]:
+    """``None`` when *project_root* may prune *collection*; a skip REASON
+    when it must not — the REGISTERED-OWNER gate (v0.2.103 R2 review M-3;
+    moved here, the prune home, by the final review M-2 so EVERY caller is
+    covered: the full kg-sync walk, a bundle update run on any folder, and
+    this module's own CLI).
+
+    A lane worktree or a second clone of a project carries the same
+    ``.claude/settings.json`` collection names, so a prune run there
+    resolves the SAME collection for a tree that is not its registered
+    owner — and pruning it against that tree deletes rows whose files exist
+    only in the real checkout (uncommitted work, gitignored ``knowledge/``,
+    nodes added on main after the branch point). The rule: *project_root*
+    must BE the registered folder of every registration that owns
+    *collection* — its KG ``primary`` or ``shared`` binding, or the
+    development / diagrams collection derived from its primary (the ONE
+    derivation, :func:`vco_lib.config_projection.resolve_project_collection_names`).
+
+    * no launcher.db at all (free tier, no registry) ⇒ proceed — no second
+      tree is registered to claim the collection;
+    * launcher.db present but unreadable ⇒ REFUSE — ownership is
+      unprovable this run, and a destructive path waits for proof;
+    * a registered project owns the name (case-insensitive): its folder IS
+      this root ⇒ proceed; a DIFFERENT folder ⇒ REFUSE, naming the owner;
+    * no registration owns the name ⇒ proceed (unregistered project).
+
+    Read-only. A failed ``vco_lib`` import propagates (a broken install is
+    loud, and the caller's prune does not run).
+    """
+    from vco_lib.config_projection import resolve_project_collection_names
+    from vco_lib.launcher_db_reader import (
+        _discover_db_path,
+        get_kg_binding,
+        list_registered_projects,
+    )
+    from vco_lib.module_gated_delivery import _canonical_path_eq
+
+    wanted = (collection or "").strip().lower()
+    if not wanted:
+        return None
+    db_path = _discover_db_path()
+    if db_path is None:
+        return None  # no registry exists ⇒ no second tree can claim it
+    unreadable = ("the launcher registry exists but could not be read — "
+                  "collection ownership is unprovable this run, so the "
+                  "prune is refused")
+    projects = list_registered_projects()
+    if projects is None:
+        return unreadable
+    for proj in projects:
+        owned = []
+        for role in ("primary", "shared"):
+            owned.append(get_kg_binding(proj.id, role) or "")
+        try:
+            names = resolve_project_collection_names(proj.id, db_path=db_path)
+        except Exception:  # noqa: BLE001 — unprovable ⇒ refuse, never guess
+            return unreadable
+        owned.extend([names.get("kg_collection", ""),
+                      names.get("development_collection", ""),
+                      names.get("diagrams_collection", "")])
+        if wanted not in {o.strip().lower() for o in owned if o}:
+            continue
+        if _canonical_path_eq(proj.folder, project_root):
+            continue  # this root IS the registered owner
+        return (f"'{collection}' is registered to {proj.folder!r} (project "
+                f"{proj.name!r}), not to the walked root {project_root} — a "
+                "worktree or second clone must not prune another tree's "
+                "collection")
+    return None
 
 
 #: Rows written from an isolated lane worktree carry the worktree prefix;
@@ -424,6 +502,15 @@ def prune_foreign_rows(
         result["skipped"] = "shared-identity collection"
         _log("ok", f"prune skipped for {collection!r}: shared-identity "
                    "collection (other projects' shared-scoped rows live here)")
+        return result
+
+    # REGISTERED-OWNER gate (v0.2.103 final review M-2): computed HERE, in
+    # the prune home, so a worktree / second clone is refused on every
+    # caller path, BEFORE any enumeration.
+    not_owner = collection_owner_refusal(project_root, collection)
+    if not_owner is not None:
+        result["skipped"] = not_owner
+        _log("warn", f"prune skipped for {collection!r}: {not_owner}")
         return result
 
     url = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")

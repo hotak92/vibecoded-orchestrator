@@ -73,10 +73,11 @@ from __future__ import annotations
 
 import contextlib
 import re
+import signal
 import subprocess  # noqa: S404 — the child argv is the caller's own analyzer
 import sys
 from pathlib import Path
-from typing import Iterator, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 #: Exit code a refused (would-be-twin) walk exits with — EX_TEMPFAIL: a
 #: transient condition, the caller may retry later. Distinct from every
@@ -142,6 +143,23 @@ def walk_claim_lock_path(project_name: str) -> Path:
 
 
 @contextlib.contextmanager
+def _held_walk_claim(project_name: str) -> Iterator[Tuple[Path, Optional[int]]]:
+    """:func:`walk_claim`, also yielding the lock's descriptor when it is a
+    POSIX ``flock`` a child can share by inheriting it (else ``None``)."""
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock
+
+    lock_path = walk_claim_lock_path(project_name)
+    try:
+        with exclusive_file_lock(lock_path, timeout_s=0) as fd:
+            yield lock_path, fd
+    except LockTimeout as exc:
+        raise WalkAlreadyRunning(
+            f"{project_name}: another code-graph walk is already running "
+            f"(claim: {lock_path})"
+        ) from exc
+
+
+@contextlib.contextmanager
 def walk_claim(project_name: str) -> Iterator[Path]:
     """Hold this project's walk claim for the block, NON-blocking.
 
@@ -150,17 +168,76 @@ def walk_claim(project_name: str) -> Iterator[Path]:
     run for hours and the claim outlives exactly as long as its holder
     (flock semantics). Yields the lock path (for log lines).
     """
-    from vco_lib.atomic import LockTimeout, exclusive_file_lock
+    with _held_walk_claim(project_name) as (lock_path, _fd):
+        yield lock_path
 
-    lock_path = walk_claim_lock_path(project_name)
+
+#: Signals the ``-m`` hop passes on to its analyzer child instead of dying
+#: alone (v0.2.103 final review L-5): a terminate aimed at the wrapper stops
+#: the walk it fronts. SIGINT is not here — Ctrl-C reaches the whole
+#: foreground group, the child included.
+_FORWARDED_SIGNALS = tuple(
+    getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGBREAK")
+    if hasattr(signal, name)
+)
+
+
+def _run_child(child: List[str], *, cwd: "str | Path | None",
+               claim_fd: Optional[int] = None) -> int:
+    """Run the analyzer child to completion and return its exit code.
+
+    * A forwarded signal (:data:`_FORWARDED_SIGNALS`) delivered to this
+      wrapper is sent on to the child, and the wrapper keeps waiting for it
+      — the claim is released only once the walk has really ended.
+    * ``claim_fd`` (POSIX ``flock``): the child INHERITS the claim's
+      descriptor, so the claim is held for the child's whole life even if
+      the wrapper is killed outright (SIGKILL cannot be forwarded) — a
+      wrapper-only kill can no longer free the claim under a running walk
+      and admit a twin. On Windows the byte-range lock is per process; there
+      a terminate of the wrapper (``TerminateProcess``) cannot be caught.
+    * Any other exception while waiting (KeyboardInterrupt) ends the child
+      too, as ``subprocess.run`` does.
+    """
+    state: dict = {"proc": None, "pending": []}
+
+    def _forward(signum: int, _frame: object) -> None:
+        proc = state["proc"]
+        if proc is None:
+            state["pending"].append(signum)
+            return
+        try:
+            proc.send_signal(signum)
+        except OSError:
+            pass  # already gone
+
+    previous: dict = {}
+    for sig in _FORWARDED_SIGNALS:
+        try:
+            previous[sig] = signal.signal(sig, _forward)
+        except (OSError, ValueError):  # not the main thread / not settable
+            pass
     try:
-        with exclusive_file_lock(lock_path, timeout_s=0):
-            yield lock_path
-    except LockTimeout as exc:
-        raise WalkAlreadyRunning(
-            f"{project_name}: another code-graph walk is already running "
-            f"(claim: {lock_path})"
-        ) from exc
+        pass_fds = (claim_fd,) if claim_fd is not None else ()
+        proc = subprocess.Popen(child, cwd=cwd, pass_fds=pass_fds)  # noqa: S603
+        state["proc"] = proc
+        for signum in state["pending"]:
+            _forward(signum, None)
+        try:
+            rc = proc.wait()
+            # A child killed by a signal reports -signum; a process exit code
+            # is 0-255, so report it the way shells do (128 + signum) instead
+            # of letting sys.exit wrap -15 to 241 (review R17-3).
+            return 128 - rc if rc < 0 else rc
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+    finally:
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (OSError, ValueError, TypeError):
+                pass
 
 
 def argv_is_scoped(args: Sequence[str]) -> bool:
@@ -233,12 +310,14 @@ def run_claimed(script: "str | Path", args: Sequence[str], *, cwd: "str | Path |
 
     Returns the analyzer's exit code; :data:`WALK_ALREADY_RUNNING_RC` when
     the claim is held (nothing spawned); scoped incrementals run without the
-    claim.
+    claim. The claim is held for the ANALYZER's life, not just this
+    wrapper's: a terminate signal to the wrapper is forwarded to the child,
+    and on POSIX the child inherits the claim itself (:func:`_run_child`).
     """
     argv = [str(a) for a in args]
     child = [sys.executable, str(script), *argv]
     if argv_is_scoped(argv):
-        return subprocess.run(child, cwd=cwd).returncode  # noqa: S603
+        return _run_child(child, cwd=cwd)
     project = project_from_argv(argv)
     if not project:
         print(
@@ -246,10 +325,10 @@ def run_claimed(script: "str | Path", args: Sequence[str], *, cwd: "str | Path |
             "analyzer argv — running WITHOUT the single-flight claim",
             file=sys.stderr, flush=True,
         )
-        return subprocess.run(child, cwd=cwd).returncode  # noqa: S603
+        return _run_child(child, cwd=cwd)
     try:
-        with walk_claim(project):
-            return subprocess.run(child, cwd=cwd).returncode  # noqa: S603
+        with _held_walk_claim(project) as (_lock_path, claim_fd):
+            return _run_child(child, cwd=cwd, claim_fd=claim_fd)
     except WalkAlreadyRunning:
         print(already_running_message(project), file=sys.stderr, flush=True)
         return WALK_ALREADY_RUNNING_RC

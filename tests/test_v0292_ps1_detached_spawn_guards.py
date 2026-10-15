@@ -799,6 +799,9 @@ def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
     env["CLAUDE_SHIM_RECORD"] = str(record)
     env["VCT_ORCHESTRATOR_ROOT"] = str(REPO)
     env["VCT_STATE_DIR"] = str(tmp_path / "state")
+    # The harness names the workspace: the hook resolves the PROJECT root by
+    # the one rule (CLAUDE_PROJECT_DIR first; v0.2.103 final review M-1).
+    env["CLAUDE_PROJECT_DIR"] = str(project)
     for key in ("VCT_DISABLE_HOOKS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
                 "VCO_KG_REVIEW_MODEL", "VCO_KG_REVIEW_MAX_TURNS",
                 "VCT_LAUNCHER_DB_PATH"):
