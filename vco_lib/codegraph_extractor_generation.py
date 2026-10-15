@@ -361,8 +361,9 @@ def parse_semver(version: str) -> "tuple[int, int, int] | None":
     """Parse ``"X.Y.Z"`` into ``(major, minor, patch)``; ``None`` if malformed.
 
     Deliberately does not pull in ``packaging`` — orchestrator version strings
-    are plain semver with no pre-release tags. ``vco_lib.project_init``'s
-    ``_parse_semver`` delegates here so there is ONE parser.
+    are plain semver with no pre-release tags. This is the ONE parser for the
+    boundary questions this package asks (the v0.2.92 extractor generation and
+    any future ``prev < bump <= running`` gate).
 
     Relation to the version SSOT (v0.2.100): the strict comparator home is
     :mod:`vco_lib.version_compare` (``X.Y.Z`` only, owner ruling Q7, raising

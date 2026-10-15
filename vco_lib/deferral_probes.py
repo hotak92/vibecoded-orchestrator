@@ -1252,14 +1252,14 @@ def chunker_resync_still_owed(ctx: ProbeContext) -> Optional[bool]:
 
     A thin wrapper over :func:`vco_lib.chunker_revision.resync_still_owed`,
     which owns the whole chunker-resync lifecycle (the sentinel the gate
-    compares, the remedy text both emitters print, and the half-stamps the two
+    compares, the remedy text the emitter prints, and the half-stamps the two
     remedy scripts write). One home for the rule: a second reading here could
     clear an entry the gate would immediately re-emit.
 
     v0.2.95 F1 — this cid was the last IMMORTAL one. It declared
     ``paired-resolution`` and named a clearing site that does not exist in
-    either language, while its own emitters promise the user it
-    "self-resolves on the next bundle update". The registry-completeness test
+    either language, while its own emitters (two then, one since v0.2.103)
+    promised the user it "self-resolves on the next bundle update". The registry-completeness test
     validates only ``probe:py:`` names, so a sentinel family whose site is
     prose failed nothing.
 

@@ -402,11 +402,11 @@ def _extract_command_lines(markdown: str) -> list:
 def test_chunker_deferral_commands_parse_clean(cli_registry):
     """Run the real emitter; every emitted CLI line must parse with zero
     unrecognized arguments on the target CLI's real parser."""
-    from vco_lib.project_init import _emit_chunker_resync_deferral
+    from vco_lib.project_init import _emit_chunker_revision_resync_deferral
 
     with tempfile.TemporaryDirectory() as td:
         folder = Path(td)
-        _emit_chunker_resync_deferral(folder, "0.2.45", "0.2.46")
+        _emit_chunker_revision_resync_deferral(folder, "r-old", "r-new")
         content = (folder / ".claude" / "context" / "UPDATE_DEFERRED.md").read_text()
 
     analyzer_parser = _load_analyzer_parser()

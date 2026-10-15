@@ -38,8 +38,8 @@
 //!     emitter was retired by the v0.2.89 immutable-names ruling)
 //!   * `codegraph::emit_stale_wrapper_deferral`
 //!   * (`chunker_revision_deferral` uses a DIFFERENT vco_lib entry point —
-//!     `_emit_chunker_resync_deferral` — so it is intentionally NOT routed
-//!     through this DeferralReport-direct writer.)
+//!     `_emit_chunker_revision_resync_deferral` — so it is intentionally NOT
+//!     routed through this DeferralReport-direct writer.)
 //!
 //! Six copies of a snippet that embeds user-controlled strings into a
 //! Python `-c` program is exactly where an escaping bug would hide. This
