@@ -891,5 +891,83 @@ def test_clear_helper_resolves_only_on_a_positive_zero(monkeypatch, tmp_path):
     assert resolved == []
 
 
+# ── R16-B-N1: the clear's re-count must use the RAW (stamp) root form ──────
+
+def _symlinked_repo(tmp_path):
+    real = tmp_path / "real-repo"
+    real.mkdir()
+    link = tmp_path / "repo-link"
+    link.symlink_to(real, target_is_directory=True)
+    return real, link
+
+
+def test_analyzer_clear_recount_uses_the_raw_root_form(
+        analyzer_mod, monkeypatch, tmp_path):
+    """R16-B-N1: rows are STAMPED with the raw (unresolved) root path; the
+    clear check must receive THAT form (primary_sources_for adds the resolved
+    one itself). Pre-fix the analyzer passed the resolved root, whose
+    primary-source set misses raw-stamped rows on a symlinked repo — the
+    count read zero and the deferral cleared while orphans remained."""
+    _real, link = _symlinked_repo(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        analyzer_mod, "_clear_orphan_deferral_if_zero",
+        lambda project, *, repo_root=None, client=None: calls.append(
+            repo_root) or True)
+
+    analyzer = _gated_analyzer(analyzer_mod)
+    analyzer._analyze_repo_root = _real.resolve()
+    analyzer._analyze_repo_root_raw = link.as_posix()
+    monkeypatch.setattr(analyzer_mod, "_prune_collection_impl",
+                        lambda collection, visited_uuids, **kw: (0, 0))
+    analyzer._prune_stale_objects()
+    assert calls == [Path(link.as_posix())], (
+        "the re-count must get the RAW root — the form rows are stamped with"
+    )
+
+
+def test_analyzer_clear_falls_back_to_the_resolved_root(
+        analyzer_mod, monkeypatch, tmp_path):
+    """Leave-alone / back-compat: a stub with no raw root recorded still
+    passes the resolved one (the old attribute) — never None-by-accident."""
+    calls = []
+    monkeypatch.setattr(
+        analyzer_mod, "_clear_orphan_deferral_if_zero",
+        lambda project, *, repo_root=None, client=None: calls.append(
+            repo_root) or True)
+
+    analyzer = _gated_analyzer(analyzer_mod)
+    analyzer._analyze_repo_root = tmp_path.resolve()
+    monkeypatch.setattr(analyzer_mod, "_prune_collection_impl",
+                        lambda collection, visited_uuids, **kw: (0, 0))
+    analyzer._prune_stale_objects()
+    assert calls == [tmp_path.resolve()]
+
+
+def test_symlink_stamped_orphan_is_counted_under_the_raw_root(
+        monkeypatch, tmp_path):
+    """End-to-end: an orphan STAMPED with the symlink path is counted (no
+    clear) when the re-count uses the raw root; the RESOLVED root misses it —
+    the exact pre-fix false-zero the fix removes."""
+    real, link = _symlinked_repo(tmp_path)
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "P")
+    coll = _Coll(rows=[_row("i-sym", project_source=link.as_posix())],
+                 fetch={"i-sym": _fetch_obj("i-sym", {})})
+    client = types.SimpleNamespace(
+        collections=types.SimpleNamespace(
+            exists=lambda n: n == coll.name, get=lambda n: coll,
+        ),
+        close=lambda: None,
+    )
+    assert cr.count_orphan_interaction_rows(
+        "P", repo_root=Path(link.as_posix()), client=client) == 1, (
+        "the raw root's primary set covers the symlink stamp — counted"
+    )
+    assert cr.count_orphan_interaction_rows(
+        "P", repo_root=real.resolve(), client=client) == 0, (
+        "the resolved root alone misses the symlink stamp (the pre-fix miss)"
+    )
+
+
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__])
