@@ -162,7 +162,10 @@ class _HookCase(unittest.TestCase):
             ln.strip() == ENGINE_LINE for ln in self.log.read_text().splitlines())
 
 
-@unittest.skipIf(IS_WINDOWS, "the bash sibling is exercised where bash exists")
+@unittest.skipIf(
+    IS_WINDOWS,
+    "bash .sh leg; Windows runs the .ps1 sibling: "
+    "tests/test_container_engine_autostart_hooks.py::Ps1HookWiringTests::test_engine_down_fires_the_autostart_cli")
 class BashHookWiringTests(_HookCase):
     def test_engine_down_fires_the_autostart_cli(self):
         proc = self._run_sh(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_DOWN,
