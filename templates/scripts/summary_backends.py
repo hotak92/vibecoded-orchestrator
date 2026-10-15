@@ -1832,7 +1832,7 @@ def _ollama_local_deferred(weights_mb: "int | None" = None) -> "str | None":
     if _codegraph_walk_active():
         return ("a code-graph embedding walk is active — the local model "
                 "would compete with it for VRAM")
-    if _ollama_model_resident(OLLAMA_DEFAULT_MODEL):
+    if _ollama_model_resident(ollama_default_model()):
         return None  # already loaded: no new allocation to make room for
     free = _free_vram_mb()
     floor = _min_free_vram_mb(weights_mb)
