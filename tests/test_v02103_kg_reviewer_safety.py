@@ -443,12 +443,12 @@ def test_rule_removed_frontmatter_is_reverted(repo):
         snap.cleanup()
 
 
-def test_rule_updated_key_and_body_edit_is_allowed(repo):
+def test_rule_updated_key_and_appended_text_is_allowed(repo):
     rel = "knowledge/concepts/cache-layer.md"
     snap = guard.take_snapshot(repo)
     try:
-        new = PLAIN_NODE.replace("2026-01-01T00:00:00Z", "2026-10-15T00:00:00Z") \
-                        .replace("100 entries", "200 entries")
+        new = (PLAIN_NODE.replace("2026-01-01T00:00:00Z", "2026-10-15T00:00:00Z")
+               + "\nSince src.py v2 the cache keeps 200 entries.\n")
         w: dict = {}
         _reviewer_write(repo, w, rel, new)
         res, _l, resynced = _validate(repo, w, snap)
@@ -457,6 +457,96 @@ def test_rule_updated_key_and_body_edit_is_allowed(repo):
         assert res.reverted == [] and resynced == [] and res.backup_dir is None
     finally:
         snap.cleanup()
+
+
+# ── field finding: existing text is append-and-annotate only ─────────────
+
+DECISIONS_NODE = """---
+title: Decisions
+type: concept
+tags: [project]
+status: active
+updated: 2026-01-01T00:00:00Z
+---
+
+# Decisions
+
+- Storage: blobs live on local disk.
+- Cache size is 100 entries.
+
+Notes follow.
+"""
+
+
+def _judge_decisions(repo: Path, new_text: str) -> tuple:
+    rel = "knowledge/concepts/decisions.md"
+    (repo / rel).write_text(DECISIONS_NODE)
+    snap = guard.take_snapshot(repo)
+    try:
+        w: dict = {}
+        _reviewer_write(repo, w, rel, new_text)
+        res, lines, _ = _validate(repo, w, snap)
+        return res, lines, (repo / rel).read_text()
+    finally:
+        snap.cleanup()
+
+
+def test_append_only_a_removed_original_line_is_reverted(repo):
+    new = DECISIONS_NODE.replace("- Storage: blobs live on local disk.\n", "")
+    res, lines, now = _judge_decisions(repo, new + "- Storage: object store.\n")
+    assert now == DECISIONS_NODE
+    assert "removed or reworded 1 original line(s)" in res.reverted[0][1]
+    assert any("'- Storage: blobs live on local disk.'" in ln for ln in lines)
+    assert _backup_of(res, "knowledge/concepts/decisions.md").endswith("object store.\n")
+
+
+def test_append_only_a_reworded_original_line_is_reverted(repo):
+    """The field shape: the superseded wording dropped, the update in its place."""
+    new = DECISIONS_NODE.replace("blobs live on local disk.",
+                                 "blobs live in the object store (since 2026-10).")
+    res, _lines, now = _judge_decisions(repo, new)
+    assert now == DECISIONS_NODE
+    assert "Storage: blobs live on local disk." in res.reverted[0][1]
+
+
+def test_append_only_annotated_in_place_lines_are_kept(repo):
+    new = (DECISIONS_NODE
+           .replace("- Storage: blobs live on local disk.",
+                    "- Original 2026-01-01: Storage: blobs live on local disk. "
+                    "(superseded by the object store, see below)")
+           .replace("- Cache size is 100 entries.", "- ~~Cache size is 100 entries.~~")
+           + "- Storage: object store (src/store.py), 2026-10-15.\n")
+    res, _l, now = _judge_decisions(repo, new)
+    assert now == new and res.kept == ["knowledge/concepts/decisions.md"]
+
+
+def test_append_only_pure_append_is_kept(repo):
+    new = DECISIONS_NODE + "\n## Update 2026-10-15\n\nThe cache now evicts LRU.\n"
+    res, _l, now = _judge_decisions(repo, new)
+    assert now == new and res.kept and res.reverted == []
+
+
+def test_append_only_whitespace_and_crlf_differences_are_kept(repo):
+    body_crlf = DECISIONS_NODE.replace("\n", "\r\n").replace(
+        "- Cache size is 100 entries.", "- Cache size is 100 entries.   ")
+    res, _l, now = _judge_decisions(repo, body_crlf.replace("Notes follow.",
+                                                            "Notes follow.\t"))
+    assert res.kept == ["knowledge/concepts/decisions.md"], res.reverted
+
+
+def test_append_only_a_dropped_duplicate_line_is_caught():
+    pre = "- TBD\n- TBD\nend\n"
+    assert guard.removed_lines(pre, "- TBD\nend\n") == ["- TBD"]
+    assert guard.removed_lines(pre, pre + "more\n") == []
+
+
+def test_append_only_list_markers_are_not_text_but_words_are():
+    pre = "- [ ] ship it\n1. first step\n> quoted rule\n"
+    ok = ("- [x] ~~ship it~~ (done 2026-10-15)\n1. Original: first step\n"
+          "> quoted rule (superseded)\n")
+    assert guard.removed_lines(pre, ok) == []
+    assert guard.removed_lines(pre, "- [ ] ship it now\n1. second step\n> quoted rule\n") \
+        == ["1. first step"]
 
 
 def test_rule_edit_tool_is_replayed_and_judged(repo):
@@ -505,7 +595,8 @@ def test_rule_bare_node_may_gain_only_an_updated_stamp(repo):
     (repo / rel).write_text("# Bare\n\nA plain note.\n")
     snap = guard.take_snapshot(repo)
     try:
-        new = "---\nupdated: 2026-10-15T00:00:00Z\n---\n# Bare\n\nA plain note, extended.\n"
+        new = ("---\nupdated: 2026-10-15T00:00:00Z\n---\n# Bare\n\nA plain note.\n"
+               "\nAn appended fact.\n")
         w: dict = {}
         _reviewer_write(repo, w, rel, new)
         res, _l, _ = _validate(repo, w, snap)

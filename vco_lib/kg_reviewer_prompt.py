@@ -169,6 +169,13 @@ not configuration. Edits elsewhere are blocked and reverted.
    partial view.
 8. Keep each existing node's YAML frontmatter exactly as it is; you may only
    add or update its `updated:` field. Never delete a node.
+   Existing node text is APPEND-AND-ANNOTATE ONLY: the stored information
+   must survive. Add new facts after the existing text. When something is
+   superseded, keep the original line and mark it IN PLACE, e.g.
+   "Original 2026-10-15: <original text> (superseded by <new fact>, see
+   below)" or "~~<original text>~~" - never delete, shorten or reword an
+   existing line. A write that removes or rewords any existing line is
+   reverted.
 9. LOCKED nodes (tags: {locked_tags}; status: {locked_statuses}; or text that
    says not to change it without discussion) are never rewritten. If such a
    node is now wrong, append ONE section at the end of the file:
