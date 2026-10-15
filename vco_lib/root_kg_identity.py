@@ -21,6 +21,17 @@ The rule (:func:`decide`, pure):
 
 1. ``VCT_ORCHESTRATOR_ROOT_KG_COLLECTION`` set → that name (white-label
    override, top priority).
+1b. The Identity-tab pick (``app_state['shared_kg.collection_name']``,
+   :data:`PICKER_KEY`) → that name. The hub and the launcher serve the pick
+   FIRST as the machine's shared name, and on the root one class serves both
+   roles, so the root follows it (review V02103-FINAL2 L-1). The pick is the
+   user's explicit consent — but it is subject to the same embedding-profile
+   rule as ``adopt``: a populated picked class written with a different model
+   (and no fill toward the current one pending) is NOT followed; the decision
+   reports it in ``picked_refused`` and install records the
+   ``root_kg_pick_wrong_embedding`` deferral. A pick that holds no rows has
+   no vectors to mismatch and is followed (blocked by a case-only sibling like
+   any other name).
 2. The root's existing PRIMARY binding is KEPT when that exact class holds rows
    — unless it was positively written with a different embedding model than
    the current profile (the recorded model, else one read off live objects)
@@ -52,7 +63,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional
 
@@ -60,8 +71,15 @@ from typing import Callable, Iterable, Mapping, Optional
 OVERRIDE_ENV = "VCT_ORCHESTRATOR_ROOT_KG_COLLECTION"
 #: launcher.db ``app_state`` key the launcher seeds the root binding from.
 POINTER_KEY = "orchestrator_root_kg_collection"
+#: The Identity-tab shared-KG pick (``set_shared_kg_collection_name``,
+#: ``project_identity.rs``). The ONE Python home of this key: every Python
+#: reader imports it from here. MUST MATCH
+#: ``launcher/src-tauri/src/commands/project_env_settings.rs::
+#: APP_STATE_KEY_SHARED_KG_NAME`` and the hub's read in ``config_api.rs``.
+PICKER_KEY = "shared_kg.collection_name"
 
 SOURCE_OVERRIDE = "override"
+SOURCE_PICKED = "picked"
 SOURCE_KEPT = "kept"
 SOURCE_DERIVED = "derived"
 SOURCE_UNKNOWN = "kept-unknown"
@@ -81,6 +99,9 @@ class RootKgDecision:
     #: A live class that differs from ``name`` only in case — creating
     #: ``name`` is impossible until the user consents (``adopt``) or removes it.
     blocked_by: Optional[str] = None
+    #: An Identity-tab pick that was NOT followed because it holds vectors
+    #: from another embedding model (the profile rule); None otherwise.
+    picked_refused: Optional[str] = None
 
     @property
     def persistable(self) -> bool:
@@ -116,11 +137,14 @@ def _same_model(a: str, b: str) -> bool:
 
 def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Optional[int]]],
            record_model: Optional[str], target_model: Optional[str],
-           override: Optional[str], *, pending_fill: bool = False) -> RootKgDecision:
+           override: Optional[str], *, pending_fill: bool = False,
+           picked: Optional[str] = None, picked_model: Optional[str] = None,
+           picked_pending: bool = False) -> RootKgDecision:
     """The root's KG name (pure). ``live_counts`` maps every live class name
     to its row count (``None`` = exists, count unknown); ``live_counts=None``
     means Weaviate's state is unknown. ``record_model`` is the model the
-    bound class was written with (None = not known)."""
+    bound class was written with (None = not known); ``picked`` is the
+    Identity-tab pick and ``picked_model`` the model it was written with."""
     derived = derived_name(root)
     ov = (override or "").strip()
     known = live_counts is not None
@@ -129,31 +153,69 @@ def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Option
         blocked = case_sibling(ov, names) if known and ov not in names else None
         return RootKgDecision(ov, SOURCE_OVERRIDE, derived,
                               f"{OVERRIDE_ENV} is set", True, blocked)
-    b = (bound or "").strip()
+    pk = (picked or "").strip()
+    refused: Optional[str] = None
     prefix = ""
+    if pk:
+        if not known:
+            return RootKgDecision(pk, SOURCE_UNKNOWN, derived,
+                                  f"Weaviate state unknown — keeping the Identity-tab pick '{pk}'",
+                                  False)
+        p_rows = live_counts.get(pk) if pk in names else 0  # type: ignore[union-attr]
+        if p_rows is None:
+            return RootKgDecision(pk, SOURCE_UNKNOWN, derived,
+                                  f"could not count the Identity-tab pick '{pk}' — keeping it", False)
+        same = bool(picked_model and target_model and _same_model(picked_model, target_model))
+        if p_rows == 0 or same or picked_pending:
+            blocked = case_sibling(pk, names) if pk not in names else None
+            return RootKgDecision(pk, SOURCE_PICKED, derived,
+                                  "the Identity-tab pick (your explicit choice)", True, blocked)
+        refused = pk
+        prefix = (f"the Identity-tab pick '{pk}' was written with "
+                  f"{picked_model or 'an unknown model'}, the profile is "
+                  f"{target_model or 'unknown'} — not followed; ")
+    decision = _decide_unpicked(derived, bound, live_counts, names, known,
+                                record_model, target_model, pending_fill, prefix)
+    if refused:
+        decision = replace(decision, picked_refused=refused)
+    return decision
+
+
+def _decide_unpicked(derived: str, bound: Optional[str],
+                     live_counts: Optional[Mapping[str, Optional[int]]], names: list,
+                     known: bool, record_model: Optional[str], target_model: Optional[str],
+                     pending_fill: bool, prefix: str) -> RootKgDecision:
+    """Rules 2-3 of :func:`decide` (the bound class kept, else derived)."""
+    b = (bound or "").strip()
     if b:
         if not known:
             return RootKgDecision(b, SOURCE_UNKNOWN, derived,
-                                  f"Weaviate state unknown — keeping the bound '{b}'", False)
+                                  f"{prefix}Weaviate state unknown — keeping the bound '{b}'", False)
         rows = live_counts.get(b) if b in names else 0  # type: ignore[union-attr]
         if rows is None:
             return RootKgDecision(b, SOURCE_UNKNOWN, derived,
-                                  f"could not count '{b}' — keeping it", False)
+                                  f"{prefix}could not count '{b}' — keeping it", False)
         if rows > 0:
             stale = bool(record_model and target_model and not pending_fill
                          and not _same_model(record_model, target_model))
             if not stale or b == derived:
-                why = f"the bound '{b}' holds {rows} rows"
+                why = f"{prefix}the bound '{b}' holds {rows} rows"
                 if stale:
                     why += f" (written with {record_model}; it is also the folder-derived name)"
                 return RootKgDecision(b, SOURCE_KEPT, derived, why)
-            prefix = (f"the bound '{b}' was written with {record_model}, the profile is "
-                      f"{target_model} and no fill toward it is pending; ")
+            prefix += (f"the bound '{b}' was written with {record_model}, the profile is "
+                       f"{target_model} and no fill toward it is pending; ")
         else:
-            prefix = f"the bound '{b}' holds no rows; "
+            prefix += f"the bound '{b}' holds no rows; "
     if not known:
         return RootKgDecision(derived, SOURCE_UNKNOWN, derived,
                               f"{prefix}Weaviate state unknown — the folder-derived name", False)
+    # Owner ruling 2026-10-15 (review V02103-FINAL2 I-1): a live class under
+    # EXACTLY the folder-derived name is the root's own and is used as-is —
+    # no consent step, even when an older uninstalled install left it (its
+    # vectors from another profile stay in their own named slot and
+    # `kg_embed_model`'s record/fill handles the switch, so nothing is lost).
+    # Only a CASE-sibling needs consent (it may be another install's class).
     blocked = case_sibling(derived, names) if derived not in names else None
     return RootKgDecision(derived, SOURCE_DERIVED, derived,
                           f"{prefix}the folder-derived name", True, blocked)
@@ -172,6 +234,77 @@ def _live_class_names(weaviate_url: str) -> Optional[list]:
         return sorted(wh.schema_class_names(json.loads(body)))
     except Exception:  # noqa: BLE001 — unreachable = unknown, never "empty"
         return None
+
+
+def picked_shared_name() -> Optional[str]:
+    """The Identity-tab pick (:data:`PICKER_KEY`), stripped; None when unset,
+    empty, or launcher.db is unreadable. The ONE Python reader of the key."""
+    try:
+        from vco_lib.launcher_db_reader import _read_app_state_key_normalized
+
+        return _read_app_state_key_normalized(PICKER_KEY)
+    except Exception:  # noqa: BLE001 — no DB = no pick
+        return None
+
+
+def resolve_shared_name(folder=None, *, fallback: str) -> str:
+    """THIS machine's shared-KG class name, as seen from ``folder`` — the ONE
+    Python home of the order (moved from ``project_init._resolve_shared_kg_name``,
+    which is now a shim over it).
+
+    ``fallback`` (``project_init._SHARED_KG_NAME``) is VCO's LAST-RESORT
+    default, not a description of the install: on an adopt-and-route install
+    the root's own collection serves both roles, so the generic literal names a
+    class that does not exist (field: one project's shared-KG searches returned
+    nothing for three days and no component reported an error).
+
+    Resolution order (first non-empty wins), all soft-fail:
+
+    0. The Identity-tab pick (:func:`picked_shared_name`) — Priority 1 in the
+       hub (``config_api.rs``), the launcher (``resolve_shared_kg_collection``
+       / ``populate``) and ``config_projection``; review V02103-FINAL2 L-1.
+    1. This project's own ``shared`` KG binding in launcher.db.
+    2. The project's existing on-disk ``SHARED_KG_COLLECTION`` pin — a value
+       already in ``.claude/settings.json`` is a user/launcher decision, and an
+       explicit empty string is the documented "cross-project fan-out
+       intentionally disabled" choice, honoured verbatim.
+    3. The ORCHESTRATOR-ROOT project's ``shared`` binding, then its ``primary``.
+    4. ``fallback`` — a genuinely launcher-less standalone install, where this
+       name is also what bootstrap will create.
+
+    Never raises.
+    """
+    # Imported OUTSIDE the swallow-all tries so a broken install is loud.
+    from vco_lib.kg_binding_read import _read_kg_binding_override
+
+    picked = picked_shared_name()
+    if picked:
+        return picked
+    if folder is not None:
+        try:
+            val = (_read_kg_binding_override(Path(folder)).get("shared_kg_collection") or "").strip()
+            if val:
+                return val
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from vco_lib.knowledge_residue import project_settings_env
+
+            existing = project_settings_env(Path(folder)).get("SHARED_KG_COLLECTION")
+            if isinstance(existing, str):
+                return existing.strip()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from vco_lib.launcher_db_reader import get_orchestrator_root_bindings
+
+        root_primary, root_shared = get_orchestrator_root_bindings()
+        for cand in (root_shared, root_primary):
+            if isinstance(cand, str) and cand.strip():
+                return cand.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return fallback
 
 
 def _bound_primary() -> Optional[str]:
@@ -204,7 +337,8 @@ def gather(root, *, weaviate_url: Optional[str] = None,
            live_names: Optional[Iterable[str]] = None,
            count: Optional[Callable[[str, str], Optional[int]]] = None,
            bound: Optional[str] = None, bound_read: Optional[Callable[[], Optional[str]]] = None,
-           env: Optional[Mapping[str, str]] = None) -> RootKgDecision:
+           env: Optional[Mapping[str, str]] = None,
+           picked_read: Optional[Callable[[], Optional[str]]] = None) -> RootKgDecision:
     """Read the live facts and :func:`decide`. ``live_names`` (an already
     fetched schema) and ``count`` are injectable; by default the schema is
     fetched and rows are counted with ``kg_binding_heal``'s Aggregate."""
@@ -214,25 +348,64 @@ def gather(root, *, weaviate_url: Optional[str] = None,
     environ = os.environ if env is None else env
     override = environ.get(OVERRIDE_ENV, "")
     b = bound if bound is not None else (bound_read or _bound_primary)()
+    pk = (picked_read or picked_shared_name)() if not override.strip() else None
     names = list(live_names) if live_names is not None else _live_class_names(url)
     live: Optional[dict] = None
     if names is not None:
         if count is None:
             from vco_lib.kg_binding_heal import _count_weaviate_class_objects as count
         live = {n: None for n in names}
-        if b and b in live:
-            live[b] = count(url, b)
-    record_model, pending = (None, False)
-    target = ""
-    if b and live is not None and (live.get(b) or 0) > 0:
-        try:
-            from vco_lib.kg_embed_model import target_text_model
+        for cls in {c for c in (b, pk) if c and c in live}:
+            live[cls] = count(url, cls)
+    target: Optional[str] = None
 
-            target = target_text_model()
-        except Exception:  # noqa: BLE001 — no target = never "stale"
-            target = ""
-        record_model, pending = _model_facts(b, target, url)
-    return decide(root, b, live, record_model, target, override, pending_fill=pending)
+    def _target() -> str:
+        nonlocal target
+        if target is None:
+            try:
+                from vco_lib.kg_embed_model import target_text_model
+
+                target = target_text_model()
+            except Exception:  # noqa: BLE001 — no target = never "stale"
+                target = ""
+        return target
+
+    record_model, pending = (None, False)
+    if b and live is not None and (live.get(b) or 0) > 0:
+        record_model, pending = _model_facts(b, _target(), url)
+    picked_model, picked_pending = (None, False)
+    if pk and live is not None and (live.get(pk) or 0) > 0:
+        picked_model, picked_pending = _model_facts(pk, _target(), url)
+    return decide(root, b, live, record_model, target or "", override, pending_fill=pending,
+                  picked=pk, picked_model=picked_model, picked_pending=picked_pending)
+
+
+PICK_REFUSED_CONDITION_ID = "root_kg_pick_wrong_embedding"
+
+
+def pick_refused_entry(decision: RootKgDecision):
+    """The deferral for an Identity-tab pick the profile rule did not follow
+    (install steps 7b and 7c record it; same condition id → idempotent)."""
+    from vco_lib.deferral_report import DeferralEntry
+
+    pick = decision.picked_refused or ""
+    return DeferralEntry(
+        condition_id=PICK_REFUSED_CONDITION_ID,
+        title="Identity-tab shared-KG pick holds another embedding model's vectors",
+        detected=(f"The shared KG picked in the launcher's Identity tab is '{pick}', but it was "
+                  f"written with a different embedding model than the current profile, so the "
+                  f"orchestrator root keeps '{decision.name}' ({decision.reason}). The hub and "
+                  f"the launcher still serve '{pick}' as every project's shared KG until you "
+                  f"choose."),
+        why_deferred=("Searching a class with the wrong model's vectors returns wrong results; "
+                      "VCO never re-embeds, drops or rebinds it on its own."),
+        command_to_apply=("In the launcher: Identity tab → Manage shared KG collection → pick a "
+                          f"class written with the current embedding profile (e.g. "
+                          f"'{decision.name}'), or switch Preferences → Embedding profile (global) "
+                          f"to the model '{pick}' was written with; then re-run the update"),
+        severity="warning",
+        kg_node_refs=[],
+    )
 
 
 # ── the consent path ────────────────────────────────────────────────────────
@@ -296,6 +469,11 @@ def _write_adoption(collection: str, *, out=print) -> int:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
                 "updated_at = excluded.updated_at",
                 (POINTER_KEY, collection, now_ms))
+            # A standing Identity-tab pick of ANOTHER class would out-rank this
+            # adoption on the next decide; the newer explicit choice wins.
+            conn.execute("UPDATE app_state SET value = ?, updated_at = ? "
+                         "WHERE key = ? AND value != ?",
+                         (collection, now_ms, PICKER_KEY, collection))
             if pid:
                 rebind_orchestrator_root_bindings(conn.cursor(), project_id=pid,
                                                   canonical=collection, now_ms=now_ms)
@@ -330,6 +508,10 @@ def main(argv: Optional[list] = None) -> int:
             print(json.dumps(decision.to_dict()))
         else:
             print(f"{decision.name} ({decision.source}: {decision.reason})")
+            if decision.picked_refused:
+                print(f"not followed: the Identity-tab pick '{decision.picked_refused}' holds "
+                      "vectors from another embedding model — pick a class written with the "
+                      "current profile, or switch the profile")
             if decision.blocked_by:
                 print(f"blocked: '{decision.blocked_by}' differs only in case — adopt it with "
                       f"`python -m vco_lib.root_kg_identity adopt --collection "

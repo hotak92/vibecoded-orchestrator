@@ -417,7 +417,7 @@ _launcher_release_api_url() {
 # After the download attempt: prints "build" or "skip" (owner rule
 # 2026-10-15 — one home: vco_lib.launcher_acquire next-step, shared with
 # first-install.bat). Unattended (--yes) → build; interactive → ask; the
-# helper not runnable → ask (a question is the conservative default).
+# helper not runnable → ask when interactive, build under --yes (never block).
 # Messages go to stderr: stdout is the caller's captured answer.
 _launcher_after_download() {
     local outcome="$1" py step="" ans
@@ -427,6 +427,12 @@ _launcher_after_download() {
         [ "${YES:-0}" -eq 1 ] && yes_arg="--yes"
         step="$(PYTHONPATH="${REPO_ROOT:-.}${PYTHONPATH:+:$PYTHONPATH}" \
             "$py" -m vco_lib.launcher_acquire next-step --outcome "$outcome" $yes_arg 2>/dev/null)"
+    fi
+    # The helper could not run (no interpreter): still never block an
+    # unattended run on `read` (review V02103-FINAL2 L-5). Must match
+    # vco_lib.launcher_acquire.next_step: --yes -> build.
+    if [ -z "$step" ] && [ "${YES:-0}" -eq 1 ]; then
+        step="build"
     fi
     case "$step" in
         build) echo "[launcher] No prebuilt launcher available; building from source (unattended)." >&2

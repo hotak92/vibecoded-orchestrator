@@ -402,7 +402,8 @@ goto :launch_no_prebuilt
 
 :launch_no_prebuilt
 REM Only NOW is the user asked about compiling (launcher_acquire next-step:
-REM unattended -> build; interactive -> ask; rule not runnable -> ask).
+REM unattended -> build; interactive -> ask; rule not runnable -> ask when
+REM interactive, build under --yes).
 set "NEXT_STEP=ask"
 if defined ACQ_PY (
     if "%YES_FLAG%"=="1" (
@@ -411,6 +412,10 @@ if defined ACQ_PY (
         for /f "usebackq delims=" %%S in (`"%ACQ_PY%" -m vco_lib.launcher_acquire next-step --outcome no-prebuilt 2^>nul`) do set "NEXT_STEP=%%S"
     )
 )
+REM The rule could not run (no interpreter, or it failed): an unattended run
+REM still never blocks on the prompt below (review V02103-FINAL2 L-5; must
+REM match launcher_acquire.next_step and post-install-launcher.sh: --yes -> build).
+if "%YES_FLAG%"=="1" if /I "%NEXT_STEP%"=="ask" set "NEXT_STEP=build"
 if /I "%NEXT_STEP%"=="build" goto :launch_build
 echo.
 echo [launcher] No prebuilt launcher is available for this OS/arch/version.

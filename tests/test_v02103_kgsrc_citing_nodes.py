@@ -845,3 +845,51 @@ def test_lookup_matches_cross_os_and_file_url_spellings(tmp_path, monkeypatch, s
     scan = prompt_mod.citing_nodes(r, _git(r, "rev-parse", "HEAD").strip())
     assert [(e.path, e.nodes) for e in scan.entries] == [
         ("docs/report.md", ("knowledge/concepts/x.md",))]
+
+
+def test_lookup_never_descends_through_a_directory_symlink(tmp_path, monkeypatch):
+    """Review V02103-FINAL2 I-2: a symlinked DIRECTORY under knowledge/ (here
+    pointing outside the project, at a tree that cites the changed path) is
+    not scanned — the same rule as for a file symlink. Red-proof: make the
+    walk follow links (``os.walk(..., followlinks=True)``) → this fails."""
+    _git_env(monkeypatch)
+    r = tmp_path / "proj"
+    (r / "knowledge" / "concepts").mkdir(parents=True)
+    (r / "docs").mkdir()
+    (r / "knowledge" / "concepts" / "real.md").write_text(_node("Real", "Cites docs/report.md."))
+    outside = tmp_path / "outside-tree"
+    (outside / "deep").mkdir(parents=True)
+    (outside / "deep" / "foreign.md").write_text(_node("Foreign", "Cites docs/report.md."))
+    (r / "knowledge" / "linked-dir").symlink_to(outside, target_is_directory=True)
+    (r / "docs" / "report.md").write_text("v1\n")
+    _git(r, "init", "-q")
+    _git(r, "add", "-A", "--", "knowledge/concepts", "docs")
+    _git(r, "commit", "-q", "-m", "base")
+    (r / "docs" / "report.md").write_text("v2\n")
+    _git(r, "commit", "-q", "-m", "feat: revise", "--", "docs")
+    scan = prompt_mod.citing_nodes(r, _git(r, "rev-parse", "HEAD").strip())
+    assert {n for e in scan.entries for n in e.nodes} == {"knowledge/concepts/real.md"}
+
+
+def test_the_guard_snapshot_records_a_dir_symlink_without_entering_it(tmp_path):
+    """The guard's snapshot walk shares the rule: the directory link is
+    recorded as a link, and nothing behind it is copied as a knowledge file."""
+    from vco_lib import kg_reviewer_guard as guard
+
+    root = tmp_path / "proj"
+    (root / "knowledge").mkdir(parents=True)
+    (root / "knowledge" / "own.md").write_text("own\n")
+    outside = tmp_path / "outside-tree"
+    outside.mkdir()
+    (outside / "foreign.md").write_text("foreign\n")
+    (root / "knowledge" / "linked-dir").symlink_to(outside, target_is_directory=True)
+    walked = [p.relative_to(root).as_posix() for p in guard.walk_no_follow(root / "knowledge")]
+    assert walked == ["knowledge/linked-dir", "knowledge/own.md"]
+    snap = guard.take_snapshot(root)
+    try:
+        assert "knowledge/linked-dir" in snap.symlinks
+        assert not any(k.startswith("knowledge/linked-dir/") for k in snap.knowledge)
+    finally:
+        import shutil
+
+        shutil.rmtree(snap.copy_dir, ignore_errors=True)

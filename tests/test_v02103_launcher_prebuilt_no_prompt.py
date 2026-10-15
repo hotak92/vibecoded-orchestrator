@@ -184,15 +184,62 @@ def test_no_prebuilt_unattended_builds_without_asking(tmp_path):
 
 def test_rule_unreachable_falls_back_to_asking(tmp_path):
     """LEAVE-ALONE of the conservative default: no interpreter for the rule
-    → a question, never a silent build."""
+    on an INTERACTIVE run → a question, never a silent build."""
     fn = _function("_launcher_after_download")
-    harness = (f"YES=1\nREPO_ROOT={tmp_path}\n"
+    harness = (f"YES=0\nREPO_ROOT={tmp_path}\n"
                "_launcher_acquire_python() { :; }\n" + fn
                + '\nr="$(_launcher_after_download no-prebuilt)"\necho "R=$r"\n')
     proc = subprocess.run(["bash", "-c", harness], input="b\n", capture_output=True,
                           text=True, timeout=30)
     assert "Your choice [b]" in proc.stderr
     assert "R=build" in proc.stdout
+
+
+def test_rule_unreachable_under_yes_never_blocks_on_read(tmp_path):
+    """Review V02103-FINAL2 L-5: with --yes and no interpreter for the rule,
+    an OPEN non-TTY stdin that never sends a line (CI) must not block — the
+    shim mirrors the rule's unattended arm (build). RED before the fix: the
+    `read` waits and the run times out."""
+    fn = _function("_launcher_after_download")
+    harness = (f"YES=1\nREPO_ROOT={tmp_path}\n"
+               "_launcher_acquire_python() { :; }\n" + fn
+               + '\nr="$(_launcher_after_download no-prebuilt)"\necho "R=$r"\n')
+    proc = subprocess.Popen(["bash", "-c", harness], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = _wait_open_stdin(proc)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        assert proc.stdin is not None
+        proc.stdin.close()
+    assert "Your choice" not in err
+    assert "R=build" in out
+
+
+def _wait_open_stdin(proc: "subprocess.Popen[str]", timeout: float = 10.0):
+    """Collect stdout/stderr while keeping stdin OPEN (communicate() would
+    close it, turning a blocking `read` into an EOF)."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None:
+        if time.monotonic() > deadline:
+            raise AssertionError("the shim blocked on read under --yes")
+        time.sleep(0.05)
+    assert proc.stdout is not None and proc.stderr is not None
+    return proc.stdout.read(), proc.stderr.read()
+
+
+def test_bat_mirrors_the_unattended_arm_when_the_rule_cannot_run():
+    """The .bat twin of the test above (it cannot run here): when the rule
+    could not answer (NEXT_STEP still "ask") under --yes, NEXT_STEP becomes
+    build BEFORE the `set /p` prompt."""
+    text = BAT.read_text(encoding="utf-8")
+    block = text[text.index("\n:launch_no_prebuilt\n"):text.index("\n:launch_build\n")]
+    mirror = block.index('if "%YES_FLAG%"=="1" if /I "%NEXT_STEP%"=="ask" set "NEXT_STEP=build"')
+    assert mirror < block.index('if /I "%NEXT_STEP%"=="build" goto :launch_build') < block.index("set /p")
 
 
 # ── the .bat: same rule, same CLI ────────────────────────────────────────

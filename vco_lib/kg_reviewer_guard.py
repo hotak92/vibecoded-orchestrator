@@ -387,6 +387,23 @@ def _status_paths(root: Path) -> Dict[str, str]:
     return out
 
 
+def walk_no_follow(top: Path) -> "Iterable[Path]":
+    """Every entry under ``top`` — files, and symlinks (to files OR to
+    directories) as entries — without ever descending through a directory
+    symlink. The ONE walk of ``knowledge/`` for the guard's snapshot and the
+    prompt's citing-node scan (review V02103-FINAL2 I-2): it states the
+    no-follow rule in code instead of relying on ``Path.rglob``'s
+    version-specific symlink semantics (``recurse_symlinks`` arrived in 3.13).
+    Sorted, so callers are deterministic.
+    """
+    out: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+        base = Path(dirpath)
+        out.extend(base / d for d in dirnames if (base / d).is_symlink())
+        out.extend(base / f for f in filenames)
+    return sorted(out)
+
+
 def take_snapshot(root: Path) -> Snapshot:
     root = root.resolve()
     head = _git(root, "rev-parse", "--verify", "--quiet", "HEAD")
@@ -395,7 +412,7 @@ def take_snapshot(root: Path) -> Snapshot:
                     copy_dir=Path(tempfile.mkdtemp(prefix="vco-kg-reviewer-")))
     kdir = root / KNOWLEDGE_DIR
     if kdir.is_dir():
-        for path in kdir.rglob("*"):
+        for path in walk_no_follow(kdir):
             rel = path.relative_to(root).as_posix()
             if path.is_symlink():
                 snap.symlinks[rel] = os.readlink(path)

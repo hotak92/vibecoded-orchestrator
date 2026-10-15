@@ -508,11 +508,16 @@ class DeliveryAuditTests(unittest.TestCase):
         v0.2.103 — LOWERED 14_725 -> 14_719: the NEW-8 symlink-redirect
         notice moved to ``vco_lib.atomic.warn_symlink_redirect`` (one wording
         for every symlink-safe writer).
+
+        v0.2.103 (review V02103-FINAL2 L-1) — LOWERED 14_719 -> 14_662: the
+        shared-KG name order moved to ``vco_lib.root_kg_identity.
+        resolve_shared_name`` (one home, Identity-tab pick first);
+        ``_resolve_shared_kg_name`` is a shim over it.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 14_719,
+            n, 14_662,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

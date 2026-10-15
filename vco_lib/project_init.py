@@ -11596,71 +11596,16 @@ def _apply_canonical_env_via_config_projection(
 
 
 def _resolve_shared_kg_name(folder: Optional[Path] = None) -> str:
-    """Resolve THIS machine's shared-KG class name (v0.2.92 F-12).
+    """THIS machine's shared-KG class name for ``folder`` (v0.2.92 F-12).
 
-    ``_SHARED_KG_NAME`` (``VibeCodedOrchestrator_KnowledgeGraph``) is VCO's
-    LAST-RESORT default, not a description of the install. On an
-    adopt-and-route install the orchestrator root's own collection serves both
-    roles, so the generic literal names a class that does not exist — a state
-    field-observed on a live machine, where one project's shared-KG searches
-    returned nothing for three days and no component reported an error. Any
-    writer that hardcodes the literal manufactures that state.
-
-    Resolution order (first non-empty wins), all soft-fail:
-
-    1. This project's own ``shared`` KG binding in launcher.db.
-    2. The project's existing on-disk ``SHARED_KG_COLLECTION`` pin — a value
-       already in ``.claude/settings.json`` is a user/launcher decision, and an
-       explicit empty string is the documented "cross-project fan-out
-       intentionally disabled" choice, honoured verbatim.
-    3. The ORCHESTRATOR-ROOT project's ``shared`` binding, then its ``primary``
-       — on an adopt-and-route install the root's primary IS the machine's
-       canonical shared collection.
-    4. ``_SHARED_KG_NAME`` — unchanged behaviour when nothing resolves (a
-       genuinely launcher-less standalone install, where this name is also what
-       bootstrap will create).
-
-    Never raises.
+    The resolution order lives ONCE in
+    ``vco_lib.root_kg_identity.resolve_shared_name`` (review V02103-FINAL2
+    L-1: the Identity-tab pick first, as the hub and the launcher read it);
+    ``_SHARED_KG_NAME`` is only its last resort. Never raises.
     """
-    # v0.2.92 size-gate extraction: the reader moved to
-    # ``vco_lib.kg_binding_read``. Imported here
-    # — lazily, but OUTSIDE the swallow-all try below so a broken install
-    # surfaces loudly instead of silently skipping tier 1.
-    from vco_lib.kg_binding_read import _read_kg_binding_override
+    from vco_lib.root_kg_identity import resolve_shared_name
 
-    # 1. this project's own shared binding.
-    if folder is not None:
-        try:
-            override = _read_kg_binding_override(Path(folder))
-            val = (override.get("shared_kg_collection") or "").strip()
-            if val:
-                return val
-        except Exception:  # noqa: BLE001
-            pass
-
-        # 2. an existing on-disk pin (including the explicit-disable "").
-        try:
-            from vco_lib.knowledge_residue import project_settings_env
-            existing = project_settings_env(Path(folder)).get(
-                "SHARED_KG_COLLECTION"
-            )
-            if isinstance(existing, str):
-                return existing.strip()
-        except Exception:  # noqa: BLE001
-            pass
-
-    # 3. the orchestrator root's shared, then primary, binding.
-    try:
-        from vco_lib.launcher_db_reader import get_orchestrator_root_bindings
-        root_primary, root_shared = get_orchestrator_root_bindings()
-        for cand in (root_shared, root_primary):
-            if isinstance(cand, str) and cand.strip():
-                return cand.strip()
-    except Exception:  # noqa: BLE001
-        pass
-
-    # 4. last resort.
-    return _SHARED_KG_NAME
+    return resolve_shared_name(folder, fallback=_SHARED_KG_NAME)
 
 
 def probe_classes_exist(

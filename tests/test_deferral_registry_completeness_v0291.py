@@ -317,6 +317,8 @@ _V02103_OWNED_ADDITIONS = frozenset({
     # vco_lib.root_kg_identity's blocked decision, emitted by step 7c into
     # the run report (install._root_kg_blocked_entry).
     "root_kg_blocked_by_case_sibling",
+    # ... and its Identity-tab pick refused by the profile rule (L-1).
+    "root_kg_pick_wrong_embedding",
 })
 
 

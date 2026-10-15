@@ -67,7 +67,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from vco_lib.kg_reviewer_guard import _parse_fm, _split_frontmatter, lock_reason
+from vco_lib.kg_reviewer_guard import _parse_fm, _split_frontmatter, lock_reason, walk_no_follow
 from vco_lib.kg_reviewer_model import config
 
 __all__ = ["CommitInfo", "collect_commit", "changed_paths",
@@ -306,7 +306,9 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
         return CitingScan(entries=(), unknown=False)
     found: Dict[str, List[str]] = {rel: [] for rel, _p, _n in patterns}
     locked: Dict[str, bool] = {}
-    for path in sorted(kdir.rglob("*.md")):
+    for path in walk_no_follow(kdir):  # never descends through a dir symlink (I-2)
+        if path.suffix != ".md":
+            continue
         try:
             if path.is_symlink():  # never follow a link out of the tree
                 continue

@@ -157,7 +157,13 @@ class _HookCase(unittest.TestCase):
                               env=self._env(**extra), capture_output=True, text=True,
                               timeout=180, cwd=str(self.tmp))
 
-    def _engine_started(self) -> bool:
+    def _engine_started(self, wait_s: float = 15.0) -> bool:
+        """The hook spawns the starter DETACHED (``( ... & )`` / Start-Process)
+        and returns at once, so the fake interpreter's argv line can land after
+        the hook exits — under a loaded full-suite run it did (field flake,
+        lane V02103-FINAL2). Wait for it (bounded); a negative test passes a
+        short wait so a late spawn is still caught."""
+        _wait_for_line(self.log, ENGINE_LINE, timeout_s=wait_s)
         return self.log.exists() and any(
             ln.strip() == ENGINE_LINE for ln in self.log.read_text().splitlines())
 
@@ -180,7 +186,7 @@ class BashHookWiringTests(_HookCase):
         proc = self._run_sh(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_NOT_INSTALLED,
                             FAKE_RESOLVE_JSON=RESOLVE_JSON_NOT_INSTALLED)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertFalse(self._engine_started(),
+        self.assertFalse(self._engine_started(wait_s=2.0),
                          "nothing installed: no engine start may be spawned; "
                          f"log:\n{self.log.read_text() if self.log.exists() else '<none>'}")
 
@@ -199,7 +205,7 @@ class Ps1HookWiringTests(_HookCase):
         proc = self._run_ps1(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_NOT_INSTALLED,
                              FAKE_RESOLVE_JSON=RESOLVE_JSON_NOT_INSTALLED)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertFalse(self._engine_started(),
+        self.assertFalse(self._engine_started(wait_s=2.0),
                          "nothing installed: no engine start may be spawned; "
                          f"log:\n{self.log.read_text() if self.log.exists() else '<none>'}")
 

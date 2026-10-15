@@ -66,6 +66,7 @@ from vco_lib.paths import vct_root_dir
 __all__ = ["VCT_CONTAINER_ENGINE_AUTOSTART", "APP_STATE_ENGINE_AUTOSTART",
            "DEFAULT_ENGINE_AUTOSTART", "autostart_enabled", "pref_enabled",
            "install_skipped_containers", "ensure_engine", "engine_start_lock_path",
+           "engine_start_log_path", "record_outcome",
            "heal_podman_reachability", "try_start_docker_daemon", "main"]
 
 #: Opt-out knob 1 (v0.2.103), the env override. No earlier env disabled
@@ -429,6 +430,49 @@ def engine_start_lock_path(root: Optional[Path] = None) -> Path:
     return (root or vct_root_dir()) / "state" / "engine-start.lock"
 
 
+#: Bound on the outcome log (review V02103-FINAL2 L-2): once it passes this
+#: size it is cut to its last :data:`ENGINE_START_LOG_KEEP_LINES` lines.
+ENGINE_START_LOG_MAX_BYTES = 256 * 1024
+ENGINE_START_LOG_KEEP_LINES = 500
+
+
+def _log_and_record(msg: str) -> None:
+    """The CLI's log callback: stderr (discarded by detached spawners) AND
+    the outcome log, so an intermediate failure line survives too."""
+    _default_log(msg)
+    record_outcome(msg, rotate=False)
+
+
+def engine_start_log_path(root: Optional[Path] = None) -> Path:
+    """Where every run's outcome is recorded: ``<vct_root>/logs/engine-start.log``."""
+    return (root or vct_root_dir()) / "logs" / "engine-start.log"
+
+
+def record_outcome(line: str, *, rotate: bool = True, path: Optional[Path] = None) -> None:
+    """Append one timestamped outcome line to :func:`engine_start_log_path`.
+
+    Review V02103-FINAL2 L-2: every surface (the session hooks, the hub, the
+    launcher) spawns this CLI detached with its output discarded, so the
+    outcome line used to vanish. The CLI writes it HERE itself, so all of
+    them leave a trace. Bounded through :func:`vco_lib.atomic.rotate_tail_lines`
+    (the one rotation home; only the claim holder rotates, a stand-down run
+    just appends). Soft-fail: a log write never changes the outcome.
+    """
+    from vco_lib.atomic import rotate_tail_lines  # noqa: PLC0415 — lazy
+
+    target = path or engine_start_log_path()
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if rotate:
+            rotate_tail_lines(target, max_bytes=ENGINE_START_LOG_MAX_BYTES,
+                              keep_lines=ENGINE_START_LOG_KEEP_LINES)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} pid={os.getpid()} {line}\n")
+    except OSError as exc:
+        print(f"container-engine-start: could not write {target}: {exc}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -470,18 +514,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.verb == "ensure":
         from vco_lib.atomic import LockTimeout  # noqa: PLC0415 — lazy
 
+        holder = True
         try:
             with exclusive_file_lock(engine_start_lock_path(), timeout_s=0.1):
-                ok, detail = ensure_engine(wait_s=max(0.0, args.wait), log=_default_log)
+                try:
+                    ok, detail = ensure_engine(wait_s=max(0.0, args.wait), log=_log_and_record)
+                except Exception as exc:  # noqa: BLE001 — record it, then surface it
+                    record_outcome(f"error — {type(exc).__name__}: {exc}")
+                    raise
         except LockTimeout:
             # Another CLI run (launcher / hub / a sibling session) is holding
             # the claim — it is already starting the engine. The loser's
             # correct behaviour is to stand down, not to race it.
+            holder = False
             ok, detail = False, "an engine start is already in progress; standing down"
+        state = "up" if ok else "not started"
+        record_outcome(f"{state} — {detail}", rotate=holder)
         if args.json:
             print(json.dumps({"ok": ok, "detail": detail}, sort_keys=True))
         else:
-            state = "up" if ok else "not started"
             print(f"container-engine-start: {state} — {detail}")
         return 0
     return 2

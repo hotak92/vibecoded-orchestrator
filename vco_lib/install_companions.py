@@ -782,7 +782,7 @@ def _stop_when_parent_ends(winapi: Any, handle, pid: int) -> None:
 # So once step 5 is done, install.py continues as the venv's python
 # (:func:`continue_in_venv`), through the same exec / spawn-and-wait primitive
 # as every other hop (:func:`hand_off`). The child restarts ``main()`` from the
-# top; what the parent already did or asked travels in a RECORD — a 0600 temp
+# top; what the parent already did or asked travels in a RECORD — an owner-only temp
 # JSON file named by :data:`ENV_POST_VENV_HANDOFF` — so the child neither
 # repeats a prompt nor loses state that lived only in this process:
 #
@@ -830,7 +830,7 @@ class PostVenvHandoff:
 
 
 def write_post_venv_handoff(state: dict, *, tmp_dir: Optional[str] = None) -> str:
-    """Write the record to a fresh 0600 temp file and return its path.
+    """Write the record to a fresh owner-only temp file and return its path.
     (``mkstemp`` creates it owner-only on POSIX; on Windows the per-user temp
     directory is the boundary — the record carries no secret either way.)"""
     fd, path = tempfile.mkstemp(prefix="vco-install-handoff-", suffix=".json", dir=tmp_dir)

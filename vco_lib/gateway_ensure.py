@@ -344,7 +344,10 @@ def _gateway_has_run_here(state_dir: Optional[Path]) -> bool:
         from model_router.config import (  # pyright: ignore[reportMissingImports]
             token_path,
         )
-    except Exception:  # noqa: BLE001 — no gateway package ⇒ no evidence
+    except ImportError as exc:  # a broken install: say so, then "no evidence"
+        print(f"gateway_ensure: {exc}", file=sys.stderr)
+        return False
+    except Exception:  # noqa: BLE001 — any other failure ⇒ no evidence
         return False
     path = Path(token_path())
     if state_dir is not None:

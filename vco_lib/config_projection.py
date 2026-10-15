@@ -906,7 +906,7 @@ SHELL_DEFAULTED_ENV_KEYS: tuple[str, ...] = (_ENV_LOGGING_LEVEL,)
 # Precedence in every implementation: non-empty
 # ``app_state[shared_kg.collection_name]`` wins; otherwise each surface's
 # pre-existing binding-derivation chain applies.
-APP_STATE_KEY_SHARED_KG_NAME = "shared_kg.collection_name"
+from vco_lib.root_kg_identity import PICKER_KEY as APP_STATE_KEY_SHARED_KG_NAME  # noqa: E402 — the one home
 
 
 def _fetch_app_state_str(

@@ -37,7 +37,10 @@ this module owns the two decisions they share, through a tiny CLI
     anything.
 
 Both shims fall back to ``ask`` when this CLI cannot run at all: when the
-rule itself cannot be consulted, a question is the conservative default.
+rule itself cannot be consulted, a question is the conservative default —
+except under ``--yes``, where they mirror :func:`next_step`'s unattended arm
+(build), because an unattended run must never block on a prompt (review
+V02103-FINAL2 L-5; ``post-install-launcher.sh`` / ``first-install.bat``).
 
 A download that cannot be VERIFIED — the sidecar is absent from the
 release, could not be fetched, is malformed, or names a different digest —

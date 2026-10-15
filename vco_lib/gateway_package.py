@@ -16,8 +16,22 @@ The parts VCO's install-time code imports (``model_router.vendors``,
 own package docstring), so :func:`ensure_importable` puts the checkout's
 ``claude_mcp_servers/`` on ``sys.path`` — APPENDED, so a venv's installed
 copy always wins — whenever ``model_router`` is not already importable.
-A checkout without the package (it is shipped, so that is a broken tree)
-changes nothing and the caller's import still fails loudly.
+
+Why this is the SUPPORTED path, not a fallback to a second copy (review
+V02103-FINAL2 I-3, the "a failed import is a broken install" rule): the
+editable install (``pip install -e claude_mcp_servers/``) only teaches the
+VENV's interpreter where the package is, and what it points at is these very
+files in this checkout. The system interpreter that runs ``install.py`` /
+``install-bundle`` before (or outside) the venv resolves ``vco_lib`` the same
+way — from the checkout on ``sys.path`` — so resolving the gateway package
+from the same checkout serves the same bytes the venv would; it cannot mask a
+stale or different copy. Removing the append would re-break the field case
+above; there is no other interpreter-independent way to reach the package.
+
+What a broken install looks like here — the shipped package directory missing
+from the checkout — is LOUD: :func:`ensure_importable` raises
+:class:`ImportError` naming the path and the remedy, instead of returning and
+leaving the caller to a bare ``ModuleNotFoundError``.
 """
 
 from __future__ import annotations
@@ -35,21 +49,29 @@ _CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def ensure_importable(checkout_root: Optional[Path] = None) -> bool:
-    """Make ``import model_router`` resolve; True when it now can.
+    """Make ``import model_router`` resolve; returns True.
 
     Already importable → untouched. Else, when ``<checkout>/claude_mcp_servers
     /model_router/__init__.py`` exists, its parent is appended to ``sys.path``.
+    Raises :class:`ImportError` when the package still cannot be found — the
+    package is shipped, so that is a broken install, never a case to skip.
     """
     if importlib.util.find_spec("model_router") is not None:
         return True
     pkg = Path(checkout_root or _CHECKOUT_ROOT) / GATEWAY_PACKAGE_REL
-    if not (pkg / "__init__.py").is_file():
-        return False
-    parent = str(pkg.parent)
-    if parent not in sys.path:
-        sys.path.append(parent)
-    importlib.invalidate_caches()
-    return importlib.util.find_spec("model_router") is not None
+    if (pkg / "__init__.py").is_file():
+        parent = str(pkg.parent)
+        if parent not in sys.path:
+            sys.path.append(parent)
+        importlib.invalidate_caches()
+        if importlib.util.find_spec("model_router") is not None:
+            return True
+    raise ImportError(
+        f"broken VCO install: the model gateway package is not importable and "
+        f"{pkg} is missing or unusable — re-run the orchestrator update "
+        f"(`python install.py --update` or the launcher's Update)",
+        name="model_router",
+    )
 
 
 __all__ = ["GATEWAY_PACKAGE_REL", "ensure_importable"]

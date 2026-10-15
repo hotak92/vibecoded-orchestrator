@@ -78,10 +78,46 @@ def test_an_installed_copy_wins_over_the_checkout(tmp_path, monkeypatch):
     assert sys.path == before
 
 
-def test_a_checkout_without_the_package_changes_nothing(tmp_path, monkeypatch):
+def test_a_checkout_without_the_package_fails_loudly_and_changes_nothing(tmp_path, monkeypatch):
+    """Review V02103-FINAL2 I-3: the package is shipped, so its absence is a
+    broken install — an ImportError naming the path and the remedy, never a
+    quiet False the caller may skip past. Red-proof: restore `return False`
+    → this fails."""
+    import pytest
+
     from vco_lib import gateway_package as gp
 
     monkeypatch.setattr(gp.importlib.util, "find_spec", lambda _n: None)
     before = list(sys.path)
-    assert gp.ensure_importable(tmp_path) is False
+    with pytest.raises(ImportError) as info:
+        gp.ensure_importable(tmp_path)
+    assert "broken VCO install" in str(info.value)
+    assert str(tmp_path / gp.GATEWAY_PACKAGE_REL) in str(info.value)
+    assert "--update" in str(info.value)
     assert sys.path == before
+
+
+def test_the_append_resolves_the_same_files_the_editable_install_serves():
+    """The supported-path rationale, pinned: under the system interpreter the
+    package resolves to THIS checkout's files — the same bytes the venv's
+    editable install points at — so the append cannot serve another copy."""
+    res = _system_python("""
+from vco_lib.gateway_package import ensure_importable
+ensure_importable()
+import model_router
+print(model_router.__file__)
+""")
+    assert res.returncode == 0, res.stderr
+    assert Path(res.stdout.strip()).resolve() == (
+        REPO_ROOT / "claude_mcp_servers" / "model_router" / "__init__.py").resolve()
+
+
+def test_gateway_ensure_reports_a_broken_install_on_stderr(monkeypatch, capsys):
+    from vco_lib import gateway_ensure, gateway_package
+
+    def broken(*_a, **_k):
+        raise ImportError("broken VCO install: test")
+
+    monkeypatch.setattr(gateway_package, "ensure_importable", broken)
+    assert gateway_ensure._gateway_has_run_here(None) is False
+    assert "broken VCO install" in capsys.readouterr().err

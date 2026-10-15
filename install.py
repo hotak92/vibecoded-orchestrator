@@ -159,6 +159,7 @@ from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
 from vco_lib import paths as _paths  # noqa: E402
 from vco_lib import service_endpoints as _service_endpoints  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
+from vco_lib import uninstall_artifacts as _uninstall_artifacts  # noqa: E402
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
 from vco_lib import compose_provider as _compose_provider  # noqa: E402
@@ -12636,6 +12637,8 @@ def _ensure_collections(embed_config: dict,
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
     ]
+    if root_kg is not None and root_kg.picked_refused and deferral_report is not None:
+        deferral_report.add_entry(_root_kg_identity.pick_refused_entry(root_kg))  # L-1
     if root_kg is not None and root_kg.blocked_by:
         # A case-only sibling makes the root's class uncreatable: the consent deferral is recorded
         # here too, since 7c may return before deciding (R24 LOW-1; same cid → idempotent).
@@ -13686,6 +13689,8 @@ def _seed_weaviate_impl(
     # case-sibling or another install's populated class. A blind read (Weaviate
     # state unknown) keeps the bound name and defers the rebind (V44-H/H1).
     root_kg = _root_kg_decision()
+    if root_kg is not None and root_kg.picked_refused and deferral_report is not None:
+        deferral_report.add_entry(_root_kg_identity.pick_refused_entry(root_kg))  # L-1
     if root_kg is not None and root_kg.blocked_by:
         if deferral_report is not None:
             deferral_report.add_entry(_root_kg_blocked_entry(root_kg))
@@ -21440,7 +21445,9 @@ def _run_uninstall(args: argparse.Namespace) -> int:
          Without this, post-uninstall every boot retried
          `scripts/launch-claude-mcp-stack.*` from a deleted clone forever.
       6. (opt-in via --remove-projects) Remove .claude/ folders in registered projects
-      7. NEVER touches: ~/.vct-secrets/ (user's secret material)
+      7. Launcher binaries, shortcuts and VCO state files OUTSIDE the clone
+         (vco_lib/uninstall_artifacts.py — exact VCO names only)
+      NEVER touches: ~/.vct-secrets/ (user's secret material)
 
     Writes an audit log of what was removed to stdout and to
     ~/.vibecoded/uninstall_audit.log.
@@ -21563,6 +21570,9 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         print("  [6] Remove .claude/ folders in registered projects (--remove-projects)")
     else:
         print("  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
+
+    _ua_plan = _uninstall_artifacts.build_plan(os_name=os_name, home=Path.home(), vct_root=_paths.vct_root_dir())
+    print("\n".join(_uninstall_artifacts.plan_lines(_ua_plan)))
 
     print()
     print("  WILL NOT TOUCH: ~/.vct-secrets/ (your GitHub PAT and other secrets stay)")
@@ -21716,6 +21726,10 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         if registry.exists() and _confirm("Remove .claude/ in registered projects?"):
             audit.append("project .claude/ removal: registry-based removal not implemented in v0.1.0; "
                          "remove manually from each project root if desired")
+
+    # Step 7: what install placed OUTSIDE the clone (review V02103-FINAL2 M-1).
+    if _ua_plan.remove and _confirm("Remove launcher binaries, shortcuts and VCO state files outside the clone?"):
+        audit.extend(_uninstall_artifacts.execute(_ua_plan, extra_hub_binaries=[_try_bundled_vct_hub_binary(PROJECT_ROOT)]))
 
     # Write audit log.
     audit_dir = Path.home() / ".vibecoded"

@@ -1,0 +1,219 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+"""Uninstall step [7] — what install places outside the clone (review
+V02103-FINAL2 M-1). Every test runs against a temp HOME / LOCALAPPDATA /
+VCT state root; nothing on the real machine is read or removed."""
+from __future__ import annotations
+
+import argparse
+import importlib
+import plistlib
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from vco_lib import uninstall_artifacts as ua  # noqa: E402
+
+
+def _lnk(path: Path, target: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A .lnk stores its target path (ANSI in LinkInfo, UTF-16 in StringData).
+    path.write_bytes(b"L\x00\x00\x00" + target.encode("utf-16-le") + b"\x00" * 8)
+    return path
+
+
+def _app(path: Path, bundle_id: str) -> Path:
+    (path / "Contents" / "MacOS").mkdir(parents=True)
+    (path / "Contents" / "MacOS" / "VCT Launcher").write_bytes(b"bin")
+    with (path / "Contents" / "Info.plist").open("wb") as fh:
+        plistlib.dump({"CFBundleIdentifier": bundle_id}, fh)
+    return path
+
+
+@pytest.fixture
+def win(tmp_path):
+    home = tmp_path / "home"
+    local = tmp_path / "LocalAppData"
+    appdata = tmp_path / "Roaming"
+    root = tmp_path / "vct"
+    dest = local / "vct-launcher"
+    dest.mkdir(parents=True)
+    for exe in ua.WINDOWS_LAUNCHER_EXES:
+        (dest / exe).write_bytes(b"MZ")
+    (dest / "notes.txt").write_text("user's own file")  # foreign
+    desk = _lnk(home / "Desktop" / "VCT Launcher.lnk", str(dest / "vct-launcher.exe"))
+    start = _lnk(
+        appdata / "Microsoft/Windows/Start Menu/Programs/VCT Launcher.lnk",
+        str(dest / "vct-launcher.exe"),
+    )
+    other = _lnk(home / "Desktop" / "Other App.lnk", r"C:\Other\other.exe")
+    (root / "state").mkdir(parents=True)
+    (root / "state" / "engine-start.lock").write_text("")
+    (root / "state" / "resync-claim.lock").write_text("")  # foreign to step 7
+    env = {"LOCALAPPDATA": str(local), "APPDATA": str(appdata), "USERPROFILE": str(home)}
+    plan = ua.build_plan(os_name="Windows", home=home, vct_root=root, env=env)
+    return dict(plan=plan, dest=dest, desk=desk, start=start, other=other, root=root)
+
+
+def test_dry_run_lists_every_windows_artefact_and_removes_nothing(win):
+    plan = win["plan"]
+    listed = {r.path for r in plan.remove}
+    for exe in ua.WINDOWS_LAUNCHER_EXES:
+        assert win["dest"] / exe in listed
+    assert {win["desk"], win["start"], win["root"] / "state" / "engine-start.lock"} <= listed
+    text = "\n".join(ua.plan_lines(plan))
+    assert "vct-launcher.exe" in text and "VCT Launcher.lnk" in text
+    audit = ua.execute(plan, dry_run=True)
+    assert any(line.startswith("would remove") for line in audit)
+    for p in listed:
+        assert p.exists(), f"dry-run removed {p}"
+
+
+def test_real_run_removes_them_and_leaves_foreign_files(win):
+    plan = win["plan"]
+    audit = ua.execute(plan, hub_running=lambda: False)
+    for r in plan.remove:
+        assert not r.path.exists(), r.path
+    assert (win["dest"] / "notes.txt").read_text() == "user's own file"
+    assert win["dest"].is_dir(), "a non-empty dir must survive"
+    assert win["other"].exists(), "a user's other shortcut must survive"
+    assert (win["root"] / "state" / "resync-claim.lock").exists()
+    assert any(line.startswith("removed") for line in audit)
+
+
+def test_a_same_named_lnk_that_is_not_ours_is_left(tmp_path):
+    home = tmp_path / "home"
+    foreign = _lnk(home / "Desktop" / "VCT Launcher.lnk", r"C:\Tools\something-else.exe")
+    plan = ua.build_plan(os_name="Windows", home=home, vct_root=tmp_path / "vct",
+                         env={"USERPROFILE": str(home)})
+    assert foreign not in {r.path for r in plan.remove}
+
+
+def test_a_running_hub_is_stopped_before_the_binaries_go(win):
+    calls = []
+    ua.execute(win["plan"], hub_running=lambda: True,
+               runner=lambda cmd, timeout=15: calls.append(cmd) or 0)
+    assert calls and calls[0][-1] == "--stop"
+    assert calls[0][0].endswith("vct-hub.exe")
+
+
+def test_a_locked_file_is_reported_and_the_step_continues(win, monkeypatch):
+    real = Path.unlink
+
+    def locked(self, *a, **k):
+        if self.name == "vct-launcher.exe":
+            raise PermissionError("in use")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+    audit = ua.execute(win["plan"], hub_running=lambda: False)
+    assert any("WARN" in a and "vct-launcher.exe" in a and "vct-hub --stop" in a for a in audit)
+    assert not (win["dest"] / "vct-hub.exe").exists(), "kept going after the lock"
+
+
+def test_linux_desktop_entries_and_flat_binary(tmp_path):
+    home = tmp_path / "home"
+    flat = home / ".local/share/vct-launcher/vct-launcher"
+    flat.parent.mkdir(parents=True)
+    flat.write_bytes(b"\x7fELF")
+    body = "[Desktop Entry]\nType=Application\nName=VCT Launcher\nExec=\"x\"\n"
+    menu = home / ".local/share/applications/vct-launcher.desktop"
+    menu.parent.mkdir(parents=True)
+    menu.write_text(body)
+    desk = home / "Desktop/vct-launcher.desktop"
+    desk.parent.mkdir(parents=True)
+    desk.write_text("[Desktop Entry]\nName=My own thing\n")  # user's, same name
+    plan = ua.build_plan(os_name="Linux", home=home, vct_root=tmp_path / "vct", env={})
+    ua.execute(plan, hub_running=lambda: False)
+    assert not flat.exists() and not flat.parent.exists()
+    assert not menu.exists()
+    assert desk.exists(), "a same-named entry that is not VCO's is left"
+
+
+def test_macos_app_bundle_and_link_only_when_the_bundle_id_matches(tmp_path):
+    home = tmp_path / "home"
+    sysapps = tmp_path / "Applications"
+    ours = _app(sysapps / "VCT Launcher.app", ua.LAUNCHER_BUNDLE_ID)
+    (home / "Applications").mkdir(parents=True)
+    link = home / "Applications" / "VCT Launcher.app"
+    link.symlink_to(ours)
+    plan = ua.build_plan(os_name="Darwin", home=home, vct_root=tmp_path / "vct",
+                         env={}, system_applications=sysapps)
+    kinds = {r.path: r.kind for r in plan.remove}
+    assert kinds == {ours: "tree", link: "link"}
+    ua.execute(plan, hub_running=lambda: False)
+    assert not ours.exists() and not link.is_symlink()
+
+    foreign = _app(sysapps / "VCT Launcher.app", "com.example.other")
+    plan = ua.build_plan(os_name="Darwin", home=home, vct_root=tmp_path / "vct",
+                         env={}, system_applications=sysapps)
+    assert foreign not in {r.path for r in plan.remove}
+
+
+def test_reviewer_backups_are_never_removed(tmp_path):
+    root = tmp_path / "vct"
+    backups = root / "backups" / "kg-reviewer-outside" / "20261016T000000Z"
+    backups.mkdir(parents=True)
+    (backups / "copy.md").write_text("user bytes")
+    (root / "model-guidance.json").write_text("{}")
+    plan = ua.build_plan(os_name="Linux", home=tmp_path / "h", vct_root=root, env={})
+    assert "LEFT IN PLACE" in "\n".join(ua.plan_lines(plan))
+    audit = ua.execute(plan, hub_running=lambda: False)
+    assert (backups / "copy.md").exists()
+    assert not (root / "model-guidance.json").exists()
+    assert any(a.startswith("left in place") for a in audit)
+
+
+def test_new_state_files_this_cycle_are_the_paths_their_writers_use(tmp_path, monkeypatch):
+    """Read the paths from the writers, not from a second list."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "vct"))
+    from vco_lib import codegraph_walk, container_engine_start, model_selection, paths
+
+    root = paths.vct_root_dir()
+    written = [
+        container_engine_start.engine_start_lock_path(),
+        codegraph_walk.walk_claim_lock_path("Demo"),
+        model_selection.state_record_path(),
+        container_engine_start.engine_start_log_path(),
+    ]
+    for p in written:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+    plan = ua.build_plan(os_name="Linux", home=tmp_path / "h", vct_root=root, env={})
+    assert set(written) <= {r.path for r in plan.remove}
+
+
+def _uninstall(monkeypatch, tmp_path, *, dry_run):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "vct"))
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(tmp_path / "vct" / "launcher.db"))
+    install = importlib.import_module("install")
+    monkeypatch.setattr(install.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(install._containers, "resolve", lambda *a, **k: argparse.Namespace(
+        runtime=None, installed=None, compose=None, reason="test"))
+    monkeypatch.setattr(install._boot_service, "unregister", lambda *a, **k: [])
+    monkeypatch.setattr(install._boot_service, "unregister_hub_boot_service", lambda *a, **k: [])
+    monkeypatch.setattr(ua, "_default_hub_running", lambda: False)
+    lock = tmp_path / "vct" / "state" / "engine-start.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("")
+    args = argparse.Namespace(dry_run=dry_run, yes=True, quiet=True, keep_data=True,
+                              remove_projects=False)
+    assert install._run_uninstall(args) == 0
+    return lock
+
+
+def test_run_uninstall_dry_run_lists_step_7_and_keeps_the_lock(monkeypatch, tmp_path, capsys):
+    lock = _uninstall(monkeypatch, tmp_path, dry_run=True)
+    out = capsys.readouterr().out
+    assert "[7]" in out and str(lock) in out
+    assert lock.exists()
+
+
+def test_run_uninstall_removes_the_engine_start_lock(monkeypatch, tmp_path):
+    lock = _uninstall(monkeypatch, tmp_path, dry_run=False)
+    assert not lock.exists()

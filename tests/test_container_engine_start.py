@@ -590,6 +590,74 @@ class CliTests(unittest.TestCase):
                          {"ok": True, "detail": "engine already up; nothing to start"})
 
 
+class OutcomeLogTests(unittest.TestCase):
+    """Review V02103-FINAL2 L-2: every surface spawns the CLI with its output
+    discarded, so the CLI itself records each outcome under the logs dir."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"VCT_STATE_DIR": self._tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.log = Path(self._tmp.name) / "logs" / "engine-start.log"
+
+    def _run(self, result=(False, "no runtime recorded; not guessing an engine")):
+        with mock.patch.object(ces, "ensure_engine", return_value=result), \
+                mock.patch("sys.stdout", io.StringIO()):
+            return ces.main(["ensure", "--wait", "0"])
+
+    def test_the_log_path_is_under_the_vco_logs_dir(self):
+        self.assertEqual(ces.engine_start_log_path(), self.log)
+
+    def test_every_run_appends_its_outcome_line(self):
+        self._run()
+        self._run((True, "daemon responsive"))
+        lines = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("not started — no runtime recorded", lines[0])
+        self.assertIn("up — daemon responsive", lines[1])
+
+    def test_an_intermediate_log_line_is_recorded_too(self):
+        def ensure(**kw):
+            kw["log"]("container engine auto-start (docker) failed: boom")
+            return False, "boom"
+
+        with mock.patch.object(ces, "ensure_engine", side_effect=ensure), \
+                mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            ces.main(["ensure", "--wait", "0"])
+        self.assertIn("failed: boom", self.log.read_text(encoding="utf-8"))
+
+    def test_a_stand_down_is_recorded(self):
+        from vco_lib.atomic import exclusive_file_lock
+
+        with exclusive_file_lock(ces.engine_start_lock_path(), timeout_s=5):
+            self._run()
+        self.assertIn("already in progress", self.log.read_text(encoding="utf-8"))
+
+    def test_a_crash_inside_ensure_is_recorded_before_it_propagates(self):
+        with mock.patch.object(ces, "ensure_engine", side_effect=RuntimeError("kaput")), \
+                mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                ces.main(["ensure", "--wait", "0"])
+        self.assertIn("RuntimeError: kaput", self.log.read_text(encoding="utf-8"))
+
+    def test_the_log_is_bounded(self):
+        self.log.parent.mkdir(parents=True)
+        self.log.write_text("old line\n" * 100_000, encoding="utf-8")
+        self._run()
+        self.assertLessEqual(len(self.log.read_text(encoding="utf-8").splitlines()),
+                             ces.ENGINE_START_LOG_KEEP_LINES + 1)
+
+    def test_an_unwritable_log_never_changes_the_outcome(self):
+        self.log.parent.parent.mkdir(parents=True, exist_ok=True)
+        self.log.parent.write_text("a file where the logs dir should be")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            self.assertEqual(self._run(), 0)
+        self.assertIn("could not write", err.getvalue())
+
+
 class InstallDelegationTests(unittest.TestCase):
     """install.py keeps patchable names that delegate to the ONE home."""
 

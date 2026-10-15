@@ -201,6 +201,7 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
             self.assertIn("TestDev", posted_classes)
         finally:
             server.shutdown()
+            server.server_close()  # L-4: release the listening socket (no ResourceWarning)
 
     def test_fresh_install_creates_capital_c(self):
         """Empty Weaviate, default env. Fresh install must create the
@@ -235,6 +236,7 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
             )
         finally:
             server.shutdown()
+            server.server_close()  # L-4: release the listening socket (no ResourceWarning)
 
     def test_adopt_mode_skips_when_canonical_already_present(self):
         """When the capital-C canonical class already exists, adopt mode
@@ -273,6 +275,7 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
             )
         finally:
             server.shutdown()
+            server.server_close()  # L-4: release the listening socket (no ResourceWarning)
 
     def test_any_casing_sibling_blocks_but_is_not_adopted(self):
         """ANY case-only sibling (here screaming-snake-case) is neither
@@ -307,6 +310,7 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
             )
         finally:
             server.shutdown()
+            server.server_close()  # L-4: release the listening socket (no ResourceWarning)
 
 
 class AdoptCaseDifferentPerProjectKgTests(unittest.TestCase):
@@ -373,6 +377,7 @@ class AdoptCaseDifferentPerProjectKgTests(unittest.TestCase):
             self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", posted_classes)
         finally:
             server.shutdown()
+            server.server_close()  # L-4: release the listening socket (no ResourceWarning)
 
 
 if __name__ == "__main__":

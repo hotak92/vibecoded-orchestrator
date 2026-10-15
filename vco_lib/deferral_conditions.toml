@@ -223,6 +223,21 @@ re-decide and both emit it, so a run whose seed leg returns early still reports 
 still-blocked root; the run after either exit does not re-emit it. A run that \
 skips BOTH steps (--skip-seed / --skip-collections) does not decide at all."""
 
+[conditions.root_kg_pick_wrong_embedding]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (review V02103-FINAL2 L-1). The launcher's Identity-tab shared-KG \
+pick (`app_state['shared_kg.collection_name']`) is followed by \
+`vco_lib.root_kg_identity`'s decision as the user's explicit choice, but only \
+under the embedding-profile rule `adopt` applies: a populated picked class \
+written with another model (and no fill toward the current one pending) is not \
+followed and the root keeps its own name. The hub and the launcher still serve \
+the pick as the shared name, so the user must re-pick or switch the profile. \
+Owned/drop-when-absent: steps 7b and 7c both re-decide and both emit it; the run \
+after either exit does not re-emit it."""
+
 [conditions.rebuild_pending_seed]
 class = "action_required"
 owner = "install.py"

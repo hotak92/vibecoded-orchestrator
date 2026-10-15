@@ -1295,7 +1295,7 @@ _APP_STATE_LAST_SHARED_KG = "last_installed_shared_kg_collection"
 #:   * `launcher/src-tauri/src/commands/project_env_settings.rs::
 #:     APP_STATE_KEY_SHARED_KG_NAME`
 #:   * `launcher/src-tauri/vct-hub/src/config_api.rs` (app_state_get call)
-_APP_STATE_PICKER_SHARED_KG = "shared_kg.collection_name"
+from vco_lib.root_kg_identity import PICKER_KEY as _APP_STATE_PICKER_SHARED_KG  # noqa: E402 — the one home
 
 
 def _read_app_state(cur, key: str) -> str:
