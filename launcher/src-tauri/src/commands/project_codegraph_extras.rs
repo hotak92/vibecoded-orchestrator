@@ -61,11 +61,6 @@ use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
-/// Cap on the analyzer stderr tail kept as failure evidence (the end of
-/// the stream is where the actual error is). Streaming drain — see
-/// [`vct_launcher_core::process::drain_child_stderr_capped`].
-const STDERR_EVIDENCE_BYTES: usize = 2048;
-
 /// Tauri event name for progress lines emitted during sync / reindex.
 /// `ExtraCodegraphPathsPanel.svelte` subscribes and folds each event
 /// (`extras-sync-progress.ts::applyExtrasProgress`, filtered by
@@ -1186,7 +1181,7 @@ async fn run_analyzer_with_stream(
             Some(stream) => {
                 vct_launcher_core::process::drain_child_stderr_capped(
                     stream,
-                    STDERR_EVIDENCE_BYTES,
+                    vct_launcher_core::process::STDERR_EVIDENCE_BYTES,
                 )
                 .await
             }
@@ -1372,7 +1367,7 @@ mod tests {
                 Some(stream) => {
                     vct_launcher_core::process::drain_child_stderr_capped(
                         stream,
-                        STDERR_EVIDENCE_BYTES,
+                        vct_launcher_core::process::STDERR_EVIDENCE_BYTES,
                     )
                     .await
                 }
@@ -1380,15 +1375,25 @@ mod tests {
             }
         };
 
-        let (status, tail) =
+        // Watchdog is TEST-ONLY: production (`await_child_no_deadline`) has no
+        // deadline; here it turns a deadlock into a red test instead of a
+        // hung suite (same 120 s watchdog as the Re-analyze sibling test).
+        let (status, tail) = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
             vct_launcher_core::process::await_child_no_deadline(
                 read_fut, drain_fut, child.wait(),
-            )
-            .await
-            .expect("child must complete, not deadlock on a full stderr pipe");
+            ),
+        )
+        .await
+        .expect("child must complete, not deadlock on a full stderr pipe")
+        .expect("wait ok");
         assert!(status.success());
         // The capped tail keeps only the LAST STDERR_EVIDENCE_BYTES.
-        assert!(tail.len() <= STDERR_EVIDENCE_BYTES, "tail len {}", tail.len());
+        assert!(
+            tail.len() <= vct_launcher_core::process::STDERR_EVIDENCE_BYTES,
+            "tail len {}",
+            tail.len()
+        );
         assert!(tail.ends_with('E'), "tail keeps the END of the stream");
     }
 

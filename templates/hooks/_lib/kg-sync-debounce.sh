@@ -301,9 +301,11 @@ _kg_debounce_pid_live() {
         hz=$(getconf CLK_TCK 2>/dev/null || printf '100')
         case "$btime$hz" in ''|*[!0-9]*) return 0 ;; esac
         # comm may contain spaces/parens; field 2 is "(...)" — strip through
-        # the last ')' so field N of the remainder is stat field N+2
-        # (starttime is field 22 → remainder field 20).
-        start=$(awk '{ i = index($0, ")"); n = split(substr($0, i + 2), f, " "); if (n >= 20) print f[20] }' "/proc/$pid/stat" 2>/dev/null)
+        # the LAST ')' (the greedy `^.*\)` match; no later field can hold a
+        # ')') so field N of the remainder is stat field N+2 (starttime is
+        # field 22 → remainder field 20). Stripping through the FIRST ')'
+        # mis-splits a comm like "a) b" and reads the wrong field.
+        start=$(awk '{ r = $0; sub(/^.*\)/, "", r); n = split(r, f, " "); if (n >= 20) print f[20] }' "/proc/$pid/stat" 2>/dev/null)
         case "$start" in ''|*[!0-9]*) return 0 ;; esac
         start_epoch=$(( btime + start / hz ))
         [ "$start_epoch" -le "$limit" ] && return 0

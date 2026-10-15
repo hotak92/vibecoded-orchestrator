@@ -325,7 +325,7 @@ async fn run_reanalysis_with_stream(
             Some(stream) => {
                 vct_launcher_core::process::drain_child_stderr_capped(
                     stream,
-                    STDERR_EVIDENCE_BYTES,
+                    vct_launcher_core::process::STDERR_EVIDENCE_BYTES,
                 )
                 .await
             }
@@ -375,11 +375,6 @@ fn analyzer_failure_message(status: &std::process::ExitStatus, stderr_text: &str
         hint
     )
 }
-
-/// Cap on the analyzer stderr tail kept as failure evidence (the end of
-/// the stream is where the actual error is). Streaming drain — see
-/// [`vct_launcher_core::process::drain_child_stderr_capped`].
-const STDERR_EVIDENCE_BYTES: usize = 2048;
 
 /// Discriminate progress vs final-report lines and dispatch each.
 /// Final-report shape carries `"final": true`. Progress shape carries
@@ -800,7 +795,7 @@ mod tests {
                 Some(stream) => {
                 vct_launcher_core::process::drain_child_stderr_capped(
                     stream,
-                    STDERR_EVIDENCE_BYTES,
+                    vct_launcher_core::process::STDERR_EVIDENCE_BYTES,
                 )
                 .await
             }
@@ -824,7 +819,7 @@ mod tests {
 
         assert!(status.success());
         // Evidence tail is capped at STDERR_EVIDENCE_BYTES despite >2 MiB.
-        assert_eq!(tail.len(), STDERR_EVIDENCE_BYTES);
+        assert_eq!(tail.len(), vct_launcher_core::process::STDERR_EVIDENCE_BYTES);
         assert!(tail.chars().all(|c| c == 'E' || c == '\n'));
     }
 }

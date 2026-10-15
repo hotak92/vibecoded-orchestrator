@@ -450,6 +450,57 @@ def test_pid_reuse_recycled_claim_is_not_inflight(proj: Path, tmp_path: Path):
     )
 
 
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="Linux /proc parse")
+def test_pid_reuse_guard_holds_for_a_comm_containing_a_paren(proj: Path, tmp_path: Path):
+    """A process `comm` may contain ')' — /proc/<pid>/stat field 2 is then
+    "(a) b)". The start-time parse must strip through the LAST ')': cut at
+    the FIRST one and the remainder shifts by one field, so "starttime"
+    reads stat field 21 (itrealvalue, always 0 → start = boot time), so
+    any claim stamped after boot looks pre-dated by its recycled pid and
+    the reuse guard silently disengages. The binary is a copy of `sleep` named "a) b", so the
+    kernel sets comm to exactly that."""
+    sleep_bin = shutil.which("sleep")
+    if sleep_bin is None:
+        pytest.skip("sleep not on PATH")
+    paren_bin = tmp_path / "a) b"
+    shutil.copy2(sleep_bin, paren_bin)
+    pend = _pending_dir(proj)
+    pend.mkdir(parents=True)
+    script = textwrap.dedent(
+        f"""
+        set -u
+        . "{LIB}"
+        "{paren_bin}" 60 &
+        LIVE_PID=$!
+        sleep 0.2
+        grep -q '(a) b)' "/proc/$LIVE_PID/stat" && echo COMM_HAS_PAREN
+        base="kg_cafef00d.lock"
+        claim="{pend}/$base.claimed.$LIVE_PID"
+        mkdir -p "$claim"
+        # Stamp AFTER boot but BEFORE the process start: the mis-split parse
+        # reads start = boot time (<= stamp → "owner"), the correct one reads
+        # the real start (~now, > stamp + slack → recycled).
+        touch -d "@$(( $(date +%s) - 60 ))" "$claim"
+        if _kg_debounce_inflight "{pend}" "$base"; then echo RECYCLED_INFLIGHT; else echo RECYCLED_CLEAR; fi
+        rm -rf "$claim"
+        mkdir -p "$claim"
+        if _kg_debounce_inflight "{pend}" "$base"; then echo LIVE_INFLIGHT; else echo LIVE_CLEAR; fi
+        kill "$LIVE_PID" 2>/dev/null
+        wait "$LIVE_PID" 2>/dev/null
+        exit 0
+        """
+    )
+    res = _run(script, cwd=proj)
+    assert res.returncode == 0, res.stderr
+    assert "COMM_HAS_PAREN" in res.stdout, "fixture: comm must contain ')'"
+    assert "RECYCLED_CLEAR" in res.stdout, (
+        "a ')'-bearing comm must not disengage the pid-reuse guard"
+    )
+    assert "LIVE_INFLIGHT" in res.stdout, (
+        "the genuine owner with a ')'-bearing comm is still in flight"
+    )
+
+
 def test_pid_reuse_recycled_claim_does_not_freeze_later_edits(proj: Path, tmp_path: Path):
     """THE freeze repro (behavioral): with a recycled-pid claim parked in
     the state dir, a fresh edit of that file must still be SERVED — the

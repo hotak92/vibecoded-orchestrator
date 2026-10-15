@@ -635,6 +635,12 @@ pub fn claimed_walk_args(script: &std::path::Path) -> Vec<std::ffi::OsString> {
 // project_codegraph_extras.rs): drain BOTH pipes concurrently for as
 // long as the child lives, then reap it.
 
+/// Cap on the analyzer stderr tail kept as failure evidence (the end of
+/// the stream is where the actual error is) — the `max_bytes` every
+/// analyzer streaming site passes to [`drain_child_stderr_capped`]. ONE
+/// home, so the Re-analyze and extra-path Sync evidence cannot diverge.
+pub const STDERR_EVIDENCE_BYTES: usize = 2048;
+
 /// Drain a child's stderr while the child runs, keeping only the LAST
 /// `max_bytes` as failure evidence (the end of the stream is where the
 /// actual error is).

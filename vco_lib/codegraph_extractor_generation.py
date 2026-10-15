@@ -497,8 +497,10 @@ class Verdict:
     reason: str
     stamp_now: bool = False
     generation: str = CURRENT_EXTRACTOR_GENERATION
-    #: EVERY rung the upgrade crosses, oldest first — set only when
-    #: ``reason`` is ``REASON_CROSSES_BUMP``. :func:`describe_rung` turns
+    #: EVERY rung the upgrade crosses, oldest first — set when ``reason``
+    #: is ``REASON_CROSSES_BUMP``, and for ``REASON_UNKNOWN_GENERATION``
+    #: when the stamp generation parses (the rungs newer than the stamp);
+    #: empty when neither names a rung. :func:`describe_rung` turns
     #: it into the user-facing reason text (newest rung's reason, plus a
     #: count of the earlier ones).
     bumps: "tuple[str, ...]" = ()
@@ -573,7 +575,23 @@ def decide(
         # ones, so a multi-rung upgrade never reads as its oldest rung.
         return Verdict(True, REASON_CROSSES_BUMP, generation=newest, bumps=crossed)
 
-    return Verdict(True, REASON_UNKNOWN_GENERATION, generation=newest)
+    # UNKNOWN prev version, but a PARSEABLE stamp generation still names the
+    # rungs the forced walk delivers: every bump newer than the generation
+    # the graph was last walked at (bounded by the running version when that
+    # parses). Without this an unknown-manifest project with a 0.2.94 stamp
+    # read the generic "may predate" text instead of the actual change.
+    stamp = parse_semver(stamp_generation or "")
+    running = parse_semver(running_version or "")
+    owed: "tuple[str, ...]" = ()
+    if stamp is not None:
+        owed = tuple(
+            bump
+            for bump in bumps
+            if (b := parse_semver(bump)) is not None
+            and stamp < b
+            and (running is None or b <= running)
+        )
+    return Verdict(True, REASON_UNKNOWN_GENERATION, generation=newest, bumps=owed)
 
 
 # ---------------------------------------------------------------------------

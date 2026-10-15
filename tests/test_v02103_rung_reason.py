@@ -95,6 +95,59 @@ def test_unknown_generation_falls_back_to_generic_wording(
     assert "extractor generation" in warns[0]  # generic fallback shown
 
 
+def test_unknown_version_with_known_stamp_names_the_owed_rung(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Review R4 (fixa residual): no recorded manifest version (UNKNOWN
+    verdict) but a stamp at generation 0.2.94 — the rungs the forced walk
+    delivers are known (only 0.2.102 is newer), so the warning names it
+    instead of the generic "may predate" text. The other arm (no stamp) is
+    `test_unknown_generation_falls_back_to_generic_wording` above."""
+    assert ceg.write_stamp(tmp_path, "0.2.94")
+    warns = _drive_bundle_update(
+        tmp_path, monkeypatch, prev_version="", running_version="0.2.103"
+    )
+    assert len(warns) == 1
+    w = warns[0]
+    assert "v0.2.102" in w and "tree-sitter" in w
+    assert "may predate" not in w
+    # Only ONE rung is newer than the stamp — no "earlier changes" count,
+    # and the rungs the stamp already has are not claimed.
+    assert "earlier extractor change" not in w
+    assert "v0.2.94" not in w
+
+
+def test_unknown_verdict_bumps_follow_the_stamp_generation():
+    known = ceg.decide(
+        prev_version="",
+        running_version="0.2.103",
+        stamp_generation="0.2.92",
+        graph_exists=True,
+    )
+    assert known.reason == ceg.REASON_UNKNOWN_GENERATION
+    assert known.needs_reindex is True
+    assert known.bumps == ("0.2.93", "0.2.94", "0.2.102")
+    # A malformed stamp names no rung → generic fallback upstream.
+    malformed = ceg.decide(
+        prev_version="",
+        running_version="0.2.103",
+        stamp_generation="garbage",
+        graph_exists=True,
+    )
+    assert malformed.reason == ceg.REASON_UNKNOWN_GENERATION
+    assert malformed.bumps == ()
+    # The running version bounds the rungs (a rung newer than what is
+    # installing is not delivered by this walk).
+    bounded = ceg.decide(
+        prev_version="",
+        running_version="0.2.95",
+        stamp_generation="0.2.92",
+        graph_exists=True,
+        bumps=("0.2.92", "0.2.93", "0.2.94", "0.2.102"),
+    )
+    assert bounded.bumps == ("0.2.93", "0.2.94")
+
+
 def test_every_rung_has_a_user_facing_reason():
     """A ladder append without its reason text would silently regress every
     future message to the generic fallback — keep them in lockstep."""
