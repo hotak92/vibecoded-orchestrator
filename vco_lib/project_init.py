@@ -87,6 +87,7 @@ from vco_lib import formats_migration_deferral
 from vco_lib import bundle_preserve as _bundle_preserve
 from vco_lib import weaviate_helpers as _wh
 from vco_lib import bootstrap_case_sibling as _bcs
+from vco_lib import bootstrap_schema_guard as _bsg
 # v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
 # configured-but-empty ``{slot: []}`` slots that weaviate rejects on re-insert).
 # LOUD-FAIL import (no fallback): a broken vco_lib install must surface, never
@@ -2681,10 +2682,8 @@ def _drop_and_recreate(
     has diverged from the current spec in a non-additive way (different
     named-vector set, indexNullState missing, legacy single-vector).
 
-    Lossless from the user's perspective: the on-disk `knowledge/**/*.md`
-    is the source of truth and the subsequent kg-sync re-ingests.
-    Forensic snapshot is captured BEFORE the drop so a mid-drop crash
-    leaves a trail.
+    Callers reach it only for an EMPTY class (v0.2.103 — a populated one is
+    deferred, never dropped). The forensic snapshot is taken first anyway.
     """
     def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
         if log_event is None:
@@ -2842,16 +2841,15 @@ def bootstrap_collections(
         "regenerated": [{"collection": str, "reason": "case-conflict"|"multi-vector"|"legacy-single-vector"|"index-null-state"|"named-vector-mismatch", "dropped_name": str}],
         "errors": [{"collection": str, "error": str}],
         "blocked": [{"collection": str, "sibling": str, "object_count": int|None}],
+        "schema_deferred": [{"collection", "reason", "object_count", "migrate_action"}],
       }
 
-    Bug-1 v0.2.4 (2026-05-12): when an existing collection's schema is
-    incompatible with the current spec (case-only name conflict, legacy
-    multi-vector config, missing indexNullState, etc.) the function
-    drops the old collection and recreates with the target schema. The
-    Rust caller parses ``regenerated[]`` to drive the banner's
-    "Migrating Weaviate schema for X..." state. Lossless: knowledge/**/*.md
-    on disk is the source of truth and the subsequent kg-sync step
-    re-populates Weaviate.
+    Bug-1 v0.2.4: an EMPTY existing class whose schema is incompatible (legacy
+    single-vector, missing core slots / indexNullState, case-only name clash)
+    is dropped and recreated; ``regenerated[]`` drives the launcher banner.
+    v0.2.103: a class that holds objects (or cannot be counted) is NEVER
+    dropped — ``schema_deferred[]`` / ``blocked[]`` + a consent deferral
+    (vco_lib/bootstrap_schema_guard.py, vco_lib/bootstrap_case_sibling.py).
 
     Soft-fail contract: the function NEVER raises for transport errors or
     for individual collection creation failures. A non-empty `errors`
@@ -2894,6 +2892,7 @@ def bootstrap_collections(
         "regenerated": [],
         "errors": [],
         "blocked": [],  # v0.2.103: targets a populated case-only sibling blocks (never dropped)
+        "schema_deferred": [],  # v0.2.103: populated schema-incompatible classes (never dropped)
     }
 
     # 1. Reachability probe + soft restart on failure.
@@ -2977,10 +2976,7 @@ def bootstrap_collections(
             continue
 
         if existing is not None:
-            # Bug-1 v0.2.4: schema-incompatibility regen. Compare actual
-            # schema fields against the canonical target; if non-trivially
-            # divergent (different named-vector set, missing
-            # indexNullState, legacy single-vector), drop + recreate.
+            # Bug-1 v0.2.4: schema-incompatibility regen (drop + recreate) — EMPTY classes only.
             incompatible, reason = _schema_incompatible(
                 existing, target_def_fn, name,
             )
@@ -2992,9 +2988,10 @@ def bootstrap_collections(
                      f"{name}: already exists with compatible schema",
                      data={"collection": name, "action": "exists"})
                 continue
-
-            # Regen path. In dry-run mode we report the intent without
-            # mutating; the Rust caller surfaces the banner state.
+            if _bsg.defers(name, existing, target_def_fn, reason, result, _log, weaviate_url,
+                           dry_run=dry_run):
+                continue  # v0.2.103: populated → schema_migration_required, never dropped
+            # Regen path. Dry-run reports the intent without mutating.
             if dry_run:
                 result["regenerated"].append({
                     "collection": name,
@@ -3126,6 +3123,8 @@ def bootstrap_collections(
 
     _bcs.settle(project_folder, result, project_name=project_name, weaviate_url=weaviate_url,
                 kg_only=kg_only, dry_run=dry_run, log=_log)
+    _bsg.settle(result, project_name=project_name, project_folder=project_folder, derived=derived,
+                weaviate_url=weaviate_url, dry_run=dry_run, log=_log)
     return result
 
 

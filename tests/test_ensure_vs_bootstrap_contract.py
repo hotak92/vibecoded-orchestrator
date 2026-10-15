@@ -64,7 +64,9 @@ _DRIFTED_LEGACY_SINGLE_VECTOR = {
 
 
 class BootstrapRegeneratesOnDriftTests(unittest.TestCase):
-    """``bootstrap_collections`` DROPS + RECREATES a drifted existing class."""
+    """``bootstrap_collections`` DROPS + RECREATES a drifted existing class —
+    when it is EMPTY (v0.2.103: a populated one is deferred to
+    ``migrate-collections``, see test_v02103_bootstrap_schema_guard.py)."""
 
     def test_drift_triggers_drop_and_recreate(self) -> None:
         created: list[str] = []
@@ -89,7 +91,9 @@ class BootstrapRegeneratesOnDriftTests(unittest.TestCase):
              mock.patch.object(project_init, "_fetch_schema", _fake_fetch), \
              mock.patch.object(project_init, "_create_class", _fake_create), \
              mock.patch.object(project_init, "_drop_and_recreate",
-                               _fake_drop_recreate):
+                               _fake_drop_recreate), \
+             mock.patch.object(project_init, "_snapshot_collection_for_rebuild",
+                               return_value={"object_count": 0, "sample_uuids": []}):
             result = project_init.bootstrap_collections(
                 "Alpha", weaviate_url="http://localhost:9", kg_only=True,
             )

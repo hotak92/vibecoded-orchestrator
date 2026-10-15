@@ -1661,7 +1661,11 @@ class = "action_required"
 owner = "vco_lib.project_init"
 clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "A clean migrate-collections dry-run clears it (project_init)."
+notes = """A clean migrate-collections dry-run clears it (project_init). Emitted by \
+the migrate-collections dry-run gate (vco_lib.migrate_deferral) and, since v0.2.103, \
+by the collection bootstrap for a schema-incompatible class that holds objects \
+(vco_lib.bootstrap_schema_guard — never dropped; an empty class is still rebuilt). \
+A shared-KG entry goes to the orchestrator root's ledger, whose dry-run covers it."""
 
 [conditions.chunker_preset_overhaul_pending]
 class = "action_required"
