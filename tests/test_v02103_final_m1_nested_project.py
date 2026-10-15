@@ -144,7 +144,12 @@ def test_nested_project_is_reviewed_and_only_the_reviewer_node_is_committed(
     assert "broken_install" not in row
 
 
-@pytest.mark.parametrize("sibling", ["sh", "ps1"])
+@pytest.mark.parametrize("sibling", [
+    pytest.param("sh", marks=pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
+    "ps1",
+])
 def test_nested_project_without_the_chain_names_the_project_path(tmp_path, sibling):
     """LEAVE-ALONE of the loud-fail rule: a genuinely missing script in the
     nested project is still a broken install, named at the PROJECT path."""

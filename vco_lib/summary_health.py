@@ -70,6 +70,7 @@ if __package__ in (None, ""):  # direct-script execution fallback
 
 from vco_lib import deferral_emit, launcher_db_reader, python_exe
 from vco_lib.deferral_report import DeferralEntry
+from vco_lib.node_formats_keys import canonicalize_keys, sidecar_key
 
 #: The ONE condition id this module emits / resolves. Declared in
 #: ``vco_lib/deferral_conditions.toml`` (class action_required,
@@ -161,8 +162,13 @@ def scan_pending(project_root: Path, *, preferred: str = PREFERRED_TIER) -> Pend
     knowledge_dir = project_root / "knowledge"
     if knowledge_dir.is_dir():
         formats = _load_json(knowledge_dir / KG_SIDECAR_RELPATH.name)
+        # v0.2.103 B1: the sidecar's keys are canonical POSIX (the shape
+        # every reader looks up by); a pre-fix Windows sidecar may still
+        # carry `\` keys, re-keyed here in memory so a node is not counted
+        # pending twice (or missing) for its separator alone.
+        canonicalize_keys(formats)
         for node_path in sorted(knowledge_dir.rglob("*.md")):
-            rel = str(node_path.relative_to(project_root))
+            rel = sidecar_key(node_path, project_root)
             entry = formats.get(rel)
             if not isinstance(entry, dict) or not (
                 entry.get("summary") or entry.get("description")

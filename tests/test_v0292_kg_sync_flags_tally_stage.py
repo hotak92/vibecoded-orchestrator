@@ -985,6 +985,10 @@ def _wrapper_env(venv_root: Path) -> dict:
 
 
 @unittest.skipIf(_IS_PRE_FIX, "wrapper subprocess tests target the tree's script")
+@unittest.skipIf(
+    sys.platform == "win32",
+    "bash .sh leg; Windows runs the .ps1 sibling: "
+    "tests/test_v0292_kg_sync_flags_tally_stage.py::Ps1WrapperForwardTests::test_unknown_flag_through_pwsh_wrapper")
 class BashWrapperForwardsRejectionTests(unittest.TestCase):
     """The bash wrapper is a dumb forwarder — the Python-side exit 2 and
     stderr token must reach the caller unchanged."""

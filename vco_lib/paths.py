@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +71,26 @@ def to_posix_rel(rel: "str | Path") -> str:
     host-OS-shaped ``dest_rel`` can be compared / joined POSIX-uniformly.
     """
     return str(rel).replace("\\", "/")
+
+
+_MSYS_DRIVE_PATH = re.compile(r"^/(?:cygdrive/)?([A-Za-z])(?:/(.*))?$")
+
+
+def msys_drive_path_to_windows(path: str) -> "str | None":
+    """``/c/Users/u/bin`` (Git Bash / MSYS2) or ``/cygdrive/c/...`` (Cygwin)
+    as the Windows path it names (``C:\\Users\\u\\bin``), else ``None``.
+
+    Only the drive-mount forms are translated: they are fixed by every MSYS2
+    and Cygwin install. A root-relative path (``/opt/bin``, ``/usr/bin``)
+    names a directory under the Git/MSYS install root, which only that
+    install's ``cygpath -w`` knows — so it returns ``None`` here rather than
+    guessing. Pure: no filesystem access.
+    """
+    match = _MSYS_DRIVE_PATH.match(path.rstrip("/") or "/")
+    if match is None:
+        return None
+    drive, rest = match.groups()
+    return f"{drive.upper()}:\\" + (rest or "").replace("/", "\\")
 
 
 def looks_like_orchestrator_root(repo_path: "str | Path") -> bool:

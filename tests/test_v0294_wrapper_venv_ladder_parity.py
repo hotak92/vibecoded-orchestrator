@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -254,6 +255,10 @@ def test_each_wrapper_keeps_its_original_shell_options(tool: str) -> None:
         )
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="bash .sh leg; Windows runs the .ps1 sibling: "
+    "tests/test_v0292_kg_duplicates_ps1.py::test_refusal_is_on_stderr_with_exit_1")
 def test_the_shared_ladder_is_set_e_safe(tmp_path: Path) -> None:
     """DRIVEN: the ladder's `[ … ] && …` guards do not abort under `set -e`.
 
@@ -406,7 +411,12 @@ def _stripped_env() -> dict:
 @pytest.mark.parametrize(
     ("tool", "target_script", "expected_exit"),
     [
-        ("kg-duplicates", "detect_duplicates.py", 1),
+        pytest.param(
+            "kg-duplicates", "detect_duplicates.py", 1,
+            marks=pytest.mark.skipif(
+                sys.platform == "win32",
+                reason="bash .sh leg; Windows runs the .ps1 sibling: "
+                "tests/test_v0292_kg_duplicates_ps1.py::test_refusal_is_on_stderr_with_exit_1")),
         ("kg-dedup", None, 1),
         # v0.2.94 newcomers: these had NO refusal at all — they fell through
         # to a bare `python` / `python3`.
@@ -494,6 +504,10 @@ def test_bash_wrapper_refuses_when_its_ladder_is_missing(tmp_path: Path) -> None
     assert "THE SCRIPT MUST NOT RUN" not in (proc.stdout + proc.stderr)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="bash .sh leg; Windows runs the .ps1 sibling: "
+    "tests/test_v0292_kg_duplicates_ps1.py::test_forwards_every_argument_to_detect_duplicates")
 def test_bash_wrapper_runs_the_script_through_a_qualifying_venv(
     tmp_path: Path,
 ) -> None:

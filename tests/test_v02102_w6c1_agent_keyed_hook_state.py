@@ -78,6 +78,10 @@ class TestAgentKeyParity:
             assert agent_state_key(sid, ag) == want, (sid, ag)
 
     @pytest.mark.skipif(not _has_bash(), reason="bash required")
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: "
+        "tests/test_v02102_w6c1_agent_keyed_hook_state.py::TestAgentKeyParity::test_ps1_leg")
     def test_bash_leg(self, tmp_path: Path) -> None:
         py = shutil.which("python3") or "python3"
         lines = [f'. "{HOOKS_LIB}/session-id.sh"']

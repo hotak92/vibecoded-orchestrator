@@ -57,7 +57,16 @@ def _split(key: str):
 BASH = shutil.which("bash")
 PWSH = shutil.which("pwsh")
 GIT = shutil.which("git")
-FLAVOURS = ["sh", "ps1"]
+#: The bash leg dies on Windows (bare `bash` there is WSL's, which cannot
+#: open a Windows path); the product runs the .ps1 sibling there, and each
+#: test's [ps1] param is that coverage (owner ruling 2026-10-15).
+_SH_LEG_WIN = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")
+FLAVOURS = [pytest.param("sh", marks=_SH_LEG_WIN), "ps1"]
+#: For a test whose [ps1] param is itself not green on Windows (triage D4):
+#: its bash leg keeps running there, so nothing is skipped without cover.
+FLAVOURS_BOTH_RUN = ["sh", "ps1"]
 
 
 def _need(flavour: str) -> None:
@@ -159,6 +168,10 @@ class TestUnambiguousAgentKey:
             assert _split(agent_state_key(sid, agent)) == (sid, agent)
 
     @pytest.mark.skipif(not BASH, reason="bash required")
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: "
+        "tests/test_v02102_w6c2_subagent_hook_census.py::TestUnambiguousAgentKey::test_ps1_leg")
     def test_bash_leg(self, tmp_path: Path) -> None:
         lines = [f'. "{HOOKS_LIB}/session-id.sh"']
         for sid, ag, _ in KEY_FIXTURES:
@@ -192,6 +205,10 @@ FAST_PAYLOADS = [
 
 class TestFastAgentKey:
     @pytest.mark.skipif(not BASH, reason="bash required")
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: "
+        "tests/test_v02102_w6c2_subagent_hook_census.py::TestFastAgentKey::test_ps1")
     def test_bash(self, tmp_path: Path) -> None:
         lines = [f'. "{HOOKS_LIB}/session-id.sh"']
         for raw, _ in FAST_PAYLOADS:
@@ -647,7 +664,7 @@ def test_deliver_hook_end_to_end(tmp_path: Path, flavour: str) -> None:
     assert "worktree KEPT at /x" in ctx
 
 
-@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize("flavour", FLAVOURS_BOTH_RUN)
 def test_post_tool_security_files_subagent_alert_for_parent(tmp_path: Path, flavour: str) -> None:
     _need(flavour)
     project = _project(tmp_path)

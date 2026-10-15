@@ -9,7 +9,7 @@ two modes:
 
 * per-node — PostToolUse hook on knowledge/**/*.md edits, and the launcher's
   per-file walk (`launcher/src-tauri/src/commands/kg_summary.rs`):
-  `generate-kg-summary.py <file> [--force] [--force-api]`
+  `generate-kg-summary.py <file> [--force] [--force-api] [--dry-run]`
 * bulk — the manual `--all` backfill, the post-sync refresh
   (`sync_knowledge_graph._regen_node_formats_after_full_sync`) and the
   schema-migration regeneration (`vco_lib/project_init.py::
@@ -292,6 +292,58 @@ def _drop_sidecar_entry(rel_path: str, formats: dict) -> bool:
     return False
 
 
+def _sidecar_key(file_path: Path) -> str:
+    """The canonical sidecar key for *file_path*: project-relative POSIX.
+
+    v0.2.103 B1: ``str(Path.relative_to(...))`` keyed entries with ``\\``
+    on Windows, while every reader looks them up by the canonical POSIX
+    ``file_path`` Weaviate stores — so every summary lookup missed there.
+    One home for the key shape: ``vco_lib.node_formats_keys.sidecar_key``.
+    """
+    from vco_lib.node_formats_keys import sidecar_key
+
+    return sidecar_key(file_path, CLAUDE_PROJECT)
+
+
+def _node_file_for_key(rel_path: str) -> Path:
+    """The node file a sidecar key names (either separator accepted).
+
+    A ``knowledge/``-prefixed key resolves under KNOWLEDGE_DIR, so a
+    ``--knowledge-dir`` override is honoured; anything else is
+    project-relative.
+    """
+    from vco_lib.paths import to_posix_rel
+
+    rel = to_posix_rel(rel_path)
+    node_prefix = KNOWLEDGE_DIR.name + "/"
+    if rel.startswith(node_prefix):
+        return KNOWLEDGE_DIR / rel[len(node_prefix):]
+    return CLAUDE_PROJECT / rel
+
+
+def _current_hash_for_key(rel_path: str) -> "str | None":
+    """The node's current canonical content hash, or ``None`` if unreadable."""
+    node_file = _node_file_for_key(rel_path)
+    try:
+        return content_hash(node_file.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+
+
+def rekey_separator_entries(db: dict) -> int:
+    """Re-key ``\\``-separated sidecar keys to canonical POSIX, in place.
+
+    v0.2.103 B1 one-time migration of sidecars written on Windows before
+    the fix. Idempotent and lossless (``vco_lib.node_formats_keys.
+    canonicalize_keys``): when both forms of a key exist, the entry that
+    still holds a summary wins, then the one matching the node's current
+    content, then the newer ``generated_at``. Returns the keys rewritten.
+    """
+    from vco_lib.node_formats_keys import canonicalize_keys
+
+    return canonicalize_keys(db, current_hash=_current_hash_for_key)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Legacy sidecar re-key (ported from the retired bulk generator, v0.2.103)
 # ──────────────────────────────────────────────────────────────────────
@@ -329,16 +381,7 @@ def rekey_legacy_entries(db: dict) -> int:
         stored = entry.get("content_hash") if isinstance(entry, dict) else None
         if not stored:
             continue
-        # Normalize `\`→`/` first — on Windows the DB keys come from
-        # `str(Path.relative_to(...))` and use `\`, which would never match
-        # the `knowledge/` prefix (the v0.2.81/v0.2.85 manifest-separator
-        # lesson).
-        rel = rel_path.replace("\\", "/")
-        node_prefix = KNOWLEDGE_DIR.name + "/"
-        if rel.startswith(node_prefix):
-            node_file = KNOWLEDGE_DIR / rel[len(node_prefix):]
-        else:
-            node_file = CLAUDE_PROJECT / rel
+        node_file = _node_file_for_key(rel_path)
         if not node_file.is_file():
             continue
         try:
@@ -550,7 +593,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="Regenerate even if content unchanged")
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="With --all: show what would be done, write nothing",
+        help=(
+            "Show what would be done and write nothing — no summary, no "
+            "sidecar re-key, no archived-entry drop (both modes)"
+        ),
     )
     parser.add_argument(
         "--knowledge-dir", metavar="PATH", default=None,
@@ -591,10 +637,7 @@ def _process_node_bulk(
     title, full_text, body = read_node(file_path)
     if not title:
         return "error:no title (neither frontmatter title nor H1) — skipped"
-    try:
-        rel_path = str(file_path.relative_to(CLAUDE_PROJECT))
-    except ValueError:
-        rel_path = str(file_path)
+    rel_path = _sidecar_key(file_path)
 
     # Archived nodes skip the summarization entirely (owner decision
     # 2026-10-14 — the same shared predicate the Weaviate sync skips and
@@ -710,6 +753,13 @@ def _run_bulk(args: argparse.Namespace) -> int:
     # Silently migrate entries still keyed under the legacy body.strip()
     # hash scheme to the canonical full-text key (no regeneration). The
     # re-key must persist even if no node needs regeneration this run.
+    n_sep = rekey_separator_entries(formats)
+    if n_sep and not args.dry_run:
+        save_formats(formats)
+        print(
+            f"Re-keyed {n_sep} sidecar "
+            f"entr{'y' if n_sep == 1 else 'ies'} to canonical POSIX paths."
+        )
     n_rekeyed = rekey_legacy_entries(formats)
     if n_rekeyed and not args.dry_run:
         save_formats(formats)
@@ -733,10 +783,7 @@ def _run_bulk(args: argparse.Namespace) -> int:
     started = time.time()
     for i, file_path in enumerate(files, 1):
         node_start = time.time()
-        try:
-            rel = file_path.relative_to(CLAUDE_PROJECT)
-        except ValueError:
-            rel = file_path
+        rel = _sidecar_key(file_path)
         status = _process_node_bulk(
             file_path, force=args.force, dry_run=args.dry_run, formats=formats
         )
@@ -820,10 +867,7 @@ def main():
         print(f"File not found: {file_path}", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        rel_path = str(file_path.relative_to(CLAUDE_PROJECT))
-    except ValueError:
-        rel_path = str(file_path)
+    rel_path = _sidecar_key(file_path)
 
     title, full_text, body = read_node(file_path)
     if not title:
@@ -833,6 +877,13 @@ def main():
 
     c_hash = content_hash(full_text)
     formats = load_formats()
+    # One-time separator re-key (v0.2.103 B1): a sidecar written on Windows
+    # before the fix holds `\` keys the lookup below (and every retrieval
+    # reader) would miss. Persisted at once so the hash-skip path also
+    # leaves a canonical sidecar behind — except under --dry-run, which
+    # writes nothing in either mode (R20 L6: this save used to ignore it).
+    if rekey_separator_entries(formats) and not args.dry_run:
+        save_formats(formats)
 
     # Archived nodes skip the summarization entirely (owner decision
     # 2026-10-14 — the ONE shared predicate the Weaviate sync skips and
@@ -844,8 +895,11 @@ def main():
     if archived:
         print(f"  {title}: {ARCHIVED_SKIP_MARKER} ({archived})")
         if _drop_sidecar_entry(rel_path, formats):
-            save_formats(formats)
-            log(f"  {title}: dropped the stale sidecar entry for the archived node")
+            if args.dry_run:
+                print(f"  {title}: dry-run — would drop the stale sidecar entry")
+            else:
+                save_formats(formats)
+                log(f"  {title}: dropped the stale sidecar entry for the archived node")
         sys.exit(0)
 
     existing = formats.get(rel_path, {})
@@ -859,6 +913,11 @@ def main():
         # mistake it for the skip path.
         log(f"  {title}: cached entry holds a non-answer, not a summary — "
             f"regenerating it now")
+
+    if args.dry_run:
+        # Before backend selection: a dry run neither probes nor calls a model.
+        print(f"  {title}: dry-run — would generate summaries (nothing written)")
+        sys.exit(0)
 
     if select_backend() == "skip":
         sys.exit(0)

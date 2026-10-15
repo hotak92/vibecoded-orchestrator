@@ -19,12 +19,22 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
 from tests.test_v02102_w6n_kg_reviewer_fixes import _hook_cmd, _scratch_repo
+
+#: Bare `bash` on Windows is WSL's and cannot open a Windows path; the product
+#: runs the .ps1 sibling there, covered by each test's [ps1] param.
+SIBLINGS = [
+    pytest.param("sh", marks=pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
+    "ps1",
+]
 
 
 def _run(sibling: str, repo: Path, env: dict) -> subprocess.CompletedProcess:
@@ -41,7 +51,7 @@ def _rows(repo: Path) -> list[dict]:
     return [json.loads(x) for x in p.read_text(encoding="utf-8-sig").splitlines() if x.strip()]
 
 
-@pytest.mark.parametrize("sibling", ["sh", "ps1"])
+@pytest.mark.parametrize("sibling", SIBLINGS)
 def test_missing_chain_script_is_named_and_nothing_is_spawned(tmp_path, sibling):
     repo, env = _scratch_repo(tmp_path, commits=1)
     proc = _run(sibling, repo, env)
@@ -70,7 +80,7 @@ pathlib.Path(sys.argv[sys.argv.index('--log') + 1]).with_name('chain-ran.marker'
 """
 
 
-@pytest.mark.parametrize("sibling", ["sh", "ps1"])
+@pytest.mark.parametrize("sibling", SIBLINGS)
 def test_healthy_install_reports_nothing(tmp_path, sibling):
     repo, env = _scratch_repo(tmp_path, commits=1)
     scripts = repo / ".claude" / "scripts"

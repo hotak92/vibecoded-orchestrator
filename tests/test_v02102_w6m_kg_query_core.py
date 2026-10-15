@@ -291,8 +291,10 @@ def test_every_moved_function_is_one_code_object_bound_to_server():
         if isinstance(obj, types.FunctionType) and obj.__module__ == core.__name__
         and name not in EMBEDDINGS_MOVED + LIGHT_ONLY and not name.startswith("__")
     ]
-    # 37 moved by W6-M + `_whole_number` (v0.2.102 W6-R, chunk-count ints).
-    assert len(moved) == 38, moved
+    # 37 moved by W6-M + `_whole_number` (v0.2.102 W6-R, chunk-count ints)
+    # + `_canonicalize_sidecar` / `_sidecar_lookup_key` (v0.2.103 B1,
+    # canonical POSIX sidecar keys).
+    assert len(moved) == 40, moved
     for name in moved:
         fn = getattr(server, name)
         assert _same_code(fn, getattr(core, name)), name
