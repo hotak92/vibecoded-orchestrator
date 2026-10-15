@@ -118,7 +118,10 @@ def _is_vco_exe(path: Path) -> bool:
     stem (``vct-hub`` …) in ASCII or UTF-16LE. A user's file that merely
     shares the name is left in place (review R29 N-1); a real VCO binary that
     somehow fails this is reported as left, never guessed at."""
-    stem = path.stem.lower().encode("ascii")
+    try:
+        stem = path.stem.lower().encode("ascii")
+    except UnicodeEncodeError:
+        return False
     sigs = (stem, stem.decode("ascii").encode("utf-16-le"))
     overlap = max(len(s) for s in sigs)
     try:
@@ -140,7 +143,7 @@ def _is_vco_exe(path: Path) -> bool:
 
 def _is_vco_lnk(path: Path) -> bool:
     try:
-        if path.is_symlink() or not path.is_file():
+        if _is_reparse(path) or not path.is_file():
             return False
         data = path.read_bytes()[: 64 * 1024].lower()
     except OSError:
@@ -150,7 +153,7 @@ def _is_vco_lnk(path: Path) -> bool:
 
 def _is_vco_desktop_entry(path: Path) -> bool:
     try:
-        if path.is_symlink() or not path.is_file():
+        if _is_reparse(path) or not path.is_file():
             return False
         text = path.read_text(encoding="utf-8", errors="replace")[: 64 * 1024]
     except OSError:
@@ -204,8 +207,27 @@ def _known_windows_desktop() -> Optional[Path]:  # pragma: no cover - Windows
     return None
 
 
-def _add_file(plan: Plan, path: Path, label: str) -> None:
-    if path.is_file() or path.is_symlink():
+def _through_real_dirs(path: Path, anchor: Path) -> bool:
+    """Every directory between ``anchor`` (exclusive — a user may relocate
+    ``~/.vct`` itself with a link) and ``path`` is a real directory, never a
+    symlink or junction, so the removal cannot land outside VCO's own tree
+    (review R32 F1)."""
+    try:
+        rel = path.parent.relative_to(anchor)
+    except ValueError:
+        return False
+    cur = anchor
+    for part in rel.parts:
+        cur = cur / part
+        if _is_reparse(cur):
+            return False
+    return True
+
+
+def _add_file(plan: Plan, path: Path, label: str, anchor: Path) -> None:
+    """Plan ``path`` (a file, or a link itself — unlinking a link never
+    touches its target) when it is reached only through real directories."""
+    if (path.is_file() or path.is_symlink()) and _through_real_dirs(path, anchor):
         plan.remove.append(Removal(path, "file", label))
 
 
@@ -226,16 +248,16 @@ def build_plan(
 
     # --- VCO state files added this cycle (every OS) ----------------------
     state = vct_root / "state"
-    _add_file(plan, state / "engine-start.lock", "container-engine start lock")
+    _add_file(plan, state / "engine-start.lock", "container-engine start lock", vct_root)
     claims = state / "codegraph-walk-claims"
-    if claims.is_dir() and not claims.is_symlink():
+    if claims.is_dir() and _through_real_dirs(claims / "x", vct_root):
         for lock in sorted(claims.glob("*.lock")):
-            _add_file(plan, lock, "code-graph walk claim")
+            _add_file(plan, lock, "code-graph walk claim", vct_root)
         plan.prune_if_empty.append(claims)
     plan.prune_if_empty.append(state)
-    _add_file(plan, vct_root / "model-guidance.json", "model-guidance record")
+    _add_file(plan, vct_root / "model-guidance.json", "model-guidance record", vct_root)
     logs = vct_root / "logs"
-    _add_file(plan, logs / ENGINE_START_LOG, "container-engine start log")
+    _add_file(plan, logs / ENGINE_START_LOG, "container-engine start log", vct_root)
     outside = vct_root / "backups" / "kg-reviewer-outside"
     if outside.exists():
         plan.keep.append((outside, "backups of your own files made by the KG reviewer"))
@@ -245,11 +267,11 @@ def build_plan(
         local = env.get("LOCALAPPDATA")
         if local:
             dest = Path(local) / WINDOWS_LAUNCHER_DIRNAME
-            if dest.is_dir() and not _is_reparse(dest):
+            if dest.is_dir() and _through_real_dirs(dest / "x", Path(local)):
                 for exe in WINDOWS_LAUNCHER_EXES:
                     candidate = dest / exe
                     if _is_vco_exe(candidate):
-                        _add_file(plan, candidate, "prebuilt launcher binary")
+                        _add_file(plan, candidate, "prebuilt launcher binary", Path(local))
                     elif candidate.exists() or candidate.is_symlink():
                         plan.keep.append((candidate, "not recognised as VCO's launcher binary"))
                 if _is_vco_exe(dest / "vct-hub.exe"):
@@ -269,8 +291,8 @@ def build_plan(
 
     # Linux, and the macOS no-.app fallback, stage the flat binary here.
     flat_dir = home / ".local" / "share" / "vct-launcher"
-    if flat_dir.is_dir() and not flat_dir.is_symlink():
-        _add_file(plan, flat_dir / "vct-launcher", "prebuilt launcher binary")
+    if flat_dir.is_dir() and _through_real_dirs(flat_dir / "x", home):
+        _add_file(plan, flat_dir / "vct-launcher", "prebuilt launcher binary", home)
         plan.prune_if_empty.append(flat_dir)
 
     if os_name == "Linux":

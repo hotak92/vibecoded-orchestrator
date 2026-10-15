@@ -265,6 +265,55 @@ def test_a_reparse_point_launcher_dir_is_never_followed(tmp_path, monkeypatch):
     assert dest not in plan.prune_if_empty
 
 
+@pytest.mark.parametrize("redirected", ["state", "state/codegraph-walk-claims", "logs"])
+def test_a_junction_under_the_state_dir_is_never_followed(tmp_path, monkeypatch, redirected):
+    """R32 F1: a junction (a reparse point that is_symlink() misses) anywhere
+    between the state root and a planned file stops that file being planned."""
+    root = tmp_path / "vct"
+    (root / "state" / "codegraph-walk-claims").mkdir(parents=True)
+    (root / "logs").mkdir()
+    (root / "state" / "engine-start.lock").write_text("")
+    (root / "state" / "codegraph-walk-claims" / "a.lock").write_text("")
+    (root / "logs" / ua.ENGINE_START_LOG).write_text("")
+    junction = root / redirected
+    real = ua._is_reparse
+    monkeypatch.setattr(ua, "_is_reparse", lambda p: p == junction or real(p))
+    plan = ua.build_plan(os_name="Linux", home=tmp_path / "home", vct_root=root, env={})
+    assert not [r.path for r in plan.remove if junction in r.path.parents]
+
+
+def test_a_junction_prune_candidate_is_never_rmdired(tmp_path, monkeypatch):
+    """R32 F2: the prune loop consults the junction-aware check, not just
+    is_symlink (a real dir standing in for a junction)."""
+    junction = tmp_path / "looks-like-a-dir"
+    junction.mkdir()
+    attempted: list = []
+    monkeypatch.setattr(type(junction), "rmdir", lambda self: attempted.append(self))
+    real = ua._is_reparse
+    monkeypatch.setattr(ua, "_is_reparse", lambda p: p == junction or real(p))
+    plan = ua.Plan()
+    plan.prune_if_empty.append(junction)
+    ua.execute(plan, hub_running=lambda: False)
+    assert attempted == []
+
+
+def test_a_signature_straddling_the_scan_chunk_boundary_is_found(tmp_path):
+    """R32 F3: the chunked scan's overlap carries a name split across reads."""
+    exe = tmp_path / "vct-hub.exe"
+    stem = b"vct-hub"
+    exe.write_bytes(b"MZ" + b"\0" * ((1 << 20) - 2 - 3) + stem + b"\0" * 16)
+    assert ua._is_vco_exe(exe)
+
+
+def test_the_committed_windows_binaries_are_recognised():
+    """R32 F3: the real release binaries in launcher/dist pass the check."""
+    dist = Path(__file__).resolve().parents[1] / "launcher" / "dist" / "windows-x64"
+    exes = [dist / name for name in ua.WINDOWS_LAUNCHER_EXES if (dist / name).is_file()]
+    if not exes:
+        pytest.skip("no committed Windows binaries in this checkout")
+    assert all(ua._is_vco_exe(e) for e in exes)
+
+
 def test_a_symlinked_prune_candidate_is_never_rmdired(tmp_path, monkeypatch):
     """N-4: the prune loop never even attempts rmdir on a link (on Windows an
     rmdir would remove a junction's reparse point; POSIX would just refuse,
