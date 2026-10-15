@@ -302,10 +302,19 @@ function Start-VcoDetachedProcess {
 function Start-VcoDetachedPwsh {
     param(
         [Parameter(Mandatory = $true)][string]$Command,
-        [string]$PowerShellExe
+        [string]$PowerShellExe,
+        # R31 L-4: hand back the child process object (nothing on a failed
+        # spawn — Start-VcoDetachedProcess never throws), so a caller can
+        # tell "spawned" from "reported failed on stderr".
+        [switch]$PassThru
     )
     $exe = if ($PowerShellExe) { $PowerShellExe } elseif ($script:PsExe) { $script:PsExe } else { 'pwsh' }
     $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Command))
+    if ($PassThru) {
+        return Start-VcoDetachedProcess -FilePath $exe -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-EncodedCommand', $enc
+        ) -PassThru
+    }
     Start-VcoDetachedProcess -FilePath $exe -ArgumentList @(
         '-NoProfile', '-NonInteractive', '-EncodedCommand', $enc
     )

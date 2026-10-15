@@ -66,7 +66,8 @@ from vco_lib.paths import vct_root_dir
 __all__ = ["VCT_CONTAINER_ENGINE_AUTOSTART", "APP_STATE_ENGINE_AUTOSTART",
            "DEFAULT_ENGINE_AUTOSTART", "autostart_enabled", "pref_enabled",
            "install_skipped_containers", "ensure_engine", "engine_start_lock_path",
-           "engine_start_log_path", "record_outcome",
+           "engine_start_log_path", "ENGINE_START_LOG", "ENGINE_START_STDERR_LOG",
+           "engine_start_stderr_log_path", "record_outcome",
            "heal_podman_reachability", "try_start_docker_daemon", "main"]
 
 #: Opt-out knob 1 (v0.2.103), the env override. No earlier env disabled
@@ -437,15 +438,47 @@ ENGINE_START_LOG_KEEP_LINES = 500
 
 
 def _log_and_record(msg: str) -> None:
-    """The CLI's log callback: stderr (discarded by detached spawners) AND
-    the outcome log, so an intermediate failure line survives too."""
+    """The CLI's log callback. Two DIFFERENT homes, one line each (review
+    V02103-VERIFY-R31 M-1/L-2): stderr — which a spawner captures in the
+    per-spawn :data:`ENGINE_START_STDERR_LOG` file (and a terminal run
+    shows live) — and ONE timestamped line in the outcome log. This module
+    keeps sole ownership of ``engine-start.log``: because the spawners no
+    longer redirect into it, an intermediate line can no longer land in it
+    twice."""
     _default_log(msg)
     record_outcome(msg, rotate=False)
 
 
+#: The starter's own rotating outcome log, under ``<state>/logs/``.
+ENGINE_START_LOG = "engine-start.log"
+
+
 def engine_start_log_path(root: Optional[Path] = None) -> Path:
-    """Where every run's outcome is recorded: ``<vct_root>/logs/engine-start.log``."""
-    return (root or vct_root_dir()) / "logs" / "engine-start.log"
+    """Where every run's outcome is recorded: ``<vct_root>/logs/engine-start.log``.
+    This CLI has SOLE ownership of that file (it is the only writer, and the
+    only rotator); the spawners never redirect into it."""
+    return (root or vct_root_dir()) / "logs" / ENGINE_START_LOG
+
+
+#: The spawners' per-spawn stderr file (review V02103-VERIFY-R31 M-1): the
+#: session hooks and the Rust spawner redirect the spawned CLI's stderr to
+#: ``<vct_root>/logs/`` + this name, TRUNCATED on every spawn, so a child
+#: that dies before it can write its own outcome line (a broken import of
+#: this module, an unhandled exception) still leaves its traceback
+#: somewhere. MUST MATCH ``templates/hooks/ensure-containers.{sh,ps1}``
+#: and the Rust spawner's ``services::engine_autostart
+#: ::ENGINE_START_STDERR_LOG`` (pinned by tests/test_container_engine_start.py).
+#: The CLI itself NEVER writes this file — one bounded-by-construction raw
+#: file per spawn (one run's stderr), no shared handle with the rotating
+#: ``engine-start.log``, hence no Windows sharing conflict and no writes to
+#: an unlinked post-rotation inode.
+ENGINE_START_STDERR_LOG = "engine-start.stderr.log"
+
+
+def engine_start_stderr_log_path(root: Optional[Path] = None) -> Path:
+    """Where the SPAWNERS capture this CLI's stderr (overwritten on every
+    spawn): ``<vct_root>/logs/engine-start.stderr.log``."""
+    return (root or vct_root_dir()) / "logs" / ENGINE_START_STDERR_LOG
 
 
 def record_outcome(line: str, *, rotate: bool = True, path: Optional[Path] = None) -> None:
@@ -520,7 +553,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 try:
                     ok, detail = ensure_engine(wait_s=max(0.0, args.wait), log=_log_and_record)
                 except Exception as exc:  # noqa: BLE001 — record it, then surface it
-                    record_outcome(f"error — {type(exc).__name__}: {exc}")
+                    # The traceback itself goes to stderr — the spawners
+                    # capture that in the per-spawn stderr file, so the
+                    # outcome line points at it (review V02103-VERIFY-R31 M-1).
+                    record_outcome(f"error — {type(exc).__name__}: {exc} "
+                                   f"(traceback: {engine_start_stderr_log_path()})")
                     raise
         except LockTimeout:
             # Another CLI run (launcher / hub / a sibling session) is holding

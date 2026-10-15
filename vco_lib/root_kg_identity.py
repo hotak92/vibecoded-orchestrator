@@ -111,6 +111,13 @@ class RootKgDecision:
     #: stands — symmetric with ``adopt`` — but the deferral is worded for an
     #: UNVERIFIABLE pick, not a wrong-model one (review V02103-R29 N-5).
     profile_unresolved: bool = False
+    #: True when ``picked_refused`` was set because the pick's model could
+    #: not be verified on EITHER side — the profile unresolved (see
+    #: ``profile_unresolved``) OR the pick's own model unknown (no
+    #: ``kg_embed_model`` record and no readable live sample). The refusal
+    #: is the same; the wording must say the model could not be verified,
+    #: never that it is "different" (review V02103-VERIFY-R31 M-2).
+    pick_unverifiable: bool = False
 
     @property
     def persistable(self) -> bool:
@@ -188,6 +195,7 @@ def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Option
     pk = (picked or "").strip()
     refused: Optional[str] = None
     profile_unresolved = False
+    unverifiable = False
     prefix = ""
     if pk:
         if not known:
@@ -206,14 +214,26 @@ def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Option
                                   "the Identity-tab pick (your explicit choice)", True, blocked)
         refused = pk
         profile_unresolved = not (target_model or "").strip()
-        prefix = (f"the Identity-tab pick '{pk}' was written with "
-                  f"{picked_model or 'an unknown model'}, the profile is "
-                  f"{target_model or 'unknown'} — not followed; ")
+        # R31 M-2: unknown on EITHER side is UNVERIFIABLE, not "different"
+        # — VCO cannot claim the models differ when it cannot read one of
+        # them (no kg_embed_model record and no live majority sample reads
+        # as picked_model=None, e.g. a legacy mixed-slot class).
+        unverifiable = profile_unresolved or not (picked_model or "").strip()
+        if unverifiable:
+            prefix = (f"the Identity-tab pick '{pk}' could not be verified "
+                      f"against the current embedding profile (the pick's model "
+                      f"is {picked_model or 'unknown'}, the profile is "
+                      f"{target_model or 'unknown'}) — not followed; ")
+        else:
+            prefix = (f"the Identity-tab pick '{pk}' was written with "
+                      f"{picked_model}, the profile is {target_model} "
+                      f"— not followed; ")
     decision = _decide_unpicked(derived, bound, live_counts, names, known,
                                 record_model, target_model, pending_fill, prefix)
     if refused:
         decision = replace(decision, picked_refused=refused,
-                           profile_unresolved=profile_unresolved)
+                           profile_unresolved=profile_unresolved,
+                           pick_unverifiable=unverifiable)
     return decision
 
 
@@ -457,15 +477,33 @@ def pick_refused_entry(decision: RootKgDecision):
     """The deferral for an Identity-tab pick the profile rule did not follow
     (install steps 7b and 7c record it; same condition id → idempotent).
 
-    Two wordings, both TRUE (review V02103-R29 N-5): when the profile was
-    resolved the pick is stated to hold another model's vectors; when the
-    profile could NOT be resolved (``decision.profile_unresolved``) the pick
-    is stated to be unverifiable — not wrong. The refusal itself is the same
-    in both corners, symmetric with ``adopt``."""
+    Three wordings, all TRUE (review V02103-R29 N-5 + R31 M-2): when BOTH
+    models are known and differ, the pick is stated to hold another model's
+    vectors; when either side could NOT be determined — the profile
+    unresolved (``decision.profile_unresolved``) or the pick's own model
+    unknown (``decision.pick_unverifiable``) — the pick is stated to be
+    UNVERIFIABLE, never "written with a different model", a claim VCO
+    cannot make. The refusal itself is the same in every corner, symmetric
+    with ``adopt``."""
     from vco_lib.deferral_report import DeferralEntry
 
     pick = decision.picked_refused or ""
-    if decision.profile_unresolved:
+    if decision.pick_unverifiable and not decision.profile_unresolved:
+        title = ("Identity-tab shared-KG pick not followed: its embedding model "
+                 "could not be determined")
+        detected = (f"The shared KG picked in the launcher's Identity tab is '{pick}', but VCO "
+                    f"could not determine which embedding model its vectors were written with "
+                    f"(no kg_embed_model record and no readable live sample), so it cannot "
+                    f"verify they are searchable with the current profile; the orchestrator "
+                    f"root keeps '{decision.name}' ({decision.reason}). The hub and the "
+                    f"launcher still serve '{pick}' as every project's shared KG until you "
+                    f"choose.")
+        command_to_apply = (
+            "In the launcher: Identity tab → Manage shared KG collection → pick a "
+            f"class written with the current embedding profile (e.g. "
+            f"'{decision.name}'), or run an update so VCO records the pick's model "
+            f"(or fills it toward the current profile); then re-run the update")
+    elif decision.profile_unresolved:
         title = ("Identity-tab shared-KG pick not followed: the embedding profile "
                  "could not be resolved")
         detected = (f"The shared KG picked in the launcher's Identity tab is '{pick}', but the "
@@ -603,9 +641,15 @@ def main(argv: Optional[list] = None) -> int:
         else:
             print(f"{decision.name} ({decision.source}: {decision.reason})")
             if decision.picked_refused:
-                print(f"not followed: the Identity-tab pick '{decision.picked_refused}' holds "
-                      "vectors from another embedding model — pick a class written with the "
-                      "current profile, or switch the profile")
+                if decision.pick_unverifiable:
+                    print(f"not followed: the Identity-tab pick '{decision.picked_refused}' "
+                          "could not be verified against the current embedding profile "
+                          "(unknown model on one side) — resolve the profile, or pick a "
+                          "class written with the current profile")
+                else:
+                    print(f"not followed: the Identity-tab pick '{decision.picked_refused}' holds "
+                          "vectors from another embedding model — pick a class written with the "
+                          "current profile, or switch the profile")
             if decision.blocked_by:
                 print(f"blocked: '{decision.blocked_by}' differs only in case — adopt it with "
                       f"`python -m vco_lib.root_kg_identity adopt --collection "

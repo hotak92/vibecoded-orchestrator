@@ -69,6 +69,12 @@ def test_a_pick_with_another_models_vectors_is_refused_and_reported():
 def test_an_unknown_model_on_a_populated_pick_is_refused_like_adopt():
     d = rki.decide(ROOT, None, {CONST: 900}, None, MODEL, "", picked=CONST)
     assert d.picked_refused == CONST and d.name == DERIVED
+    # R31 M-2: the refusal is UNVERIFIABLE, not a wrong-model claim — the
+    # entry says the model could not be determined.
+    assert d.pick_unverifiable is True and d.profile_unresolved is False
+    entry = rki.pick_refused_entry(d)
+    assert "could not be determined" in entry.title
+    assert "different embedding model" not in entry.detected
 
 
 def test_a_pending_fill_toward_the_profile_makes_the_pick_followable():

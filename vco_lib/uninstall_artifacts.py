@@ -65,8 +65,9 @@ WINDOWS_LAUNCHER_DIRNAME = "vct-launcher"
 LNK_NAME = f"{LAUNCHER_PRODUCT_NAME}.lnk"
 DESKTOP_ENTRY_NAME = "vct-launcher.desktop"
 APP_BUNDLE_NAME = f"{LAUNCHER_PRODUCT_NAME}.app"
-#: The engine starter's own outcome log (``container_engine_start``).
-ENGINE_START_LOG = "engine-start.log"
+#: The engine starter's outcome log and the spawners' per-spawn stderr file
+#: (one home: ``container_engine_start``).
+from vco_lib.container_engine_start import ENGINE_START_LOG, ENGINE_START_STDERR_LOG  # noqa: E402
 
 _LNK_SIGNATURES = (b"vct-launcher", "vct-launcher".encode("utf-16-le"))
 
@@ -258,6 +259,7 @@ def build_plan(
     _add_file(plan, vct_root / "model-guidance.json", "model-guidance record", vct_root)
     logs = vct_root / "logs"
     _add_file(plan, logs / ENGINE_START_LOG, "container-engine start log", vct_root)
+    _add_file(plan, logs / ENGINE_START_STDERR_LOG, "container-engine start stderr", vct_root)
     outside = vct_root / "backups" / "kg-reviewer-outside"
     if outside.exists():
         plan.keep.append((outside, "backups of your own files made by the KG reviewer"))

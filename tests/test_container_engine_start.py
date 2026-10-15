@@ -489,21 +489,58 @@ class PrefEnabledTests(unittest.TestCase):
         self.assertIn(f'"{ces.APP_STATE_ENGINE_AUTOSTART}"', launcher_rs)
         self.assertIn(f'"{ces.APP_STATE_ENGINE_AUTOSTART}"', core_rs)
 
-    def test_the_outcome_log_tail_matches_the_rust_and_hook_spawners(self):
-        """FINAL2 L-2 cross-language pin: the Rust spawner and the two hook
-        siblings append the spawned CLI's stderr to the SAME outcome log
-        this module writes (a venv too broken to import vco_lib leaves its
-        traceback nowhere unless the SPAWNER captures it) — the relative
-        tail ``logs/engine-start.log`` cannot drift."""
+    def test_the_spawner_stderr_file_name_matches_across_languages(self):
+        """R31 M-1 cross-language pin: the Rust spawner and the two hook
+        siblings write the spawned CLI's stderr to the spawners' OWN
+        per-spawn file (this module's ENGINE_START_STDERR_LOG), NOT into the
+        CLI's rotating engine-start.log — the relative tail
+        ``logs/engine-start.stderr.log`` cannot drift."""
         repo = Path(__file__).resolve().parents[1]
         core_rs = (repo / "launcher" / "src-tauri" / "vct-launcher-core" / "src"
                    / "services" / "engine_autostart.rs").read_text(encoding="utf-8")
-        self.assertIn('pub const ENGINE_START_LOG: &str = "engine-start.log"', core_rs)
-        self.assertIn('.join("logs").join(ENGINE_START_LOG)', core_rs)
+        self.assertIn(
+            f'pub const ENGINE_START_STDERR_LOG: &str = "{ces.ENGINE_START_STDERR_LOG}"',
+            core_rs)
+        self.assertIn('.join("logs").join(ENGINE_START_STDERR_LOG)', core_rs)
         for name in ("ensure-containers.sh", "ensure-containers.ps1"):
             body = (repo / "templates" / "hooks" / name).read_text(encoding="utf-8")
-            self.assertIn("engine-start.log", body,
-                          f"{name} must append the child's stderr to the same log")
+            self.assertIn(ces.ENGINE_START_STDERR_LOG, body,
+                          f"{name} must capture the child's stderr in the "
+                          f"spawners' own per-spawn file")
+
+    def test_the_spawners_never_redirect_into_the_clis_own_outcome_log(self):
+        """R31 M-1: the CLI keeps SOLE ownership of engine-start.log — no
+        spawner may hand the child a handle on it (the Windows sharing
+        conflict and the post-rotation unlinked-inode loss both came from
+        the old shared-file redirects)."""
+        repo = Path(__file__).resolve().parents[1]
+        sh = (repo / "templates" / "hooks" / "ensure-containers.sh").read_text(encoding="utf-8")
+        ps1 = (repo / "templates" / "hooks" / "ensure-containers.ps1").read_text(encoding="utf-8")
+        core_rs = (repo / "launcher" / "src-tauri" / "vct-launcher-core" / "src"
+                   / "services" / "engine_autostart.rs").read_text(encoding="utf-8")
+        self.assertNotIn('2>>"$__vct_engine_log"', sh,
+                         "the .sh spawner must not append stderr to engine-start.log")
+        self.assertNotIn("2>>", ps1,
+                         "the .ps1 spawner must not redirect into the shared outcome log")
+        self.assertNotIn('.join("logs").join(ENGINE_START_LOG)', core_rs,
+                         "the Rust spawner must not open the CLI's own outcome log")
+
+    def test_the_spawners_strip_whitespace_from_vct_state_dir_like_python(self):
+        """R31 L-6 cross-language pin: ``vco_lib.paths.vct_root_dir`` strips
+        surrounding whitespace from VCT_STATE_DIR (a whitespace-only value
+        means "not set"); every spawner resolves the state root the same
+        way, so the stderr file lands in the SAME directory on every side."""
+        repo = Path(__file__).resolve().parents[1]
+        sh = (repo / "templates" / "hooks" / "ensure-containers.sh").read_text(encoding="utf-8")
+        self.assertIn("[![:space:]]", sh,
+                      "the .sh spawner must trim VCT_STATE_DIR (leading/trailing)")
+        ps1 = (repo / "templates" / "hooks" / "ensure-containers.ps1").read_text(encoding="utf-8")
+        self.assertIn('"$env:VCT_STATE_DIR".Trim()', ps1,
+                      "the .ps1 spawner must Trim() VCT_STATE_DIR")
+        paths_rs = (repo / "launcher" / "src-tauri" / "vct-launcher-core" / "src"
+                    / "paths.rs").read_text(encoding="utf-8")
+        self.assertIn("custom.trim()", paths_rs,
+                      "the Rust vct_root_dir mirror must trim VCT_STATE_DIR")
 
 
 class InstallSkippedContainersTests(unittest.TestCase):
@@ -626,6 +663,10 @@ class OutcomeLogTests(unittest.TestCase):
     def test_the_log_path_is_under_the_vco_logs_dir(self):
         self.assertEqual(ces.engine_start_log_path(), self.log)
 
+    def test_the_spawner_stderr_log_path_is_beside_the_outcome_log(self):
+        self.assertEqual(ces.engine_start_stderr_log_path(),
+                         Path(self._tmp.name) / "logs" / ces.ENGINE_START_STDERR_LOG)
+
     def test_every_run_appends_its_outcome_line(self):
         self._run()
         self._run((True, "daemon responsive"))
@@ -656,7 +697,11 @@ class OutcomeLogTests(unittest.TestCase):
                 mock.patch("sys.stdout", io.StringIO()):
             with self.assertRaises(RuntimeError):
                 ces.main(["ensure", "--wait", "0"])
-        self.assertIn("RuntimeError: kaput", self.log.read_text(encoding="utf-8"))
+        line = self.log.read_text(encoding="utf-8")
+        self.assertIn("RuntimeError: kaput", line)
+        # R31 M-1: the traceback itself goes to stderr — the outcome line
+        # points the reader at the file the spawners capture it in.
+        self.assertIn("engine-start.stderr.log", line)
 
     def test_the_log_is_bounded(self):
         self.log.parent.mkdir(parents=True)

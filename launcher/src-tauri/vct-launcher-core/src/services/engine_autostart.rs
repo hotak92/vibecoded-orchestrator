@@ -13,8 +13,8 @@
 //! spawn, so the two cannot drift in argv or detach semantics.
 //!
 //! The spawn is fire-and-forget by contract: stdin/stdout are null, stderr
-//! is appended best-effort to the outcome log the CLI itself writes (see
-//! [`ENGINE_START_LOG`]; review FINAL2 L-2), nothing is
+//! is captured best-effort in the spawners' per-spawn stderr file (see
+//! [`ENGINE_START_STDERR_LOG`]; review V02103-VERIFY-R31 M-1), nothing is
 //! waited on, and the child is detached from the caller's process group
 //! (POSIX `setsid` via the pre-exec hook; Windows `CREATE_NO_WINDOW`
 //! only — never `DETACHED_PROCESS`, which flashes a console), so a kill aimed at the caller
@@ -73,35 +73,44 @@ pub fn engine_start_argv() -> [&'static str; 3] {
     ["-m", "vco_lib.container_engine_start", "ensure"]
 }
 
-/// The basename of the outcome log the Python CLI itself writes.
-/// MUST MATCH `vco_lib.container_engine_start.engine_start_log_path`
-/// (`<vct_root_dir>/logs/engine-start.log`) and the two hook siblings
-/// (`templates/hooks/ensure-containers.{sh,ps1}`), which append the
-/// child's stderr to the SAME file (review FINAL2 L-2: a venv too broken
-/// to import vco_lib leaves its traceback nowhere unless the SPAWNER
-/// captures it). Pinned by `tests/test_container_engine_start.py`.
-pub const ENGINE_START_LOG: &str = "engine-start.log";
+/// The basename of the per-spawn stderr file the SPAWNERS write (review
+/// V02103-VERIFY-R31 M-1): the child's stderr is TRUNCATED into it on every
+/// spawn, so a venv too broken to import vco_lib still leaves its traceback
+/// somewhere (this Rust spawner is the surface that sees a fully-broken
+/// venv — the hooks have already run vco_lib twice before they spawn).
+/// MUST MATCH `vco_lib.container_engine_start.ENGINE_START_STDERR_LOG` and
+/// the two hook siblings (`templates/hooks/ensure-containers.{sh,ps1}`).
+/// The Python CLI keeps SOLE ownership of its outcome log
+/// `<vct_root_dir>/logs/engine-start.log` (it appends and rotates it); the
+/// spawners never touch that file — no shared handle, no rotation race,
+/// and the stderr file is bounded by construction (one run's stderr).
+/// Pinned by `tests/test_container_engine_start.py`.
+pub const ENGINE_START_STDERR_LOG: &str = "engine-start.stderr.log";
 
-/// Where this spawner appends the child's stderr: the SAME outcome log the
-/// Python CLI writes, resolved through the one root resolver
+/// Where this spawner truncates the child's stderr:
+/// [`ENGINE_START_STDERR_LOG`] under the logs dir of the one root resolver
 /// `crate::paths::vct_root_dir` (the mirror of `vco_lib.paths::vct_root_dir`).
-/// The file stays bounded: the CLI trims it to its last 500 lines on its
-/// next healthy run, and stderr here is at most a small broken-import
-/// traceback (a working CLI emits a few short lines).
-fn engine_start_log_path() -> PathBuf {
-    crate::paths::vct_root_dir().join("logs").join(ENGINE_START_LOG)
+fn engine_start_stderr_log_path() -> PathBuf {
+    crate::paths::vct_root_dir().join("logs").join(ENGINE_START_STDERR_LOG)
 }
 
-/// Best-effort append handle to [`engine_start_log_path`] for the child's
-/// stderr. Creates the logs dir if missing. An unopenable log degrades to
-/// [`Stdio::null`] — a log problem must never fail the spawn (the engine
-/// start matters more than its traceback).
-fn engine_start_log_stdio() -> Stdio {
-    let path = engine_start_log_path();
+/// Best-effort truncate handle to [`engine_start_stderr_log_path`] for the
+/// child's stderr (write + truncate: OVERWRITTEN on every spawn, so the
+/// file holds exactly one run's stderr — bounded by construction). Creates
+/// the logs dir if missing. An unopenable file degrades to [`Stdio::null`]
+/// — a log problem must never fail the spawn (the engine start matters
+/// more than its traceback).
+fn engine_start_stderr_stdio() -> Stdio {
+    let path = engine_start_stderr_log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+    {
         Ok(file) => file.into(),
         Err(_) => Stdio::null(),
     }
@@ -177,9 +186,10 @@ pub const WINDOWS_CREATION_FLAGS: u32 = 0x0800_0000 | 0x0000_0200;
 
 /// Build and spawn the detached CLI for a GIVEN interpreter — the testable
 /// core of [`spawn_engine_start_cli`]. Returns the child's pid without
-/// waiting: stdin/stdout are null, stderr is appended best-effort to
-/// [`ENGINE_START_LOG`] (see [`engine_start_log_stdio`]), and the child is
-/// detached from this process's session/group (see the module doc).
+/// waiting: stdin/stdout are null, stderr is captured best-effort in the
+/// per-spawn [`ENGINE_START_STDERR_LOG`] (see [`engine_start_stderr_stdio`]),
+/// and the child is detached from this process's session/group (see the
+/// module doc).
 ///
 /// The exited child is REAPED on a detached thread (R19 F6): `setsid`
 /// detaches the session, not the parentage, so an unwaited child would
@@ -196,7 +206,7 @@ pub fn spawn_engine_start_cli_with(python: &Path) -> io::Result<u32> {
     cmd.args(engine_start_argv())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(engine_start_log_stdio());
+        .stderr(engine_start_stderr_stdio());
 
     #[cfg(windows)]
     {
@@ -353,12 +363,13 @@ mod tests {
     }
 
     #[test]
-    fn the_child_stderr_is_appended_to_the_engine_start_log() {
-        // FINAL2 L-2: a venv too broken to import vco_lib dies with its
-        // traceback on stderr — the spawn must append it to the SAME log
-        // the Python CLI writes (engine_start_log_stdio), never null it
-        // away. Fire-and-forget is unchanged: the spawn returns at once
-        // and the log line is polled for afterwards.
+    fn the_child_stderr_lands_in_the_per_spawn_stderr_file_truncated() {
+        // V02103-VERIFY-R31 M-1: a venv too broken to import vco_lib dies
+        // with its traceback on stderr — the spawn must capture it in the
+        // spawners' OWN file (engine-start.stderr.log), never null it away
+        // and never into the CLI's rotating engine-start.log. The file is
+        // TRUNCATED on every spawn (bounded by construction): a sentinel
+        // from a previous run must be GONE once the new child writes.
         let dir = std::env::temp_dir()
             .join(format!("vco-engine-autostart-stderr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -369,25 +380,34 @@ mod tests {
         // helper (sets VCT_STATE_DIR under GLOBAL_ENV_MUTEX and restores the
         // PRIOR value on Drop — a bare set_var/remove_var pair is banned by
         // tests/state_dir_env_lint.rs and would clobber an outer redirect).
-        // The spawn AND the poll stay inside the guard: the log lives in the
+        // The spawn AND the poll stay inside the guard: the file lives in the
         // guard's tempdir, which its Drop deletes.
         let sd = crate::test_env::state_dir_guard();
+        let logs = sd.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let stderr_file = logs.join(ENGINE_START_STDERR_LOG);
+        std::fs::write(&stderr_file, "sentinel from a previous spawn\n").unwrap();
         let pid = spawn_engine_start_cli_with(&python).expect("spawn must succeed");
-        let log = sd.path().join("logs").join(ENGINE_START_LOG);
         let needle = "fake broken venv: No module named vco_lib";
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
-            if let Ok(text) = std::fs::read_to_string(&log) {
+            if let Ok(text) = std::fs::read_to_string(&stderr_file) {
                 if text.contains(needle) {
+                    assert!(!text.contains("sentinel from a previous spawn"),
+                        "the per-spawn stderr file must be TRUNCATED on every spawn");
                     break;
                 }
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the child's stderr never reached {log:?} — a broken-import traceback would be lost"
+                "the child's stderr never reached {stderr_file:?} — a broken-import traceback would be lost"
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        // The CLI's own rotating log is NOT written by this spawner: only
+        // the per-spawn stderr file exists.
+        assert!(!logs.join("engine-start.log").exists(),
+            "the spawner must never write the CLI's own engine-start.log");
         drop(sd);
         let _ = pid;
         let _ = std::fs::remove_dir_all(&dir);

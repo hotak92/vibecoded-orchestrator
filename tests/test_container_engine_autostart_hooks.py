@@ -182,16 +182,21 @@ class _HookCase(unittest.TestCase):
         return self.log.exists() and any(
             ln.strip() == ENGINE_LINE for ln in self.log.read_text().splitlines())
 
-    def _engine_log(self) -> Path:
-        """The outcome log the Python CLI writes and the spawners must
-        append the child's stderr to (FINAL2 L-2): resolved under the same
-        ``VCT_STATE_DIR`` the test sets for the hook."""
+    def _engine_outcome_log(self) -> Path:
+        """The CLI's OWN outcome log (sole ownership — the spawners never
+        write it): resolved under the same ``VCT_STATE_DIR`` the test sets
+        for the hook."""
         return Path(self._env()["VCT_STATE_DIR"]) / "logs" / "engine-start.log"
 
+    def _engine_stderr_log(self) -> Path:
+        """The spawners' per-spawn stderr file (R31 M-1): the child's stderr
+        is TRUNCATED into it on every spawn."""
+        return Path(self._env()["VCT_STATE_DIR"]) / "logs" / "engine-start.stderr.log"
+
     def _engine_stderr_captured(self, wait_s: float = 15.0) -> bool:
-        engine_log = self._engine_log()
-        _wait_for_line(engine_log, ENGINE_STDERR_TEXT, timeout_s=wait_s)
-        return engine_log.exists() and ENGINE_STDERR_TEXT in engine_log.read_text()
+        stderr_log = self._engine_stderr_log()
+        _wait_for_line(stderr_log, ENGINE_STDERR_TEXT, timeout_s=wait_s)
+        return stderr_log.exists() and ENGINE_STDERR_TEXT in stderr_log.read_text()
 
 
 @unittest.skipIf(
@@ -216,17 +221,40 @@ class BashHookWiringTests(_HookCase):
                          "nothing installed: no engine start may be spawned; "
                          f"log:\n{self.log.read_text() if self.log.exists() else '<none>'}")
 
-    def test_a_broken_venv_traceback_lands_in_the_outcome_log(self):
-        # FINAL2 L-2: a venv too broken to import vco_lib writes nothing to
-        # the outcome log itself — the hook's spawn must append the child's
-        # stderr to the SAME log instead of discarding it.
+    def test_a_broken_venv_traceback_lands_in_the_spawners_stderr_file(self):
+        # R31 M-1: a venv too broken to import vco_lib writes nothing to the
+        # outcome log itself — the hook's spawn must capture the child's
+        # stderr in the spawners' OWN per-spawn file, never into the CLI's
+        # rotating engine-start.log.
         proc = self._run_sh(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_DOWN,
                             FAKE_RESOLVE_JSON=RESOLVE_JSON_DOWN,
                             FAKE_ENGINE_STDERR=ENGINE_STDERR_TEXT)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertTrue(self._engine_stderr_captured(),
                         "the broken-venv traceback must reach "
-                        f"{self._engine_log()}; it was discarded by the spawn")
+                        f"{self._engine_stderr_log()}; it was discarded by the spawn")
+        outcome = self._engine_outcome_log()
+        self.assertFalse(outcome.exists() and ENGINE_STDERR_TEXT in outcome.read_text(),
+                         "the spawner must NOT redirect into the CLI's own "
+                         f"rotating log {outcome}")
+
+    def test_the_stderr_file_is_truncated_on_every_spawn(self):
+        # R31 M-1: the per-spawn stderr file is OVERWRITTEN (2>), so it is
+        # bounded by construction — a previous spawn's content must not
+        # survive the next one.
+        stderr_log = self._engine_stderr_log()
+        stderr_log.parent.mkdir(parents=True, exist_ok=True)
+        stderr_log.write_text("sentinel from a previous spawn\n", encoding="utf-8")
+        proc = self._run_sh(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_DOWN,
+                            FAKE_RESOLVE_JSON=RESOLVE_JSON_DOWN,
+                            FAKE_ENGINE_STDERR=ENGINE_STDERR_TEXT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(self._engine_stderr_captured(),
+                        "the fresh traceback must reach "
+                        f"{self._engine_stderr_log()}")
+        self.assertNotIn("sentinel from a previous spawn",
+                         stderr_log.read_text(),
+                         "the per-spawn stderr file must be TRUNCATED on every spawn")
 
 
 @unittest.skipIf(not PWSH, "pwsh not available")
@@ -247,17 +275,55 @@ class Ps1HookWiringTests(_HookCase):
                          "nothing installed: no engine start may be spawned; "
                          f"log:\n{self.log.read_text() if self.log.exists() else '<none>'}")
 
-    def test_a_broken_venv_traceback_lands_in_the_outcome_log(self):
-        # FINAL2 L-2 (parity with the .sh sibling): Start-Process discards
-        # the child's output, so the spawn must route the child's stderr
-        # into the SAME outcome log the Python CLI writes.
+    def test_a_broken_venv_traceback_lands_in_the_spawners_stderr_file(self):
+        # R31 M-1 (parity with the .sh sibling): Start-Process discards the
+        # child's output, so the spawn must route the child's stderr into
+        # the spawners' OWN per-spawn file — never the CLI's rotating log.
         proc = self._run_ps1(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_DOWN,
                              FAKE_RESOLVE_JSON=RESOLVE_JSON_DOWN,
                              FAKE_ENGINE_STDERR=ENGINE_STDERR_TEXT)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertTrue(self._engine_stderr_captured(),
                         "the broken-venv traceback must reach "
-                        f"{self._engine_log()}; it was discarded by the spawn")
+                        f"{self._engine_stderr_log()}; it was discarded by the spawn")
+        outcome = self._engine_outcome_log()
+        self.assertFalse(outcome.exists() and ENGINE_STDERR_TEXT in outcome.read_text(),
+                         "the spawner must NOT redirect into the CLI's own "
+                         f"rotating log {outcome}")
+
+    def test_the_direct_fallback_runs_when_the_wrapper_spawn_failed(self):
+        # R31 L-4: Start-VcoDetachedPwsh NEVER throws — it reports a failed
+        # spawn on stderr and returns nothing. $EngineSpawned must reflect
+        # the REAL spawn, so the direct Start-Process fallback runs when the
+        # wrapper path failed (it used to be skipped exactly then). Drive
+        # the real hook bytes from a copied hooks dir whose _lib copy is
+        # patched to make Start-VcoDetachedPwsh fail like a real spawn
+        # failure (return nothing).
+        hooks_dir = self.tmp / "hooks"
+        shutil.copytree(PROJECT_ROOT / "templates" / "hooks", hooks_dir)
+        lib = hooks_dir / "_lib" / "resolve-powershell.ps1"
+        # Plain utf-8 append: the file already has its BOM; a mid-file BOM
+        # would break the child's parser.
+        with lib.open("a", encoding="utf-8") as fh:
+            fh.write(
+                "\n# test override: simulate a failed detached spawn (returns\n"
+                "# nothing, exactly like Start-VcoDetachedProcess on failure).\n"
+                "function Start-VcoDetachedPwsh { param([string]$Command, "
+                "[string]$PowerShellExe, [switch]$PassThru) return $null }\n")
+        from tests.common.pwsh import PWSH_BASE_FLAGS
+
+        env = self._env(FAKE_RESOLVE_SHELL=RESOLVE_SHELL_DOWN,
+                        FAKE_RESOLVE_JSON=RESOLVE_JSON_DOWN,
+                        FAKE_ENGINE_STDERR=ENGINE_STDERR_TEXT)
+        proc = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass",
+                               "-File", str(hooks_dir / "ensure-containers.ps1")],
+                              env=env, capture_output=True, text=True,
+                              timeout=180, cwd=str(self.tmp))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(self._engine_started(),
+                        "the direct fallback must spawn the auto-start CLI when "
+                        "the wrapper spawn failed; log:\n"
+                        f"{self.log.read_text() if self.log.exists() else '<none>'}")
 
 
 if __name__ == "__main__":  # pragma: no cover

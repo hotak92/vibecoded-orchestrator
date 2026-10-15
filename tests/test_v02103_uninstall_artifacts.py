@@ -329,3 +329,16 @@ def test_a_symlinked_prune_candidate_is_never_rmdired(tmp_path, monkeypatch):
     ua.execute(plan, hub_running=lambda: False)
     assert attempted == []
     assert link.is_symlink() and real.is_dir()
+
+
+def test_both_engine_start_logs_are_planned(tmp_path):
+    """The starter's outcome log and the spawners' per-spawn stderr file
+    (R31 M-1) are both removed, by the names container_engine_start owns."""
+    from vco_lib import container_engine_start as ces
+
+    root = tmp_path / "vct"
+    (root / "logs").mkdir(parents=True)
+    for name in (ces.ENGINE_START_LOG, ces.ENGINE_START_STDERR_LOG):
+        (root / "logs" / name).write_text("x")
+    plan = ua.build_plan(os_name="Linux", home=tmp_path / "home", vct_root=root, env={})
+    assert {r.path.name for r in plan.remove} >= {ces.ENGINE_START_LOG, ces.ENGINE_START_STDERR_LOG}

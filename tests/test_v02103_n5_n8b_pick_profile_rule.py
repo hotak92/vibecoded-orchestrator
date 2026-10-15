@@ -9,6 +9,13 @@ written with a different embedding model": with an unresolvable profile the
 pick is UNVERIFIABLE, not wrong. ``RootKgDecision.profile_unresolved`` carries
 that corner and ``pick_refused_entry`` words the two cases differently.
 
+R31 M-2 closes the other side of the same defect: a populated pick whose OWN
+model is unknown (``picked_model=None`` — no ``kg_embed_model`` record and no
+readable live sample, e.g. a legacy mixed-slot class) with a RESOLVED profile
+used to take the wrong-model wording too. ``RootKgDecision.pick_unverifiable``
+(now the union of both unknown sides) carries it, and the wording says the
+model could not be determined — never "different".
+
 N-8(b): ``heal_shared_kg_pointer_drift`` converged the shared-KG pointers
 onto ANY live Identity-tab pick, while ``root_kg_identity.decide`` refuses a
 wrong-model pick — across runs the pointers flipped between the pick and the
@@ -55,6 +62,7 @@ def test_n5_unresolvable_profile_refuses_but_words_the_entry_truthfully():
                    picked=CONST, picked_model=MODEL)
     assert d.picked_refused == CONST and d.name == DERIVED
     assert d.profile_unresolved is True
+    assert d.pick_unverifiable is True  # unknown target is one unverifiable side
     entry = rki.pick_refused_entry(d)
     assert entry.condition_id == "root_kg_pick_wrong_embedding"
     assert "could not be resolved" in entry.title
@@ -65,11 +73,33 @@ def test_n5_unresolvable_profile_refuses_but_words_the_entry_truthfully():
     assert "Resolve the embedding profile" in entry.command_to_apply
 
 
+def test_m2_unknown_pick_model_with_a_resolved_profile_words_the_entry_truthfully():
+    # R31 M-2: a populated pick whose OWN model cannot be read (no
+    # kg_embed_model record, no live majority sample) with a RESOLVED target
+    # is UNVERIFIABLE, not "written with a different model".
+    d = rki.decide(ROOT, DERIVED, {DERIVED: 10, CONST: 900}, MODEL, MODEL, "",
+                   picked=CONST, picked_model=None)
+    assert d.picked_refused == CONST and d.name == DERIVED
+    assert d.profile_unresolved is False  # the target side is fine
+    assert d.pick_unverifiable is True
+    entry = rki.pick_refused_entry(d)
+    assert entry.condition_id == "root_kg_pick_wrong_embedding"
+    assert "could not be determined" in entry.title
+    assert "could not determine which embedding model" in entry.detected
+    # The wrong-model claim must be gone: VCO cannot know the models differ.
+    assert "different embedding model" not in entry.detected
+    assert "another embedding model" not in entry.title
+    # The remedy must not name "the model the pick was written with" —
+    # nobody knows it.
+    assert "was written with; then" not in entry.command_to_apply
+
+
 def test_n5_resolved_profile_keeps_the_wrong_model_wording():
     d = rki.decide(ROOT, DERIVED, {DERIVED: 10, CONST: 900}, MODEL, MODEL, "",
                    picked=CONST, picked_model=OTHER)
     assert d.picked_refused == CONST
     assert d.profile_unresolved is False
+    assert d.pick_unverifiable is False  # both sides known → a real mismatch
     entry = rki.pick_refused_entry(d)
     assert "another embedding model" in entry.title
     assert "written with a different embedding model" in entry.detected
@@ -79,6 +109,7 @@ def test_n5_resolved_profile_keeps_the_wrong_model_wording():
 def test_n5_the_flag_is_defaulted_so_unrelated_decisions_are_unaffected():
     d = rki.decide(ROOT, None, {}, None, MODEL, "", picked="Acme_KnowledgeGraph")
     assert d.profile_unresolved is False  # followed picks never set it
+    assert d.pick_unverifiable is False
 
 
 # ─── N-8(b): the ONE predicate ───────────────────────────────────────────────
@@ -211,6 +242,11 @@ def test_heal_leaves_a_wrong_model_populated_pick_alone(tmp_path):
             "shared_kg_pointer_drift_unresolved"]
         # The entry names the refused pick — the honest disclosure.
         assert PICK in sink.entries[0].detected
+        # R31 M-2: the remedy says a still-standing entry may mean the
+        # pick's model could not be verified, and points at the entry that
+        # names which side was unknown.
+        assert "could not be verified" in sink.entries[0].command_to_apply
+        assert "root_kg_pick_wrong_embedding" in sink.entries[0].command_to_apply
         assert any("not converged onto" in m for _, m in logs)
         # No loop: a second run changes nothing and re-emits the SAME entry.
         changed2, sink2, _ = _heal(cur, pick_ok)
