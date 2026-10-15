@@ -145,6 +145,13 @@ class TestLoopSleepStillDenied:
             # timeout-wrapped bash -c inside a loop body (the wait-guard
             # timeout recursion carries the loop context too).
             "while ! check; do echo x; timeout 5 bash -c 'foo; sleep 2; bar'; done",
+            # `do bash -c …` DIRECTLY after the keyword (owner ruling
+            # 2026-10-15, gap 1): the walker peels the leading compound
+            # keyword BEFORE the dash-c decision, so the sub-command is
+            # recursed into — with the loop context inherited.
+            "while c; do bash -c 'sleep 1'; done",
+            "while c; do bash -c 'foo; sleep 1; bar'; done",
+            "for i in 1 2; do timeout 5 bash -c 'sleep 1'; done",
         ],
     )
     def test_denied(self, tmp_path, command):
@@ -156,10 +163,51 @@ class TestLoopSleepStillDenied:
         [
             "while ($true) { Get-Content f; Start-Sleep 5 }",
             "do { Get-Content f; Start-Sleep 2 } until (Test-Path f)",
+            # A wait as the loop CONDITION (PS reading): loop_pattern
+            # denies any while loop, sleep or not.
+            "while (sleep 1) { Write-Output x }",
         ],
     )
     def test_powershell_loops_still_denied(self, tmp_path, command):
         _deny(tmp_path, command, tool="PowerShell")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# (a2) a WAIT as the loop CONDITION is denied too (owner ruling 2026-10-15,
+# gap 2): the condition segments of while/until count as in-loop.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestLoopConditionWaitDenied:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "while sleep 2; do x; done",
+            "until sleep 1; do echo x; done",
+            # A `&&`-chained condition: every segment up to `do` is the
+            # condition, hence in-loop.
+            "while foo && sleep 1; do x; done",
+            # The condition's bash -c recursion inherits the loop.
+            "while bash -c 'sleep 1'; do x; done",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        reason = _deny(tmp_path, command)
+        assert "sleep" in reason
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A loop WITHOUT a wait is not the guard's business.
+            "while true; do echo x; done",
+            "until curl -s localhost:8080; do echo x; done",
+            # A condition that is a plain check, with a legal fixed pause
+            # after the loop.
+            "while ! check; do echo x; done; sleep 2; echo next",
+        ],
+    )
+    def test_no_wait_means_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -297,6 +345,31 @@ class TestWalkSegments:
         assert [s.tokens[0] for s in segs] == ["foo", "sleep", "bar"]
         assert [(s.position, s.chain_size) for s in segs] == [(0, 3), (1, 3), (2, 3)]
         assert all(s.depth == 1 for s in segs)
+
+    def test_do_prefixed_bash_c_recurses_with_loop_context(self):
+        """Gap 1 (owner ruling 2026-10-15): the dash-c decision looks
+        THROUGH leading compound keywords (do/then/else/{/!), so
+        `do bash -c '…'` recurses like a bare `bash -c '…'`."""
+        segs = self._segments("while c; do bash -c 'sleep 1'; done")
+        assert [s.tokens for s in segs] == [["while", "c"], ["sleep", "1"], ["done"]]
+        sleep = segs[1]
+        assert sleep.in_loop and sleep.depth == 1
+        assert (sleep.position, sleep.chain_size) == (0, 1)
+
+    def test_condition_segments_are_in_loop(self):
+        """Gap 2: every segment of a while/until CONDITION (up to `do`)
+        is in-loop, chained conditions included."""
+        segs = self._segments("while foo && sleep 1; do x; done")
+        assert [s.tokens[0] for s in segs] == ["while", "sleep", "do", "done"]
+        assert [s.in_loop for s in segs] == [True, True, True, False]
+
+    def test_bash_without_c_still_emits_nothing_even_after_do(self):
+        from vco_lib.bash_command_walk import walk_command
+
+        one = lambda toks: ["|".join(toks)]  # noqa: E731
+        assert walk_command("bash script.sh", one) == []
+        assert walk_command("do bash script.sh", one) == []
+        assert walk_command("do bash -c 'a; b'", one) == ["a", "b"]
 
     def test_walk_command_contract_unchanged(self):
         """The existing consumers' collector contract is byte-identical:

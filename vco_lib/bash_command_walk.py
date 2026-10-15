@@ -41,13 +41,16 @@ never disagree): every peeled segment is handed out as a
 :data:`ChainSegment` carrying its ``position``/``chain_size`` within its OWN chain
 level (a ``bash -c`` sub-command is its own chain with its own positions)
 and ``in_loop`` — True when the segment opens a ``while``/``until``/
-``for``/``select`` loop (the condition is loop machinery too) or sits in
-its ``do``..``done`` body, propagated through ``bash -c`` recursion so a
+``for``/``select`` loop, sits in a ``while``/``until`` CONDITION (every
+segment from the opener up to its ``do``), or sits in its ``do``..``done``
+body, propagated through ``bash -c`` recursion so a
 ``while c; do echo x; bash -c '…; sleep 2; …'; done`` marks the INNER
-sleep as in-loop (the walker recurses only when the peeled verb IS the
-shell — a ``do bash -c …`` segment, whose verb is ``do``, is not recursed,
-exactly as :func:`walk_command` has always behaved). Added for the wait guard's fixed-sleep rule (a literal
-``sleep`` between other actions is allowed; a sleep in a loop, or as the
+sleep as in-loop. The recursion decision looks through leading compound
+keywords (:data:`LEADING_COMPOUND_KEYWORDS`), so ``do bash -c '…'``
+recurses exactly like a bare ``bash -c '…'`` (owner ruling 2026-10-15;
+before, the keyword hid the sub-command from every consumer). Added for
+the wait guard's fixed-sleep rule (a literal ``sleep`` between other
+actions is allowed; a sleep in a loop — body or condition — or as the
 sole/last/first segment, is not) — position and loop membership are shell
 structure, so they live here, not in a consumer's raw-string scan.
 """
@@ -113,6 +116,22 @@ MAX_NESTING_DEPTH: int = 4
 #: peeling — a wrapper verb can never precede a shell keyword).
 LOOP_OPENERS: frozenset[str] = frozenset({"while", "until", "for", "select"})
 
+#: Compound/loop keywords that may LEAD a segment before its command
+#: (``do sleep 2``, ``{ bash -c '…'; }``, ``! cmd``). The ``bash -c``
+#: recursion decision looks THROUGH them (v0.2.103, owner ruling
+#: 2026-10-15: ``do bash -c '…'`` recurses exactly like a bare
+#: ``bash -c '…'`` — previously the keyword hid the sub-command from every
+#: consumer). Consumers that classify a segment's verb (the wait guard)
+#: strip this same set — import it from here, one home.
+LEADING_COMPOUND_KEYWORDS: frozenset[str] = frozenset(
+    {"do", "then", "else", "{", "!"})
+
+#: ``while``/``until`` are the loop openers whose CONDITION is a command
+#: (``for``/``select`` take a word list, never a command). Every segment
+#: from one of these openers up to its ``do`` is marked in-loop (owner
+#: ruling 2026-10-15: a wait as the loop condition is a wait in the loop).
+CONDITION_OPENERS: frozenset[str] = frozenset({"while", "until"})
+
 
 class ChainSegment(NamedTuple):
     """One peeled chain segment plus its structural context (v0.2.103).
@@ -125,9 +144,10 @@ class ChainSegment(NamedTuple):
                    counts at the outer level even though it is recursed
                    rather than emitted).
     ``in_loop``  — True when the segment OPENS a
-                   ``while``/``until``/``for``/``select`` loop (the
-                   condition runs per iteration — loop machinery too) or
-                   sits between its ``do`` and ``done``; inherited through
+                   ``while``/``until``/``for``/``select`` loop, sits in
+                   the CONDITION of a ``while``/``until`` (every segment
+                   from the opener up to its ``do``), or sits between
+                   ``do`` and ``done``; inherited through
                    ``bash -c`` recursion, so a sleep inside
                    ``while c; do echo x; bash -c '…; sleep 1; …'; done``
                    is in-loop.
@@ -351,13 +371,13 @@ def tokenize(command: str) -> Optional[List[str]]:
     ]
 
 
-def _dash_c_subcommand(tokens: List[str]) -> Optional[str]:
+def dash_c_subcommand(tokens: List[str]) -> Optional[str]:
     """The ``<sub-command>`` of a ``<shell> -c <sub>`` shape, else None.
 
     Peels the optional ``-c`` (or a combined flag whose last letter is
     ``c``, like ``-ec``) and returns the next positional. The ONE home for
-    this shape — :func:`walk_segments` and :func:`parse_dash_c` both use
-    it."""
+    this shape — :func:`walk_segments`, :func:`parse_dash_c` and the wait
+    guard's loop-condition scan all use it."""
     i = 1
     while i < len(tokens):
         tok = tokens[i]
@@ -379,7 +399,7 @@ def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]
     Returns an empty list if the shape doesn't match, the sub-cmd is
     malformed, or the depth budget is exhausted.
     """
-    sub_cmd = _dash_c_subcommand(tokens)
+    sub_cmd = dash_c_subcommand(tokens)
     if sub_cmd is None:
         return []
     # Recurse with depth-budget so attacker-crafted nested `bash -c`
@@ -398,11 +418,16 @@ def walk_segments(command: str, depth: int = 0, *,
     guard's fixed-sleep rule).
 
     Loop membership is tracked per chain level: a ``while``/``until``/
-    ``for``/``select`` opener and everything from its ``do`` up to the
-    matching ``done`` is in-loop, nested loops included; the context is
-    INHERITED by a ``bash -c`` recursion (``_in_loop``), while the
-    sub-command's positions restart at its own level. ``depth`` and the
-    ``MAX_NESTING_DEPTH`` budget behave exactly as in
+    ``for``/``select`` opener, every segment of a ``while``/``until``
+    CONDITION (up to its ``do`` — a wait there is loop machinery, owner
+    ruling 2026-10-15), and everything from the ``do`` up to the matching
+    ``done`` is in-loop, nested loops included; the context is INHERITED
+    by a ``bash -c`` recursion (``_in_loop``), while the sub-command's
+    positions restart at its own level. The recursion decision looks
+    through :data:`LEADING_COMPOUND_KEYWORDS` (``do bash -c '…'``
+    recurses); the EMITTED tokens keep the keyword prefix, exactly as
+    :func:`walk_command` collectors have always received them. ``depth``
+    and the ``MAX_NESTING_DEPTH`` budget behave exactly as in
     :func:`walk_command`.
     """
     if depth > MAX_NESTING_DEPTH:
@@ -416,6 +441,7 @@ def walk_segments(command: str, depth: int = 0, *,
     chain_size = len(segments)
     out: List[ChainSegment] = []
     loop_depth = 0
+    in_condition = False  # between a while/until opener and its `do`
     for i, segment in enumerate(segments):
         if not segment:
             continue
@@ -424,27 +450,46 @@ def walk_segments(command: str, depth: int = 0, *,
             continue
         # Loop bookkeeping reads the FIRST token before wrapper peeling:
         # a wrapper verb can never precede a shell keyword. `do` marks the
-        # body (its own tail is body content); `done` ends it (decremented
-        # AFTER this segment, so the terminator itself is not body).
+        # body (its own tail is body content); `done` ends it — the
+        # decrement happens BEFORE this segment's in_loop is computed, so
+        # the terminator itself is not body.
         first = os.path.basename(stripped[0]).lower()
         opens = first in LOOP_OPENERS
         is_do = first == "do"
         is_done = first == "done"
-        in_loop = _in_loop or loop_depth > 0 or opens or is_do
+        if is_done and loop_depth > 0:
+            # The terminator ends the body AT this segment: it is not
+            # body itself.
+            loop_depth -= 1
+        in_loop = (_in_loop or loop_depth > 0 or opens or is_do
+                   or in_condition)
         peeled = peel_wrapper_verbs(stripped)
         if peeled:
-            verb_basename = os.path.basename(peeled[0]).lower()
-            if verb_basename in SHELL_DASH_C_VERBS:
-                sub_cmd = _dash_c_subcommand(peeled)
+            # The dash-c decision looks THROUGH leading compound keywords
+            # (v0.2.103, owner ruling 2026-10-15): `do bash -c '…'`
+            # recurses exactly like a bare `bash -c '…'`. The emitted
+            # tokens are unchanged — collectors still receive the
+            # keyword-prefixed segment for non-shell verbs.
+            rec = peeled
+            while rec and (os.path.basename(rec[0]).lower()
+                           in LEADING_COMPOUND_KEYWORDS):
+                rec = rec[1:]
+            if rec and os.path.basename(rec[0]).lower() in SHELL_DASH_C_VERBS:
+                sub_cmd = dash_c_subcommand(rec)
                 if sub_cmd is not None and depth + 1 <= MAX_NESTING_DEPTH:
                     out.extend(walk_segments(sub_cmd, depth + 1,
                                              _in_loop=in_loop))
+                # Consumed either way: no `-c` sub-command (e.g.
+                # `bash script.sh`) or over budget → nothing emitted,
+                # exactly as parse_dash_c has always done.
             else:
-                out.append(ChainSegment(peeled, i, chain_size, in_loop, depth))
+                out.append(ChainSegment(peeled, i, chain_size,
+                                        in_loop, depth))
+        if opens and first in CONDITION_OPENERS:
+            in_condition = True
         if is_do:
             loop_depth += 1
-        elif is_done and loop_depth > 0:
-            loop_depth -= 1
+            in_condition = False
     return out
 
 
@@ -470,10 +515,13 @@ __all__ = [
     "CHAIN_SEPARATORS",
     "ChainSegment",
     "Collector",
+    "CONDITION_OPENERS",
+    "LEADING_COMPOUND_KEYWORDS",
     "LOOP_OPENERS",
     "MAX_NESTING_DEPTH",
     "SHELL_DASH_C_VERBS",
     "WRAPPER_VERBS",
+    "dash_c_subcommand",
     "is_env_assignment",
     "parse_dash_c",
     "peel_wrapper_verbs",

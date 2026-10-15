@@ -103,8 +103,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from vco_lib.bash_command_walk import (
+    CONDITION_OPENERS,
+    LEADING_COMPOUND_KEYWORDS,
     SHELL_DASH_C_VERBS,
     ChainSegment,
+    dash_c_subcommand,
     peel_wrapper_verbs,
     split_chain,
     strip_env_assignments,
@@ -196,8 +199,11 @@ _LITERAL_SLEEP_RE = re.compile(r"^[0-9]+(\.[0-9]+)?(?:ms|[smhd])?$")
 
 #: Shell keywords that prefix the command inside a compound body — the
 #: chain walker splits ``do sleep 2; done`` into a ``do sleep 2`` segment
-#: and the VERB is what follows the keyword.
-_LEADING_KEYWORDS = frozenset({"do", "then", "else", "{", "!", "time"})
+#: and the VERB is what follows the keyword. The set lives in the ONE
+#: chain walker (:data:`vco_lib.bash_command_walk.LEADING_COMPOUND_KEYWORDS`,
+#: imported above); ``time`` needs no entry — the walker's wrapper peel
+#: already removed it from every emitted segment.
+_LEADING_KEYWORDS = LEADING_COMPOUND_KEYWORDS
 
 
 def _tail_follows(args: List[str]) -> bool:
@@ -236,13 +242,25 @@ def _sleep_pattern(body: List[str], seg: ChainSegment) -> Optional[tuple]:
     return None
 
 
-def _pattern_of_segment(seg: ChainSegment, depth: int) -> Optional[tuple]:
-    body = seg.tokens
+def _pattern_of_tokens(tokens: List[str], depth: int,
+                       seg: ChainSegment) -> Optional[tuple]:
+    """The verb dispatch for one token list — used for each walked segment
+    AND for the condition tail of a ``while``/``until`` opener (owner
+    ruling 2026-10-15, gap 2: a wait AS the loop condition is a wait in
+    the loop; the condition tail is scanned as a segment of its own, with
+    the opener's in-loop context, so its sleep denies regardless of
+    position)."""
+    body = tokens
     while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
         body = body[1:]
     if not body:
         return None
     verb = os.path.basename(body[0]).lower()
+    if verb in CONDITION_OPENERS:
+        # `while <condition>` / `until <condition>`: the condition is a
+        # command that runs every iteration — scan its tail. (`for` /
+        # `select` take a word list, never a command: not dispatched.)
+        return _pattern_of_tokens(body[1:], depth, seg)
     if verb == "sleep":
         return _sleep_pattern(body, seg)
     if verb == "watch":
@@ -251,12 +269,24 @@ def _pattern_of_segment(seg: ChainSegment, depth: int) -> Optional[tuple]:
         return ("tail --follow", " ".join(body[:3]))
     if verb in _SCAN_WRAPPER_VERBS:
         return _scan_wrapped(body, depth, in_loop=seg.in_loop)
+    if verb in SHELL_DASH_C_VERBS:
+        # `while bash -c 'sleep 1'; do …` — the condition's own dash-c
+        # recursion (the walker only recurses a segment whose FIRST token
+        # is the shell; the condition tail starts after `while`).
+        sub = dash_c_subcommand(body)
+        if sub is not None:
+            return static_pattern(sub, depth=depth + 1, _in_loop=seg.in_loop)
+        return None
     if verb in PS_WAIT_VERBS:
         # PowerShell's foreground waits (Wait-Job / Wait-Process /
         # Wait-Event, and Receive-Job -Wait) — the translated name; no Bash
         # command starts with one, so this never fires on a Bash call.
         return (verb, " ".join(body[:3]))
     return None
+
+
+def _pattern_of_segment(seg: ChainSegment, depth: int) -> Optional[tuple]:
+    return _pattern_of_tokens(seg.tokens, depth, seg)
 
 
 def _scan_wrapped(tokens: List[str], depth: int, *,
