@@ -196,6 +196,20 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
         "$RUN_PY" -m vco_lib.runtime_reconcile record-boot-refusal --source session \
             --reason "$VCO_RUNTIME_REASON" >/dev/null 2>&1 || true
     fi
+    # v0.2.103 (owner 2026-10-15): the engine itself may just be DOWN — the
+    # resolver's "absent" is often "installed but not running" (Docker
+    # Desktop not launched after a reboot, podman machine stopped, socket
+    # down). Start it in the background through the ONE home,
+    # `python -m vco_lib.container_engine_start ensure`: idempotent (an
+    # engine that answers is a no-op), starts ONLY the runtime this install
+    # uses (a refused pin is started, never swapped), soft-fail, honours
+    # VCT_CONTAINER_ENGINE_AUTOSTART=0. Detached double-fork `( & )` so a
+    # kill aimed at this hook (its timeout, the lock relay) cannot reach the
+    # starter; only when a runtime binary exists ($VCO_RUNTIME_INSTALLED) —
+    # with nothing installed there is nothing to start.
+    if [ -n "${VCO_RUNTIME_INSTALLED:-}" ]; then
+        ( "$RUN_PY" -m vco_lib.container_engine_start ensure </dev/null >/dev/null 2>&1 & )
+    fi
     exit 0
 fi
 RUNTIME="$VCO_RUNTIME"

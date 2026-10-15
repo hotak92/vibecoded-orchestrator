@@ -283,6 +283,7 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCO_SESSION_LOCK_HELD": "container-hook plumbing: `service_lifecycle with-session-lock` sets it for the hook it re-runs under the session lock (R7a F10)",
     "VCO_RUNTIME_REASON": "container-hook plumbing (runtime decision provenance)",
     "VCO_RUNTIME_REQUESTED": "container-hook plumbing (requested-runtime handoff)",
+    "VCO_RUNTIME_INSTALLED": "container-hook plumbing (first installed runtime binary handoff; gates the v0.2.103 engine auto-start spawn)",
     "VCO_RUNTIME_STATE": "container-hook plumbing (runtime state handoff)",
     "VCO_VENV_PYTHON": "set by resolve-vco-venv, read by sibling bundled hooks",
     "VCT_ANALYZER_SCRIPT": "code-graph hooks hand the analyzer path to their child",

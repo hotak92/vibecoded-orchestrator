@@ -515,6 +515,22 @@ ensure-containers: VCT_CONTAINER_RUNTIME=podman is set but `podman info` failed 
 
 Your three ways out, in the order the message lists them: **start the pinned runtime** (usual fix — `podman machine start`, `systemctl --user start podman.socket`, launch Docker Desktop); **unset `VCT_CONTAINER_RUNTIME`** to return to auto-probe; or **repin** to the runtime the message named as usable — knowing that its volumes are a different data plane, so an existing KG on the other runtime will not be there.
 
+### Container engine auto-start (v0.2.103)
+
+The first of those three ways out — "start the pinned runtime" — is what VCO now does by itself. A resolver verdict of `absent` is most often "installed but not running": Docker Desktop was not launched after a reboot, the podman machine is stopped, the rootless socket is down. Since v0.2.103 the engine is started automatically at the moments it may simply be down: the SessionStart `ensure-containers` hooks (opening a VCO project in VS Code or the CLI), the hub's startup, and the launcher's startup — each of them spawns the ONE starter, `python -m vco_lib.container_engine_start ensure` (`vco_lib/container_engine_start.py`), detached, so nothing blocks on an engine boot. `install.py`'s pre-flight runs the same functions directly.
+
+The starter's contract:
+
+* **idempotent** — an engine that answers (`<runtime> info` exits 0) is a no-op; nothing is started twice;
+* **only the engine this install uses** — a pinned-but-down runtime (the refused pin above) IS started; the other runtime never is, for the same named-volumes reason;
+* **per-OS recipe** — Docker Desktop on macOS (`open -a Docker`) and Windows (shell-start of `Docker Desktop.exe`); the podman machine on macOS/Windows (`podman machine start`, init-if-absent); the rootless socket on Linux (`systemctl --user start podman.socket`). Linux Docker is NOT auto-started (`sudo systemctl start docker` needs an interactive password);
+* **soft-fail** — a start that cannot happen logs one line and gives up; nothing turns red;
+* **bounded waiting, never killing** — after a Docker Desktop launch the starter polls liveness for up to 60 s (in its own detached process); when the wait ends it reports and gives up, it never kills or cancels anything.
+
+| Var | Default | Effect |
+|---|---|---|
+| `VCT_CONTAINER_ENGINE_AUTOSTART` | unset (auto-start on) | Set to `0`, `false`, `no` or `off` to disable engine auto-start on EVERY surface — the starter checks it before any probe and no-ops (the hub and the launcher also skip the spawn before it is made). The engine already running is unaffected; containers are still reconciled as usual — only the "start the engine" step is opted out. |
+
 ### Volume source overrides (v0.2.97)
 
 `infrastructure/docker-compose.yml` mounts three named volumes — `weaviate_data` → `vco_weaviate_data`, `ollama_data` → `vco_ollama_data`, `code_embed_cache` → `vco_code_embed_cache`. A machine whose services were first stood up with **bind mounts** (for example an Ollama model directory at a host path shared with other containers) could not adopt that file without copying the data — and a blind `--force-recreate` from it silently re-pointed the service at an **empty** default volume, orphaning the data without deleting it. Each volume source is therefore env-overridable (the `VCT_CODE_EMBED_BUILD_CONTEXT` pattern), two knobs per service:

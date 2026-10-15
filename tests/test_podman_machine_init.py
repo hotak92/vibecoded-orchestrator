@@ -149,16 +149,20 @@ def test_already_running_is_success(install_module):
 
 
 def test_try_start_podman_daemon_routes_through_helper_on_darwin(install_module):
-    """_try_start_podman_daemon on Darwin uses the new auto-init helper."""
-    src = INSTALL_PY.read_text(encoding="utf-8")
-    # The Darwin/Windows branch should call _podman_machine_auto_init_and_start.
-    func_start = src.find("def _heal_podman_reachability(")
+    """_try_start_podman_daemon on Darwin uses the new auto-init helper.
+
+    v0.2.103: the heal moved to its ONE home,
+    ``vco_lib/container_engine_start.py::heal_podman_reachability`` (install.py
+    delegates), so the routing is asserted THERE — the Darwin/Windows branch
+    passes ``machine_start=_cp.podman_machine_init_and_start``."""
+    src = (INSTALL_PY.parent / "vco_lib" / "container_engine_start.py").read_text(encoding="utf-8")
+    func_start = src.find("def heal_podman_reachability(")
     assert func_start > 0
     func_end = src.find("\ndef ", func_start + 1)
     body = src[func_start:func_end]
-    assert "_podman_machine_auto_init_and_start" in body, (
-        "_try_start_podman_daemon (Darwin/Windows branch) must route "
-        "through the new auto-init helper."
+    assert "podman_machine_init_and_start" in body, (
+        "heal_podman_reachability (Darwin/Windows branch) must route "
+        "through the podman-machine auto-init helper."
     )
 
 
