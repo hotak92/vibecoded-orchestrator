@@ -29,8 +29,8 @@ VRAM figures are approximate practical floors at default quantization with a sma
 
 ## Where the orchestrator uses it
 
-- **KG-summary generation**: `generate-kg-summary.py` targets `qwen3.5:9b` as the highest-quality local fallback when the Claude CLI is unavailable. `install.py`'s `select_kg_summary_backend` picks it on GPU hosts with ≥16 GB VRAM; lower-power hosts fall back to `gemma4:e4b`.
-- **Install bootstrap**: `install.py` pulls `qwen3.5:9b` for KG-summary generation on capable machines + `gemma4:e4b` as the low-power fallback; `qwen3.5:0.8b` is the universal always-fits floor.
+- **KG-summary generation**: the local summary tier (`vco_lib.embedding_selection.summary_model_for_hardware`) picks `qwen3.5:9b` on any GPU that can hold its free-VRAM floor (≈9.1 GB+), and `qwen3.5:4b` on smaller cards (≈4.9 GB+) — the table asks the same floor function the runtime applies before loading, so it never assigns a model that would be refused. A capable CPU with no GPU gets `gemma4:e4b`; everything else `qwen3.5:0.8b`.
+- **Install bootstrap**: `install.py` pulls only the ONE generation model the machine's tier picks (`qwen3.5:9b`, `qwen3.5:4b`, `gemma4:e4b` or the always-pulled floor `qwen3.5:0.8b`).
 - **Not exposed as an MCP tool**: there is no Ollama MCP — `qwen3.5`'s vision and inference are not surfaced as MCP tools; Claude's native capabilities handle those use cases. Ollama runs at `http://localhost:11435` as infrastructure for Weaviate embeddings and local summary generation.
 
 ## Why this model

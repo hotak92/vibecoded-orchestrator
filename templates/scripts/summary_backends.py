@@ -56,8 +56,10 @@ falls back to ``KG_SUMMARY_BACKEND`` via the ``env_keys`` parameter):
                               model, resolved by vco_lib.summary_model — the
                               launcher Preferences pick, else what install
                               recorded and pulled, else the hardware tier
-                              (qwen3.5:9b at 16 GB+ VRAM, gemma4:e4b at 6-16 GB
-                              VRAM or a capable CPU, qwen3.5:0.8b floor)
+                              (the strongest model whose free-VRAM floor the
+                              card meets: qwen3.5:9b, else qwen3.5:4b;
+                              gemma4:e4b on a capable CPU with no GPU;
+                              qwen3.5:0.8b floor)
   KG_SUMMARY_OLLAMA_URL     → Ollama base URL (default: http://localhost:11435)
   KG_SUMMARY_OPENAI_MODEL   → OpenAI model name (default: gpt-4o-mini)
   KG_SUMMARY_TIMEOUT        → per-call timeout seconds (default: 180)
@@ -1708,21 +1710,14 @@ def _codegraph_walk_active() -> bool:
 #: ``/api/tags`` ``size``) plus a KV-cache/activation margin — NOT one flat
 #: constant for every tier. The old flat 8 192 MB floor (sized for
 #: ``qwen3.5:9b``) disabled the local tier FOREVER on every 6-8 GB GPU,
-#: whose resolved model is ``gemma4:e4b`` (~3 GB), even with no cloud key
-#: and no walk active. A machine whose free VRAM is below the derived floor
-#: defers the node (owed work) rather than risk the OOM the field saw.
-#: ``KG_SUMMARY_MIN_FREE_VRAM_MB`` overrides the derived floor.
+#: even with no cloud key and no walk active. A machine whose free VRAM is
+#: below the derived floor defers the node (owed work) rather than risk the
+#: OOM the field saw. ``KG_SUMMARY_MIN_FREE_VRAM_MB`` overrides the derived
+#: floor. The floor RULE itself lives in ONE place,
+#: :func:`vco_lib.embedding_selection.summary_required_free_vram_mb`, which
+#: the hardware tier table also asks — so the table never assigns a model
+#: this guard would refuse to load (v0.2.103, owner 2026-10-15).
 ENV_MIN_FREE_VRAM_MB = "KG_SUMMARY_MIN_FREE_VRAM_MB"
-#: Fallback floor when the model's size cannot be read (Ollama unreachable
-#: while deriving it): conservative, sized for the largest default tier.
-DEFAULT_MIN_FREE_VRAM_MB = 8192
-#: KV cache at the shared generate window + activations + headroom, as a
-#: fraction of the weights size (Q4 GGUF rule of thumb: the KV cache for an
-#: 8k-token window lands at roughly a third of the weights) — with an
-#: absolute minimum so the floor never drops to "weights alone" for the
-#: sub-1 GB floor model.
-VRAM_MARGIN_FRACTION = 0.4
-VRAM_MARGIN_MIN_MB = 1024
 
 VRAM_PROBE_TIMEOUT_S = 5
 OLLAMA_PROBE_TIMEOUT_S = 3
@@ -1767,15 +1762,18 @@ def _free_vram_mb() -> "int | None":
 
 
 def _required_free_vram_mb(weights_mb: "int | None") -> int:
-    """The floor for a model whose on-disk size is *weights_mb* MB.
+    """The floor for a model whose on-disk size is *weights_mb* MB — the
+    ONE floor rule, :func:`vco_lib.embedding_selection.summary_required_free_vram_mb`
+    (``None`` → its conservative default: an unknown model must not lower
+    the bar silently).
 
-    ``weights_mb=None`` (size unknown) → the conservative default sized for
-    the largest tier — an unknown model must not lower the bar silently.
+    Raises ``ImportError`` when vco_lib is not importable from this
+    interpreter; :func:`_ollama_local_deferred` turns that into a logged
+    deferral rather than guessing a floor.
     """
-    if weights_mb is None:
-        return DEFAULT_MIN_FREE_VRAM_MB
-    margin = max(VRAM_MARGIN_MIN_MB, int(weights_mb * VRAM_MARGIN_FRACTION))
-    return weights_mb + margin
+    from vco_lib.embedding_selection import summary_required_free_vram_mb
+
+    return summary_required_free_vram_mb(weights_mb)
 
 
 def _min_free_vram_mb(weights_mb: "int | None" = None) -> int:
@@ -1835,8 +1833,15 @@ def _ollama_local_deferred(weights_mb: "int | None" = None) -> "str | None":
     if _ollama_model_resident(ollama_default_model()):
         return None  # already loaded: no new allocation to make room for
     free = _free_vram_mb()
-    floor = _min_free_vram_mb(weights_mb)
-    if free is not None and free < floor:
+    if free is None:
+        return None  # unknown free VRAM: proceed (cross-OS rule above)
+    try:
+        floor = _min_free_vram_mb(weights_mb)
+    except ImportError as exc:
+        return (f"cannot size the free-VRAM floor: vco_lib is not importable "
+                f"from this interpreter ({type(exc).__name__}) — set "
+                f"{ENV_MIN_FREE_VRAM_MB} or run under the orchestrator venv")
+    if free < floor:
         return (f"only {free} MB VRAM free "
                 f"(< {floor} MB floor the resolved model needs)")
     return None

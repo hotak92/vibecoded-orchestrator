@@ -462,6 +462,9 @@ def definition_vendor(path: Path) -> Optional[str]:
     Raises ``ImportError`` when the gateway package is not importable — the
     caller decides what "cannot tell" means.
     """
+    from vco_lib.gateway_package import ensure_importable
+
+    ensure_importable()  # install-bundle runs under the system interpreter
     from vco_lib.vscode_settings import GATEWAY_ID_PREFIX
 
     model = _frontmatter_model(path)
@@ -742,6 +745,9 @@ def check_agent_model_ids(dirs: Iterable[Path]) -> list[dict[str, Any]]:
     nothing else looked at the rest until a mistyped id became a chat
     failure.
     """
+    from vco_lib.gateway_package import ensure_importable
+
+    ensure_importable()  # may run under the system interpreter (install)
     from model_router.routing import (  # pyright: ignore[reportMissingImports]
         validate_model_id,
     )

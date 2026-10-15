@@ -87,6 +87,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from vco_lib import boot_service, gateway_ensure
+from vco_lib.gateway_package import GATEWAY_PACKAGE_REL
 
 __all__ = [
     "CURRENT",
@@ -123,9 +124,9 @@ NOT_RUNNING = "not_running"
 MECH_BOOT_SERVICE = "boot_service"
 MECH_NONE = "none"
 
-#: Package location inside a clone. The daemon's own package directory is
-#: what ``model_router.source_identity`` hashes on the served side.
-GATEWAY_PACKAGE_REL = Path("claude_mcp_servers") / "model_router"
+#: Package location inside a clone: ``GATEWAY_PACKAGE_REL``, imported above
+#: from its one home :mod:`vco_lib.gateway_package`. The daemon's own package
+#: directory is what ``model_router.source_identity`` hashes on the served side.
 IDENTITY_MODULE = "source_identity.py"
 
 #: The gateway binds loopback only (``model_router.config.DEFAULT_HOST``).

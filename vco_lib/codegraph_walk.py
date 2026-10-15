@@ -504,7 +504,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     The claim-taking wrapper every shell/launcher spawn of a full or pruning
     walk routes through (module docstring). Stdio is inherited; the exit code
     is the analyzer's, or :data:`WALK_ALREADY_RUNNING_RC` on refusal.
+
+    The wrapper's own lines (the refusal above all) usually reach the user
+    through a PowerShell/shell wrapper's pipe on Windows, so its streams are
+    made console-safe first (:func:`vco_lib.console_text.harden_stdio`).
     """
+    from vco_lib.console_text import harden_stdio
+
+    harden_stdio()
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         print(

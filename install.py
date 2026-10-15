@@ -80,31 +80,6 @@ if _sys.version_info < (3, 11):
     )
     _sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# Windows stdout/stderr encoding sentinel — runs BEFORE any print().
-#
-# Python on Windows defaults stdout to the legacy ANSI code page (cp1252 in
-# Western locales). Any print() containing characters outside that codepage
-# — arrows (U+2192), em-dash (U+2014), check/cross marks, etc. — crashes
-# the installer with UnicodeEncodeError. install.py contains ~660 such
-# characters in user-facing prints.
-#
-# Reconfiguring stdout/stderr to UTF-8 with errors='replace' makes those
-# prints survive on any locale. errors='replace' (not 'strict') ensures
-# we never hard-fail on an unexpected glyph — a substitute character is
-# preferable to crashing mid-install.
-#
-# No-op on POSIX systems (stdout is already UTF-8 there). The reconfigure()
-# method exists on Python 3.7+, so it's safe under our MIN_PYTHON=(3,11).
-# ---------------------------------------------------------------------------
-if _sys.platform == "win32":
-    try:
-        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, OSError):
-        # Detached / redirected streams may lack reconfigure(); ignore.
-        pass
-
 import argparse
 import atexit
 import contextlib
@@ -140,6 +115,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # importable when install.py is invoked directly (no package context).
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# ---------------------------------------------------------------------------
+# Windows stdout/stderr encoding sentinel — runs BEFORE any print() (nothing
+# above prints).
+#
+# Python on Windows defaults stdout to the legacy ANSI code page (cp1252 in
+# Western locales). Any print() containing characters outside that codepage
+# — arrows (U+2192), em-dash (U+2014), check/cross marks, etc. — crashes
+# the installer with UnicodeEncodeError. install.py contains ~660 such
+# characters in user-facing prints.
+#
+# v0.2.103: forcing UTF-8 stopped the crash but printed garbage wherever the
+# output was read through a pipe by a cp1252/OEM reader (field: em dashes in
+# a Windows console). The ONE home for the per-stream choice — real console
+# keeps Unicode, a reader that declared UTF-8 gets UTF-8, any other pipe
+# gets transliterated ASCII, never a crash — is vco_lib.console_text (a pure
+# stdlib leaf, importable before the venv exists). No-op on POSIX.
+# ---------------------------------------------------------------------------
+from vco_lib.console_text import harden_stdio as _harden_stdio  # noqa: E402
+
+_harden_stdio()
 
 # The vco_lib modules install.py delegates to. Imported after the sys.path
 # insert above, hence the E402 waivers.
@@ -8077,7 +8073,8 @@ def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
     no lower rungs — a missing lower rung at runtime degrades to the next
     summary backend, never a pull). Derived from the SAME selector the runtime
     uses (v0.2.23 C10), local tier only (CLI/OpenAI are not Ollama models):
-    ``qwen3.5:9b`` / ``gemma4:e4b``, else the always-fits floor ``qwen3.5:0.8b``.
+    ``qwen3.5:9b`` / ``qwen3.5:4b`` (whichever free-VRAM floor the card meets),
+    ``gemma4:e4b`` (capable CPU, no GPU), else the floor ``qwen3.5:0.8b``.
     """
     return [summary_model_for_hardware(
         float(sysinfo.vram_gb or 0.0), float(sysinfo.ram_gb or 0.0), _probe_cpu_cores())]

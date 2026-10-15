@@ -132,6 +132,7 @@ OLLAMA_MODEL_MARKERS: frozenset[str] = frozenset({
     "unclemusclez/jina-embeddings-v2-base-code:latest",
     "qwen3.5:0.8b",
     "qwen3.5:9b",
+    "qwen3.5:4b",
     "gemma4:e4b",
 })
 _CODE_EMBED_BODY_MARKERS: tuple[str, ...] = ("codesage", "code_embed")

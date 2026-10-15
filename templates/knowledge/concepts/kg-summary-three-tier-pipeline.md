@@ -54,7 +54,7 @@ Observability: every demotion, skipped tier and fallback prints a line naming th
 
 Any other family gets temperature 0.4, top_p 0.9, num_predict 1024. Override the sampling params via `KG_SUMMARY_OLLAMA_OPTIONS='{...}'`. The context window is not a per-family option: every VCO generation request asks Ollama for the same machine-wide `num_ctx` (8192 by default, `VCO_OLLAMA_GENERATE_NUM_CTX`) so each model stays ONE resident copy; a `num_ctx` inside `KG_SUMMARY_OLLAMA_OPTIONS` is dropped with a stderr note.
 
-The model is resolved by `vco_lib.summary_model` (`python -m vco_lib.summary_model` prints it and the rule that chose it): `KG_SUMMARY_OLLAMA_MODEL`, else the Preferences "Ollama model" pick, else the model install recorded and pulled, else the hardware tier — `qwen3.5:9b` at 16 GB+ VRAM, `gemma4:e4b` (~4.5B effective params) at 6–16 GB VRAM or a capable CPU, `qwen3.5:0.8b` otherwise.
+The model is resolved by `vco_lib.summary_model` (`python -m vco_lib.summary_model` prints it and the rule that chose it): `KG_SUMMARY_OLLAMA_MODEL`, else the Preferences "Ollama model" pick, else the model install recorded and pulled, else the hardware tier — on a GPU, the strongest of `qwen3.5:9b` (≈9.1 GB+ VRAM) and `qwen3.5:4b` (≈4.9 GB+) whose free-VRAM floor the card can hold (the tier table calls the same floor function the runtime guard applies, so it never assigns a model the guard would refuse); `gemma4:e4b` on a capable CPU with no GPU; `qwen3.5:0.8b` otherwise.
 
 ## Title resolution
 
