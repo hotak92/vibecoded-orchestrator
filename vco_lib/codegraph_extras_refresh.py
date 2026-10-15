@@ -577,14 +577,36 @@ def refresh_extras(
             log(f"skip path={path}: cannot create lock ({exc})")
             continue
         try:
+            # v0.2.103: the re-index below is a FULL (or since-commit) walk of
+            # the extra path under the project's OWN prefix — it goes through
+            # the ONE per-project walk claim (vco_lib.codegraph_walk), so it
+            # never twins a launcher/driver walk of the same project (the
+            # 2026-10-14 field defect). Refusal → "busy" (same outcome shape
+            # as the per-path mkdir lock above) and the throttle stamp is NOT
+            # written, so the next eligible refresh retries instead of waiting
+            # out min_interval for a walk that never ran. Lock ordering is
+            # mkdir-lock THEN walk-claim; no holder takes them in the reverse
+            # order (scoped queued drains take only the mkdir lock), so no
+            # deadlock cycle exists.
+            from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
+
             try:
-                (lock / "pid").write_text(str(os.getpid()), encoding="utf-8")
-                stamp.write_text(str(int(now)), encoding="utf-8")
-            except OSError:
-                pass
-            argv = build_extra_sync_argv(path, prefix, bool(last), last, project_root)
-            log(f"reindex path={path} prefix={prefix} {last or 'never'}..{head[:12]}")
-            res = deps.run_analyzer(python, analyzer, argv, timeout)
+                with walk_claim(prefix):
+                    try:
+                        (lock / "pid").write_text(str(os.getpid()), encoding="utf-8")
+                        stamp.write_text(str(int(now)), encoding="utf-8")
+                    except OSError:
+                        pass
+                    argv = build_extra_sync_argv(path, prefix, bool(last), last, project_root)
+                    log(f"reindex path={path} prefix={prefix} {last or 'never'}..{head[:12]}")
+                    res = deps.run_analyzer(python, analyzer, argv, timeout)
+            except WalkAlreadyRunning:
+                outcomes[path] = "busy"
+                log(
+                    f"busy path={path} prefix={prefix}: another code-graph walk "
+                    "holds the single-flight claim — not starting a twin"
+                )
+                continue
             if not res.ok:
                 outcomes[path] = "analyzer_failed"
                 log(f"FAILED path={path}: {res.reason}; last_indexed_commit unchanged")
