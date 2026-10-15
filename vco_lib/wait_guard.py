@@ -29,7 +29,13 @@ substitution ``$(sleep 5)``, an xargs per-item command
 (``f() { while sleep 1; … }``) denies; and a recursed ``bash -c``
 sub-chain that is the outer segment's whole content inherits the outer
 position, so ``x && bash -c 'sleep 3' && y`` is the between-actions pause
-it reads as. ``cmd & wait`` is NOT a poll (``cmd`` runs; the builtin
+it reads as. A substitution in an assignment value (``x=$(sleep 5)``,
+``export x=`sleep 5```) is walked like any other — a sole wait there
+denies. A function body is judged by the same position rule WITHIN the
+body when the function is called in the same command: ``f() { sleep 1;
+}; f`` and ``f() { a; sleep 1; }; f`` deny, ``f() { a; sleep 1; b; }; f``
+is a between-actions pause, a definition-only command runs nothing and is
+judged as before, and a call inside a loop puts the whole body in-loop. ``cmd & wait`` is NOT a poll (``cmd`` runs; the builtin
 blocks once, in-process) and stays allowed. Position and loop membership
 come from the ONE chain walker
 (:func:`vco_lib.bash_command_walk.walk_segments`).
@@ -406,15 +412,18 @@ def static_pattern(command: str, depth: int = 0, *,
     trip it and ``bash -c`` sub-commands are re-parsed. ``while``/``until``
     loops need no rule of their own: the walker marks loop openers and
     bodies (:data:`ChainSegment.in_loop`), and the ``sleep`` segment inside
-    one IS the detection. Command-substitution bodies are walked too
-    (opt-in walker surface; the wait guard is the consumer).
+    one IS the detection. Command-substitution bodies are walked too —
+    including those in an assignment value (``x=$(sleep 5)``) — and the
+    body of a function called in the same command is positioned WITHIN the
+    body (both opt-in walker surfaces; the wait guard is the consumer).
     ``_in_loop`` / ``_position_override`` are the recursion's inherited
     context; callers pass nothing."""
     if not isinstance(command, str) or not command.strip():
         return None
     for seg in walk_segments(command, _in_loop=_in_loop,
                              _position_override=_position_override,
-                             _with_substitutions=True):
+                             _with_substitutions=True,
+                             _with_function_bodies=True):
         found = _pattern_of_segment(seg, depth)
         if found is not None:
             return found

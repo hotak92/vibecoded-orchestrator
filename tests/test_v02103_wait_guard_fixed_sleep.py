@@ -614,3 +614,122 @@ class TestBackgroundWaitLeaveAlone:
     def test_sleep_backgrounded_then_wait_still_denied(self, tmp_path):
         # The sleep is the FIRST segment of the chain — a plain wait.
         _deny(tmp_path, "sleep 5 & wait")
+
+
+class TestAssignmentSubstitutionWaits:
+    """A substitution in an ASSIGNMENT value is walked like any other: the
+    env-assignment strip used to eat the token before the substitution
+    scan, so `x=$(sleep 5)` (a sole wait) slipped through."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x=$(sleep 5)",
+            "x=`sleep 5`",
+            'x="$(sleep 5)"',
+            "export x=$(sleep 5)",
+            "x=$(sleep 5) cmd",
+            "sudo -E X=$(sleep 1) ls",  # assignment in the wrapper zone
+        ],
+    )
+    def test_sole_wait_in_assignment_denied(self, tmp_path, command):
+        assert "sleep" in _deny(tmp_path, command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x=$(date +%s)",
+            "x=$(git rev-parse HEAD) && echo $x",
+            "x=$(foo; sleep 1; bar)",  # fixed pause inside the body
+            "FOO=1 make",
+        ],
+    )
+    def test_assignment_without_sole_wait_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+    def test_walker_walks_assignment_substitutions_opt_in(self):
+        from vco_lib.bash_command_walk import walk_command, walk_segments
+
+        # Not opted in: the pre-existing layout (the split assignment's
+        # tail fragment), no substitution body.
+        plain = walk_segments("x=$(sleep 5)")
+        assert [s.tokens for s in plain] == [["5)"]]
+        opted = walk_segments("x=$(sleep 5)", _with_substitutions=True)
+        assert [s.tokens for s in opted] == [["5)"], ["sleep", "5"]]
+        assert (opted[1].depth, opted[1].position, opted[1].chain_size) == (
+            1, 0, 1)
+        # walk_command consumers are unchanged: no substitution body is
+        # handed to the collector.
+        one = lambda toks: ["|".join(toks)]  # noqa: E731
+        assert walk_command("x=$(sleep 5)", one) == ["5)"]
+        assert walk_command('x="$(sleep 5)"', one) == []
+        assert walk_command("FOO=$(pwd) make all", one) == ["make|all"]
+
+
+class TestFunctionBodySoleWaits:
+    """A function body's waits are judged by the position rule WITHIN the
+    body when the function is called in the same command (sole/first/last
+    in the body ⇒ deny; between actions in the body ⇒ allowed). A
+    definition-only command runs nothing and is judged as before."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "f() { sleep 1; }; f",
+            "function f { sleep 2; }; f",
+            "function f() { sleep 2; }; f",
+            "f () { sleep 2; }; f",
+            "f(){ sleep 2; }; f",
+            "f() { a; sleep 1; }; f",        # last in the body
+            "f() { sleep 1; a; }; f",        # first in the body
+            "f() { sleep 1; }; x=$(f)",      # called through a substitution
+            "f() { g() { sleep 1; }; g; }; f",  # nested definition
+            # Between actions in the body, but called per loop iteration.
+            "f() { a; sleep 1; b; }; while c; do f; done",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        assert "sleep" in _deny(tmp_path, command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "f() { a; sleep 1; b; }; f",     # between actions in the body
+            "f() { sleep 1; }",              # definition only
+            "function f { sleep 2; }",       # definition only
+            "f() { a; sleep 1; }",           # definition only
+            "f() { sleep 1; }; echo f",      # `f` is an argument, not a call
+            "f() { echo hi; }; f",
+        ],
+    )
+    def test_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+    def test_function_header_shapes(self):
+        from vco_lib.bash_command_walk import function_header
+
+        assert function_header(["f()", "{", "sleep"]) == ("f", 2)
+        assert function_header(["f(){", "sleep"]) == ("f", 1)
+        assert function_header(["f", "()", "{"]) == ("f", 3)
+        assert function_header(["function", "f", "{"]) == ("f", 3)
+        assert function_header(["function", "f()", "{"]) == ("f", 3)
+        assert function_header(["function", "f", "()", "{"]) == ("f", 4)
+        assert function_header(["echo", "f()", "{"]) is None
+        assert function_header(["f()", "(", "sleep"]) is None
+
+    def test_walker_positions_body_only_when_called_and_opted_in(self):
+        from vco_lib.bash_command_walk import walk_command, walk_segments
+
+        called = walk_segments("f() { a; sleep 1; }; f",
+                               _with_function_bodies=True)
+        sleep = [s for s in called if s.tokens[0] == "sleep"]
+        assert [(s.position, s.chain_size) for s in sleep] == [(1, 2)]
+        # Definition only: the plain layout, header prefix kept.
+        defn = walk_segments("f() { sleep 1; }", _with_function_bodies=True)
+        assert defn[0].tokens == ["f()", "{", "sleep", "1"]
+        # Not opted in: byte-identical to before.
+        plain = walk_segments("f() { sleep 1; }; f")
+        assert plain[0].tokens == ["f()", "{", "sleep", "1"]
+        one = lambda toks: ["|".join(toks)]  # noqa: E731
+        assert walk_command("f() { sleep 1; }; f", one) == [
+            "f()|{|sleep|1", "}", "f"]

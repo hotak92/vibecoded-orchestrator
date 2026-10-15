@@ -53,6 +53,10 @@ the wait guard's fixed-sleep rule (a literal ``sleep`` between other
 actions is allowed; a sleep in a loop — body or condition — or as the
 sole/last/first segment, is not) — position and loop membership are shell
 structure, so they live here, not in a consumer's raw-string scan.
+Two further opt-in surfaces serve the same consumer: command-substitution
+bodies (assignment values included — ``x=$(sleep 5)``) and the
+re-positioning of a CALLED function's body within that body
+(:func:`function_header`); :func:`walk_command` opts into neither.
 """
 from __future__ import annotations
 
@@ -476,29 +480,180 @@ def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]
     return walk_command(sub_cmd, collect, depth=depth + 1)
 
 
+#: A shell function NAME (bash accepts more than POSIX; this is the
+#: practical subset) — with an optional glued ``()`` and/or ``{``.
+_FN_NAME = r"[A-Za-z_][A-Za-z0-9_.:-]*"
+_FN_PAREN_RE = re.compile(r"^(" + _FN_NAME + r")\(\)(\{)?$")
+_FN_KEYWORD_NAME_RE = re.compile(r"^(" + _FN_NAME + r")(\(\))?(\{)?$")
+
+
+def function_header(tokens: List[str]) -> Optional[tuple]:
+    """``(name, header_len)`` when ``tokens`` OPENS a brace-bodied function
+    definition — ``f() {``, ``f(){``, ``f () {``, ``function f {``,
+    ``function f() {`` — where ``header_len`` counts the header tokens up
+    to and including the ``{``; else ``None`` (v0.2.103, owner ruling
+    2026-10-15: a function body's waits are judged by the position rule
+    WITHIN the body). Subshell-bodied functions (``f() ( … )``) are not
+    recognised: their tail is never re-positioned."""
+    if not tokens:
+        return None
+    if tokens[0] == "function" and len(tokens) >= 2:
+        m = _FN_KEYWORD_NAME_RE.match(tokens[1])
+        if m is None:
+            return None
+        if m.group(3):
+            return m.group(1), 2
+        j = 2
+        if not m.group(2) and j < len(tokens) and tokens[j] == "()":
+            j += 1
+        if j < len(tokens) and tokens[j] == "{":
+            return m.group(1), j + 1
+        return None
+    m = _FN_PAREN_RE.match(tokens[0])
+    if m is not None:
+        if m.group(2):
+            return m.group(1), 1
+        if len(tokens) > 1 and tokens[1] == "{":
+            return m.group(1), 2
+        return None
+    if (len(tokens) >= 3 and re.fullmatch(_FN_NAME, tokens[0])
+            and tokens[1] == "()" and tokens[2] == "{"):
+        return tokens[0], 3
+    return None
+
+
+def _loop_membership(segments: List[List[str]], inherited: bool) -> List[bool]:
+    """Per-segment loop membership for ONE chain level (pure bookkeeping).
+
+    A ``while``/``until``/``for``/``select`` opener (also right after a
+    ``{``/``(`` group token — ``f() { while …``), every segment of a
+    ``while``/``until`` CONDITION up to its ``do``, and everything from the
+    ``do`` up to the matching ``done`` is in-loop, nested loops included;
+    ``inherited`` is the context of an enclosing recursion. Reads the FIRST
+    token before wrapper peeling: a wrapper verb never precedes a shell
+    keyword. The ``done`` decrement happens BEFORE that segment's flag is
+    computed, so the terminator itself is not body."""
+    flags: List[bool] = []
+    loop_depth = 0
+    in_condition = False  # between a while/until opener and its `do`
+    for segment in segments:
+        stripped = strip_env_assignments(segment)
+        if not stripped:
+            flags.append(inherited or loop_depth > 0 or in_condition)
+            continue
+        opener = _segment_opener(stripped)
+        first = os.path.basename(stripped[0]).lower()
+        is_do = first == "do"
+        if first == "done" and loop_depth > 0:
+            loop_depth -= 1
+        flags.append(inherited or loop_depth > 0 or opener is not None
+                     or is_do or in_condition)
+        if opener in CONDITION_OPENERS:
+            in_condition = True
+        if is_do:
+            loop_depth += 1
+            in_condition = False
+    return flags
+
+
+def _strip_command_prefix(tokens: List[str]) -> List[str]:
+    """Env assignments, wrapper verbs, leading compound keywords and
+    subshell parens peeled — what is left starts with the command word."""
+    rec = peel_wrapper_verbs(strip_env_assignments(tokens))
+    while rec and os.path.basename(rec[0]).lower() in LEADING_COMPOUND_KEYWORDS:
+        rec = rec[1:]
+    return strip_subshell_parens(rec)
+
+
+def _invokes(tokens: List[str], name: str) -> bool:
+    """True when the segment runs ``name`` as its command word, directly or
+    as the command word of one of its substitution bodies (``x=$(f)``)."""
+    cmd = _strip_command_prefix(tokens)
+    if cmd and cmd[0] == name:
+        return True
+    for body in substitution_bodies(tokens):
+        sub = tokenize(body)
+        if sub and any(_strip_command_prefix(s)[:1] == [name]
+                       for s in split_chain(sub)):
+            return True
+    return False
+
+
+#: One layout row: (tokens, position, chain_size, in_loop).
+_Row = tuple
+
+
+def _function_body_layout(rows: List[_Row]) -> List[_Row]:
+    """Re-position the body of every brace-bodied function that is CALLED
+    later in the same chain level (v0.2.103, owner ruling 2026-10-15).
+
+    The body's segments — the header segment's tail after ``{`` plus every
+    segment up to the matching ``}`` — get positions WITHIN the body, so the
+    position rule judges a wait by where it sits in the function: sole,
+    first or last inside the body is a plain wait once the function runs;
+    between actions inside the body is the sanctioned pause. A call site in
+    a loop marks the whole body in-loop (the body runs per iteration).
+
+    A definition that is never called runs nothing: its rows stay exactly
+    as the plain chain walk laid them out (positions at the outer level,
+    header token prefix kept), so a definition-only command is judged as
+    before. No matching ``}`` (an unterminated or newline-separated body)
+    also leaves the rows untouched."""
+    out = list(rows)
+    h = 0
+    while h < len(out):
+        header = function_header(out[h][0])
+        if header is None:
+            h += 1
+            continue
+        name, hlen = header
+        tail = out[h][0][hlen:]
+        depth = 1 + tail.count("{")
+        closer = None
+        for k in range(h + 1, len(out)):
+            toks = out[k][0]
+            if toks and toks[0] == "}":
+                depth -= 1
+                if depth == 0:
+                    closer = k
+                    break
+            depth += toks.count("{")
+        if closer is None:
+            h += 1
+            continue
+        calls = [r for r in out[closer + 1:] if _invokes(r[0], name)]
+        if not calls:
+            h = closer + 1  # never runs: leave the definition untouched
+            continue
+        called_in_loop = any(r[3] for r in calls)
+        body = ([(tail,) + out[h][1:]] if tail else []) + out[h + 1:closer]
+        size = len(body)
+        body = [(r[0], j, size, r[3] or called_in_loop)
+                for j, r in enumerate(body)]
+        out[h:closer] = body
+        # Re-scan from h: the tail may itself open a nested definition.
+    return out
+
+
 def walk_segments(command: str, depth: int = 0, *,
                   _in_loop: bool = False,
                   _position_override: Optional[tuple] = None,
-                  _with_substitutions: bool = False) -> List[ChainSegment]:
+                  _with_substitutions: bool = False,
+                  _with_function_bodies: bool = False) -> List[ChainSegment]:
     """Parse `command` like :func:`walk_command` but hand out
     :data:`ChainSegment` records — peeled tokens PLUS the structural
     context (position within the chain level, loop membership, recursion
     depth) that position/loop-aware consumers need (v0.2.103: the wait
     guard's fixed-sleep rule).
 
-    Loop membership is tracked per chain level: a ``while``/``until``/
-    ``for``/``select`` opener (including right after a ``{``/``(`` group
-    token — ``f() { while …``), every segment of a ``while``/``until``
-    CONDITION (up to its ``do`` — a wait there is loop machinery, owner
-    ruling 2026-10-15), and everything from the ``do`` up to the matching
-    ``done`` is in-loop, nested loops included; the context is INHERITED
-    by a ``bash -c`` recursion (``_in_loop``), while the sub-command's
-    positions restart at its own level. The recursion decision looks
-    through :data:`LEADING_COMPOUND_KEYWORDS` and subshell parens
-    (``do bash -c '…'``, ``( bash -c '…' )`` recurse); the EMITTED tokens
-    keep the keyword/paren prefix, exactly as :func:`walk_command`
-    collectors have always received them. ``depth`` and the
-    ``MAX_NESTING_DEPTH`` budget behave exactly as in
+    Loop membership is tracked per chain level by :func:`_loop_membership`;
+    the context is INHERITED by a ``bash -c`` recursion (``_in_loop``),
+    while the sub-command's positions restart at its own level. The
+    recursion decision looks through :data:`LEADING_COMPOUND_KEYWORDS` and
+    subshell parens (``do bash -c '…'``, ``( bash -c '…' )`` recurse); the
+    EMITTED tokens keep the keyword/paren prefix, exactly as
+    :func:`walk_command` collectors have always received them. ``depth``
+    and the ``MAX_NESTING_DEPTH`` budget behave exactly as in
     :func:`walk_command`.
 
     ``_position_override`` (R6, owner 2026-10-15): a recursed sub-chain
@@ -510,10 +665,19 @@ def walk_segments(command: str, depth: int = 0, *,
     while a multi-segment sub-chain keeps its own positions.
 
     ``_with_substitutions`` (R6; opt-in — :func:`walk_command` callers are
-    unchanged): each EMITTED segment's command-substitution bodies
-    (:func:`substitution_bodies`) are walked as sub-chains at depth+1
-    (inheriting the loop context, NOT the position — a sole wait inside
-    ``$(…)`` is a sole wait).
+    unchanged): the command-substitution bodies (:func:`substitution_bodies`)
+    of each segment are walked as sub-chains at depth+1 (inheriting the loop
+    context, NOT the position — a sole wait inside ``$(…)`` is a sole
+    wait). The scan covers the segment's env-assignment and wrapper prefix
+    too, so ``x=$(sleep 5)`` / ``export x=$(sleep 5)`` / ``sudo -E
+    X=$(sleep 1) cmd`` are walked even though the assignment itself is
+    never emitted as a command.
+
+    ``_with_function_bodies`` (opt-in; :func:`_function_body_layout`): the
+    body of a brace-bodied function that is called later in the same chain
+    level is re-positioned WITHIN the body, and its header segment is
+    emitted as the tail after ``{`` (``f() { sleep 1; }; f`` emits
+    ``sleep 1`` as the body's sole segment).
     """
     if depth > MAX_NESTING_DEPTH:
         return []
@@ -524,37 +688,29 @@ def walk_segments(command: str, depth: int = 0, *,
 
     segments = split_chain(tokens)
     chain_size = len(segments)
-    out: List[ChainSegment] = []
-    loop_depth = 0
-    in_condition = False  # between a while/until opener and its `do`
+    flags = _loop_membership(segments, _in_loop)
+    rows: List[_Row] = []
     for i, segment in enumerate(segments):
-        if not segment:
-            continue
-        stripped = strip_env_assignments(segment)
-        if not stripped:
-            continue
-        # Loop bookkeeping reads the FIRST token before wrapper peeling:
-        # a wrapper verb can never precede a shell keyword. `do` marks the
-        # body (its own tail is body content); `done` ends it — the
-        # decrement happens BEFORE this segment's in_loop is computed, so
-        # the terminator itself is not body.
-        opener = _segment_opener(stripped)
-        opens = opener is not None
-        is_do = os.path.basename(stripped[0]).lower() == "do"
-        is_done = os.path.basename(stripped[0]).lower() == "done"
-        if is_done and loop_depth > 0:
-            # The terminator ends the body AT this segment: it is not
-            # body itself.
-            loop_depth -= 1
-        in_loop = (_in_loop or loop_depth > 0 or opens or is_do
-                   or in_condition)
         # R6: a recursed sub-chain that is the outer segment's whole
         # content inherits that segment's position.
         if _position_override is not None and chain_size == 1:
             pos, size = _position_override
         else:
             pos, size = i, chain_size
-        peeled = peel_wrapper_verbs(stripped)
+        rows.append((segment, pos, size, flags[i]))
+    if _with_function_bodies:
+        rows = _function_body_layout(rows)
+
+    sub_budget = depth + 1 <= MAX_NESTING_DEPTH
+    out: List[ChainSegment] = []
+    for segment, pos, size, in_loop in rows:
+        if not segment:
+            continue
+        stripped = strip_env_assignments(segment)
+        peeled = peel_wrapper_verbs(stripped) if stripped else []
+        # The env-assignment / wrapper prefix the command word sits behind:
+        # never emitted, but its substitutions still run (`x=$(sleep 5)`).
+        subst_src = segment[:len(segment) - len(peeled)]
         if peeled:
             # The dash-c decision looks THROUGH leading compound keywords
             # (v0.2.103, owner ruling 2026-10-15): `do bash -c '…'`
@@ -568,26 +724,24 @@ def walk_segments(command: str, depth: int = 0, *,
             rec = strip_subshell_parens(rec)
             if rec and os.path.basename(rec[0]).lower() in SHELL_DASH_C_VERBS:
                 sub_cmd = dash_c_subcommand(rec)
-                if sub_cmd is not None and depth + 1 <= MAX_NESTING_DEPTH:
+                if sub_cmd is not None and sub_budget:
                     out.extend(walk_segments(
                         sub_cmd, depth + 1, _in_loop=in_loop,
                         _position_override=(pos, size),
-                        _with_substitutions=_with_substitutions))
+                        _with_substitutions=_with_substitutions,
+                        _with_function_bodies=_with_function_bodies))
                 # Consumed either way: no `-c` sub-command (e.g.
                 # `bash script.sh`) or over budget → nothing emitted,
                 # exactly as parse_dash_c has always done.
             else:
                 out.append(ChainSegment(peeled, pos, size, in_loop, depth))
-                if _with_substitutions and depth + 1 <= MAX_NESTING_DEPTH:
-                    for sub_body in substitution_bodies(peeled):
-                        out.extend(walk_segments(
-                            sub_body, depth + 1, _in_loop=in_loop,
-                            _with_substitutions=True))
-        if opens and opener in CONDITION_OPENERS:
-            in_condition = True
-        if is_do:
-            loop_depth += 1
-            in_condition = False
+                subst_src = segment
+        if _with_substitutions and sub_budget:
+            for sub_body in substitution_bodies(subst_src):
+                out.extend(walk_segments(
+                    sub_body, depth + 1, _in_loop=in_loop,
+                    _with_substitutions=True,
+                    _with_function_bodies=_with_function_bodies))
     return out
 
 
@@ -620,6 +774,7 @@ __all__ = [
     "SHELL_DASH_C_VERBS",
     "WRAPPER_VERBS",
     "dash_c_subcommand",
+    "function_header",
     "is_env_assignment",
     "parse_dash_c",
     "peel_wrapper_verbs",
