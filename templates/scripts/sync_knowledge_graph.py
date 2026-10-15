@@ -4980,6 +4980,192 @@ def sync_all_nodes(server: WeaviateMCPServer) -> "SyncTally":
     return tally
 
 
+#: Cap on per-row "removed stale row" stdout lines in the prune report (the
+#: count line always prints the full total; a 400-row prune doesn't need 400
+#: lines on the launcher's console — the count and the log carry it).
+_PRUNE_PRINT_CAP = 50
+
+
+def _walked_root_not_collection_owner() -> "Optional[str]":
+    """``None`` when the prune may run; a skip REASON when it must not
+    (v0.2.103 R2, review M-3).
+
+    A lane worktree or a second clone of a project carries the same
+    ``.claude/settings.json`` ``KG_COLLECTION``, so a ``--all`` run there
+    resolves the SAME collection for a tree that is not the collection's
+    registered owner — and pruning it against that tree deletes rows whose
+    files exist only in the real checkout (uncommitted work, gitignored
+    ``knowledge/``, nodes added on main after the branch point). The rule:
+    the walked root must BE the registered folder of every registration
+    that binds ``COLLECTION_NAME``.
+
+    * no launcher.db at all (free tier, no registry) ⇒ proceed — no second
+      tree is registered to claim the collection;
+    * launcher.db present but unreadable ⇒ REFUSE — ownership is
+      unprovable this run, and a destructive path waits for proof;
+    * a registered project binds ``COLLECTION_NAME`` (any role,
+      case-insensitive): its folder IS this root ⇒ proceed; a DIFFERENT
+      folder ⇒ REFUSE, naming the owner (this tree is a worktree/clone of
+      it, or an impostor);
+    * no registration binds the name ⇒ proceed (unregistered project).
+
+    Read-only throughout. Failure polarity: a registry that is LOCATED but
+    unreadable refuses (ownership unprovable on a destructive path); a
+    registry that cannot be located at all (free tier, discovery failure)
+    proceeds — no registration exists to conflict with.
+    """
+    try:
+        from vco_lib.launcher_db_reader import (
+            _discover_db_path,
+            get_kg_binding,
+            list_registered_projects,
+        )
+        from vco_lib.module_gated_delivery import _canonical_path_eq
+    except Exception:  # noqa: BLE001 — vco_lib broken: the prune home's own
+        return None    # guards report that; nothing to prove here either way
+    if _discover_db_path() is None:
+        return None  # no registry exists ⇒ no second tree can claim it
+    projects = list_registered_projects()
+    if projects is None:
+        return ("the launcher registry exists but could not be read — "
+                "collection ownership is unprovable this run, so the prune "
+                "is refused")
+    wanted = COLLECTION_NAME.strip().lower()
+    for proj in projects:
+        for role in ("primary", "shared"):
+            bound = get_kg_binding(proj.id, role)
+            if not bound or bound.strip().lower() != wanted:
+                continue
+            if _canonical_path_eq(proj.folder, PROJECT_ROOT):
+                continue  # this root IS the registered owner
+            return (f"'{COLLECTION_NAME}' is registered to "
+                    f"{proj.folder!r} (project {proj.name!r}), not to the "
+                    f"walked root {PROJECT_ROOT} — a worktree or second "
+                    "clone must not prune another tree's collection")
+    return None
+
+
+def _prune_stored_only_rows(*, run_clean: bool, kg_total: int) -> None:
+    """v0.2.103: after a full ``--all`` walk, remove rows whose source file
+    is gone from this knowledge root — the mirror image of the upsert.
+
+    The upsert only ever deletes rows for files that still exist on disk
+    (the archived-node cleanup keys on a file the walk just read), so rows
+    whose ``.md`` was deleted or moved out of ``knowledge/`` stayed in the
+    collection forever and kept surfacing in search. The prune closes that
+    gap by delegating to the repo's ONE prune home,
+    ``vco_lib.collection_repair.prune_foreign_rows`` (bundle updates and
+    install.py's seed step already run it) — its reviewed guards apply
+    unchanged here:
+
+    * rows whose file EXISTS on disk are never touched;
+    * rows with an empty / absolute / ``..`` file_path are defensively kept
+      (unresolvable to this knowledge root — never deleted on a guess);
+    * enumeration failure ⇒ skip (no destructive action without an
+      authoritative row list).
+
+    Additional gates on THIS caller (data-destroying path — conservative
+    defaults):
+
+    * ``run_clean`` — a partial walk (any knowledge-node failure) proves
+      nothing about the tree, so nothing is pruned;
+    * ``KNOWLEDGE_ROOT`` must exist and the walk must have considered at
+      least one node (``kg_total > 0``) — a missing/empty tree is more
+      likely a mis-resolved root than a deliberate bulk delete, and the
+      doctor census names the leftover rows either way;
+    * SHARED-IDENTITY skip, decided by the prune home's ONE predicate
+      (``collection_repair.is_shared_identity_collection``, v0.2.103 R2
+      review H-2): a name match with the shared collection OR this root
+      being the orchestrator clone — the latter holds even when the shared
+      NAME is empty/unresolved (hub down, free tier), the case a
+      name-only check let through on the root, where "file absent
+      locally" is NORMAL (sibling projects' shared-scope rows live there);
+    * REGISTERED-OWNER gate (v0.2.103 R2, review M-3): the walked root
+      must be the collection's registered owner in launcher.db — a
+      worktree or second clone resolves the same collection but prunes
+      against the wrong tree (:func:`_walked_root_not_collection_owner`).
+
+    Existence inside the home is judged on the path AS THE SYNC STORES IT
+    (lexical, symlink-following), and a stored path resolving OUTSIDE the
+    root is kept — a symlinked ``knowledge/`` (vault layout) no longer
+    reads as "every file gone" (v0.2.103 R2, review H-1).
+
+    Soft-fail throughout: a skipped or failed prune never changes the sync
+    exit code (the rows it would have removed are named by ``vco doctor``'s
+    kg_drift_census on the next report).
+    """
+    if not run_clean:
+        print("🧹 Stored-only prune skipped: the walk was partial "
+              "(node failures) — nothing pruned this run")
+        return
+    if not KNOWLEDGE_ROOT.is_dir():
+        print("🧹 Stored-only prune skipped: no knowledge/ tree under the "
+              f"resolved root {PROJECT_ROOT} — refusing to prune")
+        return
+    if kg_total <= 0:
+        print("🧹 Stored-only prune skipped: the walk considered 0 knowledge "
+              "nodes — refusing to prune (a mis-resolved root must not wipe "
+              "the collection)")
+        return
+    try:
+        from vco_lib.collection_repair import (
+            is_shared_identity_collection,
+            prune_foreign_rows,
+        )
+    except ImportError as e:
+        # Broken install (vco_lib is a shipped dependency of this script) —
+        # loud on stderr, but the sync itself already succeeded; failing the
+        # run now would discard a healthy sync over a best-effort cleanup.
+        print(f"⚠️  Stored-only prune not run: vco_lib import failed "
+              f"({e}) — broken install?", file=sys.stderr)
+        return
+    if is_shared_identity_collection(
+        COLLECTION_NAME, SHARED_COLLECTION_NAME, PROJECT_ROOT,
+    ):
+        print(f"🧹 Stored-only prune skipped: '{COLLECTION_NAME}' is the "
+              "shared collection (sibling projects' shared-scope rows live "
+              "here — never pruned)")
+        return
+    not_owner = _walked_root_not_collection_owner()
+    if not_owner is not None:
+        print(f"🧹 Stored-only prune skipped: {not_owner}")
+        return
+    try:
+        result = prune_foreign_rows(
+            PROJECT_ROOT,
+            COLLECTION_NAME,
+            weaviate_url=WEAVIATE_URL,
+            shared_kg_collection=SHARED_COLLECTION_NAME,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort cleanup, never fatal
+        print(f"⚠️  Stored-only prune failed (non-fatal): {e}")
+        return
+    if result.get("skipped"):
+        print(f"🧹 Stored-only prune skipped: {result['skipped']}")
+        return
+    deleted = result.get("deleted", 0)
+    if not deleted:
+        if result.get("defensive_skipped"):
+            print(
+                f"🧹 Stored-only prune: 0 removed; "
+                f"{result['defensive_skipped']} row(s) with an empty or "
+                f"absolute file_path left untouched (unresolvable)"
+            )
+        return
+    for row in result.get("stale_rows", [])[:_PRUNE_PRINT_CAP]:
+        title = row.get("title") or ""
+        print(f"  ↳ removed stale row: {row.get('path')}"
+              + (f" (title: {title})" if title else ""))
+    _hidden = len(result.get("stale_rows", [])) - _PRUNE_PRINT_CAP
+    if _hidden > 0:
+        print(f"  ↳ … and {_hidden} more (see the count below)")
+    print(
+        f"🧹 Pruned {deleted} stale Weaviate row(s) whose source file is "
+        f"gone from knowledge/ ({len(result.get('stale_paths', []))} "
+        f"path(s), collection '{COLLECTION_NAME}')"
+    )
+
+
 def _classify_sync_target(raw: str) -> Tuple[Path, bool, bool]:
     """Classify an explicit sync-target path as knowledge / docs / neither.
 
@@ -5946,6 +6132,14 @@ def main():
             total_fail = kg_tally.failed + doc_tally.failed
             _kg_embed_model.after_walk(_fill_collections(), PROJECT_ROOT,
                                        embedding_service, full_tree=True)
+            # v0.2.103: a CLEAN full walk is also the paired proof for the
+            # prune — rows whose source file is gone from this knowledge
+            # root are removed now (gates + rationale in
+            # `_prune_stored_only_rows`; a partial walk prunes nothing).
+            _prune_stored_only_rows(
+                run_clean=total_fail == 0,
+                kg_total=kg_tally.total,
+            )
             # v0.2.89 BUG 6: surface how many nodes routed to the shared
             # collection via `scope: shared` frontmatter.
             _shared_note = (

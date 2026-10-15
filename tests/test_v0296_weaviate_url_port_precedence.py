@@ -917,6 +917,11 @@ class TestParameterDefaultsConsultTheEnvironment(unittest.TestCase):
 
         class _Resp:
             def __init__(self, payload: bytes) -> None:
+                # v0.2.103: the prune delegates to
+                # vco_lib.collection_repair → weaviate_helpers.http_request,
+                # which reads ``resp.status``; the old inline prune only
+                # called ``resp.read()``.
+                self.status = 200
                 self._payload = payload
 
             def read(self) -> bytes:
@@ -946,8 +951,7 @@ class TestParameterDefaultsConsultTheEnvironment(unittest.TestCase):
                         "KG",
                         "",  # falsy → must resolve from the env
                         dry_run=False,
-                        project_root=Path(tmp),
-                        is_orchestrator_root_install=lambda: False,
+                        project_root=Path(tmp),  # markerless ⇒ non-root
                     )
 
         self.assertEqual(

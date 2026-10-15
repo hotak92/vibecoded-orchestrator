@@ -395,5 +395,213 @@ class ResolutionReasonTests(PruneBase):
         )
 
 
+class SymlinkExistenceTests(PruneBase):
+    """v0.2.103 R2 (review H-1): existence is judged on the path AS THE
+    SYNC STORES IT — lexically, following symlinks.
+
+    The pre-fix check re-resolved every candidate and required the result
+    INSIDE the project root, so a symlinked ``knowledge/`` (the Obsidian
+    vault layout) made EVERY row read as "file gone" and a full
+    ``kg-sync --all`` deleted the rows it had just written. These tests
+    build real symlinks in tmp; where the platform refuses symlinks they
+    skip (the lexical-existence rule itself is platform-independent).
+    """
+
+    def _symlink(self, link: Path, target: Path, *, directory: bool) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlinks unavailable on this platform: {exc}")
+
+    def _run_kg(self, rows):
+        fake = _FakeWeaviateHTTP({"Proj_KnowledgeGraph": rows})
+        with mock.patch.object(crep, "_http_request", fake):
+            result = prune_foreign_rows(
+                self.project, "Proj_KnowledgeGraph", weaviate_url=_URL,
+            )
+        return result, fake
+
+    def test_symlinked_knowledge_dir_rows_are_kept(self):
+        """knowledge/ → an OUTSIDE vault: the row's stored path resolves
+        outside the root but the file EXISTS through the link — kept."""
+        vault = Path(self._tmp.name) / "vault"
+        (vault / "concepts").mkdir(parents=True)
+        (vault / "concepts" / "vault-node.md").write_text(
+            "v\n", encoding="utf-8")
+        self._symlink(self.project / "knowledge", vault, directory=True)
+        _result, fake = self._run_kg([
+            ("u-vault", "knowledge/concepts/vault-node.md"),
+        ])
+        self.assertEqual(fake.deleted_uuids, [],
+                         "a row reachable through a symlinked knowledge/ is "
+                         "NOT stale")
+
+    def test_symlinked_single_node_kept(self):
+        """A single symlinked node file (real knowledge/, linked leaf) whose
+        target lives outside the root is kept."""
+        outside = Path(self._tmp.name) / "outside-node.md"
+        outside.write_text("o\n", encoding="utf-8")
+        (self.project / "knowledge").mkdir()
+        self._symlink(self.project / "knowledge" / "linked.md", outside,
+                      directory=False)
+        _result, fake = self._run_kg([
+            ("u-linked", "knowledge/linked.md"),
+        ])
+        self.assertEqual(fake.deleted_uuids, [])
+
+    def test_resolves_outside_with_missing_target_is_kept_defensively(self):
+        """A BROKEN symlink whose chain escapes the root is unjudgeable by
+        this tree's walk — kept, never read as 'gone'."""
+        (self.project / "knowledge").mkdir()
+        self._symlink(
+            self.project / "knowledge" / "broken.md",
+            Path(self._tmp.name) / "no-such-target.md",
+            directory=False,
+        )
+        _result, fake = self._run_kg([
+            ("u-broken", "knowledge/broken.md"),
+        ])
+        self.assertEqual(fake.deleted_uuids, [],
+                         "resolves-outside ⇒ KEEP (defensive), even broken")
+
+    def test_genuinely_gone_plain_row_still_deleted(self):
+        """The act leg is unchanged: a plain missing relative path whose
+        resolution stays INSIDE the root is stale and deleted."""
+        (self.project / "knowledge").mkdir()
+        (self.project / "knowledge" / "present.md").write_text(
+            "p\n", encoding="utf-8")
+        result, fake = self._run_kg([
+            ("u-present", "knowledge/present.md"),
+            ("u-gone", "knowledge/gone.md"),
+        ])
+        self.assertEqual(fake.deleted_uuids, ["u-gone"])
+        self.assertEqual(result["deleted"], 1)
+
+
+class SharedIdentityPredicateTests(PruneBase):
+    """v0.2.103 R2 (review H-2): ONE predicate, computed INSIDE the prune
+    home — name match (case-insensitive) OR the walked root is the
+    orchestrator clone — so an EMPTY/unresolved shared name on the root
+    can no longer let the prune run."""
+
+    def _mark_orchestrator_clone(self, root: Path) -> None:
+        (root / "vct-module.json").write_text(
+            '{"id": "orchestrator"}', encoding="utf-8")
+
+    def test_predicate_name_match_case_insensitive(self):
+        self.assertTrue(crep.is_shared_identity_collection(
+            "RootKG", "rootkg", self.project))
+        self.assertFalse(crep.is_shared_identity_collection(
+            "ProjKG", "Shared_KG", self.project))
+
+    def test_predicate_root_clone_with_empty_shared_name(self):
+        self._mark_orchestrator_clone(self.project)
+        self.assertTrue(
+            crep.is_shared_identity_collection("RootKG", "", self.project),
+            "root ≡ shared by construction — the empty shared name must "
+            "not disarm the skip",
+        )
+        self.assertTrue(crep.is_shared_identity_collection(
+            "RootKG", None, self.project))
+
+    def test_predicate_non_root_empty_shared_is_not_identity(self):
+        self.assertFalse(crep.is_shared_identity_collection(
+            "ProjKG", "", self.project))
+
+    def test_predicate_empty_kg_is_never_identity(self):
+        self._mark_orchestrator_clone(self.project)
+        self.assertFalse(crep.is_shared_identity_collection(
+            "", "", self.project),
+            "the 'no collection name' skip owns the empty-name case")
+
+    def test_prune_skips_before_enumerating_on_root_clone_empty_shared(self):
+        """Behavioural, through the home: a root clone with an unresolved
+        shared name does not even enumerate."""
+        self._mark_orchestrator_clone(self.project)
+        fake = _FakeWeaviateHTTP({"RootKG": [("u-gone", "docs/gone.md")]})
+        with mock.patch.object(crep, "_http_request", fake):
+            result = prune_foreign_rows(
+                self.project, "RootKG",
+                weaviate_url=_URL, shared_kg_collection="",
+            )
+        self.assertEqual(result["skipped"], "shared-identity collection")
+        self.assertEqual(fake.calls, [])
+
+    def test_wrapper_skips_kg_leg_on_root_clone_empty_shared(self):
+        """The bundle-update caller: root clone + EMPTY shared name ⇒ the
+        KG leg is skipped (pre-fix it pruned)."""
+        self._mark_orchestrator_clone(self.project)
+        fake = _FakeWeaviateHTTP(
+            {"RootKG": [("u-gone", "docs/gone.md")],
+             "Proj_Development": []},
+        )
+        with mock.patch.object(crep, "_http_request", fake), \
+                mock.patch.object(crep, "weaviate_reachable",
+                                  lambda *_a, **_k: True):
+            result = prune_foreign_rows_for_project(
+                self.project,
+                weaviate_url=_URL,
+                kg_collection="RootKG",
+                development_collection="Proj_Development",
+                shared_kg_collection="",
+                is_root_target=True,
+            )
+        kg_leg = result["legs"][0]
+        self.assertEqual(kg_leg["skipped"], "shared-identity collection")
+        self.assertEqual(fake.deleted_uuids, [])
+
+    def test_wrapper_non_root_still_prunes_its_own_gone_rows(self):
+        """Leave-alone pin: a NON-root project with a distinct shared name
+        keeps the act leg — its own gone rows are deleted."""
+        fake = _FakeWeaviateHTTP(
+            {"Proj_KnowledgeGraph": [("u-gone", "docs/gone.md")],
+             "Proj_Development": []},
+        )
+        with mock.patch.object(crep, "_http_request", fake), \
+                mock.patch.object(crep, "weaviate_reachable",
+                                  lambda *_a, **_k: True):
+            result = prune_foreign_rows_for_project(
+                self.project,
+                weaviate_url=_URL,
+                kg_collection="Proj_KnowledgeGraph",
+                development_collection="Proj_Development",
+                shared_kg_collection="Shared_KG",
+            )
+        self.assertEqual(result["total_deleted"], 1)
+        self.assertEqual(fake.deleted_uuids, ["u-gone"])
+
+    def test_cli_skips_kg_leg_on_root_clone_empty_shared(self):
+        """The CLI caller goes through the same wrapper — root markers +
+        empty shared name skip the KG leg there too."""
+        self._mark_orchestrator_clone(self.project)
+        fake = _FakeWeaviateHTTP(
+            {"RootKG": [("u-gone", "docs/gone.md")],
+             "Proj_Development": []},
+        )
+        ctx = {
+            "weaviate_url": _URL,
+            "kg_collection": "RootKG",
+            "development_collection": "Proj_Development",
+            "shared_kg_collection": "",
+            "source": "test",
+        }
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(crep, "_http_request", fake), \
+                mock.patch.object(crep, "weaviate_reachable",
+                                  lambda *_a, **_k: True), \
+                mock.patch.object(crep, "_resolve_project_context",
+                                  lambda _f: dict(ctx)), \
+                contextlib.redirect_stdout(buf):
+            rc = crep.main(["--project", str(self.project), "--json"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        legs = {leg["collection"]: leg for leg in payload["legs"]}
+        self.assertEqual(legs["RootKG"]["skipped"],
+                         "shared-identity collection")
+        self.assertEqual(fake.deleted_uuids, [])
+
+
 if __name__ == "__main__":
     unittest.main()

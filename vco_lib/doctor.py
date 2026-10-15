@@ -2511,7 +2511,8 @@ def probe_kg_drift_census(folder: Path, res: DoctorResolvers, ctx: dict) -> list
     — ``vco_lib.project_identity.resolve_snapshot``, one read-only launcher.db
     open through ``launcher_db_reader``) with a binding-sourced primary KG
     collection, run ``scan_drift`` and report the counts (disk-only,
-    stored-only, changed) with the per-project remedy command.
+    stored-only, changed) — and, since v0.2.103, the bounded LIST of
+    stored-only paths — with the per-project remedy command.
 
     REPORTED-not-owned (the ``summary_pending`` shape): the per-project
     ``kg_sync_drift_detected`` ledger entry belongs to
@@ -2599,9 +2600,10 @@ def probe_kg_drift_census(folder: Path, res: DoctorResolvers, ctx: dict) -> list
         names = ", ".join(sorted(i.name for i, _r in drifted))
         remedy_lines = [
             "# Re-run the sync for each affected project (content-hash gated —\n"
-            "# unaffected nodes are skipped, nothing is deleted). Stored-only\n"
-            "# rows (their file is gone) are NOT removed by a re-sync: inspect\n"
-            "# them before removing anything.",
+            "# unaffected nodes are skipped). Stored-only rows (their file is\n"
+            "# gone) are PRUNED by the same re-sync; rows with an empty or\n"
+            "# absolute file_path are left untouched, and shared-identity\n"
+            "# collections (the orchestrator root) are never pruned.",
         ]
         for ident, report in drifted:
             remedy_lines.append(
@@ -2610,6 +2612,18 @@ def probe_kg_drift_census(folder: Path, res: DoctorResolvers, ctx: dict) -> list
                 f"{len(getattr(report, 'stored_only', ()) or ())} stored-only, "
                 f"{len(report.stale)} changed"
             )
+            # v0.2.103: NAME the stored-only rows (bounded) — a count alone
+            # sent the user hunting through the Weaviate panel for paths the
+            # scan had already resolved. Paths only: the hash query the drift
+            # report is built from keys on file_path and never fetched
+            # titles.
+            for p in sorted(getattr(report, "stored_only", ()) or [])[:10]:
+                remedy_lines.append(f"#   stored-only: {p}")
+            _more = (
+                len(getattr(report, "stored_only", ()) or ()) - 10
+            )
+            if _more > 0:
+                remedy_lines.append(f"#   … and {_more} more stored-only path(s)")
         return [
             Finding(
                 probe="kg_drift_census",
@@ -2634,6 +2648,9 @@ def probe_kg_drift_census(folder: Path, res: DoctorResolvers, ctx: dict) -> list
                             "stored_only": len(
                                 getattr(report, "stored_only", ()) or ()
                             ),
+                            "stored_only_paths": sorted(
+                                getattr(report, "stored_only", ()) or ()
+                            )[:10],
                             "changed": len(report.stale),
                             "drifted": sorted(report.drifted),
                         }

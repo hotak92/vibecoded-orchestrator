@@ -297,7 +297,9 @@ class _SeedHarness:
 
         return _R()
 
-    def _prune(self, collection, url):
+    def _prune(self, collection, url, **kwargs):
+        # v0.2.103: the call site also threads the resolved shared-KG name
+        # (it arms the prune home's shared-identity skip).
         self.pruned.append(collection)
 
     def run(self, *, report=None, spawn_ok: bool = True, update: bool = True):
