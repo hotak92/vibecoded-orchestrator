@@ -227,29 +227,34 @@ def _citer_needles(rel: str, project_root: Path, prefix: str) -> "List[str]":
     repo-relative spelling), and the absolute path anchored at the project
     root — as given and resolved, so a symlinked root's spelling matches
     too (v0.2.103 review N2)."""
-    needles = [rel]
-    if "/" in rel:
-        needles.append(rel.replace("/", "\\"))
+    forms = [rel]
     if prefix:
-        needles.append(prefix + rel)
+        forms.append(prefix + rel)
     for root in dict.fromkeys((project_root, project_root.resolve())):
-        form = str(Path(root) / rel)
-        if form not in needles:
-            needles.append(form)
+        absolute = Path(root) / rel
+        forms += [str(absolute), absolute.as_posix()]
+    needles: "List[str]" = []
+    # every spelling also in its other separator (a node written on the
+    # other OS; ``C:/x`` and ``C:\\x`` alike) - review R28 N6
+    for form in forms:
+        for spelling in (form, form.replace("\\", "/"), form.replace("/", "\\")):
+            if spelling not in needles:
+                needles.append(spelling)
     return needles
 
 
 def _citer_pattern(needles: "List[str]") -> "re.Pattern[str]":
     """The matcher for one changed path: any of its spellings
     (:func:`_citer_needles`) on PATH BOUNDARIES only, each optionally
-    preceded by ``./``/``../`` segments (a relative Markdown link) - a
+    preceded by ``./``/``../`` segments (a relative Markdown link) or a
+    ``file://`` scheme in front of an absolute spelling - a
     non-path character (or the string's edge) before the whole match, and
     after the path neither a path character nor a dot starting more path
     text, so ``install.py`` does not match ``first-install.py``,
     ``docs/report.md`` does not match ``mydocs/report.md.bak``, and a
     sentence-ending period still matches."""
     alts = "|".join(re.escape(n) for n in needles)
-    return re.compile(rf"(?<![\w./\\-])(?:\.{{1,2}}[\\/])*(?:{alts})"
+    return re.compile(rf"(?<![\w./\\-])(?:file:///?)?(?:\.{{1,2}}[\\/])*(?:{alts})"
                       rf"(?![\w/\\-])(?!\.[\w/\\-])")
 
 
@@ -362,7 +367,7 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
 #: Unicode characters that render as a line/paragraph break even though
 #: they are not ASCII control characters (v0.2.103 review N4) - NEL,
 #: LINE SEPARATOR, PARAGRAPH SEPARATOR.
-_LINE_SEPS = "\x85  "
+_LINE_SEPS = "\x85\u2028\u2029"
 
 
 def _inline(path: str) -> str:

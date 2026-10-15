@@ -786,3 +786,62 @@ def test_guard_still_reverts_a_status_after_block_on_a_locked_node(repo):
     res, _lines, now = _judge(repo, rel, new)
     assert now == LOCKED_NODE
     assert "locked node" in res.reverted[0][1]
+
+
+# ── review R28 (N5, N6) ──────────────────────────────────────────────────
+
+
+def test_lock_state_is_parsed_only_for_matching_nodes(tmp_path, monkeypatch):
+    """R28 N5: the speed-up (frontmatter + lock work only for MATCHED nodes)
+    is pinned: with many non-citing nodes the parser runs once per citer."""
+    _git_env(monkeypatch)
+    r = tmp_path / "proj"
+    (r / "knowledge" / "concepts").mkdir(parents=True)
+    (r / "docs").mkdir()
+    for i in range(30):
+        (r / "knowledge" / "concepts" / f"n{i:02d}.md").write_text(
+            _node(f"N{i}", "Cites nothing relevant."))
+    (r / "knowledge" / "concepts" / "citer.md").write_text(
+        _node("Citer", "Cites docs/report.md."))
+    (r / "docs" / "report.md").write_text("v1\n")
+    _git(r, "init", "-q")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-q", "-m", "base")
+    (r / "docs" / "report.md").write_text("v2\n")
+    _git(r, "commit", "-q", "-am", "feat: revise")
+    calls: list[str] = []
+    real = prompt_mod._split_frontmatter
+    monkeypatch.setattr(prompt_mod, "_split_frontmatter",
+                        lambda text: calls.append(text) or real(text))
+    scan = prompt_mod.citing_nodes(r, _git(r, "rev-parse", "HEAD").strip())
+    assert [(e.path, e.nodes) for e in scan.entries] == [
+        ("docs/report.md", ("knowledge/concepts/citer.md",))]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("spelling", [
+    "docs\\report.md",            # project-relative, Windows separators
+    "{posix_abs}",                # forward-slash absolute (C:/... on Windows)
+    "{win_abs}",                  # backslash absolute
+    "file://{posix_abs}",         # file:// link (file:///C:/... on Windows)
+])
+def test_lookup_matches_cross_os_and_file_url_spellings(tmp_path, monkeypatch, spelling):
+    _git_env(monkeypatch)
+    r = tmp_path / "proj"
+    (r / "knowledge" / "concepts").mkdir(parents=True)
+    (r / "docs").mkdir()
+    absolute = r / "docs" / "report.md"
+    text = spelling.format(posix_abs=absolute.as_posix(),
+                           win_abs=absolute.as_posix().replace("/", "\\"))
+    (r / "knowledge" / "concepts" / "x.md").write_text(_node("X", f"See {text} (rev 1)."))
+    (r / "knowledge" / "concepts" / "y.md").write_text(
+        _node("Y", f"See file://{r.as_posix()}/docs/report.md.bak and mydocs/report.md."))
+    (r / "docs" / "report.md").write_text("v1\n")
+    _git(r, "init", "-q")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-q", "-m", "base")
+    (r / "docs" / "report.md").write_text("v2\n")
+    _git(r, "commit", "-q", "-am", "feat: revise")
+    scan = prompt_mod.citing_nodes(r, _git(r, "rev-parse", "HEAD").strip())
+    assert [(e.path, e.nodes) for e in scan.entries] == [
+        ("docs/report.md", ("knowledge/concepts/x.md",))]
