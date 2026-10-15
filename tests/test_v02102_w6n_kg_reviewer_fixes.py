@@ -42,9 +42,10 @@ AGENTS_DIR = REPO_ROOT / "templates" / "agents" / "module-gateway"
 LIVE_SHAPE = (REPO_ROOT / "tests" / "fixtures" / "kg_reviewer"
               / "gateway-models-live-shape.json")
 
-GLM = "claude-gw/glm-5.3-flash[1m]"
-DEEPSEEK = "claude-gw/qwen/deepseek-v4.1-flash[1m]"
-QWEN = "claude-gw/qwen/qwen3.8-flash[1m]"
+# v0.2.103 (owner ruling 2026-10-15): the fallback rungs are the comparable
+# NON-flash gateway models; the F-1 spelling rules are pinned on them.
+GLM = "claude-gw/glm-5.3[1m]"
+KIMI = "claude-gw/kimi/k3[1m]"
 
 
 def _load(name: str, path: Path) -> types.ModuleType:
@@ -88,6 +89,8 @@ class _Rig:
         self.chain = chain
         self.latched: dict[str, dict] = {}
         self.probed = 0
+        # the chosen model (one machine-wide setting) pinned to haiku here
+        monkeypatch.setenv("VCO_KG_REVIEW_MODEL", "haiku")
         monkeypatch.setattr(chain.shutil, "which",
                             lambda cmd: "/usr/bin/claude" if claude else None)
 
@@ -122,17 +125,23 @@ def test_f1_live_catalogue_shape_serves_the_first_gateway_rung(
 
 
 @pytest.mark.parametrize("latched, expected", [
-    (("kg_reviewer:claude-gw/glm-5.3-flash",), DEEPSEEK),
-    (("kg_reviewer:claude-gw/glm-5.3-flash",
-      "kg_reviewer:claude-gw/qwen/deepseek-v4.1-flash"), QWEN),
+    (("kg_reviewer:claude-gw/glm-5.3",), KIMI),
+    (("kg_reviewer:claude-gw/glm-5.3", "kg_reviewer:claude-gw/kimi/k3"),
+     None),
 ])
-def test_f1_owner_order_walks_the_qwen_namespace_rungs(
+def test_f1_owner_order_walks_the_namespaced_rungs(
         chain, monkeypatch, latched, expected):
+    """GLM-5.3 (z.ai, ``claude-gw/``) then Kimi K3 (``claude-gw/kimi/``);
+    with both latched the walk skips — never to a served flash model."""
     rig = _Rig(chain, monkeypatch, catalogue=_live_ids())
     rig.latch("kg_reviewer:haiku")
     for tier in latched:
         rig.latch(tier)
-    assert rig.decide()["model"] == expected, rig.lines
+    d = rig.decide()
+    if expected is None:
+        assert d["mode"] == "skip", (d, rig.lines)
+    else:
+        assert d["model"] == expected, rig.lines
 
 
 def test_f1_plain_spelling_is_matched_and_1m_row_preferred(chain,
@@ -141,19 +150,21 @@ def test_f1_plain_spelling_is_matched_and_1m_row_preferred(chain,
     (WINDOW_ROWS_BOTH minus the 1M row) still serves the rung; with both
     spellings listed the ``[1m]`` row — the shipped agents' form — wins."""
     rig = _Rig(chain, monkeypatch, catalogue=frozenset(
-        {"claude-gw/glm-5.3-flash"}))
+        {"claude-gw/glm-5.3"}))
     rig.latch("kg_reviewer:haiku")
-    assert rig.decide()["model"] == "claude-gw/glm-5.3-flash"
+    assert rig.decide()["model"] == "claude-gw/glm-5.3"
     rig2 = _Rig(chain, monkeypatch, catalogue=frozenset(
-        {"claude-gw/glm-5.3-flash", GLM}))
+        {"claude-gw/glm-5.3", GLM}))
     rig2.latch("kg_reviewer:haiku")
     assert rig2.decide()["model"] == GLM
 
 
 def test_f1_hand_spelled_ids_are_not_accepted(chain, monkeypatch):
-    """The W6-K spelling (no ``qwen/`` namespace) is NOT a QwenCloud id."""
+    """An id without the vendor's namespace (``claude-gw/k3`` is not the
+    Kimi row) or on another vendor (GLM through the QwenCloud namespace)
+    is NOT a rung."""
     rig = _Rig(chain, monkeypatch, catalogue=frozenset(
-        {"claude-gw/qwen3.8-flash", "claude-gw/deepseek-v4.1-flash"}))
+        {"claude-gw/k3", "claude-gw/qwen/glm-5.3"}))
     rig.latch("kg_reviewer:haiku")
     assert rig.decide()["mode"] == "skip", rig.lines
 
@@ -171,9 +182,7 @@ def test_f1_rung_ids_derive_from_model_router_and_match_shipped_agents(
         if m:
             agent_models.add(m.group(1))
     rungs = chain.gateway_rungs()
-    assert rungs == ("claude-gw/glm-5.3-flash",
-                     "claude-gw/qwen/deepseek-v4.1-flash",
-                     "claude-gw/qwen/qwen3.8-flash")
+    assert rungs == ("claude-gw/glm-5.3", "claude-gw/kimi/k3")
     for (vendor_id, bare), rung in zip(chain.GATEWAY_RUNG_MODELS, rungs):
         vendor = VENDORS[vendor_id]
         assert bare in (vendor.verified_ids or ()) + (vendor.static_ids or ()), (
@@ -217,6 +226,7 @@ def test_f1_end_to_end_through_a_live_shape_gateway(chain, monkeypatch,
         monkeypatch.setattr(_mrc, "token_path", lambda: token_file)
         monkeypatch.setattr(chain.shutil, "which",
                             lambda cmd: "/usr/bin/claude")
+        monkeypatch.setenv("VCO_KG_REVIEW_MODEL", "haiku")
         monkeypatch.setattr(chain._sb, "breaker_state",
                             lambda tier: ({"reason": "quota", "remaining": 1}
                                           if tier == "kg_reviewer:haiku"
@@ -250,35 +260,44 @@ def test_f2_no_claude_cli_skips_the_gateway_rungs_with_a_line(chain,
 
 
 def _capture_run(chain, monkeypatch, tmp_path, decision, argv_extra=()):
+    """``run`` against a scratch repo with only the ``claude`` spawn faked
+    (git itself runs for real: v0.2.103's run reads the commit and guards
+    the tree)."""
     seen: dict = {}
+    real_run = subprocess.run
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (["init", "-q"], ["-c", "user.name=t", "-c",
+                                  "user.email=t@e.invalid", "commit", "-q",
+                                  "--allow-empty", "-m", "c"]):
+        real_run(["git", *args], cwd=repo, check=True, capture_output=True)
 
-    def _fake_run(cmd, **kw):
+    def _fake_run(cmd, *a, **kw):
+        if not (cmd and cmd[0] == "claude"):
+            return real_run(cmd, *a, **kw)
         seen["cmd"] = list(cmd)
         return subprocess.CompletedProcess(
             cmd, 0, stdout=json.dumps({"type": "result", "subtype": "success",
                                        "num_turns": 7, "result": "done"}),
             stderr="")
     monkeypatch.setattr(chain, "select_reviewer_backend",
-                        lambda log=None: decision)
-    monkeypatch.setattr(chain.subprocess, "run", _fake_run)
+                        lambda log=None, model=None: decision)
+    monkeypatch.setattr(chain, "subprocess", types.SimpleNamespace(
+        run=_fake_run, TimeoutExpired=subprocess.TimeoutExpired))
     monkeypatch.setattr(chain, "_gateway_auth_env",
                         lambda base: {"ANTHROPIC_BASE_URL": base})
     monkeypatch.setattr(chain, "_record_outcome", lambda *a, **k: None)
-    pf = tmp_path / "prompt.txt"
-    pf.write_text("review", encoding="utf-8")
     log = tmp_path / "review.log"
-    assert chain.main(["run", "--prompt-file", str(pf), "--log", str(log),
+    assert chain.main(["run", "--project-root", str(repo), "--log", str(log),
                        *argv_extra]) == 0
     return seen["cmd"], log.read_text(encoding="utf-8")
 
 
 _DECISIONS = [
-    {"mode": "claude", "model": "haiku", "base_url": None, "reason": "t"},
+    {"mode": "claude", "model": "sonnet", "base_url": None, "reason": "t"},
     {"mode": "claude", "model": GLM, "base_url": "http://127.0.0.1:1",
      "reason": "t"},
-    {"mode": "claude", "model": DEEPSEEK, "base_url": "http://127.0.0.1:1",
-     "reason": "t"},
-    {"mode": "claude", "model": QWEN, "base_url": "http://127.0.0.1:1",
+    {"mode": "claude", "model": KIMI, "base_url": "http://127.0.0.1:1",
      "reason": "t"},
 ]
 
@@ -338,7 +357,8 @@ def _scratch_repo(tmp_path: Path, *, commits: int) -> "tuple[Path, dict]":
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
     env = {k: v for k, v in os.environ.items()
            if k not in ("VCT_DISABLE_HOOKS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
-                        "VCO_KG_REVIEW_MAX_TURNS")}
+                        "VCO_KG_REVIEW_MAX_TURNS", "VCO_KG_REVIEW_MODEL",
+                        "VCT_LAUNCHER_DB_PATH")}
     env.update({
         "PATH": f"{bindir}{os.pathsep}{env.get('PATH', '')}",
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -401,10 +421,23 @@ def _argv_and_prompt(capture: str) -> "tuple[list[str], str]":
     return argv, capture
 
 
+def _install_chain(repo: Path, env: dict) -> None:
+    """Ship the reviewer chain into the scratch project (what a bundle
+    install does) and point it at this checkout's vco_lib. v0.2.103: the
+    commit capture and prompt live in the chain, so every diff assertion
+    runs through it (the hook's unguarded no-python spawn is retired)."""
+    scripts = repo / ".claude" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    for name in ("kg_reviewer_backend.py", "summary_backends.py"):
+        shutil.copy2(SCRIPTS_DIR / name, scripts / name)
+    env["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
+
+
 @pytest.mark.parametrize("sibling", ["sh", "ps1"])
 def test_f3_root_commit_is_reviewed_with_its_diff(tmp_path, sibling):
     """RED on HEAD: a single-commit repo produced an EMPTY diff."""
     repo, env = _scratch_repo(tmp_path, commits=1)
+    _install_chain(repo, env)
     _run_hook(sibling, repo, env)
     _argv, everything = _argv_and_prompt(_wait_capture(env))
     assert "first_file.txt" in everything
@@ -414,38 +447,32 @@ def test_f3_root_commit_is_reviewed_with_its_diff(tmp_path, sibling):
 @pytest.mark.parametrize("sibling", ["sh", "ps1"])
 def test_f3_later_commit_still_diffs_against_its_parent(tmp_path, sibling):
     repo, env = _scratch_repo(tmp_path, commits=2)
+    _install_chain(repo, env)
     _run_hook(sibling, repo, env)
     _argv, everything = _argv_and_prompt(_wait_capture(env))
     assert "+second-commit-marker" in everything
     assert "root-commit-marker-line" not in everything
 
 
+# test_f4_hook_no_python_branch_mirrors_the_knob is retired with the branch
+# it pinned (v0.2.103): a broken install no longer spawns an unguarded
+# `claude` with a mirrored budget — it reports and does not review
+# (tests/test_v02102_w6r_kg_reviewer_broken_install.py).
+
+
 @pytest.mark.parametrize("sibling", ["sh", "ps1"])
 @pytest.mark.parametrize("raw, expected", [(None, "30"), ("44", "44"),
                                            ("zero", "30"), ("0", "30")])
-def test_f4_hook_no_python_branch_mirrors_the_knob(tmp_path, sibling, raw,
+def test_f4_hook_chain_branch_uses_the_chain_knobs(tmp_path, sibling, raw,
                                                    expected):
-    """The broken-install branch (no chain script in the project) spawns
-    claude directly; its budget mirrors DEFAULT_MAX_TURNS and the knob."""
+    """The hook passes NO budget or model of its own: the spawned claude
+    gets the chain's DEFAULT_MAX_TURNS / VCO_KG_REVIEW_MAX_TURNS (RED on
+    the W6-K HEAD: 10) and the machine-wide model (default sonnet)."""
     repo, env = _scratch_repo(tmp_path, commits=1)
+    _install_chain(repo, env)
     if raw is not None:
         env["VCO_KG_REVIEW_MAX_TURNS"] = raw
     _run_hook(sibling, repo, env)
     argv, _ = _argv_and_prompt(_wait_capture(env))
+    assert argv[argv.index("--model") + 1] == "sonnet", argv
     assert argv[argv.index("--max-turns") + 1] == expected, argv
-
-
-@pytest.mark.parametrize("sibling", ["sh", "ps1"])
-def test_f4_hook_chain_branch_uses_the_chain_default(tmp_path, sibling):
-    """With the chain installed, the hook passes NO budget of its own: the
-    spawned claude gets the chain's DEFAULT_MAX_TURNS (RED on HEAD: 10)."""
-    repo, env = _scratch_repo(tmp_path, commits=1)
-    scripts = repo / ".claude" / "scripts"
-    scripts.mkdir(parents=True)
-    for name in ("kg_reviewer_backend.py", "summary_backends.py"):
-        shutil.copy2(SCRIPTS_DIR / name, scripts / name)
-    env["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
-    _run_hook(sibling, repo, env)
-    argv, _ = _argv_and_prompt(_wait_capture(env))
-    assert argv[argv.index("--model") + 1] == "haiku", argv
-    assert argv[argv.index("--max-turns") + 1] == "30", argv

@@ -10,8 +10,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 
 # VCO-CENTRALIZED-KG: spawns a background `claude` CLI subprocess (PR #171 / 0.1.7).
-#   The Haiku agent invokes the weaviate-kg MCP tools (hybrid_search,
-#   store_knowledge_node) — those go through claude_mcp_servers/weaviate_mcp/
+#   The reviewer invokes the weaviate-kg MCP tools (hybrid_search,
+#   store_knowledge_node) - those go through claude_mcp_servers/weaviate_mcp/
 #   server.py which is access-aware via VCT_KG_ACCESS_LIST. Hybrid_search
 #   reads from self+shared+peers; store_knowledge_node writes to the
 #   project's own collection (writes are not multi-source). This hook
@@ -20,36 +20,48 @@ if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 #   the spawned `claude` process and from there into the MCP server.
 
 # post-git-commit-kg-sync.ps1
-# Spawn a background Haiku agent to review the commit diff and update relevant
-# KG nodes / docs to keep everything in sync. Mirror of post-git-commit-kg-sync.sh.
+# Spawn the background KG reviewer for the commit. Mirror of
+# post-git-commit-kg-sync.sh.
+#
+# v0.2.103 (owner rulings 2026-10-15): this is a THIN wrapper. Everything
+# else lives in ONE home, .claude/scripts/kg_reviewer_backend.py `run`
+# (with vco_lib.kg_reviewer_prompt / _model / _guard): the commit capture
+# and research-first prompt, the model choice (one machine-wide setting,
+# default Sonnet; non-flash gateway fallback or skip), the knowledge/-only
+# tool scope, the post-run validator that reverts forbidden edits, the
+# isolated `kg-sync: <hash> <subject>` commit of the reviewer's own files,
+# and the recursion guard (a `kg-sync:` commit is never reviewed).
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 # $PsExe + the ONE guarded detached-spawn home (Start-VcoDetachedProcess).
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
-if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { exit 0 }
+# No `claude`-on-PATH check here (v0.2.103 R7 F6) - must match the .sh
+# sibling: whether a reviewer can run is the backend's decision, in ONE
+# home. Without the CLI its chain logs every claude rung as unavailable and
+# can still reach the consent-gated OpenAI rung; an early silent exit here
+# made that rung dead and left no log line or ledger row.
 
 $ProjectRoot = (& git rev-parse --show-toplevel 2>$null | Out-String).Trim()
 if (-not $ProjectRoot) { $ProjectRoot = (Get-Location).Path }
 $LogDir = Join-Path $ProjectRoot ".claude/logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+$logFile = Join-Path $LogDir "kg-commit-review.log"
 
 $Input = ""
 try { $Input = [Console]::In.ReadToEnd() } catch { }
 
-# Check if the commit actually succeeded — look for failure markers in the
+# Check if the commit actually succeeded - look for failure markers in the
 # tool_response embedded in the JSON payload. We use a substring scan rather
 # than depending on jq.
+$LibDir = Join-Path $PSScriptRoot "_lib"
+$FindPy = Join-Path $LibDir "find-python.ps1"
+if (Test-Path $FindPy) { . $FindPy }
 $ToolResponseStr = ""
-if ($Input) {
-    $LibDir = Join-Path $PSScriptRoot "_lib"
-    $FindPy = Join-Path $LibDir "find-python.ps1"
-    if (Test-Path $FindPy) { . $FindPy }
-    if ($PY) {
-        try {
-            $ToolResponseStr = ($Input | & $PY -c "import sys,json; d=json.load(sys.stdin); v=d.get('tool_response',''); print(v if isinstance(v,str) else json.dumps(v))" 2>$null | Out-String).Trim()
-        } catch { }
-    }
+if ($Input -and $PY) {
+    try {
+        $ToolResponseStr = ($Input | & $PY -c "import sys,json; d=json.load(sys.stdin); v=d.get('tool_response',''); print(v if isinstance(v,str) else json.dumps(v))" 2>$null | Out-String).Trim()
+    } catch { }
 }
 if ($ToolResponseStr -match '(nothing to commit|no changes added|error:|fatal:)') { exit 0 }
 
@@ -68,79 +80,15 @@ try {
     if ($CommitHash -eq $LastReviewed) { exit 0 }
     Set-Content -Path $LastReviewedFile -Value $CommitHash -Encoding ascii
 
-    # Root-commit safe (v0.2.102 W6-N F-3): a first commit has no HEAD~1, and
-    # `git diff HEAD~1..HEAD` printed NOTHING there -- the fresh-repo first
-    # build was reviewed with an empty diff. A root commit is shown against
-    # the empty tree by `git show`; every other commit keeps the diff against
-    # its FIRST parent (`git show` on a merge prints a combined diff instead).
-    # No SIGPIPE hazard here (W6-N review MEDIUM-3, the .sh sibling's
-    # pipefail defect): `Select-Object -First` stops the upstream native
-    # command without raising, and this script sets no pipefail-like
-    # preference. The >64 KiB commit test runs both siblings.
-    & git rev-parse --verify --quiet 'HEAD~1' *> $null
-    if ($LASTEXITCODE -eq 0) {
-        $Diff       = (& git diff 'HEAD~1' HEAD --stat --no-color 2>$null | Select-Object -First 50) -join "`n"
-        $DiffDetail = (& git diff 'HEAD~1' HEAD --no-color 2>$null | Select-Object -First 300) -join "`n"
-    } else {
-        $Diff       = (& git show --format= --stat --no-color HEAD 2>$null | Select-Object -First 50) -join "`n"
-        $DiffDetail = (& git show --format= --no-color HEAD 2>$null | Select-Object -First 300) -join "`n"
-    }
-
-    $prompt = @"
-Review the following git commit and update relevant knowledge graph nodes and documentation.
-
-## Commit: $CommitHash -- $CommitMsg
-
-### Files changed:
-$Diff
-
-### Diff (first 300 lines):
-$DiffDetail
-
-## Instructions:
-1. Read the diff carefully and identify which KG nodes (in $ProjectRoot/knowledge/) or docs (in $ProjectRoot/docs/) need updating
-2. For each affected area:
-   - If an existing KG node covers this topic: update it with the new information
-   - If this introduces a NEW concept/pattern not yet documented: create a new KG node
-   - If docs reference behavior that changed: update them
-3. Use hybrid_search to find existing relevant nodes before creating new ones
-4. Keep updates minimal and factual -- just reflect what changed, don't add speculation
-5. Skip trivial changes (typo fixes, formatting, test-only changes)
-6. Use store_knowledge_node MCP tool to write KG nodes (they auto-sync to Weaviate)
-
-Focus on architectural changes, new features, API changes, and pattern changes.
-Skip if the commit is purely cosmetic or test-only.
-"@
-
-    $logFile = Join-Path $LogDir "kg-commit-review.log"
-    # The prompt rides on STDIN / a prompt FILE, never on the command line
-    # (Start-Process re-splits -ArgumentList; the prompt embeds `git diff`
-    # output whose `---` the CLI parsed as an option; the Windows command
-    # line is capped at 32 767 chars). [IO.File]::WriteAllText, not
-    # Set-Content -Encoding utf8: the cmdlet form prepends a UTF-8 BOM on
-    # Windows PowerShell 5.1.
-    $PromptFile = Join-Path $LogDir "kg-commit-review.prompt"
-    [System.IO.File]::WriteAllText($PromptFile, $prompt)
-    # v0.2.102 W6-K (owner ruling 2026-10-11): spawn through the shared
-    # backend chain -- Haiku by default; when Haiku is unavailable
-    # (quota/429/auth, a REAL signal latched in the summary breaker) fall
-    # back to the gateway flash models the local model gateway actually
-    # serves (glm-5.3-flash -> deepseek-v4.1-flash -> qwen3.8-flash), then
-    # to OpenAI when the user enabled OpenAI for summaries. One chain, one
-    # home: .claude/scripts/kg_reviewer_backend.py. Broken/partial install
-    # (python or the chain script missing): reported as a broken install
-    # (below), then the pre-W6-K direct Haiku spawn.
     $ReviewerChain = Join-Path $ProjectRoot ".claude/scripts/kg_reviewer_backend.py"
-    $LibDir = Join-Path $PSScriptRoot "_lib"
-    $FindPy = Join-Path $LibDir "find-python.ps1"
-    if (Test-Path $FindPy) { . $FindPy }
-    # v0.2.102 W6-R (loud-fail rule) - must match the .sh sibling: a missing
-    # python or a missing shipped chain script is a BROKEN install, named on
-    # stderr and in this commit's kg-commit-reviews.jsonl row
-    # (`broken_install`); the hook runs async, so the ledger row is the one a
-    # user can find. (Unlike the .sh, which appends, the spawn below
-    # TRUNCATES kg-commit-review.log as it redirects into it, so a line
-    # written there would be lost: the ledger is this sibling's record.)
+    # Loud-fail rule - must match the .sh sibling: a missing python or a
+    # missing shipped reviewer script is a BROKEN install, named on stderr, in
+    # kg-commit-review.log and in this commit's kg-commit-reviews.jsonl row
+    # (`broken_install`). v0.2.103: the commit is then NOT reviewed - the
+    # guard that keeps the reviewer inside knowledge/ and reverts forbidden
+    # edits is Python, so an unguarded spawn would bypass the boundaries the
+    # owner requires; the pre-v0.2.103 direct `claude` spawn (and its
+    # turn-budget mirror) is retired, superseded by the guarded run.
     $BrokenParts = @()
     if (-not $PY) {
         if (Test-Path $FindPy) { $BrokenParts += "no Python interpreter found (_lib/find-python.ps1 resolved none)" }
@@ -148,52 +96,32 @@ Skip if the commit is purely cosmetic or test-only.
     }
     if (-not (Test-Path $ReviewerChain)) { $BrokenParts += "$ReviewerChain is missing" }
     $BrokenInstall = $BrokenParts -join "; "
+
+    $proc = $null
     if ($BrokenInstall) {
-        $brokenLine = "post-git-commit-kg-sync: broken install: $BrokenInstall - the KG reviewer runs the plain Haiku spawn without the backend fallback chain; repair it with the project's bundle update (launcher: project Settings -> Update bundle)"
+        $brokenLine = "post-git-commit-kg-sync: broken install: $BrokenInstall - the KG reviewer did NOT review this commit (its guarded run needs both); repair it with the project's bundle update (launcher: project Settings -> Update bundle)"
         [Console]::Error.WriteLine($brokenLine)
-    }
-    # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1). TWO
-    # cmdlet-level parameter rejections were killing this spawn outright:
-    #   * `-WindowStyle Hidden` is rejected by non-Windows PowerShell editions;
-    #   * naming the SAME file for -RedirectStandardOutput and
-    #     -RedirectStandardError is rejected on EVERY edition ("...are same").
-    # stderr goes to `<log>.err` instead.
-    # No --max-turns on the chain spawn: the turn budget is ONE knob owned
-    # by the chain (DEFAULT_MAX_TURNS / VCO_KG_REVIEW_MAX_TURNS, v0.2.102
-    # W6-N F-4).
-    if (-not $BrokenInstall) {
-        $proc = Start-VcoDetachedProcess -FilePath $PY `
-            -ArgumentList @($ReviewerChain, 'run', '--prompt-file', $PromptFile, '--log', $logFile) `
-            -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
-            -WorkingDirectory $ProjectRoot -PassThru
+        $stamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        try { Add-Content -Path $logFile -Value "[$stamp] $brokenLine" -ErrorAction Stop } catch { }
     } else {
-        # Broken install, named above: the direct Haiku spawn is KEPT so the
-        # commit is still reviewed; it hides nothing (the breakage was just
-        # reported in three places), and dropping it would lose the KG update.
-        # With no python this branch cannot ask the chain for the turn
-        # budget, so it mirrors it: the default 30 must match
-        # DEFAULT_MAX_TURNS in .claude/scripts/kg_reviewer_backend.py, and
-        # VCO_KG_REVIEW_MAX_TURNS must parse as resolve_max_turns() there
-        # does: plain ASCII digits only (no sign, blanks or `_`, and NOT
-        # trimmed), positive, within int64; anything else falls back to 30.
-        # A parity test pins the three parsers to each other.
-        $MaxTurns = 30
-        $rawTurns = "$env:VCO_KG_REVIEW_MAX_TURNS"
-        $parsedTurns = [int64]0
-        if ($rawTurns -cmatch '\A[0-9]+\z' -and [int64]::TryParse($rawTurns, [ref]$parsedTurns) -and $parsedTurns -gt 0) { $MaxTurns = $parsedTurns }
-        $allowedTools = "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,mcp__weaviate-kg__store_knowledge_node,Write,Edit"
-        $proc = Start-VcoDetachedProcess -FilePath "claude" `
-            -ArgumentList @('-p', '--model', 'haiku', '--max-turns', "$MaxTurns", '--no-session-persistence', '--allowedTools', $allowedTools) `
-            -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err" `
-            -RedirectStandardInput $PromptFile `
+        # Through the ONE guarded spawn home (_lib/resolve-powershell.ps1).
+        # The reviewer appends its own lines to kg-commit-review.log, so the
+        # process's stdout/stderr go to SIDE files: a redirect onto the log
+        # itself would truncate it on every spawn and hold it open while the
+        # reviewer appends (and naming one file for both streams is rejected
+        # on every edition). No --max-turns / --model here: each is ONE knob
+        # owned by the chain (VCO_KG_REVIEW_MAX_TURNS; VCO_KG_REVIEW_MODEL /
+        # launcher Preferences).
+        $proc = Start-VcoDetachedProcess -FilePath $PY `
+            -ArgumentList @($ReviewerChain, 'run', '--project-root', $ProjectRoot, '--commit', $CommitHash, '--log', $logFile) `
+            -RedirectStandardOutput "$logFile.out" -RedirectStandardError "$logFile.err" `
             -WorkingDirectory $ProjectRoot -PassThru
     }
 
     $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $msgEsc = $CommitMsg -replace '\\', '\\\\' -replace '"', '\"'
-    # A failed spawn leaves $proc null; interpolating $proc.Id then emitted
-    # `"pid":}` — a malformed line in a JSONL telemetry file that every later
-    # reader has to survive. Record a null instead.
+    # A failed (or skipped) spawn leaves $proc null: record a JSON null
+    # rather than the malformed `"pid":}`.
     $pidVal = if ($proc) { $proc.Id } else { "null" }
     $brokenField = ""
     if ($BrokenInstall) {
@@ -205,6 +133,6 @@ Skip if the commit is purely cosmetic or test-only.
 
 # No stdout: PostToolUse plain stdout is dropped per the v2.1.x
 # contract, AND this hook runs `async: true` (fire-and-forget). Any
-# emit here would be doubly discarded — leave it silent.
+# emit here would be doubly discarded - leave it silent.
 } finally { Pop-Location }
 exit 0

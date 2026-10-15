@@ -745,21 +745,22 @@ def _stage_claude_shim(tmp_path: Path, record: Path) -> Path:
     return bin_dir
 
 
-#: The hook's CLI argv once the prompt rides on stdin: every existing flag
-#: kept, in order, and ``-p`` with NO prompt operand after it.
-EXPECTED_CLAUDE_ARGV = [
-    "-p",
-    "--model",
-    "haiku",
-    "--max-turns",
-    # The no-python branch mirrors the chain's DEFAULT_MAX_TURNS (v0.2.102
-    # W6-N F-4: 10 truncated about half the logged reviews).
-    "30",
-    "--no-session-persistence",
-    "--allowedTools",
-    "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,"
-    "mcp__weaviate-kg__store_knowledge_node,Write,Edit",
-]
+def _expected_claude_argv() -> "list[str]":
+    """The CLI argv the reviewer chain builds (v0.2.103: the hook spawns the
+    chain, the chain spawns ``claude``) for the default model and budget —
+    ``-p`` with NO prompt operand after it. Read from the chain itself so the
+    shape has one home."""
+    import importlib.util
+    for p in (str(REPO), str(REPO / "templates" / "scripts")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    spec = importlib.util.spec_from_file_location(
+        "_spawn_guard_kg_reviewer_backend",
+        REPO / "templates" / "scripts" / "kg_reviewer_backend.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.build_claude_cmd("sonnet", mod.DEFAULT_MAX_TURNS)[1:]
 
 
 def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
@@ -773,25 +774,35 @@ def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
     * the Windows command line is capped at 32 767 chars, and this prompt
       carries the first 300 lines of the unified diff.
 
-    So the hook writes the prompt to ``.claude/logs/kg-commit-review.prompt``
-    and spawns ``claude -p`` with ``-RedirectStandardInput`` — the same stdin
-    shape ``summary_backends.call_cli`` adopted (``claude -p`` reads the
-    prompt from stdin when no positional is given).
+    v0.2.103: the hook spawns the reviewer chain
+    (``.claude/scripts/kg_reviewer_backend.py run``), which builds the prompt
+    and spawns ``claude -p`` with the prompt on STDIN — the same stdin shape
+    ``summary_backends.call_cli`` adopted (``claude -p`` reads the prompt
+    from stdin when no positional is given).
 
     Driven through the hook's production entry point: a real two-commit
-    repo, a fake ``claude`` first on PATH that records its argv AND stdin,
-    and the assertion is the OBSERVABLE consequence at the child.
+    repo with the chain installed, a fake ``claude`` first on PATH that
+    records its argv AND stdin, and the assertion is the OBSERVABLE
+    consequence at the child.
     """
     exe = _require_pwsh()
     project = _stage_commit_review_project(tmp_path)
+    scripts = project / ".claude" / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("kg_reviewer_backend.py", "summary_backends.py"):
+        shutil.copy2(REPO / "templates" / "scripts" / name, scripts / name)
     record = tmp_path / "claude-shim-record.txt"
     bin_dir = _stage_claude_shim(tmp_path, record)
 
     env = os.environ.copy()
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
     env["CLAUDE_SHIM_RECORD"] = str(record)
-    env.pop("VCT_DISABLE_HOOKS", None)
-    env.pop("CLAUDE_CODE_DISABLE_AUTO_MEMORY", None)
+    env["VCT_ORCHESTRATOR_ROOT"] = str(REPO)
+    env["VCT_STATE_DIR"] = str(tmp_path / "state")
+    for key in ("VCT_DISABLE_HOOKS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+                "VCO_KG_REVIEW_MODEL", "VCO_KG_REVIEW_MAX_TURNS",
+                "VCT_LAUNCHER_DB_PATH"):
+        env.pop(key, None)
     out_path = tmp_path / "commit-hook.out"
     err_path = tmp_path / "commit-hook.err"
     with open(out_path, "wb") as out, open(err_path, "wb") as err:
@@ -816,7 +827,7 @@ def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
     stdin_body = text.split("STDIN-START\n", 1)[1] if "STDIN-START\n" in text else ""
 
     # The prompt — with the diff inside — arrived on STDIN.
-    assert "### Diff (first 300 lines):" in stdin_body, (
+    assert "### Diff" in stdin_body, (
         "the prompt did not arrive on the child's stdin"
     )
     assert "KG_PROMPT_DIFF_MARKER_7f3a" in stdin_body, (
@@ -831,7 +842,7 @@ def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
         "parses a leading '---' as an option and rejects the call"
     )
     # Every existing flag kept, and -p carries NO prompt operand.
-    assert argv_lines == EXPECTED_CLAUDE_ARGV, (
+    assert argv_lines == _expected_claude_argv(), (
         f"the CLI argv changed shape: {argv_lines!r}"
     )
 

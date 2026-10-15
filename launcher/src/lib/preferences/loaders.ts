@@ -29,6 +29,7 @@
 import { invoke, safeInvoke, listen } from '$lib/tauri';
 import { getVersion } from '@tauri-apps/api/app';
 import { getModuleUpdateAutoCheckEnabled } from '$lib/api/module_updates';
+import type { KgReviewerModelInfo } from './kg_reviewer_model';
 
 /** The most IPC calls the page may make at mount through eager loaders. */
 export const PREF_EAGER_IPC_BUDGET = 8;
@@ -155,6 +156,13 @@ export const PREF_LOADERS = {
         // hint names (soft: null when the resolver cannot run).
         safeInvoke<unknown>('get_summary_model_info'),
       ]),
+  },
+  kgReviewerModel: {
+    eager: false,
+    section: 'KG commit reviewer',
+    /** v0.2.103: the machine-wide reviewer model + the choices/default from
+     *  the one rule table (vco_lib/kg_reviewer_config.toml, served by Rust). */
+    load: () => invoke<KgReviewerModelInfo>('get_kg_reviewer_model'),
   },
   codeEmbed: {
     eager: false,

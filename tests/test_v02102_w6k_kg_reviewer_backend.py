@@ -2,13 +2,15 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.102 W6-K item 8 — the post-commit KG reviewer's backend chain.
 
-Owner ruling 2026-10-11: keep the Haiku reviewer; when Haiku is unavailable
-(a REAL signal — quota / 429 / auth / absent), fall back
-``claude-gw/glm-5.3-flash[1m]`` → ``claude-gw/qwen/deepseek-v4.1-flash[1m]``
-→ ``claude-gw/qwen/qwen3.8-flash[1m]`` (the live catalogue's spelling —
-W6-N F-1) — each only when the LOCAL MODEL GATEWAY actually serves it (the
-catalogue is ASKED, never assumed) — and use OpenAI when the user enabled
-OpenAI for SUMMARIES.
+Owner ruling 2026-10-11, revised 2026-10-15 (v0.2.103): the reviewer runs
+the CHOSEN Claude model (one machine-wide setting; these tests pin it to
+``haiku`` through ``VCO_KG_REVIEW_MODEL`` so the chain mechanics stay the
+subject); when it is unavailable (a REAL signal — quota / 429 / auth /
+absent), fall back to the comparable non-flash gateway rungs
+``claude-gw/glm-5.3[1m]`` → ``claude-gw/kimi/k3[1m]`` — each only when the
+LOCAL MODEL GATEWAY actually serves it (the catalogue is ASKED, never
+assumed) — and use OpenAI when the user enabled OpenAI for SUMMARIES. The
+retired flash rungs are covered in tests/test_v02103_kg_reviewer_safety.py.
 
 Every rung of that walk is driven here with faked
 catalogue/consent/breaker state; the classification and the breaker file
@@ -66,6 +68,7 @@ class _Rig:
                  refusal=None):
         self.lines: list[str] = []
         self.chain = chain
+        monkeypatch.setenv("VCO_KG_REVIEW_MODEL", "haiku")
         monkeypatch.setattr(chain.shutil, "which",
                             lambda cmd: "/usr/bin/claude" if claude else None)
         monkeypatch.setattr(
@@ -90,49 +93,50 @@ class _Rig:
         assert any(needle in ln for ln in self.lines), list(self.lines)
 
 
-def test_haiku_is_the_default(chain, monkeypatch):
+def test_the_configured_model_is_the_first_rung(chain, monkeypatch):
     rig = _Rig(chain, monkeypatch)
     assert rig.decide() == {"mode": "claude", "model": "haiku",
-                            "base_url": None, "reason": "default"}
+                            "base_url": None, "reason": "chosen model (env)"}
 
 
-def test_latched_haiku_falls_to_the_first_served_gateway_model(
+def test_latched_model_falls_to_the_first_served_gateway_model(
         chain, monkeypatch):
     # W6-N F-2: an ABSENT CLI now skips the gateway rungs too (they spawn
     # `claude -p`) — see test_v02102_w6n_kg_reviewer_fixes.py.
     rig = _Rig(chain, monkeypatch,
-               catalogue=frozenset({"claude-gw/glm-5.3-flash[1m]",
-                                    "claude-gw/qwen/qwen3.8-flash[1m]"}))
+               catalogue=frozenset({"claude-gw/glm-5.3[1m]",
+                                    "claude-gw/kimi/k3[1m]"}))
     rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
     assert d["mode"] == "claude"
-    assert d["model"] == "claude-gw/glm-5.3-flash[1m]"
+    assert d["model"] == "claude-gw/glm-5.3[1m]"
     assert d["base_url"] == "http://127.0.0.1:11460"
     rig.assert_logged("rung haiku: latched (quota)")
 
 
-def test_quota_latched_haiku_is_a_real_signal_and_falls_back(chain, monkeypatch):
-    """The W6-K defect: an exhausted Haiku silently skipped the review."""
+def test_quota_latched_model_is_a_real_signal_and_falls_back(chain, monkeypatch):
+    """The W6-K defect: an exhausted model silently skipped the review."""
     rig = _Rig(chain, monkeypatch,
-               catalogue=frozenset({"claude-gw/qwen/deepseek-v4.1-flash[1m]"}))
+               catalogue=frozenset({"claude-gw/kimi/k3[1m]"}))
     rig.latched["kg_reviewer:haiku"] = {
         "reason": "quota", "until": 9e18, "remaining": 17999}
     d = rig.decide()
-    assert d["model"] == "claude-gw/qwen/deepseek-v4.1-flash[1m]", d
+    assert d["model"] == "claude-gw/kimi/k3[1m]", d
     rig.assert_logged("rung haiku: latched (quota)")
-    rig.assert_logged("rung claude-gw/glm-5.3-flash: not served")
+    rig.assert_logged("rung claude-gw/glm-5.3: not served")
 
 
 def test_catalogue_membership_is_asked_not_assumed(chain, monkeypatch):
     """A gateway rung the daemon does NOT list is skipped with a line —
-    availability is evidence, never a hard-coded yes."""
+    availability is evidence, never a hard-coded yes. A served FLASH model
+    is never a rung (v0.2.103)."""
     rig = _Rig(chain, monkeypatch,
-               catalogue=frozenset({"claude-gw/qwen/qwen3.8-flash[1m]"}))
+               catalogue=frozenset({"claude-gw/glm-5.3-flash[1m]",
+                                    "claude-gw/kimi/k3[1m]"}))
     rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
-    assert d["model"] == "claude-gw/qwen/qwen3.8-flash[1m]"
-    rig.assert_logged("rung claude-gw/glm-5.3-flash: not served")
-    rig.assert_logged("rung claude-gw/qwen/deepseek-v4.1-flash: not served")
+    assert d["model"] == "claude-gw/kimi/k3[1m]"
+    rig.assert_logged("rung claude-gw/glm-5.3: not served")
 
 
 def test_no_gateway_falls_to_openai_only_with_summaries_consent(
@@ -297,21 +301,9 @@ def test_a_refused_gateway_is_logged_as_a_refusal(chain, monkeypatch):
                    for ln in rig.lines), rig.lines
 
 
-def test_run_consumes_the_prompt_file(chain, monkeypatch, tmp_path):
-    """F2 (LOW): the .sh sibling stages the prompt through ``mktemp`` — one
-    LEAKED file per commit until the chain unlinks it after reading. The
-    decision is stubbed to ``skip`` so the test pins exactly the
-    read-and-unlink, nothing else in the chain."""
-    monkeypatch.setattr(
-        chain, "select_reviewer_backend",
-        lambda log=None: {"mode": "skip", "model": "", "base_url": None,
-                          "reason": "test"})
-    pf = tmp_path / "prompt.txt"
-    pf.write_text("review this", encoding="utf-8")
-    log = tmp_path / "review.log"
-    assert chain.main(["run", "--prompt-file", str(pf),
-                       "--log", str(log)]) == 0
-    assert not pf.exists(), "the consumed prompt file must be unlinked"
+# F2 (the leaked mktemp prompt file) is superseded in v0.2.103: no prompt
+# file exists any more — `run` builds the prompt itself
+# (vco_lib.kg_reviewer_prompt), so nothing is staged to leak.
 
 
 def test_run_handles_a_hung_reviewer_timeout(chain, monkeypatch, tmp_path):
@@ -319,15 +311,23 @@ def test_run_handles_a_hung_reviewer_timeout(chain, monkeypatch, tmp_path):
     — classified, logged, non-zero exit — not an uncaught traceback dumped
     into the detached log."""
     _Rig(chain, monkeypatch)  # haiku rung available
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    real_run = _subprocess.run
+    for args in (["init", "-q"], ["-c", "user.name=t", "-c",
+                                  "user.email=t@e.invalid", "commit", "-q",
+                                  "--allow-empty", "-m", "c"]):
+        real_run(["git", *args], cwd=repo, check=True, capture_output=True)
 
-    def _raise(*a, **kw):
-        raise _subprocess.TimeoutExpired(cmd=["claude"], timeout=900)
+    def _raise(cmd, *a, **kw):
+        if cmd and cmd[0] == "claude":
+            raise _subprocess.TimeoutExpired(cmd=["claude"], timeout=900)
+        return real_run(cmd, *a, **kw)
 
-    monkeypatch.setattr(chain.subprocess, "run", _raise)
-    pf = tmp_path / "prompt.txt"
-    pf.write_text("review this", encoding="utf-8")
+    monkeypatch.setattr(chain, "subprocess", types.SimpleNamespace(
+        run=_raise, TimeoutExpired=_subprocess.TimeoutExpired))
     log = tmp_path / "review.log"
-    rc = chain.main(["run", "--prompt-file", str(pf), "--log", str(log)])
+    rc = chain.main(["run", "--project-root", str(repo), "--log", str(log)])
     assert rc == 124, rc
     assert "TIMED OUT" in log.read_text(encoding="utf-8")
 

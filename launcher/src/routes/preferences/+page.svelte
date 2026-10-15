@@ -24,6 +24,12 @@
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
   import { parseSummaryTiers, type SummaryTier } from '$lib/preferences/summary_tiers';
+  import {
+    kgReviewerModelHint,
+    kgReviewerModelOptions,
+    kgReviewerModelToastText,
+    type KgReviewerModelInfo,
+  } from '$lib/preferences/kg_reviewer_model';
   import { get } from 'svelte/store';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
@@ -1346,6 +1352,33 @@
     }
   }
 
+  // ── KG commit reviewer model (v0.2.103, machine-wide) ────────────────
+  let kgReviewerInfo = $state<KgReviewerModelInfo | null>(null);
+  let kgReviewerSaving = $state(false);
+  let kgReviewerError = $state<string | null>(null);
+
+  async function loadKgReviewerModel() {
+    kgReviewerError = null;
+    try {
+      kgReviewerInfo = await PREF_LOADERS.kgReviewerModel.load();
+    } catch (e) {
+      kgReviewerError = String(e);
+    }
+  }
+
+  async function saveKgReviewerModel(next: string) {
+    kgReviewerSaving = true;
+    kgReviewerError = null;
+    try {
+      kgReviewerInfo = await invoke<KgReviewerModelInfo>('set_kg_reviewer_model', { model: next });
+      toast.success(kgReviewerModelToastText(next));
+    } catch (e) {
+      kgReviewerError = String(e);
+    } finally {
+      kgReviewerSaving = false;
+    }
+  }
+
   // ── "Recheck summary backend now" (v0.2.96 WP-7b) ────────────────────
   // After a quota/trust breaker demotes summaries to a fallback tier, the
   // hash-frozen fallback rows regenerate ONLY via this action (new and
@@ -2179,6 +2212,7 @@
     openAiKeyEvents: subscribeOpenAiEvents,
     artifactTool: () => { shownPanels.artifactTool = true; },
     kgSummary: loadKgSummarySettings,
+    kgReviewerModel: loadKgReviewerModel,
     codeEmbed: loadCodeEmbedSettings,
     codeEmbedStatus: loadCodeEmbedStatus,
     openAiEmbeddingsConsent: loadOpenAiEmbeddingsConsent,
@@ -2708,6 +2742,40 @@
         {/if}
         {#if kgSummaryError}
           <p class="pr-error">Couldn't save: {kgSummaryError}</p>
+        {/if}
+      {/if}
+    </section>
+
+    <!-- v0.2.103 (owner ruling 2026-10-15): the post-commit KG reviewer's
+         model — ONE machine-wide setting. Choices + default come from the
+         Rust command (the vco_lib/kg_reviewer_config.toml table). -->
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['kgReviewerModel'] }} aria-labelledby="pr-kgrev-title">
+      <h2 class="pr-section-title" id="pr-kgrev-title">KG commit reviewer</h2>
+      {#if kgReviewerError && !kgReviewerInfo}
+        <p class="pr-error">Couldn't load: {kgReviewerError}</p>
+      {:else if !kgReviewerInfo}
+        <p class="pr-hint">Loading…</p>
+      {:else}
+        <p class="pr-hint" style="margin-bottom: 10px;">{kgReviewerModelHint(kgReviewerInfo)}</p>
+        <div class="pr-kgsum-block">
+          <label for="pr-kgrev-model" class="pr-kgsum-label">Reviewer model</label>
+          <select
+            id="pr-kgrev-model"
+            class="pr-kgsum-select"
+            value={kgReviewerInfo.model}
+            onchange={(e) => {
+              const t = e.currentTarget as HTMLSelectElement;
+              void saveKgReviewerModel(t.value);
+            }}
+            disabled={kgReviewerSaving}
+          >
+            {#each kgReviewerModelOptions(kgReviewerInfo) as opt}
+              <option value={opt.value}>{opt.label}</option>
+            {/each}
+          </select>
+        </div>
+        {#if kgReviewerError}
+          <p class="pr-error">Couldn't save: {kgReviewerError}</p>
         {/if}
       {/if}
     </section>

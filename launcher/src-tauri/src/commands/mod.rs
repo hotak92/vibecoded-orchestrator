@@ -15,6 +15,7 @@ pub mod blocking;
 pub mod bundle_staleness;
 pub mod changes_cmd;
 pub mod claude_env;
+pub mod kg_reviewer_model;
 pub mod gpu;
 pub mod gpu_policy;
 pub mod codegraph;
