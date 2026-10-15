@@ -479,6 +479,8 @@ try:
         reconcile_walked_file_rows as _reconcile_walked_file_rows,
         open_walked_file_scope as _open_scope,
         commit_walked_file_scope as _commit_scope,
+        # v0.2.103 (R14-B1): post-prune deferral clear (positive zero only).
+        clear_orphan_interactions_deferral_if_zero as _clear_orphan_deferral_if_zero,
     )
     # v0.2.77 Part 5 (CG-2): ONE facade for cross-language call extraction.
     # Dependency-free to import (tree-sitter grammars are lazy-loaded inside
@@ -2018,10 +2020,9 @@ class CodeGraphAnalyzer:
         # up the new analyzer pick up the property on the next analyze run.
         # Idempotent + soft-fail per collection.
 
-        # v0.2.52 (V52-O.4) schema migration: ensure `file_path` property
-        # exists on CodeFunction + CodeClass so pre-V52-O.4 installs pick up
-        # the property on the next analyze run and `_dedup_insert` can stamp
-        # it. Idempotent + soft-fail per collection.
+        # v0.2.52 (V52-O.4) schema migration: ensure `file_path` exists on
+        # CodeFunction + CodeClass so pre-V52-O.4 installs pick it up on the
+        # next analyze run and `_dedup_insert` can stamp it.
         self._ensure_file_path_property()
 
         # v0.2.61 (Track E) schema migration: ensure `content_hash` exists on
@@ -3240,19 +3241,13 @@ class CodeGraphAnalyzer:
 
     def _ensure_file_path_property(self):
         """v0.2.52 (V52-O.4): add `file_path` (mirrors ``CodeModule.path``) to
-        the file-anchored non-Module collections. Idempotent + soft-fail.
-
-        v0.2.82 (rider a): CodeAPI + CodeInteraction also gain it so the
-        deleted-file sweep + prune anchor resolution can reap orphaned rows of
-        removed files (preserve-all before, since anchor-less). ``file_path`` is
-        in ``_CONTENT_HASH_EXCLUDE`` → stamping never perturbs a content hash →
-        zero re-write of matched rows. Legacy anchor-less rows converge on next
-        file change (DEFERRAL D3).
-
-        v0.2.103 (R12-F8): ONE home — this delegates to
-        ``vco_lib.codegraph_schema.ensure_codegraph_file_path`` (the shared
-        spec + loop, also used by the resync metadata backfill); the analyzer's
-        former inline copy of both is GONE.
+        the file-anchored non-Module collections (v0.2.82 rider a: CodeAPI +
+        CodeInteraction too, so the deleted-file sweep + prune anchor
+        resolution can reap orphaned rows). Idempotent + soft-fail; in
+        ``_CONTENT_HASH_EXCLUDE`` → zero re-write of matched rows.
+        v0.2.103 (R12-F8): ONE home — delegates to
+        ``codegraph_schema.ensure_codegraph_file_path`` (shared with the
+        resync metadata backfill); the analyzer's inline copy is GONE.
         """
         if self.client is None:
             return
@@ -3465,10 +3460,8 @@ class CodeGraphAnalyzer:
         # extra doesn't wedge the whole analyze.
         canonical_extras: List[Path] = []
         self._refused_extra_sources: Set[str] = set()  # W6-CGD D-4: nested extras, rows kept
-        # v0.2.103 (R12-F2): extras DROPPED this run (unresolvable, offline or
-        # unmounted) — their rows' provenance is missing, so the orphan
-        # reaping is disabled for the whole run (delete nothing on a walk that
-        # did not cover every enabled extra folder).
+        # v0.2.103 (R12-F2): extras DROPPED this run (unresolvable/offline/
+        # unmounted) — provenance missing → the orphan reaping is disabled.
         self._dropped_extra_sources: Set[str] = set()
         for extra in (extra_paths or []):
             try:
@@ -3502,9 +3495,8 @@ class CodeGraphAnalyzer:
         # feed it — the --prune-stale pass, the drain's deleted-file prune,
         # and the stale-file probe's orphan-clear (which runs on ANY walk) —
         # so a stale value from a prior analyze_repository call in the same
-        # process must never leak into this run's stats. v0.2.103 (plan item
-        # 24): the per-collection ledger resets with it (the PRUNE_FAILURES
-        # remedy names the REAL failing classes).
+        # process must never leak into this run's stats. v0.2.103 (plan 24):
+        # the per-collection ledger resets with it (remedy names REAL classes).
         self._prune_failures = 0
         self._prune_failure_collections = {}
         self._policy_skipped = {}  # S16-3: per-run policy-skip record (flushed per walk)
@@ -4002,13 +3994,11 @@ class CodeGraphAnalyzer:
             collections. Printed per-collection on stdout so the
             launcher's log shows what happened.
 
-        Side effect (v0.2.73 C-11/RT-3; v0.2.103 plan item 24): per-collection
-        delete failures are recorded through ``record_prune_failures`` into
-        ``self._prune_failures`` (total) AND ``self._prune_failure_collections``
-        (per-class ledger) — ADD-only, never clobbering the failures earlier
-        producers in the SAME run already recorded (per-run reset lives at
-        the top of ``analyze_repository``) — so ``stats``/main() can flip the
-        build success→partial and the remedy can name the REAL classes.
+        Side effect (v0.2.73 C-11/RT-3; v0.2.103 plan 24): delete failures are
+        recorded through ``record_prune_failures`` into the total AND the
+        per-class ledger — ADD-only (per-run reset lives at the top of
+        ``analyze_repository``) — so ``stats``/main() can flip the build
+        success→partial and the remedy can name the REAL classes.
         """
         if not self._track_visited:
             # Defensive: should never happen (caller gates on
@@ -4052,14 +4042,23 @@ class CodeGraphAnalyzer:
                 f"language={scope_lang!r} entries not visited this run"
             )
 
-        # v0.2.103 (defect 7 / R12-F2): orphan reaping needs a FULL, unscoped
-        # walk that COVERED every enabled extra folder — a refused extra, or
-        # one dropped as offline/unmounted/unresolvable, means provenance is
-        # missing for its rows → delete nothing this run (conservative).
-        _extras_uncertain = bool(
-            getattr(self, "_refused_extra_sources", None)
-        ) or bool(getattr(self, "_dropped_extra_sources", None))
-        _reap_orphans = not scope_lang and not _extras_uncertain
+        # v0.2.103 (defect 7 / R12-F2 / R14-B2): orphan reaping needs a FULL,
+        # unscoped walk. A REFUSED extra no longer gates the run (its rows
+        # are protected per-row via preserve_sources → the ONE predicate); a
+        # DROPPED (offline/unmounted) extra DOES gate it — never silently.
+        _dropped = getattr(self, "_dropped_extra_sources", None) or set()
+        if scope_lang:
+            _reap_orphans = False
+        elif _dropped:
+            _reap_orphans = False
+            print(
+                f"⚠️  Orphan cleanup skipped this run: {len(_dropped)} extra "
+                f"code folder(s) not reachable ({', '.join(sorted(_dropped))}) "
+                "— no orphan rows are deleted until every enabled code "
+                "folder is reachable", file=sys.stderr,
+            )
+        else:
+            _reap_orphans = True
 
         for coll in collections:
             if coll is None:
@@ -4084,6 +4083,19 @@ class CodeGraphAnalyzer:
                     f"(stale rows remain — see warnings above)"
                 )
                 _record_prune_failures(self, coll.name, failures)
+
+        # R14-B1: after a reaping-enabled full walk, re-count through the SAME
+        # probe and clear the pending-orphan deferral on a positive zero.
+        if _reap_orphans and self.interactions_collection is not None:
+            try:
+                _clear_orphan_deferral_if_zero(
+                    self.project_name or "",
+                    repo_root=getattr(self, "_analyze_repo_root", None),
+                    client=getattr(self, "client", None),
+                )
+            except Exception as exc:  # noqa: BLE001 — never wedge the prune
+                print(f"⚠️  orphan-deferral clear check failed: {exc}",
+                      file=sys.stderr)
 
         return total_pruned
 

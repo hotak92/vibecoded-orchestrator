@@ -342,6 +342,14 @@ def test_classifier_three_way_verdicts():
     assert cr.classify_codegraph_orphan(good, "r-mixed") == "anchored"
     assert cr.classify_codegraph_orphan(good, "r-err") == "unknown"
     assert cr.classify_codegraph_orphan(good, "r-gone") == "unknown"
+    # R14-B3: a MISSING references payload is UNKNOWN, never "no references".
+    good._fetch["r-nopayload"] = SimpleNamespace(
+        uuid="r-nopayload", properties={"file_path": None})
+    assert cr.classify_codegraph_orphan(good, "r-nopayload") == "unknown"
+    explicit_none = _fetch_obj("r-explicit-none", {})
+    explicit_none.references = None
+    good._fetch["r-explicit-none"] = explicit_none
+    assert cr.classify_codegraph_orphan(good, "r-explicit-none") == "unknown"
 
 
 def test_classifier_rejects_a_row_object_the_way_the_real_client_does():
@@ -374,10 +382,16 @@ def test_predicate_filters_match_the_purge():
         project_name="P",
         preserve_sources={"/repo/nested/extra"}) is False
     # The probe's structural twin: no preserve_sources, but the repo root
-    # says the source is a nested (refused-by-construction) extra tenant.
+    # says the source is a NON-PRIMARY tenant — nested under the root
+    # (refused by construction) or a mounted extra outside it (R14-B2: the
+    # consented cleanup walk covers the repo root only).
     assert cr.is_provable_codegraph_orphan(
         coll, "n", {"file_path": None, "project": "P",
                     "project_source": "/repo/nested/extra"},
+        project_name="P", repo_root=Path("/repo")) is False
+    assert cr.is_provable_codegraph_orphan(
+        coll, "n", {"file_path": None, "project": "P",
+                    "project_source": "/ext/refused"},
         project_name="P", repo_root=Path("/repo")) is False
     # A PRIMARY-source row is still judged.
     assert cr.is_provable_codegraph_orphan(
@@ -518,18 +532,25 @@ def _captured_reap_kwargs(analyzer_mod, monkeypatch, analyzer):
         return (0, 0)
 
     monkeypatch.setattr(analyzer_mod, "_prune_collection_impl", _capture)
+    # Keep the gating test hermetic: the post-prune clear check is covered by
+    # its own tests below.
+    monkeypatch.setattr(analyzer_mod, "_clear_orphan_deferral_if_zero",
+                        lambda *a, **kw: None)
     analyzer._prune_stale_objects()
     return captured
 
 
 def test_analyzer_gates_reaping_on_scope_and_extra_coverage(
-        analyzer_mod, monkeypatch):
-    """R12-F2: ``reap_orphans`` is passed ONLY for CodeInteraction on a full,
-    unscoped walk that refused/dropped NO extra folder — a refused extra, an
-    offline (dropped) extra, or a language scope each disable it entirely."""
+        analyzer_mod, monkeypatch, capsys):
+    """R12-F2 / R14-B2: ``reap_orphans`` is passed ONLY for CodeInteraction
+    on a full, unscoped walk. A REFUSED extra no longer gates the run (its
+    rows are protected per-row via preserve_sources); an offline (dropped)
+    extra disables reaping AND says so, naming the folder. No silent gate."""
     base = _gated_analyzer(analyzer_mod)
+    capsys.readouterr()
     assert dict(_captured_reap_kwargs(analyzer_mod, monkeypatch, base)
                 )["P_CodeInteraction"] is True
+    assert "Orphan cleanup skipped" not in capsys.readouterr().err
 
     scoped = _gated_analyzer(analyzer_mod)
     scoped._prune_language = "python"
@@ -538,13 +559,22 @@ def test_analyzer_gates_reaping_on_scope_and_extra_coverage(
 
     refused = _gated_analyzer(analyzer_mod)
     refused._refused_extra_sources = {"/repo/nested"}
+    capsys.readouterr()
     assert dict(_captured_reap_kwargs(analyzer_mod, monkeypatch, refused)
-                )["P_CodeInteraction"] is False
+                )["P_CodeInteraction"] is True, (
+        "R14-B2: a refused extra is a per-row preserve-source, not a run gate"
+    )
+    assert "Orphan cleanup skipped" not in capsys.readouterr().err
 
     dropped = _gated_analyzer(analyzer_mod)
     dropped._dropped_extra_sources = {"/mnt/offline-extra"}
+    capsys.readouterr()
     assert dict(_captured_reap_kwargs(analyzer_mod, monkeypatch, dropped)
                 )["P_CodeInteraction"] is False
+    err = capsys.readouterr().err
+    assert "Orphan cleanup skipped" in err and "/mnt/offline-extra" in err, (
+        "the gate must be audible and name the unreachable folder"
+    )
 
 
 def test_analyzer_records_dropped_extras(analyzer_mod, tmp_path):
@@ -671,9 +701,10 @@ def test_driver_stale_path_does_not_record_orphans(monkeypatch, tmp_path, capsys
 
 
 def test_orphan_deferral_flavour_text_is_true():
-    """R12-F5: the orphan flavour's prose must be TRUE — the command DELETES
-    rows a full walk does not visit; the old 're-embeds only the remaining
-    stale rows' claim must not appear in it."""
+    """R12-F5 / R14-B4: the orphan flavour's prose must be TRUE and COHERENT —
+    the command DELETES rows a full walk does not visit (the ordinary prune
+    semantics), the provably-dead rule is scoped to the anchor-less rows, and
+    the unreachable-extra skip is stated plainly."""
     entry = cr.build_unconverged_deferral(
         "Acme", None, "cmd --prune-stale", orphan_interactions=2)
     assert entry is not None
@@ -681,7 +712,15 @@ def test_orphan_deferral_flavour_text_is_true():
     assert entry.condition_id != cr._CONDITION_ID
     assert "no file anchors" in entry.detected or "file anchors" in entry.detected
     assert "DELETES" in entry.why_deferred
-    assert "--prune-stale" in entry.why_deferred or "prune" in entry.why_deferred
+    assert "ordinary prune semantics" in entry.why_deferred, (
+        "the deletion breadth must be scoped to the walk's ordinary semantics"
+    )
+    # R14-B4: the provably-dead rule is scoped to the anchor-less rows, not
+    # stated as a blanket contradiction of the sentence above it.
+    assert "orphan cleanup itself touches only anchor-less rows" in entry.why_deferred
+    assert "A row is deleted only when provably dead" not in entry.why_deferred
+    # R14-B2: the unreachable-extra skip is stated, not silent.
+    assert "extra code folder is unreachable" in entry.why_deferred
     assert "re-embeds only" not in entry.why_deferred
     assert "never" in entry.why_deferred and "automatic" in entry.why_deferred
 
@@ -697,16 +736,159 @@ def test_ordinary_unconverged_flavour_is_unchanged():
 
 
 def test_orphan_condition_is_registered_action_required():
-    """R12-F4: the orphan condition is declared in the registry as
-    action_required with NO retry action — the auto-retry handler forwards no
-    --prune-stale and must never be selected for it."""
+    """R12-F4 / R14-B1: the orphan condition is declared in the registry as
+    action_required with NO retry action and a REAL probe clear — the
+    registered probe name resolves to a callable in the probe table."""
+    from vco_lib import deferral_probes
     from vco_lib.deferral_registry import condition
 
     spec = condition(cr._ORPHAN_CONDITION_ID)
     assert spec is not None, "condition must be declared in the registry"
     assert spec.condition_class == "action_required"
     assert not spec.retry_action
-    assert spec.clear_probe == "paired-resolution"
+    assert spec.clear_probe == "probe:py:codegraph_orphan_interactions_still_present"
+    assert spec.probe_name == "codegraph_orphan_interactions_still_present"
+    assert callable(
+        deferral_probes.PROBES.get("codegraph_orphan_interactions_still_present"))
+
+
+# ── R14-B1: the clear actually fires after the consented cleanup ───────────
+
+def _entry_ctx(detected, folder):
+    from vco_lib.deferral_probes import ProbeContext
+
+    return ProbeContext(
+        folder=Path(folder),
+        entry=SimpleNamespace(detected=detected))
+
+
+def test_clear_probe_tri_state(monkeypatch, tmp_path):
+    """The registered probe maps count>0 → True, count==0 → False (clear),
+    count unknown / unparsable prose → None (never a clear)."""
+    from vco_lib import deferral_probes
+
+    counts = {"value": 2}
+
+    def _fake_count(project_name, *, repo_root=None, **kw):
+        assert project_name == "Acme Projects"
+        assert repo_root == tmp_path
+        return counts["value"]
+
+    monkeypatch.setattr(cr, "count_orphan_interaction_rows", _fake_count)
+    ctx = _entry_ctx(
+        "A background code-graph resync for project 'Acme Projects' "
+        "converged every stale row, but 2 CodeInteraction row(s) ...",
+        tmp_path)
+    assert deferral_probes.codegraph_orphan_interactions_still_present(
+        ctx) is True
+    counts["value"] = 0
+    assert deferral_probes.codegraph_orphan_interactions_still_present(
+        ctx) is False
+    counts["value"] = None
+    assert deferral_probes.codegraph_orphan_interactions_still_present(
+        ctx) is None
+    # Unparsable prose → None (the ONE builder's shape is locked below).
+    assert deferral_probes.codegraph_orphan_interactions_still_present(
+        _entry_ctx("no project name here", tmp_path)) is None
+
+
+def test_run_cleanup_then_the_entry_is_gone(monkeypatch, tmp_path):
+    """R14-B1's acceptance shape: the entry is written to a real ledger, the
+    user runs the printed cleanup (the count goes to zero), the re-probe
+    finds the condition over and the ledger entry is GONE — no driver run
+    needed."""
+    from vco_lib import deferral_emit, deferral_probes
+
+    entry = cr.build_unconverged_deferral(
+        "Acme", None, "cmd --prune-stale", orphan_interactions=2)
+    assert entry is not None
+    deferral_emit.emit(tmp_path, entry)
+    ledger = tmp_path / ".claude" / "context" / "UPDATE_DEFERRED.md"
+    assert cr._ORPHAN_CONDITION_ID in ledger.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        cr, "count_orphan_interaction_rows",
+        lambda *a, **k: 0)  # the cleanup reaped them
+    verdict = deferral_probes.run_probe(
+        "codegraph_orphan_interactions_still_present",
+        _entry_ctx(entry.detected, tmp_path))
+    assert verdict is False, "a positive zero must read as condition-over"
+    removed = deferral_emit.resolve_conditions(
+        tmp_path, (cr._ORPHAN_CONDITION_ID,))
+    assert removed == 1
+    # The emitter removes the ledger file when its last entry is gone.
+    assert not ledger.exists() or cr._ORPHAN_CONDITION_ID not in (
+        ledger.read_text(encoding="utf-8")), (
+        "run cleanup → entry gone"
+    )
+
+
+def test_analyzer_clears_the_entry_after_a_reaping_walk(analyzer_mod,
+                                                        monkeypatch, tmp_path):
+    """R14-B1: the analyzer-side clear — after a reaping-enabled full walk,
+    the pending-orphan deferral is resolved on a positive zero (the walk
+    reaped the rows, or there were none)."""
+    calls = []
+    monkeypatch.setattr(
+        analyzer_mod, "_clear_orphan_deferral_if_zero",
+        lambda project, *, repo_root=None, client=None: calls.append(
+            (project, repo_root)) or True)
+
+    analyzer = _gated_analyzer(analyzer_mod)
+    analyzer._analyze_repo_root = tmp_path
+    monkeypatch.setattr(analyzer_mod, "_prune_collection_impl",
+                        lambda collection, visited_uuids, **kw: (0, 0))
+    analyzer._prune_stale_objects()
+    assert calls == [("P", tmp_path)], (
+        "a reaping-enabled walk must run the post-prune clear check"
+    )
+
+
+def test_analyzer_does_not_clear_when_reaping_was_gated_off(
+        analyzer_mod, monkeypatch, tmp_path, capsys):
+    """R14-B1/B2 leave-alone: with an unreachable extra folder the reaping is
+    skipped (audibly) and the clear check never runs — the entry must not be
+    resolved by a walk that could not have cleaned anything."""
+    calls = []
+    monkeypatch.setattr(
+        analyzer_mod, "_clear_orphan_deferral_if_zero",
+        lambda project, *, repo_root=None, client=None: calls.append(project))
+
+    analyzer = _gated_analyzer(analyzer_mod)
+    analyzer._analyze_repo_root = tmp_path
+    analyzer._dropped_extra_sources = {"/mnt/offline-extra"}
+    monkeypatch.setattr(analyzer_mod, "_prune_collection_impl",
+                        lambda collection, visited_uuids, **kw: (0, 0))
+    capsys.readouterr()
+    analyzer._prune_stale_objects()
+    assert calls == [], "a gated-off walk must not clear the deferral"
+    assert "Orphan cleanup skipped" in capsys.readouterr().err
+
+
+def test_clear_helper_resolves_only_on_a_positive_zero(monkeypatch, tmp_path):
+    """The analyzer-side helper's contract: count 0 → resolves the ledger
+    entry; count > 0 / None → no resolve."""
+    from vco_lib import deferral_emit
+
+    resolved = []
+    monkeypatch.setattr(
+        deferral_emit, "resolve_conditions",
+        lambda folder, cids, log=None: resolved.append(cids) or 1)
+
+    monkeypatch.setattr(cr, "count_orphan_interaction_rows", lambda *a, **k: 0)
+    assert cr.clear_orphan_interactions_deferral_if_zero(
+        "P", repo_root=tmp_path) is True
+    assert resolved == [(cr._ORPHAN_CONDITION_ID,)]
+
+    resolved.clear()
+    monkeypatch.setattr(cr, "count_orphan_interaction_rows", lambda *a, **k: 3)
+    assert cr.clear_orphan_interactions_deferral_if_zero(
+        "P", repo_root=tmp_path) is False
+    monkeypatch.setattr(cr, "count_orphan_interaction_rows",
+                        lambda *a, **k: None)
+    assert cr.clear_orphan_interactions_deferral_if_zero(
+        "P", repo_root=tmp_path) is None
+    assert resolved == []
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -2019,19 +2019,23 @@ ANCHOR_VERDICT_UNKNOWN = "unknown"
 
 
 def _classify_anchor_from_refs(obj, ref_specs) -> str:
-    """R12-F2: classify an object's inline references into the three-way
-    verdict WITHOUT guessing.
+    """R12-F2 / R14-B3: classify an object's inline references into the
+    three-way verdict WITHOUT guessing.
 
     * ANCHORED — some reference target carries a non-empty path: the anchor
       backfill PATCHes ``file_path`` from it; the row is alive.
-    * UNKNOWN — a reference target EXISTS but has no path (a live target
-      whose anchor is merely unknown — e.g. a legacy CodeFunction that
-      itself predates ``file_path``), or the reference shape is unreadable.
-      NOT provably dead: preserve.
+    * UNKNOWN — the references payload is MISSING (``None`` — a client that
+      returned no reference data is indistinguishable from a row we did not
+      get to look at, R14-B3: never "provably no references"), a target
+      EXISTS but has no path (a live target whose anchor is merely unknown —
+      e.g. a legacy CodeFunction that itself predates ``file_path``), or the
+      shape is unreadable. NOT provably dead: preserve.
     * ORPHAN — the row has NO reference at all, or every reference it has
       is DANGLING (zero target objects, verified by a query that succeeded).
+      Requires a dict payload: an EMPTY dict is a positive "no references";
+      ``None`` never is.
     """
-    refs = getattr(obj, "references", None) or {}
+    refs = getattr(obj, "references", None)
     if not isinstance(refs, dict):
         return ANCHOR_VERDICT_UNKNOWN
     saw_live_target_without_path = False
@@ -2108,10 +2112,12 @@ def is_provable_codegraph_orphan(
       * ``project`` is empty/NULL/this project (the purge's foreign-project
         leave-alone rule);
       * ``project_source`` is not one of ``preserve_sources`` (the refused
-        extras the purge preserves) — and, when ``repo_root`` is given, is
-        not a NON-PRIMARY source rooted UNDER it (every under-root extra is
-        refused by construction, so its rows are preserve-sourced tenants
-        even on the driver side, which cannot know the per-walk set);
+        extras the purge preserves) — and, when ``repo_root`` is given, IS a
+        primary source (empty, or one of the root's forms). R14-B2: the
+        driver-side probe cannot know the per-walk extra set, and the
+        consented cleanup walk covers the repo root only — a non-primary
+        source's rows converge on their OWN root's walk, so counting them
+        would keep the deferral alive with a command that cannot clear it;
       * :func:`classify_codegraph_orphan` says ORPHAN (no reference at all,
         or every reference dangling — F2's narrowed proof).
     Anything else — anchored, live-target-no-path, unknown, filtered out —
@@ -2128,26 +2134,9 @@ def is_provable_codegraph_orphan(
             return False
         if repo_root is not None:
             primary = primary_sources_for(Path(repo_root)) or set()
-            if row_source not in primary and _source_under_root(
-                row_source, Path(repo_root)
-            ):
+            if row_source not in primary:
                 return False
     return classify_codegraph_orphan(collection, uuid) == ANCHOR_VERDICT_ORPHAN
-
-
-def _source_under_root(source: str, repo_root: Path) -> bool:
-    """Is ``source`` a path strictly under ``repo_root`` (either form)?
-
-    Fail-open toward "not under" on unreadable roots (an OSError must never
-    silently widen the keep-set into a delete authorisation — the callers
-    only use this to SKIP rows).
-    """
-    try:
-        roots = {repo_root.as_posix(), repo_root.resolve().as_posix()}
-    except (OSError, ValueError):
-        return False
-    s = str(source).replace("\\", "/").rstrip("/")
-    return any(s.startswith(r.rstrip("/") + "/") for r in roots)
 
 
 def count_orphan_interaction_rows(
@@ -2888,11 +2877,15 @@ def build_unconverged_deferral(
                 "Only a FULL walk with --prune-stale removes them, and that "
                 "is a user-consented action, never automatic: the command "
                 "below re-walks the repository and DELETES every code-graph "
-                "row the walk does not visit (not only the orphans), then "
-                "re-embeds what changed. A row is deleted only when provably "
-                "dead (unanchored with no resolvable source); anything "
-                "uncertain is kept. The entry clears when a later resync "
-                "probe finds zero such rows."
+                "row the walk does not visit (the ordinary prune semantics — "
+                "not only the orphans), then re-embeds what changed. The "
+                "orphan cleanup itself touches only anchor-less rows, and "
+                "removes one only when it is provably dead (no reference at "
+                "all, or only dangling ones); anything uncertain is kept. If "
+                "any enabled extra code folder is unreachable, the walk "
+                "skips orphan cleanup entirely (nothing is deleted) until "
+                "every folder is reachable. The entry clears once a re-probe "
+                "of the same count finds zero."
             ),
             command_to_apply=command_to_apply,
             severity="warning",
@@ -3039,6 +3032,50 @@ def _resolve_orphan_interactions_deferral(repo_root: Path) -> None:
         logger.warning(
             "resync driver: could not resolve orphan deferral: %s", exc
         )
+
+
+def clear_orphan_interactions_deferral_if_zero(
+    project_name: str,
+    *,
+    repo_root: Optional[Path],
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[bool]:
+    """R14-B1: the analyzer-side clear — after a reaping-enabled full
+    ``--prune-stale`` walk, re-count the orphans through the SAME probe
+    (:func:`count_orphan_interaction_rows`) and resolve the
+    ``codegraph_orphan_interactions_pending`` entry on a POSITIVE zero (the
+    walk reaped them, or there were none).
+
+    Returns ``True`` when the entry was resolved, ``False`` when orphans
+    remain, ``None`` when the count was undeterminable (never a clear).
+    Never raises; a ledger write failure logs and returns the count's
+    verdict unchanged.
+    """
+    count = count_orphan_interaction_rows(
+        project_name, repo_root=repo_root, client=client,
+        weaviate_url=weaviate_url, grpc_port=grpc_port,
+    )
+    if count is None or count > 0 or repo_root is None:
+        return False if count is not None else None
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        removed = resolve_conditions(
+            Path(repo_root), (_ORPHAN_CONDITION_ID,), log=logger,
+        ) if repo_root is not None else 0
+        if removed:
+            logger.info(
+                "codegraph orphan cleanup: resolved the orphan-interaction "
+                "deferral (probe count is zero after the prune walk)"
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001 — ledger write is best-effort
+        logger.warning(
+            "codegraph orphan cleanup: could not resolve deferral: %s", exc
+        )
+        return True
 
 
 # ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
