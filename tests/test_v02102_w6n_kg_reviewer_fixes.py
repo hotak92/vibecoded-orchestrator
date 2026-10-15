@@ -358,7 +358,11 @@ def _scratch_repo(tmp_path: Path, *, commits: int) -> "tuple[Path, dict]":
     env = {k: v for k, v in os.environ.items()
            if k not in ("VCT_DISABLE_HOOKS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
                         "VCO_KG_REVIEW_MAX_TURNS", "VCO_KG_REVIEW_MODEL",
-                        "VCT_LAUNCHER_DB_PATH")}
+                        "VCT_LAUNCHER_DB_PATH",
+                        # The hook resolves the PROJECT root by the one rule
+                        # (CLAUDE_PROJECT_DIR first); the suite pins it to a
+                        # scratch dir, so the scratch repo must not inherit it.
+                        "CLAUDE_PROJECT_DIR")}
     env.update({
         "PATH": f"{bindir}{os.pathsep}{env.get('PATH', '')}",
         "GIT_CONFIG_NOSYSTEM": "1",

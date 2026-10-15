@@ -704,7 +704,9 @@ def _take_flock(fh: Any, timeout_s: Optional[float], lock_path: Path) -> str:
 
 
 @contextlib.contextmanager
-def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -> Iterator[None]:
+def exclusive_file_lock(
+    lock_path: Path, *, timeout_s: Optional[float] = None,
+) -> Iterator[Optional[int]]:
     """Hold an exclusive advisory lock on ``lock_path`` for the block.
 
     ``timeout_s`` (v0.2.97 R9 H7): ``None`` (the default) waits as long as the
@@ -737,7 +739,14 @@ def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -
             disk between runs (typically under a git-ignored directory).
 
     Yields:
-        ``None`` — the caller does the locked work inside the ``with``.
+        The lockfile's descriptor when the lock is a POSIX ``flock`` — the
+        one mechanism whose ownership a child process SHARES when it
+        inherits that descriptor (``subprocess.Popen(pass_fds=...)``: the
+        lock then lives until the last holder of the open file description
+        exits; ``vco_lib.codegraph_walk`` relies on it, v0.2.103 final
+        review L-5) — else ``None`` (a Windows byte-range lock belongs to
+        this process alone). Most callers ignore it and just do the locked
+        work inside the ``with``.
     """
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -745,7 +754,7 @@ def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -
     mechanism = ""
     try:
         mechanism = _take_flock(fh, timeout_s, lock_path)
-        yield
+        yield fh.fileno() if mechanism == "fcntl" else None
     finally:
         if mechanism == "fcntl":
             try:

@@ -550,8 +550,17 @@ def _file_logger(log_path: str) -> Callable[[str], None]:
 
 
 def _project_root(raw: "Optional[str]") -> Path:
+    """The VCO project folder (the one that owns ``.claude/``) — the ONE
+    rule, :func:`vco_lib.project_root.resolve_project_root`; never the git
+    toplevel, which is a PARENT repo for a nested project (v0.2.103 final
+    review M-1). A folder with no VCO marker falls back to the toplevel,
+    then the cwd."""
     if raw:
         return Path(raw).resolve()
+    from vco_lib.project_root import resolve_project_root
+    found = resolve_project_root()
+    if found is not None:
+        return Path(found).resolve()
     proc = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                           capture_output=True, text=True)
     top = proc.stdout.strip()

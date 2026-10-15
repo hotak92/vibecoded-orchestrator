@@ -182,6 +182,17 @@ def _read_bytes(path: Path) -> Optional[bytes]:
         return None
 
 
+def _lf_text(data: bytes) -> str:
+    """``data`` decoded for RULE comparison with CRLF read as LF (v0.2.103
+    final review L-6). The CLI's edit tools keep a file's own line endings
+    while the transcript carries LF, so a CRLF node's pre and post texts can
+    differ in endings alone; judging them byte-for-byte made a legitimate
+    proposal append to a locked node read as a rewrite. Comparison only —
+    the guard never rewrites a file's line endings on disk (a revert
+    restores the snapshot's exact bytes)."""
+    return data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+
 def _same(a: Optional[bytes], b: Optional[bytes]) -> bool:
     """Byte equality, tolerant only of CRLF/LF (the CLI's edit tools keep a
     file's line-ending style; the transcript carries LF)."""
@@ -294,7 +305,9 @@ class Snapshot:
                 return True, None  # the user had deleted it
             return False, None
         if self.start_head:
-            blob = _git(self.root, "cat-file", "blob", f"{self.start_head}:{rel}")
+            # `./` = relative to cwd (the project), not the repo toplevel.
+            blob = _git(self.root, "cat-file", "blob",
+                        f"{self.start_head}:./{rel}")
             if blob.returncode == 0:
                 return True, blob.stdout
         ignored = _git(self.root, "check-ignore", "-q", "--", rel).returncode == 0
@@ -306,24 +319,62 @@ class Snapshot:
         shutil.rmtree(self.copy_dir, ignore_errors=True)
 
 
+def repo_prefix(root: Path) -> str:
+    """``root``'s path inside its enclosing repo (``git rev-parse
+    --show-prefix``: ``""`` at the toplevel, ``"apps/foo/"`` for a project
+    nested in a parent repo).
+
+    Every guard path is PROJECT-relative (``knowledge/...`` under the folder
+    that owns ``.claude/``), and every git command runs with ``cwd=root``, so
+    pathspecs (``add``/``commit --only``/``check-ignore``/``ls-files``) and
+    ``<rev>:./<rel>`` already resolve against the project. Only git OUTPUT
+    that lists paths (``status --porcelain``, ``diff-tree --name-only``) is
+    toplevel-relative and goes through :func:`project_rel` (v0.2.103 final
+    review M-1)."""
+    proc = _git(root, "rev-parse", "--show-prefix")
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.decode("utf-8", errors="surrogateescape").strip()
+
+
+def project_rel(top_rel: str, prefix: str) -> Optional[str]:
+    """A toplevel-relative git path as a project-relative one; ``None`` when
+    it lies outside the project (elsewhere in the parent repo)."""
+    if not prefix:
+        return top_rel
+    if top_rel.startswith(prefix):
+        return top_rel[len(prefix):]
+    return None
+
+
 def _status_paths(root: Path) -> Dict[str, str]:
-    """rel path -> porcelain XY code for every changed/untracked path."""
-    proc = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    """Project-relative path -> porcelain XY code for every changed or
+    untracked path under the project folder (paths elsewhere in a parent
+    repo are not the project's and are left out)."""
+    proc = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                "--", ".")
     if proc.returncode != 0:
         return {}
+    prefix = repo_prefix(root)
     out: Dict[str, str] = {}
     entries = proc.stdout.decode("utf-8", errors="surrogateescape").split("\0")
     i = 0
+
+    def _add(top_rel: str, code: str) -> None:
+        rel = project_rel(top_rel, prefix)
+        if rel:
+            out[rel] = code
+
     while i < len(entries):
         entry = entries[i]
         i += 1
         if len(entry) < 4:
             continue
         code, path = entry[:2], entry[3:]
-        out[path] = code
+        _add(path, code)
         if code[0] in "RC":  # rename/copy: the next field is the source
             if i < len(entries) and entries[i]:
-                out[entries[i]] = code
+                _add(entries[i], code)
             i += 1
     return out
 
@@ -921,8 +972,8 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
         elif not rel.endswith(".md"):
             reason = "not a KG node (only knowledge/**/*.md may be written)"
         elif cur is not None:
-            post_text = cur.decode("utf-8", errors="replace")
-            pre_text = pre.decode("utf-8", errors="replace") if pre is not None else None
+            post_text = _lf_text(cur)
+            pre_text = _lf_text(pre) if pre is not None else None
             if pre_text is None:
                 reason = new_node_violation(post_text, snap.titles)
             else:
@@ -1053,8 +1104,15 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         log(f"commit failed (files left uncommitted): {detail}")
         return None
     sha = _git(root, "rev-parse", "HEAD").stdout.decode().strip()
-    files = set(_git(root, "diff-tree", "--no-commit-id", "--name-only", "-r",
-                     sha).stdout.decode().split())
+    prefix = repo_prefix(root)
+    files = set()
+    for top_rel in _git(root, "diff-tree", "--no-commit-id", "--name-only",
+                        "-r", "-z", sha).stdout.decode(
+                            "utf-8", errors="surrogateescape").split("\0"):
+        if top_rel:
+            rel = project_rel(top_rel, prefix)
+            # Outside the project: named from the repo toplevel.
+            files.add(rel if rel is not None else f"<repo>/{top_rel}")
     extra = sorted(files - set(paths))
     if extra:
         log(f"WARNING: commit {sha[:12]} also contains {', '.join(extra)} "

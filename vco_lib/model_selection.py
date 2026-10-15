@@ -129,6 +129,17 @@ class GridRow:
 class GridNote:
     models: Tuple[str, ...]
     text: str
+    #: ``False`` (default): the note renders when ANY of ``models``
+    #: rendered. ``True``: only when EVERY one did — for a note that
+    #: COMPARES models, so it never names a model the reader's grid lacks
+    #: (v0.2.103 final review L-3).
+    all_of: bool = False
+
+    def renders_for(self, rendered_ids: "set[str] | FrozenSet[str]") -> bool:
+        wanted = set(self.models)
+        if self.all_of:
+            return wanted <= set(rendered_ids)
+        return bool(wanted & set(rendered_ids))
 
 
 @dataclass(frozen=True)
@@ -191,6 +202,9 @@ def load_grid(path: Optional[Path] = None) -> Grid:
     for raw in data.get("note", ()):
         models = tuple(str(m) for m in raw.get("models", ()))
         text = str(raw.get("text", "")).strip()
+        all_of = raw.get("all_of", False)
+        if not isinstance(all_of, bool):
+            raise GridError(f"model-selection note {raw!r} in {table}: all_of must be a boolean")
         unknown = [m for m in models if m not in seen_ids]
         if not models or not text:
             raise GridError(f"model-selection note {raw!r} in {table}: models and text required")
@@ -198,7 +212,7 @@ def load_grid(path: Optional[Path] = None) -> Grid:
             raise GridError(
                 f"model-selection note in {table} names unknown row ids {unknown}"
             )
-        notes.append(GridNote(models=models, text=text))
+        notes.append(GridNote(models=models, text=text, all_of=all_of))
     if not rows:
         raise GridError(f"model-selection grid at {table} declares no rows")
     return Grid(columns=columns, intro=intro, column_legend=legend,
@@ -468,7 +482,8 @@ def reachable_providers(*, key_probe: Optional[KeyProbe] = None,
 def render_grid(*, providers: Optional[FrozenSet[str]] = None,
                 path: Optional[Path] = None) -> str:
     """The markdown that fills ``{{MODEL_SELECTION_GRID}}``: intro, the
-    table, the column legend, the per-model notes whose model rendered, and
+    table, the column legend, the per-model notes whose model rendered
+    (EVERY model, for an ``all_of`` comparison note), and
     the model-independent :attr:`Grid.general_notes` (always rendered).
 
     ``providers`` is injectable for tests; ``None`` probes the machine (see
@@ -489,7 +504,7 @@ def render_grid(*, providers: Optional[FrozenSet[str]] = None,
     lines.append("")
     lines.append(grid.column_legend)
     rendered_ids = {row.id for row in rendered_rows}
-    notes = [n for n in grid.notes if set(n.models) & rendered_ids]
+    notes = [n for n in grid.notes if n.renders_for(rendered_ids)]
     lines.append("")
     lines.append("What changes the pick:")
     for note in notes:
