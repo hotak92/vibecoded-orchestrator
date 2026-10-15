@@ -107,6 +107,19 @@ describe('eventKey (v0.2.103)', () => {
     expect(eventKey(e, 0)).toContain(e.step);
     expect(eventKey(e, 0)).toContain(e.phase);
   });
+
+  // v0.2.103 (review R8 m1): the strongest form of the property — a log
+  // of IDENTICAL events. A mutation that stops using the index (e.g.
+  // `eventKey(e, 0)`) must fail this, whatever the template looks like.
+  it('eventKey stays unique over a log of IDENTICAL events (the index is load-bearing)', () => {
+    const identical = Array.from({ length: 12 }, () =>
+      ev('2026-10-13T23:51:07Z', '8/10', 'ok'),
+    );
+    const tail = tailEvents(log({ events: identical }));
+    expect(tail).toHaveLength(12);
+    const keys = tail.map((e, i) => eventKey(e, i));
+    expect(new Set(keys).size).toBe(12);
+  });
 });
 
 describe('summaryLine (W5-B C8)', () => {

@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 VibeCoded Tools
 //
-// Wiring guard for the Settings surfaces' load-failure UX (v0.2.103).
+// Wiring guard for the Settings surfaces' failure UX (v0.2.103, hardened
+// by review R8 m1/M2).
 //
-// THE DEFECT IT PINS (owner report, launcher v0.2.102): a failed
-// `get_project_v2` left BOTH the project page's Settings tab and the
-// standalone /project/<id>/settings route on a silent, infinite
-// "Loading…" — the catch path only toasted, and the template's only
-// non-loaded state was the loading paragraph. A load failure must
-// render the error inline with a Retry action (and no timeout that
-// could cut a slow-but-valid load).
+// WHAT IT PINS:
+//   - a failed load renders the error INLINE with a Retry that re-runs
+//     the load — and the Retry control lives INSIDE the error branch
+//     (the first draft accepted any `loadError` mention plus any `load()`
+//     call anywhere in the template, which stays green when the button
+//     moves out of the branch);
+//   - the whole surface is wrapped in a <svelte:boundary> whose `failed`
+//     snippet shows the error and calls reset() — a render-time throw can
+//     never again leave a silent "Loading…" (that is exactly how the
+//     v0.2.102 install-log key crash presented).
 //
-// Parsed with the Svelte compiler so a comment cannot satisfy it.
+// Parsed with the Svelte compiler so a comment cannot satisfy it. The
+// lifecycle BEHAVIOUR (reject → error → retry → success, no timeout)
+// lives in and is pinned by load-controller.test.ts — this file pins
+// only that the template is wired to it.
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -35,66 +42,80 @@ const ROUTE = parse(
   { modern: true },
 ) as unknown as Node;
 
-/** True when the fragment renders a Retry-style control that re-runs
- * `loadFn` — a button (regular element or component) whose handler
- * calls the named function, inside a branch keyed on an error state. */
-function hasRetryOn(fragment: Node, loadFn: string, errorState: string): boolean {
-  // An IfBlock (or else-if chain node) whose test mentions the error state…
-  const errorBranches = [...walk(fragment)].filter(
+/** True when an IfBlock testing `errorState` contains, WITHIN THAT
+ *  BRANCH'S OWN CONTENT, a button whose handler calls `loadFn`. */
+function errorBranchWithRetry(fragment: Node, loadFn: string, errorState: string): boolean {
+  const ifBlocks = [...walk(fragment)].filter((n) => n.type === 'IfBlock');
+  return ifBlocks.some((b) => {
+    if (!JSON.stringify(b.test ?? {}).includes(errorState)) return false;
+    const branch = [...walk(b.consequent ?? {})];
+    return branch.some(
+      (n) =>
+        n.type === 'RegularElement' &&
+        n.name === 'button' &&
+        [...walk(n)].some(
+          (x) => x.type === 'CallExpression' && isIdent(x.callee, loadFn),
+        ),
+    );
+  });
+}
+
+/** True when the fragment has a <svelte:boundary> whose `failed` snippet
+ *  renders something AND calls reset() (the retry). */
+function boundaryWithReset(fragment: Node): boolean {
+  return [...walk(fragment)].some(
     (n) =>
-      (n.type === 'IfBlock' || n.type === 'ElseBlock' || n.type === 'ExpressionTag') &&
-      JSON.stringify(n.test ?? n.expression ?? n.name ?? '').includes(errorState),
+      n.type === 'SvelteBoundary' &&
+      [...walk(n.fragment ?? {})].some(
+        (s) =>
+          s.type === 'SnippetBlock' &&
+          isIdent(s.expression, 'failed') &&
+          [...walk(s)].some(
+            (x) => x.type === 'CallExpression' && isIdent(x.callee, 'reset'),
+          ),
+      ),
   );
-  // …anywhere in the fragment (the error branch may sit inside the
-  // loading IfBlock's else), and a call to the load fn in the fragment
-  // that is not inside the script's onMount/effect wiring — i.e. a
-  // template-invoked retry.
-  const retryCalls = [...walk(fragment)].filter(
-    (n) => n.type === 'CallExpression' && isIdent(n.callee, loadFn),
+}
+
+function stateNames(instance: Node): string[] {
+  const decls = [...walk(instance)].filter(
+    (n) => n.type === 'VariableDeclaration',
   );
-  return errorBranches.length > 0 && retryCalls.length > 0;
+  return decls
+    .filter((d) => JSON.stringify(d.declarations ?? []).includes('$state'))
+    .flatMap((d) =>
+      (d.declarations as Node[]).map(
+        (dd) => String((dd.id as Node | undefined)?.name ?? ''),
+      ),
+    );
 }
 
 describe('SettingsTab — load failure UX (v0.2.103)', () => {
   it('tracks a load error in state', () => {
-    const decls = [...walk(TAB.instance as Node)].filter(
-      (n) => n.type === 'VariableDeclaration',
-    );
-    // `$state` declarations surface as CallExpression callee `$state`
-    // inside the declaration's init.
-    const stateNames = decls
-      .filter((d) => JSON.stringify(d.declarations ?? []).includes('$state'))
-      .flatMap((d) =>
-        (d.declarations as Node[]).map(
-          (dd) => (dd.id as Node | undefined)?.name ?? '',
-        ),
-      );
-    expect(stateNames, `no $state declarations found: ${stateNames}`).toContain(
-      'loadError',
-    );
+    expect(stateNames(TAB.instance as Node)).toContain('loadError');
   });
 
-  it('a failed load surfaces the error and offers Retry (no infinite silent Loading)', () => {
-    expect(hasRetryOn(TAB.fragment as Node, 'load', 'loadError')).toBe(true);
+  it('a failed load surfaces the error and offers Retry INSIDE the error branch', () => {
+    expect(errorBranchWithRetry(TAB.fragment as Node, 'load', 'loadError')).toBe(true);
+  });
+
+  it('the tab is wrapped in a svelte:boundary whose failed snippet retries via reset() (R8 M2)', () => {
+    expect(boundaryWithReset(TAB.fragment as Node)).toBe(true);
   });
 });
 
 describe('Settings standalone route — load failure UX (v0.2.103)', () => {
   it('tracks a load error in state', () => {
-    const decls = [...walk(ROUTE.instance as Node)].filter(
-      (n) => n.type === 'VariableDeclaration',
-    );
-    const stateNames = decls
-      .filter((d) => JSON.stringify(d.declarations ?? []).includes('$state'))
-      .flatMap((d) =>
-        (d.declarations as Node[]).map(
-          (dd) => (dd.id as Node | undefined)?.name ?? '',
-        ),
-      );
-    expect(stateNames).toContain('loadError');
+    expect(stateNames(ROUTE.instance as Node)).toContain('loadError');
   });
 
-  it('a failed load surfaces the error and offers Retry', () => {
-    expect(hasRetryOn(ROUTE.fragment as Node, 'loadHeader', 'loadError')).toBe(true);
+  it('a failed load surfaces the error and offers Retry INSIDE the error branch', () => {
+    expect(
+      errorBranchWithRetry(ROUTE.fragment as Node, 'loadHeader', 'loadError'),
+    ).toBe(true);
+  });
+
+  it('the SettingsTab mount is wrapped in a svelte:boundary whose failed snippet retries via reset() (R8 M2)', () => {
+    expect(boundaryWithReset(ROUTE.fragment as Node)).toBe(true);
   });
 });

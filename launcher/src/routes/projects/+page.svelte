@@ -315,7 +315,7 @@
                  (projects.update → update_project_v2 → the single
                  run_install_bundle_core spawn, per-folder single-flight).
                  Outside the card's clickable div, so these clicks never
-                 trigger the card's settings route. -->
+                 trigger the card's open route. -->
             <span class="pl-cell-actions">
               <button
                 class="pl-row-update"

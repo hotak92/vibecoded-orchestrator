@@ -49,13 +49,14 @@ export function tailEvents(log: InstallLogView | null, tail = TAIL_SIZE): Instal
  * v0.2.103: POSITION is part of identity. Real install logs contain
  * duplicate (ts, step, phase) triples — multiple actors finish the same
  * step within the same second, and the same actor can emit twice for one
- * step (the owner's own log: 3,481 duplicate triples among ~20k events,
- * 4 of them inside the rendered 30-event tail) — and Svelte 5 THROWS
- * `each_key_duplicate` on colliding keys. That throw aborted the
- * Settings tab's render mid-flush and left the stale "Loading…" DOM in
- * place (the owner-reported "Settings tab shows Loading… forever"). The
- * index disambiguates; ts/step/phase stay in the key so it still reads
- * as "this event" in devtools. */
+ * step (the owner's own log: 3,481 distinct triples repeat, 9,177
+ * surplus rows among 20,305 events, and 4 colliding keys inside the
+ * rendered 30-event tail) — and Svelte 5 THROWS `each_key_duplicate` on
+ * colliding keys. That throw aborted the Settings tab's render
+ * mid-flush and left the stale "Loading…" DOM in place (the
+ * owner-reported "Settings tab shows Loading… forever"). The index
+ * disambiguates; ts/step/phase stay in the key so it still reads as
+ * "this event" in devtools. */
 export function eventKey(e: InstallEventView, index: number): string {
   return `${index}:${e.ts}:${e.step}:${e.phase}`;
 }

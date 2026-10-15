@@ -82,7 +82,7 @@ describe('SettingsTab — Install log panel (W5-B C8)', () => {
   // `each_key_duplicate` on colliding keys, which aborted the Settings
   // tab's render mid-flush and left the stale "Loading…" DOM in place —
   // the owner-reported "Settings tab shows Loading… forever".
-  it('keys the install-log tail each by eventKey (unique under duplicate triples)', () => {
+  it('keys the install-log tail each by eventKey(e, <the each index>)', () => {
     const eachBlocks = [...walk(TAB.fragment)].filter(
       (n) => n.type === 'EachBlock' && n.key != null,
     );
@@ -96,6 +96,20 @@ describe('SettingsTab — Install log panel (W5-B C8)', () => {
       keyedByEventKey.length,
       'the install-log tail each is not keyed by eventKey',
     ).toBe(1);
+    // Review R8 m1: it must be eventKey(e, INDEX) — the mutation
+    // `eventKey(e, 0)` reintroduces the collision on identical events
+    // while still "calling eventKey", so the call alone proves nothing.
+    for (const b of keyedByEventKey) {
+      const call = [...walk(b.key!)].find(
+        (n) => n.type === 'CallExpression' && isIdent(n.callee, 'eventKey'),
+      )!;
+      const args = call.arguments as Node[];
+      expect(b.index, 'the each declares no index').toBeTruthy();
+      expect(args[1], 'the key must take the index as its 2nd argument').toMatchObject({
+        type: 'Identifier',
+        name: b.index,
+      });
+    }
     // And nothing falls back to the bare concatenation of event fields.
     for (const b of eachBlocks) {
       const keySource = JSON.stringify(b.key);

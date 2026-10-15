@@ -233,7 +233,7 @@
       {#if view?.status === 'failed' || view?.status === 'skipped'}
         <button
           type="button"
-          class="bg-btn-secondary"
+          class="sb-btn-secondary"
           onclick={() => (expanded = !expanded)}
           aria-expanded={expanded}
         >
@@ -241,7 +241,7 @@
         </button>
         <button
           type="button"
-          class="bg-btn-primary"
+          class="sb-btn-primary"
           onclick={retry}
           disabled={retrying}
         >
@@ -251,7 +251,7 @@
       {#if view?.status === 'success' || view?.status === 'skipped'}
         <button
           type="button"
-          class="bg-btn-x"
+          class="sb-btn-x"
           aria-label="Dismiss banner"
           onclick={() => (dismissed = true)}
         >×</button>
@@ -259,14 +259,14 @@
     {/snippet}
 
     {#snippet expandedContent()}
-      <div class="bg-expand-row">
+      <div class="sb-expand-row">
         <strong>{view?.status === 'skipped' ? 'Reason' : 'Error'}</strong>
-        <pre class="bg-pre">{view?.error_message ?? 'No detail persisted (check launcher logs).'}</pre>
+        <pre class="sb-pre">{view?.error_message ?? 'No detail persisted (check launcher logs).'}</pre>
       </div>
       {#if view?.log_tail}
-        <div class="bg-expand-row">
+        <div class="sb-expand-row">
           <strong>Log tail</strong>
-          <pre class="bg-pre">{view.log_tail}</pre>
+          <pre class="sb-pre">{view.log_tail}</pre>
         </div>
       {/if}
     {/snippet}

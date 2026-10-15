@@ -20,6 +20,7 @@
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
   import SettingsTab from '$lib/project-state/SettingsTab.svelte';
+  import { createLoader } from '$lib/project-state/load-controller';
   import type { ProjectView } from '$lib/types/launcher';
 
   let projectId = $derived($page.params.id);
@@ -34,14 +35,20 @@
   // no timeout, so a slow-but-valid load is never cut off.
   let loadError = $state<string | null>(null);
 
+  // v0.2.103 (review R8 m1): the lifecycle lives in the tested
+  // `createLoader` controller; this mirrors it into $state.
+  const headerLoader = createLoader<ProjectView>(
+    () => invoke<ProjectView>('get_project_v2', { id: projectId }),
+    (e) => toast.error(e),
+  );
+  headerLoader.subscribe(() => {
+    const s = headerLoader.get();
+    project = s.value;
+    loadError = s.error;
+  });
+
   async function loadHeader() {
-    loadError = null;
-    try {
-      project = await invoke<ProjectView>('get_project_v2', { id: projectId });
-    } catch (e) {
-      loadError = e instanceof Error ? e.message : String(e);
-      toast.error(e);
-    }
+    await headerLoader.retry();
   }
 
   onMount(loadHeader);
@@ -64,7 +71,21 @@
        `project` (which is loaded from the same id) gives us a real
        string AND avoids an extra "loading" state inside SettingsTab. -->
   {#if project}
-    <SettingsTab projectId={project.id} />
+    <!-- v0.2.103 (review R8 M2): defense in depth — SettingsTab carries
+         its own boundary; this one catches a throw from this route's own
+         render path so nothing here can go silently blank either. -->
+    <svelte:boundary>
+      {#snippet failed(error, reset)}
+        <div class="ps-load-error">
+          <p class="ps-empty">
+            The Settings page failed to render:
+            {error instanceof Error ? error.message : String(error)}
+          </p>
+          <button class="ps-retry-btn" onclick={() => reset()}>Try again</button>
+        </div>
+      {/snippet}
+      <SettingsTab projectId={project.id} />
+    </svelte:boundary>
   {:else if loadError}
     <div class="ps-load-error">
       <p class="ps-empty">Couldn't load this project's settings: {loadError}</p>

@@ -236,7 +236,7 @@
       {#if view?.status === 'failed'}
         <button
           type="button"
-          class="bg-btn-secondary"
+          class="sb-btn-secondary"
           onclick={() => (expanded = !expanded)}
           aria-expanded={expanded}
         >
@@ -244,7 +244,7 @@
         </button>
         <button
           type="button"
-          class="bg-btn-primary"
+          class="sb-btn-primary"
           onclick={rerun}
           disabled={rerunning}
         >
@@ -258,7 +258,7 @@
       {#if view?.status === 'partial'}
         <button
           type="button"
-          class="bg-btn-primary"
+          class="sb-btn-primary"
           onclick={rerun}
           disabled={rerunning}
         >
@@ -275,7 +275,7 @@
                carries the manual drop command). Never auto-drops. -->
           <button
             type="button"
-            class="bg-btn-secondary"
+            class="sb-btn-secondary"
             onclick={() => (showReanalysis = true)}
           >
             Drop &amp; rebuild…
@@ -285,7 +285,7 @@
       {#if view?.status === 'success' || view?.status === 'skipped' || view?.status === 'partial'}
         <button
           type="button"
-          class="bg-btn-x"
+          class="sb-btn-x"
           aria-label="Dismiss banner"
           onclick={() => (dismissed = true)}
         >×</button>
@@ -293,14 +293,14 @@
     {/snippet}
 
     {#snippet expandedContent()}
-      <div class="bg-expand-row">
+      <div class="sb-expand-row">
         <strong>Error</strong>
-        <pre class="bg-pre">{view?.error_message ?? 'No error message persisted (check launcher logs).'}</pre>
+        <pre class="sb-pre">{view?.error_message ?? 'No error message persisted (check launcher logs).'}</pre>
       </div>
       {#if view?.log_tail}
-        <div class="bg-expand-row">
+        <div class="sb-expand-row">
           <strong>Log tail</strong>
-          <pre class="bg-pre">{view.log_tail}</pre>
+          <pre class="sb-pre">{view.log_tail}</pre>
         </div>
       {/if}
     {/snippet}

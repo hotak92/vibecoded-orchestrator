@@ -192,7 +192,7 @@
                     <h3>{server.name}</h3>
                     <p class="service-desc">{server.description}</p>
                     {#if isContainerService(server.command)}
-                      <span class="service-badge container">Container</span>
+                      <span class="service-badge containerized">Container</span>
                     {:else}
                       <span class="service-badge process">Process</span>
                     {/if}
@@ -411,7 +411,7 @@
     font-weight: 500;
     margin-right: 6px;
   }
-  .service-badge.container { background: rgba(0, 191, 166, 0.1); color: var(--color-teal); }
+  .service-badge.containerized { background: rgba(0, 191, 166, 0.1); color: var(--color-teal); }
   .service-badge.process { background: rgba(123, 95, 255, 0.1); color: var(--color-purple); }
   .service-badge.port { background: rgba(255, 255, 255, 0.05); color: var(--color-mid); }
 

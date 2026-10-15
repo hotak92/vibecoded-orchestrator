@@ -57,6 +57,12 @@
     eventKey,
     type InstallLogView,
   } from './install-log-panel';
+  // v0.2.103 (review R8 M1): pure add/refuse logic for the env-notes
+  // scratch list — a duplicate key must never reach the keyed each.
+  import { addEnvNote } from './env-notes';
+  // v0.2.103 (review R8 m1): the load/retry lifecycle, tested with a
+  // fake invoke — the template keeps only thin $state bindings.
+  import { createLoader } from './load-controller';
 
   // Move types are declared HERE rather than in `$lib/types/launcher.ts`
   // because this is their only consumer today. The plan itself is produced by
@@ -125,7 +131,9 @@
   // v0.2.103: a failed `get_project_v2` used to leave this tab on a
   // silent, infinite "Loading…" (the catch only toasted). The error is
   // now state, rendered inline with a Retry — never a timeout, so a
-  // slow-but-valid load is never cut off.
+  // slow-but-valid load is never cut off. The lifecycle itself lives in
+  // the unit-tested `createLoader` controller (review R8 m1); this
+  // subscription just mirrors it into the template's $state.
   let loadError = $state<string | null>(null);
   let newName = $state('');
   let saving = $state(false);
@@ -180,15 +188,19 @@
     !!project && unregisterConfirmText === project.name && !unregistering,
   );
 
+  const projectLoader = createLoader<ProjectView>(
+    () => invoke<ProjectView>('get_project_v2', { id: projectId }),
+    (e) => toast.error(e),
+  );
+  projectLoader.subscribe(() => {
+    const s = projectLoader.get();
+    project = s.value;
+    loadError = s.error;
+    if (s.value) newName = s.value.name;
+  });
+
   async function load() {
-    loadError = null;
-    try {
-      project = await invoke<ProjectView>('get_project_v2', { id: projectId });
-      newName = project?.name ?? '';
-    } catch (e) {
-      loadError = e instanceof Error ? e.message : String(e);
-      toast.error(e);
-    }
+    await projectLoader.retry();
   }
 
   // ─── v0.2.102 (W5-B C8): Install log panel ─────────────────────────────
@@ -297,7 +309,15 @@
 
   function addEnv() {
     if (!newEnvKey.trim()) return;
-    envEntries = [...envEntries, { key: newEnvKey.trim().toUpperCase(), value: newEnvValue }];
+    // v0.2.103 (review R8 M1): refuse a duplicate key visibly — two rows
+    // with the same key would collide in the keyed each below, the same
+    // each_key_duplicate throw that broke the install-log tail.
+    const res = addEnvNote(envEntries, newEnvKey, newEnvValue);
+    if (res.refused) {
+      toast.error(res.refused);
+      return;
+    }
+    envEntries = res.entries;
     newEnvKey = '';
     newEnvValue = '';
   }
@@ -576,6 +596,22 @@
     if (projectId) void load();
   });
 </script>
+
+<!-- v0.2.103 (review R8 M2): a render-time throw anywhere below used to
+     abort the flush and leave the stale "Loading…" DOM in place — exactly
+     how the v0.2.102 install-log key crash presented. The boundary turns
+     every such throw into a visible error with a reset, so the class of
+     bug can never be silent again. -->
+<svelte:boundary>
+  {#snippet failed(error, reset)}
+    <div class="ps-load-error">
+      <p class="ps-empty">
+        The Settings tab failed to render:
+        {error instanceof Error ? error.message : String(error)}
+      </p>
+      <button class="ps-btn-primary" onclick={() => reset()}>Try again</button>
+    </div>
+  {/snippet}
 
 {#if !project}
   {#if loadError}
@@ -891,7 +927,11 @@
       <table class="ps-table">
         <thead><tr><th>KEY</th><th>Notes / placeholder</th><th></th></tr></thead>
         <tbody>
-          {#each envEntries as e, i (e.key)}
+          <!-- Keyed by POSITION, not by e.key: the key is unique by
+               construction (addEnvNote refuses duplicates) and an index
+               key can never collide even if that guard is ever bypassed
+               (review R8 M1 — same crash class as the install-log tail). -->
+          {#each envEntries as e, i (i)}
             <tr>
               <td><code>{e.key}</code></td>
               <td><input bind:value={envEntries[i].value} /></td>
@@ -1066,6 +1106,7 @@
   projectName={project?.name ?? ''}
   onDecide={onStopDecided}
 />
+</svelte:boundary>
 
 <style>
   .ps-empty { padding: 40px; text-align: center; color: #888; }

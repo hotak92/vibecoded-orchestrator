@@ -64,14 +64,14 @@
       {#if item.command}
         <button
           type="button"
-          class="bg-btn-primary"
+          class="sb-btn-primary"
           data-testid="move-banner-copy"
           onclick={() => copy(item.command ?? '')}
         >Copy command</button>
       {/if}
       <button
         type="button"
-        class="bg-btn-x"
+        class="sb-btn-x"
         aria-label="Dismiss banner"
         data-testid="move-banner-dismiss"
         onclick={() => dismiss(item.moveId)}

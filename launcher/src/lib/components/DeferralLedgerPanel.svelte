@@ -201,7 +201,12 @@
       <p class="dl-group-note">{groupNote}</p>
     {/if}
     <ul class="dl-list">
-      {#each groups.actionNeeded as e (e.condition_id)}
+      <!-- v0.2.103 (review R8 m2): the key carries the position. Only the
+           Python writer keeps condition_id unique; a hand-edited or
+           merge-damaged UPDATE_DEFERRED sidecar can repeat one, and a
+           colliding key throws each_key_duplicate (crashing the whole
+           Settings tab). Same for the records group below. -->
+      {#each groups.actionNeeded as e, ei (e.condition_id + ":" + ei)}
         {@render entryCard(e)}
       {/each}
     </ul>
@@ -213,7 +218,7 @@
         Records / by-design ({groups.records.length}) — nothing to do
       </summary>
       <ul class="dl-list">
-        {#each groups.records as e (e.condition_id)}
+        {#each groups.records as e, ei (e.condition_id + ":" + ei)}
           {@render entryCard(e)}
         {/each}
       </ul>
