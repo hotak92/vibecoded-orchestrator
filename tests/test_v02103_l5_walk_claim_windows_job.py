@@ -181,9 +181,26 @@ sys.exit(0)
 
 
 def _pid_alive(pid: int) -> bool:
-    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                         capture_output=True, text=True, check=False).stdout
-    return str(pid) in out
+    """Kernel-level liveness (OpenProcess + GetExitCodeProcess): `tasklist`
+    output is localized and, without a console, came back as None."""
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.GetExitCodeProcess.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False  # gone (or never existed)
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
 
 
 def _wait(pred, secs: float) -> bool:
@@ -212,7 +229,8 @@ def win_walk(tmp_path, monkeypatch):
     pid_file = tmp_path / "child.pid"
     procs: list = []
     env = dict(os.environ, FAKE_PID_FILE=str(pid_file), VCT_STATE_DIR=str(state),
-               PYTHONPATH=str(REPO_ROOT))
+               PYTHONPATH=os.pathsep.join(
+                   p for p in (str(REPO_ROOT), os.environ.get("PYTHONPATH", "")) if p))
 
     def start(project: str = "ProjWinL5"):
         proc = subprocess.Popen(

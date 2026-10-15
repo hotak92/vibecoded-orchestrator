@@ -1016,3 +1016,29 @@ def test_main_never_prints_clean_over_a_missing_vector_skip(
     )
     assert "⚠️" in printed and "PARTIAL" in printed
     assert "'Legacy Node'" in printed
+
+
+def test_every_object_lacking_the_target_vector_names_both_counts_in_the_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.2.103 Windows verification (the launcher's scan on a collection
+    embedded under another profile): every node lacked the target slot, so
+    nothing was compared and the scan failed, as designed. The message the
+    user saw printed a literal ``{self.nodes_skipped}``: one line of the
+    message had lost its f-prefix. RED before the fix."""
+    _pin_active_embedding(monkeypatch, "qwen3")
+    mod = _load(SCANNER)
+    nodes = _nodes(3)
+    for n in nodes:
+        n.vector = {"openai_embed": [0.3, 0.4]}
+    coll = _Collection(
+        MULTI_VECTOR, nodes=nodes,
+        still_present_failures={str(n.uuid) for n in nodes},
+    )
+
+    _duplicates, det = _scan(mod, coll)
+
+    assert det.scan_error is not None
+    assert "{" not in det.scan_error, det.scan_error
+    assert "(0 disappeared" in det.scan_error
+    assert "3 lack the target vector 'qwen3_embed'" in det.scan_error

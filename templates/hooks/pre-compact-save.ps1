@@ -193,7 +193,7 @@ if (-not (Test-Path $SentinelDir)) {
     New-Item -ItemType Directory -Path $SentinelDir -Force | Out-Null
 }
 try {
-    [int][double]::Parse((Get-Date -UFormat %s)) | Set-Content -Path $Sentinel -Encoding ascii
+    [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() | Set-Content -Path $Sentinel -Encoding ascii
 } catch {
     # Fallback: at minimum ensure the file exists so the MCP picks it up.
     New-Item -ItemType File -Path $Sentinel -Force | Out-Null

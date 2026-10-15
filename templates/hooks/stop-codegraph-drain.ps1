@@ -115,7 +115,7 @@ if ($env:VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS -match '^\d+$') {
 }
 if (Test-Path -LiteralPath $stateDir -PathType Container) {
     $extrasTsFile = Join-Path $stateDir "codegraph_extras_check.ts"
-    $extrasNow = [int][double]::Parse((Get-Date -UFormat %s))
+    $extrasNow = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $extrasLast = 0
     if (Test-Path -LiteralPath $extrasTsFile) {
         try {
@@ -174,7 +174,10 @@ if (-not (Test-Path -LiteralPath $queue) -and -not (Test-Path -LiteralPath $shar
 
 # --- RATE LIMIT ---
 $lastTsFile = Join-Path $stateDir "codegraph_drain_last_sync.ts"
-$now = [int][double]::Parse((Get-Date -UFormat %s))
+# True UTC unix seconds on every edition. `Get-Date -UFormat %s` is LOCAL
+# time on Windows PowerShell 5.1 (measured on an it-IT host: +7200 s), which
+# skewed every stamp the .sh sibling and Python read (v0.2.103 Windows run).
+$now = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $lastTs = 0
 if (Test-Path -LiteralPath $lastTsFile) {
     try {
