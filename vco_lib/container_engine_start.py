@@ -343,8 +343,8 @@ def ensure_engine(
       * idempotent — the engine already answering (resolver state RESOLVED)
         is a no-op returning ``(True, "engine already up")``;
       * only a RECORDED engine (R19 F1) — starting requires the install to
-        have recorded a runtime (``state/install/runtime.txt`` — what
-        ``install.py --container`` writes — or the ``VCT_CONTAINER_RUNTIME``
+        have recorded a runtime (``state/install/runtime.txt`` — written by every
+        install that detected a runtime — or the ``VCT_CONTAINER_RUNTIME``
         env pin). With NO recorded runtime nothing is started, never the
         first binary on PATH, and never an unattended ``podman machine
         init``; and an install that chose ``--no-containers`` (persisted in

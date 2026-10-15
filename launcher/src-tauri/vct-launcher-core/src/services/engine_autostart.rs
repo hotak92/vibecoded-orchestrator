@@ -14,8 +14,8 @@
 //!
 //! The spawn is fire-and-forget by contract: stdio is null, nothing is
 //! waited on, and the child is detached from the caller's process group
-//! (POSIX `setsid` via the pre-exec hook, Windows
-//! `DETACHED_PROCESS | CREATE_NO_WINDOW`), so a kill aimed at the caller
+//! (POSIX `setsid` via the pre-exec hook; Windows `CREATE_NO_WINDOW`
+//! only — never `DETACHED_PROCESS`, which flashes a console), so a kill aimed at the caller
 //! (hub restart, launcher quit, a hook timeout) cannot cut a legitimate
 //! engine boot short. The CLI does its own bounded liveness wait — never a
 //! cap that kills work.
@@ -315,7 +315,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    // Linux only: the zombie is observed through /proc, which macOS/BSD do
+    // not have — there the test would pass without checking anything.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_exited_child_is_reaped_not_left_a_zombie() {
         // R19 F6 / R21 L2: `setsid` detaches the child's SESSION, not its
@@ -352,7 +354,7 @@ mod tests {
 
     /// /proc/<pid>/stat field 3 (state), parsed after the last `)` because
     /// the comm field (field 2) is parenthesised and may contain spaces.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn proc_state(stat: &str) -> &str {
         stat.rsplit_once(')')
             .and_then(|(_, tail)| tail.split_whitespace().next())
