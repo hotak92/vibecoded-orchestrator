@@ -27,7 +27,8 @@ Extracted from the analyzer monolith (P2f line-count ratchet:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+import shlex
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ def prune_collection(
     language_scope: str = "",
     preserve_paths: Optional[Set[Any]] = None,
     preserve_sources: Optional[Set[str]] = None,
-    orphan_resolver: Optional[Callable[[Any, Any], Optional[str]]] = None,
+    reap_orphans: bool = False,
 ) -> Tuple[int, int]:
     """Delete every object in ``collection`` whose project matches
     ``project_name`` AND whose UUID is not in ``visited_uuids``.
@@ -99,20 +100,24 @@ def prune_collection(
     failure increments a counter that propagates to the run's exit status
     and the machine-readable ``PRUNE_FAILURES=N`` summary line.
 
-    v0.2.103 (defect 7 — orphan reaping): ``orphan_resolver`` is the
-    FULL-WALK-only provability hook for anchor-less rows. A row whose anchor
-    value is empty while skips are in play used to be preserved
+    v0.2.103 (defect 7 — orphan reaping; R12-F1/F2/F3): ``reap_orphans`` is
+    the FULL-WALK-only switch for provably-dead anchor-less rows. A row whose
+    anchor value is empty while skips are in play used to be preserved
     unconditionally — correct for skipped files' rows, but it also made
-    pre-v0.2.82 orphan CodeInteraction rows (no ``file_path``, no resolvable
-    source reference) immortal: every real walk has skips, so they survived
-    every prune. When a resolver is supplied, an anchor-less row is judged
-    by it BEFORE the conservative preserve: a resolved path → preserved
-    (the anchor backfill converges it); ``""`` (positively unresolvable) →
-    PROVABLY orphaned → deleted; ``None``/raise (unknown) → preserved.
-    Deletion is DEFERRED until the enumeration completes — an enumeration
-    failure mid-scan deletes nothing (conservative default). The caller
-    supplies the resolver only for a full, unscoped ``--prune-stale`` walk
-    and only for the collection that owns the orphan class.
+    pre-v0.2.82 orphan CodeInteraction rows (no ``file_path``, no reference
+    at all, or only dangling ones) immortal: every real walk has skips, so
+    they survived every prune. When ``reap_orphans`` is on, an anchor-less
+    row is judged by the ONE shared predicate
+    (:func:`vco_lib.codegraph_resync.is_provable_codegraph_orphan` — the
+    same function the convergence probe counts with, called with the row's
+    UUID STRING and this prune's ``project_name`` / ``preserve_sources``):
+    provable → deferred for deletion; anchored / unknown / filtered-out →
+    preserved (never delete a row that is not provably dead). Deletion is
+    DEFERRED until the enumeration completes — an enumeration failure
+    mid-scan deletes nothing (conservative default). The caller enables it
+    only for a full, unscoped ``--prune-stale`` walk that covered every
+    enabled extra folder, and only for the collection that owns the orphan
+    class.
     """
     pruned = 0
     failures = 0
@@ -122,6 +127,13 @@ def prune_collection(
     keyed = {e for e in preserve_paths if isinstance(e, tuple)}
     bare = {e for e in preserve_paths if not isinstance(e, tuple)}
     orphan_candidates: List[str] = []
+    _is_provable_orphan = None
+    if reap_orphans:
+        # ONE predicate, imported lazily so the prune module stays importable
+        # standalone (the expand_preserve_entries precedent).
+        from vco_lib.codegraph_resync import is_provable_codegraph_orphan
+
+        _is_provable_orphan = is_provable_codegraph_orphan
 
     # v0.2.82 — resolve the file-anchor property for this collection:
     # CodeModule keys files on `path`; every other file-anchored
@@ -198,26 +210,25 @@ def prune_collection(
                 elif preserve_paths:
                     # Anchored collection but this row has no value
                     # (legacy). With skips in play we lack provenance —
-                    # preserve rather than guess, UNLESS the resolver can
-                    # POSITIVELY prove the row orphaned (v0.2.103 defect 7).
-                    if orphan_resolver is not None:
+                    # preserve rather than guess, UNLESS the ONE shared
+                    # predicate POSITIVELY proves the row dead (v0.2.103
+                    # defect 7 / R12-F1: the row's UUID STRING is what the
+                    # predicate fetches by).
+                    if _is_provable_orphan is not None:
                         try:
-                            resolved = orphan_resolver(collection, obj)
+                            provable = _is_provable_orphan(
+                                collection, str(obj.uuid), props,
+                                project_name=project_name,
+                                preserve_sources=preserve_sources,
+                            )
                         except Exception as exc:  # noqa: BLE001 — unknown → keep
                             logger.debug(
-                                "orphan resolve on %s/%s failed: %s",
+                                "orphan predicate on %s/%s failed: %s",
                                 collection.name, obj.uuid, exc,
                             )
-                            resolved = None
-                        if resolved is not None:
-                            if resolved:
-                                # Anchored by reference: the anchor backfill
-                                # PATCHes file_path from it — leave it to
-                                # converge, never delete on this evidence.
-                                preserved += 1
-                                continue
-                            # "" — positively unresolvable: a provable
-                            # orphan. Deferred: deleted below ONLY after the
+                            provable = False
+                        if provable:
+                            # Deferred: deleted below ONLY after the
                             # enumeration completed (a mid-scan failure must
                             # authorise nothing).
                             orphan_candidates.append(str(obj.uuid))
@@ -357,32 +368,49 @@ PRUNE_REMEDY_URL_DEFAULT = "http://localhost:8081"
 
 
 def format_prune_remedy_lines(
-    failing_collections: Optional[Iterable[str]],
+    failing_collections: Optional[Mapping[str, int]],
     project_name: str,
+    *,
+    total_failures: int = 0,
 ) -> List[str]:
     """The drop-and-rebuild remedy lines for the PRUNE_FAILURES block.
 
     Plan item 24 (a printed command is shipped code): ONE curl line per
     collection that actually had a prune failure, with its REAL full class
     name (``<Prefix>_<Class>`` — the collection name IS the schema path), and
-    ONE re-run line with the REAL ``--project`` name. When no per-collection
-    attribution exists (a producer that could not attribute), the curl line
-    keeps the placeholder form rather than guessing a class. The
-    never-automatic / consent-flow wording lives at the call site.
+    ONE re-run line with the REAL ``--project`` name (shell-quoted, R12-F7 —
+    a project name with a space must survive copy-paste).
+
+    R12-F6: when ``total_failures`` exceeds the attributed sum, the
+    UNATTRIBUTED remainder keeps the placeholder line (with its count) so a
+    mixed run never silently drops a collection from the remedy — the
+    producers that cannot attribute per collection still bump the total.
+    The never-automatic / consent-flow wording lives at the call site.
     """
-    names = sorted({n for n in (failing_collections or []) if n})
-    if names:
-        targets = [
-            f'"${{WEAVIATE_URL:-{PRUNE_REMEDY_URL_DEFAULT}}}/v1/schema/{n}"'
-            for n in names
-        ]
-    else:
-        targets = [
-            f'"${{WEAVIATE_URL:-{PRUNE_REMEDY_URL_DEFAULT}}}'
-            '/v1/schema/<Prefix>_<Class>"'
-        ]
-    lines = [f"   curl -X DELETE {t}   # then re-run analysis" for t in targets]
-    project = project_name or "<name>"
+    per_coll: Dict[str, int] = {
+        str(n): int(c) for n, c in (failing_collections or {}).items() if n
+    }
+    names = sorted(per_coll)
+    lines = [
+        f"   curl -X DELETE \"${{WEAVIATE_URL:-{PRUNE_REMEDY_URL_DEFAULT}}}"
+        f"/v1/schema/{n}\"   # then re-run analysis"
+        for n in names
+    ]
+    unattributed = max(0, int(total_failures) - sum(per_coll.values()))
+    if unattributed or not names:
+        # R12-F6: failures no producer could attribute keep the placeholder
+        # (with their count) rather than vanishing from the remedy.
+        line = (
+            f"   curl -X DELETE \"${{WEAVIATE_URL:-{PRUNE_REMEDY_URL_DEFAULT}}}"
+            "/v1/schema/<Prefix>_<Class>\"   # then re-run analysis"
+        )
+        if unattributed:
+            line += (
+                f"   # plus {unattributed} failure(s) not attributed to a "
+                "collection"
+            )
+        lines.append(line)
+    project = shlex.quote(project_name) if project_name else "<name>"
     lines.append(
         f"   .claude/scripts/code-graph-analyze . --project {project} --prune-stale"
     )

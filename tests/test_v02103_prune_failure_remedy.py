@@ -59,7 +59,8 @@ def analyzer_mod() -> types.ModuleType:
 # ── the formatter (pure) ────────────────────────────────────────────────────
 
 def test_one_failing_collection_names_it_not_codefunction():
-    lines = format_prune_remedy_lines(["Acme_CodeInteraction"], "Acme")
+    lines = format_prune_remedy_lines({"Acme_CodeInteraction": 2}, "Acme",
+                                      total_failures=2)
     curl_lines = [ln for ln in lines if "curl" in ln]
     assert len(curl_lines) == 1, f"exactly one curl line; got {lines}"
     assert "/v1/schema/Acme_CodeInteraction" in curl_lines[0]
@@ -73,7 +74,8 @@ def test_one_failing_collection_names_it_not_codefunction():
 
 def test_two_failing_collections_get_two_lines():
     lines = format_prune_remedy_lines(
-        ["Acme_CodeInteraction", "Acme_CodeFunction"], "Acme")
+        {"Acme_CodeInteraction": 1, "Acme_CodeFunction": 1}, "Acme",
+        total_failures=2)
     curl_lines = [ln for ln in lines if "curl" in ln]
     assert len(curl_lines) == 2
     named = {ln.split("/v1/schema/")[1].split('"')[0] for ln in curl_lines}
@@ -81,13 +83,40 @@ def test_two_failing_collections_get_two_lines():
 
 
 def test_unattributed_failures_keep_the_placeholder_not_a_guess():
-    lines = format_prune_remedy_lines([], "Acme")
+    """R12-F6: when NOTHING is attributed, the placeholder line is the only
+    curl — and it carries the count it stands for."""
+    lines = format_prune_remedy_lines({}, "Acme", total_failures=3)
     curl_lines = [ln for ln in lines if "curl" in ln]
     assert len(curl_lines) == 1 and "<Prefix>_<Class>" in curl_lines[0]
+    assert "3 failure(s) not attributed" in curl_lines[0]
     assert "--project Acme" in lines[-1], (
         "the project name IS known in main() — never a placeholder there"
     )
     assert PRUNE_REMEDY_URL_DEFAULT in curl_lines[0]
+
+
+def test_mixed_attribution_keeps_both_the_real_and_the_placeholder_lines():
+    """R12-F6 (the review's scenario): 2 failures attributed to
+    CodeInteraction PLUS 5 unattributed — the remedy must print the real
+    curl AND the placeholder with the unattributed count, never silently
+    drop the unattributed collection."""
+    lines = format_prune_remedy_lines({"Acme_CodeInteraction": 2}, "Acme",
+                                      total_failures=7)
+    curl_lines = [ln for ln in lines if "curl" in ln]
+    assert len(curl_lines) == 2
+    real = [ln for ln in curl_lines if "Acme_CodeInteraction" in ln]
+    placeholder = [ln for ln in curl_lines if "<Prefix>_<Class>" in ln]
+    assert len(real) == 1 and len(placeholder) == 1
+    assert "5 failure(s) not attributed" in placeholder[0]
+
+
+def test_project_name_is_shell_quoted():
+    """R12-F7: a project name with a space must survive copy-paste."""
+    lines = format_prune_remedy_lines({"A_B": 1}, "My Project",
+                                      total_failures=1)
+    assert lines[-1] == (
+        "   .claude/scripts/code-graph-analyze . --project 'My Project' --prune-stale"
+    )
 
 
 # ── the ledger (record_prune_failures) ──────────────────────────────────────

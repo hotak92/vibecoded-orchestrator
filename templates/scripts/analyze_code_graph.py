@@ -479,8 +479,6 @@ try:
         reconcile_walked_file_rows as _reconcile_walked_file_rows,
         open_walked_file_scope as _open_scope,
         commit_walked_file_scope as _commit_scope,
-        # v0.2.103 (defect 7): the orphan provability primitive.
-        resolve_codegraph_anchor as _resolve_codegraph_anchor,
     )
     # v0.2.77 Part 5 (CG-2): ONE facade for cross-language call extraction.
     # Dependency-free to import (tree-sitter grammars are lazy-loaded inside
@@ -499,6 +497,7 @@ try:
     from vco_lib.codegraph_schema import (  # v0.2.102: one ensure loop + backfill
         backfill_missing_property as _backfill_missing_property,
         ensure_analyzer_properties as _ensure_analyzer_properties,
+        ensure_codegraph_file_path as _ensure_file_path_property_shared,
     )
     from vco_lib.codegraph_deleted_files import (  # v0.2.100: deleted-file prune
         FILE_ANCHORED_COLLECTIONS as _FILE_ANCHORED_COLLECTIONS, PruneReport as _PruneReport,
@@ -3247,42 +3246,17 @@ class CodeGraphAnalyzer:
         deleted-file sweep + prune anchor resolution can reap orphaned rows of
         removed files (preserve-all before, since anchor-less). ``file_path`` is
         in ``_CONTENT_HASH_EXCLUDE`` → stamping never perturbs a content hash →
-        zero re-write of matched rows. Analyzer-only (NOT in codegraph_schema.py,
-        which owns only migration-edge props — file_path predates it, parity
-        scope excludes it). Legacy anchor-less rows converge on next file change
-        (DEFERRAL D3).
+        zero re-write of matched rows. Legacy anchor-less rows converge on next
+        file change (DEFERRAL D3).
+
+        v0.2.103 (R12-F8): ONE home — this delegates to
+        ``vco_lib.codegraph_schema.ensure_codegraph_file_path`` (the shared
+        spec + loop, also used by the resync metadata backfill); the analyzer's
+        former inline copy of both is GONE.
         """
-        collections = [
-            ("CodeFunction",    self.functions_collection),
-            ("CodeClass",       self.classes_collection),
-            ("CodeAPI",         self.apis_collection),
-            ("CodeInteraction", self.interactions_collection),
-        ]
-        desc = (
-            "Repo-relative POSIX path of the source file "
-            "(mirrors CodeModule.path)"
-        )
-        for label, coll in collections:
-            if coll is None:
-                continue
-            try:
-                config = coll.config.get()
-                existing_props = {p.name for p in config.properties}
-                if "file_path" in existing_props:
-                    continue
-                coll.config.add_property(
-                    Property(
-                        name="file_path",
-                        data_type=DataType.TEXT,
-                        description=desc,
-                        skip_vectorization=True,
-                    )
-                )
-                print(f"   Added file_path property to {label} schema (v0.2.52)")
-            except Exception as e:
-                logger.debug(
-                    f"v0.2.52 file_path migration on {label} skipped: {e}"
-                )
+        if self.client is None:
+            return
+        _ensure_file_path_property_shared(self.client, self.project_prefix)
 
     def _ensure_content_hash_property(self):
         """v0.2.61 (Track E) schema migration: add `content_hash` (TEXT) to all
@@ -3491,6 +3465,11 @@ class CodeGraphAnalyzer:
         # extra doesn't wedge the whole analyze.
         canonical_extras: List[Path] = []
         self._refused_extra_sources: Set[str] = set()  # W6-CGD D-4: nested extras, rows kept
+        # v0.2.103 (R12-F2): extras DROPPED this run (unresolvable, offline or
+        # unmounted) — their rows' provenance is missing, so the orphan
+        # reaping is disabled for the whole run (delete nothing on a walk that
+        # did not cover every enabled extra folder).
+        self._dropped_extra_sources: Set[str] = set()
         for extra in (extra_paths or []):
             try:
                 resolved = extra.resolve()
@@ -3499,12 +3478,14 @@ class CodeGraphAnalyzer:
                     f"⚠️  Extra path {extra} could not be resolved: {exc} — skipping",
                     file=sys.stderr,
                 )
+                self._dropped_extra_sources.add(extra.as_posix())
                 continue
             if not resolved.exists() or not resolved.is_dir():
                 print(
                     f"⚠️  Extra path {resolved} does not exist or is not a directory — skipping",
                     file=sys.stderr,
                 )
+                self._dropped_extra_sources.add(extra.as_posix())
                 continue
             _ov = _extra_overlap(resolved.as_posix(), repo_path.as_posix())
             if _ov.refused:  # overlaps the project: not walked, and --prune-stale keeps its rows
@@ -4071,9 +4052,14 @@ class CodeGraphAnalyzer:
                 f"language={scope_lang!r} entries not visited this run"
             )
 
-        # v0.2.103 (defect 7): the orphan provability hook — FULL walks only
-        # (a scoped prune is partial) and the CodeInteraction class only.
-        orphan_resolver = None if scope_lang else _resolve_codegraph_anchor
+        # v0.2.103 (defect 7 / R12-F2): orphan reaping needs a FULL, unscoped
+        # walk that COVERED every enabled extra folder — a refused extra, or
+        # one dropped as offline/unmounted/unresolvable, means provenance is
+        # missing for its rows → delete nothing this run (conservative).
+        _extras_uncertain = bool(
+            getattr(self, "_refused_extra_sources", None)
+        ) or bool(getattr(self, "_dropped_extra_sources", None))
+        _reap_orphans = not scope_lang and not _extras_uncertain
 
         for coll in collections:
             if coll is None:
@@ -4083,7 +4069,7 @@ class CodeGraphAnalyzer:
                 coll, visited, language_scope=scope_lang,
                 preserve_paths=preserve_paths,
                 preserve_sources=getattr(self, "_refused_extra_sources", None),
-                orphan_resolver=orphan_resolver if coll.name.endswith("_CodeInteraction") else None,
+                reap_orphans=_reap_orphans if coll.name.endswith("_CodeInteraction") else False,
             )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
@@ -4108,7 +4094,7 @@ class CodeGraphAnalyzer:
         language_scope: str = "",
         preserve_paths: Optional[Set[Any]] = None,
         preserve_sources: Optional[Set[str]] = None,
-        orphan_resolver=None,
+        reap_orphans: bool = False,
     ) -> Tuple[int, int]:
         """Thin shim over ``vco_lib.codegraph_prune.prune_collection`` (the
         v0.2.82 extraction — full semantics, history and the 2026-07-15
@@ -4123,7 +4109,7 @@ class CodeGraphAnalyzer:
             language_scope=language_scope,
             preserve_paths=preserve_paths,
             preserve_sources=preserve_sources,
-            orphan_resolver=orphan_resolver,
+            reap_orphans=reap_orphans,
         )
 
     def _single_file_dispatch(
@@ -6892,7 +6878,8 @@ def main():
                 "rebuild the affected collection from scratch via the launcher's "
                 "Reanalyze (drop-and-rebuild) consent flow, e.g.:\n"
                 + "\n".join(_format_prune_remedy_lines(
-                    stats.get("prune_failure_collections"), project_name))
+                    stats.get("prune_failure_collections"), project_name,
+                    total_failures=prune_failures))
                 + "\nThe code graph is derived data, so a rebuild is cheap and "
                 "definitive — but it is NEVER done automatically.",
                 file=sys.stderr,

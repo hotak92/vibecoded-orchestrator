@@ -1395,6 +1395,26 @@ all pass it, and the dispatcher BLOCKS a stale verdict BEFORE writing the \
 STARTED row — a persistently stale image therefore burns NO retry budget and \
 the retry resumes by itself once the image is rebuilt and current."""
 
+[conditions.codegraph_orphan_interactions_pending]
+class = "action_required"
+owner = "vco_lib.codegraph_resync"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (plan item 7 / R12-F4): CodeInteraction rows written before \
+file anchors existed — no file_path, and no source reference at all (or only \
+dangling ones; a live target without a path is UNCERTAIN, never proof). \
+Provably dead, but no walk re-embeds them and the pre-fix prune preserved \
+every anchor-less row while any file was skipped, so they survived forever \
+while the convergence probe read "0 stale rows" over them. action_required, \
+NOT auto_retryable: only a manual consented `--run-resync --prune-stale` \
+walk removes them (that walk DELETES every unvisited row — a destructive, \
+user-consented action the retry engine must never take), so the WP-H \
+dispatcher can never clear it and would only burn full walks. Paired \
+resolution: the resync driver's post-walk orphan probe \
+(`count_orphan_interaction_rows` → the ONE predicate shared with the prune's \
+reaping) resolves the row on a POSITIVE zero; it is recorded after the \
+ordinary converged discharge so the exposure-heal clear is unaffected."""
+
 [conditions.residue_cleanup_pending]
 class = "action_required"
 owner = "vco_lib.knowledge_residue"

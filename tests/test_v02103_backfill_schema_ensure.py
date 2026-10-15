@@ -21,6 +21,7 @@ pre-fix code (no ensure → per-collection soft-fail → zero updates).
 from __future__ import annotations
 
 import types
+from pathlib import Path
 
 import pytest
 
@@ -217,6 +218,38 @@ def test_file_path_ensure_uses_the_shared_spec_home():
     results2 = ensure_codegraph_file_path(_client(colls), "Proj")
     assert results2 == {name: "ensured" for name in colls}
     assert all(c.added == ["file_path"] for c in colls.values())
+
+
+def test_analyzer_file_path_ensure_delegates_to_the_shared_home(monkeypatch):
+    """R12-F8: ONE home — the analyzer's ``_ensure_file_path_property`` must
+    delegate to ``codegraph_schema.ensure_codegraph_file_path`` (the spec and
+    the loop both live there; the analyzer's former inline copy is gone)."""
+    import importlib.util
+
+    analyzer_path = Path(__file__).resolve().parent.parent / \
+        "templates" / "scripts" / "analyze_code_graph.py"
+    spec = importlib.util.spec_from_file_location(
+        "_v02103_f8_analyzer", str(analyzer_path))
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    except SystemExit:
+        pytest.fail("weaviate-client not installed — CI env regression")
+
+    calls = []
+
+    def _shared(client, prefix):
+        calls.append((client, prefix))
+
+    monkeypatch.setattr(mod, "_ensure_file_path_property_shared", _shared)
+    analyzer = mod.CodeGraphAnalyzer.__new__(mod.CodeGraphAnalyzer)
+    analyzer.client = object()
+    analyzer.project_prefix = "Acme"
+    analyzer._ensure_file_path_property()
+    assert calls == [(analyzer.client, "Acme")], (
+        "the analyzer's file_path ensure must route through the ONE shared home"
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
