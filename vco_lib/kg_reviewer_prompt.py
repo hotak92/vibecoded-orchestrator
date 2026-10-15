@@ -28,15 +28,21 @@ hybrid_search, and nothing recorded which revision a node reflected):
 * :func:`citing_nodes` — a DETERMINISTIC lookup handed to the prompt as
   "Nodes that cite files this commit changed": a plain-text match of the
   commit's changed project-relative paths inside ``knowledge/**/*.md``
-  (Windows-style ``\\`` separators matched too), capped (``[prompt]
-  citing_nodes_max``), with the prompt saying when the list was truncated;
+  (Windows-style ``\\`` separators matched too, on path boundaries only so
+  ``install.py`` does not match ``first-install.py``), grouped per changed
+  path, capped per path and overall (``[prompt] citing_nodes_max``) with
+  UNLOCKED nodes listed before locked/archived ones (the guard's own
+  ``lock_reason`` decides), the prompt reporting the truncation per path;
+  symlinks, non-regular files and files over ``citing_nodes_max_bytes``
+  are skipped, and a shallow clone reports "changed paths unknown";
 * prompt rules — a node created or extended from a document records its
-  source path and commit ("``Source: <path> @ <short-sha>``"); when a
-  citing node's source changed in this commit, a "``## Status after
+  source path and commit ("``Source: <path> @ <short-sha>``"), and a
+  summary of a document visibly in progress is marked a snapshot of that
+  commit (a LOCKED node never takes the snapshot marker); when a citing
+  node's source changed in this commit, a "``## Status after
   <short-sha>``" block is APPENDED (append-and-annotate — superseded lines
   kept and marked in place, never deleted or reworded; locked nodes take
-  their Proposed-change section instead); a summary of a document visibly
-  in progress is marked as a snapshot of that commit. Reconciled with the
+  their Proposed-change section instead). Reconciled with the
   no-status-tracking-nodes rule: a Status-after block annotates an EXISTING
   node with one concrete change — it is not a status-tracking node.
 
@@ -47,15 +53,18 @@ incrementally and stops at the cap, so a huge commit never buffers whole.
 """
 from __future__ import annotations
 
+import re
+import stat as _stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+from vco_lib.kg_reviewer_guard import _parse_fm, _split_frontmatter, lock_reason
 from vco_lib.kg_reviewer_model import config
 
-__all__ = ["CommitInfo", "collect_commit", "changed_paths", "citing_nodes",
-           "build_prompt"]
+__all__ = ["CommitInfo", "collect_commit", "changed_paths",
+           "PathCiters", "CitingScan", "citing_nodes", "build_prompt"]
 
 
 @dataclass(frozen=True)
@@ -159,39 +168,145 @@ def changed_paths(root: Path, sha: str) -> "List[str]":
     return paths
 
 
-def citing_nodes(project_root: Path, sha: str) -> "Tuple[List[str], int]":
-    """``(nodes, more)`` — the ``knowledge/**/*.md`` nodes whose text CITES
-    a path ``sha`` changed, and how many citing nodes the cap cut.
+@dataclass(frozen=True)
+class PathCiters:
+    """One changed path and the ``knowledge/`` nodes shown citing it."""
+    #: the changed project-relative path the nodes cite.
+    path: str
+    #: the citing nodes shown, UNLOCKED ones first (each group sorted by
+    #: node path, so the prompt is stable for one commit).
+    nodes: Tuple[str, ...]
+    #: citing nodes of THIS path not shown (cut by the per-path or the
+    #: overall cap) - the per-path truncation the prompt reports.
+    more: int
 
-    A plain-text match — the changed project-relative path, and the same
-    path with ``\\\\`` separators (node text written on Windows cites it
-    that way) — so it is deterministic and cheap: no embedding, no KG
-    query, no similarity ordering. That determinism is the point (source
-    tracking, v0.2.103): hybrid_search alone missed the node summarising a
-    report whose later revisions superseded it. The list is capped
-    (``[prompt] citing_nodes_max``) and sorted, so the prompt is stable for
-    one commit; ``more`` is 0 unless the cap cut citing nodes."""
-    cap = int(config()["prompt"]["citing_nodes_max"])
-    needles: List[str] = []
-    for rel in changed_paths(project_root, sha):
-        needles.append(rel)
-        if "/" in rel:
-            needles.append(rel.replace("/", "\\"))
-    if not needles:
-        return [], 0
+
+@dataclass(frozen=True)
+class CitingScan:
+    """What :func:`citing_nodes` found, grouped per changed path."""
+    #: one :class:`PathCiters` per changed path that has citers, in the
+    #: commit's changed-path order.
+    entries: Tuple[PathCiters, ...]
+    #: True when the changed paths could NOT be determined (a shallow
+    #: clone whose commit has no parent object) - nothing was scanned.
+    unknown: bool
+
+
+def _is_shallow(root: Path) -> bool:
+    try:
+        return _git(root, "rev-parse",
+                    "--is-shallow-repository").strip() == "true"
+    except (RuntimeError, OSError):
+        return False
+
+
+def _citer_pattern(rel: str) -> "re.Pattern[str]":
+    """The matcher for one changed path: the path (and its ``\\``-separated
+    twin, node text written on Windows) on PATH BOUNDARIES only - a
+    non-path character (or the string's edge) before, and after it neither
+    a path character nor a dot starting more path text, so ``install.py``
+    does not match ``first-install.py``, ``docs/report.md`` does not match
+    ``mydocs/report.md.bak``, and a sentence-ending period still matches."""
+    needles = [rel]
+    if "/" in rel:
+        needles.append(rel.replace("/", "\\"))
+    alts = "|".join(re.escape(n) for n in needles)
+    return re.compile(rf"(?<![\w./\\-])(?:{alts})(?![\w/\\-])(?!\.[\w/\\-])")
+
+
+def citing_nodes(project_root: Path, sha: str) -> CitingScan:
+    """The ``knowledge/**/*.md`` nodes whose text CITES a path ``sha``
+    changed, GROUPED per changed path (:class:`CitingScan`).
+
+    A plain-text match on path boundaries - the changed project-relative
+    path, and the same path with ``\\`` separators (node text written on
+    Windows cites it that way) - so it is deterministic and cheap: no
+    embedding, no KG query, no similarity ordering. That determinism is
+    the point (source tracking, v0.2.103): hybrid_search alone missed the
+    node summarising a report whose later revisions superseded it.
+
+    A hot path cannot starve the others (v0.2.103 review H1): the cap
+    (``[prompt] citing_nodes_max``) applies PER PATH and to the total, the
+    total is allocated one slot per path per round, and within a path
+    UNLOCKED nodes are listed before locked/archived ones (the guard's own
+    ``lock_reason`` decides, so the two never drift). Symlinks,
+    non-regular files (a FIFO named ``*.md`` must not hang the scan) and
+    files over ``[prompt] citing_nodes_max_bytes`` are skipped. A shallow
+    clone whose commit has no parent object cannot know its changed paths
+    (every tracked file would count as changed): ``unknown=True``,
+    nothing scanned."""
+    cfg = config()["prompt"]
+    cap = int(cfg["citing_nodes_max"])
+    max_bytes = int(cfg["citing_nodes_max_bytes"])
+    has_parent = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{sha}~1"],
+        cwd=project_root, capture_output=True).returncode == 0
+    if not has_parent and _is_shallow(project_root):
+        return CitingScan(entries=(), unknown=True)
+    patterns = [(rel, _citer_pattern(rel))
+                for rel in changed_paths(project_root, sha)]
+    if not patterns:
+        return CitingScan(entries=(), unknown=False)
     kdir = project_root / "knowledge"
     if not kdir.is_dir():
-        return [], 0
-    hits: List[str] = []
+        return CitingScan(entries=(), unknown=False)
+    found: Dict[str, List[str]] = {rel: [] for rel, _ in patterns}
+    locked: Dict[str, bool] = {}
     for path in sorted(kdir.rglob("*.md")):
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            if path.is_symlink():  # never follow a link out of the tree
+                continue
+            st = path.stat()
         except OSError:
             continue
-        if any(needle in text for needle in needles):
-            hits.append(path.relative_to(project_root).as_posix())
-    more = max(0, len(hits) - cap)
-    return hits[:cap], more
+        if not _stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            continue
+        try:
+            with path.open("rb") as fh:
+                text = fh.read(max_bytes).decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        rel_node = path.relative_to(project_root).as_posix()
+        fm_block, body = _split_frontmatter(text)
+        fm = _parse_fm(fm_block) if fm_block is not None else None
+        locked[rel_node] = lock_reason(fm, body) is not None
+        for rel, pattern in patterns:
+            if pattern.search(text):
+                found[rel].append(rel_node)
+    order = [rel for rel, _ in patterns if found[rel]]
+    if not order:
+        return CitingScan(entries=(), unknown=False)
+    ranked = {rel: sorted(found[rel], key=lambda n: (locked[n], n))
+              for rel in order}
+    # Fair allocation: one slot per path per round (a hot path fills the
+    # cap only when it is alone), each path capped at `cap` nodes itself.
+    shown: Dict[str, List[str]] = {rel: [] for rel in order}
+    taken = {rel: 0 for rel in order}
+    allocated = 0
+    while allocated < cap:
+        progressed = False
+        for rel in order:
+            if taken[rel] >= len(ranked[rel]) or taken[rel] >= cap \
+                    or allocated >= cap:
+                continue
+            shown[rel].append(ranked[rel][taken[rel]])
+            taken[rel] += 1
+            allocated += 1
+            progressed = True
+        if not progressed:
+            break
+    return CitingScan(entries=tuple(
+        PathCiters(path=rel, nodes=tuple(shown[rel]),
+                   more=len(found[rel]) - len(shown[rel]))
+        for rel in order), unknown=False)
+
+
+def _inline(path: str) -> str:
+    """A path rendered so it cannot inject prompt structure: control
+    characters (newlines included) replaced by spaces, backticks defused
+    (so the inline-code quoting holds)."""
+    return ("".join(" " if ord(c) < 32 or ord(c) == 127 else c
+                    for c in path).replace("`", "'").strip())
 
 
 def build_prompt(commit: CommitInfo, project_root: Path,
@@ -224,16 +339,29 @@ def build_prompt(commit: CommitInfo, project_root: Path,
                       f"path `{prefix}x` is the file `x` here.")
     locked_tags = ", ".join(guard["locked_tags"])
     locked_statuses = ", ".join(guard["locked_statuses"])
-    citing, citing_more = citing_nodes(project_root, commit.sha)
-    if citing:
-        cite_lines = "\n".join(f"- {rel}" for rel in citing)
-        cite_trunc = (f"\n(list truncated: {citing_more} more citing node(s) "
-                      f"not shown)" if citing_more else "")
+    scan = citing_nodes(project_root, commit.sha)
+    if scan.unknown:
+        citing_block = (
+            "The commit's changed-file list could NOT be determined (this "
+            "repository is a shallow clone and the commit's parent object "
+            "is missing), so no citing-node scan ran. Work from the Files "
+            "changed and Diff above; hybrid_search in step 2 is still the "
+            "way to find nodes by TOPIC.")
+    elif scan.entries:
+        cite_lines = "\n".join(
+            "- `{path}`: {nodes}{more}".format(
+                path=_inline(entry.path),
+                nodes=", ".join(f"`{_inline(n)}`" for n in entry.nodes),
+                more=(f" ({entry.more} more citing node(s) of this path "
+                      f"not shown)" if entry.more else ""))
+            for entry in scan.entries)
         citing_block = (
             "A deterministic text scan (not hybrid_search) found these "
             "knowledge/ nodes citing a path this commit changed - what they "
-            "say about that path may be stale after this commit:\n"
-            f"{cite_lines}{cite_trunc}")
+            "say about that path may be stale after this commit (grouped by "
+            "changed path, a cap per path and overall; nodes not locked or "
+            "archived listed first):\n"
+            f"{cite_lines}")
     else:
         citing_block = (
             "The deterministic text scan found no knowledge/ node citing a "
@@ -288,7 +416,11 @@ not configuration. Edits elsewhere are blocked and reverted.
    reflects, as a line like "Source: docs/reports/cache.md @ {commit.short}".
    When you later extend the node from a newer revision, APPEND the new
    source line and keep the earlier ones (rule 10); never reword or drop an
-   existing source line.
+   existing source line. When the document you record is visibly still in
+   progress (a draft, an open review round), mark the node's summary as a
+   snapshot of that commit: "Snapshot of <path> @ {commit.short}". A LOCKED
+   node (rule 11) never takes the snapshot marker - it takes only the
+   Proposed change section of rule 11.
 8. A node listed under "Nodes that cite files this commit changed" may state
    something this commit superseded. Read the changed file it cites and,
    when the commit changed what the node states, APPEND one section at the
@@ -297,9 +429,7 @@ not configuration. Edits elsewhere are blocked and reverted.
    stating what changed and which of the node's statements it supersedes;
    mark superseded lines IN PLACE per rule 10 - never delete or reword
    them. A LOCKED node (rule 11) takes only the Proposed change section of
-   rule 11 instead. When the cited document is visibly still in progress
-   (a draft, an open review round), mark the node's summary as a snapshot
-   of that commit: "Snapshot of <path> @ {commit.short}".
+   rule 11 instead.
 9. Never create or update "blocker", "in-progress", "TODO", "investigation"
    or other status-tracking NODES from a commit diff - a single commit is a
    partial view. (A "Status after" block appended to an EXISTING node by

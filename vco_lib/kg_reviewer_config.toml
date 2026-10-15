@@ -52,12 +52,17 @@ gateway_rungs = [
 # The diff the prompt embeds is capped; the prompt says so and tells the
 # reviewer to read the full files instead of guessing. `citing_nodes_max`
 # caps the "Nodes that cite files this commit changed" list (a plain-text
-# scan of knowledge/**/*.md for the commit's changed paths); the prompt says
-# when that list was truncated.
+# scan of knowledge/**/*.md for the commit's changed paths): per changed
+# path AND overall, so one widely cited path cannot fill the whole list;
+# the prompt says, per path, when that path's list was truncated.
+# `citing_nodes_max_bytes` caps how many bytes of each knowledge/ file the
+# scan reads; a larger file (and any symlink or non-regular file, e.g. a
+# FIFO named *.md) is skipped, not read.
 stat_max_lines = 80
 diff_max_lines = 1200
 diff_max_chars = 120000
 citing_nodes_max = 20
+citing_nodes_max_bytes = 2097152
 
 [guard]
 # Subject prefix of the reviewer's own commits. The hook's reviewer never
