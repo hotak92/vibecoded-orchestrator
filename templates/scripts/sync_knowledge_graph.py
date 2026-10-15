@@ -29,6 +29,14 @@ token is a hard usage error, exit 2, BEFORE any backend connection):
                      classifies as fresh and therefore never arms via the
                      ledger (MAJOR-R5-4). Entries whose stored plan already
                      matches still skip; only stale plans re-embed.
+    --prune-missing  with a file list: a knowledge/ target that no longer
+                     exists has its Weaviate rows deleted (by exact
+                     file_path) instead of failing as "file not found" —
+                     the post-commit KG reviewer's guard passes it when it
+                     reverts a NEW node, so the embedding the project's
+                     own edit-time sync minted does not outlive the file.
+                     Skipped (rows kept, a line says so) when the KG
+                     collection is the shared one.
     --project-root <path> | --project-root=<path>   pin the target root
                      (consumed at import; at most once)
     -h | --help      print usage
@@ -72,7 +80,7 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Callable, Dict, List, Optional, Tuple, Mapping
 import uuid
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -232,6 +240,40 @@ def _extract_rechunk_flag(argv: "List[str]") -> bool:
 #: which also removes the token from ``sys.argv`` so ``main()``'s dispatch
 #: and flag validation never see it.
 _RECHUNK_FORCED = _extract_rechunk_flag(sys.argv)
+
+
+def _extract_prune_missing_flag(argv: "List[str]") -> bool:
+    """Extract and REMOVE every ``--prune-missing`` token from *argv*
+    (mutates the list in place). Returns True when the flag was present.
+
+    Why the flag exists (v0.2.103 R30 M3): the post-commit KG reviewer's
+    guard deletes a NEW node it reverts and then re-syncs the path — but a
+    missing file used to fail here as "file not found", so the rows the
+    project's edit-time sync had already embedded for the reviewer's write
+    stayed in the collection with no file behind them. With this flag a
+    missing ``knowledge/`` target is removed through the ONE delete-by-
+    file_path home (:func:`_delete_node_by_file_path`). Without it a
+    missing target still fails, exactly as before — a typo'd path never
+    deletes anything by accident.
+
+    Same import-time ``tok == "--flag"`` idiom as :func:`_extract_rechunk_flag`
+    (the emitted-remediation gate source-matches it).
+    """
+    saw = False
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--prune-missing":
+            del argv[i]
+            saw = True
+            continue
+        i += 1
+    return saw
+
+
+#: True when this run was invoked with ``--prune-missing`` (v0.2.103 R30
+#: M3); see :func:`_extract_prune_missing_flag`.
+_PRUNE_MISSING = _extract_prune_missing_flag(sys.argv)
 
 
 def _resolve_project_root() -> "Tuple[Path, str]":
@@ -2605,7 +2647,7 @@ OUTCOME_SYNCED = "synced"
 OUTCOME_EMBED_SKIPPED = "embed-skipped"          # unchanged, already current in Weaviate
 OUTCOME_ARCHIVED_SKIPPED = "archived-skipped"    # path or frontmarker: intentionally not indexed
 OUTCOME_FRONTMATTER_SKIPPED = "frontmatter-skipped"
-OUTCOME_EXCLUDED_SKIPPED = "excluded-skipped"    # meta files / out-of-root targets / dev-unset
+OUTCOME_EXCLUDED_SKIPPED = "excluded-skipped"    # meta files / out-of-root targets / dev-unset / --prune-missing removals
 OUTCOME_FAILED = "failed"
 
 _NON_FAILURE_OUTCOMES = frozenset({
@@ -3748,7 +3790,11 @@ def _file_path_filter(canonical: str):
     return _path_narrowing_filter(Filter, canonical)
 
 
-def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
+def _delete_node_by_file_path(
+    server: WeaviateMCPServer,
+    file_path_value: str,
+    on_error: "Optional[Callable[[Exception], None]]" = None,
+) -> int:
     """Remove all Weaviate entries (incl. chunks) for a specific file_path.
 
     v0.2.70 FIX #1 (silent batch data loss): the archived-node cleanup
@@ -3769,8 +3815,14 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
     active ``concepts/orchestrator-knowledge-graph.md``), so the rows are
     confirmed in Python by ``_fetch_exact_path_rows`` before any delete.
     Callers: the two archived-node branches of ``sync_node``, the project →
-    shared migration delete (``_finish_shared_scope_write``) and the
-    v0.2.101 archived-removal routing — all go through this function.
+    shared migration delete (``_finish_shared_scope_write``), the
+    v0.2.101 archived-removal routing and the v0.2.103 ``--prune-missing``
+    removal of a vanished node (:func:`_prune_missing_node`) — all go
+    through this function.
+
+    ``on_error`` (v0.2.103 R30 M3) receives the swallowed exception, so a
+    caller that must REPORT a failed removal (the prune leg) can; the
+    return value stays 0 either way (soft-fail contract unchanged).
     """
     try:
         coll = server.client.collections.get(COLLECTION_NAME)
@@ -3785,8 +3837,51 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
             coll.data.delete_by_id(obj.uuid)
             n += 1
         return n
-    except Exception:
+    except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
         return 0
+
+
+def _prune_missing_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
+    """Remove the Weaviate rows of a ``knowledge/`` node whose file is gone
+    (``--prune-missing``, v0.2.103 R30 M3).
+
+    Deletes through :func:`_delete_node_by_file_path` (exact file_path, the
+    one delete home). Conservative gate: when the KG collection IS the
+    shared one (``collection_repair.is_shared_identity_collection`` — the
+    predicate every prune caller uses), nothing is deleted, because a
+    sibling project's ``scope: shared`` row can carry the same relative
+    file_path. A failed removal (Weaviate unreachable) is a FAILED outcome
+    with the error named, so the caller's log shows it.
+    """
+    fp_value = _relative_file_path(file_path)
+    try:
+        from vco_lib.collection_repair import is_shared_identity_collection
+    except ImportError as e:
+        print(f"❌ {fp_value}: missing node not removed: vco_lib import "
+              f"failed ({e}) — broken install?", file=sys.stderr)
+        return SyncOutcome(OUTCOME_FAILED, fp_value,
+                           "missing node not removed (vco_lib import failed)")
+    if is_shared_identity_collection(
+        COLLECTION_NAME, SHARED_COLLECTION_NAME, PROJECT_ROOT,
+    ):
+        print(f"ℹ️  {fp_value}: file is gone; its rows in '{COLLECTION_NAME}' "
+              "are kept — it is the shared collection (a sibling project's "
+              "shared row may carry the same path)")
+        return SyncOutcome(OUTCOME_EXCLUDED_SKIPPED, fp_value,
+                           "missing node: shared collection, rows kept")
+    errors: List[Exception] = []
+    removed = _delete_node_by_file_path(server, fp_value, on_error=errors.append)
+    if errors:
+        print(f"❌ {fp_value}: file is gone but its Weaviate rows could not be "
+              f"removed: {errors[0]}")
+        return SyncOutcome(OUTCOME_FAILED, fp_value,
+                           f"missing node: row removal failed ({errors[0]})")
+    print(f"🗑  {fp_value}: file is gone — removed {removed} Weaviate row(s) "
+          f"from '{COLLECTION_NAME}'")
+    return SyncOutcome(OUTCOME_EXCLUDED_SKIPPED, fp_value,
+                       f"missing node: removed {removed} row(s)")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -4094,6 +4189,11 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
 
     try:
         if not file_path.exists():
+            if _PRUNE_MISSING:
+                outcome = _prune_missing_node(server, file_path)
+                if not outcome:
+                    error_msg = outcome.reason
+                return outcome
             print(f"❌ File not found: {file_path}")
             error_msg = "File not found"
             return SyncOutcome(
@@ -5861,6 +5961,8 @@ def _print_usage(stream=None) -> None:
     print("       (any form accepts --project-root <path> to pin the target project)", file=stream)
     print("       (any form accepts --rechunk to force the chunk-plan comparison even", file=stream)
     print("        with no revision crossing pending — repairs stale chunk boundaries)", file=stream)
+    print("       (a file list accepts --prune-missing: a knowledge/ target that no longer", file=stream)
+    print("        exists has its Weaviate rows removed instead of failing)", file=stream)
     print("Exit codes: 0 clean · 1 per-node/per-doc failures · 2 usage error or refused root", file=stream)
 
 

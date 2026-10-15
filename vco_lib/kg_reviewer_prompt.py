@@ -493,8 +493,10 @@ not configuration. Edits elsewhere are blocked and reverted.
    existing node on the same subject in ANY folder, under any title; if one
    exists, extend it. Create a new node only for a genuinely new topic with
    no existing node (one topic per node; no near-duplicates). A new node whose
-   title or file name is the same as, or mostly the same words as, an
-   existing node's is reverted, and the log names the node to extend. A new
+   title or file name is the same as an existing node's, or mostly the same
+   words as one and repeating its content, is reverted - this includes a
+   node you created earlier in this run - and the log names the node to
+   extend. A distinct subtopic with its own content is allowed. A new
    node must open with YAML frontmatter carrying title, type, tags, created,
    updated and status (ISO dates) - one without it is reverted.
 6. Write only facts the diff or the sources you read state explicitly. Do not
@@ -505,13 +507,16 @@ not configuration. Edits elsewhere are blocked and reverted.
    backticked `--flag` that appears in nothing you read is reverted.
    hybrid_search results do NOT count as a source for this (KG text can be
    wrong): Read the file a flag comes from before writing it.
-   Never raise a confidence or evidence level: do not write CONFIRMED,
-   VERIFIED, TESTED, PROVEN or VALIDATED (in any case), and never cite a
-   test run, run id, build or commit as evidence for a fact, unless that
-   exact wording - and that exact id - is in the diff or a file you Read
-   during this run. When the source says "inferred", "untested" or
-   "unverified", the node says so too. A line that raises an evidence label
-   or cites a run/commit found in nothing you read is reverted.
+   Never raise a confidence or evidence level: do not label a fact
+   CONFIRMED, VERIFIED, TESTED, PROVEN or VALIDATED, or write that it is
+   (or was) confirmed / verified / tested / proven / validated, or was so
+   in, via, by, on, at or during something, and never cite a test run, run
+   id, build or commit as evidence for a fact, unless that exact word - and
+   that exact id - is in the diff, its commit stat or sha, or a Read/Grep
+   result from this run. When the source says "inferred", "untested" or
+   "unverified", the node says so too. A line that makes such a claim
+   without a source, or cites a run/commit found in nothing you read, is
+   reverted with its whole write.
 7. Record where a node's facts came from. A node you create or extend from a
    document or other source file records the source path and the commit it
    reflects, as a line like "Source: docs/reports/cache.md @ {commit.short}".

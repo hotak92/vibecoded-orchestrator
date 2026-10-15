@@ -68,11 +68,14 @@ the reviewer.
      ``[guard] new_node_required_keys`` key (title, type, tags, created,
      updated, status), or whose title duplicates an existing node's
      (case/whitespace-normalised) — the log points at the node to extend;
-   * a NEW node on the SAME SUBJECT as an existing node under another title
-     or folder: title (or filename slug) content tokens overlapping an
-     existing node's with a Jaccard similarity >= ``[guard]
-     duplicate_title_jaccard`` (:func:`same_subject_node`) — the log names
-     the node to extend (field 2026-10-16: a second node on one subject);
+   * a NEW node on the SAME SUBJECT as an existing node (or as a new node
+     this run already kept) under another title or folder: title/slug
+     content tokens (title and slug compared both ways) overlapping with a
+     Jaccard similarity >= ``[guard] duplicate_title_jaccard``, AND either
+     exactly the same title/slug words or bodies sharing >= ``[guard]
+     duplicate_body_min_shared`` content tokens (:func:`same_subject_node`;
+     a subtopic with its own content is kept) — the log names the node to
+     extend (field 2026-10-16: a second node on one subject);
    * a node that GAINS a backticked ``--flag`` appearing verbatim nowhere
      the reviewer read (its ``Read`` / ``Grep`` results and the commit diff
      it was given) — the field showed invented CLI flags. Invented numbers,
@@ -80,11 +83,16 @@ the reviewer.
      flag token they have no reliable lexical shape to check without
      reverting most legitimate prose;
    * a node that GAINS a line raising an evidence level — a ``[guard]
-     evidence_markers`` word (CONFIRMED, VERIFIED, ...) the reviewer read
-     nowhere, or a run/test id / commit hash it read nowhere cited on such a
-     line (:func:`unsourced_evidence`; the field showed "CONFIRMED ... via
-     test run <stamp>" over sources that said "inferred, untested"). Lines
-     that already carried the marker are not judged.
+     evidence_markers`` word (CONFIRMED, VERIFIED, ...) used as a CLAIM
+     (uppercase, followed by in/via/by/on/at/during, directly after
+     is/are/was/were/be/been, or on a line citing a run/test id or commit
+     hash) that the reviewer read nowhere, or a
+     run/test id / commit hash it read nowhere cited on such a line
+     (:func:`unsourced_evidence`; the field showed "CONFIRMED ... via test
+     run <stamp>" over sources that said "inferred, untested"). Prose use
+     ("the tested path"), headings without attribution, fenced code and
+     frontmatter are not claims; lines that already carried the marker are
+     not judged.
 
    A deleted node is never the reviewer's doing (none of its tools deletes
    — the shell is denied — and every write leaves bytes), so a vanished
@@ -291,6 +299,9 @@ class Snapshot:
     #: rel path -> normalised frontmatter title ('' when none), for every
     #: existing ``*.md`` node (the same-subject duplicate rule).
     nodes: Dict[str, str] = field(default_factory=dict)
+    #: rel path -> :func:`body_tokens` of every existing ``*.md`` node (the
+    #: same-subject rule's content-overlap confirmation).
+    node_bodies: Dict[str, Set[str]] = field(default_factory=dict)
 
     def copy_of(self, rel: str) -> Path:
         return self.copy_dir / "files" / rel
@@ -437,8 +448,10 @@ def take_snapshot(root: Path) -> Snapshot:
             dest.write_bytes(data)
             snap.knowledge[rel] = _sha(data)
             if rel.endswith(".md"):
-                title = _node_title(data.decode("utf-8", errors="replace"))
+                text = data.decode("utf-8", errors="replace")
+                title = _node_title(text)
                 snap.nodes[rel] = title
+                snap.node_bodies[rel] = body_tokens(text)
                 if title:
                     snap.titles.setdefault(title, rel)
     budget = _DIRTY_COPY_BUDGET
@@ -807,34 +820,90 @@ def _slug(rel: str) -> str:
     return PurePosixPath(rel).stem
 
 
-def same_subject_node(title: str, rel: Optional[str],
-                      nodes: Dict[str, str]) -> "Optional[Tuple[str, float]]":
-    """The existing node (rel path, similarity) a new node with ``title`` at
-    ``rel`` duplicates by subject, or ``None``: the highest Jaccard
-    similarity of title-vs-title or slug-vs-slug :func:`subject_tokens`, when
-    it reaches ``[guard] duplicate_title_jaccard``."""
-    threshold = float(_guard()["duplicate_title_jaccard"])
-    new_title = subject_tokens(title)
-    new_slug = subject_tokens(_slug(rel)) if rel else set()
-    best: Optional[Tuple[str, float]] = None
+def body_tokens(text: str) -> Set[str]:
+    """The content tokens of a node's BODY, for the same-subject rule's
+    content-overlap confirmation: the frontmatter is dropped, then the body
+    goes through :func:`subject_tokens` (lower-cased letter/digit runs,
+    plurals folded, all-digit runs — dates, counters, versions — and
+    ``[guard] title_stopwords`` dropped) and every token shorter than
+    ``[guard] duplicate_body_min_token_len`` characters is dropped too. The
+    body's own ``# Title`` heading counts like any other line."""
+    _raw, body = _split_frontmatter(text.replace("\r\n", "\n"))
+    min_len = int(_guard()["duplicate_body_min_token_len"])
+    return {t for t in subject_tokens(body) if len(t) >= min_len}
+
+
+def subject_similarity(title: str, rel: Optional[str], other_rel: str,
+                       other_title: str) -> "Tuple[float, bool]":
+    """``(score, identical)`` between a new node (``title`` at ``rel``) and
+    an existing one: ``score`` is the highest Jaccard similarity of the
+    :func:`subject_tokens` of title-vs-title, slug-vs-slug, title-vs-slug
+    and slug-vs-title (an existing node with an empty title is still
+    reached through its slug); ``identical`` is True when one of those
+    pairs has exactly the same (non-empty) token set."""
+    new_sets = [subject_tokens(title)]
+    if rel:
+        new_sets.append(subject_tokens(_slug(rel)))
+    other_sets = [subject_tokens(other_title), subject_tokens(_slug(other_rel))]
+    score = 0.0
+    identical = False
+    for a in new_sets:
+        for b in other_sets:
+            score = max(score, _jaccard(a, b))
+            identical = identical or (bool(a) and a == b)
+    return score, identical
+
+
+def same_subject_node(title: str, rel: Optional[str], nodes: Dict[str, str],
+                      *, body: Optional[Set[str]] = None,
+                      bodies: Optional[Dict[str, Set[str]]] = None
+                      ) -> "Optional[Tuple[str, float, str]]":
+    """The existing node a new node with ``title`` at ``rel`` duplicates by
+    subject, as ``(rel path, similarity, why)``, or ``None``.
+
+    Trigger: :func:`subject_similarity` reaches ``[guard]
+    duplicate_title_jaccard``. A trigger alone is NOT a duplicate (review
+    R30 M2: one topic per node means "Cache layer eviction" is a legitimate
+    subtopic of "Cache layer"); it is confirmed only when the titles/slugs
+    carry exactly the same content tokens (a pure retitle), or the two
+    BODIES (``body`` = the new node's :func:`body_tokens`, ``bodies`` = rel
+    -> body tokens of the existing nodes) share at least ``[guard]
+    duplicate_body_min_shared`` content tokens."""
+    g = _guard()
+    threshold = float(g["duplicate_title_jaccard"])
+    min_shared = int(g["duplicate_body_min_shared"])
+    best: Optional[Tuple[str, float, str]] = None
     for other, other_title in sorted(nodes.items()):
         if other == rel:
             continue
-        score = max(_jaccard(new_title, subject_tokens(other_title)),
-                    _jaccard(new_slug, subject_tokens(_slug(other))))
-        if score >= threshold and (best is None or score > best[1]):
-            best = (other, score)
+        score, identical = subject_similarity(title, rel, other, other_title)
+        if score < threshold:
+            continue
+        shared = (body & bodies.get(other, set())
+                  if body is not None and bodies is not None else set())
+        if identical:
+            why = "the same title/slug words"
+        elif len(shared) >= min_shared:
+            why = (f"bodies share {len(shared)} content tokens >= {min_shared}: "
+                   f"{', '.join(sorted(shared)[:8])}")
+        else:
+            continue
+        if best is None or score > best[1]:
+            best = (other, score, why)
     return best
 
 
 def new_node_violation(text: str, titles: Dict[str, str], *,
                        rel: Optional[str] = None,
-                       nodes: Optional[Dict[str, str]] = None) -> Optional[str]:
+                       nodes: Optional[Dict[str, str]] = None,
+                       bodies: Optional[Dict[str, Set[str]]] = None
+                       ) -> Optional[str]:
     """Why a NEW node breaks a rule (``None`` = allowed): it must carry
     every ``[guard] new_node_required_keys`` frontmatter key, non-empty, its
     title must not duplicate an existing node's, and (given ``nodes``, rel ->
-    normalised title of every existing node) it must not be about the same
-    subject as an existing node (:func:`same_subject_node`)."""
+    normalised title of every existing node, and ``bodies``, rel -> their
+    :func:`body_tokens`) it must not be about the same subject as an
+    existing node (:func:`same_subject_node`)."""
     raw, _body = _split_frontmatter(text)
     if raw is None:
         return "a new node without YAML frontmatter"
@@ -850,12 +919,13 @@ def new_node_violation(text: str, titles: Dict[str, str], *,
         return (f"a new node duplicating the title of {existing} - extend "
                 f"the existing node instead")
     if nodes:
-        hit = same_subject_node(str(fm.get("title") or ""), rel, nodes)
+        hit = same_subject_node(str(fm.get("title") or ""), rel, nodes,
+                                body=body_tokens(text), bodies=bodies or {})
         if hit:
             return (f"a new node on the same subject as {hit[0]} (title/slug "
                     f"similarity {hit[1]:.2f} >= "
-                    f"{float(_guard()['duplicate_title_jaccard']):.2f}) - "
-                    f"extend {hit[0]} instead")
+                    f"{float(_guard()['duplicate_title_jaccard']):.2f}, "
+                    f"{hit[2]}) - extend {hit[0]} instead")
     return None
 
 
@@ -903,11 +973,14 @@ def unsourced_flags(pre: Optional[str], post: str, sources: str) -> List[str]:
 #: Lexical shapes of a cited run/test id or commit hash on an evidence line
 #: (documented in ``[guard] evidence_markers``'s comment): an 8+ digit stamp
 #: with an optional ``-``/``_``/``T`` time part; the digit-bearing token after
-#: run/test/build/job/pipeline; a 7-40 char hex token mixing digits and a-f.
+#: run/test/build/job/pipeline — unless it is VERSION-shaped (``0.2.103``,
+#: ``v1.4``: :data:`_VERSION_TOKEN`); a 7-40 char hex token mixing digits
+#: and a-f.
 _RUN_WORD_ID = re.compile(
     r"(?<![0-9A-Za-z])(?:run|test|build|job|pipeline)(?![0-9A-Za-z])"
     r"\s*(?:id(?![0-9A-Za-z])\s*)?[#:]?\s*([A-Za-z0-9][\w.-]*)", re.IGNORECASE)
 _STAMP_ID = re.compile(r"(?<![0-9A-Za-z])\d{8,}(?:[-_T]\d{4,}Z?)?(?![0-9A-Za-z])")
+_VERSION_TOKEN = re.compile(r"[vV]?\d+(?:\.\d+)+")
 _HEX_ID = re.compile(r"(?<![0-9A-Za-z])(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])"
                      r"[0-9a-fA-F]{7,40}(?![0-9A-Za-z])")
 
@@ -924,7 +997,7 @@ def evidence_ids(text: str) -> List[str]:
     hits: List[Tuple[int, str]] = []
     for m in _RUN_WORD_ID.finditer(text):
         tok = m.group(1).rstrip(".-_")
-        if any(c.isdigit() for c in tok):
+        if any(c.isdigit() for c in tok) and not _VERSION_TOKEN.fullmatch(tok):
             hits.append((m.start(1), tok))
     hits += [(m.start(), m.group(0)) for m in _STAMP_ID.finditer(text)]
     hits += [(m.start(), m.group(0)) for m in _HEX_ID.finditer(text)]
@@ -944,25 +1017,77 @@ def _id_sourced(ident: str, sources: str) -> bool:
     return _word(ident).search(sources) is not None
 
 
+_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+
+
+def _judged_lines(text: str) -> List[str]:
+    """The lines of a node the evidence rule judges: the body only (the
+    YAML frontmatter is skipped — a ``title:`` is a name, not a claim) and
+    no line inside, or opening/closing, a fenced code block (code is not a
+    claim either)."""
+    _raw, body = _split_frontmatter(text)
+    out: List[str] = []
+    fence: Optional[str] = None
+    for line in _body_lines(body):
+        m = _FENCE.match(line)
+        if m:
+            if fence is None:
+                fence = m.group(1)
+            elif m.group(1) == fence:
+                fence = None
+            continue
+        if fence is None:
+            out.append(line)
+    return out
+
+
+def evidence_claims(text: str, has_id: bool) -> List[str]:
+    """The ``[guard] evidence_markers`` words ``text`` uses AS AN EVIDENCE
+    CLAIM (review R30 M1), in config order. A whole-word marker is a claim
+    when it is written UPPERCASE (a label: "CONFIRMED"), or is followed by
+    one of ``[guard] evidence_attribution_words`` ("confirmed in game",
+    "verified via the suite", "tested on staging"), or directly follows one
+    of ``[guard] evidence_copula_words`` ("is verified", "has been tested";
+    "is not tested" is not a claim), or the line also cites a run/test id
+    or commit hash (``has_id``). "The tested path keeps the cache warm" or
+    a heading "## Validated configuration keys" is prose, not a claim."""
+    g = _guard()
+    attrib = "|".join(re.escape(w) for w in g["evidence_attribution_words"])
+    copula = "|".join(re.escape(w) for w in g["evidence_copula_words"])
+    after = re.compile(rf"\s+(?:{attrib})(?![0-9A-Za-z])", re.IGNORECASE)
+    before = re.compile(rf"(?<![0-9A-Za-z])(?:{copula})\s+$", re.IGNORECASE)
+    out: List[str] = []
+    for marker in g["evidence_markers"]:
+        for m in _word(marker).finditer(text):
+            if (has_id or m.group(0).isupper()
+                    or after.match(text, m.end())
+                    or before.search(text[:m.start()])):
+                out.append(marker)
+                break
+    return out
+
+
 def unsourced_evidence(pre: Optional[str], post: str, sources: str
                        ) -> "List[Tuple[str, List[str]]]":
     """Evidence-level labels the write ADDED without a source.
 
-    For every line of ``post`` that is not an unchanged ``pre`` line, the
-    text it added (an original line it extends in place — its text, list
-    marker aside, as in :func:`removed_lines` — is cut out first) is checked
-    for a ``[guard] evidence_markers`` word. Such a line must find that word
-    in ``sources`` (what the reviewer read) and every run/test id or commit
+    For every judged line of ``post`` (:func:`_judged_lines`: body only, no
+    fenced code) that is not an unchanged ``pre`` line, the text it added
+    (an original line it extends in place — its text, list marker aside, as
+    in :func:`removed_lines` — is cut out first) is checked for an evidence
+    CLAIM (:func:`evidence_claims`: a ``[guard] evidence_markers`` word
+    written uppercase, followed by an attribution word, directly after a
+    copula, or on a line citing a run/test id or commit hash). Such a line must find that word in
+    ``sources`` (what the reviewer read) and every run/test id or commit
     hash it cites (:func:`evidence_ids`) verbatim there too. Returns
     ``[(line, [missing evidence, ...]), ...]``; a pre-existing marker line
     is never judged."""
-    markers = [(m, _word(m)) for m in _guard()["evidence_markers"]]
     pre_lines = [ln.strip() for ln in _body_lines(pre)] if pre else []
     pre_set = {ln for ln in pre_lines if ln}
     needles = sorted({_LINE_MARKER.sub("", ln, count=1).strip()
                       for ln in pre_set} - {""}, key=len, reverse=True)
     out: List[Tuple[str, List[str]]] = []
-    for line in _body_lines(post):
+    for line in _judged_lines(post):
         text = line.strip()
         if not text or text in pre_set:
             continue
@@ -970,13 +1095,13 @@ def unsourced_evidence(pre: Optional[str], post: str, sources: str
         for needle in needles:
             if needle in added:
                 added = added.replace(needle, " \x00 ")
-        hits = [m for m, rx in markers if rx.search(added)]
+        ids = evidence_ids(added)
+        hits = evidence_claims(added, has_id=bool(ids))
         if not hits:
             continue
         missing = [f"marker '{m}'" for m in hits
                    if not _word(m).search(sources)]
-        missing += [f"id '{i}'" for i in evidence_ids(added)
-                    if not _id_sourced(i, sources)]
+        missing += [f"id '{i}'" for i in ids if not _id_sourced(i, sources)]
         if missing:
             out.append((text, missing))
     return out
@@ -1146,6 +1271,12 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
     root = snap.root
     backups = _Backups(root)
     resynced: List[str] = []
+    # The comparison set for the new-node rules: every node at the start
+    # PLUS each new node this run keeps (review R30 L3 — a second node on a
+    # subject the reviewer created moments earlier is a duplicate too).
+    titles = dict(snap.titles)
+    nodes = dict(snap.nodes)
+    bodies = dict(snap.node_bodies)
     for key in sorted(writes):
         ops = writes[key]
         rel = snap.rel(key)
@@ -1197,8 +1328,8 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
             post_text = _lf_text(cur)
             pre_text = _lf_text(pre) if pre is not None else None
             if pre_text is None:
-                reason = new_node_violation(post_text, snap.titles, rel=rel,
-                                            nodes=snap.nodes)
+                reason = new_node_violation(post_text, titles, rel=rel,
+                                            nodes=nodes, bodies=bodies)
             else:
                 reason = edit_violation(pre_text, post_text)
             if reason is None:
@@ -1221,6 +1352,13 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
             assert rel is not None and cur is not None
             res.kept.append(rel)
             res.reviewer_bytes[rel] = cur
+            if pre is None and rel.endswith(".md"):
+                kept_text = _lf_text(cur)
+                kept_title = _node_title(kept_text)
+                nodes[rel] = kept_title
+                bodies[rel] = body_tokens(kept_text)
+                if kept_title:
+                    titles.setdefault(kept_title, rel)
             continue
         if not known:
             _ok, saved = backups.save(key)
@@ -1358,7 +1496,14 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
 def resync_with(project_root: Path, log: Log,
                 timeout_s: int = 1800) -> Callable[[List[str]], None]:
     """A ``validate(resync=...)`` callback: re-sync reverted nodes into the
-    KG collection through the project's shipped sync script (soft-fail)."""
+    KG collection through the project's shipped sync script (soft-fail).
+
+    A reverted NEW node no longer exists on disk, while the project's own
+    edit-time sync may already have embedded the reviewer's write (review
+    R30 M3): when any path is gone, the script runs with
+    ``--prune-missing``, which deletes that file_path's rows through the
+    script's one delete-by-file_path home instead of failing on the
+    missing file. A failure (Weaviate down) is logged, never raised."""
     script = project_root / ".claude" / "scripts" / "sync_knowledge_graph.py"
 
     def _run(rels: List[str]) -> None:
@@ -1367,9 +1512,13 @@ def resync_with(project_root: Path, log: Log,
                 + ", ".join(rels))
             return
         try:
+            gone = [r for r in rels
+                    if not (project_root / r).exists()
+                    and not (project_root / r).is_symlink()]
             proc = subprocess.run(
                 [sys.executable, str(script), "--project-root",
-                 str(project_root), *[str(project_root / r) for r in rels]],
+                 str(project_root), *(["--prune-missing"] if gone else []),
+                 *[str(project_root / r) for r in rels]],
                 cwd=project_root, capture_output=True, text=True,
                 timeout=timeout_s, env=dict(os.environ),
                 stdin=subprocess.DEVNULL)
@@ -1377,7 +1526,9 @@ def resync_with(project_root: Path, log: Log,
                 log(f"re-sync of reverted nodes exited {proc.returncode}: "
                     f"{(proc.stderr or proc.stdout).strip()[-500:]}")
             else:
-                log(f"re-synced reverted nodes: {', '.join(rels)}")
+                log(f"re-synced reverted nodes: {', '.join(rels)}"
+                    + (f" (removed from the KG collection: {', '.join(gone)})"
+                       if gone else ""))
         except Exception as exc:  # noqa: BLE001 — soft-fail, logged
             log(f"re-sync of reverted nodes failed: {exc}")
     return _run

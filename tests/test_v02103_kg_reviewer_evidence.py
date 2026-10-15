@@ -57,6 +57,11 @@ Eviction on full is inferred, untested.
 """
 
 
+BACKUP_BODY = "Backups run nightly via the snapshot API."
+DOCKER_BODY = ("Containers start at login through the user service unit; "
+               "restart policy stays unless-stopped.")
+
+
 def _node(title: str, body: str = "Fact.") -> str:
     return (f"---\ntitle: {title}\ntype: concept\ntags: [x]\n"
             f"created: 2026-10-16\nupdated: 2026-10-16\nstatus: active\n---\n\n"
@@ -80,9 +85,9 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (r / "knowledge" / "tools").mkdir(parents=True)
     (r / "knowledge" / "concepts" / "cache-layer.md").write_text(CACHE_NODE)
     (r / "knowledge" / "tools" / "weaviate-backups.md").write_text(
-        _node("Weaviate backups"))
+        _node("Weaviate backups", BACKUP_BODY))
     (r / "knowledge" / "concepts" / "docker-auto-start.md").write_text(
-        _node("Docker auto-start"))
+        _node("Docker auto-start", DOCKER_BODY))
     (r / "knowledge" / "concepts" / "debug-overlay-hotkey.md").write_text(
         _node("Debug overlay hotkey"))
     (r / "knowledge" / "concepts" / "embedding-model-selection.md").write_text(
@@ -258,6 +263,8 @@ def test_new_node_with_an_unsourced_label_is_reverted(repo):
     ("build id: 1234abcd", ["1234abcd"]),
     ("at 4f9c2a1, stamp 20261015T2210Z", ["4f9c2a1", "20261015T2210Z"]),
     ("decade facade deadbeef 1234567 test run", []),
+    # R30 L1: a version after "build" is a version, not a run id
+    ("Validated in build 0.2.103 and build v1.4.", []),
 ])
 def test_evidence_id_shapes(text, ids):
     assert guard.evidence_ids(text) == ids
@@ -344,8 +351,9 @@ def test_run_reverts_an_invented_sha(chain, monkeypatch, repo):
 # 2. Same-subject duplicate nodes
 # ═════════════════════════════════════════════════════════════════════════
 
-# (existing title, new title, must be caught). The threshold (0.6) sits
-# between the closest near-miss and the loosest duplicate in this table.
+# (existing title, new title, TRIGGERS the rule). The threshold (0.6) sits
+# between the closest near-miss and the loosest duplicate in this table. A
+# trigger alone does not revert since R30 M2: see the body-overlap tests.
 _PAIRS = [
     ("Weaviate backups", "Weaviate backup procedure", True),        # 2/3
     ("Debug overlay hotkey", "Hotkey for the debug overlay", True),  # 3/3
@@ -358,9 +366,10 @@ _PAIRS = [
 
 @pytest.mark.parametrize("existing, new, caught", _PAIRS)
 def test_same_subject_threshold_table(existing, new, caught):
-    hit = guard.same_subject_node(new, "knowledge/x/zz-unrelated-slug.md",
-                                  {"knowledge/a/node.md": guard._norm_title(existing)})
-    assert (hit is not None) is caught, (existing, new, hit)
+    score, _same = guard.subject_similarity(
+        new, "knowledge/x/zz-unrelated-slug.md", "knowledge/a/node.md",
+        guard._norm_title(existing))
+    assert (score >= 0.6) is caught, (existing, new, score)
 
 
 def test_subject_tokens_drop_dates_stopwords_and_fold_plurals():
@@ -370,7 +379,8 @@ def test_subject_tokens_drop_dates_stopwords_and_fold_plurals():
 
 def test_near_duplicate_new_node_is_reverted_naming_the_existing_node(repo):
     rel = "knowledge/concepts/backup-procedure.md"
-    res, lines = _validate(repo, {rel: _node("Weaviate backup procedure")}, "")
+    res, lines = _validate(repo, {rel: _node(
+        "Weaviate backup procedure", BACKUP_BODY + " Retention is 7 days.")}, "")
     assert not (repo / rel).exists()
     reason = res.reverted[0][1]
     assert ("same subject as knowledge/tools/weaviate-backups.md" in reason
@@ -380,7 +390,7 @@ def test_near_duplicate_new_node_is_reverted_naming_the_existing_node(repo):
 
 def test_near_duplicate_by_filename_slug_is_reverted(repo):
     rel = "knowledge/tools/docker-auto-start-on-boot.md"
-    res, _l = _validate(repo, {rel: _node("Boot sequence")}, "")
+    res, _l = _validate(repo, {rel: _node("Boot sequence", DOCKER_BODY)}, "")
     assert not (repo / rel).exists()
     assert "knowledge/concepts/docker-auto-start.md" in res.reverted[0][1]
 
@@ -397,5 +407,435 @@ def test_distinct_subject_new_node_is_kept(repo, rel, title):
 def test_prompt_states_both_rules(repo):
     text = prompt_mod.build_prompt(prompt_mod.collect_commit(repo), repo)
     assert "Never raise a confidence or evidence level" in text
-    assert "cite a\n   test run, run id, build or commit as evidence" in text
+    assert "never cite a test run, run\n   id, build or commit as evidence" in text
+    # R30 L5: the prompt names the corpus the guard actually accepts
+    assert "the diff, its commit stat or sha, or a Read/Grep\n   result" in text
     assert "look for an\n   existing node on the same subject in ANY folder" in text
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 3. R30 review regressions (GLM-5.3 verify round, 2026-10-16)
+# ═════════════════════════════════════════════════════════════════════════
+#
+# M1 — a marker word is an evidence CLAIM only with an attribution shape
+# (uppercase label / followed by in|via|by|on|at|during / directly after
+# is|are|was|were|be|been / on a line citing a run id or hash); fenced code
+# and frontmatter are never judged.
+
+
+def _read_source(text: str, i: int = 1, path: str = "docs/cache.md") -> str:
+    return guard.transcript_sources(_stream(
+        _tool_use(i, "Read", file_path=path), _tool_result(i, text)))
+
+
+def test_r30_field_wording_still_reverted(repo):
+    src = _read_source("Eviction on full: inferred, untested (game).")
+    post = CACHE_NODE + ("Eviction on full is CONFIRMED in game via test run "
+                         "20261015-221000.\n")
+    res, _l = _validate(repo, {CACHE: post}, src)
+    assert res.kept == [] and res.reverted
+    assert "marker 'confirmed'" in res.reverted[0][1]
+    assert "id '20261015-221000'" in res.reverted[0][1]
+    assert (repo / CACHE).read_text() == CACHE_NODE
+
+
+@pytest.mark.parametrize("added", [
+    "The tested path keeps the cache warm between restarts.",
+    "## Validated configuration keys",
+    "Eviction is not tested yet.",
+    "Run the validated config through the loader first.",
+], ids=["prose-adjective", "heading", "negated", "prose-object"])
+def test_r30_marker_word_in_prose_is_kept(repo, added):
+    """RED before R30 M1: each line reverted the whole write."""
+    post = CACHE_NODE + added + "\n"
+    res, _l = _validate(repo, {CACHE: post}, _read_source("the cache module"))
+    assert res.kept == [CACHE] and res.reverted == [], res.reverted
+
+
+@pytest.mark.parametrize("added, marker", [
+    ("Eviction VERIFIED.", "verified"),
+    ("Eviction confirmed in staging.", "confirmed"),
+    ("Eviction tested via the soak suite.", "tested"),
+    ("Eviction proven by the soak suite.", "proven"),
+    ("Eviction validated on the staging box.", "validated"),
+    ("Eviction verified at deploy time.", "verified"),
+    ("Eviction confirmed during the soak.", "confirmed"),
+    ("Eviction on full is verified.", "verified"),
+    ("Eviction has been tested.", "tested"),
+    ("## Verified in staging", "verified"),
+], ids=lambda v: v if len(v) < 14 else v[:24])
+def test_r30_attributed_claim_without_source_is_reverted(repo, added, marker):
+    post = CACHE_NODE + added + "\n"
+    res, _l = _validate(repo, {CACHE: post}, _read_source("the cache module"))
+    assert res.kept == [] and f"marker '{marker}'" in res.reverted[0][1]
+
+
+def test_r30_lowercase_marker_with_an_id_is_a_claim(repo):
+    post = CACHE_NODE + "Eviction tested, see run 20261015-221000.\n"
+    res, _l = _validate(repo, {CACHE: post}, _read_source("the cache module"))
+    assert res.kept == []
+    assert "marker 'tested'" in res.reverted[0][1]
+    assert "id '20261015-221000'" in res.reverted[0][1]
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_r30_fenced_code_is_not_judged(repo, fence):
+    post = CACHE_NODE + (f"{fence}python\nassert tested_path(repo)\n"
+                         f"# CONFIRMED in run 20261015-221000\n{fence}\n")
+    res, _l = _validate(repo, {CACHE: post}, _read_source("the test module"))
+    assert res.kept == [CACHE] and res.reverted == [], res.reverted
+
+
+def test_r30_a_claim_after_a_closed_fence_is_judged(repo):
+    post = CACHE_NODE + "```\nx = 1\n```\nEviction CONFIRMED in staging.\n"
+    res, _l = _validate(repo, {CACHE: post}, _read_source("the test module"))
+    assert res.kept == [] and "marker 'confirmed'" in res.reverted[0][1]
+
+
+def test_r30_new_node_frontmatter_and_title_heading_are_not_claims(repo):
+    rel = "knowledge/concepts/validated-config-keys.md"
+    res, _l = _validate(repo, {rel: _node("Validated config keys",
+                                          "Keys are read from the table.")}, "")
+    assert res.kept == [rel] and res.reverted == [], res.reverted
+
+
+def test_r30_new_node_frontmatter_is_not_judged(repo):
+    """The frontmatter is skipped as a whole (a key is a name, not a claim) —
+    proven with a claim-shaped value that only the skip lets through."""
+    rel = "knowledge/concepts/queue-sizing.md"
+    text = ("---\ntitle: Queue sizing\ntype: concept\ntags: [x]\n"
+            "created: 2026-10-16\nupdated: 2026-10-16\nstatus: active\n"
+            "summary: CONFIRMED in run 20261015-221000\n---\n\n"
+            "# Queue sizing\n\nThe queue holds 64 items.\n")
+    res, _l = _validate(repo, {rel: text}, "")
+    assert res.kept == [rel] and res.reverted == [], res.reverted
+
+
+def test_r30_corpus_word_sources_a_prose_use(repo):
+    src = _read_source("# keep tested\nx = 1\n")
+    post = CACHE_NODE + "The tested path keeps the cache warm.\n"
+    res, _l = _validate(repo, {CACHE: post}, src)
+    assert res.kept == [CACHE]
+
+
+def test_r30_lowercase_corpus_marker_sources_uppercase_label(repo):
+    src = _read_source("soak suite verified eviction on full")
+    post = CACHE_NODE + "Eviction VERIFIED by the soak suite.\n"
+    res, _l = _validate(repo, {CACHE: post}, src)
+    assert res.kept == [CACHE]
+
+
+def test_r30_extension_raising_the_level_is_still_reverted(repo):
+    pre = CACHE_NODE + "Status: CONFIRMED in run 20250101-000000.\n"
+    (repo / CACHE).write_text(pre)
+    _git(repo, "commit", "-q", "-am", "docs: node")
+    post = (CACHE_NODE + "Status: CONFIRMED in run 20250101-000000. "
+            "(also proven in staging)\n")
+    res, _l = _validate(repo, {CACHE: post}, sources=_read_source("confirmed"))
+    assert res.kept == [] and "marker 'proven'" in res.reverted[0][1]
+
+
+# L1 / id shapes
+
+
+@pytest.mark.parametrize("added, src", [
+    ("Verified on 2026-10-15 in v0.2.103.", "verified on the staging box"),
+    ("Validated in build 0.2.103.", "validated in CI"),
+    ("Confirmed: deadbeef on port 8081 stays deadbeef.", "confirmed by inspection"),
+    ("Verified request 550e8400-e29b-41d4-a716-446655440000.",
+     "request 550e8400-e29b-41d4-a716-446655440000 verified ok"),
+], ids=["iso-date-version", "build-version", "deadbeef-port", "uuid"])
+def test_r30_non_id_shapes_are_kept(repo, added, src):
+    """``build 0.2.103`` reverted with ``id '0.2.103'`` before R30 L1."""
+    res, _l = _validate(repo, {CACHE: CACHE_NODE + added + "\n"},
+                        _read_source(src))
+    assert res.kept == [CACHE], res.reverted
+
+
+def test_r30_hex_word_is_an_id_only_when_unsourced(repo):
+    res, _l = _validate(repo, {CACHE: CACHE_NODE + "Confirmed token cafe1234.\n"},
+                        _read_source("confirmed; token cafe1234 in config"))
+    assert res.kept == [CACHE]
+    (repo / CACHE).write_text(CACHE_NODE)
+    res2, _l = _validate(repo, {CACHE: CACHE_NODE + "Confirmed token cafe1234.\n"},
+                         _read_source("confirmed"))
+    assert res2.kept == [] and "id 'cafe1234'" in res2.reverted[0][1]
+
+
+def test_r30_full_sha_needs_the_full_sha_read(repo):
+    """Documented asymmetry: a short sha in the node matches a full one read;
+    a full sha in the node needs the full sha in the corpus."""
+    src = _read_source("commit 4f9c2a1 touched the cache (verified)")
+    post = CACHE_NODE + "Verified at 4f9c2a1be0d3c7e6a5b4f3e2d1c0b9a8f7e6d5c4.\n"
+    res, _l = _validate(repo, {CACHE: post}, src)
+    assert res.kept == [] and res.reverted[0][1].count("id '") == 1
+
+
+def test_r30_run_id_on_neutral_and_marker_lines(repo):
+    res, _l = _validate(repo, {CACHE: CACHE_NODE + "Tests live in "
+                               "tests/test_cache.py (run 42).\n"}, "")
+    assert res.kept == [CACHE]
+    (repo / CACHE).write_text(CACHE_NODE)
+    res2, _l = _validate(repo, {CACHE: CACHE_NODE + "Verified in CI (run 42).\n"},
+                         _read_source("verified in CI"))
+    assert res2.kept == [] and "id '42'" in res2.reverted[0][1]
+
+
+# corpus completeness
+
+
+def test_r30_grep_and_numbered_read_results_are_sources(repo):
+    src = guard.transcript_sources(_stream(
+        _tool_use(1, "Grep", pattern="evict", path="src"),
+        _tool_result(1, "src/cache.py:7: eviction verified by soak")))
+    res, _l = _validate(repo, {CACHE: CACHE_NODE + "Eviction verified by soak.\n"},
+                        src)
+    assert res.kept == [CACHE]
+    (repo / CACHE).write_text(CACHE_NODE)
+    res2, _l = _validate(repo, {CACHE: CACHE_NODE + "Eviction verified by soak.\n"},
+                         _read_source("    7\teviction verified by soak"))
+    assert res2.kept == [CACHE]
+
+
+def test_r30_glob_and_hybrid_results_are_not_sources(repo):
+    src = guard.transcript_sources(_stream(
+        _tool_use(1, "Glob", pattern="knowledge/**/*.md"),
+        _tool_result(1, "knowledge/concepts/cache-layer.md"),
+        _tool_use(2, "mcp__weaviate-kg__hybrid_search", query="cache"),
+        _tool_result(2, "old node: eviction verified in production")))
+    post = CACHE_NODE + "Eviction verified in production.\n"
+    res, _l = _validate(repo, {CACHE: post}, src)
+    assert res.kept == [] and "marker 'verified'" in res.reverted[0][1]
+
+
+# M2 — the title trigger needs a retitle or real body overlap to revert
+
+
+def test_r30_subtopic_with_its_own_content_is_kept(repo):
+    """RED before R30 M2: reverted as "same subject" (title Jaccard 0.67)."""
+    rel = "knowledge/concepts/cache-layer-eviction.md"
+    body = ("Eviction picks the oldest entry first.\n"
+            "Tuning goes through the cache.knobs table.\n")
+    res, _l = _validate(repo, {rel: _node("Cache layer eviction", body)}, "")
+    assert res.kept == [rel] and res.reverted == [], res.reverted
+
+
+def test_r30_generic_title_next_to_a_specific_node_is_kept(repo):
+    (repo / "knowledge/concepts/error-handling-launcher.md").write_text(
+        _node("Error handling in the launcher",
+              "The launcher shows a toast and writes the log line."))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "docs: eh")
+    rel = "knowledge/concepts/error-handling.md"
+    res, _l = _validate(repo, {rel: _node(
+        "Error handling", "Errors propagate as typed results to the caller.")}, "")
+    assert res.kept == [rel] and res.reverted == [], res.reverted
+
+
+def test_r30_retitle_with_identical_words_is_reverted(repo):
+    rel = "knowledge/reports/backups-weaviate.md"
+    res, _l = _validate(repo, {rel: _node("Backups of Weaviate",
+                                          "Unrelated wording entirely.")}, "")
+    assert res.kept == [] and "the same title/slug words" in res.reverted[0][1]
+
+
+def test_r30_body_overlap_threshold_boundary():
+    """Body tokens: frontmatter dropped, stopwords / all-digit runs / tokens
+    under 3 characters dropped. 4 shared tokens trigger nothing, 5 do."""
+    nodes = {"knowledge/a/alpha-beta.md": "alpha beta"}
+    existing = guard.body_tokens(_node("Alpha beta",
+                                       "gamma delta epsilon zeta 2026 of ab"))
+    assert existing == {"alpha", "beta", "gamma", "delta", "epsilon", "zeta"}
+    four = guard.body_tokens("---\ntitle: x\n---\nalpha beta gamma delta\n")
+    five = guard.body_tokens("---\ntitle: x\n---\nalpha beta gamma delta zeta\n")
+    bodies = {"knowledge/a/alpha-beta.md": existing}
+    assert guard.same_subject_node("Alpha beta notes", "knowledge/b/n.md", nodes,
+                                   body=four, bodies=bodies) is None
+    hit = guard.same_subject_node("Alpha beta notes", "knowledge/b/n.md", nodes,
+                                  body=five, bodies=bodies)
+    assert hit is not None and hit[0] == "knowledge/a/alpha-beta.md"
+    assert "bodies share 5 content tokens" in hit[2]
+
+
+def test_r30_new_title_against_existing_slug_is_compared(repo):
+    """L4: an existing node with NO frontmatter title is reached through its
+    slug, by the new node's TITLE (and the new slug by an existing title)."""
+    (repo / "knowledge/concepts/release-checklist.md").write_text(
+        "# notes\n\n" + "Tag on main after the full suite passes; publish assets.\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "docs: rc")
+    rel = "knowledge/tools/steps.md"
+    res, _l = _validate(repo, {rel: _node(
+        "Release checklist steps",
+        "Tag on main after the full suite passes; publish assets.")}, "")
+    assert res.kept == [] and "knowledge/concepts/release-checklist.md" in \
+        res.reverted[0][1]
+    score, _same = guard.subject_similarity(
+        "Unrelated", "knowledge/x/weaviate-backup-procedure.md",
+        "knowledge/tools/a.md", "weaviate backups")
+    assert score >= 0.6
+
+
+def test_r30_second_near_duplicate_new_node_in_one_run_is_reverted(repo):
+    """L3: RED before the fix — both kept (the comparison set held only the
+    nodes present at the snapshot)."""
+    body = "Restore drills run weekly against a scratch cluster with checksums."
+    n1 = "knowledge/reports/restore-drill.md"
+    n2 = "knowledge/tools/restore-drill-notes.md"
+    res, _l = _validate(repo, {n1: _node("Restore drill", body),
+                               n2: _node("Restore drill notes", body)}, "")
+    assert res.kept == [n1], (res.kept, res.reverted)
+    assert res.reverted[0][0] == n2 and n1 in res.reverted[0][1]
+    assert not (repo / n2).exists()
+
+
+def test_r30_two_distinct_new_nodes_in_one_run_are_both_kept(repo):
+    n1 = "knowledge/reports/restore-drill.md"
+    n2 = "knowledge/tools/restore-drill-notes.md"
+    res, _l = _validate(repo, {
+        n1: _node("Restore drill", "Drills run weekly on a scratch cluster."),
+        n2: _node("Restore drill notes", "Operators record timings by hand.")}, "")
+    assert sorted(res.kept) == sorted([n1, n2])
+
+
+def test_r30_prompt_states_the_duplicate_rule_as_enforced(repo):
+    text = prompt_mod.build_prompt(prompt_mod.collect_commit(repo), repo)
+    assert "repeating its content, is reverted" in text
+    assert "A distinct subtopic with its own content is allowed." in text
+
+
+# M3 — a reverted NEW node's KG rows are removed, not left behind
+
+
+def test_r30_resync_passes_prune_missing_only_for_gone_paths(tmp_path, monkeypatch):
+    root = tmp_path / "proj"
+    (root / ".claude" / "scripts").mkdir(parents=True)
+    (root / ".claude" / "scripts" / "sync_knowledge_graph.py").write_text("#\n")
+    (root / "knowledge").mkdir()
+    (root / "knowledge" / "kept.md").write_text("x\n")
+    calls: list = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    lines: List[str] = []
+    resync = guard.resync_with(root, lines.append)
+    resync(["knowledge/kept.md"])
+    assert "--prune-missing" not in calls[-1]
+    resync(["knowledge/kept.md", "knowledge/gone.md"])
+    assert "--prune-missing" in calls[-1]
+    assert str(root / "knowledge" / "gone.md") in calls[-1]
+    assert "removed from the KG collection: knowledge/gone.md" in lines[-1]
+
+
+def test_r30_resync_failure_is_logged_not_raised(tmp_path, monkeypatch):
+    root = tmp_path / "proj"
+    (root / ".claude" / "scripts").mkdir(parents=True)
+    (root / ".claude" / "scripts" / "sync_knowledge_graph.py").write_text("#\n")
+    monkeypatch.setattr(guard.subprocess, "run", lambda cmd, **kw:
+                        subprocess.CompletedProcess(
+                            cmd, 1, stdout="", stderr="row removal failed"))
+    lines: List[str] = []
+    guard.resync_with(root, lines.append)(["knowledge/gone.md"])
+    assert "exited 1" in lines[-1] and "row removal failed" in lines[-1]
+
+
+@pytest.fixture()
+def sync_mod(tmp_path, monkeypatch):
+    from tests.test_v0270_kg_sync_batch_title_collision import (
+        _FakeServer, _load_sync_module)
+    for key in ("KG_BASE_DIR", "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                "DUAL_EMBEDDING_ENABLED", "VCT_DISABLE_HUB_RESOLVER"):
+        monkeypatch.setenv(key, "placeholder")
+    mod = _load_sync_module(tmp_path)
+    return mod, _FakeServer(), tmp_path
+
+
+def _seed_row(mod, server, rel: str) -> None:
+    server.client.collections.get(mod.COLLECTION_NAME).data.insert(
+        properties={"title": "T", "file_path": rel})
+
+
+def _rows(mod, server) -> list:
+    store = server.client.collections.get(mod.COLLECTION_NAME)._store
+    return sorted(o.properties.get("file_path") for o in store.values())
+
+
+def test_r30_sync_prune_missing_deletes_the_vanished_nodes_rows(sync_mod, monkeypatch):
+    mod, server, root = sync_mod
+    gone = "knowledge/concepts/gone-node.md"
+    _seed_row(mod, server, gone)
+    _seed_row(mod, server, "knowledge/concepts/gone-node-sibling.md")
+    deleted: list = []
+    real = mod._delete_node_by_file_path
+
+    def recording(srv, fp, on_error=None):
+        deleted.append(fp)
+        return real(srv, fp, on_error=on_error)
+
+    monkeypatch.setattr(mod, "_delete_node_by_file_path", recording)
+    monkeypatch.setattr(mod, "_PRUNE_MISSING", True)
+    outcome = mod.sync_node(server, root / gone)
+    assert outcome and outcome.status == mod.OUTCOME_EXCLUDED_SKIPPED
+    assert deleted == [gone]
+    assert _rows(mod, server) == ["knowledge/concepts/gone-node-sibling.md"]
+
+
+def test_r30_sync_without_prune_missing_still_fails_and_deletes_nothing(sync_mod):
+    """LEAVE-ALONE: a missing target without the flag is a failure, never a
+    delete (a typo'd path must not remove rows)."""
+    mod, server, root = sync_mod
+    gone = "knowledge/concepts/gone-node.md"
+    _seed_row(mod, server, gone)
+    assert mod._PRUNE_MISSING is False
+    outcome = mod.sync_node(server, root / gone)
+    assert outcome.status == mod.OUTCOME_FAILED
+    assert _rows(mod, server) == [gone]
+
+
+def test_r30_sync_prune_missing_weaviate_down_is_a_logged_failure(
+        sync_mod, monkeypatch, capsys):
+    mod, server, root = sync_mod
+
+    class _Down:
+        def get(self, _name):
+            raise ConnectionError("weaviate unreachable")
+
+    server.client.collections = _Down()
+    monkeypatch.setattr(mod, "_PRUNE_MISSING", True)
+    outcome = mod.sync_node(server, root / "knowledge/concepts/gone-node.md")
+    assert outcome.status == mod.OUTCOME_FAILED
+    assert "weaviate unreachable" in outcome.reason
+    assert "could not be removed: weaviate unreachable" in capsys.readouterr().out
+
+
+def test_r30_sync_prune_missing_keeps_rows_in_the_shared_collection(
+        sync_mod, monkeypatch):
+    mod, server, root = sync_mod
+    gone = "knowledge/concepts/gone-node.md"
+    _seed_row(mod, server, gone)
+    monkeypatch.setattr(mod, "SHARED_COLLECTION_NAME", mod.COLLECTION_NAME)
+    monkeypatch.setattr(mod, "_PRUNE_MISSING", True)
+    outcome = mod.sync_node(server, root / gone)
+    assert outcome and "shared collection" in outcome.reason
+    assert _rows(mod, server) == [gone]
+
+
+def test_r30_sync_extracts_the_prune_missing_flag(tmp_path, monkeypatch):
+    """The flag is consumed at import (so flag validation never sees it) and
+    arms the prune; a plain file list leaves it off."""
+    from tests.test_v0270_kg_sync_batch_title_collision import _load_sync_module
+    for key in ("KG_BASE_DIR", "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                "DUAL_EMBEDDING_ENABLED", "VCT_DISABLE_HUB_RESOLVER"):
+        monkeypatch.setenv(key, "placeholder")
+    argv = ["sync_knowledge_graph.py", "--prune-missing", "knowledge/a.md",
+            "--prune-missing"]
+    monkeypatch.setattr(sys, "argv", argv)
+    mod = _load_sync_module(tmp_path)
+    assert mod._PRUNE_MISSING is True
+    assert sys.argv == ["sync_knowledge_graph.py", "knowledge/a.md"]
+    mod._validate_argv_flags(sys.argv)  # no exit: nothing left to reject
+    monkeypatch.setattr(sys, "argv", ["sync_knowledge_graph.py", "knowledge/a.md"])
+    assert _load_sync_module(tmp_path)._PRUNE_MISSING is False

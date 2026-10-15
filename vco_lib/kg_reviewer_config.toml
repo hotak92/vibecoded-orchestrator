@@ -87,38 +87,57 @@ frontmatter_mutable_keys = ["updated"]
 # `title` (case- and whitespace-normalised) equals an existing node's title
 # is reverted too — extend that node instead.
 new_node_required_keys = ["title", "type", "tags", "created", "updated", "status"]
-# SAME-SUBJECT duplicates (beyond the exact-title rule above): a NEW node is
-# reverted when its title tokens — or its filename-slug tokens — overlap an
-# existing node's title (or slug) tokens with a Jaccard similarity >=
-# `duplicate_title_jaccard`; the log names the existing node to extend.
-# Tokens: lower-cased runs of letters/digits, a plural "s" folded (length > 3,
-# not "ss"), and dropped when single-character, all-digit (dates, counters)
-# or in `title_stopwords`. 0.6 is the boundary the fixtures pin
-# (tests/test_v02103_kg_reviewer_evidence.py): "Weaviate backups" vs
-# "Weaviate backup procedure" (2/3 = 0.67) is the same subject and must be
-# caught, while "Embedding model selection" vs "Embedding model migration"
-# (2/4 = 0.5) and "Docker auto-start" vs "Docker networking" (1/4) are
-# different subjects that must be kept — 0.5 would revert the former, 0.7
-# would let the duplicate through.
+# SAME-SUBJECT duplicates (beyond the exact-title rule above). TRIGGER: a NEW
+# node's title tokens or filename-slug tokens overlap an existing node's
+# title or slug tokens (all four pairings: title/title, slug/slug,
+# title/slug, slug/title) with a Jaccard similarity >=
+# `duplicate_title_jaccard`. Tokens: lower-cased runs of letters/digits, a
+# plural "s" folded (length > 3, not "ss"), and dropped when
+# single-character, all-digit (dates, counters) or in `title_stopwords`.
+# A trigger alone does not revert (one topic per node: "Cache layer
+# eviction" is a legitimate subtopic of "Cache layer"). The node is reverted
+# only when ALSO (a) one pairing has exactly the same token set (a pure
+# retitle), or (b) the two BODIES share >= `duplicate_body_min_shared`
+# content tokens — body tokens are the body below the frontmatter run
+# through the same tokenizer (stopwords, all-digit runs such as dates
+# dropped) minus every token shorter than `duplicate_body_min_token_len`.
+# The comparison set includes new nodes this same run already kept. The log
+# names the node to extend. Fixtures (tests/test_v02103_kg_reviewer_evidence.py):
+# "Weaviate backups" vs "Weaviate backup procedure" (title 2/3 = 0.67) with
+# the same body text is caught (6 shared body tokens); "Embedding model
+# selection" vs "Embedding model migration" (2/4 = 0.5) never triggers; and
+# "Cache layer eviction" (3 shared body tokens) and "Error handling" vs
+# "Error handling in the launcher" (3) trigger but are kept.
 duplicate_title_jaccard = 0.6
+duplicate_body_min_shared = 5
+duplicate_body_min_token_len = 3
 title_stopwords = ["a", "an", "the", "and", "or", "of", "for", "in", "on", "to",
                    "with", "via", "by", "at", "from", "about", "into", "vs",
                    "is", "are", "how", "what", "why", "when"]
 # EVIDENCE-LEVEL inflation: a line the reviewer ADDED (or extended in place —
-# only the text it added is judged) containing one of these words
-# (case-insensitive, whole word; "untested" does not match "tested") is
-# reverted unless the same word occurs, as a whole word, somewhere in what the
-# reviewer read (its Read/Grep results, the commit diff and stat, the commit's
-# sha and its parent's). Multi-word forms ("confirmed in", "verified in",
-# "tested in") are covered by their first word. Such a line that also cites a
-# run/test id or a commit hash must find that id verbatim in the same corpus.
-# Id shapes (the guard's `_EVIDENCE_ID_PATTERNS`): a stamp of 8+ digits,
-# optionally followed by -/_/T and 4+ digits (`20261015-221000`); the token
-# after "run", "test", "build", "job" or "pipeline" (optionally "#"/"id")
-# when it contains a digit (`run 42`, `job #a7`); and a 7-40 character hex
-# token mixing digits and a-f letters (a commit sha; a shortened sha matches
-# a full one in the corpus).
+# only the text it added is judged) that uses one of `evidence_markers`
+# (case-insensitive, whole word; "untested" does not match "tested") AS AN
+# EVIDENCE CLAIM is reverted unless the same word occurs, as a whole word,
+# somewhere in what the reviewer read (its Read/Grep results, the commit diff
+# and stat, the commit's sha and its parent's). A marker is a claim when it is
+# written UPPERCASE ("CONFIRMED"), or is followed by one of
+# `evidence_attribution_words` ("confirmed in game", "verified via the soak
+# suite"), or directly follows one of `evidence_copula_words` ("is verified",
+# "has been tested"; "is not tested" is not a claim), or its line also cites a
+# run/test id or commit hash. Prose use ("the
+# tested path"), a heading without attribution, fenced code blocks and the
+# YAML frontmatter are not claims. A claim line's run/test ids and commit
+# hashes must each be found verbatim in the same corpus. Id shapes (the
+# guard's `_STAMP_ID`, `_RUN_WORD_ID` and `_HEX_ID` patterns): a stamp of 8+
+# digits, optionally followed by -/_/T and 4+ digits (`20261015-221000`); the
+# token after "run", "test", "build", "job" or "pipeline" (optionally
+# "#"/"id") when it contains a digit and is not version-shaped (`run 42`,
+# `job #a7` are ids; `build 0.2.103` is not — `_VERSION_TOKEN`); and a 7-40
+# character hex token mixing digits and a-f letters (a commit sha; a
+# shortened sha matches a full one in the corpus).
 evidence_markers = ["confirmed", "verified", "tested", "proven", "validated"]
+evidence_attribution_words = ["in", "via", "by", "on", "at", "during"]
+evidence_copula_words = ["is", "are", "was", "were", "be", "been"]
 # The largest knowledge/ symlink TARGET the snapshot copies (bytes). A larger
 # target is recorded as "too large - not restorable": a write through that
 # link is logged REVERT-IMPOSSIBLE and nothing through it is committed.
