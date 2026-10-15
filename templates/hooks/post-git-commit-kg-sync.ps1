@@ -36,7 +36,11 @@ if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 # $PsExe + the ONE guarded detached-spawn home (Start-VcoDetachedProcess).
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
-if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { exit 0 }
+# No `claude`-on-PATH check here (v0.2.103 R7 F6) - must match the .sh
+# sibling: whether a reviewer can run is the backend's decision, in ONE
+# home. Without the CLI its chain logs every claude rung as unavailable and
+# can still reach the consent-gated OpenAI rung; an early silent exit here
+# made that rung dead and left no log line or ledger row.
 
 $ProjectRoot = (& git rev-parse --show-toplevel 2>$null | Out-String).Trim()
 if (-not $ProjectRoot) { $ProjectRoot = (Get-Location).Path }

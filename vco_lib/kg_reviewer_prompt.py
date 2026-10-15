@@ -152,9 +152,16 @@ not configuration. Edits elsewhere are blocked and reverted.
    newer source contradicts.
 5. Prefer extending an existing node over creating a new one. Create a new
    node only for a genuinely new topic with no existing node (one topic per
-   node; no near-duplicates).
+   node; no near-duplicates; a title an existing node already uses is
+   reverted). A new node must open with YAML frontmatter carrying title,
+   type, tags, created, updated and status (ISO dates) - one without it is
+   reverted.
 6. Write only facts the diff or the sources you read state explicitly. Do not
-   infer provenance, motivation, history, ownership or status.
+   infer provenance, motivation, history, ownership or status. Never write a
+   CLI flag, option name, default value, number or sample output/log that you
+   did not read VERBATIM in the diff or in a file you opened (Read/Grep)
+   during this run, and name the source path next to each such fact. A
+   backticked `--flag` that appears in nothing you read is reverted.
 7. Never create or update "blocker", "in-progress", "TODO", "investigation"
    or other status-tracking nodes from a commit diff - a single commit is a
    partial view.
@@ -165,9 +172,9 @@ not configuration. Edits elsewhere are blocked and reverted.
    node is now wrong, append ONE section at the end of the file:
    {heading}
    stating the fact and the source that shows it - and change nothing else.
-10. Write nodes with the Write/Edit tools under {knowledge}/ (or the
-    store_knowledge_node tool with a file_path under knowledge/ and
-    scope="project"). Never use scope="shared".
+10. Write nodes ONLY with the Write and Edit tools, under {knowledge}/ (the
+    project syncs them into the KG itself). Nothing else may write: no
+    shared-KG writes, no other tool, no symlinked paths.
 11. When unsure about any of this, write nothing. An unchanged KG is always
     better than a wrong one.
 

@@ -71,6 +71,11 @@ locked_body_markers = ["do not change without discussion", "do-not-change"]
 proposed_change_heading = "## Proposed change (kg-reviewer, "
 # Frontmatter keys the reviewer may add or update on an existing node.
 frontmatter_mutable_keys = ["updated"]
+# A NEW node must open with YAML frontmatter carrying every one of these
+# keys, each non-empty; otherwise the guard reverts it. A new node whose
+# `title` (case- and whitespace-normalised) equals an existing node's title
+# is reverted too — extend that node instead.
+new_node_required_keys = ["title", "type", "tags", "created", "updated", "status"]
 # Derived knowledge/ sidecars other tools regenerate (the summary generator,
 # the sync). They are neither validated nor committed by the reviewer: their
 # writers run asynchronously and also serve the user's own edits.

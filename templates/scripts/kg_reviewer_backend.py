@@ -486,19 +486,25 @@ def _cmd_record(args: argparse.Namespace) -> int:
 #: relative to the working directory, which :func:`_cmd_run` pins to the
 #: project root), so the CLI itself refuses a write outside ``knowledge/``.
 #: The post-run validator (:mod:`vco_lib.kg_reviewer_guard`) is the second,
-#: independent layer — it also covers ``store_knowledge_node``, whose
-#: ``file_path`` argument no permission rule can scope.
+#: independent layer.
+#:
+#: ``store_knowledge_node`` is deliberately NOT allowed (v0.2.103 R7): its
+#: ``file_path`` can point anywhere (or at the shared KG) and the bytes it
+#: writes cannot be replayed from the transcript, so the guard could not
+#: prove which bytes are the reviewer's — and the guard never reverts or
+#: commits bytes it cannot prove. Write/Edit carry their content, and the
+#: project's PostToolUse KG sync embeds every knowledge/ write they make.
 ALLOWED_TOOLS: "tuple[str, ...]" = (
     "Read", "Glob", "Grep",
     "mcp__weaviate-kg__hybrid_search",
-    "mcp__weaviate-kg__store_knowledge_node",
     "Edit(knowledge/**)", "Write(knowledge/**)",
 )
 #: Explicit denials (deny rules win over any allow rule a project's own
-#: settings grant): no shell, no notebook/web/agent tools, and no edits of
-#: the paths an earlier reviewer damaged or that git owns.
+#: settings grant): no shell, no notebook/web/agent tools, no KG store tool,
+#: and no edits of the paths an earlier reviewer damaged or that git owns.
 DISALLOWED_TOOLS: "tuple[str, ...]" = (
     "Bash", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent",
+    "MultiEdit", "mcp__weaviate-kg__store_knowledge_node",
     "Edit(docs/**)", "Write(docs/**)",
     "Edit(.claude/**)", "Write(.claude/**)",
     "Edit(.git/**)", "Write(.git/**)",
@@ -633,16 +639,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # Every completed write is judged, whatever the exit: each Write/Edit
         # call lands whole, and leaving it unjudged in the tree is the worse
         # outcome (it is what `git commit -a` swept up before).
-        attributed = _guard.attributed_paths(stdout, root)
-        if attributed is None:
+        writes = _guard.attributed_writes(stdout, root)
+        if writes is None:
             log("writes not attributable (no stream-json events in the "
-                "output) - every knowledge/ change is judged as the "
-                "reviewer's and nothing is committed")
-        result = _guard.validate(snap, attributed, log,
-                                 resync=_guard.resync_with(root, log))
-        _guard.commit_reviewer_changes(
-            snap, result.kept, short=commit.short, subject=commit.subject,
-            model=model, attributed=attributed is not None, log=log)
+                "output)")
+        # What the reviewer read verbatim: its Read/Grep results plus the
+        # commit stat and diff it was handed (a flag quoted from the diff is
+        # sourced too).
+        sources = "\n".join((_guard.transcript_sources(stdout), commit.stat,
+                             commit.diff))
+        result = _guard.validate(snap, writes, log,
+                                 resync=_guard.resync_with(root, log),
+                                 sources=sources)
+        if writes is not None:
+            _guard.commit_reviewer_changes(
+                snap, result.kept, reviewer_bytes=result.reviewer_bytes,
+                short=commit.short, subject=commit.subject, model=model,
+                attributed=True, log=log)
+        else:
+            log("commit skipped: the run's writes could not be attributed "
+                "to the reviewer")
     finally:
         snap.cleanup()
     return exit_code
