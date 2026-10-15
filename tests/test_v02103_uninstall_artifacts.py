@@ -34,6 +34,11 @@ def _app(path: Path, bundle_id: str) -> Path:
     return path
 
 
+def _pe_naming(exe: str) -> bytes:
+    """A stand-in PE image that names itself, like every real VCO binary."""
+    return b"MZ" + b"\0" * 64 + exe.rsplit(".", 1)[0].encode() + b"/src/main.rs\0"
+
+
 @pytest.fixture
 def win(tmp_path):
     home = tmp_path / "home"
@@ -43,7 +48,7 @@ def win(tmp_path):
     dest = local / "vct-launcher"
     dest.mkdir(parents=True)
     for exe in ua.WINDOWS_LAUNCHER_EXES:
-        (dest / exe).write_bytes(b"MZ")
+        (dest / exe).write_bytes(_pe_naming(exe))
     (dest / "notes.txt").write_text("user's own file")  # foreign
     desk = _lnk(home / "Desktop" / "VCT Launcher.lnk", str(dest / "vct-launcher.exe"))
     start = _lnk(
@@ -217,3 +222,61 @@ def test_run_uninstall_dry_run_lists_step_7_and_keeps_the_lock(monkeypatch, tmp_
 def test_run_uninstall_removes_the_engine_start_lock(monkeypatch, tmp_path):
     lock = _uninstall(monkeypatch, tmp_path, dry_run=False)
     assert not lock.exists()
+
+
+# ── review R29 (N-1, N-2/N-4) ────────────────────────────────────────────
+
+
+def test_a_user_exe_with_a_vco_name_is_left_in_place(tmp_path):
+    """N-1: name alone is not ownership — a PE that does not name itself, or a
+    non-PE file, under VCO's exe name is kept and reported."""
+    local = tmp_path / "LocalAppData"
+    dest = local / "vct-launcher"
+    dest.mkdir(parents=True)
+    (dest / "vct-hub.exe").write_bytes(b"MZ" + b"\0" * 64 + b"someone-elses-tool\0")
+    (dest / "vct-updater.exe").write_bytes(b"not a PE at all, mentions vct-updater")
+    (dest / "vct-launcher.exe").write_bytes(_pe_naming("vct-launcher.exe"))
+    plan = ua.build_plan(os_name="Windows", home=tmp_path / "home", vct_root=tmp_path / "vct",
+                         env={"LOCALAPPDATA": str(local)})
+    removed = {r.path.name for r in plan.remove}
+    kept = {p.name for p, _why in plan.keep}
+    assert "vct-launcher.exe" in removed
+    assert {"vct-hub.exe", "vct-updater.exe"} <= kept
+    assert plan.hub_binaries == []
+    ua.execute(plan, hub_running=lambda: False)
+    assert (dest / "vct-hub.exe").exists() and (dest / "vct-updater.exe").exists()
+    assert not (dest / "vct-launcher.exe").exists()
+
+
+def test_a_reparse_point_launcher_dir_is_never_followed(tmp_path, monkeypatch):
+    """N-2: a junction named vct-launcher (``is_symlink`` False on Windows) is
+    treated like a symlink: nothing inside its target is planned."""
+    local = tmp_path / "LocalAppData"
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "vct-hub.exe").write_bytes(_pe_naming("vct-hub.exe"))
+    dest = local / "vct-launcher"
+    dest.mkdir(parents=True)
+    (dest / "vct-hub.exe").write_bytes(_pe_naming("vct-hub.exe"))
+    monkeypatch.setattr(ua, "_is_reparse", lambda p: p == dest or p.is_symlink())
+    plan = ua.build_plan(os_name="Windows", home=tmp_path / "home", vct_root=tmp_path / "vct",
+                         env={"LOCALAPPDATA": str(local)})
+    assert not any(r.path.parent == dest for r in plan.remove)
+    assert dest not in plan.prune_if_empty
+
+
+def test_a_symlinked_prune_candidate_is_never_rmdired(tmp_path, monkeypatch):
+    """N-4: the prune loop never even attempts rmdir on a link (on Windows an
+    rmdir would remove a junction's reparse point; POSIX would just refuse,
+    so the attempt itself is what this pins)."""
+    real = tmp_path / "real-empty"
+    real.mkdir()
+    link = tmp_path / "linked"
+    link.symlink_to(real, target_is_directory=True)
+    attempted: list = []
+    monkeypatch.setattr(type(link), "rmdir", lambda self: attempted.append(self))
+    plan = ua.Plan()
+    plan.prune_if_empty.append(link)
+    ua.execute(plan, hub_running=lambda: False)
+    assert attempted == []
+    assert link.is_symlink() and real.is_dir()

@@ -95,6 +95,49 @@ class Plan:
 # ownership predicates
 # --------------------------------------------------------------------------
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_reparse(path: Path) -> bool:
+    """A symlink, or an NTFS junction / other reparse point (``is_symlink`` is
+    False for a junction): never followed, never pruned (review R29 N-2)."""
+    if path.is_symlink():
+        return True
+    isjunction = getattr(os.path, "isjunction", None)  # Python 3.12+
+    if isjunction is not None and isjunction(path):
+        return True
+    try:
+        attrs = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _is_vco_exe(path: Path) -> bool:
+    """A PE image (``MZ``) that names itself: every VCO binary embeds its own
+    stem (``vct-hub`` …) in ASCII or UTF-16LE. A user's file that merely
+    shares the name is left in place (review R29 N-1); a real VCO binary that
+    somehow fails this is reported as left, never guessed at."""
+    stem = path.stem.lower().encode("ascii")
+    sigs = (stem, stem.decode("ascii").encode("utf-16-le"))
+    overlap = max(len(s) for s in sigs)
+    try:
+        if _is_reparse(path) or not path.is_file():
+            return False
+        with path.open("rb") as fh:
+            if fh.read(2) != b"MZ":
+                return False
+            tail = b""
+            while chunk := fh.read(1 << 20):
+                window = (tail + chunk).lower()
+                if any(sig in window for sig in sigs):
+                    return True
+                tail = window[-overlap:]
+    except OSError:
+        return False
+    return False
+
+
 def _is_vco_lnk(path: Path) -> bool:
     try:
         if path.is_symlink() or not path.is_file():
@@ -202,10 +245,14 @@ def build_plan(
         local = env.get("LOCALAPPDATA")
         if local:
             dest = Path(local) / WINDOWS_LAUNCHER_DIRNAME
-            if dest.is_dir() and not dest.is_symlink():
+            if dest.is_dir() and not _is_reparse(dest):
                 for exe in WINDOWS_LAUNCHER_EXES:
-                    _add_file(plan, dest / exe, "prebuilt launcher binary")
-                if (dest / "vct-hub.exe").is_file():
+                    candidate = dest / exe
+                    if _is_vco_exe(candidate):
+                        _add_file(plan, candidate, "prebuilt launcher binary")
+                    elif candidate.exists() or candidate.is_symlink():
+                        plan.keep.append((candidate, "not recognised as VCO's launcher binary"))
+                if _is_vco_exe(dest / "vct-hub.exe"):
                     plan.hub_binaries.append(dest / "vct-hub.exe")
                 plan.prune_if_empty.append(dest)
         lnk_dirs = list(_windows_desktop_dirs(env))
@@ -320,7 +367,7 @@ def execute(
 
     for d in plan.prune_if_empty:
         try:
-            if d.is_dir() and not d.is_symlink() and not any(d.iterdir()):
+            if d.is_dir() and not _is_reparse(d) and not any(d.iterdir()):
                 d.rmdir()
                 audit.append(f"removed empty {d}")
         except OSError:
