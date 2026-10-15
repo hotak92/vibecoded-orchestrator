@@ -535,7 +535,12 @@ def summary_model_tiers() -> list:
         {"model": SUMMARY_CPU_TIER_MODEL,
          "when": (f"no GPU, and a CPU with {gb(SUMMARY_CPU_MIN_RAM_GB)}+ RAM "
                   f"and {SUMMARY_CPU_MIN_CORES}+ cores")},
-        {"model": SUMMARY_FLOOR_MODEL, "when": "any other machine"},
+        # The floor runs anywhere ON CPU, but on a GPU the runtime floor
+        # still applies (R20 L5): a card below it defers summaries, so the
+        # text says so instead of promising "any other machine" outright.
+        {"model": SUMMARY_FLOOR_MODEL,
+         "when": (f"any other machine (on a GPU it needs "
+                  f"{min_vram(SUMMARY_FLOOR_MODEL)}+ VRAM)")},
     ]
 
 

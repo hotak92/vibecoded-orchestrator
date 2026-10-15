@@ -366,7 +366,11 @@ REM (downloads + Expand-Archive + lands vct-launcher.exe, vct-hub.exe,
 REM vct-updater.exe in %DEST_DIR%) and keeps the bare-.exe asset as a
 REM legacy fallback. Windows sibling of the POSIX M-P0-3 fix in
 REM scripts/post-install-launcher.sh. Exit codes: 0 ok, 2 NO_ASSET,
-REM 3 TOO_SMALL, 4 NO_BINARY_IN_ZIP, 1 generic.
+REM 3 TOO_SMALL, 4 NO_BINARY_IN_ZIP, 1 generic, 5 CHECKSUM_MISMATCH,
+REM 6 UNVERIFIED (R20 M1: the archive is checked against the release's
+REM .zip.sha256 sidecar by "python -m vco_lib.launcher_acquire verify-sha256",
+REM the same verifier post-install-launcher.sh calls; without ACQ_PY nothing
+REM can be verified, so nothing is run - exit 6 -> :launch_no_prebuilt).
 REM The release asked for is THIS checkout's version (launcher_acquire
 REM api-url, must match post-install-launcher.sh); the helper's own default
 REM (the newest release) applies only when the rule's interpreter is absent.
@@ -374,10 +378,14 @@ set "API_URL="
 if defined ACQ_PY (
     for /f "usebackq delims=" %%U in (`"%ACQ_PY%" -m vco_lib.launcher_acquire api-url 2^>nul`) do set "API_URL=%%U"
 )
+REM -PythonExe only when there is one: Windows PowerShell 5.1 drops an empty
+REM quoted -File argument and then fails with "Missing an argument".
+set "PY_ARG="
+if defined ACQ_PY set PY_ARG=-PythonExe "%ACQ_PY%"
 if defined API_URL (
-    "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lib\download-launcher-asset.ps1" -DestDir "%DEST_DIR%" -ApiUrl "%API_URL%"
+    "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lib\download-launcher-asset.ps1" -DestDir "%DEST_DIR%" -ApiUrl "%API_URL%" %PY_ARG%
 ) else (
-    "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lib\download-launcher-asset.ps1" -DestDir "%DEST_DIR%"
+    "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lib\download-launcher-asset.ps1" -DestDir "%DEST_DIR%" %PY_ARG%
 )
 set "DL_EXIT=%ERRORLEVEL%"
 
@@ -386,6 +394,8 @@ if "%DL_EXIT%"=="0" (
     call :_log_event "download" "ok" "windows launcher downloaded (zip or legacy exe)"
     goto :auto_launch
 )
+if "%DL_EXIT%"=="5" echo [launcher] The downloaded launcher failed its SHA-256 check against the release - discarded, not run.
+if "%DL_EXIT%"=="6" echo [launcher] The downloaded launcher could not be verified ^(no checksum or no verifier^) - not run.
 echo [launcher] No prebuilt launcher obtained ^(download exit %DL_EXIT%^).
 call :_log_event "download" "error" "windows download failed; no prebuilt obtained"
 goto :launch_no_prebuilt

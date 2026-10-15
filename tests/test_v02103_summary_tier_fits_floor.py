@@ -98,6 +98,19 @@ def test_the_tier_text_admits_only_cards_that_fit():
         assert es.summary_model_fits_vram(tier["model"], stated)
 
 
+def test_the_floor_tier_text_names_its_gpu_need_and_that_need_fits():
+    """R20 L5: the floor model is not usable on EVERY machine — on a GPU the
+    runtime free-VRAM floor still defers it below its need. The text says so,
+    with a figure the floor rule itself admits."""
+    floor = [t for t in es.summary_model_tiers() if t["model"] == es.SUMMARY_FLOOR_MODEL]
+    assert len(floor) == 1
+    when = floor[0]["when"]
+    assert "on a GPU it needs" in when, when
+    stated = float(when.split("needs ")[1].split(" GB")[0])
+    assert es.summary_model_fits_vram(es.SUMMARY_FLOOR_MODEL, stated)
+    assert not es.summary_model_fits_vram(es.SUMMARY_FLOOR_MODEL, stated - 0.1)
+
+
 def _load_summary_backends():
     path = REPO_ROOT / "templates" / "scripts" / "summary_backends.py"
     spec = importlib.util.spec_from_file_location("_sb_floor_probe", path)

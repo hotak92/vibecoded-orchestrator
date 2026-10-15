@@ -24,8 +24,37 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
-_IDIOM = re.compile(r"Get-Date\s+-UFormat\s+['\"]?%s['\"]?\s*\)")
+#: Any spelling PowerShell accepts (R20 L3: the first version required a
+#: closing ``)`` and exact case, so a bare ``Get-Date -UFormat %s`` or
+#: ``-uformat`` escaped): parameter names are case-insensitive and may be
+#: abbreviated (``-UF``) or joined with ``:``; the value may be quoted.
+_IDIOM = re.compile(
+    r"\bGet-Date\b[^\n]*?\s-UF[a-z]*(?:\s*:\s*|\s+)['\"]?%s(?![A-Za-z0-9])",
+    re.IGNORECASE)
+
+
+@pytest.mark.parametrize("line", [
+    "$now = [int](Get-Date -UFormat %s)",
+    "$now = Get-Date -UFormat %s",
+    "$now = get-date -uformat '%s'",
+    '$now = Get-Date -UFormat:"%s"',
+    "$now = Get-Date -UF %s",
+    "$t = [long](Get-Date -Date $d -UFormat %s)",
+])
+def test_idiom_pattern_catches_every_spelling(line):
+    assert _IDIOM.search(line), line
+
+
+@pytest.mark.parametrize("line", [
+    "$now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()",
+    "$stamp = Get-Date -UFormat '%Y-%m-%d'",
+    "$s = Get-Date -UFormat %sZ-not-epoch",
+])
+def test_idiom_pattern_leaves_other_formats_alone(line):
+    assert not _IDIOM.search(line), line
 
 
 def test_no_shipped_ps1_uses_the_local_time_epoch_idiom():

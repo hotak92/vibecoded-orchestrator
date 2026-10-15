@@ -1001,3 +1001,91 @@ def test_ps1_drain_spawns_queued_refresh_inside_the_rate_limit(tmp_path: Path) -
         f"rate-limited primary drain must not run the analyzer: {blocks}"
     )
     assert primary.exists()
+
+
+# ── R20 L1: a FUTURE stamp (pre-v0.2.103 local-time stamp) never throttles ──
+# Windows PowerShell 5.1 wrote LOCAL-time epoch stamps before v0.2.103; at
+# UTC+2 such a stamp sits 7200 s in the future of the new true-UTC "now", and
+# `now - last < interval` then suppressed every drain/check for hours. Both
+# siblings read a future stamp as "no stamp".
+
+_FUTURE_S = 7200
+
+
+def _shell_argv(shell: str) -> list[str]:
+    if shell == "bash":
+        return ["bash", str(DRAIN_SH)]
+    return ["pwsh", *PWSH_BASE_FLAGS, "-File", str(DRAIN_PS1)]
+
+
+def _shell_available(shell: str) -> bool:
+    if shell == "bash":
+        return shutil.which("bash") is not None
+    # Same reach as _PS1_REQUIRED: the stand-in interpreter is a /bin/sh shim.
+    return shutil.which("pwsh") is not None and os.name != "nt"
+
+
+@pytest.mark.parametrize("shell", ["bash", "pwsh"])
+def test_future_drain_stamp_does_not_rate_limit_the_primary_drain(
+        tmp_path: Path, shell: str) -> None:
+    if not _shell_available(shell) or not shutil.which("git"):
+        pytest.skip(f"{shell} + git required")
+    repo = tmp_path / "proj"
+    repo.mkdir(parents=True)
+    _git_init(repo)
+    fx = _drain_fixture(tmp_path, repo)
+    state = fx["state"]
+    session = "sessF"
+    f = repo / "a.py"
+    f.write_text("a=1\n")
+    (state / f"codegraph_drain_{session}.txt").write_text(f"{f}\n")
+    stamp = state / "codegraph_drain_last_sync.ts"
+    stamp.write_text(str(int(fx["now"]) + _FUTURE_S))
+
+    r = subprocess.run(_shell_argv(shell), input=json.dumps({"session_id": session}),
+                       capture_output=True, text=True, timeout=120,
+                       env=_drain_env(repo, fx))  # default 120 s interval
+    assert r.returncode == 0, r.stderr
+    blocks = _wait_blocks(fx["spawn_log"], 1)
+    assert any(b and b[0] == str(fx["stub"]) for b in blocks), (
+        f"{shell}: a future stamp must not rate-limit the drain: {blocks}"
+    )
+
+
+@pytest.mark.parametrize("shell", ["bash", "pwsh"])
+def test_future_extras_check_stamp_does_not_suppress_the_check(
+        tmp_path: Path, shell: str) -> None:
+    if not _shell_available(shell):
+        pytest.skip(f"{shell} required")
+    root = tmp_path / "proj"
+    root.mkdir()
+    fx = _drain_fixture(tmp_path, root, suppress_check=False)
+    stamp = fx["state"] / "codegraph_extras_check.ts"
+    stamp.write_text(str(int(fx["now"]) + _FUTURE_S))
+
+    r = subprocess.run(_shell_argv(shell), input=json.dumps({"session_id": "sessX"}),
+                       capture_output=True, text=True, timeout=120,
+                       env=_drain_env(root, fx))
+    assert r.returncode == 0, r.stderr
+    blocks = _wait_blocks(fx["spawn_log"], 1)
+    refresh = [b for b in blocks
+               if "vco_lib.codegraph_extras_refresh" in b and "--queued" not in b]
+    assert refresh, f"{shell}: a future stamp must not suppress the check: {blocks}"
+    assert int(stamp.read_text()) <= int(time.time()), "the stamp is rewritten to now"
+
+
+@pytest.mark.parametrize("shell", ["bash", "pwsh"])
+def test_recent_real_stamp_still_suppresses_the_check(tmp_path: Path, shell: str) -> None:
+    """LEAVE-ALONE: a genuine recent (past) stamp keeps throttling."""
+    if not _shell_available(shell):
+        pytest.skip(f"{shell} required")
+    root = tmp_path / "proj"
+    root.mkdir()
+    fx = _drain_fixture(tmp_path, root, suppress_check=False)
+    (fx["state"] / "codegraph_extras_check.ts").write_text(str(int(fx["now"]) - 5))
+    r = subprocess.run(_shell_argv(shell), input=json.dumps({"session_id": "sessR"}),
+                       capture_output=True, text=True, timeout=120,
+                       env=_drain_env(root, fx))
+    assert r.returncode == 0, r.stderr
+    time.sleep(0.5)
+    assert _spawn_blocks(fx["spawn_log"]) == []

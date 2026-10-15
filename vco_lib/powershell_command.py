@@ -1028,6 +1028,11 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
         evidence = ""
         cond: List[_Tok] = []
         body: List[_Tok] = []
+        # A `for (init; cond; repeat)` header: every clause runs as part
+        # of the loop, so a wait in ANY of them is a loop wait (R20 M2 —
+        # the repeat clause escaped when only `cond` was scanned; the Bash
+        # twin is wait_guard._arith_for_clauses).
+        header: List[_Tok] = []
         unbounded = False
         if word == "do" and nxt is not None and nxt.op == "{":
             body, end = _brace_body(toks, i + 1)
@@ -1055,6 +1060,7 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
                         parts[-1].append(b)
                 bounded = len(parts) >= 2 and bool(parts[1])
                 cond = parts[1] if bounded else []
+                header = paren
                 body, _ = _brace_body(toks, pend + 1)
                 if not bounded:
                     label = "for (;;) loop"
@@ -1091,7 +1097,8 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
             evidence = f"{t.text} {{ ... }}"
         if label is None:
             continue
-        if _ps_loop_has_wait(cond) or _ps_loop_has_wait(body):
+        if (_ps_loop_has_wait(cond) or _ps_loop_has_wait(header)
+                or _ps_loop_has_wait(body)):
             return (label, evidence)
         cond_text = " ".join(b.text for b in cond)
         if _PS_INPUT_COND_RE.search(cond_text):

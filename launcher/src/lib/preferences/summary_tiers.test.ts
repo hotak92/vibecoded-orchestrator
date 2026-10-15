@@ -30,7 +30,7 @@ const PAYLOAD = {
     { model: 'qwen3.5:9b', when: '9.1 GB+ VRAM' },
     { model: 'qwen3.5:4b', when: '4.9 GB+ VRAM' },
     { model: 'gemma4:e4b', when: 'no GPU, and a CPU with 12 GB+ RAM and 6+ cores' },
-    { model: 'qwen3.5:0.8b', when: 'any other machine' },
+    { model: 'qwen3.5:0.8b', when: 'any other machine (on a GPU it needs 2.5 GB+ VRAM)' },
   ],
 };
 
