@@ -64,7 +64,7 @@ describe('wiring', () => {
     calls.length = 0;
     const res = (await PREF_LOADERS.kgSummary.load()) as unknown[];
     expect(calls).toContain('get_summary_model_info');
-    expect(parseSummaryTiers(res[4]).length).toBe(3);
+    expect(parseSummaryTiers(res[4]).length).toBe(PAYLOAD.tiers.length);
   });
 
   it('the hint renders the tiers and names no model literally', () => {
