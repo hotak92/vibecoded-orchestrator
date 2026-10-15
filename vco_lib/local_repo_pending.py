@@ -42,11 +42,13 @@ __all__ = ["CID", "PendingState", "pending_state", "reconcile"]
 #: The deferral condition id (registry: ``vco_lib/deferral_conditions.toml``).
 CID = "local_git_repo_pending"
 
-#: MUST MATCH ``SETTING_KEY`` in launcher/src-tauri/src/commands/worktree_repo_mode.rs.
+#: MUST MATCH ``SETTING_KEY`` in launcher/src-tauri/src/commands/worktree_repo_mode.rs
+#: — executable parity: both sides pin tests/fixtures/worktree_repo_mode_parity.json.
 _SETTING_KEY = "worktree_repo_mode"
 
 #: MUST MATCH ``VALID_MODES`` in launcher/src-tauri/src/commands/worktree_repo_mode.rs
-#: — a stored value outside this set counts as "no choice recorded", as there.
+#: (same parity fixture) — a stored value outside this set counts as "no choice
+#: recorded", as there.
 _VALID_MODES = frozenset(
     {"use_existing", "local_init", "no_repo", "use_existing_at", "use_existing_remote"}
 )
@@ -116,8 +118,9 @@ def _entry(folder: Path) -> Any:
         title="No git repository yet — the VCO launcher creates one",
         detected=(
             "This project folder is not inside a git repository and no git choice "
-            "is recorded for it, so isolated subagents (`isolation: worktree`) "
-            "cannot get a worktree. A bundle update run from the command line does "
+            "is recorded for it, so subagents declared `isolation: worktree` run in "
+            "the project folder itself, without isolation (VCO's worktree-guard "
+            "hook returns the folder). A bundle update run from the command line does "
             "not create the repository; the VCO launcher does, on this project's "
             "next Update bundle: a local-only repository (no remote, nothing "
             "committed). If the folder already holds other git repositories, the "

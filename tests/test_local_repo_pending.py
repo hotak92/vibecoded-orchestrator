@@ -122,6 +122,24 @@ def test_git_that_cannot_run_leaves_the_ledger_alone(tmp_path, project, monkeypa
     assert not (project / ".claude" / "context" / "UPDATE_DEFERRED.md").exists()
 
 
+def test_mode_contract_matches_the_shared_parity_fixture():
+    """The Rust writer (worktree_repo_mode.rs) pins the same fixture in
+    `worktree_repo_mode_parity_fixture`, so a new Rust mode fails there until
+    the fixture lists it, and fails HERE until Python knows it."""
+    from vco_lib.launcher_db_reader import ORCHESTRATOR_CORE_MODULE_ID
+
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "worktree_repo_mode_parity.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert fixture["_format_version"] == 1
+    assert fixture["module_id"] == ORCHESTRATOR_CORE_MODULE_ID
+    assert fixture["setting_key"] == lrp._SETTING_KEY
+    assert set(fixture["valid_modes"]) == set(lrp._VALID_MODES)
+    assert len(fixture["valid_modes"]) == len(set(fixture["valid_modes"]))
+
+
 def test_registry_declares_the_condition():
     import tomllib
 
