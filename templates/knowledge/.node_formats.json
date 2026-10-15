@@ -241,11 +241,11 @@
   },
   "knowledge/concepts/kg-summary-three-tier-pipeline.md": {
     "title": "KG-Summary Generation Pipeline — Backend Ladder",
-    "description": "Auto-generated 2-3 sentence summaries for knowledge graph nodes, triggered by hooks on Edit/Write to knowledge files and stored in knowledge/.node_formats.json for retrieval clients to consume. Implements a tiered backend hierarchy (CLI > z.ai GLM > QwenCloud > Ollama > OpenAI > Anthropic API), with Ollama tiers intelligently deferred when insufficient VRAM is available or code-graph embedding walks are in progress, preventing resource exhaustion. Includes circuit breaker logic to prevent repeated failures from misconfigured backends and supports forced backend selection via the KG_SUMMARY_BACKEND environment variable. Enables efficient knowledge node summarization across heterogeneous generation backends while managing compute costs and resource constraints.",
-    "summary": "The KG-Summary Generation Pipeline auto-generates summaries for knowledge nodes using a tiered backend ladder (claude CLI → z.ai GLM → QwenCloud → Ollama → OpenAI → Anthropic API) with a circuit breaker that latches failed tiers open for graduated cooldowns classified by failure type: rate_limit (900s), auth (120s), quota/trust (18000s), capacity (60s).",
-    "generated_at": "2026-10-15T09:36:29.221973+00:00",
-    "backend": "cli",
-    "content_hash": "c7eb55dfba16245c",
+    "description": "The KG-Summary Generation Pipeline is an automated system that creates concise summaries for every knowledge graph node and stores them in a JSON file for retrieval clients. It operates via a backend selection ladder that prioritizes local CLI tools like Claude, followed by cloud providers such as z.ai and QwenCloud, local Ollama instances, and finally OpenAI or Anthropic APIs, with specific logic to skip unavailable tiers or defer processing based on VRAM constraints. The system intelligently handles backend availability by caching smoke test results, implementing circuit breakers for failed tiers, and respecting user consent or forced environment variables to determine execution flow. This architecture ensures efficient resource usage and reliable summary generation by dynamically adapting to available models and API keys without incurring unnecessary costs or errors.",
+    "summary": "The KG-Summary Generation Pipeline automatically generates 2-3 sentence summaries for knowledge graph nodes via a tiered backend ladder that prioritizes the local `claude` CLI, followed by cloud providers (z.ai, QwenCloud), local Ollama (with dynamic VRAM deferral logic), and OpenAI, descending the ladder only when specific failure conditions like rate limits, auth errors, or quota exhaustion trigger a circuit breaker with defined cooldown periods.",
+    "generated_at": "2026-10-15T14:08:00.853990+00:00",
+    "backend": "ollama",
+    "content_hash": "79a67929061f6cb6",
     "total_chunks": 1
   },
   "knowledge/concepts/knowledge-graph.md": {
@@ -790,10 +790,11 @@
   },
   "knowledge/models/gemma4-e4b.md": {
     "title": "Gemma 4 E4B",
-    "description": "Gemma 4 E4B is Google DeepMind's \"effective 4B\" edge variant designed for laptop and mobile deployment with full multimodal capabilities.\nIt supports a 128K context window using dense and Mixture-of-Experts architectures to balance performance with a 9.6 GB footprint.\nThe model serves as a primary local fallback for knowledge graph summary generation on mid- and low-power machines with limited VRAM.\nIt matters because it provides a non-Qwen alternative for instruction-tuned, edge-class inference while adhering to Google's specific open-but-restricted license terms.",
-    "summary": "Gemma 4 E4B is Google DeepMind's \"effective 4B\" edge variant designed for laptop and mobile deployment, supporting full multimodal capabilities (text, image), configurable thinking, native function-calling, and system prompts. It utilizes a dense architecture with a 9.6 GB footprint and 128K context window. The model serves as a primary local fallback for knowledge graph summary generation on mid-to-low-power hardware (≥6 GB VRAM or ≥12 GB RAM) when larger models like Qwen 3.5:9B are unavailable or unsupported. Distributed via Ollama, it is explicitly not exposed as an MCP tool but remains accessible through the REST API. It operates under Google's Gemma Terms of Use, which are permissive but not OSI-approved.",
-    "generated_at": "2026-07-20T18:56:40.352883+00:00",
-    "content_hash": "0e4829e813417dfe",
+    "description": "Gemma 4 E4B is an edge-optimized variant of the Gemma 4 family designed for laptop and mobile deployment while maintaining full multimodal capabilities. It utilizes a dense architecture with a 9.6 GB footprint and 128K context window, requiring approximately 5 GB of VRAM and 8 GB of system RAM for practical operation. The orchestrator deploys this model as a fallback for KG-summary generation on hosts lacking GPUs or with limited resources, specifically when a non-Qwen stack is preferred. Its significance lies in filling the low-power niche for instruction-tuned, multimodal tasks where standard GPU resources are unavailable.",
+    "summary": "Gemma 4 E4B is a 9.6 GB effective 4B parameter multimodal model featuring 128K context, dense architecture, and native function-calling capabilities designed for edge deployment on systems with no GPU and ≥12 GB RAM. It serves as a non-Qwen fallback for knowledge graph summary generation via Ollama's REST API under Google's open-but-restricted Gemma Terms of Use.",
+    "generated_at": "2026-10-15T14:07:43.613272+00:00",
+    "backend": "ollama",
+    "content_hash": "21b913a6f9be5c5e",
     "total_chunks": 1
   },
   "knowledge/models/jina-embeddings-v2-base-code.md": {
@@ -814,10 +815,11 @@
   },
   "knowledge/models/qwen3.5.md": {
     "title": "Qwen3.5",
-    "description": "Qwen3.5 is a unified open-source multimodal foundation model family that replaces separate text and vision lines with a single early-fusion architecture.\nIt offers dense and sparse Mixture-of-Experts variants ranging from 0.8B to 122B parameters, all sharing a massive 256K context window.\nThe model serves as a high-quality local fallback for knowledge graph summary generation and replaces dual-model stacks to cut disk footprint in half.\nIts Apache 2.0 licensing and unified design make it a cost-effective, versatile choice for local AI stacks handling long documents and code without RAG.",
-    "summary": "Qwen3.5 is a unified text and vision foundation model family released by Alibaba, replacing the separate Qwen3 and Qwen3-VL lines with a single checkpoint trained via early-fusion. It offers dense and sparse Mixture-of-Experts variants ranging from 0.8B to 122B parameters, all supporting a 256K context window. The default orchestrator model is `qwen3.5:9b`, with `qwen3.5:0.8b` serving as a universal fallback. Deployment logic in `install.py` selects `qwen3.5:9b` for GPU hosts with ≥16 GB VRAM, falling back to `gemma4:e4b` for lower-power systems, while `qwen3.5:0.8b` remains the always-fits baseline. The model is licensed under Apache 2.0 and is used locally for KG-summary generation and embedding infrastructure via Ollama, though its vision capabilities are not exposed as MCP tools.",
-    "generated_at": "2026-07-20T18:56:53.561186+00:00",
-    "content_hash": "b8b0a71fcb9af6ee",
+    "description": "Qwen3.5 is a unified open-source multimodal foundation model family that integrates text and vision capabilities into a single checkpoint, replacing the previous separate Qwen3-VL line. The family offers dense and sparse Mixture-of-Experts variants ranging from 0.8B to 122B parameters, all supporting a 256K context window with file sizes from 1.0 GB to 81 GB. Implementation specifics include hardware-tiered selection logic that assigns the 9B model to GPUs with ~9.1 GB free VRAM, the 4B model for smaller cards, and the 0.8B model for CPU-only environments, while explicitly excluding MCP tool exposure. This unified approach halves disk footprints for projects requiring both modalities and provides a 256K context suitable for long documents without complex RAG plumbing under an Apache 2.0 license.",
+    "summary": "Qwen3.5 is a unified text-vision foundation model family released under Apache 2.0 licensing that consolidates Qwen3 and Qwen3-VL into a single early-fusion architecture with a 256K context window. The default orchestrator variant, `qwen3.5:9b`, occupies approximately 6.6 GB on disk and requires ~9 GB of VRAM at q4_K_M quantization to handle both modalities, replacing the separate Qwen3-VL line to cut disk footprint in half.",
+    "generated_at": "2026-10-15T14:07:37.816245+00:00",
+    "backend": "ollama",
+    "content_hash": "06ac87ae1ae6b821",
     "total_chunks": 1
   },
   "knowledge/models/snowflake-arctic-embed2.md": {

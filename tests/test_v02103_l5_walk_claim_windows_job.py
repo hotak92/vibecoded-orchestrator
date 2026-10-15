@@ -19,7 +19,6 @@ analyzer, never the real one) and a real Stop-Process-equivalent kill.
 from __future__ import annotations
 
 import ctypes
-import os
 import subprocess
 import sys
 import time
@@ -31,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.child_env import child_env  # noqa: E402
 from vco_lib import codegraph_walk  # noqa: E402
 
 
@@ -228,15 +228,15 @@ def win_walk(tmp_path, monkeypatch):
     script.write_text(FAKE_ANALYZER, encoding="utf-8")
     pid_file = tmp_path / "child.pid"
     procs: list = []
-    env = dict(os.environ, FAKE_PID_FILE=str(pid_file), VCT_STATE_DIR=str(state),
-               PYTHONPATH=os.pathsep.join(
-                   p for p in (str(REPO_ROOT), os.environ.get("PYTHONPATH", "")) if p))
 
     def start(project: str = "ProjWinL5"):
+        # child_env() pins this checkout first on the child's PYTHONPATH (and
+        # its root channels), so the wrapper imports THIS vco_lib.
         proc = subprocess.Popen(
             [sys.executable, "-m", "vco_lib.codegraph_walk", str(script),
              "--project", project, str(tmp_path)],
-            env=env, cwd=str(tmp_path), stderr=subprocess.PIPE, text=True)
+            env=child_env(FAKE_PID_FILE=str(pid_file), VCT_STATE_DIR=str(state)),
+            cwd=str(tmp_path), stderr=subprocess.PIPE, text=True)
         procs.append(proc)
         return proc
 
