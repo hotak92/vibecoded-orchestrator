@@ -217,6 +217,8 @@ def test_prompt_demands_research_first_and_has_no_docs_job(repo):
     assert "## Proposed change (kg-reviewer, 2026-10-15)" in text
     assert "ONLY with the Write and Edit tools" in text
     assert "store_knowledge_node" not in text  # not a reviewer tool any more
+    # R11 A3: KG search text is deliberately not a source for flags
+    assert "hybrid_search results do NOT count as a source" in text
     assert "+x = 2" in text and "feat: bump x" in text
 
 
@@ -797,6 +799,108 @@ def test_f5_user_edit_to_the_symlink_target_is_left_alone(repo, tmp_path):
         res, _l, _ = _validate(repo, w, snap)
         assert outside.read_text() == "the user's own edit\n"
         assert res.left_for_user == [str(outside.resolve())]
+    finally:
+        snap.cleanup()
+
+
+# ── R11 A2: link-target cap; outside bytes stay out of the project ───────
+
+
+def test_r11_oversized_link_target_is_not_copied_and_not_restorable(
+        repo, tmp_path, monkeypatch):
+    cap = model_mod.config()["guard"]["link_target_max_bytes"]
+    big = tmp_path / "huge.md"
+    big.write_bytes(b"x" * (cap + 1))
+    link = repo / "knowledge/huge-link.md"
+    link.symlink_to(big)
+    snap = guard.take_snapshot(repo)
+    try:
+        assert str(big.resolve()) in snap.oversized_targets
+        assert str(big.resolve()) not in snap.link_targets
+        assert not (snap.copy_dir / "link-targets").exists()
+        big.write_bytes(b"reviewer wrote through the link\n")
+        w = {_key(repo, "knowledge/huge-link.md"):
+             [("write", "reviewer wrote through the link\n")]}
+        res, lines, _ = _validate(repo, w, snap)
+        assert big.read_bytes() == b"reviewer wrote through the link\n"
+        assert res.kept == []
+        assert any("too large to snapshot" in ln for ln in lines)
+        assert res.unrestorable and "too large" in res.unrestorable[0][1]
+    finally:
+        snap.cleanup()
+
+
+def test_r11_outside_target_backup_goes_to_the_vco_state_dir(
+        repo, tmp_path, monkeypatch):
+    state = tmp_path / "vco-state"
+    monkeypatch.setenv("VCT_STATE_DIR", str(state))
+    outside = tmp_path / "outside-notes.md"
+    outside.write_text("outside original\n")
+    (repo / "knowledge/linked.md").symlink_to(outside)
+    snap = guard.take_snapshot(repo)
+    try:
+        outside.write_text("reviewer wrote through the link\n")
+        w = {_key(repo, "knowledge/linked.md"):
+             [("write", "reviewer wrote through the link\n")]}
+        res, _l, _ = _validate(repo, w, snap)
+        assert outside.read_text() == "outside original\n"
+        backed = [p for p in state.rglob("outside-notes.md")]
+        assert backed and backed[0].read_text() == "reviewer wrote through the link\n"
+        assert "kg-reviewer-outside" in str(backed[0])
+        assert not list(repo.rglob("_outside_project")), "foreign bytes in the project"
+        assert not list((repo / ".claude").rglob("outside-notes.md"))
+    finally:
+        snap.cleanup()
+
+
+# ── R11 A1: backups are never stageable ──────────────────────────────────
+
+
+def _staged_under_backups(repo: Path) -> List[str]:
+    _git(repo, "add", "-A")
+    return [p for p in _git(repo, "diff", "--cached", "--name-only").split()
+            if p.startswith(".claude/backups")]
+
+
+def test_r11_guard_backups_are_never_staged_by_git_add_all(repo):
+    snap = guard.take_snapshot(repo)
+    try:
+        w: dict = {}
+        _reviewer_write(repo, w, "docs/adr/0001.md", "# ADR 1\n\nRewritten.\n")
+        res, _l, _ = _validate(repo, w, snap)
+        assert res.backup_dir is not None and res.backup_dir.is_dir()
+    finally:
+        snap.cleanup()
+    assert (repo / ".claude/backups/.gitignore").read_text() == "*\n"
+    assert _staged_under_backups(repo) == []
+
+
+def test_r11_bundle_adoption_backups_are_never_staged_by_git_add_all(repo):
+    from vco_lib.bundle_backup import backup_bytes_for_adoption
+    rel = backup_bytes_for_adoption(repo, ".claude/hooks/x.sh",
+                                    "20261015T000000Z", b"user bytes\n")
+    assert (repo / rel).read_bytes() == b"user bytes\n"
+    assert _staged_under_backups(repo) == []
+
+
+def test_r11_an_existing_backups_gitignore_is_left_as_is(repo):
+    from vco_lib.project_backups import ensure_backups_dir
+    (repo / ".claude/backups").mkdir(parents=True)
+    (repo / ".claude/backups/.gitignore").write_text("# user rule\n!keep.txt\n")
+    ensure_backups_dir(repo)
+    assert (repo / ".claude/backups/.gitignore").read_text() == "# user rule\n!keep.txt\n"
+
+
+def test_r11_a_failed_backup_means_no_revert(repo, monkeypatch):
+    monkeypatch.setattr(guard._Backups, "save", lambda self, key: (False, None))
+    snap = guard.take_snapshot(repo)
+    try:
+        w: dict = {}
+        _reviewer_write(repo, w, "docs/adr/0001.md", "# ADR 1\n\nRewritten.\n")
+        res, lines, _ = _validate(repo, w, snap)
+        assert (repo / "docs/adr/0001.md").read_text() == "# ADR 1\n\nRewritten.\n"
+        assert res.reverted == [] and res.unrestorable
+        assert any("could not be backed up" in ln for ln in lines)
     finally:
         snap.cleanup()
 

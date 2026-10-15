@@ -37,8 +37,13 @@ the reviewer.
    REVERTED from the snapshot copy (never ``git checkout``; a path that was
    clean at the start is restored from the starting commit's blob, a path
    that did not exist is removed). The current bytes are ALWAYS backed up
-   first, under ``.claude/backups/kg-reviewer/<utc-stamp>/``. Rules, each
-   logged with path + reason:
+   first, under ``.claude/backups/kg-reviewer/<utc-stamp>/`` (self-ignoring:
+   :mod:`vco_lib.project_backups`, so ``git add -A`` never stages it), or —
+   for a symlink target outside the project — under the user's VCO state dir
+   (``backups/kg-reviewer-outside/``), never in the project tree; a file
+   whose bytes cannot be backed up is not touched. A ``knowledge/`` symlink
+   target over ``[guard] link_target_max_bytes`` is not copied at all: it is
+   logged as not restorable. Rules, each logged with path + reason:
 
    * a path outside ``knowledge/`` (or outside the project);
    * a write through, or over, a ``knowledge/`` symlink (its target may be
@@ -239,6 +244,9 @@ class Snapshot:
     #: absolute resolved target of a knowledge/ symlink -> copy path (the
     #: target may live outside the project).
     link_targets: Dict[str, Path] = field(default_factory=dict)
+    #: resolved targets over ``[guard] link_target_max_bytes``: not copied,
+    #: so not restorable.
+    oversized_targets: Set[str] = field(default_factory=set)
     #: rel path -> sha256 (None = deleted) of every path the USER already
     #: had changes on at the start (staged, unstaged or untracked).
     dirty_before: Dict[str, Optional[str]] = field(default_factory=dict)
@@ -333,7 +341,12 @@ def take_snapshot(root: Path) -> Snapshot:
             if path.is_symlink():
                 snap.symlinks[rel] = os.readlink(path)
                 target = path.resolve()
-                if target.is_file() and str(target) not in snap.link_targets:
+                if (target.is_file() and str(target) not in snap.link_targets
+                        and target.stat().st_size > _link_target_cap()):
+                    # Review R11 A2: never copy a huge link target on every
+                    # commit; it is recorded as not restorable instead.
+                    snap.oversized_targets.add(str(target))
+                elif target.is_file() and str(target) not in snap.link_targets:
                     dest = snap.copy_dir / "link-targets" / str(len(snap.link_targets))
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_bytes(target.read_bytes())
@@ -698,42 +711,77 @@ def unsourced_flags(pre: Optional[str], post: str, sources: str) -> List[str]:
                   if not re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", sources))
 
 
+def _link_target_cap() -> int:
+    return int(_guard()["link_target_max_bytes"])
+
+
+def _outside_backups_base() -> Path:
+    """Where bytes from OUTSIDE the project are backed up: the user's VCO
+    state dir, never the project tree (review R11 A2/A3 — foreign bytes
+    must not become agent-readable, committable project content)."""
+    from vco_lib.paths import vct_root_dir
+
+    return vct_root_dir() / "backups" / "kg-reviewer-outside"
+
+
+def _stamped_dir(base: Path) -> Path:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    d = base / stamp
+    n = 1
+    while d.exists():
+        n += 1
+        d = base / f"{stamp}-{n}"
+    d.mkdir(parents=True)
+    return d
+
+
 class _Backups:
-    """``<project>/.claude/backups/kg-reviewer/<utc-stamp>/`` — created on
-    first use; every revert and every left-for-the-user file is copied here
-    first, so no byte of the user's is ever lost to the guard."""
+    """Every revert and every left-for-the-user file is copied aside FIRST,
+    so no byte of the user's is ever lost to the guard:
+
+    * a project path -> ``<project>/.claude/backups/kg-reviewer/<utc-stamp>/``
+      (the backups tree is self-ignoring: :mod:`vco_lib.project_backups`);
+    * a path outside the project (a ``knowledge/`` symlink's target) ->
+      ``<VCO state dir>/backups/kg-reviewer-outside/<utc-stamp>/``.
+
+    :meth:`save` returns ``(ok, where)``: ``ok`` is False when a copy was
+    needed and could not be made — the caller must then NOT modify the file.
+    """
 
     def __init__(self, root: Path) -> None:
         self.root = root
         self.dir: Optional[Path] = None
+        self.outside_dir: Optional[Path] = None
 
-    def save(self, key: Path) -> Optional[Path]:
+    def save(self, key: Path) -> "Tuple[bool, Optional[Path]]":
         if not (key.is_file() or key.is_symlink()):
-            return None
-        if self.dir is None:
-            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            base = self.root / ".claude" / "backups" / "kg-reviewer"
-            d = base / stamp
-            n = 1
-            while d.exists():
-                n += 1
-                d = base / f"{stamp}-{n}"
-            d.mkdir(parents=True)
-            self.dir = d
+            return True, None  # nothing there: nothing to lose
         try:
-            rel = key.relative_to(self.root).as_posix()
-        except ValueError:
-            rel = "_outside_project/" + str(key).lstrip("/\\").replace(":", "")
-        dest = self.dir / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if key.is_symlink():
-            dest.with_name(dest.name + ".symlink").write_text(
-                os.readlink(key), encoding="utf-8")
-            if key.is_file():
+            try:
+                rel = key.relative_to(self.root).as_posix()
+                if self.dir is None:
+                    from vco_lib.project_backups import ensure_backups_dir
+
+                    self.dir = _stamped_dir(ensure_backups_dir(self.root)
+                                            / "kg-reviewer")
+                dest = self.dir / rel
+            except ValueError:
+                if key.is_file() and key.stat().st_size > _link_target_cap():
+                    return False, None  # too large to copy; never modified
+                if self.outside_dir is None:
+                    self.outside_dir = _stamped_dir(_outside_backups_base())
+                dest = self.outside_dir / str(key).lstrip("/\\").replace(":", "")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if key.is_symlink():
+                dest.with_name(dest.name + ".symlink").write_text(
+                    os.readlink(key), encoding="utf-8")
+                if key.is_file():
+                    shutil.copyfile(key, dest)
+            else:
                 shutil.copyfile(key, dest)
-        else:
-            shutil.copyfile(key, dest)
-        return dest
+            return True, dest
+        except OSError:
+            return False, None
 
 
 def _restore(key: Path, data: Optional[bytes]) -> None:
@@ -756,13 +804,27 @@ def _restore_symlink(snap: Snapshot, rel: str, log: Log, backups: _Backups,
     link_text = snap.symlinks[rel]
     reason = "wrote through or over a knowledge/ symlink"
     if not (key.is_symlink() and os.readlink(key) == link_text):
-        saved = backups.save(key)
+        ok, saved = backups.save(key)
+        if not ok:
+            log(f"REVERT-IMPOSSIBLE {rel}: {reason}, and its current bytes "
+                f"could not be backed up - left as is, inspect it by hand")
+            res.unrestorable.append((rel, reason))
+            return
         if key.exists() or key.is_symlink():
             key.unlink()
         key.symlink_to(link_text)
         log(f"REVERTED {rel}: {reason} (the link is restored; backup: {saved})")
         res.reverted.append((rel, reason))
     target = key.resolve()
+    if str(target) in snap.oversized_targets:
+        # Never copied (review R11 A2): it cannot be restored, and nothing
+        # written through this link is ever committed (the symlink branch
+        # keeps nothing).
+        log(f"REVERT-IMPOSSIBLE {target}: reached through {rel}, too large to "
+            f"snapshot (> {_link_target_cap()} bytes) - not restorable; "
+            f"inspect it by hand if the reviewer wrote to it")
+        res.unrestorable.append((str(target), f"{reason}; target too large"))
+        return
     copy = snap.link_targets.get(str(target))
     if copy is None:
         return
@@ -772,12 +834,17 @@ def _restore_symlink(snap: Snapshot, rel: str, log: Log, backups: _Backups,
         return
     exp = expected_bytes(pre, writes_on_link)
     if exp is UNKNOWN or not _same(exp if isinstance(exp, bytes) else None, cur):
-        saved = backups.save(target)
+        _ok, saved = backups.save(target)
         log(f"LEFT AS IS {target}: changed during the run by someone other "
             f"than the reviewer (backup: {saved}) - not reverted")
         res.left_for_user.append(str(target))
         return
-    saved = backups.save(target)
+    ok, saved = backups.save(target)
+    if not ok:
+        log(f"REVERT-IMPOSSIBLE {target}: {reason}, and its current bytes "
+            f"could not be backed up - left as is")
+        res.unrestorable.append((str(target), reason))
+        return
     _restore(target, pre)
     log(f"REVERTED {target}: {reason} (its target; backup: {saved})")
     res.reverted.append((str(target), reason))
@@ -820,7 +887,7 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
         # so a deletion is someone else's and falls in the branch below.
         owned = isinstance(exp, bytes) and _same(exp, cur)
         if not owned:
-            saved = backups.save(key)
+            _ok, saved = backups.save(key)
             log(f"LEFT AS IS {name}: its bytes cannot be proven to be the "
                 f"reviewer's (changed or deleted during the run by someone "
                 f"else, or its starting content is unknown; backup: {saved}) "
@@ -852,12 +919,17 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
             res.reviewer_bytes[rel] = cur
             continue
         if not known:
-            saved = backups.save(key)
+            _ok, saved = backups.save(key)
             log(f"REVERT-IMPOSSIBLE {name}: {reason} (its pre-run content is "
                 f"unknown; backup: {saved}) - inspect it by hand")
             res.unrestorable.append((name, reason))
             continue
-        saved = backups.save(key)
+        ok, saved = backups.save(key)
+        if not ok:
+            log(f"REVERT-IMPOSSIBLE {name}: {reason}, and its current bytes "
+                f"could not be backed up - left as is, not committed")
+            res.unrestorable.append((name, reason))
+            continue
         _restore(key, pre)
         log(f"REVERTED {name}: {reason}"
             + (f" (backup: {saved})" if saved else ""))

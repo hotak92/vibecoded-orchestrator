@@ -162,6 +162,8 @@ not configuration. Edits elsewhere are blocked and reverted.
    did not read VERBATIM in the diff or in a file you opened (Read/Grep)
    during this run, and name the source path next to each such fact. A
    backticked `--flag` that appears in nothing you read is reverted.
+   hybrid_search results do NOT count as a source for this (KG text can be
+   wrong): Read the file a flag comes from before writing it.
 7. Never create or update "blocker", "in-progress", "TODO", "investigation"
    or other status-tracking nodes from a commit diff - a single commit is a
    partial view.

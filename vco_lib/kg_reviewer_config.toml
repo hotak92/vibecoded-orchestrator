@@ -76,6 +76,10 @@ frontmatter_mutable_keys = ["updated"]
 # `title` (case- and whitespace-normalised) equals an existing node's title
 # is reverted too — extend that node instead.
 new_node_required_keys = ["title", "type", "tags", "created", "updated", "status"]
+# The largest knowledge/ symlink TARGET the snapshot copies (bytes). A larger
+# target is recorded as "too large - not restorable": a write through that
+# link is logged REVERT-IMPOSSIBLE and nothing through it is committed.
+link_target_max_bytes = 1048576
 # Derived knowledge/ sidecars other tools regenerate (the summary generator,
 # the sync). They are neither validated nor committed by the reviewer: their
 # writers run asynchronously and also serve the user's own edits.
