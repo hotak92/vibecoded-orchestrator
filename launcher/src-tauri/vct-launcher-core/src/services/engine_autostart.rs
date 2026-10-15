@@ -148,11 +148,24 @@ pub const WINDOWS_CREATION_FLAGS: u32 = 0x0800_0000 | 0x0000_0200;
 /// detaches the session, not the parentage, so an unwaited child would
 /// linger as a zombie for the hub's lifetime.
 pub fn spawn_engine_start_cli_with(python: &Path) -> io::Result<u32> {
+    // The `#[cfg(windows)]` creation_flags block sits DIRECTLY under the
+    // stdio chain (before the `#[cfg(unix)]` pre_exec block) so the
+    // command-silent gate sees the `.creation_flags(` marker: its lookahead
+    // stops at the first new `let ` binding that does not mention `cmd`
+    // (the `let _ = …last_os_error()` line inside the unix block below).
+    // Pure layout — the two blocks are mutually exclusive per OS, so the
+    // order between them cannot change behaviour.
     let mut cmd = Command::new(python);
     cmd.args(engine_start_argv())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(WINDOWS_CREATION_FLAGS);
+    }
 
     #[cfg(unix)]
     {
@@ -168,12 +181,6 @@ pub fn spawn_engine_start_cli_with(python: &Path) -> io::Result<u32> {
                 Ok(())
             });
         }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(WINDOWS_CREATION_FLAGS);
     }
 
     let mut child = cmd.spawn()?;
@@ -306,5 +313,49 @@ mod tests {
             libc::kill(pid as i32, libc::SIGKILL);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_exited_child_is_reaped_not_left_a_zombie() {
+        // R19 F6 / R21 L2: `setsid` detaches the child's SESSION, not its
+        // parentage — without the reaper thread the exited child lingers
+        // as a zombie (/proc/<pid> state Z) for the caller's whole
+        // lifetime. REAPED means the /proc entry is GONE (a zombie still
+        // has one; only wait() removes it).
+        let dir = std::env::temp_dir()
+            .join(format!("vco-engine-autostart-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Exits on its own immediately — there is nothing to wait for but
+        // the reap itself.
+        let python = fake_python(&dir, "fake-python", "#!/bin/sh\nexit 0\n");
+
+        let pid = spawn_engine_start_cli_with(&python).expect("spawn must succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => break, // the entry is gone — the child was reaped
+                Ok(stat) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child {pid} is still in /proc (state {:?}) after the \
+                         reaper window — it was left as a zombie",
+                        proc_state(&stat),
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// /proc/<pid>/stat field 3 (state), parsed after the last `)` because
+    /// the comm field (field 2) is parenthesised and may contain spaces.
+    #[cfg(unix)]
+    fn proc_state(stat: &str) -> &str {
+        stat.rsplit_once(')')
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .unwrap_or("?")
     }
 }

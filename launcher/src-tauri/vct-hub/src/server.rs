@@ -446,7 +446,13 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // `VCT_CONTAINER_ENGINE_AUTOSTART=0` opts out). The hub starts on
     // session start, launcher start and boot — each of those is a moment
     // the engine may simply not be running yet.
-    tokio::spawn(async {
+    //
+    // spawn_blocking (R21 L1), matching the launcher's own call site
+    // (`src/lib.rs`): the CLI spawn's launcher.db pre-check is a
+    // synchronous `Db::open()` (migrations, a 5 s busy_timeout) that must
+    // never block a tokio async worker under startup DB contention — the
+    // blocking pool is exactly for such work.
+    tokio::task::spawn_blocking(|| {
         vct_launcher_core::services::engine_autostart::spawn_engine_start_cli();
     });
 

@@ -521,7 +521,7 @@ The first of those three ways out — "start the pinned runtime" — is what VCO
 
 The starter's contract:
 
-* **only a RECORDED engine is ever started** — starting requires the install to have recorded a runtime (`state/install/runtime.txt`, what `install.py --container` writes, or the `VCT_CONTAINER_RUNTIME` env pin). With no recorded runtime nothing is started — never the first runtime binary on PATH, never an unattended `podman machine init`. An install that chose `--no-containers` (persisted in `state/install-manifest.json`) gets nothing started either;
+* **only a RECORDED engine is ever started** — starting requires the install to have recorded a runtime (`state/install/runtime.txt` — written by the install whenever it detected or was given a runtime, not only under `--container` — or the `VCT_CONTAINER_RUNTIME` env pin). With no recorded runtime nothing is started — never the first runtime binary on PATH, never an unattended `podman machine init`. An install that chose `--no-containers` (persisted in `state/install-manifest.json`) gets nothing started either;
 * **idempotent, single-flight** — an engine that answers (`<runtime> info` exits 0) is a no-op, and the launcher + the hub + N concurrent sessions that all reach for the starter during one engine boot produce exactly ONE start: the CLI holds a per-user claim (`<vct state dir>/state/engine-start.lock`, a kernel-level lock released when the holder exits) for its whole run, and every other concurrent run reports "already in progress" and stands down;
 * **the recorded-but-down runtime IS started** (the refused pin above); the other runtime never is, for the same named-volumes reason;
 * **per-OS recipe** — Docker Desktop on macOS (`open -a Docker`) and Windows (shell-start of `Docker Desktop.exe`); the podman machine on macOS/Windows (`podman machine start`, init-if-absent); the rootless socket on Linux (`systemctl --user start podman.socket`). Linux Docker is NOT auto-started (`sudo systemctl start docker` needs an interactive password). On Windows every process involved runs windowless (`CREATE_NO_WINDOW`) — no console flash during a boot;
@@ -529,7 +529,7 @@ The starter's contract:
 * **update gate** — a fresh `.update-in-progress.json` (the same lockfile the session hooks honour) means the starter stands down until the update completes;
 * **bounded waiting, never killing** — after a Docker Desktop launch the starter polls liveness for up to 60 s (in its own detached process); when the wait ends it reports and gives up, it never kills or cancels anything.
 
-Two opt-outs, either of which disables the starter on EVERY surface (both are checked before any probe; the env override wins):
+Two opt-outs, either of which disables the starter on EVERY surface (both are checked before any probe; either one alone is enough — the env var can only turn auto-start OFF, it cannot re-enable it over a Preferences off):
 
 | Knob | Default | Effect |
 |---|---|---|

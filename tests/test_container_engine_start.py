@@ -267,6 +267,41 @@ class TryStartDockerDaemonTests(unittest.TestCase):
             for key in record:
                 self.assertNotIn(key, kw.get("env", {}))
 
+    def test_windows_cmd_child_gets_create_no_window(self):
+        """R19 F3 / R21 L2: on Windows the ``cmd`` console child is spawned
+        with ``CREATE_NO_WINDOW`` (0x08000000) so a windowless parent (the
+        Rust spawn) never flashes a console. Red-proofed by mutation:
+        removing ``**_windows_no_window_kwargs()`` from the Popen call
+        makes this fail."""
+        with tempfile.TemporaryDirectory() as td:
+            env, exe = self._windows_env(Path(td))
+            seen: list = []
+
+            def _recording_popen(argv, **kw):
+                seen.append(kw)
+                return mock.Mock()
+
+            # `os.name` is what `_windows_no_window_kwargs` branches on —
+            # but a global patch makes every `Path()` INSIDE the starter
+            # a WindowsPath, which cannot instantiate on POSIX. So drive
+            # the REAL helper with os.name="nt" for exactly its call (it
+            # builds no Path) and let the call site pass its kwargs on.
+            real_kwargs = ces._windows_no_window_kwargs
+
+            def _nt_kwargs():
+                with mock.patch("os.name", "nt"):
+                    return real_kwargs()
+
+            with mock.patch.object(ces, "_windows_no_window_kwargs", side_effect=_nt_kwargs):
+                ok, _ = ces.try_start_docker_daemon(
+                    system="Windows", env=env,
+                    which=lambda n: f"/bin/{n}" if n == "docker" else None,
+                    popen=_recording_popen, reachable=lambda: False,
+                    wait_s=0.0)
+            self.assertTrue(ok)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0].get("creationflags"), ces.CREATE_NO_WINDOW)
+
     def test_darwin_opens_docker_app(self):
         runs: list = []
 
@@ -367,6 +402,61 @@ class TryStartDockerDaemonTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(clock.slept, [])
         self.assertIn("launch attempted", detail)
+
+
+class RealLauncherDbReaderTests(unittest.TestCase):
+    """R21 M1: the Preferences toggle through the REAL launcher.db reader.
+
+    Every unit test above injects ``pref_reader``; this one drives the
+    DEFAULT reader (``vco_lib.launcher_db_reader.read_app_state_value``,
+    resolved inside :func:`ensure_engine` when no reader is injected)
+    against a real sqlite launcher.db holding the exact row the Rust
+    Preferences command writes (``app_state_set_bool`` stores the TEXT
+    ``"false"``), through ``main()`` with nothing injected — the path the
+    hub, the launcher setup and the session hooks actually take.
+    """
+
+    def test_a_real_db_with_the_toggle_off_stops_the_cli_before_any_probe(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "launcher.db"
+            conn = sqlite3.connect(db)
+            try:
+                # The schema of migrations/008_app_state.sql; the row is the
+                # one `Db::app_state_set_bool("engine.autostart", false)`
+                # writes.
+                conn.execute(
+                    "CREATE TABLE app_state (key TEXT PRIMARY KEY, "
+                    "value TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+                conn.execute(
+                    "INSERT INTO app_state (key, value, updated_at) "
+                    "VALUES (?, ?, 0)",
+                    (ces.APP_STATE_ENGINE_AUTOSTART, "false"))
+                conn.commit()
+            finally:
+                conn.close()
+
+            env = dict(os.environ)
+            # One temp state root for BOTH the single-flight lock path and
+            # the launcher.db discovery (VCT_LAUNCHER_DB_PATH unset).
+            env["VCT_STATE_DIR"] = td
+            env.pop("VCT_LAUNCHER_DB_PATH", None)
+            env.pop(ces.VCT_CONTAINER_ENGINE_AUTOSTART, None)
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(
+                        ces._c, "resolve",
+                        side_effect=AssertionError(
+                            "the resolver must not be reached when the "
+                            "toggle is off")):
+                buf = io.StringIO()
+                with mock.patch("sys.stdout", buf):
+                    rc = ces.main(["ensure", "--wait", "0", "--json"])
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertFalse(out["ok"])
+        self.assertIn("Preferences toggle", out["detail"])
+        self.assertIn(ces.APP_STATE_ENGINE_AUTOSTART, out["detail"])
 
 
 class PrefEnabledTests(unittest.TestCase):

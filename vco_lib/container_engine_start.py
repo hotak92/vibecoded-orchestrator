@@ -73,8 +73,9 @@ __all__ = ["VCT_CONTAINER_ENGINE_AUTOSTART", "APP_STATE_ENGINE_AUTOSTART",
 #: (``docs/CONFIGURATION.md`` § Container engine auto-start). Any of the
 #: falsy values below disables the starter on EVERY surface (the CLI checks
 #: it, and the Rust spawners check the same variable before spawning the
-#: CLI). Unset or any other value: enabled. This is the OVERRIDE — it wins
-#: over the Preferences toggle.
+#: CLI). Unset or any other value: enabled. Either opt-out is enough: this
+#: env var can only turn auto-start OFF — it cannot re-enable it over a
+#: Preferences toggle that is off.
 VCT_CONTAINER_ENGINE_AUTOSTART = "VCT_CONTAINER_ENGINE_AUTOSTART"
 
 #: Opt-out knob 2 (review R19 F4), the Preferences toggle: "Start the
