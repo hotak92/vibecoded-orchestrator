@@ -573,7 +573,7 @@
               {/if}
               {#each r.notices ?? [] as n, i (i)}
                 <!-- v0.2.103 (plan item 17): informational notice, e.g. the
-                     one-time "Created a local git repository (no remote)". -->
+                     one-time "Created a local git repository (no remote, nothing committed)". -->
                 <div class="ua-row-notice">{n}</div>
               {/each}
               {#if stale.length > 0}

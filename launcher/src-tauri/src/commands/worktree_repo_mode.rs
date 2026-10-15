@@ -323,7 +323,12 @@ fn append_local_repo_gitignore_guard(root: &Path) -> std::io::Result<()> {
         writeln!(f, "/{}/", n)?;
     }
     writeln!(f, "# VCO runtime / per-machine state:")?;
-    for p in [".claude/state/", ".claude/worktrees/", ".claude/logs/"] {
+    for p in [
+        ".claude/state/",
+        ".claude/worktrees/",
+        ".claude/logs/",
+        ".claude/backups/",
+    ] {
         writeln!(f, "{}", p)?;
     }
     Ok(())
@@ -738,9 +743,8 @@ pub(crate) enum AutoLocalRepoOutcome {
 /// The user-facing notice text for a created repo. Pinned by tests and the
 /// GUI wiring test, so the wording the owner asked for cannot drift.
 pub(crate) const CREATED_LOCAL_REPO_NOTICE: &str =
-    "Created a local git repository (no remote) so subagent worktree isolation works. \
-     Nothing was committed or pushed: the repository starts empty, VCO's runtime folders \
-     are listed in its .gitignore, and connecting a remote stays your choice.";
+    "Created a local git repository (no remote, nothing committed). \
+     Isolated subagent worktrees need a first commit.";
 
 impl AutoLocalRepoOutcome {
     /// Informational notice for the GUI (success/info toast), if any.
@@ -1567,7 +1571,8 @@ mod tests {
         assert_eq!(out.notice().as_deref(), Some(CREATED_LOCAL_REPO_NOTICE));
         assert!(out.warning().is_none());
         assert!(
-            CREATED_LOCAL_REPO_NOTICE.starts_with("Created a local git repository (no remote)"),
+            CREATED_LOCAL_REPO_NOTICE
+                == "Created a local git repository (no remote, nothing committed). Isolated subagent worktrees need a first commit.",
             "owner-facing wording pinned"
         );
 
@@ -1583,6 +1588,7 @@ mod tests {
         let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
         assert!(gi.contains("VCO local-only repo guard"));
         assert!(gi.contains(".claude/state/"));
+        assert!(gi.contains(".claude/backups/"), "backups ignored: {gi}");
         assert_eq!(std::fs::read(&sentinel).unwrap(), SENTINEL_BYTES);
 
         // Recorded once — a second run (the next bundle update) is a no-op.
@@ -1785,7 +1791,8 @@ mod tests {
         let out = with_git_path(bin.path(), ensure_project_local_repo(&db, &id, tmp.path()));
         assert_eq!(out, AutoLocalRepoOutcome::Created { record_error: None });
         let notice = out.notice().unwrap();
-        assert!(notice.contains("Nothing was committed"), "{notice}");
+        assert!(notice.contains("nothing committed"), "{notice}");
+        assert!(notice.contains("need a first commit"), "{notice}");
         assert!(tmp.path().join(".git").is_dir());
         assert!(
             !w(&["rev-parse", "--verify", "-q", "HEAD"], tmp.path()).status.success(),

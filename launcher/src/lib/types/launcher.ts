@@ -87,7 +87,7 @@ export interface CreateProjectResult {
   warnings: string[];
   /**
    * v0.2.103 (plan item 17): informational notices (success toasts, never
-   * red) — e.g. "Created a local git repository (no remote)". Optional so an
+   * red) — e.g. "Created a local git repository (no remote, nothing committed)". Optional so an
    * older backend that omits the field still type-checks.
    */
   notices?: string[];

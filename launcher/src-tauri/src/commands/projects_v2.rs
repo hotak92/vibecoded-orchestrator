@@ -61,7 +61,7 @@ pub struct CreateProjectResult {
     /// Empty on a clean create.
     pub warnings: Vec<String>,
     /// v0.2.103 (plan item 17): informational notices (success/info toasts,
-    /// never red) — today the "Created a local git repository (no remote)"
+    /// never red) — today the "Created a local git repository (no remote, nothing committed)"
     /// notice from `worktree_repo_mode::ensure_project_local_repo`.
     #[serde(default)]
     pub notices: Vec<String>,
@@ -224,7 +224,7 @@ pub struct UpdateProjectResult {
     /// Aggregate per-action counts (see `UpdateSummary`).
     pub summary: UpdateSummary,
     /// v0.2.103 (plan item 17): informational notices (info toasts) — the
-    /// one-time "Created a local git repository (no remote)" catch-up for a
+    /// one-time "Created a local git repository (no remote, nothing committed)" catch-up for a
     /// project registered before automatic local repos existed.
     #[serde(default)]
     pub notices: Vec<String>,

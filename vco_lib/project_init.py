@@ -11192,6 +11192,10 @@ def install_project_bundle(
                  f"G1 git-exclude failed: {err}", data={"error": err})
             result["warnings"].append(f"G1 git-exclude failed: {err}")
 
+    if not dry_run:  # v0.2.103 R11 B3: report a repo still owed by the launcher
+        from vco_lib import local_repo_pending as _local_repo_pending
+        _local_repo_pending.reconcile_into_result(folder, result)
+
     # v0.2.73 S-8 (ONE-TIME): scan for pre-fix user-secret VALUES in tree files
     # and emit a deferral notice if found. Triggered on every bundle-update run
     # (cheap pattern scan, no value parsing); self-clears once the next env

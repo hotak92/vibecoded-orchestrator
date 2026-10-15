@@ -45,7 +45,7 @@ import { projects } from './projects';
 import type { ProjectView } from '$lib/types/launcher';
 
 const NOTICE =
-  'Created a local git repository (no remote) so subagent worktree isolation works.';
+  'Created a local git repository (no remote, nothing committed). Isolated subagent worktrees need a first commit.';
 
 function view(id: string): ProjectView {
   return { id, name: id, folder_path: `/tmp/${id}`, host: 'base', slug: id } as unknown as ProjectView;
