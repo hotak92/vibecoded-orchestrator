@@ -732,7 +732,8 @@ still absent is emitted as an explicit 0. A positive the vendor did not state is
 ever claimed for a vendor (no documented figure exists), so the "N min left" half of the hint stays silent on vendor
 routes rather than guessing. The same snapshot's JSON also carries `agents`: one row per (session, agent) identity
 naming the model that actually ANSWERED that identity's last turn — with the fallback escape beside it when the
-routing ladder served it — which the launcher's usage card renders as a "Who answered" list. That list exists because
+routing ladder served it — which the launcher's usage card renders as a "Who answered" list of SUBAGENT rows (a main-chat
+row is shown only when a fallback served it: the user knows their chat's model). That list exists because
 the VS Code agents panel shows the session model for every background lane (a harness bug,
 anthropics/claude-code#93324): the gateway's ledger is the only place the answering model is recorded. Related: for
 first-party 1M-native models (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) the client sends no `[1m]` suffix and no
