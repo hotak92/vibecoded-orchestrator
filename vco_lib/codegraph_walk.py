@@ -223,7 +223,11 @@ def _run_child(child: List[str], *, cwd: "str | Path | None",
         for signum in state["pending"]:
             _forward(signum, None)
         try:
-            return proc.wait()
+            rc = proc.wait()
+            # A child killed by a signal reports -signum; a process exit code
+            # is 0-255, so report it the way shells do (128 + signum) instead
+            # of letting sys.exit wrap -15 to 241 (review R17-3).
+            return 128 - rc if rc < 0 else rc
         except BaseException:
             proc.kill()
             proc.wait()

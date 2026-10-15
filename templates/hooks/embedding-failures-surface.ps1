@@ -67,9 +67,12 @@ if (Test-Path -LiteralPath $MetricsLib -PathType Leaf) {
     try { Invoke-VcoMetricsMigrateOnce -ScriptDir $PSScriptRoot } catch { }
 }
 
-# Discover install root — same anchor convention as ensure-containers.ps1.
-# $env:CLAUDE_PROJECT_DIR is set by Claude Code; git toplevel is the fallback.
-$InstallRoot = $env:CLAUDE_PROJECT_DIR
+# Discover the project root through the ONE hook rule (_lib/project-root.ps1:
+# $env:CLAUDE_PROJECT_DIR, else the nearest folder carrying a .claude/ marker),
+# so a VCO project nested inside a parent git repo reads ITS OWN .claude/ - the
+# git toplevel (the parent repo) is only the last-resort fallback.
+. "$PSScriptRoot/_lib/project-root.ps1"
+$InstallRoot = Get-VcoProjectRoot -Start (Get-Location).Path
 if (-not $InstallRoot) {
     try {
         $InstallRoot = (& git rev-parse --show-toplevel 2>$null).Trim()

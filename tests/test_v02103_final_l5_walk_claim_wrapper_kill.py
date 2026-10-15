@@ -149,3 +149,16 @@ def test_leave_alone_exit_code_passes_through_and_a_held_claim_refuses(tmp_path,
             == codegraph_walk.WALK_ALREADY_RUNNING_RC
     # the forwarding handlers are this run's only: the caller's are restored
     assert {s: signal.getsignal(s) for s in before} == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_a_signal_killed_child_reports_128_plus_signum():
+    """Review R17-3: a child that dies of SIGTERM is reported as 143 (128+15),
+    the shell convention — not -15, which sys.exit would wrap to 241."""
+    from vco_lib import codegraph_walk
+
+    rc = codegraph_walk._run_child(
+        [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"],
+        cwd=None, claim_fd=None,
+    )
+    assert rc == 128 + signal.SIGTERM
