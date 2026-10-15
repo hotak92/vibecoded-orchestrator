@@ -284,6 +284,8 @@ def _capture_run(chain, monkeypatch, tmp_path, decision, argv_extra=()):
                         lambda log=None, model=None: decision)
     monkeypatch.setattr(chain, "subprocess", types.SimpleNamespace(
         run=_fake_run, TimeoutExpired=subprocess.TimeoutExpired))
+    # the spawn resolves the CLI path; the fake answers for the bare name
+    monkeypatch.setattr(chain, "resolve_claude_executable", lambda: "claude")
     monkeypatch.setattr(chain, "_gateway_auth_env",
                         lambda base: {"ANTHROPIC_BASE_URL": base})
     monkeypatch.setattr(chain, "_record_outcome", lambda *a, **k: None)

@@ -511,8 +511,17 @@ DISALLOWED_TOOLS: "tuple[str, ...]" = (
 )
 
 
-def build_claude_cmd(model: str, max_turns: int) -> "list[str]":
+def build_claude_cmd(model: str, max_turns: int,
+                     executable: str = "claude") -> "list[str]":
     """The reviewer's ``claude -p`` argv (the prompt rides on stdin).
+
+    ``executable`` is the RESOLVED CLI path at the spawn site
+    (:func:`resolve_claude_executable`): on Windows an npm-installed CLI is a
+    ``claude.cmd`` shim, which ``shutil.which`` finds through PATHEXT but a
+    bare ``"claude"`` argv[0] does not — CreateProcess only appends ``.exe``,
+    so the spawn raised FileNotFoundError on every reviewed commit
+    (v0.2.103 Windows verification; ``summary_backends.call_cli`` resolves
+    the same way for the same reason).
 
     ``--permission-mode dontAsk`` overrides a project's ``defaultMode`` (an
     ``acceptEdits`` / ``bypassPermissions`` default would otherwise
@@ -525,7 +534,7 @@ def build_claude_cmd(model: str, max_turns: int) -> "list[str]":
     object ``--output-format json`` prints, so the turn count is still read.
     """
     return [
-        "claude", "-p",
+        executable, "-p",
         "--model", model,
         "--max-turns", str(max_turns),
         "--output-format", "stream-json", "--verbose",
@@ -534,6 +543,12 @@ def build_claude_cmd(model: str, max_turns: int) -> "list[str]":
         "--allowedTools", ",".join(ALLOWED_TOOLS),
         "--disallowedTools", ",".join(DISALLOWED_TOOLS),
     ]
+
+
+def resolve_claude_executable() -> "str | None":
+    """The ``claude`` CLI as an absolute path (PATHEXT honoured on Windows,
+    so a ``claude.cmd`` shim resolves), or ``None`` when it is not on PATH."""
+    return shutil.which("claude")
 
 
 def _file_logger(log_path: str) -> Callable[[str], None]:
@@ -612,7 +627,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # .cmd re-parsed by the shell, the prompt embeds `git diff` output whose
     # `---` tokens would parse as options, and the command line is capped at
     # 32 767 chars there).
-    cmd = build_claude_cmd(model, resolve_max_turns(args.max_turns))
+    claude_exe = resolve_claude_executable()
+    if claude_exe is None:
+        # The availability check found it moments ago; it vanished since.
+        log(f"rung {model}: the `claude` CLI is no longer on PATH — "
+            f"nothing spawned, this commit is not reviewed")
+        return 127  # not a backend failure: no breaker strike recorded
+    cmd = build_claude_cmd(model, resolve_max_turns(args.max_turns),
+                           executable=claude_exe)
     snap = _guard.take_snapshot(root)
     try:
         try:
