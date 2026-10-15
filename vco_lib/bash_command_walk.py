@@ -133,6 +133,73 @@ LEADING_COMPOUND_KEYWORDS: frozenset[str] = frozenset(
 CONDITION_OPENERS: frozenset[str] = frozenset({"while", "until"})
 
 
+def _segment_opener(stripped: List[str]) -> Optional[str]:
+    """The loop opener governing a segment: its FIRST token, or an opener
+    immediately after a ``{`` / ``(`` group token — the function/group
+    header shape ``f() { while …`` (R6, owner ruling 2026-10-15: the loop
+    rule applies inside function bodies). Else ``None``."""
+    if not stripped:
+        return None
+    first = os.path.basename(stripped[0]).lower()
+    if first in LOOP_OPENERS:
+        return first
+    for j in range(0, len(stripped) - 1):
+        if stripped[j] in ("{", "("):
+            cand = os.path.basename(stripped[j + 1]).lower()
+            if cand in LOOP_OPENERS:
+                return cand
+    return None
+
+
+def strip_subshell_parens(tokens: List[str]) -> List[str]:
+    """Peel the grouping punctuation of a subshell segment: leading ``(``
+    tokens or a glued leading ``(`` on the first token (``(sleep 5)`` —
+    never ``$(``, that is a command substitution), and the matching
+    trailing ``)`` tokens / glued suffix. No-op for anything else. The
+    walker never rewrites EMITTED tokens; consumers that classify a
+    segment's verb (the wait guard) call this — one home for the peel."""
+    out = list(tokens)
+    opened = False
+    while out and out[0] == "(":
+        out = out[1:]
+        opened = True
+    if out and out[0].startswith("(") and not out[0].startswith("$("):
+        out[0] = out[0].lstrip("(")
+        opened = True
+    if opened:
+        while out and out[-1] == ")":
+            out = out[:-1]
+        if out and out[-1].endswith(")"):
+            out[-1] = out[-1].rstrip(")")
+    return [t for t in out if t]
+
+
+#: Non-nested command-substitution bodies: ``$(...)`` and backticks.
+#: Nesting extracts the INNERMOST body (``$(echo $(sleep 5))`` →
+#: ``sleep 5``) — which is where a hidden wait would live. Applied to the
+#: whitespace-joined tokens, so a body split by :func:`tokenize`
+#: (``$(sleep`` + ``5)``) reassembles.
+_SUBST_PAREN_RE = re.compile(r"\$\(([^()]*)\)")
+_SUBST_BACKTICK_RE = re.compile(r"`([^`]+)`")
+
+
+def substitution_bodies(tokens: List[str]) -> List[str]:
+    """The command-substitution bodies embedded in a segment's tokens
+    (``echo $(sleep 5)``, backticks), best-effort; a nested substitution
+    yields its INNERMOST body (where a hidden wait would live). Known
+    limit: a substitution containing a top-level chain separator
+    (``$(foo; sleep 1)``) is split by :func:`split_chain` BEFORE this runs
+    — the inner segments then stand on their own (the sleep is judged by
+    the plain position rule)."""
+    text = " ".join(tokens)
+    if "$(" not in text and "`" not in text:
+        return []
+    return (
+        [m.group(1) for m in _SUBST_PAREN_RE.finditer(text)]
+        + [m.group(1) for m in _SUBST_BACKTICK_RE.finditer(text)]
+    )
+
+
 class ChainSegment(NamedTuple):
     """One peeled chain segment plus its structural context (v0.2.103).
 
@@ -410,7 +477,9 @@ def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]
 
 
 def walk_segments(command: str, depth: int = 0, *,
-                  _in_loop: bool = False) -> List[ChainSegment]:
+                  _in_loop: bool = False,
+                  _position_override: Optional[tuple] = None,
+                  _with_substitutions: bool = False) -> List[ChainSegment]:
     """Parse `command` like :func:`walk_command` but hand out
     :data:`ChainSegment` records — peeled tokens PLUS the structural
     context (position within the chain level, loop membership, recursion
@@ -418,17 +487,33 @@ def walk_segments(command: str, depth: int = 0, *,
     guard's fixed-sleep rule).
 
     Loop membership is tracked per chain level: a ``while``/``until``/
-    ``for``/``select`` opener, every segment of a ``while``/``until``
+    ``for``/``select`` opener (including right after a ``{``/``(`` group
+    token — ``f() { while …``), every segment of a ``while``/``until``
     CONDITION (up to its ``do`` — a wait there is loop machinery, owner
     ruling 2026-10-15), and everything from the ``do`` up to the matching
     ``done`` is in-loop, nested loops included; the context is INHERITED
     by a ``bash -c`` recursion (``_in_loop``), while the sub-command's
     positions restart at its own level. The recursion decision looks
-    through :data:`LEADING_COMPOUND_KEYWORDS` (``do bash -c '…'``
-    recurses); the EMITTED tokens keep the keyword prefix, exactly as
-    :func:`walk_command` collectors have always received them. ``depth``
-    and the ``MAX_NESTING_DEPTH`` budget behave exactly as in
+    through :data:`LEADING_COMPOUND_KEYWORDS` and subshell parens
+    (``do bash -c '…'``, ``( bash -c '…' )`` recurse); the EMITTED tokens
+    keep the keyword/paren prefix, exactly as :func:`walk_command`
+    collectors have always received them. ``depth`` and the
+    ``MAX_NESTING_DEPTH`` budget behave exactly as in
     :func:`walk_command`.
+
+    ``_position_override`` (R6, owner 2026-10-15): a recursed sub-chain
+    that is the outer segment's WHOLE content inherits that segment's
+    position — the recursion passes the current segment's effective
+    ``(position, chain_size)``, and a chain with exactly ONE segment
+    stamps it with the override. So ``x && bash -c 'sleep 3' && y`` reads
+    the inner sleep as BETWEEN actions (the bash -c is segment 1 of 3),
+    while a multi-segment sub-chain keeps its own positions.
+
+    ``_with_substitutions`` (R6; opt-in — :func:`walk_command` callers are
+    unchanged): each EMITTED segment's command-substitution bodies
+    (:func:`substitution_bodies`) are walked as sub-chains at depth+1
+    (inheriting the loop context, NOT the position — a sole wait inside
+    ``$(…)`` is a sole wait).
     """
     if depth > MAX_NESTING_DEPTH:
         return []
@@ -453,16 +538,22 @@ def walk_segments(command: str, depth: int = 0, *,
         # body (its own tail is body content); `done` ends it — the
         # decrement happens BEFORE this segment's in_loop is computed, so
         # the terminator itself is not body.
-        first = os.path.basename(stripped[0]).lower()
-        opens = first in LOOP_OPENERS
-        is_do = first == "do"
-        is_done = first == "done"
+        opener = _segment_opener(stripped)
+        opens = opener is not None
+        is_do = os.path.basename(stripped[0]).lower() == "do"
+        is_done = os.path.basename(stripped[0]).lower() == "done"
         if is_done and loop_depth > 0:
             # The terminator ends the body AT this segment: it is not
             # body itself.
             loop_depth -= 1
         in_loop = (_in_loop or loop_depth > 0 or opens or is_do
                    or in_condition)
+        # R6: a recursed sub-chain that is the outer segment's whole
+        # content inherits that segment's position.
+        if _position_override is not None and chain_size == 1:
+            pos, size = _position_override
+        else:
+            pos, size = i, chain_size
         peeled = peel_wrapper_verbs(stripped)
         if peeled:
             # The dash-c decision looks THROUGH leading compound keywords
@@ -474,18 +565,25 @@ def walk_segments(command: str, depth: int = 0, *,
             while rec and (os.path.basename(rec[0]).lower()
                            in LEADING_COMPOUND_KEYWORDS):
                 rec = rec[1:]
+            rec = strip_subshell_parens(rec)
             if rec and os.path.basename(rec[0]).lower() in SHELL_DASH_C_VERBS:
                 sub_cmd = dash_c_subcommand(rec)
                 if sub_cmd is not None and depth + 1 <= MAX_NESTING_DEPTH:
-                    out.extend(walk_segments(sub_cmd, depth + 1,
-                                             _in_loop=in_loop))
+                    out.extend(walk_segments(
+                        sub_cmd, depth + 1, _in_loop=in_loop,
+                        _position_override=(pos, size),
+                        _with_substitutions=_with_substitutions))
                 # Consumed either way: no `-c` sub-command (e.g.
                 # `bash script.sh`) or over budget → nothing emitted,
                 # exactly as parse_dash_c has always done.
             else:
-                out.append(ChainSegment(peeled, i, chain_size,
-                                        in_loop, depth))
-        if opens and first in CONDITION_OPENERS:
+                out.append(ChainSegment(peeled, pos, size, in_loop, depth))
+                if _with_substitutions and depth + 1 <= MAX_NESTING_DEPTH:
+                    for sub_body in substitution_bodies(peeled):
+                        out.extend(walk_segments(
+                            sub_body, depth + 1, _in_loop=in_loop,
+                            _with_substitutions=True))
+        if opens and opener in CONDITION_OPENERS:
             in_condition = True
         if is_do:
             loop_depth += 1
@@ -527,6 +625,8 @@ __all__ = [
     "peel_wrapper_verbs",
     "split_chain",
     "strip_env_assignments",
+    "strip_subshell_parens",
+    "substitution_bodies",
     "tokenize",
     "walk_command",
     "walk_segments",

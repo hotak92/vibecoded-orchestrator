@@ -354,7 +354,9 @@ class TestWalkSegments:
         assert [s.tokens for s in segs] == [["while", "c"], ["sleep", "1"], ["done"]]
         sleep = segs[1]
         assert sleep.in_loop and sleep.depth == 1
-        assert (sleep.position, sleep.chain_size) == (0, 1)
+        # R6 item 3: a recursed SOLE sub-chain inherits the outer
+        # segment's position (the bash -c is segment 1 of 3).
+        assert (sleep.position, sleep.chain_size) == (1, 3)
 
     def test_condition_segments_are_in_loop(self):
         """Gap 2: every segment of a while/until CONDITION (up to `do`)
@@ -370,6 +372,43 @@ class TestWalkSegments:
         assert walk_command("bash script.sh", one) == []
         assert walk_command("do bash script.sh", one) == []
         assert walk_command("do bash -c 'a; b'", one) == ["a", "b"]
+
+    def test_substitution_bodies_are_opt_in(self):
+        """`walk_command` consumers see NO change: substitution bodies are
+        walked only when the caller opts in (the wait guard does)."""
+        from vco_lib.bash_command_walk import walk_segments
+
+        plain = walk_segments("echo $(sleep 5)")
+        assert [s.tokens[0] for s in plain] == ["echo"]
+        opted = walk_segments("echo $(sleep 5)", _with_substitutions=True)
+        assert [s.tokens[0] for s in opted] == ["echo", "sleep"]
+        body = opted[1]
+        assert body.depth == 1 and (body.position, body.chain_size) == (0, 1)
+
+    def test_substitution_extraction_non_nested_only(self):
+        from vco_lib.bash_command_walk import substitution_bodies
+
+        assert substitution_bodies(["echo", "$(sleep", "5)"]) == ["sleep 5"]
+        assert substitution_bodies(["echo", "`sleep", "5`"]) == ["sleep 5"]
+        assert substitution_bodies(["echo", "hello"]) == []
+        # Nested parens: the INNERMOST body is extracted (where a hidden
+        # wait would live).
+        assert substitution_bodies(["echo", "$(echo", "$(sleep", "5))"]) == [
+            "sleep 5"
+        ]
+
+    def test_strip_subshell_parens(self):
+        from vco_lib.bash_command_walk import strip_subshell_parens
+
+        assert strip_subshell_parens(["(", "sleep", "5", ")"]) == ["sleep", "5"]
+        assert strip_subshell_parens(["(sleep", "5)"]) == ["sleep", "5"]
+        # `$(` is a command substitution, never peeled.
+        assert strip_subshell_parens(["$(sleep", "5)"]) == ["$(sleep", "5)"]
+        assert strip_subshell_parens(["sleep", "5"]) == ["sleep", "5"]
+
+    def test_mid_segment_opener_after_brace_marks_in_loop(self):
+        segs = self._segments("f() { while sleep 1; do x; done; }; f")
+        assert [s.in_loop for s in segs] == [True, True, False, False, False]
 
     def test_walk_command_contract_unchanged(self):
         """The existing consumers' collector contract is byte-identical:
@@ -396,3 +435,182 @@ class TestWalkSegments:
         out = parse_dash_c(["bash", "-c", "x; y"], 0, one)
         assert out == ["x", "y"]
         assert parse_dash_c(["bash", "script.sh"], 0, one) == []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# R6 review fixes (GLM R6, MERGE-AFTER-FIXES; coordinator 2026-10-15)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestScanWrappedMultiFlagDashC:
+    """MEDIUM (R6): `_scan_wrapped` used to test only rest[0] for
+    `-c`-ness, so a preceding non-c flag defeated it. It now routes
+    through the walker's `dash_c_subcommand` (one home)."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "timeout 30 bash -e -c 'sleep 30'",
+            "timeout 30 bash -u -c 'sleep 30'",
+            "timeout 5 bash -l -c 'sleep 5'",
+            "timeout 5 sh -e -c 'sleep 5'",
+            "nohup bash -e -c 'sleep 5'",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        reason = _deny(tmp_path, command)
+        assert "sleep" in reason
+
+    def test_fixed_pause_inside_still_allowed(self, tmp_path):
+        # The recursion applies the SAME rule: a literal sleep between
+        # actions of the wrapped sub-chain is a fixed pause.
+        _allow(tmp_path, "timeout 30 bash -e -c 'foo; sleep 2; bar'")
+
+
+class TestSubshellAndGroupWaits:
+    """LOW (R6): a sole wait inside a subshell/group is a sole wait."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "( sleep 5 )",
+            "(sleep 5)",
+            "{ sleep 5; }",
+            "( sleep 5 ) && echo done",   # first: not between
+            "echo start; ( sleep 5 )",    # last
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        _deny(tmp_path, command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x && ( sleep 2 ) && y",      # R6: stays allowed — a fixed
+            "x && (sleep 2) && y",        # pause between actions
+            "x && { sleep 2; } && y",
+        ],
+    )
+    def test_between_actions_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+
+class TestCommandSubstitutionWaits:
+    """LOW (R6): the walker extracts non-nested `$(...)` / backtick bodies
+    (opt-in for the wait guard) and walks each as its own sub-chain."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo $(sleep 5)",
+            "echo `sleep 5`",
+            "echo done $(sleep 5)",
+        ],
+    )
+    def test_sole_wait_in_substitution_denied(self, tmp_path, command):
+        _deny(tmp_path, command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo $(date +%s)",
+            "echo $(foo; sleep 1; bar)",  # fixed pause inside the body
+        ],
+    )
+    def test_no_sole_wait_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+
+class TestXargsPerItemWaits:
+    """LOW (R6): xargs runs its command PER ITEM — a loop context."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "seq 1 5 | xargs -I{} sh -c 'sleep 1; curl x'",
+            "cat list | xargs -I{} bash -c 'sleep 2'",
+            "xargs -n1 sleep < list.txt",
+            "xargs -n1 sleep 5 < list.txt",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        _deny(tmp_path, command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat list | xargs -I{} echo {}",
+            "xargs -n1 echo < list.txt",
+            "printf 'a\\nb\\n' | xargs -n 2 cat",
+        ],
+    )
+    def test_no_wait_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+
+class TestFunctionBodyLoops:
+    """LOW (R6): the loop rule applies inside function bodies — the walker
+    recognises an opener right after `{`/`(` (e.g. `f() { while …`)."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "f() { while sleep 1; do echo hi; done; }; f",
+            "f() { while true; do sleep 1; done; }; f",
+            "f() { until check; do sleep 2; done; }; f",
+            "f() { for i in 1 2; do sleep 0.5; done; }; f",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        reason = _deny(tmp_path, command)
+        assert "sleep" in reason
+
+    def test_function_without_wait_allowed(self, tmp_path):
+        _allow(tmp_path, "f() { echo hi; }; f")
+
+
+class TestDashCPositionInheritance:
+    """INFO (R6, over-block): a recursed sub-chain inherits the OUTER
+    segment's position — a sole sleep inside a `bash -c` that itself sits
+    between actions is a between-actions pause."""
+
+    def test_sole_sleep_in_between_actions_bash_c_allowed(self, tmp_path):
+        _allow(tmp_path, "x && bash -c 'sleep 3' && y")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash -c 'sleep 3'",           # sole at top level
+            "foo && bash -c 'sleep 3'",    # the bash -c is LAST
+            "bash -c 'sleep 3' && foo",    # the bash -c is FIRST
+        ],
+    )
+    def test_still_denied_when_not_between(self, tmp_path, command):
+        _deny(tmp_path, command)
+
+    def test_walker_stamps_the_outer_position(self):
+        from vco_lib.bash_command_walk import walk_segments
+
+        segs = walk_segments("x && bash -c 'sleep 3' && y")
+        sleep = [s for s in segs if s.tokens and s.tokens[0] == "sleep"]
+        assert len(sleep) == 1
+        assert (sleep[0].position, sleep[0].chain_size) == (1, 3)
+        assert sleep[0].depth == 1
+
+    def test_timeout_bash_c_inherits_too(self, tmp_path):
+        # The wait-guard's own timeout recursion carries the same override.
+        _allow(tmp_path, "x && timeout 5 bash -c 'sleep 3' && y")
+        _deny(tmp_path, "timeout 5 bash -c 'sleep 3'")
+
+
+class TestBackgroundWaitLeaveAlone:
+    """`cmd & wait` is NOT a poll: `cmd` runs in the background and the
+    builtin blocks ONCE, in-process, until it finishes — no request is
+    re-sent. Owner (coordinator 2026-10-15): leave allowed."""
+
+    def test_cmd_backgrounded_then_wait_allowed(self, tmp_path):
+        _allow(tmp_path, "cmd & wait")
+
+    def test_sleep_backgrounded_then_wait_still_denied(self, tmp_path):
+        # The sleep is the FIRST segment of the chain — a plain wait.
+        _deny(tmp_path, "sleep 5 & wait")

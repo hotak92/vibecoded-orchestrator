@@ -18,10 +18,20 @@ LITERAL numeric duration (``sleep 3``, ``sleep 0.5``, ``sleep 2s``;
 ``Start-Sleep -Seconds 2`` on PowerShell) sitting BETWEEN other segments
 of one command — ``start-x && sleep 3 && curl ...`` — is a fixed pause,
 not a poll, and is ALLOWED. Still denied: a sleep inside a loop (body or
-condition, ``bash -c`` recursion included), a non-literal duration
-(``sleep $N``, ``sleep infinity``), and a sleep that is the sole, first
-or last segment (outside a loop it only waits). Position and loop
-membership come from the ONE chain walker
+condition, ``bash -c`` recursion included — also behind ``do bash -c …``
+or a subshell paren), a non-literal duration (``sleep $N``, ``sleep
+infinity``), and a sleep that is the sole, first or last segment (outside
+a loop it only waits). R6 review round (same day): the wrapper-tail scan
+uses the walker's ``dash_c_subcommand`` (``timeout 30 bash -e -c '…'``
+cannot slip); a sole wait inside a subshell ``( sleep 5 )``, a command
+substitution ``$(sleep 5)``, an xargs per-item command
+(``xargs -n1 sleep`` — xargs is a loop), or a function body's loop
+(``f() { while sleep 1; … }``) denies; and a recursed ``bash -c``
+sub-chain that is the outer segment's whole content inherits the outer
+position, so ``x && bash -c 'sleep 3' && y`` is the between-actions pause
+it reads as. ``cmd & wait`` is NOT a poll (``cmd`` runs; the builtin
+blocks once, in-process) and stays allowed. Position and loop membership
+come from the ONE chain walker
 (:func:`vco_lib.bash_command_walk.walk_segments`).
 
 Shape (A>B>C, like the v0.2.101 injection surfaces): this module is the
@@ -105,12 +115,14 @@ from typing import Any, Dict, List, Optional
 from vco_lib.bash_command_walk import (
     CONDITION_OPENERS,
     LEADING_COMPOUND_KEYWORDS,
+    LOOP_OPENERS,
     SHELL_DASH_C_VERBS,
     ChainSegment,
     dash_c_subcommand,
     peel_wrapper_verbs,
     split_chain,
     strip_env_assignments,
+    strip_subshell_parens,
     tokenize,
     walk_segments,
 )
@@ -242,6 +254,45 @@ def _sleep_pattern(body: List[str], seg: ChainSegment) -> Optional[tuple]:
     return None
 
 
+#: xargs flags that take a SEPARATE value token (the combined forms
+#: ``-n1`` / ``-I{}`` do not). Skipped when looking for the per-item
+#: command, so ``xargs -I sleep echo`` (replace-str "sleep") is not
+#: misread as a per-item wait.
+_XARGS_VALUE_FLAGS = frozenset({
+    "-I", "-n", "-P", "-d", "-L", "-s", "-e", "-a",
+    "--replace", "--max-args", "--max-procs", "--delimiter",
+    "--max-lines", "--eof", "--arg-file",
+})
+
+
+def _xargs_pattern(body: List[str], depth: int,
+                   seg: ChainSegment) -> Optional[tuple]:
+    """xargs runs its command ONCE PER INPUT ITEM — a loop (R6, owner
+    ruling 2026-10-15). The per-item command is the first non-flag token
+    (separate-value flags skipped): a wait verb there is a per-item wait
+    (``xargs -n1 sleep``), and a ``sh -c '…'`` tail is recursed with
+    loop context (``xargs -I{} sh -c 'sleep 1; …'``)."""
+    i = 1
+    while i < len(body):
+        tok = body[i]
+        if tok in _XARGS_VALUE_FLAGS:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        verb = os.path.basename(tok).lower()
+        if verb in ("sleep", "watch"):
+            return ("xargs per-item wait", " ".join(body[: i + 2])[:80])
+        if verb in SHELL_DASH_C_VERBS:
+            sub = dash_c_subcommand(body[i:])
+            if sub is not None:
+                return static_pattern(sub, depth=depth + 1, _in_loop=True)
+            return None
+        return None  # the per-item command is something else — not a wait
+    return None
+
+
 def _pattern_of_tokens(tokens: List[str], depth: int,
                        seg: ChainSegment) -> Optional[tuple]:
     """The verb dispatch for one token list — used for each walked segment
@@ -253,6 +304,9 @@ def _pattern_of_tokens(tokens: List[str], depth: int,
     body = tokens
     while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
         body = body[1:]
+    # Subshell/group punctuation (R6): `( sleep 5 )` / `(sleep 5)` — the
+    # subshell's verb is what the parens wrap.
+    body = strip_subshell_parens(body)
     if not body:
         return None
     verb = os.path.basename(body[0]).lower()
@@ -268,7 +322,9 @@ def _pattern_of_tokens(tokens: List[str], depth: int,
     if verb == "tail" and _tail_follows(body[1:]):
         return ("tail --follow", " ".join(body[:3]))
     if verb in _SCAN_WRAPPER_VERBS:
-        return _scan_wrapped(body, depth, in_loop=seg.in_loop)
+        return _scan_wrapped(body, depth, seg)
+    if verb == "xargs":
+        return _xargs_pattern(body, depth, seg)
     if verb in SHELL_DASH_C_VERBS:
         # `while bash -c 'sleep 1'; do …` — the condition's own dash-c
         # recursion (the walker only recurses a segment whose FIRST token
@@ -286,42 +342,62 @@ def _pattern_of_tokens(tokens: List[str], depth: int,
 
 
 def _pattern_of_segment(seg: ChainSegment, depth: int) -> Optional[tuple]:
-    return _pattern_of_tokens(seg.tokens, depth, seg)
+    found = _pattern_of_tokens(seg.tokens, depth, seg)
+    if found is not None:
+        return found
+    if seg.in_loop:
+        # A loop opener can sit MID-SEGMENT behind a function/group header
+        # (`f() { while sleep 1; …` — R6, owner ruling 2026-10-15: the loop
+        # rule applies inside function bodies). The walker marked the
+        # segment in-loop; scan the tail of a mid-segment while/until as
+        # its condition.
+        toks = seg.tokens
+        for j in range(1, len(toks)):
+            kw = os.path.basename(toks[j]).lower()
+            if kw in CONDITION_OPENERS:
+                return _pattern_of_tokens(toks[j + 1:], depth, seg)
+            if kw in LOOP_OPENERS:
+                return None  # for/select: no condition command to scan
+    return None
 
 
-def _scan_wrapped(tokens: List[str], depth: int, *,
-                  in_loop: bool = False) -> Optional[tuple]:
+def _scan_wrapped(tokens: List[str], depth: int,
+                  seg: ChainSegment) -> Optional[tuple]:
     """``timeout 30 bash -c 'sleep 30'`` and kin: the chain walker hands the
     whole segment to the collector with ``timeout`` as the verb, so the
-    wrapped tail is scanned here — pattern verbs directly (a DIRECT
-    timeout-wrapped ``sleep``/``watch`` is a wait and stays denied
-    regardless of position), and a nested ``<shell> -c '<sub>'``
-    recursively through :func:`static_pattern`, where the fixed-sleep
-    rule applies to the sub-chain as at the top level (the loop context
-    propagates)."""
+    wrapped tail is scanned here — pattern verbs directly, and a nested
+    ``<shell> -c '<sub>'`` recursively through :func:`static_pattern`,
+    where the fixed-sleep rule applies to the sub-chain as at the top
+    level (loop context AND the segment's position both propagate — a
+    sole sleep inside a wrapper that sits between actions is a
+    between-actions pause).
+
+    The direct tail scan judges a wrapped ``sleep`` with the OUTER
+    segment's position (R6: ``timeout 5 sleep 3`` is a bounded fixed
+    pause; between actions it is allowed, as the sole/last action it is a
+    wait). The ``-c`` shape test is the walker's
+    :func:`~vco_lib.bash_command_walk.dash_c_subcommand` (one home — R6
+    MEDIUM: the retired inline rest[0] check missed ``bash -e -c``)."""
     if depth >= _MAX_TIMEOUT_SCAN_DEPTH:
         return None
     for i in range(1, len(tokens)):
         base = os.path.basename(tokens[i]).lower()
-        if base in ("sleep", "watch"):
-            return (base, " ".join(tokens[: i + 2])[:80])
+        if base == "sleep":
+            return _sleep_pattern(tokens[i:], seg)
+        if base == "watch":
+            return ("watch", " ".join(tokens[: i + 2])[:80])
         if base in SHELL_DASH_C_VERBS:
-            rest = tokens[i + 1:]
-            has_c = bool(rest) and (
-                rest[0] == "-c"
-                or (
-                    rest[0].startswith("-")
-                    and not rest[0].startswith("--")
-                    and "c" in rest[0][1:]
-                )
-            )
-            if has_c and len(rest) >= 2:
-                return static_pattern(rest[1], depth=depth + 1, _in_loop=in_loop)
+            sub = dash_c_subcommand(tokens[i:])
+            if sub is not None:
+                return static_pattern(
+                    sub, depth=depth + 1, _in_loop=seg.in_loop,
+                    _position_override=(seg.position, seg.chain_size))
     return None
 
 
 def static_pattern(command: str, depth: int = 0, *,
-                   _in_loop: bool = False) -> Optional[tuple]:
+                   _in_loop: bool = False,
+                   _position_override: Optional[tuple] = None) -> Optional[tuple]:
     """``(pattern_name, evidence)`` for the first polling shape in
     ``command``, else ``None``.
 
@@ -330,11 +406,15 @@ def static_pattern(command: str, depth: int = 0, *,
     trip it and ``bash -c`` sub-commands are re-parsed. ``while``/``until``
     loops need no rule of their own: the walker marks loop openers and
     bodies (:data:`ChainSegment.in_loop`), and the ``sleep`` segment inside
-    one IS the detection. ``_in_loop`` is the recursion's inherited loop
+    one IS the detection. Command-substitution bodies are walked too
+    (opt-in walker surface; the wait guard is the consumer).
+    ``_in_loop`` / ``_position_override`` are the recursion's inherited
     context; callers pass nothing."""
     if not isinstance(command, str) or not command.strip():
         return None
-    for seg in walk_segments(command, _in_loop=_in_loop):
+    for seg in walk_segments(command, _in_loop=_in_loop,
+                             _position_override=_position_override,
+                             _with_substitutions=True):
         found = _pattern_of_segment(seg, depth)
         if found is not None:
             return found
