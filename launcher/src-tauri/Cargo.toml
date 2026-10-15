@@ -247,9 +247,9 @@ dunce = "1"
 serial_test = "3"
 # v0.2.103: `test-util` enables `#[tokio::test(start_paused = true)]` +
 # `tokio::time::advance` for the behavioural no-wall-clock-kill test in
-# project_codegraph_extras.rs (owner rule: no timeout may cut valid long
-# work). Features are additive with the `full` set on the main dependency —
-# test-only, never shipped.
+# project_codegraph_extras.rs and codegraph_reanalyze.rs (owner rule: no timeout may cut
+# valid long work; review MEDIUM-1). Features are additive with the `full` set on the main
+# dependency — test-only, never shipped.
 tokio = { version = "1", features = ["test-util"] }
 
 # Bug 31: libc statvfs for free-space probe (Unix only — Windows path

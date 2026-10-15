@@ -4,7 +4,19 @@
 
 <div class="toast-host" aria-live="polite">
   {#each $toast as t (t.id)}
-    <div class="toast toast-{t.kind}" role="status">
+    <!-- v0.2.103: pointerenter/leave pause the auto-dismiss (the dwell
+         policy lives in stores/toast.ts — only the hover signal is wired
+         here). Keyboard focus pauses it the same way (focusin/focusout,
+         bubbles from the × button) — WCAG 2.2.1 Timing Adjustable. No
+         styling change. -->
+    <div
+      class="toast toast-{t.kind}"
+      role="status"
+      onpointerenter={() => toast.setHovered(t.id, true)}
+      onpointerleave={() => toast.setHovered(t.id, false)}
+      onfocusin={() => toast.setHovered(t.id, true)}
+      onfocusout={() => toast.setHovered(t.id, false)}
+    >
       <span class="toast-msg">{t.message}</span>
       <button class="toast-x" onclick={() => toast.dismiss(t.id)} aria-label="Dismiss">×</button>
     </div>

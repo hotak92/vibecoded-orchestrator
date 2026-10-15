@@ -312,6 +312,26 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
 #: The newest generation a freshly-built graph satisfies.
 CURRENT_EXTRACTOR_GENERATION: str = EXTRACTOR_GENERATION_BUMPS[-1]
 
+#: One-line HUMAN reason per ladder rung — the text shown to the user when
+#: that rung's re-index is launched (``describe_rung`` prefixes the version).
+#: Append an entry beside every ladder append: a rung with no entry makes
+#: the user-facing message fall back to the generic wording, which is worse
+#: than naming what actually triggered the walk. Pinned to stay in lockstep
+#: with the ladder by ``tests/test_v02103_rung_reason.py``.
+EXTRACTOR_GENERATION_RUNG_REASONS: dict[str, str] = {
+    "0.2.92": ("added Python API extraction and fixed C# route attribution"),
+    "0.2.93": (
+        "coverage re-walk for the extractor fixes (no extractor change that release)"
+    ),
+    "0.2.94": ("recovery re-walk for background walks that never ran"),
+    "0.2.102": (
+        "made tree-sitter definitions the default extractor for most "
+        "languages — new symbols, corrected line ranges and bodies, Rust "
+        "test-gated modules, PowerShell and Protobuf support, "
+        "language-aware imports"
+    ),
+}
+
 #: Env var the analyzer honours as an alternative to ``--force-rewalk``. It
 #: exists because the background trigger reaches the analyzer through TWO
 #: process hops (``spawn_background_resync`` → ``codegraph_resync --run-resync``
@@ -335,6 +355,7 @@ _GRAPH_EVIDENCE_SUFFIXES = ("CodeFunction", "CodeModule")
 # ---------------------------------------------------------------------------
 # The shared "was this built by an older version of us" primitive
 # ---------------------------------------------------------------------------
+
 
 def parse_semver(version: str) -> "tuple[int, int, int] | None":
     """Parse ``"X.Y.Z"`` into ``(major, minor, patch)``; ``None`` if malformed.
@@ -364,8 +385,9 @@ def parse_semver(version: str) -> "tuple[int, int, int] | None":
         return None
 
 
-def crosses_version_boundary(prev_version: str, running_version: str,
-                             bump_version: str) -> bool:
+def crosses_version_boundary(
+    prev_version: str, running_version: str, bump_version: str
+) -> bool:
     """True iff an upgrade ``prev → running`` crosses ``bump`` (``prev < bump <= running``).
 
     The ONE way this codebase asks "was this artifact produced by an older
@@ -385,8 +407,9 @@ def crosses_version_boundary(prev_version: str, running_version: str,
     return prev < bump <= running
 
 
-def generation_is_current(generation: Optional[str],
-                          bumps: Sequence[str] = EXTRACTOR_GENERATION_BUMPS) -> bool:
+def generation_is_current(
+    generation: Optional[str], bumps: Sequence[str] = EXTRACTOR_GENERATION_BUMPS
+) -> bool:
     """True iff ``generation`` is at least the newest bump in ``bumps``.
 
     ``None`` / malformed → False (unknown is never "current").
@@ -400,6 +423,46 @@ def generation_is_current(generation: Optional[str],
     if have is None:
         return False
     return have >= newest
+
+
+def describe_rung(rungs: object) -> "Optional[str]":
+    """Human reason for the rung(s) that triggered a re-index.
+
+    Accepts ONE rung string or a SEQUENCE of rung strings (what a
+    multi-rung upgrade crossed). Returns ``"v<bump> <one-line reason>"``
+    (e.g. ``"v0.2.102 made tree-sitter definitions the default
+    extractor…"``) for the NEWEST rung — the change the forced walk
+    delivers — plus ``" (and N earlier extractor changes)"`` when older
+    rungs were crossed too, so a 0.2.91 → 0.2.103 upgrade names the
+    tree-sitter rewrite instead of v0.2.92 alone. This is the text the
+    bundle update shows the user when it launches a background re-index,
+    so the message names the change that ACTUALLY triggered the walk
+    instead of a hard-coded version's reason. ``None`` when the newest
+    rung is unknown or missing from
+    :data:`EXTRACTOR_GENERATION_RUNG_REASONS`; callers fall back to
+    generic wording rather than guessing.
+    """
+    if isinstance(rungs, str):
+        crossed: "list[str]" = [rungs]
+    elif isinstance(rungs, (list, tuple)):
+        crossed = [r for r in rungs if isinstance(r, str)]
+    else:
+        return None
+    if not crossed:
+        return None
+    # Newest first — the rung whose reason is shown.
+    crossed.sort(key=lambda r: parse_semver(r) or (0, 0, 0), reverse=True)
+    newest = crossed[0]
+    reason = EXTRACTOR_GENERATION_RUNG_REASONS.get(newest)
+    if reason is None:
+        return None
+    text = f"v{newest} {reason}"
+    if len(crossed) > 1:
+        earlier = len(crossed) - 1
+        text += (
+            f" (and {earlier} earlier extractor change{'s' if earlier != 1 else ''})"
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +496,11 @@ class Verdict:
     reason: str
     stamp_now: bool = False
     generation: str = CURRENT_EXTRACTOR_GENERATION
+    #: EVERY rung the upgrade crosses, oldest first — set only when
+    #: ``reason`` is ``REASON_CROSSES_BUMP``. :func:`describe_rung` turns
+    #: it into the user-facing reason text (newest rung's reason, plus a
+    #: count of the earlier ones).
+    bumps: "tuple[str, ...]" = ()
 
 
 def decide(
@@ -468,7 +536,9 @@ def decide(
        is also what stops a first-install from spawning a surprise full build.)
     3. **``prev_version`` recorded and at/past the newest bump** → the graph
        was produced by an analyzer that already had the fixes. Stamp, stop.
-    4. **``prev_version`` crosses a bump** → the migration case. OWED.
+    4. **``prev_version`` crosses a bump** → the migration case. OWED;
+       ``bumps`` carries EVERY rung crossed (oldest first), so the
+       user-facing reason can name the newest change, not just the first.
     5. **Anything else** — no manifest version, an unparseable one, a
        ``running_version`` we cannot parse — is UNKNOWN, and unknown with a
        graph present (or unprovable) is OWED. Re-walking an
@@ -486,12 +556,21 @@ def decide(
     prev = parse_semver(prev_version or "")
     newest_parsed = parse_semver(newest)
     if prev is not None and newest_parsed is not None and prev >= newest_parsed:
-        return Verdict(False, REASON_VERSION_AT_OR_PAST_BUMP, stamp_now=True,
-                       generation=newest)
+        return Verdict(
+            False, REASON_VERSION_AT_OR_PAST_BUMP, stamp_now=True, generation=newest
+        )
 
-    for bump in bumps:
-        if crosses_version_boundary(prev_version or "", running_version or "", bump):
-            return Verdict(True, REASON_CROSSES_BUMP, generation=newest)
+    crossed = tuple(
+        bump
+        for bump in bumps
+        if crosses_version_boundary(prev_version or "", running_version or "", bump)
+    )
+    if crossed:
+        # EVERY crossed rung travels with the verdict (oldest first);
+        # describe_rung shows the NEWEST rung's reason — the change the
+        # forced walk actually delivers — plus a count of the earlier
+        # ones, so a multi-rung upgrade never reads as its oldest rung.
+        return Verdict(True, REASON_CROSSES_BUMP, generation=newest, bumps=crossed)
 
     return Verdict(True, REASON_UNKNOWN_GENERATION, generation=newest)
 
@@ -503,8 +582,8 @@ def decide(
 # The analyzer keeps only the I/O seams that call these.)
 # ---------------------------------------------------------------------------
 
-def resolve_force_rewalk(cli_value: bool,
-                         env: "Optional[dict]" = None) -> bool:
+
+def resolve_force_rewalk(cli_value: bool, env: "Optional[dict]" = None) -> bool:
     """Resolve ``--force-rewalk`` against its env transport. ONE resolver.
 
     ``--force-rewalk`` is the primary, documented surface;
@@ -518,7 +597,10 @@ def resolve_force_rewalk(cli_value: bool,
         return True
     source = os.environ if env is None else env
     return str(source.get(FORCE_REWALK_ENV, "")).strip().lower() in {
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -603,7 +685,8 @@ def insert_failure_row(file_rel: object, exc: object) -> dict:
 
 def _row_is_attributed(row: object) -> bool:
     return isinstance(row, dict) and all(
-        isinstance(row.get(k), str) and row.get(k, "").strip() for k in _ROW_FIELDS)
+        isinstance(row.get(k), str) and row.get(k, "").strip() for k in _ROW_FIELDS
+    )
 
 
 def failing_set_fingerprint(rows: Sequence[dict]) -> str:
@@ -626,9 +709,13 @@ class FailingSetVerdict:
     fingerprint: Optional[str] = None
 
 
-def failing_set_verdict(rows: Sequence[dict], prior: object,
-                        generation: str = CURRENT_EXTRACTOR_GENERATION,
-                        *, insert_errors: Optional[int] = None) -> FailingSetVerdict:
+def failing_set_verdict(
+    rows: Sequence[dict],
+    prior: object,
+    generation: str = CURRENT_EXTRACTOR_GENERATION,
+    *,
+    insert_errors: Optional[int] = None,
+) -> FailingSetVerdict:
     """PURE: is this walk's failing set the SAME one the previous forced walk
     recorded, for the same generation?
 
@@ -639,8 +726,11 @@ def failing_set_verdict(rows: Sequence[dict], prior: object,
     * stable only when ``prior`` carries this fingerprint AND this generation.
     """
     rows = list(rows or [])
-    if not rows or not all(_row_is_attributed(r) for r in rows) or (
-            insert_errors is not None and int(insert_errors) != len(rows)):
+    if (
+        not rows
+        or not all(_row_is_attributed(r) for r in rows)
+        or (insert_errors is not None and int(insert_errors) != len(rows))
+    ):
         return FailingSetVerdict(False, FAILING_SET_UNATTRIBUTED, None)
     fp = failing_set_fingerprint(rows)
     if not isinstance(prior, dict) or not prior.get("fingerprint"):
@@ -685,8 +775,14 @@ def walk_certifies_generation(
     return int(files_analyzed or 0) > 0
 
 
-def _failing_set_record(rows: Sequence[dict], fingerprint: str, generation: str,
-                        *, project: str, first_seen: str) -> dict:
+def _failing_set_record(
+    rows: Sequence[dict],
+    fingerprint: str,
+    generation: str,
+    *,
+    project: str,
+    first_seen: str,
+) -> dict:
     return {
         "fingerprint": fingerprint,
         "generation": generation,
@@ -701,8 +797,10 @@ def _report_failing_rows(rows: Sequence[dict], insert_errors: int, emit) -> None
     emit(f"   Insert failures this walk: {insert_errors}")
     shown = list(rows)[:FAILING_ROWS_LOG_CAP]
     for r in shown:
-        emit(f"     - {r.get('file') or '?'} [{r.get('collection') or '?'}] "
-             f"{r.get('reason') or '?'}")
+        emit(
+            f"     - {r.get('file') or '?'} [{r.get('collection') or '?'}] "
+            f"{r.get('reason') or '?'}"
+        )
     more = max(int(insert_errors or 0), len(rows)) - len(shown)
     if more > 0:
         emit(f"     … and {more} more")
@@ -746,64 +844,97 @@ def stamp_after_walk(
     say = emit if emit is not None else (lambda line: print(line, flush=True))
     try:
         if not walk_certifies_generation(
-            force_rewalk, only_file=only_file, only_files_from=only_files_from,
-            language=language, insert_errors=0, files_analyzed=files_analyzed,
+            force_rewalk,
+            only_file=only_file,
+            only_files_from=only_files_from,
+            language=language,
+            insert_errors=0,
+            files_analyzed=files_analyzed,
         ):
             return None
         errors = int(insert_errors or 0)
         if errors <= 0:
-            if write_stamp(repo_path, CURRENT_EXTRACTOR_GENERATION,
-                           note="force-rewalk completed"):
+            if write_stamp(
+                repo_path, CURRENT_EXTRACTOR_GENERATION, note="force-rewalk completed"
+            ):
                 return CURRENT_EXTRACTOR_GENERATION
             return None
         rows = list(failing_rows or [])
         payload = read_stamp_payload(repo_path) or {}
-        prior = payload.get(PENDING_FAILING_SET_KEY) or payload.get(ACCEPTED_FAILING_SET_KEY)
-        verdict = failing_set_verdict(rows, prior, CURRENT_EXTRACTOR_GENERATION,
-                                      insert_errors=errors)
+        prior = payload.get(PENDING_FAILING_SET_KEY) or payload.get(
+            ACCEPTED_FAILING_SET_KEY
+        )
+        verdict = failing_set_verdict(
+            rows, prior, CURRENT_EXTRACTOR_GENERATION, insert_errors=errors
+        )
         _report_failing_rows(rows, errors, say)
         if verdict.reason == FAILING_SET_UNATTRIBUTED:
-            say("   Extractor generation: stamp held back — the failing inserts "
-                 "could not all be attributed to a row; the project stays owed")
+            say(
+                "   Extractor generation: stamp held back — the failing inserts "
+                "could not all be attributed to a row; the project stays owed"
+            )
             return None
         assert verdict.fingerprint is not None
-        first_seen = (prior.get("first_seen") if verdict.stable and isinstance(prior, dict)
-                      else "") or _utc_now()
-        record = _failing_set_record(rows, verdict.fingerprint,
-                                     CURRENT_EXTRACTOR_GENERATION,
-                                     project=project, first_seen=first_seen)
+        first_seen = (
+            prior.get("first_seen")
+            if verdict.stable and isinstance(prior, dict)
+            else ""
+        ) or _utc_now()
+        record = _failing_set_record(
+            rows,
+            verdict.fingerprint,
+            CURRENT_EXTRACTOR_GENERATION,
+            project=project,
+            first_seen=first_seen,
+        )
         if verdict.stable and walk_certifies_generation(
-            force_rewalk, only_file=only_file, only_files_from=only_files_from,
-            language=language, insert_errors=errors, files_analyzed=files_analyzed,
+            force_rewalk,
+            only_file=only_file,
+            only_files_from=only_files_from,
+            language=language,
+            insert_errors=errors,
+            files_analyzed=files_analyzed,
             failing_set_stable=True,
         ):
-            if write_stamp(repo_path, CURRENT_EXTRACTOR_GENERATION,
-                           note="force-rewalk completed with an accepted failing set",
-                           extra={ACCEPTED_FAILING_SET_KEY: record}):
-                say(f"   Extractor generation: recorded — the same {errors} insert "
-                     f"failure(s) as the previous forced walk are accepted "
-                     f"(`vco doctor` lists them)")
+            if write_stamp(
+                repo_path,
+                CURRENT_EXTRACTOR_GENERATION,
+                note="force-rewalk completed with an accepted failing set",
+                extra={ACCEPTED_FAILING_SET_KEY: record},
+            ):
+                say(
+                    f"   Extractor generation: recorded — the same {errors} insert "
+                    f"failure(s) as the previous forced walk are accepted "
+                    f"(`vco doctor` lists them)"
+                )
                 return CURRENT_EXTRACTOR_GENERATION
             return None
-        held = {k: v for k, v in payload.items()
-                if k not in (PENDING_FAILING_SET_KEY, ACCEPTED_FAILING_SET_KEY)}
+        held = {
+            k: v
+            for k, v in payload.items()
+            if k not in (PENDING_FAILING_SET_KEY, ACCEPTED_FAILING_SET_KEY)
+        }
         if payload.get(ACCEPTED_FAILING_SET_KEY):
             held.pop("generation", None)  # its acceptance no longer holds
         held[PENDING_FAILING_SET_KEY] = record
         held["written_at"] = _utc_now()
         held["written_by"] = "vco_lib.codegraph_extractor_generation"
         _write_stamp_payload(repo_path, held)
-        say(f"   Extractor generation: stamp held back ({verdict.reason}) — "
-             f"recorded as pending; the same set on the next forced walk is accepted")
+        say(
+            f"   Extractor generation: stamp held back ({verdict.reason}) — "
+            f"recorded as pending; the same set on the next forced walk is accepted"
+        )
     except Exception as exc:  # noqa: BLE001 — a stamp never gates a build
-        logger.warning("extractor-generation stamp not written for %s: %s",
-                       repo_path, exc)
+        logger.warning(
+            "extractor-generation stamp not written for %s: %s", repo_path, exc
+        )
     return None
 
 
 # ---------------------------------------------------------------------------
 # Stamp I/O (thin; every function soft-fails)
 # ---------------------------------------------------------------------------
+
 
 def stamp_path(folder: Path) -> Path:
     """Absolute path of ``folder``'s completion stamp."""
@@ -835,8 +966,13 @@ def read_stamp_generation(folder: Path) -> Optional[str]:
     return gen if isinstance(gen, str) and gen.strip() else None
 
 
-def write_stamp(folder: Path, generation: str = CURRENT_EXTRACTOR_GENERATION,
-                *, note: str = "", extra: Optional[dict] = None) -> bool:
+def write_stamp(
+    folder: Path,
+    generation: str = CURRENT_EXTRACTOR_GENERATION,
+    *,
+    note: str = "",
+    extra: Optional[dict] = None,
+) -> bool:
     """Record that ``folder``'s code graph satisfies ``generation``.
 
     Atomic (``vco_lib.atomic.atomic_write_json``) so a crash mid-write can
@@ -868,8 +1004,9 @@ def _write_stamp_payload(folder: Path, payload: dict) -> bool:
         atomic_write_json(target, payload, sort_keys=True)
         return True
     except Exception as exc:  # noqa: BLE001 — a stamp failure never blocks
-        logger.warning("extractor-generation stamp write failed for %s: %s",
-                       folder, exc)
+        logger.warning(
+            "extractor-generation stamp write failed for %s: %s", folder, exc
+        )
         return False
 
 
@@ -884,9 +1021,10 @@ def _utc_now() -> str:
 # tri-state schema probe; this module adds no second one)
 # ---------------------------------------------------------------------------
 
-def code_graph_exists(project_name: str,
-                      weaviate_url: Optional[str] = None,
-                      *, probe=None) -> Optional[bool]:
+
+def code_graph_exists(
+    project_name: str, weaviate_url: Optional[str] = None, *, probe=None
+) -> Optional[bool]:
     """Tri-state: does ``project_name`` have code-graph classes in Weaviate?
 
     ``True`` / ``False`` / ``None`` (could not check). Delegates the actual
@@ -934,16 +1072,22 @@ def code_graph_exists(project_name: str,
 # PLAN — the decision with its inputs resolved (thin I/O over `decide`)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ReindexResult:
     """What :func:`ensure_extractor_generation` did. Never an exception."""
 
-    status: str                     # skipped | stamped | launched | deferred | failed
+    status: str  # skipped | stamped | launched | deferred | failed
     reason: str = ""
     message: str = ""
     generation: str = CURRENT_EXTRACTOR_GENERATION
+    #: Human reason for the rung that triggered the re-index
+    #: (:func:`describe_rung`), or a generic "may predate" line when the
+    #: triggering rung is unknown. What the bundle update's user-facing
+    #: warning shows — never hard-coded to one release's reason.
+    reason_text: str = ""
     pid: Optional[int] = None
-    deferral: object = None         # a DeferralEntry when status == "deferred"
+    deferral: object = None  # a DeferralEntry when status == "deferred"
     warnings: list = field(default_factory=list)
 
 
@@ -1012,7 +1156,7 @@ def _retarget_deferral(deferral, generation: str):
         if not isinstance(cmd, str) or not cmd.strip():
             return deferral
         if _NOTE_MARKER in cmd:
-            return deferral            # already retargeted — idempotent
+            return deferral  # already retargeted — idempotent
         if "--force-rewalk" not in cmd:
             cmd = cmd.rstrip() + " --force-rewalk"
         note = (
@@ -1067,7 +1211,8 @@ def ensure_extractor_generation(
         )
     except Exception as exc:  # noqa: BLE001 — a broken detector never blocks
         return ReindexResult(
-            status="failed", reason="plan_raised",
+            status="failed",
+            reason="plan_raised",
             message=f"extractor-generation planning failed: {exc}",
         )
 
@@ -1081,22 +1226,33 @@ def ensure_extractor_generation(
                 message=(
                     f"code graph already at extractor generation "
                     f"{verdict.generation} ({verdict.reason})"
-                    if ok else "completion stamp could not be written"
+                    if ok
+                    else "completion stamp could not be written"
                 ),
             )
         return ReindexResult(
-            status="skipped", reason=verdict.reason,
+            status="skipped",
+            reason=verdict.reason,
             generation=verdict.generation,
             message=f"no extractor re-index owed ({verdict.reason})",
         )
+
+    # The user-facing reason for the owed walk: the triggering rung's own
+    # text when the verdict names one, generic otherwise (never one
+    # release's hard-coded reason for every rung).
+    reason_text = describe_rung(verdict.bumps) or (
+        f"the graph may predate extractor generation v{verdict.generation}"
+    )
 
     if spawn is None:
         try:
             from vco_lib.codegraph_resync import spawn_background_resync as spawn
         except Exception as exc:  # noqa: BLE001
             return ReindexResult(
-                status="failed", reason=verdict.reason,
+                status="failed",
+                reason=verdict.reason,
                 generation=verdict.generation,
+                reason_text=reason_text,
                 message=f"codegraph_resync helper unavailable: {exc}",
             )
 
@@ -1124,8 +1280,10 @@ def ensure_extractor_generation(
         )
     except Exception as exc:  # noqa: BLE001 — a spawn failure never blocks
         return ReindexResult(
-            status="failed", reason=verdict.reason,
+            status="failed",
+            reason=verdict.reason,
             generation=verdict.generation,
+            reason_text=reason_text,
             message=f"extractor re-index spawn raised: {exc}",
         )
 
@@ -1133,8 +1291,10 @@ def ensure_extractor_generation(
     message = getattr(result, "message", "") or ""
     if status == "launched":
         return ReindexResult(
-            status="launched", reason=verdict.reason,
+            status="launched",
+            reason=verdict.reason,
             generation=verdict.generation,
+            reason_text=reason_text,
             pid=getattr(result, "pid", None),
             message=(
                 f"extractor-generation re-index launched in background for "
@@ -1143,10 +1303,13 @@ def ensure_extractor_generation(
         )
     if status == "deferred":
         return ReindexResult(
-            status="deferred", reason=verdict.reason,
+            status="deferred",
+            reason=verdict.reason,
             generation=verdict.generation,
-            deferral=_retarget_deferral(getattr(result, "deferral", None),
-                                        verdict.generation),
+            reason_text=reason_text,
+            deferral=_retarget_deferral(
+                getattr(result, "deferral", None), verdict.generation
+            ),
             message=message or "extractor re-index deferred",
         )
     if status == "failed":
@@ -1159,8 +1322,10 @@ def ensure_extractor_generation(
         # detached children died on `import vco_lib`. The stamp stays unwritten,
         # so the next bundle update retries.
         return ReindexResult(
-            status="failed", reason=verdict.reason,
+            status="failed",
+            reason=verdict.reason,
             generation=verdict.generation,
+            reason_text=reason_text,
             message=message or "extractor re-index could not be started",
         )
 
@@ -1169,8 +1334,10 @@ def ensure_extractor_generation(
     # deliberately NOT written — the project stays owed and the next update
     # asks again.
     return ReindexResult(
-        status="skipped", reason=verdict.reason,
+        status="skipped",
+        reason=verdict.reason,
         generation=verdict.generation,
+        reason_text=reason_text,
         message=message or f"extractor re-index not launched ({status})",
     )
 
@@ -1178,6 +1345,7 @@ def ensure_extractor_generation(
 __all__ = [
     "CURRENT_EXTRACTOR_GENERATION",
     "EXTRACTOR_GENERATION_BUMPS",
+    "EXTRACTOR_GENERATION_RUNG_REASONS",
     "FORCE_REWALK_ENV",
     "STAMP_REL",
     "REASON_CROSSES_BUMP",
@@ -1190,6 +1358,7 @@ __all__ = [
     "code_graph_exists",
     "crosses_version_boundary",
     "decide",
+    "describe_rung",
     "ensure_extractor_generation",
     "generation_is_current",
     "parse_semver",
@@ -1251,7 +1420,9 @@ def accepted_failing_sets(roots: "Sequence[Path]") -> "list[tuple[Path, dict]]":
     return found
 
 
-def doctor_insert_failures(folder: Path, *, roots: "Optional[Sequence[Path]]" = None) -> list:
+def doctor_insert_failures(
+    folder: Path, *, roots: "Optional[Sequence[Path]]" = None
+) -> list:
     """Findings for the ``codegraph_insert_failures`` doctor probe.
 
     A PROBLEM (the ``retired_endpoint_env`` shape — no registered condition,
@@ -1262,29 +1433,48 @@ def doctor_insert_failures(folder: Path, *, roots: "Optional[Sequence[Path]]" = 
     record). Read-only: one small JSON read per root.
     """
     from vco_lib.doctor import (  # noqa: PLC0415
-        FIX_DEFER, STATUS_OK, STATUS_PROBLEM, Finding,
+        FIX_DEFER,
+        STATUS_OK,
+        STATUS_PROBLEM,
+        Finding,
     )
 
-    hits = accepted_failing_sets(list(roots) if roots is not None else _doctor_roots(folder))
+    hits = accepted_failing_sets(
+        list(roots) if roots is not None else _doctor_roots(folder)
+    )
     if not hits:
-        return [Finding(
-            probe=DOCTOR_PROBE, status=STATUS_OK,
-            summary="no code graph was certified with persistently failing inserts",
-        )]
+        return [
+            Finding(
+                probe=DOCTOR_PROBE,
+                status=STATUS_OK,
+                summary="no code graph was certified with persistently failing inserts",
+            )
+        ]
     parts, lines, detail = [], [], {}
     for root, acc in hits:
         rows = [r for r in acc.get("rows") or [] if isinstance(r, dict)]
         name = str(acc.get("project") or "").strip() or root.name
-        parts.append(f"{name}: {len(rows)} row(s) not in the graph since "
-                     f"{acc.get('first_seen') or '?'}")
+        parts.append(
+            f"{name}: {len(rows)} row(s) not in the graph since "
+            f"{acc.get('first_seen') or '?'}"
+        )
         lines.append(f"# {name} ({root}) — fix the cause, then re-walk:")
         for r in rows:
-            lines.append(f"#   {r.get('file')} [{r.get('collection')}] {r.get('reason')}")
-        lines.append(f".claude/scripts/code-graph-analyze {root} --project {name} --force-rewalk")
+            lines.append(
+                f"#   {r.get('file')} [{r.get('collection')}] {r.get('reason')}"
+            )
+        lines.append(
+            f".claude/scripts/code-graph-analyze {root} --project {name} --force-rewalk"
+        )
         detail[str(root)] = acc
-    return [Finding(
-        probe=DOCTOR_PROBE, status=STATUS_PROBLEM,
-        summary="code graph certified with persistently failing inserts — "
-                + "; ".join(parts),
-        fix=FIX_DEFER, command="\n".join(lines), detail={"accepted": detail},
-    )]
+    return [
+        Finding(
+            probe=DOCTOR_PROBE,
+            status=STATUS_PROBLEM,
+            summary="code graph certified with persistently failing inserts — "
+            + "; ".join(parts),
+            fix=FIX_DEFER,
+            command="\n".join(lines),
+            detail={"accepted": detail},
+        )
+    ]

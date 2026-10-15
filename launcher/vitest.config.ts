@@ -15,11 +15,25 @@
 import { defineConfig } from 'vitest/config';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  // v0.2.103 (review MEDIUM-2): compile `.svelte` components so the
+  // Toast component test can mount the REAL renderer. This is the plain
+  // vite-plugin-svelte compiler pass — NOT the sveltekit pipeline the
+  // header note above rules out (no router/adapter is stood up);
+  // pure-.ts tests are unaffected (the plugin only transforms .svelte
+  // modules). Component tests opt into the DOM per file via the
+  // `@vitest-environment jsdom` docblock (jsdom is a devDependency).
+  plugins: [svelte()],
   resolve: {
+    // Resolve svelte to its CLIENT entry (`browser` export condition) —
+    // vitest's node runner otherwise resolves the server entry, where
+    // `mount()` throws lifecycle_function_unavailable. Pure-.ts tests
+    // are unaffected (none of their imports branch on this condition).
+    conditions: ['browser'],
     alias: {
       // Mirror sveltekit's `$lib` → `src/lib` alias.
       $lib: resolve(here, 'src/lib'),
@@ -32,10 +46,10 @@ export default defineConfig({
     },
   },
   test: {
-    // Pure node environment is fine; the helpers under test are
-    // dependency-free TS modules. If we later add component tests
-    // that need a DOM, we'd switch this to 'jsdom' (and add
-    // @testing-library/svelte + jsdom as dev deps).
+    // Node stays the DEFAULT environment; the helpers under test are
+    // dependency-free TS modules. Component tests that need a DOM opt
+    // in per file with the `@vitest-environment jsdom` docblock (see
+    // src/lib/components/Toast.test.ts; jsdom is a devDependency).
     environment: 'node',
     include: ['src/**/*.test.ts'],
   },
