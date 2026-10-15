@@ -291,6 +291,6 @@ pub mod update_run;
 // v0.2.71 Track T-WT (modes extended v0.2.91): GUI-only per-project worktree-repo mode
 // backing the subagent-git modal. NOT hub-resolved (config_api.rs untouched);
 // the harness spawn pathway VCO would need to consume it cannot be
-// intercepted. The generate_handler! entries for set_/get_worktree_repo_mode
+// intercepted. The generate_handler! entries for set_worktree_repo_mode / plan_project_git_repo
 // are added to lib.rs by the integrator (T-D-launcher owns lib.rs).
 pub mod worktree_repo_mode;

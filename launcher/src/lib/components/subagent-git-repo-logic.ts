@@ -72,3 +72,32 @@ export function resolveConnectSelection(
   }
   return { ok: true, kind: 'local', path };
 }
+
+/**
+ * v0.2.103 (plan item 17) — the project page's subagent-git probe result,
+ * returned by the `plan_project_git_repo` Tauri command.
+ *
+ * MUST MATCH the labels `plan_label` returns in
+ * launcher/src-tauri/src/commands/worktree_repo_mode.rs.
+ *   * `decided`           — a mode is recorded; never prompt again.
+ *   * `existing`          — the folder is (inside) a repo; `use_existing`
+ *                           was recorded by the probe.
+ *   * `needs_choice`      — repo-less but holding nested repos: a REAL
+ *                           choice (wrap them in a new root repo, point at
+ *                           one, or opt out) — the only state that prompts.
+ *   * `auto_init_pending` — repo-less with nothing nested: VCO creates the
+ *                           local repo itself at add / the next bundle update
+ *                           (owner ruling 2026-10-14: no approval needed).
+ *   * `git_unavailable`   — git cannot run; the add/update warning says so.
+ */
+export type GitRepoPlan =
+  | 'decided'
+  | 'existing'
+  | 'needs_choice'
+  | 'auto_init_pending'
+  | 'git_unavailable';
+
+/** True only when the subagent-git modal should open for this plan. */
+export function shouldOfferSubagentGitModal(plan: GitRepoPlan | string | null): boolean {
+  return plan === 'needs_choice';
+}

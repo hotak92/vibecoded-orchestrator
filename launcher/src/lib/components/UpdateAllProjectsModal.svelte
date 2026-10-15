@@ -571,6 +571,11 @@
                   </ul>
                 </details>
               {/if}
+              {#each r.notices ?? [] as n, i (i)}
+                <!-- v0.2.103 (plan item 17): informational notice, e.g. the
+                     one-time "Created a local git repository (no remote)". -->
+                <div class="ua-row-notice">{n}</div>
+              {/each}
               {#if stale.length > 0}
                 <!-- Gap A: a derived collection is stale with no data-preserving
                      migration. Surface the REAL interactive resolve, not a toast. -->
@@ -843,6 +848,15 @@
   }
   details[open] > summary .ua-disclosure-caret {
     transform: rotate(90deg);
+  }
+  .ua-row-notice {
+    flex-basis: 100%;
+    padding: 4px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--color-teal, #00bfa6);
+    background: rgba(0, 191, 166, 0.06);
+    border-left: 2px solid rgba(0, 191, 166, 0.4);
   }
   .ua-warnings-list {
     list-style: none;

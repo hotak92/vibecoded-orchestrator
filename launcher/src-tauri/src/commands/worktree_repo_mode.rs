@@ -19,8 +19,10 @@
 //!     has `.git`); the harness walks up to it, isolation already works.
 //!     Recorded automatically when detection succeeds; the user never has
 //!     to click it.
-//!   * `"local_init"` — user accepted a local-only `git init` at the
-//!     workspace root.
+//!   * `"local_init"` — a local-only `git init` was run at the workspace
+//!     root: automatically at project add / bundle update when the folder
+//!     held no repo at all (owner ruling 2026-10-14, see
+//!     `ensure_project_local_repo`), or by the user from the modal.
 //!   * `"no_repo"` — user opted out; subagents run in the shared cwd (no
 //!     isolation). The enforcement (frontmatter strip) is owned by the
 //!     project_init / install-bundle flow keyed off this setting — NOT by
@@ -47,7 +49,9 @@
 //!
 //! ## GUI-only, NOT hub-resolved
 //! Deliberately stored in `module_settings` (module_id =
-//! "orchestrator-core") and read back only via the launcher GUI. It is NOT
+//! "orchestrator-core") and read back only inside the launcher process (the
+//! page probe `plan_project_git_repo` and the add/update-time
+//! `ensure_project_local_repo`). It is NOT
 //! added to `config_api.rs`'s `ProjectConfigResponse` because the harness
 //! spawn pathway (the only consumer that would need a hub-resolved value)
 //! cannot be intercepted by VCO — there is nothing on the MCP/hook side that
@@ -154,20 +158,18 @@ pub async fn set_worktree_repo_mode(
 
 /// Read back the per-project worktree-repo mode.
 ///
-/// Returns `None` (serialised as JSON `null`) when no choice has been
-/// recorded yet — the modal uses that to know it should prompt. A non-string
-/// or unknown stored value is coerced to `None` (defensive: never hand the
-/// GUI a value outside the tri-state contract).
-#[command]
-pub async fn get_worktree_repo_mode(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<Option<String>, String> {
-    if project_id.is_empty() {
-        return Err("get_worktree_repo_mode: project_id required".into());
-    }
+/// Returns `None` when no choice has been recorded yet. A non-string or
+/// unknown stored value is coerced to `None` (defensive: never act on a value
+/// outside the mode contract).
+///
+/// v0.2.103 (plan item 17): this was the `get_worktree_repo_mode` Tauri
+/// command, whose only caller was the project page's modal gate. That gate
+/// now asks `plan_project_git_repo` (which reports a recorded mode as
+/// `"decided"`), so the command was retired from `generate_handler!` as
+/// superseded; its logic lives on here, read by `plan_repo`.
+fn recorded_mode(db: &Db, project_id: &str) -> Result<Option<String>, String> {
     let stored = db
-        .get_setting(&project_id, MODULE_ID, SETTING_KEY)?
+        .get_setting(project_id, MODULE_ID, SETTING_KEY)?
         .and_then(|v| v.as_str().map(|s| s.to_string()));
     Ok(match stored {
         Some(s) if VALID_MODES.contains(&s.as_str()) => Some(s),
@@ -218,7 +220,8 @@ pub async fn detect_project_git_repo(project_root: String) -> Result<GitRepoDete
 }
 
 /// Create a LOCAL-ONLY git repo at the project root (the modal's "create new"
-/// choice). SAFETY GUARDS — this MUTATES the user's filesystem, so it refuses
+/// choice, and the automatic add/update step `ensure_project_local_repo`).
+/// SAFETY GUARDS — this MUTATES the user's filesystem, so it refuses
 /// anything ambiguous:
 ///   1. REFUSE if the root is ALREADY inside a git repo (self or a parent) —
 ///      `git init` there would create a nested/duplicate repo or be a no-op on
@@ -291,10 +294,16 @@ pub async fn create_local_project_repo(project_root: String) -> Result<(), Strin
 /// root-anchored path (`/Code/python/app/`) relative to `root`.
 fn append_local_repo_gitignore_guard(root: &Path) -> std::io::Result<()> {
     use std::io::Write;
-    const MARKER: &str = "# --- VCO local-only repo guard (created by the subagent-git modal) ---";
+    // The repo is created either by the subagent-git modal or automatically
+    // at project add / bundle update (`ensure_project_local_repo`), so the
+    // written marker names neither. Idempotency matches the shared PREFIX,
+    // which also covers the pre-v0.2.103 marker text
+    // "(created by the subagent-git modal)" already present in older repos.
+    const MARKER_PREFIX: &str = "# --- VCO local-only repo guard";
+    const MARKER: &str = "# --- VCO local-only repo guard (created by VCO) ---";
     let gi = root.join(".gitignore");
     if let Ok(existing) = std::fs::read_to_string(&gi) {
-        if existing.contains(MARKER) {
+        if existing.contains(MARKER_PREFIX) {
             return Ok(());
         }
     }
@@ -679,6 +688,284 @@ pub async fn detect_scaffold_only_root(project_root: String) -> Result<bool, Str
         }
     }
     Ok(true)
+}
+
+// ─── v0.2.103 (plan item 17) — automatic local repo at add / update ────────
+//
+// Owner ruling 2026-10-14: "no need for approval if there's no pre-existing
+// repo in the project, just create a local one when the project gets added
+// to VCO". The decision lives HERE, once, and is consumed by three callers:
+//   * `create_project_v2` (synchronous phase, before the bundle install so
+//     the bundle's `.git/info/exclude` pass covers the fresh repo);
+//   * `update_project_v2` (before `install-bundle --update`, same reason) —
+//     the catch-up for projects registered before this release;
+//   * the project page, through `plan_project_git_repo`, which opens the
+//     subagent-git modal ONLY for the real-choice case.
+//
+// What counts as "a pre-existing repo in the project":
+//   * the folder IS a repo, or sits inside one (`git rev-parse` succeeds) —
+//     never touched; `use_existing` is recorded (the harness walks up to it);
+//   * the folder is repo-less but HOLDS nested repos (`Code/python/<app>/.git`)
+//     — the user's code already lives in a repo, so wrapping it in a new root
+//     repo vs. pointing at the nested one is a real choice: nothing is done
+//     and the modal asks.
+// Only a folder with no repo anywhere around or under it is initialised.
+// A recorded mode is always respected (`no_repo` included), which also makes
+// the update-time catch-up run at most once per project.
+
+/// What the add/update-time step found and did. Each variant maps to at most
+/// one user notice (info) or one warning (problem) — see `notice`/`warning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutoLocalRepoOutcome {
+    /// A mode was already recorded; nothing probed or changed.
+    AlreadyDecided { mode: String },
+    /// The folder is, or is inside, an existing repo. Untouched;
+    /// `use_existing` recorded.
+    ExistingRepo { toplevel: String },
+    /// Repo-less folder holding nested repos: the modal asks. Nothing done.
+    NeedsChoice { nested: Vec<String> },
+    /// A local-only repo was created (main branch, no remote, no commit).
+    /// `record_error` is set when persisting `local_init` failed — the repo
+    /// still stands (and the next probe records `use_existing` for it).
+    Created { record_error: Option<String> },
+    /// `git` could not be run. Nothing created or recorded, so the next
+    /// bundle update retries once git is installed.
+    GitUnavailable { detail: String },
+    /// `git init` failed. Nothing recorded (retried on the next update).
+    Failed { detail: String },
+}
+
+/// The user-facing notice text for a created repo. Pinned by tests and the
+/// GUI wiring test, so the wording the owner asked for cannot drift.
+pub(crate) const CREATED_LOCAL_REPO_NOTICE: &str =
+    "Created a local git repository (no remote) so subagent worktree isolation works. \
+     Nothing was committed or pushed: the repository starts empty, VCO's runtime folders \
+     are listed in its .gitignore, and connecting a remote stays your choice.";
+
+impl AutoLocalRepoOutcome {
+    /// Informational notice for the GUI (success/info toast), if any.
+    pub(crate) fn notice(&self) -> Option<String> {
+        match self {
+            AutoLocalRepoOutcome::Created { .. } => Some(CREATED_LOCAL_REPO_NOTICE.to_string()),
+            _ => None,
+        }
+    }
+
+    /// A problem the user should see (warning toast), if any. A missing git
+    /// or a failed init never fails the add/update itself.
+    pub(crate) fn warning(&self) -> Option<String> {
+        match self {
+            AutoLocalRepoOutcome::GitUnavailable { detail } => Some(format!(
+                "git could not be run ({}), so VCO did not create a local git repository \
+                 for this project: subagents that use worktree isolation cannot start \
+                 until there is one. Install git, then run Update bundle — VCO creates \
+                 the repository then.",
+                detail
+            )),
+            AutoLocalRepoOutcome::Failed { detail } => Some(format!(
+                "Creating a local git repository for this project failed: {}. \
+                 The project was set up anyway; Update bundle retries the step.",
+                detail
+            )),
+            AutoLocalRepoOutcome::Created {
+                record_error: Some(e),
+            } => Some(format!(
+                "A local git repository was created, but recording that choice failed: {}.",
+                e
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// The side-effect-free part of the decision, shared by the add/update step
+/// and the page probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepoPlan {
+    Decided(String),
+    Existing(String),
+    NeedsChoice(Vec<String>),
+    AutoInit,
+    GitUnavailable(String),
+}
+
+/// `Ok(())` when a `git` binary answers `--version`; the error text otherwise.
+async fn git_runnable(root: &Path) -> Result<(), String> {
+    match run_git(root, &["--version"]).await {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "`git --version` exited with {}",
+            o.status.code().map_or("a signal".to_string(), |c| c.to_string())
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+async fn plan_repo(db: &Db, project_id: &str, root: &Path) -> Result<RepoPlan, String> {
+    if let Some(mode) = recorded_mode(db, project_id)? {
+        return Ok(RepoPlan::Decided(mode));
+    }
+    if !root.is_dir() {
+        return Err(format!("'{}' is not a directory", root.display()));
+    }
+    // Probe git FIRST: `detect_project_git_repo` soft-fails a spawn error to
+    // "not inside a repo", which would otherwise read as "init me".
+    if let Err(e) = git_runnable(root).await {
+        return Ok(RepoPlan::GitUnavailable(e));
+    }
+    let det = detect_project_git_repo(root.to_string_lossy().to_string()).await?;
+    if det.inside_repo {
+        return Ok(RepoPlan::Existing(det.toplevel.unwrap_or_default()));
+    }
+    let nested = find_nested_git_repos(root);
+    if !nested.is_empty() {
+        return Ok(RepoPlan::NeedsChoice(nested));
+    }
+    Ok(RepoPlan::AutoInit)
+}
+
+/// Record `use_existing` for a folder found inside a repo. Best-effort: a
+/// failed write only means the next probe repeats the (read-only) detection.
+fn record_use_existing(db: &Db, project_id: &str) {
+    if let Err(e) = db.set_setting(
+        project_id,
+        MODULE_ID,
+        SETTING_KEY,
+        &Value::String("use_existing".into()),
+    ) {
+        tracing::warn!(
+            "[worktree_repo_mode] could not record use_existing for {}: {}",
+            project_id,
+            e
+        );
+    }
+}
+
+/// Add/update-time step: create a local-only repo when the project folder has
+/// no repo anywhere around or under it (see the section comment above).
+/// Never returns an error — every condition is an outcome the caller turns
+/// into a notice or a warning, so a project add/update never fails on git.
+pub(crate) async fn ensure_project_local_repo(
+    db: &Db,
+    project_id: &str,
+    root: &Path,
+) -> AutoLocalRepoOutcome {
+    let plan = match plan_repo(db, project_id, root).await {
+        Ok(p) => p,
+        Err(e) => return AutoLocalRepoOutcome::Failed { detail: e },
+    };
+    match plan {
+        RepoPlan::Decided(mode) => AutoLocalRepoOutcome::AlreadyDecided { mode },
+        RepoPlan::GitUnavailable(detail) => {
+            tracing::warn!(
+                "[worktree_repo_mode] {}: git unavailable, no local repo created: {}",
+                root.display(),
+                detail
+            );
+            AutoLocalRepoOutcome::GitUnavailable { detail }
+        }
+        RepoPlan::Existing(toplevel) => {
+            record_use_existing(db, project_id);
+            AutoLocalRepoOutcome::ExistingRepo { toplevel }
+        }
+        RepoPlan::NeedsChoice(nested) => {
+            tracing::info!(
+                "[worktree_repo_mode] {}: repo-less but holds nested repos {:?}; leaving the choice to the user",
+                root.display(),
+                nested
+            );
+            AutoLocalRepoOutcome::NeedsChoice { nested }
+        }
+        RepoPlan::AutoInit => {
+            if let Err(e) = create_local_project_repo(root.to_string_lossy().to_string()).await {
+                tracing::warn!(
+                    "[worktree_repo_mode] {}: automatic local repo creation failed: {}",
+                    root.display(),
+                    e
+                );
+                return AutoLocalRepoOutcome::Failed { detail: e };
+            }
+            tracing::info!(
+                "[worktree_repo_mode] {}: created a local-only git repository (main, no remote, no commit)",
+                root.display()
+            );
+            let record_error = db
+                .set_setting(
+                    project_id,
+                    MODULE_ID,
+                    SETTING_KEY,
+                    &Value::String("local_init".into()),
+                )
+                .err();
+            let _ = db.audit(
+                "project_git_local_init",
+                Some(project_id),
+                None,
+                &serde_json::json!({
+                    "folder": root.display().to_string(),
+                    "branch": "main",
+                    "remote": null,
+                    "committed": false,
+                }),
+            );
+            AutoLocalRepoOutcome::Created { record_error }
+        }
+    }
+}
+
+/// Run [`ensure_project_local_repo`] and route its outcome into the caller's
+/// notice/warning lists — the ONE adapter `create_project_v2` and
+/// `update_project_v2` both call, so add and update report it identically.
+pub(crate) async fn collect_local_repo_outcome(
+    db: &Db,
+    project_id: &str,
+    root: &Path,
+    notices: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let outcome = ensure_project_local_repo(db, project_id, root).await;
+    if let Some(n) = outcome.notice() {
+        notices.push(n);
+    }
+    if let Some(w) = outcome.warning() {
+        warnings.push(w);
+    }
+}
+
+/// Page probe (no filesystem mutation): which subagent-git state is this
+/// project in? Returns one of `"decided"`, `"existing"` (and records
+/// `use_existing`, as the page always did), `"needs_choice"` (the ONLY state
+/// in which the page opens the modal), `"auto_init_pending"` (repo-less with
+/// nothing nested — the next bundle update creates the repo; no prompt) or
+/// `"git_unavailable"`. The string contract MUST MATCH `GitRepoPlan` in
+/// launcher/src/lib/components/subagent-git-repo-logic.ts.
+#[command]
+pub async fn plan_project_git_repo(
+    project_id: String,
+    project_root: String,
+    db: State<'_, Db>,
+) -> Result<String, String> {
+    if project_id.is_empty() {
+        return Err("plan_project_git_repo: project_id required".into());
+    }
+    if project_root.trim().is_empty() {
+        return Err("plan_project_git_repo: project_root required".into());
+    }
+    plan_label(&db, &project_id, Path::new(&project_root)).await
+}
+
+async fn plan_label(db: &Db, project_id: &str, root: &Path) -> Result<String, String> {
+    Ok(match plan_repo(db, project_id, root).await? {
+        RepoPlan::Decided(_) => "decided",
+        RepoPlan::Existing(_) => {
+            record_use_existing(db, project_id);
+            "existing"
+        }
+        RepoPlan::NeedsChoice(_) => "needs_choice",
+        RepoPlan::AutoInit => "auto_init_pending",
+        RepoPlan::GitUnavailable(_) => "git_unavailable",
+    }
+    .to_string())
 }
 
 #[cfg(test)]
@@ -1233,6 +1520,325 @@ mod tests {
             )
             .await
             .unwrap()
+        );
+    }
+
+    // ── v0.2.103 (plan item 17) — automatic local repo at add / update ──
+
+    fn db_with_project(folder: &Path) -> (Db, String) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let id = uuid::Uuid::new_v4().to_string();
+        db.insert_project(
+            &id,
+            "Auto Repo Project",
+            &folder.to_string_lossy(),
+            crate::db::models::ProjectHost::Base,
+            &format!("auto-repo-{}", &id[..8]),
+        )
+        .expect("insert project");
+        (db, id)
+    }
+
+    fn recorded_mode(db: &Db, id: &str) -> Option<String> {
+        db.get_setting(id, MODULE_ID, SETTING_KEY)
+            .unwrap()
+            .and_then(|v| v.as_str().map(str::to_string))
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn auto_repo_created_when_folder_has_no_repo() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = write_sentinel(tmp.path());
+        let (db, id) = db_with_project(tmp.path());
+
+        let out = ensure_project_local_repo(&db, &id, tmp.path()).await;
+        assert_eq!(out, AutoLocalRepoOutcome::Created { record_error: None });
+        assert_eq!(out.notice().as_deref(), Some(CREATED_LOCAL_REPO_NOTICE));
+        assert!(out.warning().is_none());
+        assert!(
+            CREATED_LOCAL_REPO_NOTICE.starts_with("Created a local git repository (no remote)"),
+            "owner-facing wording pinned"
+        );
+
+        // Local-only shape: .git at the root, branch main, no remote, no commit.
+        assert!(tmp.path().join(".git").is_dir());
+        let head = git_out(tmp.path(), &["symbolic-ref", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "refs/heads/main");
+        let remotes = git_out(tmp.path(), &["remote"]);
+        assert!(remotes.status.success());
+        assert!(String::from_utf8_lossy(&remotes.stdout).trim().is_empty(), "no remote");
+        let commit = git_out(tmp.path(), &["rev-parse", "--verify", "-q", "HEAD"]);
+        assert!(!commit.status.success(), "nothing may be committed");
+        let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(gi.contains("VCO local-only repo guard"));
+        assert!(gi.contains(".claude/state/"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), SENTINEL_BYTES);
+
+        // Recorded once — a second run (the next bundle update) is a no-op.
+        assert_eq!(recorded_mode(&db, &id).as_deref(), Some("local_init"));
+        let again = ensure_project_local_repo(&db, &id, tmp.path()).await;
+        assert_eq!(
+            again,
+            AutoLocalRepoOutcome::AlreadyDecided { mode: "local_init".into() }
+        );
+        assert!(again.notice().is_none());
+        let gi2 = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(gi, gi2, "the second run must not touch the repo");
+    }
+
+    #[tokio::test]
+    async fn auto_repo_leaves_an_existing_repo_untouched() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        git_out(tmp.path(), &["init", "--initial-branch=trunk"]);
+        let sentinel = write_sentinel(tmp.path());
+        let config_before = std::fs::read(tmp.path().join(".git").join("config")).unwrap();
+        let (db, id) = db_with_project(tmp.path());
+
+        let out = ensure_project_local_repo(&db, &id, tmp.path()).await;
+        assert!(
+            matches!(out, AutoLocalRepoOutcome::ExistingRepo { .. }),
+            "got {out:?}"
+        );
+        assert!(out.notice().is_none() && out.warning().is_none());
+        assert!(!tmp.path().join(".gitignore").exists(), "no guard written into a user repo");
+        assert_eq!(
+            std::fs::read(tmp.path().join(".git").join("config")).unwrap(),
+            config_before
+        );
+        let head = git_out(tmp.path(), &["symbolic-ref", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "refs/heads/trunk");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), SENTINEL_BYTES);
+        assert_eq!(recorded_mode(&db, &id).as_deref(), Some("use_existing"));
+    }
+
+    #[tokio::test]
+    async fn auto_repo_never_nests_inside_an_enclosing_repo() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        git_out(tmp.path(), &["init", "--initial-branch=main"]);
+        let sub = tmp.path().join("sub").join("project");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (db, id) = db_with_project(&sub);
+
+        let out = ensure_project_local_repo(&db, &id, &sub).await;
+        match &out {
+            AutoLocalRepoOutcome::ExistingRepo { toplevel } => assert_eq!(
+                std::fs::canonicalize(toplevel).unwrap(),
+                std::fs::canonicalize(tmp.path()).unwrap()
+            ),
+            other => panic!("expected ExistingRepo, got {other:?}"),
+        }
+        assert!(!sub.join(".git").exists(), "no nested repo may be created");
+        assert_eq!(recorded_mode(&db, &id).as_deref(), Some("use_existing"));
+    }
+
+    #[tokio::test]
+    async fn auto_repo_nested_repos_are_a_real_choice_for_the_modal() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("Code").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        git_out(&nested, &["init", "--initial-branch=main"]);
+        let (db, id) = db_with_project(tmp.path());
+
+        assert_eq!(
+            plan_label(&db, &id, tmp.path()).await.unwrap(),
+            "needs_choice"
+        );
+        let out = ensure_project_local_repo(&db, &id, tmp.path()).await;
+        assert_eq!(
+            out,
+            AutoLocalRepoOutcome::NeedsChoice { nested: vec!["Code/app".into()] }
+        );
+        assert!(out.notice().is_none() && out.warning().is_none());
+        assert!(!tmp.path().join(".git").exists(), "nothing initialised");
+        assert!(!tmp.path().join(".gitignore").exists());
+        assert_eq!(recorded_mode(&db, &id), None, "undecided, so the modal still asks");
+    }
+
+    #[tokio::test]
+    async fn auto_repo_respects_a_recorded_opt_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, id) = db_with_project(tmp.path());
+        db.set_setting(&id, MODULE_ID, SETTING_KEY, &Value::String("no_repo".into()))
+            .unwrap();
+        let out = ensure_project_local_repo(&db, &id, tmp.path()).await;
+        assert_eq!(out, AutoLocalRepoOutcome::AlreadyDecided { mode: "no_repo".into() });
+        assert!(!tmp.path().join(".git").exists());
+        assert_eq!(plan_label(&db, &id, tmp.path()).await.unwrap(), "decided");
+    }
+
+    #[tokio::test]
+    async fn plan_label_reports_pending_init_and_records_existing() {
+        if !git_available() {
+            return;
+        }
+        let empty = tempfile::tempdir().unwrap();
+        let (db, id) = db_with_project(empty.path());
+        assert_eq!(
+            plan_label(&db, &id, empty.path()).await.unwrap(),
+            "auto_init_pending"
+        );
+        assert!(!empty.path().join(".git").exists(), "the probe never mutates");
+        assert_eq!(recorded_mode(&db, &id), None);
+
+        let repo = tempfile::tempdir().unwrap();
+        git_out(repo.path(), &["init", "--initial-branch=main"]);
+        let (db2, id2) = db_with_project(repo.path());
+        assert_eq!(plan_label(&db2, &id2, repo.path()).await.unwrap(), "existing");
+        assert_eq!(recorded_mode(&db2, &id2).as_deref(), Some("use_existing"));
+    }
+
+    /// Run `fut` on a current-thread runtime while THIS thread's git lookup
+    /// PATH is `dir` (`with_lookup_path` is thread-local; the process PATH is
+    /// never touched).
+    fn with_git_path<T>(dir: &Path, fut: impl std::future::Future<Output = T>) -> T {
+        vct_launcher_core::paths::with_lookup_path(Some(dir.as_os_str()), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(fut)
+        })
+    }
+
+    #[test]
+    fn auto_repo_git_missing_is_a_clear_warning_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let no_git = tempfile::tempdir().unwrap();
+        let (db, id) = db_with_project(tmp.path());
+
+        let out = with_git_path(no_git.path(), ensure_project_local_repo(&db, &id, tmp.path()));
+        assert!(
+            matches!(out, AutoLocalRepoOutcome::GitUnavailable { .. }),
+            "got {out:?}"
+        );
+        let warning = out.warning().expect("git missing must warn");
+        assert!(warning.contains("Install git"), "{warning}");
+        assert!(out.notice().is_none());
+        assert!(!tmp.path().join(".git").exists());
+        assert_eq!(recorded_mode(&db, &id), None, "unrecorded, so the next update retries");
+        let label = with_git_path(no_git.path(), plan_label(&db, &id, tmp.path())).unwrap();
+        assert_eq!(label, "git_unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_repo_without_a_git_identity_still_inits_and_never_commits() {
+        use std::os::unix::fs::PermissionsExt;
+        if !git_available() {
+            return;
+        }
+        let real_git = vct_launcher_core::paths::which_on_path("git").expect("git on PATH");
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        // A `git` with NO identity anywhere: no global/system config, a fresh
+        // HOME, identity env vars unset, and no hostname fallback.
+        let wrapper = bin.path().join("git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexport HOME='{}' GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\n\
+                 unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL\n\
+                 exec '{}' -c user.useConfigOnly=true \"$@\"\n",
+                home.path().display(),
+                real_git.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let w = |args: &[&str], dir: &Path| {
+            std::process::Command::new(&wrapper)
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap()
+        };
+        // Sanity: the fixture really cannot commit.
+        let scratch = tempfile::tempdir().unwrap();
+        assert!(w(&["init"], scratch.path()).status.success());
+        assert!(
+            !w(&["commit", "--allow-empty", "-m", "x"], scratch.path()).status.success(),
+            "fixture must have no git identity"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, id) = db_with_project(tmp.path());
+        let out = with_git_path(bin.path(), ensure_project_local_repo(&db, &id, tmp.path()));
+        assert_eq!(out, AutoLocalRepoOutcome::Created { record_error: None });
+        let notice = out.notice().unwrap();
+        assert!(notice.contains("Nothing was committed"), "{notice}");
+        assert!(tmp.path().join(".git").is_dir());
+        assert!(
+            !w(&["rev-parse", "--verify", "-q", "HEAD"], tmp.path()).status.success(),
+            "no commit"
+        );
+        assert_eq!(recorded_mode(&db, &id).as_deref(), Some("local_init"));
+    }
+
+    #[tokio::test]
+    async fn adapter_routes_created_to_notices_and_existing_to_nothing() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, id) = db_with_project(tmp.path());
+        let (mut notices, mut warnings) = (Vec::new(), vec!["earlier".to_string()]);
+        collect_local_repo_outcome(&db, &id, tmp.path(), &mut notices, &mut warnings).await;
+        assert_eq!(notices, vec![CREATED_LOCAL_REPO_NOTICE.to_string()]);
+        assert_eq!(warnings, vec!["earlier".to_string()], "a notice is never a warning");
+
+        let repo = tempfile::tempdir().unwrap();
+        git_out(repo.path(), &["init", "--initial-branch=main"]);
+        let (db2, id2) = db_with_project(repo.path());
+        let (mut n2, mut w2) = (Vec::new(), Vec::new());
+        collect_local_repo_outcome(&db2, &id2, repo.path(), &mut n2, &mut w2).await;
+        assert!(n2.is_empty() && w2.is_empty(), "existing repo: silent");
+    }
+
+    #[test]
+    fn adapter_routes_git_missing_to_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let no_git = tempfile::tempdir().unwrap();
+        let (db, id) = db_with_project(tmp.path());
+        let (mut notices, mut warnings) = (Vec::new(), Vec::new());
+        with_git_path(
+            no_git.path(),
+            collect_local_repo_outcome(&db, &id, tmp.path(), &mut notices, &mut warnings),
+        );
+        assert!(notices.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Install git"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn gitignore_guard_recognises_the_pre_v0_2_103_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = "\n# --- VCO local-only repo guard (created by the subagent-git modal) ---\n.claude/state/\n";
+        std::fs::write(tmp.path().join(".gitignore"), old).unwrap();
+        append_local_repo_gitignore_guard(tmp.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+            old,
+            "an existing guard block (old marker) must not be duplicated"
         );
     }
 }

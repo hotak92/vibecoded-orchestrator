@@ -18,6 +18,8 @@ import { describe, it, expect } from 'vitest';
 import {
   isValidGitRemoteUrl,
   resolveConnectSelection,
+  shouldOfferSubagentGitModal,
+  type GitRepoPlan,
 } from './subagent-git-repo-logic';
 
 interface UrlParityFixture {
@@ -105,5 +107,37 @@ describe('resolveConnectSelection', () => {
       ok: false,
       reason: 'invalid_url',
     });
+  });
+});
+
+// v0.2.103 (plan item 17): the page opens the modal ONLY for the real-choice
+// state; a repo-less folder with nothing nested gets its repo automatically.
+describe('shouldOfferSubagentGitModal', () => {
+  const ALL: GitRepoPlan[] = [
+    'decided',
+    'existing',
+    'needs_choice',
+    'auto_init_pending',
+    'git_unavailable',
+  ];
+
+  it('prompts only for needs_choice', () => {
+    for (const plan of ALL) {
+      expect(shouldOfferSubagentGitModal(plan), plan).toBe(plan === 'needs_choice');
+    }
+    expect(shouldOfferSubagentGitModal(null)).toBe(false);
+    expect(shouldOfferSubagentGitModal('something-new')).toBe(false);
+  });
+
+  it('every label is one the Rust plan_label can return (MUST MATCH)', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const rust = readFileSync(
+      resolve(here, '../../../src-tauri/src/commands/worktree_repo_mode.rs'),
+      'utf8',
+    );
+    const body = rust.slice(rust.indexOf('async fn plan_label('));
+    const fnBody = body.slice(0, body.indexOf('\n}\n'));
+    const rustLabels = [...fnBody.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+    expect(new Set(rustLabels)).toEqual(new Set(ALL));
   });
 });
