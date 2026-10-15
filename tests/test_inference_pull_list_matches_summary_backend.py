@@ -260,8 +260,8 @@ class RuntimeResolverMatchesInstallPullTests(unittest.TestCase):
 
     def test_summary_backends_takes_the_resolved_model(self):
         """Every generate caller reads `summary_backends.OLLAMA_DEFAULT_MODEL`
-        (process_documents, generate_node_formats) — its value IS the
-        resolver's, and the env override still wins."""
+        (process_documents; generate-kg-summary through the ladder) — its
+        value IS the resolver's, and the env override still wins."""
         import importlib
 
         scripts = str(REPO_ROOT / "templates" / "scripts")

@@ -4,7 +4,23 @@
 """
 Generate LLM summaries for a KG node and store in .node_formats.json.
 
-Called by PostToolUse hook on knowledge/**/*.md edits.
+The ONE writer of `knowledge/.node_formats.json` (v0.2.103 merge). Called in
+two modes:
+
+* per-node — PostToolUse hook on knowledge/**/*.md edits, and the launcher's
+  per-file walk (`launcher/src-tauri/src/commands/kg_summary.rs`):
+  `generate-kg-summary.py <file> [--force] [--force-api]`
+* bulk — the manual `--all` backfill, the post-sync refresh
+  (`sync_knowledge_graph._regen_node_formats_after_full_sync`) and the
+  schema-migration regeneration (`vco_lib/project_init.py::
+  _regenerate_node_formats`):
+  `generate-kg-summary.py --all [--knowledge-dir DIR] [--force] [--dry-run]`
+
+The bulk mode was merged in from the retired Ollama-only second writer of
+the same sidecar (v0.2.103, owner decision 2026-10-14 — it loaded a second
+generation model on the GPU beside the code-embedding re-index and OOMed in
+the field); every LLM call in BOTH modes goes through the shared summary
+ladder below.
 
 Four-tier model selection (in order):
   1. `claude` CLI on PATH      → best quality, requires CLI install (Max sub or API key)
@@ -62,6 +78,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -185,11 +202,22 @@ def load_formats() -> dict:
 
 
 def save_formats(data: dict) -> None:
+    """Save the sidecar JSON ATOMICALLY.
+
+    Ported from the retired bulk generator (v0.2.103 merge):
+    `.node_formats.json` holds EVERY node's LLM summary, so a plain
+    truncate-write killed mid-save corrupts the whole DB (regenerable, but
+    at full LLM-regeneration cost). The atomic primitive is the ONE shared
+    home (``vco_lib.atomic.atomic_write_text``) — the same call the retired
+    script made, and legal here because this script already hard-imports
+    ``vco_lib.kg_node_status`` for the archived predicate (the repo rule:
+    a failed ``import vco_lib`` is a broken install, never a fallback).
+    """
+    from vco_lib.atomic import atomic_write_text
+
     FORMATS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FORMATS_PATH.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    atomic_write_text(FORMATS_PATH, payload)
 
 
 def content_hash(text: str) -> str:
@@ -215,6 +243,109 @@ def read_node(file_path: Path) -> tuple[str, str, str]:
                 title = line[2:].strip()
                 break
     return title, text, body
+
+
+#: Stable substring of the per-node line printed when a node is ARCHIVED.
+#: MUST MATCH ``launcher/src-tauri/src/commands/kg_summary.rs::
+#: ARCHIVED_MARKER`` — the launcher counts a node carrying it as skipped
+#: (``nodes_unchanged``), never failed or succeeded.
+ARCHIVED_SKIP_MARKER = "archived, skipping"
+
+
+def _archived_reason(file_path: Path, full_text: str) -> str:
+    """The shared predicate's reason when *file_path* is an ARCHIVED node,
+    else ``""``.
+
+    ONE predicate, no second copy (owner decision 2026-10-14: archived
+    nodes skip the Weaviate sync AND the summarization):
+    ``vco_lib.kg_node_status.is_archived_content`` — the same rule the
+    sync's skip/delete, the seed's change check and the drift scan use.
+    The import is HARD by the repo rule (a failed ``import vco_lib`` is a
+    broken install, never a fallback case): quietly degrading to "not
+    archived" would keep summarizing — and keep sidecar entries alive for —
+    nodes the sync deliberately removed from Weaviate.
+    """
+    from vco_lib.kg_node_status import is_archived_content
+
+    archived, reason = is_archived_content(file_path, full_text)
+    return reason if archived else ""
+
+
+def _drop_sidecar_entry(rel_path: str, formats: dict) -> bool:
+    """Remove *rel_path*'s entry from the sidecar dict. True when dropped.
+
+    The sidecar must not keep SERVING summaries for a node the sync removed
+    from Weaviate: retrieval renders whatever the sidecar holds, so a stale
+    archived entry would keep a summary alive for a node that no longer
+    exists in the graph.
+    """
+    if rel_path in formats:
+        del formats[rel_path]
+        return True
+    return False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Legacy sidecar re-key (ported from the retired bulk generator, v0.2.103)
+# ──────────────────────────────────────────────────────────────────────
+def _legacy_content_hash(body: str) -> str:
+    """The PRE-2026-07-20 storage hash scheme: sha256(body.strip())[:16].
+
+    Kept for exactly one purpose — detecting sidecar entries keyed under the
+    old (frontmatter-stripped body) scheme so :func:`rekey_legacy_entries`
+    can silently migrate them to the canonical full-text key WITHOUT
+    regenerating the summary. Do NOT use this for storing new entries;
+    ``content_hash(full_file_text)`` is canonical.
+    """
+    return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def rekey_legacy_entries(db: dict) -> int:
+    """Silently re-key sidecar entries from the legacy hash scheme to canonical.
+
+    For each entry whose stored ``content_hash`` does NOT match the canonical
+    full-text hash of its node file, but DOES match the legacy ``body.strip()``
+    hash of that same file, overwrite the stored hash with the canonical value —
+    WITHOUT regenerating the (still-valid) summary. This preserves
+    skip-unchanged correctness across the 2026-07-20 hash-scheme transition: a
+    node that was summarized under the old scheme (by the retired Ollama-only
+    bulk generator) and is byte-unchanged is recognized as
+    current, not regenerated.
+
+    Entries that match neither scheme (genuinely stale, or already canonical)
+    are left untouched — the normal skip/regenerate logic handles them.
+
+    Returns the number of entries re-keyed (for logging).
+    """
+    rekeyed = 0
+    for rel_path, entry in db.items():
+        stored = entry.get("content_hash") if isinstance(entry, dict) else None
+        if not stored:
+            continue
+        # Normalize `\`→`/` first — on Windows the DB keys come from
+        # `str(Path.relative_to(...))` and use `\`, which would never match
+        # the `knowledge/` prefix (the v0.2.81/v0.2.85 manifest-separator
+        # lesson).
+        rel = rel_path.replace("\\", "/")
+        node_prefix = KNOWLEDGE_DIR.name + "/"
+        if rel.startswith(node_prefix):
+            node_file = KNOWLEDGE_DIR / rel[len(node_prefix):]
+        else:
+            node_file = CLAUDE_PROJECT / rel
+        if not node_file.is_file():
+            continue
+        try:
+            full_text = node_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        canonical = content_hash(full_text)
+        if stored == canonical:
+            continue  # already canonical
+        _title, _full, body = read_node(node_file)
+        if stored == _legacy_content_hash(body):
+            entry["content_hash"] = canonical
+            rekeyed += 1
+    return rekeyed
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -397,10 +528,32 @@ def stored_entry_is_usable(entry: dict) -> bool:
     return True
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI parser (exposed so caller-wiring tests can run the REAL
+    parser against the argv each caller spawns — argv-shape-only tests are
+    not enough)."""
     parser = argparse.ArgumentParser(description="Generate KG node summaries")
-    parser.add_argument("file", help="Path to knowledge .md file")
+    parser.add_argument(
+        "file", nargs="?", help="Path to knowledge .md file (single-node mode)"
+    )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="Process every node under knowledge/ (bulk backfill)",
+    )
     parser.add_argument("--force", action="store_true", help="Regenerate even if content unchanged")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="With --all: show what would be done, write nothing",
+    )
+    parser.add_argument(
+        "--knowledge-dir", metavar="PATH", default=None,
+        help=(
+            "Override the knowledge directory (default: <project>/knowledge). "
+            "Use an absolute path or one relative to cwd. The sidecar is "
+            "written inside it and the project root becomes its parent. "
+            "Example: --knowledge-dir /path/to/your-project/knowledge"
+        ),
+    )
     parser.add_argument(
         "--force-api", action="store_true",
         help=(
@@ -409,13 +562,251 @@ def main():
             "GUI is not available."
         ),
     )
+    return parser
+
+
+def _process_node_bulk(
+    file_path: Path, *, force: bool, dry_run: bool, formats: dict
+) -> str:
+    """Process one node in ``--all`` mode. Returns a status string.
+
+    Status values: ``"skipped"``, ``"generated"``, ``"dry_run"``,
+    ``"archived"``, ``"archived_dropped"``, ``"nonanswer:<msg>"``,
+    ``"error:<msg>"`` (the first four keep the retired bulk generator's
+    contract, so the progress/tally lines callers parse are unchanged). Every
+    LLM call goes through the shared ladder; a non-answer raises
+    :class:`summary_backends.NonAnswerResponse` there and is reported
+    as a ``nonanswer:`` status here, never cached — and, per the owner
+    ruling of 2026-10-14 (a model refusal is FINAL), it is not an error
+    either: retrying or deferring it would only build a never-clearing
+    owed loop over content no backend will ever answer.
+    """
+    title, full_text, body = read_node(file_path)
+    if not title:
+        return "error:no title (neither frontmatter title nor H1) — skipped"
+    try:
+        rel_path = str(file_path.relative_to(CLAUDE_PROJECT))
+    except ValueError:
+        rel_path = str(file_path)
+
+    # Archived nodes skip the summarization entirely (owner decision
+    # 2026-10-14 — the same shared predicate the Weaviate sync skips and
+    # deletes rows by), and any existing sidecar entry for them is DROPPED:
+    # the sidecar must not keep serving summaries for a node the graph no
+    # longer holds.
+    archived = _archived_reason(file_path, full_text)
+    if archived:
+        dropped = _drop_sidecar_entry(rel_path, formats)
+        return "archived_dropped" if dropped else "archived"
+
+    c_hash = content_hash(full_text)
+    existing = formats.get(rel_path, {})
+    if (
+        not force
+        and existing.get("content_hash") == c_hash
+        and stored_entry_is_usable(existing)
+    ):
+        return "skipped"
+    if dry_run:
+        return "dry_run"
+
+    try:
+        description = generate_description(title, body)
+        summary = generate_summary(title, body)
+    except _sb.NonAnswerResponse as exc:
+        # A refusal is FINAL (owner ruling 2026-10-14) — done-with-this-node-
+        # skipped, not owed: nothing is cached (the hash gate must not freeze
+        # a non-answer) and the status is NOT an error for the exit code.
+        return f"nonanswer:{exc}"
+    except RuntimeError as exc:
+        return f"error:{exc}"
+
+    entry: dict = {
+        "title": title,
+        "description": description,
+        "summary": summary,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "content_hash": c_hash,
+        "backend": _BACKEND_CACHE.get("choice", "?"),
+    }
+
+    chunks = get_chunks_from_weaviate(title, rel_path)
+    total_chunks = len(chunks) if chunks else 1
+    if total_chunks > 1:
+        chunk_summaries = {}
+        for cn, chunk_content in chunks:
+            try:
+                cs = generate_chunk_summary(title, cn, total_chunks, chunk_content)
+            except RuntimeError as exc:
+                # Includes NonAnswerResponse. Omitting the chunk keeps the
+                # (valid) whole-node description + summary; caching a
+                # non-answer here would make the entry unusable AND
+                # hash-frozen. The omission is regenerated next run.
+                log(f"    Chunk {cn}: not stored — {exc}")
+                continue
+            chunk_summaries[str(cn)] = cs
+        if chunk_summaries:
+            entry["chunk_summaries"] = chunk_summaries
+        entry["total_chunks"] = total_chunks
+
+    formats[rel_path] = entry
+    return "generated"
+
+
+#: Bulk exit code: NO summary backend was selectable this run (the ladder
+#: returned ``skip`` — VRAM/code-graph-walk guard, or no CLI and no keys).
+#: "Owed, retry later": nothing was generated, so the nodes stay owed for a
+#: run when a backend IS available. Distinct from 1 (per-node errors) so the
+#: bulk callers can record it WITHOUT arming the auto-retry that re-runs a
+#: full ``--all`` sync (review v0.2.103 M-2). ``2`` is argparse's; pinned
+#: across the process boundary by
+#: ``tests/test_v02103_nodeformats_merge.py``.
+BULK_EXIT_NO_BACKEND = 3
+
+
+def _run_bulk(args: argparse.Namespace) -> int:
+    """The ``--all`` pass over every node under KNOWLEDGE_DIR.
+
+    Returns the process exit code:
+
+    * ``0`` — the pass COMPLETED. Nodes may have been skipped (unchanged,
+      archived) or permanently refused (``nonanswer:`` — a model refusal is
+      final, owner ruling 2026-10-14): that IS success; the tally line names
+      the counts so nothing is invisible.
+    * ``1`` — a node errored for a non-refusal reason (a tier's transport
+      failed, a parse broke). Potentially transient → the bulk callers
+      (kg-sync's post-sync refresh, the schema-migration regeneration)
+      treat it as owed work and record a deferral. Incremental persistence
+      (below) keeps a re-run cheap: only the failed nodes regenerate.
+    * :data:`BULK_EXIT_NO_BACKEND` — no summary backend was selectable at
+      all. "Owed, retry later" — kg-sync records the environmental
+      ``kg_node_formats_backend_unavailable`` condition for it, NOT the
+      auto-retryable refresh-failed one (a deferral must not raise a
+      never-clearing retry that re-runs a full sync).
+
+    The sidecar is saved ATOMICALLY after EACH generated node (and each
+    dropped archived entry) — never only at the end: a bulk run over a
+    fresh install can spend hours on the ladder's CLI tier, and an
+    all-or-nothing save meant a kill mid-run discarded every node already
+    paid for (review v0.2.103 H-3). There is deliberately NO whole-run
+    wall-clock cap: per-LLM-call timeouts
+      (``summary_backends.TIMEOUT``, default 180 s) already bound a hung
+      backend, and a cap would cut valid long work (owner rule: shipped
+      timeouts are very long by design).
+    """
+    files = sorted(KNOWLEDGE_DIR.rglob("*.md")) if KNOWLEDGE_DIR.is_dir() else []
+    if not files:
+        print(f"No knowledge .md files under {KNOWLEDGE_DIR} — nothing to do.")
+        return 0
+
+    formats = load_formats()
+    # Silently migrate entries still keyed under the legacy body.strip()
+    # hash scheme to the canonical full-text key (no regeneration). The
+    # re-key must persist even if no node needs regeneration this run.
+    n_rekeyed = rekey_legacy_entries(formats)
+    if n_rekeyed and not args.dry_run:
+        save_formats(formats)
+        print(
+            f"Re-keyed {n_rekeyed} legacy sidecar "
+            f"entr{'y' if n_rekeyed == 1 else 'ies'} to the canonical "
+            f"full-text hash."
+        )
+
+    if select_backend() == "skip":
+        print(
+            "No summary backend available (deferred or unconfigured) — "
+            "nodes stay owed for a run when one is; nothing written.",
+            file=sys.stderr,
+        )
+        return BULK_EXIT_NO_BACKEND
+
+    total = len(files)
+    skipped = generated = errors = dry_count = archived_count = 0
+    nonanswers = 0
+    started = time.time()
+    for i, file_path in enumerate(files, 1):
+        node_start = time.time()
+        try:
+            rel = file_path.relative_to(CLAUDE_PROJECT)
+        except ValueError:
+            rel = file_path
+        status = _process_node_bulk(
+            file_path, force=args.force, dry_run=args.dry_run, formats=formats
+        )
+        elapsed = time.time() - node_start
+        if status == "skipped":
+            skipped += 1
+            print(f"[{i}/{total}] SKIP  {rel} (already has formats)")
+        elif status in ("archived", "archived_dropped"):
+            archived_count += 1
+            # The marker substring is load-bearing (ARCHIVED_SKIP_MARKER —
+            # the launcher's ARCHIVED_MARKER matches it).
+            print(f"[{i}/{total}] SKIP  {rel} (archived, skipping)")
+        elif status == "dry_run":
+            dry_count += 1
+            print(f"[{i}/{total}] DRY   {rel}")
+        elif status == "generated":
+            generated += 1
+            print(f"[{i}/{total}] OK    {rel}  ({elapsed:.1f}s)")
+        elif status.startswith("nonanswer:"):
+            nonanswers += 1
+            print(
+                f"[{i}/{total}] REFUSED {rel}: "
+                f"{status.removeprefix('nonanswer:')} (final — not retried, "
+                f"not deferred)"
+            )
+        else:
+            errors += 1
+            print(f"[{i}/{total}] ERROR {rel}: {status.removeprefix('error:')}")
+        # Incremental persistence (H-3): every node that CHANGED the sidecar
+        # is on disk before the next one starts. Atomic (shared home), so a
+        # kill mid-run leaves a valid sidecar holding everything finished so
+        # far. Dry-run writes nothing; unchanged runs rewrite nothing.
+        if not args.dry_run and status in ("generated", "archived_dropped"):
+            save_formats(formats)
+
+    print(
+        f"\nDone in {time.time() - started:.1f}s — "
+        f"generated: {generated}, skipped: {skipped}, "
+        f"non-answer: {nonanswers}, "
+        f"dry-run: {dry_count}, errors: {errors}, archived: {archived_count}"
+    )
+    if not args.dry_run and (generated or archived_count):
+        print(f"Sidecar saved incrementally to {FORMATS_PATH}")
+    return 1 if errors else 0
+
+
+def main():
+    global _FORCE_API, CLAUDE_PROJECT, KNOWLEDGE_DIR, FORMATS_PATH, LOG_PATH, ORCHESTRATOR_ROOT
+    parser = build_parser()
     args = parser.parse_args()
+
+    if not args.file and not args.all:
+        parser.print_help()
+        sys.exit(1)
 
     if args.force_api:
         # Module-level flag picked up by select_backend(). The CLI flag
         # ONLY affects this single run; it doesn't write to app_state.
-        global _FORCE_API
         _FORCE_API = True
+
+    # Apply the --knowledge-dir override before any path operations (same
+    # semantics the retired bulk generator had): the sidecar lands inside
+    # the overridden knowledge/ and the project root (the rel_path base and
+    # the chunk-fetch resolver's project) becomes its parent.
+    if args.knowledge_dir is not None:
+        override = Path(args.knowledge_dir).resolve()
+        if not override.exists():
+            print(f"--knowledge-dir path does not exist: {override}", file=sys.stderr)
+            sys.exit(1)
+        KNOWLEDGE_DIR = override
+        FORMATS_PATH = KNOWLEDGE_DIR / ".node_formats.json"
+        CLAUDE_PROJECT = KNOWLEDGE_DIR.parent
+        LOG_PATH = CLAUDE_PROJECT / ".claude" / "logs" / "kg-summary-generator.log"
+        ORCHESTRATOR_ROOT = _resolve_orchestrator_root()
+
+    if args.all:
+        sys.exit(_run_bulk(args))
 
     file_path = Path(args.file).resolve()
     if not file_path.exists():
@@ -435,6 +826,21 @@ def main():
 
     c_hash = content_hash(full_text)
     formats = load_formats()
+
+    # Archived nodes skip the summarization entirely (owner decision
+    # 2026-10-14 — the ONE shared predicate the Weaviate sync skips and
+    # deletes rows by), and any existing sidecar entry for them is DROPPED:
+    # the sidecar must not keep serving summaries for a node the graph no
+    # longer holds. The line carries ARCHIVED_SKIP_MARKER so the launcher
+    # counts this node as skipped, never failed or succeeded.
+    archived = _archived_reason(file_path, full_text)
+    if archived:
+        print(f"  {title}: {ARCHIVED_SKIP_MARKER} ({archived})")
+        if _drop_sidecar_entry(rel_path, formats):
+            save_formats(formats)
+            log(f"  {title}: dropped the stale sidecar entry for the archived node")
+        sys.exit(0)
+
     existing = formats.get(rel_path, {})
     if not args.force and existing.get("content_hash") == c_hash:
         if stored_entry_is_usable(existing):

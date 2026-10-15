@@ -1277,7 +1277,8 @@ async fn run_subprocess(
                 } else if is_finalize_line(&line) {
                     // v0.2.92 WP-B1: the script prints this stage marker
                     // right before its post-summary `.node_formats.json`
-                    // regen (up to 600 s, synchronous). Map it to a distinct
+                    // regen (synchronous, uncapped — v0.2.103 removed the 600 s cap).
+                    // Map it to a distinct
                     // phase so the GUI shows "finalizing summaries…" with
                     // the bar complete but the status honestly `running` —
                     // instead of a stalled-looking "embedding (N/N)" on a
@@ -1759,7 +1760,8 @@ fn parse_summary_line(line: &str, prefix: &str) -> Option<(u32, u32, u32)> {
 /// v0.2.92 WP-B1: true for the script's post-summary stage marker
 /// `📝 Refreshing .node_formats.json summaries …`, printed (flushed)
 /// immediately before the `.node_formats.json` regen — a synchronous
-/// step that can run up to 600 s AFTER the final counts. MUST stay in
+/// step that can run long AFTER the final counts (uncapped since v0.2.103).
+/// MUST stay in
 /// sync with `_regen_node_formats_after_full_sync` in
 /// templates/scripts/sync_knowledge_graph.py (the prefix match is
 /// deliberately on the stable leading fragment, not the trailing "…").
@@ -2434,7 +2436,7 @@ mod tests {
     #[test]
     fn finalize_line_is_recognized_and_is_not_a_summary() {
         // v0.2.92 WP-B1: the stage marker the script prints immediately
-        // before its (up to 600 s) post-summary regen — mapped to the
+        // before its (uncapped) post-summary regen — mapped to the
         // "finalize" phase by run_subprocess's dispatch.
         let line = "📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...";
         assert!(is_finalize_line(line));

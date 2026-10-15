@@ -154,9 +154,14 @@ class TestKG4RegenHook:
 
     def test_regen_is_soft_fail(self):
         src = SYNC_PY.read_text(encoding="utf-8")
-        # The helper swallows errors + is timeout-bounded (capped).
+        # The helper swallows errors and stays non-fatal. v0.2.103 (review
+        # H-3) removed the whole-run `timeout=600` cap — the regen spawns a
+        # Popen POLLED with a 120 s heartbeat (liveness without cutting
+        # valid long work); the only TimeoutExpired left is that poll's,
+        # which re-loops instead of killing the child.
         assert "TimeoutExpired" in src and "non-fatal" in src
-        assert "timeout=600" in src
+        assert "subprocess.Popen(" in src
+        assert "timeout=600" not in src
 
 
 # ── (d) NEW-4: bounded fan-out ───────────────────────────────────────────

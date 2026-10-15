@@ -324,25 +324,10 @@ def test_options_identity_migrate_and_search_fallbacks(monkeypatch):
 
 
 def test_generate_calls_carry_keep_alive(monkeypatch):
-    """Ollama GENERATE requests (KG summary, node formats) carry the same
+    """Ollama GENERATE requests (KG summary ladder — the ONE Ollama generate
+    caller since v0.2.103 merged the retired node-formats generator into
+    ``generate-kg-summary.py``, which calls it through the ladder) carry the
     keep_alive policy — item 1 says every Ollama request VCO sends."""
-    captured: list = []
-
-    def _fake_post(url, json=None, timeout=None):  # noqa: A002
-        captured.append({"url": url, "json": json})
-        resp = mock.MagicMock()
-        resp.status_code = 200
-        resp.raise_for_status.return_value = None
-        resp.json.return_value = {"response": "ok"}
-        return resp
-
-    gnf = importlib.import_module(
-        "claude_mcp_servers.scripts.generate_node_formats"
-    )
-    monkeypatch.setattr(gnf.requests, "post", _fake_post)
-    gnf.call_ollama("qwen3.5:9b", "prompt", 64)
-    assert captured[0]["json"].get("keep_alive") == "10m", captured
-
     # summary_backends.call_ollama (stdlib urllib)
     sk_dir = str(_REPO_ROOT / "templates" / "scripts")
     if sk_dir not in sys.path:

@@ -5132,10 +5132,11 @@ def _regen_node_formats_after_full_sync() -> None:
     stale until the next install/per-edit fire.
 
     The sidecar (descriptions + summaries surfaced by auto-tier retrieval) is
-    written by `generate_node_formats.py` at install time and by the
-    per-edit `generate-kg-summary.py` hook — but a bare `kg-sync --all` never
-    touched it (grep 0), so a bulk resync left every node's summary stale.
-    This calls the SAME install-time machinery as a capped, soft-fail
+    written by `generate-kg-summary.py` — the per-edit hook and the `--all`
+    bulk mode (v0.2.103 merged the retired Ollama-only bulk generator into
+    it) — but a bare `kg-sync --all` never touched it
+    (grep 0), so a bulk resync left every node's summary stale.
+    This calls the SAME generator as a capped, soft-fail
     post-sync step: any error (no generator, no summary backend, timeout) is
     swallowed with a log line — a summary refresh must never fail the sync.
     """
@@ -5146,20 +5147,23 @@ def _regen_node_formats_after_full_sync() -> None:
     # This used to look for the generator under the SYNCED PROJECT's own
     # `claude_mcp_servers/scripts/` — a directory that exists ONLY in the
     # orchestrator clone. Every user project therefore fell through to
-    # `.claude/scripts/generate-kg-summary.py --all`, which is the PER-EDIT
-    # generator: its argparse takes a FILE, so `--all` is a usage error and it
-    # exits 2. Observed live after a user project's `kg-sync --all`:
-    # `(node-format refresh exited 2; summaries left as-is — non-fatal)`. Net
-    # effect: after ANY bulk sync, no non-root project has EVER had its
-    # `.node_formats.json` refreshed, and the only trace was one stderr line.
+    # `.claude/scripts/generate-kg-summary.py --all`, which at the time was
+    # the PER-EDIT generator: its argparse took a FILE, so `--all` was a
+    # usage error and it exited 2. Observed live after a user project's
+    # `kg-sync --all`: `(node-format refresh exited 2; summaries left as-is
+    # — non-fatal)`. Net effect: after ANY bulk sync, no non-root project
+    # has EVER had its `.node_formats.json` refreshed, and the only trace
+    # was one stderr line.
     #
     # The fix is the user's standing rule — ONE component for root and non-root.
-    # `generate_node_formats.py` already accepts `--knowledge-dir`, and sets
-    # `PROJECT_ROOT = KNOWLEDGE_DIR.parent` from it, so pointing the ROOT
-    # generator at this project's `knowledge/` is the identical invocation in
-    # both cases (for the root, install_root == PROJECT_ROOT and nothing
-    # changes). `sys.executable` is right here: the kg-sync wrapper already
-    # activated the orchestrator venv, which is why `vco_lib` imports below.
+    # `generate-kg-summary.py` accepts `--knowledge-dir` (its bulk `--all`
+    # mode arrived in v0.2.103 with the merge of the retired Ollama-only
+    # bulk generator), and sets its project root from it, so
+    # pointing the clone's generator at this project's `knowledge/` is the
+    # identical invocation in both cases (for the root,
+    # install_root == PROJECT_ROOT and nothing changes). `sys.executable` is
+    # right here: the kg-sync wrapper already activated the orchestrator
+    # venv, which is why `vco_lib` imports below.
     gen = None
     install_root = None
     try:
@@ -5171,20 +5175,19 @@ def _regen_node_formats_after_full_sync() -> None:
               file=sys.stderr)
     if install_root is not None:
         candidate = (
-            Path(install_root) / "claude_mcp_servers" / "scripts"
-            / "generate_node_formats.py"
+            Path(install_root) / "templates" / "scripts"
+            / "generate-kg-summary.py"
         )
         if candidate.is_file():
             gen = candidate
     if gen is None:
         # No orchestrator clone reachable from here. NOT a silent skip any more:
-        # the summaries genuinely stay stale, and the old fallback (the per-edit
-        # generator with `--all`) never worked. Record it as owed work.
+        # the summaries genuinely stay stale. Record it as owed work.
         _emit_node_formats_deferral(
             PROJECT_ROOT,
             reason=(
                 "the orchestrator clone's "
-                "`claude_mcp_servers/scripts/generate_node_formats.py` could "
+                "`templates/scripts/generate-kg-summary.py` could "
                 "not be located from this project "
                 f"(install root: {install_root or 'unresolved'})"
             ),
@@ -5193,38 +5196,68 @@ def _regen_node_formats_after_full_sync() -> None:
     if not KNOWLEDGE_ROOT.is_dir():
         return  # nothing to summarise; not a failure
     try:
-        # Cap the whole regen so a slow/hung summary backend can't wedge the
-        # sync exit. --all over a large KG can be slow but is bounded here.
         py = sys.executable or "python3"
         # v0.2.92 WP-B1: this exact line is the STAGE MARKER the launcher's
         # kg_sync.rs maps to phase "finalize" (the regen below can legitimately
-        # run for up to 600 s AFTER the 📊 summary lines — without this signal
-        # the GUI showed a stalled "embedding (N/N)" while the process was
-        # honestly still working). Text is load-bearing: change it only with
+        # run for a LONG time AFTER the summary-count lines — the ladder's CLI
+        # tier spawns per call and a fresh install summarises every node.
+        # Without this signal the GUI showed a stalled "embedding (N/N)"
+        # while the process was honestly still working).
+        # Text is load-bearing: change it only with
         # the Rust matcher in kg_sync.rs. flush=True so the marker reaches the
         # launcher's line reader BEFORE the (potentially long) regen starts,
         # including on direct-CLI runs without PYTHONUNBUFFERED.
         print("📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...",
               flush=True)
         # The same silence hazard on the UPDATE watchdog's surface: the regen
-        # runs capture_output=True, so this script produces nothing for up to
-        # its full 600 s cap. One event restarts that clock AND tells the
-        # modal what the wait is (a run that exhausts the cap is the one
-        # honest case where the stall notice may still fire).
+        # runs with piped output, so this script produces nothing while it
+        # works. One event restarts that clock AND tells the modal what the
+        # wait is. There is deliberately NO whole-run wall-clock cap
+        # (v0.2.103, review H-3 / owner rule "no timeout may cut valid long
+        # work"): every LLM call inside the generator is already bounded by
+        # ``summary_backends.TIMEOUT`` (default 180 s per call), and the
+        # generator persists the sidecar incrementally after each node.
+        # Liveness instead of a cap: a heartbeat event every 120 s while the
+        # child runs, so the watchdog clock never expires on honest work.
         _emit_sync_event(
             "start", "refreshing KG summaries (this can take several minutes)")
         # NO `--force`: the generator skips nodes whose formats already exist,
         # so a re-run over an already-summarised project regenerates nothing.
         # (Standing rule: never re-embed / re-generate hash-unchanged content.)
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [py, str(gen), "--all", "--knowledge-dir", str(KNOWLEDGE_ROOT)],
             cwd=str(PROJECT_ROOT),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=600,
         )
-        if proc.returncode != 0:
-            tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1]
+        while True:
+            try:
+                out, err = proc.communicate(timeout=120)
+                break
+            except subprocess.TimeoutExpired:
+                _emit_sync_event(
+                    "start",
+                    "refreshing KG summaries (still working — no whole-run cap)",
+                )
+        if proc.returncode == _NODE_FORMATS_EXIT_NO_BACKEND:
+            # "Owed, retry later" WITHOUT arming the auto-retry that re-runs
+            # a full `--all` sync (review M-2): no backend was selectable at
+            # all (VRAM/code-graph-walk guard, no CLI, no keys). A full-sync
+            # retry would re-walk and re-prune the tree to maybe find a
+            # backend, competing with the very code-graph walk the guard
+            # protects. Recorded as the environmental condition; the next
+            # organic sync or per-edit hook picks the nodes up when a
+            # backend exists.
+            tail = ((err or out or "").strip().splitlines() or [""])[-1]
+            print(
+                "   (node-format refresh found no summary backend; nodes stay "
+                f"owed — non-fatal) {tail[:300]}",
+                file=sys.stderr,
+            )
+            _emit_node_formats_no_backend_deferral(PROJECT_ROOT)
+        elif proc.returncode != 0:
+            tail = ((err or out or "").strip().splitlines() or [""])[-1]
             print(
                 "   (node-format refresh exited "
                 f"{proc.returncode}; summaries left as-is — non-fatal)",
@@ -5240,15 +5273,8 @@ def _regen_node_formats_after_full_sync() -> None:
         else:
             # Paired resolution (decision-#12 shape): a refresh that exited 0 is
             # the proof the earlier failure no longer holds. Nothing else clears
-            # this entry.
+            # these entries.
             _clear_node_formats_deferral(PROJECT_ROOT)
-    except subprocess.TimeoutExpired:
-        print("   (node-format refresh timed out; summaries left as-is — non-fatal)",
-              file=sys.stderr)
-        _emit_node_formats_deferral(
-            PROJECT_ROOT,
-            reason="the generator did not finish within its 600 s cap",
-        )
     except Exception as e:  # noqa: BLE001 — soft-fail, never break the sync
         print(f"   (node-format refresh skipped: {e} — non-fatal)", file=sys.stderr)
         _emit_node_formats_deferral(PROJECT_ROOT, reason=f"{type(e).__name__}: {e}")
@@ -5257,6 +5283,17 @@ def _regen_node_formats_after_full_sync() -> None:
 #: Condition id for a failed post-sync `.node_formats.json` refresh (v0.2.94).
 #: Declared in `vco_lib/deferral_conditions.toml` as `auto_retryable`.
 _NODE_FORMATS_CID = "kg_node_formats_refresh_failed"
+
+#: Condition id for the post-sync refresh finding NO summary backend
+#: (v0.2.103, review M-2): declared `environmental` — true of the machine
+#: while no backend is selectable, resolved by the paired clear below.
+_NODE_FORMATS_NO_BACKEND_CID = "kg_node_formats_backend_unavailable"
+
+#: The generator's ``BULK_EXIT_NO_BACKEND`` exit code ("owed, retry later").
+#: MUST match ``BULK_EXIT_NO_BACKEND`` in ``templates/scripts/
+#: generate-kg-summary.py`` — pinned by
+#: ``tests/test_v02103_nodeformats_merge.py``.
+_NODE_FORMATS_EXIT_NO_BACKEND = 3
 
 
 def _clear_drift_deferral(project_root: Path) -> None:
@@ -5370,7 +5407,8 @@ def _record_metadata_repair_pass(project_root: Path) -> None:
 
 
 def _clear_node_formats_deferral(project_root: Path) -> None:
-    """Resolve :data:`_NODE_FORMATS_CID` after a refresh that exited 0.
+    """Resolve :data:`_NODE_FORMATS_CID` (and the no-backend sibling) after a
+    refresh that exited 0.
 
     The paired half of :func:`_emit_node_formats_deferral`. Soft-fail: the
     sync's exit code never depends on ledger bookkeeping.
@@ -5378,9 +5416,41 @@ def _clear_node_formats_deferral(project_root: Path) -> None:
     try:
         from vco_lib.deferral_emit import resolve_conditions
 
-        resolve_conditions(project_root, (_NODE_FORMATS_CID,))
+        resolve_conditions(
+            project_root, (_NODE_FORMATS_CID, _NODE_FORMATS_NO_BACKEND_CID)
+        )
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
+def _node_formats_recovery_command(project_root: Path) -> str:
+    """The recovery command printed in the node-formats deferrals (L-1).
+
+    A printed command is shipped code: it must run AS PRINTED. Bare `python`
+    is exactly the defect the venv resolver exists for (a system python has
+    no `vco_lib`), and `<orchestrator-root>` is a placeholder a user cannot
+    paste. Resolve BOTH: the orchestrator venv interpreter via the ONE
+    resolver home (``vco_lib.python_exe``), and the clone's generator path.
+    Fallbacks keep the old shape only when resolution itself fails.
+    """
+    py = sys.executable or "python3"
+    gen = "<orchestrator-root>/templates/scripts/generate-kg-summary.py"
+    try:
+        from vco_lib.python_exe import resolve_install_root, resolve_or_current
+
+        py = resolve_or_current()
+        root = resolve_install_root()
+        if root is not None:
+            candidate = Path(root) / "templates" / "scripts" / "generate-kg-summary.py"
+            if candidate.is_file():
+                gen = str(candidate)
+    except Exception:  # noqa: BLE001 — the printed command must still print
+        pass
+    return (
+        "# Refresh the summary sidecar for this project "
+        "(existing summaries are skipped):\n"
+        f"{py} {gen} --all --knowledge-dir {project_root / 'knowledge'}"
+    )
 
 
 def _emit_node_formats_deferral(project_root: Path, reason: str) -> None:
@@ -5410,14 +5480,52 @@ def _emit_node_formats_deferral(project_root: Path, reason: str) -> None:
                 "tree sync runs the refresh again and clears this entry. "
                 "Nothing is lost meanwhile except summary freshness."
             ),
-            command_to_apply=(
-                "# Refresh the summary sidecar for this project "
-                "(existing summaries are skipped):\n"
-                "python <orchestrator-root>/claude_mcp_servers/scripts/"
-                "generate_node_formats.py --all --knowledge-dir "
-                f"{project_root / 'knowledge'}"
-            ),
+            command_to_apply=_node_formats_recovery_command(project_root),
             severity="warning",
+        )
+        emit(project_root, entry)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+
+
+def _emit_node_formats_no_backend_deferral(project_root: Path) -> None:
+    """Record the no-backend refresh outcome as ENVIRONMENTAL, not owed-retry.
+
+    v0.2.103 (review M-2): the generator's ``BULK_EXIT_NO_BACKEND`` means no
+    summary backend was selectable at all (VRAM/code-graph-walk guard, no
+    `claude` CLI, no keys). That is a true fact about the machine while it
+    lasts — NOT a failure the auto-retry can fix: re-running a full `--all`
+    sync to maybe find a backend re-walks and re-prunes the tree and competes
+    with the very code-graph walk the guard protects. The nodes stay owed for
+    the next organic sync or per-edit run; this entry is their paper trail
+    and is cleared by the paired resolution on the first refresh that runs.
+    """
+    try:
+        from vco_lib.deferral_emit import DeferralEntry, emit
+
+        entry = DeferralEntry(
+            condition_id=_NODE_FORMATS_NO_BACKEND_CID,
+            title="No summary backend available — KG summaries stay owed",
+            detected=(
+                "The post-sync `.node_formats.json` refresh found NO summary "
+                "backend it could use (the local tier was deferred — low free "
+                "VRAM or an active code-graph walk — and no `claude` CLI or "
+                "cloud key was available). Nothing was generated and nothing "
+                "was lost: the nodes are in Weaviate, only their summary "
+                "sidecar entries are pending."
+            ),
+            why_deferred=(
+                "This is a fact about the machine right now, not a failed "
+                "step: while no backend is selectable, retrying cannot "
+                "succeed, and an automatic full-sync retry would compete "
+                "with the code-graph walk the deferral guard exists to "
+                "protect. The next `kg-sync --all` (or the per-edit "
+                "regeneration of a node you touch) picks the work up when a "
+                "backend is available, and that successful refresh clears "
+                "this entry."
+            ),
+            command_to_apply=_node_formats_recovery_command(project_root),
+            severity="info",
         )
         emit(project_root, entry)
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort

@@ -73,6 +73,15 @@ const NO_BACKEND_MARKER: &str = "no backend available";
 /// Must match `main()`'s "unchanged (hash match), skipping" line.
 const UNCHANGED_MARKER: &str = "unchanged (hash match)";
 
+/// Substring the summariser writes to stdout when a node is ARCHIVED (the
+/// shared `vco_lib.kg_node_status` rule — the Weaviate sync skips and
+/// deletes its rows too, owner decision 2026-10-14). Exit 0, nothing
+/// written, any existing sidecar entry dropped; counts toward
+/// `nodes_unchanged` (skipped), never failed or succeeded. Must match
+/// `generate-kg-summary.py`'s `ARCHIVED_SKIP_MARKER` / its
+/// "archived, skipping" per-node line.
+const ARCHIVED_MARKER: &str = "archived, skipping";
+
 /// Tauri-event payload + DTO for `get_kg_summary_status`.
 ///
 /// Mirrors `KgSummaryRow` but in a public-API shape: timestamps in ISO
@@ -1287,12 +1296,16 @@ async fn invoke_summariser_once(
 
     match exit_status {
         Ok(s) if s.success() => {
-            // Three "success" sub-paths to disambiguate. Order matters:
+            // Four "success" sub-paths to disambiguate. Order matters:
             //   1. "no backend available" — exit 0 but nothing was written.
-            //   2. "unchanged (hash match)" — exit 0, cheap no-op.
-            //   3. otherwise — entry was written.
+            //   2. "archived, skipping" — exit 0, node skipped (its sidecar
+            //      entry, if any, was dropped); counted as skipped below.
+            //   3. "unchanged (hash match)" — exit 0, cheap no-op.
+            //   4. otherwise — entry was written.
             if combined_text.contains(NO_BACKEND_MARKER) {
                 NodeOutcome::NoBackend { log }
+            } else if combined_text.contains(ARCHIVED_MARKER) {
+                NodeOutcome::Unchanged { log }
             } else if combined_text.contains(UNCHANGED_MARKER) {
                 NodeOutcome::Unchanged { log }
             } else {
@@ -2062,6 +2075,23 @@ mod tests {
     fn unchanged_marker_string_matches_script_log_line() {
         let canonical = "  Foo Title: unchanged (hash match), skipping";
         assert!(canonical.contains(UNCHANGED_MARKER));
+    }
+
+    #[test]
+    fn archived_marker_string_matches_script_log_line() {
+        // Same defensive pin: a literal snippet of the line
+        // `generate-kg-summary.py` prints for an archived node (both its
+        // per-file mode and the bulk `--all` progress line), so renaming
+        // the script's message fails here instead of silently counting
+        // every archived node as "succeeded".
+        let canonical_single = "  Foo Title: archived, skipping (frontmatter status='archived')";
+        assert!(canonical_single.contains(ARCHIVED_MARKER));
+        let canonical_bulk = "[3/7] SKIP  knowledge/archive/old.md (archived, skipping)";
+        assert!(canonical_bulk.contains(ARCHIVED_MARKER));
+        // And the archived line must NOT be mistaken for the plain skip or
+        // trip the other markers.
+        assert!(!canonical_single.contains(UNCHANGED_MARKER));
+        assert!(!canonical_single.contains(NO_BACKEND_MARKER));
     }
 
     // ─── v0.2.96 (L-6): every recheck outcome reaches the audit trail ────

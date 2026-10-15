@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Regression: generate_node_formats.py stored hash == builder/runtime canonical.
+"""Regression: generate-kg-summary.py stored hash == builder canonical.
 
 Root-cause fix for the 2026-07-20 sidecar-hash-scheme mismatch. The LLM summary
-generator ``claude_mcp_servers/scripts/generate_node_formats.py`` USED to store a
-``content_hash`` computed as ``sha256(body.strip())[:16]`` (frontmatter-stripped
-body), while BOTH the shipped-sidecar builder
-(``scripts/build_shipped_kg_node_formats.py::_content_hash``) and the runtime
-summarizer (``templates/scripts/generate-kg-summary.py::content_hash``) key by the
-CANONICAL ``sha256(full_file_text)[:16]``. Because the builder looks up private
-sidecar entries by that canonical hash, freshly generated summaries were INVISIBLE
-to the ship path (reported stale/missing → users regenerated locally, a quiet
-degradation). See the KG node
+generator that USED to store a ``content_hash`` computed as
+``sha256(body.strip())[:16]`` (frontmatter-stripped body) was merged into
+``templates/scripts/generate-kg-summary.py`` in v0.2.103 (its bulk ``--all``
+mode came from the retired
+``claude_mcp_servers/scripts/generate_node_formats.py``). BOTH the
+shipped-sidecar builder (``scripts/build_shipped_kg_node_formats.py::
+_content_hash``) and the runtime summarizer key by the CANONICAL
+``sha256(full_file_text)[:16]``. Because the builder looks up private sidecar
+entries by that canonical hash, freshly generated summaries were INVISIBLE
+to the ship path (reported stale/missing → users regenerated locally, a
+quiet degradation). See the KG node
 ``shipped-kg-sidecar-hash-scheme-mismatch-2026-07-20``.
 
 This module locks in two things:
 
-1. HASH PARITY — the generator's ``content_hash`` produces the SAME value as the
-   builder's ``_content_hash`` and the runtime summarizer's ``content_hash`` for
-   the same full file text. If any of the three drifts, this fails.
+1. HASH PARITY — the generator's ``content_hash`` produces the SAME value as
+   the builder's ``_content_hash`` for the same full file text. If either
+   drifts, this fails.
 
 2. LEGACY RE-KEY — an existing sidecar entry keyed under the old body.strip()
    scheme, whose node is byte-UNCHANGED, is silently re-keyed to the canonical
@@ -26,32 +28,29 @@ This module locks in two things:
    correctness preserved across the transition). A genuinely stale entry
    (matches neither scheme) is left for the normal regenerate path.
 
-Pure repo-introspection — no network / Ollama / Weaviate. The generator imports
-``requests`` at module import time; if that dependency is absent the import-based
-tests SkipTest rather than error.
+Pure repo-introspection — no network / Ollama / Weaviate.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-GENERATOR = REPO_ROOT / "claude_mcp_servers" / "scripts" / "generate_node_formats.py"
+GENERATOR = REPO_ROOT / "templates" / "scripts" / "generate-kg-summary.py"
 BUILDER = REPO_ROOT / "scripts" / "build_shipped_kg_node_formats.py"
-RUNTIME_SUMMARIZER = REPO_ROOT / "templates" / "scripts" / "generate-kg-summary.py"
 
 
 def _load_module(name: str, path: Path):
-    """Import a script by path, SkipTest'ing on a missing optional dep."""
+    """Import a script by path (the generator adds its own dir to sys.path
+    for the summary_backends import)."""
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    except ModuleNotFoundError as exc:  # e.g. requests not installed
-        raise unittest.SkipTest(f"{path.name} deps missing ({exc})")
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
     return mod
 
 
@@ -61,35 +60,25 @@ def _canonical(full_text: str) -> str:
 
 
 class GeneratorHashParityTest(unittest.TestCase):
-    """The generator's stored hash must equal builder + runtime canonical."""
+    """The generator's stored hash must equal the builder's canonical."""
 
     SAMPLE = "---\ntitle: X Node\ntype: concept\n---\n\nbody text here\nline two\n"
 
     def test_generator_matches_builder(self):
-        gnf = _load_module("_gnf_parity", GENERATOR)
+        gks = _load_module("_gks_parity", GENERATOR)
         bld = _load_module("_bld_parity", BUILDER)
         self.assertEqual(
-            gnf.content_hash(self.SAMPLE),
+            gks.content_hash(self.SAMPLE),
             bld._content_hash(self.SAMPLE),
-            "generate_node_formats.content_hash drifted from the shipped-sidecar "
+            "generate-kg-summary.content_hash drifted from the shipped-sidecar "
             "builder's _content_hash — freshly generated summaries become "
             "invisible to the ship path.",
         )
 
-    def test_generator_matches_runtime_summarizer(self):
-        gnf = _load_module("_gnf_parity2", GENERATOR)
-        rt = _load_module("_rt_parity", RUNTIME_SUMMARIZER)
-        self.assertEqual(
-            gnf.content_hash(self.SAMPLE),
-            rt.content_hash(self.SAMPLE),
-            "generate_node_formats.content_hash drifted from the runtime "
-            "generate-kg-summary.py content_hash.",
-        )
-
     def test_generator_hash_is_the_canonical_full_text_scheme(self):
-        gnf = _load_module("_gnf_parity3", GENERATOR)
+        gks = _load_module("_gks_parity2", GENERATOR)
         self.assertEqual(
-            gnf.content_hash(self.SAMPLE),
+            gks.content_hash(self.SAMPLE),
             _canonical(self.SAMPLE),
             "generator content_hash must be sha256(full_file_text)[:16].",
         )
@@ -97,12 +86,12 @@ class GeneratorHashParityTest(unittest.TestCase):
     def test_legacy_scheme_differs_from_canonical(self):
         """Sanity: the legacy body-only hash is genuinely a DIFFERENT value, so
         the re-key path below is actually exercising a migration (not a no-op)."""
-        gnf = _load_module("_gnf_parity4", GENERATOR)
-        # body of SAMPLE as parse_frontmatter returns it (unstripped group 2)
-        body = self.SAMPLE.split("---\n", 2)[2]
+        gks = _load_module("_gks_parity3", GENERATOR)
+        # body of SAMPLE as read_node returns it (stripped part 2)
+        body = self.SAMPLE.split("---", 2)[2].strip()
         self.assertNotEqual(
-            gnf._legacy_content_hash(body),
-            gnf.content_hash(self.SAMPLE),
+            gks._legacy_content_hash(body),
+            gks.content_hash(self.SAMPLE),
             "legacy and canonical hashes must differ for the re-key to matter.",
         )
 
@@ -119,18 +108,16 @@ class LegacyRekeyTest(unittest.TestCase):
             "---\ntitle: Sample\ntype: concept\n---\n\nreal body content\n",
             encoding="utf-8",
         )
-        gnf = _load_module("_gnf_rekey_setup", GENERATOR)
-        full = node.read_text(encoding="utf-8")
-        parsed = gnf.parse_frontmatter(node)
-        body = parsed[1]  # unstripped body, as the generator's parser returns it
-        return node, gnf.content_hash(full), gnf._legacy_content_hash(body)
+        gks = _load_module("_gks_rekey_setup", GENERATOR)
+        _title, full, body = gks.read_node(node)
+        return node, gks.content_hash(full), gks._legacy_content_hash(body)
 
-    def _configure_dirs(self, gnf, td: Path) -> None:
-        """Point the module's module-level dir globals at the temp knowledge dir,
-        the same way the --knowledge-dir override does in main()."""
-        gnf.KNOWLEDGE_DIR = td / "knowledge"
-        gnf.FORMATS_FILE = gnf.KNOWLEDGE_DIR / ".node_formats.json"
-        gnf.PROJECT_ROOT = td
+    def _configure_dirs(self, gks, td: Path) -> None:
+        """Point the module's module-level dir globals at the temp knowledge
+        dir, the same way the --knowledge-dir override does in main()."""
+        gks.CLAUDE_PROJECT = td
+        gks.KNOWLEDGE_DIR = td / "knowledge"
+        gks.FORMATS_PATH = gks.KNOWLEDGE_DIR / ".node_formats.json"
 
     def test_legacy_entry_is_rekeyed_without_regen(self):
         import tempfile
@@ -138,8 +125,8 @@ class LegacyRekeyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tds:
             td = Path(tds)
             node, canonical, legacy = self._write_node(td)
-            gnf = _load_module("_gnf_rekey1", GENERATOR)
-            self._configure_dirs(gnf, td)
+            gks = _load_module("_gks_rekey1", GENERATOR)
+            self._configure_dirs(gks, td)
 
             db = {
                 "knowledge/concepts/sample.md": {
@@ -152,7 +139,7 @@ class LegacyRekeyTest(unittest.TestCase):
             }
             self.assertNotEqual(legacy, canonical, "fixture must use legacy hash")
 
-            n = gnf.rekey_legacy_entries(db)
+            n = gks.rekey_legacy_entries(db)
 
             self.assertEqual(n, 1, "exactly one legacy entry should be re-keyed")
             entry = db["knowledge/concepts/sample.md"]
@@ -170,8 +157,8 @@ class LegacyRekeyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tds:
             td = Path(tds)
             node, canonical, legacy = self._write_node(td)
-            gnf = _load_module("_gnf_rekey2", GENERATOR)
-            self._configure_dirs(gnf, td)
+            gks = _load_module("_gks_rekey2", GENERATOR)
+            self._configure_dirs(gks, td)
 
             db = {
                 "knowledge/concepts/sample.md": {
@@ -182,21 +169,21 @@ class LegacyRekeyTest(unittest.TestCase):
                     "total_chunks": 1,
                 }
             }
-            n = gnf.rekey_legacy_entries(db)
+            n = gks.rekey_legacy_entries(db)
             self.assertEqual(n, 0, "an already-canonical entry must NOT be re-keyed")
             self.assertEqual(db["knowledge/concepts/sample.md"]["content_hash"], canonical)
 
     def test_stale_entry_matches_neither_scheme_and_is_not_rekeyed(self):
         """A hash matching neither canonical nor legacy (node edited since) is
         left alone → the normal skip/regenerate logic handles it (it will fail
-        has_formats' hash check and regenerate)."""
+        the bulk skip gate's hash check and regenerate)."""
         import tempfile
 
         with tempfile.TemporaryDirectory() as tds:
             td = Path(tds)
             node, canonical, legacy = self._write_node(td)
-            gnf = _load_module("_gnf_rekey3", GENERATOR)
-            self._configure_dirs(gnf, td)
+            gks = _load_module("_gks_rekey3", GENERATOR)
+            self._configure_dirs(gks, td)
 
             db = {
                 "knowledge/concepts/sample.md": {
@@ -207,7 +194,7 @@ class LegacyRekeyTest(unittest.TestCase):
                     "total_chunks": 1,
                 }
             }
-            n = gnf.rekey_legacy_entries(db)
+            n = gks.rekey_legacy_entries(db)
             self.assertEqual(n, 0, "a genuinely stale entry must NOT be re-keyed")
             self.assertEqual(
                 db["knowledge/concepts/sample.md"]["content_hash"],
@@ -219,18 +206,18 @@ class LegacyRekeyTest(unittest.TestCase):
 class ProcessNodeCallSiteTest(unittest.TestCase):
     """F-9: pin the CALL SITE, not just the pure function.
 
-    The 2026-07-20 defect lived in ``process_node``, which passed
-    ``body.strip()`` into ``content_hash`` (the ``content_hash`` FUNCTION was
-    already canonical, so the parity tests above pass even on the unfixed
-    code). This test drives ``process_node`` on a node whose frontmatter
-    differs from its body — so the legacy body-hash and the canonical
-    full-text hash DIVERGE — and asserts that a DB seeded with the CANONICAL
-    full-text hash makes ``process_node`` return ``"skipped"``. That skip only
-    happens when ``process_node`` computes the canonical hash for its
-    ``has_formats`` check. Under the unfixed code (``content_hash(body.strip())``)
-    the computed hash would be the LEGACY value, wouldn't match the seeded
-    canonical entry, and the node would NOT be skipped (it would fall through
-    to generation). No network is touched on the skip path.
+    The 2026-07-20 defect lived in the retired generator's ``process_node``,
+    which passed ``body.strip()`` into ``content_hash`` (the ``content_hash``
+    FUNCTION was already canonical, so the parity tests above pass even on the
+    unfixed code). This test drives the merged generator's bulk
+    ``_process_node_bulk`` on a node whose frontmatter differs from its body —
+    so the legacy body-hash and the canonical full-text hash DIVERGE — and
+    asserts that a DB seeded with the CANONICAL full-text hash makes it return
+    ``"skipped"``. That skip only happens when ``_process_node_bulk`` computes
+    the canonical hash for its skip check. Under the unfixed code
+    (``content_hash(body.strip())``) the computed hash would be the LEGACY
+    value, wouldn't match the seeded canonical entry, and the node would NOT
+    be skipped. No network is touched on the skip path.
     """
 
     # Frontmatter (title/type) present + a distinct body → legacy(body.strip())
@@ -247,42 +234,39 @@ class ProcessNodeCallSiteTest(unittest.TestCase):
     )
 
     def _prep(self, td: Path):
-        gnf = _load_module("_gnf_callsite", GENERATOR)
+        gks = _load_module("_gks_callsite", GENERATOR)
         kdir = td / "knowledge"
         node = kdir / "concepts" / "callsite.md"
         node.parent.mkdir(parents=True)
         node.write_text(self.NODE_TEXT, encoding="utf-8")
         # Point module globals at the temp knowledge dir (as --knowledge-dir does).
-        gnf.KNOWLEDGE_DIR = kdir
-        gnf.FORMATS_FILE = kdir / ".node_formats.json"
-        gnf.PROJECT_ROOT = td
-        return gnf, node
+        gks.CLAUDE_PROJECT = td
+        gks.KNOWLEDGE_DIR = kdir
+        gks.FORMATS_PATH = kdir / ".node_formats.json"
+        return gks, node
 
     def test_process_node_uses_canonical_full_text_hash_for_skip(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tds:
             td = Path(tds)
-            gnf, node = self._prep(td)
+            gks, node = self._prep(td)
 
-            full = node.read_text(encoding="utf-8")
-            canonical = gnf.content_hash(full)
-            parsed = gnf.parse_frontmatter(node)
-            legacy = gnf._legacy_content_hash(parsed[1])
+            _title, full, body = gks.read_node(node)
+            canonical = gks.content_hash(full)
+            legacy = gks._legacy_content_hash(body)
             self.assertNotEqual(
                 canonical, legacy,
                 "fixture must make canonical and legacy hashes diverge",
             )
 
             rel = str(node.relative_to(td))
-            # v0.2.92 WP-Q2: the description/summary must be PLAUSIBLE
-            # summaries, not the one-character placeholders this fixture used
-            # to carry. `has_formats` now rejects a stored NON-ANSWER (empty,
-            # sub-8-character, or refusal-shaped) so a poisoned row heals
-            # instead of being frozen by the matching content hash — and "d" /
-            # "s" are indistinguishable from exactly that. The assertion below
-            # is about the HASH SCHEME, so the fixture must satisfy every
-            # OTHER precondition of the skip.
+            # The description/summary must be PLAUSIBLE summaries, not
+            # one-character placeholders: ``stored_entry_is_usable`` rejects
+            # a stored NON-ANSWER (empty, sub-8-character, or refusal-shaped)
+            # so a poisoned row heals instead of being frozen by the matching
+            # content hash. The assertion below is about the HASH SCHEME, so
+            # the fixture must satisfy every OTHER precondition of the skip.
             db = {
                 rel: {
                     "title": "Call Site Node",
@@ -293,18 +277,17 @@ class ProcessNodeCallSiteTest(unittest.TestCase):
                 }
             }
 
-            # dry_run False, force False. If process_node computed the canonical
-            # hash it matches the seeded entry → "skipped" (never reaches the
-            # LLM). If it computed the legacy body.strip() hash (the bug), the
-            # entry won't match → it would try to generate.
-            status = gnf.process_node(
-                node, model="unused", dry_run=False, force=False, db=db
-            )
+            # dry_run False, force False. If _process_node_bulk computed the
+            # canonical hash it matches the seeded entry → "skipped" (never
+            # reaches the LLM). If it computed the legacy body.strip() hash
+            # (the bug), the entry won't match → it would try to generate.
+            status = gks._process_node_bulk(node, force=False, dry_run=False, formats=db)
             self.assertEqual(
                 status, "skipped",
-                "process_node must compute the CANONICAL full-text hash so a "
-                "canonically-keyed complete entry is recognized as current; "
-                "got a non-skip, meaning the call site used the legacy body hash.",
+                "_process_node_bulk must compute the CANONICAL full-text hash "
+                "so a canonically-keyed complete entry is recognized as "
+                "current; got a non-skip, meaning the call site used the "
+                "legacy body hash.",
             )
 
     def test_process_node_stores_canonical_hash_when_seeded_legacy(self):
@@ -316,10 +299,10 @@ class ProcessNodeCallSiteTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tds:
             td = Path(tds)
-            gnf, node = self._prep(td)
+            gks, node = self._prep(td)
 
-            parsed = gnf.parse_frontmatter(node)
-            legacy = gnf._legacy_content_hash(parsed[1])
+            _title, full, body = gks.read_node(node)
+            legacy = gks._legacy_content_hash(body)
 
             rel = str(node.relative_to(td))
             db = {
@@ -331,11 +314,9 @@ class ProcessNodeCallSiteTest(unittest.TestCase):
                     "total_chunks": 1,
                 }
             }
-            # With a legacy-keyed entry and no re-key applied, process_node's
-            # canonical hash will NOT match → not skipped (dry_run avoids the LLM).
-            status = gnf.process_node(
-                node, model="unused", dry_run=True, force=False, db=db
-            )
+            # With a legacy-keyed entry and no re-key applied, the canonical
+            # skip hash will NOT match → not skipped (dry_run avoids the LLM).
+            status = gks._process_node_bulk(node, force=False, dry_run=True, formats=db)
             self.assertEqual(
                 status, "dry_run",
                 "a legacy-hash entry must be seen as stale by the canonical "

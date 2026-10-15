@@ -679,15 +679,16 @@ class FinalizeStageMarkerTests(_SyncTestBase):
             text,
             "the stage marker's text is load-bearing (kg_sync.rs::is_finalize_line "
             "matches its stable prefix) and must be flushed so the launcher's line "
-            "reader sees it before the up-to-600 s regen starts",
+            "reader sees it before the (uncapped, potentially long) regen starts",
         )
-        # Ordering pin: the marker print precedes subprocess.run in the
-        # regen function body.
+        # Ordering pin: the marker print precedes the subprocess spawn in
+        # the regen function body. v0.2.103 (review H-3): the spawn is a
+        # Popen polled with a heartbeat — there is no whole-run cap any more.
         fn_text = text[text.index("def _regen_node_formats_after_full_sync"):]
         fn_text = fn_text[:fn_text.index("\ndef ")]
         self.assertLess(
             fn_text.index("📝 Refreshing .node_formats.json summaries"),
-            fn_text.index("subprocess.run("),
+            fn_text.index("subprocess.Popen("),
             "the marker must be printed before the regen subprocess starts",
         )
 
@@ -696,12 +697,13 @@ class FinalizeStageMarkerTests(_SyncTestBase):
 
         v0.2.94: the refresh no longer looks inside the SYNCED project — that
         was the bug (``claude_mcp_servers/scripts/`` exists only in the clone,
-        so every user project fell through to the per-edit generator, which
-        exits 2 on ``--all``). It resolves the clone through
-        ``vco_lib.python_exe.resolve_install_root`` and runs the clone's
-        ``generate_node_formats.py`` with ``--knowledge-dir``. The fake clone
-        here is a NON-ROOT layout: it is a different directory from the project
-        being synced, which is the case that never worked.
+        so every user project fell through to the then per-edit-only
+        generator, which exited 2 on ``--all``). It resolves the clone
+        through ``vco_lib.python_exe.resolve_install_root`` and runs the
+        clone's ``templates/scripts/generate-kg-summary.py`` (the ONE writer,
+        per-node and bulk, since v0.2.103) with ``--knowledge-dir``. The
+        fake clone here is a NON-ROOT layout: it is a different directory
+        from the project being synced, which is the case that never worked.
 
         Returns ``(argv_record, install_root)``. The stub writes its own argv to
         ``argv_record`` so the test can prove WHICH generator ran and with what.
@@ -710,7 +712,8 @@ class FinalizeStageMarkerTests(_SyncTestBase):
         # `looks_like_orchestrator_root` wants vco_lib/ + .claude/.
         (install_root / "vco_lib").mkdir(parents=True, exist_ok=True)
         (install_root / ".claude").mkdir(parents=True, exist_ok=True)
-        gen = install_root / "claude_mcp_servers" / "scripts" / "generate_node_formats.py"
+        gen = (install_root / "templates" / "scripts"
+               / "generate-kg-summary.py")
         gen.parent.mkdir(parents=True, exist_ok=True)
         argv_record = self.root / "regen-argv.json"
         gen.write_text(
@@ -744,7 +747,7 @@ class FinalizeStageMarkerTests(_SyncTestBase):
         self.assertTrue(argv_record.exists(), "the ROOT generator was invoked")
         argv = json.loads(argv_record.read_text(encoding="utf-8"))
         self.assertTrue(
-            argv[0].endswith("generate_node_formats.py"),
+            argv[0].endswith("generate-kg-summary.py"),
             f"the CLONE's generator must be the one that runs, got {argv[0]!r}",
         )
         self.assertIn(str(install_root), argv[0],
@@ -762,14 +765,17 @@ class FinalizeStageMarkerTests(_SyncTestBase):
                              f"the automatic path must never pass {forbidden}")
 
     def test_regen_failure_is_non_fatal_and_lands_in_the_ledger(self):
-        self._stub_root_generator(exit_code=3)
+        # v0.2.103 (review M-2): exit 1 is the per-node-error exit; exit 3
+        # (no backend) now maps to the environmental sibling condition —
+        # pinned in tests/test_v02103_nodeformats_merge.py.
+        self._stub_root_generator(exit_code=1)
         _write_node(self.root / "knowledge" / "concepts" / "active.md", "Active")
         mod = self.load()
         self.install_working_backends(mod)
         mod._regen_node_formats_after_full_sync = self.real_regen
         code, _out, err = self.run_main(mod, ["kg-sync", "--all"])
         self.assertEqual(code, 0, "a failed summary regen never fails the sync")
-        self.assertIn("node-format refresh exited 3", err)
+        self.assertIn("node-format refresh exited 1", err)
         # v0.2.94: a non-zero exit is no longer ONE stderr line nobody reads.
         ledger = self.root / ".claude" / "context" / "UPDATE_DEFERRED.md"
         self.assertTrue(ledger.is_file(),

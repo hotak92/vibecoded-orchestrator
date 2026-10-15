@@ -197,16 +197,18 @@ class CheckNodeFormatsSchemaSubcommandTests(unittest.TestCase):
             folder, db = self._seed_project(d)
             (folder / ".claude" / "scripts").mkdir(parents=True)
             # A WORKING generator MUST actually rewrite the cache — exit-0
-            # alone is NOT regeneration (review B1: the real generator exits
-            # 0 without writing when no backend is available). This fake
-            # appends a fresh entry so the cache content CHANGES, which is
-            # what `_regenerate_node_formats` now requires to report success.
+            # alone is NOT regeneration (review B1: the real bulk generator
+            # exits non-zero when no backend is available, but the hash check
+            # stays as proof a WRITE happened). This fake appends a fresh
+            # entry so the cache content CHANGES, which is what
+            # `_regenerate_node_formats` (v0.2.103: one bulk `--all --force`
+            # invocation) requires to report success.
             (folder / ".claude" / "scripts" / "generate-kg-summary.py").write_text(
                 "import json, sys, time\n"
                 "from pathlib import Path\n"
                 "f = Path('knowledge/.node_formats.json')\n"
                 "d = json.loads(f.read_text()) if f.exists() else {}\n"
-                "d[sys.argv[1]] = {'title': 'regenerated', 'at': time.time()}\n"
+                "d['regenerated'] = {'title': 'regenerated', 'at': time.time()}\n"
                 "f.write_text(json.dumps(d))\n"
                 "sys.exit(0)\n"
             )

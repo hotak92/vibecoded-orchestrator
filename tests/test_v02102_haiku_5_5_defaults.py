@@ -11,9 +11,10 @@ so the gateway keeps it in its static catalogue and keeps treating it as a
 Pinned here by BEHAVIOUR, not by scanning source text: each default is driven
 through the code path that sends it and the outgoing request is inspected.
 
-* the KG-summary API tier (``templates/scripts/summary_backends.py``);
-* the node-format generator's ``--provider haiku`` path
-  (``claude_mcp_servers/scripts/generate_node_formats.py``);
+* the KG-summary API tier (``templates/scripts/summary_backends.py``) — the
+  ONLY Haiku caller since v0.2.103 merged the retired node-format
+  generator's ``--provider haiku`` path into ``generate-kg-summary.py``,
+  which reaches Anthropic exclusively through this ladder tier;
 * the gateway data: the current Haiku has a cited 1M seed row, the legacy one
   has none, and the first-party route carries no effort-policy row for either
   — first-party adaptive-thinking models pass ``output_config.effort``
@@ -34,7 +35,6 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SUMMARY_BACKENDS = REPO_ROOT / "templates" / "scripts" / "summary_backends.py"
-GENERATOR = REPO_ROOT / "claude_mcp_servers" / "scripts" / "generate_node_formats.py"
 
 CURRENT_HAIKU = "claude-haiku-5-5"
 LEGACY_HAIKU = "claude-haiku-4-5-20251001"
@@ -75,30 +75,10 @@ class SummaryBackendSendsTheCurrentHaiku(unittest.TestCase):
             self.assertEqual(sb.call_api("summarise this"), "a summary")
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["model"], CURRENT_HAIKU)
-
-
-class NodeFormatGeneratorSendsTheCurrentHaiku(unittest.TestCase):
-    def test_provider_haiku_posts_haiku_5_5(self) -> None:
-        gnf = _load("_w4h_generate_node_formats", GENERATOR)
-        self.assertEqual(gnf.HAIKU_MODEL, CURRENT_HAIKU)
-        captured: dict[str, Any] = {}
-
-        class _Ok:
-            def raise_for_status(self) -> None:
-                return None
-
-            def json(self) -> dict[str, Any]:
-                return {"content": [{"text": " formats "}]}
-
-        def fake_post(url: str, **kwargs: Any) -> _Ok:
-            captured.update(kwargs["json"])
-            return _Ok()
-
-        env = {"ANTHROPIC_API_KEY": "test-not-a-key"}  # vco-secret-scan: test-placeholder
-        with mock.patch.dict("os.environ", env), \
-                mock.patch.object(gnf.requests, "post", fake_post):
-            self.assertEqual(gnf.call_haiku("p", 64), "formats")
-        self.assertEqual(captured["model"], CURRENT_HAIKU)
+        # The Claude 5.5 generation rejects non-default sampling params — the
+        # ladder never sent a temperature, and the retired generator's
+        # ``--provider haiku`` path (merged away in v0.2.103) pinned the same.
+        self.assertNotIn("temperature", sent[0])
 
 
 class GatewayDataTreatsHaiku55LikeThe55Generation(unittest.TestCase):

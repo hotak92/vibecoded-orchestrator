@@ -241,10 +241,11 @@
   },
   "knowledge/concepts/kg-summary-three-tier-pipeline.md": {
     "title": "KG-Summary Three-Tier Generation Pipeline",
-    "description": "This pipeline automatically generates concise summaries for every knowledge graph node to enhance retrieval performance.\nIt intelligently selects backend models like Claude, Ollama, or OpenAI based on availability and user consent.\nA built-in circuit breaker system automatically demotes failing tiers to ensure continuous operation during rate limits or capacity issues.\nThe system is triggered by specific tool hooks and stored in a JSON file for immediate consumption by retrieval clients.",
-    "summary": "The KG-Summary Three-Tier Generation Pipeline automatically generates 2-3 sentence summaries for Knowledge Graph nodes via a `PostToolUse` hook, utilizing a fallback backend ladder (CLI > Ollama > OpenAI/Anthropic API > Skip) managed by a shared logic layer. To handle failures, the system employs two distinct gates: a **circuit breaker** that demotes tiers based on specific error types (rate limits, auth, capacity) with configurable cooldowns, and a **non-answer gate** that prevents caching or falling back when an LLM returns a refusal or canned prompt, ensuring poisoned rows are regenerated. The generator resolves titles from YAML frontmatter or H1 headers, writes outputs to `knowledge/.node_formats.json`, and addresses cross-platform issues like Windows argument parsing defects and race conditions in parallel file writes.",
-    "generated_at": "2026-09-16T01:16:05.415719+00:00",
-    "content_hash": "9eed378a0966c923",
+    "description": "Auto-generated 2-3 sentence summaries for every KG node, written to `.node_formats.json` and consumed by retrieval clients for efficient tier-based access, triggered by PostToolUse hooks on knowledge file edits. Uses a 5-tier backend cascade (claude CLI → Ollama → OpenAI → Anthropic API → skip) with automatic circuit-breaker demotion when backends fail due to rate limits, auth failures, or capacity issues (different cooldown windows per failure type). Configuration via `KG_SUMMARY_BACKEND` env var or launcher preferences; latches stored in VCT state dir so failures don't recur for each node. Critical for keeping KG retrieval fast while gracefully degrading when generation backends become unavailable.",
+    "summary": "Auto-generated KG node summaries use tiered backend selection (CLI > Ollama > OpenAI > Anthropic API) with circuit breaker logic that latches failing tiers for cooldown periods (900s for rate limits, 120s for auth, 60s for capacity) rather than attempting indefinite retries. Non-answer gate prevents caching refusals, allowing poisoned rows to regenerate on next sync.",
+    "generated_at": "2026-10-14T02:51:40.480135+00:00",
+    "backend": "cli",
+    "content_hash": "146ec48e33c505f3",
     "total_chunks": 1
   },
   "knowledge/concepts/knowledge-graph.md": {
@@ -594,10 +595,11 @@
   },
   "knowledge/concepts/score-driven-retrieval-tiers.md": {
     "title": "Score-Driven Retrieval Tiers",
-    "description": "Score-Driven Retrieval Tiers is a per-result verbosity policy that adjusts content detail based on relevance scores.\nIt replaces uniform detail parameters to save tokens on low-score results while enriching high-score hits.\nThe system applies five calibrated tiers ranging from discarding noise to returning full node content.\nThis approach optimizes context budgets for agents by preventing redundant re-calls for deeper detail.",
-    "summary": "Score-Driven Retrieval Tiers is a per-result verbosity policy implemented in the Weaviate MCP server that adjusts content richness based on search relevance scores, replacing the previous uniform `detail` parameter. This system normalizes scores to 0..1 and applies five calibrated tiers: `discard` (<0.42), `summary` (0.42–0.55), `single_chunk` (0.55–0.65), `three_chunks` (0.65–0.75), and `full` (≥0.75). It is applied by `hybrid_search`, `semantic_graph_search`, and the pre-edit hook (`rl_kg_search.py`), where connected nodes in graph searches default to `summary` to avoid latency. The policy relies on a sidecar file (`knowledge/.node_formats.json`) for LLM-generated descriptions and chunk summaries, with fallbacks to shorter summaries or content snippets if missing. Tunable thresholds are defined in `_TIER_THRESHOLDS` and environment variables. The implementation yields approximately 57% token savings compared to uniform `full` retrieval while ensuring the highest-relevance results retain full detail. Explicit `detail` overrides bypass score-based logic, and RL reranker failures silently fall back to distance-based ordering without surfacing a fallback flag.",
-    "generated_at": "2026-07-20T18:54:42.908302+00:00",
-    "content_hash": "e70b29dec758c7a4",
+    "description": "Score-Driven Retrieval Tiers is a per-result verbosity policy that adjusts content depth based on relevance score, replacing uniform detail parameters across all search results. It defines five score-based tiers (discard <0.42, summary 0.42–0.55, single_chunk 0.55–0.65, three_chunks 0.65–0.75, full ≥0.75) implemented in Weaviate MCP's hybrid_search, semantic_graph_search, and search_code_graph with calibrated, env-tunable thresholds. Connected graph nodes always render at summary tier regardless of score to avoid latency overhead. This adaptive approach prevents token waste on low-relevance results while giving top hits rich context, eliminating redundant re-calls and maintaining consistency across the pre-edit hook and API callers.",
+    "summary": "Score-driven retrieval tiers automatically adjust per-result verbosity across five tiers (discard <0.42, summary 0.42–0.55, single_chunk 0.55–0.65, three_chunks 0.65–0.75, full ≥0.75) based on normalized relevance scores, replacing prior uniform detail returns. Implemented in Weaviate MCP's hybrid_search and semantic_graph_search, the system allocates token budget to high-relevance hits while marginal results contribute only summaries, optimizing both cost and quality.",
+    "generated_at": "2026-10-14T02:52:04.526109+00:00",
+    "backend": "cli",
+    "content_hash": "1ea16f9c13b669bd",
     "total_chunks": 1
   },
   "knowledge/concepts/semantic-search.md": {
