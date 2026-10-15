@@ -106,6 +106,8 @@ def _run(chain, monkeypatch, tmp_path, *, exit_code: int, stdout: str,
                         lambda log=None, model=None: HAIKU)
     monkeypatch.setattr(chain, "subprocess", types.SimpleNamespace(
         run=_fake_run, TimeoutExpired=subprocess.TimeoutExpired))
+    # the spawn resolves the CLI path; the fake answers for the bare name
+    monkeypatch.setattr(chain, "resolve_claude_executable", lambda: "claude")
     monkeypatch.delenv("VCO_SUMMARY_BREAKER", raising=False)
     chain.main(["run", "--project-root", str(repo),
                 "--log", str(tmp_path / "review.log")])

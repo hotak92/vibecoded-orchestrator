@@ -1251,3 +1251,101 @@ class TestR16MultiLineBodies:
             tmp_path, "for (( i=0 ; ; i++ )); do :; done")
         _allow(tmp_path, "for (( i=0 ; i<3 ; i++ )); do :; done")
         _allow(tmp_path, "for ((i=0; i<3; i++)); do :; done")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Windows verification (v0.2.103 item 19): a WAIT inside a BOUNDED
+# PowerShell loop is denied, like its Bash twin. Before, loop_pattern gave a
+# bounded `for`, a `foreach` over a collection and a `| ForEach-Object`
+# stage no label at all, so the wait check never ran on them.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestPowerShellBoundedLoopWaits:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "for ($i=0;$i -lt 9;$i++) { Start-Sleep 1; Get-Content f }",
+            "for ($i=0; $i -lt 9; $i++) { Get-Content f; Start-Sleep -Seconds 1 }",
+            "foreach ($i in 1..9) { Start-Sleep 1; Get-Content f }",
+            "foreach ($f in Get-ChildItem) { Get-Content $f; Start-Sleep 2 }",
+            "1..9 | ForEach-Object { Start-Sleep 1; Get-Content f }",
+            "1..9 | % { Get-Content f; Start-Sleep 1 }",
+            "Get-ChildItem | foreach { [Threading.Thread]::Sleep(500); $_ }",
+        ],
+    )
+    def test_wait_in_a_bounded_loop_is_denied(self, tmp_path, command):
+        _deny(tmp_path, command, tool="PowerShell")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "for ($i=0;$i -lt 3;$i++) { Write-Output $i }",
+            "foreach ($f in Get-ChildItem) { ruff check $f }",
+            "Get-ChildItem | ForEach-Object { ruff check $_ }",
+            "Get-ChildItem | foreach { $_.Name }",
+            # the loop text inside a string is not a loop
+            "Write-Output 'for ($i=0;$i -lt 3;$i++) { Start-Sleep 1 }'",
+        ],
+    )
+    def test_bounded_loop_without_a_wait_is_allowed(self, tmp_path, command):
+        _allow(tmp_path, command, tool="PowerShell")
+
+    def test_bash_twins_agree(self, tmp_path):
+        _deny(tmp_path, "for i in 1 2 3; do sleep 1; cat f; done")
+        _deny(tmp_path, "for ((i=0;i<9;i++)); do sleep 1; cat f; done")
+        _allow(tmp_path, "for f in a b; do ruff check $f; done")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# R20 M2: a wait in ANY clause of a C-style `for` header is a loop wait —
+# on BOTH shells (parity: wait_guard._arith_for_clauses for Bash,
+# powershell_command.loop_pattern's `header` scan for PowerShell).
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestForHeaderClauseWaits:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "for ((i=0;i<3;sleep 1)); do echo $i; done",       # repeat
+            "for (( i=0 ; i<3 ; sleep 1 )); do echo $i; done",  # spaced
+            "for ((sleep 1;i<3;i++)); do echo $i; done",       # init
+            "for ((i=0;sleep 1;i++)); do echo $i; done",       # condition
+        ],
+    )
+    def test_bash_header_wait_denied(self, tmp_path, command):
+        assert "sleep" in _deny(tmp_path, command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "for ($i=0; $i -lt 3; ($i++; Start-Sleep 1)) { Write-Output $i }",
+            "for ($i=0; $i -lt 3; $i++, (Start-Sleep -Seconds 1)) { $i }",
+            "for (Start-Sleep 1; $i -lt 3; $i++) { Write-Output $i }",
+            "for ($i=0; $i -lt 3; ($i++; [Threading.Thread]::Sleep(500))) { $i }",
+        ],
+    )
+    def test_powershell_header_wait_denied(self, tmp_path, command):
+        _deny(tmp_path, command, tool="PowerShell")
+
+    def test_powershell_repeat_clause_judged_by_loop_reader(self):
+        """The repeat clause is caught by the PowerShell loop reader
+        itself, not only incidentally through the Bash translation."""
+        from vco_lib.powershell_command import loop_pattern
+
+        found = loop_pattern(
+            "for ($i=0; $i -lt 3; ($i++; Start-Sleep 1)) { Write-Output $i }")
+        assert found is not None and found[0] == "for loop"
+
+    @pytest.mark.parametrize(
+        ("command", "tool"),
+        [
+            ("for ((i=0;i<3;i++)); do echo $i; done", "Bash"),
+            ("for (( i=0 ; i<3 ; i++ )); do ruff check; done", "Bash"),
+            ("for f in a b; do echo $f; done", "Bash"),
+            ("for ($i=0; $i -lt 3; $i++) { Write-Output $i }", "PowerShell"),
+        ],
+    )
+    def test_headers_without_a_wait_still_allowed(self, tmp_path, command, tool):
+        _allow(tmp_path, command, tool=tool)

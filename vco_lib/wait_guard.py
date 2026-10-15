@@ -382,6 +382,17 @@ def _pattern_of_tokens(tokens: List[str], depth: int,
         # command that runs every iteration — scan its tail. (`for` /
         # `select` take a word list, never a command: not dispatched.)
         return _pattern_of_tokens(body[1:], depth, seg)
+    if verb == "for":
+        # The arithmetic `for ((init; cond; repeat))` header belongs to the
+        # loop (R20 M2, parity with the PowerShell `for (…;…;…)` reader in
+        # vco_lib.powershell_command.loop_pattern): a wait word in ANY of
+        # its clauses is a wait in the loop. A word-list `for x in …` has
+        # no clauses and returns None here.
+        for clause in _arith_for_clauses(body):
+            found = _pattern_of_tokens(tokenize(clause) or [], depth, seg)
+            if found is not None:
+                return found
+        return None
     if verb == "sleep":
         return _sleep_pattern(body, seg)
     if verb == "watch":
@@ -579,6 +590,18 @@ def _infinite_for_header(tokens: List[str], start: int) -> bool:
         return True  # `(( ; ; ))`: every clause empty
     parts = core.split(";")
     return len(parts) >= 2 and parts[1].strip() == ""
+
+
+def _arith_for_clauses(tokens: List[str]) -> List[str]:
+    """The clause texts of an arithmetic ``for ((init; cond; repeat))``
+    header in ``tokens`` (``tokens[0]`` is ``for``), else ``[]`` — a
+    word-list ``for x in …`` has none. Works on both the glued
+    (``((i=0;i<3;i++))``) and spaced (``(( i=0 ; i<3 ; i++ ))``) token
+    shapes the chain walker emits."""
+    s = " ".join(tokens[1:]).strip()
+    if not (s.startswith("((") and s.endswith("))")):
+        return []
+    return [c.strip() for c in s[2:-2].split(";") if c.strip()]
 
 
 #: A Bash loop condition's variable references (`[ "$r" = 200 ]` → ``r``).

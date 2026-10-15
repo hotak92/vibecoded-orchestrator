@@ -340,9 +340,10 @@ class TestSummaryBackendSelector:
                 f"CLI should win at vram={vram}, ram={ram}, cores={cores}"
             )
 
-    @pytest.mark.parametrize("vram", [16.0, 24.0, 80.0])
-    def test_gpu_16gb_plus_picks_qwen35_9b(self, vram: float) -> None:
-        """VRAM >= 16 GB → qwen3.5:9b (highest local quality)."""
+    @pytest.mark.parametrize("vram", [10.0, 12.0, 16.0, 24.0, 80.0])
+    def test_gpu_fitting_the_9b_floor_picks_qwen35_9b(self, vram: float) -> None:
+        """A card that meets qwen3.5:9b's free-VRAM floor → qwen3.5:9b
+        (highest local quality; v0.2.103 derives the rung from the floor)."""
         got = select_summary_backend(
             gpu_vram_gb=vram, ram_gb=32.0, cores=16,
             claude_cli_available=False,
@@ -350,15 +351,17 @@ class TestSummaryBackendSelector:
         )
         assert got == _SUMMARY_BACKEND_QWEN35_9B
 
-    @pytest.mark.parametrize("vram", [6.0, 8.0, 12.0, 15.9])
-    def test_gpu_6_to_16gb_picks_gemma(self, vram: float) -> None:
-        """6 GB <= VRAM < 16 GB → gemma4:e4b."""
+    @pytest.mark.parametrize("vram", [6.0, 8.0, 9.0])
+    def test_gpu_below_the_9b_floor_picks_qwen35_4b(self, vram: float) -> None:
+        """6-9 GB cards → qwen3.5:4b, never gemma4:e4b (whose floor no
+        6-12 GB card meets — the v0.2.103 field case)."""
         got = select_summary_backend(
             gpu_vram_gb=vram, ram_gb=8.0, cores=4,
             claude_cli_available=False,
             openai_consent=False,
         )
-        assert got == _SUMMARY_BACKEND_GEMMA
+        assert got == "qwen3.5:4b"
+        assert got != _SUMMARY_BACKEND_GEMMA
 
     def test_no_gpu_high_ram_high_cores_picks_gemma(self) -> None:
         got = select_summary_backend(

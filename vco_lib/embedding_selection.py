@@ -54,6 +54,7 @@ _KG_BACKEND_OPENAI = "openai-text-embedding-3-small"
 
 _SUMMARY_BACKEND_CLI = "cli"           # claude CLI (Max subscription / API key)
 _SUMMARY_BACKEND_QWEN35_9B = "qwen3.5:9b"
+_SUMMARY_BACKEND_QWEN35_4B = "qwen3.5:4b"
 _SUMMARY_BACKEND_GEMMA = "gemma4:e4b"
 _SUMMARY_BACKEND_OPENAI = "openai"     # routes via API tier with consent gate
 
@@ -315,14 +316,92 @@ def select_kg_embedding_backend(
     return _KG_BACKEND_ARCTIC
 
 
-#: The local summary tiers' thresholds — the ONE table: the selector below
-#: decides with them and :func:`summary_model_tiers` describes them (the
-#: launcher's Preferences hint renders that description), so the two cannot
-#: drift (v0.2.102 W5-D).
-SUMMARY_VRAM_QWEN35_9B_GB = 16.0
-SUMMARY_VRAM_GEMMA_GB = 6.0
+#: The local summary tiers — the ONE table: the selector below decides with
+#: it and :func:`summary_model_tiers` describes it (the launcher's
+#: Preferences hint renders that description), so the two cannot drift
+#: (v0.2.102 W5-D).
+#:
+#: v0.2.103 (owner 2026-10-15): the GPU tiers are no longer fixed VRAM
+#: thresholds. A GPU rung is chosen only when the card can satisfy the SAME
+#: free-VRAM floor the runtime applies before loading the model
+#: (:func:`summary_required_free_vram_mb`, read by
+#: ``templates/scripts/summary_backends.py``) — so the table can never again
+#: assign a model the runtime refuses to load. The field case: an 8 GB RTX
+#: 4070 Laptop was assigned ``gemma4:e4b`` (~9 GB on disk as pulled then)
+#: whose floor no 6-12 GB card meets, and install pulled it for nothing.
 SUMMARY_CPU_MIN_RAM_GB = 12.0
 SUMMARY_CPU_MIN_CORES = 6
+
+#: GPU rungs, strongest first. ``qwen3.5:4b`` (Apache-2.0, ~3.2 GB) is the
+#: small-card rung: it fits the floor on every 6-8 GB card, where
+#: ``gemma4:e2b`` (~4.4 GB) fits only from ~7 GB up and scores lower on the
+#: vendors' own cards. ``gemma4:e4b`` is not a GPU rung: its floor is no
+#: lower than ``qwen3.5:9b``'s, so any card that fits it fits the stronger
+#: model.
+SUMMARY_GPU_TIER_MODELS: tuple = (_SUMMARY_BACKEND_QWEN35_9B, _SUMMARY_BACKEND_QWEN35_4B)
+#: The no-GPU rung for a capable CPU (RAM >= SUMMARY_CPU_MIN_RAM_GB and
+#: cores >= SUMMARY_CPU_MIN_CORES).
+SUMMARY_CPU_TIER_MODEL = _SUMMARY_BACKEND_GEMMA
+
+#: Nominal on-disk size (MiB) of each tier model as Ollama reports it in
+#: ``/api/tags`` ``size`` — the sum of the model's blobs (weights + vision
+#: projector + draft), which is exactly what the runtime floor is sized from.
+#: Taken from the Ollama registry manifests of the tags install pulls
+#: (2026-10-15) and, where a local copy existed, the larger of the two:
+#: ``qwen3.5:9b`` 6 288 (local) / 6 247 (registry); ``qwen3.5:4b`` 3 170;
+#: ``gemma4:e4b`` 9 163 (the copy pulled 2026-09-28; the tag was re-published
+#: at 6 278 since — the larger, field-observed size is kept so no machine
+#: holding the old copy is told it fits); ``qwen3.5:0.8b`` 988.
+#: At runtime the floor uses the ACTUAL size of the copy Ollama holds.
+SUMMARY_MODEL_SIZE_MB: dict = {
+    _SUMMARY_BACKEND_QWEN35_9B: 6288,
+    _SUMMARY_BACKEND_QWEN35_4B: 3170,
+    _SUMMARY_BACKEND_GEMMA: 9163,
+    "qwen3.5:0.8b": 988,
+}
+
+#: Free-VRAM floor shape (v0.2.103 R2/H-4): the model's on-disk size plus a
+#: KV-cache/activation margin — a fraction of the size (Q4 GGUF rule of
+#: thumb: the KV cache for an 8k-token window lands at roughly a third of the
+#: weights) with an absolute minimum so the floor never drops to "weights
+#: alone" for the sub-1 GB floor model. Unknown size → the conservative
+#: default, sized for the largest default tier.
+SUMMARY_VRAM_MARGIN_FRACTION = 0.4
+SUMMARY_VRAM_MARGIN_MIN_MB = 1024
+SUMMARY_DEFAULT_MIN_FREE_VRAM_MB = 8192
+#: VRAM an idle desktop already holds on the card the summary model would
+#: load on: the tier table sees TOTAL VRAM, the runtime floor sees FREE VRAM.
+#: Field reading 2026-10-15: an 8 GB RTX 4070 Laptop shows ~7.6 GB free at
+#: idle, i.e. ~0.4-0.5 GB held.
+SUMMARY_IDLE_VRAM_RESERVE_MB = 512
+
+
+def summary_required_free_vram_mb(size_mb: "int | None") -> int:
+    """The free-VRAM floor (MB) for a generation model whose on-disk size is
+    *size_mb* — the ONE floor rule: the runtime guard
+    (``summary_backends._ollama_local_deferred``) and the tier table
+    (:func:`summary_model_fits_vram`) both call it.
+
+    ``size_mb=None`` (size unknown) → :data:`SUMMARY_DEFAULT_MIN_FREE_VRAM_MB`
+    — an unknown model must not lower the bar silently."""
+    if size_mb is None:
+        return SUMMARY_DEFAULT_MIN_FREE_VRAM_MB
+    margin = max(SUMMARY_VRAM_MARGIN_MIN_MB, int(size_mb * SUMMARY_VRAM_MARGIN_FRACTION))
+    return int(size_mb) + margin
+
+
+def summary_min_vram_gb(model: str) -> float:
+    """Total card VRAM (GB, 1 GB = 1024 MB like the hardware probe) at which
+    *model* satisfies the floor with an idle desktop's reserve held."""
+    need = summary_required_free_vram_mb(SUMMARY_MODEL_SIZE_MB.get(model))
+    return (need + SUMMARY_IDLE_VRAM_RESERVE_MB) / 1024.0
+
+
+def summary_model_fits_vram(model: str, gpu_vram_gb: float) -> bool:
+    """True when a card with *gpu_vram_gb* total VRAM can satisfy the
+    runtime free-VRAM floor for *model* (the question every GPU rung of the
+    tier table asks)."""
+    return float(gpu_vram_gb or 0.0) >= summary_min_vram_gb(model)
 
 
 def select_summary_backend(
@@ -335,15 +414,18 @@ def select_summary_backend(
 ) -> "str | None":
     """Pick a KG-summary generation backend, or None if no path is viable.
 
-    Spec (2026-05-21):
+    Spec (2026-05-21; GPU rungs re-derived from the floor in v0.2.103):
       claude CLI present (AND authenticated) → ALWAYS use it (highest
         quality, costs come out of the user's Max subscription).
-      GPU:
-        - VRAM >= 16 GB → qwen3.5:9b
-        - VRAM >=  6 GB → gemma4:e4b
-        - else → CPU path
+      GPU (any detected VRAM): the first of :data:`SUMMARY_GPU_TIER_MODELS`
+        (``qwen3.5:9b`` then ``qwen3.5:4b``) whose free-VRAM floor the card
+        can satisfy (:func:`summary_model_fits_vram`) — ~9.1 GB+ and
+        ~4.9 GB+ total VRAM today; else the CPU path.
       CPU:
-        - RAM >= 12 GB AND cores >= 6 → gemma4:e4b
+        - RAM >= 12 GB AND cores >= 6 → gemma4:e4b — only when no GPU was
+          detected, or the GPU can satisfy gemma4:e4b's floor too (the
+          runtime guard measures the card's free VRAM whenever one is
+          present, so a model that fails the floor would never load)
         - else → no local model viable
       OpenAI: gated on `openai_consent` (default OFF — the user has
         to explicitly opt in via Preferences). When opted in AND a key
@@ -352,8 +434,7 @@ def select_summary_backend(
 
     Returns None when:
       - no claude CLI, AND
-      - hardware can't run gemma4:e4b (sub-12 GB RAM or <6 cores AND
-        no GPU >= 6 GB VRAM), AND
+      - no GPU rung fits and the CPU rung does not apply, AND
       - either no OpenAI consent OR no OpenAI key.
 
     The None case is NOT an error — install.py should record a
@@ -378,7 +459,8 @@ def select_summary_backend(
 
     Returns:
         Backend ID string, or None when nothing viable is available.
-        Possible strings: "cli", "qwen3.5:9b", "gemma4:e4b", "openai".
+        Possible strings: "cli", "qwen3.5:9b", "qwen3.5:4b", "gemma4:e4b",
+        "openai".
     """
     # CLI always wins when available — best quality, no local resource
     # cost, paid out of the user's subscription.
@@ -387,19 +469,22 @@ def select_summary_backend(
 
     vram = float(gpu_vram_gb or 0.0)
 
-    # GPU tiers.
-    if vram >= SUMMARY_VRAM_QWEN35_9B_GB:
-        return _SUMMARY_BACKEND_QWEN35_9B
-    if vram >= SUMMARY_VRAM_GEMMA_GB:
-        return _SUMMARY_BACKEND_GEMMA
+    # GPU tiers: the strongest model whose runtime floor the card meets.
+    if vram > 0:
+        for model in SUMMARY_GPU_TIER_MODELS:
+            if summary_model_fits_vram(model, vram):
+                return model
 
-    # CPU tier (only when GPU is sub-6 GB or absent).
+    # CPU tier (no GPU, or a GPU no GPU rung fits).
     # NOTE: inclusive (`>=`) RAM boundary here — a 12 GB host CAN run
     # gemma4:e4b — unlike the code/KG selectors' strict-> 24 GB rule.
     # `strict_ram=False` parameterises that distinction. See `_cpu_meets`.
+    # With a GPU present the runtime floor still applies to the CPU rung's
+    # model, so it is chosen only when it fits that floor as well.
     if _cpu_meets(ram_gb, cores, min_ram=SUMMARY_CPU_MIN_RAM_GB,
-                  min_cores=SUMMARY_CPU_MIN_CORES, strict_ram=False):
-        return _SUMMARY_BACKEND_GEMMA
+                  min_cores=SUMMARY_CPU_MIN_CORES, strict_ram=False) and (
+            vram <= 0 or summary_model_fits_vram(SUMMARY_CPU_TIER_MODEL, vram)):
+        return SUMMARY_CPU_TIER_MODEL
 
     # No local path viable. Last resort: OpenAI, only if the user
     # explicitly consented AND a key is available.
@@ -420,33 +505,42 @@ def summary_model_for_hardware(gpu_vram_gb: float, ram_gb: float, cores: int) ->
     Ollama for (v0.2.102 W5-D: one table, both callers).
 
     Derived from :func:`select_summary_backend`'s LOCAL tiers (CLI and
-    OpenAI are not Ollama models, so they are taken as absent):
-    ``qwen3.5:9b`` (VRAM >= 16 GB), ``gemma4:e4b`` (VRAM >= 6 GB, or a
-    capable CPU), else :data:`SUMMARY_FLOOR_MODEL`."""
+    OpenAI are not Ollama models, so they are taken as absent): the
+    strongest GPU rung whose free-VRAM floor the card meets (``qwen3.5:9b``,
+    ``qwen3.5:4b``), ``gemma4:e4b`` for a capable CPU, else
+    :data:`SUMMARY_FLOOR_MODEL`."""
     pick = select_summary_backend(
         gpu_vram_gb=gpu_vram_gb, ram_gb=ram_gb, cores=cores,
         claude_cli_available=False, openai_consent=False, openai_key_available=False)
-    if pick in (_SUMMARY_BACKEND_QWEN35_9B, _SUMMARY_BACKEND_GEMMA):
+    if pick is not None and (pick in SUMMARY_GPU_TIER_MODELS or pick == SUMMARY_CPU_TIER_MODEL):
         return pick
     return SUMMARY_FLOOR_MODEL
 
 
 def summary_model_tiers() -> list:
     """The local generation tiers as data, strongest first: ``[{"model",
-    "when"}]`` — built from the SAME thresholds :func:`select_summary_backend`
+    "when"}]`` — built from the SAME floor rule :func:`select_summary_backend`
     decides with, for surfaces that must name the tier models (the launcher's
     "No Ollama models installed" hint). Pinned against
-    :func:`summary_model_for_hardware` by test."""
+    :func:`summary_model_for_hardware` by test. The GPU figures are rounded
+    UP to 0.1 GB, so a card the text admits always fits."""
     def gb(v: float) -> str:
         return f"{v:g} GB"
 
-    return [
-        {"model": _SUMMARY_BACKEND_QWEN35_9B,
-         "when": f"{gb(SUMMARY_VRAM_QWEN35_9B_GB)}+ VRAM"},
-        {"model": _SUMMARY_BACKEND_GEMMA,
-         "when": (f"{gb(SUMMARY_VRAM_GEMMA_GB)}+ VRAM, or a CPU with "
-                  f"{gb(SUMMARY_CPU_MIN_RAM_GB)}+ RAM and {SUMMARY_CPU_MIN_CORES}+ cores")},
-        {"model": SUMMARY_FLOOR_MODEL, "when": "any other machine"},
+    def min_vram(model: str) -> str:
+        return gb(math.ceil(summary_min_vram_gb(model) * 10) / 10)
+
+    gpu = [{"model": m, "when": f"{min_vram(m)}+ VRAM"} for m in SUMMARY_GPU_TIER_MODELS]
+    return gpu + [
+        {"model": SUMMARY_CPU_TIER_MODEL,
+         "when": (f"no GPU, and a CPU with {gb(SUMMARY_CPU_MIN_RAM_GB)}+ RAM "
+                  f"and {SUMMARY_CPU_MIN_CORES}+ cores")},
+        # The floor runs anywhere ON CPU, but on a GPU the runtime floor
+        # still applies (R20 L5): a card below it defers summaries, so the
+        # text says so instead of promising "any other machine" outright.
+        {"model": SUMMARY_FLOOR_MODEL,
+         "when": (f"any other machine (on a GPU it needs "
+                  f"{min_vram(SUMMARY_FLOOR_MODEL)}+ VRAM)")},
     ]
 
 

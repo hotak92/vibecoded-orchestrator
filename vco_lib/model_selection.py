@@ -240,8 +240,13 @@ def vendor_key_state_probe() -> KeyStateProbe:
     returns a :class:`~model_router.secrets.KeyResult` whose ``key`` is
     ``None`` — so the try/except around the probe below covers only the
     genuinely unexpected. Import failures (gateway not installed/active) are
-    the caller's business.
+    the caller's business. An interpreter outside the venv (``install.py``
+    and its ``install-bundle`` child run under the system Python) still sees
+    the checkout's package: :func:`vco_lib.gateway_package.ensure_importable`.
     """
+    from vco_lib.gateway_package import ensure_importable
+
+    ensure_importable()
     from model_router.secrets import VendorKeyResolver
     from model_router.vendors import VENDORS
 

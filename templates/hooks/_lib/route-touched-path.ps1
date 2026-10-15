@@ -185,7 +185,7 @@ function Emit-KgGateSkippedMetric {
             New-Item -ItemType Directory -Path $cacheDir -Force -ErrorAction SilentlyContinue | Out-Null
         }
         $jsonl = Join-Path $cacheDir "dropped_writes.jsonl"
-        $ts = [int][double]::Parse((Get-Date -UFormat %s))
+        $ts = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $row = @{
             ts          = $ts
             project_id  = ""

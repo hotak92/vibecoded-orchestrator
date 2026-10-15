@@ -270,11 +270,11 @@ def test_defer_guard_string_present():
     assert 'VCT_AUTO_RESTART_LAUNCHER:-0' in text, (
         "defer guard reading VCT_AUTO_RESTART_LAUNCHER missing"
     )
-    # The guard must appear BEFORE the interactive build/download prompt
-    # ('Launcher binary not found. Choose how to get it') so it short-
-    # circuits the wasteful build.
+    # The guard must appear BEFORE the acquisition step (since v0.2.103 the
+    # prebuilt download runs without a prompt; Step 3 is where acquisition
+    # starts) so it short-circuits the wasteful download/build.
     guard_idx = text.index("VCT_AUTO_RESTART_LAUNCHER:-0")
-    prompt_idx = text.index("Choose how to get it")
+    prompt_idx = text.index("# ----- Step 3:")
     assert guard_idx < prompt_idx, (
         "defer guard must short-circuit before the build/download prompt"
     )

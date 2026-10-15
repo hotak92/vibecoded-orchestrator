@@ -66,12 +66,16 @@ Stop-hook drain batches) deliberately do NOT claim, with evidence:
     unconditionally).
 
 Cross-OS: the lock is ``vco_lib.atomic.exclusive_file_lock``, which locks for
-real on POSIX (``flock``) and Windows (``msvcrt.locking``, v0.2.103).
+real on POSIX (``flock``) and Windows (``msvcrt.locking``, v0.2.103). A
+kill of the ``-m`` wrapper alone never leaves the analyzer walking without
+the claim: POSIX children inherit the flock descriptor, Windows children die
+with the wrapper through a kill-on-close Job Object (:func:`_run_child`).
 """
 
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import re
 import signal
 import subprocess  # noqa: S404 — the child argv is the caller's own analyzer
@@ -182,6 +186,160 @@ _FORWARDED_SIGNALS = tuple(
 )
 
 
+# --- Windows: the analyzer dies with the wrapper (v0.2.103 L-5 / R17-2) -----
+#
+# POSIX keeps the claim alive under a wrapper-only kill by letting the child
+# INHERIT the flock descriptor. Windows has no equivalent: the
+# ``msvcrt.locking`` byte-range lock belongs to the wrapper PROCESS, and
+# ``TerminateProcess`` (Stop-Process, Task Manager, the launcher's kill)
+# cannot be caught, so a wrapper-only kill freed the claim while the analyzer
+# walked on — admitting a twin. The Windows mechanism is the inverse one: the
+# analyzer is put in a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+# whose ONLY handle lives in the wrapper. When the wrapper dies (any way —
+# the kernel closes its handles), the job closes and the kernel terminates
+# every process in it: the analyzer and anything it spawned after the
+# assignment. Claim and walk end together.
+#
+# The handle is created non-inheritable (NULL security attributes), so the
+# child never holds a copy that would keep the job open. Nested jobs are
+# supported since Windows 8, so a wrapper that itself runs inside a job (a
+# launcher, a CI runner) can still assign its child. Residual window: a
+# process the analyzer spawns in the microseconds between ``CreateProcess``
+# and the assignment is not in the job (the analyzer is a Python script
+# whose first spawns happen long after interpreter start-up). If any step
+# fails, the walk still runs and one stderr line says the wrapper-kill
+# protection is off for it — the walk itself is never refused for this.
+
+#: JOBOBJECTINFOCLASS value for JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_ulonglong) for name in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+    )]
+
+
+class _JobBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _JobExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _load_kernel32():  # pragma: no cover — Windows only
+    """kernel32 with explicit signatures (HANDLE is pointer-sized: a default
+    ``int`` return would truncate it on 64-bit)."""
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k32.AssignProcessToJobObject.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    return k32
+
+
+def _last_error() -> int:
+    get = getattr(ctypes, "get_last_error", None)
+    return int(get()) if get is not None else 0
+
+
+def _bind_child_to_kill_on_close_job(pid: int, kernel32=None) -> Optional[int]:
+    """Put process ``pid`` in a fresh KILL_ON_JOB_CLOSE job; return the job
+    handle (held by THIS process only), or ``None`` after one stderr line when
+    any step fails. ``kernel32`` is injectable for tests."""
+    k32 = kernel32 if kernel32 is not None else _load_kernel32()
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        _warn_job(f"CreateJobObjectW failed (error {_last_error()})")
+        return None
+    info = _JobExtendedLimitInformation()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not k32.SetInformationJobObject(
+            job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info), ctypes.sizeof(info)):
+        _warn_job(f"SetInformationJobObject failed (error {_last_error()})")
+        k32.CloseHandle(job)
+        return None
+    proc = k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+    if not proc:
+        _warn_job(f"OpenProcess({pid}) failed (error {_last_error()})")
+        k32.CloseHandle(job)
+        return None
+    try:
+        if not k32.AssignProcessToJobObject(job, proc):
+            _warn_job(f"AssignProcessToJobObject failed (error {_last_error()})")
+            k32.CloseHandle(job)
+            return None
+    finally:
+        k32.CloseHandle(proc)
+    return job
+
+
+def _warn_job(detail: str) -> None:
+    print(
+        f"[codegraph-walk] WARNING: could not tie the analyzer to this "
+        f"wrapper's life ({detail}) — killing only the wrapper would leave "
+        f"the walk running without its claim",
+        file=sys.stderr, flush=True,
+    )
+
+
+def _tie_child_to_wrapper(pid: int) -> Optional[int]:
+    """Platform branch: on Windows bind ``pid`` to a kill-on-close job (the
+    returned handle must stay open until the child has ended); a no-op
+    returning ``None`` on POSIX, where the inherited flock descriptor and
+    signal forwarding already cover a wrapper kill."""
+    if sys.platform != "win32":
+        return None
+    try:
+        return _bind_child_to_kill_on_close_job(pid)
+    except Exception as exc:  # noqa: BLE001 — never fail the walk for this
+        _warn_job(f"{type(exc).__name__}: {exc}")
+        return None
+
+
+def _release_job(job: Optional[int], kernel32=None) -> None:
+    """Close the job handle once the child has ended (kills any straggler the
+    analyzer left in the job — the walk is over either way)."""
+    if job is None:
+        return
+    try:
+        (kernel32 if kernel32 is not None else _load_kernel32()).CloseHandle(job)
+    except Exception:  # noqa: BLE001 — process exit closes it anyway
+        pass
+
+
 def _run_child(child: List[str], *, cwd: "str | Path | None",
                claim_fd: Optional[int] = None) -> int:
     """Run the analyzer child to completion and return its exit code.
@@ -193,8 +351,10 @@ def _run_child(child: List[str], *, cwd: "str | Path | None",
       descriptor, so the claim is held for the child's whole life even if
       the wrapper is killed outright (SIGKILL cannot be forwarded) — a
       wrapper-only kill can no longer free the claim under a running walk
-      and admit a twin. On Windows the byte-range lock is per process; there
-      a terminate of the wrapper (``TerminateProcess``) cannot be caught.
+      and admit a twin. On Windows the byte-range lock is per process and
+      ``TerminateProcess`` cannot be caught, so the child is instead bound to
+      a kill-on-close Job Object held by the wrapper
+      (:func:`_tie_child_to_wrapper`): the wrapper's death ends the analyzer.
     * Any other exception while waiting (KeyboardInterrupt) ends the child
       too, as ``subprocess.run`` does.
     """
@@ -220,6 +380,7 @@ def _run_child(child: List[str], *, cwd: "str | Path | None",
         pass_fds = (claim_fd,) if claim_fd is not None else ()
         proc = subprocess.Popen(child, cwd=cwd, pass_fds=pass_fds)  # noqa: S603
         state["proc"] = proc
+        job = _tie_child_to_wrapper(proc.pid)
         for signum in state["pending"]:
             _forward(signum, None)
         try:
@@ -232,6 +393,8 @@ def _run_child(child: List[str], *, cwd: "str | Path | None",
             proc.kill()
             proc.wait()
             raise
+        finally:
+            _release_job(job)
     finally:
         for sig, handler in previous.items():
             try:
@@ -312,7 +475,8 @@ def run_claimed(script: "str | Path", args: Sequence[str], *, cwd: "str | Path |
     the claim is held (nothing spawned); scoped incrementals run without the
     claim. The claim is held for the ANALYZER's life, not just this
     wrapper's: a terminate signal to the wrapper is forwarded to the child,
-    and on POSIX the child inherits the claim itself (:func:`_run_child`).
+    on POSIX the child inherits the claim itself, and on Windows the child is
+    bound to a kill-on-close job held by the wrapper (:func:`_run_child`).
     """
     argv = [str(a) for a in args]
     child = [sys.executable, str(script), *argv]
@@ -340,7 +504,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     The claim-taking wrapper every shell/launcher spawn of a full or pruning
     walk routes through (module docstring). Stdio is inherited; the exit code
     is the analyzer's, or :data:`WALK_ALREADY_RUNNING_RC` on refusal.
+
+    The wrapper's own lines (the refusal above all) usually reach the user
+    through a PowerShell/shell wrapper's pipe on Windows, so its streams are
+    made console-safe first (:func:`vco_lib.console_text.harden_stdio`).
     """
+    from vco_lib.console_text import harden_stdio
+
+    harden_stdio()
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         print(

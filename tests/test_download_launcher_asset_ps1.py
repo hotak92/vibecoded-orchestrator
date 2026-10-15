@@ -26,11 +26,13 @@ asserts exit 0 + the binary landing on disk.
 
 from __future__ import annotations
 
+import hashlib
 import http.server
 import io
 import json
 import shutil
 import subprocess
+import sys
 import threading
 import zipfile
 from pathlib import Path
@@ -85,7 +87,7 @@ class _FixtureServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def log_message(self, *args):  # silence test output
+            def log_message(self, format, *args):  # noqa: A002 — silence test output
                 pass
 
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -111,10 +113,17 @@ def _release_json(server: _FixtureServer, asset_names: list[str]) -> bytes:
     return json.dumps({"tag_name": "v0.2.53", "assets": assets}).encode()
 
 
-def _run_helper(dest_dir: Path, api_url: str) -> subprocess.CompletedProcess:
+def _sidecar(blob: bytes, name: str) -> bytes:
+    """A sha256sum-shaped sidecar for *blob*, as release.yml publishes it."""
+    return f"{hashlib.sha256(blob).hexdigest()}  {name}\n".encode()
+
+
+def _run_helper(dest_dir: Path, api_url: str, *,
+                python_exe: str | None = sys.executable) -> subprocess.CompletedProcess:
+    extra = ["-PythonExe", python_exe] if python_exe else []
     return subprocess.run(
         [
-            _pwsh(),
+            _pwsh() or "pwsh",
             *PWSH_BASE_FLAGS,
             "-NonInteractive",
             "-File",
@@ -127,6 +136,7 @@ def _run_helper(dest_dir: Path, api_url: str) -> subprocess.CompletedProcess:
             # would false-trip TOO_SMALL.
             "-MinSizeBytes",
             "1024",
+            *extra,
         ],
         capture_output=True,
         text=True,
@@ -154,7 +164,8 @@ def test_zip_only_release_downloads_and_extracts(tmp_path: Path) -> None:
     blobs: dict[str, bytes] = {
         # sha256 sidecars listed FIRST to prove the picker does not
         # grab them (they match '*windows*' but not EndsWith('.zip')).
-        "vibecoded-orchestrator-0.2.53-windows-x64.zip.sha256": b"deadbeef\n",
+        "vibecoded-orchestrator-0.2.53-windows-x64.zip.sha256": _sidecar(
+            zip_bytes, f"{inner}.zip"),
         "vibecoded-orchestrator-0.2.53-linux-x64.zip": b"not-windows",
         "vibecoded-orchestrator-0.2.53-linux-x64.zip.sha256": b"deadbeef\n",
         "vibecoded-orchestrator-0.2.53-macos-arm64.zip": b"not-windows",
@@ -203,10 +214,12 @@ def test_no_windows_asset_exits_2(tmp_path: Path) -> None:
 @pwsh_required
 def test_legacy_exe_asset_fallback(tmp_path: Path) -> None:
     """Pre-2026-05-10 packaging (bare .exe asset) still works."""
-    blobs = {"vct-launcher-windows-x64.exe": LAUNCHER_BYTES}
+    blobs = {"vct-launcher-windows-x64.exe": LAUNCHER_BYTES,
+             "vct-launcher-windows-x64.exe.sha256": _sidecar(
+                 LAUNCHER_BYTES, "vct-launcher-windows-x64.exe")}
     with _FixtureServer(blobs) as srv:
         srv.blobs["release.json"] = _release_json(
-            srv, ["vct-launcher-windows-x64.exe"]
+            srv, ["vct-launcher-windows-x64.exe", "vct-launcher-windows-x64.exe.sha256"]
         )
         dest = tmp_path / "dest"
         out = _run_helper(dest, srv.url("release.json"))
@@ -218,12 +231,88 @@ def test_legacy_exe_asset_fallback(tmp_path: Path) -> None:
 def test_zip_without_launcher_exits_4(tmp_path: Path) -> None:
     """Zip downloaded + extracted but no vct-launcher.exe inside -> exit 4."""
     inner = "vibecoded-orchestrator-0.2.53-windows-x64"
-    blobs = {f"{inner}.zip": _make_release_zip(inner, include_launcher=False)}
+    zip_bytes = _make_release_zip(inner, include_launcher=False)
+    blobs = {f"{inner}.zip": zip_bytes,
+             f"{inner}.zip.sha256": _sidecar(zip_bytes, f"{inner}.zip")}
     with _FixtureServer(blobs) as srv:
-        srv.blobs["release.json"] = _release_json(srv, [f"{inner}.zip"])
+        srv.blobs["release.json"] = _release_json(srv, [f"{inner}.zip", f"{inner}.zip.sha256"])
         out = _run_helper(tmp_path / "dest", srv.url("release.json"))
     assert out.returncode == 4, f"stdout={out.stdout}\nstderr={out.stderr}"
     assert "NO_BINARY_IN_ZIP" in out.stdout
+
+
+# ---------------------------------------------------------------------------
+# R20 M1: the archive is verified against the release's .sha256 sidecar
+# BEFORE anything is extracted or landed in -DestDir.
+# ---------------------------------------------------------------------------
+
+
+def _verify_case(tmp_path: Path, *, sidecar,
+                 python_exe: str | None = sys.executable) -> tuple[subprocess.CompletedProcess, Path]:
+    """``sidecar(zip_bytes, zip_name)`` builds the sidecar bytes (``None``:
+    the release lists no sidecar). The zip is built ONCE — its entries
+    carry the current time, so a second build could hash differently."""
+    inner = "vibecoded-orchestrator-0.2.103-windows-x64"
+    zip_bytes = _make_release_zip(inner)
+    blobs = {f"{inner}.zip": zip_bytes}
+    sidecar = sidecar(zip_bytes, f"{inner}.zip") if sidecar else None
+    names = [f"{inner}.zip"]
+    if sidecar is not None:
+        blobs[f"{inner}.zip.sha256"] = sidecar
+        names.append(f"{inner}.zip.sha256")
+    dest = tmp_path / "dest"
+    with _FixtureServer(blobs) as srv:
+        srv.blobs["release.json"] = _release_json(srv, names)
+        out = _run_helper(dest, srv.url("release.json"), python_exe=python_exe)
+    return out, dest
+
+
+@pwsh_required
+def test_matching_checksum_lands_the_binary(tmp_path: Path) -> None:
+    out, dest = _verify_case(tmp_path, sidecar=_sidecar)
+    assert out.returncode == 0, f"stdout={out.stdout}\nstderr={out.stderr}"
+    assert "Checksum verified" in out.stdout
+    assert (dest / "vct-launcher.exe").read_bytes() == LAUNCHER_BYTES
+
+
+@pwsh_required
+def test_checksum_mismatch_exits_5_and_lands_nothing(tmp_path: Path) -> None:
+    out, dest = _verify_case(
+        tmp_path, sidecar=lambda _b, name: f"{'0' * 64}  {name}\n".encode())
+    assert out.returncode == 5, f"stdout={out.stdout}\nstderr={out.stderr}"
+    assert "CHECKSUM_MISMATCH" in out.stdout
+    assert not (dest / "vct-launcher.exe").exists()
+    assert not (dest / "vct-hub.exe").exists()
+
+
+@pwsh_required
+def test_missing_sidecar_exits_6_and_lands_nothing(tmp_path: Path) -> None:
+    out, dest = _verify_case(tmp_path, sidecar=None)
+    assert out.returncode == 6, f"stdout={out.stdout}\nstderr={out.stderr}"
+    assert "UNVERIFIED" in out.stdout
+    assert not (dest / "vct-launcher.exe").exists()
+
+
+@pwsh_required
+def test_crashed_verifier_is_unverified_not_a_mismatch(tmp_path: Path) -> None:
+    """A verifier that dies with exit 1 (traceback, broken venv, failed
+    vco_lib import) must not be reported as a checksum mismatch (R22 N1)."""
+    crash = tmp_path / "crashing-python"
+    crash.write_text("#!/bin/sh\necho 'Traceback: ModuleNotFoundError' >&2\nexit 1\n")
+    crash.chmod(0o755)
+    out, dest = _verify_case(tmp_path, sidecar=_sidecar, python_exe=str(crash))
+    assert out.returncode == 6, f"stdout={out.stdout}\nstderr={out.stderr}"
+    assert "UNVERIFIED" in out.stdout
+    assert "CHECKSUM_MISMATCH" not in out.stdout
+    assert not (dest / "vct-launcher.exe").exists()
+
+
+@pwsh_required
+def test_no_verifier_interpreter_exits_6_and_lands_nothing(tmp_path: Path) -> None:
+    """Without -PythonExe nothing can be verified, so nothing is run."""
+    out, dest = _verify_case(tmp_path, sidecar=_sidecar, python_exe=None)
+    assert out.returncode == 6, f"stdout={out.stdout}\nstderr={out.stderr}"
+    assert not (dest / "vct-launcher.exe").exists()
 
 
 # ---------------------------------------------------------------------------

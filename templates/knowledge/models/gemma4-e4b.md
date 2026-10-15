@@ -24,7 +24,7 @@ For `gemma4:e4b` at q4_K_M the orchestrator's `VISION_MODEL_REQUIREMENTS` table 
 
 ## Where the orchestrator uses it
 
-- **KG-summary generation fallback**: `generate-kg-summary.py` targets `gemma4:e4b` when the Claude CLI is unavailable and the host is not capable enough for `qwen3.5:9b`. `install.py`'s `select_kg_summary_backend` picks it for GPU hosts with ≥6 GB but <16 GB VRAM, or CPU hosts with ≥12 GB RAM and ≥6 cores. It is the primary local fallback for summarization on mid- and low-power machines.
+- **KG-summary generation fallback**: the hardware tier table picks `gemma4:e4b` for hosts with NO GPU and ≥12 GB RAM and ≥6 cores. It is not a GPU rung: its free-VRAM floor (on-disk size, ~9 GB for copies pulled before the tag's 2026-09-29 re-publication, plus a max(1 GB, 40 %) KV margin) is no lower than `qwen3.5:9b`'s, so a card that fits it gets the stronger `qwen3.5:9b`, and 6–9 GB cards get `qwen3.5:4b`.
 - **Bundled by `install.py`**: pulled via `ollama pull` on capable hosts (alongside `qwen3.5:9b`) and as the low-power summary model on hosts that cannot run `qwen3.5:9b`; the `low_resource` preset also lists it in its inference-model override.
 - **Not exposed as an MCP tool**: there is no Ollama MCP — Claude's built-in vision and reasoning handle vision/chat use cases. Gemma 4 E4B remains available via Ollama's REST API for direct use outside VCO's default stack.
 

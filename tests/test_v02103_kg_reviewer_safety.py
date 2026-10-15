@@ -1260,6 +1260,9 @@ def _fake_subprocess(behaviour: Callable[[dict], str], calls: list):
 
 def _run_chain(chain, monkeypatch, repo, behaviour, calls) -> str:
     monkeypatch.setattr(chain, "subprocess", _fake_subprocess(behaviour, calls))
+    # The spawn resolves the CLI's path (PATHEXT on Windows); the fake
+    # subprocess answers for argv[0] == "claude".
+    monkeypatch.setattr(chain, "resolve_claude_executable", lambda: "claude")
     monkeypatch.setattr(chain, "select_reviewer_backend",
                         lambda log=None, model=None: {
                             "mode": "claude", "model": "sonnet",
@@ -1268,6 +1271,60 @@ def _run_chain(chain, monkeypatch, repo, behaviour, calls) -> str:
     log = repo.parent / "review.log"
     chain.main(["run", "--project-root", str(repo), "--log", str(log)])
     return log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+def _decide_sonnet(log=None, model=None) -> dict:
+    return {"mode": "claude", "model": "sonnet", "base_url": None, "reason": "t"}
+
+
+def test_run_spawns_the_resolved_cli_path_not_a_bare_name(chain, monkeypatch, repo):
+    """v0.2.103 Windows verification: an npm-installed CLI is `claude.cmd`;
+    `shutil.which` finds it through PATHEXT but CreateProcess does not, so a
+    bare "claude" argv[0] raised FileNotFoundError on every reviewed commit.
+    RED before the fix: argv[0] was the literal "claude"."""
+    resolved = str(repo.parent / "bin" / "claude.CMD")
+    seen: list = []
+
+    def run(cmd, *a, **kw):
+        if cmd and cmd[0] == resolved:
+            seen.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout=_stream(), stderr="")
+        if cmd and cmd[0] == "claude":
+            raise FileNotFoundError(2, "bare name: CreateProcess cannot see .cmd")
+        return _REAL_RUN(cmd, *a, **kw)
+
+    monkeypatch.setattr(chain, "subprocess", types.SimpleNamespace(
+        run=run, TimeoutExpired=subprocess.TimeoutExpired,
+        CompletedProcess=subprocess.CompletedProcess,
+        DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE))
+    monkeypatch.setattr(chain.shutil, "which",
+                        lambda name: resolved if name == "claude" else None)
+    monkeypatch.setattr(chain, "select_reviewer_backend", _decide_sonnet)
+    monkeypatch.setattr(chain, "_record_outcome", lambda *a, **k: None)
+    log = repo.parent / "review.log"
+    assert chain.main(["run", "--project-root", str(repo), "--log", str(log)]) == 0
+    assert seen and seen[0][0] == resolved and seen[0][1] == "-p"
+
+
+def test_run_with_the_cli_gone_at_spawn_time_spawns_nothing(chain, monkeypatch, repo):
+    """LEAVE-ALONE: the CLI vanished between the availability check and the
+    spawn: nothing is spawned, a line says so, no breaker strike."""
+    calls: list = []
+    monkeypatch.setattr(chain, "subprocess", _fake_subprocess(lambda kw: "", calls))
+    monkeypatch.setattr(chain, "resolve_claude_executable", lambda: None)
+    monkeypatch.setattr(chain, "select_reviewer_backend", _decide_sonnet)
+    struck: list = []
+    monkeypatch.setattr(chain, "_record_outcome", lambda *a, **k: struck.append(a))
+    log = repo.parent / "review.log"
+    assert chain.main(["run", "--project-root", str(repo), "--log", str(log)]) == 127
+    assert calls == [] and struck == []
+    assert "no longer on PATH" in log.read_text(encoding="utf-8")
+
+
+def test_build_claude_cmd_takes_the_resolved_executable(chain):
+    cmd = chain.build_claude_cmd("sonnet", 30, executable=r"C:\bin\claude.cmd")
+    assert cmd[0] == r"C:\bin\claude.cmd" and cmd[1] == "-p"
+    assert chain.build_claude_cmd("sonnet", 30)[0] == "claude"
 
 
 def test_run_end_to_end_reverts_the_incident_and_commits_only_good_nodes(

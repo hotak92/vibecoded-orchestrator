@@ -330,28 +330,17 @@ if defined LAUNCHER_BIN (
     call :_log_event "binary-probe" "skip" "no existing launcher binary on disk"
 )
 
-REM Binary not found — present the same 3-way menu as the bash helper.
+REM Binary not found. Owner rule 2026-10-15 (one home:
+REM vco_lib\launcher_acquire.py, shared with scripts/post-install-launcher.sh):
+REM a prebuilt for this OS/arch/version is downloaded WITHOUT a prompt;
+REM "build from source or skip?" is asked only when no prebuilt could be
+REM obtained (see :launch_no_prebuilt).
 echo.
-echo ===============================================
-echo   Launcher binary not found. Choose how to get it:
-echo ===============================================
-echo   [1] Download prebuilt ^(recommended^) - fast, ~22 MB
-echo        ^(downloads vibecoded-orchestrator-^<version^>-windows-x64.zip from latest GitHub Release^)
-echo   [2] Build from source - slower, requires Node + Tauri toolchain
-echo        ^(auto-installs Node via winget if missing, then runs pnpm tauri build^)
-echo   [3] Skip ^(build later manually^)
-echo.
+echo [launcher] No usable launcher binary on disk - fetching the prebuilt one.
 
-set "CHOICE=1"
-if "%YES_FLAG%"=="1" (
-    echo [launcher] --yes / non-interactive: defaulting to [1] download
-) else (
-    set /p "CHOICE=Your choice [1]: "
-    if not defined CHOICE set "CHOICE=1"
-)
-
-if "%CHOICE%"=="3" goto :launch_skip
-if "%CHOICE%"=="2" goto :launch_build
+REM The rule's interpreter: the venv install.py just created (empty if absent).
+set "ACQ_PY="
+if exist "%~dp0.venv\Scripts\python.exe" set "ACQ_PY=%~dp0.venv\Scripts\python.exe"
 goto :launch_download
 
 :launch_download
@@ -377,8 +366,27 @@ REM (downloads + Expand-Archive + lands vct-launcher.exe, vct-hub.exe,
 REM vct-updater.exe in %DEST_DIR%) and keeps the bare-.exe asset as a
 REM legacy fallback. Windows sibling of the POSIX M-P0-3 fix in
 REM scripts/post-install-launcher.sh. Exit codes: 0 ok, 2 NO_ASSET,
-REM 3 TOO_SMALL, 4 NO_BINARY_IN_ZIP, 1 generic.
-"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lib\download-launcher-asset.ps1" -DestDir "%DEST_DIR%"
+REM 3 TOO_SMALL, 4 NO_BINARY_IN_ZIP, 1 generic, 5 CHECKSUM_MISMATCH,
+REM 6 UNVERIFIED (R20 M1: the archive is checked against the release's
+REM .zip.sha256 sidecar by "python -m vco_lib.launcher_acquire verify-sha256",
+REM the same verifier post-install-launcher.sh calls; without ACQ_PY nothing
+REM can be verified, so nothing is run - exit 6 -> :launch_no_prebuilt).
+REM The release asked for is THIS checkout's version (launcher_acquire
+REM api-url, must match post-install-launcher.sh); the helper's own default
+REM (the newest release) applies only when the rule's interpreter is absent.
+set "API_URL="
+if defined ACQ_PY (
+    for /f "usebackq delims=" %%U in (`"%ACQ_PY%" -m vco_lib.launcher_acquire api-url 2^>nul`) do set "API_URL=%%U"
+)
+REM -PythonExe only when there is one: Windows PowerShell 5.1 drops an empty
+REM quoted -File argument and then fails with "Missing an argument".
+set "PY_ARG="
+if defined ACQ_PY set PY_ARG=-PythonExe "%ACQ_PY%"
+if defined API_URL (
+    "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lib\download-launcher-asset.ps1" -DestDir "%DEST_DIR%" -ApiUrl "%API_URL%" %PY_ARG%
+) else (
+    "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lib\download-launcher-asset.ps1" -DestDir "%DEST_DIR%" %PY_ARG%
+)
 set "DL_EXIT=%ERRORLEVEL%"
 
 if "%DL_EXIT%"=="0" (
@@ -386,8 +394,31 @@ if "%DL_EXIT%"=="0" (
     call :_log_event "download" "ok" "windows launcher downloaded (zip or legacy exe)"
     goto :auto_launch
 )
-echo [launcher] Download failed ^(exit %DL_EXIT%^). Falling back to build.
-call :_log_event "download" "error" "windows download failed; falling back to build"
+if "%DL_EXIT%"=="5" echo [launcher] The downloaded launcher failed its SHA-256 check against the release - discarded, not run.
+if "%DL_EXIT%"=="6" echo [launcher] The downloaded launcher could not be verified ^(no checksum or no verifier^) - not run.
+echo [launcher] No prebuilt launcher obtained ^(download exit %DL_EXIT%^).
+call :_log_event "download" "error" "windows download failed; no prebuilt obtained"
+goto :launch_no_prebuilt
+
+:launch_no_prebuilt
+REM Only NOW is the user asked about compiling (launcher_acquire next-step:
+REM unattended -> build; interactive -> ask; rule not runnable -> ask).
+set "NEXT_STEP=ask"
+if defined ACQ_PY (
+    if "%YES_FLAG%"=="1" (
+        for /f "usebackq delims=" %%S in (`"%ACQ_PY%" -m vco_lib.launcher_acquire next-step --outcome no-prebuilt --yes 2^>nul`) do set "NEXT_STEP=%%S"
+    ) else (
+        for /f "usebackq delims=" %%S in (`"%ACQ_PY%" -m vco_lib.launcher_acquire next-step --outcome no-prebuilt 2^>nul`) do set "NEXT_STEP=%%S"
+    )
+)
+if /I "%NEXT_STEP%"=="build" goto :launch_build
+echo.
+echo [launcher] No prebuilt launcher is available for this OS/arch/version.
+echo   [b] Build from source ^(slower; needs Node + the Tauri toolchain^)
+echo   [s] Skip ^(build later manually^)
+set "BUILD_ANS=b"
+set /p "BUILD_ANS=Your choice [b]: "
+if /I "%BUILD_ANS%"=="s" goto :launch_skip
 goto :launch_build
 
 :launch_build

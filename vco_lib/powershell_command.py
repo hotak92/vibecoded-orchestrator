@@ -772,6 +772,11 @@ def _paren_body(toks: List[_Tok], open_idx: int) -> Tuple[List[_Tok], int]:
     return body, len(toks)
 
 
+#: The per-item pipeline cmdlet and its aliases (``foreach`` is the alias
+#: only in COMMAND position after a pipe; the keyword takes ``(``).
+_PS_FOREACH_OBJECT = frozenset({"foreach-object", "foreach", "%"})
+
+
 def _brace_body(toks: List[_Tok], open_idx: int) -> Tuple[List[_Tok], int]:
     """Tokens inside the ``{`` at ``open_idx`` up to its matching ``}``."""
     depth = 0
@@ -999,8 +1004,12 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
     A loop doing real work passes (``foreach ($f in Get-ChildItem) { ruff
     check $f }``); a condition that consumes input bounds the loop
     (``while (($l = $r.ReadLine()) -ne $null) { $l }`` — the ``while
-    read`` twin); a bounded ``for`` (non-empty middle clause) and a
-    ``foreach`` over a collection pass whatever the body does.
+    read`` twin); a bounded ``for`` (non-empty middle clause), a
+    ``foreach`` over a collection and a ``… | ForEach-Object { … }``
+    stage are never busy-waits or polls — but a WAIT inside them still
+    denies, as a sleep inside a Bash ``for`` or an xargs per-item command
+    does (v0.2.103 Windows verification: before, a bounded loop's wait
+    was never looked at).
 
     Keywords are recognised only as unquoted words followed by their
     syntax (``(`` / ``{``), so ``Write-Output "while (x)"`` and the
@@ -1019,6 +1028,11 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
         evidence = ""
         cond: List[_Tok] = []
         body: List[_Tok] = []
+        # A `for (init; cond; repeat)` header: every clause runs as part
+        # of the loop, so a wait in ANY of them is a loop wait (R20 M2 —
+        # the repeat clause escaped when only `cond` was scanned; the Bash
+        # twin is wait_guard._arith_for_clauses).
+        header: List[_Tok] = []
         unbounded = False
         if word == "do" and nxt is not None and nxt.op == "{":
             body, end = _brace_body(toks, i + 1)
@@ -1046,11 +1060,17 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
                         parts[-1].append(b)
                 bounded = len(parts) >= 2 and bool(parts[1])
                 cond = parts[1] if bounded else []
+                header = paren
                 body, _ = _brace_body(toks, pend + 1)
                 if not bounded:
                     label = "for (;;) loop"
                     evidence = "for (...; ; ...)"
                     unbounded = True
+                else:
+                    # A bounded for is judged for a WAIT only (the Bash
+                    # twin `for ((i=0;i<n;i++)); do sleep 1; …` denies).
+                    label = "for loop"
+                    evidence = f"for ({' '.join(b.text for b in paren)[:60]})"
             elif word == "foreach":
                 src = " ".join(b.text for b in paren)
                 cond = paren
@@ -1062,9 +1082,23 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
                     label = "unbounded foreach"
                     evidence = f"foreach ({src[:60]})"
                     unbounded = True
+                else:
+                    # A foreach over a collection: judged for a WAIT only
+                    # (the Bash twin `for f in a b; do sleep 1; …` denies).
+                    label = "foreach loop"
+                    evidence = f"foreach ({src[:60]})"
+        elif (word in _PS_FOREACH_OBJECT and nxt is not None and nxt.op == "{"
+                and i > 0 and toks[i - 1].op == "|"):
+            # The per-item pipeline stage — `… | ForEach-Object { … }` (and
+            # its `foreach` / `%` aliases): the twin of an xargs per-item
+            # command, judged for a WAIT only (bounded by its input).
+            body, _ = _brace_body(toks, i + 1)
+            label = "ForEach-Object loop"
+            evidence = f"{t.text} {{ ... }}"
         if label is None:
             continue
-        if _ps_loop_has_wait(cond) or _ps_loop_has_wait(body):
+        if (_ps_loop_has_wait(cond) or _ps_loop_has_wait(header)
+                or _ps_loop_has_wait(body)):
             return (label, evidence)
         cond_text = " ".join(b.text for b in cond)
         if _PS_INPUT_COND_RE.search(cond_text):

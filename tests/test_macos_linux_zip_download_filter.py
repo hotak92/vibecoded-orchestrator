@@ -8,72 +8,46 @@ publishes `.zip` for both, so the filter always missed the actual
 asset and the script fell through to the build path. This is the third
 silent-failure layer on top of M-P0-1 + M-P0-2.
 
-This test:
-1. Extracts the embedded Python `pick()` block from
-   `scripts/post-install-launcher.sh`.
-2. Runs it standalone against a synthetic GitHub-Releases JSON that
-   ships only `.zip` assets (matching the real release.yml output).
-3. Asserts the picker returns the right asset for macOS-arm64 and
-   Linux-x64.
-4. Also exercises a legacy-DMG/AppImage release payload to confirm
+This test drives the picker through the SAME call the shell script makes
+(R20 L2: the picker moved from an inline here-doc fed by an env var — which
+an over-128 KiB release document turns into E2BIG — into
+``python -m vco_lib.launcher_acquire pick-asset --release-json <file>``):
+
+1. The release JSON is written to a file and the CLI is run as a
+   subprocess, exactly as post-install-launcher.sh runs it.
+2. Asserts the picker returns the right asset for macOS-arm64 and
+   Linux-x64, plus the URL of its ``.sha256`` sidecar (R20 M1).
+3. Also exercises a legacy-DMG/AppImage release payload to confirm
    the fallback still works for legacy assets.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "post-install-launcher.sh"
 
 
-def _extract_pick_block(src: str) -> str:
-    """Pull out the inline `python3 - "$OS" <<'PY' ... PY` block."""
-    m = re.search(
-        r"python3 - \"\$OS\" <<'PY'\n(.*?)\nPY\n",
-        src,
-        re.DOTALL,
-    )
-    assert m, "Could not locate embedded Python pick block"
-    return m.group(1)
-
-
-def _run_pick(pick_src: str, os_name: str, arch: str, assets: list[dict]) -> dict:
-    """Run the embedded picker with os_name + arch + synthetic release JSON."""
-    # We need to inject `arch` overriding the platform.machine() call.
-    # Wrap the original code so platform.machine() returns our arch.
-    wrapper = textwrap.dedent(f"""
-        import sys, json, platform
-        _ORIG_MACHINE = platform.machine
-        platform.machine = lambda: {arch!r}
-        sys.argv = [sys.argv[0], {os_name!r}]
-        _release = {{"assets": {json.dumps(assets)}}}
-        # Replace stdin with the release JSON.
-        import io
-        sys.stdin = io.StringIO(json.dumps(_release))
-        # Now run the original block.
-    """)
-    full = wrapper + "\n" + pick_src
+def _run_pick(os_name: str, arch: str, assets: list[dict], tmp_path: Path) -> dict:
+    """Run the shared picker CLI on a release document held in a FILE."""
+    release = tmp_path / "release.json"
+    release.write_text(json.dumps({"assets": assets}), encoding="utf-8")
     out = subprocess.run(
-        [sys.executable, "-c", full],
-        capture_output=True,
-        text=True,
-        timeout=10,
+        [sys.executable, "-m", "vco_lib.launcher_acquire", "pick-asset",
+         "--os", os_name, "--arch", arch, "--release-json", str(release)],
+        capture_output=True, text=True, timeout=30, cwd=str(REPO_ROOT),
     )
+    if out.returncode == 2:
+        return {"url": "", "name": "", "sha256_url": ""}
     assert out.returncode == 0, (
-        f"pick block exit {out.returncode}; stderr={out.stderr!r}"
+        f"pick-asset exit {out.returncode}; stderr={out.stderr!r}"
     )
-    lines = out.stdout.splitlines()
-    if not lines:
-        return {"url": "", "name": ""}
-    url = lines[0] if len(lines) >= 1 else ""
-    name = lines[1] if len(lines) >= 2 else ""
-    return {"url": url, "name": name}
+    lines = out.stdout.splitlines() + ["", "", ""]
+    return {"url": lines[0], "name": lines[1], "sha256_url": lines[2]}
 
 
 def _zip_only_release() -> list[dict]:
@@ -120,45 +94,45 @@ def _legacy_release() -> list[dict]:
     ]
 
 
-def test_pick_block_extractable():
-    pick_src = _extract_pick_block(SCRIPT.read_text())
-    assert "def pick(" in pick_src
-    assert "endswith(\".zip\")" in pick_src, (
-        "M-P0-3: pick block must accept .zip assets (release.yml output)"
-    )
+def test_script_calls_the_shared_picker_through_a_file():
+    """The shell no longer embeds a picker or passes the JSON in an env var."""
+    src = SCRIPT.read_text()
+    assert "vco_lib.launcher_acquire pick-asset" in src
+    assert '--release-json "$release_file"' in src
+    assert "VCT_RELEASE_JSON" not in src
+    assert "python3 - \"$OS\" <<'PY'" not in src
 
 
-def test_zip_only_macos_arm64():
-    pick_src = _extract_pick_block(SCRIPT.read_text())
-    r = _run_pick(pick_src, "macos", "arm64", _zip_only_release())
+def test_zip_only_macos_arm64(tmp_path):
+    r = _run_pick("macos", "arm64", _zip_only_release(), tmp_path)
     assert r["name"] == "vibecoded-orchestrator-v0.2.53-macos-arm64.zip", (
         f"macOS arm64 should pick the macos-arm64.zip asset, got: {r}"
     )
     assert r["url"] == "https://example.com/macos-arm64.zip"
+    assert r["sha256_url"] == "https://example.com/macos-arm64.zip.sha256"
 
 
-def test_zip_only_linux_x86_64():
-    pick_src = _extract_pick_block(SCRIPT.read_text())
-    r = _run_pick(pick_src, "linux", "x86_64", _zip_only_release())
+def test_zip_only_linux_x86_64(tmp_path):
+    r = _run_pick("linux", "x86_64", _zip_only_release(), tmp_path)
     assert r["name"] == "vibecoded-orchestrator-v0.2.53-linux-x64.zip", (
         f"Linux x86_64 should pick the linux-x64.zip asset, got: {r}"
     )
     assert r["url"] == "https://example.com/linux-x64.zip"
+    assert r["sha256_url"] == "https://example.com/linux-x64.zip.sha256"
 
 
-def test_legacy_dmg_macos_arm64_fallback():
+def test_legacy_dmg_macos_arm64_fallback(tmp_path):
     """Legacy .dmg path still picked when no .zip available."""
-    pick_src = _extract_pick_block(SCRIPT.read_text())
-    r = _run_pick(pick_src, "macos", "arm64", _legacy_release())
+    r = _run_pick("macos", "arm64", _legacy_release(), tmp_path)
     assert r["name"] == "vct-launcher-0.2.0-macos-arm64.dmg", (
         f"macOS arm64 fallback should pick legacy .dmg, got: {r}"
     )
+    assert r["sha256_url"] == ""  # no sidecar in that release
 
 
-def test_legacy_appimage_linux_fallback():
+def test_legacy_appimage_linux_fallback(tmp_path):
     """Legacy .appimage path still picked when no .zip available."""
-    pick_src = _extract_pick_block(SCRIPT.read_text())
-    r = _run_pick(pick_src, "linux", "x86_64", _legacy_release())
+    r = _run_pick("linux", "x86_64", _legacy_release(), tmp_path)
     assert r["name"].lower().endswith(".appimage"), (
         f"Linux fallback should pick .appimage, got: {r}"
     )

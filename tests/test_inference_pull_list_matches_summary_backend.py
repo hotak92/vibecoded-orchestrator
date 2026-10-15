@@ -34,6 +34,7 @@ from install import (  # noqa: E402
     _inference_models_for_capability,
     select_summary_backend,
 )
+from vco_lib.embedding_selection import _SUMMARY_BACKEND_QWEN35_4B  # noqa: E402
 
 
 def _sysinfo(has_gpu: bool, vram_gb: float, ram_gb: float) -> SystemInfo:
@@ -67,8 +68,9 @@ class PullListMatchesSummaryBackendTests(unittest.TestCase):
         self.assertEqual(summary_pick, _SUMMARY_BACKEND_QWEN35_9B)
         self.assertIn("qwen3.5:9b", pull_list)
 
-    def test_mid_vram_pulls_gemma_matching_summary_pick(self):
-        # 8 GB VRAM (below 16 GB qwen3.5:9b tier) → summary picks gemma
+    def test_mid_vram_pulls_the_small_rung_matching_summary_pick(self):
+        # 8 GB VRAM: qwen3.5:9b's free-VRAM floor does not fit → qwen3.5:4b
+        # (v0.2.103: gemma4:e4b's floor never fit a 6-12 GB card either)
         sysinfo = _sysinfo(has_gpu=True, vram_gb=8.0, ram_gb=64.0)
         with patch.object(install, "_probe_cpu_cores", return_value=8):
             summary_pick = select_summary_backend(
@@ -77,10 +79,11 @@ class PullListMatchesSummaryBackendTests(unittest.TestCase):
                 openai_consent=False, openai_key_available=False,
             )
             pull_list = _inference_models_for_capability(sysinfo)
-        self.assertEqual(summary_pick, _SUMMARY_BACKEND_GEMMA)
-        self.assertIn("gemma4:e4b", pull_list)
-        # Critical: qwen3.5:9b NOT pulled at 8 GB VRAM (would be wasted)
+        self.assertEqual(summary_pick, _SUMMARY_BACKEND_QWEN35_4B)
+        self.assertEqual(pull_list, ["qwen3.5:4b"])
+        # Critical: neither model whose floor misses an 8 GB card is pulled
         self.assertNotIn("qwen3.5:9b", pull_list)
+        self.assertNotIn("gemma4:e4b", pull_list)
 
     def test_cpu_capable_pulls_gemma_matching_summary_pick(self):
         # CPU-only, 64 GB RAM, 8 cores → summary picks gemma (CPU path)
@@ -118,7 +121,7 @@ class PullListMatchesSummaryBackendTests(unittest.TestCase):
         next summary backend, never a pull."""
         configurations = [
             (_sysinfo(has_gpu=True, vram_gb=24.0, ram_gb=64.0), 8, ["qwen3.5:9b"]),
-            (_sysinfo(has_gpu=True, vram_gb=8.0, ram_gb=64.0), 8, ["gemma4:e4b"]),
+            (_sysinfo(has_gpu=True, vram_gb=8.0, ram_gb=64.0), 8, ["qwen3.5:4b"]),
             (_sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=64.0), 8, ["gemma4:e4b"]),
             (_sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=16.0), 4, ["qwen3.5:0.8b"]),
             (_sysinfo(has_gpu=True, vram_gb=4.0, ram_gb=8.0), 2, ["qwen3.5:0.8b"]),
@@ -134,10 +137,10 @@ class PullListMatchesSummaryBackendTests(unittest.TestCase):
 
 #: (vram_gb, ram_gb, cores, the one model) — every tier of the shared table.
 TIERS = [
-    (24.0, 64.0, 8, "qwen3.5:9b"),     # >= 16 GB VRAM
+    (24.0, 64.0, 8, "qwen3.5:9b"),     # qwen3.5:9b's floor fits
     (16.0, 32.0, 8, "qwen3.5:9b"),
-    (8.0, 64.0, 8, "gemma4:e4b"),      # 6-16 GB VRAM
-    (0.0, 64.0, 8, "gemma4:e4b"),      # capable CPU
+    (8.0, 64.0, 8, "qwen3.5:4b"),      # only qwen3.5:4b's floor fits
+    (0.0, 64.0, 8, "gemma4:e4b"),      # capable CPU, no GPU
     (0.0, 16.0, 4, "qwen3.5:0.8b"),    # floor
     (4.0, 8.0, 2, "qwen3.5:0.8b"),
 ]
@@ -243,11 +246,12 @@ class RuntimeResolverMatchesInstallPullTests(unittest.TestCase):
 
         tiers = es.summary_model_tiers()
         self.assertEqual([t["model"] for t in tiers],
-                         ["qwen3.5:9b", "gemma4:e4b", es.SUMMARY_FLOOR_MODEL])
+                         ["qwen3.5:9b", "qwen3.5:4b", "gemma4:e4b", es.SUMMARY_FLOOR_MODEL])
         self.assertEqual(sorted({w for _v, _r, _c, w in TIERS}),
                          sorted(t["model"] for t in tiers))
-        self.assertIn(f"{es.SUMMARY_VRAM_QWEN35_9B_GB:g} GB", tiers[0]["when"])
-        self.assertIn(f"{es.SUMMARY_CPU_MIN_CORES}+ cores", tiers[1]["when"])
+        self.assertIn("9.1 GB+ VRAM", tiers[0]["when"])
+        self.assertIn("4.9 GB+ VRAM", tiers[1]["when"])
+        self.assertIn(f"{es.SUMMARY_CPU_MIN_CORES}+ cores", tiers[2]["when"])
         import io
         import json
         from contextlib import redirect_stdout

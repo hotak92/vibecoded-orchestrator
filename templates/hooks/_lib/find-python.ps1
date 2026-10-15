@@ -17,6 +17,16 @@
 # pre-NB-H2 behaviour) — for harnesses simulating an interpreter-less
 # machine and users who deliberately want PATH resolution.
 #
+# v0.2.103 (Windows field) - MUST MATCH the .sh sibling: the PATH fallback
+# skips the Microsoft Store app-execution-alias stubs
+# (`%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe` and friends), which only
+# print "Python was not found" (localized) and exit 9009. A WindowsApps
+# candidate is kept only if it actually runs Python (a real Store install
+# also lives there). On Windows the `py -3` launcher is preferred before
+# PATH names and resolved to the real interpreter path it starts. When the
+# ONLY candidates are alias stubs, one stderr line says so and $PY stays
+# empty. On non-Windows pwsh the order (python, py, python3) is unchanged.
+#
 # Usage (from any .ps1 hook):
 #     $LibDir = Join-Path $PSScriptRoot "_lib"
 #     . (Join-Path $LibDir "find-python.ps1")
@@ -35,15 +45,57 @@ if (-not $env:VCO_FIND_PYTHON_PATH_ONLY -and (Test-Path -LiteralPath $resolveVen
     # does for the hooks themselves.
     $PY = Resolve-VcoVenvPython -ScriptDir (Split-Path -Parent $PSScriptRoot)
 }
-if (-not $PY) {
-    foreach ($candidate in @('python', 'py', 'python3')) {
-        $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
-        if ($cmd) {
-            $PY = $cmd.Source
-            break
+# True when $Path is a Microsoft Store app-execution alias location
+# (-match is case-insensitive).
+function _FindPython-IsStoreAlias([string]$Path) {
+    return ($Path -match '[\\/]Microsoft[\\/]WindowsApps[\\/]')
+}
+$script:_FindPythonAliasSeen = $false
+# The first REAL interpreter among the PATH matches of the names given, in
+# order; a skipped stub sets $script:_FindPythonAliasSeen.
+function _FindPython-OnPath([string[]]$Names) {
+    foreach ($name in $Names) {
+        foreach ($cmd in @(Get-Command $name -CommandType Application -All -ErrorAction SilentlyContinue)) {
+            $src = $cmd.Source
+            if (-not $src) { continue }
+            if (_FindPython-IsStoreAlias $src) {
+                $ok = $false
+                try {
+                    & $src -c "import sys" *> $null
+                    $ok = ($LASTEXITCODE -eq 0)
+                } catch { $ok = $false }
+                if (-not $ok) {
+                    $script:_FindPythonAliasSeen = $true
+                    continue
+                }
+            }
+            return $src
         }
     }
+    return $null
 }
+$_fpOnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or ($IsWindows -eq $true)
+if (-not $PY -and $_fpOnWindows) {
+    # Windows: the py launcher first, resolved to the interpreter it runs.
+    $_fpLauncher = _FindPython-OnPath @('py')
+    if ($_fpLauncher) {
+        try {
+            $_fpExe = & $_fpLauncher -3 -c "import sys; print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $_fpExe) {
+                $_fpExe = ([string]($_fpExe | Select-Object -First 1)).Trim()
+                if ($_fpExe -and (Test-Path -LiteralPath $_fpExe -PathType Leaf)) { $PY = $_fpExe }
+            }
+        } catch { }
+    }
+}
+if (-not $PY) {
+    $PY = _FindPython-OnPath @('python', 'py', 'python3')
+}
+if (-not $PY -and $script:_FindPythonAliasSeen) {
+    [Console]::Error.WriteLine("VCO: no Python interpreter found - only the Microsoft Store 'python' alias stub is on PATH. Install Python (python.org or 'winget install Python.Python.3.12'), or turn the alias off in Settings > Apps > Advanced app settings > App execution aliases.")
+}
+Remove-Item -Path Function:\_FindPython-IsStoreAlias, Function:\_FindPython-OnPath -ErrorAction SilentlyContinue
+Remove-Variable -Name _FindPythonAliasSeen -Scope Script -ErrorAction SilentlyContinue
 # Make available to the dot-sourcing scope.
 #
 # `-Scope Script` (not `-Scope 1`): when this lib is dot-sourced (the only

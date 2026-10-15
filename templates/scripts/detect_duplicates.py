@@ -615,7 +615,7 @@ class DuplicateDetector:
                 # failure so `main` exits non-zero and prints "no verdict".
                 raise RuntimeError(
                     f"all {len(nodes)} nodes were skipped between the "
-                    "snapshot and their comparison ({self.nodes_skipped} "
+                    f"snapshot and their comparison ({self.nodes_skipped} "
                     "disappeared — re-synced under new uuids; "
                     f"{len(missing_vector_objects)} lack the target vector "
                     f"{target_vector!r}), so nothing was compared. The "

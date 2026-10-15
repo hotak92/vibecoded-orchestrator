@@ -304,17 +304,23 @@ from urllib.parse import urlsplit
 # fix is register item 22 + 24 (add the package to pyrightconfig, then move
 # `fileperms` to `vco_lib/`), both merge-lane items; when they land, delete
 # these three ignores and this comment.
-from model_router.fileperms import (  # pyright: ignore[reportMissingImports]
+#
+# v0.2.103: `install.py` and the `install-bundle` child it spawns run under the
+# SYSTEM interpreter, which has no venv editable install — so the checkout's
+# package is made importable first (one home: vco_lib.gateway_package).
+from vco_lib import jsonc_edit
+from vco_lib.atomic import atomic_copy_file, atomic_write_text
+from vco_lib.gateway_package import ensure_importable as _ensure_gateway_importable
+from vco_lib.jsonc_edit import sniff_indent, sniff_newline
+from vco_lib.paths import user_home
+
+_ensure_gateway_importable()
+from model_router.fileperms import (  # noqa: E402  # pyright: ignore[reportMissingImports]
     OwnerOnlyState,
     PermissionHardeningError,
     owner_only_state,
     restrict_to_owner,
 )
-
-from vco_lib import jsonc_edit
-from vco_lib.atomic import atomic_copy_file, atomic_write_text
-from vco_lib.jsonc_edit import sniff_indent, sniff_newline
-from vco_lib.paths import user_home
 
 # ---------------------------------------------------------------------------
 # The two keys this module is allowed to touch, and the env-block key names.

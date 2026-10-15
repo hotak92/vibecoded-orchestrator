@@ -326,6 +326,8 @@ def test_run_handles_a_hung_reviewer_timeout(chain, monkeypatch, tmp_path):
 
     monkeypatch.setattr(chain, "subprocess", types.SimpleNamespace(
         run=_raise, TimeoutExpired=_subprocess.TimeoutExpired))
+    # the spawn resolves the CLI path; the fake answers for the bare name
+    monkeypatch.setattr(chain, "resolve_claude_executable", lambda: "claude")
     log = tmp_path / "review.log"
     rc = chain.main(["run", "--project-root", str(repo), "--log", str(log)])
     assert rc == 124, rc
