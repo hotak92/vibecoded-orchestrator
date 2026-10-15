@@ -261,12 +261,18 @@ def _build_python_mcp_entries(
     # env — so the override goes the wrong direction. The launcher's
     # the env projection (config_projection) puts these in .claude/settings.json env where
     # they reach MCP subprocesses correctly. Don't shadow them here.
+    # v0.2.103: ACTIVE_EMBEDDING joined that list. A hard-coded
+    # ``ACTIVE_EMBEDDING=qwen3`` here overrode the one global embedding
+    # profile (written to .claude/settings.json env from launcher.db
+    # ``embedding.active_profile``) in every MCP subprocess, so an install on
+    # the arctic profile searched with the qwen3 vector. Every install /
+    # update rewrites this entry wholesale, which also removes the key from
+    # an existing registration.
     weaviate_env_raw = {
         "WEAVIATE_URL": weaviate_url,
         "OLLAMA_URL": ollama_url,
         "GRPC_PORT": str(grpc_port),
         "PYTHONPATH": pythonpath,
-        "ACTIVE_EMBEDDING": "qwen3",
         "CODE_EMBED_SERVICE_URL": code_embed_url,
     }
     weaviate_env, weaviate_dropped = _filter_env_for_global_json(weaviate_env_raw)

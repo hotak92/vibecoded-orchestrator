@@ -179,6 +179,48 @@ emit_surfaces = ["ledger"]
 notes = """The re-probe pass also re-checks reachability every --update; the \
 SIDE-EFFECTFUL `podman start` remediation stays behind --apply-deferred."""
 
+[conditions.install_python_env_broken]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103. The Weaviate collection bootstrap / KG seed \
+(`vco_lib.install_weaviate.collections_and_seed`) raised ImportError: the \
+interpreter running install.py lacks a module VCO's requirements ship. Before \
+v0.2.103 that read as `weaviate_unreachable_at_update` and restarted a healthy \
+container. action_required: the exit is an install/update run that repairs the \
+venv. Owned/drop-when-absent: every run re-attempts the seed, and a run whose \
+seed imports cleanly does not re-emit it. No dismiss_key — a broken install is \
+a real break, not a machine description to acknowledge."""
+
+[conditions.kg_seed_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103. The Weaviate collection bootstrap / KG seed raised an \
+exception that is neither a connection failure (→ weaviate_unreachable_at_update) \
+nor an ImportError (→ install_python_env_broken); the entry names its type and \
+message. No container start — the database was not the problem. \
+action_required (a non-transient error a human must read); owned/drop-when-absent: \
+the next run re-attempts the seed and a success does not re-emit it."""
+
+[conditions.root_kg_blocked_by_case_sibling]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (owner ruling 2026-10-15). The orchestrator root's KG name \
+(`vco_lib.root_kg_identity`'s decision: the white-label override, the populated \
+bound class it keeps, else the folder-derived name) cannot be created because \
+Weaviate holds a class differing from it only in case. VCO never adopts such a \
+class on its own (it may be another install's data or another model's vectors) \
+and never drops it; the seed is skipped. The exits are the user's: \
+`python -m vco_lib.root_kg_identity adopt --collection <sibling> --yes` (refused \
+unless written with the current embedding model) or removing the sibling. \
+Owned/drop-when-absent: step 7c re-decides every run, so the run after either \
+exit does not re-emit it."""
+
 [conditions.rebuild_pending_seed]
 class = "action_required"
 owner = "install.py"

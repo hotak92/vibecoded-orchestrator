@@ -286,7 +286,6 @@ mod tests {
                 "OLLAMA_URL",
                 "GRPC_PORT",
                 "PYTHONPATH",
-                "ACTIVE_EMBEDDING",
                 "CODE_EMBED_SERVICE_URL",
             ],
         );

@@ -307,6 +307,19 @@ _V02101_OWNED_ADDITIONS = frozenset({
 })
 
 
+# v0.2.103: the collections/seed step's two non-connection arms
+# (vco_lib.install_weaviate.collections_and_seed). Both are emitted INSIDE the
+# install.py run into that run's report (family A proper), so the run whose
+# seed no longer fails that way drops the row.
+_V02103_OWNED_ADDITIONS = frozenset({
+    "install_python_env_broken",
+    "kg_seed_failed",
+    # vco_lib.root_kg_identity's blocked decision, emitted by step 7c into
+    # the run report (install._root_kg_blocked_entry).
+    "root_kg_blocked_by_case_sibling",
+})
+
+
 # v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12, WP-04): fifteen ids registered in
 # wave 1 AHEAD of most of their emitters, every one `owned-drop-when-absent`
 # by the plan's ruling (state-keyed re-probe, R26). Two shapes:
@@ -773,7 +786,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             | _V0297_OWNED_ADDITIONS
             | _V0298_OWNED_ADDITIONS
             | _V02100_OWNED_ADDITIONS
-            | _V02101_OWNED_ADDITIONS,
+            | _V02101_OWNED_ADDITIONS
+            | _V02103_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

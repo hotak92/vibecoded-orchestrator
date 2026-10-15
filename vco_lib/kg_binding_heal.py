@@ -196,10 +196,13 @@ def _rebind_collection_names_to_on_disk_casing(
     extra_select_cols: tuple[str, ...] = (),
     do_rebind: Callable[..., None],
     resolve_conflict: Optional[Callable[..., None]] = None,
+    skip_row: Optional[Callable[[tuple], bool]] = None,
 ) -> list[tuple]:
     """Generic helper: rebind a SQLite table's ``collection_name`` column to
     the on-disk Weaviate casing when a case-different sibling exists in
-    ``existing_classes``.
+    ``existing_classes``. ``skip_row(row)`` True → the row is never rebound
+    (v0.2.103: the orchestrator root's rows — its name is never case-adopted,
+    owner ruling 2026-10-15).
 
     Algorithm (per row):
       1. ``SELECT project_id, collection_name, *extra_select_cols FROM <table>``.
@@ -246,6 +249,8 @@ def _rebind_collection_names_to_on_disk_casing(
         coll_name = row[1]
         if not coll_name:
             continue
+        if skip_row is not None and skip_row(row):
+            continue
         if coll_name in existing_classes:
             # Exact match — nothing to do.
             continue
@@ -282,12 +287,26 @@ def _rebind_collection_names_to_on_disk_casing(
     return rebinds
 
 
+def root_project_ids(cur) -> "set[str]":
+    """The orchestrator-root project id(s) (``projects.host``); empty when the
+    table cannot be read. v0.2.103: their binding rows are never adopted onto
+    another class by a heal pass — the root's name is
+    ``vco_lib.root_kg_identity``'s decision, and adopting an existing class is
+    an explicit consent step."""
+    try:
+        cur.execute("SELECT id FROM projects WHERE host = 'orchestrator_root'")
+        return {str(r[0]) for r in cur.fetchall() if r and r[0]}
+    except sqlite3.Error:
+        return set()
+
+
 def _prefix_adopt_kg_bindings_pass(
     cur,
     *,
     existing_classes: set[str],
     existing_by_lower: dict[str, str],
     weaviate_url: str,
+    skip_project_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> dict[str, list]:
     """Second-pass cross-prefix adoption for ``project_kg_bindings``.
 
@@ -361,7 +380,7 @@ def _prefix_adopt_kg_bindings_pass(
 
     for row in rows:
         proj_id, role, coll_name, config_json = row
-        if not coll_name:
+        if not coll_name or proj_id in skip_project_ids:
             continue
         # Pass-1 already aligned exact-match and case-sibling rows.
         if coll_name in existing_classes:
@@ -2072,6 +2091,10 @@ def self_heal_kg_bindings(
                 )
                 rebinds.append((project_id, role, old_name, new_name))
 
+            # v0.2.103 (owner ruling 2026-10-15): never adopt another class
+            # onto the orchestrator root's rows (its name is root_kg_identity's
+            # decision; adoption is the explicit consent CLI).
+            _root_ids = root_project_ids(cur)
             try:
                 binding_rebinds = _rebind_collection_names_to_on_disk_casing(
                     cur,
@@ -2082,6 +2105,7 @@ def self_heal_kg_bindings(
                     existing_by_lower=existing_by_lower,
                     extra_select_cols=("role",),
                     do_rebind=_bind_rebind,
+                    skip_row=lambda row: row[0] in _root_ids,
                 )
             except sqlite3.OperationalError as oe:
                 if "no such table" in str(oe).lower():
@@ -2169,6 +2193,7 @@ def self_heal_kg_bindings(
                     extra_select_cols=("access_level",),
                     do_rebind=_access_rebind,
                     resolve_conflict=_access_resolve_conflict,
+                    skip_row=lambda row: row[0] in _root_ids,
                 )
                 access_rebinds.extend(acc_rebinds)
             except sqlite3.OperationalError as oe:
@@ -2197,6 +2222,7 @@ def self_heal_kg_bindings(
                     existing_classes=existing_classes,
                     existing_by_lower=existing_by_lower,
                     weaviate_url=weaviate_url,
+                    skip_project_ids=_root_ids,  # v0.2.103: the root adopts only with consent
                 )
                 prefix_adopts.extend(prefix_outcomes["adopts"])
                 prefix_multi_candidates.extend(

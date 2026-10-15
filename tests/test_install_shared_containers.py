@@ -156,6 +156,13 @@ class EnsureCollectionsTests(unittest.TestCase):
         _Handler.schema = {"classes": []}
         _Handler.posted = []
         _Handler.fail_post = False
+        # v0.2.103: these exercise a PER-PROJECT install's naming; on the
+        # orchestrator root (this checkout) the KG name is
+        # `vco_lib.root_kg_identity`'s decision, never the env value
+        # (tests/test_v02103_root_kg_identity.py).
+        _nonroot = mock.patch.object(install, "_is_orchestrator_root_install", lambda: False)
+        _nonroot.start()
+        self.addCleanup(_nonroot.stop)
 
     def test_creates_missing_collections(self):
         server, port, _ = _start_server()
@@ -546,6 +553,13 @@ class EnsureCollectionsFixtureGuardTests(unittest.TestCase):
         # The suite sets the declaration for every test; these two need the
         # production default (undeclared) to exercise the guard at all.
         self._prev = os.environ.pop("VCT_ALLOW_FIXTURE_CLASS_WRITES", None)
+        # v0.2.103: these exercise a PER-PROJECT install's naming; on the
+        # orchestrator root (this checkout) the KG name is
+        # `vco_lib.root_kg_identity`'s decision, never the env value
+        # (tests/test_v02103_root_kg_identity.py).
+        _nonroot = mock.patch.object(install, "_is_orchestrator_root_install", lambda: False)
+        _nonroot.start()
+        self.addCleanup(_nonroot.stop)
 
     def tearDown(self):
         if self._prev is not None:

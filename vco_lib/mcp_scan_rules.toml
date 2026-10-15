@@ -109,14 +109,16 @@ format_version = 1
 # CRITICAL CONTRACT (Issue H.1, mcp-instability audit 2026-05-16): Claude
 # Code applies ~/.claude.json mcpServers.*.env keys LAST to MCP subprocesses,
 # so they WIN against .claude/settings.json env. Only TRULY machine-invariant
-# keys belong here (service URLs/ports, PYTHONPATH, ACTIVE_EMBEDDING).
+# keys belong here (service URLs/ports, PYTHONPATH).
 # Removed in PR-43: RL_SERVER_URL, EMBEDDING_MODEL (per-project overrides).
+# Removed in v0.2.103: ACTIVE_EMBEDDING — the embedding profile is chosen in
+# launcher.db and projected into .claude/settings.json env; a global copy
+# here won against it and pinned every MCP subprocess to qwen3.
 allowed_global_keys = [
     "WEAVIATE_URL",
     "OLLAMA_URL",
     "GRPC_PORT",
     "PYTHONPATH",
-    "ACTIVE_EMBEDDING",
     "CODE_EMBED_SERVICE_URL",
 ]
 

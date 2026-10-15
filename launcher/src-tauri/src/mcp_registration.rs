@@ -261,7 +261,6 @@ const ALLOWED_ENV_KEYS: &[&str] = &[
     "OLLAMA_URL",
     "GRPC_PORT",
     "PYTHONPATH",
-    "ACTIVE_EMBEDDING",
     "CODE_EMBED_SERVICE_URL",
 ];
 
@@ -491,13 +490,15 @@ pub fn build_default_mcp_entries(
     // .claude/settings.json env — so the override goes the wrong direction.
     // The launcher's env projection (config_projection apply) puts these in
     // .claude/settings.json env where they reach MCP subprocesses
-    // correctly. Don't shadow them here.
+    // correctly. Don't shadow them here. v0.2.103: ACTIVE_EMBEDDING joined
+    // that list — a hard-coded `qwen3` here overrode the global embedding
+    // profile projected into .claude/settings.json env (must match
+    // vco_lib/install_mcp.py::_build_python_mcp_entries).
     let mut weaviate_env = serde_json::Map::new();
     weaviate_env.insert("WEAVIATE_URL".into(), weaviate_url.clone().into());
     weaviate_env.insert("OLLAMA_URL".into(), ollama_url.clone().into());
     weaviate_env.insert("GRPC_PORT".into(), ports.grpc_port.to_string().into());
     weaviate_env.insert("PYTHONPATH".into(), pythonpath.clone().into());
-    weaviate_env.insert("ACTIVE_EMBEDDING".into(), "qwen3".into());
     weaviate_env.insert("CODE_EMBED_SERVICE_URL".into(), code_embed_url.into());
     let (weaviate_env_safe, weaviate_dropped) = filter_env_for_global_json(&weaviate_env);
     let weaviate_entry = serde_json::json!({
@@ -1721,6 +1722,33 @@ mod tests {
         }
 
         fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// v0.2.103 — the weaviate-kg registration carries NO `ACTIVE_EMBEDDING`.
+    /// `~/.claude.json` mcpServers.*.env wins over `.claude/settings.json`
+    /// env, so a global value pinned every MCP subprocess to one embedding
+    /// regardless of the launcher's global profile. Red-proof: re-insert the
+    /// key in `build_default_mcp_entries` (and the allowlist) → this fails.
+    #[test]
+    fn weaviate_kg_entry_carries_no_active_embedding() {
+        let root = make_pseudo_install_root();
+        let py = resolve_venv_python(&root).expect("pseudo venv-python");
+        let entries = build_default_mcp_entries(&root, &py, ServicePorts::default());
+        let (_, entry, _) = entries
+            .iter()
+            .find(|(n, _, _)| n == "weaviate-kg")
+            .expect("weaviate-kg entry");
+        let env = entry["env"].as_object().expect("env object");
+        assert!(
+            !env.contains_key("ACTIVE_EMBEDDING"),
+            "weaviate-kg env must not carry ACTIVE_EMBEDDING: {:?}",
+            env
+        );
+        assert!(
+            !ALLOWED_ENV_KEYS.contains(&"ACTIVE_EMBEDDING"),
+            "ACTIVE_EMBEDDING must not be allowlisted for ~/.claude.json"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

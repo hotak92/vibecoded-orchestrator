@@ -5,8 +5,9 @@
 # committed list both languages parse (tier B of the A>B>C rule).
 #
 # install.py sets these on the run it relaunches itself as (the venv relaunch,
-# the venv-rebuild handoff; `vco_lib/install_companions.py::mark_relaunch` /
-# `hand_off`). They describe THAT hop only. A process that merely inherited
+# the venv-rebuild handoff, the post-venv hand-off after step 5;
+# `vco_lib/install_companions.py::mark_relaunch` / `hand_off` /
+# `continue_in_venv`). They describe THAT hop only. A process that merely inherited
 # them — a detached child (vct-updater -> the relaunched launcher -> its next
 # `install.py --update`), a terminal opened from such a launcher — must never
 # act on them: a stale RELAUNCHED skips the venv relaunch, a stale PARENT_WAITS
@@ -37,4 +38,5 @@ keys = [
     "VCT_INSTALL_BASE_PYTHON_VERSION",
     "VCT_INSTALL_PARENT_WAITS",
     "VCT_INSTALL_RELAUNCH_TOKEN",
+    "VCT_INSTALL_POST_VENV_HANDOFF",
 ]

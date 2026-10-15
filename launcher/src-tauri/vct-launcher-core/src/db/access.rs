@@ -1140,6 +1140,12 @@ impl Db {
     /// matches the same suffix. Auto-adopt is safe because there's
     /// exactly one populated `*_KnowledgeGraph` candidate.
     ///
+    /// v0.2.103 (owner ruling 2026-10-15): that root-shaped fixture is no
+    /// longer adopted here — rows of the orchestrator root (`projects.host =
+    /// 'orchestrator_root'`) are excluded, because a class the root did not
+    /// write is adopted only with consent (`vco_lib.root_kg_identity adopt`).
+    /// Every other project's rows keep this heal.
+    ///
     /// Algorithm:
     /// 1. Fetch Weaviate schema → set of existing class names
     ///    (`/v1/schema`).
@@ -1248,9 +1254,17 @@ impl Db {
         let rows: Vec<BindingRow> = {
             let guard = self.lock();
             let mut stmt = guard
+                // v0.2.103 (owner ruling 2026-10-15): the orchestrator
+                // root's rows are never adopted onto another class — its
+                // name is `vco_lib/root_kg_identity.py`'s decision and
+                // adopting an existing class is the explicit consent CLI.
+                // Must match `vco_lib/kg_binding_heal.py`
+                // (`_prefix_adopt_kg_bindings_pass(skip_project_ids=...)`).
                 .prepare(
-                    "SELECT project_id, role, collection_name \
-                     FROM project_kg_bindings",
+                    "SELECT b.project_id, b.role, b.collection_name \
+                     FROM project_kg_bindings b \
+                     LEFT JOIN projects p ON p.id = b.project_id \
+                     WHERE COALESCE(p.host, '') != 'orchestrator_root'",
                 )
                 .map_err(|e| format!("adopt_populated: prepare: {}", e))?;
             let mapped = stmt
@@ -3720,6 +3734,32 @@ mod adopt_populated_tests {
 
         let result = db.adopt_populated_collections_at_boot(&dead_url).await;
         assert!(result.is_err(), "expected Err on unreachable Weaviate, got {:?}", result);
+    }
+
+    /// T8 (v0.2.103, owner ruling 2026-10-15) — the ORCHESTRATOR ROOT's row
+    /// is never prefix-adopted at boot, even in the T2 shape (its class is
+    /// missing and exactly one populated same-suffix class exists): adopting
+    /// a class the root did not write needs the user's consent
+    /// (`python -m vco_lib.root_kg_identity adopt --yes`). Red-proof: drop
+    /// the `orchestrator_root` filter in the SELECT → `adopted: 1`.
+    #[tokio::test]
+    async fn t8_orchestrator_root_row_is_never_adopted() {
+        let db = Db::open_in_memory().unwrap();
+        seed_binding(&db, "root", "primary", "Vibecodedorchestrator_KnowledgeGraph", json!({}));
+        {
+            let guard = db.lock();
+            guard
+                .execute("UPDATE projects SET host = 'orchestrator_root' WHERE id = 'root'", [])
+                .unwrap();
+        }
+        let mock = MockWeaviate::spawn(
+            vec!["Other_KnowledgeGraph".to_string()],
+            HashMap::from([("Other_KnowledgeGraph".to_string(), 500_u64)]),
+        );
+        let report = db.adopt_populated_collections_at_boot(&mock.url).await.unwrap();
+        assert_eq!(report, AdoptionReport { adopted: 0, deferred: 0, no_change: 0 });
+        let (name, _cfg) = read_binding(&db, "root", "primary");
+        assert_eq!(name, "Vibecodedorchestrator_KnowledgeGraph");
     }
 }
 

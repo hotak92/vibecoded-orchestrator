@@ -997,21 +997,31 @@ async fn project_config(
     let probe_weaviate_url =
         vct_launcher_core::services::service_endpoints::machine_weaviate_url(&h.0);
 
-    let kg_collection = crate::weaviate_schema_probe::resolve_existing_casing_for_class(
-        &probe_weaviate_url,
-        &kg_collection_raw,
-    )
-    .await;
-
-    let shared_kg_collection = if shared_kg_collection_raw.is_empty() {
-        String::new()
+    // v0.2.103 (owner ruling 2026-10-15): the orchestrator root's KG name is
+    // the one install.py DECIDED (`vco_lib.root_kg_identity`, persisted to
+    // `app_state['orchestrator_root_kg_collection']` and the root's binding
+    // rows), and every surface uses exactly it. A case-insensitive rebind
+    // here silently ADOPTED a case-sibling class — another install's data, or
+    // a class the root never wrote — for the root's primary KG and for the
+    // machine's shared name. Both are therefore returned byte-for-byte as
+    // bound; adopting a sibling is an explicit consent step
+    // (`python -m vco_lib.root_kg_identity adopt --yes`). Per-project primary
+    // and development names keep the legacy casing rebind (an existing
+    // install may depend on it). Must match
+    // `vco_lib/root_kg_identity.py` (decide / the no-adoption rule).
+    let is_orchestrator_root =
+        matches!(project.host, vct_launcher_core::db::models::ProjectHost::OrchestratorRoot);
+    let kg_collection = if is_orchestrator_root {
+        kg_collection_raw.clone()
     } else {
         crate::weaviate_schema_probe::resolve_existing_casing_for_class(
             &probe_weaviate_url,
-            &shared_kg_collection_raw,
+            &kg_collection_raw,
         )
         .await
     };
+
+    let shared_kg_collection = shared_kg_collection_raw.clone();
 
     // v0.2.46 Decision C — development collection name derives from the
     // primary KG via the canonical suffix swap (mirrors the diagrams
@@ -4394,10 +4404,78 @@ kg_tier_full = 0.8
             Some("Vibecodedorchestrator_Diagrams"),
             "diagrams_collection must adopt on-disk casing (parity with development)"
         );
+        // v0.2.103 (owner ruling 2026-10-15): the SHARED name is never
+        // case-rebound — it is served byte-for-byte as bound; adopting a
+        // case-sibling is an explicit consent step.
         assert_eq!(
             body.get("shared_kg_collection").and_then(|v| v.as_str()),
-            Some("Vibecodedorchestrator_KnowledgeGraph"),
-            "shared_kg_collection must adopt on-disk casing"
+            Some("VibeCodedOrchestrator_KnowledgeGraph"),
+            "shared_kg_collection must be the bound name, never a case-sibling"
+        );
+    }
+
+    /// v0.2.103 (owner ruling 2026-10-15) — the ORCHESTRATOR ROOT's primary
+    /// KG is served exactly as bound, even when Weaviate holds only a
+    /// case-different sibling: the root owns the name install.py decided,
+    /// and a silent rebind would adopt a class the root never wrote. Its
+    /// development sibling keeps the legacy casing rebind. Red-proof: drop
+    /// the `is_orchestrator_root` branch in `get_project_config` → the
+    /// `kg_collection` assertion fails.
+    #[tokio::test]
+    async fn root_primary_kg_is_never_case_rebound() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        crate::weaviate_schema_probe::_reset_cache_for_test();
+
+        let (weaviate_url, _w) = spawn_fake_weaviate(vec![
+            "Vibecodedorchestrator_KnowledgeGraph".to_string(),
+            "Vibecodedorchestrator_Development".to_string(),
+        ])
+        .await;
+        let (base, h) = spawn_config_api_hub().await;
+        seed_weaviate_row(&h.0, &weaviate_url);
+        let project_id = "p-root-no-rebind";
+        let folder = format!("/tmp/test-config-project-{}", project_id);
+        seed_project(&h.0, project_id, "VibeCoded Orchestrator", &folder, "orchestrator-root");
+        {
+            let guard = h.0.lock();
+            guard
+                .execute(
+                    "UPDATE projects SET host = 'orchestrator_root' WHERE id = ?1",
+                    rusqlite::params![project_id],
+                )
+                .unwrap();
+        }
+        for role in ["primary", "shared"] {
+            h.0.set_project_kg_binding(
+                project_id,
+                role,
+                "VibeCodedOrchestrator_KnowledgeGraph",
+                Some(1024),
+                None,
+                None,
+                &empty_json_obj(),
+            )
+            .unwrap();
+        }
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, project_id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("kg_collection").and_then(|v| v.as_str()),
+            Some("VibeCodedOrchestrator_KnowledgeGraph"),
+            "the root's primary KG is served exactly as bound"
+        );
+        assert_eq!(
+            body.get("shared_kg_collection").and_then(|v| v.as_str()),
+            Some("VibeCodedOrchestrator_KnowledgeGraph"),
+        );
+        assert_eq!(
+            body.get("development_collection").and_then(|v| v.as_str()),
+            Some("Vibecodedorchestrator_Development"),
+            "the development sibling keeps the legacy casing rebind"
         );
     }
 

@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.23 B1 (2026-05-21) — case-insensitive collection adoption.
+"""v0.2.23 B1 (2026-05-21) — case-insensitive collection adoption, narrowed
+in v0.2.103 (owner ruling 2026-10-15).
 
-The behaviour under test lives in ``install.py::_ensure_collections``.
-When a Weaviate class exists whose name differs from the canonical
-required name ONLY by casing, the install path must:
+The behaviour under test lives in ``install.py::_ensure_collections``, run
+here as a NON-root install (the root's names are ``vco_lib.root_kg_identity``'s
+decision — ``tests/test_v02103_root_kg_identity.py``). When a Weaviate class
+exists whose name differs from a required name ONLY by casing:
 
-  * Adopt the existing class in place (no new schema POST for the
-    "missing" capital-C variant).
-  * Propagate the on-disk casing to ``os.environ['KG_COLLECTION']`` /
-    ``DEVELOPMENT_COLLECTION`` / ``SHARED_KG_COLLECTION`` so .env writes,
-    settings.json env blocks, and launcher.db binding rows all match
-    the live class.
-  * Announce the case-different adoption in adopt-mode output (D21
-    phrasing — "Will ADOPT (existing case-different class: `<name>`)").
+  * the per-project KG and the development collection adopt it in place and
+    propagate the on-disk casing to ``KG_COLLECTION`` /
+    ``DEVELOPMENT_COLLECTION`` (legacy behaviour, kept — an existing install
+    may depend on it);
+  * the SHARED name is never case-adopted: ``SHARED_KG_COLLECTION`` keeps the
+    requested name and nothing is created beside the sibling (Weaviate would
+    refuse it). Adopting it is an explicit consent step.
 
 These tests stub out Weaviate via an HTTP server (see
 ``test_install_shared_containers.py`` for the same pattern — we copy the
@@ -140,6 +141,9 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
         )
         _gate.start()
         self.addCleanup(_gate.stop)
+        _nonroot = mock.patch.object(install, "_is_orchestrator_root_install", lambda: False)
+        _nonroot.start()
+        self.addCleanup(_nonroot.stop)
         _Handler.schema = {"classes": []}
         _Handler.posted = []
         _Handler.fail_post = False
@@ -149,12 +153,13 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
                   "SHARED_KG_COLLECTION", "WEAVIATE_PORT"):
             os.environ.pop(k, None)
 
-    def test_adopt_mode_uses_case_different_existing_shared_class(self):
+    def test_case_different_shared_class_is_never_adopted(self):
         """Pre-seed Weaviate with the lowercase-c v0.2.12–v0.2.22 shared
-        KG class, set the canonical default (capital-C) via env. Adopt
-        mode must NOT create a new capital-C class — it adopts the
-        lowercase-c sibling in place and rebinds the env var so
-        downstream writes target the on-disk class casing.
+        KG class, request the canonical capital-C via env. v0.2.103: the
+        shared name is NOT rebound to the sibling (that would adopt a class
+        without consent) and the capital-C class is not POSTed beside it.
+        Red-proof: restore the `_resolve_existing_casing(shared_name)` call
+        → the env assertion fails.
         """
         # The on-disk class is the lowercase-c v0.2.12–v0.2.22 default.
         _Handler.schema = {"classes": [
@@ -178,21 +183,17 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
                 install._ensure_collections(
                     {}, decisions=decisions, args=_ns(yes=True),
                 )
-                # Critical: env var was rebound to the on-disk casing.
                 self.assertEqual(
                     os.environ["SHARED_KG_COLLECTION"],
-                    "VibecodedOrchestrator_KnowledgeGraph",
-                    "shared KG env var must rebind to the live class casing "
-                    "so .env writes / binding rows match the on-disk class",
+                    "VibeCodedOrchestrator_KnowledgeGraph",
+                    "the shared name is never rebound to a case-sibling",
                 )
-            # No new capital-C class was POSTed (we adopted the
-            # lowercase-c sibling).
+            # No capital-C class POSTed beside the lowercase-c sibling.
             posted_classes = [p.get("class") for p in _Handler.posted]
             self.assertNotIn(
                 "VibeCodedOrchestrator_KnowledgeGraph",
                 posted_classes,
-                "must NOT POST a new capital-C class when a lowercase-c "
-                "sibling already exists in Weaviate",
+                "must NOT POST a capital-C class beside a lowercase-c sibling",
             )
             # Per-project KG + Dev are still created (they have no
             # case-different siblings here).
@@ -273,12 +274,9 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
         finally:
             server.shutdown()
 
-    def test_case_insensitive_lookup_handles_arbitrary_casing(self):
-        """The case-insensitive lookup must work for ANY casing, not just
-        the specific lowercase-c → capital-C transition. Future-proofing:
-        if a user manually creates a class with weird casing (e.g.
-        ``VIBECODEDORCHESTRATOR_KNOWLEDGEGRAPH``), the helper should
-        adopt it rather than recreate."""
+    def test_any_casing_sibling_blocks_but_is_not_adopted(self):
+        """ANY case-only sibling (here screaming-snake-case) is neither
+        adopted for the shared name nor recreated beside."""
         _Handler.schema = {"classes": [
             {"class": "VIBECODEDORCHESTRATOR_KNOWLEDGEGRAPH"}
         ]}
@@ -298,15 +296,14 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
                 install._ensure_collections(
                     {}, decisions=decisions, args=_ns(yes=True),
                 )
-                # Env rebound to the screaming-snake-case on-disk variant.
                 self.assertEqual(
                     os.environ["SHARED_KG_COLLECTION"],
-                    "VIBECODEDORCHESTRATOR_KNOWLEDGEGRAPH",
+                    "VibeCodedOrchestrator_KnowledgeGraph",
                 )
             posted_classes = [p.get("class") for p in _Handler.posted]
             self.assertNotIn(
                 "VibeCodedOrchestrator_KnowledgeGraph", posted_classes,
-                "must adopt screaming-snake-case sibling rather than create",
+                "must not create a class beside its screaming-snake-case sibling",
             )
         finally:
             server.shutdown()
@@ -327,6 +324,9 @@ class AdoptCaseDifferentPerProjectKgTests(unittest.TestCase):
         )
         _gate.start()
         self.addCleanup(_gate.stop)
+        _nonroot = mock.patch.object(install, "_is_orchestrator_root_install", lambda: False)
+        _nonroot.start()
+        self.addCleanup(_nonroot.stop)
         _Handler.schema = {"classes": []}
         _Handler.posted = []
         _Handler.fail_post = False

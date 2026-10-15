@@ -285,7 +285,10 @@ class TestInstallOwnershipSet(unittest.TestCase):
         # P2c-b (v0.2.75): the seed/finalize choreography moved to
         # vco_lib.install_deferral_flow — main() must hold the A-2 seed
         # call site (the flow is constructed with the owned sets above).
-        self.assertIn("_deferral_flow.seed(", self.source)
+        # v0.2.103: main() calls `_seed_run_report(_deferral_flow)`, which
+        # seeds and then adopts a post-venv hand-off parent's entries.
+        self.assertIn("_seed_run_report(_deferral_flow)", self.source)
+        self.assertIn("seeded = flow.seed()", self.source)
 
     def test_mid_run_write_removed(self):
         """A-11: exactly ONE write moment remains — P2c-b moved it into
