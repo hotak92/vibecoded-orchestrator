@@ -57,6 +57,13 @@ the reviewer.
      ``locked_statuses`` / ``locked_body_markers``) edited in any way other
      than appending one ``## Proposed change (kg-reviewer, <YYYY-MM-DD>)``
      section;
+   * an existing (unlocked) node whose body lost or reworded any original
+     non-blank line — existing text is APPEND-AND-ANNOTATE ONLY (owner rule
+     2026-10-15: stored information survives; a superseded line is kept and
+     marked in place, e.g. "Original <date>: <line> (superseded by ...)" or
+     "~~<line>~~"). Compared after CRLF->LF and trailing-whitespace strip;
+     an original line survives verbatim or as a contiguous substring of a
+     new line (:func:`removed_lines`); the log names the lost lines;
    * a NEW node without frontmatter carrying every
      ``[guard] new_node_required_keys`` key (title, type, tags, created,
      updated, status), or whose title duplicates an existing node's
@@ -133,6 +140,7 @@ __all__ = [
     "transcript_sources",
     "unsourced_flags",
     "new_node_violation",
+    "removed_lines",
     "validate",
     "commit_reviewer_changes",
     "is_reviewer_commit_subject",
@@ -646,6 +654,52 @@ def lock_reason(fm: Optional[dict], body: str) -> Optional[str]:
     return None
 
 
+def _clip(text: str, width: int = 80) -> str:
+    return text if len(text) <= width else text[:width - 3] + "..."
+
+
+#: A leading Markdown list / quote / task marker: "- ", "* ", "+ ", "1. ",
+#: "1) ", "> ", "- [ ] ", "- [x] " (combinations included).
+_LINE_MARKER = re.compile(r"^(?:>\s*)*(?:(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)?")
+
+
+def _body_lines(body: str) -> List[str]:
+    """Body lines after CRLF->LF and trailing-whitespace strip."""
+    return [line.rstrip() for line in body.replace("\r\n", "\n").split("\n")]
+
+
+def removed_lines(body_pre: str, body_post: str) -> List[str]:
+    """The non-blank ORIGINAL body lines that do not survive in the new body.
+
+    Owner rule (2026-10-15): stored information must survive — an existing
+    node's text is append-and-annotate only. An original line survives when
+    it is still present verbatim or EXTENDED IN PLACE: its text (leading and
+    trailing whitespace aside) is a contiguous substring of a new line, so
+    "Original 2026-10-15: <line> (superseded by ...)" and "~~<line>~~" pass.
+    Lines are matched in order, each to a distinct new line (greedy
+    earliest match, which finds a match whenever one exists), so a duplicate
+    original line that was dropped is caught too. Reordering original lines
+    counts as removing them: a reorder is a rewrite."""
+    new = _body_lines(body_post)
+    missing: List[str] = []
+    j = 0
+    for line in _body_lines(body_pre):
+        # The needle is the line's TEXT: a leading Markdown list/quote marker
+        # is not text, so "- X" annotated as "- Original <date>: X ..." or
+        # "- ~~X~~" survives (the marker stays, the annotation goes after it).
+        needle = _LINE_MARKER.sub("", line.strip(), count=1).strip()
+        if not needle:
+            continue
+        k = j
+        while k < len(new) and needle not in new[k]:
+            k += 1
+        if k < len(new):
+            j = k + 1
+        else:
+            missing.append(line.strip())  # named as the user wrote it
+    return missing
+
+
 def edit_violation(pre: str, post: str) -> Optional[str]:
     """Why an edit of an EXISTING node breaks a rule (``None`` = allowed)."""
     g = _guard()
@@ -675,6 +729,13 @@ def edit_violation(pre: str, post: str) -> Optional[str]:
                         f"{', '.join(changed)})")
     locked = lock_reason(fm_pre, body_pre)
     if locked is None:
+        removed = removed_lines(body_pre, body_post)
+        if removed:
+            shown = "; ".join(repr(_clip(line)) for line in removed[:3])
+            more = f" (+{len(removed) - 3} more)" if len(removed) > 3 else ""
+            return (f"removed or reworded {len(removed)} original line(s) - "
+                    f"existing text is append-and-annotate only: "
+                    f"{shown}{more}")
         return None
     base = body_pre.rstrip()
     if body_post == body_pre:
