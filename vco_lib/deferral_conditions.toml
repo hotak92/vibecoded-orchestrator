@@ -1561,8 +1561,8 @@ emit_surfaces = ["ledger"]
 notes = """v0.2.92 WP-D: the PER-PROJECT state-keyed gate \
 (`vco_lib.chunker_revision.gate` on the `.claude/state/chunker-revision.json` \
 sentinel) fires inside the ONE bundle engine on all four install/update \
-surfaces. v0.2.95 F1 gives it the clear mechanism it always ADVERTISED: both \
-emitters tell the user "once you run the re-sync commands below, this deferral \
+surfaces. v0.2.95 F1 gives it the clear mechanism it always ADVERTISED: its \
+emitters (both, before the v0.2.103 retirement of the semver one) tell the user "once you run the re-sync commands below, this deferral \
 self-resolves on the next bundle update", and nothing implemented that — the \
 row declared `paired-resolution` while naming a Rust site that has no resolve \
 call, and the gate re-stamps its own sentinel at EMIT time, so no later \

@@ -595,6 +595,23 @@ class PrintedRemedyTests(unittest.TestCase):
             "the basename-resolving shape must never come back",
         )
 
+    def test_the_emitter_writes_one_info_entry(self):
+        """Severity ``info`` (searches still work; the re-sync is a quality
+        recommendation) and a repeat emit leaves ONE entry, not two — the
+        contract the retired v0.2.47 test file used to pin."""
+        from vco_lib import project_init
+
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            for _ in range(2):
+                project_init._emit_chunker_revision_resync_deferral(
+                    folder, "r-old", "r-new")
+            content = (folder / ".claude" / "context"
+                       / "UPDATE_DEFERRED.md").read_text(encoding="utf-8")
+        self.assertEqual(
+            content.count("## chunker_preset_overhaul_pending "), 1)
+        self.assertIn("## chunker_preset_overhaul_pending (info)", content)
+
     def test_remedy_has_no_cd_precondition(self):
         """The wrapper is named absolutely and the folder is the analyzer's
         positional ``repo_path`` — so the line works from any cwd, on any OS."""
