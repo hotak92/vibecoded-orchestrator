@@ -31,12 +31,32 @@ sub-chain that is the outer segment's whole content inherits the outer
 position, so ``x && bash -c 'sleep 3' && y`` is the between-actions pause
 it reads as. A substitution in an assignment value (``x=$(sleep 5)``,
 ``export x=`sleep 5```) is walked like any other — a sole wait there
-denies. A function body is judged by the same position rule WITHIN the
-body when the function is called in the same command: ``f() { sleep 1;
-}; f`` and ``f() { a; sleep 1; }; f`` deny, ``f() { a; sleep 1; b; }; f``
-is a between-actions pause, a definition-only command runs nothing and is
-judged as before, and a call inside a loop puts the whole body in-loop. ``cmd & wait`` is NOT a poll (``cmd`` runs; the builtin
-blocks once, in-process) and stays allowed. Position and loop membership
+denies. A function body — brace- OR subshell-bodied — is judged by the
+same position rule WITHIN the body when the function is called in the
+same command: ``f() { sleep 1; }; f`` and ``f() ( sleep 1 ); f`` deny,
+``f() { a; sleep 1; b; }; f`` is a between-actions pause, a
+definition-only command runs nothing and is judged as before, and a call
+inside a loop puts the whole body in-loop. ``cmd & wait`` is NOT a poll (``cmd`` runs; the builtin
+blocks once, in-process) and stays allowed. An UNQUOTED NEWLINE is a
+command separator (the walker rewrites it to ``;``), so a multi-line
+command is judged like its one-line form; an ``eval '<literal>'`` body is
+re-parsed exactly like a ``bash -c`` body; a process substitution
+(``diff <(sleep 5)``) has its body scanned like a command substitution;
+and heredoc BODIES are stripped before the walk (they are data — a body
+line is never a command).
+
+Busy-wait loops (owner ruling 2026-10-15): a ``while``/``until`` loop
+whose BODY does no real work is denied as a ``busy-wait loop`` even when
+it contains no sleep at all — it spins on its condition with no pause,
+re-checking as fast as the shell allows (``until curl -s localhost:8080;
+do :; done``). "No real work" is precise: every body segment is empty,
+``:``, ``true``, or a bare ``echo``/``printf`` with NO redirection or
+pipe (an ``echo "$l" >> out`` ACCUMULATES output — that is work). A body
+segment doing anything else — a real command, a ``read``, a redirected
+``echo``, an embedded loop — is work and the loop stays allowed
+(``while read l; do echo "$l" >> out; done < in``,
+``for f in *.py; do ruff check $f; done`` — ``for``/``select`` iterate a
+finite word list and are never busy-waits). Position and loop membership
 come from the ONE chain walker
 (:func:`vco_lib.bash_command_walk.walk_segments`).
 
@@ -106,7 +126,12 @@ fan-out, not a new check. A payload with no ``tool_use_id`` falls back to
 collapsing same-key stamps closer than :data:`_BURST_COLLAPSE_S` — real
 polling is never sub-second, every poll is a model round-trip. N DISTINCT
 calls of the same check within the window are still denied at the Nth,
-and a denied call still counts.
+and a denied call still counts. And a command that WRITES is never a
+status check at all (field case 2026-10-15: ``cat > f <<'EOF' …; sed -i
+…`` keyed on ``cat``): :func:`bash_repeat_key` drops the key when the
+command text shows a write, decided by the ONE write-shape predicate
+(:func:`vco_lib.bash_write_targets.command_has_write_shape`) — pure reads
+still accumulate.
 """
 from __future__ import annotations
 
@@ -125,6 +150,7 @@ from vco_lib.bash_command_walk import (
     SHELL_DASH_C_VERBS,
     ChainSegment,
     dash_c_subcommand,
+    literal_eval_body,
     peel_wrapper_verbs,
     split_chain,
     strip_env_assignments,
@@ -132,6 +158,7 @@ from vco_lib.bash_command_walk import (
     tokenize,
     walk_segments,
 )
+from vco_lib.bash_write_targets import command_has_write_shape, strip_heredocs
 from vco_lib.powershell_command import (
     POWERSHELL_TOOL,
     loop_pattern,
@@ -339,6 +366,13 @@ def _pattern_of_tokens(tokens: List[str], depth: int,
         if sub is not None:
             return static_pattern(sub, depth=depth + 1, _in_loop=seg.in_loop)
         return None
+    if verb == "eval":
+        # `while eval 'sleep 1'; do …` — a literal eval body in a loop
+        # condition is re-parsed like a dash-c body (v0.2.103).
+        sub = literal_eval_body(body)
+        if sub is not None:
+            return static_pattern(sub, depth=depth + 1, _in_loop=seg.in_loop)
+        return None
     if verb in PS_WAIT_VERBS:
         # PowerShell's foreground waits (Wait-Job / Wait-Process /
         # Wait-Event, and Receive-Job -Wait) — the translated name; no Bash
@@ -398,7 +432,98 @@ def _scan_wrapped(tokens: List[str], depth: int,
                 return static_pattern(
                     sub, depth=depth + 1, _in_loop=seg.in_loop,
                     _position_override=(seg.position, seg.chain_size))
+        if base == "eval":
+            sub = literal_eval_body(tokens[i:])
+            if sub is not None:
+                return static_pattern(
+                    sub, depth=depth + 1, _in_loop=seg.in_loop,
+                    _position_override=(seg.position, seg.chain_size))
     return None
+
+
+#: Body verbs that do NO real work (owner ruling 2026-10-15): a
+#: ``while``/``until`` loop whose every body segment is one of these (or
+#: empty) spins on its condition with no pause — a busy-wait. ``echo`` /
+#: ``printf`` count ONLY without a redirection or pipe: an
+#: ``echo "$l" >> out`` accumulates output, which is work.
+_NOWORK_VERBS = frozenset({":", "true", "echo", "printf"})
+
+#: Redirection / pipe tokens that make an ``echo``/``printf`` body real
+#: work (it writes a file or feeds a downstream command).
+_REDIRECT_TOKENS = frozenset({">", ">>", "<", "|", "&>", "&>>"})
+
+
+def _is_redirect_token(tok: str) -> bool:
+    return (tok in _REDIRECT_TOKENS
+            or tok.startswith(">")
+            or tok.startswith("&>")
+            or (tok.endswith(">") and tok[:-1].isdigit()))
+
+
+def _segment_does_real_work(tokens: List[str]) -> bool:
+    """The busy-wait rule's work test for ONE loop-body segment: empty,
+    ``:``, ``true``, the ``done`` terminator, or a bare ``echo``/``printf``
+    (no redirection, no pipe) do no work; anything else — a real command,
+    a ``read``, a redirected echo, an embedded loop opener — does."""
+    body = tokens
+    while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
+        body = body[1:]
+    body = strip_subshell_parens(body)
+    if not body:
+        return False
+    first = os.path.basename(body[0]).lower()
+    if first == "done":
+        return False  # the terminator, not body work
+    if first in _NOWORK_VERBS and first not in ("echo", "printf"):
+        return False
+    if first in ("echo", "printf"):
+        return any(_is_redirect_token(t) for t in body[1:])
+    return True
+
+
+def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
+    """The busy-wait rule (owner ruling 2026-10-15): a ``while``/``until``
+    loop whose BODY does no real work — every body segment empty, ``:``,
+    ``true``, or a bare ``echo``/``printf`` — is a spin with no pause and
+    is denied as ``busy-wait loop`` even with no sleep in it. ``for`` /
+    ``select`` iterate a finite word list and are never busy-waits; a body
+    with real work (a redirected ``echo`` included) stays allowed.
+
+    ``segments[i]`` is the opener (or a segment with a mid-segment opener
+    behind a ``{``/``(`` header); the body is the following ``in_loop``
+    run from its ``do`` to the matching ``done``."""
+    seg = segments[i]
+    toks = seg.tokens
+    body0 = list(toks)
+    while body0 and os.path.basename(body0[0]).lower() in _LEADING_KEYWORDS:
+        body0 = body0[1:]
+    body0 = strip_subshell_parens(body0)
+    has_opener = bool(body0) and os.path.basename(body0[0]).lower() in CONDITION_OPENERS
+    if not has_opener and seg.in_loop:
+        # A loop opener sitting MID-SEGMENT behind a function/group header
+        # (`f() { while true; …` — same shape as _pattern_of_segment).
+        for j in range(1, len(toks)):
+            kw = os.path.basename(toks[j]).lower()
+            if kw in CONDITION_OPENERS:
+                has_opener = True
+                break
+            if kw in LOOP_OPENERS:
+                return None  # for/select: never a busy-wait
+    if not has_opener:
+        return None
+    # Skip the loop's condition segments, then take the `do`..`done` run.
+    j = i + 1
+    while (j < len(segments) and segments[j].in_loop
+           and not (segments[j].tokens and segments[j].tokens[0] == "do")):
+        j += 1
+    if not (j < len(segments) and segments[j].in_loop
+            and segments[j].tokens and segments[j].tokens[0] == "do"):
+        return None  # no `do`: malformed, not our business
+    while j < len(segments) and segments[j].in_loop:
+        if _segment_does_real_work(segments[j].tokens):
+            return None
+        j += 1
+    return ("busy-wait loop", " ".join(toks[:6])[:80])
 
 
 def static_pattern(command: str, depth: int = 0, *,
@@ -409,24 +534,34 @@ def static_pattern(command: str, depth: int = 0, *,
 
     Parsed with the ONE chain walker (:mod:`vco_lib.bash_command_walk`) —
     never a raw-string scan — so quoted text (``echo "sleep"``) cannot
-    trip it and ``bash -c`` sub-commands are re-parsed. ``while``/``until``
-    loops need no rule of their own: the walker marks loop openers and
-    bodies (:data:`ChainSegment.in_loop`), and the ``sleep`` segment inside
-    one IS the detection. Command-substitution bodies are walked too —
-    including those in an assignment value (``x=$(sleep 5)``) — and the
-    body of a function called in the same command is positioned WITHIN the
-    body (both opt-in walker surfaces; the wait guard is the consumer).
-    ``_in_loop`` / ``_position_override`` are the recursion's inherited
-    context; callers pass nothing."""
+    trip it and ``bash -c`` / literal ``eval`` sub-commands are
+    re-parsed. ``while``/``until`` loops need no rule of their own for
+    sleeps: the walker marks loop openers and bodies
+    (:data:`ChainSegment.in_loop`), and the ``sleep`` segment inside one
+    IS the detection; a ``while``/``until`` whose body does no real work
+    is additionally denied as a ``busy-wait loop`` (owner ruling
+    2026-10-15) even with no sleep in it. Heredoc bodies are stripped
+    first (they are data). Command-substitution and process-substitution
+    bodies are walked too — including those in an assignment value
+    (``x=$(sleep 5)``) — and the body of a function called in the same
+    command is positioned WITHIN the body (both opt-in walker surfaces;
+    the wait guard is the consumer). ``_in_loop`` /
+    ``_position_override`` are the recursion's inherited context; callers
+    pass nothing."""
     if not isinstance(command, str) or not command.strip():
         return None
-    for seg in walk_segments(command, _in_loop=_in_loop,
+    command, _heredoc_bodies = strip_heredocs(command)
+    segments = walk_segments(command, _in_loop=_in_loop,
                              _position_override=_position_override,
                              _with_substitutions=True,
-                             _with_function_bodies=True):
+                             _with_function_bodies=True)
+    for i, seg in enumerate(segments):
         found = _pattern_of_segment(seg, depth)
         if found is not None:
             return found
+        busy = _busy_wait_pattern(segments, i)
+        if busy is not None:
+            return busy
     return None
 
 
@@ -437,7 +572,13 @@ def static_pattern(command: str, depth: int = 0, *,
 
 def bash_repeat_key(command: str, prefix: str = "bash") -> Optional[str]:
     """The normalized repeat key for a Bash STATUS CHECK, or ``None`` when
-    the command is not one (first peeled verb outside :data:`REPEAT_VERBS`).
+    the command is not one (first peeled verb outside :data:`REPEAT_VERBS`),
+    or when the command WRITES: a command with an output redirection to a
+    file, a heredoc-to-file, ``sed -i``, ``tee`` or kin is never a poll
+    (field case 2026-10-15: ``cat > f <<'EOF' …`` keyed as a "status
+    check" on ``cat``). The write test is the ONE write-shape predicate
+    (:func:`vco_lib.bash_write_targets.command_has_write_shape`), not a
+    second scanner here. Pure reads (``cat log``) still accumulate.
 
     The key is the full token-joined command — quoting/whitespace variants
     of the same check normalize together, while a different target or flag
@@ -452,6 +593,8 @@ def bash_repeat_key(command: str, prefix: str = "bash") -> Optional[str]:
     if not first:
         return None
     if os.path.basename(first[0]).lower() not in REPEAT_VERBS:
+        return None
+    if command_has_write_shape(command):
         return None
     return prefix + ":" + " ".join(tokens)
 

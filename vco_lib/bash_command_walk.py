@@ -18,6 +18,10 @@ What the walker does, per command string:
   1. ``shlex.split`` the command (POSIX mode) and peel glued UNQUOTED
      separator tails into standalone tokens (``log;`` → ``log``, ``;``)
      — quote-aware, via a posix=False shadow pass (see :func:`tokenize`).
+     An UNQUOTED newline is a command separator exactly like ``;``
+     (v0.2.103): ``make\\nsleep 5`` is judged like ``make; sleep 5``.
+     A newline inside quotes, or after a backslash (line continuation),
+     is data and stays.
   2. Split the token list on top-level ``;`` ``&&`` ``||`` ``|`` ``&``.
   3. Per segment: drop leading ``KEY=val`` env assignments, then peel
      wrapper verbs (``sudo``, ``nice -n 10``, ``env``, ``time``, ...).
@@ -57,6 +61,11 @@ Two further opt-in surfaces serve the same consumer: command-substitution
 bodies (assignment values included — ``x=$(sleep 5)``) and the
 re-positioning of a CALLED function's body within that body
 (:func:`function_header`); :func:`walk_command` opts into neither.
+Process substitutions (``<(sleep 5)`` / ``>(cat f)``) count as
+substitution bodies; an ``eval '<literal>'`` body is re-parsed exactly
+like a ``bash -c '<sub>'`` body (:func:`literal_eval_body`), and a
+subshell-bodied function (``f() ( sleep 1 )``) is recognised by
+:func:`function_header` like a brace-bodied one.
 """
 from __future__ import annotations
 
@@ -185,22 +194,27 @@ def strip_subshell_parens(tokens: List[str]) -> List[str]:
 #: (``$(sleep`` + ``5)``) reassembles.
 _SUBST_PAREN_RE = re.compile(r"\$\(([^()]*)\)")
 _SUBST_BACKTICK_RE = re.compile(r"`([^`]+)`")
+#: Process substitutions (v0.2.103): ``<(sleep 5)`` / ``>(cat f)`` — the
+#: body runs as its own command, so it is scanned like a substitution.
+_PROC_SUBST_RE = re.compile(r"[<>]\(([^()]*)\)")
 
 
 def substitution_bodies(tokens: List[str]) -> List[str]:
     """The command-substitution bodies embedded in a segment's tokens
     (``echo $(sleep 5)``, backticks), best-effort; a nested substitution
-    yields its INNERMOST body (where a hidden wait would live). Known
-    limit: a substitution containing a top-level chain separator
-    (``$(foo; sleep 1)``) is split by :func:`split_chain` BEFORE this runs
-    — the inner segments then stand on their own (the sleep is judged by
-    the plain position rule)."""
+    yields its INNERMOST body (where a hidden wait would live). Process
+    substitutions (``diff <(sleep 5) <(cat f)``) count too (v0.2.103) —
+    the body runs as its own command. Known limit: a substitution
+    containing a top-level chain separator (``$(foo; sleep 1)``) is split
+    by :func:`split_chain` BEFORE this runs — the inner segments then
+    stand on their own (the sleep is judged by the plain position rule)."""
     text = " ".join(tokens)
-    if "$(" not in text and "`" not in text:
+    if "$(" not in text and "`" not in text and "<(" not in text and ">(" not in text:
         return []
     return (
         [m.group(1) for m in _SUBST_PAREN_RE.finditer(text)]
         + [m.group(1) for m in _SUBST_BACKTICK_RE.finditer(text)]
+        + [m.group(1) for m in _PROC_SUBST_RE.finditer(text)]
     )
 
 
@@ -412,8 +426,45 @@ def _tail_quoted(raw_token: str) -> bool:
     return raw_token.endswith(("'", '"'))
 
 
+def _newlines_as_separators(command: str) -> str:
+    """An UNQUOTED newline is a command separator, exactly like ``;``
+    (v0.2.103): ``make\\nsleep 5`` is judged like ``make; sleep 5``, and a
+    multi-line loop/condition like its one-line form. A newline inside a
+    single/double-quoted string is data; a backslash directly before a
+    newline is a line continuation and also stays. Quote-aware character
+    scan — the one home for this rule (every :func:`tokenize` consumer,
+    including the wait guard, gets it)."""
+    out: List[str] = []
+    quote: Optional[str] = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == quote and not (quote == '"' and i and command[i - 1] == "\\"):
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+        elif ch == "\\" and i + 1 < n:
+            out.append(ch)
+            i += 1
+            out.append(command[i])
+        elif ch == "\n":
+            out.append(" ; ")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def tokenize(command: str) -> Optional[List[str]]:
     """`shlex.split` the command, returning None on malformed quoting.
+
+    An unquoted newline is rewritten to ``;`` FIRST (one home — see
+    :func:`_newlines_as_separators`), so a multi-line command splits into
+    the same segments its ``;``-joined form produces.
 
     Glued UNQUOTED separator tails (``log;``) are peeled HERE, not in
     :func:`split_chain` (v0.2.102 W4-D LOW 2): quote information is
@@ -428,11 +479,12 @@ def tokenize(command: str) -> Optional[List[str]]:
     Callers treat None as "unparseable -- collect nothing", which keeps
     every consumer's soft-fail contract identical.
     """
+    prepared = _newlines_as_separators(command)
     try:
-        tokens = shlex.split(command, posix=True)
+        tokens = shlex.split(prepared, posix=True)
     except ValueError:
         return None
-    raws = _quoted_token_views(command)
+    raws = _quoted_token_views(prepared)
     if raws is None or len(raws) != len(tokens):
         return [piece for tok in tokens for piece in _split_glued(tok)]
     return [
@@ -463,6 +515,25 @@ def dash_c_subcommand(tokens: List[str]) -> Optional[str]:
     return None
 
 
+#: Characters that make an ``eval`` body NON-literal — the string is not a
+#: fixed command, so re-parsing it would judge something that never runs
+#: as written (``eval "$cmd"``, ``eval 'sleep $N'``).
+_EVAL_NONLITERAL_CHARS = ("$", "`")
+
+
+def literal_eval_body(tokens: List[str]) -> Optional[str]:
+    """The literal string body of ``eval '<cmd>'`` / ``eval "<cmd>"``
+    (v0.2.103), else ``None``. Only the single-argument form whose body
+    contains no expansions (``$`` / backtick) counts: ``eval 'sleep 5'``
+    → ``sleep 5``, while ``eval "$cmd"`` / ``eval 'sleep $N'`` / the
+    multi-token ``eval sleep 5`` stay as they are (never re-parsed). The
+    ONE home for this shape — :func:`walk_segments`' recursion decision
+    and the wait guard's condition/wrapper scans use it."""
+    if len(tokens) == 2 and not any(c in tokens[1] for c in _EVAL_NONLITERAL_CHARS):
+        return tokens[1]
+    return None
+
+
 def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]:
     """If `tokens` is shaped like `bash -c "<sub-cmd>"`, re-parse
     `<sub-cmd>` as a fresh chain with the same collector.
@@ -481,20 +552,25 @@ def parse_dash_c(tokens: List[str], depth: int, collect: Collector) -> List[str]
 
 
 #: A shell function NAME (bash accepts more than POSIX; this is the
-#: practical subset) — with an optional glued ``()`` and/or ``{``.
+#: practical subset) — with an optional glued ``()`` and/or ``{`` / ``(``.
 _FN_NAME = r"[A-Za-z_][A-Za-z0-9_.:-]*"
 _FN_PAREN_RE = re.compile(r"^(" + _FN_NAME + r")\(\)(\{)?$")
 _FN_KEYWORD_NAME_RE = re.compile(r"^(" + _FN_NAME + r")(\(\))?(\{)?$")
+#: ``f()(`` — name, parameter parens and the subshell-body paren glued
+#: into one token.
+_FN_PAREN_OPEN_GLUED_RE = re.compile(r"^(" + _FN_NAME + r")\(\)\($")
 
 
 def function_header(tokens: List[str]) -> Optional[tuple]:
-    """``(name, header_len)`` when ``tokens`` OPENS a brace-bodied function
-    definition — ``f() {``, ``f(){``, ``f () {``, ``function f {``,
-    ``function f() {`` — where ``header_len`` counts the header tokens up
-    to and including the ``{``; else ``None`` (v0.2.103, owner ruling
-    2026-10-15: a function body's waits are judged by the position rule
-    WITHIN the body). Subshell-bodied functions (``f() ( … )``) are not
-    recognised: their tail is never re-positioned."""
+    """``(name, header_len)`` when ``tokens`` OPENS a function definition
+    — brace-bodied (``f() {``, ``f(){``, ``f () {``, ``function f {``,
+    ``function f() {``) or subshell-bodied (``f() ( sleep 1 )``,
+    ``f()(``, ``function f (`` — v0.2.103) — where ``header_len`` counts
+    the header tokens up to and including the ``{`` / ``(`` body opener;
+    else ``None`` (v0.2.103, owner ruling 2026-10-15: a function body's
+    waits are judged by the position rule WITHIN the body). The body KIND
+    is read by the caller from ``tokens[header_len - 1]`` (``{`` brace,
+    ``(`` subshell) — one home for both."""
     if not tokens:
         return None
     if tokens[0] == "function" and len(tokens) >= 2:
@@ -506,18 +582,21 @@ def function_header(tokens: List[str]) -> Optional[tuple]:
         j = 2
         if not m.group(2) and j < len(tokens) and tokens[j] == "()":
             j += 1
-        if j < len(tokens) and tokens[j] == "{":
+        if j < len(tokens) and tokens[j] in ("{", "("):
             return m.group(1), j + 1
         return None
     m = _FN_PAREN_RE.match(tokens[0])
     if m is not None:
         if m.group(2):
             return m.group(1), 1
-        if len(tokens) > 1 and tokens[1] == "{":
+        if len(tokens) > 1 and tokens[1] in ("{", "("):
             return m.group(1), 2
         return None
+    g = _FN_PAREN_OPEN_GLUED_RE.match(tokens[0])
+    if g is not None:
+        return g.group(1), 1
     if (len(tokens) >= 3 and re.fullmatch(_FN_NAME, tokens[0])
-            and tokens[1] == "()" and tokens[2] == "{"):
+            and tokens[1] == "()" and tokens[2] in ("{", "(")):
         return tokens[0], 3
     return None
 
@@ -565,18 +644,23 @@ def _strip_command_prefix(tokens: List[str]) -> List[str]:
     return strip_subshell_parens(rec)
 
 
-def _invokes(tokens: List[str], name: str) -> bool:
-    """True when the segment runs ``name`` as its command word, directly or
-    as the command word of one of its substitution bodies (``x=$(f)``)."""
+def _row_invoked_names(tokens: List[str]) -> List[str]:
+    """The function NAMES this row invokes as its command word — directly
+    or as the command word of one of its substitution bodies (``x=$(f)``).
+    Only name-shaped words are reported (a header's ``f()`` verb is not a
+    name), so the layout's invocation index stays small."""
+    names: List[str] = []
     cmd = _strip_command_prefix(tokens)
-    if cmd and cmd[0] == name:
-        return True
+    if cmd and re.fullmatch(_FN_NAME, cmd[0]):
+        names.append(cmd[0])
     for body in substitution_bodies(tokens):
         sub = tokenize(body)
-        if sub and any(_strip_command_prefix(s)[:1] == [name]
-                       for s in split_chain(sub)):
-            return True
-    return False
+        if sub:
+            for s in split_chain(sub):
+                c = _strip_command_prefix(s)
+                if c and re.fullmatch(_FN_NAME, c[0]):
+                    names.append(c[0])
+    return names
 
 
 #: One layout row: (tokens, position, chain_size, in_loop).
@@ -584,22 +668,40 @@ _Row = tuple
 
 
 def _function_body_layout(rows: List[_Row]) -> List[_Row]:
-    """Re-position the body of every brace-bodied function that is CALLED
-    later in the same chain level (v0.2.103, owner ruling 2026-10-15).
+    """Re-position the body of every function (brace- OR subshell-bodied)
+    that is CALLED later in the same chain level (v0.2.103, owner ruling
+    2026-10-15).
 
-    The body's segments — the header segment's tail after ``{`` plus every
-    segment up to the matching ``}`` — get positions WITHIN the body, so the
-    position rule judges a wait by where it sits in the function: sole,
-    first or last inside the body is a plain wait once the function runs;
-    between actions inside the body is the sanctioned pause. A call site in
-    a loop marks the whole body in-loop (the body runs per iteration).
+    The body's segments — the header segment's tail after ``{`` / ``(``
+    plus every segment up to the matching ``}`` / ``)`` — get positions
+    WITHIN the body, so the position rule judges a wait by where it sits
+    in the function: sole, first or last inside the body is a plain wait
+    once the function runs; between actions inside the body is the
+    sanctioned pause. A call site in a loop marks the whole body in-loop
+    (the body runs per iteration).
 
     A definition that is never called runs nothing: its rows stay exactly
     as the plain chain walk laid them out (positions at the outer level,
     header token prefix kept), so a definition-only command is judged as
-    before. No matching ``}`` (an unterminated or newline-separated body)
-    also leaves the rows untouched."""
+    before. No matching closer (an unterminated body) also leaves the
+    rows untouched.
+
+    Performance (v0.2.103): call sites are looked up through an invocation
+    index built in ONE pass up front (name → the entry indices of the rows
+    that invoke it, with their loop flags) — the per-definition scan of the
+    whole tail was quadratic (1500 function definitions walked in ~2 s;
+    now linear-ish). Indices are ENTRY indices: every splice replaces its
+    range with the same rows minus the header prefix and deletes exactly
+    the closer row before everything examined later, so
+    ``entry_index = current_index + deleted`` stays true left to right,
+    and a spliced header row's new (tail) command word is re-indexed
+    under its original index."""
     out = list(rows)
+    invocations: dict = {}
+    for idx, r in enumerate(out):
+        for name in _row_invoked_names(r[0]):
+            invocations.setdefault(name, []).append((idx, r[3]))
+    deleted = 0
     h = 0
     while h < len(out):
         header = function_header(out[h][0])
@@ -607,30 +709,89 @@ def _function_body_layout(rows: List[_Row]) -> List[_Row]:
             h += 1
             continue
         name, hlen = header
-        tail = out[h][0][hlen:]
-        depth = 1 + tail.count("{")
-        closer = None
-        for k in range(h + 1, len(out)):
-            toks = out[k][0]
-            if toks and toks[0] == "}":
-                depth -= 1
+        header_toks = out[h][0]
+        # Body kind from the header's LAST token: every recognised opener
+        # ends in `{` (brace) or `(` (subshell, also glued as `f()(`).
+        subshell_body = header_toks[hlen - 1].endswith("(")
+        tail = header_toks[hlen:]
+        body: List[tuple] = []
+        closer: Optional[int] = None
+        if not subshell_body:
+            depth = 1 + tail.count("{")
+            for k in range(h + 1, len(out)):
+                toks = out[k][0]
+                if toks and toks[0] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        closer = k
+                        break
+                depth += toks.count("{")
+            if closer is None:
+                h += 1
+                continue
+            if tail:
+                body.append((tail, out[h][3]))
+            body.extend((r[0], r[3]) for r in out[h + 1:closer])
+        else:
+            # Subshell body: scan pieces until the paren depth closes; the
+            # piece that closes is trimmed at the closing ``)`` and the
+            # closer row is consumed entirely (unlike a brace closer, the
+            # ``)`` never stands as its own segment).
+            depth = 1
+            k = h
+            piece = tail
+            while k < len(out):
+                trimmed: List[str] = []
+                for tok in piece:
+                    if depth == 0:
+                        break
+                    opens = tok.count("(")
+                    closes = tok.count(")")
+                    if closes == 0 or depth + opens - closes > 0:
+                        trimmed.append(tok)
+                        depth += opens - closes
+                    else:
+                        keep: List[str] = []
+                        d = depth
+                        for ch in tok:
+                            if ch == "(":
+                                d += 1
+                            elif ch == ")":
+                                d -= 1
+                                if d == 0:
+                                    break
+                            keep.append(ch)
+                        if keep:
+                            trimmed.append("".join(keep))
+                        depth = 0
+                body.append((trimmed, out[k][3]))
                 if depth == 0:
                     closer = k
                     break
-            depth += toks.count("{")
-        if closer is None:
-            h += 1
-            continue
-        calls = [r for r in out[closer + 1:] if _invokes(r[0], name)]
+                k += 1
+                piece = out[k][0] if k < len(out) else []
+            if closer is None:
+                h += 1
+                continue
+        closer_entry = closer + deleted
+        calls = [e for e in invocations.get(name, ()) if e[0] > closer_entry]
         if not calls:
             h = closer + 1  # never runs: leave the definition untouched
             continue
-        called_in_loop = any(r[3] for r in calls)
-        body = ([(tail,) + out[h][1:]] if tail else []) + out[h + 1:closer]
-        size = len(body)
-        body = [(r[0], j, size, r[3] or called_in_loop)
-                for j, r in enumerate(body)]
-        out[h:closer] = body
+        called_in_loop = any(flag for _i, flag in calls)
+        kept_body = [(toks, fl) for toks, fl in body if toks]
+        size = len(kept_body)
+        new_rows = [(toks, j, size, fl or called_in_loop)
+                    for j, (toks, fl) in enumerate(kept_body)]
+        end = closer if not subshell_body else closer + 1
+        out[h:end] = new_rows
+        deleted += (end - h) - len(new_rows)
+        if new_rows and new_rows[0][0] != header_toks:
+            # The repositioned header row lost its prefix, so its command
+            # word may have become a CALL of another function — re-index.
+            for n2 in _row_invoked_names(new_rows[0][0]):
+                invocations.setdefault(n2, []).append(
+                    (h + deleted, new_rows[0][3]))
         # Re-scan from h: the tail may itself open a nested definition.
     return out
 
@@ -722,17 +883,26 @@ def walk_segments(command: str, depth: int = 0, *,
                            in LEADING_COMPOUND_KEYWORDS):
                 rec = rec[1:]
             rec = strip_subshell_parens(rec)
-            if rec and os.path.basename(rec[0]).lower() in SHELL_DASH_C_VERBS:
+            rec_verb = os.path.basename(rec[0]).lower() if rec else ""
+            sub_cmd: Optional[str] = None
+            if rec_verb in SHELL_DASH_C_VERBS:
                 sub_cmd = dash_c_subcommand(rec)
+            elif rec_verb == "eval":
+                # `eval '<literal>'` (v0.2.103): the body is re-parsed
+                # exactly like a `bash -c` body — same loop-context and
+                # position inheritance. A NON-literal body (`eval "$cmd"`)
+                # is not re-parsed: the segment is emitted as usual.
+                sub_cmd = literal_eval_body(rec)
+            if rec_verb in SHELL_DASH_C_VERBS or sub_cmd is not None:
                 if sub_cmd is not None and sub_budget:
                     out.extend(walk_segments(
                         sub_cmd, depth + 1, _in_loop=in_loop,
                         _position_override=(pos, size),
                         _with_substitutions=_with_substitutions,
                         _with_function_bodies=_with_function_bodies))
-                # Consumed either way: no `-c` sub-command (e.g.
-                # `bash script.sh`) or over budget → nothing emitted,
-                # exactly as parse_dash_c has always done.
+                # Consumed either way: no sub-command (`bash script.sh`)
+                # or over budget → nothing emitted, exactly as parse_dash_c
+                # has always done.
             else:
                 out.append(ChainSegment(peeled, pos, size, in_loop, depth))
                 subst_src = segment
@@ -776,6 +946,7 @@ __all__ = [
     "dash_c_subcommand",
     "function_header",
     "is_env_assignment",
+    "literal_eval_body",
     "parse_dash_c",
     "peel_wrapper_verbs",
     "split_chain",

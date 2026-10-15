@@ -198,12 +198,26 @@ class TestLoopConditionWaitDenied:
     @pytest.mark.parametrize(
         "command",
         [
-            # A loop WITHOUT a wait is not the guard's business.
+            # Bare echo/true/: bodies are BUSY-WAIT loops now (owner ruling
+            # 2026-10-15, item 6) — denied even with no sleep in them.
             "while true; do echo x; done",
             "until curl -s localhost:8080; do echo x; done",
+            "while ! check; do echo x; done; sleep 2; echo next",
+        ],
+    )
+    def test_bare_echo_body_is_a_busy_wait_now(self, tmp_path, command):
+        reason = _deny(tmp_path, command)
+        assert "busy-wait loop" in reason
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # A loop whose body does real work is not the guard's business.
+            "while true; do build_step; done",
+            "until curl -s localhost:8080 >/dev/null; do prepare; done",
             # A condition that is a plain check, with a legal fixed pause
             # after the loop.
-            "while ! check; do echo x; done; sleep 2; echo next",
+            "while ! check; do process; done; sleep 2; echo next",
         ],
     )
     def test_no_wait_means_allowed(self, tmp_path, command):
@@ -715,7 +729,11 @@ class TestFunctionBodySoleWaits:
         assert function_header(["function", "f()", "{"]) == ("f", 3)
         assert function_header(["function", "f", "()", "{"]) == ("f", 4)
         assert function_header(["echo", "f()", "{"]) is None
-        assert function_header(["f()", "(", "sleep"]) is None
+        # Subshell bodies (v0.2.103 item 4): recognised like brace bodies.
+        assert function_header(["f()", "(", "sleep"]) == ("f", 2)
+        assert function_header(["f()(", "sleep", "1", ")"]) == ("f", 1)
+        assert function_header(["f", "()", "(", "sleep"]) == ("f", 3)
+        assert function_header(["function", "f", "(", "sleep"]) == ("f", 3)
 
     def test_walker_positions_body_only_when_called_and_opted_in(self):
         from vco_lib.bash_command_walk import walk_command, walk_segments
@@ -733,3 +751,245 @@ class TestFunctionBodySoleWaits:
         one = lambda toks: ["|".join(toks)]  # noqa: E731
         assert walk_command("f() { sleep 1; }; f", one) == [
             "f()|{|sleep|1", "}", "f"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# R9 follow-up wave (owner ruling 2026-10-15): newline separators, literal
+# eval bodies, process substitutions, subshell-bodied functions, walker
+# performance, and the busy-wait loop rule.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestNewlineCommandSeparator:
+    """An unquoted newline is a command separator exactly like `;` (one
+    home: the walker's tokenize). A quoted newline is data; a backslash
+    newline is a continuation."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "make\nsleep 5",                  # the sleep is LAST: a wait
+            "make\nsleep 5\nmake test",       # between actions: allowed
+            "while ! check\ndo sleep 2\ndone",
+            "while ! check; do echo x; sleep 2; done\nsleep 2\necho next",
+        ],
+    )
+    def test_newline_form_matches_semicolon_form(self, tmp_path, command):
+        from vco_lib.wait_guard import static_pattern
+
+        assert static_pattern(command) == static_pattern(
+            command.replace("\n", "; "))
+
+    def test_denied_last_sleep_on_newline(self, tmp_path):
+        assert "sleep" in _deny(tmp_path, "make\nsleep 5")
+
+    def test_allowed_between_actions_on_newlines(self, tmp_path):
+        _allow(tmp_path, "make\nsleep 5\nmake test")
+
+    def test_multiline_loop_sleep_denied(self, tmp_path):
+        reason = _deny(tmp_path, "while ! check\ndo sleep 2\ndone")
+        assert "sleep" in reason
+
+    def test_quoted_newline_is_data(self, tmp_path):
+        _allow(tmp_path, 'echo "a\nsleep 5"')
+
+    def test_backslash_newline_is_a_continuation(self, tmp_path):
+        # `sleep 5` stays ONE command with its argument — the sole/last
+        # segment rule applies as to the one-line form.
+        assert "sleep" in _deny(tmp_path, "make && sleep \\\n5")
+
+    def test_walker_splits_newlines_like_semicolons(self):
+        from vco_lib.bash_command_walk import tokenize, walk_command
+
+        assert tokenize("make\nsleep 5") == ["make", ";", "sleep", "5"]
+        one = lambda toks: ["|".join(toks)]  # noqa: E731
+        assert walk_command("make\nsleep 5", one) == ["make", "sleep|5"]
+        assert walk_command("make\nsleep 5\nmake test", one) == [
+            "make", "sleep|5", "make|test"]
+
+    def test_heredoc_body_is_data_not_a_command(self, tmp_path):
+        # A heredoc BODY line is raw text: `sleep 5` inside one is not a
+        # wait verb any more than `echo "sleep 5"` is.
+        _allow(tmp_path, "cat > f <<'EOF'\nsleep 5\nEOF")
+
+
+class TestLiteralEvalBodies:
+    """`eval '<literal>'` runs the string as a shell command — re-parsed
+    exactly like a `bash -c` body (loop context and position inherited).
+    A NON-literal body (`eval "$cmd"`) is never re-parsed."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "eval 'sleep 5'",
+            'eval "sleep 5"',
+            "foo; eval 'sleep 5'",           # last: it only waits
+            "while eval 'sleep 1'; do x; done",
+            "timeout 5 eval 'sleep 3'",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        assert "sleep" in _deny(tmp_path, command)
+
+    def test_between_actions_allowed(self, tmp_path):
+        # A sole sub-chain inherits the outer between-actions position —
+        # the same pause `x && bash -c 'sleep 3' && y` is.
+        _allow(tmp_path, "foo; eval 'sleep 5'; bar")
+        _allow(tmp_path, "x && eval 'sleep 3' && y")
+        _allow(tmp_path, "eval 'foo; sleep 2; bar'")
+
+    def test_non_literal_eval_stays_as_is(self, tmp_path):
+        # The body is not a fixed command: judged as the plain `eval`
+        # segment (no wait verb), exactly as before.
+        _allow(tmp_path, 'eval "sleep $N"')
+        _allow(tmp_path, "eval \"$cmd\"")
+
+    def test_walker_recurses_literal_eval_like_dash_c(self):
+        from vco_lib.bash_command_walk import (
+            literal_eval_body, walk_command,
+        )
+
+        assert literal_eval_body(["eval", "sleep 5"]) == "sleep 5"
+        assert literal_eval_body(["eval", "sleep $N"]) is None
+        assert literal_eval_body(["eval", "$cmd"]) is None
+        assert literal_eval_body(["eval", "sleep", "5"]) is None
+        one = lambda toks: ["|".join(toks)]  # noqa: E731
+        assert walk_command("eval 'a; b'", one) == ["a", "b"]
+        # Non-literal: the segment is emitted, not recursed.
+        assert walk_command('eval "$cmd"', one) == ["eval|$cmd"]
+
+
+class TestProcessSubstitutionWaits:
+    """`<(sleep 5)` / `>(...)` run their body as a command — scanned like
+    a command substitution."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "diff <(sleep 5) <(cat x)",
+            "cmp <(cat a) <(sleep 2)",
+            "tee >(sleep 5)",
+            "echo x > >(sleep 3)",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        assert "sleep" in _deny(tmp_path, command)
+
+    def test_between_actions_substitution_allowed(self, tmp_path):
+        # The body's own chain is a fixed pause between body actions.
+        _allow(tmp_path, "diff <(foo; sleep 1; bar) <(cat x)")
+
+    def test_no_wait_substitution_allowed(self, tmp_path):
+        _allow(tmp_path, "diff <(cat a) <(cat b)")
+        _allow(tmp_path, "wc -l <(ls)")
+
+
+class TestSubshellBodiedFunctions:
+    """`f() ( sleep 1 )` — same rule as brace bodies when the function is
+    called in the same command."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "f() ( sleep 1 ); f",
+            "f()( sleep 2 ); f",
+            "f () ( sleep 2 ); f",
+            "function f ( sleep 2 ); f",
+            "f() (\n  sleep 1\n); f",
+            "f() ( a; sleep 1 ); f",        # last in the body
+            "f() ( sleep 1; a ); f",        # first in the body
+            "f() ( while sleep 1; do x; done ); f",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        assert "sleep" in _deny(tmp_path, command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "f() ( a; sleep 1; b ); f",     # between actions in the body
+            "f() ( sleep 1 )",              # definition only
+            "f() ( echo hi ); f",
+        ],
+    )
+    def test_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+
+class TestWalkerFunctionBodyPerformance:
+    """The per-definition call-site scan used to be quadratic (review R9:
+    1500 function definitions → 5.2 s; ~2 s on this lane's machine). The
+    invocation index makes it linear-ish."""
+
+    def test_1500_definitions_walk_fast(self):
+        import time
+
+        from vco_lib.bash_command_walk import walk_segments
+
+        command = "; ".join("f%d() { echo hi; }" % i for i in range(1500))
+        start = time.perf_counter()
+        segments = walk_segments(command, _with_function_bodies=True)
+        elapsed = time.perf_counter() - start
+        assert len(segments) == 3000  # headers + `echo hi` bodies
+        # Generous bound: the pre-fix walk took ~2-5 s; the indexed one
+        # runs in tens of milliseconds. Slow CI stays far under this.
+        assert elapsed < 1.0, f"walker regressed to quadratic: {elapsed:.2f}s"
+
+
+class TestBusyWaitLoops:
+    """Owner ruling 2026-10-15: a while/until loop whose body does NO real
+    work is a busy-wait — denied with its own message even with no sleep."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "until curl -s localhost:8080; do :; done",
+            "while ! test -f x; do true; done",
+            "while true; do :; done",
+            "while true; do echo x; done",
+            "until curl -s localhost:8080; do echo waiting; done",
+            "while ! check; do printf .; done",
+            "while check; do done",
+            # Multi-line form (newline separator).
+            "until curl -s localhost:8080\ndo :\ndone",
+            # Inside a called function body.
+            "f() { while true; do :; done; }; f",
+            "f() ( while true; do :; done ); f",
+            # Nested: the INNER spin is caught.
+            "while true; do while true; do :; done; done",
+        ],
+    )
+    def test_denied(self, tmp_path, command):
+        reason = _deny(tmp_path, command)
+        assert "busy-wait loop" in reason
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # The ruling's leave-alone examples: the body does real work.
+            "for f in *.py; do ruff check $f; done",
+            "while read l; do echo \"$l\" >> out; done < in",
+            # for/select iterate a finite word list: never a busy-wait.
+            "for f in *.py; do echo $f; done",
+            "select x in a b; do echo $x; break; done",
+            # Real work in the body, spin or not.
+            "while true; do build_step; done",
+            "while :; do date; done",
+            # A redirected echo accumulates output — that is work.
+            "while read l; do echo \"$l\" >> out; done",
+            # A pipe out of the body is downstream work.
+            "while true; do echo x | gzip >> log.gz; done",
+            # An embedded loop in the body is work at this level.
+            "while a; do for i in 1 2; do echo $i; done; done",
+        ],
+    )
+    def test_allowed(self, tmp_path, command):
+        _allow(tmp_path, command)
+
+    def test_deny_reason_has_its_own_message(self, tmp_path):
+        reason = _deny(tmp_path, "until curl -s localhost:8080; do :; done")
+        assert "busy-wait loop" in reason
+
+    def test_sleep_in_body_still_names_the_sleep(self, tmp_path):
+        reason = _deny(tmp_path, "while ! check; do echo x; sleep 2; done")
+        assert "sleep" in reason and "busy-wait" not in reason

@@ -562,10 +562,11 @@ def collect_candidates(command: str) -> List[str]:
     collector = _WriteTargetCollector()
     lines = stripped.split("\n")
     if len(lines) > 1 and all(tokenize(line) is not None for line in lines):
-        # shlex treats a newline as ordinary whitespace, so a multi-line
-        # script would otherwise collapse into ONE segment and only its
-        # first verb would be classified. Walk line by line, sharing the
-        # collector so `cd` state still flows forward.
+        # Walk line by line, sharing the collector so `cd` state still
+        # flows forward. (v0.2.103 made the walker itself treat an
+        # unquoted newline as a separator, so this split is now a
+        # belt-and-braces equivalence — kept because it also bounds each
+        # walk to one line.)
         raw: List[str] = []
         for line in lines:
             raw.extend(walk_command(line, collector))

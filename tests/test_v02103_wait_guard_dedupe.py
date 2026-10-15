@@ -36,6 +36,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+
+import pytest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -172,6 +174,134 @@ class TestToolUseIdDedupe:
             assert reason is None, f"Read fan-out fire {i + 1} denied: {reason}"
         entry = _entry(tmp_path, "/tmp/app.log")
         assert entry["stamps"] == [1000.0]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Real field false positives (both blocked on their FIRST run by the
+# double-count bug; pinned at coordinator request 2026-10-15)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestFieldFalsePositives:
+    """Two REAL commands denied as the "4th/5th identical status check"
+    on their first run in the field (one tool call fanned out to N
+    `if`-filtered registrations, each stamping the repeat window). Each
+    is driven through the PreToolUse decision with ONE tool_use_id fired
+    N times — the shape of one real call — and must never deny."""
+
+    RENDER_SH = (
+        "ls -t /tmp/*/render.sh /tmp/render.sh 2>/dev/null | head -3; "
+        "f=$(ls -t /tmp/*/render.sh /tmp/render.sh 2>/dev/null | head -1); "
+        'cat "$f"'
+    )
+    REMOTE_RUNS = (
+        "cat /tmp/claude-1000/x/tasks/bq37mq98e.output; "
+        "d=work/pmr/remote-runs/"
+        "$(ls -t work/pmr/remote-runs | grep ^2 | head -1); "
+        "echo $d; ls $d $d/udp | head -30"
+    )
+
+    @pytest.mark.parametrize("command", [RENDER_SH, REMOTE_RUNS])
+    def test_static_classifier_allows(self, command):
+        from vco_lib.wait_guard import static_pattern
+
+        assert static_pattern(command) is None
+
+    @pytest.mark.parametrize("command", [RENDER_SH, REMOTE_RUNS])
+    def test_one_call_fanned_out_never_denies(self, tmp_path, command):
+        """ONE tool call, one tool_use_id, N registration fires (N=8,
+        above the real per-verb registration count of ~6 and the deny
+        threshold of 4): never denied, on any fire."""
+        from vco_lib import wait_guard as wg
+
+        payload = _bash(command, tool_use_id="toolu_field")
+        for i in range(8):
+            reason = wg.evaluate(payload, env=dict(ENV_DEFAULT),
+                                 state_root=tmp_path, now=1000.0 + i * 0.01)
+            assert reason is None, (
+                f"fire {i + 1} of ONE tool call denied: {reason}"
+            )
+
+
+class TestWriteIsNeverAStatusCheck:
+    """A command that WRITES is never a poll (field case 2026-10-15:
+    ``cat > f <<'EOF' … ; sed -i …`` keyed on ``cat`` and was blocked as
+    the "6th identical status check" on its FIRST run). The write test is
+    the one-home write-shape predicate
+    (``vco_lib.bash_write_targets.command_has_write_shape``): an output
+    redirection, a heredoc, ``sed -i``, ``tee`` kin. Pure reads still
+    accumulate exactly as before."""
+
+    WRITE_HEREDOC = (
+        "cat > tools/pmr/nav/restart_session.json <<'EOF'\n"
+        '{"a":1}\n'
+        "EOF\n"
+        "; sed -i '10a x' tools/pmr/nav/README.md"
+        "; python3 tools/remote/pmr_remote.py nav --list | grep restart"
+        "; python3 tools/remote/pmr_remote.py nav restart_session --dry-run"
+        " | tail -4"
+    )
+
+    def test_static_classifier_allows(self):
+        from vco_lib.wait_guard import static_pattern
+
+        assert static_pattern(self.WRITE_HEREDOC) is None
+
+    def test_write_command_one_id_fired_n_times_never_denies(self, tmp_path):
+        from vco_lib import wait_guard as wg
+
+        payload = _bash(self.WRITE_HEREDOC, tool_use_id="toolu_write")
+        for i in range(8):
+            reason = wg.evaluate(payload, env=dict(ENV_DEFAULT),
+                                 state_root=tmp_path, now=1000.0 + i * 0.01)
+            assert reason is None, (
+                f"fire {i + 1} of ONE WRITE call denied: {reason}"
+            )
+
+    def test_write_command_distinct_ids_still_never_denied(self, tmp_path):
+        """Writes NEVER count — even N genuinely distinct calls of the
+        same write command accumulate no repeat entry."""
+        from vco_lib import wait_guard as wg
+
+        for i in range(8):
+            reason = wg.evaluate(
+                _bash(self.WRITE_HEREDOC, tool_use_id=f"toolu_w{i}"),
+                env=dict(ENV_DEFAULT), state_root=tmp_path,
+                now=1000.0 + i * 10.0,
+            )
+            assert reason is None, f"distinct WRITE call {i} denied: {reason}"
+        assert not _state_file(tmp_path).exists() or "bash:" not in (
+            tmp_path / "wait_sess-1__main.json").read_text("utf-8")
+
+    def test_plain_redirect_write_excluded_too(self, tmp_path):
+        from vco_lib import wait_guard as wg
+
+        for i in range(8):
+            reason = wg.evaluate(
+                _bash("cat /tmp/app.log >> /tmp/seen.log; grep x /tmp/app.log",
+                      tool_use_id=f"toolu_r{i}"),
+                env=dict(ENV_DEFAULT), state_root=tmp_path,
+                now=1000.0 + i * 10.0,
+            )
+            assert reason is None, f"append-write call {i} denied: {reason}"
+
+    def test_pure_reads_still_count(self, tmp_path):
+        """What the detector is FOR: N DISTINCT pure-read checks of the
+        same file are denied at the threshold, exactly as before."""
+        from vco_lib import wait_guard as wg
+
+        cmd = "cat /tmp/x.log"
+        for n in (1, 2, 3):
+            assert wg.evaluate(
+                _bash(cmd, tool_use_id=f"toolu_p{n}"),
+                env=dict(ENV_DEFAULT), state_root=tmp_path,
+                now=1000.0 + n * 10.0,
+            ) is None
+        reason = wg.evaluate(
+            _bash(cmd, tool_use_id="toolu_p4"),
+            env=dict(ENV_DEFAULT), state_root=tmp_path, now=1040.0,
+        )
+        assert reason and "4th" in reason
 
 
 # ═══════════════════════════════════════════════════════════════════════
