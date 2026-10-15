@@ -74,7 +74,7 @@ from vco_lib.powershell_command import (
     spellings_for_bash_verbs,
 )
 from vco_lib.bash_write_targets import (
-    _REDIRECT_NOISE,
+    REDIRECT_NOISE,
     _SECRETISH_RE,
     extract_write_targets,
     prebash_query_parts,
@@ -195,7 +195,7 @@ def powershell_rule_spellings() -> List[str]:
     verbs = _READ_VERBS | _SEARCH_VERBS | _EDIT_RULE_VERBS | _CHAIN_RULE_VERBS
     return spellings_for_bash_verbs(sorted(verbs)) + sorted(_PS_NATIVE_RULE_VERBS)
 
-_SINK_NOISE = _REDIRECT_NOISE  # one home: the bash_write_targets strip list
+_SINK_NOISE = REDIRECT_NOISE  # one home: the bash_write_targets strip list
 
 
 def _strip_sinks(command: str) -> str:

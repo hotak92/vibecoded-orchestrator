@@ -196,7 +196,7 @@ _OPAQUE_WRITER_RE = re.compile(
 # two decide whether this module is spawned at all, so a shape they reject can
 # never reach these predicates. `tests/test_v0295_bash_write_sync.py` pins all
 # three against one corpus.
-_REDIRECT_NOISE = (
+REDIRECT_NOISE = (
     "2>&1", "1>&2", ">&2", "&>/dev/null", "2>/dev/null",
     "1>/dev/null", ">/dev/null", "> /dev/null",
 )
@@ -222,7 +222,7 @@ def command_has_write_shape(command: str) -> bool:
     if not command:
         return False
     stripped = command
-    for noise in _REDIRECT_NOISE:
+    for noise in REDIRECT_NOISE:
         stripped = stripped.replace(noise, "")
     if ">" in stripped or "<<" in command:
         return True
@@ -562,10 +562,15 @@ def collect_candidates(command: str) -> List[str]:
     collector = _WriteTargetCollector()
     lines = stripped.split("\n")
     if len(lines) > 1 and all(tokenize(line) is not None for line in lines):
-        # shlex treats a newline as ordinary whitespace, so a multi-line
-        # script would otherwise collapse into ONE segment and only its
-        # first verb would be classified. Walk line by line, sharing the
-        # collector so `cd` state still flows forward.
+        # Walk line by line, sharing the collector so `cd` state still
+        # flows forward. NOT equivalent to one whole-string walk any more
+        # (v0.2.103 R10 F5): when a line holds a MULTI-LINE QUOTED string
+        # this branch is skipped and the whole command goes through the
+        # walker, which now splits unquoted newlines itself — the fallback
+        # path then finds the same targets the per-line walk would (and
+        # better ones than before, when a quoted newline glued words
+        # across lines). Pinned by the fallback tests in
+        # tests/test_v0295_bash_write_sync.py.
         raw: List[str] = []
         for line in lines:
             raw.extend(walk_command(line, collector))

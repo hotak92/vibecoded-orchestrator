@@ -102,6 +102,13 @@ LIB_SRC = HOOKS / "_lib"
         # Commands that write nothing at all.
         ("git status --short", []),
         ("grep -rn 'migrate_collections' vco_lib/", []),
+        # v0.2.103 R10 F5: a multi-line QUOTED string on a line defeats the
+        # per-line split, so the whole command goes through the walker —
+        # which now splits unquoted newlines itself. The fallback finds the
+        # same targets the per-line walk would (before, the quoted newline
+        # glued words across lines and forged paths like `x\ny/a`).
+        ("cp a b\necho \"x\ny\" > out.txt", ["b", "out.txt"]),
+        ("echo \"x\ny\" > out.txt\ncp a c", ["out.txt", "c"]),
     ],
 )
 def test_collect_candidates(command: str, expected: list[str]) -> None:

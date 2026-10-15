@@ -772,23 +772,235 @@ def _paren_body(toks: List[_Tok], open_idx: int) -> Tuple[List[_Tok], int]:
     return body, len(toks)
 
 
+def _brace_body(toks: List[_Tok], open_idx: int) -> Tuple[List[_Tok], int]:
+    """Tokens inside the ``{`` at ``open_idx`` up to its matching ``}``."""
+    depth = 0
+    for k in range(open_idx, len(toks)):
+        t = toks[k]
+        if t.op == "{":
+            depth += 1
+        elif t.op == "}":
+            depth -= 1
+            if depth == 0:
+                return toks[open_idx + 1 : k], k
+    return toks[open_idx + 1 :], len(toks)
+
+
+#: PowerShell loop-body verbs that do NO real work — the Bash busy-wait
+#: rule's ``echo``/``printf`` twins (output-only cmdlets). A bare
+#: expression statement (``$l``, a literal) is output too.
+_PS_NOWORK_VERBS = frozenset({
+    "write-output", "write-host", "echo", "write-debug", "write-verbose",
+    "write-information", "write-progress", "out-null", "out-default",
+})
+
+#: A wait ANYWHERE in a loop (condition or body) is a wait in the loop —
+#: the same rule the Bash side applies to sleeps in loops. ``sleep`` is
+#: Start-Sleep's alias; ``timeout`` covers ``timeout /t``.
+_PS_LOOP_WAIT_WORDS = frozenset({"start-sleep", "sleep", "timeout"}) | set(
+    PS_WAIT_VERBS)
+
+#: A loop condition that consumes input bounds the loop (it ends at EOF):
+#: the ReadLine/read-host family — the PowerShell twin of the Bash
+#: ``while read`` exemption.
+_PS_INPUT_COND_RE = re.compile(
+    r"(?i)(\.read(line)?\b|read-host|\[console\]::in)")
+
+_PS_WAIT_FLAG_RE = re.compile(r"(?i)^-wait$")
+
+#: ``[Threading.Thread]::Sleep(n)`` and its fully-qualified twin (R14 A4).
+_PS_STATIC_SLEEP_RE = re.compile(r"(?i)::sleep")
+
+#: The PowerShell no-op sinks: a redirect to ``$null``, a pipe to
+#: ``Out-Null``, and an fd duplication write nowhere (R14 A4 — the
+#: ``/dev/null`` twin of R10 F2).
+_PS_NULL_TARGETS = frozenset({"$null", "null"})
+
+_PS_OUT_NULL_RE = re.compile(r"(?i)^out-null$")
+
+#: A condition's variable references (`$r.StatusCode` → ``r``).
+_PS_COND_VAR_RE = re.compile(r"\$(\w+)")
+
+
+def _ps_loop_has_wait(toks: List[_Tok]) -> bool:
+    """A wait anywhere in the token list: a wait verb, a ``-Wait`` flag, a
+    static ``[Threading.Thread]::Sleep(n)`` call, or the Windows sleep
+    shapes ``ping -n <count>`` / ``timeout /t <secs>`` (R14 A4)."""
+    for k, t in enumerate(toks):
+        if t.quoted or t.op:
+            continue
+        low = t.text.lower()
+        if low == "ping":
+            # `ping` is a sleeper only in its Windows count shape
+            # (`ping -n 2 host`); pinging as work stays work.
+            nxt = toks[k + 1] if k + 1 < len(toks) else None
+            if (nxt is not None and not nxt.quoted and nxt.op == ""
+                    and nxt.text.lower().startswith("-n")):
+                return True
+            continue
+        if low in _PS_LOOP_WAIT_WORDS or _PS_WAIT_FLAG_RE.match(t.text):
+            return True
+        if _PS_STATIC_SLEEP_RE.search(low):
+            return True
+    return False
+
+
+def _ps_stmt_has_real_output(stmt: List[_Tok]) -> bool:
+    """True when the statement's output goes somewhere REAL: a redirect
+    whose target is not ``$null`` and not an fd duplication, or a pipe
+    whose consumer is not ``Out-Null`` (R14 A4)."""
+    for k, t in enumerate(stmt):
+        if t.op == "redir":
+            nxt = stmt[k + 1] if k + 1 < len(stmt) else None
+            if "&" in t.text:
+                continue  # `2>&1`: a duplication, writes nowhere new
+            if (nxt is not None and not nxt.op
+                    and nxt.text.lower() in _PS_NULL_TARGETS):
+                continue  # `> $null`
+            return True
+        if t.op == "|":
+            nxt = stmt[k + 1] if k + 1 < len(stmt) else None
+            if (nxt is not None and not nxt.op and not nxt.quoted
+                    and _PS_OUT_NULL_RE.match(nxt.text)):
+                continue  # `| Out-Null`
+            return True  # a pipe feeds a consumer: work
+    return False
+
+
+def _ps_stmts(toks: List[_Tok]) -> List[List[_Tok]]:
+    """The body split into statements at ``;``."""
+    stmt: List[_Tok] = []
+    stmts: List[List[_Tok]] = []
+    for t in toks:
+        if t.op == ";":
+            stmts.append(stmt)
+            stmt = []
+        else:
+            stmt.append(t)
+    stmts.append(stmt)
+    return stmts
+
+
+def _ps_stmt_does_real_work(stmt: List[_Tok]) -> bool:
+    """The Bash busy-wait rule's work test, for ONE PowerShell statement:
+    output-only (``Write-Output`` kin, a bare value expression) with no
+    real output → no work. ``if``/``switch``/``try`` carry structure,
+    ``break``/``continue``/``return`` change control flow, and — R14 A1 —
+    an ASSIGNMENT (``$x = …``, ``$i++``) or a method call (``$p.Refresh()``)
+    is work: only a single VALUE token counts as a bare expression."""
+    if not stmt:
+        return False
+    head = next((t for t in stmt if not t.op), None)
+    if head is None:
+        return False  # pure operators (a stray redirect): no command word
+    word = head.text.lower().rsplit("\\", 1)[-1]
+    if word in ("if", "elseif", "else", "switch", "try", "catch",
+                "finally", "break", "continue", "return"):
+        return True
+    redirected = _ps_stmt_has_real_output(stmt)
+    if word in _PS_NOWORK_VERBS and not redirected:
+        return False
+    if head.text.startswith("$"):
+        # A bare expression ONLY as a single value: no assignment, no
+        # increment, no call (R14 A1 — `$i++`, `$out += …`, `$x = …` and
+        # `$p.Refresh()` are all work; `$l`, `$row.Name` are output).
+        # The text includes OPERATOR tokens: a call's `(` is an op.
+        text = " ".join(t.text for t in stmt)
+        if ("=" not in text and "++" not in text and "--" not in text
+                and "(" not in text and not redirected):
+            return False
+        return True
+    if (head.quoted or head.text[0].isdigit()) and not redirected:
+        return False  # a literal statement: output, not work
+    return True
+
+
+def _ps_body_does_real_work(toks: List[_Tok]) -> bool:
+    """The Bash busy-wait rule's work test, for ONE PowerShell loop body:
+    no work iff every statement is output-only (see
+    :func:`_ps_stmt_does_real_work`)."""
+    return any(_ps_stmt_does_real_work(s) for s in _ps_stmts(toks))
+
+
+_PS_ASSIGN_RE = re.compile(r"^(\$\w+)\s*(=|\+=|-=)\s*(.*)$")
+
+
+def _ps_condition_refresh_poll(cond: List[_Tok],
+                               body: List[_Tok]) -> Optional[Tuple[str, str]]:
+    """The condition-refresh poll rule, PowerShell side (coordinator
+    ruling 2026-10-15 — the twin of the wait guard's Bash rule): a loop
+    whose ONLY work is assigning the very variables its condition reads
+    from an external fetch (``do { $r = Invoke-WebRequest u } until
+    ($r.StatusCode -eq 200)``, ``while (-not $ok) { $ok = Test-Path x }``)
+    is a poll. Precisely: the condition reads at least one variable, and
+    every body statement is either no-work or an assignment to one of
+    those variables whose value FETCHES (a command word or a method call
+    on the right-hand side — not a literal, not arithmetic on the
+    variable itself, which is a counted loop and stays allowed)."""
+    cond_vars = set()
+    for t in cond:
+        if not t.op:
+            cond_vars.update(_PS_COND_VAR_RE.findall(t.text))
+    if not cond_vars:
+        return None
+    saw_fetch = False
+    for stmt in _ps_stmts(body):
+        if not _ps_stmt_does_real_work(stmt):
+            continue
+        # Full text INCLUDING operator tokens: a method call's `(` is an
+        # op, and it is what makes the right-hand side a fetch.
+        text = " ".join(t.text for t in stmt)
+        m = _PS_ASSIGN_RE.match(text)
+        if m is None:
+            return None  # work that is not an assignment to a cond var
+        if m.group(1)[1:] not in cond_vars:
+            return None  # assigns a variable the condition never reads
+        rhs = m.group(3).strip()
+        if not rhs:
+            return None
+        first = rhs.split()[0]
+        if "(" in rhs:
+            saw_fetch = True  # a method call: $q.Dequeue(), a web call…
+            continue
+        if first.startswith("$") or first[0].isdigit() or first[0] in "'\"":
+            continue  # a value/arithmetic: not a fetch (counted loop)
+        saw_fetch = True  # a command word: Invoke-WebRequest, Test-Path…
+    if saw_fetch:
+        return ("condition-refresh poll", "")
+    return None
+
+
 def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
-    """``(pattern_name, evidence)`` for a PowerShell loop that waits, else
-    ``None`` (v0.2.102 W5-D review W5D-2).
+    """``(pattern_name, evidence)`` for a PowerShell loop the wait guard
+    denies, else ``None`` (v0.2.102 W5-D; ALIGNED with the Bash rule by
+    review R10, 2026-10-15 — before, EVERY ``while``/``do`` loop was
+    denied, which was stricter than the owner's ruling).
 
     A PowerShell loop keyword is not a command, so no ``PowerShell(...)``
     ``if`` rule can ever match it; the wait guard therefore runs on EVERY
-    PowerShell call and asks this function. Detected, with or without a
-    ``Start-Sleep`` inside (a loop with no sleep spins and re-polls just the
-    same):
+    PowerShell call and asks this function. A loop is denied exactly when
+    its Bash twin would be:
 
-    * ``while (<cond>) { … }`` — any condition;
-    * ``do { … } while (…)`` / ``do { … } until (…)``;
-    * ``for (<init>; ; <step>)`` — an EMPTY condition (``for (;;)``); a
-      ``for`` with a condition is bounded and passes;
-    * ``foreach ($x in a..<bound>)`` where the bound is a type's
-      ``MaxValue`` or a literal >= :data:`UNBOUNDED_RANGE_MIN`; a
-      ``foreach`` over a collection (``foreach ($f in $files)``) passes.
+    * it CONTAINS A WAIT — ``Start-Sleep``/``sleep``, a ``Wait-*`` cmdlet,
+      a ``-Wait`` flag, ``[Threading.Thread]::Sleep(n)`` or the Windows
+      sleep shapes ``ping -n <count>`` / ``timeout /t`` in the condition
+      or the body (a sleep inside a loop is denied on the Bash side
+      whatever its position);
+    * or it is a BUSY-WAIT — an unbounded loop (``while``/``do … while/
+      until``, ``for (;;)``, an unbounded ``foreach`` range) whose body
+      does no real work: every statement empty, output-only
+      (``Write-Output`` kin, a bare value expression — an assignment,
+      increment or method call IS work, R14 A1) with no real output
+      (``> $null`` and ``| Out-Null`` write nowhere, R14 A4);
+    * or it is a CONDITION-REFRESH POLL (coordinator ruling 2026-10-15,
+      the twin of the wait guard's Bash rule) — its only work assigns the
+      very variables the condition reads from an external fetch.
+
+    A loop doing real work passes (``foreach ($f in Get-ChildItem) { ruff
+    check $f }``); a condition that consumes input bounds the loop
+    (``while (($l = $r.ReadLine()) -ne $null) { $l }`` — the ``while
+    read`` twin); a bounded ``for`` (non-empty middle clause) and a
+    ``foreach`` over a collection pass whatever the body does.
 
     Keywords are recognised only as unquoted words followed by their
     syntax (``(`` / ``{``), so ``Write-Output "while (x)"`` and the
@@ -796,37 +1008,75 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
     if not isinstance(command, str) or not command.strip():
         return None
     toks = _tokenize(command)
+    skip_past = -1  # a do-loop's trailing condition is not a NEW loop head
     for i, t in enumerate(toks):
-        if t.op or t.quoted:
+        if t.op or t.quoted or i <= skip_past:
             continue
         word = t.text.lower()
         nxt = toks[i + 1] if i + 1 < len(toks) else None
+        # (label, condition tokens, body tokens, unbounded)
+        label: Optional[str] = None
+        evidence = ""
+        cond: List[_Tok] = []
+        body: List[_Tok] = []
+        unbounded = False
         if word == "do" and nxt is not None and nxt.op == "{":
-            return ("do loop", "do { ... } while/until (...)")
-        if nxt is None or nxt.op != "(":
+            body, end = _brace_body(toks, i + 1)
+            rest = toks[end + 1:]
+            label, evidence, unbounded = "do loop", "do { ... } while/until (...)", True
+            if (len(rest) >= 2 and rest[0].op == ""
+                    and rest[0].text.lower() in ("while", "until")
+                    and rest[1].op == "("):
+                cond, cond_end = _paren_body(rest, 1)
+                skip_past = end + 1 + cond_end  # absolute index of the `)`
+        elif nxt is not None and nxt.op == "(":
+            paren, pend = _paren_body(toks, i + 1)
+            if word == "while":
+                cond = paren
+                body, _ = _brace_body(toks, pend + 1)
+                label = "while loop"
+                evidence = f"while ({' '.join(b.text for b in cond)[:60]})"
+                unbounded = True
+            elif word == "for":
+                parts: List[List[_Tok]] = [[]]
+                for b in paren:
+                    if b.op == ";":
+                        parts.append([])
+                    else:
+                        parts[-1].append(b)
+                bounded = len(parts) >= 2 and bool(parts[1])
+                cond = parts[1] if bounded else []
+                body, _ = _brace_body(toks, pend + 1)
+                if not bounded:
+                    label = "for (;;) loop"
+                    evidence = "for (...; ; ...)"
+                    unbounded = True
+            elif word == "foreach":
+                src = " ".join(b.text for b in paren)
+                cond = paren
+                body, _ = _brace_body(toks, pend + 1)
+                if _MAXVALUE_RE.search(src) or (
+                    (m := _RANGE_LITERAL_RE.search(src))
+                    and int(m.group(1).replace("_", "")) >= UNBOUNDED_RANGE_MIN
+                ):
+                    label = "unbounded foreach"
+                    evidence = f"foreach ({src[:60]})"
+                    unbounded = True
+        if label is None:
             continue
-        if word == "while":
-            body, _end = _paren_body(toks, i + 1)
-            cond = " ".join(b.text for b in body)[:60]
-            return ("while loop", f"while ({cond})")
-        if word == "for":
-            body, _end = _paren_body(toks, i + 1)
-            parts: List[List[_Tok]] = [[]]
-            for b in body:
-                if b.op == ";":
-                    parts.append([])
-                else:
-                    parts[-1].append(b)
-            if len(parts) >= 2 and not parts[1]:
-                return ("for (;;) loop", "for (...; ; ...)")
-        if word == "foreach":
-            body, _end = _paren_body(toks, i + 1)
-            src = " ".join(b.text for b in body)
-            if _MAXVALUE_RE.search(src):
-                return ("unbounded foreach", f"foreach ({src[:60]})")
-            m = _RANGE_LITERAL_RE.search(src)
-            if m and int(m.group(1).replace("_", "")) >= UNBOUNDED_RANGE_MIN:
-                return ("unbounded foreach", f"foreach ({src[:60]})")
+        if _ps_loop_has_wait(cond) or _ps_loop_has_wait(body):
+            return (label, evidence)
+        cond_text = " ".join(b.text for b in cond)
+        if _PS_INPUT_COND_RE.search(cond_text):
+            continue  # bounded by its input: never a busy-wait
+        if not unbounded:
+            continue  # a bounded for/foreach: never a busy-wait
+        if _ps_body_does_real_work(body):
+            poll = _ps_condition_refresh_poll(cond, body)
+            if poll is not None:
+                return ("condition-refresh poll", evidence)
+            continue
+        return ("busy-wait loop", evidence)
     return None
 
 
