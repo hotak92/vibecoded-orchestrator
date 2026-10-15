@@ -247,9 +247,15 @@ export function nextPollMs(result: UsageBridgeResult | null): number {
  * (anthropics/claude-code#93324), so this is where VCO says which model
  * actually answered each. A gateway older than v0.2.102 sends no `agents`
  * block — that reads as an empty list, never as an error.
+ *
+ * Main-chat rows (null agent) are hidden unless a fallback served the turn
+ * (owner 2026-10-15): the user already knows their chat's model, and every
+ * session's background Haiku calls produced one row each — dozens of
+ * identical "main chat / claude-haiku-…" lines that buried the subagent rows
+ * this list exists for. A fallback is the one main-chat fact worth showing.
  */
 export function visibleAgents(snapshot: UsageSnapshot): UsageAgentRow[] {
-  return snapshot.agents ?? [];
+  return (snapshot.agents ?? []).filter((row) => row.agent !== null || row.fallback_from);
 }
 
 /** The identity's name: the agent id, or "main chat" for the null agent. */
