@@ -1304,6 +1304,47 @@ def first_run_setup_sections_still_pending(ctx: ProbeContext) -> Optional[bool]:
     return bool(pending)
 
 
+def codegraph_orphan_interactions_still_present(ctx: ProbeContext) -> Optional[bool]:
+    """``codegraph_orphan_interactions_pending`` — do provable orphan
+    CodeInteraction rows still exist for the project?
+
+    R14-B1: the entry's printed remedy is a manual ``--prune-stale`` walk,
+    and nothing used to trigger a resync-driver run afterwards (the owed
+    gate sees no owed work once the orphans are gone), so the entry could
+    never clear itself. This probe re-counts through the SAME home the
+    reaping and the driver's post-walk probe use
+    (:func:`vco_lib.codegraph_resync.count_orphan_interaction_rows` → the
+    ONE predicate), so the probe can never clear a row the next driver run
+    would re-emit. The project name is parsed from the entry's ``detected``
+    prose (``project '<name>'``) — the ONE deferral builder writes it and a
+    test locks the shape.
+
+    Returns:
+        True  — the count is positive: provable orphans remain.
+        False — the count is POSITIVELY zero: the consented walk reaped
+                them (or there were none) — the entry describes a state
+                that is over.
+        None  — could not look (Weaviate down, prefix unresolvable, the
+                entry prose unparsable). Positive evidence only: an unknown
+                count never clears.
+    """
+    from vco_lib import codegraph_resync
+
+    entry = ctx.entry
+    match = re.search(
+        r"project '([^']+)'", getattr(entry, "detected", "") or "")
+    if not match:
+        return None
+    try:
+        count = codegraph_resync.count_orphan_interaction_rows(
+            match.group(1), repo_root=ctx.folder)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if count is None:
+        return None
+    return count > 0
+
+
 PROBES: dict[str, ProbeFn] = {
     "bash_env_cleanup_still_owed": bash_env_cleanup_still_owed,
     "first_run_setup_sections_still_pending": first_run_setup_sections_still_pending,
@@ -1332,6 +1373,8 @@ PROBES: dict[str, ProbeFn] = {
     "service_adoption_confirmation_still_pending": service_adoption_confirmation_still_pending,
     "container_runtime_still_unusable": container_runtime_still_unusable,
     "container_runtime_data_still_under_both": container_runtime_data_still_under_both,
+    "codegraph_orphan_interactions_still_present": (
+        codegraph_orphan_interactions_still_present),
 }
 
 
@@ -1911,5 +1954,6 @@ __all__ = [
     "resolvable_condition_ids",
     "retry_history_note",
     "run_probe",
+    "codegraph_orphan_interactions_still_present",
     "upstream_sidecar_paths",
 ]

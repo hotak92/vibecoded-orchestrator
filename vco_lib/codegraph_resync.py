@@ -98,6 +98,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_CODE_EMBED_PORT = 11440
 _CONDITION_ID = "codegraph_embed_resync_pending"
 
+#: v0.2.103 (R12-F4): the provable-orphan flavour's OWN condition id. Classed
+#: ``action_required`` in ``vco_lib/deferral_conditions.toml`` — only a manual
+#: consented ``--prune-stale`` walk clears it, so the WP-H retry dispatcher
+#: must never select it (the auto-retryable resync handler forwards no
+#: ``--prune-stale`` and would burn full walks that remove nothing).
+_ORPHAN_CONDITION_ID = "codegraph_orphan_interactions_pending"
+
 # Hygiene (v0.2.75): keep the Popen handles of deliberately-DETACHED children
 # alive for the parent's lifetime. The children (resync driver, prune,
 # metadata backfill, code-summary rider) are meant to outlive install.py —
@@ -190,6 +197,15 @@ from vco_lib.codegraph_guards import (  # noqa: E402 — grouped with the notes 
 
 from vco_lib.kg_vector_slot import collection_vector_slots as _collection_vector_slots  # noqa: E402
 from vco_lib import codegraph_one_time_audits as _audits  # noqa: E402
+# v0.2.103 (defect 6): the backfill ensures its target properties through the
+# ONE property-spec home BEFORE it probes/patches them (the analyzer walk it
+# races used to be the only ensure home — first run after a property shipped
+# always warned and backfilled nothing).
+from vco_lib.codegraph_schema import (  # noqa: E402 — grouped with the notes above
+    CodegraphPropertyEnsureError as _PropertyEnsureError,
+    ensure_codegraph_file_path as _ensure_file_path_props,
+    ensure_codegraph_properties as _ensure_spec_props,
+)
 
 #: Backwards-compat alias (pre-v0.2.75 module-local name).
 _path_reachable_on_disk = path_reachable_on_disk
@@ -1995,6 +2011,237 @@ def _resolve_anchor_from_refs(obj, ref_specs) -> str:
     return ""
 
 
+#: Verdicts of :func:`classify_codegraph_orphan` (v0.2.103 R12-F2: the
+#: three-way split "never delete a row that is not provably dead" demands).
+ANCHOR_VERDICT_ANCHORED = "anchored"
+ANCHOR_VERDICT_ORPHAN = "orphan"
+ANCHOR_VERDICT_UNKNOWN = "unknown"
+
+
+def _classify_anchor_from_refs(obj, ref_specs) -> str:
+    """R12-F2 / R14-B3: classify an object's inline references into the
+    three-way verdict WITHOUT guessing.
+
+    * ANCHORED — some reference target carries a non-empty path: the anchor
+      backfill PATCHes ``file_path`` from it; the row is alive.
+    * UNKNOWN — the references payload is MISSING (``None`` — a client that
+      returned no reference data is indistinguishable from a row we did not
+      get to look at, R14-B3: never "provably no references"), a target
+      EXISTS but has no path (a live target whose anchor is merely unknown —
+      e.g. a legacy CodeFunction that itself predates ``file_path``), or the
+      shape is unreadable. NOT provably dead: preserve.
+    * ORPHAN — the row has NO reference at all, or every reference it has
+      is DANGLING (zero target objects, verified by a query that succeeded).
+      Requires a dict payload: an EMPTY dict is a positive "no references";
+      ``None`` never is.
+    """
+    refs = getattr(obj, "references", None)
+    if not isinstance(refs, dict):
+        return ANCHOR_VERDICT_UNKNOWN
+    saw_live_target_without_path = False
+    for ref_prop, target_prop in ref_specs:
+        try:
+            targets = refs.get(ref_prop)
+            if targets is None:
+                continue  # reference property absent from this row
+            objects = getattr(targets, "objects", None)
+            if objects is None and isinstance(targets, list):
+                objects = targets
+            for target in objects or []:
+                if (getattr(target, "properties", None) or {}).get(target_prop):
+                    return ANCHOR_VERDICT_ANCHORED
+            if objects:
+                # R12-F2: the target EXISTS but carries no path — uncertain,
+                # never a delete authorisation.
+                saw_live_target_without_path = True
+            # objects empty → dangling reference: counts toward ORPHAN.
+        except Exception:  # noqa: BLE001 — unreadable shape → uncertain
+            return ANCHOR_VERDICT_UNKNOWN
+    if saw_live_target_without_path:
+        return ANCHOR_VERDICT_UNKNOWN
+    return ANCHOR_VERDICT_ORPHAN
+
+
+def classify_codegraph_orphan(collection, uuid, base: str = "CodeInteraction") -> str:
+    """v0.2.103 (defect 7 / R12-F1,F2): classify ONE row's anchor from its
+    stored references — the provability primitive.
+
+    Fetches the row BY UUID with its :data:`_ANCHOR_BACKFILL_REFS` references
+    inline (ONE query; the real client validates the uuid — a non-str/UUID
+    argument raises, which is exactly the R12-F1 mismatch class) and returns
+    :data:`ANCHOR_VERDICT_ANCHORED` / :data:`ANCHOR_VERDICT_ORPHAN` /
+    :data:`ANCHOR_VERDICT_UNKNOWN`. A fetch/query failure and a row that is
+    concurrently gone both classify UNKNOWN — never a delete authorisation.
+    Never raises.
+    """
+    ref_specs = _ANCHOR_BACKFILL_REFS.get(base) or []
+    if not ref_specs:
+        return ANCHOR_VERDICT_UNKNOWN
+    try:
+        from weaviate.classes.query import QueryReference
+
+        obj = collection.query.fetch_object_by_id(
+            uuid=uuid,
+            return_references=[
+                QueryReference(link_on=ref_prop, return_properties=[target_prop])
+                for ref_prop, target_prop in ref_specs
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001 — unknown, never an orphan verdict
+        logger.debug("codegraph orphan-classify: fetch %s failed: %s", uuid, exc)
+        return ANCHOR_VERDICT_UNKNOWN
+    if obj is None:
+        return ANCHOR_VERDICT_UNKNOWN
+    return _classify_anchor_from_refs(obj, ref_specs)
+
+
+def is_provable_codegraph_orphan(
+    collection, uuid, props,
+    *,
+    project_name: str,
+    preserve_sources=None,
+    repo_root: Optional[Path] = None,
+) -> bool:
+    """R12-F3: the ONE predicate both the orphan reaping (the full-walk
+    stale prune) and the convergence probe (:func:`count_orphan_interaction_rows`)
+    route through — same function, same filters, so the probe can never count
+    a row the purge must keep.
+
+    A row is a PROVABLE orphan iff ALL hold:
+      * ``file_path`` is empty (unanchored);
+      * ``project`` is empty/NULL/this project (the purge's foreign-project
+        leave-alone rule);
+      * ``project_source`` is not one of ``preserve_sources`` (the refused
+        extras the purge preserves) — and, when ``repo_root`` is given, IS a
+        primary source (empty, or one of the root's forms). R14-B2: the
+        driver-side probe cannot know the per-walk extra set, and the
+        consented cleanup walk covers the repo root only — a non-primary
+        source's rows converge on their OWN root's walk, so counting them
+        would keep the deferral alive with a command that cannot clear it;
+      * :func:`classify_codegraph_orphan` says ORPHAN (no reference at all,
+        or every reference dangling — F2's narrowed proof).
+    Anything else — anchored, live-target-no-path, unknown, filtered out —
+    returns False (keep).
+    """
+    p = props or {}
+    if p.get("file_path"):
+        return False
+    if p.get("project") not in (None, "", project_name):
+        return False
+    row_source = str(p.get("project_source") or "").strip()
+    if row_source:
+        if preserve_sources and row_source in preserve_sources:
+            return False
+        if repo_root is not None:
+            primary = primary_sources_for(Path(repo_root)) or set()
+            if row_source not in primary:
+                return False
+    return classify_codegraph_orphan(collection, uuid) == ANCHOR_VERDICT_ORPHAN
+
+
+def count_orphan_interaction_rows(
+    project_name: str,
+    *,
+    repo_root: Optional[Path] = None,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[int]:
+    """v0.2.103 (defect 7 / R12-F3): count provable-orphan CodeInteraction
+    rows through the ONE predicate.
+
+    The immortal residue the v0.2.82 anchor backfill reports as
+    "unresolvable": rows written before ``file_path`` existed, with
+    ``file_path`` NULL and NO ``source_function``/``source_module``
+    reference at all (or only dangling ones — R12-F2's narrowed proof).
+    ``count_stale_rows`` classifies pathless rows ``"purgeable"``
+    (correctly — no re-walk converges them), so the convergence verdict read
+    "0 stale rows" over rows that also survived every prune (each prune keys
+    on file_path / the walked file set and preserves anchor-less rows while
+    any file was skipped).
+
+    Applies the SAME filters the purge applies (project, refused-extra
+    sources — structurally derived when ``repo_root`` is given), so the
+    count is exactly what a covering full walk's reaping deletes.
+
+    Returns the count (``>= 0``), or ``None`` when undeterminable (Weaviate
+    down / prefix unresolvable / the collection cannot be enumerated) — the
+    caller must NOT treat that as zero.
+    """
+    if not project_name:
+        return None
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+    with _probe_client(client, weaviate_url, grpc_port) as client:
+        if client is None:
+            return None
+        coll, status = _open_collection(
+            client, f"{prefix}_CodeInteraction", "orphan-interaction probe",
+        )
+        if status == _COLL_ABSENT:
+            return 0
+        if status == _COLL_ERROR:
+            return None
+        read_props = ["file_path", "project"]
+        try:
+            if "project_source" in {
+                p.name for p in coll.config.get().properties
+            }:
+                read_props.append("project_source")
+        except Exception:  # noqa: BLE001 — probe best-effort; skip the prop
+            pass
+        try:
+            orphans = 0
+            for obj in coll.iterator(return_properties=read_props):
+                props = getattr(obj, "properties", None) or {}
+                if is_provable_codegraph_orphan(
+                    coll, str(obj.uuid), props,
+                    project_name=project_name, repo_root=repo_root,
+                ):
+                    orphans += 1
+            return orphans
+        except Exception as exc:  # noqa: BLE001 — undeterminable, never zero
+            logger.warning(
+                "codegraph orphan-interaction probe: scan failed: %s", exc
+            )
+            return None
+
+
+def _ensure_backfill_schema(client, prefix: str) -> None:
+    """v0.2.103 (defect 6): ensure the backfill's target properties exist
+    BEFORE the pass probes/patches them — through the ONE property-spec home.
+
+    WHY here (and not "move the backfill after the walk"): the backfill is
+    spawned as a detached child that races the analyzer walk, and the walk's
+    analyzer is what adds missing properties — so the FIRST backfill after a
+    property shipped (``is_test`` via the spec table, ``file_path`` on
+    CodeAPI/CodeInteraction) always warned and updated nothing. Moving it
+    after the walk would not fix the OTHER caller (the WP-3 post-build
+    backfill rider runs on every non-root update with NO walk at all) and
+    would serialize a metadata-only pass behind an hours-long walk. Making
+    the backfill self-sufficient through ``vco_lib.codegraph_schema`` keeps
+    one ensure home and fixes every caller at once.
+
+    Soft-fail (the backfill's own posture): an ensure failure logs and the
+    run continues — the per-collection halves then soft-degrade exactly as
+    they did pre-fix on a genuinely un-ensurable class.
+    """
+    try:
+        _ensure_spec_props(client, prefix)
+    except _PropertyEnsureError as exc:
+        logger.warning(
+            "codegraph backfill: property ensure failed on %s: %s "
+            "(continuing; the affected halves soft-degrade)", exc.class_name, exc,
+        )
+    except Exception as exc:  # noqa: BLE001 — never wedge the backfill on ensure
+        logger.warning("codegraph backfill: property ensure unavailable: %s", exc)
+    try:
+        _ensure_file_path_props(client, prefix)
+    except Exception as exc:  # noqa: BLE001 — soft-fail per class inside; belt
+        logger.warning("codegraph backfill: file_path ensure unavailable: %s", exc)
+
+
 def backfill_codegraph_metadata(
     project_name: str,
     *,
@@ -2017,6 +2264,10 @@ def backfill_codegraph_metadata(
     at the cost of one iterator row). is_test rules (M1): only when stored
     is NULL and a path is present (fail-safe: no path → leave NULL, the
     query-time derive treats it as not-a-test).
+
+    v0.2.103 (defect 6): ensures the schema first (:func:`_ensure_backfill_schema`)
+    — an old-schema collection no longer fails the whole pass on a missing
+    ``is_test`` / ``file_path`` property.
     """
     counts: dict = {}
     if not project_name:
@@ -2043,6 +2294,9 @@ def backfill_codegraph_metadata(
     with _probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return counts
+        # v0.2.103 (defect 6): properties first — the probes/patches below
+        # 422 on a class that lacks them (the walk adds them too late).
+        _ensure_backfill_schema(client, prefix)
         try:
             from weaviate.classes.query import Filter
         except Exception as exc:  # noqa: BLE001
@@ -2583,6 +2837,8 @@ def build_unconverged_deferral(
     counts: Optional[dict],
     command_to_apply: str,
     stuck_identities: "Optional[list]" = None,
+    *,
+    orphan_interactions: Optional[int] = None,
 ) -> Optional["_DeferralEntryT"]:
     """R-7 (v0.2.73): the ONE-TIME "resync did not converge" ledger entry.
 
@@ -2596,9 +2852,45 @@ def build_unconverged_deferral(
     v0.2.91 (WP-C): ``stuck_identities`` (from :func:`list_owed_row_identities`)
     is appended to ``detected`` when the walk made NO progress — the entry then
     names the exact rows that did not converge instead of only counting them.
+
+    v0.2.103 (R12-F4/F5): ``orphan_interactions`` (a POSITIVE count) selects
+    the ORPHAN flavour — its own condition id (:data:`_ORPHAN_CONDITION_ID`,
+    classed ``action_required`` because only a manual consented
+    ``--prune-stale`` walk clears it) and prose that is TRUE for it: the
+    command DELETES rows a full walk does not visit, it does not re-embed
+    them. ONE builder, parameterised — no second deferral builder.
     """
     if DeferralEntry is None:
         return None
+    if orphan_interactions:
+        return DeferralEntry(
+            condition_id=_ORPHAN_CONDITION_ID,
+            title="Code-graph orphan rows pending a consented prune walk",
+            detected=(
+                f"A background code-graph resync for project '{project_name}' "
+                f"converged every stale row, but {orphan_interactions} "
+                "CodeInteraction row(s) written before file anchors existed "
+                "remain: no file_path, and no source reference at all (or "
+                "only dangling ones) — provably dead rows no walk re-embeds."
+            ),
+            why_deferred=(
+                "Only a FULL walk with --prune-stale removes them, and that "
+                "is a user-consented action, never automatic: the command "
+                "below re-walks the repository and DELETES every code-graph "
+                "row the walk does not visit (the ordinary prune semantics — "
+                "not only the orphans), then re-embeds what changed. The "
+                "orphan cleanup itself touches only anchor-less rows, and "
+                "removes one only when it is provably dead (no reference at "
+                "all, or only dangling ones); anything uncertain is kept. If "
+                "any enabled extra code folder is unreachable, the walk "
+                "skips orphan cleanup entirely (nothing is deleted) until "
+                "every folder is reachable. The entry clears once a re-probe "
+                "of the same count finds zero."
+            ),
+            command_to_apply=command_to_apply,
+            severity="warning",
+            kg_node_refs=[],
+        )
     if counts is not None:
         owed = ", ".join(f"{k}: {v}" for k, v in counts.items() if v) or "unknown"
         detected = (
@@ -2694,6 +2986,96 @@ def _record_unconverged_deferral(
         )
     except Exception as exc:  # noqa: BLE001 — surfacing must not crash the child
         logger.warning("resync driver: could not record deferral: %s", exc)
+
+
+def _record_orphan_interactions_deferral(
+    repo_root: Path, project_name: str, count: int, command_to_apply: str,
+) -> None:
+    """R12-F4/F5: persist the provable-orphan entry (own condition id,
+    action_required). Read-merge-write through the ONE emitter home, same
+    discipline as :func:`_record_unconverged_deferral`; soft-fail."""
+    try:
+        entry = build_unconverged_deferral(
+            project_name, None, command_to_apply, orphan_interactions=int(count),
+        )
+        if entry is None:
+            return
+        from vco_lib.deferral_emit import emit
+
+        folder = Path(repo_root)
+        emit(folder, entry, log=logger)
+        print(
+            "[resync-driver] orphan-interaction deferral recorded in "
+            f"{folder / '.claude' / 'context' / 'UPDATE_DEFERRED.md'}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfacing must not crash the child
+        logger.warning(
+            "resync driver: could not record orphan deferral: %s", exc
+        )
+
+
+def _resolve_orphan_interactions_deferral(repo_root: Path) -> None:
+    """R12-F4: the orphan entry's paired clear — a later driver run whose
+    orphan probe is POSITIVELY zero resolves it (the consented prune walk
+    removed the rows). Read-merge-write; soft-fail."""
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        folder = Path(repo_root)
+        removed = resolve_conditions(folder, (_ORPHAN_CONDITION_ID,), log=logger)
+        if removed:
+            logger.info(
+                "resync driver: resolved orphan-interaction deferral"
+            )
+    except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+        logger.warning(
+            "resync driver: could not resolve orphan deferral: %s", exc
+        )
+
+
+def clear_orphan_interactions_deferral_if_zero(
+    project_name: str,
+    *,
+    repo_root: Optional[Path],
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[bool]:
+    """R14-B1: the analyzer-side clear — after a reaping-enabled full
+    ``--prune-stale`` walk, re-count the orphans through the SAME probe
+    (:func:`count_orphan_interaction_rows`) and resolve the
+    ``codegraph_orphan_interactions_pending`` entry on a POSITIVE zero (the
+    walk reaped them, or there were none).
+
+    Returns ``True`` when the entry was resolved, ``False`` when orphans
+    remain, ``None`` when the count was undeterminable (never a clear).
+    Never raises; a ledger write failure logs and returns the count's
+    verdict unchanged.
+    """
+    count = count_orphan_interaction_rows(
+        project_name, repo_root=repo_root, client=client,
+        weaviate_url=weaviate_url, grpc_port=grpc_port,
+    )
+    if count is None or count > 0 or repo_root is None:
+        return False if count is not None else None
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        removed = resolve_conditions(
+            Path(repo_root), (_ORPHAN_CONDITION_ID,), log=logger,
+        ) if repo_root is not None else 0
+        if removed:
+            logger.info(
+                "codegraph orphan cleanup: resolved the orphan-interaction "
+                "deferral (probe count is zero after the prune walk)"
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001 — ledger write is best-effort
+        logger.warning(
+            "codegraph orphan cleanup: could not resolve deferral: %s", exc
+        )
+        return True
 
 
 # ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
@@ -3812,6 +4194,22 @@ def _run_resync_and_verify_slotted(
         counts = None
 
     resume_cmd = " ".join(shlex.quote(p) for p in argv)
+    # v0.2.103 (defect 7): "0 stale rows" must not hide provable orphan
+    # CodeInteraction rows — count_stale_rows classifies pathless rows
+    # purgeable (no re-walk converges them), and pre-fix they also survived
+    # every prune. R12-F4: the orphan condition is recorded AFTER the
+    # ordinary converged discharge (exposure heal + persisted-entry clear),
+    # under its OWN action_required condition id — a manual --prune-stale
+    # walk is the only thing that clears it, so it must never ride the
+    # auto-retryable resync entry (the retry would burn full walks that
+    # cannot remove orphans). None (undeterminable) is conservative: no
+    # record, no clear — the next walk's post-walk probe re-checks.
+    orphan_interactions = None
+    try:
+        orphan_interactions = count_orphan_interaction_rows(
+            project_name, repo_root=Path(repo_root))
+    except Exception as exc:  # noqa: BLE001 — probe must never crash the child
+        print(f"[resync-driver] orphan-interaction probe raised: {exc}", flush=True)
     if counts is not None and sum(counts.values()) == 0:
         # The probe is authoritative for the ledger's "owed" semantic —
         # converged even when the analyzer exit code was non-zero (rc is
@@ -3838,6 +4236,21 @@ def _run_resync_and_verify_slotted(
                     "resync driver: could not clear exposure marker: %s", exc
                 )
         _resolve_persisted_resync_deferral(repo_root)
+        if orphan_interactions:
+            print(
+                f"[resync-driver] {orphan_interactions} provable orphan "
+                "CodeInteraction row(s) remain (no file_path, no reference "
+                "at all or only dangling ones) — only a full-walk "
+                "--prune-stale run removes them (action required; never "
+                "automatic)",
+                flush=True,
+            )
+            _record_orphan_interactions_deferral(
+                repo_root, project_name, orphan_interactions,
+                resume_cmd + " --prune-stale",
+            )
+        elif orphan_interactions == 0:
+            _resolve_orphan_interactions_deferral(repo_root)
         return 0
     stale_desc = (
         str(sum(counts.values())) if counts is not None else "unverifiable"

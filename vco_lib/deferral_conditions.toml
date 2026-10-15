@@ -1408,6 +1408,31 @@ all pass it, and the dispatcher BLOCKS a stale verdict BEFORE writing the \
 STARTED row — a persistently stale image therefore burns NO retry budget and \
 the retry resumes by itself once the image is rebuilt and current."""
 
+[conditions.codegraph_orphan_interactions_pending]
+class = "action_required"
+owner = "vco_lib.codegraph_resync"
+clear_probe = "probe:py:codegraph_orphan_interactions_still_present"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (plan item 7 / R12-F4, clear hardened R14-B1): \
+CodeInteraction rows written before file anchors existed — no file_path, and \
+no source reference at all (or only dangling ones; a live target without a \
+path is UNCERTAIN, never proof). Provably dead, but no walk re-embeds them \
+and the pre-fix prune preserved every anchor-less row while any file was \
+skipped, so they survived forever while the convergence probe read "0 stale \
+rows" over them. action_required, NOT auto_retryable: only a manual \
+consented `--run-resync --prune-stale` walk removes them (that walk DELETES \
+every unvisited row — a destructive, user-consented action the retry engine \
+must never take), so the WP-H dispatcher can never clear it and would only \
+burn full walks. Clear: the `probe:py:` re-count through the SAME \
+predicate the reaping uses — a POSITIVE zero clears (the consented walk \
+reaped the rows, or there were none); an unknown count never clears. The \
+analyzer also clears the entry directly after a reaping-enabled full \
+--prune-stale walk whose re-count is zero, and the resync driver resolves \
+it in its converged branch — all three route through \
+`count_orphan_interaction_rows`, one counting home. Rows whose non-primary \
+`project_source` belongs to an extra code folder are never counted: the \
+consented cleanup walk covers the repo root only."""
+
 [conditions.residue_cleanup_pending]
 class = "action_required"
 owner = "vco_lib.knowledge_residue"
