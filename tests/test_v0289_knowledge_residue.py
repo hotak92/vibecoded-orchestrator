@@ -481,6 +481,21 @@ class BundleWiringTests(unittest.TestCase):
         self.assertIn("residue_cleanup", result)
         self.assertIn("foreign_rows", result)
 
+    def test_wiring_threads_the_machines_shared_class_not_the_constant(self):
+        """v0.2.103 (R24 HIGH-1 sweep): with no SHARED_KG_COLLECTION pin the
+        shared-identity guard gets THIS machine's shared class — the
+        orchestrator root's binding, which can be the folder-derived
+        case-variant of the constant — not the shipped literal. Red-proof:
+        revert the fallback to ``_SHARED_KG_NAME`` → fails."""
+        self._pin_identity()
+        p1, p2, cleanup_rec, _prune_rec = self._patched()
+        derived = "VibecodedOrchestrator_KnowledgeGraph"
+        p3 = mock.patch("vco_lib.launcher_db_reader.get_orchestrator_root_bindings",
+                        return_value=(derived, derived))
+        with p1, p2, p3:
+            project_init.install_project_bundle(self.project, self.orch)
+        self.assertEqual(cleanup_rec.call_args.kwargs["shared_kg_collection"], derived)
+
     def test_wiring_skipped_when_identity_not_pinned(self):
         """No launcher binding + no settings-env KG_COLLECTION pin ⇒ the
         step must not touch anything (a name-derived identity is a guess —

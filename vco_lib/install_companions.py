@@ -888,7 +888,7 @@ def continue_in_venv(venv_python, argv: List[str], state: dict, *,
     Returns False — and does nothing — when this run already IS a hand-off
     child (the loop guard), when it already runs inside that venv (a CLI user
     with it active, or the V45-A relaunch), or when the interpreter is missing
-    (one stdout line; the run continues where it is). Otherwise it writes the
+    (one stderr line; the run continues where it is). Otherwise it writes the
     record, calls ``before_hand_off`` (install.py releases its singleton lock,
     which the child must re-take — on Windows this process stays alive, waiting)
     and hands off: on POSIX it never returns; on Windows it exits with the
@@ -899,9 +899,10 @@ def continue_in_venv(venv_python, argv: List[str], state: dict, *,
     if is_running_inside_venv(venv_python):
         return False
     if not Path(venv_python).is_file():
+        # R24 LOW-2: a warning, so stderr (a GUI-captured install log keeps the streams apart).
         print(f"[vct] cannot continue under the venv ({venv_python} is missing) — proceeding "
-              f"on {sys.executable}; steps that import venv-only packages may fail")
-        sys.stdout.flush()
+              f"on {sys.executable}; steps that import venv-only packages may fail",
+              file=sys.stderr, flush=True)
         return False
     env = os.environ.copy()
     mark_relaunch(env)  # loop guard + token + (first hop) the launching interpreter

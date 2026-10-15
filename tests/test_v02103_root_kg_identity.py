@@ -291,9 +291,10 @@ def test_the_root_rows_are_never_case_rebound_by_the_heal(tmp_path):
     assert done == ["p"]
 
 
-def _root_launcher_db(db, rows):
+def _root_launcher_db(db, rows, access=()):
     """A real-schema launcher.db whose project ``root`` is the orchestrator
-    root (``projects.host``) and ``p`` an ordinary project."""
+    root (``projects.host``) and ``p`` an ordinary project; ``access`` seeds
+    ``kg_collection_access`` (project_id, collection_name, access_level)."""
     from tests.common.launcher_db_fixture import create_empty_launcher_db
 
     create_empty_launcher_db(db)
@@ -307,6 +308,9 @@ def _root_launcher_db(db, rows):
         conn.executemany(
             "INSERT INTO project_kg_bindings (project_id, role, collection_name, config_json, "
             "updated_at) VALUES (?, ?, ?, '{}', 0)", rows)
+        conn.executemany(
+            "INSERT INTO kg_collection_access (project_id, collection_name, access_level) "
+            "VALUES (?, ?, ?)", access)
         conn.commit()
     finally:
         conn.close()
@@ -321,12 +325,21 @@ def _bindings(db):
         conn.close()
 
 
-def _heal_against(monkeypatch, tmp_path, classes, counts, rows):
+def _access(db):
+    conn = sqlite3.connect(str(db))
+    try:
+        return conn.execute("SELECT project_id, collection_name, access_level "
+                            "FROM kg_collection_access ORDER BY project_id, collection_name").fetchall()
+    finally:
+        conn.close()
+
+
+def _heal_against(monkeypatch, tmp_path, classes, counts, rows, access=()):
     """Run install.py's real heal entry (``_self_heal_kg_bindings_on_update``)
     against a launcher.db and a Weaviate stub."""
     db = tmp_path / "state" / "launcher.db"
     db.parent.mkdir()
-    _root_launcher_db(db, rows)
+    _root_launcher_db(db, rows, access)
     monkeypatch.setenv("VCT_STATE_DIR", str(db.parent))
     monkeypatch.delenv("VCT_LAUNCHER_DB_PATH", raising=False)
     from tests.test_self_heal_cross_prefix_adopt import _start_stub_weaviate
@@ -362,3 +375,44 @@ def test_the_update_heal_never_prefix_adopts_onto_the_root_rows(monkeypatch, tmp
                         {"Other_KnowledgeGraph": 40}, rows)
     assert got == [("p", "primary", "Other_KnowledgeGraph"),
                    ("root", "primary", "Missing_KnowledgeGraph")]
+
+
+def test_the_access_heal_skips_only_the_roots_grant_on_its_own_class(monkeypatch, tmp_path):
+    """R24 MEDIUM-1 — both arms, through install.py's heal entry. The root's
+    grant on its OWN class (named by its binding rows) is its identity and is
+    never case-rebound; the root's grant on ANOTHER project's collection whose
+    on-disk casing differs is case-healed exactly like any other project's
+    (pre-v0.2.103 behaviour). Red-proof: revert the access-pass ``skip_row``
+    to ``row[0] in _root_ids`` → the root's ``Widget_KnowledgeGraph`` grant
+    stays stale."""
+    rows = [("root", "primary", CONST), ("root", "shared", CONST)]
+    access = [("root", CONST, "write"), ("root", "Widget_KnowledgeGraph", "read"),
+              ("p", "Widget_KnowledgeGraph", "read")]
+    db = tmp_path / "state" / "launcher.db"
+    _heal_against(monkeypatch, tmp_path, [DERIVED, "WIDGET_KnowledgeGraph"],
+                  {DERIVED: 5, "WIDGET_KnowledgeGraph": 7}, rows, access)
+    got = sorted(r for r in _access(db) if r[1].endswith("_KnowledgeGraph"))
+    assert got == sorted([
+        ("p", "WIDGET_KnowledgeGraph", "read"),
+        ("root", "WIDGET_KnowledgeGraph", "read"),   # another project's class: healed
+        ("root", CONST, "write"),                    # the root's own class: kept as bound
+    ])
+
+
+def test_step_7b_alone_records_the_blocked_deferral(root_install, monkeypatch):
+    """R24 LOW-1: step 7b records `root_kg_blocked_by_case_sibling` itself, so
+    a run whose seed leg returns before step 7c's decision (missing venv
+    python, gated sync) still reports a still-blocked root instead of letting
+    the owned-drop-when-absent row drop. The main() call site threads the run
+    report into 7b (``deferral_report=_deferral_report`` on the
+    ``collections_and_seed`` lambda). Red-proof: remove the 7b ``add_entry``
+    → fails."""
+    fake = _FakeWeaviate([CONST])
+    monkeypatch.setattr(install._wh, "http_request", fake)
+    monkeypatch.setattr(rki, "_live_class_names", lambda url: list(fake.classes))
+    monkeypatch.setattr("vco_lib.kg_binding_heal._count_weaviate_class_objects", lambda u, n: 892)
+    report = DeferralReport()
+    install._ensure_collections({}, deferral_report=report)
+    (entry,) = [e for e in report.entries if e.condition_id == "root_kg_blocked_by_case_sibling"]
+    assert f"adopt --collection {CONST} --yes" in entry.command_to_apply
+    assert DERIVED not in fake.posted

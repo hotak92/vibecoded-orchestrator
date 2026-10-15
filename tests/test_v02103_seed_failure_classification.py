@@ -101,6 +101,20 @@ def test_file_not_found_is_not_a_connection_error(monkeypatch):
     assert [e.condition_id for e in report.entries] == ["kg_seed_failed"]
 
 
+@pytest.mark.parametrize("exc", [
+    ValueError("embed timed out waiting for batch"),
+    TypeError("could not connect the dots: unsupported operand"),
+    KeyError("host unreachable in config map"),
+])
+def test_a_programming_error_whose_text_looks_like_an_outage_is_not_one(exc, monkeypatch):
+    """R24 LOW-4: the message markers do not apply to builtin programming-error
+    types — a seed bug saying "timed out" restarts no container. Red-proof:
+    remove the ``_PROGRAMMING_ERROR_TYPES`` early return → fails."""
+    status, calls, report = _run(_raiser(exc), monkeypatch=monkeypatch)
+    assert status == iw.FAILED and calls == []
+    assert [e.condition_id for e in report.entries] == ["kg_seed_failed"]
+
+
 def test_rebuild_drop_still_owes_a_reseed_on_non_connection_failure(monkeypatch):
     _status, calls, report = _run(_raiser(ValueError("bad schema")), rebuild=True,
                                   monkeypatch=monkeypatch)

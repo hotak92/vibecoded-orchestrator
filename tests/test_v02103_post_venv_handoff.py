@@ -111,7 +111,10 @@ def test_a_missing_interpreter_continues_here_and_says_so(tmp_path, monkeypatch,
     released: list = []
     assert ic.continue_in_venv(tmp_path / "nope" / "python", ["install.py"], {},
                                before_hand_off=lambda: released.append(1)) is False
-    assert "cannot continue under the venv" in capsys.readouterr().out
+    # R24 LOW-2: a warning goes to stderr (red-proof: print it to stdout → fails).
+    captured = capsys.readouterr()
+    assert "cannot continue under the venv" in captured.err
+    assert "cannot continue under the venv" not in captured.out
     assert released == []
 
 

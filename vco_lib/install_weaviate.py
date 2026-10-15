@@ -2691,8 +2691,25 @@ def _is_unreachable(exc: BaseException) -> bool:
         return True
     if any("timeout" in k.__name__.lower() for k in type(exc).__mro__):
         return True
+    # R24 LOW-4: the message markers exist for client exceptions whose TYPE
+    # says nothing (``WeaviateStartUpError("Could not connect …")``). A
+    # builtin programming-error type is never a transport failure, whatever
+    # its text — ``ValueError("embed timed out waiting for batch")`` is a seed
+    # bug, not an outage. Residual (accepted): a generic ``Exception`` /
+    # ``RuntimeError`` whose message carries a marker still reads as an outage
+    # and costs one container start.
+    if isinstance(exc, _PROGRAMMING_ERROR_TYPES):
+        return False
     text = str(exc).lower()
     return any(m in text for m in _UNREACHABLE_MESSAGE_MARKERS)
+
+
+#: Builtin exception types that signal a bug in the caller, never a socket
+#: failure (``_is_unreachable``'s message-marker leg does not apply to them).
+_PROGRAMMING_ERROR_TYPES: tuple[type, ...] = (
+    ValueError, TypeError, LookupError, AttributeError, AssertionError,
+    NotImplementedError, ArithmeticError,
+)
 
 
 def _record_non_connection_failure(report, exc: BaseException,

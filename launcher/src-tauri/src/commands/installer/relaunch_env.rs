@@ -74,6 +74,7 @@ mod tests {
             "VCT_INSTALL_BASE_PYTHON_VERSION",
             "VCT_INSTALL_PARENT_WAITS",
             "VCT_INSTALL_RELAUNCH_TOKEN",
+            "VCT_INSTALL_POST_VENV_HANDOFF",
         ] {
             assert!(keys.iter().any(|k| k == key), "{key} missing from {keys:?}");
         }

@@ -1659,8 +1659,11 @@ pub fn run() {
             //
             // Pre-v0.2.12 installs may carry `VibeCodedTools_KnowledgeGraph`
             // rows; v0.2.12–v0.2.22 installs may carry the lowercase-c
-            // `VibecodedOrchestrator_KnowledgeGraph`. Both are silently
-            // rewritten to `VibeCodedOrchestrator_KnowledgeGraph` here.
+            // `VibecodedOrchestrator_KnowledgeGraph`. Both are rewritten to
+            // THIS machine's shared class — the persisted orchestrator-root
+            // pointer (v0.2.103, R24: never the shipped constant; on a clone
+            // whose root owns the folder-derived lowercase-c name, that name
+            // IS the shared class and is left alone).
             //
             // Dedup-then-rename: if BOTH legacy and canonical rows exist
             // for the same project_id, the legacy duplicate is deleted and
@@ -1670,11 +1673,9 @@ pub fn run() {
             {
                 use tauri::Manager;
                 if let Some(db) = app.try_state::<db::Db>() {
-                    let canonical =
-                        commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION;
-                    match db.migrate_legacy_shared_kg_collection_names(canonical) {
-                        Ok(0) => {}
-                        Ok(n) => {
+                    match db.migrate_legacy_shared_kg_collection_names_to_root_pointer() {
+                        Ok((_, 0)) => {}
+                        Ok((canonical, n)) => {
                             tracing::info!(
                                 "[vct] migrate-shared-kg: renamed {} \
                                  legacy row(s) → '{}'",

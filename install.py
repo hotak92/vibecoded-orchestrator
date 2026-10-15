@@ -6196,7 +6196,7 @@ def main() -> int:
         # crash, never an unbounded hang (v0.2.89 FIX 1 readiness gate). A seed
         # the write gate refused is SKIPPED, not a success (L1-F18).
         _seed_succeeded = _install_weaviate.collections_and_seed(
-            lambda: _ensure_collections(embed_config, decisions=decisions, args=args),
+            lambda: _ensure_collections(embed_config, decisions=decisions, args=args, deferral_report=_deferral_report),
             lambda: _seed_weaviate(args, deferral_report=_deferral_report),
             report=_deferral_report, rebuild_performed=_rebuild_was_performed,
             runtime=lambda: _detect_container_runtime() or _runtime_preference_from_env() or "podman",
@@ -12494,7 +12494,7 @@ def _wait_for_weaviate_ready(
 
 def _ensure_collections(embed_config: dict,
                         decisions: dict | None = None,
-                        args: argparse.Namespace | None = None) -> None:
+                        args: argparse.Namespace | None = None, deferral_report: "DeferralReport | None" = None) -> None:
     """Detect existing Weaviate collections and create only the ones missing.
 
     Code-graph collections (CodeModule / CodeClass / CodeFunction / CodeAPI /
@@ -12589,15 +12589,8 @@ def _ensure_collections(embed_config: dict,
     # with the diagrams integrations — the install no longer creates or
     # projects `<Project>_Diagrams`. Existing collections stay untouched.
 
-    # Cross-project shared KG. All vibecoded installs read from the same shared
-    # collection name (default "VibeCodedOrchestrator_KnowledgeGraph" since
-    # v0.2.23 B1 — was lowercase-c "VibecodedOrchestrator_KnowledgeGraph"
-    # v0.2.12–v0.2.22, itself renamed from "VibeCodedTools_KnowledgeGraph"
-    # pre-v0.2.12); the projects only differ in their per-project KG.
-    # Bootstrapped once per Weaviate instance — re-runs are no-ops thanks
-    # to the existing-class detection (which is case-insensitive since
-    # v0.2.23 B1, so the lowercase-c class on existing installs is adopted
-    # in place without recreate).
+    # Cross-project shared KG: the env pin, else the shipped last-resort constant. On the ROOT this is
+    # replaced below by `root_kg_identity`'s decision (one class, both roles; never case-adopted).
     shared_name = os.environ.get(
         "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
     ) or ""
@@ -12715,8 +12708,10 @@ def _ensure_collections(embed_config: dict,
         (dev_name, _development_class_definition),
     ]
     if root_kg is not None and root_kg.blocked_by:
-        # A case-only sibling makes the root's class uncreatable; the seed
-        # step records the consent deferral (`root_kg_blocked_by_case_sibling`).
+        # A case-only sibling makes the root's class uncreatable: the consent deferral is recorded
+        # here too, since 7c may return before deciding (R24 LOW-1; same cid → idempotent).
+        if deferral_report is not None:
+            deferral_report.add_entry(_root_kg_blocked_entry(root_kg))
         print(f"  ! not creating {kg_name}: '{root_kg.blocked_by}' differs only in case")
         required = [(dev_name, _development_class_definition)]
     # Shared cross-project KG. Same schema as the per-project KG (the MCP

@@ -300,6 +300,24 @@ def root_project_ids(cur) -> "set[str]":
         return set()
 
 
+def root_own_collection_names(cur, root_ids) -> "set[str]":
+    """The orchestrator root's OWN KG class names (lowercased), read from its
+    ``project_kg_bindings`` rows; empty when none / unreadable. v0.2.103
+    (R24 MEDIUM-1): the access-table heal skips a root row only when it names
+    one of these — the root's grants to OTHER projects' collections keep the
+    legacy case-heal."""
+    ids = [i for i in root_ids if i]
+    if not ids:
+        return set()
+    try:
+        cur.execute(
+            "SELECT collection_name FROM project_kg_bindings WHERE project_id IN (%s)"
+            % ",".join("?" * len(ids)), tuple(ids))
+        return {str(r[0]).lower() for r in cur.fetchall() if r and r[0]}
+    except sqlite3.Error:
+        return set()
+
+
 def _prefix_adopt_kg_bindings_pass(
     cur,
     *,
@@ -2095,6 +2113,7 @@ def self_heal_kg_bindings(
             # onto the orchestrator root's rows (its name is root_kg_identity's
             # decision; adoption is the explicit consent CLI).
             _root_ids = root_project_ids(cur)
+            _root_own_lower = root_own_collection_names(cur, _root_ids)
             try:
                 binding_rebinds = _rebind_collection_names_to_on_disk_casing(
                     cur,
@@ -2193,7 +2212,11 @@ def self_heal_kg_bindings(
                     extra_select_cols=("access_level",),
                     do_rebind=_access_rebind,
                     resolve_conflict=_access_resolve_conflict,
-                    skip_row=lambda row: row[0] in _root_ids,
+                    # R24 MEDIUM-1: only the root's grant on one of its OWN
+                    # classes is its identity; its grants to other projects'
+                    # collections are case-healed like everyone else's.
+                    skip_row=lambda row: (row[0] in _root_ids
+                                          and str(row[1]).lower() in _root_own_lower),
                 )
                 access_rebinds.extend(acc_rebinds)
             except sqlite3.OperationalError as oe:

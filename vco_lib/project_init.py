@@ -86,6 +86,7 @@ from vco_lib import bundle_skip_deferral as _bsd
 from vco_lib import formats_migration_deferral
 from vco_lib import bundle_preserve as _bundle_preserve
 from vco_lib import weaviate_helpers as _wh
+from vco_lib import bootstrap_case_sibling as _bcs
 # v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
 # configured-but-empty ``{slot: []}`` slots that weaviate rejects on re-insert).
 # LOUD-FAIL import (no fallback): a broken vco_lib install must surface, never
@@ -2580,8 +2581,8 @@ def _extract_similar_class_name(error_body: Optional[str]) -> Optional[str]:
     """Parse Weaviate's `class already exists: found similar class "X"` 422
     response. Returns the actual server-side name if present, else None.
 
-    Used by bootstrap_collections to recover from case-only name conflicts
-    by dropping the actual-named class and re-creating with the target name.
+    Used by bootstrap_collections to recover from case-only name conflicts by
+    dropping the actual-named class (only when EMPTY, v0.2.103) and re-creating.
 
     Handles both the unescaped form (`similar class "X"`) and the JSON-
     escaped form (`similar class \\"X\\"`) — Weaviate's REST error body is
@@ -2840,6 +2841,7 @@ def bootstrap_collections(
         "actions": [{"collection": str, "action": "create"|"exists"|"would-create"|"regenerated", "ok": bool}],
         "regenerated": [{"collection": str, "reason": "case-conflict"|"multi-vector"|"legacy-single-vector"|"index-null-state"|"named-vector-mismatch", "dropped_name": str}],
         "errors": [{"collection": str, "error": str}],
+        "blocked": [{"collection": str, "sibling": str, "object_count": int|None}],
       }
 
     Bug-1 v0.2.4 (2026-05-12): when an existing collection's schema is
@@ -2891,6 +2893,7 @@ def bootstrap_collections(
         # See _schema_incompatible for the regen trigger conditions.
         "regenerated": [],
         "errors": [],
+        "blocked": [],  # v0.2.103: targets a populated case-only sibling blocks (never dropped)
     }
 
     # 1. Reachability probe + soft restart on failure.
@@ -2952,11 +2955,11 @@ def bootstrap_collections(
         # Existing `<Project>_Diagrams` collections on user machines are
         # untouched (still recognised by the migration / naming paths
         # below); nothing writes into them anymore.
-    # Shared KG: always created when missing (per coordinator: shared KG is
-    # READ by every project regardless of per-project opt-out, so creation
-    # is unconditional). The opt-out toggle is purely a write-gate enforced
-    # at MCP-call time, not a creation gate.
-    targets.append((_SHARED_KG_NAME, kg_class_definition))
+    # Shared KG: always created when missing (every project READS it; the opt-out is a write-gate
+    # only). v0.2.103 (R24 HIGH-1): THIS machine's shared class, never the constant — see
+    # vco_lib/bootstrap_case_sibling.py.
+    targets += [(n, kg_class_definition) for n in
+                _bcs.shared_targets(project_folder, derived["kg_collection"], _log)]
 
     # 3. Iterate: existence check + schema probe + POST.
     for name, target_def_fn in targets:
@@ -3058,14 +3061,13 @@ def bootstrap_collections(
                  f"{name}: created with target schema",
                  data={"collection": name, "action": "create"})
         except Exception as e:
-            # Bug-1 v0.2.4: case-only name conflict path. Weaviate POSTs
-            # are case-sensitive (so our existence-probe missed the old
-            # `<Project>_development` lowercase variant), but the server-
-            # side dedup rejects creating `<Project>_Development` with
-            # HTTP 422 `class already exists: found similar class "<actual>"`.
-            # Extract the actual existing name, drop it, retry the POST.
+            # Bug-1 v0.2.4: case-only name conflict (HTTP 422 `found similar class "<actual>"`):
+            # drop the EMPTY sibling and retry the POST. v0.2.103 (R24 HIGH-1): a sibling that
+            # holds objects (or cannot be counted) is never dropped — `_bcs.blocks` defers it.
             err_str = str(e)
             actual_name = _extract_similar_class_name(err_str)
+            if _bcs.blocks(name, actual_name, result, _log, weaviate_url):
+                continue
             if actual_name and actual_name != name:
                 _log("7b.bootstrap", "warn",
                      f"{name}: case-conflict with existing {actual_name!r}; "
@@ -3122,6 +3124,8 @@ def bootstrap_collections(
             })
             result["errors"].append({"collection": name, "error": err})
 
+    _bcs.settle(project_folder, result, project_name=project_name, weaviate_url=weaviate_url,
+                kg_only=kg_only, dry_run=dry_run, log=_log)
     return result
 
 
@@ -3199,13 +3203,12 @@ def _write_bootstrap_deferral(
     # otherwise list the two per-project collections plus the shared KG.
     # (v0.2.102: `<Project>_Diagrams` dropped from the list — the diagrams
     # bootstrap was removed with the diagrams integrations.)
+    _shared = _resolve_shared_kg_name(project_folder) or "(shared KG disabled)"  # v0.2.103
     if kg_only:
-        _collections_human = f"{derived['kg_collection']}, {_SHARED_KG_NAME}"
+        _collections_human = f"{derived['kg_collection']}, {_shared}"
     else:
         _collections_human = (
-            f"{derived['kg_collection']}, "
-            f"{derived['development_collection']}, "
-            f"{_SHARED_KG_NAME}"
+            f"{derived['kg_collection']}, {derived['development_collection']}, {_shared}"
         )
     entry = DeferralEntry(
         condition_id="weaviate_unreachable_at_bootstrap",
@@ -9930,12 +9933,11 @@ def install_project_bundle(
                     (_res_env.get("WEAVIATE_URL") or "").strip()
                     or _weaviate_url_default()
                 )
-                # SHARED_KG_COLLECTION: explicit empty string is a
-                # legitimate "no shared collection" choice — only an ABSENT
-                # key falls back to the canonical default name.
+                # SHARED_KG_COLLECTION: explicit "" = no shared collection; only an ABSENT key
+                # falls back — to THIS machine's shared class (v0.2.103), not the constant.
                 _res_shared = _res_env.get("SHARED_KG_COLLECTION")
                 if not isinstance(_res_shared, str):
-                    _res_shared = _SHARED_KG_NAME
+                    _res_shared = _resolve_shared_kg_name(folder)
 
                 result["residue_cleanup"] = (
                     _kres.cleanup_bundled_knowledge_residue(
@@ -12780,19 +12782,17 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
     targets.extend(derived.get("code_collections", []) or [])
     weaviate_url = args.weaviate_url
 
+    # Defense in depth: never drop a shared collection — the constant or THIS machine's shared
+    # class (v0.2.103: the root's decided name), case-insensitively.
+    machine_shared, protected = _bcs.protected_shared_names()
     result: dict = {
         "dropped": [],
-        "skipped_shared": _SHARED_KG_NAME,
+        "skipped_shared": machine_shared,
         "errors": [],
     }
 
     for name in targets:
-        # Defense in depth: refuse to drop anything that looks like a
-        # shared collection. The shared name is fixed at install time,
-        # but a future config knob could let users override it; if we
-        # ever ship that knob, the override has to flow through here so
-        # this guard stays correct.
-        if name == _SHARED_KG_NAME:
+        if name.lower() in protected:
             result["errors"].append({
                 "collection": name,
                 "error": (

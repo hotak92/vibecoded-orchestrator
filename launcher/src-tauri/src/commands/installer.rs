@@ -13085,6 +13085,7 @@ MemAvailable:   23456789 kB
                 "VCT_INSTALL_BASE_PYTHON_VERSION",
                 "VCT_INSTALL_PARENT_WAITS",
                 "VCT_INSTALL_RELAUNCH_TOKEN",
+                "VCT_INSTALL_POST_VENV_HANDOFF",
             ] {
                 assert!(
                     envs.contains(&(key.to_string(), None)),

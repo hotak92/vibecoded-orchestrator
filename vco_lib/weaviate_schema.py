@@ -946,6 +946,11 @@ def enumerate_kg_collections(
             derived["development_collection"],
             derived["shared_kg_collection"],
         ]
+        # v0.2.103: also this machine's shared class (the root's decided
+        # name, which can be the folder-derived case-variant of the constant).
+        machine_shared = _pi._resolve_shared_kg_name(None)
+        if machine_shared and machine_shared not in candidates:
+            candidates.append(machine_shared)
         return [c for c in candidates if c in listed]
 
     # All projects path.

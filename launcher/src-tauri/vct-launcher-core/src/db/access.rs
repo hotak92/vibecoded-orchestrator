@@ -873,6 +873,23 @@ impl Db {
         self.reconcile_kg_collection_access(&existing_classes)
     }
 
+    /// v0.2.103 (R24 HIGH-1 sweep): the boot-time NEW-12 migration aimed at
+    /// THIS machine's shared class — the persisted orchestrator-root pointer
+    /// (`app_state['orchestrator_root_kg_collection']`, which install.py writes
+    /// from `vco_lib/root_kg_identity.py`'s decision) — never the shipped
+    /// constant. On a clone whose root owns the folder-derived
+    /// `VibecodedOrchestrator_KnowledgeGraph` that name IS the shared class,
+    /// so rewriting it to the capital-C constant retargeted every project's
+    /// shared grant at a class that does not exist, on every launcher boot.
+    /// Returns `(canonical, renamed)`.
+    pub fn migrate_legacy_shared_kg_collection_names_to_root_pointer(
+        &self,
+    ) -> Result<(String, usize), String> {
+        let canonical = self.get_orchestrator_root_kg_collection()?;
+        let renamed = self.migrate_legacy_shared_kg_collection_names(&canonical)?;
+        Ok((canonical, renamed))
+    }
+
     /// Init-time migration: rewrite legacy shared-KG collection names in
     /// `kg_collection_access` to the current canonical name.
     ///
@@ -2507,6 +2524,43 @@ mod migrate_shared_kg_tests {
             .migrate_legacy_shared_kg_collection_names(CANONICAL)
             .unwrap();
         assert_eq!(second, 0, "second call must be a no-op");
+    }
+
+    /// v0.2.103 (R24 HIGH-1 sweep) — the boot entry aims at the ROOT POINTER.
+    /// A machine whose root owns the folder-derived lowercase-c class keeps
+    /// every grant on it (that IS its shared class), and a pre-v0.2.12 legacy
+    /// grant is renamed to it — never to the capital-C constant. Red-proof:
+    /// make the entry pass `CANONICAL` instead of the pointer → the lowercase-c
+    /// grant is rewritten and this fails.
+    #[test]
+    fn boot_entry_targets_the_root_pointer_not_the_constant() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_orchestrator_root_kg_collection(LEGACY_LOWERCASE_C).unwrap();
+        seed(&db, "p1", LEGACY_LOWERCASE_C, "write");
+        seed(&db, "p2", LEGACY_TOOLS, "read");
+
+        let (canonical, renamed) = db
+            .migrate_legacy_shared_kg_collection_names_to_root_pointer()
+            .unwrap();
+        assert_eq!(canonical, LEGACY_LOWERCASE_C);
+        assert_eq!(renamed, 1);
+        assert_eq!(count(&db, "p1", LEGACY_LOWERCASE_C), 1, "the root's shared grant is kept");
+        assert_eq!(count(&db, "p1", CANONICAL), 0);
+        assert_eq!(count(&db, "p2", LEGACY_LOWERCASE_C), 1, "legacy grant renamed to the pointer");
+        assert_eq!(count(&db, "p2", CANONICAL), 0);
+    }
+
+    /// The migration-028 default pointer (the constant) keeps the historical
+    /// behaviour: a lowercase-c grant is renamed to the capital-C constant.
+    #[test]
+    fn boot_entry_with_the_default_pointer_keeps_the_legacy_rename() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", LEGACY_LOWERCASE_C, "write");
+        let (canonical, renamed) = db
+            .migrate_legacy_shared_kg_collection_names_to_root_pointer()
+            .unwrap();
+        assert_eq!((canonical.as_str(), renamed), (CANONICAL, 1));
+        assert_eq!(count(&db, "p1", CANONICAL), 1);
     }
 }
 
