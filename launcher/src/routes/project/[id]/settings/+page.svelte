@@ -20,6 +20,7 @@
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
   import SettingsTab from '$lib/project-state/SettingsTab.svelte';
+  import { createLoader } from '$lib/project-state/load-controller';
   import type { ProjectView } from '$lib/types/launcher';
 
   let projectId = $derived($page.params.id);
@@ -27,13 +28,27 @@
   // its own copy internally. Two reads of the same row is cheap (DB
   // lookup, no Weaviate calls).
   let project = $state<ProjectView | null>(null);
+  // v0.2.103: a failed `get_project_v2` used to leave this route on a
+  // silent, infinite "Loading…" (the catch only toasted) — and because
+  // the route gates mounting SettingsTab on `project`, the whole tab was
+  // unreachable. The error is now state, rendered inline with a Retry;
+  // no timeout, so a slow-but-valid load is never cut off.
+  let loadError = $state<string | null>(null);
+
+  // v0.2.103 (review R8 m1): the lifecycle lives in the tested
+  // `createLoader` controller; this mirrors it into $state.
+  const headerLoader = createLoader<ProjectView>(
+    () => invoke<ProjectView>('get_project_v2', { id: projectId }),
+    (e) => toast.error(e),
+  );
+  headerLoader.subscribe(() => {
+    const s = headerLoader.get();
+    project = s.value;
+    loadError = s.error;
+  });
 
   async function loadHeader() {
-    try {
-      project = await invoke<ProjectView>('get_project_v2', { id: projectId });
-    } catch (e) {
-      toast.error(e);
-    }
+    await headerLoader.retry();
   }
 
   onMount(loadHeader);
@@ -56,7 +71,26 @@
        `project` (which is loaded from the same id) gives us a real
        string AND avoids an extra "loading" state inside SettingsTab. -->
   {#if project}
-    <SettingsTab projectId={project.id} />
+    <!-- v0.2.103 (review R8 M2): defense in depth — SettingsTab carries
+         its own boundary; this one catches a throw from this route's own
+         render path so nothing here can go silently blank either. -->
+    <svelte:boundary>
+      {#snippet failed(error, reset)}
+        <div class="ps-load-error">
+          <p class="ps-empty">
+            The Settings page failed to render:
+            {error instanceof Error ? error.message : String(error)}
+          </p>
+          <button class="ps-retry-btn" onclick={() => reset()}>Try again</button>
+        </div>
+      {/snippet}
+      <SettingsTab projectId={project.id} />
+    </svelte:boundary>
+  {:else if loadError}
+    <div class="ps-load-error">
+      <p class="ps-empty">Couldn't load this project's settings: {loadError}</p>
+      <button class="ps-retry-btn" onclick={() => void loadHeader()}>Retry</button>
+    </div>
   {:else}
     <p class="ps-empty">Loading…</p>
   {/if}
@@ -70,4 +104,17 @@
   .ps-header h1 { font-size: 16px; margin: 0; }
   .ps-back { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: inherit; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
   .ps-empty { padding: 40px; text-align: center; color: #888; }
+  /* v0.2.103: the load-failure block — mirrors SettingsTab's own. Brand
+     failure accent (pink) on the error text, teal Retry, per
+     VCO_BRAND_REFERENCE.md; no new tokens. */
+  .ps-load-error {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    padding: 40px 16px;
+  }
+  .ps-load-error .ps-empty { padding: 0; color: var(--color-pink, #ff4fa0); }
+  .ps-retry-btn {
+    background: var(--color-teal, #00bfa6); border: none; color: #001a17;
+    padding: 5px 14px; border-radius: 4px; cursor: pointer; font-size: 12px;
+    font-weight: 600;
+  }
 </style>

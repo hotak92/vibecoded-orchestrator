@@ -153,8 +153,8 @@ describe('the real shell', () => {
     // And the banner itself is a normal-flow block — `position: absolute`
     // or `fixed` is exactly what would make two banners overlap.
     const shell = read('./components/StatusBannerShell.svelte');
-    expect(shell).toMatch(/\.bg-banner\s*\{[^}]*display:\s*block/);
-    expect(shell).not.toMatch(/\.bg-banner\s*\{[^}]*position:\s*(absolute|fixed)/);
+    expect(shell).toMatch(/\.sb-banner\s*\{[^}]*display:\s*block/);
+    expect(shell).not.toMatch(/\.sb-banner\s*\{[^}]*position:\s*(absolute|fixed)/);
   });
 });
 
@@ -179,9 +179,9 @@ describe('one banner shell, no re-inlined clones', () => {
       // Comments are stripped, so the prose "cloned verbatim from …" that
       // documents the history cannot mask a real re-inlined rule.
       const css = read(`./components/${name}`).replace(/\/\*[\s\S]*?\*\//g, '');
-      expect(css, name).not.toMatch(/\.bg-banner\s*\{/);
-      expect(css, name).not.toMatch(/\.bg-row\s*\{/);
-      expect(css, name).not.toMatch(/\.bg-btn-primary\s*\{/);
+      expect(css, name).not.toMatch(/\.sb-banner\s*\{/);
+      expect(css, name).not.toMatch(/\.sb-row\s*\{/);
+      expect(css, name).not.toMatch(/\.sb-btn-primary\s*\{/);
     }
   });
 });

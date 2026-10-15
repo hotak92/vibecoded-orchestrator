@@ -17,8 +17,8 @@
   //                       verbs: Retry sync / Rebuild / Drop & rebuild…).
   //   `expandedContent` — the inline failure/detail drawer.
   // Snippets are compiled in the CALLER, so the classes they use
-  // (`.bg-btn-primary`, `.bg-pre`, …) are styled from here via `:global()`
-  // nested under `.bg-banner` — that keeps the banner vocabulary in one
+  // (`.sb-btn-primary`, `.sb-pre`, …) are styled from here via `:global()`
+  // nested under `.sb-banner` — that keeps the banner vocabulary in one
   // file without leaking the rules to unrelated components.
   //
   // Palette + motion per `.claude/references/VCO_BRAND_REFERENCE.md`
@@ -76,28 +76,28 @@
 </script>
 
 <div
-  class="bg-banner tone-{tone}"
+  class="sb-banner tone-{tone}"
   role={alert ? 'alert' : 'status'}
   aria-live="polite"
 >
-  <div class="bg-row">
-    <span class="bg-glyph" class:spin={spinning} aria-hidden="true">{glyph}</span>
-    <div class="bg-text">
-      <div class="bg-label" class:strong={strongTitle}>{title}</div>
+  <div class="sb-row">
+    <span class="sb-glyph" class:spin={spinning} aria-hidden="true">{glyph}</span>
+    <div class="sb-text">
+      <div class="sb-label" class:strong={strongTitle}>{title}</div>
       {#if phase}
-        <div class="bg-phase">{phase}</div>
+        <div class="sb-phase">{phase}</div>
       {/if}
       {#if detail}
-        <div class="bg-detail">{detail}</div>
+        <div class="sb-detail">{detail}</div>
       {/if}
     </div>
-    <div class="bg-actions">
+    <div class="sb-actions">
       {@render actions?.()}
     </div>
   </div>
 
   {#if showExpanded && expandedContent}
-    <div class="bg-expand" role={expandedRole} aria-label={expandedLabel}>
+    <div class="sb-expand" role={expandedRole} aria-label={expandedLabel}>
       {@render expandedContent()}
     </div>
   {/if}
@@ -106,20 +106,29 @@
 <style>
   /* Every rule below was previously duplicated in four components; values
      are theirs, verbatim. Do NOT re-inline a copy into a banner — add a
-     prop here instead. */
-  .bg-banner {
+     prop here instead.
+  
+     v0.2.103 (review R8 B1): the whole family is prefixed `sb-` (status
+     banner), NOT `bg-`. Tailwind v4 turns every `--color-*` theme token
+     in app.css into a `bg-<token>` utility and emits it for any matching
+     class in the source — the old `class="bg-text"` therefore painted the
+     title/body column `background-color: var(--color-text)` (#F1F5F9, a
+     white box) behind light text (the owner-reported unreadable failure
+     banner). Never name a class here after a Tailwind utility prefix;
+     `app-css-utility-collision.test.ts` guards this for every component. */
+  .sb-banner {
     display: block;
     border-bottom: 1px solid transparent;
     font-size: 13px;
     line-height: 1.4;
   }
-  .bg-row {
+  .sb-row {
     display: flex;
     align-items: center;
     gap: 12px;
     padding: 10px 24px;
   }
-  .bg-glyph {
+  .sb-glyph {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -131,22 +140,24 @@
     font-weight: 600;
     flex-shrink: 0;
   }
-  .bg-glyph.spin { animation: bg-spin 1.4s linear infinite; }
-  @keyframes bg-spin {
+  .sb-glyph.spin { animation: sb-spin 1.4s linear infinite; }
+  @keyframes sb-spin {
     from { transform: rotate(0deg); }
     to   { transform: rotate(360deg); }
   }
-  /* Honour the OS reduced-motion setting, like the global `.bg-glyph-spin`
+  /* Honour the OS reduced-motion setting, like the global `.sb-glyph-spin`
      button glyph in app.css already does. */
   @media (prefers-reduced-motion: reduce) {
-    .bg-glyph.spin { animation: none; }
+    .sb-glyph.spin { animation: none; }
   }
-  .bg-text { flex: 1; min-width: 0; }
-  .bg-label { font-weight: 600; }
-  .bg-label.strong { font-weight: 700; }
-  .bg-phase { font-size: 12.5px; margin-top: 1px; }
-  .bg-detail { font-size: 12px; color: rgba(255,255,255,0.55); margin-top: 2px; }
-  .bg-actions {
+  .sb-text { flex: 1; min-width: 0; }
+  .sb-label { font-weight: 600; }
+  .sb-label.strong { font-weight: 700; }
+  .sb-phase { font-size: 12.5px; margin-top: 1px; }
+  /* v0.2.103: solid brand secondary text — the old 55%-transparent white
+     is frail on any lighter tone wash. */
+  .sb-detail { font-size: 12px; color: var(--color-mid, #94a3b8); margin-top: 2px; }
+  .sb-actions {
     display: flex;
     gap: 8px;
     flex-shrink: 0;
@@ -155,8 +166,8 @@
 
   /* ── Caller-authored content (snippets compile in the caller, so these
         must be :global, anchored under our own root class). ── */
-  .bg-banner :global(.bg-btn-secondary),
-  .bg-banner :global(.bg-btn-primary) {
+  .sb-banner :global(.sb-btn-secondary),
+  .sb-banner :global(.sb-btn-primary) {
     padding: 4px 12px;
     border-radius: 4px;
     font-size: 12px;
@@ -165,33 +176,33 @@
     border: 1px solid transparent;
     font-family: inherit;
   }
-  .bg-banner :global(.bg-btn-secondary) {
+  .sb-banner :global(.sb-btn-secondary) {
     background: rgba(255,255,255,0.06);
     color: #ccc;
     border-color: rgba(255,255,255,0.12);
   }
-  .bg-banner :global(.bg-btn-secondary:hover) { background: rgba(255,255,255,0.1); }
-  .bg-banner :global(.bg-btn-primary) {
+  .sb-banner :global(.sb-btn-secondary:hover) { background: rgba(255,255,255,0.1); }
+  .sb-banner :global(.sb-btn-primary) {
     background: rgb(0,191,166);
     color: #001a17;
   }
-  .bg-banner :global(.bg-btn-primary:hover:not(:disabled)) { background: rgb(0,210,180); }
-  .bg-banner :global(.bg-btn-primary:disabled) { opacity: 0.5; cursor: default; }
-  .bg-banner :global(.bg-btn-x) {
+  .sb-banner :global(.sb-btn-primary:hover:not(:disabled)) { background: rgb(0,210,180); }
+  .sb-banner :global(.sb-btn-primary:disabled) { opacity: 0.5; cursor: default; }
+  .sb-banner :global(.sb-btn-x) {
     background: none; border: none; color: inherit;
     font-size: 18px; line-height: 1; cursor: pointer;
     padding: 0 8px; border-radius: 6px;
     opacity: 0.6;
   }
-  .bg-banner :global(.bg-btn-x:hover) { opacity: 1; background: rgba(255,255,255,0.06); }
+  .sb-banner :global(.sb-btn-x:hover) { opacity: 1; background: rgba(255,255,255,0.06); }
 
-  .bg-expand {
+  .sb-expand {
     padding: 8px 24px 14px 56px;
     font-size: 12px;
     border-top: 1px dashed rgba(255,255,255,0.08);
   }
-  .bg-expand :global(.bg-expand-row) { margin-bottom: 8px; }
-  .bg-expand :global(.bg-expand-row strong) {
+  .sb-expand :global(.sb-expand-row) { margin-bottom: 8px; }
+  .sb-expand :global(.sb-expand-row strong) {
     display: block;
     font-size: 11px;
     text-transform: uppercase;
@@ -199,7 +210,7 @@
     color: rgba(255,255,255,0.5);
     margin-bottom: 4px;
   }
-  .bg-expand :global(.bg-pre) {
+  .sb-expand :global(.sb-pre) {
     margin: 0;
     padding: 6px 8px;
     background: rgba(255,255,255,0.04);
@@ -220,7 +231,7 @@
     border-bottom-color: rgba(255,255,255,0.10);
     color: var(--color-mid, #999);
   }
-  .tone-pending .bg-glyph {
+  .tone-pending .sb-glyph {
     background: rgba(255,255,255,0.06);
     color: #999;
   }
@@ -229,7 +240,7 @@
     border-bottom-color: rgba(0,191,166,0.30);
     color: rgb(0,191,166);
   }
-  .tone-running .bg-glyph {
+  .tone-running .sb-glyph {
     background: rgba(0,191,166,0.15);
     color: rgb(0,191,166);
   }
@@ -238,7 +249,7 @@
     border-bottom-color: rgba(70, 200, 120, 0.30);
     color: rgb(120, 220, 160);
   }
-  .tone-success .bg-glyph {
+  .tone-success .sb-glyph {
     background: rgba(70, 200, 120, 0.18);
     color: rgb(120, 220, 160);
   }
@@ -248,7 +259,7 @@
     border-bottom-color: rgba(245, 179, 66, 0.30);
     color: rgb(245, 179, 66);
   }
-  .tone-warning .bg-glyph {
+  .tone-warning .sb-glyph {
     background: rgba(245, 179, 66, 0.18);
     color: rgb(245, 179, 66);
   }
@@ -257,7 +268,7 @@
     border-bottom-color: rgba(255, 79, 160, 0.35);
     color: rgb(255, 130, 180);
   }
-  .tone-failed .bg-glyph {
+  .tone-failed .sb-glyph {
     background: rgba(255, 79, 160, 0.18);
     color: rgb(255, 130, 180);
   }
