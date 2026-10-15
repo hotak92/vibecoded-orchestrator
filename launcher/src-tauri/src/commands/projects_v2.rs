@@ -60,6 +60,11 @@ pub struct CreateProjectResult {
     /// (e.g. "env file write failed — manual setup required").
     /// Empty on a clean create.
     pub warnings: Vec<String>,
+    /// v0.2.103 (plan item 17): informational notices (success/info toasts,
+    /// never red) — today the "Created a local git repository (no remote, nothing committed)"
+    /// notice from `worktree_repo_mode::ensure_project_local_repo`.
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 
 /// Result returned by `rename_project_v2`.
@@ -218,6 +223,11 @@ pub struct UpdateProjectResult {
     pub warnings: Vec<String>,
     /// Aggregate per-action counts (see `UpdateSummary`).
     pub summary: UpdateSummary,
+    /// v0.2.103 (plan item 17): informational notices (info toasts) — the
+    /// one-time "Created a local git repository (no remote, nothing committed)" catch-up for a
+    /// project registered before automatic local repos existed.
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 
 /// MEDIUM-1 (2026-05-01): sentinel module_id used for project-level settings
@@ -614,6 +624,22 @@ pub async fn create_project_v2(
         }
     }
 
+    // v0.2.103 (plan item 17, owner ruling 2026-10-14): a folder with no git
+    // repo around or under it gets a local-only repo now (main, no remote,
+    // nothing committed) — no prompt. An existing repo is never touched; a
+    // repo-less folder holding nested repos is left to the subagent-git
+    // modal. Runs BEFORE the detached bundle install so the bundle's
+    // `.git/info/exclude` pass covers the fresh repo. Never fails the add.
+    let mut notices: Vec<String> = Vec::new();
+    crate::commands::worktree_repo_mode::collect_local_repo_outcome(
+        &db,
+        &row.id,
+        folder,
+        &mut notices,
+        &mut warnings,
+    )
+    .await;
+
     // ── Defect B (v0.2.68): DETACH the heavy phase ──────────────────────
     //
     // PR 4 (2026-05-01) used to run bootstrap-collections + install-bundle +
@@ -696,6 +722,7 @@ pub async fn create_project_v2(
     Ok(CreateProjectResult {
         project: ProjectView::from_row(row, 0),
         warnings,
+        notices,
     })
 }
 
@@ -3058,6 +3085,20 @@ pub async fn update_project_v2(
     // update exactly once. See run_node_formats_schema_check + the C1 note in
     // apply_post_bundle_steps.)
 
+    // 3b. v0.2.103 (plan item 17): the add-time automatic local repo, caught
+    //     up ONCE for projects registered before it existed (a recorded
+    //     worktree_repo_mode — any mode — makes this a no-op). Before the
+    //     bundle install so its `.git/info/exclude` pass covers a fresh repo.
+    let mut notices: Vec<String> = Vec::new();
+    crate::commands::worktree_repo_mode::collect_local_repo_outcome(
+        &db,
+        &row.id,
+        &folder,
+        &mut notices,
+        &mut warnings,
+    )
+    .await;
+
     // 4. Bundle install in update mode. Manifest-driven drift detection.
     let (bundle_warnings, summary) = run_install_bundle_update(&folder).await;
     for w in bundle_warnings {
@@ -3199,6 +3240,7 @@ pub async fn update_project_v2(
         project: ProjectView::from_row(row, count),
         warnings,
         summary,
+        notices,
     })
 }
 
@@ -3258,6 +3300,10 @@ pub struct UpdateAllProjectEntry {
     /// per-project so the GUI can stream them as it does today.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// v0.2.103: `UpdateProjectResult.notices`, propagated per-project
+    /// (informational — the modal renders them apart from warnings).
+    #[serde(default)]
+    pub notices: Vec<String>,
     /// Per-project summary counts (None on hard failure / skip — there
     /// was no install run to count).
     pub summary: Option<UpdateSummary>,
@@ -3414,6 +3460,7 @@ fn root_current_skip_entry(project_id: &str, project_name: &str) -> UpdateAllPro
         status: "skipped".to_string(),
         error: None,
         warnings: Vec::new(),
+        notices: Vec::new(),
         summary: None,
         skip_reason: Some(ROOT_BUNDLE_CURRENT_SKIP_SUMMARY.to_string()),
     }
@@ -3493,6 +3540,7 @@ pub async fn update_all_projects(
                 status: "skipped".to_string(),
                 error: None,
                 warnings: Vec::new(),
+                notices: Vec::new(),
                 summary: None,
                 skip_reason: None,
             });
@@ -3559,6 +3607,7 @@ pub async fn update_all_projects(
                     status: "succeeded".to_string(),
                     error: None,
                     warnings: r.warnings,
+                    notices: r.notices,
                     summary: Some(r.summary),
                     skip_reason: None,
                 });
@@ -3575,6 +3624,7 @@ pub async fn update_all_projects(
                     status: "failed".to_string(),
                     error: Some(e),
                     warnings: Vec::new(),
+                    notices: Vec::new(),
                     summary: None,
                     skip_reason: None,
                 });
@@ -10177,6 +10227,7 @@ SHARED_KG_OPT_OUT=false\n"),
                     status: "skipped".to_string(),
                     error: None,
                     warnings: Vec::new(),
+                    notices: Vec::new(),
                     summary: None,
                     skip_reason: None,
                 });
@@ -10207,6 +10258,7 @@ SHARED_KG_OPT_OUT=false\n"),
                     project: ProjectView::from_row(row, count),
                     warnings: Vec::new(),
                     summary: UpdateSummary::default(),
+                    notices: Vec::new(),
                 })
             })().await;
             match result {
@@ -10217,6 +10269,7 @@ SHARED_KG_OPT_OUT=false\n"),
                         status: "succeeded".to_string(),
                         error: None,
                         warnings: r.warnings,
+                        notices: r.notices,
                         summary: Some(r.summary),
                         skip_reason: None,
                     });
@@ -10229,6 +10282,7 @@ SHARED_KG_OPT_OUT=false\n"),
                         status: "failed".to_string(),
                         error: Some(e),
                         warnings: Vec::new(),
+                        notices: Vec::new(),
                         summary: None,
                         skip_reason: None,
                     });

@@ -879,6 +879,11 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
 
         # Snapshot manifest before.
         manifest_before = (self.proj / ".claude" / ".vco-manifest.json").read_bytes()
+        # v0.2.103: setUp's real install may already have written the ledger
+        # (`local_git_repo_pending` — the fixture folder is not a git repo);
+        # the contract is that the DRY run changes nothing in it.
+        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        deferral_before = deferral_path.read_bytes() if deferral_path.exists() else None
 
         result = project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch,
@@ -903,9 +908,9 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
                          "dry_run must not rewrite the manifest")
         # `manifest_written=False` reflects the no-write state.
         self.assertFalse(result["manifest_written"])
-        # No deferral file written.
-        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
-        self.assertFalse(deferral_path.exists(),
+        # No deferral written or changed.
+        deferral_after = deferral_path.read_bytes() if deferral_path.exists() else None
+        self.assertEqual(deferral_before, deferral_after,
                          "dry_run must not emit deferral .md")
 
     def test_multiple_user_modified_files_adopted_under_one_backup_dir(self):
@@ -1593,6 +1598,10 @@ class DeferralReconcileTests(unittest.TestCase):
         self.orch.mkdir()
         self.proj.mkdir()
         _make_fake_orchestrator(self.orch)
+        # v0.2.103: a git repo, so the only deferrals in play are the bundle
+        # conditions under test (a repo-less folder also gets
+        # `local_git_repo_pending`, which would keep the file alive).
+        subprocess.run(["git", "init", "-q", str(self.proj)], check=True)
 
     def tearDown(self):
         import shutil

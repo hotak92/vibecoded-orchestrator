@@ -1120,6 +1120,19 @@ owner = "vco_lib.project_init"
 clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
 
+[conditions.local_git_repo_pending]
+class = "action_required"
+owner = "vco_lib.local_repo_pending"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (plan item 17, review R11 B3). Every bundle run (launcher or \
+CLI) calls `local_repo_pending.reconcile`: emitted while the folder is not inside \
+a git repo and no worktree_repo_mode is recorded; resolved on the first run that \
+finds a repo or a recorded choice; an unanswerable question (git cannot run, \
+launcher.db unreadable) leaves the ledger untouched. The launcher's own Update \
+bundle creates the repo before the bundle install, so this mainly reaches users \
+who update from the command line."""
+
 [conditions.bundle_skipped_existing_files]
 class = "informational_record"
 owner = "vco_lib.project_init"

@@ -183,6 +183,11 @@ class DelegatedIsIdempotentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             proj = Path(tmp) / "proj"
             proj.mkdir()
+            # v0.2.103: a git repo, like a real project. A repo-less folder
+            # gets a `local_git_repo_pending` ledger entry on run 1, and the
+            # ledger then also carries whatever the run's detached workers
+            # file between the runs — churn this test does not measure.
+            subprocess.run(["git", "init", "-q", str(proj)], check=True)
             _run_bundle_into(proj)
 
             def _snap() -> dict[str, bytes]:

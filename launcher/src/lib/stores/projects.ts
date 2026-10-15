@@ -158,6 +158,9 @@ function createProjectsStore() {
       });
       const project = result.project;
       for (const w of result.warnings) toast.error(w);
+      // v0.2.103 (plan item 17): informational notices — e.g. "Created a
+      // local git repository (no remote)" — are successes, never red.
+      for (const n of result.notices ?? []) toast.success(n);
       update((s) => ({
         ...s,
         projects: [...s.projects, project],
@@ -218,6 +221,9 @@ function createProjectsStore() {
         if (isErrorWarning(w)) toast.error(w);
         else toast.info(w);
       }
+      // v0.2.103 (plan item 17): the one-time "Created a local git
+      // repository (no remote)" catch-up for an older project.
+      for (const n of result.notices ?? []) toast.info(n);
 
       // Refresh the cached project view (e.g. updated_at bumped via
       // db.log_change).

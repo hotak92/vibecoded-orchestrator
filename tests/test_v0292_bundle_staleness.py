@@ -65,6 +65,12 @@ def _make_registry_db(db_path: Path, rows: list[tuple[str, str, str, str]]) -> N
     ])
 
 
+def _ledger_bytes(folder: Path) -> bytes | None:
+    """The project's deferral ledger bytes, or ``None`` when it is absent."""
+    md = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
+    return md.read_bytes() if md.exists() else None
+
+
 def _tree_digest(root: Path) -> str:
     """Byte digest of every file under root (path → sha256), excluding
     nothing — the census must leave the WHOLE project tree identical."""
@@ -260,6 +266,13 @@ class TestCensusVerdicts(_CensusFixture):
         )
         digests[str(self.p_stale)] = _tree_digest(self.p_stale)
         before_root_ledger = (self.orch / ".claude" / "context").exists()
+        # v0.2.103: setUp's real installs may have written a project ledger
+        # (`local_git_repo_pending` — the fixture folders are not git repos);
+        # the contract is that the census adds or changes none.
+        ledgers_before = {
+            str(f): _ledger_bytes(f)
+            for f in (self.p_current, self.p_stale, self.p_nomanifest)
+        }
 
         bundle_staleness.run_census(self.orch, refresh_ledger=False)
 
@@ -272,8 +285,8 @@ class TestCensusVerdicts(_CensusFixture):
         # any project (dry-run emits nothing).
         self.assertFalse(before_root_ledger)
         for folder in (self.p_current, self.p_stale, self.p_nomanifest):
-            self.assertFalse(
-                (folder / ".claude" / "context" / "UPDATE_DEFERRED.md").exists(),
+            self.assertEqual(
+                _ledger_bytes(folder), ledgers_before[str(folder)],
                 f"dry-run census emitted a deferral into {folder}",
             )
 

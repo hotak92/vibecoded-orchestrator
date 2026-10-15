@@ -3066,8 +3066,11 @@ pub fn run() {
             // v0.2.71: GUI-only per-project worktree-repo mode (T-WT) — the
             // subagent-git modal's create-local/adopt/opt-out choice.
             commands::worktree_repo_mode::set_worktree_repo_mode,
-            commands::worktree_repo_mode::get_worktree_repo_mode,
+            // v0.2.103 (plan item 17): `get_worktree_repo_mode` retired —
+            // superseded by `plan_project_git_repo`, which also decides the
+            // add/update-time automatic local repo.
             commands::worktree_repo_mode::detect_project_git_repo,
+            commands::worktree_repo_mode::plan_project_git_repo,
             commands::worktree_repo_mode::create_local_project_repo,
             // v0.2.91 (#30): the modal's "Connect an existing repo" arm —
             // remote-URL attach (init+remote+fetch only, never merged over),
