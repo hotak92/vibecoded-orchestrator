@@ -503,6 +503,34 @@ _node_formats_cache: dict | None = None
 _node_formats_by_collection: dict[str, dict] = {}
 
 
+def _canonicalize_sidecar(data: object) -> None:
+    """Re-key a loaded sidecar to canonical POSIX keys, in memory.
+
+    v0.2.103 B1: lookups use the canonical POSIX ``file_path`` Weaviate
+    stores on every OS, but a sidecar written on Windows before the fix
+    keyed entries with ``\\`` — every lookup missed. The writer rewrites
+    such a sidecar on its next run; until then the reader re-keys what it
+    loaded (the file on disk is never touched from here). One home for the
+    rule: ``vco_lib.node_formats_keys``.
+    """
+    if not isinstance(data, dict):
+        return
+    try:
+        from vco_lib.node_formats_keys import canonicalize_keys
+    except ImportError as exc:
+        _reraise_vco_lib_import(exc, "node_formats_keys.canonicalize_keys")
+    canonicalize_keys(data)
+
+
+def _sidecar_lookup_key(file_path: str) -> str:
+    """The canonical sidecar key for a result's ``file_path``."""
+    try:
+        from vco_lib.paths import to_posix_rel
+    except ImportError as exc:
+        _reraise_vco_lib_import(exc, "paths.to_posix_rel")
+    return to_posix_rel(file_path)
+
+
 def _load_node_formats() -> dict:
     """Load the project-KG .node_formats.json sidecar. Cached after first load.
 
@@ -525,6 +553,7 @@ def _load_node_formats() -> dict:
             try:
                 with open(path, encoding="utf-8") as fh:
                     loaded = json.loads(fh.read())
+                _canonicalize_sidecar(loaded)
                 _node_formats_cache = loaded
                 logger.info(f"Loaded node formats from {path} ({len(loaded)} entries)")
                 return loaded
@@ -574,6 +603,7 @@ def _load_node_formats_for_collection(collection_name: str) -> dict:
             try:
                 with open(path, encoding="utf-8") as fh:
                     data = json.loads(fh.read())
+                _canonicalize_sidecar(data)
                 _node_formats_by_collection[collection_name] = data
                 logger.info(
                     f"Loaded node formats for {collection_name} from {path} ({len(data)} entries)"
@@ -600,6 +630,7 @@ def _get_node_format(file_path: str, level: str, collection_name: str | None = N
     Returns:
         The formatted text (or dict for 'chunk_summaries'), or None if not available.
     """
+    file_path = _sidecar_lookup_key(file_path)
     if collection_name:
         db = _load_node_formats_for_collection(collection_name)
         entry = db.get(file_path, {})
@@ -912,7 +943,10 @@ def _format_result_by_tier(
     # Helper to read sidecar respecting an injected db override (used by tests).
     def _sc(level: str):
         if sidecar_db is not None:
-            entry = sidecar_db.get(fp, {}) if isinstance(sidecar_db, dict) else {}
+            entry = (
+                sidecar_db.get(_sidecar_lookup_key(fp), {})
+                if isinstance(sidecar_db, dict) else {}
+            )
             return entry.get(level) if isinstance(entry, dict) else None
         return _get_node_format(fp, level, source_collection)
 

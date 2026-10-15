@@ -28,6 +28,7 @@ import copy
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -430,7 +431,10 @@ class TestWaitGuard:
 
     @pytest.mark.skipif(BASH is None, reason="no bash")
     @pytest.mark.parametrize("wrapper", [
-        "sh", pytest.param("ps1", marks=pytest.mark.skipif(PWSH_FOUND is None, reason="pwsh absent"))])
+        pytest.param("sh", marks=pytest.mark.skipif(
+            sys.platform == "win32",
+            reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
+        pytest.param("ps1", marks=pytest.mark.skipif(PWSH_FOUND is None, reason="pwsh absent"))])
     @pytest.mark.parametrize("cmd", ["Start-Sleep 45", "while ($true) { Start-Sleep 1 }"])
     def test_wrappers_deny_a_powershell_sleep(self, wrapper, cmd, tmp_path):
         env = child_env()
@@ -623,7 +627,11 @@ def _pre_tool_use(impl: str, tmp_path: Path, payload: dict) -> subprocess.Comple
                           timeout=180, env=env, cwd=str(proj))
 
 
-_IMPLS = [pytest.param("sh", marks=pytest.mark.skipif(BASH is None, reason="no bash")),
+_IMPLS = [pytest.param("sh", marks=[
+              pytest.mark.skipif(BASH is None, reason="no bash"),
+              pytest.mark.skipif(
+                  sys.platform == "win32",
+                  reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")]),
           pytest.param("ps1", marks=pytest.mark.skipif(PWSH_FOUND is None, reason="pwsh absent"))]
 
 

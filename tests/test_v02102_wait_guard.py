@@ -561,6 +561,10 @@ class TestWrapperParity:
     DENY_STDIN = json.dumps(_bash("sleep 45"))
     ALLOW_STDIN = json.dumps(_bash("ls /tmp"))
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: "
+        "tests/test_v02102_powershell_hooks.py::TestWaitGuard::test_wrappers_deny_a_powershell_sleep[ps1]")
     def test_sh_wrapper_denies(self, tmp_path):
         if shutil.which("bash") is None:
             pytest.skip("no bash")

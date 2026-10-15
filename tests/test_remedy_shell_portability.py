@@ -207,6 +207,43 @@ def test_doctor_stale_vct_remediation_is_pasteable_on_windows(on_windows):
         "the destination must be the DIRECTORY, not the stale file itself")
 
 
+def test_doctor_stale_vct_posix_destination_is_not_rebased_onto_a_drive(
+    on_windows, monkeypatch
+):
+    """v0.2.103 B2 (Windows triage 2026-10-15): on a real Windows host
+    ``display_path('/opt/bin')`` absolutises against the CWD's drive and
+    printed ``C:\\opt\\bin`` — a directory that does not exist for the Git
+    Bash user this branch serves. Simulated here by giving ``display_path``
+    the Windows behaviour; a Windows-shaped destination keeps going through
+    it (the other arm)."""
+    from vco_lib import doctor
+
+    def _windows_display_path(path):
+        text = str(path)
+        if text.startswith("/"):
+            return "C:" + text.replace("/", "\\")
+        return text
+
+    monkeypatch.setattr(doctor, "display_path", _windows_display_path)
+    block = doctor._stale_vct_remediation(
+        Path("/vco/tools/vct-secrets/vct"), "/opt/bin/vct")
+    copy_line = next(
+        line for line in _command_lines(block) if line.startswith("Copy-Item")
+    )
+    assert copy_line.endswith(" /opt/bin"), copy_line
+    assert "C:\\opt" not in block
+    assert "cygpath -w /opt/bin" in block
+    _assert_pasteable_on_windows(block, "_stale_vct_remediation")
+
+    win_block = doctor._stale_vct_remediation(
+        Path("/vco/tools/vct-secrets/vct"), r"C:\Users\u\bin\vct")
+    win_copy = next(
+        line for line in _command_lines(win_block) if line.startswith("Copy-Item")
+    )
+    assert win_copy.endswith(r"C:\Users\u\bin"), win_copy
+    assert "cygpath" not in win_block
+
+
 def test_shadow_remediation_never_cds_into_tmp():
     """The named instance this sweep started from: the shadowed-``vco_lib``
     verify line used to be prefixed with ``cd /tmp &&``. cmd.exe has no

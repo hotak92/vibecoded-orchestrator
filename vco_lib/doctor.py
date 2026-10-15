@@ -127,7 +127,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Optional, Sequence
 
 from vco_lib import remedy_shell
@@ -4063,22 +4063,40 @@ def _stale_vct_remediation(checkout_cli: Path, deployed: str) -> str:
     canonical = display_path(checkout_cli)
     tree = display_path(checkout_cli.parent)
     if remedy_shell.is_windows():
-        deployed_dir = display_path(Path(deployed).parent)
-        return "\n".join(
-            [
-                f"# PATH `vct` runs {deployed}",
-                f"# which is not {canonical}.",
-                "# VCO never edits a deployed copy, so this is yours to",
-                "# refresh — copy the checkout TREE over it (lib/ included):",
-                "#   Copy-Item -Recurse -Force "
-                + remedy_shell.quote(tree.rstrip("\\/") + "\\*") + " "
-                + remedy_shell.quote(deployed_dir),
-                "# `vct` is a bash script: run it from Git Bash or WSL, not",
-                "# from cmd/PowerShell.",
-                "# Verify afterwards — it must list every guard:",
-                "#   vct version",
-            ]
+        # v0.2.103 B2: a POSIX-shaped deployed path (`/opt/bin/vct`) names
+        # the Git Bash (MSYS) tree, not a Windows directory. `display_path`
+        # absolutises against the CWD's drive and turned it into
+        # `C:\opt\bin` — a directory that does not exist. The deployed
+        # path is already absolute (the probe realpaths `shutil.which`), so
+        # a POSIX-shaped one is printed verbatim, with a note naming the
+        # Git Bash tool that gives its Windows form.
+        posix_dest = deployed.startswith("/")
+        deployed_dir = (
+            str(PurePosixPath(deployed).parent) if posix_dest
+            else display_path(str(PureWindowsPath(deployed).parent))
         )
+        lines = [
+            f"# PATH `vct` runs {deployed}",
+            f"# which is not {canonical}.",
+            "# VCO never edits a deployed copy, so this is yours to",
+            "# refresh — copy the checkout TREE over it (lib/ included):",
+            "#   Copy-Item -Recurse -Force "
+            + remedy_shell.quote(tree.rstrip("\\/") + "\\*") + " "
+            + remedy_shell.quote(deployed_dir),
+        ]
+        if posix_dest:
+            lines += [
+                f"# {deployed_dir} is a Git Bash path: if PowerShell cannot",
+                f"# find it, `cygpath -w {deployed_dir}` in Git Bash prints",
+                "# the Windows form to use as the destination.",
+            ]
+        lines += [
+            "# `vct` is a bash script: run it from Git Bash or WSL, not",
+            "# from cmd/PowerShell.",
+            "# Verify afterwards — it must list every guard:",
+            "#   vct version",
+        ]
+        return "\n".join(lines)
     return "\n".join(
         [
             f"# PATH `vct` runs {deployed}",

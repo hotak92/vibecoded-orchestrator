@@ -1375,7 +1375,12 @@ def test_hook_end_to_end_commits_only_the_reviewer_node(tmp_path, sibling):
     assert _git_env(repo, env, "diff", "--cached", "--name-only").split() == ["first_file.txt"]
 
 
-@pytest.mark.parametrize("sibling", ["sh", "ps1"])
+@pytest.mark.parametrize("sibling", [
+    pytest.param("sh", marks=pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
+    "ps1",
+])
 def test_f6_no_claude_cli_reaches_the_backend_which_logs_its_decision(
         tmp_path, sibling):
     """RED before R7: the hooks exited silently when `claude` was not on
