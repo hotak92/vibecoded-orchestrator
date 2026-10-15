@@ -9,30 +9,49 @@ generator (``generate-code-summary.py``) does not clone ~450 lines of ladder
 logic (the M-2 "one concern, one home" extraction). Both generators are thin
 callers of this module; ``generate-kg-summary.py``'s behaviour is unchanged.
 
-Five-tier model selection (in order) — the ladder is BY DESIGN (three real
-tiers + a legacy one + the silent skip); nothing here is a defect finding:
+Five-tier model selection (in order) — the ladder is BY DESIGN; nothing here
+is a defect finding. v0.2.103 (8b, owner order 2026-10-14) put the two cloud
+vendor tiers BETWEEN the CLI and local Ollama, so a machine with a vendor
+subscription never loads a local generation model onto a GPU the code-embed
+re-index may need:
   1. `claude` CLI on PATH      → best quality, requires CLI install (Max sub or API key)
                                  v0.2.23 C10: gated by a smoke-test, not just --version,
                                  so an installed-but-unauthenticated CLI doesn't get picked.
-  2. Ollama (local, FREE)      → http://localhost:11435, no extra dep beyond what
-                                 the orchestrator already requires for embeddings
-  3. OpenAI API (opt-in)       → gated twice: an OpenAI key in VCO's shared slot
+  2. z.ai GLM (cloud)          → v0.2.103 8b: the vendor's cheap/flash model, used
+                                 ONLY when the z.ai key resolves on this machine (the
+                                 model gateway's own VendorKeyResolver over its vendor
+                                 registry). No key → the tier is silently not
+                                 selectable (one debug line), never an error.
+  3. QwenCloud (cloud)         → v0.2.103 8b: same shape, the qwen key. QwenCloud
+                                 serves ONLY this summary fallback (owner ruling
+                                 2026-10-14) — no lane, review or other consumer
+                                 may grow on it.
+  4. Ollama (local, FREE)      → http://localhost:11435, no extra dep beyond what
+                                 the orchestrator already requires for embeddings.
+                                 v0.2.103 8c: DEFERRED (tier reads unavailable, the
+                                 caller records owed work) while a code-graph
+                                 embedding walk is active or free VRAM is below the
+                                 floor — the local model must not compete with the
+                                 re-index for the GPU (field 2026-10-14: OOM).
+  5. OpenAI API (opt-in)       → gated twice: an OpenAI key in VCO's shared slot
                                  AND `kg_summary_openai_consent` app_state key
                                  (default false). Set via launcher Preferences → KG
                                  Summaries. Bypass via `--force-api`. Costs apply.
-  4. ANTHROPIC_API_KEY direct  → LEGACY opt-in fallback (kept by design): reached
-                                 only when the env key is set AND tiers 1-3 were
+  6. ANTHROPIC_API_KEY direct  → LEGACY opt-in fallback (kept by design): reached
+                                 only when the env key is set AND tiers 1-5 were
                                  unavailable or consent-gated. Costs $$ per call —
                                  a cost warning is logged when the tier is selected.
-  5. Silent skip               → friendly log line; the caller exits 0.
+  7. Silent skip               → friendly log line; the caller exits 0.
 
 Env overrides (shared knobs — the ``KG_SUMMARY_*`` names stay canonical for
 BOTH callers; the code generator adds a ``CODE_SUMMARY_BACKEND`` alias that
 falls back to ``KG_SUMMARY_BACKEND`` via the ``env_keys`` parameter):
-  KG_SUMMARY_BACKEND        → force "cli" | "ollama" | "api" | "openai" | "skip"
-                              (auto-detect default; "api" = Anthropic, "openai" = OpenAI).
-                              Unset: the launcher Preferences → KG Summaries
-                              backend pin (app_state kg_summary_backend_override)
+  KG_SUMMARY_BACKEND        → force "cli" | "zai" | "qwen" | "ollama" | "api" |
+                              "openai" | "skip" (auto-detect default; "api" =
+                              Anthropic, "openai" = OpenAI, "zai"/"qwen" = the
+                              cloud vendor tiers). Unset: the launcher
+                              Preferences → KG Summaries backend pin
+                              (app_state kg_summary_backend_override)
   KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag. Unset: the machine's generation
                               model, resolved by vco_lib.summary_model — the
                               launcher Preferences pick, else what install
@@ -270,7 +289,7 @@ OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 APP_STATE_KEY_OPENAI_CONSENT = "kg_summary_openai_consent"
 APP_STATE_KEY_OPENAI_MODEL = "kg_summary_openai_model"
 #: v0.2.102 W5-D: the launcher Preferences → KG Summaries backend pin
-#: ('' = auto-detect, or one of cli / ollama / openai / skip). Written by the
+#: ('' = auto-detect, or one of :data:`VALID_BACKENDS`). Written by the
 #: launcher since v0.2.23 (preferences/loaders.ts — MUST MATCH); read by
 #: `_forced_backend` after the env keys.
 APP_STATE_KEY_BACKEND_OVERRIDE = "kg_summary_backend_override"
@@ -281,8 +300,10 @@ SYSTEM_PROMPT = (
     "Start directly with the content."
 )
 
-# The valid KG_SUMMARY_BACKEND / CODE_SUMMARY_BACKEND force values.
-VALID_BACKENDS = {"cli", "ollama", "api", "openai", "skip"}
+# The valid KG_SUMMARY_BACKEND / CODE_SUMMARY_BACKEND force values. v0.2.103
+# (8b) added the cloud vendor tiers "zai" and "qwen" (the model gateway's
+# registry ids) between the CLI and local Ollama.
+VALID_BACKENDS = {"cli", "zai", "qwen", "ollama", "api", "openai", "skip"}
 
 _BACKEND_CACHE: dict[str, str] = {}
 
@@ -496,6 +517,7 @@ def reset_backend_cache() -> None:
     _BACKEND_CACHE.clear()
     _BREAKER_MEM.clear()
     _CLI_ISOLATION.clear()
+    _VENDOR_STATE.clear()
 
 
 def reset_breaker(*, persisted: bool = False) -> None:
@@ -1087,6 +1109,15 @@ _ISOLATION_DIR: dict[str, Path] = {}
 EMPTY_MCP_CONFIG = {"mcpServers": {}}
 NO_HOOKS_SETTINGS = {"disableAllHooks": True}
 CLI_HELP_TIMEOUT_S = 20
+#: v0.2.103 (8g): how many times ``--help`` may be re-read while hunting the
+#: complete text. Measured on Claude CLI 2.1.285: the CLI's own writer
+#: INTERMITTENTLY truncates its help output at an ~8 KiB pipe boundary
+#: (observed 8190 / 8191 / 16381 bytes where the full text is 22 336), so a
+#: single read can lose everything past the first screenful — including the
+#: ONLY place ``--strict-mcp-config`` is documented on that CLI generation.
+#: Complete output is stable across runs, so two identical consecutive reads
+#: are accepted at once; otherwise the longest read wins.
+CLI_HELP_ATTEMPTS = 4
 
 
 def _cli_lists_flag(help_text: str, flag: str) -> bool:
@@ -1109,17 +1140,86 @@ def _isolation_dir() -> Path:
 
 
 def _cli_help_text(claude_path: str) -> str:
-    """``claude --help`` output, or ``""`` when it cannot be read."""
+    """``claude --help`` output, or ``""`` when it cannot be read.
+
+    v0.2.103 (8g) — why this RETRIES. Measured on Claude CLI 2.1.285 with
+    ``subprocess.run(capture_output=True)`` (which reads to EOF, so the
+    truncation is the CLI's own writer exiting early, not our reader):
+    repeated reads returned 22 336 bytes, then 8 190, then 22 336 three
+    times — an intermittent cut at an ~8 KiB pipe boundary. The full text
+    is stable across runs, and every truncated read observed was a PREFIX
+    of it, so "two identical consecutive reads" certifies completeness and
+    "longest read wins" is never worse than the old single read.
+
+    The second half of 8g: on that CLI generation ``--strict-mcp-config``
+    has NO option row of its own — its only appearance is inside another
+    option's description prose ("…add --strict-mcp-config to skip MCP
+    servers too"), ~20 KB into the text, past every truncation point
+    observed. So a single truncated read made ``cli_isolation_args``
+    report the CLI as lacking a flag it documents and accepts — and every
+    headless summary call started the user's MCP servers.
+    """
     import subprocess as _sub
 
+    best = ""
+    previous = ""
+    for _attempt in range(max(2, CLI_HELP_ATTEMPTS)):
+        try:
+            result = _sub.run(
+                [claude_path, "--help"], capture_output=True, text=True,
+                timeout=CLI_HELP_TIMEOUT_S, stdin=_sub.DEVNULL,
+            )
+        except (_sub.TimeoutExpired, OSError):
+            return best
+        text = f"{result.stdout or ''}\n{result.stderr or ''}"
+        if len(text) > len(best):
+            best = text
+        if text and text == previous:
+            return text
+        previous = text
+    return best
+
+
+#: v0.2.103 R2 (L-5): the isolation verdict is cached ACROSS processes in
+#: the VCT state dir (the same home as the breaker latch), keyed by the CLI
+#: binary's path + mtime + size — a CLI upgrade changes the stat, so the
+#: verdict is re-derived exactly when the binary changed. Without this, a
+#: one-process-per-node caller (the launcher's summary walk) re-ran
+#: ``claude --help`` 2-4 times per node: 2-4 Node.js startups of ~1 s each
+#: per summarised node.
+CLI_ISOLATION_CACHE_FILENAME = "summary-cli-isolation-cache.json"
+
+
+def _cli_isolation_cache_path() -> Path:
+    return _vct_state_dir() / CLI_ISOLATION_CACHE_FILENAME
+
+
+def _load_isolation_cache() -> dict:
     try:
-        result = _sub.run(
-            [claude_path, "--help"], capture_output=True, text=True,
-            timeout=CLI_HELP_TIMEOUT_S, stdin=_sub.DEVNULL,
-        )
-    except (_sub.TimeoutExpired, OSError):
-        return ""
-    return f"{result.stdout or ''}\n{result.stderr or ''}"
+        data = json.loads(_cli_isolation_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_isolation_cache(data: dict) -> None:
+    """Persist the cache (tmp + replace). Soft-fails like the breaker file."""
+    try:
+        path = _cli_isolation_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a read-only state dir must not break summary runs
+
+
+def _cli_binary_fingerprint(claude_path: str) -> "str | None":
+    try:
+        st = os.stat(claude_path)
+    except OSError:
+        return None
+    return f"{st.st_mtime_ns}:{st.st_size}"
 
 
 def cli_isolation_args(claude_path: str) -> list[str]:
@@ -1128,20 +1228,50 @@ def cli_isolation_args(claude_path: str) -> list[str]:
     Each flag is added only when the installed CLI lists it in ``--help``
     (verified once per process per binary); a missing flag is logged once
     and the call runs without it — never refused, never guessed.
+
+    v0.2.103 R2 (L-5): the FLAG VERDICT is cached on disk (path + mtime +
+    size key) beside the breaker latch, so the launcher's
+    one-process-per-node summary walk stops paying 2-4 ``claude --help``
+    spawns per node. Only the verdict is cached — never the argv, whose
+    isolation-file paths point into THIS process's temp dir. A binary
+    whose stat cannot be read is never cached (the key would be
+    meaningless) — it simply re-probes, as before.
     """
     if claude_path in _CLI_ISOLATION:
         return list(_CLI_ISOLATION[claude_path])
-    help_text = _cli_help_text(claude_path)
+    fingerprint = _cli_binary_fingerprint(claude_path)
+    verdict: "dict[str, bool] | None" = None
+    if fingerprint is not None:
+        entry = _load_isolation_cache().get(claude_path)
+        if (isinstance(entry, dict)
+                and entry.get("fingerprint") == fingerprint
+                and isinstance(entry.get("verdict"), dict)):
+            verdict = {
+                str(k): bool(v)
+                for k, v in entry["verdict"].items() if k in ("strict_mcp", "settings")
+            }
+            if len(verdict) != 2:
+                verdict = None
+    if verdict is None:
+        help_text = _cli_help_text(claude_path)
+        verdict = {
+            "strict_mcp": (_cli_lists_flag(help_text, "--strict-mcp-config")
+                           and _cli_lists_flag(help_text, "--mcp-config")),
+            "settings": _cli_lists_flag(help_text, "--settings"),
+        }
+        if fingerprint is not None:
+            cache = _load_isolation_cache()
+            cache[claude_path] = {"fingerprint": fingerprint, "verdict": verdict}
+            _save_isolation_cache(cache)
     args: list[str] = []
     missing: list[str] = []
     try:
-        if (_cli_lists_flag(help_text, "--strict-mcp-config")
-                and _cli_lists_flag(help_text, "--mcp-config")):
+        if verdict["strict_mcp"]:
             args += ["--strict-mcp-config", "--mcp-config",
                      str(_isolation_dir() / "empty-mcp.json")]
         else:
             missing.append("--strict-mcp-config/--mcp-config (MCP servers will start)")
-        if _cli_lists_flag(help_text, "--settings"):
+        if verdict["settings"]:
             args += ["--settings", str(_isolation_dir() / "no-hooks-settings.json")]
         else:
             missing.append("--settings (hooks will run)")
@@ -1280,6 +1410,179 @@ def call_cli(prompt: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Backend: cloud vendor tiers (v0.2.103 8b — z.ai GLM, then QwenCloud)
+# ──────────────────────────────────────────────────────────────────────
+#: Owner order 2026-10-14: cloud providers BEFORE local Ollama, z.ai GLM
+#: before QwenCloud. These are the model gateway's own registry ids
+#: (``model_router.vendors.VENDORS`` keys) — the tier names double as the
+#: ``KG_SUMMARY_BACKEND`` force values and breaker keys.
+CLOUD_VENDOR_TIERS: tuple[str, ...] = ("zai", "qwen")
+
+#: Resolved tier facts per vendor id (see :func:`_vendor_tier_state`), or an
+#: empty dict caching "known not selectable" so the miss is probed (and its
+#: ONE debug line logged) once per process, not once per node call.
+_VENDOR_STATE: dict[str, dict] = {}
+
+
+def _load_gateway_registry():
+    """``(VENDORS, FALLBACK_LADDER, DEFAULT_ANTHROPIC_VERSION, resolver)``
+    from the model gateway package, or ``None`` when it is not importable
+    here (a per-project ``.claude/scripts/`` context with no gateway on
+    ``sys.path``).
+
+    Split out as its own function so tests can substitute a synthetic
+    registry; the lazy import keeps this module importable without the
+    gateway package (the stdlib-only contract, see ``_save_breaker_file``).
+    """
+    from model_router.secrets import VendorKeyResolver
+    from model_router.vendors import (
+        DEFAULT_ANTHROPIC_VERSION,
+        FALLBACK_LADDER,
+        VENDORS,
+    )
+
+    return VENDORS, FALLBACK_LADDER, DEFAULT_ANTHROPIC_VERSION, VendorKeyResolver()
+
+
+def _vendor_tier_state(vendor_id: str) -> "dict | None":
+    """The call facts for *vendor_id*'s summary tier, or ``None`` when the
+    tier is not selectable on this machine.
+
+    Every vendor fact comes from the model gateway's ONE registry — never a
+    second copy here: base URL and auth-header shape from the ``Vendor``
+    row, the key through ``VendorKeyResolver`` over ``VENDORS`` (the same
+    resolution ``vco_lib.model_selection.vendor_key_probe`` uses), and the
+    MODEL from the gateway's own fallback ladder
+    (``model_router.vendors.FALLBACK_LADDER``): the rung that escalates TO
+    this vendor names its cheap/flash model — glm-5.3-flash for z.ai,
+    qwen3.8-flash for QwenCloud — and summaries are short, so the cheap
+    rung is the right one. No key / no gateway package / no cheap rung →
+    ``None`` after ONE debug line: a third-party user without that
+    provider simply never sees the tier, never an error. A key VALUE never
+    reaches a log line, a message or argv (only the vendor's short name
+    does).
+    """
+    cached = _VENDOR_STATE.get(vendor_id)
+    if cached is not None:
+        return cached or None
+    state = _vendor_tier_state_uncached(vendor_id)
+    _VENDOR_STATE[vendor_id] = state or {}
+    return state
+
+
+def _vendor_tier_state_uncached(vendor_id: str) -> "dict | None":
+    try:
+        registry = _load_gateway_registry()
+    except Exception as exc:  # noqa: BLE001 — one line, the tier is off, that's all
+        _log(f"  summary: cloud tier '{vendor_id}' not selectable "
+             f"(model gateway package unavailable: {type(exc).__name__})")
+        return None
+    if registry is None:  # a substituted (test) registry said "absent"
+        return None
+    vendors, ladder, anthropic_version, resolver = registry
+    vendor = vendors.get(vendor_id)
+    if vendor is None:
+        return None
+    # The summary model: the gateway's own CHEAP rung for this vendor. The
+    # ladder's contract is that a rung's ``to_model_id`` is an id the vendor
+    # row is known to serve, so this can never name an un-routable id.
+    model = next(
+        (rung.to_model_id for rung in ladder if rung.to_vendor_id == vendor_id),
+        None,
+    )
+    if model is None:
+        _log(f"  summary: cloud tier '{vendor_id}' not selectable "
+             "(no cheap rung in the gateway fallback ladder)")
+        return None
+    try:
+        key = resolver.resolve(vendor).key
+    except Exception:  # noqa: BLE001 — resolution never selects the tier
+        key = None
+    if not key:
+        _log(f"  summary: cloud tier '{vendor_id}' not selectable "
+             f"(no {vendor.short_name or vendor_id} key resolved)")
+        return None
+    return {
+        "key": key,
+        "model": model,
+        "upstream": vendor.upstream,
+        "auth_header": vendor.auth_header,
+        "auth_scheme": vendor.auth_scheme,
+        "anthropic_version": anthropic_version,
+    }
+
+
+def _vendor_available(vendor_id: str) -> bool:
+    return _vendor_tier_state(vendor_id) is not None
+
+
+def zai_available() -> bool:
+    """The z.ai GLM tier is selectable (its key resolves on this machine)."""
+    return _vendor_available("zai")
+
+
+def qwen_available() -> bool:
+    """The QwenCloud tier is selectable (its key resolves on this machine)."""
+    return _vendor_available("qwen")
+
+
+def _vendor_summary_model(vendor_id: str) -> str:
+    state = _vendor_tier_state(vendor_id)
+    return str(state["model"]) if state else ""
+
+
+def _call_vendor(vendor_id: str, prompt: str) -> str:
+    """One Anthropic-messages request against *vendor_id*'s upstream.
+
+    The request shape is the same ``/v1/messages`` payload the legacy
+    ``api`` tier already builds (these vendors serve Anthropic-shaped
+    APIs — that is why the gateway relays them for Claude Code); the URL,
+    auth header and version header come from the registry row, so no
+    vendor fact is duplicated here. HTTP errors propagate to
+    :func:`call_llm`, whose breaker classifies them (401/403 auth, 429
+    rate limit, 5xx capacity) and demotes exactly like any other tier.
+    """
+    state = _vendor_tier_state(vendor_id)
+    if state is None:
+        raise RuntimeError(
+            f"cloud tier '{vendor_id}' has no resolved key at call time"
+        )
+    payload = json.dumps(
+        {
+            "model": state["model"],
+            "max_tokens": 350,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{state['upstream'].rstrip('/')}/v1/messages",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            state["auth_header"]: f"{state['auth_scheme']}{state['key']}",
+            "anthropic-version": state["anthropic_version"],
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    blocks = data.get("content", [])
+    # ``type == "text"`` skips thinking/reasoning blocks a vendor may add.
+    return "".join(
+        b.get("text", "") for b in blocks if b.get("type") == "text"
+    ).strip()
+
+
+def call_zai(prompt: str) -> str:
+    return _call_vendor("zai", prompt)
+
+
+def call_qwen(prompt: str) -> str:
+    return _call_vendor("qwen", prompt)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Backend: Ollama
 # ──────────────────────────────────────────────────────────────────────
 # Per-model SAMPLING params for short technical summarization. Override
@@ -1289,7 +1592,8 @@ def call_cli(prompt: str) -> str:
 # (num_ctx and friends) are owned by the ONE generate-body builder,
 # `vco_lib.ollama_generate.generate_request_body`, so every VCO caller loads a
 # model with the same window and Ollama keeps ONE resident copy. Its window
-# (32768 — ~3 × 8k chunks of input + system + output) is machine-wide and
+# (8192 since v0.2.103 8c — the smallest shared value that fits every
+# generation prompt VCO sends; see that module) is machine-wide and
 # overridable with VCO_OLLAMA_GENERATE_NUM_CTX; a num_ctx inside
 # KG_SUMMARY_OLLAMA_OPTIONS is superseded by that knob (dropped, with a
 # stderr note naming it). Our prompts are ~1.5k tokens (4000-char body
@@ -1349,6 +1653,195 @@ def _strip_think_blocks(text: str) -> str:
     return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
 
 
+def _codegraph_walk_active() -> bool:
+    """True when a code-graph embedding walk is provably running NOW.
+
+    Two read-only signals, either sufficient (v0.2.103 8c):
+
+    * the launcher's ``code_graph_builds`` ledger carries a row in
+      ``running`` for ANY project — the GPU is machine-wide, so another
+      project's walk competes just as hard. ``running`` only (v0.2.103 R2,
+      L-5): a merely ``pending`` row is a queued build that has not started
+      (launcher closed, ``resume_pending_builds`` not yet run) — deferring
+      on it blocked local summaries while nothing used the GPU;
+      ``vco_lib.collection_rename._refuse_if_in_flight`` keeps the stricter
+      pending+running filter because a RENAME must not race a queued build's
+      later spawn — the two guards answer different questions;
+    * the code-embed service's ``/health`` reports ``in_flight`` requests
+      or ``inference_busy`` (its own liveness fields, v0.2.102 r2).
+
+    Every failure — missing DB/table, locked DB, unreachable service,
+      malformed body — reads "not known" (False): the guard DEFERS only on
+      positive evidence a walk is live, never on a probe that failed.
+    """
+    try:
+        db_path = _vct_state_dir() / "launcher.db"
+        if db_path.is_file():
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM code_graph_builds "
+                    "WHERE status = 'running' LIMIT 1"
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is not None:
+                return True
+    except Exception:  # noqa: BLE001 — a failed probe is not evidence
+        pass
+    base = (os.getenv("CODE_EMBED_SERVICE_URL")
+            or os.getenv("CODE_EMBED_URL")
+            or "http://localhost:11440").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/health", timeout=3) as resp:
+            health = json.loads(resp.read().decode("utf-8") or "{}")
+        if health.get("in_flight") or health.get("inference_busy"):
+            return True
+    except Exception:  # noqa: BLE001 — service down: nothing to defer for
+        pass
+    return False
+
+
+#: Free-VRAM floor for the local tier (MB). v0.2.103 R2 (H-4): sized from
+#: the RESOLVED model's own need — its on-disk weights size (Ollama
+#: ``/api/tags`` ``size``) plus a KV-cache/activation margin — NOT one flat
+#: constant for every tier. The old flat 8 192 MB floor (sized for
+#: ``qwen3.5:9b``) disabled the local tier FOREVER on every 6-8 GB GPU,
+#: whose resolved model is ``gemma4:e4b`` (~3 GB), even with no cloud key
+#: and no walk active. A machine whose free VRAM is below the derived floor
+#: defers the node (owed work) rather than risk the OOM the field saw.
+#: ``KG_SUMMARY_MIN_FREE_VRAM_MB`` overrides the derived floor.
+ENV_MIN_FREE_VRAM_MB = "KG_SUMMARY_MIN_FREE_VRAM_MB"
+#: Fallback floor when the model's size cannot be read (Ollama unreachable
+#: while deriving it): conservative, sized for the largest default tier.
+DEFAULT_MIN_FREE_VRAM_MB = 8192
+#: KV cache at the shared generate window + activations + headroom, as a
+#: fraction of the weights size (Q4 GGUF rule of thumb: the KV cache for an
+#: 8k-token window lands at roughly a third of the weights) — with an
+#: absolute minimum so the floor never drops to "weights alone" for the
+#: sub-1 GB floor model.
+VRAM_MARGIN_FRACTION = 0.4
+VRAM_MARGIN_MIN_MB = 1024
+
+VRAM_PROBE_TIMEOUT_S = 5
+OLLAMA_PROBE_TIMEOUT_S = 3
+
+
+def _free_vram_mb() -> "int | None":
+    """Free VRAM in MB (the BEST card), or ``None`` when unknown.
+
+    ``nvidia-smi`` is the only probe — it ships with the NVIDIA driver on
+    every OS VCO supports. Absent (non-NVIDIA machine), failing or slow →
+    unknown, and the caller then proceeds only when no walk is active
+    (the brief's cross-OS rule: a failed probe must not block the tier on
+    its own).
+
+    v0.2.103 R2 (L-5): the MAXIMUM across cards, not GPU 0's line — Ollama
+    places the model where the VRAM is, so a machine whose GPU 0 is busy
+    but GPU 1 is empty must not read as VRAM-starved.
+    """
+    import subprocess as _sub
+
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return None
+    try:
+        result = _sub.run(
+            [smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=VRAM_PROBE_TIMEOUT_S,
+            stdin=_sub.DEVNULL,
+        )
+    except (_sub.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
+    values: list[int] = []
+    for ln in lines:
+        try:
+            values.append(int(float(ln.split()[0])))
+        except (IndexError, ValueError):
+            continue
+    return max(values) if values else None
+
+
+def _required_free_vram_mb(weights_mb: "int | None") -> int:
+    """The floor for a model whose on-disk size is *weights_mb* MB.
+
+    ``weights_mb=None`` (size unknown) → the conservative default sized for
+    the largest tier — an unknown model must not lower the bar silently.
+    """
+    if weights_mb is None:
+        return DEFAULT_MIN_FREE_VRAM_MB
+    margin = max(VRAM_MARGIN_MIN_MB, int(weights_mb * VRAM_MARGIN_FRACTION))
+    return weights_mb + margin
+
+
+def _min_free_vram_mb(weights_mb: "int | None" = None) -> int:
+    """The effective floor: ``KG_SUMMARY_MIN_FREE_VRAM_MB`` when set,
+    else the model-derived one."""
+    override = _int_env(ENV_MIN_FREE_VRAM_MB, 0)
+    if override >= 1:
+        return override
+    return _required_free_vram_mb(weights_mb)
+
+
+def _ollama_model_resident(model: str) -> bool:
+    """True when Ollama's ``/api/ps`` shows *model* already loaded.
+
+    A resident model needs NO new VRAM allocation, so the free-VRAM floor
+    must not count it against itself (H-4: a 16 GB GPU with the generation
+    model idle-resident read as "below floor" forever). Any probe failure
+    reads "not resident" — the caller then applies the ordinary floor.
+    """
+    want = model if ":" in model else f"{model}:latest"
+    try:
+        with urllib.request.urlopen(
+            f"{OLLAMA_URL}/api/ps", timeout=OLLAMA_PROBE_TIMEOUT_S
+        ) as resp:
+            if resp.status != 200:
+                return False
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+    except Exception:  # noqa: BLE001 — a failed probe is not residency
+        return False
+    models = body.get("models") if isinstance(body, dict) else None
+    names = {
+        str(m.get(key)) for m in (models if isinstance(models, list) else [])
+        if isinstance(m, dict) for key in ("name", "model") if m.get(key)
+    }
+    return want in names
+
+
+def _ollama_local_deferred(weights_mb: "int | None" = None) -> "str | None":
+    """Why the local tier must NOT load right now, or ``None``.
+
+    v0.2.103 8c (field 2026-10-14: a local 32K-ctx generation model filled
+    the 16 GB GPU beside the code-embedding re-index → OOM). DEFER — never
+    kill anything, never time out long work: the tier reads unavailable,
+    the ladder moves on, and the caller's existing no-backend outcome
+    records the node as owed work for the next run. A FORCED
+    ``KG_SUMMARY_BACKEND=ollama`` bypasses this guard by design — the
+    forced path never probes availability (see ``select_backend``).
+
+    v0.2.103 R2 (H-4): the free-VRAM floor is sized from the model's own
+    need (``weights_mb``, from ``/api/tags``), and the check is SKIPPED
+    entirely when ``/api/ps`` shows the model already resident — nothing
+    new would be allocated.
+    """
+    if _codegraph_walk_active():
+        return ("a code-graph embedding walk is active — the local model "
+                "would compete with it for VRAM")
+    if _ollama_model_resident(OLLAMA_DEFAULT_MODEL):
+        return None  # already loaded: no new allocation to make room for
+    free = _free_vram_mb()
+    floor = _min_free_vram_mb(weights_mb)
+    if free is not None and free < floor:
+        return (f"only {free} MB VRAM free "
+                f"(< {floor} MB floor the resolved model needs)")
+    return None
+
+
 def ollama_available() -> bool:
     """The Ollama tier is usable only when Ollama answers AND already HOLDS
     the summary model (``OLLAMA_DEFAULT_MODEL``).
@@ -1358,6 +1851,15 @@ def ollama_available() -> bool:
     rung, or a tier this machine never pulled — degrades to the next backend
     (OpenAI / Anthropic API / skip); nothing is ever pulled at runtime (an
     ``/api/generate`` for an absent model is a 404, and a pull is multi-GB).
+
+    v0.2.103 8c: the local tier is additionally DEFERRED while a code-graph
+    embedding walk is active or free VRAM is below the model-derived floor —
+    see :func:`_ollama_local_deferred`.
+
+    v0.2.103 R2 (L-5): ``/api/tags`` is checked BEFORE the deferral
+    reasons — a machine that simply lacks the model must log "does not hold
+    <model> — not pulling it", not "deferred — low VRAM", and the model's
+    on-disk size from the same ``/api/tags`` reply is what sizes the floor.
     """
     model = ollama_default_model()
     if not model:
@@ -1367,22 +1869,39 @@ def ollama_available() -> bool:
         return False
     want = model if ":" in model else f"{model}:latest"
     try:
-        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as resp:
+        with urllib.request.urlopen(
+            f"{OLLAMA_URL}/api/tags", timeout=OLLAMA_PROBE_TIMEOUT_S
+        ) as resp:
             if resp.status != 200:
                 return False
             body = json.loads(resp.read().decode("utf-8") or "{}")
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
         return False
     models = body.get("models") if isinstance(body, dict) else None
-    names = {
-        str(m.get(key)) for m in (models if isinstance(models, list) else [])
-        if isinstance(m, dict) for key in ("name", "model") if m.get(key)
-    }
-    if want in names:
-        return True
-    _log(f"  Ollama answers but does not hold `{want}` — not pulling it at runtime; "
-         "trying the next summary backend")
-    return False
+    size_mb: "int | None" = None
+    held = False
+    for m in (models if isinstance(models, list) else []):
+        if not isinstance(m, dict):
+            continue
+        for key in ("name", "model"):
+            if m.get(key) and str(m.get(key)) == want:
+                held = True
+                raw_size = m.get("size")
+                if isinstance(raw_size, (int, float)) and raw_size > 0:
+                    size_mb = int(raw_size) // (1024 * 1024)
+                break
+        if held:
+            break
+    if not held:
+        _log(f"  Ollama answers but does not hold `{want}` — not pulling it at runtime; "
+             "trying the next summary backend")
+        return False
+    defer_reason = _ollama_local_deferred(size_mb)
+    if defer_reason is not None:
+        _log(f"  Ollama summary tier deferred — {defer_reason}; "
+             "the node stays owed for the next run")
+        return False
+    return True
 
 
 def call_ollama(prompt: str, model: str = "") -> str:
@@ -1688,15 +2207,18 @@ def select_backend(
     rate-limited CLI paying the 20 s smoke test once per node. A cached
     choice that has since been demoted is discarded rather than returned.
 
-    Selection order (v0.2.23 C10):
+    Selection order (v0.2.23 C10; cloud tiers inserted v0.2.103 8b):
       1. Forced-backend env override (``env_keys``, first non-empty; if valid).
       2. claude CLI on PATH + smoke-test passes.
-      3. Ollama reachable at OLLAMA_URL.
-      4. OpenAI (requires OPENAI_API_KEY AND consent — either via the
+      3. z.ai GLM — only when the z.ai key resolves (the model gateway's
+         own registry + resolver); no key → skipped silently.
+      4. QwenCloud — same shape, the qwen key.
+      5. Ollama reachable at OLLAMA_URL and not VRAM-deferred (8c).
+      6. OpenAI (requires OPENAI_API_KEY AND consent — either via the
          launcher Preferences app_state key, or via the ``force_api``
          operator flag, i.e. the caller's --force-api).
-      5. Anthropic API direct (legacy fallback, uses ANTHROPIC_API_KEY).
-      6. Skip — log a friendly line; the caller exits 0.
+      7. Anthropic API direct (legacy fallback, uses ANTHROPIC_API_KEY).
+      8. Skip — log a friendly line; the caller exits 0.
 
     When the OpenAI path is reachable in principle (key present) but
     consent has not been granted, this returns "skip" AND logs
@@ -1740,6 +2262,18 @@ def select_backend(
         _BACKEND_CACHE["choice"] = "cli"
         _log(f"  {label} backend: cli (claude on PATH, smoke-test OK)")
         return "cli"
+    for vendor_id in CLOUD_VENDOR_TIERS:
+        # Resolved through the per-tier probe functions (``zai_available`` /
+        # ``qwen_available``) so a substituted or pinned probe governs
+        # selection exactly as for every other tier.
+        probe = {"zai": zai_available, "qwen": qwen_available}.get(vendor_id)
+        if probe is None:
+            continue
+        if _tier_selectable(vendor_id, label) and probe():
+            _BACKEND_CACHE["choice"] = vendor_id
+            _log(f"  {label} backend: {vendor_id} "
+                 f"({_vendor_summary_model(vendor_id)}; subscription key)")
+            return vendor_id
     if _tier_selectable("ollama", label) and ollama_available():
         _BACKEND_CACHE["choice"] = "ollama"
         _log(f"  {label} backend: ollama ({ollama_default_model()})")
@@ -1771,7 +2305,7 @@ def select_backend(
     # branch exists because "install the claude CLI" is the WRONG advice for
     # a user whose CLI is installed and merely rate-limited.
     cooling = [
-        tier for tier in ("cli", "ollama", "openai", "api")
+        tier for tier in ("cli", *CLOUD_VENDOR_TIERS, "ollama", "openai", "api")
         if breaker_state(tier) is not None
     ]
     if cooling:
@@ -1782,8 +2316,9 @@ def select_backend(
         )
     else:
         _log(
-            f"  {label}: no backend available (no claude CLI, no Ollama at "
-            f"{OLLAMA_URL}, no OPENAI_API_KEY, no ANTHROPIC_API_KEY). Skipping."
+            f"  {label}: no backend available (no claude CLI, no cloud-vendor "
+            f"key (z.ai / QwenCloud), no Ollama at {OLLAMA_URL} or VRAM-"
+            f"deferred, no OPENAI_API_KEY, no ANTHROPIC_API_KEY). Skipping."
         )
     return "skip"
 
@@ -1802,6 +2337,9 @@ def _dispatch(backend: str, prompt: str) -> str:
         )
     if backend == "cli":
         return call_cli(prompt)
+    if backend in CLOUD_VENDOR_TIERS:
+        call = {"zai": call_zai, "qwen": call_qwen}[backend]
+        return call(prompt)
     if backend == "ollama":
         return call_ollama(prompt)
     if backend == "openai":
@@ -1817,6 +2355,7 @@ def call_llm(
     force_api: bool = False,
     env_keys: tuple[str, ...] = ("KG_SUMMARY_BACKEND",),
     label: str = "KG-summary",
+    forbid: "tuple[str, ...] | frozenset[str]" = (),
 ) -> str:
     """Summarise *prompt*, descending the ladder when a tier stops serving.
 
@@ -1829,6 +2368,16 @@ def call_llm(
     so substituting another model silently would be exactly the kind of
     unannounced behaviour change this release exists to remove. The
     failure is raised (and logged) instead.
+
+    ``forbid`` (v0.2.103 R2, M-1): tier ids this PROMPT must not descend
+    to, whatever the ladder's health. A batch envelope up to
+    ``BATCH_CHAR_BUDGET`` (~48k chars ≈ 12-16k tokens) does not fit the
+    shared Ollama ``num_ctx`` (8 192) — sending it there would silently
+    truncate the front of the prompt, lose the envelope instructions, fail
+    the parse and re-run every entity. A caller holding such a prompt
+    passes ``forbid=("ollama",)`` and handles the raise by SPLITTING to
+    per-item calls (whose prompts fit the window); the tier itself is
+    healthy and its breaker is NOT tripped.
     """
     forced = _forced_backend(env_keys) in VALID_BACKENDS
     tried: set = set()
@@ -1837,6 +2386,12 @@ def call_llm(
                                  label=label)
         if backend == "skip" or backend in tried:
             raise RuntimeError("no backend available")
+        if backend in forbid:
+            raise RuntimeError(
+                f"{label}: backend '{backend}' is excluded for this prompt "
+                "(its context window cannot hold it); the caller splits "
+                "the work instead"
+            )
         tried.add(backend)
         try:
             text = _dispatch(backend, prompt)

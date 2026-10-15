@@ -91,6 +91,8 @@ def sb(state_dir: Path):
 
 def _pin_probes(monkeypatch, mod, *, cli=False, ollama=False) -> None:
     monkeypatch.setattr(mod, "cli_available", lambda: cli)
+    monkeypatch.setattr(mod, "zai_available", lambda: False)
+    monkeypatch.setattr(mod, "qwen_available", lambda: False)
     monkeypatch.setattr(mod, "ollama_available", lambda: ollama)
     monkeypatch.setattr(mod, "openai_available", lambda: False)
     monkeypatch.setattr(mod, "api_available", lambda: False)

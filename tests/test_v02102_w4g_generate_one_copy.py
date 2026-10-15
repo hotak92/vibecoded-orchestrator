@@ -109,6 +109,11 @@ def _process_documents_body(monkeypatch, model=MODEL):
     import requests
 
     monkeypatch.setattr(sb, "OLLAMA_DEFAULT_MODEL", model)
+    # v0.2.103 R2 (L-5): generate_document_summary now consults the local
+    # tier's VRAM/walk guard before posting; this test is about the request
+    # BODY's load identity, so pin the guard to "not deferred" — its
+    # behaviour is covered in test_v02103_summary_ladder_cloud_and_vram.py.
+    monkeypatch.setattr(sb, "_ollama_local_deferred", lambda *a, **k: None)
 
     seen: list = []
     monkeypatch.setattr(requests, "post", _capture_requests_post(seen))

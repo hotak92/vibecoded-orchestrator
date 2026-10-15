@@ -152,8 +152,9 @@ def select_backend() -> str:
     )
 
 
-def call_llm(prompt: str) -> str:
-    return _sb.call_llm(prompt, force_api=_FORCE_API, env_keys=_ENV_KEYS, label=_LABEL)
+def call_llm(prompt: str, *, forbid: "tuple[str, ...] | frozenset" = ()) -> str:
+    return _sb.call_llm(prompt, force_api=_FORCE_API, env_keys=_ENV_KEYS,
+                        label=_LABEL, forbid=forbid)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -777,10 +778,17 @@ def run(project: str, *, project_root: Path, max_per_run: int,
             ids = [f"e{i + 1}" for i in range(len(group))]
             answers: dict = {}
             try:
+                # M-1 (v0.2.103 R2): the batch envelope (up to
+                # BATCH_CHAR_BUDGET ≈ 12-16k tokens) must NEVER descend to
+                # the Ollama tier — the shared num_ctx (8 192) would
+                # silently truncate the prompt's front, lose the envelope
+                # instructions, fail the parse and re-run every entity.
+                # `forbid` raises instead, and the per-entity fallback
+                # below splits the work into prompts that DO fit.
                 reply = call_llm(_sb.build_batch_prompt(
                     BATCH_INSTRUCTIONS,
                     [(item_id, block) for item_id, (_item, block, _c) in zip(ids, group)],
-                ))
+                ), forbid=("ollama",))
                 state.batch_calls += 1
                 answers = _sb.parse_batch_reply(reply, ids)
             except Exception as exc:  # noqa: BLE001 — falls back per entity
