@@ -29,6 +29,7 @@ The three shapes, and why each is a defect and not a style nit:
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -180,7 +181,7 @@ def test_doctor_reattach_remediation_is_pasteable_on_windows(on_windows):
     assert "EXIT" in block or "exit code" in block.lower()
 
 
-def test_doctor_stale_vct_remediation_is_pasteable_on_windows(on_windows):
+def test_doctor_stale_vct_remediation_is_pasteable_on_windows(on_windows, monkeypatch):
     """Reachable on Windows: `vct` is extensionless, and `shutil.which` on
     Windows checks the bare name in addition to the PATHEXT variants, so a
     user who followed the old copy-onto-PATH docs and runs it under Git Bash
@@ -191,6 +192,9 @@ def test_doctor_stale_vct_remediation_is_pasteable_on_windows(on_windows):
     # absolutises, and a `C:\...` literal on a POSIX test host absolutises
     # against the CWD — which would let this test pass while asserting on
     # mangled paths.
+    # The `os.name` fake cannot run a real `shutil.which` probe; cygpath's
+    # own arms are pinned in the Windows-form test below.
+    monkeypatch.setattr(doctor, "_find_cygpath", lambda: None)
     checkout = Path("/vco/tools/vct-secrets/vct")
     block = doctor._stale_vct_remediation(checkout, "/opt/bin/vct")
     _assert_pasteable_on_windows(block, "_stale_vct_remediation")
@@ -225,6 +229,8 @@ def test_doctor_stale_vct_posix_destination_is_not_rebased_onto_a_drive(
         return text
 
     monkeypatch.setattr(doctor, "display_path", _windows_display_path)
+    # No cygpath reachable: the Git Bash path is printed as-is with the note.
+    monkeypatch.setattr(doctor, "_find_cygpath", lambda: None)
     block = doctor._stale_vct_remediation(
         Path("/vco/tools/vct-secrets/vct"), "/opt/bin/vct")
     copy_line = next(
@@ -242,6 +248,64 @@ def test_doctor_stale_vct_posix_destination_is_not_rebased_onto_a_drive(
     )
     assert win_copy.endswith(r"C:\Users\u\bin"), win_copy
     assert "cygpath" not in win_block
+
+
+def test_doctor_stale_vct_git_bash_destination_is_given_in_windows_form(
+    on_windows, monkeypatch
+):
+    """R20 L4: a Git Bash destination pasted into PowerShell resolves against
+    the current drive (`/opt/bin` -> `C:\\opt\\bin`), so the Copy-Item
+    destination is the Windows form whenever it can be positively obtained:
+    the drive mount (`/c/...`, `/cygdrive/c/...`) without any tool, a
+    root-relative path through this install's own `cygpath -w`."""
+    from vco_lib import doctor
+
+    checkout = Path("/vco/tools/vct-secrets/vct")
+
+    def copy_line_of(block: str) -> str:
+        return next(line for line in _command_lines(block) if line.startswith("Copy-Item"))
+
+    monkeypatch.setattr(doctor, "_find_cygpath", lambda: None)
+    for deployed in ("/c/Users/u/bin/vct", "/cygdrive/c/Users/u/bin/vct"):
+        block = doctor._stale_vct_remediation(checkout, deployed)
+        assert copy_line_of(block).endswith(r"C:\Users\u\bin"), block
+        assert "cygpath -w" not in block
+        _assert_pasteable_on_windows(block, "_stale_vct_remediation")
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="C:\\Program Files\\Git\\opt\\bin\n",
+                                           stderr="")
+
+    monkeypatch.setattr(doctor, "_find_cygpath", lambda: r"C:\Git\usr\bin\cygpath.exe")
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+    block = doctor._stale_vct_remediation(checkout, "/opt/bin/vct")
+    assert calls == [[r"C:\Git\usr\bin\cygpath.exe", "-w", "/opt/bin"]]
+    assert copy_line_of(block).endswith('"C:\\Program Files\\Git\\opt\\bin"'), block
+    assert "Git Bash directory /opt/bin" in block
+    _assert_pasteable_on_windows(block, "_stale_vct_remediation")
+
+    # cygpath fails or prints something that is not a Windows path: no guess,
+    # the as-is path and the note come back.
+    for result in (subprocess.CompletedProcess([], 1, stdout="", stderr="boom"),
+                   subprocess.CompletedProcess([], 0, stdout="/opt/bin\n", stderr="")):
+        monkeypatch.setattr(doctor.subprocess, "run", lambda argv, _r=result, **kw: _r)
+        block = doctor._stale_vct_remediation(checkout, "/opt/bin/vct")
+        assert copy_line_of(block).endswith(" /opt/bin"), block
+        assert "cygpath -w /opt/bin" in block
+
+
+def test_msys_drive_path_to_windows_translates_only_the_drive_mounts():
+    from vco_lib.paths import msys_drive_path_to_windows as conv
+
+    assert conv("/c/Users/u/bin") == r"C:\Users\u\bin"
+    assert conv("/d") == "D:\\"
+    assert conv("/c/") == "C:\\"
+    assert conv("/cygdrive/e/x/y") == r"E:\x\y"
+    for not_a_drive in ("/opt/bin", "/usr/bin", "/", "C:\\x", "relative/c", "/cc/x"):
+        assert conv(not_a_drive) is None, not_a_drive
 
 
 def test_shadow_remediation_never_cds_into_tmp():

@@ -228,6 +228,60 @@ def test_single_mode_rekeys_a_windows_sidecar_without_regenerating(
     assert calls == []
 
 
+def _single(mod, monkeypatch, node: Path, *extra: str) -> int:
+    monkeypatch.setattr(sys, "argv", ["generate-kg-summary.py", str(node), *extra])
+    try:
+        mod.main()  # the generate-and-save path returns without sys.exit
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 1
+    return 0
+
+
+def test_single_mode_dry_run_writes_nothing_in_any_arm(tmp_path, monkeypatch, capsys):
+    """R20 L6: ``--dry-run`` writes nothing in single-file mode either — not
+    the separator re-key, not an archived node's entry drop, not a summary —
+    and calls no model; without the flag the same runs do write."""
+    root = tmp_path / "proj"
+    node = _seed(root)
+    sidecar = root / "knowledge" / ".node_formats.json"
+    legacy = json.dumps({WIN_KEY: _entry(KEPT, chash="stale")})
+    monkeypatch.setenv("KG_PROJECT_ROOT", str(root))  # read at import
+    mod = _load_generator()
+    assert Path(mod.FORMATS_PATH) == sidecar
+    calls = _stub_ladder(monkeypatch, mod)
+
+    # 1. A stale Windows-keyed entry: would re-key AND regenerate.
+    sidecar.write_text(legacy, encoding="utf-8")
+    assert _single(mod, monkeypatch, node, "--dry-run") == 0
+    assert "would generate" in capsys.readouterr().out
+    assert sidecar.read_text(encoding="utf-8") == legacy
+    assert calls == []
+
+    # 2. An archived node with a sidecar entry: would drop it.
+    node.write_text(NODE_TEXT.replace("type: concept\n", "type: concept\nstatus: archived\n"),
+                    encoding="utf-8")
+    current = json.dumps({POSIX_KEY: _entry(KEPT)})
+    sidecar.write_text(current, encoding="utf-8")
+    assert _single(mod, monkeypatch, node, "--dry-run") == 0
+    assert "would drop" in capsys.readouterr().out
+    assert sidecar.read_text(encoding="utf-8") == current
+
+    # The other arm: the same runs without --dry-run write.
+    assert _single(mod, monkeypatch, node) == 0
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == {}
+    node.write_bytes(NODE_TEXT.encode("utf-8"))
+    sidecar.write_text(legacy, encoding="utf-8")
+    assert _single(mod, monkeypatch, node) == 0
+    db = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert list(db) == [POSIX_KEY] and db[POSIX_KEY]["summary"] == "GEN"
+    assert calls, "the non-dry run generates"
+
+
+def test_the_dry_run_flag_text_names_both_modes():
+    help_text = _load_generator().build_parser().format_help()
+    assert "both modes" in " ".join(help_text.split())
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # summary_health.scan_pending — the separator alone never makes a node pending
 # ═══════════════════════════════════════════════════════════════════════════

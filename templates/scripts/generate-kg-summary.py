@@ -9,7 +9,7 @@ two modes:
 
 * per-node — PostToolUse hook on knowledge/**/*.md edits, and the launcher's
   per-file walk (`launcher/src-tauri/src/commands/kg_summary.rs`):
-  `generate-kg-summary.py <file> [--force] [--force-api]`
+  `generate-kg-summary.py <file> [--force] [--force-api] [--dry-run]`
 * bulk — the manual `--all` backfill, the post-sync refresh
   (`sync_knowledge_graph._regen_node_formats_after_full_sync`) and the
   schema-migration regeneration (`vco_lib/project_init.py::
@@ -592,7 +592,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="Regenerate even if content unchanged")
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="With --all: show what would be done, write nothing",
+        help=(
+            "Show what would be done and write nothing — no summary, no "
+            "sidecar re-key, no archived-entry drop (both modes)"
+        ),
     )
     parser.add_argument(
         "--knowledge-dir", metavar="PATH", default=None,
@@ -876,8 +879,9 @@ def main():
     # One-time separator re-key (v0.2.103 B1): a sidecar written on Windows
     # before the fix holds `\` keys the lookup below (and every retrieval
     # reader) would miss. Persisted at once so the hash-skip path also
-    # leaves a canonical sidecar behind.
-    if rekey_separator_entries(formats):
+    # leaves a canonical sidecar behind — except under --dry-run, which
+    # writes nothing in either mode (R20 L6: this save used to ignore it).
+    if rekey_separator_entries(formats) and not args.dry_run:
         save_formats(formats)
 
     # Archived nodes skip the summarization entirely (owner decision
@@ -890,8 +894,11 @@ def main():
     if archived:
         print(f"  {title}: {ARCHIVED_SKIP_MARKER} ({archived})")
         if _drop_sidecar_entry(rel_path, formats):
-            save_formats(formats)
-            log(f"  {title}: dropped the stale sidecar entry for the archived node")
+            if args.dry_run:
+                print(f"  {title}: dry-run — would drop the stale sidecar entry")
+            else:
+                save_formats(formats)
+                log(f"  {title}: dropped the stale sidecar entry for the archived node")
         sys.exit(0)
 
     existing = formats.get(rel_path, {})
@@ -905,6 +912,11 @@ def main():
         # mistake it for the skip path.
         log(f"  {title}: cached entry holds a non-answer, not a summary — "
             f"regenerating it now")
+
+    if args.dry_run:
+        # Before backend selection: a dry run neither probes nor calls a model.
+        print(f"  {title}: dry-run — would generate summaries (nothing written)")
+        sys.exit(0)
 
     if select_backend() == "skip":
         sys.exit(0)

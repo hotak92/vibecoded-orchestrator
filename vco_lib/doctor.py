@@ -131,6 +131,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Optional, Sequence
 
 from vco_lib import remedy_shell
+from vco_lib.paths import msys_drive_path_to_windows
 
 #: Report contract version (the GUI + tests pin it).
 SCHEMA_VERSION = 1
@@ -4040,6 +4041,49 @@ def parse_vct_guards(text: str) -> Optional[list[str]]:
     return None
 
 
+def _find_cygpath() -> "str | None":
+    """Git for Windows' ``cygpath``: on PATH, or beside the ``git`` on PATH
+    (``<Git>\\cmd\\git.exe`` / ``<Git>\\bin\\git.exe`` →
+    ``<Git>\\usr\\bin\\cygpath.exe``)."""
+    try:
+        found = shutil.which("cygpath")
+        if found:
+            return found
+        git = shutil.which("git")
+        if not git:
+            return None
+        for root in list(Path(git).resolve().parents)[:3]:
+            candidate = root / "usr" / "bin" / "cygpath.exe"
+            if candidate.is_file():
+                return str(candidate)
+    except (OSError, AttributeError, ValueError):
+        # Best-effort lookup for a remedy text: a failed probe means "no
+        # cygpath", and the caller prints the as-is path with its note.
+        return None
+    return None
+
+
+def _git_bash_dir_as_windows(posix_dir: str) -> "str | None":
+    """The Windows form of a Git Bash directory, or ``None`` when it cannot be
+    positively obtained — the caller then prints the path as-is with a note,
+    never a guessed translation."""
+    converted = msys_drive_path_to_windows(posix_dir)
+    if converted:
+        return converted
+    cygpath = _find_cygpath()
+    if cygpath is None:
+        return None
+    try:
+        proc = subprocess.run([cygpath, "-w", posix_dir], capture_output=True,
+                              text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = proc.stdout.strip()
+    if proc.returncode == 0 and re.match(r"^[A-Za-z]:\\", text):
+        return text
+    return None
+
+
 def _stale_vct_remediation(checkout_cli: Path, deployed: str) -> str:
     """Advice for a stale deployed ``vct``. Detection only — never a repair.
 
@@ -4066,15 +4110,20 @@ def _stale_vct_remediation(checkout_cli: Path, deployed: str) -> str:
         # v0.2.103 B2: a POSIX-shaped deployed path (`/opt/bin/vct`) names
         # the Git Bash (MSYS) tree, not a Windows directory. `display_path`
         # absolutises against the CWD's drive and turned it into
-        # `C:\opt\bin` — a directory that does not exist. The deployed
-        # path is already absolute (the probe realpaths `shutil.which`), so
-        # a POSIX-shaped one is printed verbatim, with a note naming the
-        # Git Bash tool that gives its Windows form.
+        # `C:\opt\bin` — a directory that does not exist. R20 L4: printing
+        # it verbatim is no better, since PowerShell resolves `/opt/bin`
+        # against the current drive in exactly the same way. So the
+        # Copy-Item destination is the WINDOWS form whenever it can be
+        # positively obtained (the drive mount `/c/...`, or this install's
+        # own `cygpath -w`); only when neither is available is the Git Bash
+        # path printed as-is, with the note naming the tool to translate it.
         posix_dest = deployed.startswith("/")
-        deployed_dir = (
-            str(PurePosixPath(deployed).parent) if posix_dest
-            else display_path(str(PureWindowsPath(deployed).parent))
-        )
+        posix_dir = str(PurePosixPath(deployed).parent) if posix_dest else ""
+        win_dir = _git_bash_dir_as_windows(posix_dir) if posix_dest else None
+        if not posix_dest:
+            deployed_dir = display_path(str(PureWindowsPath(deployed).parent))
+        else:
+            deployed_dir = win_dir or posix_dir
         lines = [
             f"# PATH `vct` runs {deployed}",
             f"# which is not {canonical}.",
@@ -4084,11 +4133,14 @@ def _stale_vct_remediation(checkout_cli: Path, deployed: str) -> str:
             + remedy_shell.quote(tree.rstrip("\\/") + "\\*") + " "
             + remedy_shell.quote(deployed_dir),
         ]
-        if posix_dest:
+        if posix_dest and win_dir:
+            lines.append(f"# ({win_dir} is the Git Bash directory {posix_dir}.)")
+        elif posix_dest:
             lines += [
-                f"# {deployed_dir} is a Git Bash path: if PowerShell cannot",
-                f"# find it, `cygpath -w {deployed_dir}` in Git Bash prints",
-                "# the Windows form to use as the destination.",
+                f"# {posix_dir} is a Git Bash path that PowerShell cannot",
+                "# resolve (no cygpath was found to translate it): run",
+                f"# `cygpath -w {posix_dir}` in Git Bash and use the Windows",
+                "# form it prints as the destination.",
             ]
         lines += [
             "# `vct` is a bash script: run it from Git Bash or WSL, not",

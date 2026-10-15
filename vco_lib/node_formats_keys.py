@@ -35,7 +35,7 @@ from typing import Callable, Optional
 from vco_lib.paths import to_posix_rel
 
 
-def sidecar_key(node_path: "str | Path", base: "str | Path | None" = None) -> str:
+def sidecar_key(node_path: "str | PurePath", base: "str | PurePath | None" = None) -> str:
     """The canonical sidecar key for *node_path*.
 
     With *base*, the key is *node_path* relative to *base* (a path outside
@@ -51,7 +51,7 @@ def sidecar_key(node_path: "str | Path", base: "str | Path | None" = None) -> st
             p = p.relative_to(base_p)
         except ValueError:
             pass
-    return to_posix_rel(p)
+    return to_posix_rel(str(p))
 
 
 def _usable(entry: object) -> bool:
