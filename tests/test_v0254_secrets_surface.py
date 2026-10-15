@@ -311,6 +311,9 @@ def _build_envelope(extra_env: dict | None = None) -> dict:
     return json.loads(cp.stdout)
 
 
+# W-MODEL-CLI (v0.2.103): the bootstrap envelope probes `claude --version`;
+# the conftest stub refuses a real CLI, so these get the benign fake.
+@pytest.mark.usefixtures("fake_claude_cli")
 def test_envelope_secrets_block_names_only(tmp_path):
     store = tmp_path / "store"
     (store / "shared").mkdir(parents=True)
@@ -327,6 +330,7 @@ def test_envelope_secrets_block_names_only(tmp_path):
     assert "SUPER-SENSITIVE-VALUE" not in raw, "values must NEVER enter the envelope"
 
 
+@pytest.mark.usefixtures("fake_claude_cli")
 def test_envelope_secrets_block_soft_fails_on_missing_store(tmp_path):
     envelope = _build_envelope({"VCT_SECRETS_DIR": str(tmp_path / "nope")})
     s = envelope["secrets"]

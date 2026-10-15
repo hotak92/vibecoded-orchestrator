@@ -27,6 +27,10 @@ import pytest
 from tests.common.child_env import child_env
 from vco_lib import hub_ensure
 
+# W-MODEL-CLI (v0.2.103): the bootstrap envelope probes `claude --version`; the
+# conftest stub refuses a real CLI, so the probe gets the benign fake.
+pytestmark = pytest.mark.usefixtures("fake_claude_cli")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
