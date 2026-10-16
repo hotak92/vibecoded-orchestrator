@@ -38,6 +38,7 @@ from vco_lib import self_install  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("install_py_v02103_f4", REPO_ROOT / "install.py")
+assert _spec is not None and _spec.loader is not None
 install_py = importlib.util.module_from_spec(_spec)
 sys.modules["install_py_v02103_f4"] = install_py
 _spec.loader.exec_module(install_py)

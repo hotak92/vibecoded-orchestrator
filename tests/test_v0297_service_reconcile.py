@@ -1007,7 +1007,9 @@ def test_gpu_profile_appears_once_in_the_step5_argv(monkeypatch, tmp_path):
          mock.patch.object(install, "_get_compose_command", return_value=["docker", "compose"]), \
          mock.patch.object(code_embed_image, "image_state", return_value=state), \
          mock.patch.object(install.subprocess, "run", side_effect=fake_run):
-        install._start_services(sysinfo, argparse.Namespace(update=True), {}, decisions=decisions)
+        # A CodeSage install, so code_embed is in the stack (v0.2.103).
+        install._start_services(sysinfo, argparse.Namespace(update=True), {"code_backend": "gpu"},
+                                decisions=decisions)
     cmd = seen["cmd"]
     assert cmd.count("--profile") == 1 and "code_embed" in cmd and "--no-deps" in cmd
 

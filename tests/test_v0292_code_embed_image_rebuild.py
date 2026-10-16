@@ -378,6 +378,24 @@ class RebuildOwnershipTests(unittest.TestCase):
         }}
         self.assertTrue(self._allowed(decisions, True, False))
 
+    def test_out_of_stack_is_never_built(self):
+        """v0.2.103 field run: a container the ONE in-stack decision does not
+        want is never built nor recreated — on any path."""
+        decisions = {"code_embed": {"action": self.install.ACTION_START,
+                                    "probe": self.install.PROBE_NOT_RUNNING}}
+        for d, fs in ((decisions, False), (None, False), ({}, True)):
+            self.assertFalse(code_embed_image.rebuild_allowed(
+                d, True, fs, adopt_action=self.install.ACTION_ADOPT,
+                managed_probe=self.install.PROBE_VCT_MANAGED, in_stack=False))
+            plan = code_embed_image.plan_rebuild(
+                decisions=d, has_gpu=True, force_separate=fs, install_root=REPO_ROOT,
+                url=None, services_to_start=[], services_to_recreate=[],
+                adopt_action=self.install.ACTION_ADOPT,
+                managed_probe=self.install.PROBE_VCT_MANAGED, in_stack=False,
+                state=code_embed_image.ImageState(code_embed_image.STALE, "stale"))
+            self.assertFalse(plan.build)
+            self.assertEqual(plan.recreate, ())
+
     def test_legacy_and_force_separate_paths_may_be_rebuilt(self):
         self.assertTrue(self._allowed(None, True, False))
         self.assertTrue(self._allowed({}, True, True))
@@ -458,7 +476,9 @@ class ComposeArgvTests(unittest.TestCase):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 install._start_services(
-                    sysinfo, mock.Mock(), {}, decisions=decisions, deferral_report=None,
+                    # A CodeSage install: the container is in the stack (v0.2.103).
+                    sysinfo, mock.Mock(), {"code_backend": "gpu"}, decisions=decisions,
+                    deferral_report=None,
                 )
         return recorded.get("cmd", []), buf.getvalue()
 

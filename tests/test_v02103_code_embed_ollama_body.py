@@ -261,11 +261,11 @@ def test_the_service_has_no_unguarded_vco_lib_import():
     guarded: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.If) and "VCO_LIB_AVAILABLE" in ast.unparse(node.test):
-            guarded |= {n.lineno for b in node.body for n in ast.walk(b) if hasattr(n, "lineno")}
+            guarded |= {getattr(n, "lineno") for b in node.body for n in ast.walk(b) if hasattr(n, "lineno")}
         if isinstance(node, ast.Try) and any(
             h.type is not None and "ImportError" in ast.unparse(h.type) for h in node.handlers
         ):
-            guarded |= {n.lineno for b in node.body for n in ast.walk(b) if hasattr(n, "lineno")}
+            guarded |= {getattr(n, "lineno") for b in node.body for n in ast.walk(b) if hasattr(n, "lineno")}
     bare = [
         n.lineno for n in ast.walk(tree)
         if isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "vco_lib"

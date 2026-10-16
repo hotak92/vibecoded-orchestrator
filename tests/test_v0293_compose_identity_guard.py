@@ -269,7 +269,10 @@ class StartServicesIdentityGuardTests(unittest.TestCase):
              mock.patch.object(subprocess, "run", side_effect=fake_run):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                install._start_services(sysinfo, args, {}, decisions=decisions, deferral_report=ledger)
+                # A CodeSage install: the container is in the stack (v0.2.103 — an
+                # empty config no longer means "any GPU host runs it").
+                install._start_services(sysinfo, args, {"code_backend": "gpu"}, decisions=decisions,
+                                        deferral_report=ledger)
         return recorded.get("cmd", []), buf.getvalue(), ledger.entries
 
     def test_foreign_owned_services_are_left_alone_and_ledgered(self):

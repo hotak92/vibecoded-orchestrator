@@ -11788,7 +11788,7 @@ def _start_services(
             services_to_start.append("weaviate")
         if not detected["ollama_url"]:
             services_to_start.append("ollama")
-        if sysinfo.has_gpu and not detected["code_embed_url"]:
+        if code_embed_wanted and not detected["code_embed_url"]:  # the ONE in-stack decision
             services_to_start.append("code_embed")
 
     # ── v0.2.92 BLOCKER-1: rebuild the code_embed IMAGE when it is not
@@ -11804,16 +11804,9 @@ def _start_services(
     recreate_for_rebuild: list[str] = []
     from vco_lib import code_embed_image as _cei
     _rebuild = _cei.plan_rebuild(
-        decisions=decisions,
-        has_gpu=sysinfo.has_gpu,
-        force_separate=force_separate,
-        install_root=PROJECT_ROOT,
-        url=detected.get("code_embed_url"),
-        services_to_start=services_to_start,
-        services_to_recreate=services_to_recreate,
-        adopt_action=ACTION_ADOPT,
-        managed_probe=PROBE_VCT_MANAGED,
-    )
+        decisions=decisions, has_gpu=sysinfo.has_gpu, force_separate=force_separate, in_stack=code_embed_wanted,
+        install_root=PROJECT_ROOT, url=detected.get("code_embed_url"), services_to_start=services_to_start,
+        services_to_recreate=services_to_recreate, adopt_action=ACTION_ADOPT, managed_probe=PROBE_VCT_MANAGED)
     for _line in _rebuild.lines:
         print(_line)
     if _rebuild.build:
@@ -11827,6 +11820,11 @@ def _start_services(
                   "expected_sha": _rebuild.expected_sha,
                   "served_sha": _rebuild.served_sha},
         )
+    # v0.2.103 R42-L1: a stale CODE_EMBED_OLLAMA_BODY is rewritten + recreated BEFORE the guards below.
+    services_to_recreate.extend(_cei.plan_body_template_recreate(
+        _rebuild, force_separate=force_separate, url=detected.get("code_embed_url"), infra_dir=infra_dir,
+        embed_config=embed_config, services=services_to_start + services_to_recreate,
+        write_env=_write_infrastructure_env, log_event=_log_install_event))
 
     # Nothing to start or recreate → nothing to do. v0.2.93: a container
     # another compose identity created is never recreated.
@@ -20811,8 +20809,9 @@ def _configure_claude_settings(
         print("  Claude settings: managed keys refreshed (user keys preserved)")
         return
 
-    # v0.2.103 F4: step 5b's bundle CREATED this file this run — VCO's own,
-    # so fill in the defaults and stamp the sentinel (vco_lib.self_install).
+    # v0.2.103 F4: step 5b's bundle CREATED this file this run — VCO's own, so fill in the
+    # defaults and stamp the sentinel (vco_lib.self_install). Not a tautology: a symlinked
+    # .claude/ or settings.json diverted settings_file to a .vco-new sibling above.
     if settings_file == PROJECT_ROOT / ".claude" / "settings.json" and \
             _self_install.root_settings_created_this_run(PROJECT_ROOT):
         adopted = _self_install.adopt_bundle_created_settings(
