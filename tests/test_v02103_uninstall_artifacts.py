@@ -209,6 +209,7 @@ def _uninstall(monkeypatch, tmp_path, *, dry_run):
     from vco_lib import uninstall_quiesce as uq
     monkeypatch.setattr(uq, "_default_hub_running", lambda: False)
     monkeypatch.setattr(uq, "_default_lister", lambda: [])
+    monkeypatch.setattr(uq, "_default_gateway_reader", lambda: None)
     lock = tmp_path / "vct" / "state" / "engine-start.lock"
     lock.parent.mkdir(parents=True)
     lock.write_text("")

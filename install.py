@@ -21529,7 +21529,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     os_name = platform.system()
     st_plan = _uninstall_state.build_plan(clone_root=PROJECT_ROOT)
     launcher_exes = _uninstall_artifacts.launcher_exe_paths(os_name=os_name, home=Path.home(), clone_root=PROJECT_ROOT)
-    print("\n".join(_uninstall_quiesce.plan_lines(launcher_exes)))
+    print("\n".join(_uninstall_quiesce.plan_lines(launcher_exes, install_root=PROJECT_ROOT)))
 
     claude_json = Path.home() / ".claude.json"
     will_clean_claude_json = claude_json.exists()
@@ -21645,7 +21645,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         audit.extend(_uninstall_containers.remove(_rt.runtime, current_compose_dir=compose_dir))
 
     # Step 3: stop what holds the state dir open, before ANY state removal.
-    if _confirm("Stop vct-hub and the VCO launcher before VCO state is removed?"):
+    if _confirm("Stop the model gateway, vct-hub and the VCO launcher before VCO state is removed?"):
+        audit.extend(_uninstall_quiesce.stop_gateway(interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT))
         audit.extend(_uninstall_quiesce.stop_hub(hub_bins))
         audit.extend(_uninstall_quiesce.stop_launchers(
             launcher_exes, interactive=not non_interactive, confirm=_confirm, wait_for_user=_confirm))
@@ -21719,6 +21720,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     # Step 8: the whole VCO state dir (uninstall_state.py; exact names when refused).
     if (st_plan.exists or st_plan.db_files or gateway_present) and _confirm(
             f"Remove the VCO state dir {st_plan.root} (RL training data included)?"):
+        audit.extend(_uninstall_quiesce.stop_gateway(  # again: its boot unit may have restarted it
+            interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT, report_idle=False))
         audit.extend(_uninstall_state.execute(st_plan))
         if gateway_present:
             audit.extend(_boot_service.remove_gateway_state())

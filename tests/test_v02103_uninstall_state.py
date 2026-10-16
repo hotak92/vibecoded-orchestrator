@@ -304,7 +304,7 @@ def test_launcher_paths_cover_the_install_locations(tmp_path):
 # ── end to end through install._run_uninstall ─────────────────────────────
 
 
-def _run(monkeypatch, tmp_path, home, *, dry_run, events):
+def _run(monkeypatch, tmp_path, home, *, dry_run, events, gateway_restarts=False):
     root = _state(home / ".vct")
     monkeypatch.setenv("VCT_STATE_DIR", str(root))
     monkeypatch.delenv("VCT_LAUNCHER_DB_PATH", raising=False)
@@ -324,6 +324,8 @@ def _run(monkeypatch, tmp_path, home, *, dry_run, events):
     def runner(cmd, timeout=15):
         events.append(("hub-stop", (root / "launcher.db").exists()))
         hub["alive"] = False
+        if gateway_restarts:  # its boot unit brings it back before step [5] unregisters it
+            gw["alive"] = True
         return 0
 
     monkeypatch.setattr(uq, "_default_runner", runner)
@@ -331,6 +333,18 @@ def _run(monkeypatch, tmp_path, home, *, dry_run, events):
     monkeypatch.setattr(uq, "_default_lister", lambda: [uq.ProcInfo(55, "vct-launcher", ours)])
     monkeypatch.setattr(uq, "_default_stopper", lambda pid, exe: events.append(
         ("launcher-stop", (root / "launcher.db").exists())) or True)
+    venv_script = str(tmp_path / "clone" / ".venv" / "bin" / "vct-model-gateway")
+    monkeypatch.setattr(uq, "_default_candidates", lambda install_root: [[venv_script]])
+    gw = {"alive": True}
+    monkeypatch.setattr(uq, "_default_gateway_reader", lambda: uq.GatewayProc(
+        77, ("/venv/python", venv_script, "serve")) if gw["alive"] else None)
+
+    def gw_stop(pid, cands):
+        events.append(("gateway-stop", (root / "logs" / "model-gateway.log").exists()))
+        gw["alive"] = False
+        return True
+
+    monkeypatch.setattr(uq, "_default_gateway_stopper", gw_stop)
     real_exec = us.execute
     monkeypatch.setattr(us, "execute", lambda plan: events.append(("state", None)) or real_exec(plan))
     args = argparse.Namespace(dry_run=dry_run, yes=True, quiet=True, keep_data=True,
@@ -343,10 +357,17 @@ def test_hub_and_launcher_stop_before_any_state_is_removed(monkeypatch, tmp_path
     events: list = []
     root = _run(monkeypatch, tmp_path, home, dry_run=False, events=events)
     names = [e[0] for e in events]
-    assert names == ["hub-stop", "launcher-stop", "state"], events
-    assert events[0][1] and events[1][1], "launcher.db was already gone when the hub stopped"
+    assert names == ["gateway-stop", "hub-stop", "launcher-stop", "state"], events
+    assert all(e[1] for e in events[:3]), "state was already gone when a process was stopped"
     assert not root.exists()
     assert (home / ".vct-secrets" / "shared" / "github_pat").read_text() == "secret"
+
+
+def test_a_gateway_restarted_by_its_unit_is_stopped_again_before_step_8(monkeypatch, tmp_path, home):
+    events: list = []
+    _run(monkeypatch, tmp_path, home, dry_run=False, events=events, gateway_restarts=True)
+    assert [e[0] for e in events] == ["gateway-stop", "hub-stop", "launcher-stop",
+                                      "gateway-stop", "state"], events
 
 
 def test_dry_run_lists_everything_and_touches_nothing(monkeypatch, tmp_path, home, capsys):
@@ -354,7 +375,7 @@ def test_dry_run_lists_everything_and_touches_nothing(monkeypatch, tmp_path, hom
     root = _run(monkeypatch, tmp_path, home, dry_run=True, events=events)
     out = capsys.readouterr().out
     assert events == []
-    assert "[3]" in out and "pid 55" in out
+    assert "[3]" in out and "pid 55" in out and "model gateway running: pid 77" in out
     assert "[8]" in out and str(root) in out and "RL training data" in out
     assert (root / "launcher.db-wal").exists() and (root / "retrieval_rl_data").is_dir()
 
@@ -419,3 +440,86 @@ def test_compose_identity_reads_the_service_label(monkeypatch):
     monkeypatch.setattr(containers, "_resolve_runtime", lambda *a, **k: "podman")
     ident = containers.compose_identity_of("vct_code_embed", "podman", run=run)
     assert ident is not None and ident.service == "code_embed" and ident.provider == "podman"
+
+
+# ── step [3]: the model gateway ───────────────────────────────────────────
+
+VENV = "/opt/vco/.venv/bin"
+CANDS = [[f"{VENV}/vct-model-gateway"], [f"{VENV}/python", "-m", "model_router"]]
+
+
+@pytest.mark.parametrize("cmdline,exe,ours", [
+    ((f"{VENV}/python", f"{VENV}/vct-model-gateway", "serve"), None, True),  # POSIX shebang
+    (("vct-model-gateway", "serve"), f"{VENV}/vct-model-gateway", True),  # Windows launcher exe
+    ((f"{VENV}/python", "-m", "model_router", "serve"), None, True),
+    (("/usr/bin/python3", "-m", "model_router", "serve"), None, False),  # not the VCO venv
+    (("/home/u/other/.venv/bin/python", "/home/u/other/.venv/bin/vct-model-gateway", "serve"),
+     None, False),  # same script name, another venv
+    (("/usr/bin/python3", "my_server.py"), None, False),
+])
+def test_gateway_identity_is_the_vco_venv_argv(cmdline, exe, ours):
+    proc = uq.GatewayProc(9, cmdline, Path(exe) if exe else None)
+    assert uq.is_vco_gateway(proc, CANDS) is ours
+
+
+def _gw(proc, **kw):
+    stopped: list = []
+    audit = uq.stop_gateway(candidates=CANDS, reader=lambda: proc,
+                            stopper=lambda pid, c: stopped.append(pid) or True, **kw)
+    return audit, stopped
+
+
+def test_the_vco_gateway_is_stopped_with_yes():
+    audit, stopped = _gw(uq.GatewayProc(9, (f"{VENV}/python", "-m", "model_router", "serve")),
+                         interactive=False, confirm=lambda m: False)
+    assert stopped == [9] and audit == ["stopped VCO model gateway (pid 9)"]
+
+
+@pytest.mark.parametrize("answer", [True, False])
+def test_interactive_the_gateway_is_stopped_only_on_yes(answer):
+    asked: list = []
+    audit, stopped = _gw(uq.GatewayProc(9, (f"{VENV}/vct-model-gateway", "serve")),
+                         interactive=True, confirm=lambda m: asked.append(m) or answer)
+    assert asked and "model gateway" in asked[0]
+    assert stopped == ([9] if answer else [])
+    assert answer or "declined" in audit[0]
+
+
+@pytest.mark.parametrize("proc", [
+    uq.GatewayProc(9, ("/usr/bin/python3", "unrelated.py")),
+    uq.GatewayProc(9, None),  # access denied: cannot be identified
+])
+def test_a_pidfile_naming_another_process_is_reported_never_stopped(proc):
+    audit, stopped = _gw(proc, interactive=False, confirm=lambda m: True)
+    assert stopped == []
+    assert audit[0].startswith("WARN") and "not stopped" in audit[0]
+
+
+def test_no_gateway_running():
+    audit, stopped = _gw(None, interactive=False, confirm=lambda m: True)
+    assert stopped == [] and audit == ["model gateway not running"]
+    assert _gw(None, interactive=False, confirm=lambda m: True, report_idle=False)[0] == []
+
+
+def test_the_real_reader_follows_the_pidfile_and_refuses_a_foreign_pid(tmp_path, monkeypatch):
+    """The daemon's own pid file (fake, naming THIS test process) is read
+    through gateway_ensure; the process it names is not a VCO gateway, so it
+    is reported and nothing is stopped."""
+    from vco_lib import boot_service
+
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
+    (tmp_path / boot_service.GATEWAY_PID_BASENAME).write_text(f"{os.getpid()}\n")
+    stopped: list = []
+    audit = uq.stop_gateway(candidates=CANDS, interactive=False, confirm=lambda m: True,
+                            stopper=lambda pid, c: stopped.append(pid) or True)
+    assert stopped == []
+    assert f"pid {os.getpid()}" in audit[0] and "not stopped" in audit[0]
+
+
+def test_a_gateway_check_that_cannot_run_is_reported():
+    def broken():
+        raise RuntimeError("psutil is not importable")
+
+    audit = uq.stop_gateway(candidates=CANDS, reader=broken, interactive=False,
+                            confirm=lambda m: True)
+    assert audit[0].startswith("WARN") and "psutil" in audit[0]
