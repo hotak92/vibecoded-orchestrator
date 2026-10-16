@@ -595,6 +595,9 @@ def test_uninstall_plan_builders_need_only_the_standard_library(tmp_path):
         "assert not [x for x in left if 'unreadable' in x or 'cannot check' in x], left;"
         "print('ok')"
     )
+    # DELIBERATELY UNPINNED (no `child_env()`): `-S` + a minimal env is the
+    # base-Python shape under test; the child puts the checkout on sys.path
+    # itself (allowlisted in tests/test_v0292_fixround_child_env_lint.py).
     env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
            "VCT_STATE_DIR": str(tmp_path / ".vct"), "PATH": os.environ.get("PATH", "")}
     proc = subprocess.run([sys.executable, "-S", "-c", code, str(repo)],

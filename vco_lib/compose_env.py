@@ -136,6 +136,19 @@ def compose_substitution_env(embed_config: dict) -> dict[str, str]:
     model = code_embed_service_model(embed_config)
     if model:
         env["CODE_EMBED_MODEL"] = model
+    # v0.2.103 (Windows field run F1): an ``ollama``-backend container builds
+    # its Ollama embed body from THIS resolved template — the image carries no
+    # vco_lib, so it cannot call the one builder itself (A>B>C option B: the
+    # host resolves from the SSOT, the container parses). Written whenever the
+    # container serves an Ollama model; the service refuses a missing or
+    # other-model template rather than guessing a num_ctx.
+    if model and backend.strip().lower() == "ollama":
+        from vco_lib.ollama_embed_body import (  # noqa: PLC0415
+            CONTAINER_BODY_ENV_KEY,
+            container_body_template,
+        )
+
+        env[CONTAINER_BODY_ENV_KEY] = container_body_template(model)
     # v0.2.102 W6-B2: is the code_embed container part of this install at
     # all? ONE decision (vco_lib.code_embed_serving.code_embed_in_stack),
     # projected here so install's compose start and the hub watchdog

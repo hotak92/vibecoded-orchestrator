@@ -703,6 +703,60 @@ def _dim_gpu() -> int:
 # ---------------------------------------------------------------------------
 # Backend: Ollama
 # ---------------------------------------------------------------------------
+#: The env key carrying the host-resolved Ollama embed body template. MUST
+#: MATCH ``vco_lib/ollama_embed_body.py`` ``CONTAINER_BODY_ENV_KEY`` and the
+#: ``code_embed`` environment in ``infrastructure/docker-compose.yml``
+#: (pinned by tests/test_v02103_code_embed_ollama_body.py).
+OLLAMA_BODY_ENV_KEY = "CODE_EMBED_OLLAMA_BODY"
+
+
+def _ollama_embed_request_body(model: str, text: str) -> dict:
+    """The Ollama ``/api/embeddings`` body for ``text`` — identical to every
+    other VCO caller's (one runner per model: same num_ctx, keep_alive and
+    ``truncate: false``).
+
+    * Host process (``VCO_LIB_AVAILABLE``): the ONE builder,
+      ``vco_lib.ollama_embed_body.embed_request_body`` (v0.2.102 W4-E).
+    * Container (no vco_lib, BY DESIGN — v0.2.103 F1: the bare import here
+      failed every embed and every /health with ``No module named
+      'vco_lib'``): the template install resolved from that same builder and
+      wrote to ``infrastructure/.env`` (A>B>C option B), plus the prompt.
+
+    A missing, unparseable or other-model template is REFUSED with the remedy
+    — never a body with a guessed ``num_ctx`` (Ollama's 2048 default would
+    silently truncate every chunk tail with a 200)."""
+    if VCO_LIB_AVAILABLE:
+        from vco_lib.ollama_embed_body import embed_request_body
+
+        return embed_request_body(model, prompt=text)
+    import json
+
+    raw = os.environ.get(OLLAMA_BODY_ENV_KEY, "").strip()
+    remedy = (
+        "re-run `python install.py --update` (or the launcher's Update) so "
+        f"install writes {OLLAMA_BODY_ENV_KEY} for this model into "
+        "infrastructure/.env, then recreate the code_embed container"
+    )
+    if not raw:
+        raise RuntimeError(
+            f"{OLLAMA_BODY_ENV_KEY} is not set — the ollama backend cannot "
+            f"build its embed request without vco_lib; {remedy}"
+        )
+    try:
+        template = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{OLLAMA_BODY_ENV_KEY} is not valid JSON ({exc}); {remedy}") from exc
+    if not isinstance(template, dict) or template.get("model") != model:
+        got = template.get("model") if isinstance(template, dict) else None
+        raise RuntimeError(
+            f"{OLLAMA_BODY_ENV_KEY} was resolved for model {got!r}, but this "
+            f"service serves {model!r}; {remedy}"
+        )
+    body = dict(template)
+    body["prompt"] = text
+    return body
+
+
 def _embed_ollama(
     texts: list[str], is_query: bool = False, task: str | None = None
 ) -> list[list[float]]:
@@ -713,19 +767,9 @@ def _embed_ollama(
     for text in texts:
         if is_query and instruction:
             text = instruction + text
-        # v0.2.102 W4-E: the body comes from the ONE shared builder
-        # (vco_lib.embedding_providers.ollama.embed_request_body — the same
-        # home the canonical adapter uses), so this Ollama tier sends the
-        # IDENTICAL load options per model as every other VCO caller and
-        # Ollama never loads a second runner of the same model. The builder
-        # also carries keep_alive (v0.2.77 task 6, default 10m since W4-E)
-        # and resolve num_ctx from the one table (chunking.MODEL_TOKEN_LIMITS
-        # — v0.2.92 R40: unset meant Ollama's 2048 default and silent tail
-        # truncation with a 200 response).
-        from vco_lib.embedding_providers.ollama import embed_request_body
         resp = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json=embed_request_body(MODEL_NAME, prompt=text),
+            json=_ollama_embed_request_body(MODEL_NAME, text),
             timeout=30,
         )
         if resp.status_code != 200:

@@ -75,6 +75,9 @@ EMBEDDINGS_PATH = (
     REPO_ROOT / "claude_mcp_servers" / "weaviate_mcp" / "embeddings.py"
 )
 OLLAMA_PROVIDER_PATH = REPO_ROOT / "vco_lib" / "embedding_providers" / "ollama.py"
+# v0.2.103 F1: the builder moved to a stdlib-only module (the provider
+# re-exports it) so install can project it into the code_embed container.
+OLLAMA_BODY_PATH = REPO_ROOT / "vco_lib" / "ollama_embed_body.py"
 
 
 class TestBudgetDerivesFromEmbeddingWindow:
@@ -351,6 +354,14 @@ class TestR40NumCtxExplicit:
 
     def test_canonical_adapter_always_sets_num_ctx(self) -> None:
         src = OLLAMA_PROVIDER_PATH.read_text(encoding="utf-8")
+        body_src = OLLAMA_BODY_PATH.read_text(encoding="utf-8")
+        # v0.2.103 F1: the builder lives in vco_lib/ollama_embed_body.py; the
+        # literals must appear exactly once ACROSS both files (in the builder),
+        # and the provider's three sites still route through it.
+        assert '"options": {"num_ctx": num_ctx}' not in src
+        assert '"truncate": False' not in src
+        src_routing = src
+        src = body_src
         # v0.2.102 W4-E: the explicit, resolver-backed options.num_ctx now
         # lives ONCE in the shared body builder `embed_request_body` (the
         # ONE home — owner ruling 2026-10-08: identical load options per
@@ -369,7 +380,7 @@ class TestR40NumCtxExplicit:
             "the truncate:false refusal must live EXACTLY ONCE, in the "
             "shared body builder (R45)"
         )
-        assert src.count("embed_request_body(model") == 3, (
+        assert src_routing.count("embed_request_body(model") == 3, (
             "ALL THREE Ollama adapter call sites must build their request "
             "body through the ONE shared builder so no caller can drift "
             "into loading a second runner of the same model (v0.2.102 W4-E)"

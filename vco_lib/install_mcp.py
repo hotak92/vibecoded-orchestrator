@@ -1097,3 +1097,56 @@ def auto_scrub_mcp_entries(
         return []
     removed, _errors = remove_mcp_entries(claude_json, shaped)
     return removed
+
+
+def strip_unallowlisted_global_env(
+    install_root: Path,
+    claude_json: Path,
+) -> "list[tuple[str, list[str]]]":
+    """Drop every env key outside ``[env].allowed_global_keys`` (or
+    secret-shaped) from VCO's OWN bundled ``mcpServers`` entries — the same
+    filter both writers apply (:func:`_filter_env_for_global_json` / Rust
+    ``filter_env_for_global_json``), enforced on what is actually ON DISK.
+
+    v0.2.103 (Windows field run, F2): install's preferred writer is the
+    BUNDLED launcher binary (``--register-default-mcps``), and a fresh clone's
+    ``launcher/dist`` binary is the one built at the previous tag. Built before
+    item 31(d), it still wrote ``ACTIVE_EMBEDDING=qwen3`` into
+    ``weaviate-kg.env`` — which wins against the project's
+    ``.claude/settings.json`` env (``arctic`` there) in every MCP subprocess.
+    Whatever binary wrote the entry, the ordinary install/update converges it
+    here, so a retired key (that one, or the PR-43 ones) never outlives the
+    run.
+
+    Ownership: only names in ``[entries].default_names`` whose command or
+    ``args[0]`` sits inside ``install_root`` (the predicate the stale /
+    deprecated scans use) — a user's own same-named MCP is left alone. No
+    retired key → no write at all. Returns ``[(name, dropped_keys)]``.
+    """
+    def mutate(data: dict) -> "list[tuple[str, list[str]]]":
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict):
+            return []
+        changed: list[tuple[str, list[str]]] = []
+        for name in _DEFAULT_MCP_ENTRY_NAMES:
+            entry = servers.get(name)
+            if not isinstance(entry, dict) or not isinstance(entry.get("env"), dict):
+                continue
+            if not _mcp_entry_path_inside_install_root(entry, install_root):
+                continue
+            safe, dropped = _filter_env_for_global_json(entry["env"])
+            if dropped:
+                entry["env"] = safe
+                changed.append((name, sorted(dropped)))
+        return changed
+
+    # Read-only probe first: the common case (nothing retired) must not take
+    # the lock or rewrite the user's file.
+    try:
+        probe = json.loads(claude_json.read_text(encoding="utf-8") or "{}")
+    except (OSError, ValueError):
+        return []
+    if not isinstance(probe, dict) or not mutate(probe):
+        return []
+    changed, errors = _locked_json_edit(claude_json, mutate)
+    return [] if errors else list(changed or [])
