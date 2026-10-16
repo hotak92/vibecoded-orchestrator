@@ -342,3 +342,22 @@ def test_both_engine_start_logs_are_planned(tmp_path):
         (root / "logs" / name).write_text("x")
     plan = ua.build_plan(os_name="Linux", home=tmp_path / "home", vct_root=root, env={})
     assert {r.path.name for r in plan.remove} >= {ces.ENGINE_START_LOG, ces.ENGINE_START_STDERR_LOG}
+
+
+def test_shortcut_and_desktop_predicates_refuse_a_reparse_file(tmp_path, monkeypatch):
+    """R35 G2: the content predicates never read through a link/junction."""
+    lnk = _lnk(tmp_path / "VCT Launcher.lnk", r"C:\x\vct-launcher.exe")
+    entry = tmp_path / "vct-launcher.desktop"
+    entry.write_text(f"[Desktop Entry]\nName={ua.LAUNCHER_PRODUCT_NAME}\n")
+    assert ua._is_vco_lnk(lnk) and ua._is_vco_desktop_entry(entry)
+    real = ua._is_reparse
+    monkeypatch.setattr(ua, "_is_reparse", lambda p: p in (lnk, entry) or real(p))
+    assert not ua._is_vco_lnk(lnk)
+    assert not ua._is_vco_desktop_entry(entry)
+
+
+def test_a_non_ascii_exe_name_is_never_recognised(tmp_path):
+    """R35 G2 / R32 F4: a stem that is not ASCII cannot be VCO's binary."""
+    exe = tmp_path / "vct-hüb.exe"
+    exe.write_bytes(b"MZ" + b"\0" * 64 + "vct-hüb".encode())
+    assert ua._is_vco_exe(exe) is False
