@@ -967,13 +967,42 @@ def _listing_run(*, ps_stdout="", volume_stdout="", ps_fails=False,
     return run
 
 
+def _BOTH(_rt):
+    return True
+
+
+def test_a_runtime_that_is_not_installed_is_not_read_as_data():
+    """R45 P1: on a first install runtime.txt does not exist yet, so both
+    runtimes are candidates. A Docker-only (or podman-only) machine whose
+    installed runtime answers clean is a genuine first install — the
+    absent runtime is skipped, not read as "could not answer"."""
+    from vco_lib import runtime_reconcile as rr
+
+    asked = []
+    clean = _listing_run(ps_stdout="", volume_stdout="")
+
+    def run(argv, **kw):
+        asked.append(argv[0])
+        return clean(argv, **kw)
+
+    for only in ("docker", "podman"):
+        asked.clear()
+        assert rr.vco_data_exists_somewhere(run=run, installed=lambda rt, o=only: rt == o) is False
+        assert set(asked) == {only}, asked
+    # No runtime installed at all: nothing can hold data.
+    assert rr.vco_data_exists_somewhere(run=run, installed=lambda _rt: False) is False
+    # The installed one failing still keeps the conservative answer.
+    assert rr.vco_data_exists_somewhere(run=_listing_run(ps_fails=True),
+                                        installed=lambda rt: rt == "docker") is True
+
+
 def test_a_vco_data_volume_keeps_the_unknown_owed():
     """R43 N1: a VCO named volume in ANY runtime's listing is data — the
     uninstall→re-clone scenario keeps the conservative reading."""
     from vco_lib import runtime_reconcile as rr
 
     run = _listing_run(volume_stdout="vco_weaviate_data\n")
-    assert rr.vco_data_exists_somewhere(run=run) is True
+    assert rr.vco_data_exists_somewhere(run=run, installed=_BOTH) is True
 
 
 def test_no_vco_data_anywhere_reads_as_absent():
@@ -983,7 +1012,7 @@ def test_no_vco_data_anywhere_reads_as_absent():
 
     run = _listing_run(ps_stdout="some_foreign_container\n",
                        volume_stdout="postgres_data\n")
-    assert rr.vco_data_exists_somewhere(run=run) is False
+    assert rr.vco_data_exists_somewhere(run=run, installed=_BOTH) is False
 
 
 def test_a_runtime_that_cannot_answer_never_says_absent():
@@ -992,8 +1021,8 @@ def test_a_runtime_that_cannot_answer_never_says_absent():
     the other runtime answered clean."""
     from vco_lib import runtime_reconcile as rr
 
-    assert rr.vco_data_exists_somewhere(run=_listing_run(ps_fails=True)) is True
-    assert rr.vco_data_exists_somewhere(run=_listing_run(ps_raises=True)) is True
+    assert rr.vco_data_exists_somewhere(run=_listing_run(ps_fails=True), installed=_BOTH) is True
+    assert rr.vco_data_exists_somewhere(run=_listing_run(ps_raises=True), installed=_BOTH) is True
 
 
 def test_the_recorded_runtime_is_probed_alone(tmp_path):
@@ -1011,6 +1040,6 @@ def test_the_recorded_runtime_is_probed_alone(tmp_path):
         asked.append(argv[0])
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert rr.vco_data_exists_somewhere(install_root=tmp_path, run=run) is False
+    assert rr.vco_data_exists_somewhere(install_root=tmp_path, run=run, installed=_BOTH) is False
     # Only the recorded runtime was asked (its two listings: ps + volume ls).
     assert set(asked) == {"podman"}, asked

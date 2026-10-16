@@ -6043,10 +6043,8 @@ def main() -> int:
     # missing, so user edits survive every --update.
     _materialize_vct_secrets_shared_readme(PROJECT_ROOT)
 
-    # V0243-5: emit VCT_ORCHESTRATOR_ROOT + VCT_INFRASTRUCTURE_DIR + KG_BASE_DIR
-    # to .claude/env managed block. Done unconditionally on orchestrator-root
-    # installs so the 3 portability keys are always present regardless of
-    # whether launcher.db exists yet (pre-first-boot fresh installs).
+    # V0243-5: the 3 portability keys go to .claude/env on every root install,
+    # launcher.db or not (pre-first-boot fresh installs).
     if _is_orchestrator_root_install():
         _emit_orchestrator_root_env_keys(PROJECT_ROOT)
 
@@ -6063,6 +6061,7 @@ def main() -> int:
             + ", ".join(str(p) for p in foreign),
         )
 
+    _prior_code_model = _recorded_code_model_before_step7()  # R45 P2
     # Step 6: Container services (restart on update to pick up config changes)
     if not args.no_containers:
         if not sysinfo.container_cmd:
@@ -6171,6 +6170,7 @@ def main() -> int:
             _write_preset_defaults_to_app_state(
                 embed_config,
                 openai_set_as_default=bool(embed_config.get("openai_key")),
+                prior_code_model=_prior_code_model,
             )
         except Exception as _preset_err:  # noqa: BLE001 — never block install
             # Defense-in-depth: the helper already soft-fails on every
@@ -9607,9 +9607,20 @@ def _discover_app_state_db_path() -> Path:
     return launcher_db_path()
 
 
+def _recorded_code_model_before_step7() -> "str | None":
+    """The code model the PREVIOUS run recorded (R45 P2). Step 7 rewrites the
+    record with THIS run's hardware pick, so main() reads it before step 7 and
+    the preset seed uses it — the seeded default then matches the graph that
+    run built instead of re-targeting it. Stdlib-only reader (pre-venv safe)."""
+    from vco_lib.embedding_pull_plan import recorded_code_model
+
+    return recorded_code_model([PROJECT_ROOT])
+
+
 def _write_preset_defaults_to_app_state(
     embed_config: dict,
     openai_set_as_default: bool,
+    prior_code_model: "str | None" = None,
 ) -> None:
     """Seed the launcher's `app_state` table with the install-time
     embedding-model defaults so the GUI dropdowns pre-populate for
@@ -9721,11 +9732,10 @@ def _write_preset_defaults_to_app_state(
                     (_APP_STATE_KEY_DEFAULT_CODE_EMBED,),
                 ).fetchone() is None
             ):
-                from vco_lib.embedding_pull_plan import recorded_code_model
-
-                recorded = recorded_code_model()
-                if recorded:
-                    code_model = recorded
+                # `prior_code_model`: the record as the PREVIOUS run left it
+                # (step 7 has already rewritten it with this run's pick, R45 P2).
+                if prior_code_model:
+                    code_model = prior_code_model
             cur.execute(
                 "INSERT INTO app_state (key, value, updated_at) "
                 "VALUES (?, ?, ?) "

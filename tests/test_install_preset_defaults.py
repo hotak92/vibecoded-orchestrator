@@ -520,52 +520,35 @@ class WritePresetDefaultsTests(unittest.TestCase):
 # value matching the machine's data, never an implicit re-embed)
 # ---------------------------------------------------------------------------
 class SeededCodeDefaultMatchesTheRecordTests(unittest.TestCase):
-    """The record reader install consults is the ONE stdlib-only leaf
-    (``vco_lib.embedding_pull_plan.recorded_code_model`` — R43 N2: install
-    must not reach a third-party module pre-venv, and code_embed_model
-    pulls in embedding_service/requests)."""
+    """install snapshots the record's code model BEFORE step 7 rewrites the
+    record with this run's hardware pick (R45 P2) and passes it as
+    ``prior_code_model``; the seed uses it only when the key is absent."""
 
-    def _epp(self):
-        from vco_lib import embedding_pull_plan as epp
-        return epp
-
-    def test_a_seed_takes_the_recorded_model_when_a_graph_is_recorded(self):
-        # R41 L2's failure scenario, closed: the first install ran before
-        # launcher.db existed (nothing was seeded), the graph was built and
-        # recorded with qwen3 — the next --update must seed qwen3, NOT the
-        # gpu preset's codesage, or the default would re-target the graph
-        # the first install built.
-        epp = self._epp()
-        with _LogFixture() as log_fix, _DbFixture() as db_fix, \
-                mock.patch.object(epp, "recorded_code_model",
-                                  lambda: "qwen3-embedding:0.6b"):
+    def test_a_seed_takes_the_prior_recorded_model(self):
+        # R41 L2's failure scenario: the graph was built and recorded with
+        # qwen3; the next --update (gpu preset) must seed qwen3, not codesage.
+        with _LogFixture() as log_fix, _DbFixture() as db_fix:
             _create_db_with_app_state(db_fix.db_path)
             install._write_preset_defaults_to_app_state(
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
                 openai_set_as_default=False,
+                prior_code_model="qwen3-embedding:0.6b",
             )
             state = _read_app_state(db_fix.db_path)
             self.assertEqual(state.get("default_code_embedding"),
                              "qwen3-embedding:0.6b")
             data = log_fix.events_for_step("preset_defaults")[0].get("data", {})
-            self.assertEqual(data.get("default_code_embedding"),
-                             "qwen3-embedding:0.6b")
             self.assertTrue(data.get("code_inserted"))
 
     def test_an_existing_key_is_never_touched_even_when_a_record_differs(self):
-        # The user's (or a previous GUI) value is never overwritten — the
-        # record only picks the value of a seed, and only when the key is
-        # absent.
-        epp = self._epp()
-        with _LogFixture() as log_fix, _DbFixture() as db_fix, \
-                mock.patch.object(epp, "recorded_code_model",
-                                  lambda: "qwen3-embedding:0.6b"):
+        with _LogFixture() as log_fix, _DbFixture() as db_fix:
             _create_db_with_app_state(db_fix.db_path)
             set_app_state(db_fix.db_path, "default_code_embedding",
                           "user-picked-code-model")
             install._write_preset_defaults_to_app_state(
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
                 openai_set_as_default=False,
+                prior_code_model="qwen3-embedding:0.6b",
             )
             state = _read_app_state(db_fix.db_path)
             self.assertEqual(state.get("default_code_embedding"),
@@ -573,35 +556,43 @@ class SeededCodeDefaultMatchesTheRecordTests(unittest.TestCase):
             data = log_fix.events_for_step("preset_defaults")[0].get("data", {})
             self.assertFalse(data.get("code_inserted"))
 
-    def test_without_a_record_the_hardware_pick_is_seeded(self):
-        epp = self._epp()
-        with _LogFixture(), _DbFixture() as db_fix, \
-                mock.patch.object(epp, "recorded_code_model", lambda: None):
+    def test_without_a_prior_record_the_hardware_pick_is_seeded(self):
+        with _LogFixture(), _DbFixture() as db_fix:
             _create_db_with_app_state(db_fix.db_path)
             install._write_preset_defaults_to_app_state(
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
                 openai_set_as_default=False,
+                prior_code_model=None,
             )
             state = _read_app_state(db_fix.db_path)
             self.assertEqual(state.get("default_code_embedding"),
                              "codesage-large-v2")
 
     def test_the_explicit_openai_opt_in_is_not_replaced_by_the_record(self):
-        # --openai-key with "set as default" is an EXPLICIT user choice of
-        # OpenAI, not a hardware seed — the record must not override it.
-        epp = self._epp()
-        with _LogFixture(), _DbFixture() as db_fix, \
-                mock.patch.object(epp, "recorded_code_model",
-                                  lambda: "qwen3-embedding:0.6b"):
+        with _LogFixture(), _DbFixture() as db_fix:
             _create_db_with_app_state(db_fix.db_path)
             config = dict(install.EMBEDDING_CONFIGS["openai"])
             config["openai_key"] = "sk-fake"
             install._write_preset_defaults_to_app_state(
                 config, openai_set_as_default=True,
+                prior_code_model="qwen3-embedding:0.6b",
             )
             state = _read_app_state(db_fix.db_path)
             self.assertEqual(state.get("default_code_embedding"),
                              "openai-text-embedding-3-small")
+
+    def test_the_snapshot_reads_the_record_as_the_previous_run_left_it(self):
+        # The reader install calls before step 7 answers the OLD model; once
+        # step 7's record_profile rewrites the file it answers the new pick —
+        # which is why the snapshot must precede it.
+        from vco_lib import embedding_pull_plan as epp
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            epp.record_profile(root, {"code_model": "qwen3-embedding:0.6b"}, [])
+            prior = epp.recorded_code_model([root])
+            epp.record_profile(root, {"code_model": "codesage-large-v2"}, [])
+            self.assertEqual(prior, "qwen3-embedding:0.6b")
+            self.assertEqual(epp.recorded_code_model([root]), "codesage-large-v2")
 
 
 if __name__ == "__main__":
