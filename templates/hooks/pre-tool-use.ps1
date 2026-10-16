@@ -423,6 +423,35 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
                         }
                     } catch { }
                 }
+                # v0.2.104: a miss right after a compaction may be a file
+                # Claude Code itself re-attached (post-compact wiped the
+                # ledger). Ask the ONE home, vco_lib/compact_reattach.py,
+                # which reads the exact set from the transcript (it also
+                # normalises Windows case and separators); only the exact
+                # answer `reattached` allows -- no interpreter, a broken
+                # vco_lib, any error or doubt keeps the block (fail closed).
+                # The allowed path is appended to the ledger below, so later
+                # Writes do not rescan. MUST MATCH pre-tool-use.sh.
+                if (-not $alreadyRead -and $TranscriptPath) {
+                    $raPy = ""
+                    $venvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
+                    if (Test-Path -LiteralPath $venvLib) {
+                        try {
+                            . $venvLib
+                            $raVenv = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+                            if ($raVenv -and (Test-Path -LiteralPath $raVenv)) { $raPy = [string]$raVenv }
+                        } catch { }
+                    }
+                    if (-not $raPy -and $PY) { $raPy = [string]$PY }
+                    if ($raPy) {
+                        try {
+                            $raOut = @(& $raPy -m vco_lib.compact_reattach check "--transcript=$TranscriptPath" "--path=$filePath" "--agent-id=$AgentId" 2>$null)
+                            if ($LASTEXITCODE -eq 0 -and $raOut.Count -ge 1 -and ([string]$raOut[0]).Trim() -ceq "reattached") {
+                                $alreadyRead = $true
+                            }
+                        } catch { }
+                    }
+                }
                 if (-not $alreadyRead) {
                     $bn = Split-Path $filePath -Leaf
                     # Route to STDERR (matches pre-tool-use.sh's Build Anchor

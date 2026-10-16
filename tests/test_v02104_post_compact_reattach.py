@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.104 — post-compact re-seeds the Build Anchor reads list with the files
-Claude Code re-attached, and the compact re-inject stops repeating them.
+"""v0.2.104 — Build Anchor recognises the files Claude Code re-attached after
+a compaction, read EXACTLY from the session transcript.
 
-Documented harness rule (https://code.claude.com/docs/en/context-window,
-"What survives compaction"): right after a compaction Claude Code re-reads
-up to five of the files read or edited in the session, the most recently
-modified first; a file over 5,000 tokens comes back as a path reference only.
-Before v0.2.104 ``post-compact`` wiped the reads ledger, so Build Anchor
-blocked a Write to a file whose content was back in context.
-
-The estimate lives in ``vco_lib/compact_reattach.py``; these tests drive the
-pure function AND the real hook scripts (bash, and pwsh where installed).
+Right after a compaction Claude Code puts up to five recently read/edited
+files back in the context and records each one in the transcript JSONL as a
+``{"type":"attachment","attachment":{"type":"file",…}}`` row after the
+``compact_boundary`` row. ``post-compact`` still wipes the Build Anchor reads
+ledger (as v0.2.103 did); on a Write miss ``pre-tool-use`` asks
+``vco_lib/compact_reattach.py`` whether the target was re-attached after the
+LATEST boundary, and allows (and records) only on a positive answer — every
+doubt blocks. These tests drive the pure function and the real hook scripts
+(bash, and pwsh where installed).
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import time
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -36,7 +37,39 @@ _SHELLS = ["sh", pytest.param("ps1", marks=pytest.mark.skipif(
 SID = "sessPC1"
 
 
-# ─── helpers ──────────────────────────────────────────────────────────────
+# ─── transcript fixtures (shapes observed on real transcripts) ───────────
+
+
+def _row(obj: dict) -> str:
+    return json.dumps(obj, separators=(",", ":")) + "\n"
+
+
+def _boundary() -> str:
+    return _row({"parentUuid": None, "type": "system",
+                 "subtype": "compact_boundary", "content": "Conversation compacted",
+                 "compactMetadata": {"trigger": "auto", "preTokens": 1}})
+
+
+def _attach(kind: str, path: Path, *, start: int = 1,
+            num: int = 1, total: int = 1) -> str:
+    att: dict = {"type": kind, "filename": str(path), "displayPath": path.name}
+    if kind == "file":
+        att["content"] = {"type": "text", "file": {
+            "filePath": str(path), "content": "x = 1\n",
+            "startLine": start, "numLines": num, "totalLines": total}}
+    elif kind == "edited_text_file":
+        att["snippet"] = "x"
+    return _row({"type": "attachment", "attachment": att})
+
+
+def _user(text: str) -> str:
+    return _row({"type": "user", "message": {"role": "user", "content": text}})
+
+
+def _transcript(tmp_path: Path, *rows: str) -> Path:
+    t = tmp_path / "transcript.jsonl"
+    t.write_text("".join(rows), encoding="utf-8")
+    return t
 
 
 def _project(tmp_path: Path) -> Path:
@@ -46,17 +79,175 @@ def _project(tmp_path: Path) -> Path:
     return proj
 
 
-def _touch(path: Path, text: str, mtime: float) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    os.utime(path, (mtime, mtime))
-    return path
+def _file(proj: Path, name: str = "src/a.py") -> Path:
+    f = proj / name
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("x = 1\n", encoding="utf-8")
+    return f
 
 
-def _ledger(proj: Path, entries: list[str], key: str = SID) -> Path:
-    led = proj / ".claude" / "state" / f"reads_{key}.txt"
-    led.write_text("".join(f"{e}\n" for e in entries), encoding="utf-8")
-    return led
+# ─── the pure check ───────────────────────────────────────────────────────
+
+
+def test_file_reattached_after_latest_boundary_is_yes(tmp_path: Path):
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _user("hi"), _boundary(), _user("summary"),
+                    _attach("file", f), _user("go on"))
+    assert cr.was_reattached(str(t), str(f)) is True
+
+
+def test_file_reattached_only_before_an_earlier_boundary_is_no(tmp_path: Path):
+    f = _file(tmp_path)
+    other = _file(tmp_path, "src/b.py")
+    t = _transcript(tmp_path, _boundary(), _attach("file", f), _user("work"),
+                    _boundary(), _attach("file", other))
+    assert cr.was_reattached(str(t), str(f)) is False
+    assert cr.was_reattached(str(t), str(other)) is True
+
+
+@pytest.mark.parametrize("kind", ["compact_file_reference", "edited_text_file"])
+def test_non_file_attachment_is_no(tmp_path: Path, kind: str):
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _boundary(), _attach(kind, f))
+    assert cr.was_reattached(str(t), str(f)) is False
+
+
+@pytest.mark.parametrize("start,num,total", [(10, 5, 50), (1, 5, 50)])
+def test_partial_file_content_is_no(tmp_path: Path, start, num, total):
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _boundary(),
+                    _attach("file", f, start=start, num=num, total=total))
+    assert cr.was_reattached(str(t), str(f)) is False
+
+
+def test_no_boundary_is_no(tmp_path: Path):
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _user("hi"), _attach("file", f))
+    assert cr.was_reattached(str(t), str(f)) is False
+
+
+def test_missing_or_unreadable_transcript_is_no(tmp_path: Path):
+    f = _file(tmp_path)
+    assert cr.was_reattached(str(tmp_path / "absent.jsonl"), str(f)) is False
+    assert cr.was_reattached(str(tmp_path), str(f)) is False  # a directory
+    assert cr.was_reattached("", str(f)) is False
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    t.chmod(0)
+    try:
+        if not os.access(t, os.R_OK):  # root can still read it
+            assert cr.was_reattached(str(t), str(f)) is False
+    finally:
+        t.chmod(0o600)
+
+
+def test_subagent_call_is_no(tmp_path: Path):
+    # The payload's transcript is the PARENT's; its re-attachments are not in
+    # the subagent's context.
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    assert cr.was_reattached(str(t), str(f), agent_id="a123") is False
+
+
+def test_escaped_boundary_text_inside_a_message_is_not_a_boundary(tmp_path: Path):
+    f = _file(tmp_path)
+    fake = '{"type":"system","subtype":"compact_boundary"}'
+    t = _transcript(tmp_path, _boundary(), _attach("file", f), _user(fake))
+    assert cr.was_reattached(str(t), str(f)) is True
+
+
+def test_unterminated_row_is_ignored(tmp_path: Path):
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f).rstrip("\n"))
+    assert cr.was_reattached(str(t), str(f)) is False
+
+
+def test_paths_are_normalised(tmp_path: Path):
+    f = _file(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(f.parent, target_is_directory=True)
+    t = _transcript(tmp_path, _boundary(), _attach("file", link / "a.py"))
+    assert cr.was_reattached(str(t), str(f.parent / ".." / "src" / "a.py")) is True
+
+
+def test_boundary_outside_the_scan_window_is_no(tmp_path: Path):
+    f = _file(tmp_path)
+    filler = _user("z" * 1000) * 300
+    t = _transcript(tmp_path, _boundary(), _attach("file", f), filler)
+    assert cr.was_reattached(str(t), str(f)) is True
+    assert cr.was_reattached(str(t), str(f), window=100_000) is False
+
+
+def _big_transcript(tmp_path: Path, f: Path) -> Path:
+    """~50 MB of ordinary rows plus one 6 MB single line BEFORE the boundary,
+    then the boundary and the re-attached file."""
+    t = tmp_path / "big.jsonl"
+    row = _user("filler " + "y" * 1000)
+    with open(t, "w", encoding="utf-8") as fh:
+        fh.write(_boundary())
+        fh.write(_attach("file", tmp_path / "old.py"))
+        fh.write(row * 25_000)
+        fh.write(_user("w" * (6 * 1024 * 1024)))
+        fh.write(row * 25_000)
+        fh.write(_boundary())
+        fh.write(_user("summary"))
+        fh.write(_attach("file", f))
+        fh.write(row * 50)
+    assert t.stat().st_size > 50 * 1024 * 1024
+    return t
+
+
+def test_large_transcript_answers_fast_with_bounded_memory(tmp_path: Path):
+    f = _file(tmp_path)
+    t = _big_transcript(tmp_path, f)
+    tracemalloc.start()
+    t0 = time.monotonic()
+    yes = cr.was_reattached(str(t), str(f))
+    no = cr.was_reattached(str(t), str(tmp_path / "old.py"))
+    elapsed = time.monotonic() - t0
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert (yes, no) == (True, False)
+    assert elapsed < 2.0, elapsed
+    assert peak < 16 * 1024 * 1024, peak
+
+
+def test_large_transcript_without_boundary_is_bounded(tmp_path: Path):
+    # Worst case: no compaction at all — the scan stops at the window.
+    f = _file(tmp_path)
+    t = tmp_path / "nob.jsonl"
+    with open(t, "w", encoding="utf-8") as fh:
+        fh.write(_user("filler " + "y" * 1000) * 52_000)
+    tracemalloc.start()
+    t0 = time.monotonic()
+    assert cr.was_reattached(str(t), str(f)) is False
+    elapsed = time.monotonic() - t0
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert elapsed < 2.0, elapsed
+    assert peak < 16 * 1024 * 1024, peak
+
+
+def test_cli_answers_exact_words(tmp_path: Path):
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    assert cr._main(["check", f"--transcript={t}", f"--path={f}"]) == 0
+    assert cr._main(["check", f"--transcript={t}",
+                     f"--path={tmp_path / 'other.py'}"]) == 1
+
+
+def test_snapshot_body_drops_the_git_status_block(tmp_path: Path):
+    snap = tmp_path / "snap.md"
+    snap.write_text("# Pre-Compaction Snapshot\nSaved: now\n\n"
+                    "## Modified Files (git status, top 30)\n M a.py\n\n"
+                    "## Recently Modified Files (newest first)\n/p/b.py\n",
+                    encoding="utf-8")
+    body = cr.snapshot_body(str(snap))
+    assert " M a.py" not in body
+    assert "/p/b.py" in body
+    assert body[0] == "# Pre-Compaction Snapshot"
+
+
+# ─── the real hooks ───────────────────────────────────────────────────────
 
 
 def _env(proj: Path, **extra: str) -> dict:
@@ -80,149 +271,106 @@ def _hook(impl: str, name: str, proj: Path, payload: dict,
                           env=_env(proj, **extra))
 
 
-def _seven_files(proj: Path) -> list[Path]:
-    """f0..f6 touched in that order; mtimes put f4,f2,f6,f3,f5 newest."""
-    base = time.time() - 3600
-    order_by_mtime = {4: 50, 2: 40, 6: 30, 3: 20, 5: 10, 1: 5, 0: 1}
-    return [_touch(proj / "src" / f"f{i}.py", f"x = {i}\n",
-                   base + order_by_mtime[i]) for i in range(7)]
+def _write(impl: str, proj: Path, target: Path, transcript: Path | None,
+           **payload_extra: str) -> subprocess.CompletedProcess:
+    payload = {"session_id": SID, "tool_name": "Write",
+               "tool_input": {"file_path": str(target), "content": "x = 9\n"}}
+    if transcript is not None:
+        payload["transcript_path"] = str(transcript)
+    payload.update(payload_extra)
+    return _hook(impl, "pre-tool-use", proj, payload)
 
 
-# ─── the pure estimate ────────────────────────────────────────────────────
-
-
-def test_picks_five_newest_by_mtime_among_touched_files(tmp_path: Path):
-    proj = _project(tmp_path)
-    files = _seven_files(proj)
-    got = cr.select_reattached([str(f) for f in files], str(proj))
-    assert got == [str(files[i]) for i in (4, 2, 6, 3, 5)]
-
-
-def test_duplicates_collapse_and_relative_entries_resolve(tmp_path: Path):
-    proj = _project(tmp_path)
-    f = _touch(proj / "a.md", "hi\n", time.time())
-    got = cr.select_reattached(["a.md", str(f), "a.md"], str(proj))
-    assert got == ["a.md"]
-
-
-def test_newest_mtime_but_touched_long_ago_is_left_out(tmp_path: Path):
-    # Conservative hedge: "modified most recently" may mean the session's own
-    # touch order; a file outside the five last-touched entries is left out
-    # even with the newest mtime — and its slot is NOT refilled.
-    proj = _project(tmp_path)
-    files = _seven_files(proj)
-    os.utime(files[0], (time.time(), time.time()))
-    got = cr.select_reattached([str(f) for f in files], str(proj))
-    assert str(files[0]) not in got
-    assert got == [str(files[i]) for i in (4, 2, 6, 3)]
-
-
-def test_over_token_cap_file_is_not_reattached(tmp_path: Path):
-    proj = _project(tmp_path)
-    now = time.time()
-    big = _touch(proj / "big.py", "y = 1\n" * 4000, now)          # 24 000 bytes
-    near = _touch(proj / "near.py", "z" * 15600 + "\n", now - 1)   # est. > 5000
-    small = _touch(proj / "small.py", "ok\n", now - 2)
-    got = cr.select_reattached([str(big), str(near), str(small)], str(proj))
-    assert got == [str(small)]
-
-
-def test_binary_and_non_utf8_count_as_over_cap(tmp_path: Path):
-    proj = _project(tmp_path)
-    b = proj / "img.bin"
-    b.write_bytes(b"\x89PNG\x00\x01")
-    l1 = proj / "latin.txt"
-    l1.write_bytes(b"caf\xe9\n")
-    assert not cr.within_token_cap(str(b))
-    assert not cr.within_token_cap(str(l1))
-
-
-def test_deleted_file_is_not_reattached(tmp_path: Path):
-    proj = _project(tmp_path)
-    now = time.time()
-    keep = _touch(proj / "keep.py", "k\n", now - 5)
-    gone = _touch(proj / "gone.py", "g\n", now)
-    gone.unlink()
-    assert cr.select_reattached([str(keep), str(gone)], str(proj)) == [str(keep)]
-
-
-def test_reseed_failure_clears_the_ledger(tmp_path: Path, monkeypatch):
-    proj = _project(tmp_path)
-    led = _ledger(proj, [str(_touch(proj / "a.py", "a\n", time.time()))])
-
-    def boom(*_a, **_k):
-        raise OSError("disk says no")
-
-    monkeypatch.setattr(cr, "select_reattached", boom)
-    with pytest.raises(OSError):
-        cr.reseed(str(proj), SID)
-    assert not led.exists()
-
-
-def test_reattached_ignores_a_stale_marker(tmp_path: Path):
-    proj = _project(tmp_path)
-    marker = Path(cr.reattached_path(str(proj), SID))
-    marker.write_text(".claude/CONTEXT_STATE.md\n", encoding="utf-8")
-    assert cr.reattached(str(proj), SID) == [".claude/CONTEXT_STATE.md"]
-    old = time.time() - 4000
-    os.utime(marker, (old, old))
-    assert cr.reattached(str(proj), SID) == []
-
-
-def test_snapshot_body_drops_the_git_status_block(tmp_path: Path):
-    snap = tmp_path / "snap.md"
-    snap.write_text("# Pre-Compaction Snapshot\nSaved: now\n\n"
-                    "## Modified Files (git status, top 30)\n M secret.py\n\n"
-                    "## Recently Modified Files (newest first, since the last "
-                    "compaction)\n/p/a.py\n", encoding="utf-8")
-    body = "\n".join(cr.snapshot_body(str(snap)))
-    assert "secret.py" not in body and "git status" not in body
-    assert "/p/a.py" in body and "Saved: now" in body
-
-
-# ─── the real hooks ───────────────────────────────────────────────────────
+def _ledger(proj: Path) -> Path:
+    return proj / ".claude" / "state" / f"reads_{SID}.txt"
 
 
 @pytest.mark.parametrize("impl", _SHELLS)
-def test_post_compact_reseeds_and_build_anchor_follows(impl: str,
-                                                       tmp_path: Path):
+def test_post_compact_wipes_the_ledger(impl: str, tmp_path: Path):
     proj = _project(tmp_path)
-    files = _seven_files(proj)
-    led = _ledger(proj, [str(f) for f in files])
+    led = _ledger(proj)
+    led.write_text(f"{_file(proj)}\n", encoding="utf-8")
     res = _hook(impl, "post-compact", proj,
                 {"session_id": SID, "trigger": "auto", "compact_summary": "s"})
     assert res.returncode == 0, res.stderr
-    assert led.read_text(encoding="utf-8").splitlines() == [
-        str(files[i]) for i in (4, 2, 6, 3, 5)]
-    marker = proj / ".claude" / "state" / f"compact_reattached_{SID}.txt"
-    assert marker.read_text(encoding="utf-8").splitlines() == [
-        f"src/f{i}.py" for i in (4, 2, 6, 3, 5)]
-
-    # Build Anchor: a Write to a re-attached file passes, a Write to a file
-    # that was read before the compaction but NOT re-attached is blocked.
-    ok = _hook(impl, "pre-tool-use", proj, {
-        "session_id": SID, "tool_name": "Write",
-        "tool_input": {"file_path": str(files[4]), "content": "x = 9\n"}})
-    assert ok.returncode == 0, ok.stderr
-    blocked = _hook(impl, "pre-tool-use", proj, {
-        "session_id": SID, "tool_name": "Write",
-        "tool_input": {"file_path": str(files[0]), "content": "x = 9\n"}})
-    assert blocked.returncode == 2
-    assert "Build Anchor" in blocked.stderr
+    assert not led.exists()
 
 
 @pytest.mark.parametrize("impl", _SHELLS)
-def test_post_compact_falls_back_to_wipe_without_vco_lib(impl: str,
-                                                         tmp_path: Path):
+def test_write_to_a_reattached_file_is_allowed_and_recorded(impl: str,
+                                                            tmp_path: Path):
     proj = _project(tmp_path)
-    led = _ledger(proj, [str(_touch(proj / "a.py", "a\n", time.time()))])
-    res = _hook(impl, "post-compact", proj,
-                {"session_id": SID, "trigger": "manual"},
-                PYTHONPATH=str(tmp_path / "nowhere"),
-                PATH="/usr/bin:/bin" + os.pathsep + str(Path(PWSH).parent))
+    f = _file(proj)
+    t = _transcript(tmp_path, _user("read it"), _boundary(), _attach("file", f))
+    ok = _write(impl, proj, f, t)
+    assert ok.returncode == 0, ok.stderr
+    assert str(f) in _ledger(proj).read_text(encoding="utf-8").splitlines()
+    # Recorded: a later Write passes without the transcript.
+    again = _write(impl, proj, f, None)
+    assert again.returncode == 0, again.stderr
+
+
+def _scenario(name: str, tmp_path: Path, f: Path) -> Path | None:
+    if name == "earlier_boundary_only":
+        return _transcript(tmp_path, _boundary(), _attach("file", f),
+                           _boundary(), _user("nothing re-attached"))
+    if name == "non_file_attachment":
+        return _transcript(tmp_path, _boundary(),
+                           _attach("compact_file_reference", f))
+    if name == "no_boundary":
+        return _transcript(tmp_path, _attach("file", f))
+    if name == "missing_transcript":
+        return tmp_path / "absent.jsonl"
+    return None  # no transcript_path in the payload
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+@pytest.mark.parametrize("scenario", ["earlier_boundary_only",
+                                      "non_file_attachment", "no_boundary",
+                                      "missing_transcript", "no_transcript"])
+def test_write_is_blocked_unless_reattached(impl: str, scenario: str,
+                                            tmp_path: Path):
+    proj = _project(tmp_path)
+    f = _file(proj)
+    res = _write(impl, proj, f, _scenario(scenario, tmp_path, f))
+    assert res.returncode == 2, (res.stdout, res.stderr)
+    assert "Build Anchor" in res.stderr
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_subagent_write_is_blocked_even_when_the_parent_had_it(impl: str,
+                                                               tmp_path: Path):
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    res = _write(impl, proj, f, t, agent_id="a123", agent_type="general")
+    assert res.returncode == 2, (res.stdout, res.stderr)
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_write_is_blocked_when_vco_lib_cannot_be_imported(impl: str,
+                                                          tmp_path: Path):
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    payload = {"session_id": SID, "tool_name": "Write", "transcript_path": str(t),
+               "tool_input": {"file_path": str(f), "content": "x = 9\n"}}
+    res = _hook(impl, "pre-tool-use", proj, payload,
+                PYTHONPATH=str(tmp_path / "nowhere"))
+    assert res.returncode == 2, (res.stdout, res.stderr)
+
+
+def test_hook_on_a_large_transcript_is_fast(tmp_path: Path):
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _big_transcript(tmp_path, f)
+    t0 = time.monotonic()
+    res = _write("sh", proj, f, t)
     assert res.returncode == 0, res.stderr
-    assert not led.exists()
-    assert "compact_reattach" in res.stderr
+    assert time.monotonic() - t0 < 20
+
+
+# ─── the compact re-inject ───────────────────────────────────────────────
 
 
 def _snapshot(proj: Path) -> None:
@@ -234,50 +382,27 @@ def _snapshot(proj: Path) -> None:
 
 
 @pytest.mark.parametrize("impl", _SHELLS)
-def test_reinject_skips_a_reattached_context_state(impl: str, tmp_path: Path):
+def test_compact_reinject_keeps_state_drops_harness_restored_git(impl: str,
+                                                                 tmp_path: Path):
     proj = _project(tmp_path)
-    ctx = _touch(proj / ".claude" / "CONTEXT_STATE.md",
-                 "# State\nUNIQUE_CTX_BODY_MARKER\n", time.time())
+    (proj / ".claude" / "CONTEXT_STATE.md").write_text(
+        "# State\nUNIQUE_CTX_BODY_MARKER\n", encoding="utf-8")
     _snapshot(proj)
-    _ledger(proj, [str(ctx)])
-    assert _hook(impl, "post-compact", proj,
-                 {"session_id": SID, "trigger": "auto"}).returncode == 0
     res = _hook(impl, "compact-context-reinject", proj,
                 {"session_id": SID, "source": "compact"})
     assert res.returncode == 0, res.stderr
     out = res.stdout
-    assert "UNIQUE_CTX_BODY_MARKER" not in out
-    assert "Already in context: Claude Code re-attached .claude/CONTEXT_STATE.md" in out
-    # Harness-restored material is not repeated after a compaction.
+    assert "UNIQUE_CTX_BODY_MARKER" in out
     assert "## Recent Commits" not in out
     assert "only_in_git_status.py" not in out
     assert "/p/recent_marker.py" in out
 
 
 @pytest.mark.parametrize("impl", _SHELLS)
-def test_reinject_keeps_context_state_not_reattached(impl: str, tmp_path: Path):
-    proj = _project(tmp_path)
-    _touch(proj / ".claude" / "CONTEXT_STATE.md",
-           "# State\nUNIQUE_CTX_BODY_MARKER\n", time.time())
-    other = _touch(proj / "other.py", "o\n", time.time())
-    _ledger(proj, [str(other)])
-    assert _hook(impl, "post-compact", proj,
-                 {"session_id": SID, "trigger": "auto"}).returncode == 0
-    res = _hook(impl, "compact-context-reinject", proj,
-                {"session_id": SID, "source": "compact"})
-    assert res.returncode == 0, res.stderr
-    assert "UNIQUE_CTX_BODY_MARKER" in res.stdout
-    assert "Already in context" not in res.stdout
-
-
-@pytest.mark.parametrize("impl", _SHELLS)
 def test_startup_reinject_is_unchanged(impl: str, tmp_path: Path):
-    # A fresh marker must not leak into a startup injection.
     proj = _project(tmp_path)
-    _touch(proj / ".claude" / "CONTEXT_STATE.md",
-           "# State\nUNIQUE_CTX_BODY_MARKER\n", time.time())
-    Path(cr.reattached_path(str(proj), SID)).write_text(
-        ".claude/CONTEXT_STATE.md\n", encoding="utf-8")
+    (proj / ".claude" / "CONTEXT_STATE.md").write_text(
+        "# State\nUNIQUE_CTX_BODY_MARKER\n", encoding="utf-8")
     res = _hook(impl, "compact-context-reinject", proj,
                 {"session_id": SID, "source": "startup"})
     assert res.returncode == 0, res.stderr

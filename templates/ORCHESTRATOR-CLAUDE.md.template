@@ -384,13 +384,13 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `context-size-check.sh` — warn (no truncation) if `CONTEXT_STATE.md` exceeds 500 lines.
 
 **SessionStart (startup/compact)**:
-- `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan (matchers: `startup`, `compact`; the pre-compact snapshot section only on `compact` — it is a compaction artefact; `resume` deliberately does NOT re-inject: a resumed chat already has CONTEXT_STATE in context). After a compaction it skips what Claude Code restores itself: a file the harness re-attached (e.g. `CONTEXT_STATE.md`) becomes a one-line pointer, and the recent commits and the snapshot's git-status block are dropped (the harness re-injects a fresh git status).
+- `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan (matchers: `startup`, `compact`; the pre-compact snapshot section only on `compact` — it is a compaction artefact; `resume` deliberately does NOT re-inject: a resumed chat already has CONTEXT_STATE in context). After a compaction it drops the recent commits and the snapshot's git-status block (the harness re-injects a fresh git status).
 
 **PreCompact (manual + auto)**:
 - `pre-compact-save.sh` — save git status + recent files to `.claude/context/pre-compact-snapshot.md` (before every compaction, `/compact` included).
 
 **PostCompact**:
-- `post-compact.sh` — log compaction event + desktop notification (logs to `compactions.jsonl` in the metrics directory); resets the per-session injection dedupe state, and re-seeds the Build Anchor reads list with the files Claude Code re-attached after the compaction (up to five most recently read/edited, each under 5,000 tokens — estimated conservatively by `vco_lib/compact_reattach.py`), so a `Write` to one of them is not blocked; every other file needs a fresh `Read`.
+- `post-compact.sh` — log compaction event + desktop notification (logs to `compactions.jsonl` in the metrics directory); resets the per-session injection dedupe state and wipes the Build Anchor reads list. A `Write` to a file Claude Code itself re-attached after the compaction is still allowed: on a miss `pre-tool-use` finds that file's `file` attachment row after the latest `compact_boundary` in the session transcript (`vco_lib/compact_reattach.py`); every other file needs a fresh `Read`.
 
 **UserPromptSubmit**:
 - `user-prompt-submit-reminder.sh` — workflow reminders (counter = the session's cumulative work units from the live transcript, scanned incrementally by the same `claude_token_counter.py` the nudge uses).
