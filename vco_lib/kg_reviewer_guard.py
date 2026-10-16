@@ -85,14 +85,16 @@ the reviewer.
    * a node that GAINS a line raising an evidence level — a ``[guard]
      evidence_markers`` word (CONFIRMED, VERIFIED, ...) used as a CLAIM
      (uppercase, followed by in/via/by/on/at/during, directly after
-     is/are/was/were/be/been, or on a line citing a run/test id or commit
-     hash) that the reviewer read nowhere, or a
+     is/are/was/were/be/been or after a ``[guard] evidence_label_words``
+     label and colon such as "Status:", or on a line citing a run/test id
+     or commit hash) that the reviewer read nowhere, or a
      run/test id / commit hash it read nowhere cited on such a line
      (:func:`unsourced_evidence`; the field showed "CONFIRMED ... via test
      run <stamp>" over sources that said "inferred, untested"). Prose use
      ("the tested path"), headings without attribution, fenced code and
-     frontmatter are not claims; lines that already carried the marker are
-     not judged.
+     frontmatter are not claims (a fence that never closes does not exempt
+     the lines after it); lines that already carried the marker are not
+     judged.
 
    A deleted node is never the reviewer's doing (none of its tools deletes
    — the shell is denied — and every write leaves bytes), so a vanished
@@ -100,7 +102,11 @@ the reviewer.
    resurrected over the user's decision.
 
    A reverted node is re-synced to the KG collection (soft-fail) so the
-   store does not keep the reviewer's version. An UNATTRIBUTABLE run
+   store does not keep the reviewer's version; a reverted NEW node's rows
+   are pruned instead — on the orchestrator root (KG collection == shared
+   collection) only the rows carrying the reviewer's exact bytes' content
+   hash — and the log states what the sync reported (:func:`resync_with`).
+   An UNATTRIBUTABLE run
    (no stream events) judges, reverts and commits NOTHING: without proof of
    who wrote what, any knowledge/ change since the snapshot may be the
    user's own.
@@ -146,7 +152,9 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import yaml
 
+from vco_lib import kg_prune_result
 from vco_lib.kg_reviewer_model import config
+from vco_lib.knowledge_residue import content_signature_of_file_bytes
 
 __all__ = [
     "Snapshot",
@@ -1024,20 +1032,38 @@ def _judged_lines(text: str) -> List[str]:
     """The lines of a node the evidence rule judges: the body only (the
     YAML frontmatter is skipped — a ``title:`` is a name, not a claim) and
     no line inside, or opening/closing, a fenced code block (code is not a
-    claim either)."""
+    claim either).
+
+    A fence that never closes does NOT hide the rest of the node (review
+    R33 N3): the lines after an unclosed opener are judged as prose (any
+    properly closed fence among them still skipped). KG retrieval reads the
+    raw text, so a stray fence must not exempt every later line; judging
+    them is not noisy because a line is only reverted for a marker used in a
+    claim shape AND absent from everything the reviewer read. (Closing the
+    fence at the next heading instead would still exempt a heading-less
+    node's whole tail.)"""
     _raw, body = _split_frontmatter(text)
+    lines = _body_lines(body)
     out: List[str] = []
-    fence: Optional[str] = None
-    for line in _body_lines(body):
-        m = _FENCE.match(line)
-        if m:
+    start = 0
+    while start < len(lines):
+        fence: Optional[str] = None
+        opener = -1
+        for i in range(start, len(lines)):
+            line = lines[i]
+            m = _FENCE.match(line)
+            if m:
+                if fence is None:
+                    fence, opener = m.group(1), i
+                elif m.group(1) == fence:
+                    fence = None
+                continue
             if fence is None:
-                fence = m.group(1)
-            elif m.group(1) == fence:
-                fence = None
-            continue
+                out.append(line)
         if fence is None:
-            out.append(line)
+            break
+        # Unclosed: drop what was skipped as "inside" it and judge it.
+        start = opener + 1
     return out
 
 
@@ -1048,20 +1074,27 @@ def evidence_claims(text: str, has_id: bool) -> List[str]:
     one of ``[guard] evidence_attribution_words`` ("confirmed in game",
     "verified via the suite", "tested on staging"), or directly follows one
     of ``[guard] evidence_copula_words`` ("is verified", "has been tested";
-    "is not tested" is not a claim), or the line also cites a run/test id
-    or commit hash (``has_id``). "The tested path keeps the cache warm" or
-    a heading "## Validated configuration keys" is prose, not a claim."""
+    "is not tested" is not a claim), or directly follows one of ``[guard]
+    evidence_label_words`` and a colon ("Status: confirmed", "**Result:**
+    verified" — review R33 N2; "Status: not confirmed" is not a claim), or
+    the line also cites a run/test id or commit hash (``has_id``). "The
+    tested path keeps the cache warm" or a heading "## Validated
+    configuration keys" is prose, not a claim."""
     g = _guard()
     attrib = "|".join(re.escape(w) for w in g["evidence_attribution_words"])
     copula = "|".join(re.escape(w) for w in g["evidence_copula_words"])
+    labels = "|".join(re.escape(w) for w in g["evidence_label_words"])
     after = re.compile(rf"\s+(?:{attrib})(?![0-9A-Za-z])", re.IGNORECASE)
     before = re.compile(rf"(?<![0-9A-Za-z])(?:{copula})\s+$", re.IGNORECASE)
+    label = re.compile(rf"(?<![0-9A-Za-z])(?:{labels})\s*(?:\*\*|__)?\s*:"
+                       rf"\s*(?:\*\*|__|\*|_|`)?\s*$", re.IGNORECASE)
     out: List[str] = []
     for marker in g["evidence_markers"]:
         for m in _word(marker).finditer(text):
+            head = text[:m.start()]
             if (has_id or m.group(0).isupper()
                     or after.match(text, m.end())
-                    or before.search(text[:m.start()])):
+                    or before.search(head) or label.search(head)):
                 out.append(marker)
                 break
     return out
@@ -1252,8 +1285,14 @@ def _restore_symlink(snap: Snapshot, rel: str, log: Log, backups: _Backups,
     res.reverted.append((str(target), reason))
 
 
+#: ``resync(rels, prune_hashes)``: re-sync the reverted ``knowledge/`` nodes
+#: ``rels``; ``prune_hashes`` maps each reverted NEW node (its file is gone)
+#: to the KG ``content_hash`` of the bytes the reviewer wrote there.
+Resync = Callable[[List[str], Dict[str, str]], None]
+
+
 def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
-             log: Log, resync: Optional[Callable[[List[str]], None]] = None,
+             log: Log, resync: Optional[Resync] = None,
              *, sources: str) -> ValidationResult:
     """Revert every rule-breaking change the reviewer PROVABLY made; return
     what survives. ``writes`` is :func:`attributed_writes`; ``None``
@@ -1271,6 +1310,7 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
     root = snap.root
     backups = _Backups(root)
     resynced: List[str] = []
+    prune_hashes: Dict[str, str] = {}
     # The comparison set for the new-node rules: every node at the start
     # PLUS each new node this run keeps (review R30 L3 — a second node on a
     # subject the reviewer created moments earlier is a duplicate too).
@@ -1378,9 +1418,18 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
         res.reverted.append((name, reason))
         if under_knowledge and rel is not None and rel.endswith(".md"):
             resynced.append(rel)
+            if pre is None and cur is not None:
+                # A reverted NEW node: its file is gone now, but the project's
+                # edit-time sync may have embedded these exact bytes. Their
+                # content_hash (the sync's own signature) lets the prune
+                # remove only those rows, even in the shared collection (R33 N1).
+                try:
+                    prune_hashes[rel] = content_signature_of_file_bytes(cur)
+                except UnicodeDecodeError:
+                    pass  # the sync could not have read them either
     res.backup_dir = backups.dir
     if resynced and resync is not None:
-        resync(resynced)
+        resync(resynced, prune_hashes)
     return res
 
 
@@ -1494,41 +1543,62 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
 
 
 def resync_with(project_root: Path, log: Log,
-                timeout_s: int = 1800) -> Callable[[List[str]], None]:
+                timeout_s: int = 1800) -> Resync:
     """A ``validate(resync=...)`` callback: re-sync reverted nodes into the
     KG collection through the project's shipped sync script (soft-fail).
 
     A reverted NEW node no longer exists on disk, while the project's own
     edit-time sync may already have embedded the reviewer's write (review
     R30 M3): when any path is gone, the script runs with
-    ``--prune-missing``, which deletes that file_path's rows through the
-    script's one delete-by-file_path home instead of failing on the
-    missing file. A failure (Weaviate down) is logged, never raised."""
+    ``--prune-missing`` (plus ``--prune-hash <rel>=<content_hash>`` for each
+    gone path validate hashed — what lets the orchestrator root, whose KG
+    collection is the shared one, delete only the rows carrying the
+    reviewer's exact bytes; R33 N1). The log states, per gone path, what
+    the script REPORTED (``vco_lib.kg_prune_result``): rows removed, nothing
+    matched, skipped and why, or failed — and "not confirmed" when the
+    script printed no result, never an assumed removal. A failure (Weaviate
+    down) is logged, never raised."""
     script = project_root / ".claude" / "scripts" / "sync_knowledge_graph.py"
 
-    def _run(rels: List[str]) -> None:
+    def _run(rels: List[str], prune_hashes: Optional[Dict[str, str]] = None
+             ) -> None:
+        hashes = prune_hashes or {}
         if not script.is_file():
             log(f"reverted nodes not re-synced ({script} is missing): "
                 + ", ".join(rels))
             return
+        gone: List[str] = []
+        proc: "Optional[subprocess.CompletedProcess[str]]" = None
+        failure = ""
         try:
             gone = [r for r in rels
                     if not (project_root / r).exists()
                     and not (project_root / r).is_symlink()]
+            prune_args: List[str] = []
+            if gone:
+                prune_args.append("--prune-missing")
+                for r in gone:
+                    if r in hashes:
+                        prune_args += ["--prune-hash", f"{r}={hashes[r]}"]
             proc = subprocess.run(
                 [sys.executable, str(script), "--project-root",
-                 str(project_root), *(["--prune-missing"] if gone else []),
+                 str(project_root), *prune_args,
                  *[str(project_root / r) for r in rels]],
                 cwd=project_root, capture_output=True, text=True,
                 timeout=timeout_s, env=dict(os.environ),
                 stdin=subprocess.DEVNULL)
-            if proc.returncode != 0:
-                log(f"re-sync of reverted nodes exited {proc.returncode}: "
-                    f"{(proc.stderr or proc.stdout).strip()[-500:]}")
-            else:
-                log(f"re-synced reverted nodes: {', '.join(rels)}"
-                    + (f" (removed from the KG collection: {', '.join(gone)})"
-                       if gone else ""))
         except Exception as exc:  # noqa: BLE001 — soft-fail, logged
-            log(f"re-sync of reverted nodes failed: {exc}")
+            failure = str(exc) or type(exc).__name__
+        results = kg_prune_result.parse_lines(proc.stdout if proc else "")
+        removal = "; ".join(
+            f"{r}: {kg_prune_result.describe(results.get(r))}" for r in gone)
+        removal = f" [file gone - {removal}]" if removal else ""
+        if proc is None:
+            log(f"re-sync of reverted nodes failed: {failure}{removal}")
+        elif proc.returncode != 0:
+            log(f"re-sync of reverted nodes exited {proc.returncode}: "
+                f"{(proc.stderr or proc.stdout).strip()[-500:]}{removal}")
+        else:
+            log(f"re-sync of reverted nodes finished: {', '.join(rels)}"
+                f"{removal}")
     return _run

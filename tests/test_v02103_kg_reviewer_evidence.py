@@ -120,7 +120,7 @@ def _validate(repo: Path, writes: dict, sources: str,
         for rel, content in writes.items():
             _reviewer_write(repo, w, rel, content)
         lines: List[str] = []
-        res = guard.validate(snap, w, lines.append, resync=lambda _r: None,
+        res = guard.validate(snap, w, lines.append, resync=lambda _r, _h: None,
                              sources=sources)
         return res, lines
     finally:
@@ -727,7 +727,9 @@ def test_r30_resync_passes_prune_missing_only_for_gone_paths(tmp_path, monkeypat
     resync(["knowledge/kept.md", "knowledge/gone.md"])
     assert "--prune-missing" in calls[-1]
     assert str(root / "knowledge" / "gone.md") in calls[-1]
-    assert "removed from the KG collection: knowledge/gone.md" in lines[-1]
+    # R33 N1: the stub printed no result line, so no removal is claimed.
+    assert "removed" not in lines[-1].replace("NOT confirmed", "")
+    assert "knowledge/gone.md: removal NOT confirmed" in lines[-1]
 
 
 def test_r30_resync_failure_is_logged_not_raised(tmp_path, monkeypatch):
@@ -771,9 +773,9 @@ def test_r30_sync_prune_missing_deletes_the_vanished_nodes_rows(sync_mod, monkey
     deleted: list = []
     real = mod._delete_node_by_file_path
 
-    def recording(srv, fp, on_error=None):
+    def recording(srv, fp, on_error=None, **kw):
         deleted.append(fp)
-        return real(srv, fp, on_error=on_error)
+        return real(srv, fp, on_error=on_error, **kw)
 
     monkeypatch.setattr(mod, "_delete_node_by_file_path", recording)
     monkeypatch.setattr(mod, "_PRUNE_MISSING", True)
@@ -839,3 +841,339 @@ def test_r30_sync_extracts_the_prune_missing_flag(tmp_path, monkeypatch):
     mod._validate_argv_flags(sys.argv)  # no exit: nothing left to reject
     monkeypatch.setattr(sys, "argv", ["sync_knowledge_graph.py", "knowledge/a.md"])
     assert _load_sync_module(tmp_path)._PRUNE_MISSING is False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 4. R33 review fixes (GLM-5.3 verify round, 2026-10-16)
+# ═════════════════════════════════════════════════════════════════════════
+
+from vco_lib import kg_prune_result  # noqa: E402
+from vco_lib.knowledge_residue import (  # noqa: E402
+    content_signature_excluding_updated, content_signature_of_file_bytes)
+
+# N1 — the orchestrator root (KG collection == shared collection) deletes a
+# reverted new node's rows by exact path AND content_hash; every arm reports
+# what happened, and the guard logs exactly that.
+
+_H_REVIEWER = "a" * 64
+_H_SIBLING = "b" * 64
+GONE = "knowledge/concepts/gone-node.md"
+
+
+def _seed_hashed(mod, server, rel: str, content_hash: str) -> None:
+    server.client.collections.get(mod.COLLECTION_NAME).data.insert(
+        properties={"title": "T", "file_path": rel,
+                    "content_hash": content_hash})
+
+
+def _hashed_rows(mod, server) -> list:
+    store = server.client.collections.get(mod.COLLECTION_NAME)._store
+    return sorted((o.properties.get("file_path"),
+                   o.properties.get("content_hash")) for o in store.values())
+
+
+def _result(capsys, rel: str = GONE) -> dict:
+    rec = kg_prune_result.parse_lines(capsys.readouterr().out).get(rel)
+    assert rec is not None, "the sync printed no result line"
+    return rec
+
+
+def _as_root(mod, monkeypatch) -> None:
+    monkeypatch.setattr(mod, "SHARED_COLLECTION_NAME", mod.COLLECTION_NAME)
+    monkeypatch.setattr(mod, "_PRUNE_MISSING", True)
+
+
+def test_r33_root_prune_deletes_only_the_hash_matching_row(
+        sync_mod, monkeypatch, capsys):
+    """RED before R33 N1: the root kept every row (shared-identity skip)."""
+    mod, server, root = sync_mod
+    _seed_hashed(mod, server, GONE, _H_REVIEWER)   # the reviewer's write
+    _seed_hashed(mod, server, GONE, _H_REVIEWER)   # its second chunk
+    _seed_hashed(mod, server, GONE, _H_SIBLING)    # a sibling's shared row
+    _seed_hashed(mod, server, "knowledge/concepts/gone-node-sibling.md",
+                 _H_REVIEWER)                      # token-superset path
+    _as_root(mod, monkeypatch)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    outcome = mod.sync_node(server, root / GONE)
+    assert outcome and outcome.status == mod.OUTCOME_EXCLUDED_SKIPPED
+    assert _hashed_rows(mod, server) == sorted([
+        (GONE, _H_SIBLING),
+        ("knowledge/concepts/gone-node-sibling.md", _H_REVIEWER)])
+    rec = _result(capsys)
+    assert (rec["status"], rec["deleted"], rec["kept"]) == (
+        kg_prune_result.STATUS_DELETED, 2, 1)
+
+
+def test_r33_root_prune_with_no_matching_hash_deletes_nothing(
+        sync_mod, monkeypatch, capsys):
+    mod, server, root = sync_mod
+    _seed_hashed(mod, server, GONE, _H_SIBLING)
+    _as_root(mod, monkeypatch)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    mod.sync_node(server, root / GONE)
+    assert _hashed_rows(mod, server) == [(GONE, _H_SIBLING)]
+    rec = _result(capsys)
+    assert (rec["status"], rec["deleted"], rec["kept"]) == (
+        kg_prune_result.STATUS_NOTHING_MATCHED, 0, 1)
+
+
+def test_r33_root_prune_without_a_hash_is_reported_skipped(
+        sync_mod, monkeypatch, capsys):
+    mod, server, root = sync_mod
+    _seed_hashed(mod, server, GONE, _H_REVIEWER)
+    _as_root(mod, monkeypatch)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {})
+    mod.sync_node(server, root / GONE)
+    assert _hashed_rows(mod, server) == [(GONE, _H_REVIEWER)]
+    rec = _result(capsys)
+    assert rec["status"] == kg_prune_result.STATUS_SKIPPED
+    assert "shared collection" in rec["reason"]
+
+
+def test_r33_non_root_prune_is_unchanged_hash_or_not(
+        sync_mod, monkeypatch, capsys):
+    """Non-root: every exact-path row goes; a --prune-hash does not narrow
+    it (nothing else writes to a per-project collection)."""
+    mod, server, root = sync_mod
+    _seed_hashed(mod, server, GONE, _H_REVIEWER)
+    _seed_hashed(mod, server, GONE, _H_SIBLING)
+    monkeypatch.setattr(mod, "_PRUNE_MISSING", True)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    mod.sync_node(server, root / GONE)
+    assert _hashed_rows(mod, server) == []
+    rec = _result(capsys)
+    assert (rec["status"], rec["deleted"]) == (
+        kg_prune_result.STATUS_DELETED, 2)
+
+
+@pytest.mark.parametrize("as_root", [False, True], ids=["non-root", "root"])
+def test_r33_prune_weaviate_down_reports_failed(sync_mod, monkeypatch, capsys,
+                                                as_root):
+    mod, server, root = sync_mod
+
+    class _Down:
+        def get(self, _name):
+            raise ConnectionError("weaviate unreachable")
+
+    server.client.collections = _Down()
+    monkeypatch.setattr(mod, "_PRUNE_MISSING", True)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    if as_root:
+        _as_root(mod, monkeypatch)
+    outcome = mod.sync_node(server, root / GONE)
+    assert outcome.status == mod.OUTCOME_FAILED
+    rec = _result(capsys)
+    assert rec["status"] == kg_prune_result.STATUS_FAILED
+    assert "weaviate unreachable" in rec["reason"]
+
+
+def test_r33_sync_extracts_prune_hashes(tmp_path, monkeypatch):
+    from tests.test_v0270_kg_sync_batch_title_collision import _load_sync_module
+    for key in ("KG_BASE_DIR", "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                "DUAL_EMBEDDING_ENABLED", "VCT_DISABLE_HUB_RESOLVER"):
+        monkeypatch.setenv(key, "placeholder")
+    argv = ["sync_knowledge_graph.py", "--prune-missing", "--prune-hash",
+            f"{GONE}={'A' * 64}", GONE]
+    monkeypatch.setattr(sys, "argv", argv)
+    mod = _load_sync_module(tmp_path)
+    assert mod._PRUNE_HASHES == {GONE: "a" * 64}
+    assert sys.argv == ["sync_knowledge_graph.py", GONE]
+    mod._validate_argv_flags(sys.argv)
+
+
+@pytest.mark.parametrize("argv", [
+    ["--prune-missing", "--prune-hash", "knowledge/a.md=nothex"],
+    ["--prune-missing", "--prune-hash", "no-equals-sign"],
+    ["--prune-missing", "--prune-hash"],
+    ["--prune-hash", f"knowledge/a.md={'a' * 64}"],  # without --prune-missing
+], ids=["bad-hex", "no-eq", "no-value", "no-prune-missing"])
+def test_r33_sync_rejects_malformed_prune_hash(tmp_path, monkeypatch, argv):
+    from tests.test_v0270_kg_sync_batch_title_collision import _load_sync_module
+    for key in ("KG_BASE_DIR", "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                "DUAL_EMBEDDING_ENABLED", "VCT_DISABLE_HUB_RESOLVER"):
+        monkeypatch.setenv(key, "placeholder")
+    monkeypatch.setattr(sys, "argv", ["sync_knowledge_graph.py", *argv])
+    with pytest.raises(SystemExit) as exc:
+        _load_sync_module(tmp_path)
+    assert exc.value.code == 2
+
+
+def test_r33_guard_hash_is_the_hash_the_sync_stores(sync_mod):
+    """One home: the sync's signature IS the vco_lib one, and the guard's
+    bytes-hash equals what the sync stores for that file after its own read
+    and ``updated:`` bump (CRLF bytes included)."""
+    mod, _server, root = sync_mod
+    assert mod._content_signature_excluding_updated is \
+        content_signature_excluding_updated
+    raw = _node("Gone node", "Line one.\r\nLine two.").replace(
+        "\n", "\r\n").encode("utf-8")
+    path = root / GONE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    guard_hash = content_signature_of_file_bytes(raw)
+    content = mod._update_frontmatter_timestamp(
+        path, path.read_text(encoding="utf-8"))
+    assert mod._content_signature_excluding_updated(content) == guard_hash
+
+
+def test_r33_validate_hands_the_reverted_new_nodes_hash_to_resync(repo):
+    rel = "knowledge/concepts/eviction-notes.md"
+    text = _node("Eviction notes", "Eviction CONFIRMED in staging.")
+    snap = guard.take_snapshot(repo)
+    try:
+        w: dict = {}
+        _reviewer_write(repo, w, rel, text)
+        calls: list = []
+        res = guard.validate(snap, w, [].append,
+                             resync=lambda r, h: calls.append((r, h)),
+                             sources=_read_source("the cache module"))
+    finally:
+        snap.cleanup()
+    assert res.reverted and not (repo / rel).exists()
+    assert calls == [([rel], {rel: content_signature_of_file_bytes(
+        text.encode("utf-8"))})]
+
+
+def _resync_root(tmp_path: Path) -> Path:
+    root = tmp_path / "proj"
+    (root / ".claude" / "scripts").mkdir(parents=True)
+    (root / ".claude" / "scripts" / "sync_knowledge_graph.py").write_text("#\n")
+    (root / "knowledge").mkdir()
+    return root
+
+
+@pytest.mark.parametrize("rc, stdout, expect, never", [
+    (0, kg_prune_result.format_line("knowledge/gone.md", "deleted",
+                                    deleted=2, kept=1),
+     "knowledge/gone.md: removed 2 row(s) from the KG collection; 1 row(s) "
+     "with other content at the same path kept", None),
+    (0, kg_prune_result.format_line("knowledge/gone.md", "nothing_matched"),
+     "knowledge/gone.md: no rows matched in the KG collection, nothing "
+     "removed", "removed 0"),
+    (0, kg_prune_result.format_line("knowledge/gone.md", "skipped",
+                                    reason="shared collection, no hash"),
+     "knowledge/gone.md: rows NOT removed: shared collection, no hash",
+     "removed from"),
+    (1, kg_prune_result.format_line("knowledge/gone.md", "failed",
+                                    reason="weaviate unreachable"),
+     "knowledge/gone.md: row removal FAILED: weaviate unreachable",
+     "removed from"),
+    (0, "", "knowledge/gone.md: removal NOT confirmed", "removed from"),
+], ids=["deleted", "nothing-matched", "skipped", "failed", "no-result"])
+def test_r33_resync_log_states_what_the_sync_reported(
+        tmp_path, monkeypatch, rc, stdout, expect, never):
+    """RED before R33 N1: every exit-0 arm logged "removed from the KG
+    collection"."""
+    root = _resync_root(tmp_path)
+    calls: list = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, rc, stdout=stdout + "\n",
+                                           stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    lines: List[str] = []
+    guard.resync_with(root, lines.append)(["knowledge/gone.md"],
+                                          {"knowledge/gone.md": _H_REVIEWER})
+    cmd = calls[-1]
+    assert "--prune-missing" in cmd
+    i = cmd.index("--prune-hash")
+    assert cmd[i + 1] == f"knowledge/gone.md={_H_REVIEWER}"
+    assert expect in lines[-1], lines[-1]
+    if never:
+        assert never not in lines[-1], lines[-1]
+    assert ("exited 1" in lines[-1]) == (rc == 1)
+
+
+def test_r33_resync_spawn_failure_claims_no_removal(tmp_path, monkeypatch):
+    root = _resync_root(tmp_path)
+
+    def boom(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(guard.subprocess, "run", boom)
+    lines: List[str] = []
+    guard.resync_with(root, lines.append)(["knowledge/gone.md"], {})
+    assert lines[-1].startswith("re-sync of reverted nodes failed:")
+    assert "knowledge/gone.md: removal NOT confirmed" in lines[-1]
+
+
+def test_r33_resync_without_gone_paths_passes_no_prune_flags(tmp_path,
+                                                             monkeypatch):
+    root = _resync_root(tmp_path)
+    (root / "knowledge" / "kept.md").write_text("x\n")
+    calls: list = []
+    monkeypatch.setattr(guard.subprocess, "run", lambda cmd, **kw: (
+        calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")))
+    lines: List[str] = []
+    guard.resync_with(root, lines.append)(["knowledge/kept.md"],
+                                          {"knowledge/kept.md": _H_REVIEWER})
+    assert "--prune-missing" not in calls[-1]
+    assert "--prune-hash" not in calls[-1]
+    assert lines[-1] == "re-sync of reverted nodes finished: knowledge/kept.md"
+
+
+# N2 — a marker right after a label word and a colon is a claim.
+
+
+@pytest.mark.parametrize("added, marker", [
+    ("Status: confirmed", "confirmed"),
+    ("Result: verified.", "verified"),
+    ("status:verified", "verified"),
+    ("OUTCOME : tested", "tested"),
+    ("**Result:** proven", "proven"),
+    ("**Status**: validated", "validated"),
+    ("- Verdict: `confirmed`", "confirmed"),
+    ("Eviction status: confirmed", "confirmed"),
+], ids=lambda v: v if len(v) < 14 else v[:24])
+def test_r33_label_colon_marker_without_source_is_reverted(repo, added,
+                                                           marker):
+    """RED before R33 N2: kept."""
+    res, _l = _validate(repo, {CACHE: CACHE_NODE + added + "\n"},
+                        _read_source("the cache module"))
+    assert res.kept == [] and f"marker '{marker}'" in res.reverted[0][1]
+
+
+def test_r33_label_colon_marker_in_the_corpus_is_kept(repo):
+    res, _l = _validate(repo, {CACHE: CACHE_NODE + "Status: confirmed\n"},
+                        _read_source("Eviction confirmed by the soak run."))
+    assert res.kept == [CACHE] and res.reverted == []
+
+
+@pytest.mark.parametrize("added", [
+    "Status: not confirmed yet.",
+    "The result: a tested path through the loader.",
+    "Two cases: tested and untested inputs.",
+    "Inputs: validated strings only reach the parser.",
+    "Note: the tested path keeps the cache warm.",
+], ids=["negated", "article", "no-label-word", "other-label", "note"])
+def test_r33_label_shaped_prose_is_kept(repo, added):
+    res, _l = _validate(repo, {CACHE: CACHE_NODE + added + "\n"},
+                        _read_source("the cache module"))
+    assert res.kept == [CACHE] and res.reverted == [], res.reverted
+
+
+# N3 — an unclosed fence does not hide the rest of the node.
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_r33_claim_after_an_unclosed_fence_is_judged(repo, fence):
+    """RED before R33 N3: the stray fence exempted every later line."""
+    post = CACHE_NODE + (f"{fence}\nx = 1\n\n"
+                         "Eviction on full: confirmed in game.\n")
+    res, _l = _validate(repo, {CACHE: post}, _read_source("the cache module"))
+    assert res.kept == [] and "marker 'confirmed'" in res.reverted[0][1]
+
+
+def test_r33_closed_fence_inside_an_unclosed_tail_is_still_skipped():
+    text = ("```\nstray opener\n~~~\n# CONFIRMED in run 20261015-221000\n~~~\n"
+            "Eviction VERIFIED.\n")
+    judged = guard._judged_lines(text)
+    assert "stray opener" in judged and "Eviction VERIFIED." in judged
+    assert "# CONFIRMED in run 20261015-221000" not in judged
+
+
+def test_r33_closed_fences_behave_as_before():
+    text = "a\n```\ncode CONFIRMED\n```\nb\n~~~\nmore\n~~~\nc\n"
+    assert [ln for ln in guard._judged_lines(text) if ln] == ["a", "b", "c"]

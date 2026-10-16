@@ -510,7 +510,8 @@ not configuration. Edits elsewhere are blocked and reverted.
    Never raise a confidence or evidence level: do not label a fact
    CONFIRMED, VERIFIED, TESTED, PROVEN or VALIDATED, or write that it is
    (or was) confirmed / verified / tested / proven / validated, or was so
-   in, via, by, on, at or during something, and never cite a test run, run
+   in, via, by, on, at or during something, or write it after a label such
+   as "Status:" / "Result:" / "Outcome:", and never cite a test run, run
    id, build or commit as evidence for a fact, unless that exact word - and
    that exact id - is in the diff, its commit stat or sha, or a Read/Grep
    result from this run. When the source says "inferred", "untested" or

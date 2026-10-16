@@ -56,14 +56,15 @@ Data-safety invariants (binding, from the 2026-07-30 wave-2 plan §7.2):
 The step is wired into ``install_project_bundle`` behind a soft-fail wrapper
 — it must NEVER fail the bundle update.
 
-Signature note (one-home + parity): :func:`content_signature_excluding_updated`
-is the vco_lib home of the storage-layer signature. It MUST match
-``templates/scripts/sync_knowledge_graph.py::_content_signature_excluding_updated``
-byte-for-byte in behavior — a parity test
-(``tests/test_v0289_curated_hash_registry.py``) locks the two together. The
-sync script cannot be imported here (module-level side effects: hub
-resolution, env reads), which is why a mirrored implementation + parity lock
-is used instead of an import.
+Signature note (one home): :func:`content_signature_excluding_updated` is
+THE storage-layer signature — the ``content_hash`` every KG row carries.
+``templates/scripts/sync_knowledge_graph.py`` imports it as its
+``_content_signature_excluding_updated`` (v0.2.103 R33 N1 collapsed the former
+mirror into this one home: the post-commit KG reviewer's guard hashes a node it
+reverts with :func:`content_signature_of_file_bytes` and the sync's
+hash-scoped prune compares that against the stored ``content_hash``, so the two
+must be the same function, not two parity-locked copies). The parity test in
+``tests/test_v0289_curated_hash_registry.py`` still holds trivially.
 """
 
 from __future__ import annotations
@@ -102,9 +103,8 @@ _DEFERRAL_PATHS_SHOWN = 10
 def content_signature_excluding_updated(content: str) -> str:
     """SHA256 of the node content excluding the frontmatter ``updated:`` line.
 
-    vco_lib home of the STORAGE-LAYER signature — mirrors
-    ``sync_knowledge_graph.py::_content_signature_excluding_updated`` exactly
-    (parity test pins the behavior; see module docstring). Deliberately
+    THE storage-layer signature — ``sync_knowledge_graph.py`` imports it as
+    ``_content_signature_excluding_updated`` (one home; see module docstring). Deliberately
     tolerant ONLY of ``updated:``-line churn, which is machine-written; any
     body or other-frontmatter edit changes the signature.
     """
@@ -117,6 +117,18 @@ def content_signature_excluding_updated(content: str) -> str:
     body = parts[2]
     fm_no_updated = re.sub(r"^updated:.*$\n?", "", fm_text, flags=re.MULTILINE)
     return sha256_text(fm_no_updated + body)
+
+
+def content_signature_of_file_bytes(data: bytes) -> str:
+    """:func:`content_signature_excluding_updated` of a file's raw ``data``,
+    decoded exactly as the KG sync reads a node (``Path.read_text(encoding=
+    "utf-8")``: UTF-8, universal newlines — CRLF/CR become LF), so the hash
+    equals the ``content_hash`` the sync stores for those bytes. Raises
+    ``UnicodeDecodeError`` on non-UTF-8 bytes (the sync cannot read them
+    either)."""
+    import io
+    text = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8").read()
+    return content_signature_excluding_updated(text)
 
 
 # ---------------------------------------------------------------------------
