@@ -43,14 +43,15 @@ recently modified files to `.claude/context/pre-compact-snapshot.md`.
 
 After compaction, Claude Code itself re-attaches up to five recently read or
 edited files (over 5,000 tokens: path only), CLAUDE.md, auto memory and a fresh
-git status. `compact-context-reinject.sh` adds what it does not:
-- `CONTEXT_STATE.md` (current task state) — a pointer only when the harness
-  already re-attached it
+git status. `compact-context-reinject.sh` adds:
+- `CONTEXT_STATE.md` (current task state)
 - Active plan summary (first 30 lines from `.claude/context/plans/`)
-- The pre-compaction snapshot (recently modified files)
+- The pre-compaction snapshot (recently modified files; its git-status block
+  is left to the harness's fresh one)
 
-The re-attached files stay writable; any other file needs a `Read` before a
-`Write` (Build Anchor).
+A file the harness re-attached with its whole content stays writable (Build
+Anchor finds it in the session transcript); any other file needs a `Read`
+before a `Write`.
 
 Tips: include the file or module name in the focus (`/compact auth/jwt.py`);
 CONTEXT_STATE.md and active plans come back automatically.

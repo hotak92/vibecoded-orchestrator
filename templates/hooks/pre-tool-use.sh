@@ -468,6 +468,30 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
                     grep -qxF "$FILE_PATH" "$SESSION_READS_FILE" 2>/dev/null && ALREADY_READ=1 || true
                 fi
 
+                # v0.2.104: a miss right after a compaction may be a file
+                # Claude Code itself re-attached (post-compact wiped the
+                # ledger). Ask the ONE home, vco_lib/compact_reattach.py,
+                # which reads the exact set from the transcript; only the
+                # exact answer `reattached` allows — no interpreter, a broken
+                # vco_lib, any error or doubt keeps the block (fail closed).
+                # The allowed path is appended to the ledger below, so later
+                # Writes do not rescan. MUST MATCH pre-tool-use.ps1.
+                if [[ "$ALREADY_READ" -eq 0 ]] && [[ -n "$TRANSCRIPT_PATH" ]]; then
+                    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+                    [[ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ]] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+                    VCO_VENV_PYTHON=""
+                    if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+                        resolve_vco_venv_python "$SCRIPT_DIR" 2>/dev/null || true
+                    fi
+                    _PTU_RA_PY="${VCO_VENV_PYTHON:-${PY:-}}"
+                    if [[ -n "$_PTU_RA_PY" ]]; then
+                        _PTU_RA=$("$_PTU_RA_PY" -m vco_lib.compact_reattach check \
+                            "--transcript=$TRANSCRIPT_PATH" "--path=$FILE_PATH" \
+                            "--agent-id=$AGENT_ID" 2>/dev/null) || _PTU_RA=""
+                        [[ "$_PTU_RA" == "reattached" ]] && ALREADY_READ=1
+                    fi
+                fi
+
                 if [[ "$ALREADY_READ" -eq 0 ]]; then
                     BASENAME=$(basename "$FILE_PATH")
                     # Block messages route to stderr — see bash-security

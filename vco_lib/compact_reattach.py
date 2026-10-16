@@ -1,171 +1,216 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Which files Claude Code re-attached to the context after a compaction.
+"""Was a file re-attached to the context after the latest compaction?
 
-The ONE home for that estimate (A>B>C tier A): ``post-compact.{sh,ps1}`` call
-``python -m vco_lib.compact_reattach reseed`` and
-``compact-context-reinject.{sh,ps1}`` call ``... reattached`` and
-``... snapshot-body``; neither shell
-sibling carries a copy of the rule.
+The ONE home of that question (A>B>C tier A): ``pre-tool-use.{sh,ps1}`` ask
+``python -m vco_lib.compact_reattach check`` on a Build Anchor miss, and
+``compact-context-reinject.{sh,ps1}`` call ``... snapshot-body``; neither
+shell sibling carries a copy of the rule.
 
-Harness rule this module models
--------------------------------
-Source: https://code.claude.com/docs/en/context-window, section "What
-survives compaction" (verified 2026-10-16; the page names no Claude Code
-version for it):
+What the harness does
+---------------------
+Right after a compaction Claude Code re-reads up to five files read or edited
+in the session and puts their content back in the context (a file over 5,000
+tokens comes back as a path-only ``Referenced file``) — vendor page
+https://code.claude.com/docs/en/context-window, "What survives compaction".
+No hook payload lists those files, and the page names no Claude Code version.
 
-* "Right after compaction, Claude Code re-reads up to five of the files
-  Claude has read or edited in the session, choosing the ones modified most
-  recently. A file over 5,000 tokens comes back as a path reference without
-  its content, shown as ``Referenced file`` instead of ``Read``."  No total
-  cap is documented.
-* Also re-injected from disk by the harness: the project-root CLAUDE.md and
-  unscoped rules, the plan-mode plan, auto memory, invoked skills (5k tokens
-  each, 25k total) and a fresh git status (which carries the recent
-  commits). SessionStart hooks matching ``compact`` run and their output is
-  added.
-* No hook payload lists the re-attached files (PreCompact: trigger,
-  custom_instructions; PostCompact: trigger, compact_summary; SessionStart:
-  source="compact") and no setting controls the re-attach — so VCO has to
-  ESTIMATE the set. If a future Claude Code changes the count, the cap or the
-  ordering, ``MAX_REATTACHED`` / ``TOKEN_CAP`` / ``select_reattached`` here
-  are the only things to update.
+But the session transcript JSONL (``transcript_path`` in every hook's input)
+records them exactly. After the ``{"type":"system","subtype":
+"compact_boundary"}`` row the harness writes one row per re-attached file::
 
-Why it matters
+    {"type":"attachment","attachment":{"type":"file","filename":"<abs path>",
+     "content":{"type":"text","file":{"filePath":…,"content":…,
+     "startLine":1,"numLines":N,"totalLines":N}},"displayPath":…}}
+
+An over-cap file is a ``compact_file_reference`` row (no content) and an
+externally edited file an ``edited_text_file`` row (a snippet) — neither puts
+the whole file in context, so neither counts. Those rows are flushed ~90 ms
+before the SessionStart(compact) hook's success row, so a compact-time hook
+may race them; this module is therefore asked LAZILY, at the first Write that
+needs it.
+
+How it is used
 --------------
-``pre-tool-use``'s Build Anchor guard blocks a ``Write`` to an existing file
-that is not in the session's reads ledger (``.claude/state/reads_<key>.txt``,
-which records every Read AND every Write/Edit path, in call order). Before
-v0.2.104 ``post-compact`` wiped that ledger outright, so a Write to a file the
-harness had just re-attached was blocked and forced a redundant re-Read. Now
-``post-compact`` re-seeds the ledger with exactly the estimated set.
+``post-compact`` wipes the Build Anchor reads ledger
+(``.claude/state/reads_<key>.txt``) as it always has. When a later ``Write``
+to an existing file misses the ledger, ``pre-tool-use`` asks
+:func:`was_reattached`; "yes" allows the Write and appends the path to the
+ledger (so later Writes do not rescan), anything else blocks exactly as
+before. Exact and version-independent: a harness that re-attaches nothing
+writes no row, so the Write is still blocked.
 
-Conservative by construction: a file wrongly LEFT OUT only costs one extra
-Read (Build Anchor asks for it); a file wrongly LET IN would allow a blind
-overwrite of a file whose content is not in context. So every uncertainty
-resolves towards leaving a file out:
-
-* "modified most recently" is ambiguous — file mtime, or the time Claude last
-  touched it in the session. A file is kept only when it is among the five
-  newest by mtime AND among the five most recently touched ledger entries
-  (deleted files included in the latter, so they still take a slot).
-* the token estimate over-counts (``TOKEN_CAP`` below); binary or
-  non-UTF-8 content counts as over the cap.
-* any error while computing the set leaves the ledger EMPTY (the pre-v0.2.104
-  behaviour), never the old full list.
-
-A re-seeded entry is an ordinary ledger line: Build Anchor treats it exactly
-like a file Read this session (the ledger is a plain path list with no
-staleness check, so a later on-disk change by something else is handled the
-same way it is for any read file).
+Fail closed, bounded
+--------------------
+"Yes" requires, all at once: a readable transcript; a verified
+``compact_boundary`` row within the last :data:`SCAN_MAX_BYTES` of it (the
+LATEST one — an earlier compaction's attachments do not count); after it, a
+``file`` attachment row whose ``filename`` names the target (``realpath`` +
+``normcase`` on both sides, so Windows case and separators match) and whose
+content is the whole file as text. Any other outcome — no transcript, no
+boundary within the window, a row that does not parse, an I/O error — is
+"no". The transcript is never read whole (it can exceed 1 GB): the scan reads
+:data:`CHUNK_BYTES` blocks backwards from the end, looks only for the exact
+byte markers below, and parses at most one line of at most
+:data:`MAX_LINE_BYTES` per marker hit, so memory stays O(chunk + line) and the
+time is bounded by the window. A subagent's tool call is always "no": the
+payload's transcript is the parent's, whose re-attachments are not in the
+subagent's context.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
-import time
-from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO
 
-from vco_lib.atomic import atomic_write_text
+# The scan window: the latest compact_boundary must lie within this many
+# bytes of the end of the transcript. Observed on real transcripts
+# (2026-10-16, 64 transcripts with compactions, up to 1.6 GB each): the bytes
+# between two consecutive boundaries were p50 0.9 MB, p90 6.1 MB, max 66.5 MB.
+# A Write that comes after a longer post-compaction stretch is blocked (the
+# model re-Reads) — the safe direction.
+SCAN_MAX_BYTES = 128 * 1024 * 1024
+CHUNK_BYTES = 1024 * 1024
+# A boundary row is ~1.5 KB and a re-attached file row carries < 5,000 tokens
+# (largest observed ~0.4 MB); a longer line is neither and is not parsed.
+MAX_LINE_BYTES = 4 * 1024 * 1024
 
-# Documented harness values (see the module docstring for the source).
-MAX_REATTACHED = 5
-TOKEN_CAP = 5000
+# Exact serialisations (compact JSON, no spaces). The same text inside a JSON
+# STRING is escaped (`\"subtype\":…`), so these bytes only match real rows;
+# every hit is still parsed and checked.
+_BOUNDARY_MARKER = b'"subtype":"compact_boundary"'
+_FILE_MARKER = b'"attachment":{"type":"file"'
 
-# Freshness window for the persisted set, read by compact-context-reinject at
-# SessionStart(compact). PostCompact fires just before it; an older file
-# belongs to an earlier compaction and is ignored. Same knob and default as
-# the reinject hook's snapshot staleness guard (VCO_SNAPSHOT_MAX_AGE).
-_DEFAULT_MAX_AGE = 1800
-# Persisted-set files untouched this long are garbage-collected on reseed
-# (same 14-day horizon as pre-tool-use's reads_*.txt sweep).
-_GC_SECONDS = 14 * 24 * 3600
-_SNIFF_BYTES = 8192
-
-
-def estimated_tokens(data: bytes) -> int:
-    """Over-estimate of the token count of *data* as the harness re-reads it.
-
-    ~3 bytes per token (real code and prose average nearer 4) plus one token
-    per line for the line-number prefix a re-read carries. Deliberately high:
-    an over-estimate only costs one extra Read.
-    """
-    return len(data) // 3 + 1 + data.count(b"\n")
+ANSWER_YES = "reattached"
+ANSWER_NO = "no"
 
 
-def within_token_cap(path: str, cap: int = TOKEN_CAP) -> bool:
-    """True only when *path* is positively known to fit under *cap*."""
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _line_around(fh: BinaryIO, pos: int, size: int) -> tuple[bytes, int] | None:
+    """The whole line containing byte *pos* (newline excluded) and the offset
+    just past its newline; None when the line is longer than MAX_LINE_BYTES
+    or unterminated (a row still being written)."""
+    lo = max(0, pos - MAX_LINE_BYTES)
+    fh.seek(lo)
+    nl = fh.read(pos - lo).rfind(b"\n")
+    if nl < 0 and lo > 0:
+        return None
+    start = lo + nl + 1
+    fh.seek(pos)
+    end = fh.read(min(size, pos + MAX_LINE_BYTES) - pos).find(b"\n")
+    if end < 0 or pos + end - start > MAX_LINE_BYTES:
+        return None
+    fh.seek(start)
+    return fh.read(pos + end - start), pos + end + 1
+
+
+def _parse(found: tuple[bytes, int] | None) -> dict | None:
+    if found is None:
+        return None
     try:
-        size = os.path.getsize(path)
-        # Fast reject: even at the estimate's floor it cannot fit.
-        if size // 3 > cap:
+        row = json.loads(found[0])
+    except ValueError:
+        return None
+    return row if isinstance(row, dict) else None
+
+
+def _last_boundary_end(fh: BinaryIO, size: int, window: int) -> int | None:
+    """Offset just past the latest verified compact_boundary row within the
+    last *window* bytes; None when there is none."""
+    floor = max(0, size - window)
+    end = size
+    overlap = len(_BOUNDARY_MARKER) - 1
+    while end > floor:
+        start = max(floor, end - CHUNK_BYTES)
+        fh.seek(start)
+        block = fh.read(min(size, end + overlap) - start)
+        idx = len(block)
+        while True:
+            idx = block.rfind(_BOUNDARY_MARKER, 0, idx)
+            if idx < 0:
+                break
+            found = _line_around(fh, start + idx, size)
+            row = _parse(found)
+            if found is not None and row is not None \
+                    and row.get("type") == "system" \
+                    and row.get("subtype") == "compact_boundary":
+                return found[1]
+        end = start
+    return None
+
+
+def _row_reattaches(row: dict | None, target: str) -> bool:
+    """True for a `file` attachment row carrying the WHOLE text of *target*."""
+    if not row or row.get("type") != "attachment":
+        return False
+    att = row.get("attachment")
+    if not isinstance(att, dict) or att.get("type") != "file":
+        return False
+    filename = att.get("filename")
+    if not isinstance(filename, str) or not filename:
+        return False
+    if not os.path.isabs(filename):
+        cwd = row.get("cwd")
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
             return False
-        with open(path, "rb") as fh:
-            data = fh.read(size + 1)
-    except OSError:
+        filename = os.path.join(cwd, filename)
+    if _norm(filename) != target:
         return False
-    if b"\x00" in data[:_SNIFF_BYTES]:
-        return False  # binary: not re-read as text, never let in
+    content = att.get("content")
+    if not isinstance(content, dict) or content.get("type") != "text":
+        return False
+    inner = content.get("file")
+    if not isinstance(inner, dict) or not isinstance(inner.get("content"), str):
+        return False
+    # A line range is not the whole file.
+    if inner.get("startLine", 1) not in (None, 0, 1):
+        return False
+    num, total = inner.get("numLines"), inner.get("totalLines")
+    if isinstance(num, int) and isinstance(total, int) and num < total:
+        return False
+    return True
+
+
+def was_reattached(transcript_path: str, target_path: str, agent_id: str = "",
+                   window: int = SCAN_MAX_BYTES) -> bool:
+    """Did the harness re-attach the whole of *target_path* after the latest
+    compaction recorded in *transcript_path*? Fails closed (False) on every
+    doubt — see the module docstring."""
+    if agent_id or not transcript_path or not target_path:
+        return False
     try:
-        data.decode("utf-8")
-    except UnicodeDecodeError:
+        target = _norm(target_path)
+        with open(transcript_path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            pos = _last_boundary_end(fh, size, window)
+            if pos is None:
+                return False
+            overlap = len(_FILE_MARKER) - 1
+            while pos < size:
+                fh.seek(pos)
+                block = fh.read(min(CHUNK_BYTES + overlap, size - pos))
+                idx = block.find(_FILE_MARKER)
+                while 0 <= idx < CHUNK_BYTES:
+                    found = _line_around(fh, pos + idx, size)
+                    if _row_reattaches(_parse(found), target):
+                        return True
+                    idx = block.find(_FILE_MARKER, idx + 1)
+                pos += CHUNK_BYTES
+    except (OSError, ValueError):
         return False
-    return estimated_tokens(data) <= cap
+    return False
 
 
-def _resolve(entry: str, project_dir: str) -> str:
-    return os.path.normpath(os.path.join(project_dir, entry))
-
-
-def select_reattached(entries: Iterable[str], project_dir: str,
-                      limit: int = MAX_REATTACHED,
-                      cap: int = TOKEN_CAP) -> list[str]:
-    """The ledger entries (original spelling, newest mtime first) that the
-    harness re-attached WITH content after compaction.
-
-    *entries* are the reads-ledger lines in call order; relative entries
-    resolve against *project_dir*.
-    """
-    # Keyed by the case-normalised path (one file, one slot, on Windows too).
-    last_touch: dict[str, tuple[int, str]] = {}
-    for idx, raw in enumerate(entries):
-        entry = raw.strip()
-        if not entry:
-            continue
-        last_touch[os.path.normcase(_resolve(entry, project_dir))] = (idx, entry)
-
-    recent_touch = {
-        p for p, _ in sorted(last_touch.items(), key=lambda kv: kv[1][0],
-                             reverse=True)[:limit]
-    }
-    dated: list[tuple[float, int, str, str]] = []
-    for path, (idx, entry) in last_touch.items():
-        if not os.path.isfile(path):
-            continue  # deleted (or never a regular file): nothing re-read
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            continue
-        dated.append((mtime, idx, path, entry))
-    dated.sort(reverse=True)
-    picked = dated[:limit]
-    return [entry for _, _, path, entry in picked
-            if path in recent_touch and within_token_cap(path, cap)]
-
-
-def state_dir(project_dir: str) -> str:
-    return os.path.join(project_dir, ".claude", "state")
-
-
-def reads_ledger_path(project_dir: str, key: str) -> str:
-    """Must match SESSION_READS_FILE in pre-tool-use.{sh,ps1}."""
-    return os.path.join(state_dir(project_dir), f"reads_{key}.txt")
-
-
-def reattached_path(project_dir: str, key: str) -> str:
-    return os.path.join(state_dir(project_dir), f"compact_reattached_{key}.txt")
+# The snapshot section pre-compact-save writes first; the harness re-injects
+# a FRESH git status after compaction, so the stale copy is not replayed.
+# Must match the header written by pre-compact-save.{sh,ps1}.
+_SNAPSHOT_GIT_STATUS_HEADER = "## Modified Files (git status"
+SNAPSHOT_LINE_CAP = 50
 
 
 def _read_lines(path: str) -> list[str]:
@@ -174,96 +219,6 @@ def _read_lines(path: str) -> list[str]:
             return fh.read().splitlines()
     except OSError:
         return []
-
-
-def _write_atomic(path: str, lines: list[str]) -> None:
-    atomic_write_text(Path(path), "".join(f"{line}\n" for line in lines),
-                      fsync=False)
-
-
-def _remove(path: str) -> None:
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
-def _gc_reattached(project_dir: str, now: float) -> None:
-    sdir = state_dir(project_dir)
-    try:
-        names = os.listdir(sdir)
-    except OSError:
-        return
-    for name in names:
-        if name.startswith("compact_reattached_") and name.endswith(".txt"):
-            path = os.path.join(sdir, name)
-            try:
-                if now - os.path.getmtime(path) > _GC_SECONDS:
-                    os.remove(path)
-            except OSError:
-                pass
-
-
-def _project_relative(entry: str, project_dir: str) -> str:
-    """POSIX path of *entry* relative to the project; "" when it lies on
-    another drive (Windows) — the re-inject compares only project files."""
-    try:
-        return os.path.relpath(_resolve(entry, project_dir),
-                               project_dir).replace(os.sep, "/")
-    except ValueError:
-        return ""
-
-
-def reseed(project_dir: str, key: str) -> list[str]:
-    """Replace the reads ledger with the re-attached set; persist the set for
-    the SessionStart(compact) re-inject. Returns the set.
-
-    On any failure the ledger is removed (the safe, pre-v0.2.104 state) and
-    the error propagates to the caller.
-    """
-    ledger = reads_ledger_path(project_dir, key)
-    marker = reattached_path(project_dir, key)
-    try:
-        chosen = select_reattached(_read_lines(ledger), project_dir)
-        os.makedirs(state_dir(project_dir), exist_ok=True)
-        if chosen:
-            _write_atomic(ledger, chosen)
-        else:
-            _remove(ledger)
-        _write_atomic(marker, [r for r in (_project_relative(e, project_dir)
-                                           for e in chosen) if r])
-        _gc_reattached(project_dir, time.time())
-        return chosen
-    except Exception:
-        _remove(ledger)
-        _remove(marker)
-        raise
-
-
-def _max_age() -> int:
-    raw = (os.environ.get("VCO_SNAPSHOT_MAX_AGE") or "").strip()
-    return int(raw) if raw.isdigit() else _DEFAULT_MAX_AGE
-
-
-def reattached(project_dir: str, key: str) -> list[str]:
-    """The persisted set (project-relative POSIX paths) when it belongs to
-    the compaction that just happened; empty otherwise (nothing is then
-    skipped by the re-inject — the safe direction)."""
-    marker = reattached_path(project_dir, key)
-    try:
-        mtime = os.path.getmtime(marker)
-    except OSError:
-        return []
-    if mtime < time.time() - _max_age():
-        return []
-    return [line for line in _read_lines(marker) if line.strip()]
-
-
-# The snapshot section pre-compact-save writes first; the harness re-injects
-# a FRESH git status after compaction, so the stale copy is not replayed.
-# Must match the header written by pre-compact-save.{sh,ps1}.
-_SNAPSHOT_GIT_STATUS_HEADER = "## Modified Files (git status"
-SNAPSHOT_LINE_CAP = 50
 
 
 def snapshot_body(path: str, line_cap: int = SNAPSHOT_LINE_CAP) -> list[str]:
@@ -283,11 +238,12 @@ def snapshot_body(path: str, line_cap: int = SNAPSHOT_LINE_CAP) -> list[str]:
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m vco_lib.compact_reattach")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("reseed", "reattached"):
-        p = sub.add_parser(name)
-        p.add_argument("--project", required=True)
-        p.add_argument("--key", required=True,
-                       help="the session (or session__agent) ledger key")
+    chk = sub.add_parser("check", help="print 'reattached' (exit 0) when the "
+                         "path was re-attached after the latest compaction, "
+                         "else 'no' (exit 1)")
+    chk.add_argument("--transcript", default="")
+    chk.add_argument("--path", required=True)
+    chk.add_argument("--agent-id", default="")
     snap = sub.add_parser("snapshot-body")
     snap.add_argument("--path", required=True)
     args = parser.parse_args(argv)
@@ -295,23 +251,11 @@ def _main(argv: list[str] | None = None) -> int:
         for line in snapshot_body(args.path):
             print(line)
         return 0
-    key = "".join(ch for ch in args.key if ch.isalnum() or ch in "_-")
-    if not key:
-        # No usable ledger key: report failure so the caller falls back to
-        # its conservative path (post-compact clears the ledger).
-        return 1 if args.cmd == "reseed" else 0
-    project = os.path.abspath(args.project)
-    if args.cmd == "reseed":
-        try:
-            reseed(project, key)
-        except Exception as exc:  # noqa: BLE001 - reported, ledger already cleared
-            print(f"[VCO] compact_reattach reseed failed ({exc}); the Build "
-                  "Anchor reads list was cleared instead", file=sys.stderr)
-            return 1
+    if was_reattached(args.transcript, args.path, args.agent_id):
+        print(ANSWER_YES)
         return 0
-    for line in reattached(project, key):
-        print(line)
-    return 0
+    print(ANSWER_NO)
+    return 1
 
 
 if __name__ == "__main__":

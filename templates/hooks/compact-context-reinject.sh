@@ -101,24 +101,22 @@ if [ -z "$HOOK_SOURCE" ] || [ "$HOOK_SOURCE" = "compact" ]; then
     _IS_COMPACT_SOURCE=1
 fi
 
-# v0.2.104: after a compaction Claude Code itself re-attaches up to five
-# recently read/edited files and re-injects CLAUDE.md, the plan-mode plan,
-# auto memory, invoked skills and a fresh git status (documented harness
-# rule — facts + URL in vco_lib/compact_reattach.py, the ONE home). Repeating
-# any of that here only spends the 10 000-char hook budget twice, so when the
-# payload POSITIVELY says source=compact (an absent/unknown source keeps the
-# full pre-v0.2.104 shape — repeating is the safe direction):
-#   * a section whose file is in the re-attached set (as estimated by
-#     post-compact, persisted under .claude/state/compact_reattached_<id>.txt)
-#     becomes a one-line pointer;
-#   * the Recent Commits section and the snapshot's git-status block are
-#     dropped (the harness's fresh git status carries both).
-# The estimate is read through `python -m vco_lib.compact_reattach`; when
-# that is unavailable nothing is skipped (re-injecting twice is the safe
-# direction). MUST MATCH compact-context-reinject.ps1.
+# v0.2.104: after a compaction Claude Code itself re-injects a fresh git
+# status (which carries the recent commits) — vendor page
+# https://code.claude.com/docs/en/context-window, "What survives compaction".
+# Repeating it here only spends the 10 000-char hook budget twice, so when
+# the payload POSITIVELY says source=compact (an absent/unknown source keeps
+# the full pre-v0.2.104 shape — repeating is the safe direction) the Recent
+# Commits section and the snapshot's git-status block are dropped. Every
+# other section (CONTEXT_STATE, the session state, the plan) is re-injected
+# in full: whether the harness also re-attached one of those files is only
+# flushed to the transcript around this hook's own start, so it is not
+# knowable reliably here. The snapshot trimming is
+# `python -m vco_lib.compact_reattach snapshot-body`; when that is
+# unavailable the plain first 50 lines are replayed.
+# MUST MATCH compact-context-reinject.ps1.
 _IS_HARNESS_COMPACT=0
 [ "$HOOK_SOURCE" = "compact" ] && _IS_HARNESS_COMPACT=1
-REATTACHED=""
 _RC_PY=""
 if [ "$_IS_HARNESS_COMPACT" = "1" ] && [ -n "${PY:-}" ]; then
     # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
@@ -129,21 +127,7 @@ if [ "$_IS_HARNESS_COMPACT" = "1" ] && [ -n "${PY:-}" ]; then
     fi
     _RC_PY="${VCO_VENV_PYTHON:-$PY}"
     [ -x "$_RC_PY" ] || _RC_PY="$PY"
-    if [ -n "$SESSION_ID" ]; then
-        if ! REATTACHED=$("$_RC_PY" -m vco_lib.compact_reattach reattached \
-                --project "$PROJECT_DIR" --key "$SESSION_ID"); then
-            echo "[VCO] compact-context-reinject: vco_lib.compact_reattach unavailable (interpreter: $_RC_PY); re-injecting every section" >&2
-            REATTACHED=""
-        fi
-    fi
 fi
-# _rc_reattached <project-relative path> — exit 0 when the harness re-attached it.
-_rc_reattached() {
-    [ -n "$REATTACHED" ] && printf '%s\n' "$REATTACHED" | grep -qxF "$1"
-}
-_rc_pointer() {
-    printf '%s\nAlready in context: Claude Code re-attached %s after the compaction, so it is not repeated here.' "$1" "$2"
-}
 
 # The shared injection cap. A missing helper is a broken install; the hook
 # still re-injects (uncapped) rather than dropping the user's state.
@@ -251,9 +235,7 @@ S_ctx=""; S_sess=""; S_plan=""; S_commits=""; S_snap=""
 #    The header names WHY we fired (compact vs startup/resume) so the model
 #    does not read a fresh session's injection as post-compaction recovery.
 if [ -f "$PROJECT_DIR/.claude/CONTEXT_STATE.md" ]; then
-    if [ "$_IS_HARNESS_COMPACT" = "1" ] && _rc_reattached ".claude/CONTEXT_STATE.md"; then
-        S_ctx=$(_rc_pointer "## Current Task State" ".claude/CONTEXT_STATE.md")
-    elif [ "$_IS_COMPACT_SOURCE" = "1" ]; then
+    if [ "$_IS_COMPACT_SOURCE" = "1" ]; then
         S_ctx="## Current Task State (re-injected after compaction)
 $(cat "$PROJECT_DIR/.claude/CONTEXT_STATE.md")"
     else
@@ -270,10 +252,7 @@ fi
 # so single-session projects (no per-session file) pay nothing.
 if [ -n "$SESSION_ID" ]; then
     SESSION_CONTEXT_FILE="$PROJECT_DIR/.claude/context/CONTEXT_STATE_${SESSION_ID}.md"
-    if [ -f "$SESSION_CONTEXT_FILE" ] && [ "$_IS_HARNESS_COMPACT" = "1" ] \
-            && _rc_reattached ".claude/context/CONTEXT_STATE_${SESSION_ID}.md"; then
-        S_sess=$(_rc_pointer "## This Session's Task State" ".claude/context/CONTEXT_STATE_${SESSION_ID}.md")
-    elif [ -f "$SESSION_CONTEXT_FILE" ]; then
+    if [ -f "$SESSION_CONTEXT_FILE" ]; then
         S_sess="## This Session's Task State (re-injected after compaction)
 $(head -120 "$SESSION_CONTEXT_FILE")"
     fi
@@ -281,10 +260,7 @@ fi
 
 # 2. Active plan summary -- MIDDLE position (line cap: 30)
 LATEST_PLAN=$(ls -t "$PROJECT_DIR/.claude/context/plans/"*.md 2>/dev/null | grep -v archive | head -1)
-if [ -n "$LATEST_PLAN" ] && [ "$_IS_HARNESS_COMPACT" = "1" ] \
-        && _rc_reattached ".claude/context/plans/$(basename "$LATEST_PLAN")"; then
-    S_plan=$(_rc_pointer "## Active Plan: $(basename "$LATEST_PLAN")" ".claude/context/plans/$(basename "$LATEST_PLAN")")
-elif [ -n "$LATEST_PLAN" ]; then
+if [ -n "$LATEST_PLAN" ]; then
     S_plan="## Active Plan: $(basename "$LATEST_PLAN")
 $(head -30 "$LATEST_PLAN")"
 fi
