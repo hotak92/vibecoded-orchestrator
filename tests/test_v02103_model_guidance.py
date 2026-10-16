@@ -94,7 +94,7 @@ class TestTriStateProbe:
         ]
         for result, expected in cases:
             monkeypatch.setattr(secrets, "VendorKeyResolver",
-                                lambda _r=result: _Resolver(_r))
+                                lambda _r=result, **_kw: _Resolver(_r))
             probe = model_selection.vendor_key_state_probe()
             assert probe("zai") is expected
 
@@ -108,7 +108,7 @@ class TestTriStateProbe:
             def resolve(self, _vendor):
                 return secrets.KeyResult(problem="busy", transient=True)
 
-        monkeypatch.setattr(secrets, "VendorKeyResolver", lambda: _Resolver())
+        monkeypatch.setattr(secrets, "VendorKeyResolver", lambda **_kw: _Resolver())
         _fake_vendors_module(monkeypatch, {"zai": object()})
         probe = model_selection.vendor_key_probe()
         assert probe("zai") is False

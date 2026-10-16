@@ -4694,7 +4694,10 @@ def _continue_in_venv_after_deps(venv_python: Path, args: argparse.Namespace,
     ran) finished on the launching interpreter. The record carries this run's
     buffered log lines, the answers it already has and its deferral entries;
     the singleton lock is released just before the hop (the child takes it
-    again). A no-op when this run already runs in that venv or is the child."""
+    again). A no-op when this run already runs in that venv or is the child.
+    First: on a machine with no ``service_endpoints`` rows yet (a first install) the
+    rows-pending grace is set, so no step before [5b] warns "no usable row"."""
+    _service_endpoints.mark_rows_pending()
     _install_companions.continue_in_venv(venv_python, sys.argv, {
         "pending_events": list(_PENDING_EVENTS),
         "decisions": {
@@ -11468,7 +11471,7 @@ def _reconcile_service_endpoints(
         return None
     _SERVICE_ENDPOINTS.update(rows=dict(result.rows), pinned=result.pinned,
                               weaviate_pending=result.weaviate_pending)
-    os.environ.update(_service_endpoints.transport_env(result.rows))
+    _service_endpoints.pin_process_env(result.rows)  # also ends the rows-pending grace
     if result.migrate_code_embed and rt:
         _migrate_code_embed_with_cache(result.rows["code_embed"], rt, deferral_report)
     decisions: dict = {}
