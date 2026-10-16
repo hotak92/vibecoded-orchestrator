@@ -2430,6 +2430,7 @@ def report_trigger_result(
     project_name: str,
     deferral_report,
     log_event,
+    folder: Optional[Path] = None,
 ) -> None:
     """Surface a :func:`spawn_background_resync` outcome (v0.2.96 M-2).
 
@@ -2446,6 +2447,11 @@ def report_trigger_result(
     ``log_event`` is install.py's ``_log_install_event(step, level, msg)``,
     passed IN rather than imported so the event vocabulary stays
     install.py's.  Soft-fail throughout, exactly as the shim was.
+
+    ``folder`` (v0.2.104) is the ledger's folder: when given, a ``not_owed``
+    clear of an entry that WAS present also closes that condition's retry
+    episode (:func:`vco_lib.deferral_retry.record_episode_end`), so a later
+    occurrence is not reported as already capped by this one's attempts.
     """
     def _log(level: str, msg: str) -> None:
         try:
@@ -2459,6 +2465,11 @@ def report_trigger_result(
     elif result.status == "not_owed":
         print("  → code-graph resync not owed (all rows at current embed revision)")
         try:
+            if folder is not None and deferral_report.has_condition(_CONDITION_ID):
+                from vco_lib.deferral_retry import record_episode_end
+
+                record_episode_end(Path(folder), _CONDITION_ID,
+                                   "update probe: no resync owed")
             deferral_report.mark_resolved(_CONDITION_ID)
         except Exception as exc:  # noqa: BLE001
             _log("warn", f"could not resolve resync deferral: {exc}")
@@ -2530,7 +2541,21 @@ def walk_uses_container(project_name: Optional[str]) -> bool:
 def code_backend_down(
     project_name: Optional[str], code_embed_url: Optional[str] = None,
 ) -> "tuple[Optional[str], bool]":
-    """``(label, container_used)``: ``label`` names the embedding backend the
+    """``(label, container_used)`` — see :func:`_code_backend_down_service`."""
+    down, container_used, _service = _code_backend_down_service(project_name, code_embed_url)
+    return down, container_used
+
+
+def _code_backend_down_service(
+    project_name: Optional[str], code_embed_url: Optional[str] = None,
+) -> "tuple[Optional[str], bool, Optional[str]]":
+    """``(label, container_used, service)``: ``service`` is the container
+    service (``code_embed`` / ``ollama``, the :mod:`vco_lib.containers` keys)
+    whose backend did NOT ANSWER — ``None`` when all answer, or when the
+    backend answered and refused for another reason (a model not pulled: no
+    restart is in flight, so nothing is worth waiting for).
+
+    ``(label, container_used)``: ``label`` names the embedding backend the
     project's walk needs that does not answer (None when all do);
     ``container_used`` says whether that walk embeds through the code_embed
     container (the stale-image gate applies only then).
@@ -2551,8 +2576,9 @@ def code_backend_down(
 
     models = _walk_code_models(project_name)
     if not models:
-        ok = code_embed_service_healthy(code_embed_url)
-        return (None if ok else f"code-embed service (:{DEFAULT_CODE_EMBED_PORT})"), True
+        if code_embed_service_healthy(code_embed_url):
+            return None, True, None
+        return f"code-embed service (:{DEFAULT_CODE_EMBED_PORT})", True, "code_embed"
     container_used = False
     for model in models:
         serving = code_serving_backend(model)
@@ -2560,7 +2586,7 @@ def code_backend_down(
             container_used = True
             if not code_embed_service_healthy(code_embed_url):
                 return (f"the code_embed container (:{DEFAULT_CODE_EMBED_PORT}) serving "
-                        f"{model}"), True
+                        f"{model}"), True, "code_embed"
         elif serving == CODE_SERVED_BY_OPENAI:
             continue
         else:
@@ -2571,10 +2597,68 @@ def code_backend_down(
             try:
                 _present, missing = ollama_pull.verify_present(base, [model])
             except Exception:  # noqa: BLE001 — Ollama down / bad body
-                return f"Ollama at {base} (serving {model})", container_used
+                return f"Ollama at {base} (serving {model})", container_used, "ollama"
             if missing:
-                return f"Ollama at {base} (model {model} not pulled)", container_used
-    return None, container_used
+                return f"Ollama at {base} (model {model} not pulled)", container_used, None
+    return None, container_used, None
+
+
+def _backend_container_running(service: str) -> bool:
+    """True only when the container serving ``service`` positively EXISTS and
+    is RUNNING — the one state in which a backend that does not answer is
+    still starting (a model loading after a (re)start), so waiting can help.
+    Absent, stopped, no runtime, or unreadable → False (conservative: no wait,
+    the caller defers exactly as before). Read-only; never raises."""
+    try:
+        from vco_lib import containers as _containers
+        from vco_lib.ollama_pull import inspect_container_run
+
+        runtime = _containers.installed_runtime()
+        if not runtime:
+            return False
+        name = _containers.find_existing_container(service, runtime=runtime)
+        if not name:
+            return False
+        state = inspect_container_run(runtime, name)
+        return bool(state is not None and state.exists and state.running)
+    except Exception as exc:  # noqa: BLE001 — a probe never gates the update
+        logger.info("codegraph resync: container state of %s unreadable (%s)", service, exc)
+        return False
+
+
+def code_backend_down_waiting(
+    project_name: Optional[str], code_embed_url: Optional[str] = None,
+) -> "tuple[Optional[str], bool]":
+    """:func:`code_backend_down`, but a backend whose container is RUNNING and
+    not answering yet is WAITED for before it is called down.
+
+    v0.2.104 (field 2026-10-16): a GUI update restarted the code_embed
+    container and, five seconds later, the update's resync probed ``/health``
+    once, found the model still loading, and deferred
+    ``codegraph_embed_resync_pending`` for work that could have run a minute
+    later. The wait is the shared transient policy's BATCH refusal bound
+    (:func:`vco_lib.retry_after.wait_until_reachable`, ``interactive=False``
+    — ``VCO_EMBED_503_TOLERANCE_SECS``, long by design so slow machines
+    finish loading), applied to this ONE wait — never a global install
+    timeout. A container that is absent or stopped is not starting, so it
+    is not waited for: the answer is the instant probe's, as before."""
+    down, container_used, service = _code_backend_down_service(project_name, code_embed_url)
+    if down is None or service is None or not _backend_container_running(service):
+        return down, container_used
+    from vco_lib.retry_after import resolve_refused_tolerance, wait_until_reachable
+
+    print(f"  → {down} is not answering yet but its container is running (starting "
+          f"up?) — waiting up to {resolve_refused_tolerance(interactive=False):.0f}s "
+          "before deferring the code-graph resync", flush=True)
+    latest: "dict[str, tuple[Optional[str], bool]]" = {}
+
+    def _answers() -> bool:
+        label, used, _svc = _code_backend_down_service(project_name, code_embed_url)
+        latest["state"] = (label, used)
+        return label is None
+
+    wait_until_reachable(_answers, interactive=False, log=logger)
+    return latest.get("state", (down, container_used))
 
 
 def code_embed_image_verdict(
@@ -2783,18 +2867,64 @@ def build_stale_image_deferral(
     )
 
 
-def _stale_image_resume_command(repo_root: Path, project_name: str) -> str:
+def driver_argv(
+    python: str,
+    repo_root: Path,
+    analyzer: Path,
+    project_name: str,
+    *,
+    index_dot_claude: bool = True,
+    force_rewalk: bool = False,
+    prune_stale: bool = False,
+) -> "list[str]":
+    """The R-7 resync DRIVER's argv — ONE home for the detached spawn AND
+    every ``codegraph_embed_resync_pending`` entry's printed command.
+
+    v0.2.104 (G5): the entries used to print the bare analyzer
+    (``analyze_code_graph.py <root> --project <name>``). That walk re-embeds
+    the stale rows, but nothing in it clears this condition — the driver's
+    post-walk probe is the clear (:func:`_resolve_persisted_resync_deferral`
+    on a positive zero) — so a user who ran the printed command successfully
+    still found the entry in UPDATE_DEFERRED.md. The driver runs the same
+    analyzer walk, then re-probes and clears. ``-m`` with the resolved venv
+    interpreter imports ``vco_lib`` from any cwd.
+    """
+    argv = [
+        str(python), "-m", "vco_lib.codegraph_resync", "--run-resync",
+        "--project", project_name,
+        "--repo-root", str(repo_root),
+        "--analyzer", str(analyzer),
+    ]
+    # P1b-1 (v0.2.75): forward the `.claude` decision so the driver's
+    # post-walk verify probe classifies with the SAME gate as the spawn's
+    # owed-probe (otherwise spawn says "owed" / verify says "converged" —
+    # or vice versa — for `.claude/**` rows on user projects).
+    if index_dot_claude:
+        argv.append("--index-dot-claude")
+    if prune_stale:
+        argv.append("--prune-stale")
+    # v0.2.92: forwarded to the driver, which forwards it to the analyzer.
+    if force_rewalk:
+        argv.append("--force-rewalk")
+    return argv
+
+
+def driver_resume_command(*args: Any, **kwargs: Any) -> str:
+    """:func:`driver_argv`, shell-quoted on one line (R-5 rider: the command
+    lands verbatim in UPDATE_DEFERRED.md and must survive spaces)."""
+    return " ".join(shlex.quote(part) for part in driver_argv(*args, **kwargs))
+
+
+def _stale_image_resume_command(resync: str) -> str:
     """The manual recovery line the stale-image entry prints (single-line).
 
     Rebuild FIRST (``install.py --update`` is what rebuilds the image on an
     ordinary install), resync SECOND — the ordering is the whole point of
-    the entry, so the command must not read as one optional step.
+    the entry, so the command must not read as one optional step. ``resync``
+    is :func:`driver_resume_command` (pre-v0.2.104 this line built its own
+    driver command with a bare ``python`` and no ``--analyzer``, which the
+    driver rejects with exit 2).
     """
-    resync = " ".join(shlex.quote(part) for part in (
-        "python", "-m", "vco_lib.codegraph_resync", "--run-resync",
-        "--project", project_name,
-        "--repo-root", str(repo_root),
-    ))
     return (
         "python install.py --update  # 1) rebuilds the code_embed image; "
         f"2) THEN re-run the resync: {resync}"
@@ -2802,7 +2932,7 @@ def _stale_image_resume_command(repo_root: Path, project_name: str) -> str:
 
 
 def _record_stale_image_deferral(
-    repo_root: Path, project_name: str,
+    repo_root: Path, project_name: str, resync_cmd: str,
 ) -> None:
     """Persist/refresh the stale-image entry in the driver's own ledger write.
 
@@ -2813,7 +2943,7 @@ def _record_stale_image_deferral(
     """
     try:
         entry = build_stale_image_deferral(
-            project_name, _stale_image_resume_command(Path(repo_root), project_name),
+            project_name, _stale_image_resume_command(resync_cmd),
         )
         if entry is None:
             return
@@ -3989,7 +4119,11 @@ def _run_resync_and_verify_slotted(
             "it; rebuild the image first (see UPDATE_DEFERRED.md)",
             flush=True,
         )
-        _record_stale_image_deferral(repo_root, project_name)
+        _record_stale_image_deferral(repo_root, project_name, driver_resume_command(
+            _python_exe.resolve_or_current(), Path(repo_root), Path(analyzer_path),
+            project_name, index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            prune_stale=prune_stale,
+        ))
         # #31 discipline: the spawn's registration (when there was one — the
         # retry and manual paths register nothing) must not be left to the
         # pid-aliveness reconciler's false "died before completing" verdict
@@ -4313,8 +4447,14 @@ def _run_resync_and_verify_slotted(
         f"{', NO PROGRESS since the previous walk' if no_progress else ''})",
         flush=True,
     )
+    # v0.2.104 (G5): the DRIVER, not the bare walk (`resume_cmd`) — its
+    # post-walk probe is what clears this entry once the rows converge.
     _record_unconverged_deferral(
-        repo_root, project_name, counts, resume_cmd, stuck,
+        repo_root, project_name, counts, driver_resume_command(
+            argv[0], Path(repo_root), Path(analyzer_path), project_name,
+            index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            prune_stale=prune_stale,
+        ), stuck,
     )
     return 0
 
@@ -4561,6 +4701,7 @@ def spawn_background_resync(
     check_owed: bool = True,
     force_rewalk: bool = False,
     index_dot_claude: bool = True,
+    wait_for_starting_backend: bool = False,
 ) -> ResyncTriggerResult:
     """Launch a BACKGROUND, revision-gated full re-analyze of ``repo_root``.
 
@@ -4577,6 +4718,13 @@ def spawn_background_resync(
     Degrade path: when ``check_service`` and the code-embed service is down, we
     do NOT spawn (a re-embed would fail). We return ``status="deferred"`` with a
     :class:`DeferralEntry` for the caller to record; the update still succeeds.
+
+    ``wait_for_starting_backend`` (v0.2.104, install.py's update trigger): a
+    backend whose container is running but not answering yet is waited for
+    (:func:`code_backend_down_waiting`) instead of deferring on one instant
+    probe — the update that just restarted the container must not defer the
+    resync while the model loads. Off by default: a scoped walk's hand-off
+    must never block on it.
 
     Never raises: precondition failures (missing analyzer/python, empty project
     name, spawn error) return a ``skipped``/``deferred`` result with a message.
@@ -4639,9 +4787,11 @@ def spawn_background_resync(
 
     # R-5 rider (A-1): shlex-quote every part — the command lands verbatim in
     # UPDATE_DEFERRED.md and must survive paths containing spaces.
-    resume_cmd = " ".join(
-        shlex.quote(part)
-        for part in (str(py), str(analyzer), str(repo_root), "--project", project_name)
+    # v0.2.104 (G5): the DRIVER command (see `driver_argv`) — the bare
+    # analyzer walk this used to print never clears the entry it is printed in.
+    resume_cmd = driver_resume_command(
+        py, Path(repo_root), analyzer, project_name,
+        index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
     )
 
     # R-6 (v0.2.73): gate on OWED WORK, not on "--update happened". Pre-fix,
@@ -4742,7 +4892,11 @@ def spawn_background_resync(
     # CodeSage, nothing for OpenAI), so CPU-only hosts fill and resync.
     container_used = True
     if check_service:
-        down, container_used = code_backend_down(project_name, code_embed_url)
+        down, container_used = (
+            code_backend_down_waiting(project_name, code_embed_url)
+            if wait_for_starting_backend
+            else code_backend_down(project_name, code_embed_url)
+        )
         if down is not None:
             deferral = build_resync_deferral(project_name, resume_cmd, backend=down)
             return ResyncTriggerResult(
@@ -4770,7 +4924,7 @@ def spawn_background_resync(
         repo_root, code_embed_url,
     ) == _STALE_VERDICT:
         deferral = build_stale_image_deferral(
-            project_name, _stale_image_resume_command(Path(repo_root), project_name),
+            project_name, _stale_image_resume_command(resume_cmd),
         )
         return ResyncTriggerResult(
             status="deferred",
@@ -4831,21 +4985,10 @@ def spawn_background_resync(
     # cwd, and the cwd here is the USER PROJECT — so the child could only ever
     # import `vco_lib` by accident. `-m` resolves the package through the
     # interpreter's own environment, which is the thing we just preflighted.
-    argv = [
-        py, "-m", "vco_lib.codegraph_resync", "--run-resync",
-        "--project", project_name,
-        "--repo-root", str(repo_root),
-        "--analyzer", str(analyzer),
-    ]
-    # P1b-1 (v0.2.75): forward the `.claude` decision so the driver's
-    # post-walk verify probe classifies with the SAME gate as this spawn's
-    # owed-probe (otherwise spawn says "owed" / verify says "converged" —
-    # or vice versa — for `.claude/**` rows on user projects).
-    if index_dot_claude:
-        argv.append("--index-dot-claude")
-    # v0.2.92: forwarded to the driver, which forwards it to the analyzer.
-    if force_rewalk:
-        argv.append("--force-rewalk")
+    argv = driver_argv(
+        py, Path(repo_root), analyzer, project_name,
+        index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+    )
 
     # Detached background spawn. stdout/stderr go to a per-spawn log file
     # under <vct_root_dir>/logs/ (R-5 / RT-2 — pre-fix they went to DEVNULL,

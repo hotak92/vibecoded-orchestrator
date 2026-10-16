@@ -14411,6 +14411,7 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
             PROJECT_ROOT,
             project_name,
             python_exe=venv_python,
+            wait_for_starting_backend=True,
         )
     except Exception as exc:  # noqa: BLE001 — never crash the update
         _log_install_event(
@@ -14419,7 +14420,7 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
         )
         return
 
-    report_trigger_result(result, project_name, deferral_report, _log_install_event)
+    report_trigger_result(result, project_name, deferral_report, _log_install_event, PROJECT_ROOT)
 
 
 def _trigger_codegraph_identity_sweep(deferral_report: "DeferralReport") -> None:
