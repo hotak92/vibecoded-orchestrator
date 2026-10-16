@@ -174,6 +174,51 @@ class G4BundleExcludeTests(unittest.TestCase):
         self.assertEqual(result["g1_git_exclude"]["removed"], [])
         self.assertEqual(self.exclude.read_text(encoding="utf-8").splitlines()[0], "/.claude/")
 
+    def test_a_claude_line_the_user_appends_after_vcos_block_is_kept(self):
+        """M2: `echo '/.claude/' >> .git/info/exclude` lands right after VCO's
+        block; the next update must keep it (the user chose to hide .claude/)."""
+        self._bundle(update_mode=False)
+        with self.exclude.open("a", encoding="utf-8") as fh:
+            fh.write("/.claude/\n")
+        self.assertTrue(_ignored(self.proj, ".claude/CONTEXT_STATE.md"))
+        result = self._bundle(update_mode=True)
+        self.assertEqual(result["g1_git_exclude"]["removed"], [])
+        self.assertEqual(self.exclude.read_text(encoding="utf-8").splitlines()[-1], "/.claude/")
+        self._touch((".claude/CONTEXT_STATE.md",))
+        self.assertTrue(_ignored(self.proj, ".claude/CONTEXT_STATE.md"))
+
+    def test_a_users_claude_line_after_a_pre_v02104_block_is_kept(self):
+        """M2, upgrade path: VCO's old glob goes, the user's appended copy stays."""
+        self._bundle(update_mode=False)
+        self.exclude.write_text(
+            "\n# VCO safe-add (v0.2.63): keep orchestrator-created files out of your commits.\n"
+            "# This is .git/info/exclude (LOCAL-only) — not the tracked .gitignore.\n"
+            "/.claude/\n/CLAUDE.md\n/.claude/\n/my-notes/\n",
+            encoding="utf-8",
+        )
+        result = self._bundle(update_mode=True)
+        self.assertEqual(result["g1_git_exclude"]["removed"], ["/.claude/"])
+        lines = self.exclude.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines.count("/.claude/"), 1)
+        self.assertLess(lines.index("# VCO end"), lines.index("/.claude/"))
+        self.assertIn("/my-notes/", lines)
+
+    def test_a_retired_shipped_file_takes_its_exclude_line_with_it(self):
+        """L4: a script VCO stops shipping is deleted by the update; its line
+        must go too, or the user's own file at that path is hidden."""
+        self._bundle(update_mode=False)
+        self.assertIn("/.claude/scripts/notify.py",
+                      self.exclude.read_text(encoding="utf-8").splitlines())
+        (self.orch / "templates" / "scripts" / "notify.py").unlink()
+        result = self._bundle(update_mode=True)
+        self.assertIn(".claude/scripts/notify.py", result["actions"]["orphan-deleted"])
+        self.assertEqual(result["g1_git_exclude"]["removed"], ["/.claude/scripts/notify.py"])
+        self.assertNotIn("/.claude/scripts/notify.py",
+                         self.exclude.read_text(encoding="utf-8").splitlines())
+        self._touch((".claude/scripts/notify.py",))
+        self.assertFalse(_ignored(self.proj, ".claude/scripts/notify.py"))
+        self.assertTrue(_ignored(self.proj, ".claude/scripts/kg-search"))
+
 
 class G4PatternUnitTests(unittest.TestCase):
     def test_user_owned_paths_are_never_patterns(self):
@@ -189,7 +234,7 @@ class G4PatternUnitTests(unittest.TestCase):
             r".claude\agents\x.md": "/.claude/agents/x.md",
             ".claude/hooks/_lib/a.sh": "/.claude/hooks/_lib/",
             ".claude/skills/architect/SKILL.md": "/.claude/skills/architect/",
-            ".claude/specializations/x/y.md": "/.claude/specializations/",
+            ".claude/specializations/x/y.md": "/.claude/specializations/x/y.md",
             ".claude/.vco-manifest.json": "/.claude/.vco-manifest.json",
             ".claude/state/x": "/.claude/state/",
             "CLAUDE.md": "/CLAUDE.md",
@@ -233,10 +278,74 @@ class G4PatternUnitTests(unittest.TestCase):
         self.assertTrue(text.endswith("/e11 and 3 more"), text)
 
     def test_migration_only_touches_vco_blocks(self):
-        text = "/.claude/\n\n# VCO project move: x\n/.claude/\n/a\n\n/.vco-manifest.json\n"
-        new, removed = git_exclude._strip_legacy_vco_lines(text)
+        text = "*.swp\n\n# VCO project move: x\n/.claude/\n/a\n\n/.claude/\n/.vco-manifest.json\n"
+        new, removed = git_exclude._rewrite_vco_blocks(text)
         self.assertEqual(removed, ["/.claude/"])
-        self.assertEqual(new, "/.claude/\n\n# VCO project move: x\n/a\n\n/.vco-manifest.json\n")
+        self.assertEqual(
+            new,
+            "*.swp\n\n# VCO project move: x\n/a\n# VCO end\n\n/.claude/\n/.vco-manifest.json\n",
+        )
+
+    def test_a_claude_line_after_vcos_newer_entries_is_the_users(self):
+        """M2 (review reproduction): VCO never wrote `/.claude/` AFTER a
+        per-path `/.claude/<file>` entry, so that line is the user's."""
+        text = (
+            "# VCO safe-add (v0.2.63): x\n# This is .git/info/exclude\n"
+            "/.claude/hooks/a.sh\n/.claude/\n/my-own-private-notes/\n"
+        )
+        new, removed = git_exclude._rewrite_vco_blocks(text)
+        self.assertEqual(removed, [])
+        self.assertIn("/.claude/\n/my-own-private-notes/\n", new)
+        self.assertLess(new.index("# VCO end"), new.index("/.claude/\n"))
+
+    def test_a_repeated_line_is_never_vcos(self):
+        """VCO de-duplicates against the whole file: a repeat ends its block."""
+        text = "# VCO safe-add: x\n/.claude/\n/CLAUDE.md\n/.claude/\n"
+        new, removed = git_exclude._rewrite_vco_blocks(text)
+        self.assertEqual(removed, ["/.claude/"])
+        self.assertEqual(new, "# VCO safe-add: x\n/CLAUDE.md\n# VCO end\n/.claude/\n")
+
+    def test_new_blocks_end_with_the_end_marker_and_are_stable(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            (folder / ".git" / "info").mkdir(parents=True)
+            git_exclude.append_git_info_exclude(folder, ("/a", "/b"))
+            body = (folder / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+            self.assertTrue(body.endswith("/a\n/b\n# VCO end\n"), body)
+            again = git_exclude.append_git_info_exclude(folder, ("/a", "/b"))
+            self.assertEqual(again["action"], "noop")
+
+    def test_an_ended_block_keeps_a_claude_line_the_user_put_inside_it(self):
+        text = "# VCO safe-add: x\n/.claude/\n/a\n# VCO end\n"
+        new, removed = git_exclude._rewrite_vco_blocks(text)
+        self.assertEqual((new, removed), (text, []))
+
+    def test_retired_patterns_leave_vco_blocks_only(self):
+        text = (
+            "/.claude/hooks/old.sh\n\n# VCO safe-add: x\n/.claude/hooks/old.sh\n"
+            "/.claude/hooks/kept.sh\n# VCO end\n"
+        )
+        new, removed = git_exclude._rewrite_vco_blocks(text, ["/.claude/hooks/old.sh"])
+        self.assertEqual(removed, ["/.claude/hooks/old.sh"])
+        self.assertEqual(
+            new,
+            "/.claude/hooks/old.sh\n\n# VCO safe-add: x\n/.claude/hooks/kept.sh\n# VCO end\n",
+        )
+
+    def test_retired_entries_skip_patterns_still_shipped(self):
+        envelope = {"actions": {
+            "orphan-deleted": [".claude/hooks/old.sh", ".claude/skills/arch/gone.txt"],
+            "orphan-retired": [".claude/agents/mine-now.md"],
+        }}
+        out = git_exclude.retired_exclude_entries(envelope, ["/.claude/skills/arch/"])
+        self.assertEqual(out, ["/.claude/hooks/old.sh", "/.claude/agents/mine-now.md"])
+
+    def test_specializations_are_excluded_per_shipped_file(self):
+        """L6: a user's own review-kind doc beside the shipped ones stays addable."""
+        self.assertEqual(
+            git_exclude.exclude_pattern_for(".claude/specializations/review-kinds/code.md"),
+            "/.claude/specializations/review-kinds/code.md",
+        )
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")

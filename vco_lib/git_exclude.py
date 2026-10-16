@@ -41,7 +41,9 @@ user, Claude Code reads a committed ``.claude/settings.json`` and
 * :func:`append_git_info_exclude` removes the legacy ``/.claude/`` (and the
   never-matching root ``/.vco-manifest.json``) line from VCO's OWN blocks on
   every write, so a project upgraded from an older release is repaired by its
-  next bundle update; a user's own lines are never touched.
+  next bundle update; a user's own lines are never touched. Every block now
+  ends with :data:`VCO_BLOCK_END_MARKER` (older blocks are closed on the next
+  write), and a retired shipped file's line is dropped with the file.
 """
 
 from __future__ import annotations
@@ -64,12 +66,15 @@ __all__ = [
     "SAFE_ADD_SIDECAR_SUFFIX",
     "USER_OWNED_CLAUDE_PATHS",
     "VCO_BLOCK_MARKER",
+    "VCO_BLOCK_END_MARKER",
     "VCO_RUNTIME_EXCLUDES",
     "LEGACY_VCO_EXCLUDE_LINES",
     "exclude_pattern_for",
     "summarize_entries",
     "exclude_entries_for_created_paths",
     "safe_add_exclude_entries",
+    "retired_exclude_entries",
+    "bundle_exclude_plan",
     "append_git_info_exclude",
 ]
 
@@ -84,6 +89,12 @@ SAFE_ADD_SIDECAR_SUFFIX = ".vco.reference"
 #: carrying this prefix. The legacy-line migration recognises VCO's blocks by
 #: it, so it can repair what VCO wrote without touching the user's own lines.
 VCO_BLOCK_MARKER = "# VCO "
+
+#: The line that closes every block VCO writes (v0.2.104 on). Without it a
+#: block's end had to be guessed, and a line the user appended right after it
+#: (``echo '/.claude/' >> .git/info/exclude``) read as VCO's. Blocks from
+#: older releases are closed with it on the next write.
+VCO_BLOCK_END_MARKER = "# VCO end"
 
 #: Paths under ``.claude/`` that belong to the USER even when VCO seeded them.
 #: Never excluded, whatever a caller passes in. A trailing ``/`` means the
@@ -125,9 +136,11 @@ VCO_RUNTIME_EXCLUDES: tuple[str, ...] = (
 
 #: Bundle subtrees VCO owns outright: every file is always-overwritten from the
 #: shipped copy, so one directory entry replaces a line per file.
+#: ``.claude/specializations/`` is deliberately NOT here: users add their own
+#: review-kind / topic docs beside the shipped ones, so each shipped doc is
+#: excluded by its own path like a hook or an agent.
 _VCO_ONLY_SUBTREES: tuple[str, ...] = (
     ".claude/hooks/_lib/",
-    ".claude/specializations/",
 )
 
 #: Lines VCO wrote before v0.2.104 that the migration removes from VCO's own
@@ -267,6 +280,42 @@ def safe_add_exclude_entries(result: dict, folder: Path) -> list[str]:
     )
 
 
+#: Bundle-envelope buckets of shipped files a release STOPPED shipping:
+#: ``orphan-deleted`` (VCO deleted its unmodified copy) and ``orphan-retired``
+#: (a user-modified copy kept on disk — it is the user's file now).
+_RETIRED_ACTION_BUCKETS: tuple[str, ...] = ("orphan-deleted", "orphan-retired")
+
+
+def retired_exclude_entries(result: dict, still_listed: Iterable[str]) -> list[str]:
+    """Exclude lines to drop for shipped files this bundle run retired.
+
+    ``result`` is an ``install_project_bundle`` envelope; ``still_listed`` is
+    this run's entry set (:func:`safe_add_exclude_entries`). A retired file's
+    pattern is dropped only when no file still shipped maps to it (a shipped
+    skill's directory stays while any of its files ships). Without this a
+    retired hook's line outlived it, and a user's own file later written at
+    that path was silently hidden. :func:`append_git_info_exclude` removes
+    these only from VCO's own blocks.
+    """
+    keep = set(still_listed)
+    actions = result.get("actions", {}) or {}
+    out: list[str] = []
+    for key in _RETIRED_ACTION_BUCKETS:
+        for rel in actions.get(key, []) or []:
+            pattern = exclude_pattern_for(rel)
+            if pattern and pattern not in keep and pattern not in out:
+                out.append(pattern)
+    return out
+
+
+def bundle_exclude_plan(result: dict, folder: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(entries, retired)`` for one bundle run — the arguments of
+    :func:`append_git_info_exclude` (``paths``, ``retired``) at every bundle
+    call site, computed in one place."""
+    entries = tuple(safe_add_exclude_entries(result, folder))
+    return entries, tuple(retired_exclude_entries(result, entries))
+
+
 def summarize_entries(entries: Sequence[str], shown: int = 12) -> str:
     """One-line human summary of exclude entries for a deferral message.
 
@@ -282,34 +331,138 @@ def summarize_entries(entries: Sequence[str], shown: int = 12) -> str:
     return text
 
 
-def _strip_legacy_vco_lines(existing: str) -> tuple[str, list[str]]:
-    """Remove :data:`LEGACY_VCO_EXCLUDE_LINES` from VCO's own blocks.
+def _is_end_marker(stripped: str) -> bool:
+    return stripped == VCO_BLOCK_END_MARKER
 
-    A VCO block is a line starting with :data:`VCO_BLOCK_MARKER` and the
-    non-blank lines after it (``append_git_info_exclude`` always writes a blank
-    line, its header, then its entries). A legacy line OUTSIDE such a block is
-    the user's own and is kept. Every other line is kept byte-for-byte.
 
-    Returns ``(new_text, removed_lines)``; ``new_text is existing`` when
-    nothing was removed.
+def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
+    """Map each line VCO wrote inside one of its blocks to that block's kind.
+
+    Returns ``(members, legacy_block_ends)``: ``members`` maps a line index to
+    ``"ended"`` (a block closed by :data:`VCO_BLOCK_END_MARKER`, written whole
+    by v0.2.104 or later — every line from the header to the end marker is
+    VCO's) or ``"legacy"`` (a block from an older release, which has no end
+    marker); ``legacy_block_ends`` lists, per legacy block, the index of its
+    last member line — where the end marker goes when the block is closed.
+
+    A legacy block's end is INFERRED, conservatively, because the user's own
+    ``echo '…' >> .git/info/exclude`` lands directly after VCO's last line with
+    no blank line between them. A line belongs to a legacy block only while it
+    is one VCO could have written there:
+
+    * a ``#`` comment, only in the header run right after the marker;
+    * a root-anchored pattern (``/…``, no whitespace) that has NOT appeared
+      earlier in the file — VCO de-duplicates every entry against the whole
+      file, so a repeat is never VCO's;
+    * the legacy ``/.claude/`` glob only BEFORE any ``/.claude/<path>`` entry
+      in the same block — VCO wrote either the glob (up to v0.2.103) or the
+      per-path entries (v0.2.104 on), never the glob after them.
+
+    The first line that fails ends the block; it and everything after it up
+    to the next marker are the user's.
     """
-    lines = existing.splitlines(keepends=True)
-    kept: list[str] = []
-    removed: list[str] = []
-    in_vco_block = False
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            in_vco_block = False
-        elif stripped.startswith(VCO_BLOCK_MARKER):
-            in_vco_block = True
-        elif in_vco_block and stripped in LEGACY_VCO_EXCLUDE_LINES:
-            removed.append(stripped)
+    members: dict[int, str] = {}
+    legacy_ends: list[int] = []
+    seen: set[str] = set()
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        if not stripped.startswith(VCO_BLOCK_MARKER) or _is_end_marker(stripped):
+            if stripped and not stripped.startswith("#"):
+                seen.add(stripped)
+            i += 1
             continue
-        kept.append(line)
-    if not removed:
+        # A block header. Closed by an end marker before the next blank line
+        # or the next header? Then every line up to the marker is VCO's.
+        j = i + 1
+        end_at = None
+        while j < n:
+            s = lines[j].strip()
+            if _is_end_marker(s):
+                end_at = j
+                break
+            if not s or s.startswith(VCO_BLOCK_MARKER):
+                break
+            j += 1
+        if end_at is not None:
+            for k in range(i, end_at + 1):
+                members[k] = "ended"
+                s = lines[k].strip()
+                if s and not s.startswith("#"):
+                    seen.add(s)
+            i = end_at + 1
+            continue
+        members[i] = "legacy"
+        last = i
+        in_header = True
+        has_claude_subpath = False
+        k = i + 1
+        while k < n:
+            s = lines[k].strip()
+            if not s or s.startswith(VCO_BLOCK_MARKER):
+                break
+            if s.startswith("#"):
+                if not in_header:
+                    break
+            else:
+                in_header = False
+                if not s.startswith("/") or any(c.isspace() for c in s) or s in seen:
+                    break
+                if s == "/.claude/" and has_claude_subpath:
+                    break
+                if s.startswith("/.claude/") and s != "/.claude/":
+                    has_claude_subpath = True
+                seen.add(s)
+            members[k] = "legacy"
+            last = k
+            k += 1
+        legacy_ends.append(last)
+        i = k
+    return members, legacy_ends
+
+
+def _rewrite_vco_blocks(
+    existing: str, retired: Iterable[str] = (),
+) -> tuple[str, list[str]]:
+    """Repair VCO's own blocks; never touch a line of the user's.
+
+    * Removes :data:`LEGACY_VCO_EXCLUDE_LINES` from LEGACY blocks (v0.2.104 G4
+      migration). An ended block never carries them, so one found there was
+      put there by the user and stays.
+    * Removes the ``retired`` patterns — lines for shipped files a release
+      stopped shipping — from any VCO block.
+    * Closes every legacy block with :data:`VCO_BLOCK_END_MARKER`, so a line
+      the user appends afterwards is unambiguously outside it.
+
+    See :func:`_block_members` for what counts as a VCO line. Returns
+    ``(new_text, removed_lines)``; ``new_text is existing`` when nothing
+    changed.
+    """
+    retired_set = set(retired)
+    lines = existing.splitlines(keepends=True)
+    members, legacy_ends = _block_members(lines)
+    close_after = set(legacy_ends)
+    out: list[str] = []
+    removed: list[str] = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        kind = members.get(idx)
+        drop = kind is not None and (
+            (kind == "legacy" and stripped in LEGACY_VCO_EXCLUDE_LINES)
+            or stripped in retired_set
+        )
+        if drop:
+            removed.append(stripped)
+        else:
+            if idx in close_after and not line.endswith("\n"):
+                line += "\n"
+            out.append(line)
+        if idx in close_after:
+            out.append(VCO_BLOCK_END_MARKER + "\n")
+    if not removed and not close_after:
         return existing, []
-    return "".join(kept), removed
+    return "".join(out), removed
 
 
 def append_git_info_exclude(
@@ -318,6 +471,7 @@ def append_git_info_exclude(
     *,
     write_bytes: Optional[Callable[[Path, bytes], object]] = None,
     block_comment: Optional[Sequence[str]] = None,
+    retired: Sequence[str] = (),
 ) -> dict:
     """Idempotently append ``paths`` to ``<folder>/.git/info/exclude``.
 
@@ -328,8 +482,12 @@ def append_git_info_exclude(
         would write into an unrelated repo's exclude file.
       - Entry already present (exact-line match) -> not re-added.
       - Legacy VCO lines (:data:`LEGACY_VCO_EXCLUDE_LINES`) inside VCO's own
-        blocks are removed in the same write (v0.2.104 G4 migration — see
-        :func:`_strip_legacy_vco_lines`); the user's own lines never are.
+        pre-v0.2.104 blocks, and the ``retired`` patterns inside any VCO
+        block, are removed in the same write, and pre-v0.2.104 blocks are
+        closed with :data:`VCO_BLOCK_END_MARKER` (see
+        :func:`_rewrite_vco_blocks`); the user's own lines never are touched.
+      - Every new block ends with :data:`VCO_BLOCK_END_MARKER`, so a line the
+        user appends later is never mistaken for VCO's.
       - Write failure -> ``action="write_failed:<ErrorClass>"``, no raise.
 
     Args:
@@ -349,11 +507,14 @@ def append_git_info_exclude(
             security regression.
         block_comment: Header lines written above a NEW block. Defaults to the
             safe-add wording; the move engine passes its own.
+        retired: Patterns of shipped files a release retired
+            (:func:`retired_exclude_entries`); removed from VCO's blocks only.
 
     Returns:
         ``{"action": str, "added": [str, ...], "removed": [str, ...],
-        "path": str}``. Actions: ``appended`` (new entries written, any legacy
-        lines removed alongside) | ``migrated`` (only legacy lines removed) |
+        "path": str}``. Actions: ``appended`` (new entries written, any
+        legacy/retired lines removed alongside) | ``migrated`` (only VCO's
+        existing blocks repaired: lines removed and/or old blocks closed) |
         ``noop`` | ``not_a_git_repo`` | ``write_failed:*``.
     """
     writer = write_bytes if write_bytes is not None else _default_write_bytes
@@ -376,7 +537,9 @@ def append_git_info_exclude(
         result["action"] = f"write_failed:{type(e).__name__}"
         return result
 
-    existing, removed = _strip_legacy_vco_lines(existing)
+    original = existing
+    existing, removed = _rewrite_vco_blocks(existing, retired)
+    rewritten = existing is not original
 
     # Exact-line membership check (strip trailing whitespace per line).
     present = {line.strip() for line in existing.splitlines()}
@@ -387,7 +550,7 @@ def append_git_info_exclude(
             if p not in present and p not in LEGACY_VCO_EXCLUDE_LINES
         )
     )
-    if not to_add and not removed:
+    if not to_add and not rewritten:
         result["action"] = "noop"
         return result
 
@@ -409,7 +572,7 @@ def append_git_info_exclude(
         header.insert(0, VCO_BLOCK_MARKER + "exclude block (orchestrator-managed).")
     block = ""
     if to_add:
-        block = "\n".join(["", *header, *to_add]) + "\n"
+        block = "\n".join(["", *header, *to_add, VCO_BLOCK_END_MARKER]) + "\n"
 
     # Ensure we don't glue onto a non-newline-terminated last line.
     prefix = existing
