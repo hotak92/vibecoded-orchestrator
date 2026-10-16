@@ -97,7 +97,7 @@ _DEFERRAL_PATHS_SHOWN = 10
 
 
 # ---------------------------------------------------------------------------
-# Storage-layer content signature (parity-locked with sync_knowledge_graph.py)
+# Storage-layer content signature (the ONE implementation: sync_knowledge_graph.py imports it)
 # ---------------------------------------------------------------------------
 
 def content_signature_excluding_updated(content: str) -> str:

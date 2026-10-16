@@ -1126,6 +1126,7 @@ def test_r33_resync_without_gone_paths_passes_no_prune_flags(tmp_path,
     ("**Status**: validated", "validated"),
     ("- Verdict: `confirmed`", "confirmed"),
     ("Eviction status: confirmed", "confirmed"),
+    ("`Result`: verified.", "verified"),
 ], ids=lambda v: v if len(v) < 14 else v[:24])
 def test_r33_label_colon_marker_without_source_is_reverted(repo, added,
                                                            marker):

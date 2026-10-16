@@ -1086,7 +1086,7 @@ def evidence_claims(text: str, has_id: bool) -> List[str]:
     labels = "|".join(re.escape(w) for w in g["evidence_label_words"])
     after = re.compile(rf"\s+(?:{attrib})(?![0-9A-Za-z])", re.IGNORECASE)
     before = re.compile(rf"(?<![0-9A-Za-z])(?:{copula})\s+$", re.IGNORECASE)
-    label = re.compile(rf"(?<![0-9A-Za-z])(?:{labels})\s*(?:\*\*|__)?\s*:"
+    label = re.compile(rf"(?<![0-9A-Za-z])(?:`|\*\*|__)?(?:{labels})(?:`)?\s*(?:\*\*|__)?\s*:"
                        rf"\s*(?:\*\*|__|\*|_|`)?\s*$", re.IGNORECASE)
     out: List[str] = []
     for marker in g["evidence_markers"]:
