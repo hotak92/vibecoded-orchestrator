@@ -304,7 +304,7 @@ function Start-VcoDetachedPwsh {
         [Parameter(Mandatory = $true)][string]$Command,
         [string]$PowerShellExe,
         # R31 L-4: hand back the child process object (nothing on a failed
-        # spawn — Start-VcoDetachedProcess never throws), so a caller can
+        # spawn - Start-VcoDetachedProcess never throws), so a caller can
         # tell "spawned" from "reported failed on stderr".
         [switch]$PassThru
     )
