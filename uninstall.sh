@@ -12,7 +12,8 @@
 # By default the uninstaller is interactive and prompts before each
 # destructive step. It stops the model gateway, vct-hub and the VCO launcher first, then
 # removes the WHOLE VCO state dir (~/.vct or $VCT_STATE_DIR, RL training
-# data included). It NEVER touches ~/.vct-secrets/ and NEVER touches
+# data included; a linked state dir, or a $VCT_STATE_DIR not named .vct,
+# loses only VCO's own files). It NEVER touches ~/.vct-secrets/ and NEVER touches
 # user source code outside orchestrator-managed paths.
 
 set -euo pipefail

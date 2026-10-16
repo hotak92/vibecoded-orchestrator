@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The uninstaller no longer deletes files outside VCO's state folder when that folder is a link, and no longer empties a custom state folder you share with your own files** (review R39 of the v0.2.103 uninstall work; deferred by the owner from v0.2.103). If `~/.vct` (`%USERPROFILE%\.vct`) was a symlink or a junction — for example `mklink /J` to move it to another drive — step [8] walked through it and deleted everything in the target folder, which the plan never showed. It now refuses such a folder, names the link and its target in the plan, and removes only VCO's exact file names (`launcher.db` and its siblings, the model-gateway and step [7] state files); the link and its target are left for you to remove by hand. If `VCT_STATE_DIR` pointed at a folder with another name than `.vct` — say `~/Documents` — that held VCO's files, the whole folder used to go; now only VCO's own top-level entries go (`launcher.db*`, `hub.*`, `model-gateway*`, `retrieval_rl_data/` and the other names only VCO writes), the folder and everything else in it stay, and folders with a generic name VCO also uses (`logs`, `data`, `state` …) are listed as left in place for you to check. The step [8] question now says what it will actually remove instead of always asking about the whole folder. Step [3] no longer takes a process for the model gateway just because the gateway script's path appears somewhere on its command line (for example a `cp` of it, or an editor with it open): the script must be the program itself or the script a Python interpreter runs. On podman-compose versions that leave a container's `working_dir` label blank, step [1b] no longer lists the current install's own container as a legacy one. The uninstaller's built-in step list now names the model gateway under step [3].
+
 ## [0.2.103] - 2026-10-16
 
 ### Added
