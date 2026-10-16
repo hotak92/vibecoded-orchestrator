@@ -597,8 +597,10 @@ def test_uninstall_plan_builders_need_only_the_standard_library(tmp_path):
     )
     env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
            "VCT_STATE_DIR": str(tmp_path / ".vct"), "PATH": os.environ.get("PATH", "")}
+    from tests.common.child_env import child_env
+
     proc = subprocess.run([sys.executable, "-S", "-c", code, str(repo)],
-                          capture_output=True, text=True, env=env, timeout=60)
+                          capture_output=True, text=True, env=child_env(env), timeout=60)
     assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr[-2000:]
 
 
