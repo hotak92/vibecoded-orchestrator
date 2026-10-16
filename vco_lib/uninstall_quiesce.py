@@ -43,11 +43,11 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 __all__ = [
     "ProcInfo", "GatewayProc", "stop_hub", "find_launchers", "stop_launchers",
-    "is_vco_gateway", "find_gateway", "stop_gateway", "still_running", "plan_lines",
+    "is_vco_gateway", "find_gateway", "stop_gateway", "quiesce", "still_running", "plan_lines",
 ]
 
 Runner = Callable[..., Optional[int]]
@@ -128,23 +128,45 @@ def stop_hub(
 # launcher GUI
 # --------------------------------------------------------------------------
 
-def _stdlib_lister() -> list[ProcInfo]:
+def _cim_json(query: str, *, run: Optional[Callable[..., object]] = None) -> Any:
+    """Run one ``Get-CimInstance Win32_Process`` pipeline and parse its JSON.
+
+    PowerShell 5.1 writes a REDIRECTED stdout in ``[Console]::OutputEncoding``
+    (the OEM code page — cp850 on it-IT/de-DE), which ``text=True`` would
+    decode with the ANSI code page and raise on bytes such as cp850 ``ü``
+    (review V02103-FINAL4 M1). The command forces UTF-8 output and the bytes
+    are decoded as UTF-8 with ``errors="replace"``: an odd byte becomes U+FFFD
+    in that one row, never an exception that hides the whole table. Raises
+    when PowerShell cannot run or exits non-zero."""
+    import json
+    import subprocess
+
+    cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+           "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + query]
+    res = (run or subprocess.run)(cmd, capture_output=True, timeout=60,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    rc = getattr(res, "returncode", 0)
+    if rc:
+        raise OSError(f"PowerShell process query exited {rc}")
+    raw = getattr(res, "stdout", b"") or b""
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+    text = text.lstrip("\ufeff").strip()
+    return json.loads(text) if text else None
+
+
+def _stdlib_lister(*, platform: Optional[str] = None,
+                   run: Optional[Callable[..., object]] = None) -> list[ProcInfo]:
     """The process table without psutil — the uninstaller may run on the base
     Python of a clone whose venv is gone or was never built (Windows field run,
     v0.2.103). Windows: CIM via PowerShell; Linux: /proc; macOS: ps. Raises
     when the table cannot be read (callers treat that as "may be running")."""
-    import json
     import subprocess
     import sys
 
     out: list[ProcInfo] = []
-    if sys.platform == "win32":
-        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-               "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,"
-               "ExecutablePath | ConvertTo-Json -Compress"]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        rows = json.loads(res.stdout or "[]")
+    if (platform or sys.platform) == "win32":
+        rows = _cim_json("Get-CimInstance Win32_Process | Select-Object ProcessId,Name,"
+                         "ExecutablePath | ConvertTo-Json -Compress", run=run) or []
         for row in rows if isinstance(rows, list) else [rows]:
             exe = row.get("ExecutablePath")
             out.append(ProcInfo(int(row["ProcessId"]), str(row.get("Name") or ""),
@@ -189,11 +211,112 @@ def _default_lister() -> list[ProcInfo]:
     return out
 
 
-def _terminate_if(pid: int, still_ours: Callable[..., bool], *, grace: float = 10.0) -> bool:
-    """Terminate ``pid`` only if ``still_ours(proc)`` holds at that moment
-    (guards a pid reused since it was identified). True when it is gone."""
-    import psutil
+def _psutil():
+    """psutil when importable, else ``None`` — the base-Python shape (no venv)
+    takes the standard-library paths below (review V02103-FINAL4 H1)."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    return psutil
 
+
+def _gone(pid: int) -> bool:
+    """No live process has ``pid`` (an exited, not-yet-reaped zombie counts
+    as gone). Raises when it cannot tell on Windows (process table unreadable)."""
+    import sys
+
+    if sys.platform == "win32":
+        return all(p.pid != pid for p in _stdlib_lister())
+    if Path("/proc").is_dir():
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return stat.rpartition(")")[2].split()[:1] in (["Z"], ["X"])
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    import subprocess
+
+    res = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                         text=True, timeout=30)
+    return res.returncode != 0 or res.stdout.strip().startswith("Z")
+
+
+def _wait_gone(pid: int, seconds: float, sleep: Callable[[float], None] = time.sleep) -> bool:
+    waited = 0.0
+    while True:
+        if _gone(pid):
+            return True
+        if waited >= seconds:
+            return False
+        sleep(0.25)
+        waited += 0.25
+
+
+def _signal_stdlib(pid: int, *, force: bool) -> bool:
+    """POSIX: SIGTERM (graceful) / SIGKILL. Windows: ``taskkill /PID`` (asks
+    the process to close) / ``taskkill /PID /F``. False when the request
+    itself failed."""
+    import signal
+    import subprocess
+    import sys
+
+    if sys.platform == "win32":
+        argv = ["taskkill", "/PID", str(pid)] + (["/F"] if force else [])
+        res = subprocess.run(argv, capture_output=True, timeout=30,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return res.returncode == 0
+    try:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    return True
+
+
+def _terminate_if_stdlib(pid: int, still_ours: Callable[[], Optional[bool]], *,
+                         grace: float, sleep: Callable[[float], None] = time.sleep) -> bool:
+    """The psutil-free stop. ``still_ours()`` re-identifies the pid from the
+    standard-library process readers (``None`` = it is gone); it is checked
+    before the graceful request AND again before the forced one, so a pid
+    reused during the grace wait is never killed. True when it is gone."""
+    try:
+        if _gone(pid):
+            return True
+        verdict = still_ours()
+        if verdict is None:
+            return True
+        if not verdict:
+            return False
+        _signal_stdlib(pid, force=False)  # bounded wait even if the request failed
+        if _wait_gone(pid, grace, sleep):
+            return True
+        verdict = None if _gone(pid) else still_ours()
+        if verdict is None:
+            return True
+        if not verdict:
+            return False
+        _signal_stdlib(pid, force=True)
+        return _wait_gone(pid, 5.0, sleep)
+    except Exception:  # noqa: BLE001 — "could not stop" is an audit line, never a crash
+        return False
+
+
+def _terminate_if(pid: int, still_ours: Callable[..., bool],
+                  still_ours_stdlib: Callable[[], Optional[bool]], *, grace: float = 10.0) -> bool:
+    """Terminate ``pid`` only if it is still the identified process at that
+    moment (guards a pid reused since it was identified). True when it is
+    gone. ``still_ours(proc)`` is the psutil check; without psutil the stop
+    goes through :func:`_terminate_if_stdlib` with ``still_ours_stdlib``."""
+    psutil = _psutil()
+    if psutil is None:
+        return _terminate_if_stdlib(pid, still_ours_stdlib, grace=grace)
     try:
         proc = psutil.Process(pid)
         if not still_ours(proc):
@@ -211,13 +334,22 @@ def _terminate_if(pid: int, still_ours: Callable[..., bool], *, grace: float = 1
         return False
 
 
+def _launcher_still_ours_stdlib(pid: int, exe: Path) -> Optional[bool]:
+    """``None`` gone / True same exe / False reused — through the same stdlib
+    process table :func:`find_launchers` identified it from."""
+    for p in _stdlib_lister():
+        if p.pid == pid:
+            return p.exe is not None and _norm(p.exe) == _norm(exe)
+    return None
+
+
 def _default_stopper(pid: int, exe: Path) -> bool:
     """Terminate ``pid`` only if it STILL runs from ``exe`` (pid reuse)."""
     def ours(proc) -> bool:
         current = proc.exe()
         return bool(current) and _norm(Path(current)) == _norm(exe)
 
-    return _terminate_if(pid, ours)
+    return _terminate_if(pid, ours, lambda: _launcher_still_ours_stdlib(pid, exe))
 
 
 def find_launchers(
@@ -292,7 +424,12 @@ def stop_launchers(
     stop = stopper or _default_stopper
     for p in vco:
         assert p.exe is not None  # identified by exe
-        if stop(p.pid, p.exe):
+        try:
+            stopped = stop(p.pid, p.exe)
+        except Exception as exc:  # noqa: BLE001 — the uninstall continues; [8] re-checks
+            audit.append(f"WARN: could not stop VCO launcher ({_describe(p)}): {exc} — close it by hand")
+            continue
+        if stopped:
             audit.append(f"stopped VCO launcher ({_describe(p)})")
         else:
             audit.append(f"WARN: could not stop VCO launcher ({_describe(p)}) — close it by hand")
@@ -343,15 +480,87 @@ def is_vco_gateway(proc: GatewayProc, candidates: Sequence[Sequence[str]]) -> bo
     return False
 
 
+def _split_windows_cmdline(line: str) -> tuple[str, ...]:
+    """Tokens of a Windows command line: whitespace splits outside double
+    quotes, quotes are dropped. Enough for the paths VCO starts the gateway
+    with; a line it splits differently simply does not match (not stopped)."""
+    toks: list[str] = []
+    cur: list[str] = []
+    quoted = started = False
+    for ch in line:
+        if ch == '"':
+            quoted, started = not quoted, True
+        elif ch.isspace() and not quoted:
+            if started:
+                toks.append("".join(cur))
+            cur, started = [], False
+        else:
+            cur.append(ch)
+            started = True
+    if started:
+        toks.append("".join(cur))
+    return tuple(toks)
+
+
+def _stdlib_identity(pid: int, *, platform: Optional[str] = None,
+                     run: Optional[Callable[..., object]] = None) -> Optional[GatewayProc]:
+    """``pid``'s command line and executable without psutil: ``None`` when no
+    such process; ``cmdline=None`` when it exists but will not say. Linux
+    ``/proc/<pid>/cmdline``; macOS ``ps -o args=``; Windows the same CIM
+    query :func:`_stdlib_lister` uses, filtered to the pid. Raises when it
+    cannot look at all."""
+    import subprocess
+    import sys
+
+    plat = platform or sys.platform
+    if plat == "win32":
+        row = _cim_json(f"Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}' | "
+                        "Select-Object CommandLine,ExecutablePath | ConvertTo-Json -Compress", run=run)
+        if isinstance(row, list):
+            row = row[0] if row else None
+        if not isinstance(row, dict):
+            return None
+        line, exe = row.get("CommandLine"), row.get("ExecutablePath")
+        toks = _split_windows_cmdline(line) if line else ()
+        return GatewayProc(pid, toks or None, Path(exe) if exe else None)
+    if Path("/proc").is_dir():
+        if _gone(pid):
+            return None
+        d = Path(f"/proc/{pid}")
+        try:
+            raw = (d / "cmdline").read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return GatewayProc(pid, None)
+        toks = tuple(os.fsdecode(t) for t in raw.split(b"\0") if t)
+        try:
+            exe: Optional[Path] = Path(os.readlink(d / "exe"))
+        except OSError:
+            exe = None
+        return GatewayProc(pid, toks or None, exe)
+    res = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+                         text=True, errors="replace", timeout=30)
+    line = res.stdout.strip()
+    if res.returncode != 0 or not line:
+        return None  # ps exits 1 for an unknown pid
+    comm = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True,
+                          text=True, errors="replace", timeout=30).stdout.strip()
+    return GatewayProc(pid, tuple(line.split()), Path(comm) if comm else None)
+
+
 def _default_gateway_reader() -> Optional[GatewayProc]:
-    """The live process the daemon's own pid file names, or ``None``."""
+    """The live process the daemon's own pid file names, or ``None``. A pid
+    file whose pid now belongs to another process yields that process's
+    command line (so it reads "not ours"), with or without psutil."""
     from vco_lib import gateway_ensure
 
     pid = gateway_ensure.gateway_pid()
     if pid is None or not gateway_ensure.is_running():
         return None
-    import psutil
-
+    psutil = _psutil()
+    if psutil is None:
+        return _stdlib_identity(pid)
     try:
         proc = psutil.Process(pid)
         exe = proc.exe()
@@ -374,8 +583,12 @@ def _default_gateway_stopper(pid: int, candidates: Sequence[Sequence[str]]) -> b
         return is_vco_gateway(
             GatewayProc(pid, tuple(proc.cmdline()), Path(exe) if exe else None), candidates)
 
+    def ours_stdlib() -> Optional[bool]:
+        proc = _stdlib_identity(pid)
+        return None if proc is None else is_vco_gateway(proc, candidates)
+
     # its graceful shutdown drains for up to 60 s; an uninstall waits 15
-    return _terminate_if(pid, ours, grace=15.0)
+    return _terminate_if(pid, ours, ours_stdlib, grace=15.0)
 
 
 def find_gateway(
@@ -423,9 +636,42 @@ def stop_gateway(
             f"Stop the VCO model gateway (pid {proc.pid})? Chats routed through it will drop"):
         return [f"WARN: VCO model gateway (pid {proc.pid}) left running (declined) — its open "
                 "log/state files may not be removable"]
-    if (stopper or _default_gateway_stopper)(proc.pid, cands):
+    try:
+        stopped = (stopper or _default_gateway_stopper)(proc.pid, cands)
+    except Exception as exc:  # noqa: BLE001 — the uninstall continues; [8] re-checks
+        return [f"WARN: could not stop the VCO model gateway (pid {proc.pid}): {exc} — stop it by hand"]
+    if stopped:
         return [f"stopped VCO model gateway (pid {proc.pid})"]
     return [f"WARN: could not stop the VCO model gateway (pid {proc.pid}) — stop it by hand"]
+
+
+def quiesce(
+    launcher_exes: Sequence[Path],
+    hub_binaries: Iterable[Optional[Path]],
+    *,
+    interactive: bool,
+    confirm: Callable[[str], bool],
+    install_root: Optional[Path] = None,
+) -> list[str]:
+    """Uninstall step [3]: the gateway, then vct-hub, then the launcher GUI.
+    Each stop is guarded: an unexpected failure in one becomes a WARN line and
+    the uninstall goes on (step [8]'s :func:`still_running` re-check still
+    refuses to remove the state dir while anything of VCO runs)."""
+    steps: list[tuple[str, Callable[[], list[str]]]] = [
+        ("the model gateway", lambda: stop_gateway(
+            interactive=interactive, confirm=confirm, install_root=install_root)),
+        ("vct-hub", lambda: stop_hub(hub_binaries)),
+        ("the VCO launcher", lambda: stop_launchers(
+            launcher_exes, interactive=interactive, confirm=confirm, wait_for_user=confirm)),
+    ]
+    audit: list[str] = []
+    for what, step in steps:
+        try:
+            audit.extend(step())
+        except Exception as exc:  # noqa: BLE001
+            audit.append(f"WARN: could not stop {what} ({type(exc).__name__}: {exc}) — "
+                         "stop it yourself; the state dir is removed only once nothing of VCO runs")
+    return audit
 
 
 def still_running(

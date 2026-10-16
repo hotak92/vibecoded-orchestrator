@@ -126,7 +126,10 @@ What it does, step by step:
   you to run — it deliberately does not invoke `volume rm` itself
   (defense-in-depth audit rule). Treat the printed commands as the
   intended cleanup: running them deletes your KG data.
-- Removes the launcher state DB (`~/.vct/launcher.db`).
+- Stops the model gateway, vct-hub and the VCO launcher, then removes the
+  WHOLE VCO state folder (`%USERPROFILE%\.vct`): `launcher.db`, logs,
+  caches, `license.key` and the RL training data (`retrieval_rl_data\`).
+  It is skipped while any of those processes is still running.
 - Removes orchestrator MCP registrations from `~/.claude.json` (your
   other MCP servers are preserved).
 - Removes boot autostart entries (closed in v0.2.54 Track G — this used
@@ -140,16 +143,20 @@ What it does, step by step:
 
 Flags that change confirmation behavior — be explicit about these:
 
-- **`--yes`** (or running non-interactively / piped stdin) **skips every
-  confirmation prompt** — all steps proceed as `[auto-yes]` with no
-  chance to back out. Combine `--yes` WITHOUT `--keep-data` only if you
+- **`--yes`** **skips every confirmation prompt** — all steps proceed as
+  `[auto-yes]` with no chance to back out. A piped / non-interactive stdin
+  (or `--quiet`) auto-approves the other steps too, but never the process
+  stops or the state-folder removal: those two need an explicit `--yes`. Combine `--yes` WITHOUT `--keep-data` only if you
   have already backed up or deliberately want the data gone.
 - **`--dry-run`** prints the full plan and exits without removing
   anything. Run this first if unsure.
-- **`--keep-data`** skips the volume-removal step entirely.
+- **`--keep-data`** skips the volume-removal step entirely — it keeps the
+  container volumes ONLY. The state folder (RL training data,
+  `license.key`) is still removed unless you decline that step.
 
 To finish the cleanup manually after uninstall (only if you're sure —
-this deletes your KG vectors):
+this deletes your KG vectors; the `rmdir` is needed only if the state
+folder step was skipped or declined):
 
 ```cmd
 rmdir /s /q "%USERPROFILE%\.vct"

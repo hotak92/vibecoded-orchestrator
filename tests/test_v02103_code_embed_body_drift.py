@@ -89,6 +89,62 @@ def test_the_same_template_is_not_drift(tmp_path):
     assert not compose_env.code_embed_body_template_drifted(tmp_path, OLLAMA_CFG)
 
 
+def _shell(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("VCO_OLLAMA_KEEP_ALIVE", raising=False)
+    else:
+        monkeypatch.setenv("VCO_OLLAMA_KEEP_ALIVE", value)
+
+
+def _keep_alive_in(infra):
+    import json
+
+    raw = _env_value(infra, CONTAINER_BODY_ENV_KEY)
+    assert raw is not None
+    return json.loads(raw).get("keep_alive")
+
+
+@pytest.mark.parametrize("value", ["2h", ""])
+def test_keep_alive_set_once_then_unset_is_kept_and_never_drifts(tmp_path, monkeypatch, value):
+    """Review V02103-FINAL4 L3 (coordinator ruling 2026-10-16): a run with
+    ``VCO_OLLAMA_KEEP_ALIVE`` persists it (``CODE_EMBED_OLLAMA_KEEP_ALIVE``);
+    the next run WITHOUT it reuses that value — no drift, no recreate, the
+    container keeps the override (the empty opt-out included)."""
+    from vco_lib.ollama_embed_body import CONTAINER_KEEP_ALIVE_ENV_KEY
+
+    _shell(monkeypatch, value)
+    compose_env.write_infrastructure_env(tmp_path, OLLAMA_CFG)
+    assert _env_value(tmp_path, CONTAINER_KEEP_ALIVE_ENV_KEY) == value
+    _shell(monkeypatch, None)
+    assert not compose_env.code_embed_body_template_drifted(tmp_path, OLLAMA_CFG)
+    assert _plan(tmp_path, OLLAMA_CFG) == ((), [])
+    compose_env.write_infrastructure_env(tmp_path, OLLAMA_CFG)  # an unset run rewrites nothing of it
+    assert _env_value(tmp_path, CONTAINER_KEEP_ALIVE_ENV_KEY) == value
+    assert _keep_alive_in(tmp_path) == (value or None)
+
+
+def test_keep_alive_never_set_is_the_shipped_default(tmp_path, monkeypatch):
+    from vco_lib.ollama_embed_body import _KEEP_ALIVE_DEFAULT, CONTAINER_KEEP_ALIVE_ENV_KEY
+
+    _shell(monkeypatch, None)
+    compose_env.write_infrastructure_env(tmp_path, OLLAMA_CFG)
+    assert _env_value(tmp_path, CONTAINER_KEEP_ALIVE_ENV_KEY) is None
+    assert _keep_alive_in(tmp_path) == _KEEP_ALIVE_DEFAULT
+    assert not compose_env.code_embed_body_template_drifted(tmp_path, OLLAMA_CFG)
+
+
+@pytest.mark.parametrize("first,second", [(None, "2h"), ("2h", "30m")])
+def test_setting_keep_alive_again_changes_it(tmp_path, monkeypatch, first, second):
+    """The knob still works: a run that sets a NEW value is drift, rewrites
+    the template and plans the recreate."""
+    _shell(monkeypatch, first)
+    compose_env.write_infrastructure_env(tmp_path, OLLAMA_CFG)
+    _shell(monkeypatch, second)
+    assert compose_env.code_embed_body_template_drifted(tmp_path, OLLAMA_CFG)
+    assert _plan(tmp_path, OLLAMA_CFG)[0] == ("code_embed",)
+    assert _keep_alive_in(tmp_path) == second
+
+
 def test_a_gpu_backend_is_never_drifted(stale_infra):
     """The gpu backend never reads the key — even a stale value is no drift."""
     assert not compose_env.code_embed_body_template_drifted(stale_infra, GPU_CFG)

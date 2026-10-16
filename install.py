@@ -5579,7 +5579,7 @@ def main() -> int:
                         help="Uninstall the orchestrator. Lists what will be removed (dry-run by "
                              "default), then prompts for confirmation per category.")
     parser.add_argument("--keep-data", action="store_true", default=False,
-                        help="Uninstall: keep container volumes (Weaviate / Ollama / code embeddings).")
+                        help="Uninstall: keep the container volumes ONLY — step [8] still removes the state dir (RL training data, license.key) unless declined.")
     parser.add_argument("--remove-projects", action="store_true", default=False,
                         help="Uninstall: also remove orchestrator-managed .claude/ folders in "
                              "registered projects (default: off — leave user code alone).")
@@ -11664,7 +11664,7 @@ def _detect_existing_volume_paths() -> dict:
 def _compose_substitution_env(embed_config: dict) -> dict[str, str]:
     """Shim over :func:`vco_lib.compose_env.compose_substitution_env`."""
     from vco_lib.compose_env import compose_substitution_env
-    return compose_substitution_env(embed_config)
+    return compose_substitution_env(embed_config, infra_dir=PROJECT_ROOT / "infrastructure")
 
 
 def _write_infrastructure_env(embed_config: dict) -> None:
@@ -21536,7 +21536,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     def _confirm_strict(prompt: str) -> bool:  # R39 M3: a non-tty stdin alone never approves stops / [8]
         if args.yes or (sys.stdin.isatty() and not args.quiet):
             return _confirm(prompt)
-        print(f"  {prompt} [skipped — needs --yes when not interactive]")
+        print(f"  {prompt} [skipped — needs --yes {'with --quiet' if sys.stdin.isatty() else 'when stdin is not a terminal'}]")
         return False
 
     # Plan: enumerate everything we WILL touch.
@@ -21705,11 +21705,9 @@ def _run_uninstall(args: argparse.Namespace) -> int:
 
     # Step 3: stop what holds the state dir open, before ANY state removal.
     quiesced = _confirm_strict("Stop the model gateway, vct-hub and the VCO launcher before VCO state is removed?")
-    if quiesced:
-        audit.extend(_uninstall_quiesce.stop_gateway(interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT))
-        audit.extend(_uninstall_quiesce.stop_hub(hub_bins))
-        audit.extend(_uninstall_quiesce.stop_launchers(
-            launcher_exes, interactive=not non_interactive, confirm=_confirm, wait_for_user=_confirm))
+    if quiesced:  # each stop guarded inside quiesce(): a failure WARNs, [8] re-checks
+        audit.extend(_uninstall_quiesce.quiesce(
+            launcher_exes, hub_bins, interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT))
 
     # Step 4: scrub orchestrator MCP entries from ~/.claude.json.
     #

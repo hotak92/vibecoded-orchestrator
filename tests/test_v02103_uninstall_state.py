@@ -305,7 +305,7 @@ def test_launcher_paths_cover_the_install_locations(tmp_path):
 
 
 def _run(monkeypatch, tmp_path, home, *, dry_run, events, gateway_restarts=False,
-         yes=True, tty=None, answers=None):
+         yes=True, tty=None, answers=None, quiet=None):
     root = _state(home / ".vct")
     monkeypatch.setenv("VCT_STATE_DIR", str(root))
     monkeypatch.delenv("VCT_LAUNCHER_DB_PATH", raising=False)
@@ -360,7 +360,7 @@ def _run(monkeypatch, tmp_path, home, *, dry_run, events, gateway_restarts=False
     if answers is not None:  # prompt substring -> answer; anything else "n"
         monkeypatch.setattr("builtins.input", lambda prompt: next(
             (a for k, a in answers.items() if k in prompt), "n"))
-    args = argparse.Namespace(dry_run=dry_run, yes=yes, quiet=yes, keep_data=True,
+    args = argparse.Namespace(dry_run=dry_run, yes=yes, quiet=yes if quiet is None else quiet, keep_data=True,
                               remove_projects=False)
     install._run_uninstall(args)
     return root
@@ -560,7 +560,18 @@ def test_non_tty_without_yes_never_stops_processes_or_removes_the_state_dir(
     root = _run(monkeypatch, tmp_path, home, dry_run=False, events=events, yes=False, tty=False)
     assert events == []
     assert root.is_dir() and (root / "launcher.db").exists()
-    assert capsys.readouterr().out.count("needs --yes when not interactive") == 2
+    assert capsys.readouterr().out.count("needs --yes when stdin is not a terminal") == 2
+
+
+def test_tty_with_quiet_without_yes_says_quiet_is_the_reason(monkeypatch, tmp_path, home, capsys):
+    """Review V02103-FINAL4 L2: on a terminal, --quiet without --yes skips
+    [3]/[8] — and the line names --quiet, not a missing terminal."""
+    events: list = []
+    root = _run(monkeypatch, tmp_path, home, dry_run=False, events=events, yes=False, tty=True,
+                quiet=True)
+    assert events == [] and (root / "launcher.db").exists()
+    out = capsys.readouterr().out
+    assert out.count("needs --yes with --quiet") == 2 and "not a terminal" not in out
 
 
 def test_still_running_uses_the_same_identification(tmp_path):
@@ -616,3 +627,218 @@ def test_still_running_treats_an_unreadable_hub_state_as_running(tmp_path):
     out = uq.still_running([], hub_running=broken, lister=lambda: [],
                            gateway_reader=lambda: None, gateway_candidates=[])
     assert any("vct-hub" in item for item in out)
+
+
+# ── review V02103-FINAL4 H1: stop + gateway read without psutil ───────────
+
+_SLEEPER = "import time\ntime.sleep(60)\n"
+
+
+def _sleeper(tmp_path: Path, name: str) -> "subprocess.Popen":
+    """A harmless child of THIS test process (never a real VCO process)."""
+    from tests.common.child_env import child_env
+
+    script = tmp_path / name
+    script.write_text(_SLEEPER)
+    return subprocess.Popen([sys.executable, "-S", str(script)], env=child_env())
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="drives real signals against throwaway children via /proc")
+def test_stops_and_gateway_read_work_on_a_base_python_without_psutil(tmp_path):
+    """The field shape: uninstall on the base Python (``-S``, psutil absent).
+    The REAL launcher stopper and gateway stopper/reader run against
+    throwaway sleepers this test spawned: a sleeper that does NOT run from
+    the identified exe / gateway argv is left alive; one that does is
+    stopped; a pid file naming a non-gateway reads "not ours", never
+    "cannot check"."""
+    from tests.common.child_env import child_env
+
+    repo = Path(__file__).resolve().parents[1]
+    state = tmp_path / ".vct"
+    state.mkdir()
+    keep_l, kill_l = _sleeper(tmp_path, "keep-launcher"), _sleeper(tmp_path, "kill-launcher")
+    keep_g, kill_g = _sleeper(tmp_path, "keep-gw"), _sleeper(tmp_path, "vct-model-gateway")
+    procs = [keep_l, kill_l, keep_g, kill_g]
+    code = r"""
+import importlib.util, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+assert importlib.util.find_spec("psutil") is None, "psutil must be absent (base-Python shape)"
+from vco_lib import boot_service
+from vco_lib import uninstall_quiesce as uq
+keep_l, kill_l, keep_g, kill_g = (int(a) for a in sys.argv[2:6])
+gw_script, state = sys.argv[6], Path(sys.argv[7])
+py = Path(os.path.realpath(sys.executable))
+ok = lambda m: True
+# launcher, leave-alone arm: identified at a VCO path the process does not run from
+fake = Path(sys.argv[7]) / "vct-launcher"
+a = uq.stop_launchers([fake], interactive=False, confirm=ok, wait_for_user=ok,
+                      lister=lambda: [uq.ProcInfo(keep_l, "vct-launcher", fake)])
+assert any("could not stop" in x for x in a), a
+# launcher, act arm: the stopper targets it via its real (injected) exe path
+a = uq.stop_launchers([py], interactive=False, confirm=ok, wait_for_user=ok,
+                      lister=lambda: [uq.ProcInfo(kill_l, "vct-launcher", py)])
+assert any(x.startswith("stopped VCO launcher") for x in a), a
+# gateway reader: the pid file names a live NON-gateway -> "not ours"
+(state / boot_service.GATEWAY_PID_BASENAME).write_text(f"{keep_g}\n")
+proc = uq._default_gateway_reader()
+assert proc is not None and proc.cmdline, proc
+cands = [[gw_script]]
+assert uq.find_gateway(candidates=cands)[1].endswith("not VCO's gateway"), uq.find_gateway(candidates=cands)
+a = uq.stop_gateway(candidates=cands, interactive=False, confirm=ok)
+assert "not stopped" in a[0], a
+left = uq.still_running([], install_root=Path(sys.argv[1]), hub_running=lambda: False,
+                        gateway_candidates=cands)
+assert not [x for x in left if "cannot check" in x or "unreadable" in x], left
+# gateway, act arm: the pid file names the sleeper running the gateway script
+(state / boot_service.GATEWAY_PID_BASENAME).write_text(f"{kill_g}\n")
+a = uq.stop_gateway(candidates=cands, interactive=False, confirm=ok)
+assert a == [f"stopped VCO model gateway (pid {kill_g})"], a
+print("ok")
+"""
+    env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "VCT_STATE_DIR": str(state),
+           "PATH": os.environ.get("PATH", "")}
+    try:
+        res = subprocess.run(
+            [sys.executable, "-S", "-c", code, str(repo), *(str(p.pid) for p in procs),
+             str(tmp_path / "vct-model-gateway"), str(state)],
+            capture_output=True, text=True, env=child_env(env), timeout=120)
+        assert res.returncode == 0 and res.stdout.strip() == "ok", res.stderr[-3000:]
+        assert keep_l.poll() is None and keep_g.poll() is None, "a non-matching process was killed"
+        assert kill_l.wait(timeout=10) == -15 and kill_g.wait(timeout=10) == -15
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+            p.wait(timeout=10)
+
+
+class _Res:
+    def __init__(self, stdout: bytes, returncode: int = 0):
+        self.stdout, self.returncode = stdout, returncode
+
+
+def _fake_ps(payload: bytes, rc: int = 0):
+    calls: list = []
+
+    def run(cmd, **kw):
+        calls.append((cmd, kw))
+        return _Res(payload, rc)
+
+    return run, calls
+
+
+def test_windows_listing_survives_oem_code_page_bytes():
+    """Review V02103-FINAL4 M1: PowerShell 5.1 bytes in cp850 (``ü`` = 0x81,
+    undefined in cp1252) never raise; the query forces UTF-8 output and the
+    bytes are decoded as UTF-8 with replacement."""
+    rows = ('[{"ProcessId":4242,"Name":"vct-launcher.exe","ExecutablePath":'
+            '"C:\\\\Users\\\\J\u00fcrgen\\\\AppData\\\\Local\\\\vct-launcher\\\\vct-launcher.exe"},'
+            '{"ProcessId":7,"Name":"Pi\u00f9.exe","ExecutablePath":null}]')
+    run, calls = _fake_ps(rows.encode("cp850"))
+    procs = uq._stdlib_lister(platform="win32", run=run)
+    assert [p.pid for p in procs] == [4242, 7]
+    assert "J\ufffdrgen" in str(procs[0].exe) and procs[1].exe is None
+    cmd, kw = calls[0]
+    assert cmd[-1].startswith("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;")
+    assert "text" not in kw and "encoding" not in kw  # raw bytes, decoded by us
+    run, _ = _fake_ps(rows.encode("utf-8"))
+    assert "J\u00fcrgen" in str(uq._stdlib_lister(platform="win32", run=run)[0].exe)
+    run, _ = _fake_ps(b"", rc=1)
+    with pytest.raises(OSError):
+        uq._stdlib_lister(platform="win32", run=run)
+
+
+def test_windows_gateway_identity_reads_the_cim_command_line():
+    line = '"C:\\VCO\\.venv\\Scripts\\vct-model-gateway.exe" serve --port 11460'
+    payload = ('{"CommandLine":%s,"ExecutablePath":"C:\\\\VCO\\\\.venv\\\\Scripts\\\\vct-model-gateway.exe"}'
+               % __import__("json").dumps(line)).encode("utf-8")
+    run, calls = _fake_ps(payload)
+    proc = uq._stdlib_identity(99, platform="win32", run=run)
+    assert proc is not None and proc.cmdline == (
+        "C:\\VCO\\.venv\\Scripts\\vct-model-gateway.exe", "serve", "--port", "11460")
+    assert "ProcessId=99" in calls[0][0][-1]
+    assert uq._stdlib_identity(99, platform="win32", run=_fake_ps(b"")[0]) is None  # gone
+    no_line = b'{"CommandLine":null,"ExecutablePath":null}'
+    blank = uq._stdlib_identity(99, platform="win32", run=_fake_ps(no_line)[0])
+    assert blank is not None and blank.cmdline is None  # alive, will not say
+
+
+@pytest.mark.parametrize("line,toks", [
+    ('a b  c', ("a", "b", "c")),
+    ('"C:\\Program Files\\x.exe" -m model_router', ("C:\\Program Files\\x.exe", "-m", "model_router")),
+    ('"" x', ("", "x")),
+])
+def test_windows_command_line_split(line, toks):
+    assert uq._split_windows_cmdline(line) == toks
+
+
+@pytest.mark.parametrize("second_check,forced", [(True, True), (False, False), (None, False)])
+def test_stdlib_stop_rechecks_identity_before_forcing(monkeypatch, second_check, forced):
+    """The psutil-free stop asks gracefully, waits (bounded), and forces only
+    if the pid is STILL the identified process (a pid reused during the
+    grace wait is left alone; a pid gone by then needs nothing)."""
+    signals: list = []
+    checks = iter([True, second_check])
+    monkeypatch.setattr(uq, "_gone", lambda pid: False)
+    monkeypatch.setattr(uq, "_signal_stdlib", lambda pid, force: signals.append(force) or True)
+    monkeypatch.setattr(uq, "_wait_gone", lambda pid, s, sleep=None: bool(signals and signals[-1]))
+    out = uq._terminate_if_stdlib(5, lambda: next(checks), grace=1.0)
+    assert signals == ([False, True] if forced else [False])
+    assert out is (forced or second_check is None)
+
+
+def test_stdlib_stop_never_signals_a_process_that_is_not_ours(monkeypatch):
+    signals: list = []
+    monkeypatch.setattr(uq, "_gone", lambda pid: False)
+    monkeypatch.setattr(uq, "_signal_stdlib", lambda pid, force: signals.append(force) or True)
+    assert uq._terminate_if_stdlib(5, lambda: False, grace=1.0) is False and signals == []
+
+
+def test_without_psutil_the_default_stopper_takes_the_stdlib_path(monkeypatch, tmp_path):
+    seen: list = []
+    monkeypatch.setattr(uq, "_psutil", lambda: None)
+    monkeypatch.setattr(uq, "_terminate_if_stdlib",
+                        lambda pid, ours, grace: seen.append((pid, grace)) or True)
+    assert uq._default_stopper(5, tmp_path / "vct-launcher") is True
+    assert uq._default_gateway_stopper(6, CANDS) is True
+    assert seen == [(5, 10.0), (6, 15.0)]
+
+
+def test_a_stopper_that_raises_is_a_warn_and_the_rest_continue(tmp_path):
+    ours = tmp_path / "vct-launcher"
+
+    def boom(pid, exe):
+        if pid == 1:
+            raise ModuleNotFoundError("No module named 'psutil'")
+        return True
+
+    audit = uq.stop_launchers([ours], interactive=False, confirm=lambda m: True,
+                              wait_for_user=lambda m: None,
+                              lister=_procs((1, "vct-launcher", ours), (2, "vct-launcher", ours)),
+                              stopper=boom)
+    assert audit[0].startswith("WARN: could not stop VCO launcher") and "psutil" in audit[0]
+    assert audit[1].startswith("stopped VCO launcher")
+    g = uq.stop_gateway(candidates=CANDS, reader=lambda: uq.GatewayProc(9, (f"{VENV}/vct-model-gateway",)),
+                        interactive=False, confirm=lambda m: True,
+                        stopper=lambda pid, c: (_ for _ in ()).throw(OSError("denied")))
+    assert g[0].startswith("WARN: could not stop the VCO model gateway") and "denied" in g[0]
+
+
+def test_quiesce_runs_every_stop_even_when_one_raises(monkeypatch, tmp_path):
+    """install.py step [3] goes through quiesce(): an unexpected failure in
+    one stop is a WARN line and the others still run (step [8] re-checks)."""
+    order: list = []
+
+    def gw(**kw):
+        order.append("gateway")
+        raise ImportError("No module named 'psutil'")
+
+    monkeypatch.setattr(uq, "stop_gateway", gw)
+    monkeypatch.setattr(uq, "stop_hub", lambda bins: order.append("hub") or ["hub ok"])
+    monkeypatch.setattr(uq, "stop_launchers", lambda *a, **k: order.append("launcher") or ["l ok"])
+    audit = uq.quiesce([tmp_path / "x"], [], interactive=False, confirm=lambda m: True)
+    assert order == ["gateway", "hub", "launcher"]
+    assert audit[0].startswith("WARN: could not stop the model gateway") and "psutil" in audit[0]
+    assert audit[1:] == ["hub ok", "l ok"]
