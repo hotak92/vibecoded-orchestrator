@@ -90,14 +90,15 @@ def _num_ctx_for_model(model: str) -> int:
 _KEEP_ALIVE_DEFAULT = "10m"
 
 
-def _keep_alive() -> str | None:
+def _keep_alive(environ: "Any" = None) -> str | None:
     """Resolve the keep_alive value to attach to embed requests.
 
     Returns the string to send, or ``None`` to send no keep_alive field
     (explicit opt-out via an empty ``VCO_OLLAMA_KEEP_ALIVE``). Respecting an
-    explicit user override is required by the task-6 spec.
+    explicit user override is required by the task-6 spec. ``environ``
+    defaults to this process's environment.
     """
-    val = os.environ.get("VCO_OLLAMA_KEEP_ALIVE")
+    val = (os.environ if environ is None else environ).get("VCO_OLLAMA_KEEP_ALIVE")
     if val is None:
         return _KEEP_ALIVE_DEFAULT
     val = val.strip()
@@ -161,7 +162,15 @@ def embed_request_body(
         body["input"] = input
     return _with_keep_alive(body)
 
-def container_body_template(model: str) -> str:
+#: The ``infrastructure/.env`` key that PERSISTS the container's keep_alive
+#: knob (review V02103-FINAL4 L3, coordinator ruling 2026-10-16): install
+#: writes the resolved ``VCO_OLLAMA_KEEP_ALIVE`` here when its environment sets
+#: it, and a later install whose environment does not set it reuses this value
+#: (:func:`vco_lib.compose_env.container_keep_alive_environ`).
+CONTAINER_KEEP_ALIVE_ENV_KEY = "CODE_EMBED_OLLAMA_KEEP_ALIVE"
+
+
+def container_body_template(model: str, *, environ: "Any" = None) -> str:
     """The embed body for ``model`` WITHOUT its prompt, as compact JSON — the
     value of :data:`CONTAINER_BODY_ENV_KEY`.
 
@@ -183,4 +192,14 @@ def container_body_template(model: str) -> str:
 
     body = embed_request_body(model, prompt="")
     body.pop("prompt")
+    # keep_alive from ``environ`` (default: this process's environment).
+    # compose_env passes the ONE resolved source — the install env's
+    # ``VCO_OLLAMA_KEEP_ALIVE`` if set, else the value persisted in
+    # infrastructure/.env, else nothing (shipped default) — to BOTH the writer
+    # and the drift check, so an update run without the variable never sees
+    # drift (review V02103-FINAL4 L3).
+    body.pop("keep_alive", None)
+    ka = _keep_alive(environ)
+    if ka is not None:
+        body["keep_alive"] = ka
     return json.dumps(body, separators=(",", ":"), sort_keys=True)

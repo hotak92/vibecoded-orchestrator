@@ -115,7 +115,38 @@ def read_code_embed_in_stack(infra_dir: Path) -> Optional[bool]:
     return None
 
 
-def compose_substitution_env(embed_config: dict) -> dict[str, str]:
+def container_keep_alive_environ(
+    infra_dir: "Optional[Path]", environ: "Optional[Mapping[str, str]]" = None,
+) -> "tuple[dict[str, str], Optional[str]]":
+    """The ONE keep_alive source for the code_embed container's body template
+    (review V02103-FINAL4 L3, coordinator ruling 2026-10-16).
+
+    ``(source, persist)``: ``source`` is the mapping handed to
+    :func:`vco_lib.ollama_embed_body.container_body_template` as ``environ``;
+    ``persist`` is the value to write to ``CODE_EMBED_OLLAMA_KEEP_ALIVE``
+    (``None`` = write nothing; an existing line is then kept verbatim).
+
+    * ``VCO_OLLAMA_KEEP_ALIVE`` set in this process (``""`` = the explicit
+      no-keep_alive opt-out) → it wins and is persisted;
+    * unset → the value persisted in ``<infra_dir>/.env`` by an earlier run;
+    * neither → empty source (the shipped default).
+
+    So an update run without the variable resolves exactly what the last run
+    with it wrote — no drift, no recreate — and setting it again changes it."""
+    from vco_lib.ollama_embed_body import CONTAINER_KEEP_ALIVE_ENV_KEY  # noqa: PLC0415
+
+    env = os.environ if environ is None else environ
+    if "VCO_OLLAMA_KEEP_ALIVE" in env:
+        value = env["VCO_OLLAMA_KEEP_ALIVE"].strip()
+        return {"VCO_OLLAMA_KEEP_ALIVE": value}, value
+    persisted = _read_env_keys(infra_dir).get(CONTAINER_KEEP_ALIVE_ENV_KEY) if infra_dir else None
+    if persisted is not None:
+        return {"VCO_OLLAMA_KEEP_ALIVE": persisted}, None
+    return {}, None
+
+
+def compose_substitution_env(embed_config: dict, *,
+                             infra_dir: "Optional[Path]" = None) -> dict[str, str]:
     """Keys docker-compose.yml substitutes that install.py COMPUTES
     (rather than inheriting from the caller's environment).
 
@@ -125,8 +156,17 @@ def compose_substitution_env(embed_config: dict) -> dict[str, str]:
     CPU multi-arch default — even on NVIDIA hosts. The v0.2.54
     gpu-audit C-4 fix moves the writes to ``infrastructure/.env`` so
     compose actually sees them.
+
+    ``infra_dir`` (the compose project dir) lets the container's keep_alive
+    fall back to the value an earlier install persisted there
+    (:func:`container_keep_alive_environ`); every install caller passes it.
     """
     env: dict[str, str] = {}
+    from vco_lib.ollama_embed_body import CONTAINER_KEEP_ALIVE_ENV_KEY  # noqa: PLC0415
+
+    ka_source, ka_persist = container_keep_alive_environ(infra_dir)
+    if ka_persist is not None:
+        env[CONTAINER_KEEP_ALIVE_ENV_KEY] = ka_persist
     backend = str(embed_config.get("code_backend", "") or "")
     if backend:
         env["CODE_EMBED_BACKEND"] = backend
@@ -151,7 +191,7 @@ def compose_substitution_env(embed_config: dict) -> dict[str, str]:
             container_body_template,
         )
 
-        env[CONTAINER_BODY_ENV_KEY] = container_body_template(model)
+        env[CONTAINER_BODY_ENV_KEY] = container_body_template(model, environ=ka_source)
     # v0.2.102 W6-B2: is the code_embed container part of this install at
     # all? ONE decision (vco_lib.code_embed_serving.code_embed_in_stack),
     # projected here so install's compose start and the hub watchdog
@@ -200,7 +240,7 @@ def write_infrastructure_env(
     A successful no-op (no managed keys to write) returns
     ``(True, "")``.
     """
-    return _write_managed_keys(infra_dir, compose_substitution_env(embed_config))
+    return _write_managed_keys(infra_dir, compose_substitution_env(embed_config, infra_dir=infra_dir))
 
 
 def code_embed_body_template_drifted(infra_dir: Path, embed_config: dict) -> bool:
@@ -218,7 +258,7 @@ def code_embed_body_template_drifted(infra_dir: Path, embed_config: dict) -> boo
     The on-disk value is read the way compose reads it (last occurrence)."""
     from vco_lib.ollama_embed_body import CONTAINER_BODY_ENV_KEY  # noqa: PLC0415
 
-    wanted = compose_substitution_env(embed_config).get(CONTAINER_BODY_ENV_KEY)
+    wanted = compose_substitution_env(embed_config, infra_dir=infra_dir).get(CONTAINER_BODY_ENV_KEY)
     if wanted is None:
         return False
     return _read_env_keys(infra_dir).get(CONTAINER_BODY_ENV_KEY) != wanted

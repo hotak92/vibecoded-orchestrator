@@ -5,7 +5,9 @@ REM Windows sibling of uninstall.sh (v0.2.54 Track G, G-2). Thin wrapper:
 REM delegates to `python install.py --uninstall`, forwarding all args.
 REM
 REM Flags forwarded to the uninstaller:
-REM   --keep-data         keep container volumes
+REM   --keep-data         keep the container volumes ONLY (KG vectors, models); step [8]
+REM                       still removes the state dir (RL training data, license.key)
+REM                       unless you decline it
 REM   --remove-projects   also remove .claude\ in registered projects
 REM   --dry-run           print plan and exit
 REM   --yes               non-interactive: accept all confirmations
@@ -46,7 +48,9 @@ echo %%USERPROFILE%%\.vct-secrets is never touched.
 echo.
 echo Options forwarded to install.py --uninstall:
 echo   --dry-run           Print the removal plan and exit. Run this first.
-echo   --keep-data         Preserve container volumes - KG vectors, models.
+echo   --keep-data         Preserve the container volumes ONLY - KG vectors, models.
+echo                       The state folder - RL training data, license.key - is still
+echo                       removed in step [8] unless you decline that step.
 echo   --remove-projects   Also remove .claude\ folders in registered projects.
 echo   --yes               Non-interactive: accept every confirmation.
 echo.

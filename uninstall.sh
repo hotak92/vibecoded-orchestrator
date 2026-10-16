@@ -2,7 +2,9 @@
 # VibeCoded Tools — Orchestrator Uninstaller (shell wrapper)
 #
 # Delegates to `python install.py --uninstall`. Pass any of:
-#   --keep-data         keep container volumes
+#   --keep-data         keep the container volumes ONLY (KG vectors, models); step [8]
+#                       still removes the state dir (RL training data, license.key)
+#                       unless you decline it
 #   --remove-projects   also remove .claude/ in registered projects
 #   --dry-run           print plan and exit
 #   --yes               non-interactive (accept all confirmations)
