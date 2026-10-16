@@ -274,7 +274,7 @@ def test_a_junction_under_the_state_dir_is_never_followed(tmp_path, monkeypatch,
     (root / "logs").mkdir()
     (root / "state" / "engine-start.lock").write_text("")
     (root / "state" / "codegraph-walk-claims" / "a.lock").write_text("")
-    (root / "logs" / ua.ENGINE_START_LOG).write_text("")
+    (root / "logs" / "engine-start.log").write_text("")
     junction = root / redirected
     real = ua._is_reparse
     monkeypatch.setattr(ua, "_is_reparse", lambda p: p == junction or real(p))

@@ -217,7 +217,7 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
         # MUST MATCH vco_lib.container_engine_start
         # .ENGINE_START_STDERR_LOG, the .ps1 sibling and the Rust spawner —
         # TRUNCATED on every spawn (2>), so it is bounded by construction
-        # (one run's stderr) and never shares a handle with the CLI's
+        # (the latest spawn's stderr) and never shares a handle with the CLI's
         # rotating engine-start.log (no rotation race, no writes to an
         # unlinked post-rotation inode). What this capture sees on the HOOK
         # path: the spawn is reached only after vco_lib.service_lifecycle

@@ -469,7 +469,7 @@ def engine_start_log_path(root: Optional[Path] = None) -> Path:
 #: and the Rust spawner's ``services::engine_autostart
 #: ::ENGINE_START_STDERR_LOG`` (pinned by tests/test_container_engine_start.py).
 #: The CLI itself NEVER writes this file — one bounded-by-construction raw
-#: file per spawn (one run's stderr), no shared handle with the rotating
+#: file per spawn (the latest spawn's stderr), no shared handle with the rotating
 #: ``engine-start.log``, hence no Windows sharing conflict and no writes to
 #: an unlinked post-rotation inode.
 ENGINE_START_STDERR_LOG = "engine-start.stderr.log"

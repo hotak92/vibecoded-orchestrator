@@ -213,7 +213,7 @@ if ($VcoRt.state -ne "resolved") {
         # <vct_root>\logs\engine-start.stderr.log — MUST MATCH
         # vco_lib.container_engine_start.ENGINE_START_STDERR_LOG, the .sh
         # sibling and the Rust spawner — OVERWRITTEN on every spawn (2>),
-        # so it is bounded by construction (one run's stderr) and never
+        # so it is bounded by construction (the latest spawn's stderr) and never
         # shares a handle with the CLI's rotating engine-start.log (the
         # parent pwsh used to hold the append-redirect target open while
         # the CLI appended to and rotated the SAME file). Encoding: on Windows

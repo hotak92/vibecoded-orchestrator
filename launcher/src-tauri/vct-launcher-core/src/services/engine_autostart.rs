@@ -83,7 +83,7 @@ pub fn engine_start_argv() -> [&'static str; 3] {
 /// The Python CLI keeps SOLE ownership of its outcome log
 /// `<vct_root_dir>/logs/engine-start.log` (it appends and rotates it); the
 /// spawners never touch that file — no shared handle, no rotation race,
-/// and the stderr file is bounded by construction (one run's stderr).
+/// and the stderr file is bounded by construction (the latest spawn's stderr).
 /// Pinned by `tests/test_container_engine_start.py`.
 pub const ENGINE_START_STDERR_LOG: &str = "engine-start.stderr.log";
 
@@ -96,7 +96,7 @@ fn engine_start_stderr_log_path() -> PathBuf {
 
 /// Best-effort truncate handle to [`engine_start_stderr_log_path`] for the
 /// child's stderr (write + truncate: OVERWRITTEN on every spawn, so the
-/// file holds exactly one run's stderr — bounded by construction). Creates
+/// file holds the latest spawn's stderr — bounded by construction). Creates
 /// the logs dir if missing. An unopenable file degrades to [`Stdio::null`]
 /// — a log problem must never fail the spawn (the engine start matters
 /// more than its traceback).
