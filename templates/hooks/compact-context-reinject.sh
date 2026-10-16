@@ -101,6 +101,50 @@ if [ -z "$HOOK_SOURCE" ] || [ "$HOOK_SOURCE" = "compact" ]; then
     _IS_COMPACT_SOURCE=1
 fi
 
+# v0.2.104: after a compaction Claude Code itself re-attaches up to five
+# recently read/edited files and re-injects CLAUDE.md, the plan-mode plan,
+# auto memory, invoked skills and a fresh git status (documented harness
+# rule — facts + URL in vco_lib/compact_reattach.py, the ONE home). Repeating
+# any of that here only spends the 10 000-char hook budget twice, so when the
+# payload POSITIVELY says source=compact (an absent/unknown source keeps the
+# full pre-v0.2.104 shape — repeating is the safe direction):
+#   * a section whose file is in the re-attached set (as estimated by
+#     post-compact, persisted under .claude/state/compact_reattached_<id>.txt)
+#     becomes a one-line pointer;
+#   * the Recent Commits section and the snapshot's git-status block are
+#     dropped (the harness's fresh git status carries both).
+# The estimate is read through `python -m vco_lib.compact_reattach`; when
+# that is unavailable nothing is skipped (re-injecting twice is the safe
+# direction). MUST MATCH compact-context-reinject.ps1.
+_IS_HARNESS_COMPACT=0
+[ "$HOOK_SOURCE" = "compact" ] && _IS_HARNESS_COMPACT=1
+REATTACHED=""
+_RC_PY=""
+if [ "$_IS_HARNESS_COMPACT" = "1" ] && [ -n "${PY:-}" ]; then
+    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+    [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/resolve-vco-venv.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/resolve-vco-venv.sh"
+    VCO_VENV_PYTHON=""
+    if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+        resolve_vco_venv_python "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" 2>/dev/null || true
+    fi
+    _RC_PY="${VCO_VENV_PYTHON:-$PY}"
+    [ -x "$_RC_PY" ] || _RC_PY="$PY"
+    if [ -n "$SESSION_ID" ]; then
+        if ! REATTACHED=$("$_RC_PY" -m vco_lib.compact_reattach reattached \
+                --project "$PROJECT_DIR" --key "$SESSION_ID"); then
+            echo "[VCO] compact-context-reinject: vco_lib.compact_reattach unavailable (interpreter: $_RC_PY); re-injecting every section" >&2
+            REATTACHED=""
+        fi
+    fi
+fi
+# _rc_reattached <project-relative path> — exit 0 when the harness re-attached it.
+_rc_reattached() {
+    [ -n "$REATTACHED" ] && printf '%s\n' "$REATTACHED" | grep -qxF "$1"
+}
+_rc_pointer() {
+    printf '%s\nAlready in context: Claude Code re-attached %s after the compaction, so it is not repeated here.' "$1" "$2"
+}
+
 # The shared injection cap. A missing helper is a broken install; the hook
 # still re-injects (uncapped) rather than dropping the user's state.
 # shellcheck source=_lib/emit-context.sh disable=SC1091
@@ -207,7 +251,9 @@ S_ctx=""; S_sess=""; S_plan=""; S_commits=""; S_snap=""
 #    The header names WHY we fired (compact vs startup/resume) so the model
 #    does not read a fresh session's injection as post-compaction recovery.
 if [ -f "$PROJECT_DIR/.claude/CONTEXT_STATE.md" ]; then
-    if [ "$_IS_COMPACT_SOURCE" = "1" ]; then
+    if [ "$_IS_HARNESS_COMPACT" = "1" ] && _rc_reattached ".claude/CONTEXT_STATE.md"; then
+        S_ctx=$(_rc_pointer "## Current Task State" ".claude/CONTEXT_STATE.md")
+    elif [ "$_IS_COMPACT_SOURCE" = "1" ]; then
         S_ctx="## Current Task State (re-injected after compaction)
 $(cat "$PROJECT_DIR/.claude/CONTEXT_STATE.md")"
     else
@@ -224,7 +270,10 @@ fi
 # so single-session projects (no per-session file) pay nothing.
 if [ -n "$SESSION_ID" ]; then
     SESSION_CONTEXT_FILE="$PROJECT_DIR/.claude/context/CONTEXT_STATE_${SESSION_ID}.md"
-    if [ -f "$SESSION_CONTEXT_FILE" ]; then
+    if [ -f "$SESSION_CONTEXT_FILE" ] && [ "$_IS_HARNESS_COMPACT" = "1" ] \
+            && _rc_reattached ".claude/context/CONTEXT_STATE_${SESSION_ID}.md"; then
+        S_sess=$(_rc_pointer "## This Session's Task State" ".claude/context/CONTEXT_STATE_${SESSION_ID}.md")
+    elif [ -f "$SESSION_CONTEXT_FILE" ]; then
         S_sess="## This Session's Task State (re-injected after compaction)
 $(head -120 "$SESSION_CONTEXT_FILE")"
     fi
@@ -232,14 +281,21 @@ fi
 
 # 2. Active plan summary -- MIDDLE position (line cap: 30)
 LATEST_PLAN=$(ls -t "$PROJECT_DIR/.claude/context/plans/"*.md 2>/dev/null | grep -v archive | head -1)
-if [ -n "$LATEST_PLAN" ]; then
+if [ -n "$LATEST_PLAN" ] && [ "$_IS_HARNESS_COMPACT" = "1" ] \
+        && _rc_reattached ".claude/context/plans/$(basename "$LATEST_PLAN")"; then
+    S_plan=$(_rc_pointer "## Active Plan: $(basename "$LATEST_PLAN")" ".claude/context/plans/$(basename "$LATEST_PLAN")")
+elif [ -n "$LATEST_PLAN" ]; then
     S_plan="## Active Plan: $(basename "$LATEST_PLAN")
 $(head -30 "$LATEST_PLAN")"
 fi
 
-# 3. Recent git activity -- MIDDLE position (cap: 8 commits)
-S_commits="## Recent Commits
+# 3. Recent git activity -- MIDDLE position (cap: 8 commits). Not after a
+#    compaction (v0.2.104): the harness re-injects a fresh git status with
+#    the recent commits itself.
+if [ "$_IS_HARNESS_COMPACT" != "1" ]; then
+    S_commits="## Recent Commits
 $(git -C "$PROJECT_DIR" log --oneline -8 2>/dev/null || true)"
+fi
 
 # 4. Pre-compaction snapshot -- END position (line cap: 50)
 #    Contains git status + recently changed files, saved by pre-compact-save.sh
@@ -252,8 +308,15 @@ if [ "$_IS_COMPACT_SOURCE" = "1" ] && [ -f "$SNAPSHOT" ]; then
         S_snap="## Pre-Compaction Snapshot (stale -- NOT replayed)
 Last saved: $(_vco_snapshot_saved_line "$SNAPSHOT"). This snapshot is older than the current session's compaction, so pre-compact-save.sh did not run for it (it should, on every compact since v0.2.102). Read .claude/context/pre-compact-snapshot.md only if you need it."
     else
+        # v0.2.104: minus its git-status block (the harness re-injects a
+        # fresh one); the plain first 50 lines when the module is unavailable.
+        _SNAP_BODY=""
+        if [ -n "$_RC_PY" ]; then
+            _SNAP_BODY=$("$_RC_PY" -m vco_lib.compact_reattach snapshot-body --path "$SNAPSHOT" 2>/dev/null) || _SNAP_BODY=""
+        fi
+        [ -n "$_SNAP_BODY" ] || _SNAP_BODY=$(head -50 "$SNAPSHOT")
         S_snap="## Pre-Compaction Snapshot
-$(head -50 "$SNAPSHOT")"
+$_SNAP_BODY"
     fi
 fi
 

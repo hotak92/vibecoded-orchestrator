@@ -56,6 +56,61 @@ if ($HookStdin) {
 }
 $IsCompactSource = ($HookSource -eq "" -or $HookSource -eq "compact")
 
+# v0.2.104: after a compaction Claude Code itself re-attaches up to five
+# recently read/edited files and re-injects CLAUDE.md, the plan-mode plan,
+# auto memory, invoked skills and a fresh git status (documented harness
+# rule -- facts + URL in vco_lib/compact_reattach.py, the ONE home).
+# Repeating any of that here only spends the 10 000-char hook budget twice,
+# so when the payload POSITIVELY says source=compact (an absent/unknown
+# source keeps the full pre-v0.2.104 shape -- repeating is the safe
+# direction):
+#   * a section whose file is in the re-attached set (as estimated by
+#     post-compact, persisted under .claude/state/compact_reattached_<id>.txt)
+#     becomes a one-line pointer;
+#   * the Recent Commits section and the snapshot's git-status block are
+#     dropped (the harness's fresh git status carries both).
+# The estimate is read through `python -m vco_lib.compact_reattach`; when
+# that is unavailable nothing is skipped (re-injecting twice is the safe
+# direction). MUST MATCH compact-context-reinject.sh.
+$IsHarnessCompact = ($HookSource -eq "compact")
+$Reattached = @()
+$RcPy = ""
+if ($IsHarnessCompact) {
+    $FindPy = Join-Path $PSScriptRoot "_lib/find-python.ps1"
+    if (Test-Path -LiteralPath $FindPy) { . $FindPy }
+    if ($PY) {
+        $RcPy = $PY
+        $VenvLib = Join-Path $PSScriptRoot "_lib/resolve-vco-venv.ps1"
+        if (Test-Path -LiteralPath $VenvLib) {
+            . $VenvLib
+            try {
+                $VcoVenvPython = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+                if ($VcoVenvPython -and (Test-Path $VcoVenvPython)) { $RcPy = $VcoVenvPython }
+            } catch { }
+        }
+        if ($SessionId) {
+            $rcOk = $false
+            try {
+                $rcOut = @(& $RcPy -m vco_lib.compact_reattach reattached --project $ProjectDir --key $SessionId)
+                if ($LASTEXITCODE -eq 0) {
+                    $rcOk = $true
+                    $Reattached = @($rcOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+                }
+            } catch { }
+            if (-not $rcOk) {
+                [Console]::Error.WriteLine("[VCO] compact-context-reinject: vco_lib.compact_reattach unavailable (interpreter: $RcPy); re-injecting every section")
+                $Reattached = @()
+            }
+        }
+    }
+}
+function Test-RcReattached([string]$RelPath) {
+    return ($Reattached -ccontains $RelPath)
+}
+function Get-RcPointer([string]$Header, [string]$RelPath) {
+    return "$Header`nAlready in context: Claude Code re-attached $RelPath after the compaction, so it is not repeated here."
+}
+
 # v0.2.100 WP-17: the WHOLE output goes through the shared injection cap
 # (_lib/emit-context.ps1 Limit-VcoHookContext): Claude Code shows the model
 # only a file path + a 2 000-character preview past 10 000 characters, and
@@ -140,7 +195,9 @@ $S_ctx = ""; $S_sess = ""; $S_plan = ""; $S_commits = ""; $S_snap = ""
 # .sh sibling.
 $CtxState = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"
 if (Test-Path -LiteralPath $CtxState) {
-    if ($IsCompactSource) {
+    if ($IsHarnessCompact -and (Test-RcReattached ".claude/CONTEXT_STATE.md")) {
+        $S_ctx = Get-RcPointer "## Current Task State" ".claude/CONTEXT_STATE.md"
+    } elseif ($IsCompactSource) {
         $S_ctx = "## Current Task State (re-injected after compaction)`n" + ([IO.File]::ReadAllText($CtxState).TrimEnd())
     } else {
         $S_ctx = "## Current Task State (re-injected at session start: $HookSource)`n" + ([IO.File]::ReadAllText($CtxState).TrimEnd())
@@ -154,7 +211,10 @@ if (Test-Path -LiteralPath $CtxState) {
 # file existence.
 if ($SessionId) {
     $SessionCtxFile = Join-Path $ProjectDir ".claude/context/CONTEXT_STATE_$SessionId.md"
-    if (Test-Path -LiteralPath $SessionCtxFile) {
+    if ((Test-Path -LiteralPath $SessionCtxFile) -and $IsHarnessCompact -and
+            (Test-RcReattached ".claude/context/CONTEXT_STATE_$SessionId.md")) {
+        $S_sess = Get-RcPointer "## This Session's Task State" ".claude/context/CONTEXT_STATE_$SessionId.md"
+    } elseif (Test-Path -LiteralPath $SessionCtxFile) {
         $S_sess = "## This Session's Task State (re-injected after compaction)`n" + ((Get-Content -LiteralPath $SessionCtxFile -TotalCount 120) -join "`n")
     }
 }
@@ -167,15 +227,22 @@ if (Test-Path -LiteralPath $PlansDir) {
         Where-Object { $_.FullName -notmatch '[/\\]archive[/\\]' } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
-    if ($LatestPlan) {
+    if ($LatestPlan -and $IsHarnessCompact -and
+            (Test-RcReattached ".claude/context/plans/$($LatestPlan.Name)")) {
+        $S_plan = Get-RcPointer "## Active Plan: $($LatestPlan.Name)" ".claude/context/plans/$($LatestPlan.Name)"
+    } elseif ($LatestPlan) {
         $S_plan = "## Active Plan: $($LatestPlan.Name)`n" + ((Get-Content -LiteralPath $LatestPlan.FullName -TotalCount 30) -join "`n")
     }
 }
 
-# 3. Recent git activity (cap 8 commits)
-$gitLog = ""
-try { $gitLog = (@(& git -C $ProjectDir log --oneline -8 2>$null) | ForEach-Object { "$_" }) -join "`n" } catch { }
-$S_commits = "## Recent Commits`n$gitLog"
+# 3. Recent git activity (cap 8 commits). Not after a compaction
+#    (v0.2.104): the harness re-injects a fresh git status with the recent
+#    commits itself.
+if (-not $IsHarnessCompact) {
+    $gitLog = ""
+    try { $gitLog = (@(& git -C $ProjectDir log --oneline -8 2>$null) | ForEach-Object { "$_" }) -join "`n" } catch { }
+    $S_commits = "## Recent Commits`n$gitLog"
+}
 
 # 4. Pre-compaction snapshot (line cap 50); stale => one line, NOT replayed.
 #    A compaction artefact: only emitted for source=compact / unknown (W6-F).
@@ -184,7 +251,17 @@ if ($IsCompactSource -and (Test-Path -LiteralPath $Snapshot)) {
     if (Test-VcoSnapshotStale -Path $Snapshot) {
         $S_snap = "## Pre-Compaction Snapshot (stale -- NOT replayed)`nLast saved: $(Get-VcoSnapshotSavedLine -Path $Snapshot). This snapshot is older than the current session's compaction, so pre-compact-save.ps1 did not run for it (it should, on every compact since v0.2.102). Read .claude/context/pre-compact-snapshot.md only if you need it."
     } else {
-        $S_snap = "## Pre-Compaction Snapshot`n" + ((Get-Content -LiteralPath $Snapshot -TotalCount 50) -join "`n")
+        # v0.2.104: minus its git-status block (the harness re-injects a
+        # fresh one); the plain first 50 lines when the module is unavailable.
+        $SnapBody = ""
+        if ($RcPy) {
+            try {
+                $snapOut = @(& $RcPy -m vco_lib.compact_reattach snapshot-body --path $Snapshot 2>$null)
+                if ($LASTEXITCODE -eq 0) { $SnapBody = ($snapOut | ForEach-Object { "$_" }) -join "`n" }
+            } catch { }
+        }
+        if (-not $SnapBody) { $SnapBody = (Get-Content -LiteralPath $Snapshot -TotalCount 50) -join "`n" }
+        $S_snap = "## Pre-Compaction Snapshot`n" + $SnapBody
     }
 }
 

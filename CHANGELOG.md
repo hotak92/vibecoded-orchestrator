@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **After a compaction you are no longer asked to re-Read a file Claude Code just put back in the context.** Right after a compaction Claude Code re-attaches up to five of the files read or edited in the session (the most recently modified; a file over 5,000 tokens comes back as a path only — documented at https://code.claude.com/docs/en/context-window, "What survives compaction"). VCO's `post-compact` hook used to wipe the Build Anchor reads list, so the next `Write` to one of those files was blocked with "has not been Read this session" and forced a redundant `Read`. The list is now re-seeded with exactly the re-attached files; every other file still needs a fresh `Read` before a `Write`. No hook payload names the re-attached files, so VCO estimates the set in one place, `vco_lib/compact_reattach.py`, and every uncertainty resolves towards asking for a `Read`: a file is kept only when it is among the five newest by modification time AND among the five most recently touched in the session, files that no longer exist are dropped, the token count is over-estimated (binary or non-UTF-8 content counts as too large), and any failure (no Python, a broken `vco_lib` import) falls back to the old wipe with one line on stderr. Both `post-compact.sh` and `post-compact.ps1` call the module.
+- **The post-compaction re-inject no longer repeats what Claude Code restores itself** (roughly 6-10k duplicated characters per compaction). When the SessionStart payload says `source: compact`, `compact-context-reinject` replaces a section whose file was re-attached (`CONTEXT_STATE.md`, the per-session state file, the active plan) with a one-line pointer, and drops the Recent Commits section and the snapshot's git-status block, since the harness re-injects a fresh git status. An absent or unknown source, and session start, keep the full output; the per-section budgets and the 10 000-character cap are unchanged. `VCO_SNAPSHOT_MAX_AGE` also bounds how old the re-attached list may be before it is ignored.
+
 ## [0.2.103] - 2026-10-16
 
 ### Added
