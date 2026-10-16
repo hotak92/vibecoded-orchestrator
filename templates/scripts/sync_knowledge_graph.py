@@ -3830,6 +3830,16 @@ def _file_path_filter(canonical: str):
     return _path_narrowing_filter(Filter, canonical)
 
 
+def _shared_class_exists(server: WeaviateMCPServer) -> bool:
+    """True unless Weaviate answers that the shared class is absent. A failed
+    probe returns True so the delete runs and reports its own error — an
+    unreadable state is never reported as "nothing there"."""
+    try:
+        return bool(server.client.collections.exists(SHARED_COLLECTION_NAME))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _delete_node_by_file_path(
     server: WeaviateMCPServer,
     file_path_value: str,
@@ -4002,6 +4012,13 @@ def _prune_missing_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutc
                       "embedded the node there")
             print(f"ℹ️  {fp_value}: shared collection "
                   f"'{SHARED_COLLECTION_NAME}' not pruned — {reason}")
+            shared_recs[SHARED_COLLECTION_NAME] = {
+                "status": _pr.STATUS_SKIPPED, "deleted": 0, "kept": 0,
+                "reason": reason}
+        elif not _shared_class_exists(server):
+            reason = (f"the shared class '{SHARED_COLLECTION_NAME}' does not "
+                      "exist, so nothing was ever embedded there (R37 N-2)")
+            print(f"ℹ️  {fp_value}: shared collection not pruned — {reason}")
             shared_recs[SHARED_COLLECTION_NAME] = {
                 "status": _pr.STATUS_SKIPPED, "deleted": 0, "kept": 0,
                 "reason": reason}

@@ -1379,3 +1379,19 @@ def test_l2_format_line_roundtrips_the_per_collection_breakdown():
         kg_prune_result.format_line(
             GONE, kg_prune_result.STATUS_DELETED,
             collections={SHARED: {"status": "nonsense"}})
+
+
+def test_r37_absent_shared_class_is_skipped_not_failed(sync_mod, monkeypatch, capsys):
+    """R37 N-2: a shared class that was never created holds nothing to prune —
+    reported as skipped with the reason, never as a failed removal."""
+    mod, server, root = sync_mod
+    _as_non_root_shared(mod, monkeypatch)
+    _seed_hashed(mod, server, GONE, _H_REVIEWER)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    monkeypatch.setattr(server.client.collections, "exists",
+                        lambda name: name != SHARED)
+    mod.sync_node(server, root / GONE)
+    rec = _result(capsys)
+    assert rec["collections"][SHARED]["status"] == kg_prune_result.STATUS_SKIPPED
+    assert "does not exist" in rec["collections"][SHARED]["reason"]
+    assert rec["collections"][mod.COLLECTION_NAME]["status"] == kg_prune_result.STATUS_DELETED
