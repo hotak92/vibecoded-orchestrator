@@ -8675,9 +8675,7 @@ def _safe_add_exclude_entries(result: dict, folder: Path) -> list:
     return _git_exclude.safe_add_exclude_entries(result, folder)
 
 
-def _append_git_info_exclude(
-    folder: Path, paths: tuple,
-) -> dict:
+def _append_git_info_exclude(folder: Path, paths: tuple, retired: tuple = ()) -> dict:
     """Idempotently append ``paths`` to ``<folder>/.git/info/exclude``.
 
     See :func:`vco_lib.git_exclude.append_git_info_exclude`. The local
@@ -8688,6 +8686,7 @@ def _append_git_info_exclude(
         folder,
         paths,
         write_bytes=lambda path, data: _write_file_atomic(path, data),
+        retired=retired,
     )
 
 
@@ -10986,7 +10985,7 @@ def install_project_bundle(
 
         try:
             git_result = _append_git_info_exclude(
-                folder, tuple(_safe_add_exclude_entries(result, folder)),
+                folder, *_git_exclude.bundle_exclude_plan(result, folder),
             )
             result["safe_add_git_exclude"] = git_result
             _log("4.bundle.safe_add_git_exclude", "ok",
@@ -11029,7 +11028,7 @@ def install_project_bundle(
     if not dry_run and not (safe_add and not update_mode):
         try:
             git_result = _append_git_info_exclude(
-                folder, tuple(_safe_add_exclude_entries(result, folder)),
+                folder, *_git_exclude.bundle_exclude_plan(result, folder),
             )
             result["g1_git_exclude"] = git_result
             _log("4.bundle.g1_git_exclude", "ok",

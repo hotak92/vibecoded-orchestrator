@@ -1461,6 +1461,9 @@ def execute_pre_flip(
         result.git_exclude = _git_exclude.append_git_info_exclude(
             dst,
             tuple(entries),
+            retired=tuple(
+                _git_exclude.retired_exclude_entries(result.bundle, entries)
+            ),
             block_comment=[
                 "# VCO project move: keep orchestrator-created files out of "
                 "your commits.",
