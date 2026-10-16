@@ -199,6 +199,21 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "by the 2026-09-09 defect still get their owed walk: decide() rule 4 "
         "fires on crosses_version_boundary(prev, 0.2.95, 0.2.94)."
     ),
+    "0.2.103": (
+        "No extraction-semantics change. `git diff v0.2.102..HEAD` across the "
+        "extractor surface: codegraph_{guards,content_hash,entities,lang,calls,"
+        "references,naming,imports}, weaviate_mcp/code_truncation.py and "
+        "schema_versions.py are UNCHANGED (0 lines); weaviate_mcp/chunking.py "
+        "changes one comment only (the retired CHUNKER_BUMP_VERSION note). "
+        "analyze_code_graph.py's changes are walk housekeeping, not extraction: "
+        "provably orphaned CodeInteraction rows are pruned on a full walk (one "
+        "orphan predicate shared with the probe), the metadata backfill ensures "
+        "its properties first (codegraph_schema.ensure_codegraph_file_path), and "
+        "the prune-failure remedy names the real collections — every one of them "
+        "runs on an ordinary walk, so none needs a forced re-walk. The code-graph "
+        "golden snapshots (tests/fixtures/codegraph_golden) are byte-identical to "
+        "v0.2.102. _CHUNKER_REVISION and CODEGRAPH_EMBED_REVISION unchanged."
+    ),
     "0.2.101": (
         "No extraction-semantics change. `git diff v0.2.100..HEAD` across the "
         "extractor surface (analyze_code_graph.py, codegraph_{guards,"
