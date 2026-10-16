@@ -128,12 +128,58 @@ def stop_hub(
 # launcher GUI
 # --------------------------------------------------------------------------
 
+def _stdlib_lister() -> list[ProcInfo]:
+    """The process table without psutil — the uninstaller may run on the base
+    Python of a clone whose venv is gone or was never built (Windows field run,
+    v0.2.103). Windows: CIM via PowerShell; Linux: /proc; macOS: ps. Raises
+    when the table cannot be read (callers treat that as "may be running")."""
+    import json
+    import subprocess
+    import sys
+
+    out: list[ProcInfo] = []
+    if sys.platform == "win32":
+        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+               "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,"
+               "ExecutablePath | ConvertTo-Json -Compress"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        rows = json.loads(res.stdout or "[]")
+        for row in rows if isinstance(rows, list) else [rows]:
+            exe = row.get("ExecutablePath")
+            out.append(ProcInfo(int(row["ProcessId"]), str(row.get("Name") or ""),
+                                Path(exe) if exe else None))
+        return out
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for d in proc_root.iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                exe: Optional[Path] = Path(os.readlink(d / "exe"))
+            except OSError:
+                exe = None
+            try:
+                name = (d / "comm").read_text().strip()
+            except OSError:
+                continue
+            out.append(ProcInfo(int(d.name), name, exe))
+        return out
+    res = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True,
+                         text=True, timeout=60, check=True)
+    for line in res.stdout.splitlines():
+        pid, _, comm = line.strip().partition(" ")
+        if pid.isdigit():
+            comm = comm.strip()
+            out.append(ProcInfo(int(pid), Path(comm).name, Path(comm) if comm else None))
+    return out
+
+
 def _default_lister() -> list[ProcInfo]:
     try:
         import psutil
-    except ImportError:  # psutil is a declared dependency: a broken install
-        raise RuntimeError("psutil is not importable — the VCO venv is broken; "
-                           "re-run the installer") from None
+    except ImportError:
+        return _stdlib_lister()
     out: list[ProcInfo] = []
     for proc in psutil.process_iter(["pid", "name", "exe"]):
         info = proc.info

@@ -588,6 +588,11 @@ def test_uninstall_plan_builders_need_only_the_standard_library(tmp_path):
         "from vco_lib import uninstall_state, uninstall_quiesce, uninstall_artifacts;"
         "import vco_lib.uninstall_containers;"
         "uninstall_state.build_plan(clone_root=Path(sys.argv[1]));"
+        # the pre-[8] check must work too: read-only process listing, no stops
+        "import platform;"
+        "exes = uninstall_artifacts.launcher_exe_paths(os_name=platform.system(), home=Path.home());"
+        "left = uninstall_quiesce.still_running(exes, install_root=Path(sys.argv[1]));"
+        "assert not [x for x in left if 'unreadable' in x or 'cannot check' in x], left;"
         "print('ok')"
     )
     env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
