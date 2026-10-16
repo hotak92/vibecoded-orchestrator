@@ -354,7 +354,7 @@ Step-by-step guide for manual migration from flat secrets to the structured layo
 ## Infrastructure / Compose
 
 ### `infrastructure/docker-compose.yml` — base services
-Three services: `weaviate` (pinned `cr.weaviate.io/semitechnologies/weaviate:1.28.4`, ports `8081:8080` + `50052:50051`, named volume `weaviate_data`, healthcheck via `wget --spider`), `ollama` (pinned `docker.io/ollama/ollama:0.20.2`, port `11435:11434`, named volume `ollama_data`, env `OLLAMA_ORIGINS=*`, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`), and `code_embed` (custom-built from `claude_mcp_servers/code_embedding_service`, port `11440`, volume `code_embed_cache`, profile `gpu` — only started with `--profile gpu`).
+Three services: `weaviate` (pinned `cr.weaviate.io/semitechnologies/weaviate:1.28.4`, ports `8081:8080` + `50052:50051`, named volume `weaviate_data`, healthcheck via `wget --spider`), `ollama` (pinned `docker.io/ollama/ollama:0.40.5`, port `11435:11434`, named volume `ollama_data`, env `OLLAMA_ORIGINS=*`, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`), and `code_embed` (custom-built from `claude_mcp_servers/code_embedding_service`, port `11440`, volume `code_embed_cache`, profile `gpu` — only started with `--profile gpu`).
 
 <details>
 <summary>Details</summary>

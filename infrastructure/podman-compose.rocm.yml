@@ -51,7 +51,7 @@ services:
     # Pinned to the ROCm-tagged Ollama image. Bump deliberately when the
     # base compose file's CPU/CUDA image family is bumped (keep in sync
     # with docker-compose.rocm.yml).
-    image: docker.io/ollama/ollama:0.20.2-rocm
+    image: docker.io/ollama/ollama:0.40.5-rocm
     devices:
       - /dev/kfd
       - /dev/dri
