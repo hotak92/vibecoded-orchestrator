@@ -67,7 +67,7 @@ def _validate(repo: Path, rel: str, on_disk: bytes, op: tuple):
     (repo / rel).write_bytes(on_disk)
     writes = {guard.path_key(repo / rel, repo.resolve()): [op]}
     lines: List[str] = []
-    res = guard.validate(snap, writes, lines.append, resync=lambda _r: None,
+    res = guard.validate(snap, writes, lines.append, resync=lambda _r, _h: None,
                          sources="")
     return snap, res, lines
 

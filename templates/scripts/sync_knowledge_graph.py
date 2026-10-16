@@ -29,6 +29,27 @@ token is a hard usage error, exit 2, BEFORE any backend connection):
                      classifies as fresh and therefore never arms via the
                      ledger (MAJOR-R5-4). Entries whose stored plan already
                      matches still skip; only stale plans re-embed.
+    --prune-missing  with a file list: a knowledge/ target that no longer
+                     exists has its Weaviate rows deleted (by exact
+                     file_path) instead of failing as "file not found" —
+                     the post-commit KG reviewer's guard passes it when it
+                     reverts a NEW node, so the embedding the project's
+                     own edit-time sync minted does not outlive the file.
+                     When the KG collection is the shared one (the
+                     orchestrator root) only rows whose content_hash equals
+                     the target's --prune-hash are deleted; with no hash
+                     there, nothing is deleted. A non-root project with a
+                     distinct shared collection also deletes the vanished
+                     node's rows there — always hash-scoped the same way,
+                     skipped with a reason when SHARED_KG_WRITE_DISABLED is
+                     set or no hash names the path. Every pruned target
+                     prints one `KG_PRUNE_RESULT {json}` line saying what
+                     happened (vco_lib.kg_prune_result), with a
+                     per-collection breakdown when the shared arm ran.
+    --prune-hash <knowledge/rel.md>=<sha256>   (with --prune-missing,
+                     repeatable) the content_hash of the bytes the vanished
+                     node last had — scopes the shared-collection delete to
+                     rows that carry exactly those bytes
     --project-root <path> | --project-root=<path>   pin the target root
                      (consumed at import; at most once)
     -h | --help      print usage
@@ -72,7 +93,7 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Callable, Dict, List, Optional, Tuple, Mapping
 import uuid
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -234,6 +255,88 @@ def _extract_rechunk_flag(argv: "List[str]") -> bool:
 _RECHUNK_FORCED = _extract_rechunk_flag(sys.argv)
 
 
+def _extract_prune_missing_flag(argv: "List[str]") -> bool:
+    """Extract and REMOVE every ``--prune-missing`` token from *argv*
+    (mutates the list in place). Returns True when the flag was present.
+
+    Why the flag exists (v0.2.103 R30 M3): the post-commit KG reviewer's
+    guard deletes a NEW node it reverts and then re-syncs the path — but a
+    missing file used to fail here as "file not found", so the rows the
+    project's edit-time sync had already embedded for the reviewer's write
+    stayed in the collection with no file behind them. With this flag a
+    missing ``knowledge/`` target is removed through the ONE delete-by-
+    file_path home (:func:`_delete_node_by_file_path`). Without it a
+    missing target still fails, exactly as before — a typo'd path never
+    deletes anything by accident.
+
+    Same import-time ``tok == "--flag"`` idiom as :func:`_extract_rechunk_flag`
+    (the emitted-remediation gate source-matches it).
+    """
+    saw = False
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--prune-missing":
+            del argv[i]
+            saw = True
+            continue
+        i += 1
+    return saw
+
+
+#: True when this run was invoked with ``--prune-missing`` (v0.2.103 R30
+#: M3); see :func:`_extract_prune_missing_flag`.
+_PRUNE_MISSING = _extract_prune_missing_flag(sys.argv)
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _extract_prune_hashes(argv: "List[str]") -> "Dict[str, str]":
+    """Extract and REMOVE every ``--prune-hash <rel>=<sha256>`` pair from
+    *argv* (mutates the list in place). Returns ``{rel: sha256}``.
+
+    Why (v0.2.103 R33 N1): on the orchestrator root the KG collection IS the
+    shared collection, and ``file_path`` is not project-qualified there — a
+    sibling project's ``scope: shared`` row can carry the same relative path,
+    so a bare delete-by-file_path is refused. The post-commit KG reviewer's
+    guard knows the exact bytes of the node it reverted and passes their
+    ``content_hash`` (``vco_lib.knowledge_residue.content_signature_of_file_bytes``,
+    the one signature home the sync stores); the prune then deletes only the
+    rows carrying THAT hash. A malformed value, or the flag without
+    ``--prune-missing``, is a usage error (exit 2) — same import-time
+    ``tok == "--flag"`` idiom as :func:`_extract_prune_missing_flag`.
+    """
+    out: "Dict[str, str]" = {}
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--prune-hash":
+            value = argv[i + 1] if i + 1 < len(argv) else ""
+            rel, sep, digest = value.rpartition("=")
+            digest = digest.strip().lower()
+            if not sep or not rel.strip() or not _SHA256_HEX.fullmatch(digest):
+                print("❌ --prune-hash requires <knowledge/rel.md>=<sha256 hex>"
+                      f" (got: {value!r})", file=sys.stderr)
+                sys.exit(2)
+            # POSIX spelling, like every stored file_path (to_posix_rel is
+            # imported further down, after this import-time pre-scan).
+            out[rel.strip().replace("\\", "/").removeprefix("./")] = digest
+            del argv[i:i + 2]
+            continue
+        i += 1
+    if out and not _PRUNE_MISSING:
+        print("❌ --prune-hash is only meaningful with --prune-missing",
+              file=sys.stderr)
+        sys.exit(2)
+    return out
+
+
+#: ``{rel: content_hash}`` from ``--prune-hash`` (v0.2.103 R33 N1); see
+#: :func:`_extract_prune_hashes`.
+_PRUNE_HASHES = _extract_prune_hashes(sys.argv)
+
+
 def _resolve_project_root() -> "Tuple[Path, str]":
     """Resolve the target project root with the v0.2.89 layered precedence.
 
@@ -352,6 +455,18 @@ from vco_lib.containers import runtime_command_hint as _runtime_command_hint  # 
 # skips — otherwise archived nodes (which never get a stored content_hash) are
 # re-listed as "changed" on every update. Import, not a second copy.
 from vco_lib.kg_node_status import is_archived_node as _is_archived_node_shared  # noqa: E402 — same import-order constraint as the group above
+# The STORAGE-LAYER content signature (the ``content_hash`` every row
+# carries): sha256 of the node minus its frontmatter ``updated:`` line, so a
+# timestamp-only edit hashes identically (v0.2.14) and an unchanged file is
+# embed-skipped. Its one home is ``vco_lib.knowledge_residue`` (v0.2.103 R33
+# N1 collapsed the former mirror): the post-commit KG reviewer's guard hashes
+# a node it reverts with the same function and hands that hash to
+# ``--prune-hash``, so the two can never disagree. Intentionally distinct from
+# the RETRIEVAL content-identity hash (rl_client/content_dedup.content_sha) —
+# the v0.2.70 dedup triage keeps them separate on purpose; do NOT converge.
+from vco_lib.knowledge_residue import (  # noqa: E402 — same import-order constraint as the group above
+    content_signature_excluding_updated as _content_signature_excluding_updated,
+)
 # v0.2.101 B3: `file_path` / `title` are word-TOKENIZED, so a Weaviate `Equal`
 # returns token-superset rows of OTHER nodes. Every read here that deletes,
 # judges, or picks rows narrows with the filter and confirms in Python through
@@ -950,39 +1065,6 @@ class WeaviateWrapper:
 
 # For backward compatibility
 WeaviateMCPServer = WeaviateWrapper
-
-
-def _content_signature_excluding_updated(content: str) -> str:
-    """Return a SHA256 of the file content excluding the `updated:` line.
-
-    Used to detect whether a re-sync actually contains substantive changes
-    or just an unchanged file passing through the post-file-edit hook. If
-    the signature is unchanged, the `updated:` timestamp is not bumped —
-    avoiding KG-wide timestamp churn on every install run (v0.2.14).
-
-    STORAGE-LAYER hash, intentionally distinct from the RETRIEVAL content-
-    identity hash (rl_client/content_dedup.content_sha, sha1[:12]): this one
-    answers "is the stored object unchanged so I can skip the re-embed" and
-    carries the deliberate "exclude the `updated:` line" nuance so a timestamp-
-    only edit hashes identically. The retrieval hash answers "drop this
-    duplicate before it reaches Claude". The v0.2.70 dedup triage keeps them
-    separate on purpose — do NOT converge.
-    """
-    if not content.strip().startswith('---'):
-        return _sha256_text(content)
-    parts = content.split('---', 2)
-    if len(parts) < 3:
-        return _sha256_text(content)
-    fm_text = parts[1]
-    body = parts[2]
-    # Strip the `updated:` line from the frontmatter for the signature.
-    fm_no_updated = re.sub(r'^updated:.*$\n?', '', fm_text, flags=re.MULTILINE)
-    return _sha256_text(fm_no_updated + body)
-
-
-def _sha256_text(s: str) -> str:
-    import hashlib
-    return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
 
 def _embedding_failures_jsonl_hint() -> str:
@@ -2605,7 +2687,7 @@ OUTCOME_SYNCED = "synced"
 OUTCOME_EMBED_SKIPPED = "embed-skipped"          # unchanged, already current in Weaviate
 OUTCOME_ARCHIVED_SKIPPED = "archived-skipped"    # path or frontmarker: intentionally not indexed
 OUTCOME_FRONTMATTER_SKIPPED = "frontmatter-skipped"
-OUTCOME_EXCLUDED_SKIPPED = "excluded-skipped"    # meta files / out-of-root targets / dev-unset
+OUTCOME_EXCLUDED_SKIPPED = "excluded-skipped"    # meta files / out-of-root targets / dev-unset / --prune-missing removals
 OUTCOME_FAILED = "failed"
 
 _NON_FAILURE_OUTCOMES = frozenset({
@@ -3748,7 +3830,25 @@ def _file_path_filter(canonical: str):
     return _path_narrowing_filter(Filter, canonical)
 
 
-def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
+def _shared_class_exists(server: WeaviateMCPServer) -> bool:
+    """True unless Weaviate answers that the shared class is absent. A failed
+    probe returns True so the delete runs and reports its own error — an
+    unreadable state is never reported as "nothing there"."""
+    try:
+        return bool(server.client.collections.exists(SHARED_COLLECTION_NAME))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _delete_node_by_file_path(
+    server: WeaviateMCPServer,
+    file_path_value: str,
+    on_error: "Optional[Callable[[Exception], None]]" = None,
+    *,
+    only_content_hash: "Optional[str]" = None,
+    on_kept: "Optional[Callable[[int], None]]" = None,
+    collection: "Optional[str]" = None,
+) -> int:
     """Remove all Weaviate entries (incl. chunks) for a specific file_path.
 
     v0.2.70 FIX #1 (silent batch data loss): the archived-node cleanup
@@ -3769,24 +3869,244 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
     active ``concepts/orchestrator-knowledge-graph.md``), so the rows are
     confirmed in Python by ``_fetch_exact_path_rows`` before any delete.
     Callers: the two archived-node branches of ``sync_node``, the project →
-    shared migration delete (``_finish_shared_scope_write``) and the
-    v0.2.101 archived-removal routing — all go through this function.
+    shared migration delete (``_finish_shared_scope_write``), the
+    v0.2.101 archived-removal routing and the v0.2.103 ``--prune-missing``
+    removal of a vanished node (:func:`_prune_missing_node`) — all go
+    through this function.
+
+    ``on_error`` (v0.2.103 R30 M3) receives the swallowed exception, so a
+    caller that must REPORT a failed removal (the prune leg) can; the
+    return value stays 0 either way (soft-fail contract unchanged).
+
+    ``only_content_hash`` (v0.2.103 R33 N1) narrows the delete further to
+    the exact-path rows whose stored ``content_hash`` equals it (the
+    shared-collection prune: a sibling project's row at the same path with
+    other content survives); ``on_kept`` then receives how many exact-path
+    rows were left because their hash differs.
+
+    ``collection`` (v0.2.103 FINAL3 L-2) names the collection to delete
+    from — ``None`` (every pre-L-2 caller) means ``COLLECTION_NAME``. The
+    prune's shared arm passes ``SHARED_COLLECTION_NAME``; no other caller
+    changes.
     """
     try:
-        coll = server.client.collections.get(COLLECTION_NAME)
+        coll = server.client.collections.get(collection or COLLECTION_NAME)
         existing = _fetch_exact_path_rows(
             coll,
             _file_path_filter(file_path_value),
             file_path_value,
-            return_properties=["file_path"],
+            return_properties=(["file_path"] if only_content_hash is None
+                               else ["file_path", "content_hash"]),
         )
         n = 0
+        kept = 0
         for obj in existing:
+            if (only_content_hash is not None
+                    and (obj.properties or {}).get("content_hash")
+                    != only_content_hash):
+                kept += 1
+                continue
             coll.data.delete_by_id(obj.uuid)
             n += 1
+        if on_kept is not None:
+            on_kept(kept)
         return n
-    except Exception:
+    except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
         return 0
+
+
+def _prune_missing_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
+    """Remove the Weaviate rows of a ``knowledge/`` node whose file is gone
+    (``--prune-missing``, v0.2.103 R30 M3 / R33 N1).
+
+    Deletes through :func:`_delete_node_by_file_path` (exact file_path, the
+    one delete home). When the KG collection IS the shared one
+    (``collection_repair.is_shared_identity_collection`` — the predicate
+    every prune caller uses; true on the orchestrator root) a sibling
+    project's ``scope: shared`` row can carry the same relative file_path,
+    so the delete is scoped to rows whose stored ``content_hash`` equals the
+    target's ``--prune-hash`` (the bytes the post-commit KG reviewer wrote
+    and reverted); a sibling row survives unless byte-identical (minus
+    ``updated:``). With no hash for the target there, nothing is deleted.
+    On a non-shared collection every exact-path row goes (the hash is not
+    needed: nothing else writes there).
+
+    v0.2.103 FINAL3 L-2: a NON-root project's edit-time sync routes a
+    ``scope: shared`` node to ``SHARED_COLLECTION_NAME`` (the v0.2.89 scope
+    routing), so the reverted write's rows can sit in the SHARED collection
+    while the project arm above finds nothing. When a distinct shared
+    collection is configured, its exact-path rows carrying the
+    ``--prune-hash`` are deleted too — hash-scoped ALWAYS there (the same
+    sibling risk: a same-path row survives unless byte-identical; no hash →
+    no shared delete, reported) — and the shared arm is SKIPPED with a
+    reason when shared writes are disabled for this project
+    (``SHARED_KG_WRITE_DISABLED``: this sync then never embeds into the
+    shared collection, so no row of it can exist).
+
+    Every arm prints ONE ``vco_lib.kg_prune_result`` line so the caller
+    logs what actually happened, never an assumed removal — with a
+    per-collection breakdown when the shared arm ran. A failed removal
+    (Weaviate unreachable) is a FAILED outcome with the error named.
+    """
+    fp_value = _relative_file_path(file_path)
+    try:
+        from vco_lib import kg_prune_result as _pr
+    except ImportError as e:
+        print(f"❌ {fp_value}: missing node not removed: vco_lib import "
+              f"failed ({e}) — broken install?", file=sys.stderr)
+        return SyncOutcome(OUTCOME_FAILED, fp_value,
+                           "missing node not removed (vco_lib import failed)")
+    try:
+        from vco_lib.collection_repair import is_shared_identity_collection
+    except ImportError as e:
+        print(f"❌ {fp_value}: missing node not removed: vco_lib import "
+              f"failed ({e}) — broken install?", file=sys.stderr)
+        print(_pr.format_line(fp_value, _pr.STATUS_FAILED,
+                              reason=f"vco_lib import failed ({e})"))
+        return SyncOutcome(OUTCOME_FAILED, fp_value,
+                           "missing node not removed (vco_lib import failed)")
+    is_root = is_shared_identity_collection(
+        COLLECTION_NAME, SHARED_COLLECTION_NAME, PROJECT_ROOT,
+    )
+    expect_hash: "Optional[str]" = None
+    if is_root:
+        expect_hash = _PRUNE_HASHES.get(fp_value)
+        if expect_hash is None:
+            reason = (f"'{COLLECTION_NAME}' is the shared collection and no "
+                      "--prune-hash names this path (a sibling project's "
+                      "shared row may carry the same path)")
+            print(f"ℹ️  {fp_value}: file is gone; its rows are kept — {reason}")
+            print(_pr.format_line(fp_value, _pr.STATUS_SKIPPED, reason=reason))
+            return SyncOutcome(OUTCOME_EXCLUDED_SKIPPED, fp_value,
+                               "missing node: shared collection, rows kept")
+    errors: List[Exception] = []
+    kept_box: List[int] = []
+    removed = _delete_node_by_file_path(
+        server, fp_value, on_error=errors.append,
+        only_content_hash=expect_hash, on_kept=kept_box.append,
+    )
+    kept = kept_box[0] if kept_box else 0
+    if errors:
+        print(f"❌ {fp_value}: file is gone but its Weaviate rows could not be "
+              f"removed: {errors[0]}")
+    else:
+        scope = ("" if expect_hash is None
+                 else f" whose content_hash is {expect_hash[:12]}…"
+                      f" ({kept} row(s) with other content kept)")
+        print(f"🗑  {fp_value}: file is gone — removed {removed} Weaviate "
+              f"row(s){scope} from '{COLLECTION_NAME}'")
+    # FINAL3 L-2 — the shared arm (non-root, distinct shared collection):
+    # a `scope: shared` reverted node's rows were embedded there by the
+    # edit-time sync. Hash-scoped ALWAYS (a sibling project's same-path row
+    # survives unless byte-identical); SHARED_KG_WRITE_DISABLED or a missing
+    # hash skips it with a reason the result line carries.
+    shared_recs: "Dict[str, dict]" = {}
+    if not is_root and SHARED_COLLECTION_NAME and \
+            SHARED_COLLECTION_NAME != COLLECTION_NAME:
+        shared_hash = _PRUNE_HASHES.get(fp_value)
+        if _resolve_shared_kg_write_disabled():
+            reason = ("shared KG writes are disabled for this project "
+                      "(SHARED_KG_WRITE_DISABLED), so this sync never "
+                      "embedded the node there")
+            print(f"ℹ️  {fp_value}: shared collection "
+                  f"'{SHARED_COLLECTION_NAME}' not pruned — {reason}")
+            shared_recs[SHARED_COLLECTION_NAME] = {
+                "status": _pr.STATUS_SKIPPED, "deleted": 0, "kept": 0,
+                "reason": reason}
+        elif not _shared_class_exists(server):
+            reason = (f"the shared class '{SHARED_COLLECTION_NAME}' does not "
+                      "exist, so nothing was ever embedded there (R37 N-2)")
+            print(f"ℹ️  {fp_value}: shared collection not pruned — {reason}")
+            shared_recs[SHARED_COLLECTION_NAME] = {
+                "status": _pr.STATUS_SKIPPED, "deleted": 0, "kept": 0,
+                "reason": reason}
+        elif shared_hash is None:
+            reason = ("no --prune-hash names this path — only rows "
+                      "byte-identical to the reverted node's bytes are "
+                      "deleted from the shared collection (a sibling "
+                      "project's row at the same path must survive)")
+            print(f"ℹ️  {fp_value}: shared collection "
+                  f"'{SHARED_COLLECTION_NAME}' not pruned — {reason}")
+            shared_recs[SHARED_COLLECTION_NAME] = {
+                "status": _pr.STATUS_SKIPPED, "deleted": 0, "kept": 0,
+                "reason": reason}
+        else:
+            s_errors: List[Exception] = []
+            s_kept_box: List[int] = []
+            s_removed = _delete_node_by_file_path(
+                server, fp_value, on_error=s_errors.append,
+                only_content_hash=shared_hash, on_kept=s_kept_box.append,
+                collection=SHARED_COLLECTION_NAME)
+            s_kept = s_kept_box[0] if s_kept_box else 0
+            if s_errors:
+                print(f"❌ {fp_value}: shared collection "
+                      f"'{SHARED_COLLECTION_NAME}' rows could not be "
+                      f"removed: {s_errors[0]}")
+                shared_recs[SHARED_COLLECTION_NAME] = {
+                    "status": _pr.STATUS_FAILED, "deleted": s_removed,
+                    "kept": s_kept, "reason": str(s_errors[0])}
+            else:
+                print(f"🗑  {fp_value}: file is gone — removed {s_removed} "
+                      f"Weaviate row(s) whose content_hash is "
+                      f"{shared_hash[:12]}… ({s_kept} row(s) with other "
+                      f"content kept) from '{SHARED_COLLECTION_NAME}'")
+                shared_recs[SHARED_COLLECTION_NAME] = {
+                    "status": (_pr.STATUS_DELETED if s_removed
+                               else _pr.STATUS_NOTHING_MATCHED),
+                    "deleted": s_removed, "kept": s_kept, "reason": ""}
+    if not shared_recs:
+        # single-collection prune (root or no distinct shared collection):
+        # the exact pre-L-2 record and outcome
+        if errors:
+            print(_pr.format_line(fp_value, _pr.STATUS_FAILED,
+                                  reason=str(errors[0])))
+            return SyncOutcome(OUTCOME_FAILED, fp_value,
+                               f"missing node: row removal failed "
+                               f"({errors[0]})")
+        print(_pr.format_line(
+            fp_value,
+            _pr.STATUS_DELETED if removed else _pr.STATUS_NOTHING_MATCHED,
+            deleted=removed, kept=kept))
+        return SyncOutcome(OUTCOME_EXCLUDED_SKIPPED, fp_value,
+                           f"missing node: removed {removed} row(s)")
+    # shared arm ran: one aggregated record with the per-collection
+    # breakdown, so the guard's log names each collection and its counts
+    colls: "Dict[str, dict]" = {COLLECTION_NAME: {
+        "status": (_pr.STATUS_FAILED if errors else
+                   _pr.STATUS_DELETED if removed
+                   else _pr.STATUS_NOTHING_MATCHED),
+        "deleted": removed, "kept": kept,
+        "reason": (str(errors[0]) if errors else "")}}
+    colls.update(shared_recs)
+    total_deleted = removed + sum(
+        r["deleted"] for r in shared_recs.values())
+    total_kept = kept + sum(r["kept"] for r in shared_recs.values())
+    failed = [r for r in colls.values() if r["status"] == _pr.STATUS_FAILED]
+    skipped = [(n, r) for n, r in colls.items()
+               if r["status"] == _pr.STATUS_SKIPPED]
+    if failed:
+        status = _pr.STATUS_FAILED
+        reason = "; ".join(r["reason"] for r in failed if r["reason"])
+    elif total_deleted:
+        status = _pr.STATUS_DELETED
+        reason = ""
+    elif skipped:
+        status = _pr.STATUS_SKIPPED
+        reason = "; ".join(f"'{n}': {r['reason']}" for n, r in skipped
+                           if r["reason"])
+    else:
+        status = _pr.STATUS_NOTHING_MATCHED
+        reason = ""
+    print(_pr.format_line(fp_value, status, deleted=total_deleted,
+                          kept=total_kept, reason=reason,
+                          collections=colls))
+    if failed:
+        return SyncOutcome(OUTCOME_FAILED, fp_value,
+                           f"missing node: row removal failed ({reason})")
+    return SyncOutcome(OUTCOME_EXCLUDED_SKIPPED, fp_value,
+                       f"missing node: removed {total_deleted} row(s)")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -4094,6 +4414,11 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
 
     try:
         if not file_path.exists():
+            if _PRUNE_MISSING:
+                outcome = _prune_missing_node(server, file_path)
+                if not outcome:
+                    error_msg = outcome.reason
+                return outcome
             print(f"❌ File not found: {file_path}")
             error_msg = "File not found"
             return SyncOutcome(
@@ -5861,6 +6186,8 @@ def _print_usage(stream=None) -> None:
     print("       (any form accepts --project-root <path> to pin the target project)", file=stream)
     print("       (any form accepts --rechunk to force the chunk-plan comparison even", file=stream)
     print("        with no revision crossing pending — repairs stale chunk boundaries)", file=stream)
+    print("       (a file list accepts --prune-missing: a knowledge/ target that no longer", file=stream)
+    print("        exists has its Weaviate rows removed instead of failing)", file=stream)
     print("Exit codes: 0 clean · 1 per-node/per-doc failures · 2 usage error or refused root", file=stream)
 
 

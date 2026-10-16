@@ -14,9 +14,13 @@ edited an ADR and minted duplicate/stale status nodes from a partial diff):
 * research FIRST — search the KG for each topic, read every node in full
   before editing it, read the full files the diff touches, and prefer the
   NEWEST source when sources disagree (``git log`` dates);
-* extend an existing node rather than create a near-duplicate;
+* extend an existing node rather than create a near-duplicate — search for
+  a node on the same subject (any folder, any title) first;
 * write only facts the diff/sources state — no inferred provenance,
   motivation or status; never "blocker"/"in-progress"/investigation nodes;
+  never raise an evidence level (CONFIRMED/VERIFIED/TESTED/...) or cite a
+  run/commit as evidence unless that wording is in a source read (field
+  2026-10-16; both rules are also enforced by the guard);
 * KG only — ``docs/`` is never edited;
 * skip trivial/cosmetic/test-only commits; when unsure, write nothing.
 
@@ -83,6 +87,9 @@ class CommitInfo:
     diff: str
     diff_truncated: bool
     diff_lines: int
+    #: the first parent's full sha ("" for a root commit). The commit's own
+    #: sha and its parent count as READ for the guard's evidence rule.
+    parent: str = ""
 
 
 def _git(root: Path, *args: str) -> str:
@@ -137,8 +144,11 @@ def collect_commit(root: Path, rev: str = "HEAD") -> CommitInfo:
                            int(caps["diff_max_chars"]))
     diff, truncated, kept = _capped(root, base, int(caps["diff_max_lines"]),
                                     int(caps["diff_max_chars"]))
+    parent = (_git(root, "rev-parse", "--verify", f"{sha}~1").strip()
+              if has_parent else "")
     return CommitInfo(sha=sha, short=short, subject=subject, stat=stat,
-                      diff=diff, diff_truncated=truncated, diff_lines=kept)
+                      diff=diff, diff_truncated=truncated, diff_lines=kept,
+                      parent=parent)
 
 
 def _show_prefix(root: Path) -> str:
@@ -480,12 +490,17 @@ not configuration. Edits elsewhere are blocked and reverted.
    hunks - and any doc or node they cite. When two sources disagree, check
    their dates (git log) and prefer the NEWEST source; never re-assert what a
    newer source contradicts.
-5. Prefer extending an existing node over creating a new one. Create a new
-   node only for a genuinely new topic with no existing node (one topic per
-   node; no near-duplicates; a title an existing node already uses is
-   reverted). A new node must open with YAML frontmatter carrying title,
-   type, tags, created, updated and status (ISO dates) - one without it is
-   reverted.
+5. Prefer extending an existing node over creating a new one. BEFORE
+   creating any node, run hybrid_search for its subject and look for an
+   existing node on the same subject in ANY folder, under any title; if one
+   exists, extend it. Create a new node only for a genuinely new topic with
+   no existing node (one topic per node; no near-duplicates). A new node whose
+   title or file name is the same as an existing node's, or mostly the same
+   words as one and repeating its content, is reverted - this includes a
+   node you created earlier in this run - and the log names the node to
+   extend. A distinct subtopic with its own content is allowed. A new
+   node must open with YAML frontmatter carrying title, type, tags, created,
+   updated and status (ISO dates) - one without it is reverted.
 6. Write only facts the diff or the sources you read state explicitly. Do not
    infer provenance, motivation, history, ownership or status. Never write a
    CLI flag, option name, default value, number or sample output/log that you
@@ -494,6 +509,17 @@ not configuration. Edits elsewhere are blocked and reverted.
    backticked `--flag` that appears in nothing you read is reverted.
    hybrid_search results do NOT count as a source for this (KG text can be
    wrong): Read the file a flag comes from before writing it.
+   Never raise a confidence or evidence level: do not label a fact
+   CONFIRMED, VERIFIED, TESTED, PROVEN or VALIDATED, or write that it is
+   (or was) confirmed / verified / tested / proven / validated, or was so
+   in, via, by, on, at or during something, or write it after a label such
+   as "Status:" / "Result:" / "Outcome:", and never cite a test run, run
+   id, build or commit as evidence for a fact, unless that exact word - and
+   that exact id - is in the diff, its commit stat or sha, or a Read/Grep
+   result from this run. When the source says "inferred", "untested" or
+   "unverified", the node says so too. A line that makes such a claim
+   without a source, or cites a run/commit found in nothing you read, is
+   reverted with its whole write.
 7. Record where a node's facts came from. A node you create or extend from a
    document or other source file records the source path and the commit it
    reflects, as a line like "Source: docs/reports/cache.md @ {commit.short}".

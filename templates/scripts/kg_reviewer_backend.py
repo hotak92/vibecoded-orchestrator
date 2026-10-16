@@ -676,9 +676,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 "output)")
         # What the reviewer read verbatim: its Read/Grep results plus the
         # commit stat and diff it was handed (a flag quoted from the diff is
-        # sourced too).
+        # sourced too) and the commit's own sha and its parent's (a node may
+        # cite the commit it reflects).
         sources = "\n".join((_guard.transcript_sources(stdout), commit.stat,
-                             commit.diff))
+                             commit.diff, commit.sha, commit.parent))
         result = _guard.validate(snap, writes, log,
                                  resync=_guard.resync_with(root, log),
                                  sources=sources)

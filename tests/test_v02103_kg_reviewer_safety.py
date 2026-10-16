@@ -369,7 +369,8 @@ def _reviewer_write(repo: Path, writes: dict, rel: str, content: str) -> None:
 def _validate(repo: Path, writes: Optional[dict], snap, sources: str = "") -> tuple:
     lines: List[str] = []
     resynced: List[List[str]] = []
-    res = guard.validate(snap, writes, lines.append, resync=resynced.append,
+    res = guard.validate(snap, writes, lines.append,
+                         resync=lambda r, _h: resynced.append(r),
                          sources=sources)
     return res, lines, resynced
 
