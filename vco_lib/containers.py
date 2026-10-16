@@ -89,6 +89,7 @@ __all__ = [
     "HISTORICAL_ALIASES",
     "canonical_name",
     "all_known_names",
+    "vco_prefixed_container_names",
     "find_existing_container",
     "classify_container_probe",
     "UnknownServiceError",
@@ -210,6 +211,25 @@ def all_known_names(service: str) -> list[str]:
             continue
         seen.add(name)
         out.append(name)
+    return out
+
+
+def vco_prefixed_container_names() -> list[tuple[str, str]]:
+    """Every ``(container_name, service)`` VCO has shipped under its OWN
+    prefix (``vco_*`` / ``vct_*``) — canonical names and historical aliases
+    alike, read from the two tables above, never re-typed.
+
+    The unprefixed v0.1.x names (``weaviate``, ``ollama``, ``code_embed``) and
+    the maintainer-era ``*_claude`` names are deliberately NOT here: a user's
+    own container may carry them, so nothing destructive is keyed on them.
+    Used by the uninstaller's legacy-container sweep
+    (:mod:`vco_lib.uninstall_containers`).
+    """
+    out: list[tuple[str, str]] = []
+    for service in CANONICAL_CONTAINERS:
+        for name in all_known_names(service):
+            if name.startswith(("vco_", "vct_")):
+                out.append((name, service))
     return out
 
 
@@ -378,6 +398,10 @@ COMPOSE_CONFIG_FILES_LABEL = "com.docker.compose.project.config_files"
 #: config hash podman-compose never writes.
 PODMAN_COMPOSE_PROJECT_LABEL = "io.podman.compose.project"
 DOCKER_COMPOSE_CONFIG_HASH_LABEL = "com.docker.compose.config-hash"
+#: The compose SERVICE a container was created for (both tools write it).
+#: The uninstaller's legacy-container sweep requires it to equal the VCO
+#: service a name belongs to before it removes anything (v0.2.103).
+COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
 
 _COMPOSE_NAME_KEY_RE = re.compile(r"^name:\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
 
@@ -394,6 +418,8 @@ class ComposeIdentity:
     #: ``""`` when the labels do not say. Compared against
     #: :attr:`vco_lib.compose_provider.ComposeProvider.label_family`.
     provider: str = ""
+    #: ``com.docker.compose.service`` — ``""`` when the label is absent.
+    service: str = ""
 
     def describe(self) -> str:
         parts = [f"project '{self.project}'"]
@@ -472,6 +498,7 @@ def compose_identity_of(
             COMPOSE_CONFIG_FILES_LABEL,
             PODMAN_COMPOSE_PROJECT_LABEL,
             DOCKER_COMPOSE_CONFIG_HASH_LABEL,
+            COMPOSE_SERVICE_LABEL,
         )
     )
     argv = [bin_name, "inspect", "--type", "container", "--format", fmt, container]
@@ -495,6 +522,7 @@ def compose_identity_of(
         working_dir=_field(1),
         config_files=_field(2),
         provider=compose_label_family(_field(3), _field(4)),
+        service=_field(5),
     )
 
 

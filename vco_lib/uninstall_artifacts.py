@@ -23,6 +23,9 @@ the clone (review V02103-FINAL2 M-1):
   ``state/codegraph-walk-claims/*.lock`` (``codegraph_walk``),
   ``model-guidance.json`` (``model_selection``) and the engine starter's log
   ``logs/engine-start.log`` (bounded in place, no rotated siblings).
+  Since the v0.2.103 field run these are planned here only when the
+  whole-state-dir step [8] (:mod:`vco_lib.uninstall_state`) REFUSED the state
+  dir (``include_state``); otherwise that step removes them with the dir.
 
 Ownership is decided per path, never by a directory walk: an exact name VCO
 writes AND, where the name alone could be a user's, a VCO signature in the
@@ -35,8 +38,9 @@ files are gone, so a file someone else put there survives.
 user's own bytes (the KG reviewer backs up before it reverts). The plan lists
 it as left in place so the user decides.
 
-A running ``vct-hub`` is stopped first (its own ``--stop``) because Windows
-cannot delete a running ``.exe``; a file that still cannot be removed (the
+A running ``vct-hub`` is stopped first (its own ``--stop``, through
+:func:`vco_lib.uninstall_quiesce.stop_hub` — uninstall step [3] normally
+stopped it already) because Windows cannot delete a running ``.exe``; a file that still cannot be removed (the
 launcher GUI is open) is reported with what to do, and the step continues.
 Never raises.
 """
@@ -51,7 +55,7 @@ from typing import Callable, Mapping, Optional, Sequence
 
 __all__ = [
     "LAUNCHER_BUNDLE_ID", "WINDOWS_LAUNCHER_EXES", "Plan", "Removal",
-    "build_plan", "plan_lines", "execute",
+    "build_plan", "plan_lines", "execute", "launcher_exe_paths",
 ]
 
 #: ``identifier`` in ``launcher/src-tauri/tauri.conf.json`` (must match).
@@ -240,15 +244,27 @@ def build_plan(
     vct_root: Path,
     env: Optional[Mapping[str, str]] = None,
     system_applications: Path = Path("/Applications"),
+    include_state: bool = True,
 ) -> Plan:
     """Every VCO-written path outside the clone that exists on this machine.
 
     Pure apart from reads; ``os_name`` is ``platform.system()``.
+    ``include_state=False`` leaves out the files under ``vct_root``: the
+    uninstall's whole-state-dir step [8] (:mod:`vco_lib.uninstall_state`)
+    removes them, so they are not listed twice. They are planned here only
+    when that step refused the state dir (the exact-name fallback).
     """
     env = os.environ if env is None else env
     plan = Plan()
+    if include_state:
+        _plan_state_files(plan, vct_root)
+    _plan_launcher(plan, os_name=os_name, home=home, env=env,
+                   system_applications=system_applications)
+    return plan
 
-    # --- VCO state files added this cycle (every OS) ----------------------
+
+def _plan_state_files(plan: Plan, vct_root: Path) -> None:
+    """VCO state files added this cycle (every OS) — exact names only."""
     state = vct_root / "state"
     _add_file(plan, state / "engine-start.lock", "container-engine start lock", vct_root)
     claims = state / "codegraph-walk-claims"
@@ -271,7 +287,10 @@ def build_plan(
     if outside.exists():
         plan.keep.append((outside, "backups of your own files made by the KG reviewer"))
 
-    # --- launcher binaries + shortcuts ------------------------------------
+
+def _plan_launcher(plan: Plan, *, os_name: str, home: Path, env: Mapping[str, str],
+                   system_applications: Path) -> None:
+    """Launcher binaries + shortcuts."""
     if os_name == "Windows":
         local = env.get("LOCALAPPDATA")
         if local:
@@ -298,7 +317,7 @@ def build_plan(
             lnk = d / LNK_NAME
             if _is_vco_lnk(lnk):
                 plan.remove.append(Removal(lnk, "file", "launcher shortcut"))
-        return plan
+        return
 
     # Linux, and the macOS no-.app fallback, stage the flat binary here.
     flat_dir = home / ".local" / "share" / "vct-launcher"
@@ -322,7 +341,54 @@ def build_plan(
                     plan.remove.append(Removal(app, "link", "launcher Applications link"))
             elif app.is_dir() and _is_vco_app(app):
                 plan.remove.append(Removal(app, "tree", "launcher app bundle"))
-    return plan
+
+
+def launcher_exe_paths(
+    *,
+    os_name: str,
+    home: Path,
+    env: Optional[Mapping[str, str]] = None,
+    clone_root: Optional[Path] = None,
+    system_applications: Path = Path("/Applications"),
+) -> list[Path]:
+    """Every exact path a VCO launcher GUI binary runs from on this machine:
+    the locations above (``%LOCALAPPDATA%\\vct-launcher``, the flat
+    ``~/.local/share/vct-launcher``, a VCO ``VCT Launcher.app``), the clone's
+    ``launcher/dist/`` slots, ``~/.vct/bin`` and ``$VCT_LAUNCHER_BIN`` (the
+    discovery chain of :func:`vco_lib.hub_ensure.find_dist_binary`).
+
+    The uninstaller stops a running launcher only when its executable is one
+    of these paths (:mod:`vco_lib.uninstall_quiesce`) — never on a name match.
+    """
+    env = os.environ if env is None else env
+    names = ("vct-launcher.exe", "vct-launcher") if os_name == "Windows" else ("vct-launcher",)
+    dirs: list[Path] = [home / ".vct" / "bin"]
+    if os_name == "Windows":
+        local = env.get("LOCALAPPDATA")
+        if local:
+            dirs.append(Path(local) / WINDOWS_LAUNCHER_DIRNAME)
+    else:
+        dirs.append(home / ".local" / "share" / "vct-launcher")
+    if clone_root is not None:
+        dist = Path(clone_root) / "launcher" / "dist"
+        dirs.append(dist)
+        try:
+            dirs += sorted(d for d in dist.iterdir() if d.is_dir() and not _is_reparse(d))
+        except OSError:
+            pass
+    out = [d / n for d in dirs for n in names]
+    pinned = (env.get("VCT_LAUNCHER_BIN") or "").strip()
+    if pinned:
+        out.append(Path(pinned))
+    if os_name == "Darwin":
+        for apps_dir in (system_applications, home / "Applications"):
+            app = apps_dir / APP_BUNDLE_NAME
+            if _is_vco_app(app):
+                try:
+                    out += sorted((app / "Contents" / "MacOS").iterdir())
+                except OSError:
+                    pass
+    return out
 
 
 def plan_lines(plan: Plan) -> list[str]:
@@ -371,18 +437,14 @@ def execute(
             f"left in place: {p} ({why})" for p, why in plan.keep
         ]
 
-    hubs = [p for p in [*plan.hub_binaries, *extra_hub_binaries] if p is not None]
-    if hubs and (hub_running or _default_hub_running)():
-        run = runner or _default_runner
-        for hub in hubs:
-            if Path(hub).is_file():
-                rc = run([str(hub), "--stop"], timeout=30)
-                audit.append(
-                    f"stopped vct-hub via `{hub} --stop`" if rc == 0
-                    else f"WARN: `{hub} --stop` "
-                    + ("could not be spawned / timed out" if rc is None else f"exited {rc}")
-                )
-                break
+    # Normally a no-op: uninstall step [3] already stopped the hub before any
+    # removal. Kept so this step is safe on its own (Windows locks a running
+    # .exe); ONE implementation, :func:`vco_lib.uninstall_quiesce.stop_hub`.
+    from vco_lib.uninstall_quiesce import stop_hub
+
+    audit += stop_hub([*plan.hub_binaries, *extra_hub_binaries],
+                      hub_running=hub_running or _default_hub_running,
+                      runner=runner or _default_runner, report_idle=False)
 
     for item in plan.remove:
         try:

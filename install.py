@@ -160,6 +160,7 @@ from vco_lib import paths as _paths  # noqa: E402
 from vco_lib import service_endpoints as _service_endpoints  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
 from vco_lib import uninstall_artifacts as _uninstall_artifacts  # noqa: E402
+from vco_lib import uninstall_containers as _uninstall_containers, uninstall_quiesce as _uninstall_quiesce, uninstall_state as _uninstall_state  # noqa: E402,E501
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
 from vco_lib import compose_provider as _compose_provider  # noqa: E402
@@ -21432,9 +21433,11 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     Removes ONLY orchestrator-managed paths. Never touches user source code.
 
     Categories (each prompted separately, unless --yes):
-      1. Stop containers (compose down — preserves volumes)
+      1. Stop containers (compose down — preserves volumes); 1b. remove
+         legacy VCO containers compose cannot reach (uninstall_containers.py)
       2. Remove container volumes (default: prompt; suppressed by --keep-data)
-      3. Remove launcher state (~/.vct/launcher.db)
+      3. Stop vct-hub + the VCO launcher GUI BEFORE any state removal
+         (vco_lib/uninstall_quiesce.py)
       4. Remove orchestrator MCP server entries from ~/.claude.json
          (preserves user's other MCP servers)
       5. Remove boot-time autostart entries (v0.2.54 Track G):
@@ -21445,8 +21448,10 @@ def _run_uninstall(args: argparse.Namespace) -> int:
          Without this, post-uninstall every boot retried
          `scripts/launch-claude-mcp-stack.*` from a deleted clone forever.
       6. (opt-in via --remove-projects) Remove .claude/ folders in registered projects
-      7. Launcher binaries, shortcuts and VCO state files OUTSIDE the clone
+      7. Launcher binaries and shortcuts OUTSIDE the clone
          (vco_lib/uninstall_artifacts.py — exact VCO names only)
+      8. The WHOLE VCO state dir (~/.vct / $VCT_STATE_DIR), RL training data
+         included (vco_lib/uninstall_state.py — refuses a dir not plainly VCO's)
       NEVER touches: ~/.vct-secrets/ (user's secret material)
 
     Writes an audit log of what was removed to stdout and to
@@ -21510,6 +21515,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         # Never silent: pre-v0.2.92 an unusable/absent runtime made step 1 a
         # no-op with no line in the plan at all.
         print(f"  [1] [skip] Containers not stopped — {_rt.reason}")
+    legacy = _uninstall_containers.find(_rt.runtime, current_compose_dir=compose_dir) if _rt.runtime else ([], [])
+    print("\n".join(_uninstall_containers.plan_lines(*legacy)))
 
     if not args.keep_data:
         print("  [2] Remove container volumes (Weaviate KG data + Ollama models + code embeddings)")
@@ -21517,13 +21524,12 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     else:
         print("  [2] [skip] Container volumes preserved (--keep-data)")
 
-    # Honour VCT_STATE_DIR / VCT_LAUNCHER_DB_PATH so a dev launcher's
-    # state isolates cleanly (v0.2.54: canonical resolver).
-    from vco_lib.paths import launcher_db_path
-    launcher_db = launcher_db_path()
-    will_remove_launcher_db = launcher_db.exists()
-    if will_remove_launcher_db:
-        print(f"  [3] Remove launcher state: {launcher_db}")
+    # [3]/[8] (owner ruling 2026-10-16): the hub + launcher GUI hold the state
+    # dir open, so they stop BEFORE the whole state dir is removed.
+    os_name = platform.system()
+    st_plan = _uninstall_state.build_plan(clone_root=PROJECT_ROOT)
+    launcher_exes = _uninstall_artifacts.launcher_exe_paths(os_name=os_name, home=Path.home(), clone_root=PROJECT_ROOT)
+    print("\n".join(_uninstall_quiesce.plan_lines(launcher_exes)))
 
     claude_json = Path.home() / ".claude.json"
     will_clean_claude_json = claude_json.exists()
@@ -21533,7 +21539,6 @@ def _run_uninstall(args: argparse.Namespace) -> int:
 
     # Boot-service removal (v0.2.54 Track G): plan lines name the exact
     # OS-specific artefact so --dry-run output is auditable.
-    os_name = platform.system()
     if os_name == "Linux":
         boot_artefact = (
             f"systemd user unit ~/.config/systemd/user/{_BOOT_SERVICE_UNIT_NAME}"
@@ -21550,29 +21555,20 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     print("      + `vct-hub --unregister-boot` (no-op if never enabled)")
     print(f"      + model gateway autostart: {_gateway_boot_artefact(os_name)}")
 
-    # v0.2.92 (WP-10): the model gateway's runtime state. Until now this
-    # uninstaller removed exactly one file under the state root
-    # (launcher.db) and nothing else, so a gateway that had ever run left
-    # its token, pid, port, log and exported context table behind. Named
-    # files only — `~/.vct/` also holds hub.token, hub.port, services.toml
-    # and the launcher DB the user may want to keep, so the DIRECTORY is
-    # never removed and never walked.
-    gateway_state = _boot_service.gateway_state_paths()
-    gateway_present = [p for p in gateway_state if p.exists()]
-    if gateway_present:
-        print(f"  [5b] Remove model-gateway state files under {_paths.vct_root_dir()}:")
-        for path in gateway_present:
-            print(f"       - {path.name if path.parent == _paths.vct_root_dir() else path}")
-    else:
-        print(f"  [5b] [skip] No model-gateway state files under {_paths.vct_root_dir()}")
+    # The gateway's state files (v0.2.92 WP-10) go with the state dir [8]; by
+    # name only when [8] refused the dir.
+    gateway_present = [p for p in _boot_service.gateway_state_paths() if p.exists()] if st_plan.refused else []
 
     if args.remove_projects:
         print("  [6] Remove .claude/ folders in registered projects (--remove-projects)")
     else:
         print("  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
 
-    _ua_plan = _uninstall_artifacts.build_plan(os_name=os_name, home=Path.home(), vct_root=_paths.vct_root_dir())
+    _ua_plan = _uninstall_artifacts.build_plan(os_name=os_name, home=Path.home(), vct_root=st_plan.root,
+                                               include_state=st_plan.refused is not None)
+    hub_bins = [*_ua_plan.hub_binaries, _try_bundled_vct_hub_binary(PROJECT_ROOT)]
     print("\n".join(_uninstall_artifacts.plan_lines(_ua_plan)))
+    print("\n".join(_uninstall_state.plan_lines(st_plan, fallback_files=gateway_present)))
 
     print()
     print("  WILL NOT TOUCH: ~/.vct-secrets/ (your GitHub PAT and other secrets stay)")
@@ -21644,13 +21640,15 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             print(f"    {container_runtime} {removeop} <NAME>     # one at a time")
             print()
 
-    # Step 3: launcher.db.
-    if will_remove_launcher_db and _confirm(f"Remove {launcher_db}?"):
-        try:
-            launcher_db.unlink()
-            audit.append(f"removed {launcher_db}")
-        except OSError as e:
-            audit.append(f"WARN: could not remove {launcher_db}: {e}")
+    # Step 1b: legacy VCO containers (exact names + VCO compose labels; re-probed).
+    if legacy[0] and _rt.runtime and _confirm("Remove legacy VCO containers from an older install (volumes kept)?"):
+        audit.extend(_uninstall_containers.remove(_rt.runtime, current_compose_dir=compose_dir))
+
+    # Step 3: stop what holds the state dir open, before ANY state removal.
+    if _confirm("Stop vct-hub and the VCO launcher before VCO state is removed?"):
+        audit.extend(_uninstall_quiesce.stop_hub(hub_bins))
+        audit.extend(_uninstall_quiesce.stop_launchers(
+            launcher_exes, interactive=not non_interactive, confirm=_confirm, wait_for_user=_confirm))
 
     # Step 4: scrub orchestrator MCP entries from ~/.claude.json.
     #
@@ -21707,19 +21705,6 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             _boot_service.model_gateway_spec(os_key=platform.system()),
         ))
 
-    # Step 5b: model-gateway runtime state (v0.2.92 WP-10).
-    #
-    # `~/.vct/` was never scrubbed by this uninstaller — only launcher.db
-    # was removed — so the gateway's token, pid, port, log and exported
-    # chat-model context table survived an uninstall and confused the next
-    # install (a stale pid file makes a fresh gateway refuse to start).
-    # Named files only; the state root itself belongs to other components
-    # and to the user.
-    if gateway_present and _confirm(
-        f"Remove model-gateway state files under {_paths.vct_root_dir()}?"
-    ):
-        audit.extend(_boot_service.remove_gateway_state())
-
     # Step 6: per-project .claude/ folders (opt-in).
     if args.remove_projects:
         registry = PROJECT_ROOT / ".claude" / "PROJECT_REGISTRY.md"
@@ -21729,7 +21714,14 @@ def _run_uninstall(args: argparse.Namespace) -> int:
 
     # Step 7: what install placed OUTSIDE the clone (review V02103-FINAL2 M-1).
     if _ua_plan.remove and _confirm("Remove launcher binaries, shortcuts and VCO state files outside the clone?"):
-        audit.extend(_uninstall_artifacts.execute(_ua_plan, extra_hub_binaries=[_try_bundled_vct_hub_binary(PROJECT_ROOT)]))
+        audit.extend(_uninstall_artifacts.execute(_ua_plan, extra_hub_binaries=hub_bins[-1:]))
+
+    # Step 8: the whole VCO state dir (uninstall_state.py; exact names when refused).
+    if (st_plan.exists or st_plan.db_files or gateway_present) and _confirm(
+            f"Remove the VCO state dir {st_plan.root} (RL training data included)?"):
+        audit.extend(_uninstall_state.execute(st_plan))
+        if gateway_present:
+            audit.extend(_boot_service.remove_gateway_state())
 
     # Write audit log.
     audit_dir = Path.home() / ".vibecoded"

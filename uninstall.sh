@@ -8,7 +8,9 @@
 #   --yes               non-interactive (accept all confirmations)
 #
 # By default the uninstaller is interactive and prompts before each
-# destructive step. It NEVER touches ~/.vct-secrets/ and NEVER touches
+# destructive step. It stops vct-hub and the VCO launcher first, then
+# removes the WHOLE VCO state dir (~/.vct or $VCT_STATE_DIR, RL training
+# data included). It NEVER touches ~/.vct-secrets/ and NEVER touches
 # user source code outside orchestrator-managed paths.
 
 set -euo pipefail

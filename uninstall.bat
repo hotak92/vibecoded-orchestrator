@@ -11,7 +11,9 @@ REM   --dry-run           print plan and exit
 REM   --yes               non-interactive: accept all confirmations
 REM
 REM By default the uninstaller is interactive and prompts before each
-REM destructive step. It NEVER touches %USERPROFILE%\.vct-secrets and
+REM destructive step. It stops vct-hub and the VCO launcher first, then
+REM removes the WHOLE VCO state dir (%USERPROFILE%\.vct or VCT_STATE_DIR,
+REM RL training data included). It NEVER touches %USERPROFILE%\.vct-secrets and
 REM NEVER touches user source code outside orchestrator-managed paths.
 setlocal enabledelayedexpansion
 
@@ -38,6 +40,9 @@ echo Usage: uninstall.bat [options]
 echo.
 echo Uninstalls the VibeCoded Tools orchestrator. Removes ONLY
 echo orchestrator-managed paths - never your source code or secrets.
+echo It stops vct-hub and the VCO launcher, then removes the whole VCO state
+echo folder %%USERPROFILE%%\.vct - RL training data and launcher.db included.
+echo %%USERPROFILE%%\.vct-secrets is never touched.
 echo.
 echo Options forwarded to install.py --uninstall:
 echo   --dry-run           Print the removal plan and exit. Run this first.

@@ -100,7 +100,8 @@ def test_a_same_named_lnk_that_is_not_ours_is_left(tmp_path):
 
 def test_a_running_hub_is_stopped_before_the_binaries_go(win):
     calls = []
-    ua.execute(win["plan"], hub_running=lambda: True,
+    # running until its --stop has been called (stop_hub waits for the exit)
+    ua.execute(win["plan"], hub_running=lambda: not calls,
                runner=lambda cmd, timeout=15: calls.append(cmd) or 0)
     assert calls and calls[0][-1] == "--stop"
     assert calls[0][0].endswith("vct-hub.exe")
@@ -203,6 +204,11 @@ def _uninstall(monkeypatch, tmp_path, *, dry_run):
     monkeypatch.setattr(install._boot_service, "unregister", lambda *a, **k: [])
     monkeypatch.setattr(install._boot_service, "unregister_hub_boot_service", lambda *a, **k: [])
     monkeypatch.setattr(ua, "_default_hub_running", lambda: False)
+    # never read the real process table: a test run from a checkout whose
+    # launcher/dist binary is running would otherwise see a VCO launcher
+    from vco_lib import uninstall_quiesce as uq
+    monkeypatch.setattr(uq, "_default_hub_running", lambda: False)
+    monkeypatch.setattr(uq, "_default_lister", lambda: [])
     lock = tmp_path / "vct" / "state" / "engine-start.lock"
     lock.parent.mkdir(parents=True)
     lock.write_text("")
