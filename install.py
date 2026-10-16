@@ -438,7 +438,8 @@ EMBEDDING_CONFIGS = {
     # Text uses Snowflake Arctic Embed v2 (smaller than qwen3, still 1024d, Apache 2.0).
     # Code uses Jina V2 base-code (768d, specialized for code).
     # Both run via Ollama (no GPU code-embed service).
-    # Picks: opt-in via --low-resource (not auto-selected — explicit choice).
+    # Picks: --low-resource (explicit, keeps the inference cap below) or the
+    # auto tier when KG picks arctic (cap dropped — the hardware ladder picks).
     "low_resource": {
         "text_model": "snowflake-arctic-embed2:latest",
         "text_dims": 1024,
@@ -9349,7 +9350,7 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     if args.low_resource:
         config = dict(EMBEDDING_CONFIGS["low_resource"])
         _record_install_choice("embedding_mode", "low_resource",
-                               {"reason": "user passed --low-resource"})
+                               {"reason": "user passed --low-resource", "explicit": True})
         return config
     if args.cpu_only:
         config = dict(EMBEDDING_CONFIGS["cpu"])
@@ -9368,8 +9369,12 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         _apply_tier_overrides(config, code_pick=prior.get("code_model") or config["code_model"],
                               kg_pick=prior.get("text_model") or config["text_model"],
                               has_gpu=bool(sysinfo.has_gpu))
+        # The low_resource inference cap replays only for the explicit opt-in.
+        explicit = bool(prior.get("explicit") or prior.get("reason") == "user passed --low-resource")
+        if not explicit:
+            config.pop("inference_models_override", None)
         _record_install_choice("embedding_mode", prior["value"], {
-            "reason": "replayed from last install",
+            "reason": "replayed from last install", "explicit": explicit,
             "code_model": config["code_model"], "text_model": config["text_model"]})
         return config
 
@@ -9425,6 +9430,7 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
                   f"RAM={ram:.1f} GB, cores={cores})")
 
     config = dict(EMBEDDING_CONFIGS[profile_key])
+    config.pop("inference_models_override", None)  # cap = explicit opt-in only
 
     # Surgical overrides when the selector disagrees with the stock
     # profile model. v0.2.54 (gpu-audit C-5): extracted to
