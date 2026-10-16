@@ -351,13 +351,15 @@ SUMMARY_CPU_TIER_MODEL = _SUMMARY_BACKEND_GEMMA
 #: ``qwen3.5:9b`` 6 288 (local) / 6 247 (registry); ``qwen3.5:4b`` 3 170;
 #: ``gemma4:e4b`` 9 163 (the copy pulled 2026-09-28; the tag was re-published
 #: at 6 278 since — the larger, field-observed size is kept so no machine
-#: holding the old copy is told it fits); ``qwen3.5:0.8b`` 988.
+#: holding the old copy is told it fits); ``qwen3.5:0.8b`` 1 260 (re-checked
+#: 2026-10-16 against Ollama 0.40.5: the tag grew from the 988 first recorded;
+#: the other three sizes were unchanged).
 #: At runtime the floor uses the ACTUAL size of the copy Ollama holds.
 SUMMARY_MODEL_SIZE_MB: dict = {
     _SUMMARY_BACKEND_QWEN35_9B: 6288,
     _SUMMARY_BACKEND_QWEN35_4B: 3170,
     _SUMMARY_BACKEND_GEMMA: 9163,
-    "qwen3.5:0.8b": 988,
+    "qwen3.5:0.8b": 1260,
 }
 
 #: Free-VRAM floor shape (v0.2.103 R2/H-4): the model's on-disk size plus a

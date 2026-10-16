@@ -139,7 +139,7 @@ services:
     # Pinned for supply-chain trust + reproducibility (matches
     # infrastructure/docker-compose.yml). Bump deliberately on a new
     # ollama release; releases: https://github.com/ollama/ollama/releases
-    image: docker.io/ollama/ollama:0.20.2
+    image: docker.io/ollama/ollama:0.40.5
     # Prefixed name avoids collision with bare `ollama` containers — see
     # weaviate above.
     container_name: vco_ollama
