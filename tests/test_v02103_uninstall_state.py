@@ -595,3 +595,15 @@ def test_uninstall_plan_builders_need_only_the_standard_library(tmp_path):
     proc = subprocess.run([sys.executable, "-S", "-c", code, str(repo)],
                           capture_output=True, text=True, env=env, timeout=60)
     assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr[-2000:]
+
+
+def test_still_running_treats_an_unreadable_hub_state_as_running(tmp_path):
+    """R40 L1: the pre-[8] check fails closed for the hub too."""
+    from vco_lib import uninstall_quiesce as uq
+
+    def broken():
+        raise OSError("pidfile unreadable")
+
+    out = uq.still_running([], hub_running=broken, lister=lambda: [],
+                           gateway_reader=lambda: None, gateway_candidates=[])
+    assert any("vct-hub" in item for item in out)

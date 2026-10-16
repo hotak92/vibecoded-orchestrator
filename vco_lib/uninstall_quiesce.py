@@ -394,7 +394,18 @@ def still_running(
     """What of VCO still runs (same identification as the stops). Step [8]
     removes nothing while this is non-empty (review R39 M2); a check that
     cannot run counts as running."""
-    out = ["vct-hub"] if (hub_running or _default_hub_running)() else []
+    out: list[str] = []
+    try:  # unlike step [3]'s lenient probe, an unreadable hub state here blocks [8]
+        if hub_running is not None:
+            hub_up = hub_running()
+        else:
+            from vco_lib import hub_ensure
+
+            hub_up = hub_ensure.is_running()
+        if hub_up:
+            out.append("vct-hub")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"possibly vct-hub (cannot check: {exc})")
     try:
         out += [f"the VCT Launcher ({_describe(p)})" for p in find_launchers(launcher_exes, lister=lister)[0]]
     except Exception as exc:  # noqa: BLE001
