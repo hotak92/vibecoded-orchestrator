@@ -49,7 +49,11 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: ``os.name == 'nt'``, ``platform.system()``, module constants
 #: (``IS_WINDOWS``, ``not POSIX``), ``skipUnless`` and imperative
 #: ``if <windows>: pytest.skip(...)``, all of which were already there.
-NON_CONVENTION_BASELINE = 177
+#: 177 -> 178 (Fable FINAL4, 2026-10-16): the uninstall stopper's live `-S`
+#: test sends real POSIX signals and reads /proc — a POSIX-only primitive with
+#: no .ps1 sibling; its Windows leg is unit-tested with a fake runner
+#: (tests/test_v02103_uninstall_state.py::test_windows_listing_survives_*).
+NON_CONVENTION_BASELINE = 178
 
 
 # -- which conditions skip on Windows --------------------------------------
