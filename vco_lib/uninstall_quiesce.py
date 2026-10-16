@@ -325,6 +325,11 @@ def _terminate_if(pid: int, still_ours: Callable[..., bool],
         try:
             proc.wait(timeout=grace)
         except psutil.TimeoutExpired:
+            # Re-identify before forcing, as the stdlib leg does (psutil's own
+            # pid-reuse check covers a reused pid; this also covers a process
+            # that exec'd into something else during the grace wait).
+            if not proc.is_running() or not still_ours(proc):
+                return not proc.is_running()
             proc.kill()
             proc.wait(timeout=5)
         return True

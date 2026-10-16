@@ -858,3 +858,59 @@ def test_quiesce_runs_every_stop_even_when_one_raises(monkeypatch, tmp_path):
     assert order == ["gateway", "hub", "launcher"]
     assert audit[0].startswith("WARN: could not stop the model gateway") and "psutil" in audit[0]
     assert audit[1:] == ["hub ok", "l ok"]
+
+
+class _FakePsutil:
+    """Minimal psutil stand-in for the psutil leg of `_terminate_if`."""
+
+    class Error(Exception):
+        pass
+
+    class NoSuchProcess(Error):
+        pass
+
+    class TimeoutExpired(Error):
+        pass
+
+    def __init__(self, ours_after_grace: bool):
+        self.ours_after_grace = ours_after_grace
+        self.killed = False
+        fake = self
+
+        class Process:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                if not fake.killed:
+                    raise fake.TimeoutExpired()
+
+            def is_running(self):
+                return not fake.killed
+
+            def kill(self):
+                fake.killed = True
+
+        self.Process = Process
+
+
+@pytest.mark.parametrize("ours_after_grace, killed", [(True, True), (False, False)])
+def test_psutil_stop_reidentifies_before_forcing(monkeypatch, ours_after_grace, killed):
+    """R47 / R39 L1: after the grace timeout the psutil leg re-checks the
+    identity before `kill()` — a process that is no longer ours is left alone."""
+    from vco_lib import uninstall_quiesce as uq
+
+    fake = _FakePsutil(ours_after_grace)
+    monkeypatch.setattr(uq, "_psutil", lambda: fake)
+    calls = []
+
+    def still_ours(_proc):
+        calls.append(1)
+        return True if len(calls) == 1 else fake.ours_after_grace
+
+    uq._terminate_if(4242, still_ours, lambda: None, grace=0.01)
+    assert fake.killed is killed
+    assert len(calls) == 2
