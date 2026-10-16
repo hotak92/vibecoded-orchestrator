@@ -356,7 +356,7 @@ _wtrec_lexnorm() {
 #   * `git status --porcelain --untracked-files=all --ignored=matching` is
 #     empty — nothing modified, nothing untracked, and no IGNORED file either
 #     (a fresh checkout has none, so any is the agent's output, e.g. a report
-#     under a git-excluded `.claude/`);
+#     under the git-excluded `.claude/state/`);
 #   * `git worktree remove` (no --force) agrees — git refuses an unclean or
 #     locked worktree on its own.
 # worktree-guard creates DETACHED worktrees for head/snapshot, so there is no

@@ -147,23 +147,23 @@ class ManifestPathOneHomeTests(unittest.TestCase):
             manifest_paths.MANIFEST_REL.name, manifest_paths.MANIFEST_BASENAME
         )
 
-    def test_the_git_exclude_pattern_is_composed_from_the_basename(self) -> None:
-        """The one caller that needs the ROOT-anchored form still gets it.
+    def test_the_git_exclude_pattern_is_composed_from_the_manifest_path(self) -> None:
+        """The exclude pattern is composed from the one home's path.
 
-        `.git/info/exclude` patterns are root-anchored, so git_exclude reaches
-        the same file by a different route — the leave-alone half of this
-        migration, pinned so a future "tidy-up" cannot collapse the two.
+        A `.git/info/exclude` pattern containing a slash is anchored at the
+        repository root, so the manifest must be named by its project-relative
+        path: the pre-v0.2.104 `/.vco-manifest.json` matched only a ROOT file
+        and never `.claude/.vco-manifest.json` (G4).
         """
         from vco_lib import git_exclude
 
-        self.assertEqual(
-            git_exclude.VCO_EXCLUSIVE_TOPLEVEL[manifest_paths.MANIFEST_BASENAME],
-            "/" + manifest_paths.MANIFEST_BASENAME,
-        )
+        want = "/" + manifest_paths.MANIFEST_REL_POSIX
+        self.assertIn(want, git_exclude.VCO_RUNTIME_EXCLUDES)
         entries = git_exclude.exclude_entries_for_created_paths(
             [], Path("/nonexistent-folder-for-this-test"), include_manifest=True
         )
-        self.assertIn("/" + manifest_paths.MANIFEST_BASENAME, entries)
+        self.assertIn(want, entries)
+        self.assertNotIn("/" + manifest_paths.MANIFEST_BASENAME, entries)
 
 
 if __name__ == "__main__":  # pragma: no cover

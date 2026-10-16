@@ -75,7 +75,7 @@ $ttl = [int]$TtlHours
 # Users:Modify. Any failure to make them private SKIPS compression (the
 # uncompressed pass-through arm below - the CHANGELOG's "skips compression
 # if it cannot make them private" promise). Git never sees the dir (bundle
-# add/update writes /.claude/ to .git/info/exclude) and the code graph
+# add/update writes /.claude/state/ to .git/info/exclude) and the code graph
 # classifies .claude/state/ as transient (TRANSIENT_STATE_MARKER).
 function Set-PosixMode([string]$Path, [string]$Mode) {
     if (Get-Command chmod -ErrorAction SilentlyContinue) {
