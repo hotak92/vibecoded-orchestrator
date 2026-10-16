@@ -316,8 +316,11 @@ class SafeAddBundleTests(unittest.TestCase):
             ln.strip()
             for ln in self.exclude_path.read_text(encoding="utf-8").splitlines()
         ]
-        # VCO's own namespace + the Rust sidecar are excluded.
-        self.assertIn("/.claude/", lines)
+        # VCO's runtime namespaces + the Rust sidecar are excluded; the user's
+        # own .claude/ files are not, so no blanket `/.claude/` (v0.2.104 G4).
+        self.assertIn("/.claude/state/", lines)
+        self.assertIn("/.claude/.vco-manifest.json", lines)
+        self.assertNotIn("/.claude/", lines)
         self.assertIn("/.env.vco.reference", lines)
         # Collision-safety: NO bare dir-glob for namespaces the user can own.
         # The user's pre-existing .vscode/settings.json was MERGED (not created
@@ -353,10 +356,10 @@ class SafeAddBundleTests(unittest.TestCase):
         second = self.exclude_path.read_text(encoding="utf-8")
         # The VCO block should appear exactly once.
         self.assertEqual(
-            first.count("/.claude/"), 1,
+            first.splitlines().count("/.claude/state/"), 1,
         )
         self.assertEqual(
-            second.count("/.claude/"), 1,
+            second.splitlines().count("/.claude/state/"), 1,
             "re-running safe-add must not duplicate .git/info/exclude lines",
         )
 
@@ -395,7 +398,8 @@ class SafeAddBundleTests(unittest.TestCase):
         self.assertIn("g1_git_exclude", result)
         self.assertTrue(
             self.exclude_path.exists()
-            and "/.claude/" in self.exclude_path.read_text(encoding="utf-8"),
+            and "/.claude/state/"
+            in self.exclude_path.read_text(encoding="utf-8").splitlines(),
             "non-safe add must ALSO keep VCO paths out of the user's commits",
         )
 
@@ -415,7 +419,7 @@ class SafeAddGitExcludeUnitTests(unittest.TestCase):
         import shutil
         shutil.rmtree(str(self.tmp), ignore_errors=True)
 
-    _SAMPLE_PATHS = ("/.claude/", "/.vco-manifest.json", "/CLAUDE.md")
+    _SAMPLE_PATHS = ("/.claude/state/", "/.claude/.vco-manifest.json", "/CLAUDE.md")
 
     def test_not_a_git_repo(self):
         res = project_init._append_git_info_exclude(
@@ -435,13 +439,13 @@ class SafeAddGitExcludeUnitTests(unittest.TestCase):
     def test_appended_then_noop(self):
         (self.tmp / ".git").mkdir()
         res1 = project_init._append_git_info_exclude(
-            self.tmp, ("/.claude/", "/CLAUDE.md"),
+            self.tmp, ("/.claude/state/", "/CLAUDE.md"),
         )
         self.assertEqual(res1["action"], "appended")
-        self.assertEqual(set(res1["added"]), {"/.claude/", "/CLAUDE.md"})
+        self.assertEqual(set(res1["added"]), {"/.claude/state/", "/CLAUDE.md"})
         # Second call → everything present → noop.
         res2 = project_init._append_git_info_exclude(
-            self.tmp, ("/.claude/", "/CLAUDE.md"),
+            self.tmp, ("/.claude/state/", "/CLAUDE.md"),
         )
         self.assertEqual(res2["action"], "noop")
         self.assertEqual(res2["added"], [])

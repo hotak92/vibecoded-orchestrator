@@ -235,7 +235,11 @@ anything.
 4. **Git hygiene** (if the destination is a repo): add the bundle paths to
    `.git/info/exclude` (LOCAL-only, never the tracked `.gitignore`) so
    VCO-managed files can't reach a commit by accident; deliberately
-   un-exclude anything you want tracked.
+   un-exclude anything you want tracked. Exclude VCO's files one by one
+   (hooks, scripts, agents, skills) plus its runtime dirs (`.claude/state/`,
+   `logs/`, `backups/`, `worktrees/`) — never the whole `.claude/` folder,
+   which would also hide your own `CONTEXT_STATE.md`, `context/` plans and
+   handoffs, and `settings.json`.
 5. **Flip the DB row with the launcher CLOSED** (single-writer): back up
    `launcher.db`, then `UPDATE projects SET folder_path='<new>' WHERE
    id='<project-id>'`, then sweep EVERY table's path-like columns for the

@@ -92,8 +92,8 @@ For a worktree that `worktree-guard` created, Claude Code does not remove it and
 removes it instead (with `git worktree remove`, never `--force`), but only when **all** of these hold:
 
 - `git status` in the worktree shows nothing: no modified files, no untracked files, and no ignored files
-  either (a fresh checkout has none, so any is the agent's output, such as a report under a git-excluded
-  `.claude/` folder);
+  either (a fresh checkout has none, so any is the agent's output, such as a log under the git-excluded
+  `.claude/state/` folder);
 - the worktree's HEAD is still the commit it was created from (so no commits were added);
 - git itself agrees to remove it (git refuses a dirty or locked worktree).
 

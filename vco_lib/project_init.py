@@ -8666,7 +8666,6 @@ def _emit_codegraph_prefix_drift_deferral(
 # that silently dropped that defense would be a security regression disguised
 # as a refactor.
 _SAFE_ADD_SIDECAR_SUFFIX = _git_exclude.SAFE_ADD_SIDECAR_SUFFIX
-_SAFE_ADD_VCO_EXCLUSIVE_TOPLEVEL = _git_exclude.VCO_EXCLUSIVE_TOPLEVEL
 
 
 def _safe_add_exclude_entries(result: dict, folder: Path) -> list:
@@ -8875,15 +8874,15 @@ def _emit_safe_add_git_exclude_deferral(
     """Emit `safe_add_git_exclude_updated`: record that VCO appended its
     created paths to `.git/info/exclude` (local-only) under Safe add.
 
-    Informational — the project's Claude should know VCO files are locally
-    git-ignored so it doesn't get confused about why `git status` is clean for
-    `.claude/` etc. The tracked `.gitignore` is intentionally untouched.
+    Informational — the project's Claude should know VCO's own files are
+    locally git-ignored (never the user's: v0.2.104 G4). The tracked
+    `.gitignore` is intentionally untouched.
     """
     from vco_lib.deferral_report import DeferralEntry
     from vco_lib import deferral_emit as _de
 
     added = git_result.get("added", [])
-    added_str = ", ".join(added) if added else "(none)"
+    added_str = _git_exclude.summarize_entries(added)
     exclude_path = git_result.get("path", ".git/info/exclude")
 
     detected_msg = (

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Your own `.claude/` files can be committed again after a bundle update** (G4, user report after the 0.2.103 update). Every bundle add and update wrote one blanket `/.claude/` line to the project's local-only `.git/info/exclude`, so `git add .claude/CONTEXT_STATE.md` failed with "paths are ignored … use -f", and new plans, handoffs, a `.claude/settings.json` or a `.claude/CLAUDE.md` could not be added without `-f`. Now VCO excludes only what it manages: each hook, script and agent it ships (so a hook or agent you write beside them stays addable), each shipped skill as its own folder, `.claude/hooks/_lib/` and `.claude/specializations/`, its runtime folders (`.claude/state/`, `logs/`, `backups/`, `worktrees/`, and the launcher's `agents.disabled/` / `skills.disabled/`), `.claude/env`, the bundle manifest, and the machine-local files it writes into `.claude/context/` (`UPDATE_DEFERRED.md` and `.json`, the pre-compact snapshot and markers). `CONTEXT_STATE.md`, `CLAUDE.md`, `MEMORY.md`, `settings.json`, `settings.local.json`, and everything else under `context/`, `rules/` and `commands/` are never excluded. The next bundle update repairs projects that already carry the old line: it removes `/.claude/` (and the old `/.vco-manifest.json` line, which never matched the real manifest at `.claude/.vco-manifest.json`) from VCO's own blocks in that file and adds the precise entries in the same run. Your own lines stay untouched, including a `/.claude/` you wrote yourself. A project move no longer hides the material it carries over to the new folder either: your knowledge nodes, `CONTEXT_STATE.md` and `.claude/context/` stay addable there. The "VCO files excluded" deferral now names the first dozen entries and counts the rest.
+
 ## [0.2.103] - 2026-10-16
 
 ### Added

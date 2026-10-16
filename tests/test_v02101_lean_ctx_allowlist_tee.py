@@ -638,12 +638,12 @@ class TestStateDirExclusions:
     home `_lib/route-touched-path.sh` only routes knowledge/**, docs/**.md,
     diagrams and code extensions — `.claude/state/**` matches no route.)"""
 
-    def test_git_exclude_covers_the_whole_claude_tree(self):
+    def test_git_exclude_covers_the_state_dir(self):
         sys.path.insert(0, str(REPO_ROOT))
-        from vco_lib.git_exclude import VCO_EXCLUSIVE_TOPLEVEL
-        assert VCO_EXCLUSIVE_TOPLEVEL[".claude"] == "/.claude/", (
-            "bundle add/update writes /.claude/ to .git/info/exclude — the "
-            "tee dir must stay inside that exclusion"
+        from vco_lib.git_exclude import VCO_RUNTIME_EXCLUDES
+        assert "/.claude/state/" in VCO_RUNTIME_EXCLUDES, (
+            "bundle add/update writes /.claude/state/ to .git/info/exclude — "
+            "the tee dir must stay inside that exclusion"
         )
 
     def test_tee_paths_are_codegraph_purgeable(self):

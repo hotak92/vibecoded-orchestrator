@@ -87,10 +87,12 @@ class A12G1UpdateModeTests(unittest.TestCase):
         .git/info/exclude (G1 unconditional coverage)."""
         result = self._run(safe_add=False, update_mode=True)
         self.assertIn("g1_git_exclude", result)
-        # The .claude/ glob is the canonical VCO-created namespace.
+        # VCO's runtime state dir is always excluded (v0.2.104 G4: never the
+        # whole .claude/ tree).
         if self.exclude_path.exists():
-            body = self.exclude_path.read_text(encoding="utf-8")
-            self.assertIn("/.claude/", body)
+            body = self.exclude_path.read_text(encoding="utf-8").splitlines()
+            self.assertIn("/.claude/state/", body)
+            self.assertNotIn("/.claude/", body)
 
     def test_g1_exclude_idempotent_on_second_update(self):
         self._run(safe_add=False, update_mode=True)
@@ -115,8 +117,9 @@ class A12G1UpdateModeTests(unittest.TestCase):
         result = self._run(safe_add=False, update_mode=False)
         self.assertIn("g1_git_exclude", result)
         self.assertTrue(self.exclude_path.exists(), "exclude file must be written")
-        body = self.exclude_path.read_text(encoding="utf-8")
-        self.assertIn("/.claude/", body)
+        body = self.exclude_path.read_text(encoding="utf-8").splitlines()
+        self.assertIn("/.claude/state/", body)
+        self.assertNotIn("/.claude/", body)
 
     def test_g1_exclude_idempotent_after_fresh_add_then_update(self):
         """Fresh non-safe add followed by an update: the update re-run is a
