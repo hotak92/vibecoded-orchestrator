@@ -117,7 +117,10 @@ def test_resume_command_is_shlex_quoted(monkeypatch, tmp_path):
 
         parts = shlex.split(cmd)
         assert str(repo) in parts
-        assert parts[-2:] == ["--project", "MyProj"]
+        # v0.2.104 (G5): the printed command is the resync DRIVER.
+        i = parts.index("--project")
+        assert parts[i + 1] == "MyProj"
+        assert "--run-resync" in parts
 
 
 # ─────────────────── R-6: gate the trigger on owed work ───────────────────

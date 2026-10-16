@@ -196,6 +196,16 @@ SKIPPED = "skipped"       # precondition absent (backend down, cap reached…)
 #: the day it comes back (``test_skips_do_not_burn_the_cap``).
 BLOCKED = "blocked"
 
+#: TRAIL-ONLY row status: the condition's ledger entry was CLEARED by
+#: something other than this dispatcher (the resync driver run by hand, an
+#: update's positive-zero probe — :func:`record_episode_end`). Like
+#: :data:`BLOCKED` it is never a :class:`RetryResult` status callers receive.
+#: It exists so the attempt cap is scoped to ONE EPISODE of a condition (see
+#: :func:`retry_history`): without it a condition that came back months after
+#: it was last fixed inherited the earlier episodes' attempts and was reported
+#: as capped before VCO had retried it once (field 2026-10-16).
+RESOLVED = "resolved"
+
 #: Consecutive blocked passes after which the generic "VCO retries this
 #: itself" stops being the most useful thing to say. Below it the condition is
 #: plausibly transient and the generic disposition is fair; at it, the reader
@@ -901,7 +911,8 @@ def attempts_path(folder: Path) -> Path:
 
 
 def attempt_count(folder: Path, condition_id: str) -> int:
-    """How many times a handler for this condition has been STARTED here.
+    """How many times a handler for this condition has been STARTED in the
+    CURRENT episode here (:func:`retry_history` defines the episode).
 
     Counts :data:`STARTED` rows only — exactly one per dispatched handler
     invocation, written BEFORE the handler runs. Counting outcome rows instead
@@ -911,25 +922,10 @@ def attempt_count(folder: Path, condition_id: str) -> int:
 
     An unreadable/absent trail counts as zero attempts — the cap protects
     against looping, and a missing log is not evidence that the cap was
-    reached.
+    reached. ONE home with :func:`retry_history`, so the dispatcher's gate,
+    ``vco doctor`` and the disposition note can never count differently.
     """
-    path = attempts_path(folder)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return 0
-    n = 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get("condition_id") == condition_id and row.get("status") == STARTED:
-            n += 1
-    return n
+    return retry_history(folder, condition_id).attempts
 
 
 def record_attempt(folder: Path, result: RetryResult) -> None:
@@ -982,8 +978,40 @@ class RetryHistory:
         return self.attempts >= MAX_ATTEMPTS
 
 
+#: Row statuses that END an episode (see :func:`retry_history`).
+_EPISODE_END_STATUSES = frozenset({RETRIED, RESOLVED})
+#: Row statuses that close an OPEN attempt (the dispatcher's verdict row).
+_ATTEMPT_OUTCOME_STATUSES = frozenset({RETRIED, FAILED, INCONCLUSIVE, SKIPPED})
+
+
 def retry_history(folder: Path, condition_id: str) -> RetryHistory:
-    """Summarise ``condition_id``'s trail in ``folder``. Never raises.
+    """Summarise ``condition_id``'s CURRENT EPISODE in ``folder``. Never raises.
+
+    **Episodes (v0.2.104).** The trail is append-only and lives as long as the
+    project, but the cap is about one occurrence of a condition: "a retry that
+    failed three times is not transient". Counting the whole file instead
+    (pre-fix) meant a condition fixed three times over the months — each time
+    by a COMPLETED retry — came back and was reported as "ran 3 times and has
+    STOPPED" before VCO had retried it once. So every count here covers only
+    the rows AFTER the last row that ended an episode:
+
+    * :data:`RETRIED` — the dispatcher's own verdict that the handler ran AND
+      the child's paired clear removed the entry (it re-reads the ledger
+      before writing it, so this row is proof for every emitter alike);
+    * :data:`RESOLVED` — :func:`record_episode_end`: the entry was cleared by
+      something else (the resync driver run by hand, an update's
+      positive-zero probe). Honoured only OUTSIDE a dispatched attempt — a
+      ``RESOLVED`` written while a :data:`STARTED` row has no verdict yet is
+      the handler's own child at work, and that attempt's verdict row decides
+      (a child that clears and re-emits must not reset the cap each attempt
+      and loop forever).
+
+    Why not the ledger entry's ``detected_at`` instead: most retryable
+    emitters re-emit WITHOUT ``keep_first_detected``, so ``detected_at`` moves
+    on every re-emission — including a failed retry's own — and a cap scoped
+    to it would never engage. The trail's own episode-end rows have no such
+    hole. :data:`MAX_ATTEMPTS` therefore means "per episode": a genuinely
+    stuck current episode still stops at the cap.
 
     An absent or unreadable trail yields an all-zero history — the same
     posture :func:`attempt_count` takes, and for the same reason: a missing
@@ -998,6 +1026,7 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
     attempts = blocked = streak = 0
     streak_first = streak_last = streak_detail = ""
     last_status = ""
+    in_attempt = False
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -1011,8 +1040,17 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
         status = str(row.get("status") or "")
         ts = str(row.get("ts") or "")
         last_status = status or last_status
+        if status in _EPISODE_END_STATUSES and not (status == RESOLVED and in_attempt):
+            # Episode over: what follows is a NEW occurrence of the condition.
+            attempts = blocked = streak = 0
+            streak_first = streak_last = streak_detail = ""
+            in_attempt = False
+            continue
         if status == STARTED:
             attempts += 1
+            in_attempt = True
+        elif status in _ATTEMPT_OUTCOME_STATUSES:
+            in_attempt = False
         if status == BLOCKED:
             blocked += 1
             streak = streak + 1 if streak else 1
@@ -1034,6 +1072,24 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
         streak_last_detail=streak_detail,
         last_status=last_status,
     )
+
+
+def record_episode_end(folder: Path, condition_id: str, detail: str) -> None:
+    """Mark that ``condition_id``'s entry was CLEARED outside this dispatcher.
+
+    Writes one :data:`RESOLVED` row, which closes the current episode for
+    :func:`retry_history` (and so for the cap and the disposition note). Only
+    conditions this dispatcher can retry get a row — the trail is the retry
+    record, not a general clear log. Best-effort, never raises: a missing row
+    only means the next occurrence inherits this episode's count, the
+    conservative direction.
+    """
+    try:
+        if handler_name_for(condition_id) is None:
+            return
+    except Exception:  # noqa: BLE001 — bookkeeping never fails the clear
+        return
+    record_attempt(folder, RetryResult(condition_id, RESOLVED, detail))
 
 
 def retry_disposition_note(folder: Path, condition_id: str) -> str:
@@ -1828,6 +1884,7 @@ __all__ = [
     "MAX_ATTEMPTS",
     "PIDFILE_NAME",
     "PIDFILE_STALE_SECONDS",
+    "RESOLVED",
     "RETRIED",
     "SKIPPED",
     "STARTED",
@@ -1849,6 +1906,7 @@ __all__ = [
     "owed_condition_ids",
     "pidfile_path",
     "record_attempt",
+    "record_episode_end",
     "retry_disposition_note",
     "retry_history",
     "retry_code_graph_walk",
