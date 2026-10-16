@@ -269,6 +269,24 @@ def read_record(root: Path) -> Optional[dict[str, Any]]:
     return rec if isinstance(rec, dict) else None
 
 
+def recorded_code_model(roots: Optional[Sequence] = None) -> Optional[str]:
+    """The code model of the profile install recorded (and pulled), or
+    None — the ONE reader of that answer. v0.2.103 R43 N2 moved the loop
+    here from ``vco_lib.code_embed_model`` (whose shim keeps the
+    resolver-side name): this module is a stdlib-only leaf, so install.py
+    can read the SAME answer before the venv exists. The root ladder is
+    the same one ``vco_lib.summary_model`` resolves (``VCT_INSTALL_ROOT``,
+    then the checkout this ``vco_lib`` is imported from)."""
+    from vco_lib.summary_model import _orchestrator_roots
+
+    for root in (roots if roots is not None else list(_orchestrator_roots())):
+        rec = read_record(Path(root))
+        model = rec.get("code_model") if isinstance(rec, dict) else None
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    return None
+
+
 # ── launcher.db (read-only) ─────────────────────────────────────────────────
 
 

@@ -585,12 +585,14 @@ class TestCpuCoresProbe:
         assert ram >= 1.0, "a real host has at least 1 GB of RAM"
 
     def test_selected_gpu_specs_smoke_never_raises(self) -> None:
-        """The ONE selected-card helper (R41 M2) runs the real GPU probes
-        and always answers a ``(float, str)`` pair, whatever the host."""
-        from tests import conftest
+        """The ONE selected-card helper (R41 M2; R43 N4 made it a thin
+        wrapper over ``selected_gpu``, which owns the per-process cache)
+        runs the real GPU probes and always answers a ``(float, str)``
+        pair, whatever the host."""
+        from vco_lib import host_probe
 
-        specs = conftest._REAL_SELECTED_GPU_SPECS
-        specs.cache_clear()
+        specs = host_probe.selected_gpu_specs
+        host_probe._selected_gpu_cached.cache_clear()
         vram, vendor = specs()
         assert isinstance(vram, float) and vram >= 0.0
         assert vendor in ("nvidia", "amd", "intel", "metal", "unknown", "")

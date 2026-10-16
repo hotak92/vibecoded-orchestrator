@@ -5902,7 +5902,7 @@ def _trigger_extractor_generation_reindex(
     is_root_target: bool,
     result: dict,
     log: Callable[..., None],
-    had_prior_install: bool = False,
+    had_prior_install: bool = True,
 ) -> None:
     """Decide + (when owed) launch the extractor-generation re-index.
 
@@ -5927,7 +5927,6 @@ def _trigger_extractor_generation_reindex(
         update re-triggers (no stamp is written).
     """
     from vco_lib import codegraph_extractor_generation as _ceg
-    from vco_lib.code_embed_model import root_graph_build_recorded as _root_graph_recorded
     from vco_lib.codegraph_resync import bundle_update_audit_step as _cg_audit_step
 
     project_name = _resolve_codegraph_project_name(folder)
@@ -5946,11 +5945,12 @@ def _trigger_extractor_generation_reindex(
         # tri-state the analyzer resolves — passed explicitly so the spawn's
         # probes classify `.claude/**` rows the same way the walk will.
         index_dot_claude=bool(is_root_target),
-        # v0.2.103 F3, tightened by R41 M1 — see this kwarg's docstring in
+        # v0.2.103 F3, tightened by R41 M1 and R43 N1 — see
+        # root_first_install_unknown_absent's docstring in
         # codegraph_extractor_generation for the full gate rule.
-        unknown_graph_is_absent=bool(
-            is_root_target and not had_prior_install
-            and not _root_graph_recorded(project_name)),
+        unknown_graph_is_absent=_ceg.root_first_install_unknown_absent(
+            is_root_target=is_root_target, had_prior_install=had_prior_install,
+            project_name=project_name, install_root=folder),
     )
 
     phase = {

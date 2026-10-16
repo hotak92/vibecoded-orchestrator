@@ -282,15 +282,13 @@ def recorded_code_model(roots: Optional[Sequence] = None) -> Optional[str]:
     This is the same value install.py, the pull plan and compose all derive
     from — reading it here makes the resolver agree with what the machine
     actually runs even in processes that carry none of the settings env
-    (the 5b bundle child, the hub- or retry-driven walks)."""
-    from vco_lib.embedding_pull_plan import read_record
+    (the 5b bundle child, the hub- or retry-driven walks). The loop lives
+    in the ONE stdlib-only leaf (:func:`vco_lib.embedding_pull_plan.
+    recorded_code_model`, v0.2.103 R43 N2) so install.py reads the SAME
+    answer pre-venv; this shim keeps the resolver-side name."""
+    from vco_lib.embedding_pull_plan import recorded_code_model as _leaf
 
-    for root in (roots if roots is not None else _orchestrator_roots()):
-        rec = read_record(root)
-        model = rec.get("code_model") if isinstance(rec, dict) else None
-        if isinstance(model, str) and model.strip():
-            return model.strip()
-    return None
+    return _leaf(roots)
 
 
 def _hardware_code_model() -> str:
@@ -454,9 +452,25 @@ def root_graph_build_recorded(codegraph_prefix: str) -> bool:
     fresh clone has no manifest), which the extractor-generation first-install
     gate reads as "do not treat an unanswered existence probe as absent".
     Soft-fails to True — an unreadable record keeps the conservative
-    unknown-means-owed reading (v0.2.103 R41 M1)."""
+    unknown-means-owed reading (v0.2.103 R41 M1; R43 N3 made it real: the
+    flagged reader distinguishes "positively no row" from "could not read",
+    so a launcher.db that exists but cannot be opened or queried answers
+    True). No launcher.db AT ALL is a positive absence — False — the
+    gate's volume leg covers the re-clone whose uninstall deleted it."""
     try:
-        return record_from_binding(read_binding_row(codegraph_prefix)) is not None
+        from vco_lib.launcher_db_reader import (
+            _discover_db_path, get_codegraph_binding_row_flagged,
+        )
+
+        if _discover_db_path() is None:
+            return False
+        prefix = canonical_prefix(codegraph_prefix) if codegraph_prefix else ""
+        if not prefix:
+            return False
+        row, read_error = get_codegraph_binding_row_flagged(prefix)
+        if read_error is not None:
+            return True
+        return record_from_binding(row) is not None
     except Exception:  # noqa: BLE001 — an unreadable record never gates
         return True
 

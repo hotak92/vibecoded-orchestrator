@@ -426,9 +426,23 @@ from vco_lib import host_probe as _host_probe_for_ladder  # noqa: E402
 _REAL_CODE_HARDWARE_MODEL = _cem_for_ladder._hardware_code_model
 _REAL_RECORDED_CODE_MODEL = _cem_for_ladder.recorded_code_model
 _REAL_SELECTED_GPU_SPECS = _host_probe_for_ladder.selected_gpu_specs
+_REAL_SELECTED_GPU = _host_probe_for_ladder.selected_gpu
+
+
+class _PinnedGpuCard:
+    """The card the ``selected_gpu`` pin answers — the SAME card the
+    ``selected_gpu_specs`` pin describes (16 GB NVIDIA), so the two pins
+    cannot tell two different stories about the host (R43 N4/N5)."""
+
+    vendor = "nvidia"
+    name = "pinned (16 GB NVIDIA)"
+    vram_gb = 16.0
+    is_integrated = False
+
 
 _LADDER_PIN: "dict[tuple, object]" = {
     (_host_probe_for_ladder, "selected_gpu_specs"): lambda: (16.0, "nvidia"),
+    (_host_probe_for_ladder, "selected_gpu"): lambda: _PinnedGpuCard(),
     (_cem_for_ladder, "recorded_code_model"): lambda: None,
 }
 
@@ -436,6 +450,10 @@ _LADDER_PIN: "dict[tuple, object]" = {
 def _apply_ladder_pin() -> None:
     for (module, name), stub in _LADDER_PIN.items():
         setattr(module, name, stub)
+    # R43 N8: the once-per-process "ignoring CODE_EMBED_BACKEND=gpu" notice
+    # flag is per-TEST — reset it so a test that expects the stderr line
+    # does not depend on the order tests ran in.
+    _cem_for_ladder._gpu_backend_ignore_notice_shown = False
 
 
 if not _ALLOW_REAL_STATE:

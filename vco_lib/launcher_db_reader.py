@@ -445,33 +445,52 @@ def _binding_row_dict(row: sqlite3.Row) -> dict:
     return out
 
 
-def get_codegraph_binding_row(prefix: str) -> Optional[dict]:
-    """The ``project_codegraph_bindings`` row whose ``collection_prefix`` is
-    ``prefix`` (case-insensitive — Weaviate class names are), or ``None``.
+def get_codegraph_binding_row_flagged(
+    prefix: str,
+) -> "tuple[Optional[dict], Optional[str]]":
+    """``(row, read_error)`` — the flagged half of
+    :func:`get_codegraph_binding_row` (v0.2.103 R43 N3).
 
-    v0.2.102 W6-B2: the code-graph model RECORD lives in this row's
-    ``embedding_model`` / ``embedding_dim`` (read by
-    :mod:`vco_lib.code_embed_model`). Read-only, soft-fail.
+    ``(row, None)``: the database ANSWERED — ``row`` may still be ``None``
+    (the prefix is positively absent). ``(None, reason)``: the read could
+    NOT be confirmed (launcher.db unreadable, query error, empty prefix) —
+    never "absent"; callers that must not read a maybe-existing row as
+    absent (the first-install gate's build-record leg) treat it as
+    unknown. Read-only, soft-fail.
     """
     if not prefix:
-        return None
+        return None, "empty prefix"
     conn = _open_db_readonly()
     if conn is None:
-        return None
+        return None, "launcher.db unreadable"
     try:
         row = conn.execute(
             f"SELECT {_BINDING_COLUMNS} FROM project_codegraph_bindings AS b "
             "WHERE lower(b.collection_prefix) = lower(?) LIMIT 1",
             (prefix,),
         ).fetchone()
-        return _binding_row_dict(row) if row else None
-    except Exception:
-        return None
+        return (_binding_row_dict(row) if row else None), None
+    except Exception as exc:  # noqa: BLE001 — the reason IS the product here
+        return None, f"binding-row query failed: {exc}"
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+
+def get_codegraph_binding_row(prefix: str) -> Optional[dict]:
+    """The ``project_codegraph_bindings`` row whose ``collection_prefix`` is
+    ``prefix`` (case-insensitive — Weaviate class names are), or ``None``.
+
+    v0.2.102 W6-B2: the code-graph model RECORD lives in this row's
+    ``embedding_model`` / ``embedding_dim`` (read by
+    :mod:`vco_lib.code_embed_model`). Read-only, soft-fail; swallows the
+    read error (use :func:`get_codegraph_binding_row_flagged` when
+    "could not read" must stay distinguishable from "no row").
+    """
+    row, _read_error = get_codegraph_binding_row_flagged(prefix)
+    return row
 
 
 def list_codegraph_binding_rows() -> Optional[List[dict]]:

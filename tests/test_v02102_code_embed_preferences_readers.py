@@ -215,6 +215,21 @@ class TestTarget:
         assert pick(env={"CODE_EMBED_BACKEND": "gpu"},
                     hardware=lambda: DEFAULT_CODE_MODEL) == (DEFAULT_CODE_MODEL, "install-env")
 
+    def test_the_gpu_backend_notice_flag_is_reset_by_the_ladder_pin(self, capsys):
+        """R43 N8: the once-per-process notice flag is order-dependent
+        unless something resets it — the conftest ladder pin (re-established
+        per test by the autouse ``_redirect_user_state_dir``) now resets it,
+        so a flag leaked True by an earlier test cannot swallow THIS test's
+        stderr line. Red before: the pin did not touch the flag."""
+        from tests import conftest
+
+        cem._gpu_backend_ignore_notice_shown = True  # a leaked flag
+        conftest._apply_ladder_pin()  # what the autouse fixture runs per test
+        assert cem._gpu_backend_ignore_notice_shown is False
+        assert pick(env={"CODE_EMBED_BACKEND": "gpu"},
+                    hardware=lambda: DEFAULT_TEXT_MODEL) == (DEFAULT_TEXT_MODEL, "hardware-probe")
+        assert "ignoring CODE_EMBED_BACKEND=gpu" in capsys.readouterr().err
+
     def test_precedence_env_then_project_then_pin(self):
         state = {"code_embed_backend_override": "qwen3"}
         assert pick(state=state, project_target=_JINA) == (_JINA, "project")
@@ -455,8 +470,17 @@ class TestServingFollowsTheModel:
         assert (got["code_backend"], got["code_model"]) == ("ollama", _JINA)
 
         # no record either → the ladder, which never answers CodeSage below
-        # its 12 GB rung or on any AMD host
+        # its 12 GB rung or on any AMD host. R43 N6: the REAL
+        # ``_hardware_code_model`` runs (the stub above is retired for the
+        # loop), fed the faked card specs plus stubbed RAM/cores so the
+        # answer depends on neither the machine nor the conftest pin.
+        from tests import conftest
+
         monkeypatch.setattr(cem, "recorded_code_model", lambda: None)
+        monkeypatch.setattr(cem, "_hardware_code_model",
+                            conftest._REAL_CODE_HARDWARE_MODEL)
+        monkeypatch.setattr(host_probe, "probe_system_ram_gb", lambda: 32.0)
+        monkeypatch.setattr(host_probe, "probe_cpu_cores", lambda: 8)
         for vram, vendor in ((8.0, "nvidia"), (16.0, "amd")):
             monkeypatch.setattr(host_probe, "selected_gpu_specs",
                                 lambda vram=vram, vendor=vendor: (vram, vendor))

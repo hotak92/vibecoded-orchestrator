@@ -7674,7 +7674,7 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
         # to the full usable set rather than stranding the install). The
         # "metal" preference is handled separately (Apple has no discrete
         # VRAM to rank).
-        from vco_lib.gpu_device import enumerate_gpus, select_gpu_device
+        from vco_lib.gpu_device import enumerate_gpus
 
         vendor_pref = _gpu_vendor_preference_from_env()
 
@@ -7692,7 +7692,16 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
 
         if not gpu_vendor and not has_metal:
             candidates = enumerate_gpus()
-            chosen = select_gpu_device(candidates, vendor_pref=vendor_pref)
+            # v0.2.103 R43 N4: the ONE selection home — host_probe.selected_gpu
+            # applies the SAME select_gpu_device rule (VCT_GPU_VENDOR included)
+            # to THIS enumeration and hands back the chosen card itself, so
+            # install's tier choice and the runtime code-model resolver's
+            # hardware leg read the SAME card without a second GPU-probe round
+            # (R41 M2 re-ran the probes inside selected_gpu_specs; two
+            # non-deterministic enumerations could describe two cards).
+            from vco_lib import host_probe as _hp
+
+            chosen = _hp.selected_gpu(candidates)
             # Surface the full enumeration on the system-info banner /
             # event log so multi-GPU selection is observable.
             usable_discrete = [
@@ -7703,19 +7712,13 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
 
             if chosen is not None:
                 has_gpu = True
-                # v0.2.103 R41 M2: VRAM and vendor come from the ONE cached
-                # selector helper — the same call the runtime code-model
-                # resolver's hardware leg makes — so install's tier choice
-                # and the resolver can never read two different cards on a
-                # multi-GPU host. The values match `chosen` (the selection
-                # is deterministic); `chosen` itself still feeds the banner
-                # below. The helper's empty answer (probe hiccup) falls
-                # back to the card this enumeration picked.
-                from vco_lib.host_probe import selected_gpu_specs
-
-                spec_vram, spec_vendor = selected_gpu_specs()
-                gpu_vendor = spec_vendor or chosen.vendor
-                vram_gb = spec_vram if spec_vram > 0 else float(chosen.vram_gb or 0.0)
+                # v0.2.103 R43 N4: vendor and VRAM come straight off the ONE
+                # chosen card (host_probe.selected_gpu — the same selection
+                # the runtime code-model resolver's hardware leg makes), so
+                # install's tier choice and the resolver can never read two
+                # different cards on a multi-GPU host.
+                gpu_vendor = (chosen.vendor or "").strip().lower()
+                vram_gb = float(chosen.vram_gb or 0.0)
                 # Enrich the display name with the vendor-specific probe
                 # when it gives a friendlier string than the enumerator's
                 # generic label (AMD rocm-smi product, NVIDIA driver/CUDA).
@@ -9700,6 +9703,29 @@ def _write_preset_defaults_to_app_state(
                 (_APP_STATE_KEY_DEFAULT_TEXT_EMBED, text_model, now_ms),
             )
             text_inserted = cur.rowcount > 0
+            # v0.2.103 R43 N2: the code key is seeded ONLY when absent (the
+            # DO NOTHING below already guarantees that), and — when it IS
+            # seeded and a code graph is already recorded — with the
+            # RECORDED model, not the hardware pick. The key is a user
+            # choice OR a value matching the machine's existing data: a
+            # hardware-pick seed on a later --update (first install ran
+            # before launcher.db existed, so nothing was seeded then) would
+            # act as an implicit re-embed of the recorded graph, because
+            # `resolve_code_model` treats `default_code_embedding` as an
+            # EXPLICIT selection. The explicit OpenAI opt-in keeps its own
+            # model — the user chose it, it is not a seed default.
+            if (
+                not openai_set_as_default
+                and cur.execute(
+                    "SELECT 1 FROM app_state WHERE key = ?",
+                    (_APP_STATE_KEY_DEFAULT_CODE_EMBED,),
+                ).fetchone() is None
+            ):
+                from vco_lib.embedding_pull_plan import recorded_code_model
+
+                recorded = recorded_code_model()
+                if recorded:
+                    code_model = recorded
             cur.execute(
                 "INSERT INTO app_state (key, value, updated_at) "
                 "VALUES (?, ?, ?) "

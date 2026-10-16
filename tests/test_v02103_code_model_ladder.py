@@ -285,12 +285,14 @@ def test_install_binds_the_real_host_probe_functions(install):
 
 
 def test_one_selected_card_feeds_both_install_and_the_resolver(
-        install, monkeypatch):
-    """R41 M2: VRAM and vendor must come from ONE selected card — the
-    6 GB NVIDIA + 16 GB AMD host where the old resolver read VRAM from the
-    AMD card and vendor from the first NVIDIA entry (→ CodeSage on a host
-    whose install pick is qwen3). The helper, install's step-[3] choice and
-    the resolver's hardware leg must all answer qwen3."""
+        install, monkeypatch, tmp_path, capsys):
+    """R41 M2 + R43 N4/N5: VRAM and vendor must come from ONE selected card —
+    the 6 GB NVIDIA + 16 GB AMD host where the old resolver read VRAM from
+    the AMD card and vendor from the first NVIDIA entry (→ CodeSage on a host
+    whose install pick is qwen3). The helper, install's system-info
+    DETECTION (``_detect_system`` itself, not a hand-built SystemInfo),
+    install's step-[3] choice and the resolver's hardware leg must all
+    answer the AMD card / qwen3."""
     from tests import conftest
     from vco_lib import gpu_device
     from vco_lib.gpu_device import GpuCandidate
@@ -303,18 +305,61 @@ def test_one_selected_card_feeds_both_install_and_the_resolver(
     ]
     monkeypatch.setattr(gpu_device, "enumerate_gpus", lambda: candidates)
     monkeypatch.delenv("VCT_GPU_VENDOR", raising=False)
-    real_specs = conftest._REAL_SELECTED_GPU_SPECS
-    real_specs.cache_clear()
-    monkeypatch.setattr(host_probe, "selected_gpu_specs", real_specs)
+    # R43 N4: unpin BOTH shapes of the ONE selection (the specs wrapper and
+    # the card itself — the conftest pin stubs them separately) and clear
+    # the per-process cache, so the REAL helper enumerates the faked list.
+    host_probe._selected_gpu_cached.cache_clear()
+    monkeypatch.setattr(host_probe, "selected_gpu", conftest._REAL_SELECTED_GPU)
+    monkeypatch.setattr(host_probe, "selected_gpu_specs",
+                        conftest._REAL_SELECTED_GPU_SPECS)
 
     # The ONE helper selects the AMD card (most VRAM) and reports BOTH
     # numbers from it — a GPU vendor with no CodeSage build.
     assert host_probe.selected_gpu_specs() == (16.0, "amd")
+    card = host_probe.selected_gpu()
+    assert (card.vendor, float(card.vram_gb)) == ("amd", 16.0)
 
-    # install's step-[3] profile choice (which reads the helper through the
-    # system-info detection's vendor/VRAM) and the resolver's hardware leg
-    # agree on qwen3, not CodeSage.
-    cfg = _choose(install, monkeypatch, 16.0, 32.0, 8, "amd")
+    # R43 N5: install's system-info detection runs on the SAME enumeration —
+    # every other probe _detect_system touches is stubbed, so a wrong
+    # vendor/VRAM here can only come from the selection under test. The
+    # enumeration counter + a COLD cache also pin N4: _detect_system
+    # enumerates ONCE (the R41 shape re-ran the probes inside
+    # selected_gpu_specs — two non-deterministic enumerations could describe
+    # two different cards).
+    enumerations = []
+
+    def _counting_enumerate():
+        enumerations.append(1)
+        return candidates
+
+    monkeypatch.setattr(gpu_device, "enumerate_gpus", _counting_enumerate)
+    host_probe._selected_gpu_cached.cache_clear()
+    monkeypatch.setattr(install, "_probe_system_ram_gb", lambda: 32.0)
+    monkeypatch.setattr(install, "_log_install_event", lambda *a, **k: None)
+    monkeypatch.setattr(install._runtime_reconcile, "apply_at_install",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(install, "_detect_amd_rocm",
+                        lambda: (True, "Radeon 16GB (ROCm)"))
+    monkeypatch.setattr(install, "_detect_nvidia_gpu", lambda: (False, ""))
+    monkeypatch.setattr(install, "_probe_nvidia_versions", lambda: "")
+    monkeypatch.setattr(install, "_print_render_video_group_hint", lambda: None)
+    args = argparse.Namespace(
+        cpu_only=False, gpu=False, openai_key="", no_gpu_check=False,
+        container="podman", no_containers=True, gpu_vram_threshold_gb=8.0,
+    )
+    sysinfo = install._detect_system(args)
+    assert (sysinfo.gpu_vendor, sysinfo.vram_gb) == ("amd", 16.0)
+    assert sysinfo.has_gpu is True
+    assert len(enumerations) == 1, enumerations
+
+    # install's step-[3] profile choice (fed the SystemInfo the detection
+    # just produced) and the resolver's hardware leg agree on qwen3.
+    monkeypatch.setattr(install, "_record_install_choice", lambda *a, **k: None)
+    monkeypatch.setattr(install, "_load_previous_choices", lambda: {})
+    monkeypatch.setattr(install, "_probe_cpu_cores", lambda: 8)
+    cfg = install._choose_embedding_config(
+        sysinfo, argparse.Namespace(cpu_only=False, low_resource=False,
+                                    openai_key="", no_gpu_check=False))
     assert cfg["code_model"] == QWEN3
     assert cem._hardware_code_model() == QWEN3
 
