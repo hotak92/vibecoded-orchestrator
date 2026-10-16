@@ -21480,6 +21480,12 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             return False
         return ans in {"y", "yes"}
 
+    def _confirm_strict(prompt: str) -> bool:  # R39 M3: a non-tty stdin alone never approves stops / [8]
+        if args.yes or (sys.stdin.isatty() and not args.quiet):
+            return _confirm(prompt)
+        print(f"  {prompt} [skipped — needs --yes when not interactive]")
+        return False
+
     # Plan: enumerate everything we WILL touch.
     print("This uninstaller will:")
     print()
@@ -21645,7 +21651,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         audit.extend(_uninstall_containers.remove(_rt.runtime, current_compose_dir=compose_dir))
 
     # Step 3: stop what holds the state dir open, before ANY state removal.
-    if _confirm("Stop the model gateway, vct-hub and the VCO launcher before VCO state is removed?"):
+    quiesced = _confirm_strict("Stop the model gateway, vct-hub and the VCO launcher before VCO state is removed?")
+    if quiesced:
         audit.extend(_uninstall_quiesce.stop_gateway(interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT))
         audit.extend(_uninstall_quiesce.stop_hub(hub_bins))
         audit.extend(_uninstall_quiesce.stop_launchers(
@@ -21718,11 +21725,16 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         audit.extend(_uninstall_artifacts.execute(_ua_plan, extra_hub_binaries=hub_bins[-1:]))
 
     # Step 8: the whole VCO state dir (uninstall_state.py; exact names when refused).
-    if (st_plan.exists or st_plan.db_files or gateway_present) and _confirm(
+    if (st_plan.exists or st_plan.db_files or gateway_present) and _confirm_strict(
             f"Remove the VCO state dir {st_plan.root} (RL training data included)?"):
-        audit.extend(_uninstall_quiesce.stop_gateway(  # again: its boot unit may have restarted it
-            interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT, report_idle=False))
-        audit.extend(_uninstall_state.execute(st_plan))
+        if quiesced:  # again: its boot unit may have restarted it
+            audit.extend(_uninstall_quiesce.stop_gateway(
+                interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT, report_idle=False))
+        if busy := _uninstall_quiesce.still_running(launcher_exes, install_root=PROJECT_ROOT):  # R39 M2
+            audit.append(f"SKIPPED [8]: still running — {'; '.join(busy)}. Close it, then re-run the uninstall")
+            gateway_present = []
+        else:
+            audit.extend(_uninstall_state.execute(st_plan))
         if gateway_present:
             audit.extend(_boot_service.remove_gateway_state())
 

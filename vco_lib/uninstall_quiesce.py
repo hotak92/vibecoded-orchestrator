@@ -47,7 +47,7 @@ from typing import Callable, Iterable, Optional, Sequence
 
 __all__ = [
     "ProcInfo", "GatewayProc", "stop_hub", "find_launchers", "stop_launchers",
-    "is_vco_gateway", "find_gateway", "stop_gateway", "plan_lines",
+    "is_vco_gateway", "find_gateway", "stop_gateway", "still_running", "plan_lines",
 ]
 
 Runner = Callable[..., Optional[int]]
@@ -380,6 +380,32 @@ def stop_gateway(
     if (stopper or _default_gateway_stopper)(proc.pid, cands):
         return [f"stopped VCO model gateway (pid {proc.pid})"]
     return [f"WARN: could not stop the VCO model gateway (pid {proc.pid}) — stop it by hand"]
+
+
+def still_running(
+    launcher_exes: Sequence[Path],
+    *,
+    install_root: Optional[Path] = None,
+    hub_running: Optional[Callable[[], bool]] = None,
+    lister: Optional[Callable[[], list[ProcInfo]]] = None,
+    gateway_reader: Optional[Callable[[], Optional[GatewayProc]]] = None,
+    gateway_candidates: Optional[Sequence[Sequence[str]]] = None,
+) -> list[str]:
+    """What of VCO still runs (same identification as the stops). Step [8]
+    removes nothing while this is non-empty (review R39 M2); a check that
+    cannot run counts as running."""
+    out = ["vct-hub"] if (hub_running or _default_hub_running)() else []
+    try:
+        out += [f"the VCT Launcher ({_describe(p)})" for p in find_launchers(launcher_exes, lister=lister)[0]]
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"possibly the VCT Launcher (process list unreadable: {exc})")
+    try:
+        gw, why, _ = find_gateway(install_root=install_root, candidates=gateway_candidates, reader=gateway_reader)
+        if gw is not None and why is None:
+            out.append(f"the model gateway (pid {gw.pid})")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"possibly the model gateway (cannot check: {exc})")
+    return out
 
 
 def plan_lines(

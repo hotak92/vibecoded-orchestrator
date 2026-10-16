@@ -304,7 +304,8 @@ def test_launcher_paths_cover_the_install_locations(tmp_path):
 # ── end to end through install._run_uninstall ─────────────────────────────
 
 
-def _run(monkeypatch, tmp_path, home, *, dry_run, events, gateway_restarts=False):
+def _run(monkeypatch, tmp_path, home, *, dry_run, events, gateway_restarts=False,
+         yes=True, tty=None, answers=None):
     root = _state(home / ".vct")
     monkeypatch.setenv("VCT_STATE_DIR", str(root))
     monkeypatch.delenv("VCT_LAUNCHER_DB_PATH", raising=False)
@@ -330,9 +331,16 @@ def _run(monkeypatch, tmp_path, home, *, dry_run, events, gateway_restarts=False
 
     monkeypatch.setattr(uq, "_default_runner", runner)
     ours = home / ".local" / "share" / "vct-launcher" / "vct-launcher"
-    monkeypatch.setattr(uq, "_default_lister", lambda: [uq.ProcInfo(55, "vct-launcher", ours)])
-    monkeypatch.setattr(uq, "_default_stopper", lambda pid, exe: events.append(
-        ("launcher-stop", (root / "launcher.db").exists())) or True)
+    launcher = {"alive": True}
+    monkeypatch.setattr(uq, "_default_lister", lambda: [uq.ProcInfo(55, "vct-launcher", ours)]
+                        if launcher["alive"] else [])
+
+    def launcher_stop(pid, exe):
+        events.append(("launcher-stop", (root / "launcher.db").exists()))
+        launcher["alive"] = False
+        return True
+
+    monkeypatch.setattr(uq, "_default_stopper", launcher_stop)
     venv_script = str(tmp_path / "clone" / ".venv" / "bin" / "vct-model-gateway")
     monkeypatch.setattr(uq, "_default_candidates", lambda install_root: [[venv_script]])
     gw = {"alive": True}
@@ -347,9 +355,14 @@ def _run(monkeypatch, tmp_path, home, *, dry_run, events, gateway_restarts=False
     monkeypatch.setattr(uq, "_default_gateway_stopper", gw_stop)
     real_exec = us.execute
     monkeypatch.setattr(us, "execute", lambda plan: events.append(("state", None)) or real_exec(plan))
-    args = argparse.Namespace(dry_run=dry_run, yes=True, quiet=True, keep_data=True,
+    if tty is not None:
+        monkeypatch.setattr(install.sys.stdin, "isatty", lambda: tty)
+    if answers is not None:  # prompt substring -> answer; anything else "n"
+        monkeypatch.setattr("builtins.input", lambda prompt: next(
+            (a for k, a in answers.items() if k in prompt), "n"))
+    args = argparse.Namespace(dry_run=dry_run, yes=yes, quiet=yes, keep_data=True,
                               remove_projects=False)
-    assert install._run_uninstall(args) == 0
+    install._run_uninstall(args)
     return root
 
 
@@ -523,3 +536,40 @@ def test_a_gateway_check_that_cannot_run_is_reported():
     audit = uq.stop_gateway(candidates=CANDS, reader=broken, interactive=False,
                             confirm=lambda m: True)
     assert audit[0].startswith("WARN") and "psutil" in audit[0]
+
+
+# ── review R39: M2 (no [8] while VCO still runs), M3 (non-tty needs --yes) ──
+
+
+def test_declining_step_3_then_accepting_step_8_removes_nothing(monkeypatch, tmp_path, home, capsys):
+    """M2: hub + launcher + gateway still running -> [8] is skipped with a line."""
+    events: list = []
+    root = _run(monkeypatch, tmp_path, home, dry_run=False, events=events, yes=False, tty=True,
+                answers={"Proceed": "y", "Remove the VCO state dir": "y"})
+    assert events == []
+    assert (root / "launcher.db").exists() and (root / "retrieval_rl_data").is_dir()
+    out = capsys.readouterr().out
+    assert "SKIPPED [8]: still running" in out and "vct-hub" in out
+    assert "VCT Launcher" in out and "model gateway" in out
+
+
+def test_non_tty_without_yes_never_stops_processes_or_removes_the_state_dir(
+        monkeypatch, tmp_path, home, capsys):
+    """M3: a piped stdin alone does not approve step [3] or [8]."""
+    events: list = []
+    root = _run(monkeypatch, tmp_path, home, dry_run=False, events=events, yes=False, tty=False)
+    assert events == []
+    assert root.is_dir() and (root / "launcher.db").exists()
+    assert capsys.readouterr().out.count("needs --yes when not interactive") == 2
+
+
+def test_still_running_uses_the_same_identification(tmp_path):
+    ours = tmp_path / "vct-launcher"
+    cands = [[str(tmp_path / "vct-model-gateway")]]
+    busy = uq.still_running(
+        [ours], hub_running=lambda: True,
+        lister=lambda: [uq.ProcInfo(5, "vct-launcher", ours), uq.ProcInfo(6, "vct-launcher", tmp_path / "x")],
+        gateway_reader=lambda: uq.GatewayProc(7, ("/usr/bin/python3", "other.py")), gateway_candidates=cands)
+    assert busy[0] == "vct-hub" and len(busy) == 2 and "pid 5" in busy[1]  # foreign gateway/launcher: not ours
+    assert uq.still_running([ours], hub_running=lambda: False, lister=lambda: [],
+                            gateway_reader=lambda: None, gateway_candidates=cands) == []
