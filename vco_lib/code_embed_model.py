@@ -36,10 +36,22 @@ Target precedence (first hit wins):
 2. the launcher Preferences pin (``code_embed_backend_override`` + its model key).
 3. the install default — ``app_state[default_code_embedding]`` (install.py's
    hardware ladder; the "Default code embedding" dropdown).
+3b. the install RECORD — the code model of the profile install wrote at step 7
+   (``<orchestrator>/.claude/state/ollama_pull_profile.json``, the same value
+   the pull plan and compose derive from; v0.2.103 F1).
 4. ``CODE_EMBED_BACKEND`` env — the code_embed CONTAINER's selector, which
    install.py projects into the root's settings env: a default only, never an
-   override (review HIGH-1).
-5. ``codesage-large-v2``.
+   override (review HIGH-1). ``openai`` keeps meaning "the OpenAI default
+   model"; ``gpu`` is honoured ONLY when the hardware ladder agrees this host
+   should run CodeSage; ``ollama`` names a backend, not a model, and is
+   ignored (v0.2.103 F1 removed the fixed ``ollama → qwen3`` mapping — on a
+   Jina-tier host it named a model install never pulled).
+5. the hardware ladder itself —
+   :func:`vco_lib.embedding_selection.select_code_model_for_host` over the
+   live probes (:mod:`vco_lib.host_probe`), i.e. the SAME rule install's
+   profile choice uses. The hardware-blind ``codesage-large-v2`` builtin
+   default is gone (v0.2.103 F1): CodeSage is never selected below the
+   ladder's 12 GB VRAM threshold.
 
 OpenAI code models need the EMBEDDINGS consent (:mod:`vco_lib.openai_consent`,
 shared with the KG text OpenAI slots; separate from the summaries consent).
@@ -53,7 +65,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib.embedding_service import (
     _FALLBACK_JINA_MODEL,
@@ -77,9 +89,10 @@ SOURCE_ENV = "env"
 SOURCE_PROJECT = "project"
 SOURCE_PREFERENCES = "preferences"
 SOURCE_DEFAULT = "default"
+SOURCE_INSTALL_RECORD = "install-record"
 SOURCE_INSTALL_ENV = "install-env"
-SOURCE_BUILTIN = "builtin"
 SOURCE_RECORDED = "recorded"
+SOURCE_HARDWARE = "hardware-probe"
 
 #: The binding row's ``config_json`` key holding the fill progress.
 FILL_CONFIG_KEY = "code_model_fill"
@@ -229,15 +242,88 @@ def _pin_model(pin: str, app_state) -> Optional[str]:
     return None
 
 
+def _orchestrator_roots() -> "list":
+    """Where the install record may live — the SAME ladder
+    :mod:`vco_lib.summary_model` uses (``VCT_INSTALL_ROOT``, then the
+    checkout this ``vco_lib`` is imported from). Imported, not re-declared,
+    so the two resolvers can never discover different roots."""
+    from vco_lib.summary_model import _orchestrator_roots as _roots
+
+    return list(_roots())
+
+
+def recorded_code_model(roots: Optional[Sequence] = None) -> Optional[str]:
+    """The code model of the profile install recorded (and pulled), or None.
+
+    This is the same value install.py, the pull plan and compose all derive
+    from — reading it here makes the resolver agree with what the machine
+    actually runs even in processes that carry none of the settings env
+    (the 5b bundle child, the hub- or retry-driven walks)."""
+    from vco_lib.embedding_pull_plan import read_record
+
+    for root in (roots if roots is not None else _orchestrator_roots()):
+        rec = read_record(root)
+        model = rec.get("code_model") if isinstance(rec, dict) else None
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    return None
+
+
+def _gpu_vendor() -> str:
+    """``"nvidia"`` / ``"amd"`` / ``""`` — the explicit ``VCT_GPU_VENDOR``
+    preference, else the first attributed card, else unknown. The AMD rule
+    needs it: CodeSage has no ROCm build, so an AMD host on the >= 12 GB
+    rung runs qwen3 instead."""
+    try:
+        from vco_lib.gpu_profile import gpu_vendor_preference_from_env
+
+        pref = gpu_vendor_preference_from_env()
+        if pref:
+            return pref
+    except Exception:  # noqa: BLE001 — a failed env read never blocks
+        pass
+    try:
+        from vco_lib import gpu_device
+
+        for cand in gpu_device.enumerate_gpus():
+            vendor = (getattr(cand, "vendor", "") or "").strip().lower()
+            if vendor in ("nvidia", "amd"):
+                return vendor
+    except Exception:  # noqa: BLE001 — soft-fail to "unknown"
+        pass
+    return ""
+
+
+def _hardware_code_model() -> str:
+    """The ladder's answer for THIS host, right now — the ONE selector
+    install's own profile choice uses
+    (:func:`vco_lib.embedding_selection.select_code_model_for_host`), fed by
+    the ONE probe module (:mod:`vco_lib.host_probe`). Reached only when
+    nothing configured and no install record answers."""
+    from vco_lib.embedding_selection import select_code_model_for_host
+    from vco_lib import host_probe
+
+    return select_code_model_for_host(
+        gpu_vram_gb=host_probe.probe_gpu_vram_gb(),
+        ram_gb=host_probe.probe_system_ram_gb(),
+        cores=host_probe.probe_cpu_cores(),
+        gpu_vendor=_gpu_vendor(),
+    )
+
+
 def resolve_code_model_pick(
     env: Optional[Mapping[str, str]] = None,
     *,
     app_state: Optional[Callable[[str], Optional[str]]] = None,
     project_target: Optional[str] = None,
+    install_record: Optional[Callable[[], Optional[str]]] = None,
+    hardware: Optional[Callable[[], str]] = None,
 ) -> "tuple[str, str]":
     """``(model, source)`` the configuration asks for — see the module
-    docstring for the precedence. Never raises; the consent gate is applied
-    by :func:`resolve_code_model` to whatever model ends up effective."""
+    docstring for the precedence. ``install_record`` / ``hardware`` are
+    seams for tests; production passes neither. Never raises; the consent
+    gate is applied by :func:`resolve_code_model` to whatever model ends up
+    effective."""
     env = os.environ if env is None else env
     app_state = app_state or _app_state_reader()
 
@@ -254,21 +340,36 @@ def resolve_code_model_pick(
     default = _str(app_state, APP_STATE_KEY_DEFAULT_CODE_EMBED)
     if default:
         return _to_openai_api_model(default), SOURCE_DEFAULT
+    recorded = (install_record or recorded_code_model)()
+    if recorded:
+        return _to_openai_api_model(recorded), SOURCE_INSTALL_RECORD
     backend = str(env.get("CODE_EMBED_BACKEND", "") or "").strip().lower()
-    if backend == "ollama":
-        return DEFAULT_TEXT_MODEL, SOURCE_INSTALL_ENV
     if backend == "openai":
         return _OPENAI_CODE_EMBED_DEFAULT_MODEL, SOURCE_INSTALL_ENV
-    if backend:
+    ladder = (hardware or _hardware_code_model)()
+    if backend == "gpu" and ladder != DEFAULT_CODE_MODEL:
+        # v0.2.103 F1: the projected GPU-service selector is honoured ONLY
+        # when the ladder agrees this host should run CodeSage — never below
+        # the 12 GB VRAM threshold (a hardware-blind codesage here names a
+        # container this host does not run).
+        print(
+            f"[vct] code-embed: ignoring CODE_EMBED_BACKEND=gpu — the hardware "
+            f"ladder selects {ladder} for this host",
+            file=sys.stderr,
+        )
+        return ladder, SOURCE_HARDWARE
+    if backend == "gpu":
         return DEFAULT_CODE_MODEL, SOURCE_INSTALL_ENV
-    return DEFAULT_CODE_MODEL, SOURCE_BUILTIN
+    return ladder, SOURCE_HARDWARE
 
 
 _SOURCE_LABEL = {
     SOURCE_PROJECT: "this project's Codegraph-tab selection",
     SOURCE_PREFERENCES: f"the Preferences pin ({APP_STATE_KEY_CODE_EMBED_OVERRIDE})",
     SOURCE_DEFAULT: f"the install default ({APP_STATE_KEY_DEFAULT_CODE_EMBED})",
+    SOURCE_INSTALL_RECORD: "the recorded install profile (ollama_pull_profile.json)",
     SOURCE_INSTALL_ENV: "the install-projected CODE_EMBED_BACKEND",
+    SOURCE_HARDWARE: "the hardware ladder (vco_lib.embedding_selection)",
     SOURCE_RECORDED: "this project's recorded code-graph model",
 }
 
@@ -363,6 +464,8 @@ def resolve_code_model(
     record_reader: Optional[Callable[[str], Optional[CodeModelRecord]]] = None,
     role: str = "query",
     project_target: Optional[str] = None,
+    install_record: Optional[Callable[[], Optional[str]]] = None,
+    hardware: Optional[Callable[[], str]] = None,
 ) -> CodeModelResolution:
     """Which code model one project's code graph uses, for ``role``.
 
@@ -393,7 +496,8 @@ def resolve_code_model(
         except Exception:  # noqa: BLE001 — an unreadable record is "none"
             record = None
     target, target_source = resolve_code_model_pick(
-        env, app_state=app_state, project_target=project_target)
+        env, app_state=app_state, project_target=project_target,
+        install_record=install_record, hardware=hardware)
     target_refusal = consent_refusal_for(target, target_source, app_state)
     filling, carry = False, None
     if record is None:

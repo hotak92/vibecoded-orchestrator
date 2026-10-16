@@ -645,3 +645,82 @@ def test_the_bundle_seam_runs_on_the_update_path(monkeypatch):
     # And it must be skipped on a dry run (a dry run mutates nothing).
     idx = src.index("_trigger_extractor_generation_reindex(")
     assert "if not dry_run:" in src[max(0, idx - 400): idx]
+
+
+# ===========================================================================
+# v0.2.103 F3 — the root's FIRST install: unknown graph ⇒ absent
+# ===========================================================================
+def _probe_graph_unknown(names, _url):
+    """Weaviate cannot answer (containers not started yet, or unreachable)."""
+    return {n: None for n in names}
+
+
+def test_a_root_first_install_treats_an_unknown_graph_as_absent(tmp_path: Path):
+    """v0.2.103 F3: the root's first install (no prior manifest) runs the
+    bundle at install step 5b, BEFORE the containers exist — the existence
+    probe cannot answer there, and reading the unknown as "owed" launched a
+    walk / queued a ``codegraph_embed_resync_pending`` deferral for a graph
+    that cannot exist yet, naming a backend the machine has not configured.
+    Red before: status "deferred" with a deferral in hand."""
+    spawn = RecordingSpawn(status="deferred", deferral=object())
+    out = _ensure(tmp_path, spawn=spawn, prev_version="",
+                  probe=_probe_graph_unknown, unknown_graph_is_absent=True)
+    assert out.status == "stamped"
+    assert out.reason == ceg.REASON_NO_GRAPH
+    assert spawn.calls == [], "no walk, no deferral, for a graph that cannot exist"
+    assert out.deferral is None
+    assert ceg.read_stamp_generation(tmp_path) == ceg.CURRENT_EXTRACTOR_GENERATION
+
+
+def test_an_update_with_an_unknown_graph_still_owes_the_walk(tmp_path: Path):
+    """The leave-alone case: the conservative unknown-means-owed reading is
+    KEPT for updates (a prior manifest means services should be reachable —
+    an unanswered probe is then a real outage worth a walk/deferral)."""
+    spawn = RecordingSpawn()
+    out = _ensure(tmp_path, spawn=spawn, prev_version="0.2.91",
+                  probe=_probe_graph_unknown)
+    assert out.status == "launched"
+    assert len(spawn.calls) == 1
+
+
+def test_a_user_project_first_install_keeps_unknown_means_owed(tmp_path: Path):
+    """The flag is the ROOT's only — user projects never get it, whatever
+    their manifest state (their bundle runs after services exist, so an
+    unanswered probe means something is wrong)."""
+    spawn = RecordingSpawn()
+    out = _ensure(tmp_path, spawn=spawn, prev_version="",
+                  probe=_probe_graph_unknown)
+    assert out.status == "launched"
+    assert len(spawn.calls) == 1
+
+
+def test_project_init_sets_the_flag_only_for_a_root_first_install(
+        tmp_path: Path, monkeypatch):
+    """Wiring pin (red on the source change): the bundle seam computes
+    ``unknown_graph_is_absent`` from ``is_root_target AND no prior
+    manifest`` — true only for the root's first install."""
+    from vco_lib import project_init
+
+    seen = []
+
+    def fake(folder, **kw):
+        seen.append(kw.get("unknown_graph_is_absent"))
+        return types.SimpleNamespace(
+            status="stamped", reason=ceg.REASON_NO_GRAPH, message="",
+            generation=ceg.CURRENT_EXTRACTOR_GENERATION, reason_text="",
+            pid=None, deferral=None, warnings=[])
+
+    monkeypatch.setattr(ceg, "ensure_extractor_generation", fake)
+
+    def log(*a, **k):
+        pass
+
+    for is_root, prev, want in (
+        (True, "", True),          # the root's first install
+        (True, "0.2.102", False),  # a root UPDATE (prior manifest)
+        (False, "", False),        # a user project's first install
+    ):
+        project_init._trigger_extractor_generation_reindex(
+            tmp_path, prev_version=prev, running_version="0.2.103",
+            is_root_target=is_root, result={"warnings": []}, log=log)
+        assert seen[-1] is want

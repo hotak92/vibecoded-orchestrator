@@ -1119,18 +1119,28 @@ def plan(
     weaviate_url: Optional[str] = None,
     graph_exists: Optional[bool] = None,
     probe=None,
+    unknown_graph_is_absent: bool = False,
 ) -> Verdict:
     """Resolve :func:`decide`'s inputs from disk + Weaviate, then decide.
 
     ``graph_exists`` may be supplied by a caller that already knows (or by a
     test); otherwise it is probed. The probe runs ONLY when it can change the
     answer — a stamp that is already current short-circuits before any I/O.
-    """
+
+    ``unknown_graph_is_absent`` (v0.2.103 F3) is set ONLY for the
+    orchestrator root's FIRST install (no prior manifest): that call runs at
+    step 5b, BEFORE the containers exist, so "could not check" is the
+    guaranteed answer for a graph that cannot exist yet — treating it as
+    "absent" lets rule 2 stamp instead of queueing a deferral that names a
+    backend the machine has not even configured. Updates and user projects
+    keep the conservative unknown-means-owed reading."""
     stamp_generation = read_stamp_generation(folder)
     if generation_is_current(stamp_generation):
         return Verdict(False, REASON_STAMP_CURRENT)
     if graph_exists is None:
         graph_exists = code_graph_exists(project_name, weaviate_url, probe=probe)
+        if graph_exists is None and unknown_graph_is_absent:
+            graph_exists = False
     return decide(
         prev_version=prev_version,
         running_version=running_version,
@@ -1203,6 +1213,7 @@ def ensure_extractor_generation(
     graph_exists: Optional[bool] = None,
     probe=None,
     spawn=None,
+    unknown_graph_is_absent: bool = False,
 ) -> ReindexResult:
     """Decide, and when owed, launch the background force-rewalk.
 
@@ -1217,6 +1228,8 @@ def ensure_extractor_generation(
     ``spawn`` / ``probe`` are the injection seams for tests; production leaves
     both ``None`` so the real
     :func:`vco_lib.codegraph_resync.spawn_background_resync` runs.
+    ``unknown_graph_is_absent`` is the root-first-install flag — see
+    :func:`plan`.
     """
     try:
         verdict = plan(
@@ -1227,6 +1240,7 @@ def ensure_extractor_generation(
             weaviate_url=weaviate_url,
             graph_exists=graph_exists,
             probe=probe,
+            unknown_graph_is_absent=unknown_graph_is_absent,
         )
     except Exception as exc:  # noqa: BLE001 — a broken detector never blocks
         return ReindexResult(

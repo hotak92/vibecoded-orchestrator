@@ -387,6 +387,44 @@ if not _ALLOW_REAL_STATE:
         os.environ[_key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
 
 
+# ─── W-CODE-LADDER (v0.2.103 F1): the resolver's hardware tail is FIXED ─────
+#
+# `vco_lib.code_embed_model.resolve_code_model_pick`'s last rung is no longer
+# a constant: since v0.2.103 it is the hardware ladder over the live probes
+# (`vco_lib.host_probe` + the GPU vendor), i.e. the SAME selector install
+# uses. That is the fix — the old builtin answered `codesage-large-v2` on
+# every host — but it means an unpinned test would branch on the machine the
+# suite happens to run on (an 8 GB laptop answers qwen3, a CI container
+# jina, this dev box codesage), and would SPAWN the probe subprocesses
+# (nvidia-smi / lspci / wmic) on every resolution. The pins below fix the
+# probes at one known host — a 16 GB NVIDIA card, whose ladder answer is
+# CodeSage, exactly what the pre-v0.2.103 builtin said, so the resync /
+# spawn tests that stub the container-health leg keep their meaning.
+# A test that needs another host stubs the probes itself
+# (`monkeypatch.setattr` runs later and wins, and restores the pin); the
+# ladder's own tier tests (`tests/test_v02103_code_model_ladder.py`,
+# `test_hardware_auto_selection.py`) inject values explicitly. Re-established
+# per test in `_redirect_user_state_dir` below, like the env pins.
+from vco_lib import code_embed_model as _cem_for_ladder  # noqa: E402
+from vco_lib import host_probe as _host_probe  # noqa: E402
+
+_LADDER_PIN: "dict[tuple, object]" = {
+    (_host_probe, "probe_gpu_vram_gb"): lambda: 16.0,
+    (_host_probe, "probe_system_ram_gb"): lambda: 64.0,
+    (_host_probe, "probe_cpu_cores"): lambda: 16,
+    (_cem_for_ladder, "_gpu_vendor"): lambda: "nvidia",
+}
+
+
+def _apply_ladder_pin() -> None:
+    for (module, name), stub in _LADDER_PIN.items():
+        setattr(module, name, stub)
+
+
+if not _ALLOW_REAL_STATE:
+    _apply_ladder_pin()
+
+
 # ─── W-SESSION-RECONCILE (v0.2.97 SE-3): no hook test probes live ports ─────
 #
 # `ensure-containers.{sh,ps1}` runs `service_endpoints reconcile --phase
@@ -923,6 +961,9 @@ def _redirect_user_state_dir(request):
     os.environ.update(claude_keys)
     os.environ.update(install_root_keys)
     os.environ.update(resync_keys)
+    # W-CODE-LADDER: re-established per test — a raw (un-restored) setattr in
+    # a test must not un-pin the hardware ladder for the rest of the session.
+    _apply_ladder_pin()
     try:
         yield
     finally:

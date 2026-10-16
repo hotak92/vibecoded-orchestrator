@@ -5944,6 +5944,14 @@ def _trigger_extractor_generation_reindex(
         # tri-state the analyzer resolves — passed explicitly so the spawn's
         # probes classify `.claude/**` rows the same way the walk will.
         index_dot_claude=bool(is_root_target),
+        # v0.2.103 F3: the root's FIRST install (no prior manifest) runs at
+        # install step 5b, BEFORE the containers exist — "could not check
+        # whether a graph exists" is then the guaranteed answer for a graph
+        # that cannot exist yet, and reading it as "owed" queued a
+        # codegraph_embed_resync_pending deferral naming a backend the
+        # machine has not configured. Updates (a prior manifest) and user
+        # projects keep the conservative unknown-means-owed reading.
+        unknown_graph_is_absent=bool(is_root_target and not prev_version),
     )
 
     phase = {

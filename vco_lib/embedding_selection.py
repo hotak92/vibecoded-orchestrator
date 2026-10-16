@@ -248,6 +248,47 @@ def select_code_embedding_backend(
     return _CODE_BACKEND_JINA
 
 
+def select_code_model_for_host(
+    gpu_vram_gb: float,
+    ram_gb: float,
+    cores: int,
+    gpu_vendor: str = "",
+    *,
+    openai_key_available: bool = False,
+    prefer_openai: bool = False,
+) -> str:
+    """The code model THIS host should run — the ladder PLUS the vendor
+    correction, in ONE place (v0.2.103 F1).
+
+    ``select_code_embedding_backend`` is the pure VRAM/RAM/cores ladder.
+    Install has always applied one correction on top of it — CodeSage has no
+    ROCm build, so an AMD card that reaches the >= 12 GB rung must run the
+    Ollama-served qwen3 code model instead — but until v0.2.103 that rule
+    lived inline in ``install.py::_choose_embedding_config`` only, and the
+    runtime resolver (:mod:`vco_lib.code_embed_model`) never saw it. This
+    wrapper is now the ONE selector every consumer (install's profile choice
+    AND the resolver's no-record fallback) calls, so the two can never
+    disagree about an AMD host.
+
+    ``gpu_vendor="amd"`` implies a GPU was detected (a vendor is only ever
+    attributed to a detected card), so no separate ``has_gpu`` flag is taken.
+    """
+    pick = select_code_embedding_backend(
+        gpu_vram_gb=gpu_vram_gb,
+        ram_gb=ram_gb,
+        cores=cores,
+        openai_key_available=openai_key_available,
+        prefer_openai=prefer_openai,
+    )
+    if pick == _CODE_BACKEND_CODESAGE and (gpu_vendor or "").strip().lower() == "amd":
+        # v0.2.54 (gpu-audit C-2): CodeSage has no ROCm build path — the
+        # code-embed container image is CUDA-only. Ollama itself IS
+        # ROCm-accelerated, so code embeddings still run on the GPU through
+        # the backend that actually has a ROCm path.
+        return _CODE_BACKEND_QWEN3
+    return pick
+
+
 def select_kg_embedding_backend(
     gpu_vram_gb: float,
     ram_gb: float,

@@ -48,6 +48,48 @@ def gpu_vendor_preference_from_env() -> Optional[str]:
     return None
 
 
+#: v0.2.103 F2 — human names for the label rebuild. Keyed on the model ids
+#: the profiles / the tier ladder can produce (a prefix the map doesn't know
+#: falls back to the model id itself, so a future model never crashes a label).
+_TIER_LABEL: "dict[str, str]" = {
+    "qwen3-embedding:0.6b": "qwen3",
+    "snowflake-arctic-embed2:latest": "Arctic",
+    "codesage-large-v2": "CodeSage",
+    "unclemusclez/jina-embeddings-v2-base-code:latest": "Jina V2",
+    "text-embedding-3-small": "OpenAI",
+}
+
+
+def _rebuilt_description(config: dict) -> str:
+    """The profile description rebuilt from the FINAL models (v0.2.103 F2).
+
+    The field case: an 8 GB host gets the ``low_resource`` profile whose
+    stock description says "Jina V2 code", then the tier override swaps the
+    code model to qwen3 — the printed label kept promising Jina. The
+    profile KEY still names the text tier; only the parenthesised body is
+    regenerated, from the models actually chosen. The prefix ("GPU-accelerated"
+    / "CPU-only" / "Low-resource" / …) is kept from the stock description.
+    """
+    def label(model: object) -> str:
+        text = str(model or "").strip()
+        return _TIER_LABEL.get(text, text or "?")
+
+    text = label(config.get("text_model"))
+    code = label(config.get("code_model"))
+    backend = str(config.get("code_backend", "") or "").strip().lower()
+    serving = {
+        "gpu": "best quality",
+        "ollama": "both via Ollama",
+        "openai": "via the OpenAI API",
+    }.get(backend, "")
+    body = f"{text} text + {code} code"
+    if serving:
+        body += f", {serving}"
+    stock = str(config.get("description") or "")
+    prefix = stock.split(" (", 1)[0].strip() if " (" in stock else ""
+    return f"{prefix} ({body})" if prefix else body
+
+
 def apply_tier_overrides(
     config: dict,
     *,
@@ -68,11 +110,13 @@ def apply_tier_overrides(
     See install.py's `_apply_tier_overrides` docstring for the rationale
     on why ``code_backend`` is NOT swapped.
     """
+    swapped = False
     if config.get("code_model") != code_pick:
         config["code_model"] = code_pick
         dims = model_dims.get(code_pick)
         if dims is not None:
             config["code_dims"] = dims
+        swapped = True
     if config.get("text_model") != kg_pick:
         config["text_model"] = kg_pick
         dims = model_dims.get(kg_pick)
@@ -81,3 +125,9 @@ def apply_tier_overrides(
         slot = text_model_active_embedding.get(kg_pick)
         if slot is not None:
             config["active_embedding"] = slot
+        swapped = True
+    if swapped:
+        # v0.2.103 F2: the label follows the override — the stock
+        # description still names the profile's STOCK code model otherwise
+        # ("Jina V2 code" printed on a host whose code model is qwen3).
+        config["description"] = _rebuilt_description(config)

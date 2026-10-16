@@ -242,12 +242,13 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     # venv exists, so it may only reach a pure stdlib leaf.
     model_id_for_active as _model_id_for_active_shared,
     _cpu_meets,  # pyright: ignore[reportUnusedImport] — re-export for tests
-    select_code_embedding_backend,
+    select_code_embedding_backend,  # pyright: ignore[reportUnusedImport] — re-export (tests/test_hardware_auto_selection.py)
+    select_code_model_for_host,  # v0.2.103 F1: the ladder + AMD rule, ONE home
     select_kg_embedding_backend,
     select_summary_backend,  # pyright: ignore[reportUnusedImport] — re-export (tests/test_hardware_auto_selection.py)
     summary_model_for_hardware,
     _CODE_BACKEND_CODESAGE,
-    _CODE_BACKEND_QWEN3,
+    _CODE_BACKEND_QWEN3,  # pyright: ignore[reportUnusedImport] — re-export (tests drive install's AMD route through it)
     _CODE_BACKEND_JINA,  # pyright: ignore[reportUnusedImport] — re-export
     _CODE_BACKEND_OPENAI,  # pyright: ignore[reportUnusedImport] — re-export
     _KG_BACKEND_QWEN3,
@@ -9358,10 +9359,18 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     ram = float(sysinfo.ram_gb or 0.0)
     has_gpu = bool(sysinfo.has_gpu)
 
-    code_pick = select_code_embedding_backend(
+    code_pick = select_code_model_for_host(
         gpu_vram_gb=vram,
         ram_gb=ram,
         cores=cores,
+        gpu_vendor=sysinfo.gpu_vendor,
+        # v0.2.103 F1: the ladder PLUS the AMD→qwen3 vendor correction now
+        # live in ONE selector — the runtime resolver
+        # (vco_lib.code_embed_model) calls the same function, so install and
+        # the resolver can never disagree about an AMD host. The correction
+        # itself is v0.2.54 (gpu-audit C-2): CodeSage has no ROCm build
+        # path, so an AMD card on the >= 12 GB rung runs the Ollama-served
+        # qwen3 code model instead (Ollama IS ROCm-accelerated).
         openai_key_available=False,  # auto-detect never picks OpenAI
         prefer_openai=False,
     )
@@ -9372,21 +9381,6 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         openai_key_available=False,
         prefer_openai=False,
     )
-
-    # v0.2.54 (gpu-audit C-2): CodeSage has no ROCm build path — the
-    # code-embed container image is CPU-multi-arch by default with a
-    # CUDA-only alternative (`Dockerfile.cuda`, emitted only for
-    # gpu_vendor == "nvidia"). Pre-v0.2.54, an AMD host with >=12 GB
-    # VRAM landed on the "gpu" profile labeled "GPU-accelerated ...
-    # best quality" while CodeSage 1.3B silently ran on CPU inside the
-    # container. Route AMD hosts to the Ollama-served qwen3 code model
-    # instead: Ollama itself IS ROCm-accelerated (via the rocm compose
-    # overlay), so code embeddings still run on the GPU — through the
-    # backend that actually has a ROCm path. This also makes the
-    # shipped claims true (CHANGELOG F7 + podman-compose.amd-rocm.yml:
-    # "AMD users get the Ollama-based code embedding fallback").
-    if has_gpu and code_pick == _CODE_BACKEND_CODESAGE and sysinfo.gpu_vendor == "amd":
-        code_pick = _CODE_BACKEND_QWEN3
 
     # Map the per-tier picks back to a profile + overrides. The profile
     # determines the shape (active_embedding slot + which Ollama models
@@ -10214,7 +10208,7 @@ def _reconcile_install_active_embedding(
         notice = (
             f"[embedding] settings.json ACTIVE_EMBEDDING={env_active} is stale for "
             f"this CPU hardware; auto-selected {resolved}. (Set it explicitly in "
-            f"the launcher Identity tab to override.)"
+            f"launcher Preferences → Embedding profile (global) to override.)"
         )
         print(f"  {notice}")
         _log_install_event(
@@ -10228,8 +10222,8 @@ def _reconcile_install_active_embedding(
         # expected fresh-box default, not a stale-value correction.
         notice = (
             f"[embedding] no ACTIVE_EMBEDDING set; applied hardware-selected "
-            f"{resolved} for this run. (Set it explicitly in the launcher "
-            f"Identity tab to override.)"
+            f"{resolved} for this run. (Set it explicitly in launcher "
+            f"Preferences → Embedding profile (global) to override.)"
         )
         print(f"  {notice}")
         _log_install_event(
