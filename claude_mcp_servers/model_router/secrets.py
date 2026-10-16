@@ -270,8 +270,16 @@ class VendorKeyResolver:
         probe_scope_on_miss: bool = False,
         install_root: Optional[InstallRootResolver] = None,
         serve_stale_max_age_s: int = DEFAULT_SERVE_STALE_MAX_AGE_S,
+        miss_log_level: int = logging.WARNING,
     ) -> None:
         self._project = project
+        #: Level of the once-per-vendor "no key" line. WARNING for the daemon
+        #: (a request for that vendor fails). A PRESENCE probe passes DEBUG:
+        #: asking "is this vendor's key set?" on a machine where it never
+        #: was is an ordinary answer, not a fault — the caller reports what
+        #: matters (``vco_lib.model_selection.reachable_providers`` warns when
+        #: a vendor whose key DID resolve stops resolving).
+        self._miss_log_level = int(miss_log_level)
         self._ttl_s = max(1, int(ttl_s))
         self._getter = getter
         self._clock = clock
@@ -873,7 +881,8 @@ class VendorKeyResolver:
         )
         if vendor.vendor_id not in self._no_key_logged:
             self._no_key_logged.add(vendor.vendor_id)
-            logger.warning(
+            logger.log(
+                self._miss_log_level,
                 "model-gateway: no key for vendor %s (tried %s). Said once "
                 "per vendor until it resolves again, not once per attempt.",
                 vendor.vendor_id,

@@ -341,7 +341,7 @@ owner = "vco_lib.service_reconcile"
 clear_probe = "probe:py:adopted_service_config_drift_persists"
 emit_surfaces = ["ledger"]
 dismiss_key = ["service", "drift_keys"]
-notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). True of the machine while it lasts; VCO never recreates an adopted container. The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2)."""
+notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). v0.2.104: or on an image OLDER than the one VCO's compose pins (key `image`; e.g. an Ollama too old for the summary-tier models). True of the machine while it lasts; VCO never recreates an adopted container. The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2). The probe inspects only the adopted rows' own containers, so an unrelated container vanishing mid-probe no longer leaves it undetermined."""
 
 [conditions.service_adopted_without_prompt]
 class = "informational_record"

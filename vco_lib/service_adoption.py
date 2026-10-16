@@ -612,6 +612,21 @@ def _compose_entrypoints(need_gpu: bool, gpu_overlay: Optional[str],
     return files, cfg or {}
 
 
+def pinned_image(service: str, root: Path) -> Optional[str]:
+    """The image VCO's compose pins for *service* — the base file plus the
+    managed overrides, read through the SAME chain :func:`_compose_entrypoints`
+    builds for ``hand-to-vco`` (so it names the image a hand-over would run).
+    No GPU overlay: the NVIDIA overlays set no ``image:``, and a ROCm variant
+    differs from the base pin only by its ``-rocm`` suffix, which callers
+    compare away (:func:`vco_lib.service_reconcile.image_drift`). ``None``
+    when the chain cannot be read or the service names no image."""
+    infra_dir = Path(root) / "infrastructure"
+    _files, cfg = _compose_entrypoints(False, None, infra_dir,
+                                       infrastructure_env_for_substitution(infra_dir))
+    image = ((cfg.get("services") or {}).get(service) or {}).get("image")
+    return (image.strip() or None) if isinstance(image, str) else None
+
+
 # ===========================================================================
 # Reconciliation
 # ===========================================================================
@@ -1268,9 +1283,17 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
             identity = None
         plan.identity = identity
         own_reason = _containers.foreign_compose_identity(identity, own_project)
-        if own_reason is None:
+        named = container_refs is not None and service in container_refs
+        if own_reason is None and not named:
             plan.reason = "already owned by this install's compose project"
             continue
+        # A container NAMED by ``hand-to-vco`` that already carries this
+        # install's compose project is still re-created: its row says VCO
+        # only USES it (``adopted_container`` — e.g. an earlier install's
+        # "adopt" decision on VCO's own container), so no update has ever
+        # brought it to the shipped image and env. Same guarded flow; the
+        # rollback re-creates it under the same (own) project and files.
+        own_reason = own_reason or f"named by hand-to-vco under '{own_project}'"
         # Constraint #1: the owner's files must exist on disk — else there
         # is nothing to compare against and nothing to roll back to.
         owning_files = owning_config_files(identity) if identity is not None else []

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An adopted container running an older image than VCO pins is now reported.** VCO never recreates a container it adopted, so when v0.2.103 moved Ollama to 0.40.5 (older Ollama cannot pull the summary-tier models), an adopted Ollama container kept running 0.20.2 and nothing said so: the `adopted_service_config_drift` entry listed only missing env settings. The drift check now also compares the container's image with the image VCO's compose pins for that service (read through the same compose chain `hand-to-vco` uses) and lists it, for example "ollama (vco_ollama): image docker.io/ollama/ollama:0.20.2, VCO pins 0.40.5 — the newer summary models need it". Only a provably older version of the same image is reported: a `docker.io/` prefix, the `-rocm` variant or a digest do not count as a difference, and `latest`, a newer version or a different repository are never claimed.
+- **The clear check for that entry now reaches a verdict.** It inspected every container on the machine, so one unrelated container disappearing between the listing and the inspection (another project's test run, a recreate) failed the whole check and the entry was kept as "undetermined". It now inspects only the adopted containers the entry is about, and decides both ways.
+- **`hand-to-vco` now works on VCO's own container when its row says "adopted".** The remedy the entry prints refused a container that already carried VCO's own compose project ("already owned"), which is exactly the case of a container an earlier install adopted. When `hand-to-vco` names the container, it is now recreated through the same guarded flow (same data mount, verified, rolled back on failure), which brings it to the pinned image and settings. The bulk adoption still leaves VCO's own containers alone.
+- **A first install no longer prints a wrong "run install.py --update" warning.** Before the install reached the step that records the service endpoints, anything that read them warned "no usable row … run `python install.py --update`", although the same run writes them minutes later. While a first install has not reached that step, the missing rows are now expected and logged at debug level only; once the step has run, a missing row is reported again.
+- **A model gateway that was never configured no longer prints "no key for vendor" for every vendor during install.** Checking whether a vendor's key is set is an ordinary question when no key was ever added, so that check no longer logs a warning per vendor. A real warning remains when a vendor whose key used to resolve stops resolving, and the gateway itself still warns when a request needs a key that is missing.
+
 ## [0.2.103] - 2026-10-16
 
 ### Added
