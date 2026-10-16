@@ -16,9 +16,14 @@ as the low-end tier, the conservative direction.
 """
 from __future__ import annotations
 
+import functools
 import os
 import platform
 import subprocess
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # stdlib-only at RUNTIME scope — gpu_device imports lazily
+    from vco_lib.gpu_device import GpuCandidate
 
 
 def probe_system_ram_gb() -> float:
@@ -129,4 +134,92 @@ def probe_gpu_vram_gb() -> float:
     return float(vram) if vram and vram > 0 else 0.0
 
 
-__all__ = ["probe_cpu_cores", "probe_gpu_vram_gb", "probe_system_ram_gb"]
+def _select_gpu(candidates: "list[GpuCandidate]") -> "Optional[GpuCandidate]":
+    """The ONE selection rule over a GIVEN enumeration: apply
+    :func:`vco_lib.gpu_device.select_gpu_device` with the ``VCT_GPU_VENDOR``
+    preference — exactly what install's system-info step asks for. Never
+    raises; ``None`` is the CPU path."""
+    from vco_lib.gpu_device import select_gpu_device
+    from vco_lib.gpu_profile import gpu_vendor_preference_from_env
+
+    try:
+        return select_gpu_device(
+            candidates, vendor_pref=gpu_vendor_preference_from_env())
+    except Exception:  # noqa: BLE001 — a failed probe is the CPU path
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _selected_gpu_cached() -> "Optional[GpuCandidate]":
+    """The chosen card of THIS host's own enumeration, memoised per process.
+
+    The cache (v0.2.103 R43 N8, deliberately kept) holds the answer —
+    INCLUDING the ``(None`` → CPU-path ``)`` failure answer — for the
+    process lifetime: no caller needs fresh data in-process (a GPU driver
+    install happens in the launcher, a separate process, and nothing
+    mutates ``VCT_GPU_VENDOR`` mid-process), while the enumeration spawns
+    GPU subprocesses (nvidia-smi / rocm-smi / lspci) and the resolver's
+    hardware tail runs on every no-record resolution. Tests that vary the
+    hardware call :meth:`_selected_gpu_cached.cache_clear()
+    <functools.lru_cache.cache_clear>`."""
+    try:
+        from vco_lib.gpu_device import enumerate_gpus
+
+        return _select_gpu(enumerate_gpus())
+    except Exception:  # noqa: BLE001 — a failed probe is the CPU path
+        return None
+
+
+def selected_gpu(
+    candidates: "Optional[list[GpuCandidate]]" = None,
+) -> "Optional[GpuCandidate]":
+    """The ONE CHOSEN CARD every hardware-aware GPU decision selects —
+    v0.2.103 R43 N4, the single home of that choice: a
+    :class:`vco_lib.gpu_device.GpuCandidate` (name, vendor, VRAM on one
+    object), or ``None`` for the CPU path. R41 M2 made install and the
+    runtime code-model resolver read the same card; this returns the card
+    ITSELF so install's system-info step can pass its OWN enumeration
+    (``selected_gpu(candidates)`` — no second probe round) and read name,
+    vendor and VRAM off the one object the resolver would also choose.
+
+    ``candidates is None`` (the resolver's form) enumerates and reads the
+    per-process cache (:func:`_selected_gpu_cached`); an explicit
+    ``candidates`` list is selected without touching the cache. Never
+    raises."""
+    if candidates is None:
+        return _selected_gpu_cached()
+    return _select_gpu(list(candidates))
+
+
+def selected_gpu_specs() -> "tuple[float, str]":
+    """``(vram_gb, vendor)`` of the ONE card every hardware-aware code-model
+    decision selects — v0.2.103 R41 M2, the single home of that choice, as a
+    thin wrapper over :func:`selected_gpu` (R43 N4: same selection, one
+    object, two shapes).
+
+    Install's own GPU detection (``install.py``'s system-info step) reads
+    name, vendor and VRAM off the SAME chosen card; the runtime code-model
+    resolver (:func:`vco_lib.code_embed_model._hardware_code_model`) used to
+    take VRAM from one card (``probe_gpu_vram_gb``, no vendor preference) and
+    vendor from another (the FIRST attributed entry of the enumeration), so
+    on a 6 GB NVIDIA + 16 GB AMD host the resolver answered CodeSage while
+    install answered qwen3. This helper makes the selection once, honours
+    ``VCT_GPU_VENDOR`` exactly like install, and returns both numbers from
+    that one card. Memoised per process (see :func:`_selected_gpu_cached`
+    for why, and how tests that vary the hardware clear it).
+
+    ``(0.0, "")`` when no usable discrete card is found or the probes fail —
+    the selectors read that as the CPU path, the conservative direction.
+    Never raises."""
+    chosen = selected_gpu()
+    if chosen is None:
+        return (0.0, "")
+    vram = getattr(chosen, "vram_gb", None)
+    vendor = (getattr(chosen, "vendor", "") or "").strip().lower()
+    return (float(vram) if vram and vram > 0 else 0.0, vendor)
+
+
+__all__ = [
+    "probe_cpu_cores", "probe_gpu_vram_gb", "probe_system_ram_gb",
+    "selected_gpu", "selected_gpu_specs",
+]

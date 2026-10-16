@@ -11,8 +11,10 @@ vector the stored objects are not in). W6-B2 built :mod:`vco_lib.code_embed_mode
 the owner's 2026-10-10 ruling then made a selection apply itself:
 
 * TARGET — ``CODE_EMBED_MODEL`` env → the project's Codegraph-tab selection →
-  the Preferences pin → ``default_code_embedding`` → ``CODE_EMBED_BACKEND``
-  (a default only) → codesage;
+  the Preferences pin → ``default_code_embedding`` → the install record →
+  ``CODE_EMBED_BACKEND`` (a default only; gpu honoured only when the ladder
+  agrees) → the hardware ladder (v0.2.103 F1: the codesage builtin and the
+  fixed ollama→qwen3 mapping are gone);
 * RECORD — what the graph's COMPLETE slot holds (the launcher binding row);
   searches use it; writes embed the target (and carry the record) while the
   target's slot fills; when the slot is complete the record flips. Switching
@@ -54,14 +56,22 @@ QWEN3_RECORD = cem.CodeModelRecord(DEFAULT_TEXT_MODEL, 1024, "qwen3_embed")
 CONSENT = openai_consent.APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT
 
 
-def pick(env=None, state=None, project_target=None):
+def pick(env=None, state=None, project_target=None, *, record=None, hardware=None):
+    # v0.2.103 F1 defaults the two new tail seams to a KNOWN answer (no
+    # install record; a 16 GB-class ladder pick of codesage, what the old
+    # builtin default said) so the record-vs-target mechanics tests stay
+    # hermetic — the tests of the tail itself override them.
     return cem.resolve_code_model_pick(env or {}, app_state=(state or {}).get,
-                                       project_target=project_target)
+                                       project_target=project_target,
+                                       install_record=record or (lambda: None),
+                                       hardware=hardware or (lambda: DEFAULT_CODE_MODEL))
 
 
 def resolve(env=None, state=None, record=None, role="query"):
     return cem.resolve_code_model(env=env or {}, app_state=(state or {}).get,
-                                  record=record, record_reader=lambda _p: None, role=role)
+                                  record=record, record_reader=lambda _p: None, role=role,
+                                  install_record=lambda: None,
+                                  hardware=lambda: DEFAULT_CODE_MODEL)
 
 
 @pytest.fixture(autouse=True)
@@ -155,8 +165,15 @@ class TestTarget:
               ).read_text(encoding="utf-8")
         assert f"'{cem.TARGET_CONFIG_KEY}'" in kg
 
-    def test_nothing_configured_is_codesage(self):
-        assert pick() == (DEFAULT_CODE_MODEL, "builtin")
+    def test_nothing_configured_follows_the_ladder_not_a_builtin(self):
+        """v0.2.103 F1 removed the hardware-blind codesage builtin: with
+        nothing configured and no install record, the pick is the hardware
+        ladder's answer for this host (the same selector install uses) —
+        on an 8 GB ladder that is qwen3, never CodeSage."""
+        assert pick(hardware=lambda: DEFAULT_TEXT_MODEL) == (DEFAULT_TEXT_MODEL, "hardware-probe")
+
+    def test_nothing_configured_with_an_install_record_uses_it(self):
+        assert pick(record=lambda: _JINA, hardware=lambda: DEFAULT_TEXT_MODEL) == (_JINA, "install-record")
 
     @pytest.mark.parametrize("pin,model", [
         ("codesage", DEFAULT_CODE_MODEL), ("qwen3", DEFAULT_TEXT_MODEL), ("jina", _JINA),
@@ -167,7 +184,10 @@ class TestTarget:
     def test_ollama_and_openai_pins_use_their_model_rows(self):
         assert pick(state={"code_embed_backend_override": "ollama",
                            "code_embed_ollama_model": "my-code:latest"}) == ("my-code:latest", "preferences")
-        assert pick(state={"code_embed_backend_override": "ollama"})[1] == "builtin"
+        # v0.2.103 F1: a pin "ollama" with no model is ignored and the tail
+        # answers (was: the codesage "builtin"; now: install record → ladder).
+        assert pick(state={"code_embed_backend_override": "ollama"},
+                    hardware=lambda: DEFAULT_TEXT_MODEL) == (DEFAULT_TEXT_MODEL, "hardware-probe")
         assert pick(state={"code_embed_backend_override": "openai"})[0] == "text-embedding-3-small"
 
     def test_install_default_row(self):
@@ -179,7 +199,36 @@ class TestTarget:
                         state={"code_embed_backend_override": "qwen3"}) == (DEFAULT_TEXT_MODEL, "preferences")
             assert pick(env={"CODE_EMBED_BACKEND": backend},
                         state={"default_code_embedding": _JINA}) == (_JINA, "default")
-        assert pick(env={"CODE_EMBED_BACKEND": "ollama"}) == (DEFAULT_TEXT_MODEL, "install-env")
+        # v0.2.103 F1: "ollama" names a backend, not a model — the fixed
+        # ollama→qwen3 mapping is gone; the answer comes from the tail
+        # (install record first, here the field case's qwen3 record).
+        assert pick(env={"CODE_EMBED_BACKEND": "ollama"},
+                    record=lambda: DEFAULT_TEXT_MODEL) == (DEFAULT_TEXT_MODEL, "install-record")
+
+    def test_gpu_backend_is_honoured_only_when_the_ladder_agrees(self, capsys):
+        """v0.2.103 F1: CODE_EMBED_BACKEND=gpu no longer means CodeSage
+        unconditionally — below the ladder's 12 GB threshold the projected
+        selector is ignored with a stderr line and the ladder answers."""
+        assert pick(env={"CODE_EMBED_BACKEND": "gpu"},
+                    hardware=lambda: DEFAULT_TEXT_MODEL) == (DEFAULT_TEXT_MODEL, "hardware-probe")
+        assert "ignoring CODE_EMBED_BACKEND=gpu" in capsys.readouterr().err
+        assert pick(env={"CODE_EMBED_BACKEND": "gpu"},
+                    hardware=lambda: DEFAULT_CODE_MODEL) == (DEFAULT_CODE_MODEL, "install-env")
+
+    def test_the_gpu_backend_notice_flag_is_reset_by_the_ladder_pin(self, capsys):
+        """R43 N8: the once-per-process notice flag is order-dependent
+        unless something resets it — the conftest ladder pin (re-established
+        per test by the autouse ``_redirect_user_state_dir``) now resets it,
+        so a flag leaked True by an earlier test cannot swallow THIS test's
+        stderr line. Red before: the pin did not touch the flag."""
+        from tests import conftest
+
+        cem._gpu_backend_ignore_notice_shown = True  # a leaked flag
+        conftest._apply_ladder_pin()  # what the autouse fixture runs per test
+        assert cem._gpu_backend_ignore_notice_shown is False
+        assert pick(env={"CODE_EMBED_BACKEND": "gpu"},
+                    hardware=lambda: DEFAULT_TEXT_MODEL) == (DEFAULT_TEXT_MODEL, "hardware-probe")
+        assert "ignoring CODE_EMBED_BACKEND=gpu" in capsys.readouterr().err
 
     def test_precedence_env_then_project_then_pin(self):
         state = {"code_embed_backend_override": "qwen3"}
@@ -395,18 +444,49 @@ class TestServingFollowsTheModel:
     def test_adoption_derives_the_install_models_pairing(self, monkeypatch):
         """Re-review LOW-7: the adoption path's .env refresh writes a
         CODE_EMBED_MODEL the container's backend can serve."""
-        from vco_lib import gpu_device, service_adoption
+        from vco_lib import host_probe, service_adoption
         from vco_lib.compose_env import compose_substitution_env
 
-        monkeypatch.setattr(gpu_device, "enumerate_gpus",
-                            lambda: [types.SimpleNamespace(vendor="amd")])
+        monkeypatch.setattr(host_probe, "selected_gpu_specs", lambda: (0.0, "amd"))
         amd = service_adoption._derive_embed_config(DEFAULT_TEXT_MODEL)
         assert (amd["code_backend"], amd["code_model"]) == ("ollama", DEFAULT_TEXT_MODEL)
         assert compose_substitution_env(amd)["CODE_EMBED_MODEL"] == DEFAULT_TEXT_MODEL
         gpu = service_adoption._derive_embed_config("codesage-large-v2")
         assert compose_substitution_env(gpu)["CODE_EMBED_MODEL"] == "codesage/codesage-large-v2"
-        legacy = service_adoption._derive_embed_config("")
-        assert legacy == {"gpu_vendor": "amd", "code_backend": "gpu"}   # no install default: old rule
+
+    def test_adoption_without_an_install_default_uses_the_record_then_the_ladder(
+            self, monkeypatch):
+        """R41 M4: no ``default_code_embedding`` (the normal first-install
+        path — launcher.db does not exist yet) must fall back to the install
+        RECORD, then the hardware ladder — the SAME resolver rule — never
+        the hardware-blind vendor→CodeSage guess."""
+        from vco_lib import code_embed_model as cem
+        from vco_lib import host_probe, service_adoption
+
+        monkeypatch.setattr(host_probe, "selected_gpu_specs", lambda: (0.0, "amd"))
+        monkeypatch.setattr(cem, "recorded_code_model", lambda: _JINA)
+        monkeypatch.setattr(cem, "_hardware_code_model", lambda: DEFAULT_TEXT_MODEL)
+        got = service_adoption._derive_embed_config(None)   # no app_state default
+        assert (got["code_backend"], got["code_model"]) == ("ollama", _JINA)
+
+        # no record either → the ladder, which never answers CodeSage below
+        # its 12 GB rung or on any AMD host. R43 N6: the REAL
+        # ``_hardware_code_model`` runs (the stub above is retired for the
+        # loop), fed the faked card specs plus stubbed RAM/cores so the
+        # answer depends on neither the machine nor the conftest pin.
+        from tests import conftest
+
+        monkeypatch.setattr(cem, "recorded_code_model", lambda: None)
+        monkeypatch.setattr(cem, "_hardware_code_model",
+                            conftest._REAL_CODE_HARDWARE_MODEL)
+        monkeypatch.setattr(host_probe, "probe_system_ram_gb", lambda: 32.0)
+        monkeypatch.setattr(host_probe, "probe_cpu_cores", lambda: 8)
+        for vram, vendor in ((8.0, "nvidia"), (16.0, "amd")):
+            monkeypatch.setattr(host_probe, "selected_gpu_specs",
+                                lambda vram=vram, vendor=vendor: (vram, vendor))
+            got = service_adoption._derive_embed_config(None)
+            assert got["code_model"] == DEFAULT_TEXT_MODEL, (vram, vendor, got)
+            assert got["code_backend"] == "ollama"
 
 
 class TestReReviewLows:

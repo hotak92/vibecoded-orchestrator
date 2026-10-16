@@ -1110,6 +1110,42 @@ class ReindexResult:
     warnings: list = field(default_factory=list)
 
 
+def _volume_data_exists(install_root: Optional[Path]) -> bool:
+    """The gate's volume leg, one indirection so tests can patch it:
+    :func:`vco_lib.runtime_reconcile.vco_data_exists_somewhere` (the ONE
+    listing reader — no new docker parsing here)."""
+    from vco_lib import runtime_reconcile
+
+    return runtime_reconcile.vco_data_exists_somewhere(install_root)
+
+
+def root_first_install_unknown_absent(
+    *,
+    is_root_target: bool,
+    had_prior_install: bool,
+    project_name: str,
+    install_root: Optional[Path] = None,
+) -> bool:
+    """True ONLY for the orchestrator root's GENUINE first install
+    (v0.2.103 F3, tightened by R41 M1 and R43 N1): root target AND no prior
+    install (the manifest FILE, whatever its ``vco_version`` reads) AND no
+    launcher build record for the root's graph
+    (:func:`vco_lib.code_embed_model.root_graph_build_recorded`) AND no VCO
+    data volume left on the machine (:func:`_volume_data_exists` — an
+    uninstall keeps the named volumes, so a re-clone after one may still
+    hold the old graph and keeps the conservative unknown-means-owed
+    reading). This is the ONE home of the rule; ``project_init``'s trigger
+    passes it as ``unknown_graph_is_absent`` — see :func:`plan` for what
+    the flag does there."""
+    if not is_root_target or had_prior_install:
+        return False
+    from vco_lib.code_embed_model import root_graph_build_recorded
+
+    if root_graph_build_recorded(project_name):
+        return False
+    return not _volume_data_exists(install_root)
+
+
 def plan(
     folder: Path,
     *,
@@ -1119,18 +1155,35 @@ def plan(
     weaviate_url: Optional[str] = None,
     graph_exists: Optional[bool] = None,
     probe=None,
+    unknown_graph_is_absent: bool = False,
 ) -> Verdict:
     """Resolve :func:`decide`'s inputs from disk + Weaviate, then decide.
 
     ``graph_exists`` may be supplied by a caller that already knows (or by a
     test); otherwise it is probed. The probe runs ONLY when it can change the
     answer — a stamp that is already current short-circuits before any I/O.
-    """
+
+    ``unknown_graph_is_absent`` (v0.2.103 F3, tightened by R41 M1 and R43
+    N1) is set ONLY for the orchestrator root's GENUINE first install —
+    :func:`root_first_install_unknown_absent` is the ONE home of the rule:
+    no manifest FILE from a prior install (whatever its ``vco_version``
+    field reads: a corrupt or version-less manifest is still a prior
+    install) AND no launcher build record for the root's graph AND no VCO
+    data volume anywhere on the machine (an uninstall keeps the named
+    volumes, so a re-clone after one may still hold the old graph). The
+    check runs at step 5b, BEFORE the containers exist, so "could not
+    check" is the guaranteed answer for a graph that cannot exist yet —
+    treating it as "absent" lets rule 2 stamp instead of queueing a
+    deferral that names a backend the machine has not even configured.
+    Updates, re-clones with a surviving graph and user projects keep the
+    conservative unknown-means-owed reading."""
     stamp_generation = read_stamp_generation(folder)
     if generation_is_current(stamp_generation):
         return Verdict(False, REASON_STAMP_CURRENT)
     if graph_exists is None:
         graph_exists = code_graph_exists(project_name, weaviate_url, probe=probe)
+        if graph_exists is None and unknown_graph_is_absent:
+            graph_exists = False
     return decide(
         prev_version=prev_version,
         running_version=running_version,
@@ -1203,6 +1256,7 @@ def ensure_extractor_generation(
     graph_exists: Optional[bool] = None,
     probe=None,
     spawn=None,
+    unknown_graph_is_absent: bool = False,
 ) -> ReindexResult:
     """Decide, and when owed, launch the background force-rewalk.
 
@@ -1217,6 +1271,8 @@ def ensure_extractor_generation(
     ``spawn`` / ``probe`` are the injection seams for tests; production leaves
     both ``None`` so the real
     :func:`vco_lib.codegraph_resync.spawn_background_resync` runs.
+    ``unknown_graph_is_absent`` is the root-first-install flag — see
+    :func:`plan`.
     """
     try:
         verdict = plan(
@@ -1227,6 +1283,7 @@ def ensure_extractor_generation(
             weaviate_url=weaviate_url,
             graph_exists=graph_exists,
             probe=probe,
+            unknown_graph_is_absent=unknown_graph_is_absent,
         )
     except Exception as exc:  # noqa: BLE001 — a broken detector never blocks
         return ReindexResult(
@@ -1497,3 +1554,34 @@ def doctor_insert_failures(
             detail={"accepted": detail},
         )
     ]
+
+
+def emit_reindex_deferral(folder: Path, outcome: ReindexResult, log) -> None:
+    """Emit a ``deferred`` outcome's DeferralEntry through the ONE locked
+    emitter (v0.2.103 R41 M1: extracted from project_init's trigger — the
+    emission is this module's decision-follow-up, and project_init is under
+    a line ratchet). NEVER raises; a failed write is logged, not raised
+    (v0.2.103 R43 N7: the imports sit INSIDE the guard so a lazy-import
+    failure is logged too, keeping the NEVER-raises promise real).
+
+    ``ReindexResult.deferral`` is declared ``object`` so this module keeps
+    no import-TIME edge to ``deferral_report`` (the import is lazy on
+    purpose, right where it is used); the value it carries when
+    ``status == "deferred"`` is always a real ``DeferralEntry`` (see the
+    field comment and ``_retarget_deferral``). The annotation is the only
+    thing wider than reality, hence the cast — same convention as
+    ``codegraph_ref_dedup._http_request``. NOT an ``isinstance`` narrowing:
+    the emit path is duck-typed by contract and
+    ``tests/test_v0292_reindex_trigger.py`` drives it with a sentinel to
+    prove the wiring forwards whatever it is given.
+    """
+    try:
+        from typing import cast
+
+        from vco_lib import deferral_emit
+        from vco_lib.deferral_report import DeferralEntry
+
+        deferral_emit.emit(folder, cast(DeferralEntry, outcome.deferral))
+    except Exception as e:  # noqa: BLE001 — a deferral write never blocks
+        log("4.bundle.extractor_reindex", "warn",
+            f"extractor-reindex deferral write failed: {e}")

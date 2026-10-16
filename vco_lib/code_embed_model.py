@@ -29,6 +29,13 @@ are stale (``embed_revision`` / content hash / the extractor-generation
 ladder) — no second versioning scheme. Fill progress is kept on the same
 binding row (``config_json.code_model_fill``) for the Preferences status.
 
+v0.2.103 R41 L2 refines which targets may start that fill at all: a DERIVED
+default (:data:`DERIVED_TARGET_SOURCES` — the install record, the
+install-projected backend env, the hardware probe) applies only to graphs
+with NO recorded model; a graph that already has a record keeps it for both
+roles until an explicit selection (env, project Codegraph tab, Preferences
+pin / ``default_code_embedding``) names a different model.
+
 Target precedence (first hit wins):
 
 1. ``CODE_EMBED_MODEL`` env — the operator's explicit model.
@@ -36,10 +43,22 @@ Target precedence (first hit wins):
 2. the launcher Preferences pin (``code_embed_backend_override`` + its model key).
 3. the install default — ``app_state[default_code_embedding]`` (install.py's
    hardware ladder; the "Default code embedding" dropdown).
+3b. the install RECORD — the code model of the profile install wrote at step 7
+   (``<orchestrator>/.claude/state/ollama_pull_profile.json``, the same value
+   the pull plan and compose derive from; v0.2.103 F1).
 4. ``CODE_EMBED_BACKEND`` env — the code_embed CONTAINER's selector, which
    install.py projects into the root's settings env: a default only, never an
-   override (review HIGH-1).
-5. ``codesage-large-v2``.
+   override (review HIGH-1). ``openai`` keeps meaning "the OpenAI default
+   model"; ``gpu`` is honoured ONLY when the hardware ladder agrees this host
+   should run CodeSage; ``ollama`` names a backend, not a model, and is
+   ignored (v0.2.103 F1 removed the fixed ``ollama → qwen3`` mapping — on a
+   Jina-tier host it named a model install never pulled).
+5. the hardware ladder itself —
+   :func:`vco_lib.embedding_selection.select_code_model_for_host` over the
+   live probes (:mod:`vco_lib.host_probe`), i.e. the SAME rule install's
+   profile choice uses. The hardware-blind ``codesage-large-v2`` builtin
+   default is gone (v0.2.103 F1): CodeSage is never selected below the
+   ladder's 12 GB VRAM threshold.
 
 OpenAI code models need the EMBEDDINGS consent (:mod:`vco_lib.openai_consent`,
 shared with the KG text OpenAI slots; separate from the summaries consent).
@@ -53,7 +72,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib.embedding_service import (
     _FALLBACK_JINA_MODEL,
@@ -77,9 +96,27 @@ SOURCE_ENV = "env"
 SOURCE_PROJECT = "project"
 SOURCE_PREFERENCES = "preferences"
 SOURCE_DEFAULT = "default"
+SOURCE_INSTALL_RECORD = "install-record"
 SOURCE_INSTALL_ENV = "install-env"
-SOURCE_BUILTIN = "builtin"
 SOURCE_RECORDED = "recorded"
+SOURCE_HARDWARE = "hardware-probe"
+
+#: Target sources that are DERIVED defaults, not a selection (R41 L2,
+#: owner ruling "never fall back to a different embedding model"): the
+#: install record, the install-projected backend env and the hardware
+#: probe describe what the machine WOULD pick — they never re-target a
+#: graph that already has a recorded model. Only an explicit selection
+#: (``CODE_EMBED_MODEL``, the project's Codegraph tab, the Preferences
+#: pin / ``default_code_embedding``) starts the additive re-embed.
+DERIVED_TARGET_SOURCES = frozenset({
+    SOURCE_INSTALL_RECORD, SOURCE_INSTALL_ENV, SOURCE_HARDWARE,
+})
+
+#: v0.2.103 R41 L3 — the "ignoring CODE_EMBED_BACKEND=gpu" stderr line is
+#: emitted once per process, not per resolution (``resolve_code_model_pick``
+#: runs for every ``EmbeddingService.for_project``, the hook router's code
+#: leg and ``status_all``).
+_gpu_backend_ignore_notice_shown = False
 
 #: The binding row's ``config_json`` key holding the fill progress.
 FILL_CONFIG_KEY = "code_model_fill"
@@ -229,15 +266,66 @@ def _pin_model(pin: str, app_state) -> Optional[str]:
     return None
 
 
+def _orchestrator_roots() -> "list":
+    """Where the install record may live — the SAME ladder
+    :mod:`vco_lib.summary_model` uses (``VCT_INSTALL_ROOT``, then the
+    checkout this ``vco_lib`` is imported from). Imported, not re-declared,
+    so the two resolvers can never discover different roots."""
+    from vco_lib.summary_model import _orchestrator_roots as _roots
+
+    return list(_roots())
+
+
+def recorded_code_model(roots: Optional[Sequence] = None) -> Optional[str]:
+    """The code model of the profile install recorded (and pulled), or None.
+
+    This is the same value install.py, the pull plan and compose all derive
+    from — reading it here makes the resolver agree with what the machine
+    actually runs even in processes that carry none of the settings env
+    (the 5b bundle child, the hub- or retry-driven walks). The loop lives
+    in the ONE stdlib-only leaf (:func:`vco_lib.embedding_pull_plan.
+    recorded_code_model`, v0.2.103 R43 N2) so install.py reads the SAME
+    answer pre-venv; this shim keeps the resolver-side name."""
+    from vco_lib.embedding_pull_plan import recorded_code_model as _leaf
+
+    return _leaf(roots)
+
+
+def _hardware_code_model() -> str:
+    """The ladder's answer for THIS host, right now — the ONE selector
+    install's own profile choice uses
+    (:func:`vco_lib.embedding_selection.select_code_model_for_host`), fed by
+    the ONE probe module (:mod:`vco_lib.host_probe`); VRAM and vendor come
+    from the ONE selected card (:func:`host_probe.selected_gpu_specs`,
+    v0.2.103 R41 M2 — the same choice install makes, so a multi-GPU host
+    cannot make the two disagree). Reached only when nothing configured and
+    no install record answers."""
+    from vco_lib.embedding_selection import select_code_model_for_host
+    from vco_lib import host_probe
+
+    vram, vendor = host_probe.selected_gpu_specs()
+    return select_code_model_for_host(
+        gpu_vram_gb=vram,
+        ram_gb=host_probe.probe_system_ram_gb(),
+        cores=host_probe.probe_cpu_cores(),
+        gpu_vendor=vendor,
+    )
+
+
 def resolve_code_model_pick(
     env: Optional[Mapping[str, str]] = None,
     *,
     app_state: Optional[Callable[[str], Optional[str]]] = None,
     project_target: Optional[str] = None,
+    install_record: Optional[Callable[[], Optional[str]]] = None,
+    hardware: Optional[Callable[[], str]] = None,
 ) -> "tuple[str, str]":
     """``(model, source)`` the configuration asks for — see the module
-    docstring for the precedence. Never raises; the consent gate is applied
-    by :func:`resolve_code_model` to whatever model ends up effective."""
+    docstring for the precedence. ``install_record`` / ``hardware`` are
+    seams for tests; production passes neither. Never raises; the consent
+    gate is applied by :func:`resolve_code_model` to whatever model ends up
+    effective."""
+    global _gpu_backend_ignore_notice_shown
     env = os.environ if env is None else env
     app_state = app_state or _app_state_reader()
 
@@ -254,21 +342,38 @@ def resolve_code_model_pick(
     default = _str(app_state, APP_STATE_KEY_DEFAULT_CODE_EMBED)
     if default:
         return _to_openai_api_model(default), SOURCE_DEFAULT
+    recorded = (install_record or recorded_code_model)()
+    if recorded:
+        return _to_openai_api_model(recorded), SOURCE_INSTALL_RECORD
     backend = str(env.get("CODE_EMBED_BACKEND", "") or "").strip().lower()
-    if backend == "ollama":
-        return DEFAULT_TEXT_MODEL, SOURCE_INSTALL_ENV
     if backend == "openai":
         return _OPENAI_CODE_EMBED_DEFAULT_MODEL, SOURCE_INSTALL_ENV
-    if backend:
+    ladder = (hardware or _hardware_code_model)()
+    if backend == "gpu" and ladder != DEFAULT_CODE_MODEL:
+        # v0.2.103 F1: the projected GPU-service selector is honoured ONLY
+        # when the ladder agrees this host should run CodeSage — never below
+        # the 12 GB VRAM threshold (a hardware-blind codesage here names a
+        # container this host does not run). R41 L3: once per process.
+        if not _gpu_backend_ignore_notice_shown:
+            _gpu_backend_ignore_notice_shown = True
+            print(
+                f"[vct] code-embed: ignoring CODE_EMBED_BACKEND=gpu — the hardware "
+                f"ladder selects {ladder} for this host",
+                file=sys.stderr,
+            )
+        return ladder, SOURCE_HARDWARE
+    if backend == "gpu":
         return DEFAULT_CODE_MODEL, SOURCE_INSTALL_ENV
-    return DEFAULT_CODE_MODEL, SOURCE_BUILTIN
+    return ladder, SOURCE_HARDWARE
 
 
 _SOURCE_LABEL = {
     SOURCE_PROJECT: "this project's Codegraph-tab selection",
     SOURCE_PREFERENCES: f"the Preferences pin ({APP_STATE_KEY_CODE_EMBED_OVERRIDE})",
     SOURCE_DEFAULT: f"the install default ({APP_STATE_KEY_DEFAULT_CODE_EMBED})",
+    SOURCE_INSTALL_RECORD: "the recorded install profile (ollama_pull_profile.json)",
     SOURCE_INSTALL_ENV: "the install-projected CODE_EMBED_BACKEND",
+    SOURCE_HARDWARE: "the hardware ladder (vco_lib.embedding_selection)",
     SOURCE_RECORDED: "this project's recorded code-graph model",
 }
 
@@ -340,6 +445,36 @@ def read_code_model_record(codegraph_prefix: str) -> Optional[CodeModelRecord]:
     return record_from_binding(read_binding_row(codegraph_prefix))
 
 
+def root_graph_build_recorded(codegraph_prefix: str) -> bool:
+    """True when a launcher build record exists for the prefix's graph —
+    POSITIVE evidence a graph exists (a re-clone of the root whose persisted
+    Weaviate volume still holds the old graph has such a row even though its
+    fresh clone has no manifest), which the extractor-generation first-install
+    gate reads as "do not treat an unanswered existence probe as absent".
+    Soft-fails to True — an unreadable record keeps the conservative
+    unknown-means-owed reading (v0.2.103 R41 M1; R43 N3 made it real: the
+    flagged reader distinguishes "positively no row" from "could not read",
+    so a launcher.db that exists but cannot be opened or queried answers
+    True). No launcher.db AT ALL is a positive absence — False — the
+    gate's volume leg covers the re-clone whose uninstall deleted it."""
+    try:
+        from vco_lib.launcher_db_reader import (
+            _discover_db_path, get_codegraph_binding_row_flagged,
+        )
+
+        if _discover_db_path() is None:
+            return False
+        prefix = canonical_prefix(codegraph_prefix) if codegraph_prefix else ""
+        if not prefix:
+            return False
+        row, read_error = get_codegraph_binding_row_flagged(prefix)
+        if read_error is not None:
+            return True
+        return record_from_binding(row) is not None
+    except Exception:  # noqa: BLE001 — an unreadable record never gates
+        return True
+
+
 def write_code_model_record(codegraph_prefix: str, record: CodeModelRecord) -> bool:
     """Stamp the record onto the project's existing binding row (soft-fail)."""
     from vco_lib.kg_binding_heal import stamp_codegraph_model_record
@@ -363,6 +498,8 @@ def resolve_code_model(
     record_reader: Optional[Callable[[str], Optional[CodeModelRecord]]] = None,
     role: str = "query",
     project_target: Optional[str] = None,
+    install_record: Optional[Callable[[], Optional[str]]] = None,
+    hardware: Optional[Callable[[], str]] = None,
 ) -> CodeModelResolution:
     """Which code model one project's code graph uses, for ``role``.
 
@@ -393,7 +530,20 @@ def resolve_code_model(
         except Exception:  # noqa: BLE001 — an unreadable record is "none"
             record = None
     target, target_source = resolve_code_model_pick(
-        env, app_state=app_state, project_target=project_target)
+        env, app_state=app_state, project_target=project_target,
+        install_record=install_record, hardware=hardware)
+    if (record is not None and target_source in DERIVED_TARGET_SOURCES
+            and not same_code_model(target, record.model)):
+        # v0.2.103 R41 L2 (coordinator ruling, per the owner rule "never
+        # fall back to a different embedding model — query with the model
+        # the data was embedded with"): a DERIVED default (the install
+        # record, the install-env backend, the hardware probe) describes
+        # what an empty graph WOULD get — it never re-targets a graph that
+        # already has a recorded model. The recorded model wins for both
+        # roles; only an explicit selection (env, the project's Codegraph
+        # tab, the Preferences pin / default_code_embedding) starts the
+        # additive re-embed.
+        target, target_source = record.model, SOURCE_RECORDED
     target_refusal = consent_refusal_for(target, target_source, app_state)
     filling, carry = False, None
     if record is None:

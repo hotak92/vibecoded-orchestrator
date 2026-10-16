@@ -242,12 +242,13 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     # venv exists, so it may only reach a pure stdlib leaf.
     model_id_for_active as _model_id_for_active_shared,
     _cpu_meets,  # pyright: ignore[reportUnusedImport] — re-export for tests
-    select_code_embedding_backend,
+    select_code_embedding_backend,  # pyright: ignore[reportUnusedImport] — re-export (tests/test_hardware_auto_selection.py)
+    select_code_model_for_host,  # v0.2.103 F1: the ladder + AMD rule, ONE home
     select_kg_embedding_backend,
     select_summary_backend,  # pyright: ignore[reportUnusedImport] — re-export (tests/test_hardware_auto_selection.py)
     summary_model_for_hardware,
     _CODE_BACKEND_CODESAGE,
-    _CODE_BACKEND_QWEN3,
+    _CODE_BACKEND_QWEN3,  # pyright: ignore[reportUnusedImport] — re-export (tests drive install's AMD route through it)
     _CODE_BACKEND_JINA,  # pyright: ignore[reportUnusedImport] — re-export
     _CODE_BACKEND_OPENAI,  # pyright: ignore[reportUnusedImport] — re-export
     _KG_BACKEND_QWEN3,
@@ -6042,10 +6043,8 @@ def main() -> int:
     # missing, so user edits survive every --update.
     _materialize_vct_secrets_shared_readme(PROJECT_ROOT)
 
-    # V0243-5: emit VCT_ORCHESTRATOR_ROOT + VCT_INFRASTRUCTURE_DIR + KG_BASE_DIR
-    # to .claude/env managed block. Done unconditionally on orchestrator-root
-    # installs so the 3 portability keys are always present regardless of
-    # whether launcher.db exists yet (pre-first-boot fresh installs).
+    # V0243-5: the 3 portability keys go to .claude/env on every root install,
+    # launcher.db or not (pre-first-boot fresh installs).
     if _is_orchestrator_root_install():
         _emit_orchestrator_root_env_keys(PROJECT_ROOT)
 
@@ -6062,6 +6061,7 @@ def main() -> int:
             + ", ".join(str(p) for p in foreign),
         )
 
+    _prior_code_model = _recorded_code_model_before_step7()  # R45 P2
     # Step 6: Container services (restart on update to pick up config changes)
     if not args.no_containers:
         if not sysinfo.container_cmd:
@@ -6170,6 +6170,7 @@ def main() -> int:
             _write_preset_defaults_to_app_state(
                 embed_config,
                 openai_set_as_default=bool(embed_config.get("openai_key")),
+                prior_code_model=_prior_code_model,
             )
         except Exception as _preset_err:  # noqa: BLE001 — never block install
             # Defense-in-depth: the helper already soft-fails on every
@@ -7673,7 +7674,7 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
         # to the full usable set rather than stranding the install). The
         # "metal" preference is handled separately (Apple has no discrete
         # VRAM to rank).
-        from vco_lib.gpu_device import enumerate_gpus, select_gpu_device
+        from vco_lib.gpu_device import enumerate_gpus
 
         vendor_pref = _gpu_vendor_preference_from_env()
 
@@ -7691,7 +7692,16 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
 
         if not gpu_vendor and not has_metal:
             candidates = enumerate_gpus()
-            chosen = select_gpu_device(candidates, vendor_pref=vendor_pref)
+            # v0.2.103 R43 N4: the ONE selection home — host_probe.selected_gpu
+            # applies the SAME select_gpu_device rule (VCT_GPU_VENDOR included)
+            # to THIS enumeration and hands back the chosen card itself, so
+            # install's tier choice and the runtime code-model resolver's
+            # hardware leg read the SAME card without a second GPU-probe round
+            # (R41 M2 re-ran the probes inside selected_gpu_specs; two
+            # non-deterministic enumerations could describe two cards).
+            from vco_lib import host_probe as _hp
+
+            chosen = _hp.selected_gpu(candidates)
             # Surface the full enumeration on the system-info banner /
             # event log so multi-GPU selection is observable.
             usable_discrete = [
@@ -7702,8 +7712,13 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
 
             if chosen is not None:
                 has_gpu = True
-                gpu_vendor = chosen.vendor
-                vram_gb = chosen.vram_gb
+                # v0.2.103 R43 N4: vendor and VRAM come straight off the ONE
+                # chosen card (host_probe.selected_gpu — the same selection
+                # the runtime code-model resolver's hardware leg makes), so
+                # install's tier choice and the resolver can never read two
+                # different cards on a multi-GPU host.
+                gpu_vendor = (chosen.vendor or "").strip().lower()
+                vram_gb = float(chosen.vram_gb or 0.0)
                 # Enrich the display name with the vendor-specific probe
                 # when it gives a friendlier string than the enumerator's
                 # generic label (AMD rocm-smi product, NVIDIA driver/CUDA).
@@ -9287,11 +9302,15 @@ _TEXT_MODEL_ACTIVE_EMBEDDING = {
     "text-embedding-3-small": "openai",
 }
 
-def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None:
+def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str,
+                          has_gpu: Optional[bool] = None) -> None:
     """Shim over :func:`vco_lib.gpu_profile.apply_tier_overrides`.
 
     Passes install.py's module-level constants through to the shared
     helper. See `vco_lib/gpu_profile.py` for the canonical logic.
+    ``has_gpu`` (v0.2.103 R41 L4) lets the rebuilt label's prefix follow
+    the DETECTED hardware instead of the stock profile string (a cpu
+    profile on a 6-12 GB GPU host is not "CPU-only").
     """
     from vco_lib.gpu_profile import apply_tier_overrides
     apply_tier_overrides(
@@ -9300,6 +9319,7 @@ def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None
         kg_pick=kg_pick,
         model_dims=_EMBEDDING_MODEL_DIMS,
         text_model_active_embedding=_TEXT_MODEL_ACTIVE_EMBEDDING,
+        has_gpu=has_gpu,
     )
 
 
@@ -9346,7 +9366,8 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         print(f"[3] Embedding profile: verified, skipped (recorded profile '{prior['value']}' replayed)")
         config = dict(EMBEDDING_CONFIGS[prior["value"]])
         _apply_tier_overrides(config, code_pick=prior.get("code_model") or config["code_model"],
-                              kg_pick=prior.get("text_model") or config["text_model"])
+                              kg_pick=prior.get("text_model") or config["text_model"],
+                              has_gpu=bool(sysinfo.has_gpu))
         _record_install_choice("embedding_mode", prior["value"], {
             "reason": "replayed from last install",
             "code_model": config["code_model"], "text_model": config["text_model"]})
@@ -9358,10 +9379,18 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     ram = float(sysinfo.ram_gb or 0.0)
     has_gpu = bool(sysinfo.has_gpu)
 
-    code_pick = select_code_embedding_backend(
+    code_pick = select_code_model_for_host(
         gpu_vram_gb=vram,
         ram_gb=ram,
         cores=cores,
+        gpu_vendor=sysinfo.gpu_vendor,
+        # v0.2.103 F1: the ladder PLUS the AMD→qwen3 vendor correction now
+        # live in ONE selector — the runtime resolver
+        # (vco_lib.code_embed_model) calls the same function, so install and
+        # the resolver can never disagree about an AMD host. The correction
+        # itself is v0.2.54 (gpu-audit C-2): CodeSage has no ROCm build
+        # path, so an AMD card on the >= 12 GB rung runs the Ollama-served
+        # qwen3 code model instead (Ollama IS ROCm-accelerated).
         openai_key_available=False,  # auto-detect never picks OpenAI
         prefer_openai=False,
     )
@@ -9372,21 +9401,6 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         openai_key_available=False,
         prefer_openai=False,
     )
-
-    # v0.2.54 (gpu-audit C-2): CodeSage has no ROCm build path — the
-    # code-embed container image is CPU-multi-arch by default with a
-    # CUDA-only alternative (`Dockerfile.cuda`, emitted only for
-    # gpu_vendor == "nvidia"). Pre-v0.2.54, an AMD host with >=12 GB
-    # VRAM landed on the "gpu" profile labeled "GPU-accelerated ...
-    # best quality" while CodeSage 1.3B silently ran on CPU inside the
-    # container. Route AMD hosts to the Ollama-served qwen3 code model
-    # instead: Ollama itself IS ROCm-accelerated (via the rocm compose
-    # overlay), so code embeddings still run on the GPU — through the
-    # backend that actually has a ROCm path. This also makes the
-    # shipped claims true (CHANGELOG F7 + podman-compose.amd-rocm.yml:
-    # "AMD users get the Ollama-based code embedding fallback").
-    if has_gpu and code_pick == _CODE_BACKEND_CODESAGE and sysinfo.gpu_vendor == "amd":
-        code_pick = _CODE_BACKEND_QWEN3
 
     # Map the per-tier picks back to a profile + overrides. The profile
     # determines the shape (active_embedding slot + which Ollama models
@@ -9419,7 +9433,8 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     # was replaced, so e.g. a 6-12 GB GPU host got the cpu profile with
     # code_model swapped to qwen3 (1024-dim) while code_dims stayed 768
     # and CODE_EMBED_DIMS=768 was written to .env for a 1024-dim model.
-    _apply_tier_overrides(config, code_pick=code_pick, kg_pick=kg_pick)
+    _apply_tier_overrides(config, code_pick=code_pick, kg_pick=kg_pick,
+                          has_gpu=has_gpu)
 
     _record_install_choice("embedding_mode", profile_key, {
         "reason": reason, "code_model": config["code_model"], "text_model": config["text_model"]})
@@ -9592,9 +9607,20 @@ def _discover_app_state_db_path() -> Path:
     return launcher_db_path()
 
 
+def _recorded_code_model_before_step7() -> "str | None":
+    """The code model the PREVIOUS run recorded (R45 P2). Step 7 rewrites the
+    record with THIS run's hardware pick, so main() reads it before step 7 and
+    the preset seed uses it — the seeded default then matches the graph that
+    run built instead of re-targeting it. Stdlib-only reader (pre-venv safe)."""
+    from vco_lib.embedding_pull_plan import recorded_code_model
+
+    return recorded_code_model([PROJECT_ROOT])
+
+
 def _write_preset_defaults_to_app_state(
     embed_config: dict,
     openai_set_as_default: bool,
+    prior_code_model: "str | None" = None,
 ) -> None:
     """Seed the launcher's `app_state` table with the install-time
     embedding-model defaults so the GUI dropdowns pre-populate for
@@ -9688,6 +9714,28 @@ def _write_preset_defaults_to_app_state(
                 (_APP_STATE_KEY_DEFAULT_TEXT_EMBED, text_model, now_ms),
             )
             text_inserted = cur.rowcount > 0
+            # v0.2.103 R43 N2: the code key is seeded ONLY when absent (the
+            # DO NOTHING below already guarantees that), and — when it IS
+            # seeded and a code graph is already recorded — with the
+            # RECORDED model, not the hardware pick. The key is a user
+            # choice OR a value matching the machine's existing data: a
+            # hardware-pick seed on a later --update (first install ran
+            # before launcher.db existed, so nothing was seeded then) would
+            # act as an implicit re-embed of the recorded graph, because
+            # `resolve_code_model` treats `default_code_embedding` as an
+            # EXPLICIT selection. The explicit OpenAI opt-in keeps its own
+            # model — the user chose it, it is not a seed default.
+            if (
+                not openai_set_as_default
+                and cur.execute(
+                    "SELECT 1 FROM app_state WHERE key = ?",
+                    (_APP_STATE_KEY_DEFAULT_CODE_EMBED,),
+                ).fetchone() is None
+            ):
+                # `prior_code_model`: the record as the PREVIOUS run left it
+                # (step 7 has already rewritten it with this run's pick, R45 P2).
+                if prior_code_model:
+                    code_model = prior_code_model
             cur.execute(
                 "INSERT INTO app_state (key, value, updated_at) "
                 "VALUES (?, ?, ?) "
@@ -10214,7 +10262,7 @@ def _reconcile_install_active_embedding(
         notice = (
             f"[embedding] settings.json ACTIVE_EMBEDDING={env_active} is stale for "
             f"this CPU hardware; auto-selected {resolved}. (Set it explicitly in "
-            f"the launcher Identity tab to override.)"
+            f"launcher Preferences → Embedding profile (global) to override.)"
         )
         print(f"  {notice}")
         _log_install_event(
@@ -10228,8 +10276,8 @@ def _reconcile_install_active_embedding(
         # expected fresh-box default, not a stale-value correction.
         notice = (
             f"[embedding] no ACTIVE_EMBEDDING set; applied hardware-selected "
-            f"{resolved} for this run. (Set it explicitly in the launcher "
-            f"Identity tab to override.)"
+            f"{resolved} for this run. (Set it explicitly in launcher "
+            f"Preferences → Embedding profile (global) to override.)"
         )
         print(f"  {notice}")
         _log_install_event(

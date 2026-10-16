@@ -1759,27 +1759,40 @@ def _derive_embed_config(install_code_model: Optional[str] = None) -> dict:
     install.py wrote) and the container backend FOLLOWS it (v0.2.102 W6-B2,
     re-review LOW-7: serving follows the model — CodeSage → the container's
     gpu backend, an Ollama model → ``ollama``, so the written
-    ``CODE_EMBED_MODEL`` is one that backend serves). With no install default
-    recorded, the pre-v0.2.102 vendor rule stands."""
-    vendor = ""
-    try:
-        from vco_lib import gpu_device as _gpu_device
+    ``CODE_EMBED_MODEL`` is one that backend serves).
 
-        gpus = _gpu_device.enumerate_gpus()
-        if gpus:
-            vendor = str(getattr(gpus[0], "vendor", "") or "")
-    except Exception:  # noqa: BLE001 — probe failure ⇒ no substitution keys
-        vendor = ""
+    v0.2.103 R41 M4: with NO install default recorded (the normal
+    ``first-install.bat`` path — ``launcher.db`` does not exist yet), the
+    model falls back to the install RECORD, then the hardware ladder — the
+    SAME resolver rule :mod:`vco_lib.code_embed_model` uses — never the
+    pre-v0.2.102 hardware-blind vendor→CodeSage guess (which wrote
+    ``CODE_EMBED_MODEL=codesage`` for any 8 GB NVIDIA host and any AMD host,
+    where CodeSage has no ROCm build)."""
     from vco_lib.code_embed_serving import APP_STATE_KEY_DEFAULT_CODE_EMBED, container_pairing
 
+    try:
+        from vco_lib.host_probe import selected_gpu_specs
+
+        vendor = selected_gpu_specs()[1]
+    except Exception:  # noqa: BLE001 — probe failure ⇒ no substitution keys
+        vendor = ""
     if install_code_model is None:
         try:
             from vco_lib.launcher_db_reader import read_app_state_value
 
             install_code_model = read_app_state_value(APP_STATE_KEY_DEFAULT_CODE_EMBED)
-        except Exception:  # noqa: BLE001 — unreadable ⇒ the vendor rule
+        except Exception:  # noqa: BLE001 — unreadable ⇒ the record/ladder
             install_code_model = None
     model = (install_code_model or "").strip()
+    if not model:
+        # R41 M4: no install default — the install record, then the
+        # hardware ladder (ONE rule on every surface).
+        try:
+            from vco_lib.code_embed_model import _hardware_code_model, recorded_code_model
+
+            model = (recorded_code_model() or _hardware_code_model() or "").strip()
+        except Exception:  # noqa: BLE001 — unreadable ⇒ the bare backend pair
+            model = ""
     pairing = container_pairing(model) if model else None
     if pairing is not None:
         return {"gpu_vendor": vendor, "code_backend": pairing[0], "code_model": model}

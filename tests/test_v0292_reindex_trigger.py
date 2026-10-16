@@ -645,3 +645,401 @@ def test_the_bundle_seam_runs_on_the_update_path(monkeypatch):
     # And it must be skipped on a dry run (a dry run mutates nothing).
     idx = src.index("_trigger_extractor_generation_reindex(")
     assert "if not dry_run:" in src[max(0, idx - 400): idx]
+
+
+# ===========================================================================
+# v0.2.103 F3 — the root's FIRST install: unknown graph ⇒ absent
+# ===========================================================================
+def _probe_graph_unknown(names, _url):
+    """Weaviate cannot answer (containers not started yet, or unreachable)."""
+    return {n: None for n in names}
+
+
+def test_a_root_first_install_treats_an_unknown_graph_as_absent(tmp_path: Path):
+    """v0.2.103 F3: the root's first install (no prior manifest) runs the
+    bundle at install step 5b, BEFORE the containers exist — the existence
+    probe cannot answer there, and reading the unknown as "owed" launched a
+    walk / queued a ``codegraph_embed_resync_pending`` deferral for a graph
+    that cannot exist yet, naming a backend the machine has not configured.
+    Red before: status "deferred" with a deferral in hand."""
+    spawn = RecordingSpawn(status="deferred", deferral=object())
+    out = _ensure(tmp_path, spawn=spawn, prev_version="",
+                  probe=_probe_graph_unknown, unknown_graph_is_absent=True)
+    assert out.status == "stamped"
+    assert out.reason == ceg.REASON_NO_GRAPH
+    assert spawn.calls == [], "no walk, no deferral, for a graph that cannot exist"
+    assert out.deferral is None
+    assert ceg.read_stamp_generation(tmp_path) == ceg.CURRENT_EXTRACTOR_GENERATION
+
+
+def test_an_update_with_an_unknown_graph_still_owes_the_walk(tmp_path: Path):
+    """The leave-alone case: the conservative unknown-means-owed reading is
+    KEPT for updates (a prior manifest means services should be reachable —
+    an unanswered probe is then a real outage worth a walk/deferral)."""
+    spawn = RecordingSpawn()
+    out = _ensure(tmp_path, spawn=spawn, prev_version="0.2.91",
+                  probe=_probe_graph_unknown)
+    assert out.status == "launched"
+    assert len(spawn.calls) == 1
+
+
+def test_a_user_project_first_install_keeps_unknown_means_owed(tmp_path: Path):
+    """The flag is the ROOT's only — user projects never get it, whatever
+    their manifest state (their bundle runs after services exist, so an
+    unanswered probe means something is wrong)."""
+    spawn = RecordingSpawn()
+    out = _ensure(tmp_path, spawn=spawn, prev_version="",
+                  probe=_probe_graph_unknown)
+    assert out.status == "launched"
+    assert len(spawn.calls) == 1
+
+
+def test_project_init_sets_the_flag_only_for_a_genuine_root_first_install(
+        tmp_path: Path, monkeypatch):
+    """Wiring pin (red on the source change): the bundle seam computes
+    ``unknown_graph_is_absent`` through the ONE gate
+    (``ceg.root_first_install_unknown_absent``) — root AND no prior INSTALL
+    (the manifest FILE's existence, whatever ``vco_version`` reads) AND no
+    launcher build record for the root's graph AND no VCO data volume
+    anywhere on the machine (v0.2.103 R41 M1, R43 N1: an uninstall keeps
+    the named volumes, so a re-clone after one may still hold the old
+    graph)."""
+    from vco_lib import code_embed_model as cem
+    from vco_lib import project_init
+    from vco_lib import runtime_reconcile as rr
+
+    seen = []
+
+    def fake(folder, **kw):
+        seen.append(kw.get("unknown_graph_is_absent"))
+        return types.SimpleNamespace(
+            status="stamped", reason=ceg.REASON_NO_GRAPH, message="",
+            generation=ceg.CURRENT_EXTRACTOR_GENERATION, reason_text="",
+            pid=None, deferral=None, warnings=[])
+
+    monkeypatch.setattr(ceg, "ensure_extractor_generation", fake)
+
+    def log(*a, **k):
+        pass
+
+    # The gate's two evidence legs, patched at their one home each: the
+    # build record (launcher.db) and the volume probe (runtime listings).
+    recorded: dict = {"v": False}
+    monkeypatch.setattr(cem, "root_graph_build_recorded",
+                        lambda _prefix: recorded["v"])
+    volume: dict = {"v": False}
+    monkeypatch.setattr(rr, "vco_data_exists_somewhere",
+                        lambda _root: volume["v"])
+
+    for is_root, had_prior, prev, build_recorded, volume_present, want in (
+        # genuine first install: no manifest file, no launcher.db at all,
+        # no VCO data volume anywhere
+        (True, False, "", False, False, True),
+        # R43 N1's scenario: uninstall → re-clone — no manifest (fresh
+        # clone), no launcher.db (the uninstaller removed the state dir),
+        # but the Weaviate data volume SURVIVED → unknown stays OWED
+        (True, False, "", False, True, False),
+        # a build-stamped binding row = positive evidence the root's graph
+        # exists (a re-clone whose persisted Weaviate volume still holds it)
+        (True, False, "", True, False, False),
+        # a prior INSTALL, whatever the manifest's vco_version field reads
+        # (corrupt manifest, or one without vco_version — prev "" both ways)
+        (True, True, "", False, False, False),
+        (True, True, "0.2.102", False, False, False),
+        # a user project never gets the flag
+        (False, False, "", False, False, False),
+    ):
+        recorded["v"] = build_recorded
+        volume["v"] = volume_present
+        project_init._trigger_extractor_generation_reindex(
+            tmp_path, prev_version=prev, running_version="0.2.103",
+            is_root_target=is_root, result={"warnings": []}, log=log,
+            had_prior_install=had_prior)
+        assert seen[-1] is want, (
+            is_root, had_prior, prev, build_recorded, volume_present)
+
+
+def test_the_trigger_defaults_to_a_prior_install(tmp_path: Path, monkeypatch):
+    """R43 N8: the gate-OPENING direction is never the default — a caller
+    that omits ``had_prior_install`` gets the conservative prior-install
+    reading (flag False). Red before: the default was False, so an omitted
+    argument opened the gate on an update."""
+    from vco_lib import code_embed_model as cem
+    from vco_lib import project_init
+    from vco_lib import runtime_reconcile as rr
+
+    seen = []
+
+    def fake(folder, **kw):
+        seen.append(kw.get("unknown_graph_is_absent"))
+        return types.SimpleNamespace(
+            status="stamped", reason=ceg.REASON_NO_GRAPH, message="",
+            generation=ceg.CURRENT_EXTRACTOR_GENERATION, reason_text="",
+            pid=None, deferral=None, warnings=[])
+
+    monkeypatch.setattr(ceg, "ensure_extractor_generation", fake)
+    monkeypatch.setattr(cem, "root_graph_build_recorded", lambda _p: False)
+    monkeypatch.setattr(rr, "vco_data_exists_somewhere", lambda _r: False)
+
+    def log(*a, **k):
+        pass
+
+    project_init._trigger_extractor_generation_reindex(
+        tmp_path, prev_version="", running_version="0.2.103",
+        is_root_target=True, result={"warnings": []}, log=log)
+    assert seen == [False]
+
+
+def test_emit_reindex_deferral_never_raises_even_on_a_broken_import(
+        tmp_path: Path, monkeypatch):
+    """R43 N7: the docstring's NEVER-raises promise must be REAL — the
+    imports sit inside the guard, so a lazy import that fails is logged,
+    not raised. Red before: the imports ran outside the ``try``."""
+    import sys
+
+    import vco_lib
+
+    logged = []
+
+    def log(*args, **kwargs):
+        logged.append(args)
+
+    outcome = types.SimpleNamespace(deferral=object())
+    # Break BOTH lazy imports the way a broken install would: the package
+    # attribute is gone AND the sys.modules entry halts the re-import.
+    monkeypatch.setitem(sys.modules, "vco_lib.deferral_emit", None)
+    monkeypatch.setitem(sys.modules, "vco_lib.deferral_report", None)
+    monkeypatch.delattr(vco_lib, "deferral_emit", raising=False)
+    monkeypatch.delattr(vco_lib, "deferral_report", raising=False)
+    # Must not raise.
+    ceg.emit_reindex_deferral(tmp_path, outcome, log)
+    assert logged, "the broken import must be logged, not swallowed silently"
+
+
+def test_a_corrupt_root_manifest_still_counts_as_a_prior_install(
+        tmp_path: Path, monkeypatch):
+    """R41 M1, end to end through ``install_project_bundle``: the "first
+    install" signal is the manifest FILE's existence — an update whose
+    manifest is CORRUPT must reach the trigger with
+    ``had_prior_install=True``, so an unanswered existence probe stays
+    "owed" instead of stamping a possibly-existing stale graph current."""
+    from vco_lib import project_init
+
+    repo_root = Path(__file__).resolve().parent.parent
+    folder = tmp_path / "rootclone"
+    (folder / ".claude").mkdir(parents=True)
+
+    seen = []
+
+    def _recorder(target, **kwargs):
+        seen.append(kwargs)
+        return None
+
+    monkeypatch.setattr(project_init, "_trigger_extractor_generation_reindex",
+                        _recorder)
+    _identity_snapshot(monkeypatch, resolvable=True, projects=[])
+
+    # A prior install's manifest exists but is unparseable.
+    project_init.install_project_bundle(
+        folder, orchestrator_root=repo_root, update_mode=False, dry_run=False)
+    manifest = folder / project_init._MANIFEST_REL
+    assert manifest.is_file()
+    manifest.write_text("{not json", encoding="utf-8")
+    seen.clear()
+
+    project_init.install_project_bundle(
+        folder, orchestrator_root=repo_root, update_mode=True, dry_run=False)
+
+    assert len(seen) == 1
+    assert seen[0]["had_prior_install"] is True
+
+
+def test_a_manifest_without_vco_version_still_counts_as_a_prior_install(
+        tmp_path: Path, monkeypatch):
+    """R41 M1's second shape: a prior install's manifest that simply has no
+    ``vco_version`` key (``prev_version`` reads "" — indistinguishable from
+    a first install at that level) must still reach the trigger as a prior
+    install."""
+    import json
+
+    from vco_lib import project_init
+
+    repo_root = Path(__file__).resolve().parent.parent
+    folder = tmp_path / "rootclone2"
+    (folder / ".claude").mkdir(parents=True)
+
+    seen = []
+
+    def _recorder(target, **kwargs):
+        seen.append(kwargs)
+        return None
+
+    monkeypatch.setattr(project_init, "_trigger_extractor_generation_reindex",
+                        _recorder)
+    _identity_snapshot(monkeypatch, resolvable=True, projects=[])
+
+    project_init.install_project_bundle(
+        folder, orchestrator_root=repo_root, update_mode=False, dry_run=False)
+    manifest = folder / project_init._MANIFEST_REL
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data.pop("vco_version", None)
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    seen.clear()
+
+    project_init.install_project_bundle(
+        folder, orchestrator_root=repo_root, update_mode=True, dry_run=False)
+
+    assert len(seen) == 1
+    assert seen[0]["had_prior_install"] is True
+    assert seen[0]["prev_version"] == ""
+
+
+# ===========================================================================
+# v0.2.103 R43 N1/N3 — the gate's evidence legs: the launcher.db build
+# record (a DB that cannot be read is NEVER "no record") and the VCO data
+# volume probe (an uninstall keeps the named volumes)
+# ===========================================================================
+def test_a_corrupt_launcher_db_reads_as_a_recorded_graph(tmp_path, monkeypatch):
+    """R43 N3: ``root_graph_build_recorded`` soft-fails to True — a
+    launcher.db that EXISTS but cannot be read (corrupt blob: SQLite opens
+    it read-only fine, the first query raises) must keep the conservative
+    unknown-means-owed reading, never read as "no build record". Red
+    before: no flagged reader existed, ``get_codegraph_binding_row``
+    swallowed the query error into ``None`` and the gate OPENED."""
+    from tests.common.launcher_db_fixture import create_corrupt_launcher_db
+    from vco_lib.code_embed_model import root_graph_build_recorded
+
+    db = create_corrupt_launcher_db(tmp_path / "launcher.db")
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db))
+    assert root_graph_build_recorded("VibeCodedOrchestrator") is True
+
+
+def test_a_readable_launcher_db_answers_the_row_it_actually_has(
+        tmp_path, monkeypatch):
+    """R43 N3's leave-alone cases: no launcher.db at all and a readable DB
+    with no stamped row are POSITIVE absences (False); a build-stamped row
+    is positive evidence (True)."""
+    from tests.common.launcher_db_fixture import (
+        add_codegraph_binding, make_launcher_db,
+    )
+    from vco_lib.code_embed_model import root_graph_build_recorded
+
+    # No launcher.db anywhere (the conftest redirect points the default
+    # discovery at an empty tmp tree; no VCT_LAUNCHER_DB_PATH override).
+    monkeypatch.delenv("VCT_LAUNCHER_DB_PATH", raising=False)
+    assert root_graph_build_recorded("VibeCodedOrchestrator") is False
+
+    db = make_launcher_db(tmp_path / "statedir", projects=[
+        {"name": "root", "folder_path": "/tmp/root"},
+        {"name": "other", "folder_path": "/tmp/other", "project_id": "p2"},
+    ])
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db))
+    # A binding row a build never stamped (the seed every binding starts
+    # with) is not a record.
+    add_codegraph_binding(db, "p1", "VibeCodedOrchestrator",
+                          embedding_model="codesage-large-v2", embedding_dim=2048)
+    assert root_graph_build_recorded("VibeCodedOrchestrator") is False
+    # last_analyzed_at is what a build stamps — THE positive evidence.
+    add_codegraph_binding(db, "p2", "Otherproj",
+                          embedding_model="qwen3-embedding:0.6b",
+                          embedding_dim=1024, last_analyzed_at=1697200000000)
+    assert root_graph_build_recorded("Otherproj") is True
+    assert root_graph_build_recorded("VibeCodedOrchestrator") is False
+
+
+def _listing_run(*, ps_stdout="", volume_stdout="", ps_fails=False,
+                 ps_raises=False):
+    """A ``run`` seam for the listing commands
+    :func:`vco_lib.runtime_reconcile.vco_data_under` spawns."""
+    import subprocess
+
+    def run(argv, **_kw):
+        if ps_raises:
+            raise OSError("daemon socket down")
+        if list(argv[1:3]) == ["ps", "-a"]:
+            if ps_fails:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="x")
+            return subprocess.CompletedProcess(argv, 0, stdout=ps_stdout, stderr="")
+        if list(argv[1:3]) == ["volume", "ls"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=volume_stdout, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    return run
+
+
+def _BOTH(_rt):
+    return True
+
+
+def test_a_runtime_that_is_not_installed_is_not_read_as_data():
+    """R45 P1: on a first install runtime.txt does not exist yet, so both
+    runtimes are candidates. A Docker-only (or podman-only) machine whose
+    installed runtime answers clean is a genuine first install — the
+    absent runtime is skipped, not read as "could not answer"."""
+    from vco_lib import runtime_reconcile as rr
+
+    asked = []
+    clean = _listing_run(ps_stdout="", volume_stdout="")
+
+    def run(argv, **kw):
+        asked.append(argv[0])
+        return clean(argv, **kw)
+
+    for only in ("docker", "podman"):
+        asked.clear()
+        assert rr.vco_data_exists_somewhere(run=run, installed=lambda rt, o=only: rt == o) is False
+        assert set(asked) == {only}, asked
+    # No runtime installed at all: nothing can hold data.
+    assert rr.vco_data_exists_somewhere(run=run, installed=lambda _rt: False) is False
+    # The installed one failing still keeps the conservative answer.
+    assert rr.vco_data_exists_somewhere(run=_listing_run(ps_fails=True),
+                                        installed=lambda rt: rt == "docker") is True
+
+
+def test_a_vco_data_volume_keeps_the_unknown_owed():
+    """R43 N1: a VCO named volume in ANY runtime's listing is data — the
+    uninstall→re-clone scenario keeps the conservative reading."""
+    from vco_lib import runtime_reconcile as rr
+
+    run = _listing_run(volume_stdout="vco_weaviate_data\n")
+    assert rr.vco_data_exists_somewhere(run=run, installed=_BOTH) is True
+
+
+def test_no_vco_data_anywhere_reads_as_absent():
+    """R43 N1's leave-alone case: every runtime answered and NOTHING of
+    VCO's is there — a genuine first install reads as absent."""
+    from vco_lib import runtime_reconcile as rr
+
+    run = _listing_run(ps_stdout="some_foreign_container\n",
+                       volume_stdout="postgres_data\n")
+    assert rr.vco_data_exists_somewhere(run=run, installed=_BOTH) is False
+
+
+def test_a_runtime_that_cannot_answer_never_says_absent():
+    """R43 N1: a probe that could not run (daemon down, listing error) is
+    NOT a verdict — the conservative True (owed) is the answer, even when
+    the other runtime answered clean."""
+    from vco_lib import runtime_reconcile as rr
+
+    assert rr.vco_data_exists_somewhere(run=_listing_run(ps_fails=True), installed=_BOTH) is True
+    assert rr.vco_data_exists_somewhere(run=_listing_run(ps_raises=True), installed=_BOTH) is True
+
+
+def test_the_recorded_runtime_is_probed_alone(tmp_path):
+    """A recorded runtime.txt pins the whole candidate order (a PIN IS THE
+    WHOLE ORDER) — only the recorded runtime is asked."""
+    import subprocess
+
+    from vco_lib import runtime_reconcile as rr
+
+    (tmp_path / "state" / "install").mkdir(parents=True)
+    (tmp_path / "state" / "install" / "runtime.txt").write_text("podman\n")
+    asked = []
+
+    def run(argv, **_kw):
+        asked.append(argv[0])
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert rr.vco_data_exists_somewhere(install_root=tmp_path, run=run, installed=_BOTH) is False
+    # Only the recorded runtime was asked (its two listings: ps + volume ls).
+    assert set(asked) == {"podman"}, asked

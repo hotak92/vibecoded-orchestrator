@@ -579,6 +579,39 @@ def vco_data_kind(runtime: str, *, run: Optional[RunFn] = None,
                          corroborate_overrides=corroborate_overrides, want_running=True)
 
 
+def vco_data_exists_somewhere(install_root: Optional[Path] = None, *,
+                              run: Optional[RunFn] = None,
+                              installed: Optional[Callable[[str], bool]] = None) -> bool:
+    """Does ANY container runtime this machine can run hold VCO's data
+    (containers or named volumes)? v0.2.103 R43 N1 — the extractor-generation
+    first-install gate's volume leg: a VCO Weaviate data volume left behind
+    by an uninstall (the uninstaller stops containers and prints the volume
+    commands but never runs them) is evidence a root graph may still exist
+    in it, so the gate keeps the unknown-means-owed reading.
+
+    ``True`` unless EVERY runtime in the candidate order POSITIVELY answers
+    "no VCO data" — :func:`vco_data_under` over each runtime, the recorded
+    runtime first (:func:`vco_lib.containers.runtime_candidate_order` of
+    ``runtime.txt``). A runtime whose binary is not installed cannot hold
+    data and is skipped (R45 P1: on a first install ``runtime.txt`` does not
+    exist yet, so both runtimes are candidates — a Docker-only or podman-only
+    machine must not read the absent one as "data present"); no runtime
+    installed at all → ``False``. An INSTALLED runtime that cannot answer
+    (daemon down, listing timeout) counts as data present: the conservative
+    direction, never a verdict from a probe that did not run. Works with the
+    containers stopped — ``volume ls`` needs only the daemon. Read-only."""
+    from vco_lib.tool_search_dirs import which as _which
+
+    is_installed = installed if installed is not None else (lambda rt: _which(rt) is not None)
+    order = [rt for rt in _c.runtime_candidate_order(_c.read_runtime_txt(install_root))
+             if is_installed(rt)]
+    for runtime in order:
+        under = vco_data_under(runtime, run=run, install_root=install_root)
+        if under is None or under:
+            return True
+    return False
+
+
 #: Word-boundary runtime names in a ``version`` output — the shim leg of the
 #: one-engine probe (R12 M7). ``podman version`` under a ``podman-docker``
 #: shim prints e.g. ``docker version 4.9.3 (podman ...)``, naming BOTH.
