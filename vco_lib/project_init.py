@@ -54,7 +54,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, cast
+from typing import Any, Callable, Iterable, Optional
 
 # NEW-8 / B3 (v0.2.53) — symlink-blocking defense used by
 # ``_write_file_atomic``. Mirrors install.py's V47-B contract for the
@@ -5902,6 +5902,7 @@ def _trigger_extractor_generation_reindex(
     is_root_target: bool,
     result: dict,
     log: Callable[..., None],
+    had_prior_install: bool = False,
 ) -> None:
     """Decide + (when owed) launch the extractor-generation re-index.
 
@@ -5926,6 +5927,7 @@ def _trigger_extractor_generation_reindex(
         update re-triggers (no stamp is written).
     """
     from vco_lib import codegraph_extractor_generation as _ceg
+    from vco_lib.code_embed_model import root_graph_build_recorded as _root_graph_recorded
     from vco_lib.codegraph_resync import bundle_update_audit_step as _cg_audit_step
 
     project_name = _resolve_codegraph_project_name(folder)
@@ -5944,14 +5946,11 @@ def _trigger_extractor_generation_reindex(
         # tri-state the analyzer resolves — passed explicitly so the spawn's
         # probes classify `.claude/**` rows the same way the walk will.
         index_dot_claude=bool(is_root_target),
-        # v0.2.103 F3: the root's FIRST install (no prior manifest) runs at
-        # install step 5b, BEFORE the containers exist — "could not check
-        # whether a graph exists" is then the guaranteed answer for a graph
-        # that cannot exist yet, and reading it as "owed" queued a
-        # codegraph_embed_resync_pending deferral naming a backend the
-        # machine has not configured. Updates (a prior manifest) and user
-        # projects keep the conservative unknown-means-owed reading.
-        unknown_graph_is_absent=bool(is_root_target and not prev_version),
+        # v0.2.103 F3, tightened by R41 M1 — see this kwarg's docstring in
+        # codegraph_extractor_generation for the full gate rule.
+        unknown_graph_is_absent=bool(
+            is_root_target and not had_prior_install
+            and not _root_graph_recorded(project_name)),
     )
 
     phase = {
@@ -5975,26 +5974,9 @@ def _trigger_extractor_generation_reindex(
             f"Progress: <vct_root>/logs/resync-*.log"
         )
     elif outcome.status == "deferred" and outcome.deferral is not None:
-        try:
-            from vco_lib import deferral_emit as _de
-            from vco_lib.deferral_report import DeferralEntry as _DeferralEntry
-
-            # `codegraph_extractor_generation.ReindexResult.deferral` is
-            # declared `object` so that module keeps no import edge to
-            # `deferral_report`; the value it carries when `status ==
-            # "deferred"` is always a real `DeferralEntry` (see that module's
-            # own field comment and `_retarget_deferral`). The annotation is
-            # the only thing wider than reality, hence the cast — same
-            # convention as `codegraph_ref_dedup._http_request`. NOT an
-            # `isinstance` narrowing: the emit path here is duck-typed by
-            # contract and `tests/test_v0292_reindex_trigger.py` drives it with
-            # a sentinel to prove the wiring forwards whatever it is given.
-            # (Pre-existing `reportArgumentType`; fixed in v0.2.92 W18 because
-            # this file is exclusively held this wave and pyright is a gate.)
-            _de.emit(Path(folder), cast("_DeferralEntry", outcome.deferral))
-        except Exception as e:  # noqa: BLE001 — a deferral write never blocks
-            log("4.bundle.extractor_reindex", "warn",
-                f"extractor-reindex deferral write failed: {e}")
+        # R41 M1: the emission itself lives in ceg (one home, and this file
+        # is under a line ratchet).
+        _ceg.emit_reindex_deferral(Path(folder), outcome, log)
         result["warnings"].append(
             f"code-graph re-index deferred for {project_name}: "
             f"{outcome.message} — see UPDATE_DEFERRED.md"
@@ -10447,6 +10429,7 @@ def install_project_bundle(
                 is_root_target=is_root_target,
                 result=result,
                 log=_log,
+                had_prior_install=_had_prior_install,
             )
         except Exception as e:  # noqa: BLE001 — never abort an install
             err = f"{type(e).__name__}: {e}"

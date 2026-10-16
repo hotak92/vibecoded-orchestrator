@@ -7703,8 +7703,19 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
 
             if chosen is not None:
                 has_gpu = True
-                gpu_vendor = chosen.vendor
-                vram_gb = chosen.vram_gb
+                # v0.2.103 R41 M2: VRAM and vendor come from the ONE cached
+                # selector helper — the same call the runtime code-model
+                # resolver's hardware leg makes — so install's tier choice
+                # and the resolver can never read two different cards on a
+                # multi-GPU host. The values match `chosen` (the selection
+                # is deterministic); `chosen` itself still feeds the banner
+                # below. The helper's empty answer (probe hiccup) falls
+                # back to the card this enumeration picked.
+                from vco_lib.host_probe import selected_gpu_specs
+
+                spec_vram, spec_vendor = selected_gpu_specs()
+                gpu_vendor = spec_vendor or chosen.vendor
+                vram_gb = spec_vram if spec_vram > 0 else float(chosen.vram_gb or 0.0)
                 # Enrich the display name with the vendor-specific probe
                 # when it gives a friendlier string than the enumerator's
                 # generic label (AMD rocm-smi product, NVIDIA driver/CUDA).
@@ -9288,11 +9299,15 @@ _TEXT_MODEL_ACTIVE_EMBEDDING = {
     "text-embedding-3-small": "openai",
 }
 
-def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None:
+def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str,
+                          has_gpu: Optional[bool] = None) -> None:
     """Shim over :func:`vco_lib.gpu_profile.apply_tier_overrides`.
 
     Passes install.py's module-level constants through to the shared
     helper. See `vco_lib/gpu_profile.py` for the canonical logic.
+    ``has_gpu`` (v0.2.103 R41 L4) lets the rebuilt label's prefix follow
+    the DETECTED hardware instead of the stock profile string (a cpu
+    profile on a 6-12 GB GPU host is not "CPU-only").
     """
     from vco_lib.gpu_profile import apply_tier_overrides
     apply_tier_overrides(
@@ -9301,6 +9316,7 @@ def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None
         kg_pick=kg_pick,
         model_dims=_EMBEDDING_MODEL_DIMS,
         text_model_active_embedding=_TEXT_MODEL_ACTIVE_EMBEDDING,
+        has_gpu=has_gpu,
     )
 
 
@@ -9347,7 +9363,8 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         print(f"[3] Embedding profile: verified, skipped (recorded profile '{prior['value']}' replayed)")
         config = dict(EMBEDDING_CONFIGS[prior["value"]])
         _apply_tier_overrides(config, code_pick=prior.get("code_model") or config["code_model"],
-                              kg_pick=prior.get("text_model") or config["text_model"])
+                              kg_pick=prior.get("text_model") or config["text_model"],
+                              has_gpu=bool(sysinfo.has_gpu))
         _record_install_choice("embedding_mode", prior["value"], {
             "reason": "replayed from last install",
             "code_model": config["code_model"], "text_model": config["text_model"]})
@@ -9413,7 +9430,8 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     # was replaced, so e.g. a 6-12 GB GPU host got the cpu profile with
     # code_model swapped to qwen3 (1024-dim) while code_dims stayed 768
     # and CODE_EMBED_DIMS=768 was written to .env for a 1024-dim model.
-    _apply_tier_overrides(config, code_pick=code_pick, kg_pick=kg_pick)
+    _apply_tier_overrides(config, code_pick=code_pick, kg_pick=kg_pick,
+                          has_gpu=has_gpu)
 
     _record_install_choice("embedding_mode", profile_key, {
         "reason": reason, "code_model": config["code_model"], "text_model": config["text_model"]})

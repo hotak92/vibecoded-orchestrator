@@ -16,6 +16,7 @@ as the low-end tier, the conservative direction.
 """
 from __future__ import annotations
 
+import functools
 import os
 import platform
 import subprocess
@@ -129,4 +130,43 @@ def probe_gpu_vram_gb() -> float:
     return float(vram) if vram and vram > 0 else 0.0
 
 
-__all__ = ["probe_cpu_cores", "probe_gpu_vram_gb", "probe_system_ram_gb"]
+@functools.lru_cache(maxsize=1)
+def selected_gpu_specs() -> "tuple[float, str]":
+    """``(vram_gb, vendor)`` of the ONE card every hardware-aware code-model
+    decision selects — v0.2.103 R41 M2, the single home of that choice.
+
+    Install's own GPU detection (``install.py``'s system-info step) takes
+    ``select_gpu_device(enumerate_gpus(), vendor_pref=VCT_GPU_VENDOR)`` and
+    reads vendor and VRAM off the SAME chosen card; the runtime code-model
+    resolver (:func:`vco_lib.code_embed_model._hardware_code_model`) used to
+    take VRAM from one card (``probe_gpu_vram_gb``, no vendor preference) and
+    vendor from another (the FIRST attributed entry of the enumeration), so
+    on a 6 GB NVIDIA + 16 GB AMD host the resolver answered CodeSage while
+    install answered qwen3. This helper makes the selection once, honours
+    ``VCT_GPU_VENDOR`` exactly like install, and returns both numbers from
+    that one card. Memoised per process — the enumeration runs GPU
+    subprocesses (nvidia-smi / rocm-smi / lspci) and the resolver's tail runs
+    on every no-record resolution.
+
+    ``(0.0, "")`` when no usable discrete card is found or the probes fail —
+    the selectors read that as the CPU path, the conservative direction.
+    Never raises."""
+    try:
+        from vco_lib.gpu_device import enumerate_gpus, select_gpu_device
+        from vco_lib.gpu_profile import gpu_vendor_preference_from_env
+
+        chosen = select_gpu_device(
+            enumerate_gpus(), vendor_pref=gpu_vendor_preference_from_env())
+    except Exception:
+        return (0.0, "")
+    if chosen is None:
+        return (0.0, "")
+    vram = getattr(chosen, "vram_gb", None)
+    vendor = (getattr(chosen, "vendor", "") or "").strip().lower()
+    return (float(vram) if vram and vram > 0 else 0.0, vendor)
+
+
+__all__ = [
+    "probe_cpu_cores", "probe_gpu_vram_gb", "probe_system_ram_gb",
+    "selected_gpu_specs",
+]

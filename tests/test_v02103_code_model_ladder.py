@@ -63,10 +63,11 @@ SWEEP = [
 
 
 def _stub_probes(monkeypatch, vram, ram, cores, vendor):
-    monkeypatch.setattr(host_probe, "probe_gpu_vram_gb", lambda: vram)
+    """Stub the resolver's OWN seams (R41 M3): the ONE selected-card helper
+    (VRAM and vendor from the same card) plus the real cpu/ram probes."""
+    monkeypatch.setattr(host_probe, "selected_gpu_specs", lambda: (vram, vendor))
     monkeypatch.setattr(host_probe, "probe_system_ram_gb", lambda: ram)
     monkeypatch.setattr(host_probe, "probe_cpu_cores", lambda: cores)
-    monkeypatch.setattr(cem, "_gpu_vendor", lambda: vendor)
 
 
 @pytest.fixture
@@ -122,12 +123,16 @@ def test_resolver_tail_answers_with_the_ladder(monkeypatch, vram, ram, cores, ve
 def test_the_recorded_install_profile_answers_before_the_ladder(monkeypatch, tmp_path):
     """3b: with a record on disk (step 7), the resolver answers with it — the
     same value the pull plan and compose derive from — in processes that carry
-    none of the settings env (the 5b bundle child)."""
+    none of the settings env (the 5b bundle child). Drives the REAL
+    ``recorded_code_model`` (the conftest W-CODE-LADDER pin mutes it for the
+    rest of the suite — R41 L1)."""
+    from tests import conftest
     from vco_lib import embedding_pull_plan as epp
 
     epp.record_profile(tmp_path, {"text_model": ARCTIC, "code_backend": "ollama",
                                   "code_model": JINA}, [])
     monkeypatch.setenv("VCT_INSTALL_ROOT", str(tmp_path))
+    monkeypatch.setattr(cem, "recorded_code_model", conftest._REAL_RECORDED_CODE_MODEL)
     assert cem.recorded_code_model() == JINA
     _stub_probes(monkeypatch, 16.0, 32.0, 8, "nvidia")  # ladder would say codesage
     assert cem.resolve_code_model_pick(
@@ -221,10 +226,174 @@ def test_an_unswapped_profile_keeps_its_stock_description():
 # ═══════════════════════════ F4 — the notices ═══════════════════════════
 
 
-def test_the_active_embedding_notices_point_at_preferences():
-    """The global selector has lived in Preferences → "Embedding profile
-    (global)" since v0.2.102 W6-R; the stale "Identity tab" hint is gone."""
-    src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
-    assert "Identity tab" not in src
-    # Both notices (stale-reconcile + empty-env fill) carry the new pointer.
-    assert src.count("Preferences → Embedding profile (global) to override") == 2
+def _reconcile_args(**over):
+    base = dict(cpu_only=False, low_resource=False, openai_key="", no_gpu_check=False)
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def test_the_stale_active_embedding_notice_points_at_preferences(
+        install, monkeypatch, capsys):
+    """F4, driven behaviourally (R41 L5 — not a source scan): the
+    stale-reconcile branch PRINTS a notice naming Preferences → "Embedding
+    profile (global)", never the stale "Identity tab"."""
+    monkeypatch.setattr(install, "_read_active_embedding_from_app_state",
+                        lambda: "")
+    monkeypatch.setattr(install, "_log_install_event", lambda *a, **k: None)
+    monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
+    embed_config = {"active_embedding": "arctic"}
+    assert install._reconcile_install_active_embedding(
+        embed_config, _reconcile_args()) is True
+    out = capsys.readouterr().out
+    assert "stale for this CPU hardware" in out
+    assert "Preferences → Embedding profile (global)" in out
+    assert "Identity tab" not in out
+
+
+def test_the_empty_env_active_embedding_notice_points_at_preferences(
+        install, monkeypatch, capsys):
+    """F4's empty-env-fill branch (the GUI install path) PRINTS the same
+    Preferences pointer."""
+    monkeypatch.setattr(install, "_read_active_embedding_from_app_state",
+                        lambda: "")
+    monkeypatch.setattr(install, "_log_install_event", lambda *a, **k: None)
+    monkeypatch.delenv("ACTIVE_EMBEDDING", raising=False)
+    embed_config = {"active_embedding": "arctic"}
+    assert install._reconcile_install_active_embedding(
+        embed_config, _reconcile_args()) is True
+    out = capsys.readouterr().out
+    assert "no ACTIVE_EMBEDDING set" in out
+    assert "Preferences → Embedding profile (global)" in out
+    assert "Identity tab" not in out
+
+
+# ═══════════════ R41 — the fix round (review V02103-R41) ══════════════════
+
+
+def test_install_binds_the_real_host_probe_functions(install):
+    """R41 M3: the suite's W-CODE-LADDER pin must not stub
+    ``vco_lib.host_probe``'s public probes — install.py binds
+    ``probe_cpu_cores`` / ``probe_system_ram_gb`` BY NAME at import, so a
+    conftest-time stub would silently fake every install-path test's host
+    (an identity check alone cannot catch it: the stub would be bound on
+    BOTH sides). Under pytest, ``install._probe_cpu_cores`` is the REAL
+    probe — a conftest lambda would carry ``conftest`` as its module."""
+    assert install._probe_cpu_cores is host_probe.probe_cpu_cores
+    assert install._probe_system_ram_gb is host_probe.probe_system_ram_gb
+    for bound in (install._probe_cpu_cores, install._probe_system_ram_gb):
+        assert bound.__module__ == "vco_lib.host_probe", bound
+
+
+def test_one_selected_card_feeds_both_install_and_the_resolver(
+        install, monkeypatch):
+    """R41 M2: VRAM and vendor must come from ONE selected card — the
+    6 GB NVIDIA + 16 GB AMD host where the old resolver read VRAM from the
+    AMD card and vendor from the first NVIDIA entry (→ CodeSage on a host
+    whose install pick is qwen3). The helper, install's step-[3] choice and
+    the resolver's hardware leg must all answer qwen3."""
+    from tests import conftest
+    from vco_lib import gpu_device
+    from vco_lib.gpu_device import GpuCandidate
+
+    candidates = [
+        GpuCandidate(vendor="nvidia", name="RTX 6GB", vram_gb=6.0,
+                     is_integrated=False, pci_bus="0000:01"),
+        GpuCandidate(vendor="amd", name="Radeon 16GB", vram_gb=16.0,
+                     is_integrated=False, pci_bus="0000:02"),
+    ]
+    monkeypatch.setattr(gpu_device, "enumerate_gpus", lambda: candidates)
+    monkeypatch.delenv("VCT_GPU_VENDOR", raising=False)
+    real_specs = conftest._REAL_SELECTED_GPU_SPECS
+    real_specs.cache_clear()
+    monkeypatch.setattr(host_probe, "selected_gpu_specs", real_specs)
+
+    # The ONE helper selects the AMD card (most VRAM) and reports BOTH
+    # numbers from it — a GPU vendor with no CodeSage build.
+    assert host_probe.selected_gpu_specs() == (16.0, "amd")
+
+    # install's step-[3] profile choice (which reads the helper through the
+    # system-info detection's vendor/VRAM) and the resolver's hardware leg
+    # agree on qwen3, not CodeSage.
+    cfg = _choose(install, monkeypatch, 16.0, 32.0, 8, "amd")
+    assert cfg["code_model"] == QWEN3
+    assert cem._hardware_code_model() == QWEN3
+
+
+def test_the_suite_pins_the_install_record_rung_to_none(monkeypatch, tmp_path):
+    """R41 L1: rung 3b reads the MACHINE's ``ollama_pull_profile.json`` by
+    default (``VCT_INSTALL_ROOT`` is pinned to the checkout, whose
+    ``summary_model._orchestrator_roots`` ladder is consulted) — on an
+    installed checkout that record would answer for every test instead of
+    the pinned ladder. The conftest pin mutes it; only a test that restores
+    the real function (or passes ``install_record``) reads a record."""
+    from vco_lib import embedding_pull_plan as epp
+
+    epp.record_profile(tmp_path, {"text_model": ARCTIC, "code_backend": "ollama",
+                                  "code_model": JINA}, [])
+    monkeypatch.setenv("VCT_INSTALL_ROOT", str(tmp_path))
+    assert cem.recorded_code_model() is None
+
+
+def test_a_derived_default_never_retargets_a_recorded_graph():
+    """R41 L2 (coordinator ruling, per the owner rule "never fall back to a
+    different embedding model"): a DERIVED default (the install record here)
+    must NOT re-target a graph that already has a recorded model — the
+    record wins for both roles and no fill starts. Red before: the Jina
+    record would have started a fill toward CodeSage, re-embedding the whole
+    graph on the machine's weakest tier without the user selecting
+    anything."""
+    record = cem.CodeModelRecord(model=JINA, dim=768, slot="jina_embed")
+    res = cem.resolve_code_model(
+        record=record, env={}, app_state={}.get,
+        install_record=lambda: CODESAGE, role="write")
+    assert res.model == JINA
+    assert res.target == JINA and res.target_source == "recorded"
+    assert res.filling is False
+
+
+def test_an_explicit_selection_still_retargets_a_recorded_graph():
+    """R41 L2's other arm: an EXPLICIT selection (CODE_EMBED_MODEL env —
+    likewise the Codegraph tab and the Preferences pin/default) still
+    starts the additive fill toward the selected model."""
+    record = cem.CodeModelRecord(model=JINA, dim=768, slot="jina_embed")
+    res = cem.resolve_code_model(
+        record=record, env={"CODE_EMBED_MODEL": QWEN3}, app_state={}.get,
+        role="write")
+    assert res.filling is True
+    assert res.model == QWEN3 and res.target == QWEN3
+    assert res.carry == JINA
+
+
+def test_the_gpu_backend_ignore_line_prints_once_per_process(monkeypatch, capsys):
+    """R41 L3: the "ignoring CODE_EMBED_BACKEND=gpu" stderr line is emitted
+    ONCE per process, not on every resolution."""
+    monkeypatch.setattr(cem, "_gpu_backend_ignore_notice_shown", False)
+    _stub_probes(monkeypatch, 8.0, 16.0, 8, "nvidia")  # ladder says qwen3
+    for _ in range(3):
+        assert cem.resolve_code_model_pick(
+            {"CODE_EMBED_BACKEND": "gpu"}, app_state={}.get,
+            install_record=lambda: None) == (QWEN3, "hardware-probe")
+    err = capsys.readouterr().err
+    assert err.count("ignoring CODE_EMBED_BACKEND=gpu") == 1
+
+
+def test_the_rebuilt_label_never_says_cpu_only_on_a_gpu_host(install, monkeypatch):
+    """R41 L4: a 6-12 GB NVIDIA (or any >= 12 GB AMD) host lands on the cpu
+    PROFILE, but its Ollama runs on the GPU — the rebuilt label's prefix
+    follows the detected hardware, and the serving phrase follows the FINAL
+    code model, not the profile's un-swapped code_backend."""
+    for vram, vendor in ((10.0, "nvidia"), (16.0, "amd")):
+        cfg = _choose(install, monkeypatch, vram, 32.0, 8, vendor)
+        assert cfg["code_model"] == QWEN3
+        assert cfg["description"].startswith("GPU-accelerated ("), cfg["description"]
+        assert "qwen3 code, both via Ollama" in cfg["description"]
+        assert "CPU-only" not in cfg["description"]
+
+
+def test_a_cpu_only_host_keeps_the_cpu_only_prefix(install, monkeypatch):
+    """R41 L4's leave-alone arm: no GPU → the cpu profile's "CPU-only"
+    prefix stays (and the helper's has_gpu=False correction is not applied
+    to a prefix that is already right)."""
+    cfg = _choose(install, monkeypatch, 0.0, 32.0, 8, "")
+    assert cfg["description"].startswith("CPU-only (")
+    assert cfg["code_model"] == QWEN3

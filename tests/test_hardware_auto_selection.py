@@ -573,6 +573,28 @@ class TestCpuCoresProbe:
         assert isinstance(n, int)
         assert n >= 1
 
+    def test_the_real_system_ram_probe_is_exercised(self) -> None:
+        """R41 M3: the suite must drive the REAL host probes (the
+        W-CODE-LADDER pin targets the resolver's seams only). A real host
+        reports a plausible RAM figure; 0 would mean every fallback
+        failed."""
+        from vco_lib import host_probe
+
+        ram = host_probe.probe_system_ram_gb()
+        assert isinstance(ram, float)
+        assert ram >= 1.0, "a real host has at least 1 GB of RAM"
+
+    def test_selected_gpu_specs_smoke_never_raises(self) -> None:
+        """The ONE selected-card helper (R41 M2) runs the real GPU probes
+        and always answers a ``(float, str)`` pair, whatever the host."""
+        from tests import conftest
+
+        specs = conftest._REAL_SELECTED_GPU_SPECS
+        specs.cache_clear()
+        vram, vendor = specs()
+        assert isinstance(vram, float) and vram >= 0.0
+        assert vendor in ("nvidia", "amd", "intel", "metal", "unknown", "")
+
 
 # ────────────────────────────────────────────────────────────────────
 # v0.2.61 — stale ACTIVE_EMBEDDING reconciliation

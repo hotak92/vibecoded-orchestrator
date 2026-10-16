@@ -429,18 +429,40 @@ class TestServingFollowsTheModel:
     def test_adoption_derives_the_install_models_pairing(self, monkeypatch):
         """Re-review LOW-7: the adoption path's .env refresh writes a
         CODE_EMBED_MODEL the container's backend can serve."""
-        from vco_lib import gpu_device, service_adoption
+        from vco_lib import host_probe, service_adoption
         from vco_lib.compose_env import compose_substitution_env
 
-        monkeypatch.setattr(gpu_device, "enumerate_gpus",
-                            lambda: [types.SimpleNamespace(vendor="amd")])
+        monkeypatch.setattr(host_probe, "selected_gpu_specs", lambda: (0.0, "amd"))
         amd = service_adoption._derive_embed_config(DEFAULT_TEXT_MODEL)
         assert (amd["code_backend"], amd["code_model"]) == ("ollama", DEFAULT_TEXT_MODEL)
         assert compose_substitution_env(amd)["CODE_EMBED_MODEL"] == DEFAULT_TEXT_MODEL
         gpu = service_adoption._derive_embed_config("codesage-large-v2")
         assert compose_substitution_env(gpu)["CODE_EMBED_MODEL"] == "codesage/codesage-large-v2"
-        legacy = service_adoption._derive_embed_config("")
-        assert legacy == {"gpu_vendor": "amd", "code_backend": "gpu"}   # no install default: old rule
+
+    def test_adoption_without_an_install_default_uses_the_record_then_the_ladder(
+            self, monkeypatch):
+        """R41 M4: no ``default_code_embedding`` (the normal first-install
+        path — launcher.db does not exist yet) must fall back to the install
+        RECORD, then the hardware ladder — the SAME resolver rule — never
+        the hardware-blind vendor→CodeSage guess."""
+        from vco_lib import code_embed_model as cem
+        from vco_lib import host_probe, service_adoption
+
+        monkeypatch.setattr(host_probe, "selected_gpu_specs", lambda: (0.0, "amd"))
+        monkeypatch.setattr(cem, "recorded_code_model", lambda: _JINA)
+        monkeypatch.setattr(cem, "_hardware_code_model", lambda: DEFAULT_TEXT_MODEL)
+        got = service_adoption._derive_embed_config(None)   # no app_state default
+        assert (got["code_backend"], got["code_model"]) == ("ollama", _JINA)
+
+        # no record either → the ladder, which never answers CodeSage below
+        # its 12 GB rung or on any AMD host
+        monkeypatch.setattr(cem, "recorded_code_model", lambda: None)
+        for vram, vendor in ((8.0, "nvidia"), (16.0, "amd")):
+            monkeypatch.setattr(host_probe, "selected_gpu_specs",
+                                lambda vram=vram, vendor=vendor: (vram, vendor))
+            got = service_adoption._derive_embed_config(None)
+            assert got["code_model"] == DEFAULT_TEXT_MODEL, (vram, vendor, got)
+            assert got["code_backend"] == "ollama"
 
 
 class TestReReviewLows:

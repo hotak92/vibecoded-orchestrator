@@ -387,32 +387,49 @@ if not _ALLOW_REAL_STATE:
         os.environ[_key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
 
 
-# ─── W-CODE-LADDER (v0.2.103 F1): the resolver's hardware tail is FIXED ─────
+# ─── W-CODE-LADDER (v0.2.103 F1, pinned tighter by R41 M3/L1): the ───────────
+# resolver's hardware tail and install-record rung are FIXED, at the
+# resolver's OWN seams — never at vco_lib.host_probe's public probes.
 #
 # `vco_lib.code_embed_model.resolve_code_model_pick`'s last rung is no longer
 # a constant: since v0.2.103 it is the hardware ladder over the live probes
-# (`vco_lib.host_probe` + the GPU vendor), i.e. the SAME selector install
-# uses. That is the fix — the old builtin answered `codesage-large-v2` on
-# every host — but it means an unpinned test would branch on the machine the
-# suite happens to run on (an 8 GB laptop answers qwen3, a CI container
-# jina, this dev box codesage), and would SPAWN the probe subprocesses
-# (nvidia-smi / lspci / wmic) on every resolution. The pins below fix the
-# probes at one known host — a 16 GB NVIDIA card, whose ladder answer is
-# CodeSage, exactly what the pre-v0.2.103 builtin said, so the resync /
-# spawn tests that stub the container-health leg keep their meaning.
-# A test that needs another host stubs the probes itself
-# (`monkeypatch.setattr` runs later and wins, and restores the pin); the
-# ladder's own tier tests (`tests/test_v02103_code_model_ladder.py`,
-# `test_hardware_auto_selection.py`) inject values explicitly. Re-established
-# per test in `_redirect_user_state_dir` below, like the env pins.
+# (`vco_lib.host_probe`), i.e. the SAME selector install uses. That is the
+# fix — the old builtin answered `codesage-large-v2` on every host — but it
+# means an unpinned test would branch on the machine the suite happens to
+# run on (an 8 GB laptop answers qwen3, a CI container jina, this dev box
+# codesage), and would SPAWN the GPU probe subprocesses (nvidia-smi /
+# rocm-smi / lspci) on every resolution.
+#
+# R41 M3: the v0.2.103 pin replaced `host_probe.probe_*` THEMSELVES at
+# conftest import — but `install.py` binds `probe_cpu_cores` /
+# `probe_system_ram_gb` BY NAME at import (install.py:262-263), so the stubs
+# leaked into every install-path test and the real probes were never
+# exercised anywhere. The pin now targets the resolver's own entry points
+# only: the ONE selected-card helper the resolver's hardware leg reads
+# (`host_probe.selected_gpu_specs`, fixed at a 16 GB NVIDIA card, whose
+# ladder answer is CodeSage — exactly what the pre-v0.2.103 builtin said, so
+# the resync / spawn tests that stub the container-health leg keep their
+# meaning) and the install-record rung (R41 L1: `recorded_code_model` →
+# None, so the suite never answers from the MACHINE's
+# `ollama_pull_profile.json`; record-rung tests pass `roots` / the
+# `install_record` seam explicitly, and `test_hardware_auto_selection.py`
+# still drives the REAL cpu/ram probes).
+# A test that needs another host stubs the seam itself
+# (`monkeypatch.setattr` runs later and wins, and restores the pin).
+# Re-established per test in `_redirect_user_state_dir` below, like the env
+# pins.
 from vco_lib import code_embed_model as _cem_for_ladder  # noqa: E402
-from vco_lib import host_probe as _host_probe  # noqa: E402
+from vco_lib import host_probe as _host_probe_for_ladder  # noqa: E402
+
+#: The REAL functions the pins below replace — importable by tests that
+#: need to drive the unpinned behaviour (`from tests import conftest`).
+_REAL_CODE_HARDWARE_MODEL = _cem_for_ladder._hardware_code_model
+_REAL_RECORDED_CODE_MODEL = _cem_for_ladder.recorded_code_model
+_REAL_SELECTED_GPU_SPECS = _host_probe_for_ladder.selected_gpu_specs
 
 _LADDER_PIN: "dict[tuple, object]" = {
-    (_host_probe, "probe_gpu_vram_gb"): lambda: 16.0,
-    (_host_probe, "probe_system_ram_gb"): lambda: 64.0,
-    (_host_probe, "probe_cpu_cores"): lambda: 16,
-    (_cem_for_ladder, "_gpu_vendor"): lambda: "nvidia",
+    (_host_probe_for_ladder, "selected_gpu_specs"): lambda: (16.0, "nvidia"),
+    (_cem_for_ladder, "recorded_code_model"): lambda: None,
 }
 
 

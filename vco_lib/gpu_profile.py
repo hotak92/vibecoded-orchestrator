@@ -60,15 +60,20 @@ _TIER_LABEL: "dict[str, str]" = {
 }
 
 
-def _rebuilt_description(config: dict) -> str:
+def _rebuilt_description(config: dict, *, has_gpu: Optional[bool] = None) -> str:
     """The profile description rebuilt from the FINAL models (v0.2.103 F2).
 
     The field case: an 8 GB host gets the ``low_resource`` profile whose
     stock description says "Jina V2 code", then the tier override swaps the
     code model to qwen3 — the printed label kept promising Jina. The
     profile KEY still names the text tier; only the parenthesised body is
-    regenerated, from the models actually chosen. The prefix ("GPU-accelerated"
-    / "CPU-only" / "Low-resource" / …) is kept from the stock description.
+    regenerated, from the models actually chosen, and the SERVING phrase
+    follows the final code MODEL (v0.2.103 R41 L4 — the profile's
+    ``code_backend`` is deliberately not swapped, so it can name a backend
+    the swapped model is not served by). The prefix ("GPU-accelerated"
+    / "CPU-only" / "Low-resource" / …) is kept from the stock description,
+    EXCEPT when ``has_gpu`` says the hardware contradicts it (a cpu profile
+    on a 6-12 GB GPU host is not "CPU-only" — its Ollama runs on the GPU).
     """
     def label(model: object) -> str:
         text = str(model or "").strip()
@@ -76,17 +81,26 @@ def _rebuilt_description(config: dict) -> str:
 
     text = label(config.get("text_model"))
     code = label(config.get("code_model"))
-    backend = str(config.get("code_backend", "") or "").strip().lower()
-    serving = {
-        "gpu": "best quality",
-        "ollama": "both via Ollama",
-        "openai": "via the OpenAI API",
-    }.get(backend, "")
+    serving = ""
+    try:
+        from vco_lib.code_embed_serving import code_serving_backend
+
+        serving = {
+            "code_embed": "best quality",
+            "openai": "via the OpenAI API",
+            "ollama": "both via Ollama",
+        }.get(code_serving_backend(str(config.get("code_model") or "")), "")
+    except Exception:  # noqa: BLE001 — a label never raises
+        serving = ""
     body = f"{text} text + {code} code"
     if serving:
         body += f", {serving}"
     stock = str(config.get("description") or "")
     prefix = stock.split(" (", 1)[0].strip() if " (" in stock else ""
+    if has_gpu is True and prefix.lower().startswith("cpu-only"):
+        prefix = "GPU-accelerated"
+    elif has_gpu is False and prefix.lower().startswith("gpu-accelerated"):
+        prefix = "CPU-only"
     return f"{prefix} ({body})" if prefix else body
 
 
@@ -97,6 +111,7 @@ def apply_tier_overrides(
     kg_pick: str,
     model_dims: Mapping[str, int],
     text_model_active_embedding: Mapping[str, str],
+    has_gpu: Optional[bool] = None,
 ) -> None:
     """Swap the profile's stock models for the hardware-tier picks,
     keeping every dependent field consistent (v0.2.54, gpu-audit C-5).
@@ -105,7 +120,9 @@ def apply_tier_overrides(
     of a shared profile). The two mapping parameters are install.py's
     module-level constants (``_EMBEDDING_MODEL_DIMS``,
     ``_TEXT_MODEL_ACTIVE_EMBEDDING``) passed by reference so this helper has
-    no coupling to install.py.
+    no coupling to install.py. ``has_gpu`` (v0.2.103 R41 L4) corrects the
+    rebuilt label's prefix when the detected hardware contradicts the stock
+    profile's wording; ``None`` keeps the stock prefix.
 
     See install.py's `_apply_tier_overrides` docstring for the rationale
     on why ``code_backend`` is NOT swapped.
@@ -130,4 +147,4 @@ def apply_tier_overrides(
         # v0.2.103 F2: the label follows the override — the stock
         # description still names the profile's STOCK code model otherwise
         # ("Jina V2 code" printed on a host whose code model is qwen3).
-        config["description"] = _rebuilt_description(config)
+        config["description"] = _rebuilt_description(config, has_gpu=has_gpu)

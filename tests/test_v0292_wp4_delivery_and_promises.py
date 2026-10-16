@@ -513,11 +513,16 @@ class DeliveryAuditTests(unittest.TestCase):
         shared-KG name order moved to ``vco_lib.root_kg_identity.
         resolve_shared_name`` (one home, Identity-tab pick first);
         ``_resolve_shared_kg_name`` is a shim over it.
+
+        v0.2.103 (review V02103-R41 M1) — LOWERED 14_662 -> 14_653: the
+        re-index deferral emission moved to
+        ``codegraph_extractor_generation.emit_reindex_deferral`` (its
+        decision module's follow-up, not bundle plumbing).
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 14_662,
+            n, 14_653,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

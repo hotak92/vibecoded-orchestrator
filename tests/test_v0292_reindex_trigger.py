@@ -694,11 +694,14 @@ def test_a_user_project_first_install_keeps_unknown_means_owed(tmp_path: Path):
     assert len(spawn.calls) == 1
 
 
-def test_project_init_sets_the_flag_only_for_a_root_first_install(
+def test_project_init_sets_the_flag_only_for_a_genuine_root_first_install(
         tmp_path: Path, monkeypatch):
     """Wiring pin (red on the source change): the bundle seam computes
-    ``unknown_graph_is_absent`` from ``is_root_target AND no prior
-    manifest`` — true only for the root's first install."""
+    ``unknown_graph_is_absent`` from ``is_root_target AND no prior INSTALL
+    (the manifest FILE's existence, whatever ``vco_version`` reads) AND no
+    launcher build record for the root's graph`` — true only for a root's
+    genuine first install (v0.2.103 R41 M1)."""
+    from vco_lib import code_embed_model as cem
     from vco_lib import project_init
 
     seen = []
@@ -715,12 +718,107 @@ def test_project_init_sets_the_flag_only_for_a_root_first_install(
     def log(*a, **k):
         pass
 
-    for is_root, prev, want in (
-        (True, "", True),          # the root's first install
-        (True, "0.2.102", False),  # a root UPDATE (prior manifest)
-        (False, "", False),        # a user project's first install
+    # A build-stamped binding row = positive evidence the root's graph
+    # exists (a re-clone whose persisted Weaviate volume still holds it).
+    stamped = {"embedding_model": "qwen3-embedding:0.6b", "embedding_dim": 1024,
+               "last_analyzed_at": 1697200000000, "config": {}}
+    row: dict = {"v": None}
+    monkeypatch.setattr(cem, "read_binding_row", lambda _prefix: row["v"])
+
+    for is_root, had_prior, prev, binding_row, want in (
+        # genuine first install: no manifest file, no launcher.db at all
+        (True, False, "", None, True),
+        # re-clone with the old graph still in the persisted volume: the
+        # binding row says a build stamped it — unknown means OWED
+        (True, False, "", stamped, False),
+        # a prior INSTALL, whatever the manifest's vco_version field reads
+        # (corrupt manifest, or one without vco_version — prev "" both ways)
+        (True, True, "", None, False),
+        (True, True, "0.2.102", None, False),
+        # a user project never gets the flag
+        (False, False, "", None, False),
     ):
+        row["v"] = binding_row
         project_init._trigger_extractor_generation_reindex(
             tmp_path, prev_version=prev, running_version="0.2.103",
-            is_root_target=is_root, result={"warnings": []}, log=log)
-        assert seen[-1] is want
+            is_root_target=is_root, result={"warnings": []}, log=log,
+            had_prior_install=had_prior)
+        assert seen[-1] is want, (is_root, had_prior, prev, binding_row)
+
+
+def test_a_corrupt_root_manifest_still_counts_as_a_prior_install(
+        tmp_path: Path, monkeypatch):
+    """R41 M1, end to end through ``install_project_bundle``: the "first
+    install" signal is the manifest FILE's existence — an update whose
+    manifest is CORRUPT must reach the trigger with
+    ``had_prior_install=True``, so an unanswered existence probe stays
+    "owed" instead of stamping a possibly-existing stale graph current."""
+    from vco_lib import project_init
+
+    repo_root = Path(__file__).resolve().parent.parent
+    folder = tmp_path / "rootclone"
+    (folder / ".claude").mkdir(parents=True)
+
+    seen = []
+
+    def _recorder(target, **kwargs):
+        seen.append(kwargs)
+        return None
+
+    monkeypatch.setattr(project_init, "_trigger_extractor_generation_reindex",
+                        _recorder)
+    _identity_snapshot(monkeypatch, resolvable=True, projects=[])
+
+    # A prior install's manifest exists but is unparseable.
+    project_init.install_project_bundle(
+        folder, orchestrator_root=repo_root, update_mode=False, dry_run=False)
+    manifest = folder / project_init._MANIFEST_REL
+    assert manifest.is_file()
+    manifest.write_text("{not json", encoding="utf-8")
+    seen.clear()
+
+    project_init.install_project_bundle(
+        folder, orchestrator_root=repo_root, update_mode=True, dry_run=False)
+
+    assert len(seen) == 1
+    assert seen[0]["had_prior_install"] is True
+
+
+def test_a_manifest_without_vco_version_still_counts_as_a_prior_install(
+        tmp_path: Path, monkeypatch):
+    """R41 M1's second shape: a prior install's manifest that simply has no
+    ``vco_version`` key (``prev_version`` reads "" — indistinguishable from
+    a first install at that level) must still reach the trigger as a prior
+    install."""
+    import json
+
+    from vco_lib import project_init
+
+    repo_root = Path(__file__).resolve().parent.parent
+    folder = tmp_path / "rootclone2"
+    (folder / ".claude").mkdir(parents=True)
+
+    seen = []
+
+    def _recorder(target, **kwargs):
+        seen.append(kwargs)
+        return None
+
+    monkeypatch.setattr(project_init, "_trigger_extractor_generation_reindex",
+                        _recorder)
+    _identity_snapshot(monkeypatch, resolvable=True, projects=[])
+
+    project_init.install_project_bundle(
+        folder, orchestrator_root=repo_root, update_mode=False, dry_run=False)
+    manifest = folder / project_init._MANIFEST_REL
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data.pop("vco_version", None)
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+    seen.clear()
+
+    project_init.install_project_bundle(
+        folder, orchestrator_root=repo_root, update_mode=True, dry_run=False)
+
+    assert len(seen) == 1
+    assert seen[0]["had_prior_install"] is True
+    assert seen[0]["prev_version"] == ""

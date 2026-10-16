@@ -1127,13 +1127,19 @@ def plan(
     test); otherwise it is probed. The probe runs ONLY when it can change the
     answer — a stamp that is already current short-circuits before any I/O.
 
-    ``unknown_graph_is_absent`` (v0.2.103 F3) is set ONLY for the
-    orchestrator root's FIRST install (no prior manifest): that call runs at
-    step 5b, BEFORE the containers exist, so "could not check" is the
-    guaranteed answer for a graph that cannot exist yet — treating it as
-    "absent" lets rule 2 stamp instead of queueing a deferral that names a
-    backend the machine has not even configured. Updates and user projects
-    keep the conservative unknown-means-owed reading."""
+    ``unknown_graph_is_absent`` (v0.2.103 F3, tightened by R41 M1) is set
+    ONLY for the orchestrator root's GENUINE first install — no manifest
+    FILE from a prior install (whatever its ``vco_version`` field reads: a
+    corrupt or version-less manifest is still a prior install) AND no
+    launcher build record for the root's graph
+    (:func:`vco_lib.code_embed_model.root_graph_build_recorded` — a
+    re-clone whose persisted Weaviate volume still holds the old graph has
+    one). That call runs at step 5b, BEFORE the containers exist, so "could
+    not check" is the guaranteed answer for a graph that cannot exist yet —
+    treating it as "absent" lets rule 2 stamp instead of queueing a
+    deferral that names a backend the machine has not even configured.
+    Updates, re-clones with a surviving graph and user projects keep the
+    conservative unknown-means-owed reading."""
     stamp_generation = read_stamp_generation(folder)
     if generation_is_current(stamp_generation):
         return Verdict(False, REASON_STAMP_CURRENT)
@@ -1511,3 +1517,31 @@ def doctor_insert_failures(
             detail={"accepted": detail},
         )
     ]
+
+
+def emit_reindex_deferral(folder: Path, outcome: ReindexResult, log) -> None:
+    """Emit a ``deferred`` outcome's DeferralEntry through the ONE locked
+    emitter (v0.2.103 R41 M1: extracted from project_init's trigger — the
+    emission is this module's decision-follow-up, and project_init is under
+    a line ratchet). NEVER raises; a failed write is logged, not raised.
+
+    ``ReindexResult.deferral`` is declared ``object`` so this module keeps
+    no import edge to ``deferral_report``; the value it carries when
+    ``status == "deferred"`` is always a real ``DeferralEntry`` (see the
+    field comment and ``_retarget_deferral``). The annotation is the only
+    thing wider than reality, hence the cast — same convention as
+    ``codegraph_ref_dedup._http_request``. NOT an ``isinstance`` narrowing:
+    the emit path is duck-typed by contract and
+    ``tests/test_v0292_reindex_trigger.py`` drives it with a sentinel to
+    prove the wiring forwards whatever it is given.
+    """
+    from typing import cast
+
+    from vco_lib import deferral_emit
+    from vco_lib.deferral_report import DeferralEntry
+
+    try:
+        deferral_emit.emit(folder, cast(DeferralEntry, outcome.deferral))
+    except Exception as e:  # noqa: BLE001 — a deferral write never blocks
+        log("4.bundle.extractor_reindex", "warn",
+            f"extractor-reindex deferral write failed: {e}")

@@ -29,6 +29,13 @@ are stale (``embed_revision`` / content hash / the extractor-generation
 ladder) — no second versioning scheme. Fill progress is kept on the same
 binding row (``config_json.code_model_fill``) for the Preferences status.
 
+v0.2.103 R41 L2 refines which targets may start that fill at all: a DERIVED
+default (:data:`DERIVED_TARGET_SOURCES` — the install record, the
+install-projected backend env, the hardware probe) applies only to graphs
+with NO recorded model; a graph that already has a record keeps it for both
+roles until an explicit selection (env, project Codegraph tab, Preferences
+pin / ``default_code_embedding``) names a different model.
+
 Target precedence (first hit wins):
 
 1. ``CODE_EMBED_MODEL`` env — the operator's explicit model.
@@ -93,6 +100,23 @@ SOURCE_INSTALL_RECORD = "install-record"
 SOURCE_INSTALL_ENV = "install-env"
 SOURCE_RECORDED = "recorded"
 SOURCE_HARDWARE = "hardware-probe"
+
+#: Target sources that are DERIVED defaults, not a selection (R41 L2,
+#: owner ruling "never fall back to a different embedding model"): the
+#: install record, the install-projected backend env and the hardware
+#: probe describe what the machine WOULD pick — they never re-target a
+#: graph that already has a recorded model. Only an explicit selection
+#: (``CODE_EMBED_MODEL``, the project's Codegraph tab, the Preferences
+#: pin / ``default_code_embedding``) starts the additive re-embed.
+DERIVED_TARGET_SOURCES = frozenset({
+    SOURCE_INSTALL_RECORD, SOURCE_INSTALL_ENV, SOURCE_HARDWARE,
+})
+
+#: v0.2.103 R41 L3 — the "ignoring CODE_EMBED_BACKEND=gpu" stderr line is
+#: emitted once per process, not per resolution (``resolve_code_model_pick``
+#: runs for every ``EmbeddingService.for_project``, the hook router's code
+#: leg and ``status_all``).
+_gpu_backend_ignore_notice_shown = False
 
 #: The binding row's ``config_json`` key holding the fill progress.
 FILL_CONFIG_KEY = "code_model_fill"
@@ -269,45 +293,24 @@ def recorded_code_model(roots: Optional[Sequence] = None) -> Optional[str]:
     return None
 
 
-def _gpu_vendor() -> str:
-    """``"nvidia"`` / ``"amd"`` / ``""`` — the explicit ``VCT_GPU_VENDOR``
-    preference, else the first attributed card, else unknown. The AMD rule
-    needs it: CodeSage has no ROCm build, so an AMD host on the >= 12 GB
-    rung runs qwen3 instead."""
-    try:
-        from vco_lib.gpu_profile import gpu_vendor_preference_from_env
-
-        pref = gpu_vendor_preference_from_env()
-        if pref:
-            return pref
-    except Exception:  # noqa: BLE001 — a failed env read never blocks
-        pass
-    try:
-        from vco_lib import gpu_device
-
-        for cand in gpu_device.enumerate_gpus():
-            vendor = (getattr(cand, "vendor", "") or "").strip().lower()
-            if vendor in ("nvidia", "amd"):
-                return vendor
-    except Exception:  # noqa: BLE001 — soft-fail to "unknown"
-        pass
-    return ""
-
-
 def _hardware_code_model() -> str:
     """The ladder's answer for THIS host, right now — the ONE selector
     install's own profile choice uses
     (:func:`vco_lib.embedding_selection.select_code_model_for_host`), fed by
-    the ONE probe module (:mod:`vco_lib.host_probe`). Reached only when
-    nothing configured and no install record answers."""
+    the ONE probe module (:mod:`vco_lib.host_probe`); VRAM and vendor come
+    from the ONE selected card (:func:`host_probe.selected_gpu_specs`,
+    v0.2.103 R41 M2 — the same choice install makes, so a multi-GPU host
+    cannot make the two disagree). Reached only when nothing configured and
+    no install record answers."""
     from vco_lib.embedding_selection import select_code_model_for_host
     from vco_lib import host_probe
 
+    vram, vendor = host_probe.selected_gpu_specs()
     return select_code_model_for_host(
-        gpu_vram_gb=host_probe.probe_gpu_vram_gb(),
+        gpu_vram_gb=vram,
         ram_gb=host_probe.probe_system_ram_gb(),
         cores=host_probe.probe_cpu_cores(),
-        gpu_vendor=_gpu_vendor(),
+        gpu_vendor=vendor,
     )
 
 
@@ -324,6 +327,7 @@ def resolve_code_model_pick(
     seams for tests; production passes neither. Never raises; the consent
     gate is applied by :func:`resolve_code_model` to whatever model ends up
     effective."""
+    global _gpu_backend_ignore_notice_shown
     env = os.environ if env is None else env
     app_state = app_state or _app_state_reader()
 
@@ -351,12 +355,14 @@ def resolve_code_model_pick(
         # v0.2.103 F1: the projected GPU-service selector is honoured ONLY
         # when the ladder agrees this host should run CodeSage — never below
         # the 12 GB VRAM threshold (a hardware-blind codesage here names a
-        # container this host does not run).
-        print(
-            f"[vct] code-embed: ignoring CODE_EMBED_BACKEND=gpu — the hardware "
-            f"ladder selects {ladder} for this host",
-            file=sys.stderr,
-        )
+        # container this host does not run). R41 L3: once per process.
+        if not _gpu_backend_ignore_notice_shown:
+            _gpu_backend_ignore_notice_shown = True
+            print(
+                f"[vct] code-embed: ignoring CODE_EMBED_BACKEND=gpu — the hardware "
+                f"ladder selects {ladder} for this host",
+                file=sys.stderr,
+            )
         return ladder, SOURCE_HARDWARE
     if backend == "gpu":
         return DEFAULT_CODE_MODEL, SOURCE_INSTALL_ENV
@@ -441,6 +447,20 @@ def read_code_model_record(codegraph_prefix: str) -> Optional[CodeModelRecord]:
     return record_from_binding(read_binding_row(codegraph_prefix))
 
 
+def root_graph_build_recorded(codegraph_prefix: str) -> bool:
+    """True when a launcher build record exists for the prefix's graph —
+    POSITIVE evidence a graph exists (a re-clone of the root whose persisted
+    Weaviate volume still holds the old graph has such a row even though its
+    fresh clone has no manifest), which the extractor-generation first-install
+    gate reads as "do not treat an unanswered existence probe as absent".
+    Soft-fails to True — an unreadable record keeps the conservative
+    unknown-means-owed reading (v0.2.103 R41 M1)."""
+    try:
+        return record_from_binding(read_binding_row(codegraph_prefix)) is not None
+    except Exception:  # noqa: BLE001 — an unreadable record never gates
+        return True
+
+
 def write_code_model_record(codegraph_prefix: str, record: CodeModelRecord) -> bool:
     """Stamp the record onto the project's existing binding row (soft-fail)."""
     from vco_lib.kg_binding_heal import stamp_codegraph_model_record
@@ -498,6 +518,18 @@ def resolve_code_model(
     target, target_source = resolve_code_model_pick(
         env, app_state=app_state, project_target=project_target,
         install_record=install_record, hardware=hardware)
+    if (record is not None and target_source in DERIVED_TARGET_SOURCES
+            and not same_code_model(target, record.model)):
+        # v0.2.103 R41 L2 (coordinator ruling, per the owner rule "never
+        # fall back to a different embedding model — query with the model
+        # the data was embedded with"): a DERIVED default (the install
+        # record, the install-env backend, the hardware probe) describes
+        # what an empty graph WOULD get — it never re-targets a graph that
+        # already has a recorded model. The recorded model wins for both
+        # roles; only an explicit selection (env, the project's Codegraph
+        # tab, the Preferences pin / default_code_embedding) starts the
+        # additive re-embed.
+        target, target_source = record.model, SOURCE_RECORDED
     target_refusal = consent_refusal_for(target, target_source, app_state)
     filling, carry = False, None
     if record is None:
