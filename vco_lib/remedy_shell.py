@@ -41,7 +41,7 @@ from __future__ import annotations
 import shlex
 import sys
 from pathlib import Path
-from typing import Union
+from typing import Sequence, Union
 
 #: Characters that force quoting on Windows. cmd.exe splits on space and tab;
 #: the rest are redirection / grouping metacharacters PowerShell also honours.
@@ -82,6 +82,16 @@ def quote(value: Union[str, Path]) -> str:
     if text and not any(ch in _WIN_NEEDS_QUOTES for ch in text):
         return text
     return '"' + text.replace('"', '""') + '"'
+
+
+def command_line(argv: "Sequence[Union[str, Path]]") -> str:
+    """One printed command line from ``argv``, every part through :func:`quote`.
+
+    The ONE join for "show the user the argv we would spawn": POSIX gets the
+    ``shlex`` form, Windows the double-quoted form ``cmd.exe`` reads (a
+    ``shlex``-quoted ``'C:\\…\\python.exe'`` names a file nobody has).
+    """
+    return " ".join(quote(part) for part in argv)
 
 
 def steps(*commands: str) -> str:

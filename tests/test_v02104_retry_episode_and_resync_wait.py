@@ -35,15 +35,18 @@ CID = "codegraph_embed_resync_pending"
 # ─────────────────────────────── helpers ───────────────────────────────
 
 
-def _trail(folder: Path, *rows: "tuple[str, str]") -> None:
+def _trail(folder: Path, *rows: "tuple") -> None:
+    """Append rows ``(status, detail[, extra fields])`` for :data:`CID`."""
     path = dr.attempts_path(folder)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
-        for i, (status, detail) in enumerate(rows):
-            fh.write(json.dumps({
+        for i, (status, detail, *extra) in enumerate(rows):
+            row = dict(extra[0]) if extra else {}
+            row.update({
                 "ts": f"2026-09-{(i % 28) + 1:02d}T10:00:00Z",
                 "condition_id": CID, "status": status, "detail": detail,
-            }) + "\n")
+            })
+            fh.write(json.dumps(row) + "\n")
 
 
 def _completed_episode() -> "list[tuple[str, str]]":
@@ -130,11 +133,111 @@ def test_an_external_clear_ends_the_episode(tmp_path):
 
 def test_a_clear_inside_an_open_attempt_does_not_reset_the_cap(tmp_path):
     """A handler's child that clears and re-emits must not loop forever."""
-    attempt = [(dr.STARTED, "handler codegraph_resync"),
-               (dr.RESOLVED, "ledger entry cleared"),
-               (dr.INCONCLUSIVE, "the condition is STILL in the ledger")]
-    _trail(tmp_path, *(attempt * dr.MAX_ATTEMPTS))
+    for n in range(dr.MAX_ATTEMPTS):
+        aid = {"attempt": f"4242-a{n}"}
+        _trail(tmp_path,
+               (dr.STARTED, "handler codegraph_resync", aid),
+               (dr.RESOLVED, "ledger entry cleared", {**aid, "attempt_driver_alive": True}),
+               (dr.INCONCLUSIVE, "the condition is STILL in the ledger"))
     assert dr.retry_history(tmp_path, CID).cap_reached
+
+
+def test_a_clear_after_a_driver_died_mid_attempt_ends_the_episode(tmp_path):
+    """R1 M1: the reviewer's trail — the third attempt's driver was SIGKILLed
+    (no verdict row), then the user fixed the condition by hand. Pre-fix the
+    RESOLVED row was read as the dead attempt's own child and the episode
+    stayed capped forever."""
+    _trail(tmp_path,
+           (dr.STARTED, "handler codegraph_resync", {"attempt": "11-a"}),
+           (dr.FAILED, "exited 1"),
+           (dr.STARTED, "handler codegraph_resync", {"attempt": "12-b"}),
+           (dr.FAILED, "exited 1"),
+           (dr.STARTED, "handler codegraph_resync", {"attempt": "13-c"}),
+           (dr.RESOLVED, "cleared by hand"))
+    history = dr.retry_history(tmp_path, CID)
+    assert history.attempts == 0 and not history.cap_reached
+    assert "STOPPED" not in dr.retry_disposition_note(tmp_path, CID)
+
+
+def test_an_orphaned_childs_clear_after_its_driver_died_ends_the_episode(tmp_path):
+    """The killed driver's child kept running and cleared the entry: its row
+    names the open attempt, but records that attempt's dispatcher as gone."""
+    _trail(tmp_path,
+           *(_failed_attempt() * (dr.MAX_ATTEMPTS - 1)),
+           (dr.STARTED, "handler codegraph_resync", {"attempt": "13-c"}),
+           (dr.RESOLVED, "ledger entry cleared",
+            {"attempt": "13-c", "attempt_driver_alive": False}))
+    assert dr.attempt_count(tmp_path, CID) == 0
+
+
+def test_a_clear_naming_another_attempt_ends_the_episode(tmp_path):
+    _trail(tmp_path,
+           (dr.STARTED, "handler codegraph_resync", {"attempt": "13-c"}),
+           (dr.RESOLVED, "ledger entry cleared",
+            {"attempt": "99-z", "attempt_driver_alive": True}))
+    assert dr.attempt_count(tmp_path, CID) == 0
+
+
+def test_record_episode_end_records_the_attempt_context(tmp_path, monkeypatch):
+    def last_row():
+        return json.loads(dr.attempts_path(tmp_path).read_text().splitlines()[-1])
+
+    monkeypatch.delenv(dr.ATTEMPT_ENV, raising=False)
+    dr.record_episode_end(tmp_path, CID, "by hand")
+    assert "attempt" not in last_row()
+    # Inside a live attempt of THIS process.
+    monkeypatch.setenv(dr.ATTEMPT_ENV, f"{__import__('os').getpid()}-x")
+    dr.record_episode_end(tmp_path, CID, "child")
+    assert last_row()["attempt_driver_alive"] is True
+    # Inside an attempt whose dispatcher is gone.
+    monkeypatch.setattr("vco_lib.deferral_probes.pid_is_alive", lambda pid: False)
+    monkeypatch.setenv(dr.ATTEMPT_ENV, "999999-y")
+    dr.record_episode_end(tmp_path, CID, "orphan")
+    assert last_row()["attempt"] == "999999-y"
+    assert last_row()["attempt_driver_alive"] is False
+
+
+def test_a_dispatched_childs_own_clear_is_tied_to_its_attempt(tmp_path, monkeypatch):
+    """End to end: the child clears (in-process stand-in) and re-emits; three
+    dispatches reach the cap, and the env marker does not leak out."""
+    scripts = tmp_path / ".claude" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "analyze_code_graph.py").write_text("# stub\n", encoding="utf-8")
+    monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
+    monkeypatch.delenv(dr.ATTEMPT_ENV, raising=False)
+
+    def child(argv, cwd):
+        emit(tmp_path, _entry())
+        resolve_conditions(tmp_path, (CID,))
+        emit(tmp_path, _entry())
+        return 0
+
+    for _ in range(dr.MAX_ATTEMPTS):
+        dr.dispatch(tmp_path, condition_ids=[CID], backend_probe=lambda *_a: True,
+                    runner=child, single_instance=False)
+    rows = [json.loads(ln) for ln in dr.attempts_path(tmp_path).read_text().splitlines()]
+    started = [r for r in rows if r["status"] == dr.STARTED]
+    resolved = [r for r in rows if r["status"] == dr.RESOLVED]
+    assert [r["attempt"] for r in resolved] == [r["attempt"] for r in started]
+    assert dr.retry_history(tmp_path, CID).cap_reached
+    assert dr.ATTEMPT_ENV not in __import__("os").environ
+
+
+def test_a_handler_that_raises_still_writes_a_verdict(tmp_path, monkeypatch):
+    def boom(argv, cwd):
+        raise RuntimeError("kaboom")
+
+    scripts = tmp_path / ".claude" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "analyze_code_graph.py").write_text("# stub\n", encoding="utf-8")
+    monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
+    with pytest.raises(RuntimeError):
+        dr.dispatch(tmp_path, condition_ids=[CID], backend_probe=lambda *_a: True,
+                    runner=boom, single_instance=False)
+    assert _trail_statuses(tmp_path) == [dr.STARTED, dr.FAILED]
+    # The attempt is closed, so a later hand clear ends the episode.
+    dr.record_episode_end(tmp_path, CID, "by hand")
+    assert dr.attempt_count(tmp_path, CID) == 0
 
 
 def test_the_blocked_streak_is_scoped_to_the_episode_too(tmp_path):
@@ -322,3 +425,79 @@ def test_the_drivers_converged_run_clears_the_entry_it_printed(tmp_path):
     emit(tmp_path, _entry())
     cr._resolve_persisted_resync_deferral(tmp_path)
     assert not DeferralReport.read(tmp_path).has_condition(CID)
+
+
+# ───────────────────── R1 review: L1 / L2 / L3 ─────────────────────
+
+
+@pytest.fixture
+def containers_world(monkeypatch):
+    """A runtime with a canonical-named leftover and an adopted container."""
+    from types import SimpleNamespace
+
+    from vco_lib import containers, ollama_pull, service_endpoints
+
+    world = {"running": {"adopted_ce": True, "vco_code_embed": False}, "rows": {}}
+    monkeypatch.setattr(containers, "installed_runtime", lambda: "podman")
+    monkeypatch.setattr(containers, "find_existing_container",
+                        lambda service, runtime=None: "vco_code_embed")
+    monkeypatch.setattr(service_endpoints, "load_rows", lambda *a, **k: world["rows"])
+
+    def _inspect(runtime, name, run=None):
+        if name not in world["running"]:
+            return ollama_pull.ContainerRun(exists=False)
+        return ollama_pull.ContainerRun(exists=True, running=world["running"][name])
+
+    monkeypatch.setattr(ollama_pull, "inspect_container_run", _inspect)
+    world["row"] = lambda name: SimpleNamespace(container_name=name)
+    return world
+
+
+def test_the_container_check_follows_the_service_rows_container(containers_world):
+    """R1 L1 (W4R-11): the row names the adopted container that serves; the
+    stopped canonical-named leftover beside it is not the service."""
+    containers_world["rows"] = {"code_embed": containers_world["row"]("adopted_ce")}
+    assert cr._backend_container_running("code_embed") is True
+    # Inverse: a running leftover does not stand in for a stopped row container.
+    containers_world["running"] = {"adopted_ce": False, "vco_code_embed": True}
+    assert cr._backend_container_running("code_embed") is False
+
+
+def test_with_no_service_row_the_canonical_lookup_still_applies(containers_world):
+    containers_world["running"]["vco_code_embed"] = True
+    assert cr._backend_container_running("code_embed") is True
+
+
+def test_a_prune_stale_run_never_prints_prune_stale_into_the_resync_entry(
+    tmp_path, monkeypatch,
+):
+    """R1 L2: the stale-image refusal of a run started WITH --prune-stale
+    prints the plain driver — --prune-stale deletes unvisited rows."""
+    analyzer = tmp_path / "analyze_code_graph.py"
+    analyzer.write_text("# stub\n", encoding="utf-8")
+    monkeypatch.setattr(cr, "walk_uses_container", lambda *_a: True)
+    monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "stale")
+    monkeypatch.setattr(cr, "_report_terminal_to_hub", lambda *a, **k: None)
+    printed = []
+    monkeypatch.setattr(cr, "_record_stale_image_deferral",
+                        lambda root, name, cmd, *a, **k: printed.append(cmd))
+    cr._run_resync_and_verify_slotted("MyProj", tmp_path, analyzer, prune_stale=True)
+    assert printed and "--run-resync" in printed[0]
+    assert "--prune-stale" not in printed[0]
+    with pytest.raises(TypeError):
+        kwargs = {"prune_stale": True}
+        cr.driver_resume_command("python", tmp_path, analyzer, "MyProj", **kwargs)
+
+
+def test_the_printed_driver_command_is_quoted_for_windows_shells(monkeypatch):
+    """R1 L3: cmd.exe does not read single quotes — a shlex-quoted
+    ``'C:\\...\\python.exe'`` names a file nobody has."""
+    from vco_lib import remedy_shell
+
+    monkeypatch.setattr(remedy_shell.sys, "platform", "win32")
+    py = r"C:\Program Files\VCO\.venv\Scripts\python.exe"
+    cmd = cr.driver_resume_command(py, Path(r"C:\work\a repo"),
+                                   Path(r"C:\work\a repo\analyze_code_graph.py"), "MyProj")
+    assert "'" not in cmd
+    assert cmd.startswith(f'"{py}" -m vco_lib.codegraph_resync --run-resync')
+    assert '"C:\\work\\a repo"' in cmd
