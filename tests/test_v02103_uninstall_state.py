@@ -66,6 +66,22 @@ def test_the_whole_state_dir_goes_rl_data_and_db_siblings_included(home):
     assert (home / ".vct-secrets" / "shared" / "github_pat").read_text() == "secret"
 
 
+def test_a_second_run_on_an_uninstalled_machine_removes_nothing_and_claims_nothing(home):
+    """Idempotence (the Rust source audit `test_uninstall_is_idempotent_via_
+    existence_guards` checked a per-file `launcher_db.exists()` guard; step
+    [8] removes the whole state dir now, so the property is pinned here by
+    behaviour): after a full run, a second plan finds nothing and executing
+    it neither errors nor reports a removal."""
+    root = _state(home / ".vct")
+    us.execute(us.build_plan(root=root, home=home, env={}, launcher_db=root / "launcher.db"))
+    assert not root.exists()
+    again = us.build_plan(root=root, home=home, env={}, launcher_db=root / "launcher.db")
+    assert not again.exists and not again.db_files
+    audit = us.execute(again)
+    assert not any("removed" in line.lower() for line in audit), audit
+    assert not root.exists()
+
+
 def test_dry_run_lines_name_the_dir_its_size_and_the_rl_data(home):
     root = _state(home / ".vct")
     (root / "license.key").write_text("k")
