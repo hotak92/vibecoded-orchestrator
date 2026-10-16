@@ -225,8 +225,12 @@ def _through_real_dirs(path: Path, anchor: Path) -> bool:
 def _add_file(plan: Plan, path: Path, label: str, anchor: Path) -> None:
     """Plan ``path`` (a file, or a link itself — unlinking a link never
     touches its target) when it is reached only through real directories."""
-    if (path.is_file() or path.is_symlink()) and _through_real_dirs(path, anchor):
+    if not (path.is_file() or path.is_symlink()):
+        return
+    if _through_real_dirs(path, anchor):
         plan.remove.append(Removal(path, "file", label))
+    else:  # reported, never silently dropped (FINAL3 L-1)
+        plan.keep.append((path, f"{label} behind a symlink or junction — not followed"))
 
 
 def build_plan(
@@ -252,6 +256,8 @@ def build_plan(
         for lock in sorted(claims.glob("*.lock")):
             _add_file(plan, lock, "code-graph walk claim", vct_root)
         plan.prune_if_empty.append(claims)
+    elif claims.is_dir():
+        plan.keep.append((claims, "code-graph walk claims behind a symlink or junction — not followed"))
     plan.prune_if_empty.append(state)
     _add_file(plan, vct_root / "model-guidance.json", "model-guidance record", vct_root)
     logs = vct_root / "logs"
@@ -280,6 +286,8 @@ def build_plan(
                 if _is_vco_exe(dest / "vct-hub.exe"):
                     plan.hub_binaries.append(dest / "vct-hub.exe")
                 plan.prune_if_empty.append(dest)
+            elif dest.is_dir():
+                plan.keep.append((dest, "prebuilt launcher folder behind a symlink or junction — not followed"))
         lnk_dirs = list(_windows_desktop_dirs(env))
         appdata = env.get("APPDATA")
         if appdata:
@@ -297,6 +305,8 @@ def build_plan(
     if flat_dir.is_dir() and _through_real_dirs(flat_dir / "x", home):
         _add_file(plan, flat_dir / "vct-launcher", "prebuilt launcher binary", home)
         plan.prune_if_empty.append(flat_dir)
+    elif flat_dir.is_dir():
+        plan.keep.append((flat_dir, "prebuilt launcher folder behind a symlink or junction — not followed"))
 
     if os_name == "Linux":
         xdg = env.get("XDG_DATA_HOME")

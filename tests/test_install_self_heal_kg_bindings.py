@@ -238,6 +238,7 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         self._env_patch.stop()
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -812,6 +813,7 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
         self._env_patch.stop()
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -1393,6 +1395,7 @@ class SelfHealDeadRootRowSweepEndToEndTests(unittest.TestCase):
         self._env_patch.stop()
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -1509,6 +1512,7 @@ class SelfHealIdentityPickRemedyEndToEndTests(unittest.TestCase):
         self._env_patch.stop()
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)

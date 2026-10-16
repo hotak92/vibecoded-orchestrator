@@ -230,7 +230,9 @@ def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Option
                       f"— not followed; ")
     decision = _decide_unpicked(derived, bound, live_counts, names, known,
                                 record_model, target_model, pending_fill, prefix)
-    if refused:
+    # a refused pick that the unpicked rules keep anyway (it IS the bound
+    # class) was not "not followed" — no refusal is reported (FINAL3 M-1)
+    if refused and decision.name != refused:
         decision = replace(decision, picked_refused=refused,
                            profile_unresolved=profile_unresolved,
                            pick_unverifiable=unverifiable)
@@ -323,7 +325,8 @@ def resolve_shared_name(folder=None, *, fallback: str) -> str:
     2. The project's existing on-disk ``SHARED_KG_COLLECTION`` pin — a value
        already in ``.claude/settings.json`` is a user/launcher decision, and an
        explicit empty string is the documented "cross-project fan-out
-       intentionally disabled" choice, honoured verbatim.
+       intentionally disabled" choice, honoured verbatim — when no
+       Identity-tab pick (rule 0) precedes it, exactly as in the hub.
     3. The ORCHESTRATOR-ROOT project's ``shared`` binding, then its ``primary``.
     4. ``fallback`` — a genuinely launcher-less standalone install, where this
        name is also what bootstrap will create.

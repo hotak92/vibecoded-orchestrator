@@ -361,3 +361,20 @@ def test_a_non_ascii_exe_name_is_never_recognised(tmp_path):
     exe = tmp_path / "vct-hüb.exe"
     exe.write_bytes(b"MZ" + b"\0" * 64 + "vct-hüb".encode())
     assert ua._is_vco_exe(exe) is False
+
+
+@pytest.mark.parametrize("redirected", ["logs", "state/codegraph-walk-claims"])
+def test_a_vco_file_behind_a_junction_is_reported_left_not_dropped(tmp_path, monkeypatch, redirected):
+    """FINAL3 L-1: a VCO file the step will not follow a link to is listed as
+    left in place, and the plan never claims there is nothing to do."""
+    root = tmp_path / "vct"
+    (root / "state" / "codegraph-walk-claims").mkdir(parents=True)
+    (root / "logs").mkdir()
+    (root / "state" / "codegraph-walk-claims" / "a.lock").write_text("")
+    (root / "logs" / "engine-start.log").write_text("")
+    junction = root / redirected
+    real = ua._is_reparse
+    monkeypatch.setattr(ua, "_is_reparse", lambda p: p == junction or real(p))
+    plan = ua.build_plan(os_name="Linux", home=tmp_path / "home", vct_root=root, env={})
+    assert any(junction == p or junction in p.parents for p, _why in plan.keep)
+    assert "[skip]" not in "\n".join(ua.plan_lines(plan))

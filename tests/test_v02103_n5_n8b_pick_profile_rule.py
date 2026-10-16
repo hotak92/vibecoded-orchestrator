@@ -474,3 +474,13 @@ def test_bundle_update_pointer_heal_passes_the_predicate(tmp_path, monkeypatch):
         assert verdicts == [PICK]
     finally:
         server.shutdown()
+
+
+def test_final3_m1_a_pick_that_is_the_bound_class_is_never_reported_refused():
+    """FINAL3 M-1: when the Identity-tab pick IS the bound class and its model
+    cannot be read, the unpicked rules keep that same class — the root uses
+    the pick, so no "not followed" deferral may be recorded."""
+    d = rki.decide(ROOT, CONST, {CONST: 900}, None, MODEL, "",
+                   picked=CONST, picked_model=None)
+    assert d.name == CONST
+    assert d.picked_refused is None
