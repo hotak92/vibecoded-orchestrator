@@ -1178,3 +1178,204 @@ def test_r33_closed_fence_inside_an_unclosed_tail_is_still_skipped():
 def test_r33_closed_fences_behave_as_before():
     text = "a\n```\ncode CONFIRMED\n```\nb\n~~~\nmore\n~~~\nc\n"
     assert [ln for ln in guard._judged_lines(text) if ln] == ["a", "b", "c"]
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 5. FINAL3 L-2 (Fable ship-gate 2026-10-16): a non-root project's reverted
+# `scope: shared` node was embedded into the SHARED collection by the
+# edit-time sync (v0.2.89 scope routing), so the prune must delete it there
+# too — hash-scoped ALWAYS (a sibling's same-path row survives unless
+# byte-identical), skipped with a reason when shared writes are disabled or
+# no hash names the path, and the guard's log carries the per-collection
+# outcome verbatim. The root (KG == shared) and the project-collection arm
+# are unchanged.
+# ═════════════════════════════════════════════════════════════════════════
+
+SHARED = "TestProject_SharedKnowledgeGraph"
+
+
+def _as_non_root_shared(mod, monkeypatch):
+    monkeypatch.setattr(mod, "SHARED_COLLECTION_NAME", SHARED)
+    monkeypatch.setattr(mod, "_PRUNE_MISSING", True)
+
+
+def _shared_seed(mod, server, rel: str, content_hash: str) -> None:
+    server.client.collections.get(SHARED).data.insert(
+        properties={"title": "T", "file_path": rel,
+                    "content_hash": content_hash})
+
+
+def _shared_rows(mod, server) -> list:
+    store = server.client.collections.get(SHARED)._store
+    return sorted((o.properties.get("file_path"),
+                   o.properties.get("content_hash")) for o in store.values())
+
+
+def test_l2_shared_rows_of_a_reverted_shared_node_are_deleted_hash_scoped(
+        sync_mod, monkeypatch, capsys):
+    """RED before FINAL3 L-2: the prune looked only in the project
+    collection, so the shared row outlived the file."""
+    mod, server, root = sync_mod
+    _as_non_root_shared(mod, monkeypatch)
+    _seed_hashed(mod, server, GONE, _H_SIBLING)      # a stale project row
+    _seed_hashed(mod, server, "knowledge/concepts/other-node.md", _H_SIBLING)
+    _shared_seed(mod, server, GONE, _H_REVIEWER)     # the reviewer's write
+    _shared_seed(mod, server, GONE, _H_REVIEWER)     # its second chunk
+    _shared_seed(mod, server, GONE, _H_SIBLING)      # a sibling's shared row
+    _shared_seed(mod, server, "knowledge/concepts/gone-node-sibling.md",
+                 _H_REVIEWER)                        # token-superset path
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    outcome = mod.sync_node(server, root / GONE)
+    assert outcome and outcome.status == mod.OUTCOME_EXCLUDED_SKIPPED
+    # project collection: unchanged semantics — every exact-path row goes
+    assert _hashed_rows(mod, server) == [
+        ("knowledge/concepts/other-node.md", _H_SIBLING)]
+    # shared collection: only the reviewer's byte-identical rows go
+    assert _shared_rows(mod, server) == sorted([
+        (GONE, _H_SIBLING),
+        ("knowledge/concepts/gone-node-sibling.md", _H_REVIEWER)])
+    rec = _result(capsys)
+    assert rec["status"] == kg_prune_result.STATUS_DELETED
+    assert rec["deleted"] == 3  # 1 project row + 2 shared rows
+    assert rec["kept"] == 1     # the sibling's same-path shared row
+    colls = rec["collections"]
+    assert colls[mod.COLLECTION_NAME] == {
+        "status": kg_prune_result.STATUS_DELETED, "deleted": 1, "kept": 0,
+        "reason": ""}
+    assert colls[SHARED] == {
+        "status": kg_prune_result.STATUS_DELETED, "deleted": 2, "kept": 1,
+        "reason": ""}
+    # the guard's log phrase names both collections and both counts
+    phrase = kg_prune_result.describe(rec)
+    assert f"removed 1 row(s) from '{mod.COLLECTION_NAME}'" in phrase
+    assert f"removed 2 row(s) from '{SHARED}'" in phrase
+    assert "1 row(s) with other content" in phrase
+
+
+def test_l2_shared_write_disabled_skips_the_shared_collection_with_a_reason(
+        sync_mod, monkeypatch, capsys):
+    """The node cannot have been embedded in the shared collection by this
+    project's sync when shared writes are disabled — skipped, said so."""
+    mod, server, root = sync_mod
+    _as_non_root_shared(mod, monkeypatch)
+    monkeypatch.setenv("SHARED_KG_WRITE_DISABLED", "true")
+    _seed_hashed(mod, server, GONE, _H_SIBLING)
+    _shared_seed(mod, server, GONE, _H_REVIEWER)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    mod.sync_node(server, root / GONE)
+    # project arm unchanged; shared rows untouched
+    assert _hashed_rows(mod, server) == []
+    assert _shared_rows(mod, server) == [(GONE, _H_REVIEWER)]
+    rec = _result(capsys)
+    assert rec["status"] == kg_prune_result.STATUS_DELETED
+    assert rec["deleted"] == 1
+    sub = rec["collections"][SHARED]
+    assert sub["status"] == kg_prune_result.STATUS_SKIPPED
+    assert "SHARED_KG_WRITE_DISABLED" in sub["reason"]
+    phrase = kg_prune_result.describe(rec)
+    assert f"'{SHARED}'" in phrase and "SHARED_KG_WRITE_DISABLED" in phrase
+
+
+def test_l2_no_hash_names_the_path_so_nothing_is_deleted_from_shared(
+        sync_mod, monkeypatch, capsys):
+    """Hash-scoped ALWAYS on the shared collection: without a hash the
+    sibling-risk wins and nothing is deleted there — reported."""
+    mod, server, root = sync_mod
+    _as_non_root_shared(mod, monkeypatch)
+    _seed_hashed(mod, server, GONE, _H_SIBLING)
+    _shared_seed(mod, server, GONE, _H_REVIEWER)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {})
+    mod.sync_node(server, root / GONE)
+    assert _hashed_rows(mod, server) == []
+    assert _shared_rows(mod, server) == [(GONE, _H_REVIEWER)]
+    rec = _result(capsys)
+    assert rec["status"] == kg_prune_result.STATUS_DELETED
+    sub = rec["collections"][SHARED]
+    assert sub["status"] == kg_prune_result.STATUS_SKIPPED
+    assert "--prune-hash" in sub["reason"]
+    assert kg_prune_result.describe(rec).count("removed 1 row(s)") == 1
+
+
+def test_l2_shared_arm_weaviate_down_reports_the_failure_per_collection(
+        sync_mod, monkeypatch, capsys):
+    """A shared-collection delete failure is named, never swallowed into a
+    success record."""
+    mod, server, root = sync_mod
+    _as_non_root_shared(mod, monkeypatch)
+    real_get = server.client.collections.get
+
+    def flaky_get(name):
+        if name == SHARED:
+            raise ConnectionError("shared store unreachable")
+        return real_get(name)
+
+    server.client.collections = types.SimpleNamespace(get=flaky_get)
+    _seed_hashed(mod, server, GONE, _H_SIBLING)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    outcome = mod.sync_node(server, root / GONE)
+    assert outcome.status == mod.OUTCOME_FAILED
+    rec = _result(capsys)
+    assert rec["status"] == kg_prune_result.STATUS_FAILED
+    assert "shared store unreachable" in rec["reason"]
+    sub = rec["collections"][SHARED]
+    assert sub["status"] == kg_prune_result.STATUS_FAILED
+    # the project arm's own removal is still reported, not erased
+    assert rec["collections"][mod.COLLECTION_NAME]["deleted"] == 1
+    assert "shared store unreachable" in kg_prune_result.describe(rec)
+
+
+def test_l2_root_prune_record_stays_single_collection(
+        sync_mod, monkeypatch, capsys):
+    """Root (KG == shared): the record format is unchanged — one collection,
+    no per-collection split."""
+    mod, server, root = sync_mod
+    _seed_hashed(mod, server, GONE, _H_REVIEWER)
+    _as_root(mod, monkeypatch)
+    monkeypatch.setattr(mod, "_PRUNE_HASHES", {GONE: _H_REVIEWER})
+    mod.sync_node(server, root / GONE)
+    rec = _result(capsys)
+    assert (rec["status"], rec["deleted"], rec["kept"]) == (
+        kg_prune_result.STATUS_DELETED, 1, 0)
+    assert "collections" not in rec
+
+
+def test_l2_guard_log_states_the_per_collection_outcome(
+        tmp_path, monkeypatch):
+    """The guard's resync log renders the per-collection record the sync
+    now prints — both collection names, truthful counts."""
+    root = _resync_root(tmp_path)
+    stdout = kg_prune_result.format_line(
+        "knowledge/gone.md", kg_prune_result.STATUS_DELETED,
+        deleted=3, kept=1,
+        collections={"TestProject_KnowledgeGraph": {
+            "status": kg_prune_result.STATUS_DELETED, "deleted": 1,
+            "kept": 0, "reason": ""},
+            SHARED: {"status": kg_prune_result.STATUS_DELETED,
+                     "deleted": 2, "kept": 1, "reason": ""}})
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout + "\n",
+                                           stderr="")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    lines: List[str] = []
+    guard.resync_with(root, lines.append)(["knowledge/gone.md"],
+                                          {"knowledge/gone.md": _H_REVIEWER})
+    assert "removed 1 row(s) from 'TestProject_KnowledgeGraph'" in lines[-1]
+    assert f"removed 2 row(s) from '{SHARED}'" in lines[-1], lines[-1]
+    assert "1 row(s) with other content" in lines[-1], lines[-1]
+
+
+def test_l2_format_line_roundtrips_the_per_collection_breakdown():
+    line = kg_prune_result.format_line(
+        GONE, kg_prune_result.STATUS_SKIPPED,
+        collections={SHARED: {
+            "status": kg_prune_result.STATUS_SKIPPED, "deleted": 0,
+            "kept": 0, "reason": "no hash"}})
+    rec = kg_prune_result.parse_lines(line).get(GONE)
+    assert rec is not None
+    assert rec["collections"][SHARED]["reason"] == "no hash"
+    with pytest.raises(ValueError):
+        kg_prune_result.format_line(
+            GONE, kg_prune_result.STATUS_DELETED,
+            collections={SHARED: {"status": "nonsense"}})

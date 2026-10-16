@@ -21,6 +21,15 @@ Statuses:
 * ``nothing_matched`` — no row matched, nothing removed;
 * ``skipped`` — deliberately not removed (``reason`` says why);
 * ``failed`` — the removal failed (``reason`` carries the error).
+
+v0.2.103 FINAL3 L-2: a record may also carry a ``collections`` breakdown —
+one sub-record per collection — when the prune touched more than one
+collection (a non-root project whose reverted node was ``scope: shared``:
+its rows live in the SHARED collection, so the prune deletes there too,
+hash-scoped). The top-level fields stay the aggregate and
+:func:`describe` then names each collection with its own counts; a record
+without ``collections`` (the single-collection case, including the
+orchestrator root) is formatted exactly as before.
 """
 
 from __future__ import annotations
@@ -40,15 +49,40 @@ STATUSES = (STATUS_DELETED, STATUS_NOTHING_MATCHED, STATUS_SKIPPED,
 
 
 def format_line(path: str, status: str, *, deleted: int = 0, kept: int = 0,
-                reason: str = "") -> str:
+                reason: str = "",
+                collections: Optional[Dict[str, dict]] = None) -> str:
     """The result line for one pruned target (``path`` is its project-relative
-    POSIX file_path)."""
+    POSIX file_path).
+
+    ``collections`` (FINAL3 L-2), when given, adds a per-collection
+    breakdown for a prune that touched more than one collection: each
+    value is ``{"status": ..., "deleted": n, "kept": m, "reason": ...}``
+    for that collection. The top-level fields stay the AGGREGATE the
+    caller computed (rows removed in total, kept in total, and a status
+    that is ``failed`` when any collection's removal failed). ``None`` —
+    the single-collection case — keeps the exact pre-L-2 record.
+    """
     if status not in STATUSES:
         raise ValueError(f"unknown prune status {status!r}")
-    return PREFIX + json.dumps(
-        {"path": path, "status": status, "deleted": int(deleted),
-         "kept": int(kept), "reason": reason},
-        ensure_ascii=False, sort_keys=True)
+    rec: Dict[str, object] = {
+        "path": path, "status": status, "deleted": int(deleted),
+        "kept": int(kept), "reason": reason}
+    if collections is not None:
+        checked: Dict[str, dict] = {}
+        for name, sub in collections.items():
+            sub_rec = sub if isinstance(sub, dict) else {}
+            sub_status = sub_rec.get("status")
+            if sub_status not in STATUSES:
+                raise ValueError(
+                    f"unknown prune status {sub_status!r} for collection "
+                    f"{name!r}")
+            checked[name] = {
+                "status": sub_status,
+                "deleted": int(sub_rec.get("deleted") or 0),
+                "kept": int(sub_rec.get("kept") or 0),
+                "reason": str(sub_rec.get("reason") or "")}
+        rec["collections"] = checked
+    return PREFIX + json.dumps(rec, ensure_ascii=False, sort_keys=True)
 
 
 def parse_lines(stdout: Optional[str]) -> Dict[str, dict]:
@@ -69,12 +103,37 @@ def parse_lines(stdout: Optional[str]) -> Dict[str, dict]:
     return out
 
 
+def _describe_collection(name: str, sub: dict) -> str:
+    """A log phrase for one ``collections`` sub-record (FINAL3 L-2)."""
+    status = sub.get("status")
+    deleted = int(sub.get("deleted") or 0)
+    kept = int(sub.get("kept") or 0)
+    reason = str(sub.get("reason") or "")
+    if status == STATUS_DELETED:
+        tail = (f" ({kept} row(s) with other content at the same path kept)"
+                if kept else "")
+        return f"removed {deleted} row(s) from '{name}'{tail}"
+    if status == STATUS_NOTHING_MATCHED:
+        tail = (f" ({kept} row(s) with other content at the same path kept)"
+                if kept else "")
+        return f"no rows matched in '{name}', nothing removed{tail}"
+    if status == STATUS_SKIPPED:
+        return f"'{name}' not pruned: {reason or 'skipped'}"
+    return f"removal from '{name}' FAILED: {reason or 'unknown error'}"
+
+
 def describe(rec: Optional[dict], collection_hint: str = "the KG collection"
              ) -> str:
     """A log phrase that states exactly what the result record says."""
     if rec is None:
         return ("removal NOT confirmed (the sync script reported no result "
                 "for it)")
+    colls = rec.get("collections")
+    if isinstance(colls, dict) and colls:
+        return "; ".join(
+            _describe_collection(str(name),
+                                 sub if isinstance(sub, dict) else {})
+            for name, sub in colls.items())
     status = rec.get("status")
     deleted = int(rec.get("deleted") or 0)
     kept = int(rec.get("kept") or 0)

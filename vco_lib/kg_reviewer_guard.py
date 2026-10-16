@@ -105,7 +105,10 @@ the reviewer.
    store does not keep the reviewer's version; a reverted NEW node's rows
    are pruned instead — on the orchestrator root (KG collection == shared
    collection) only the rows carrying the reviewer's exact bytes' content
-   hash — and the log states what the sync reported (:func:`resync_with`).
+   hash, and on a non-root project the shared collection's rows of a
+   ``scope: shared`` node too (same hash scoping; skipped with a reason
+   when shared writes are disabled or no hash names the path) — and the
+   log states what the sync reported (:func:`resync_with`).
    An UNATTRIBUTABLE run
    (no stream events) judges, reverts and commits NOTHING: without proof of
    who wrote what, any knowledge/ change since the snapshot may be the
@@ -1553,8 +1556,11 @@ def resync_with(project_root: Path, log: Log,
     ``--prune-missing`` (plus ``--prune-hash <rel>=<content_hash>`` for each
     gone path validate hashed — what lets the orchestrator root, whose KG
     collection is the shared one, delete only the rows carrying the
-    reviewer's exact bytes; R33 N1). The log states, per gone path, what
-    the script REPORTED (``vco_lib.kg_prune_result``): rows removed, nothing
+    reviewer's exact bytes; R33 N1 — and, on a non-root project, what lets
+    the sync delete a ``scope: shared`` node's rows from the SHARED
+    collection under the same hash scoping; FINAL3 L-2). The log states,
+    per gone path, what the script REPORTED (``vco_lib.kg_prune_result``):
+    rows removed (per collection when more than one was touched), nothing
     matched, skipped and why, or failed — and "not confirmed" when the
     script printed no result, never an assumed removal. A failure (Weaviate
     down) is logged, never raised."""
