@@ -26,18 +26,19 @@ from vco_lib import materialize, model_selection
 
 #: The source grid (medium-effort re-score, 2026-10-03; owner-approved
 #: revision 2026-10-08: Haiku 5.5 replaces Haiku 4.5, GLM-5.3 Review 8,
-#: DeepSeek V4.1 Flash Docs 7), transcribed verbatim: row id -> the 11
+#: DeepSeek V4.1 Flash Docs 7; re-score 2026-10-16: GLM-5.3 Debug 5, DeepSeek
+#: Review 7, `*` dropped on Opus Instr / Kimi Review / DeepSeek Instr), transcribed verbatim: row id -> the 11
 #: column scores, in the source's row ORDER.
 #: Columns: Code, Debug, Review, Plan, Bulk, Tools, Instr, LongCtx, Docs,
 #: Vision, Cost.
 EXPECTED_SCORES = {
-    "opus": ["10", "10", "9", "9", "5", "10", "8*", "10", "9", "10", "4"],
+    "opus": ["10", "10", "9", "9", "5", "10", "8", "10", "9", "10", "4"],
     "fable": ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"],
-    "glm-5.3": ["7", "6", "8", "6", "6", "6", "7*", "7", "7", "—", "8"],
+    "glm-5.3": ["7", "5", "8", "6", "6", "6", "7*", "7", "7", "—", "8"],
     # v0.2.102: scored from cited evidence, not the maintainer's
     # grid — see the comment above the row in model_selection.toml.
-    "kimi-k3": ["7", "6", "6*", "6*", "3", "7", "7*", "8", "8", "8", "3"],
-    "deepseek-v4.1-flash": ["7", "6", "6", "6", "9", "6", "7*", "8", "7", "7", "10"],
+    "kimi-k3": ["7", "6", "6", "6*", "3", "7", "7*", "8", "8", "8", "3"],
+    "deepseek-v4.1-flash": ["7", "6", "7", "6", "9", "6", "7", "8", "7", "7", "10"],
     "sonnet": ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"],
     "qwen3.8-max": ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"],
     "glm-5.3-flash": ["5", "5", "5", "5", "8", "5", "6*", "7", "6*", "8", "8"],
@@ -60,8 +61,11 @@ EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
 #: does (v0.2.103 final review L-3).
 EXPECTED_NOTES = [
     ("opus", "**Opus 5.5** leads at medium on almost every axis and costs less "
-             "per task than Fable 5.1 (≈$1.3 vs ≈$3.0); keep Fable for final "
-             "reviews, plans and the hardest debugging."),
+             "per task than Fable 5.1 (≈$1.3 vs ≈$3.0); as a fix-round "
+             "implementer it converges reliably, but its first-pass lanes still "
+             "need an independent review. Keep Fable for final reviews, plans "
+             "and the hardest debugging — a Fable delta review after each fix "
+             "wave has kept finding issues that every per-lane review missed."),
     ("sonnet", "**Sonnet 5.5** is the most effort-sensitive model: near Opus at "
                "max, but well behind it on coding at medium. Not a default "
                "choice."),
@@ -79,7 +83,8 @@ EXPECTED_NOTES = [
                             "to first token) and cheapest per task: default for "
                             "research, surveys, bulk and bounded implementation. "
                             "Users report fragile tool calls / loops on long runs "
-                            "— keep tasks bounded."),
+                            "— keep tasks bounded. Accurate as a read-only "
+                            "verifier of bounded fix deltas."),
     ("glm-5.3", "**GLM-5.3** — the non-Claude model users route review/audit to; "
                 "text-only."),
     ("glm-5.3", "**GLM-5.3 as implementer** — strong on bounded lanes whose brief "
@@ -87,7 +92,10 @@ EXPECTED_NOTES = [
                 "misses are \"every call-site\" coverage claims (check them with "
                 "an independent grep), line-count / ASCII gates, and stray "
                 "working-tree edits while proving a test red — name each in the "
-                "brief."),
+                "brief. Fixes to install-order or stateful code can pass their "
+                "own tests and still fail in the real order: ask for a real-order "
+                "check, and move a fix that two rounds closed only partly to "
+                "another model family."),
     ("kimi-k3", "**Kimi K3** — near-frontier code quality on real repos and "
                 "strong long-context retrieval, but the slowest and most verbose "
                 "lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about "
