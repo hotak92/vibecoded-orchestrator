@@ -129,7 +129,7 @@ class TestTransientKeepsRows:
             sleeper=_no_sleep)
         assert providers == frozenset({"anthropic", "zai", "qwen"})
         md = model_selection.render_grid(providers=providers)
-        assert "GLM-5.3 †" in md and "Qwen3.8-Max †" in md
+        assert "| GLM-5.3 (" in md and "Qwen3.8-Max †" in md
         assert "Kimi K3" not in md
 
     def test_unavailable_is_retried_before_the_record_is_consulted(
@@ -248,7 +248,7 @@ class TestTransientKeepsRows:
             md = model_selection.render_grid()
             # Row fragments are the discriminators — the Sonnet note NAMES
             # GLM-5.3 in prose (same trap test_model_selection_grid documents).
-            assert "Kimi K3 †" in md and "| GLM-5.3 † (" not in md
+            assert "Kimi K3 †" in md and "| GLM-5.3 (" not in md
         finally:
             model_selection.set_provider_override(None)
 
@@ -433,14 +433,14 @@ class TestRefreshEngine:
         assert result["projects"][0]["changed"] is True
         # Row fragments are the discriminators: the rendered grid's Sonnet
         # note NAMES GLM-5.3 in prose (test_model_selection_grid's own trap).
-        assert "| GLM-5.3 † (" not in first and "Kimi K3 †" not in first
+        assert "| GLM-5.3 (" not in first and "Kimi K3 †" not in first
 
         # The user adds a z.ai key; the next refresh renders the GLM rows.
         states["zai"] = model_selection.KeyState.PRESENT
         result, notice = _refresh(root, db, state_path, states, monkeypatch)
         second = claude.read_text(encoding="utf-8")
         assert result["projects"][0]["changed"] is True
-        assert "| GLM-5.3 † (" in second
+        assert "| GLM-5.3 (" in second
         assert "- **The z.ai lane**" in second
         assert "The kimi-vendor lane" not in second
         assert "model guidance refreshed" in notice
@@ -455,13 +455,13 @@ class TestRefreshEngine:
         states = {v: model_selection.KeyState.ABSENT for v in VENDORS}
         states["zai"] = model_selection.KeyState.PRESENT
         _refresh(root, db, state_path, states, monkeypatch)
-        assert "| GLM-5.3 † (" in claude.read_text(encoding="utf-8")
+        assert "| GLM-5.3 (" in claude.read_text(encoding="utf-8")
 
         states["zai"] = model_selection.KeyState.ABSENT
         result, _ = _refresh(root, db, state_path, states, monkeypatch)
         assert result["projects"][0]["changed"] is True
         text = claude.read_text(encoding="utf-8")
-        assert "| GLM-5.3 † (" not in text
+        assert "| GLM-5.3 (" not in text
         assert "- **The z.ai lane**" not in text
 
     def test_unchanged_output_writes_nothing(self, tmp_path, monkeypatch):
@@ -542,7 +542,7 @@ class TestRefreshEngine:
         # AUTO markers survives, not its absolute position.
         assert "user head" in text
         assert text.endswith("user tail\n")
-        assert "| GLM-5.3 † (" in text
+        assert "| GLM-5.3 (" in text
         assert entry.path in result["root"]["changed"]
 
     def test_last_refresh_is_recorded_for_the_gui(self, tmp_path, monkeypatch):

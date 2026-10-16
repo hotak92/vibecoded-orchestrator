@@ -47,8 +47,8 @@ EXPECTED_SCORES = {
 }
 
 #: Rows carrying the `†` marker (only xhigh/max benchmark results).
-EXPECTED_DAGGERS = {"glm-5.3", "kimi-k3", "qwen3.8-max", "glm-5.3-flash",
-                    "qwen3.8-flash"}
+#: GLM-5.3 lost its dagger 2026-10-16 (owner): ~110 own medium-effort lanes.
+EXPECTED_DAGGERS = {"kimi-k3", "qwen3.8-max", "glm-5.3-flash", "qwen3.8-flash"}
 
 EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
                     "Instr", "LongCtx", "Docs", "Vision", "Cost"]
@@ -157,7 +157,7 @@ class TestProviderFilter:
 
     def test_zai_key_adds_the_glm_rows_only(self):
         md = model_selection.render_grid(providers=frozenset({"anthropic", "zai"}))
-        assert _rows_rendered(md) == set(CLAUDE_ROWS) | {"GLM-5.3 †", "GLM-5.3-Flash †"}
+        assert _rows_rendered(md) == set(CLAUDE_ROWS) | {"GLM-5.3", "GLM-5.3-Flash †"}
         assert "the non-Claude model users route review/audit to" in md
         assert "GLM-5.3 as implementer" in md
         assert "6.9% of rollouts" in md
@@ -170,7 +170,7 @@ class TestProviderFilter:
         per-vendor-block."""
         md = model_selection.render_grid(providers=frozenset({"anthropic", "qwen"}))
         assert _rows_rendered(md) == set(CLAUDE_ROWS) | {
-            "GLM-5.3 †", "DeepSeek V4.1 Flash", "Qwen3.8-Max †", "Qwen3.8-Flash †",
+            "GLM-5.3", "DeepSeek V4.1 Flash", "Qwen3.8-Max †", "Qwen3.8-Flash †",
         }
         assert "GLM-5.3-Flash" not in md
         assert "best prose and literal instruction-following" in md
@@ -241,7 +241,7 @@ class TestGridData:
         grid = model_selection.load_grid()
         assert {row.id for row in grid.rows if row.dagger} == EXPECTED_DAGGERS
         md = model_selection.render_grid(providers=frozenset({"anthropic", "zai"}))
-        assert "| GLM-5.3 † (" in md and "**`†`**" in md
+        assert "| GLM-5.3-Flash † (" in md and "| GLM-5.3 (" in md and "**`†`**" in md
 
     def test_notes_match_the_source_grid(self):
         """The per-model notes AND the model-independent general notes are the

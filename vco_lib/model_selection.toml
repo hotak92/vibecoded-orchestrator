@@ -78,7 +78,8 @@ scores = ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"]
 [[row]]
 id = "glm-5.3"
 model = "GLM-5.3"
-dagger = true
+# No dagger since 2026-10-16 (owner): this setup's own ~110 reviewed GLM-5.3
+# lanes, all at medium effort, are real medium-effort evidence.
 reach_via = "glm-implementer / glm-implementer-high / glm-reviewer / glm-planner"
 providers = ["zai", "qwen"]
 # Review 7 -> 8 (owner 2026-10-08): this setup's own reviewed-lane record now
