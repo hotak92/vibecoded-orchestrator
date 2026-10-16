@@ -484,3 +484,4 @@ def test_final3_m1_a_pick_that_is_the_bound_class_is_never_reported_refused():
                    picked=CONST, picked_model=None)
     assert d.name == CONST
     assert d.picked_refused is None
+    assert "not followed" not in d.reason  # R37 N-1

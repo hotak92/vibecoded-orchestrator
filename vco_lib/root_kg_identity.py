@@ -236,6 +236,9 @@ def decide(root, bound: Optional[str], live_counts: Optional[Mapping[str, Option
         decision = replace(decision, picked_refused=refused,
                            profile_unresolved=profile_unresolved,
                            pick_unverifiable=unverifiable)
+    elif refused:  # kept anyway: its reason must not say "not followed" (R37 N-1)
+        decision = _decide_unpicked(derived, bound, live_counts, names, known,
+                                    record_model, target_model, pending_fill, "")
     return decision
 
 
