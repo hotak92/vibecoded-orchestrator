@@ -386,6 +386,12 @@ pub async fn set_secret_v2(
     // keychain.
     refresh_env_after_user_secret_change_blocking(app, &project_id, &scope, &module_id, "set_secret_v2")
         .await;
+    // v0.2.103 (plan item 12): a key change may add/remove a model provider —
+    // re-render the model guidance (detached; writes only on change).
+    crate::commands::model_guidance::spawn_model_guidance_refresh(
+        &db,
+        crate::commands::model_guidance::REFRESH_TRIGGER_SECRETS,
+    );
     Ok(())
 }
 
@@ -426,6 +432,12 @@ pub async fn clear_secret_v2(
     // (Lifecycle B) so reactivate is one-click.
     refresh_env_after_user_secret_change_blocking(app, &project_id, &scope, &module_id, "clear_secret_v2")
         .await;
+    // v0.2.103 (plan item 12): a paused key may remove a model provider —
+    // re-render the model guidance (detached; writes only on change).
+    crate::commands::model_guidance::spawn_model_guidance_refresh(
+        &db,
+        crate::commands::model_guidance::REFRESH_TRIGGER_SECRETS,
+    );
     Ok(())
 }
 
@@ -468,6 +480,12 @@ pub async fn reactivate_secret_v2(
         "reactivate_secret_v2",
     )
     .await;
+    // v0.2.103 (plan item 12): a resumed key may add a model provider —
+    // re-render the model guidance (detached; writes only on change).
+    crate::commands::model_guidance::spawn_model_guidance_refresh(
+        &db,
+        crate::commands::model_guidance::REFRESH_TRIGGER_SECRETS,
+    );
     Ok(())
 }
 
@@ -549,6 +567,12 @@ pub async fn remove_secret_v2(
         Some(&module_id),
         &remove_audit_payload(&scope, &key, project_name.as_deref()),
     )?;
+    // v0.2.103 (plan item 12): a removed key may drop a model provider —
+    // re-render the model guidance (detached; writes only on change).
+    crate::commands::model_guidance::spawn_model_guidance_refresh(
+        &db,
+        crate::commands::model_guidance::REFRESH_TRIGGER_SECRETS,
+    );
     Ok(())
 }
 

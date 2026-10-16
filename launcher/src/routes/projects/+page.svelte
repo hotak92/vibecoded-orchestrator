@@ -140,14 +140,22 @@
   const attention = $derived(needsAttentionCount(census));
   const censusSummary = $derived(summaryLine(census));
 
-  // v0.2.101 (PLAN-V02101-PULL-IN §7, owner ruling 2026-10-05 — P299-C3):
-  // a card click routes into the project's SETTINGS page. Before the
-  // v0.2.99-era rework this is where users landed from the card; the
-  // rework left them on the project overview and the settings surface —
-  // with the bundle Update button, rename, repoint and unregister — was
-  // two clicks away. `/project/[id]/settings` is the standalone route
-  // that renders the same SettingsTab the overview's Settings tab does.
+  // v0.2.103 (owner ruling 2026-10-15, reversing the v0.2.101 P299-C3
+  // routing): a plain project open — the card body — lands on the
+  // PROJECT page `/project/<id>` (its default tab), never on settings.
+  // The v0.2.101 routing sent every card click to
+  // `/project/<id>/settings`, which the owner found neither expected nor
+  // wanted (and which stuck on "Loading…" while the v0.2.102 Settings-tab
+  // render bug was live). The explicit ⚙ Settings row action keeps the
+  // settings route through `openSettings` below.
   function open(id: string) {
+    projects.select(id);
+    goto(`/project/${id}`);
+  }
+
+  // The EXPLICIT settings entry point (the per-row ⚙ Settings button) —
+  // the only projects-list click that lands on `/project/<id>/settings`.
+  function openSettings(id: string) {
     projects.select(id);
     goto(`/project/${id}/settings`);
   }
@@ -307,7 +315,7 @@
                  (projects.update → update_project_v2 → the single
                  run_install_bundle_core spawn, per-folder single-flight).
                  Outside the card's clickable div, so these clicks never
-                 trigger the card's settings route. -->
+                 trigger the card's open route. -->
             <span class="pl-cell-actions">
               <button
                 class="pl-row-update"
@@ -321,7 +329,7 @@
               <button
                 class="pl-row-settings"
                 data-testid="project-row-settings"
-                onclick={() => open(p.id)}
+                onclick={() => openSettings(p.id)}
                 title="Open this project's settings page"
               >
                 ⚙ Settings

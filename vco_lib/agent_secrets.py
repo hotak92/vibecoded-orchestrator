@@ -236,8 +236,9 @@ class SecretPaused(AccessDenied):
 
 
 def _secrets_root() -> Path:
-    raw = os.environ.get("VCT_SECRETS_DIR", "").strip()
-    return Path(raw) if raw else (Path.home() / ".vct-secrets")
+    from vco_lib.paths import secrets_root  # one home
+
+    return secrets_root()
 
 
 def _detect_file_project_name(project: Optional[str]) -> Optional[str]:

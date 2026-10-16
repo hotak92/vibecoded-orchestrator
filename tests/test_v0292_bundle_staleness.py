@@ -65,6 +65,12 @@ def _make_registry_db(db_path: Path, rows: list[tuple[str, str, str, str]]) -> N
     ])
 
 
+def _ledger_bytes(folder: Path) -> bytes | None:
+    """The project's deferral ledger bytes, or ``None`` when it is absent."""
+    md = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
+    return md.read_bytes() if md.exists() else None
+
+
 def _tree_digest(root: Path) -> str:
     """Byte digest of every file under root (path → sha256), excluding
     nothing — the census must leave the WHOLE project tree identical."""
@@ -260,6 +266,13 @@ class TestCensusVerdicts(_CensusFixture):
         )
         digests[str(self.p_stale)] = _tree_digest(self.p_stale)
         before_root_ledger = (self.orch / ".claude" / "context").exists()
+        # v0.2.103: setUp's real installs may have written a project ledger
+        # (`local_git_repo_pending` — the fixture folders are not git repos);
+        # the contract is that the census adds or changes none.
+        ledgers_before = {
+            str(f): _ledger_bytes(f)
+            for f in (self.p_current, self.p_stale, self.p_nomanifest)
+        }
 
         bundle_staleness.run_census(self.orch, refresh_ledger=False)
 
@@ -272,8 +285,8 @@ class TestCensusVerdicts(_CensusFixture):
         # any project (dry-run emits nothing).
         self.assertFalse(before_root_ledger)
         for folder in (self.p_current, self.p_stale, self.p_nomanifest):
-            self.assertFalse(
-                (folder / ".claude" / "context" / "UPDATE_DEFERRED.md").exists(),
+            self.assertEqual(
+                _ledger_bytes(folder), ledgers_before[str(folder)],
                 f"dry-run census emitted a deferral into {folder}",
             )
 
@@ -727,18 +740,23 @@ class TestChunkerRevisionGate(unittest.TestCase):
 
     def test_superseded_semver_gate_is_pinned_inert_on_sha_inputs(self) -> None:
         """The retired call site's arithmetic, pinned BOTH ways so the
-        supersession is documented in code, not folklore: the helper still
-        answers semver questions correctly, and still returns False on the
-        SHA inputs real manifests carried — the structural inertness that
-        made the per-project flow blind for its entire life (v0.2.47→91).
+        supersession is documented in code, not folklore: the shared
+        primitive answers semver questions correctly, and still returns
+        False on the SHA inputs real manifests carried — the structural
+        inertness that made the per-project flow blind for its entire
+        life (v0.2.47→91). (The ``_crosses_chunker_boundary`` wrapper was
+        deleted in v0.2.103; the rule lives in
+        ``codegraph_extractor_generation.crosses_version_boundary``.)
         """
+        from vco_lib.codegraph_extractor_generation import crosses_version_boundary
+
         # Correct on semver inputs (kept for the shared-rule binding):
         self.assertTrue(
-            project_init._crosses_chunker_boundary("0.2.45", "0.2.92")
+            crosses_version_boundary("0.2.45", "0.2.92", "0.2.46")
         )
         # Structurally inert on every real pre-v0.2.92 manifest:
         self.assertFalse(
-            project_init._crosses_chunker_boundary("5155a553", "0.2.92")
+            crosses_version_boundary("5155a553", "0.2.92", "0.2.46")
         )
 
     def _prune_ledger(self) -> None:

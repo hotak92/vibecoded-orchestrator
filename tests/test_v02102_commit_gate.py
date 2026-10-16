@@ -56,6 +56,13 @@ BASH_CASES = [
     ("ls -la", False),
     ("git checkout -b commit-fix", False),
     ("", False),
+    # v0.2.103: an unquoted newline is a command separator — a commit on
+    # a later line of a multi-line command fires the gate.
+    ("make\ngit commit -m x", True),
+    ("git add .\ngit commit -m x\ngit push", True),
+    # A heredoc BODY line is raw text, not a command (the gate strips
+    # heredoc bodies before the walk, like its sibling consumers).
+    ("cat > notes.md <<'EOF'\ngit commit something\nEOF", False),
 ]
 
 

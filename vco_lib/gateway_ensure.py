@@ -338,10 +338,16 @@ def _gateway_has_run_here(state_dir: Optional[Path]) -> bool:
     """True when the gateway's host-token file EXISTS (it is created on the
     first run). Existence only — the credential is never read here."""
     try:
+        from vco_lib.gateway_package import ensure_importable
+
+        ensure_importable()  # install.py runs under the system interpreter
         from model_router.config import (  # pyright: ignore[reportMissingImports]
             token_path,
         )
-    except Exception:  # noqa: BLE001 — no gateway package ⇒ no evidence
+    except ImportError as exc:  # a broken install: say so, then "no evidence"
+        print(f"gateway_ensure: {exc}", file=sys.stderr)
+        return False
+    except Exception:  # noqa: BLE001 — any other failure ⇒ no evidence
         return False
     path = Path(token_path())
     if state_dir is not None:

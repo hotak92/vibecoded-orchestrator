@@ -1139,6 +1139,31 @@ pub fn run() {
                 crate::deferral_ledger::run_boot_doctor_and_retries(root).await;
             });
 
+            // v0.2.103 (plan item 12): re-render the provider-dependent
+            // model guidance (the {{MODEL_SELECTION_GRID}} and the
+            // provider-conditional CLAUDE.md sections) at launcher startup,
+            // so the guidance follows the vendor keys the user actually
+            // holds without waiting for the next install/update. The work is
+            // Python (`python -m vco_lib.model_guidance refresh`, spawned
+            // detached by the trigger); it writes only when the rendered
+            // output changes and soft-fails to one log line. Same BOOT
+            // DISCIPLINE as the probes above: `tauri::async_runtime::spawn`,
+            // never inline, nothing blocks the `setup complete` marker. The
+            // DB-backed install-root resolver covers a launcher running
+            // outside the clone (the v0.2.37 seed path), which the bare
+            // exe walk-up cannot.
+            {
+                let guidance_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let db = guidance_handle.state::<crate::db::Db>();
+                    commands::model_guidance::spawn_model_guidance_refresh(
+                        db.inner(),
+                        commands::model_guidance::REFRESH_TRIGGER_STARTUP,
+                    );
+                });
+            }
+
             // v0.2.37 (Agent V37-E, 2026-05-27): consume the
             // install_path seed file that install.py may have written
             // alongside the orchestrator clone (see
@@ -1335,37 +1360,16 @@ pub fn run() {
                         commands::module_catalog_client::bust_cache_if_launcher_version_changed(
                             db.inner(),
                         );
-                    // v0.2.47 RL-7.5: chunker-revision deferral — when the
-                    // running launcher version crosses the v0.2.46 boundary
-                    // (any pre-v0.2.46 → v0.2.46+), append a re-sync notice
-                    // to the orchestrator-root project's
-                    // .claude/context/UPDATE_DEFERRED.md. The new chunker
-                    // presets in claude_mcp_servers/weaviate_mcp/chunking.py
-                    // produce different chunk boundaries; existing Weaviate
-                    // rows are stale and search recall degrades on long
-                    // answers until the user re-syncs.
-                    // Soft-fails: any write error logs to stderr and proceeds.
-                    if let commands::module_catalog_client::VersionBustOutcome::VersionChanged {
-                        ref prev,
-                        ref running,
-                        ..
-                    } = bust_outcome
-                    {
-                        let _ = commands::chunker_revision_deferral::write_chunker_deferral_if_crossing_boundary(
-                            db.inner(),
-                            prev,
-                            running,
-                        );
-                    }
-                    // R2-4: chunker-REVISION deferral. Independent of the semver
-                    // boundary above (which only fired across the one-off v0.2.46
-                    // launcher-version crossing and never again). This compares
-                    // the live `_CHUNKER_REVISION` sentinel from chunking.py
-                    // against the persisted last-seen value and, on change, writes
-                    // the same re-sync deferral — the consumer the sentinel's own
+                    // R2-4: chunker-REVISION deferral. Compares the live
+                    // `_CHUNKER_REVISION` sentinel from chunking.py against
+                    // the persisted last-seen value and, on change, writes
+                    // the re-sync deferral — the consumer the sentinel's own
                     // contract comment always promised. Runs every boot (not
                     // gated on VersionChanged) so a chunking.py revision bump
                     // shipped without a launcher-version bump is still detected.
+                    // (The one-off v0.2.46 semver-boundary hook this sat beside
+                    // was retired in v0.2.103, superseded by this revision-keyed
+                    // path — owner decision 2026-10-15.)
                     // Soft-fails: any read/DB/python error Skips without blocking
                     // boot.
                     let _ = commands::chunker_revision_deferral::write_chunker_deferral_if_revision_changed(
@@ -1655,8 +1659,11 @@ pub fn run() {
             //
             // Pre-v0.2.12 installs may carry `VibeCodedTools_KnowledgeGraph`
             // rows; v0.2.12–v0.2.22 installs may carry the lowercase-c
-            // `VibecodedOrchestrator_KnowledgeGraph`. Both are silently
-            // rewritten to `VibeCodedOrchestrator_KnowledgeGraph` here.
+            // `VibecodedOrchestrator_KnowledgeGraph`. Both are rewritten to
+            // THIS machine's shared class — the persisted orchestrator-root
+            // pointer (v0.2.103, R24: never the shipped constant; on a clone
+            // whose root owns the folder-derived lowercase-c name, that name
+            // IS the shared class and is left alone).
             //
             // Dedup-then-rename: if BOTH legacy and canonical rows exist
             // for the same project_id, the legacy duplicate is deleted and
@@ -1666,11 +1673,9 @@ pub fn run() {
             {
                 use tauri::Manager;
                 if let Some(db) = app.try_state::<db::Db>() {
-                    let canonical =
-                        commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION;
-                    match db.migrate_legacy_shared_kg_collection_names(canonical) {
-                        Ok(0) => {}
-                        Ok(n) => {
+                    match db.migrate_legacy_shared_kg_collection_names_to_root_pointer() {
+                        Ok((_, 0)) => {}
+                        Ok((canonical, n)) => {
                             tracing::info!(
                                 "[vct] migrate-shared-kg: renamed {} \
                                  legacy row(s) → '{}'",
@@ -2146,6 +2151,20 @@ pub fn run() {
             // budget either way.
             tauri::async_runtime::spawn_blocking(|| {
                 let _ = hub_launcher::ensure_hub_running();
+            });
+
+            // v0.2.103 (owner ruling 2026-10-15): auto-start the container
+            // ENGINE this install uses (Docker Desktop / the podman machine
+            // or socket) when it is down — the same ONE Python home the
+            // session hooks and the hub spawn
+            // (`python -m vco_lib.container_engine_start ensure`, detached,
+            // idempotent, soft-fail; `VCT_CONTAINER_ENGINE_AUTOSTART=0`
+            // opts out). Opening the launcher is one of the moments the
+            // engine may simply not be running yet; this never blocks the
+            // GUI — the spawn is fire-and-forget.
+            tauri::async_runtime::spawn_blocking(|| {
+                let _ =
+                    vct_launcher_core::services::engine_autostart::spawn_engine_start_cli();
             });
 
             // v0.2.33 (Agent C, architecture review §10.b): startup
@@ -3062,8 +3081,11 @@ pub fn run() {
             // v0.2.71: GUI-only per-project worktree-repo mode (T-WT) — the
             // subagent-git modal's create-local/adopt/opt-out choice.
             commands::worktree_repo_mode::set_worktree_repo_mode,
-            commands::worktree_repo_mode::get_worktree_repo_mode,
+            // v0.2.103 (plan item 17): `get_worktree_repo_mode` retired —
+            // superseded by `plan_project_git_repo`, which also decides the
+            // add/update-time automatic local repo.
             commands::worktree_repo_mode::detect_project_git_repo,
+            commands::worktree_repo_mode::plan_project_git_repo,
             commands::worktree_repo_mode::create_local_project_repo,
             // v0.2.91 (#30): the modal's "Connect an existing repo" arm —
             // remote-URL attach (init+remote+fetch only, never merged over),
@@ -3246,6 +3268,8 @@ pub fn run() {
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
             commands::claude_env::set_claude_env_value,
+            commands::kg_reviewer_model::get_kg_reviewer_model,
+            commands::kg_reviewer_model::set_kg_reviewer_model,
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,
@@ -3493,6 +3517,7 @@ pub fn run() {
             commands::embedding_catalog::get_code_embed_model_status,
             commands::embedding_catalog::get_kg_embed_model_status,
             commands::embedding_catalog::validate_model_against_catalog,
+            commands::model_guidance::get_model_guidance_status,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,
@@ -3624,6 +3649,10 @@ pub fn run() {
             // have to branch internally on which service it means.
             commands::session_autostart::get_launcher_session_autostart,
             commands::session_autostart::set_launcher_session_autostart,
+            // v0.2.103 (review R19 F4): the GUI switch for the container-engine
+            // auto-start (read by the Python home + the core Rust pre-check).
+            commands::engine_autostart_pref::get_container_engine_autostart,
+            commands::engine_autostart_pref::set_container_engine_autostart,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,

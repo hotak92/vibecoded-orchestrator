@@ -29,6 +29,27 @@ token is a hard usage error, exit 2, BEFORE any backend connection):
                      classifies as fresh and therefore never arms via the
                      ledger (MAJOR-R5-4). Entries whose stored plan already
                      matches still skip; only stale plans re-embed.
+    --prune-missing  with a file list: a knowledge/ target that no longer
+                     exists has its Weaviate rows deleted (by exact
+                     file_path) instead of failing as "file not found" —
+                     the post-commit KG reviewer's guard passes it when it
+                     reverts a NEW node, so the embedding the project's
+                     own edit-time sync minted does not outlive the file.
+                     When the KG collection is the shared one (the
+                     orchestrator root) only rows whose content_hash equals
+                     the target's --prune-hash are deleted; with no hash
+                     there, nothing is deleted. A non-root project with a
+                     distinct shared collection also deletes the vanished
+                     node's rows there — always hash-scoped the same way,
+                     skipped with a reason when SHARED_KG_WRITE_DISABLED is
+                     set or no hash names the path. Every pruned target
+                     prints one `KG_PRUNE_RESULT {json}` line saying what
+                     happened (vco_lib.kg_prune_result), with a
+                     per-collection breakdown when the shared arm ran.
+    --prune-hash <knowledge/rel.md>=<sha256>   (with --prune-missing,
+                     repeatable) the content_hash of the bytes the vanished
+                     node last had — scopes the shared-collection delete to
+                     rows that carry exactly those bytes
     --project-root <path> | --project-root=<path>   pin the target root
                      (consumed at import; at most once)
     -h | --help      print usage
@@ -72,7 +93,7 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Callable, Dict, List, Optional, Tuple, Mapping
 import uuid
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -234,6 +255,88 @@ def _extract_rechunk_flag(argv: "List[str]") -> bool:
 _RECHUNK_FORCED = _extract_rechunk_flag(sys.argv)
 
 
+def _extract_prune_missing_flag(argv: "List[str]") -> bool:
+    """Extract and REMOVE every ``--prune-missing`` token from *argv*
+    (mutates the list in place). Returns True when the flag was present.
+
+    Why the flag exists (v0.2.103 R30 M3): the post-commit KG reviewer's
+    guard deletes a NEW node it reverts and then re-syncs the path — but a
+    missing file used to fail here as "file not found", so the rows the
+    project's edit-time sync had already embedded for the reviewer's write
+    stayed in the collection with no file behind them. With this flag a
+    missing ``knowledge/`` target is removed through the ONE delete-by-
+    file_path home (:func:`_delete_node_by_file_path`). Without it a
+    missing target still fails, exactly as before — a typo'd path never
+    deletes anything by accident.
+
+    Same import-time ``tok == "--flag"`` idiom as :func:`_extract_rechunk_flag`
+    (the emitted-remediation gate source-matches it).
+    """
+    saw = False
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--prune-missing":
+            del argv[i]
+            saw = True
+            continue
+        i += 1
+    return saw
+
+
+#: True when this run was invoked with ``--prune-missing`` (v0.2.103 R30
+#: M3); see :func:`_extract_prune_missing_flag`.
+_PRUNE_MISSING = _extract_prune_missing_flag(sys.argv)
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _extract_prune_hashes(argv: "List[str]") -> "Dict[str, str]":
+    """Extract and REMOVE every ``--prune-hash <rel>=<sha256>`` pair from
+    *argv* (mutates the list in place). Returns ``{rel: sha256}``.
+
+    Why (v0.2.103 R33 N1): on the orchestrator root the KG collection IS the
+    shared collection, and ``file_path`` is not project-qualified there — a
+    sibling project's ``scope: shared`` row can carry the same relative path,
+    so a bare delete-by-file_path is refused. The post-commit KG reviewer's
+    guard knows the exact bytes of the node it reverted and passes their
+    ``content_hash`` (``vco_lib.knowledge_residue.content_signature_of_file_bytes``,
+    the one signature home the sync stores); the prune then deletes only the
+    rows carrying THAT hash. A malformed value, or the flag without
+    ``--prune-missing``, is a usage error (exit 2) — same import-time
+    ``tok == "--flag"`` idiom as :func:`_extract_prune_missing_flag`.
+    """
+    out: "Dict[str, str]" = {}
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--prune-hash":
+            value = argv[i + 1] if i + 1 < len(argv) else ""
+            rel, sep, digest = value.rpartition("=")
+            digest = digest.strip().lower()
+            if not sep or not rel.strip() or not _SHA256_HEX.fullmatch(digest):
+                print("❌ --prune-hash requires <knowledge/rel.md>=<sha256 hex>"
+                      f" (got: {value!r})", file=sys.stderr)
+                sys.exit(2)
+            # POSIX spelling, like every stored file_path (to_posix_rel is
+            # imported further down, after this import-time pre-scan).
+            out[rel.strip().replace("\\", "/").removeprefix("./")] = digest
+            del argv[i:i + 2]
+            continue
+        i += 1
+    if out and not _PRUNE_MISSING:
+        print("❌ --prune-hash is only meaningful with --prune-missing",
+              file=sys.stderr)
+        sys.exit(2)
+    return out
+
+
+#: ``{rel: content_hash}`` from ``--prune-hash`` (v0.2.103 R33 N1); see
+#: :func:`_extract_prune_hashes`.
+_PRUNE_HASHES = _extract_prune_hashes(sys.argv)
+
+
 def _resolve_project_root() -> "Tuple[Path, str]":
     """Resolve the target project root with the v0.2.89 layered precedence.
 
@@ -352,6 +455,18 @@ from vco_lib.containers import runtime_command_hint as _runtime_command_hint  # 
 # skips — otherwise archived nodes (which never get a stored content_hash) are
 # re-listed as "changed" on every update. Import, not a second copy.
 from vco_lib.kg_node_status import is_archived_node as _is_archived_node_shared  # noqa: E402 — same import-order constraint as the group above
+# The STORAGE-LAYER content signature (the ``content_hash`` every row
+# carries): sha256 of the node minus its frontmatter ``updated:`` line, so a
+# timestamp-only edit hashes identically (v0.2.14) and an unchanged file is
+# embed-skipped. Its one home is ``vco_lib.knowledge_residue`` (v0.2.103 R33
+# N1 collapsed the former mirror): the post-commit KG reviewer's guard hashes
+# a node it reverts with the same function and hands that hash to
+# ``--prune-hash``, so the two can never disagree. Intentionally distinct from
+# the RETRIEVAL content-identity hash (rl_client/content_dedup.content_sha) —
+# the v0.2.70 dedup triage keeps them separate on purpose; do NOT converge.
+from vco_lib.knowledge_residue import (  # noqa: E402 — same import-order constraint as the group above
+    content_signature_excluding_updated as _content_signature_excluding_updated,
+)
 # v0.2.101 B3: `file_path` / `title` are word-TOKENIZED, so a Weaviate `Equal`
 # returns token-superset rows of OTHER nodes. Every read here that deletes,
 # judges, or picks rows narrows with the filter and confirms in Python through
@@ -950,39 +1065,6 @@ class WeaviateWrapper:
 
 # For backward compatibility
 WeaviateMCPServer = WeaviateWrapper
-
-
-def _content_signature_excluding_updated(content: str) -> str:
-    """Return a SHA256 of the file content excluding the `updated:` line.
-
-    Used to detect whether a re-sync actually contains substantive changes
-    or just an unchanged file passing through the post-file-edit hook. If
-    the signature is unchanged, the `updated:` timestamp is not bumped —
-    avoiding KG-wide timestamp churn on every install run (v0.2.14).
-
-    STORAGE-LAYER hash, intentionally distinct from the RETRIEVAL content-
-    identity hash (rl_client/content_dedup.content_sha, sha1[:12]): this one
-    answers "is the stored object unchanged so I can skip the re-embed" and
-    carries the deliberate "exclude the `updated:` line" nuance so a timestamp-
-    only edit hashes identically. The retrieval hash answers "drop this
-    duplicate before it reaches Claude". The v0.2.70 dedup triage keeps them
-    separate on purpose — do NOT converge.
-    """
-    if not content.strip().startswith('---'):
-        return _sha256_text(content)
-    parts = content.split('---', 2)
-    if len(parts) < 3:
-        return _sha256_text(content)
-    fm_text = parts[1]
-    body = parts[2]
-    # Strip the `updated:` line from the frontmatter for the signature.
-    fm_no_updated = re.sub(r'^updated:.*$\n?', '', fm_text, flags=re.MULTILINE)
-    return _sha256_text(fm_no_updated + body)
-
-
-def _sha256_text(s: str) -> str:
-    import hashlib
-    return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
 
 def _embedding_failures_jsonl_hint() -> str:
@@ -2605,7 +2687,7 @@ OUTCOME_SYNCED = "synced"
 OUTCOME_EMBED_SKIPPED = "embed-skipped"          # unchanged, already current in Weaviate
 OUTCOME_ARCHIVED_SKIPPED = "archived-skipped"    # path or frontmarker: intentionally not indexed
 OUTCOME_FRONTMATTER_SKIPPED = "frontmatter-skipped"
-OUTCOME_EXCLUDED_SKIPPED = "excluded-skipped"    # meta files / out-of-root targets / dev-unset
+OUTCOME_EXCLUDED_SKIPPED = "excluded-skipped"    # meta files / out-of-root targets / dev-unset / --prune-missing removals
 OUTCOME_FAILED = "failed"
 
 _NON_FAILURE_OUTCOMES = frozenset({
@@ -3748,7 +3830,25 @@ def _file_path_filter(canonical: str):
     return _path_narrowing_filter(Filter, canonical)
 
 
-def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -> int:
+def _shared_class_exists(server: WeaviateMCPServer) -> bool:
+    """True unless Weaviate answers that the shared class is absent. A failed
+    probe returns True so the delete runs and reports its own error — an
+    unreadable state is never reported as "nothing there"."""
+    try:
+        return bool(server.client.collections.exists(SHARED_COLLECTION_NAME))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _delete_node_by_file_path(
+    server: WeaviateMCPServer,
+    file_path_value: str,
+    on_error: "Optional[Callable[[Exception], None]]" = None,
+    *,
+    only_content_hash: "Optional[str]" = None,
+    on_kept: "Optional[Callable[[int], None]]" = None,
+    collection: "Optional[str]" = None,
+) -> int:
     """Remove all Weaviate entries (incl. chunks) for a specific file_path.
 
     v0.2.70 FIX #1 (silent batch data loss): the archived-node cleanup
@@ -3769,24 +3869,244 @@ def _delete_node_by_file_path(server: WeaviateMCPServer, file_path_value: str) -
     active ``concepts/orchestrator-knowledge-graph.md``), so the rows are
     confirmed in Python by ``_fetch_exact_path_rows`` before any delete.
     Callers: the two archived-node branches of ``sync_node``, the project →
-    shared migration delete (``_finish_shared_scope_write``) and the
-    v0.2.101 archived-removal routing — all go through this function.
+    shared migration delete (``_finish_shared_scope_write``), the
+    v0.2.101 archived-removal routing and the v0.2.103 ``--prune-missing``
+    removal of a vanished node (:func:`_prune_missing_node`) — all go
+    through this function.
+
+    ``on_error`` (v0.2.103 R30 M3) receives the swallowed exception, so a
+    caller that must REPORT a failed removal (the prune leg) can; the
+    return value stays 0 either way (soft-fail contract unchanged).
+
+    ``only_content_hash`` (v0.2.103 R33 N1) narrows the delete further to
+    the exact-path rows whose stored ``content_hash`` equals it (the
+    shared-collection prune: a sibling project's row at the same path with
+    other content survives); ``on_kept`` then receives how many exact-path
+    rows were left because their hash differs.
+
+    ``collection`` (v0.2.103 FINAL3 L-2) names the collection to delete
+    from — ``None`` (every pre-L-2 caller) means ``COLLECTION_NAME``. The
+    prune's shared arm passes ``SHARED_COLLECTION_NAME``; no other caller
+    changes.
     """
     try:
-        coll = server.client.collections.get(COLLECTION_NAME)
+        coll = server.client.collections.get(collection or COLLECTION_NAME)
         existing = _fetch_exact_path_rows(
             coll,
             _file_path_filter(file_path_value),
             file_path_value,
-            return_properties=["file_path"],
+            return_properties=(["file_path"] if only_content_hash is None
+                               else ["file_path", "content_hash"]),
         )
         n = 0
+        kept = 0
         for obj in existing:
+            if (only_content_hash is not None
+                    and (obj.properties or {}).get("content_hash")
+                    != only_content_hash):
+                kept += 1
+                continue
             coll.data.delete_by_id(obj.uuid)
             n += 1
+        if on_kept is not None:
+            on_kept(kept)
         return n
-    except Exception:
+    except Exception as exc:
+        if on_error is not None:
+            on_error(exc)
         return 0
+
+
+def _prune_missing_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
+    """Remove the Weaviate rows of a ``knowledge/`` node whose file is gone
+    (``--prune-missing``, v0.2.103 R30 M3 / R33 N1).
+
+    Deletes through :func:`_delete_node_by_file_path` (exact file_path, the
+    one delete home). When the KG collection IS the shared one
+    (``collection_repair.is_shared_identity_collection`` — the predicate
+    every prune caller uses; true on the orchestrator root) a sibling
+    project's ``scope: shared`` row can carry the same relative file_path,
+    so the delete is scoped to rows whose stored ``content_hash`` equals the
+    target's ``--prune-hash`` (the bytes the post-commit KG reviewer wrote
+    and reverted); a sibling row survives unless byte-identical (minus
+    ``updated:``). With no hash for the target there, nothing is deleted.
+    On a non-shared collection every exact-path row goes (the hash is not
+    needed: nothing else writes there).
+
+    v0.2.103 FINAL3 L-2: a NON-root project's edit-time sync routes a
+    ``scope: shared`` node to ``SHARED_COLLECTION_NAME`` (the v0.2.89 scope
+    routing), so the reverted write's rows can sit in the SHARED collection
+    while the project arm above finds nothing. When a distinct shared
+    collection is configured, its exact-path rows carrying the
+    ``--prune-hash`` are deleted too — hash-scoped ALWAYS there (the same
+    sibling risk: a same-path row survives unless byte-identical; no hash →
+    no shared delete, reported) — and the shared arm is SKIPPED with a
+    reason when shared writes are disabled for this project
+    (``SHARED_KG_WRITE_DISABLED``: this sync then never embeds into the
+    shared collection, so no row of it can exist).
+
+    Every arm prints ONE ``vco_lib.kg_prune_result`` line so the caller
+    logs what actually happened, never an assumed removal — with a
+    per-collection breakdown when the shared arm ran. A failed removal
+    (Weaviate unreachable) is a FAILED outcome with the error named.
+    """
+    fp_value = _relative_file_path(file_path)
+    try:
+        from vco_lib import kg_prune_result as _pr
+    except ImportError as e:
+        print(f"❌ {fp_value}: missing node not removed: vco_lib import "
+              f"failed ({e}) — broken install?", file=sys.stderr)
+        return SyncOutcome(OUTCOME_FAILED, fp_value,
+                           "missing node not removed (vco_lib import failed)")
+    try:
+        from vco_lib.collection_repair import is_shared_identity_collection
+    except ImportError as e:
+        print(f"❌ {fp_value}: missing node not removed: vco_lib import "
+              f"failed ({e}) — broken install?", file=sys.stderr)
+        print(_pr.format_line(fp_value, _pr.STATUS_FAILED,
+                              reason=f"vco_lib import failed ({e})"))
+        return SyncOutcome(OUTCOME_FAILED, fp_value,
+                           "missing node not removed (vco_lib import failed)")
+    is_root = is_shared_identity_collection(
+        COLLECTION_NAME, SHARED_COLLECTION_NAME, PROJECT_ROOT,
+    )
+    expect_hash: "Optional[str]" = None
+    if is_root:
+        expect_hash = _PRUNE_HASHES.get(fp_value)
+        if expect_hash is None:
+            reason = (f"'{COLLECTION_NAME}' is the shared collection and no "
+                      "--prune-hash names this path (a sibling project's "
+                      "shared row may carry the same path)")
+            print(f"ℹ️  {fp_value}: file is gone; its rows are kept — {reason}")
+            print(_pr.format_line(fp_value, _pr.STATUS_SKIPPED, reason=reason))
+            return SyncOutcome(OUTCOME_EXCLUDED_SKIPPED, fp_value,
+                               "missing node: shared collection, rows kept")
+    errors: List[Exception] = []
+    kept_box: List[int] = []
+    removed = _delete_node_by_file_path(
+        server, fp_value, on_error=errors.append,
+        only_content_hash=expect_hash, on_kept=kept_box.append,
+    )
+    kept = kept_box[0] if kept_box else 0
+    if errors:
+        print(f"❌ {fp_value}: file is gone but its Weaviate rows could not be "
+              f"removed: {errors[0]}")
+    else:
+        scope = ("" if expect_hash is None
+                 else f" whose content_hash is {expect_hash[:12]}…"
+                      f" ({kept} row(s) with other content kept)")
+        print(f"🗑  {fp_value}: file is gone — removed {removed} Weaviate "
+              f"row(s){scope} from '{COLLECTION_NAME}'")
+    # FINAL3 L-2 — the shared arm (non-root, distinct shared collection):
+    # a `scope: shared` reverted node's rows were embedded there by the
+    # edit-time sync. Hash-scoped ALWAYS (a sibling project's same-path row
+    # survives unless byte-identical); SHARED_KG_WRITE_DISABLED or a missing
+    # hash skips it with a reason the result line carries.
+    shared_recs: "Dict[str, dict]" = {}
+    if not is_root and SHARED_COLLECTION_NAME and \
+            SHARED_COLLECTION_NAME != COLLECTION_NAME:
+        shared_hash = _PRUNE_HASHES.get(fp_value)
+        if _resolve_shared_kg_write_disabled():
+            reason = ("shared KG writes are disabled for this project "
+                      "(SHARED_KG_WRITE_DISABLED), so this sync never "
+                      "embedded the node there")
+            print(f"ℹ️  {fp_value}: shared collection "
+                  f"'{SHARED_COLLECTION_NAME}' not pruned — {reason}")
+            shared_recs[SHARED_COLLECTION_NAME] = {
+                "status": _pr.STATUS_SKIPPED, "deleted": 0, "kept": 0,
+                "reason": reason}
+        elif not _shared_class_exists(server):
+            reason = (f"the shared class '{SHARED_COLLECTION_NAME}' does not "
+                      "exist, so nothing was ever embedded there (R37 N-2)")
+            print(f"ℹ️  {fp_value}: shared collection not pruned — {reason}")
+            shared_recs[SHARED_COLLECTION_NAME] = {
+                "status": _pr.STATUS_SKIPPED, "deleted": 0, "kept": 0,
+                "reason": reason}
+        elif shared_hash is None:
+            reason = ("no --prune-hash names this path — only rows "
+                      "byte-identical to the reverted node's bytes are "
+                      "deleted from the shared collection (a sibling "
+                      "project's row at the same path must survive)")
+            print(f"ℹ️  {fp_value}: shared collection "
+                  f"'{SHARED_COLLECTION_NAME}' not pruned — {reason}")
+            shared_recs[SHARED_COLLECTION_NAME] = {
+                "status": _pr.STATUS_SKIPPED, "deleted": 0, "kept": 0,
+                "reason": reason}
+        else:
+            s_errors: List[Exception] = []
+            s_kept_box: List[int] = []
+            s_removed = _delete_node_by_file_path(
+                server, fp_value, on_error=s_errors.append,
+                only_content_hash=shared_hash, on_kept=s_kept_box.append,
+                collection=SHARED_COLLECTION_NAME)
+            s_kept = s_kept_box[0] if s_kept_box else 0
+            if s_errors:
+                print(f"❌ {fp_value}: shared collection "
+                      f"'{SHARED_COLLECTION_NAME}' rows could not be "
+                      f"removed: {s_errors[0]}")
+                shared_recs[SHARED_COLLECTION_NAME] = {
+                    "status": _pr.STATUS_FAILED, "deleted": s_removed,
+                    "kept": s_kept, "reason": str(s_errors[0])}
+            else:
+                print(f"🗑  {fp_value}: file is gone — removed {s_removed} "
+                      f"Weaviate row(s) whose content_hash is "
+                      f"{shared_hash[:12]}… ({s_kept} row(s) with other "
+                      f"content kept) from '{SHARED_COLLECTION_NAME}'")
+                shared_recs[SHARED_COLLECTION_NAME] = {
+                    "status": (_pr.STATUS_DELETED if s_removed
+                               else _pr.STATUS_NOTHING_MATCHED),
+                    "deleted": s_removed, "kept": s_kept, "reason": ""}
+    if not shared_recs:
+        # single-collection prune (root or no distinct shared collection):
+        # the exact pre-L-2 record and outcome
+        if errors:
+            print(_pr.format_line(fp_value, _pr.STATUS_FAILED,
+                                  reason=str(errors[0])))
+            return SyncOutcome(OUTCOME_FAILED, fp_value,
+                               f"missing node: row removal failed "
+                               f"({errors[0]})")
+        print(_pr.format_line(
+            fp_value,
+            _pr.STATUS_DELETED if removed else _pr.STATUS_NOTHING_MATCHED,
+            deleted=removed, kept=kept))
+        return SyncOutcome(OUTCOME_EXCLUDED_SKIPPED, fp_value,
+                           f"missing node: removed {removed} row(s)")
+    # shared arm ran: one aggregated record with the per-collection
+    # breakdown, so the guard's log names each collection and its counts
+    colls: "Dict[str, dict]" = {COLLECTION_NAME: {
+        "status": (_pr.STATUS_FAILED if errors else
+                   _pr.STATUS_DELETED if removed
+                   else _pr.STATUS_NOTHING_MATCHED),
+        "deleted": removed, "kept": kept,
+        "reason": (str(errors[0]) if errors else "")}}
+    colls.update(shared_recs)
+    total_deleted = removed + sum(
+        r["deleted"] for r in shared_recs.values())
+    total_kept = kept + sum(r["kept"] for r in shared_recs.values())
+    failed = [r for r in colls.values() if r["status"] == _pr.STATUS_FAILED]
+    skipped = [(n, r) for n, r in colls.items()
+               if r["status"] == _pr.STATUS_SKIPPED]
+    if failed:
+        status = _pr.STATUS_FAILED
+        reason = "; ".join(r["reason"] for r in failed if r["reason"])
+    elif total_deleted:
+        status = _pr.STATUS_DELETED
+        reason = ""
+    elif skipped:
+        status = _pr.STATUS_SKIPPED
+        reason = "; ".join(f"'{n}': {r['reason']}" for n, r in skipped
+                           if r["reason"])
+    else:
+        status = _pr.STATUS_NOTHING_MATCHED
+        reason = ""
+    print(_pr.format_line(fp_value, status, deleted=total_deleted,
+                          kept=total_kept, reason=reason,
+                          collections=colls))
+    if failed:
+        return SyncOutcome(OUTCOME_FAILED, fp_value,
+                           f"missing node: row removal failed ({reason})")
+    return SyncOutcome(OUTCOME_EXCLUDED_SKIPPED, fp_value,
+                       f"missing node: removed {total_deleted} row(s)")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -4094,6 +4414,11 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
 
     try:
         if not file_path.exists():
+            if _PRUNE_MISSING:
+                outcome = _prune_missing_node(server, file_path)
+                if not outcome:
+                    error_msg = outcome.reason
+                return outcome
             print(f"❌ File not found: {file_path}")
             error_msg = "File not found"
             return SyncOutcome(
@@ -4980,6 +5305,132 @@ def sync_all_nodes(server: WeaviateMCPServer) -> "SyncTally":
     return tally
 
 
+#: Cap on per-row "removed stale row" stdout lines in the prune report (the
+#: count line always prints the full total; a 400-row prune doesn't need 400
+#: lines on the launcher's console — the count and the log carry it).
+_PRUNE_PRINT_CAP = 50
+
+
+def _prune_stored_only_rows(*, run_clean: bool, kg_total: int) -> None:
+    """v0.2.103: after a full ``--all`` walk, remove rows whose source file
+    is gone from this knowledge root — the mirror image of the upsert.
+
+    The upsert only ever deletes rows for files that still exist on disk
+    (the archived-node cleanup keys on a file the walk just read), so rows
+    whose ``.md`` was deleted or moved out of ``knowledge/`` stayed in the
+    collection forever and kept surfacing in search. The prune closes that
+    gap by delegating to the repo's ONE prune home,
+    ``vco_lib.collection_repair.prune_foreign_rows`` (bundle updates and
+    install.py's seed step already run it) — its reviewed guards apply
+    unchanged here:
+
+    * rows whose file EXISTS on disk are never touched;
+    * rows with an empty / absolute / ``..`` file_path are defensively kept
+      (unresolvable to this knowledge root — never deleted on a guess);
+    * enumeration failure ⇒ skip (no destructive action without an
+      authoritative row list).
+
+    Additional gates on THIS caller (data-destroying path — conservative
+    defaults):
+
+    * ``run_clean`` — a partial walk (any knowledge-node failure) proves
+      nothing about the tree, so nothing is pruned;
+    * ``KNOWLEDGE_ROOT`` must exist and the walk must have considered at
+      least one node (``kg_total > 0``) — a missing/empty tree is more
+      likely a mis-resolved root than a deliberate bulk delete, and the
+      doctor census names the leftover rows either way;
+    * SHARED-IDENTITY skip, decided by the prune home's ONE predicate
+      (``collection_repair.is_shared_identity_collection``, v0.2.103 R2
+      review H-2): a name match with the shared collection OR this root
+      being the orchestrator clone — the latter holds even when the shared
+      NAME is empty/unresolved (hub down, free tier), the case a
+      name-only check let through on the root, where "file absent
+      locally" is NORMAL (sibling projects' shared-scope rows live there);
+    * REGISTERED-OWNER gate (v0.2.103 R2, review M-3): the walked root
+      must be the collection's registered owner in launcher.db — a
+      worktree or second clone resolves the same collection but prunes
+      against the wrong tree. It lives in the prune home
+      (``collection_repair.collection_owner_refusal``, evaluated inside
+      ``prune_foreign_rows``; final review M-2) so the bundle and CLI
+      callers are covered too; its refusal arrives here as ``skipped``.
+
+    Existence inside the home is judged on the path AS THE SYNC STORES IT
+    (lexical, symlink-following), and a stored path resolving OUTSIDE the
+    root is kept — a symlinked ``knowledge/`` (vault layout) no longer
+    reads as "every file gone" (v0.2.103 R2, review H-1).
+
+    Soft-fail throughout: a skipped or failed prune never changes the sync
+    exit code (the rows it would have removed are named by ``vco doctor``'s
+    kg_drift_census on the next report).
+    """
+    if not run_clean:
+        print("🧹 Stored-only prune skipped: the walk was partial "
+              "(node failures) — nothing pruned this run")
+        return
+    if not KNOWLEDGE_ROOT.is_dir():
+        print("🧹 Stored-only prune skipped: no knowledge/ tree under the "
+              f"resolved root {PROJECT_ROOT} — refusing to prune")
+        return
+    if kg_total <= 0:
+        print("🧹 Stored-only prune skipped: the walk considered 0 knowledge "
+              "nodes — refusing to prune (a mis-resolved root must not wipe "
+              "the collection)")
+        return
+    try:
+        from vco_lib.collection_repair import (
+            is_shared_identity_collection,
+            prune_foreign_rows,
+        )
+    except ImportError as e:
+        # Broken install (vco_lib is a shipped dependency of this script) —
+        # loud on stderr, but the sync itself already succeeded; failing the
+        # run now would discard a healthy sync over a best-effort cleanup.
+        print(f"⚠️  Stored-only prune not run: vco_lib import failed "
+              f"({e}) — broken install?", file=sys.stderr)
+        return
+    if is_shared_identity_collection(
+        COLLECTION_NAME, SHARED_COLLECTION_NAME, PROJECT_ROOT,
+    ):
+        print(f"🧹 Stored-only prune skipped: '{COLLECTION_NAME}' is the "
+              "shared collection (sibling projects' shared-scope rows live "
+              "here — never pruned)")
+        return
+    try:
+        result = prune_foreign_rows(
+            PROJECT_ROOT,
+            COLLECTION_NAME,
+            weaviate_url=WEAVIATE_URL,
+            shared_kg_collection=SHARED_COLLECTION_NAME,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort cleanup, never fatal
+        print(f"⚠️  Stored-only prune failed (non-fatal): {e}")
+        return
+    if result.get("skipped"):
+        print(f"🧹 Stored-only prune skipped: {result['skipped']}")
+        return
+    deleted = result.get("deleted", 0)
+    if not deleted:
+        if result.get("defensive_skipped"):
+            print(
+                f"🧹 Stored-only prune: 0 removed; "
+                f"{result['defensive_skipped']} row(s) with an empty or "
+                f"absolute file_path left untouched (unresolvable)"
+            )
+        return
+    for row in result.get("stale_rows", [])[:_PRUNE_PRINT_CAP]:
+        title = row.get("title") or ""
+        print(f"  ↳ removed stale row: {row.get('path')}"
+              + (f" (title: {title})" if title else ""))
+    _hidden = len(result.get("stale_rows", [])) - _PRUNE_PRINT_CAP
+    if _hidden > 0:
+        print(f"  ↳ … and {_hidden} more (see the count below)")
+    print(
+        f"🧹 Pruned {deleted} stale Weaviate row(s) whose source file is "
+        f"gone from knowledge/ ({len(result.get('stale_paths', []))} "
+        f"path(s), collection '{COLLECTION_NAME}')"
+    )
+
+
 def _classify_sync_target(raw: str) -> Tuple[Path, bool, bool]:
     """Classify an explicit sync-target path as knowledge / docs / neither.
 
@@ -5132,10 +5583,11 @@ def _regen_node_formats_after_full_sync() -> None:
     stale until the next install/per-edit fire.
 
     The sidecar (descriptions + summaries surfaced by auto-tier retrieval) is
-    written by `generate_node_formats.py` at install time and by the
-    per-edit `generate-kg-summary.py` hook — but a bare `kg-sync --all` never
-    touched it (grep 0), so a bulk resync left every node's summary stale.
-    This calls the SAME install-time machinery as a capped, soft-fail
+    written by `generate-kg-summary.py` — the per-edit hook and the `--all`
+    bulk mode (v0.2.103 merged the retired Ollama-only bulk generator into
+    it) — but a bare `kg-sync --all` never touched it
+    (grep 0), so a bulk resync left every node's summary stale.
+    This calls the SAME generator as a capped, soft-fail
     post-sync step: any error (no generator, no summary backend, timeout) is
     swallowed with a log line — a summary refresh must never fail the sync.
     """
@@ -5146,20 +5598,23 @@ def _regen_node_formats_after_full_sync() -> None:
     # This used to look for the generator under the SYNCED PROJECT's own
     # `claude_mcp_servers/scripts/` — a directory that exists ONLY in the
     # orchestrator clone. Every user project therefore fell through to
-    # `.claude/scripts/generate-kg-summary.py --all`, which is the PER-EDIT
-    # generator: its argparse takes a FILE, so `--all` is a usage error and it
-    # exits 2. Observed live after a user project's `kg-sync --all`:
-    # `(node-format refresh exited 2; summaries left as-is — non-fatal)`. Net
-    # effect: after ANY bulk sync, no non-root project has EVER had its
-    # `.node_formats.json` refreshed, and the only trace was one stderr line.
+    # `.claude/scripts/generate-kg-summary.py --all`, which at the time was
+    # the PER-EDIT generator: its argparse took a FILE, so `--all` was a
+    # usage error and it exited 2. Observed live after a user project's
+    # `kg-sync --all`: `(node-format refresh exited 2; summaries left as-is
+    # — non-fatal)`. Net effect: after ANY bulk sync, no non-root project
+    # has EVER had its `.node_formats.json` refreshed, and the only trace
+    # was one stderr line.
     #
     # The fix is the user's standing rule — ONE component for root and non-root.
-    # `generate_node_formats.py` already accepts `--knowledge-dir`, and sets
-    # `PROJECT_ROOT = KNOWLEDGE_DIR.parent` from it, so pointing the ROOT
-    # generator at this project's `knowledge/` is the identical invocation in
-    # both cases (for the root, install_root == PROJECT_ROOT and nothing
-    # changes). `sys.executable` is right here: the kg-sync wrapper already
-    # activated the orchestrator venv, which is why `vco_lib` imports below.
+    # `generate-kg-summary.py` accepts `--knowledge-dir` (its bulk `--all`
+    # mode arrived in v0.2.103 with the merge of the retired Ollama-only
+    # bulk generator), and sets its project root from it, so
+    # pointing the clone's generator at this project's `knowledge/` is the
+    # identical invocation in both cases (for the root,
+    # install_root == PROJECT_ROOT and nothing changes). `sys.executable` is
+    # right here: the kg-sync wrapper already activated the orchestrator
+    # venv, which is why `vco_lib` imports below.
     gen = None
     install_root = None
     try:
@@ -5171,20 +5626,19 @@ def _regen_node_formats_after_full_sync() -> None:
               file=sys.stderr)
     if install_root is not None:
         candidate = (
-            Path(install_root) / "claude_mcp_servers" / "scripts"
-            / "generate_node_formats.py"
+            Path(install_root) / "templates" / "scripts"
+            / "generate-kg-summary.py"
         )
         if candidate.is_file():
             gen = candidate
     if gen is None:
         # No orchestrator clone reachable from here. NOT a silent skip any more:
-        # the summaries genuinely stay stale, and the old fallback (the per-edit
-        # generator with `--all`) never worked. Record it as owed work.
+        # the summaries genuinely stay stale. Record it as owed work.
         _emit_node_formats_deferral(
             PROJECT_ROOT,
             reason=(
                 "the orchestrator clone's "
-                "`claude_mcp_servers/scripts/generate_node_formats.py` could "
+                "`templates/scripts/generate-kg-summary.py` could "
                 "not be located from this project "
                 f"(install root: {install_root or 'unresolved'})"
             ),
@@ -5193,38 +5647,68 @@ def _regen_node_formats_after_full_sync() -> None:
     if not KNOWLEDGE_ROOT.is_dir():
         return  # nothing to summarise; not a failure
     try:
-        # Cap the whole regen so a slow/hung summary backend can't wedge the
-        # sync exit. --all over a large KG can be slow but is bounded here.
         py = sys.executable or "python3"
         # v0.2.92 WP-B1: this exact line is the STAGE MARKER the launcher's
         # kg_sync.rs maps to phase "finalize" (the regen below can legitimately
-        # run for up to 600 s AFTER the 📊 summary lines — without this signal
-        # the GUI showed a stalled "embedding (N/N)" while the process was
-        # honestly still working). Text is load-bearing: change it only with
+        # run for a LONG time AFTER the summary-count lines — the ladder's CLI
+        # tier spawns per call and a fresh install summarises every node.
+        # Without this signal the GUI showed a stalled "embedding (N/N)"
+        # while the process was honestly still working).
+        # Text is load-bearing: change it only with
         # the Rust matcher in kg_sync.rs. flush=True so the marker reaches the
         # launcher's line reader BEFORE the (potentially long) regen starts,
         # including on direct-CLI runs without PYTHONUNBUFFERED.
         print("📝 Refreshing .node_formats.json summaries (KG-4, soft-fail) ...",
               flush=True)
         # The same silence hazard on the UPDATE watchdog's surface: the regen
-        # runs capture_output=True, so this script produces nothing for up to
-        # its full 600 s cap. One event restarts that clock AND tells the
-        # modal what the wait is (a run that exhausts the cap is the one
-        # honest case where the stall notice may still fire).
+        # runs with piped output, so this script produces nothing while it
+        # works. One event restarts that clock AND tells the modal what the
+        # wait is. There is deliberately NO whole-run wall-clock cap
+        # (v0.2.103, review H-3 / owner rule "no timeout may cut valid long
+        # work"): every LLM call inside the generator is already bounded by
+        # ``summary_backends.TIMEOUT`` (default 180 s per call), and the
+        # generator persists the sidecar incrementally after each node.
+        # Liveness instead of a cap: a heartbeat event every 120 s while the
+        # child runs, so the watchdog clock never expires on honest work.
         _emit_sync_event(
             "start", "refreshing KG summaries (this can take several minutes)")
         # NO `--force`: the generator skips nodes whose formats already exist,
         # so a re-run over an already-summarised project regenerates nothing.
         # (Standing rule: never re-embed / re-generate hash-unchanged content.)
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [py, str(gen), "--all", "--knowledge-dir", str(KNOWLEDGE_ROOT)],
             cwd=str(PROJECT_ROOT),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=600,
         )
-        if proc.returncode != 0:
-            tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1]
+        while True:
+            try:
+                out, err = proc.communicate(timeout=120)
+                break
+            except subprocess.TimeoutExpired:
+                _emit_sync_event(
+                    "start",
+                    "refreshing KG summaries (still working — no whole-run cap)",
+                )
+        if proc.returncode == _NODE_FORMATS_EXIT_NO_BACKEND:
+            # "Owed, retry later" WITHOUT arming the auto-retry that re-runs
+            # a full `--all` sync (review M-2): no backend was selectable at
+            # all (VRAM/code-graph-walk guard, no CLI, no keys). A full-sync
+            # retry would re-walk and re-prune the tree to maybe find a
+            # backend, competing with the very code-graph walk the guard
+            # protects. Recorded as the environmental condition; the next
+            # organic sync or per-edit hook picks the nodes up when a
+            # backend exists.
+            tail = ((err or out or "").strip().splitlines() or [""])[-1]
+            print(
+                "   (node-format refresh found no summary backend; nodes stay "
+                f"owed — non-fatal) {tail[:300]}",
+                file=sys.stderr,
+            )
+            _emit_node_formats_no_backend_deferral(PROJECT_ROOT)
+        elif proc.returncode != 0:
+            tail = ((err or out or "").strip().splitlines() or [""])[-1]
             print(
                 "   (node-format refresh exited "
                 f"{proc.returncode}; summaries left as-is — non-fatal)",
@@ -5240,15 +5724,8 @@ def _regen_node_formats_after_full_sync() -> None:
         else:
             # Paired resolution (decision-#12 shape): a refresh that exited 0 is
             # the proof the earlier failure no longer holds. Nothing else clears
-            # this entry.
+            # these entries.
             _clear_node_formats_deferral(PROJECT_ROOT)
-    except subprocess.TimeoutExpired:
-        print("   (node-format refresh timed out; summaries left as-is — non-fatal)",
-              file=sys.stderr)
-        _emit_node_formats_deferral(
-            PROJECT_ROOT,
-            reason="the generator did not finish within its 600 s cap",
-        )
     except Exception as e:  # noqa: BLE001 — soft-fail, never break the sync
         print(f"   (node-format refresh skipped: {e} — non-fatal)", file=sys.stderr)
         _emit_node_formats_deferral(PROJECT_ROOT, reason=f"{type(e).__name__}: {e}")
@@ -5257,6 +5734,17 @@ def _regen_node_formats_after_full_sync() -> None:
 #: Condition id for a failed post-sync `.node_formats.json` refresh (v0.2.94).
 #: Declared in `vco_lib/deferral_conditions.toml` as `auto_retryable`.
 _NODE_FORMATS_CID = "kg_node_formats_refresh_failed"
+
+#: Condition id for the post-sync refresh finding NO summary backend
+#: (v0.2.103, review M-2): declared `environmental` — true of the machine
+#: while no backend is selectable, resolved by the paired clear below.
+_NODE_FORMATS_NO_BACKEND_CID = "kg_node_formats_backend_unavailable"
+
+#: The generator's ``BULK_EXIT_NO_BACKEND`` exit code ("owed, retry later").
+#: MUST match ``BULK_EXIT_NO_BACKEND`` in ``templates/scripts/
+#: generate-kg-summary.py`` — pinned by
+#: ``tests/test_v02103_nodeformats_merge.py``.
+_NODE_FORMATS_EXIT_NO_BACKEND = 3
 
 
 def _clear_drift_deferral(project_root: Path) -> None:
@@ -5370,7 +5858,8 @@ def _record_metadata_repair_pass(project_root: Path) -> None:
 
 
 def _clear_node_formats_deferral(project_root: Path) -> None:
-    """Resolve :data:`_NODE_FORMATS_CID` after a refresh that exited 0.
+    """Resolve :data:`_NODE_FORMATS_CID` (and the no-backend sibling) after a
+    refresh that exited 0.
 
     The paired half of :func:`_emit_node_formats_deferral`. Soft-fail: the
     sync's exit code never depends on ledger bookkeeping.
@@ -5378,9 +5867,41 @@ def _clear_node_formats_deferral(project_root: Path) -> None:
     try:
         from vco_lib.deferral_emit import resolve_conditions
 
-        resolve_conditions(project_root, (_NODE_FORMATS_CID,))
+        resolve_conditions(
+            project_root, (_NODE_FORMATS_CID, _NODE_FORMATS_NO_BACKEND_CID)
+        )
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
+def _node_formats_recovery_command(project_root: Path) -> str:
+    """The recovery command printed in the node-formats deferrals (L-1).
+
+    A printed command is shipped code: it must run AS PRINTED. Bare `python`
+    is exactly the defect the venv resolver exists for (a system python has
+    no `vco_lib`), and `<orchestrator-root>` is a placeholder a user cannot
+    paste. Resolve BOTH: the orchestrator venv interpreter via the ONE
+    resolver home (``vco_lib.python_exe``), and the clone's generator path.
+    Fallbacks keep the old shape only when resolution itself fails.
+    """
+    py = sys.executable or "python3"
+    gen = "<orchestrator-root>/templates/scripts/generate-kg-summary.py"
+    try:
+        from vco_lib.python_exe import resolve_install_root, resolve_or_current
+
+        py = resolve_or_current()
+        root = resolve_install_root()
+        if root is not None:
+            candidate = Path(root) / "templates" / "scripts" / "generate-kg-summary.py"
+            if candidate.is_file():
+                gen = str(candidate)
+    except Exception:  # noqa: BLE001 — the printed command must still print
+        pass
+    return (
+        "# Refresh the summary sidecar for this project "
+        "(existing summaries are skipped):\n"
+        f"{py} {gen} --all --knowledge-dir {project_root / 'knowledge'}"
+    )
 
 
 def _emit_node_formats_deferral(project_root: Path, reason: str) -> None:
@@ -5410,14 +5931,52 @@ def _emit_node_formats_deferral(project_root: Path, reason: str) -> None:
                 "tree sync runs the refresh again and clears this entry. "
                 "Nothing is lost meanwhile except summary freshness."
             ),
-            command_to_apply=(
-                "# Refresh the summary sidecar for this project "
-                "(existing summaries are skipped):\n"
-                "python <orchestrator-root>/claude_mcp_servers/scripts/"
-                "generate_node_formats.py --all --knowledge-dir "
-                f"{project_root / 'knowledge'}"
-            ),
+            command_to_apply=_node_formats_recovery_command(project_root),
             severity="warning",
+        )
+        emit(project_root, entry)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+
+
+def _emit_node_formats_no_backend_deferral(project_root: Path) -> None:
+    """Record the no-backend refresh outcome as ENVIRONMENTAL, not owed-retry.
+
+    v0.2.103 (review M-2): the generator's ``BULK_EXIT_NO_BACKEND`` means no
+    summary backend was selectable at all (VRAM/code-graph-walk guard, no
+    `claude` CLI, no keys). That is a true fact about the machine while it
+    lasts — NOT a failure the auto-retry can fix: re-running a full `--all`
+    sync to maybe find a backend re-walks and re-prunes the tree and competes
+    with the very code-graph walk the guard protects. The nodes stay owed for
+    the next organic sync or per-edit run; this entry is their paper trail
+    and is cleared by the paired resolution on the first refresh that runs.
+    """
+    try:
+        from vco_lib.deferral_emit import DeferralEntry, emit
+
+        entry = DeferralEntry(
+            condition_id=_NODE_FORMATS_NO_BACKEND_CID,
+            title="No summary backend available — KG summaries stay owed",
+            detected=(
+                "The post-sync `.node_formats.json` refresh found NO summary "
+                "backend it could use (the local tier was deferred — low free "
+                "VRAM or an active code-graph walk — and no `claude` CLI or "
+                "cloud key was available). Nothing was generated and nothing "
+                "was lost: the nodes are in Weaviate, only their summary "
+                "sidecar entries are pending."
+            ),
+            why_deferred=(
+                "This is a fact about the machine right now, not a failed "
+                "step: while no backend is selectable, retrying cannot "
+                "succeed, and an automatic full-sync retry would compete "
+                "with the code-graph walk the deferral guard exists to "
+                "protect. The next `kg-sync --all` (or the per-edit "
+                "regeneration of a node you touch) picks the work up when a "
+                "backend is available, and that successful refresh clears "
+                "this entry."
+            ),
+            command_to_apply=_node_formats_recovery_command(project_root),
+            severity="info",
         )
         emit(project_root, entry)
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
@@ -5627,6 +6186,8 @@ def _print_usage(stream=None) -> None:
     print("       (any form accepts --project-root <path> to pin the target project)", file=stream)
     print("       (any form accepts --rechunk to force the chunk-plan comparison even", file=stream)
     print("        with no revision crossing pending — repairs stale chunk boundaries)", file=stream)
+    print("       (a file list accepts --prune-missing: a knowledge/ target that no longer", file=stream)
+    print("        exists has its Weaviate rows removed instead of failing)", file=stream)
     print("Exit codes: 0 clean · 1 per-node/per-doc failures · 2 usage error or refused root", file=stream)
 
 
@@ -5838,6 +6399,14 @@ def main():
             total_fail = kg_tally.failed + doc_tally.failed
             _kg_embed_model.after_walk(_fill_collections(), PROJECT_ROOT,
                                        embedding_service, full_tree=True)
+            # v0.2.103: a CLEAN full walk is also the paired proof for the
+            # prune — rows whose source file is gone from this knowledge
+            # root are removed now (gates + rationale in
+            # `_prune_stored_only_rows`; a partial walk prunes nothing).
+            _prune_stored_only_rows(
+                run_clean=total_fail == 0,
+                kg_total=kg_tally.total,
+            )
             # v0.2.89 BUG 6: surface how many nodes routed to the shared
             # collection via `scope: shared` frontmatter.
             _shared_note = (

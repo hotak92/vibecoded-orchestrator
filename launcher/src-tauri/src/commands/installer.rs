@@ -10490,11 +10490,12 @@ MemAvailable:   23456789 kB
         let body_end = after_start.find("\n# ----").unwrap_or(after_start.len());
         let body = &after_start[..body_end];
 
-        // launcher.db removal is gated by .exists() check.
-        assert!(
-            body.contains("launcher_db.exists()"),
-            "launcher.db removal must be guarded by .exists()"
-        );
+        // NOT CHECKED HERE ANY MORE — SUPERSEDED (v0.2.103): launcher.db is no
+        // longer removed by its own guarded step; step [8] removes the whole
+        // state dir through `vco_lib.uninstall_state` (owner ruling
+        // 2026-10-16). Its idempotence is pinned by BEHAVIOUR in
+        // tests/test_v02103_uninstall_state.py::
+        // test_a_second_run_on_an_uninstalled_machine_removes_nothing_and_claims_nothing.
         // claude.json scrub is gated by .exists() check.
         assert!(
             body.contains("claude_json.exists()"),
@@ -13085,6 +13086,7 @@ MemAvailable:   23456789 kB
                 "VCT_INSTALL_BASE_PYTHON_VERSION",
                 "VCT_INSTALL_PARENT_WAITS",
                 "VCT_INSTALL_RELAUNCH_TOKEN",
+                "VCT_INSTALL_POST_VENV_HANDOFF",
             ] {
                 assert!(
                     envs.contains(&(key.to_string(), None)),

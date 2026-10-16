@@ -791,10 +791,18 @@ class ConstructionPresetTests(unittest.TestCase):
                     svc.close()
 
     def test_cpu_fallback_preset(self):
-        # CODE_EMBED_BACKEND=ollama means qwen3 for both text + code
+        # CODE_EMBED_BACKEND=ollama names a backend, not a model (v0.2.103
+        # F1 removed the fixed ollama→qwen3 mapping) — a capable CPU host's
+        # ladder answer is qwen3 for both text + code.
         with _EnvIsolation(), patch.dict(os.environ, {
             "CODE_EMBED_BACKEND": "ollama",
-        }, clear=False):
+        }, clear=False), \
+             patch("vco_lib.host_probe.selected_gpu_specs",
+                   return_value=(0.0, "")), \
+             patch("vco_lib.host_probe.probe_system_ram_gb",
+                   return_value=32.0), \
+             patch("vco_lib.host_probe.probe_cpu_cores",
+                   return_value=8):
             ollama_m, code_m, oa_m = self._patch_adapters(
                 ollama_ready=True, code_ready=False, openai_valid=False
             )

@@ -143,14 +143,14 @@ def _run_hook(
     """Run the hook through its production entry point.
 
     stdout/stderr go to FILES rather than pipes, deliberately. A detached
-    child INHERITS the parent's stdio handles, so with ``capture_output=True``
-    ``subprocess.run`` would block until the grandchild exits — the pipe stays
-    open even though the hook process is long gone. That confound would make
-    the timing assertion below measure the child instead of the hook.
-    (The inheritance itself is a real .sh/.ps1 parity gap — the POSIX siblings
-    detach with ``>/dev/null 2>&1 &`` and hold nothing — but it is a separate
-    concern from whether the child survives at all, which is what these tests
-    are for.)
+    child that inherits the parent's stdio handles would make
+    ``capture_output=True`` block until the grandchild exits — a confound
+    that would make the timing assertions below measure the child instead
+    of the hook. (v0.2.103 closed the underlying .sh/.ps1 parity gap —
+    ``Start-VcoDetachedProcess`` detaches the child with kernel-level fd
+    redirections on POSIX, pinned by
+    ``test_unredirected_detached_child_does_not_hold_the_hooks_pipes`` —
+    but measuring the HOOK through files stays the right isolation.)
     """
     env = os.environ.copy()
     env["CLAUDE_PROJECT_DIR"] = str(project)
@@ -457,6 +457,162 @@ Write-Output ("emitted=" + $out.Count)
     )
 
 
+def test_unredirected_detached_child_does_not_hold_the_hooks_pipes(tmp_path):
+    """QUIRK 4 (v0.2.103): an un-redirected detached child must not inherit
+    the hook's stdout/stderr pipes on POSIX.
+
+    The harness reads a hook's output to EOF. A detached child that
+    inherits the write end of those pipes keeps them open for its whole
+    lifetime, so a hook that detaches a multi-second job blocks its caller
+    for that whole job even though the hook process itself exited in
+    milliseconds — empirically: a 5-second `Start-Sleep` grandchild held a
+    piped hook's output hostage until it exited. The POSIX .sh siblings
+    always detach with ``>/dev/null 2>&1 < /dev/null``
+    (stop-drain-citations.sh, kg-sync-debounce.sh, verify-container-ports.sh);
+    ``Start-VcoDetachedProcess`` must hold no pipes either.
+
+    Driven, not asserted: the "hook" really runs, its output really goes
+    through a pipe, and the grandchild really outlives it — the marker
+    lands only AFTER the pipe has been proven closed, so a helper that
+    reaped the child (instead of detaching it) cannot pass either.
+    """
+    exe = _require_pwsh()
+    if os.name == "nt":
+        pytest.skip("the pipe-inheritance hazard is POSIX-specific; Windows behaviour is unchanged")
+    #: Comfortably above a cold pwsh start (~1-2 s) and the hook body, and
+    #: comfortably below the child's lifetime — pre-fix, ``communicate``
+    #: raises TimeoutExpired at this bound; post-fix it returns in ~1-2 s.
+    pipe_close_budget_s = 6.0
+    child_sleep_s = 12.0
+    marker = tmp_path / "child-ran.txt"
+    child = _stage_child_script(
+        tmp_path,
+        "pipechild.sh",
+        f"sleep {child_sleep_s}\nprintf ran > '{marker}'\n",
+    )
+    script = f"""
+. '{PS_LIB}'
+Write-Output hook-start
+Start-VcoDetachedProcess -FilePath '{child}'
+Write-Output hook-end
+"""
+    path = tmp_path / "drive-pipes.ps1"
+    path.write_text(script, encoding="utf-8")
+    proc = subprocess.Popen(
+        [exe, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        out, err = proc.communicate(timeout=pipe_close_budget_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail(
+            "the hook's output pipes were still open after "
+            f"{pipe_close_budget_s}s — an un-redirected detached child is "
+            "holding them (it must outlive the hook without inheriting its "
+            "stdio)"
+        )
+    assert b"hook-start" in out and b"hook-end" in out, (
+        f"the hook did not run to completion: {out!r} {err!r}"
+    )
+    # The child must still have RUN — detached, not dropped: it writes its
+    # marker only after outliving the pipe-close budget above.
+    deadline = time.monotonic() + MARKER_TIMEOUT_S
+    while time.monotonic() < deadline and not marker.is_file():
+        time.sleep(0.2)
+    assert marker.is_file(), (
+        "the detached child never ran — the spawn itself is broken"
+    )
+
+
+def test_detached_child_writing_after_hook_return_survives_and_logs_stderr(tmp_path):
+    """HIGH-1 (review R3 2026-10-14): a detached POSIX child that WRITES to
+    stdout and stderr AFTER the hook has returned must SURVIVE (no EPIPE)
+    and its stderr must land in the shared state-dir log; the hook itself
+    must return promptly with its pipes closed.
+
+    The first attempt at QUIRK 4 used ``Start-Process
+    -RedirectStandardOutput/-RedirectStandardError`` — on Unix pwsh
+    implements those by handing the child PIPES back to the parent and
+    copying them to the files, so once the hook exits nobody drains them
+    and the child's first write dies with BrokenPipeError (verified: both
+    streams, log left empty). The redesign launches the child through
+    ``/bin/sh -c 'exec "$0" "$@" </dev/null >/dev/null 2>><log>'`` so the
+    redirection is a kernel-level fd duplication the child owns outright.
+    """
+    exe = _require_pwsh()
+    if os.name == "nt":
+        pytest.skip("the EPIPE hazard is POSIX-specific; Windows behaviour is unchanged")
+    state = tmp_path / "state"
+    marker = tmp_path / "child-lived.txt"
+    #: The child writes only after the hook has had ample time to exit —
+    #: pre-redesign, exactly these writes killed it (EPIPE) and neither
+    #: the stderr log nor the marker ever appeared.
+    child = _stage_child_script(
+        tmp_path,
+        "writer.sh",
+        "sleep 3\n"
+        "printf 'progress noise on stdout'\n"
+        "printf 'vco-detached-stderr-marker\\n' 1>&2\n"
+        f"printf ran > '{marker}'\n",
+    )
+    script = f"""
+. '{PS_LIB}'
+Write-Output hook-start
+Start-VcoDetachedProcess -FilePath '{child}'
+Write-Output hook-end
+"""
+    path = tmp_path / "drive-writer.ps1"
+    path.write_text(script, encoding="utf-8")
+    env = os.environ.copy()
+    env["VCT_STATE_DIR"] = str(state)
+    proc = subprocess.Popen(
+        [exe, *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+    try:
+        out, err = proc.communicate(timeout=10.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail(
+            "the hook's output pipes were still open after 10s — the "
+            "detached child is holding them"
+        )
+    assert b"hook-start" in out and b"hook-end" in out, (
+        f"the hook did not run to completion: {out!r} {err!r}"
+    )
+    # The child SURVIVED its post-exit stdout+stderr writes (no EPIPE) and
+    # wrote its marker.
+    deadline = time.monotonic() + MARKER_TIMEOUT_S
+    while time.monotonic() < deadline and not marker.is_file():
+        time.sleep(0.2)
+    assert marker.is_file(), (
+        "the detached child died on its first write after the hook exited "
+        "(EPIPE) — it must own its redirections, not borrow the parent's pipes"
+    )
+    # Its stderr landed in the shared, bounded state-dir log.
+    log = state / "logs" / "detached-children.log"
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        body = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+        if "vco-detached-stderr-marker" in body:
+            break
+        time.sleep(0.2)
+    assert log.is_file() and "vco-detached-stderr-marker" in log.read_text(
+        encoding="utf-8", errors="replace"
+    ), (
+        "the detached child's stderr did not land in "
+        f"$VCT_STATE_DIR/logs/detached-children.log (exists={log.is_file()})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Item 3 — QUIRK 3: argument elements survive the spawn roundtrip, and the
 # commit-review prompt rides on stdin (MAJOR-R7-1)
@@ -589,21 +745,22 @@ def _stage_claude_shim(tmp_path: Path, record: Path) -> Path:
     return bin_dir
 
 
-#: The hook's CLI argv once the prompt rides on stdin: every existing flag
-#: kept, in order, and ``-p`` with NO prompt operand after it.
-EXPECTED_CLAUDE_ARGV = [
-    "-p",
-    "--model",
-    "haiku",
-    "--max-turns",
-    # The no-python branch mirrors the chain's DEFAULT_MAX_TURNS (v0.2.102
-    # W6-N F-4: 10 truncated about half the logged reviews).
-    "30",
-    "--no-session-persistence",
-    "--allowedTools",
-    "Read,Glob,Grep,mcp__weaviate-kg__hybrid_search,"
-    "mcp__weaviate-kg__store_knowledge_node,Write,Edit",
-]
+def _expected_claude_argv() -> "list[str]":
+    """The CLI argv the reviewer chain builds (v0.2.103: the hook spawns the
+    chain, the chain spawns ``claude``) for the default model and budget —
+    ``-p`` with NO prompt operand after it. Read from the chain itself so the
+    shape has one home."""
+    import importlib.util
+    for p in (str(REPO), str(REPO / "templates" / "scripts")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    spec = importlib.util.spec_from_file_location(
+        "_spawn_guard_kg_reviewer_backend",
+        REPO / "templates" / "scripts" / "kg_reviewer_backend.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.build_claude_cmd("sonnet", mod.DEFAULT_MAX_TURNS)[1:]
 
 
 def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
@@ -617,25 +774,38 @@ def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
     * the Windows command line is capped at 32 767 chars, and this prompt
       carries the first 300 lines of the unified diff.
 
-    So the hook writes the prompt to ``.claude/logs/kg-commit-review.prompt``
-    and spawns ``claude -p`` with ``-RedirectStandardInput`` — the same stdin
-    shape ``summary_backends.call_cli`` adopted (``claude -p`` reads the
-    prompt from stdin when no positional is given).
+    v0.2.103: the hook spawns the reviewer chain
+    (``.claude/scripts/kg_reviewer_backend.py run``), which builds the prompt
+    and spawns ``claude -p`` with the prompt on STDIN — the same stdin shape
+    ``summary_backends.call_cli`` adopted (``claude -p`` reads the prompt
+    from stdin when no positional is given).
 
     Driven through the hook's production entry point: a real two-commit
-    repo, a fake ``claude`` first on PATH that records its argv AND stdin,
-    and the assertion is the OBSERVABLE consequence at the child.
+    repo with the chain installed, a fake ``claude`` first on PATH that
+    records its argv AND stdin, and the assertion is the OBSERVABLE
+    consequence at the child.
     """
     exe = _require_pwsh()
     project = _stage_commit_review_project(tmp_path)
+    scripts = project / ".claude" / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("kg_reviewer_backend.py", "summary_backends.py"):
+        shutil.copy2(REPO / "templates" / "scripts" / name, scripts / name)
     record = tmp_path / "claude-shim-record.txt"
     bin_dir = _stage_claude_shim(tmp_path, record)
 
     env = os.environ.copy()
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
     env["CLAUDE_SHIM_RECORD"] = str(record)
-    env.pop("VCT_DISABLE_HOOKS", None)
-    env.pop("CLAUDE_CODE_DISABLE_AUTO_MEMORY", None)
+    env["VCT_ORCHESTRATOR_ROOT"] = str(REPO)
+    env["VCT_STATE_DIR"] = str(tmp_path / "state")
+    # The harness names the workspace: the hook resolves the PROJECT root by
+    # the one rule (CLAUDE_PROJECT_DIR first; v0.2.103 final review M-1).
+    env["CLAUDE_PROJECT_DIR"] = str(project)
+    for key in ("VCT_DISABLE_HOOKS", "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+                "VCO_KG_REVIEW_MODEL", "VCO_KG_REVIEW_MAX_TURNS",
+                "VCT_LAUNCHER_DB_PATH"):
+        env.pop(key, None)
     out_path = tmp_path / "commit-hook.out"
     err_path = tmp_path / "commit-hook.err"
     with open(out_path, "wb") as out, open(err_path, "wb") as err:
@@ -660,7 +830,7 @@ def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
     stdin_body = text.split("STDIN-START\n", 1)[1] if "STDIN-START\n" in text else ""
 
     # The prompt — with the diff inside — arrived on STDIN.
-    assert "### Diff (first 300 lines):" in stdin_body, (
+    assert "### Diff" in stdin_body, (
         "the prompt did not arrive on the child's stdin"
     )
     assert "KG_PROMPT_DIFF_MARKER_7f3a" in stdin_body, (
@@ -675,7 +845,7 @@ def test_commit_review_prompt_rides_on_stdin_not_the_command_line(tmp_path):
         "parses a leading '---' as an option and rejects the call"
     )
     # Every existing flag kept, and -p carries NO prompt operand.
-    assert argv_lines == EXPECTED_CLAUDE_ARGV, (
+    assert argv_lines == _expected_claude_argv(), (
         f"the CLI argv changed shape: {argv_lines!r}"
     )
 

@@ -278,14 +278,17 @@ def resync_still_owed(folder: Path) -> Optional[bool]:
 
 
 def resync_commands(folder: Path, tail_comment: str) -> str:
-    """The ONE re-chunk remediation both chunker deferrals emit.
+    """The ONE re-chunk remediation the chunker deferral emits.
 
-    Two emitters exist in ``project_init`` (the v0.2.46 SEMVER-boundary gate
-    and the ``_CHUNKER_REVISION`` gate) and they share a ``condition_id``, so
-    their commands MUST be the same text — a divergence would ship whichever
-    ran first. One builder, two callers. It lives here rather than in
-    ``project_init`` because this module owns the chunker-resync lifecycle and
-    ``project_init`` is ratchet-capped (its call sites stay thin).
+    The emitter is ``project_init._emit_chunker_revision_resync_deferral``
+    (called from the Python bundle engine and, via ``python -c``, from the
+    launcher's Rust revision hook), and the ``condition_id`` it writes is
+    shared with the resolver — so the commands MUST stay this one text. One
+    builder, every caller. It lives here rather than in ``project_init``
+    because this module owns the chunker-resync lifecycle and
+    ``project_init`` is ratchet-capped (its call sites stay thin). (The
+    v0.2.46 SEMVER-boundary sibling emitter was retired in v0.2.103, owner
+    decision 2026-10-15 — superseded by the revision-keyed paths.)
 
     Shape (v0.2.92, BLOCKER-2 + the R42 portability sweep):
 

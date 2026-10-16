@@ -197,6 +197,31 @@ def test_partial_final_line_is_left_unconsumed(tmp_path: Path) -> None:
     assert second.end_offset == t.stat().st_size
 
 
+def test_scan_at_eof_resumes_from_its_start_not_zero(tmp_path: Path) -> None:
+    """A scan that starts at EOF consumes nothing: its resume point is its own
+    start. Returning 0 here made the nudge re-count the whole transcript."""
+    ctc = _load_counter()
+    t = tmp_path / "s.jsonl"
+    _write_transcript(t, [_entry("a", 100), _entry("b", 200)])
+    size = t.stat().st_size
+    r = ctc.TranscriptScanner().scan(t, start_offset=size)
+    assert r.work_units_total == 0
+    assert r.start_offset_used == size
+    assert r.end_offset == size
+
+
+def test_only_a_partial_line_after_the_offset_keeps_the_offset(tmp_path: Path) -> None:
+    ctc = _load_counter()
+    t = tmp_path / "s.jsonl"
+    _write_transcript(t, [_entry("a", 100)])
+    done = t.stat().st_size
+    with open(t, "a", encoding="utf-8") as fh:
+        fh.write('{"requestId": "b", "message": {"role": "assist')  # mid-write
+    r = ctc.TranscriptScanner().scan(t, start_offset=done)
+    assert r.work_units_total == 0
+    assert r.end_offset == done
+
+
 # --- 3. the hook: resolution + persistence + loud-fail --------------------------
 
 needs_bash = pytest.mark.skipif(
@@ -236,8 +261,8 @@ def _nudge_rig(tmp_path: Path) -> dict:
             "metrics": state / "metrics" / "kg_update_tokens.jsonl"}
 
 
-def _run_nudge(rig: dict, session: str) -> subprocess.CompletedProcess:
-    payload = {
+def _run_nudge(rig: dict, session: str, payload: dict | None = None) -> subprocess.CompletedProcess:
+    payload = payload or {
         "hook_event_name": "UserPromptSubmit",
         "session_id": session,
         "transcript_path": str(rig["transcript"]),
@@ -284,6 +309,32 @@ def test_nudge_resume_does_not_double_count(tmp_path: Path) -> None:
     assert _run_nudge(rig, "s-resume").returncode == 0
     row = _state_row(rig, "s-resume")
     assert row["last_seen_total"] == 12_000, row
+
+
+@needs_bash
+def test_kg_write_with_no_new_bytes_keeps_offset_and_total(tmp_path: Path) -> None:
+    """2026-10-14 field report: prompt → KG-write PostToolUse (no new
+    transcript bytes) → prompt. The KG write's scan starts at EOF; it must
+    not persist scan_offset=0, or the next prompt re-adds the whole
+    transcript and the nudge fires right after a KG write."""
+    rig = _nudge_rig(tmp_path)
+    _write_transcript(rig["transcript"], [_entry("a", 5000), _entry("b", 7000)])
+    size = rig["transcript"].stat().st_size
+    assert _run_nudge(rig, "s-kgw").returncode == 0
+    kg_write = {
+        "hook_event_name": "PostToolUse",
+        "session_id": "s-kgw",
+        "transcript_path": str(rig["transcript"]),
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(rig["proj"] / "knowledge" / "concepts" / "x.md")},
+    }
+    assert _run_nudge(rig, "s-kgw", kg_write).returncode == 0
+    after_write = _state_row(rig, "s-kgw")
+    assert after_write["scan_offset"] == size, after_write
+    assert _run_nudge(rig, "s-kgw").returncode == 0
+    row = _state_row(rig, "s-kgw")
+    assert row["last_seen_total"] == 12_000, row
+    assert row["scan_offset"] == size, row
 
 
 @needs_bash

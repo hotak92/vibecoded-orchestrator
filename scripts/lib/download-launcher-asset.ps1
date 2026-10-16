@@ -28,6 +28,13 @@
 #      present (they ship in the same archive since v0.2.21).
 #   5. Sanity-check the landed binary is >= -MinSizeBytes (default 10 MB;
 #      a healthy vct-launcher.exe is ~24-31 MB).
+#   R20 M1: BEFORE anything is extracted or landed, the download is checked
+#      against the `<asset>.sha256` sidecar release.yml publishes beside it,
+#      through the ONE verifier `python -m vco_lib.launcher_acquire
+#      verify-sha256` (-PythonExe; also called by post-install-launcher.sh).
+#      No sidecar in the release, a failed sidecar fetch, no -PythonExe, or a
+#      digest mismatch: nothing reaches -DestDir and the helper exits 5/6, so
+#      first-install.bat treats it as "no prebuilt obtained".
 #
 # Exit codes (consumed by first-install.bat :launch_download):
 #   0  success — vct-launcher.exe landed at <DestDir>\vct-launcher.exe
@@ -35,6 +42,9 @@
 #   2  NO_ASSET — release has no matching windows .zip or .exe asset
 #   3  TOO_SMALL — downloaded binary smaller than -MinSizeBytes
 #   4  NO_BINARY_IN_ZIP — zip downloaded + extracted but no vct-launcher.exe inside
+#   5  CHECKSUM_MISMATCH — the download does not match the release's .sha256
+#   6  UNVERIFIED — no .sha256 sidecar in the release, the sidecar could not be
+#      fetched/parsed, or no -PythonExe to run the verifier
 #
 # Parameters:
 #   -DestDir      directory to land vct-launcher.exe in (created if missing)
@@ -42,6 +52,8 @@
 #                 tests/test_download_launcher_asset_ps1.py points this at
 #                 a localhost fixture server)
 #   -MinSizeBytes minimum acceptable binary size (overridable for tests)
+#   -PythonExe    interpreter that runs vco_lib.launcher_acquire verify-sha256
+#                 (first-install.bat passes the venv install.py created)
 
 [CmdletBinding()]
 param(
@@ -50,7 +62,9 @@ param(
 
     [string]$ApiUrl = 'https://api.github.com/repos/hotak92/vibecoded-orchestrator/releases/latest',
 
-    [long]$MinSizeBytes = 10MB
+    [long]$MinSizeBytes = 10MB,
+
+    [string]$PythonExe = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,6 +72,58 @@ $ErrorActionPreference = 'Stop'
 # Invoke-WebRequest that slows a ~22 MB download by an order of
 # magnitude. pwsh 7 is unaffected; silencing is harmless there.
 $ProgressPreference = 'SilentlyContinue'
+
+# The checkout root (scripts\lib\ -> ..\..): the verifier is imported from it.
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+
+# R20 M1 — check $Path against the release's sidecar for $Asset. Returns the
+# helper's exit code: 0 verified, 5 mismatch, 6 unverifiable. Prints why.
+function Test-LauncherDownload {
+    param($Release, $Asset, [string]$Path, [string]$WorkDir)
+    $sidecarName = $Asset.name + '.sha256'
+    $sidecar = $Release.assets | Where-Object { $_.name -eq $sidecarName } | Select-Object -First 1
+    if (-not $sidecar) {
+        Write-Host ('UNVERIFIED: the release publishes no ' + $sidecarName + ' - not running an unverified download')
+        return 6
+    }
+    if (-not $PythonExe) {
+        Write-Host ('UNVERIFIED: no Python to verify ' + $Asset.name + ' - not running an unverified download')
+        return 6
+    }
+    $shaPath = Join-Path $WorkDir $sidecarName
+    try {
+        Invoke-WebRequest -Uri $sidecar.browser_download_url -OutFile $shaPath -UseBasicParsing
+    }
+    catch {
+        Write-Host ('UNVERIFIED: could not fetch ' + $sidecarName + ': ' + $_.Exception.Message)
+        return 6
+    }
+    $savedPyPath = $env:PYTHONPATH
+    try {
+        $env:PYTHONPATH = if ($savedPyPath) { $RepoRoot + [IO.Path]::PathSeparator + $savedPyPath } else { $RepoRoot }
+        & $PythonExe -m vco_lib.launcher_acquire verify-sha256 --file $Path --sidecar $shaPath --name $Asset.name | Out-Null
+        $rc = $LASTEXITCODE
+    }
+    catch {
+        Write-Host ('UNVERIFIED: the verifier could not run: ' + $_.Exception.Message)
+        return 6
+    }
+    finally {
+        $env:PYTHONPATH = $savedPyPath
+    }
+    if ($rc -eq 0) {
+        Write-Host ('Checksum verified for ' + $Asset.name)
+        return 0
+    }
+    # 3 = VERIFY_MISMATCH in vco_lib/launcher_acquire.py (must match). Exit 1
+    # is a crashed verifier and falls through to UNVERIFIED below.
+    if ($rc -eq 3) {
+        Write-Host ('CHECKSUM_MISMATCH: ' + $Asset.name + ' does not match ' + $sidecarName + ' - the download is discarded, never run')
+        return 5
+    }
+    Write-Host ('UNVERIFIED: the verifier rejected ' + $sidecarName + ' (exit ' + $rc + ')')
+    return 6
+}
 
 try {
     if (-not (Test-Path -LiteralPath $DestDir)) {
@@ -68,7 +134,8 @@ try {
     $release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing
 
     # Current packaging: uniform .zip per OS. EndsWith('.zip') excludes
-    # the .zip.sha256 checksum sidecars that ship alongside.
+    # the .zip.sha256 checksum sidecars that ship alongside (they are
+    # fetched by Test-LauncherDownload to verify the archive).
     $asset = $release.assets |
         Where-Object { $_.name -like '*windows*' -and $_.name.EndsWith('.zip') } |
         Select-Object -First 1
@@ -89,16 +156,27 @@ try {
 
     Write-Host ('Downloading ' + $asset.name)
 
+    $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('vct-launcher-dl-' + [IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
     if (-not $isZip) {
-        # Legacy direct-exe path.
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $destExe -UseBasicParsing
+        # Legacy direct-exe path: downloaded aside, verified, then landed.
+        try {
+            $exePath = Join-Path $tmpRoot $asset.name
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $exePath -UseBasicParsing
+            $verdict = Test-LauncherDownload -Release $release -Asset $asset -Path $exePath -WorkDir $tmpRoot
+            if ($verdict -ne 0) { exit $verdict }
+            Copy-Item -LiteralPath $exePath -Destination $destExe -Force
+        }
+        finally {
+            Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
     else {
-        $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('vct-launcher-dl-' + [IO.Path]::GetRandomFileName())
-        New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
         try {
             $zipPath = Join-Path $tmpRoot $asset.name
             Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
+            $verdict = Test-LauncherDownload -Release $release -Asset $asset -Path $zipPath -WorkDir $tmpRoot
+            if ($verdict -ne 0) { exit $verdict }
 
             $extractDir = Join-Path $tmpRoot 'extracted'
             # Expand-Archive ships with PowerShell 5.0+ (every Win10+ box)

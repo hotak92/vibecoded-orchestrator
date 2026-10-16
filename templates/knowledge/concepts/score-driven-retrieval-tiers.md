@@ -69,8 +69,9 @@ alias `descriptions` maps to `summary` for backward compatibility.
 ## Sidecar Dependency
 
 Tier formatting reads from `knowledge/.node_formats.json` (the LLM-generated
-sidecar maintained by `claude_mcp_servers/scripts/generate_node_formats.py` and the
-`kg-summary-generator.sh` post-edit hook). Fields used:
+sidecar maintained by `templates/scripts/generate-kg-summary.py` — the
+`kg-summary-generator.sh` post-edit hook per node, plus its `--all` bulk
+mode). Fields used:
 
 - `description` — preferred body for `summary` tier (~6 lines)
 - `summary` — shorter fallback when description missing (~1-2 lines); also used as

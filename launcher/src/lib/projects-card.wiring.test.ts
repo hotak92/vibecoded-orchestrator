@@ -2,23 +2,16 @@
 // Copyright (c) 2026 VibeCoded Tools
 //
 // Wiring guard for the Projects-page card routing (P299-C3, pinned by
-// W5-B in v0.2.102).
+// W5-B in v0.2.102; re-pinned by the owner ruling of 2026-10-15).
 //
 // THE DEFECT IT PINS (the owner-reported regression): the v0.2.99-era
 // rework left the project card with no route at all. The v0.2.101 fix
-// (owner ruling 2026-10-05, PLAN-V02101-PULL-IN §7) made a card click
-// route into `/project/<id>/settings` — the surface with the bundle
-// Update button, rename, repoint and unregister — and added the per-row
-// ⚙ Settings button beside it. This file pins that BOTH the card body
-// and the settings action are wired and route to the settings page, so
-// the card can never go inert again silently.
-//
-// NOTE for the owner: the W5-B brief words it "the card routes to the
-// project page and the settings action to settings". As written in code
-// BOTH go to settings, per the 2026-10-05 ruling's own comment ("a card
-// click routes into the project's SETTINGS page"). Splitting the card to
-// the overview is a one-line change here + open() — an owner decision,
-// not taken by this lane.
+// (owner ruling 2026-10-05) made a card click route into
+// `/project/<id>/settings`. The owner reversed that on 2026-10-15: a
+// plain project open (the card body) must land on the project page
+// `/project/<id>` (its default tab), NOT settings — only the explicit
+// ⚙ Settings action goes to `/project/<id>/settings`. This file pins
+// BOTH wirings so the card can never go inert again silently.
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -40,7 +33,7 @@ const CARD = parse(
 ) as unknown as Node;
 
 describe('Projects page — card routing (P299-C3)', () => {
-  it('open() routes to the project SETTINGS page (the 2026-10-05 ruling)', () => {
+  it('open() routes to the PROJECT page (owner ruling 2026-10-15: a plain project open lands on the default tab)', () => {
     const fn = [...walk((PAGE.instance as Node).content)].find(
       (n) => n.type === 'FunctionDeclaration' && isIdent(n.id, 'open'),
     );
@@ -53,20 +46,37 @@ describe('Projects page — card routing (P299-C3)', () => {
       [...walk(goto[0])].some(
         (n) => n.type === 'TemplateLiteral' && JSON.stringify(n).includes('/settings'),
       ),
-      'open() does not route to /settings',
+      'open() routes to /settings — a plain project open must land on /project/<id>',
+    ).toBe(false);
+  });
+
+  it('openSettings() routes to the project SETTINGS page (the explicit ⚙ action)', () => {
+    const fn = [...walk((PAGE.instance as Node).content)].find(
+      (n) => n.type === 'FunctionDeclaration' && isIdent(n.id, 'openSettings'),
+    );
+    expect(fn, 'no openSettings() function').toBeTruthy();
+    const goto = [...walk(fn!)].filter(
+      (n) => n.type === 'CallExpression' && isIdent(n.callee, 'goto'),
+    );
+    expect(goto.length, 'openSettings() never navigates').toBe(1);
+    expect(
+      [...walk(goto[0])].some(
+        (n) => n.type === 'TemplateLiteral' && JSON.stringify(n).includes('/settings'),
+      ),
+      'openSettings() does not route to /settings',
     ).toBe(true);
   });
 
-  it('the per-row ⚙ Settings action calls open()', () => {
+  it('the per-row ⚙ Settings action calls openSettings()', () => {
     const button = [...walk(PAGE.fragment)].find(
       (n) =>
         n.type === 'RegularElement' &&
         n.name === 'button' &&
         [...walk(n)].some(
-          (x) => x.type === 'CallExpression' && isIdent((x as Node).callee, 'open'),
+          (x) => x.type === 'CallExpression' && isIdent((x as Node).callee, 'openSettings'),
         ),
     );
-    expect(button, 'no settings button calling open()').toBeTruthy();
+    expect(button, 'no settings button calling openSettings()').toBeTruthy();
   });
 
   it('the CARD body itself is wired: ProjectCard is rendered with onOpen={open}', () => {

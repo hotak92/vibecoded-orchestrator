@@ -80,31 +80,6 @@ if _sys.version_info < (3, 11):
     )
     _sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# Windows stdout/stderr encoding sentinel — runs BEFORE any print().
-#
-# Python on Windows defaults stdout to the legacy ANSI code page (cp1252 in
-# Western locales). Any print() containing characters outside that codepage
-# — arrows (U+2192), em-dash (U+2014), check/cross marks, etc. — crashes
-# the installer with UnicodeEncodeError. install.py contains ~660 such
-# characters in user-facing prints.
-#
-# Reconfiguring stdout/stderr to UTF-8 with errors='replace' makes those
-# prints survive on any locale. errors='replace' (not 'strict') ensures
-# we never hard-fail on an unexpected glyph — a substitute character is
-# preferable to crashing mid-install.
-#
-# No-op on POSIX systems (stdout is already UTF-8 there). The reconfigure()
-# method exists on Python 3.7+, so it's safe under our MIN_PYTHON=(3,11).
-# ---------------------------------------------------------------------------
-if _sys.platform == "win32":
-    try:
-        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, OSError):
-        # Detached / redirected streams may lack reconfigure(); ignore.
-        pass
-
 import argparse
 import atexit
 import contextlib
@@ -141,6 +116,27 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# ---------------------------------------------------------------------------
+# Windows stdout/stderr encoding sentinel — runs BEFORE any print() (nothing
+# above prints).
+#
+# Python on Windows defaults stdout to the legacy ANSI code page (cp1252 in
+# Western locales). Any print() containing characters outside that codepage
+# — arrows (U+2192), em-dash (U+2014), check/cross marks, etc. — crashes
+# the installer with UnicodeEncodeError. install.py contains ~660 such
+# characters in user-facing prints.
+#
+# v0.2.103: forcing UTF-8 stopped the crash but printed garbage wherever the
+# output was read through a pipe by a cp1252/OEM reader (field: em dashes in
+# a Windows console). The ONE home for the per-stream choice — real console
+# keeps Unicode, a reader that declared UTF-8 gets UTF-8, any other pipe
+# gets transliterated ASCII, never a crash — is vco_lib.console_text (a pure
+# stdlib leaf, importable before the venv exists). No-op on POSIX.
+# ---------------------------------------------------------------------------
+from vco_lib.console_text import harden_stdio as _harden_stdio  # noqa: E402
+
+_harden_stdio()
+
 # The vco_lib modules install.py delegates to. Imported after the sys.path
 # insert above, hence the E402 waivers.
 from vco_lib.atomic import atomic_copy_file as _atomic_copy_file, atomic_write_text as _atomic_write_text  # noqa: E402
@@ -155,6 +151,7 @@ from vco_lib import deferral_dismissal as _deferral_dismissal  # noqa: E402
 from vco_lib import deferral_probes as _deferral_probes  # noqa: E402
 from vco_lib import deferral_registry as _deferral_registry  # noqa: E402
 from vco_lib import doctor as _doctor  # noqa: E402
+from vco_lib import container_engine_start as _container_engine_start  # noqa: E402
 from vco_lib import playwright_mcp as _playwright_mcp  # noqa: E402
 from vco_lib import install_companions as _install_companions  # noqa: E402
 from vco_lib import manifest_paths as _manifest_paths  # noqa: E402
@@ -162,6 +159,8 @@ from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
 from vco_lib import paths as _paths  # noqa: E402
 from vco_lib import service_endpoints as _service_endpoints  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
+from vco_lib import uninstall_artifacts as _uninstall_artifacts  # noqa: E402
+from vco_lib import uninstall_containers as _uninstall_containers, uninstall_quiesce as _uninstall_quiesce, uninstall_state as _uninstall_state  # noqa: E402,E501
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
 from vco_lib import compose_provider as _compose_provider  # noqa: E402
@@ -243,12 +242,13 @@ from vco_lib.embedding_selection import (  # noqa: E402,F401
     # venv exists, so it may only reach a pure stdlib leaf.
     model_id_for_active as _model_id_for_active_shared,
     _cpu_meets,  # pyright: ignore[reportUnusedImport] — re-export for tests
-    select_code_embedding_backend,
+    select_code_embedding_backend,  # pyright: ignore[reportUnusedImport] — re-export (tests/test_hardware_auto_selection.py)
+    select_code_model_for_host,  # v0.2.103 F1: the ladder + AMD rule, ONE home
     select_kg_embedding_backend,
     select_summary_backend,  # pyright: ignore[reportUnusedImport] — re-export (tests/test_hardware_auto_selection.py)
     summary_model_for_hardware,
     _CODE_BACKEND_CODESAGE,
-    _CODE_BACKEND_QWEN3,
+    _CODE_BACKEND_QWEN3,  # pyright: ignore[reportUnusedImport] — re-export (tests drive install's AMD route through it)
     _CODE_BACKEND_JINA,  # pyright: ignore[reportUnusedImport] — re-export
     _CODE_BACKEND_OPENAI,  # pyright: ignore[reportUnusedImport] — re-export
     _KG_BACKEND_QWEN3,
@@ -438,7 +438,8 @@ EMBEDDING_CONFIGS = {
     # Text uses Snowflake Arctic Embed v2 (smaller than qwen3, still 1024d, Apache 2.0).
     # Code uses Jina V2 base-code (768d, specialized for code).
     # Both run via Ollama (no GPU code-embed service).
-    # Picks: opt-in via --low-resource (not auto-selected — explicit choice).
+    # Picks: --low-resource (explicit, keeps the inference cap below) or the
+    # auto tier when KG picks arctic (cap dropped — the hardware ladder picks).
     "low_resource": {
         "text_model": "snowflake-arctic-embed2:latest",
         "text_dims": 1024,
@@ -522,6 +523,11 @@ _RESUME_ENABLED: bool = True
 # directory exists. Bounded only by the install length (~10s of entries),
 # so no eviction needed.
 _PENDING_EVENTS: list[str] = []
+
+# v0.2.103: the record of the post-venv hand-off this run IS (a child the
+# install.py that finished step 5 continued as — `_continue_in_venv_after_deps`),
+# loaded once at the top of main(); the empty record in every other run.
+_HANDOFF = _install_companions.PostVenvHandoff()
 
 # v0.2.44 V44-H/H5: set True when _seed_weaviate detects a dual-clone
 # situation (PROJECT_ROOT has all orchestrator-root file markers but
@@ -4666,6 +4672,76 @@ def _ensure_running_under_mcp_venv() -> None:
     _install_companions.hand_off(str(target), [str(target), *sys.argv], env)  # exec; Windows: wait
 
 
+
+def _adopt_post_venv_handoff() -> None:
+    """v0.2.103: load this run's post-venv hand-off record (see
+    ``vco_lib.install_companions.continue_in_venv``) into ``_HANDOFF`` and
+    re-buffer the log lines its parent wrote before step 8 existed, so they
+    reach ``install.jsonl`` ahead of this run's own. A no-op in every run that
+    is not such a child."""
+    global _HANDOFF
+    _HANDOFF = _install_companions.load_post_venv_handoff()
+    if _HANDOFF.pending_events:
+        _PENDING_EVENTS[:0] = _HANDOFF.pending_events
+
+
+def _continue_in_venv_after_deps(venv_python: Path, args: argparse.Namespace,
+                                 adopt_project_mode: str | None, storage_choice: dict,
+                                 flow: InstallDeferralFlow) -> None:
+    """v0.2.103 — once step 5 filled the venv, continue the run AS that venv's
+    python, so every later in-process step imports what step 5 installed.
+    Without it a fresh install (no ``.venv`` when `_ensure_running_under_mcp_venv`
+    ran) finished on the launching interpreter. The record carries this run's
+    buffered log lines, the answers it already has and its deferral entries;
+    the singleton lock is released just before the hop (the child takes it
+    again). A no-op when this run already runs in that venv or is the child."""
+    _install_companions.continue_in_venv(venv_python, sys.argv, {
+        "pending_events": list(_PENDING_EVENTS),
+        "decisions": {
+            "adopt_project_mode": adopt_project_mode,
+            "storage_choice": storage_choice,
+            "env_secret_offer_made": True,
+            "lean_ctx_offer_made": True,
+            "conflict_strategy_applied": bool(getattr(args, "conflict_strategy", None)),
+        },
+        "deferral_entries": flow.carried_state(),
+    }, before_hand_off=_release_main_entry_lock_atexit)
+
+
+def _seed_run_report(flow: InstallDeferralFlow) -> None:
+    """A-2 (v0.2.73): seed the run's report FROM DISK so the end-of-run write
+    cannot clobber entries other writer families persisted (project_init,
+    Rust emitters, background resync children). Only FOREIGN entries merge;
+    owned condition IDs keep their drop-when-absent self-cleaning semantics.
+    Soft-fail: a seed failure degrades to the pre-A-2 behaviour, never blocks
+    the install. v0.2.103: then take a hand-off parent's entries as this run's
+    own (``InstallDeferralFlow.adopt_carried``)."""
+    try:
+        seeded = flow.seed()
+        if seeded:
+            _log_install_event(
+                "deferral_report", "ok",
+                f"preserved {seeded} foreign deferral entr"
+                f"{'y' if seeded == 1 else 'ies'} from disk (A-2 seed)",
+            )
+    except Exception as exc:  # noqa: BLE001 — seeding is best-effort
+        _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
+    flow.adopt_carried(_HANDOFF.deferral_entries)
+
+
+def _storage_choice_step(args: argparse.Namespace) -> dict:
+    """Step 3b: prompt for the storage layout, persist and record it (moved
+    out of main(), v0.2.103 — a hand-off child replays its parent's answer
+    instead of calling this)."""
+    choice = _prompt_storage_location(PROJECT_ROOT, args)
+    if choice.get("mode") != "deferred":
+        _persist_storage_choice(choice, PROJECT_ROOT)
+        _record_install_choice(
+            "storage_mode", choice["mode"],
+            {"bind_paths": list((choice.get("bind_paths") or {}).keys())},
+        )
+    return choice
+
 # ---------------------------------------------------------------------------
 # V47-C (v0.2.46 Part 2 Gap C): .env secret detection + keychain migration.
 #
@@ -4750,6 +4826,8 @@ def _audit_and_offer_env_secret_migration(
     install starts. Soft-fails on any exception — secrets handling must
     never block the install (the user can re-run with secrets later).
     """
+    if _HANDOFF.done("env_secret_offer_made"):
+        return  # v0.2.103: the hand-off parent already made this offer (its entries were carried)
     try:
         env_path = project_root / ".env"
         candidates = _secrets_audit.audit_env_secrets(env_path)
@@ -5224,6 +5302,7 @@ def main() -> int:
     # A relaunch record counts only if THIS run's parent made it (argv token);
     # then (Windows) a kill of that waiting parent stops this run too.
     _install_companions.adopt_relaunch(sys.argv)
+    _adopt_post_venv_handoff()  # v0.2.103: a child of the step-5 hand-off replays its parent
     # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
     # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
     # probe is usable on a freshly cloned repo with no .venv. The bootstrap
@@ -5500,7 +5579,7 @@ def main() -> int:
                         help="Uninstall the orchestrator. Lists what will be removed (dry-run by "
                              "default), then prompts for confirmation per category.")
     parser.add_argument("--keep-data", action="store_true", default=False,
-                        help="Uninstall: keep container volumes (Weaviate / Ollama / code embeddings).")
+                        help="Uninstall: keep the container volumes ONLY — step [8] still removes the state dir (RL training data, license.key) unless declined.")
     parser.add_argument("--remove-projects", action="store_true", default=False,
                         help="Uninstall: also remove orchestrator-managed .claude/ folders in "
                              "registered projects (default: off — leave user code alone).")
@@ -5767,22 +5846,7 @@ def main() -> int:
     _deferral_report = _deferral_flow.report
     _deferral_folder = _deferral_flow.folder
 
-    # A-2 (v0.2.73): seed the run's report FROM DISK so the end-of-run write
-    # cannot clobber entries other writer families persisted (project_init,
-    # Rust emitters, background resync children). Only FOREIGN entries merge;
-    # owned condition IDs keep their drop-when-absent self-cleaning
-    # semantics. Soft-fail: a seed failure degrades to the pre-A-2
-    # behaviour, never blocks the install.
-    try:
-        _seeded = _deferral_flow.seed()
-        if _seeded:
-            _log_install_event(
-                "deferral_report", "ok",
-                f"preserved {_seeded} foreign deferral entr"
-                f"{'y' if _seeded == 1 else 'ies'} from disk (A-2 seed)",
-            )
-    except Exception as exc:  # noqa: BLE001 — seeding is best-effort
-        _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
+    _seed_run_report(_deferral_flow)  # A-2 disk seed (+ a hand-off parent's entries)
 
     # PR-11: warn early when global lean-ctx hooks are present in
     # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
@@ -5801,7 +5865,7 @@ def main() -> int:
     # subsequent steps see the post-resolution file tree. Best-effort
     # logging — the install log dir may not exist yet, in which case
     # _log_install_event() silently skips (matches Rust contract).
-    if args.conflict_strategy:
+    if args.conflict_strategy and not _HANDOFF.done("conflict_strategy_applied"):
         if not args.conflict_source_path:
             print("ERROR: --conflict-strategy requires --conflict-source-path")
             return 2
@@ -5846,7 +5910,8 @@ def main() -> int:
     # functions. V47-G-final's detection heuristic + interactive prompt fires
     # here when no explicit flag is set AND PROJECT_ROOT shows existing-
     # project signals (CLAUDE.md, .env, .venv/, .claude/, knowledge/).
-    adopt_project_mode = _resolve_adopt_project_mode(args, install_path=PROJECT_ROOT)
+    adopt_project_mode = _HANDOFF.replay(
+        "adopt_project_mode", lambda: _resolve_adopt_project_mode(args, install_path=PROJECT_ROOT))
     if adopt_project_mode == "no-adopt":
         print(
             "Adopt-project mode explicitly refused via --no-adopt-project. "
@@ -5883,7 +5948,9 @@ def main() -> int:
     # at least once (i.e. on second+ install attempts on this checkout).
     global _RESUME_ENABLED, _RESUME_SESSION
     _RESUME_ENABLED = not args.no_resume
-    _RESUME_SESSION = _install_resume.load_session(_install_log_path(), enabled=_RESUME_ENABLED)
+    _RESUME_SESSION = _install_resume.load_session(  # a hand-off child resumes its parent's steps
+        _install_log_path(), enabled=_RESUME_ENABLED or _HANDOFF.active,
+        extra_lines=_HANDOFF.pending_events)
 
     print()
     print("=" * 62)
@@ -5947,24 +6014,18 @@ def main() -> int:
     # BEFORE the container-runtime detection so a user with 110 GB of
     # legacy Ollama models doesn't end up with empty named volumes after
     # `_start_services`. Silently skipped on --quiet / --yes / non-TTY
-    # stdin / when no legacy data is detected. Result persisted via the
-    # launcher binary CLI (preferred) or a direct Python write of
-    # ~/.vct/storage.toml (fallback). See
-    # `.claude/context/volume-binding-fix-2026-05-16.md` for the silent-
-    # data-loss footgun this closes.
-    _storage_choice = _prompt_storage_location(PROJECT_ROOT, args)
-    if _storage_choice.get("mode") != "deferred":
-        _persist_storage_choice(_storage_choice, PROJECT_ROOT)
-        _record_install_choice(
-            "storage_mode", _storage_choice["mode"],
-            {"bind_paths": list((_storage_choice.get("bind_paths") or {}).keys())},
-        )
+    # stdin / when no legacy data is detected. Persisted via the launcher
+    # CLI or ~/.vct/storage.toml (`_persist_storage_choice`); see
+    # `.claude/context/volume-binding-fix-2026-05-16.md`.
+    _storage_choice = _HANDOFF.replay("storage_choice", lambda: _storage_choice_step(args))
 
     # Step 4: Create virtual environment
     venv_python = _create_venv(PROJECT_ROOT)
 
     # Step 5: Install/update Python dependencies
     _install_requirements(venv_python, dev=args.dev)
+    _continue_in_venv_after_deps(venv_python, args, adopt_project_mode, _storage_choice,
+                                 _deferral_flow)  # v0.2.103: the rest runs under the venv
     _run_machine_migrations(_deferral_report)  # needs the venv (v0.2.97)
 
     # Step 5b (v0.2.85, PLAN-v0285 D1/D2): install the orchestrator-self runtime
@@ -5983,10 +6044,8 @@ def main() -> int:
     # missing, so user edits survive every --update.
     _materialize_vct_secrets_shared_readme(PROJECT_ROOT)
 
-    # V0243-5: emit VCT_ORCHESTRATOR_ROOT + VCT_INFRASTRUCTURE_DIR + KG_BASE_DIR
-    # to .claude/env managed block. Done unconditionally on orchestrator-root
-    # installs so the 3 portability keys are always present regardless of
-    # whether launcher.db exists yet (pre-first-boot fresh installs).
+    # V0243-5: the 3 portability keys go to .claude/env on every root install,
+    # launcher.db or not (pre-first-boot fresh installs).
     if _is_orchestrator_root_install():
         _emit_orchestrator_root_env_keys(PROJECT_ROOT)
 
@@ -6003,6 +6062,7 @@ def main() -> int:
             + ", ".join(str(p) for p in foreign),
         )
 
+    _prior_code_model = _recorded_code_model_before_step7()  # R45 P2
     # Step 6: Container services (restart on update to pick up config changes)
     if not args.no_containers:
         if not sysinfo.container_cmd:
@@ -6111,6 +6171,7 @@ def main() -> int:
             _write_preset_defaults_to_app_state(
                 embed_config,
                 openai_set_as_default=bool(embed_config.get("openai_key")),
+                prior_code_model=_prior_code_model,
             )
         except Exception as _preset_err:  # noqa: BLE001 — never block install
             # Defense-in-depth: the helper already soft-fails on every
@@ -6140,7 +6201,7 @@ def main() -> int:
         # crash, never an unbounded hang (v0.2.89 FIX 1 readiness gate). A seed
         # the write gate refused is SKIPPED, not a success (L1-F18).
         _seed_succeeded = _install_weaviate.collections_and_seed(
-            lambda: _ensure_collections(embed_config, decisions=decisions, args=args),
+            lambda: _ensure_collections(embed_config, decisions=decisions, args=args, deferral_report=_deferral_report),
             lambda: _seed_weaviate(args, deferral_report=_deferral_report),
             report=_deferral_report, rebuild_performed=_rebuild_was_performed,
             runtime=lambda: _detect_container_runtime() or _runtime_preference_from_env() or "podman",
@@ -6304,13 +6365,22 @@ def main() -> int:
     #     exclude block (the existing `.vscode/settings.json.example` is
     #     templated for the `claude-code.env` block, which the launcher
     #     writes on registration — the excludes are an orthogonal concern).
-    #   - Update: adds missing exclude keys only; user-set values
-    #     preserved verbatim (user-wins).
+    #   - Update: adds missing exclude keys; user-set values preserved
+    #     verbatim (user-wins). Since v0.2.103 it also PRUNES the retired
+    #     `files.exclude` build-output entries (dist/build/target) — only
+    #     from a block that still matches VCO's legacy write signature.
     _vscode_excludes_result = _backfill_vscode_excludes()
     if _vscode_excludes_result["action"] in ("created", "backfilled"):
         print(
             f"  VS Code excludes: {_vscode_excludes_result['action']} "
             f"({len(_vscode_excludes_result['added_keys'])} key(s))"
+        )
+    elif _vscode_excludes_result["action"] == "pruned":
+        print(
+            f"  VS Code excludes: pruned "
+            f"({len(_vscode_excludes_result['removed_entries'])} retired "
+            f"files.exclude entry/entries: "
+            f"{', '.join(_vscode_excludes_result['removed_entries'])})"
         )
     _log_install_event(
         "9/10", "info",
@@ -6605,12 +6675,9 @@ def main() -> int:
     # an out-of-band hint for the binary-outside-clone case.
     _seed_launcher_install_path(PROJECT_ROOT, _deferral_report)
 
-    # v0.2.49 access-matrix Phase 1 (item #2): persist the orchestrator-
-    # root KG collection canonical name from
-    # `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env (if set). When unset,
-    # migration 028's default is authoritative — this call is a no-op.
-    # See `_persist_orchestrator_root_kg_collection` docstring for the
-    # resolution priority + soft-fail semantics.
+    # Persist the root's decided KG name (`root_kg_identity`) into launcher.db
+    # — after the hub start above, so a fresh DB has it before the launcher's
+    # first boot seeds the root binding from it (v0.2.103).
     _persist_orchestrator_root_kg_collection(_deferral_report)
     # v0.2.91 WP-B (#5) re-probe + WP-D doctor phase — v0.2.95 F1: runs AFTER
     # the hub restart (rationale in the helper; order pinned in test_v0295).
@@ -7608,7 +7675,7 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
         # to the full usable set rather than stranding the install). The
         # "metal" preference is handled separately (Apple has no discrete
         # VRAM to rank).
-        from vco_lib.gpu_device import enumerate_gpus, select_gpu_device
+        from vco_lib.gpu_device import enumerate_gpus
 
         vendor_pref = _gpu_vendor_preference_from_env()
 
@@ -7626,7 +7693,16 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
 
         if not gpu_vendor and not has_metal:
             candidates = enumerate_gpus()
-            chosen = select_gpu_device(candidates, vendor_pref=vendor_pref)
+            # v0.2.103 R43 N4: the ONE selection home — host_probe.selected_gpu
+            # applies the SAME select_gpu_device rule (VCT_GPU_VENDOR included)
+            # to THIS enumeration and hands back the chosen card itself, so
+            # install's tier choice and the runtime code-model resolver's
+            # hardware leg read the SAME card without a second GPU-probe round
+            # (R41 M2 re-ran the probes inside selected_gpu_specs; two
+            # non-deterministic enumerations could describe two cards).
+            from vco_lib import host_probe as _hp
+
+            chosen = _hp.selected_gpu(candidates)
             # Surface the full enumeration on the system-info banner /
             # event log so multi-GPU selection is observable.
             usable_discrete = [
@@ -7637,8 +7713,13 @@ def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> Sys
 
             if chosen is not None:
                 has_gpu = True
-                gpu_vendor = chosen.vendor
-                vram_gb = chosen.vram_gb
+                # v0.2.103 R43 N4: vendor and VRAM come straight off the ONE
+                # chosen card (host_probe.selected_gpu — the same selection
+                # the runtime code-model resolver's hardware leg makes), so
+                # install's tier choice and the resolver can never read two
+                # different cards on a multi-GPU host.
+                gpu_vendor = (chosen.vendor or "").strip().lower()
+                vram_gb = float(chosen.vram_gb or 0.0)
                 # Enrich the display name with the vendor-specific probe
                 # when it gives a friendlier string than the enumerator's
                 # generic label (AMD rocm-smi product, NVIDIA driver/CUDA).
@@ -8068,7 +8149,8 @@ def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
     no lower rungs — a missing lower rung at runtime degrades to the next
     summary backend, never a pull). Derived from the SAME selector the runtime
     uses (v0.2.23 C10), local tier only (CLI/OpenAI are not Ollama models):
-    ``qwen3.5:9b`` / ``gemma4:e4b``, else the always-fits floor ``qwen3.5:0.8b``.
+    ``qwen3.5:9b`` / ``qwen3.5:4b`` (whichever free-VRAM floor the card meets),
+    ``gemma4:e4b`` (capable CPU, no GPU), else the floor ``qwen3.5:0.8b``.
     """
     return [summary_model_for_hardware(
         float(sysinfo.vram_gb or 0.0), float(sysinfo.ram_gb or 0.0), _probe_cpu_cores())]
@@ -8223,19 +8305,13 @@ def _container_runtime_reachable(container_cmd: str) -> bool:
 #: vco_lib.compose_provider in v0.2.100.
 _podman_machine_auto_init_and_start = _compose_provider.podman_machine_init_and_start
 
-
-def _heal_podman_reachability():
-    """Start / heal podman's reachability — thin over
-    :func:`vco_lib.compose_provider.heal_socket`: Linux `systemctl --user
-    restart podman.socket` when the unit is active but the socket FILE is gone,
-    `start` when it is down; macOS / Windows `_podman_machine_auto_init_and_start`.
-    Then `podman info` must answer (folded into the REAL HealResult, W1R-03)."""
-    from vco_lib.compose_recovery import CID_SOCKET_HEAL_FAILED
-    res = _compose_provider.heal_socket("podman", machine_start=_podman_machine_auto_init_and_start)
-    if res.healed and _containers.daemon_responsive("podman") is not True:
-        return _compose_provider.HealResult(False, res.actions, f"{res.reason}, but `podman info` still "
-                                            "does not answer", CID_SOCKET_HEAL_FAILED, res.details)
-    return res
+#: v0.2.103: the engine starters moved to their ONE home,
+#: :mod:`vco_lib.container_engine_start`, so the SessionStart hooks, the hub
+#: and the launcher spawn the SAME logic (`python -m vco_lib.container_engine_start
+#: ensure`) that the install pre-flight runs here. These module-level aliases
+#: (not `from … import` at the call-sites) keep ``install.<name>`` patchable —
+#: the Step5 wiring below looks the names up at call time.
+_heal_podman_reachability = _container_engine_start.heal_podman_reachability
 
 
 def _try_start_podman_daemon() -> tuple[bool, str]:
@@ -8246,78 +8322,12 @@ def _try_start_podman_daemon() -> tuple[bool, str]:
 
 def _try_start_docker_daemon() -> tuple[bool, str]:
     """v0.2.54 (container-scout C-RT-7): best-effort auto-start of the
-    Docker daemon — closes the auto-heal asymmetry where Podman got
-    socket auto-start (v0.2.51) + machine auto-init/start (v0.2.53)
-    while Docker users only got a printed hint.
-
-    OS matrix:
-      - macOS:   ``open -a Docker`` — launches Docker Desktop. No sudo,
-                 no GUI prompt beyond Docker Desktop's own startup.
-      - Windows: shell-start ``Docker Desktop.exe`` from its canonical
-                 install locations.
-      - Linux:   NOT automated. ``sudo systemctl start docker`` needs an
-                 interactive password we don't shoulder in a pre-flight
-                 (same rationale as the original hint). Returns False
-                 with the manual recipe.
-
-    After a successful launch attempt, polls ``docker info`` for up to
-    60s (Docker Desktop's VM boot is slow). Soft-fail throughout — the
-    caller falls back to the printed hint.
-    """
-    os_name = platform.system()
-    if not shutil.which("docker"):
-        return False, "docker binary not on PATH"
-
-    if os_name == "Darwin":
-        try:
-            result = subprocess.run(
-                ["open", "-a", "Docker"],
-                capture_output=True, text=True, timeout=15,
-            )
-        except (subprocess.TimeoutExpired, OSError) as e:
-            return False, f"`open -a Docker` failed: {e}"
-        if result.returncode != 0:
-            return False, (
-                f"`open -a Docker` exited {result.returncode}: "
-                f"{(result.stderr or '').strip()[:200]}"
-            )
-    elif os_name == "Windows":
-        candidates = [
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-            / "Docker" / "Docker" / "Docker Desktop.exe",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Docker" / "Docker Desktop.exe",
-        ]
-        exe = next((c for c in candidates if c.is_file()), None)
-        if exe is None:
-            return False, (
-                "Docker Desktop.exe not found at the canonical install "
-                "locations; start Docker Desktop from the Start Menu."
-            )
-        try:
-            # Detached start — Docker Desktop is a GUI app; don't block.
-            # Handle kept in _DETACHED_CHILDREN: suppresses the Popen
-            # destructor's ResourceWarning for a child that outlives us.
-            _DETACHED_CHILDREN.append(
-                subprocess.Popen(
-                    ["cmd", "/c", "start", "", str(exe)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    env=_install_companions.detached_child_env(),
-                )
-            )
-        except OSError as e:
-            return False, f"could not launch Docker Desktop: {e}"
-    else:
-        return False, (
-            "Docker daemon auto-start is not automated on Linux "
-            "(requires sudo): run `sudo systemctl start docker`."
-        )
-
-    deadline = time.monotonic() + 60.0
-    while time.monotonic() < deadline:
-        if _container_runtime_reachable("docker"):
-            return True, "daemon responsive"
-        time.sleep(2.0)
-    return False, "docker daemon did not become responsive within 60s"
+    Docker daemon. v0.2.103: the BODY lives in
+    :func:`vco_lib.container_engine_start.try_start_docker_daemon` (the ONE
+    home, shared with the session hooks / hub / launcher); install.py keeps
+    this delegating name so the Step5 hooks and the tests that patch
+    ``install._try_start_docker_daemon`` keep working."""
+    return _container_engine_start.try_start_docker_daemon()
 
 
 def _emit_podman_daemon_start_failed_deferral(
@@ -9220,7 +9230,8 @@ def _detect_optional_companions(args: argparse.Namespace) -> None:
     # PATH (see its docstring for the ~/.cargo/bin rationale); auto-install
     # via cargo / brew when available.
     lean_ctx_path = _find_lean_ctx_binary()
-    if not lean_ctx_path and not args.quiet and not args.no_lean_ctx:
+    if (not lean_ctx_path and not args.quiet and not args.no_lean_ctx
+            and not _HANDOFF.done("lean_ctx_offer_made")):  # v0.2.103: never offered twice in one run
         # Try auto-install via the most appropriate package manager.
         lean_ctx_path = _maybe_install_lean_ctx(args)
     if lean_ctx_path:
@@ -9292,11 +9303,15 @@ _TEXT_MODEL_ACTIVE_EMBEDDING = {
     "text-embedding-3-small": "openai",
 }
 
-def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None:
+def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str,
+                          has_gpu: Optional[bool] = None) -> None:
     """Shim over :func:`vco_lib.gpu_profile.apply_tier_overrides`.
 
     Passes install.py's module-level constants through to the shared
     helper. See `vco_lib/gpu_profile.py` for the canonical logic.
+    ``has_gpu`` (v0.2.103 R41 L4) lets the rebuilt label's prefix follow
+    the DETECTED hardware instead of the stock profile string (a cpu
+    profile on a 6-12 GB GPU host is not "CPU-only").
     """
     from vco_lib.gpu_profile import apply_tier_overrides
     apply_tier_overrides(
@@ -9305,6 +9320,7 @@ def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None
         kg_pick=kg_pick,
         model_dims=_EMBEDDING_MODEL_DIMS,
         text_model_active_embedding=_TEXT_MODEL_ACTIVE_EMBEDDING,
+        has_gpu=has_gpu,
     )
 
 
@@ -9334,7 +9350,7 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     if args.low_resource:
         config = dict(EMBEDDING_CONFIGS["low_resource"])
         _record_install_choice("embedding_mode", "low_resource",
-                               {"reason": "user passed --low-resource"})
+                               {"reason": "user passed --low-resource", "explicit": True})
         return config
     if args.cpu_only:
         config = dict(EMBEDDING_CONFIGS["cpu"])
@@ -9351,9 +9367,14 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         print(f"[3] Embedding profile: verified, skipped (recorded profile '{prior['value']}' replayed)")
         config = dict(EMBEDDING_CONFIGS[prior["value"]])
         _apply_tier_overrides(config, code_pick=prior.get("code_model") or config["code_model"],
-                              kg_pick=prior.get("text_model") or config["text_model"])
+                              kg_pick=prior.get("text_model") or config["text_model"],
+                              has_gpu=bool(sysinfo.has_gpu))
+        # The low_resource inference cap replays only for the explicit opt-in.
+        explicit = bool(prior.get("explicit") or prior.get("reason") == "user passed --low-resource")
+        if not explicit:
+            config.pop("inference_models_override", None)
         _record_install_choice("embedding_mode", prior["value"], {
-            "reason": "replayed from last install",
+            "reason": "replayed from last install", "explicit": explicit,
             "code_model": config["code_model"], "text_model": config["text_model"]})
         return config
 
@@ -9363,10 +9384,18 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     ram = float(sysinfo.ram_gb or 0.0)
     has_gpu = bool(sysinfo.has_gpu)
 
-    code_pick = select_code_embedding_backend(
+    code_pick = select_code_model_for_host(
         gpu_vram_gb=vram,
         ram_gb=ram,
         cores=cores,
+        gpu_vendor=sysinfo.gpu_vendor,
+        # v0.2.103 F1: the ladder PLUS the AMD→qwen3 vendor correction now
+        # live in ONE selector — the runtime resolver
+        # (vco_lib.code_embed_model) calls the same function, so install and
+        # the resolver can never disagree about an AMD host. The correction
+        # itself is v0.2.54 (gpu-audit C-2): CodeSage has no ROCm build
+        # path, so an AMD card on the >= 12 GB rung runs the Ollama-served
+        # qwen3 code model instead (Ollama IS ROCm-accelerated).
         openai_key_available=False,  # auto-detect never picks OpenAI
         prefer_openai=False,
     )
@@ -9377,21 +9406,6 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         openai_key_available=False,
         prefer_openai=False,
     )
-
-    # v0.2.54 (gpu-audit C-2): CodeSage has no ROCm build path — the
-    # code-embed container image is CPU-multi-arch by default with a
-    # CUDA-only alternative (`Dockerfile.cuda`, emitted only for
-    # gpu_vendor == "nvidia"). Pre-v0.2.54, an AMD host with >=12 GB
-    # VRAM landed on the "gpu" profile labeled "GPU-accelerated ...
-    # best quality" while CodeSage 1.3B silently ran on CPU inside the
-    # container. Route AMD hosts to the Ollama-served qwen3 code model
-    # instead: Ollama itself IS ROCm-accelerated (via the rocm compose
-    # overlay), so code embeddings still run on the GPU — through the
-    # backend that actually has a ROCm path. This also makes the
-    # shipped claims true (CHANGELOG F7 + podman-compose.amd-rocm.yml:
-    # "AMD users get the Ollama-based code embedding fallback").
-    if has_gpu and code_pick == _CODE_BACKEND_CODESAGE and sysinfo.gpu_vendor == "amd":
-        code_pick = _CODE_BACKEND_QWEN3
 
     # Map the per-tier picks back to a profile + overrides. The profile
     # determines the shape (active_embedding slot + which Ollama models
@@ -9416,6 +9430,7 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
                   f"RAM={ram:.1f} GB, cores={cores})")
 
     config = dict(EMBEDDING_CONFIGS[profile_key])
+    config.pop("inference_models_override", None)  # cap = explicit opt-in only
 
     # Surgical overrides when the selector disagrees with the stock
     # profile model. v0.2.54 (gpu-audit C-5): extracted to
@@ -9424,7 +9439,8 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     # was replaced, so e.g. a 6-12 GB GPU host got the cpu profile with
     # code_model swapped to qwen3 (1024-dim) while code_dims stayed 768
     # and CODE_EMBED_DIMS=768 was written to .env for a 1024-dim model.
-    _apply_tier_overrides(config, code_pick=code_pick, kg_pick=kg_pick)
+    _apply_tier_overrides(config, code_pick=code_pick, kg_pick=kg_pick,
+                          has_gpu=has_gpu)
 
     _record_install_choice("embedding_mode", profile_key, {
         "reason": reason, "code_model": config["code_model"], "text_model": config["text_model"]})
@@ -9597,9 +9613,20 @@ def _discover_app_state_db_path() -> Path:
     return launcher_db_path()
 
 
+def _recorded_code_model_before_step7() -> "str | None":
+    """The code model the PREVIOUS run recorded (R45 P2). Step 7 rewrites the
+    record with THIS run's hardware pick, so main() reads it before step 7 and
+    the preset seed uses it — the seeded default then matches the graph that
+    run built instead of re-targeting it. Stdlib-only reader (pre-venv safe)."""
+    from vco_lib.embedding_pull_plan import recorded_code_model
+
+    return recorded_code_model([PROJECT_ROOT])
+
+
 def _write_preset_defaults_to_app_state(
     embed_config: dict,
     openai_set_as_default: bool,
+    prior_code_model: "str | None" = None,
 ) -> None:
     """Seed the launcher's `app_state` table with the install-time
     embedding-model defaults so the GUI dropdowns pre-populate for
@@ -9693,6 +9720,28 @@ def _write_preset_defaults_to_app_state(
                 (_APP_STATE_KEY_DEFAULT_TEXT_EMBED, text_model, now_ms),
             )
             text_inserted = cur.rowcount > 0
+            # v0.2.103 R43 N2: the code key is seeded ONLY when absent (the
+            # DO NOTHING below already guarantees that), and — when it IS
+            # seeded and a code graph is already recorded — with the
+            # RECORDED model, not the hardware pick. The key is a user
+            # choice OR a value matching the machine's existing data: a
+            # hardware-pick seed on a later --update (first install ran
+            # before launcher.db existed, so nothing was seeded then) would
+            # act as an implicit re-embed of the recorded graph, because
+            # `resolve_code_model` treats `default_code_embedding` as an
+            # EXPLICIT selection. The explicit OpenAI opt-in keeps its own
+            # model — the user chose it, it is not a seed default.
+            if (
+                not openai_set_as_default
+                and cur.execute(
+                    "SELECT 1 FROM app_state WHERE key = ?",
+                    (_APP_STATE_KEY_DEFAULT_CODE_EMBED,),
+                ).fetchone() is None
+            ):
+                # `prior_code_model`: the record as the PREVIOUS run left it
+                # (step 7 has already rewritten it with this run's pick, R45 P2).
+                if prior_code_model:
+                    code_model = prior_code_model
             cur.execute(
                 "INSERT INTO app_state (key, value, updated_at) "
                 "VALUES (?, ?, ?) "
@@ -10219,7 +10268,7 @@ def _reconcile_install_active_embedding(
         notice = (
             f"[embedding] settings.json ACTIVE_EMBEDDING={env_active} is stale for "
             f"this CPU hardware; auto-selected {resolved}. (Set it explicitly in "
-            f"the launcher Identity tab to override.)"
+            f"launcher Preferences → Embedding profile (global) to override.)"
         )
         print(f"  {notice}")
         _log_install_event(
@@ -10233,8 +10282,8 @@ def _reconcile_install_active_embedding(
         # expected fresh-box default, not a stale-value correction.
         notice = (
             f"[embedding] no ACTIVE_EMBEDDING set; applied hardware-selected "
-            f"{resolved} for this run. (Set it explicitly in the launcher "
-            f"Identity tab to override.)"
+            f"{resolved} for this run. (Set it explicitly in launcher "
+            f"Preferences → Embedding profile (global) to override.)"
         )
         print(f"  {notice}")
         _log_install_event(
@@ -10359,6 +10408,7 @@ def _converge_orchestrator_root_kg_pointer(canonical: str) -> None:
 # ---------------------------------------------------------------------------
 
 from vco_lib import install_weaviate as _install_weaviate  # noqa: E402
+from vco_lib import root_kg_identity as _root_kg_identity  # noqa: E402
 
 # Re-export the pure content-hash helper under its original name so tests
 # that call `install._compute_on_disk_content_hashes` keep resolving.
@@ -10405,19 +10455,26 @@ def _prune_stale_kg_rows(
     weaviate_url: str,
     *,
     dry_run: bool | None = None,
+    shared_kg_collection: str | None = None,
 ) -> None:
     """Thin wrapper over vco_lib.install_weaviate (IN-1, v0.2.73).
 
-    Threads the live ``PROJECT_ROOT``, install.py's ``_log_install_event``,
-    and ``_is_orchestrator_root_install`` (which drives the ``dry_run=None``
-    default) so behaviour is identical to the pre-extraction inline version.
+    Threads the live ``PROJECT_ROOT``, install.py's ``_log_install_event``
+    and the resolved ``SHARED_KG_COLLECTION`` name so the prune runs through
+    the repo's ONE guarded home (v0.2.103) with the shared-identity skip
+    armed — the orchestrator root's KG collection IS the shared collection,
+    where sibling projects' rows legitimately have no local file. v0.2.103
+    R2 (review H-2/L-3): the identity decision is the home's ONE predicate
+    (name match OR ``PROJECT_ROOT`` being the orchestrator clone);
+    install.py only ever runs AS the clone, so in production this wrapper
+    always skips and the doctor census reports the stored-only rows.
     """
     _install_weaviate._prune_stale_kg_rows(
         collection_name, weaviate_url,
         dry_run=dry_run,
         project_root=PROJECT_ROOT,
         log_event=_log_install_event,
-        is_orchestrator_root_install=_is_orchestrator_root_install,
+        shared_kg_collection=shared_kg_collection,
     )
 
 
@@ -11607,7 +11664,7 @@ def _detect_existing_volume_paths() -> dict:
 def _compose_substitution_env(embed_config: dict) -> dict[str, str]:
     """Shim over :func:`vco_lib.compose_env.compose_substitution_env`."""
     from vco_lib.compose_env import compose_substitution_env
-    return compose_substitution_env(embed_config)
+    return compose_substitution_env(embed_config, infra_dir=PROJECT_ROOT / "infrastructure")
 
 
 def _write_infrastructure_env(embed_config: dict) -> None:
@@ -11785,7 +11842,7 @@ def _start_services(
             services_to_start.append("weaviate")
         if not detected["ollama_url"]:
             services_to_start.append("ollama")
-        if sysinfo.has_gpu and not detected["code_embed_url"]:
+        if code_embed_wanted and not detected["code_embed_url"]:  # the ONE in-stack decision
             services_to_start.append("code_embed")
 
     # ── v0.2.92 BLOCKER-1: rebuild the code_embed IMAGE when it is not
@@ -11801,16 +11858,9 @@ def _start_services(
     recreate_for_rebuild: list[str] = []
     from vco_lib import code_embed_image as _cei
     _rebuild = _cei.plan_rebuild(
-        decisions=decisions,
-        has_gpu=sysinfo.has_gpu,
-        force_separate=force_separate,
-        install_root=PROJECT_ROOT,
-        url=detected.get("code_embed_url"),
-        services_to_start=services_to_start,
-        services_to_recreate=services_to_recreate,
-        adopt_action=ACTION_ADOPT,
-        managed_probe=PROBE_VCT_MANAGED,
-    )
+        decisions=decisions, has_gpu=sysinfo.has_gpu, force_separate=force_separate, in_stack=code_embed_wanted,
+        install_root=PROJECT_ROOT, url=detected.get("code_embed_url"), services_to_start=services_to_start,
+        services_to_recreate=services_to_recreate, adopt_action=ACTION_ADOPT, managed_probe=PROBE_VCT_MANAGED)
     for _line in _rebuild.lines:
         print(_line)
     if _rebuild.build:
@@ -11824,6 +11874,11 @@ def _start_services(
                   "expected_sha": _rebuild.expected_sha,
                   "served_sha": _rebuild.served_sha},
         )
+    # v0.2.103 R42-L1: a stale CODE_EMBED_OLLAMA_BODY is rewritten + recreated BEFORE the guards below.
+    services_to_recreate.extend(_cei.plan_body_template_recreate(
+        _rebuild, force_separate=force_separate, url=detected.get("code_embed_url"), infra_dir=infra_dir,
+        embed_config=embed_config, services=services_to_start + services_to_recreate,
+        write_env=_write_infrastructure_env, log_event=_log_install_event))
 
     # Nothing to start or recreate → nothing to do. v0.2.93: a container
     # another compose identity created is never recreated.
@@ -12141,7 +12196,10 @@ def _backfill_vscode_excludes(settings_file: Path | None = None) -> dict:
       - OOM kills (verified live 2026-05-16 on multiple workspaces).
 
     Idempotency contract matches the per-project version: only ADDS
-    missing keys, never overwrites. Returns the same dict shape.
+    missing keys, never overwrites — and since v0.2.103 also PRUNES the
+    retired `files.exclude` build-output entries (dist/build/target) from
+    a block that still matches VCO's legacy write signature. Returns the
+    same dict shape.
 
     Args:
         settings_file: path to `.vscode/settings.json`. Defaults to
@@ -12152,8 +12210,9 @@ def _backfill_vscode_excludes(settings_file: Path | None = None) -> dict:
 
     # Delegate to the project_init helper using the parent folder of
     # `.vscode/`. This keeps the canonical exclude block in ONE place
-    # (project_init._VSCODE_EXCLUDE_DEFAULTS) so the orchestrator and
-    # per-project surfaces never drift.
+    # (vco_lib/vscode_excludes.py — `_VSCODE_EXCLUDE_DEFAULTS` is
+    # re-exported by project_init) so the orchestrator and per-project
+    # surfaces never drift.
     if settings_file.parent.name == ".vscode":
         parent = settings_file.parent.parent
     else:
@@ -12418,7 +12477,7 @@ def _wait_for_weaviate_ready(
 
 def _ensure_collections(embed_config: dict,
                         decisions: dict | None = None,
-                        args: argparse.Namespace | None = None) -> None:
+                        args: argparse.Namespace | None = None, deferral_report: "DeferralReport | None" = None) -> None:
     """Detect existing Weaviate collections and create only the ones missing.
 
     Code-graph collections (CodeModule / CodeClass / CodeFunction / CodeAPI /
@@ -12496,6 +12555,11 @@ def _ensure_collections(embed_config: dict,
         kg_name = env_kg
     else:
         kg_name = _derive_project_kg_name(PROJECT_ROOT)
+    # v0.2.103 (owner ruling 2026-10-15): on the orchestrator root the KG name
+    # (== the shared name: one class serves both roles) is `root_kg_identity`'s
+    # decision — the folder-derived name, or the populated bound class it
+    # keeps — never an env value and never a case-sibling adopted on the fly.
+    is_root = _is_orchestrator_root_install()
 
     # Per-project Development collection: same logic.
     env_dev = os.environ.get("DEVELOPMENT_COLLECTION")
@@ -12508,15 +12572,8 @@ def _ensure_collections(embed_config: dict,
     # with the diagrams integrations — the install no longer creates or
     # projects `<Project>_Diagrams`. Existing collections stay untouched.
 
-    # Cross-project shared KG. All vibecoded installs read from the same shared
-    # collection name (default "VibeCodedOrchestrator_KnowledgeGraph" since
-    # v0.2.23 B1 — was lowercase-c "VibecodedOrchestrator_KnowledgeGraph"
-    # v0.2.12–v0.2.22, itself renamed from "VibeCodedTools_KnowledgeGraph"
-    # pre-v0.2.12); the projects only differ in their per-project KG.
-    # Bootstrapped once per Weaviate instance — re-runs are no-ops thanks
-    # to the existing-class detection (which is case-insensitive since
-    # v0.2.23 B1, so the lowercase-c class on existing installs is adopted
-    # in place without recreate).
+    # Cross-project shared KG: the env pin, else the shipped last-resort constant. On the ROOT this is
+    # replaced below by `root_kg_identity`'s decision (one class, both roles; never case-adopted).
     shared_name = os.environ.get(
         "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
     ) or ""
@@ -12597,10 +12654,16 @@ def _ensure_collections(embed_config: dict,
             return actual
         return name
 
-    kg_name = _resolve_existing_casing(kg_name)
+    # v0.2.103 (owner ruling 2026-10-15): the ROOT and SHARED names are never
+    # case-adopted — a case-sibling is another class, adopted only with consent
+    # (`python -m vco_lib.root_kg_identity adopt --yes`). The per-project
+    # primary (non-root runs) and the development name keep the legacy rebind.
+    root_kg = _root_kg_decision(existing_names=existing) if is_root else None
+    if root_kg is not None:
+        kg_name = shared_name = root_kg.name
+    else:
+        kg_name = _resolve_existing_casing(kg_name)
     dev_name = _resolve_existing_casing(dev_name)
-    if shared_name:
-        shared_name = _resolve_existing_casing(shared_name)
 
     # Note: we deliberately do NOT auto-adopt existing cross-project KGs
     # (e.g. `ClaudeKnowledgeGraph` from another install). The orchestrator
@@ -12627,13 +12690,27 @@ def _ensure_collections(embed_config: dict,
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
     ]
+    if root_kg is not None and root_kg.picked_refused and deferral_report is not None:
+        deferral_report.add_entry(_root_kg_identity.pick_refused_entry(root_kg))  # L-1
+    if root_kg is not None and root_kg.blocked_by:
+        # A case-only sibling makes the root's class uncreatable: the consent deferral is recorded
+        # here too, since 7c may return before deciding (R24 LOW-1; same cid → idempotent).
+        if deferral_report is not None:
+            deferral_report.add_entry(_root_kg_blocked_entry(root_kg))
+        print(f"  ! not creating {kg_name}: '{root_kg.blocked_by}' differs only in case")
+        required = [(dev_name, _development_class_definition)]
     # Shared cross-project KG. Same schema as the per-project KG (the MCP
     # server reads them with the same shape). Created once per Weaviate
     # instance — the existing-class check above means concurrent installs
     # don't double-create. Skip if shared_name resolved to an existing class
     # (we already adopted it above).
     if shared_name and shared_name != kg_name:
-        required.append((shared_name, _kg_class_definition))
+        shared_sibling = (None if shared_name in existing
+                          else _root_kg_identity.case_sibling(shared_name, existing))
+        if shared_sibling:  # v0.2.103: never case-adopted, and uncreatable beside it
+            print(f"  ! not creating {shared_name}: '{shared_sibling}' differs only in case")
+        else:
+            required.append((shared_name, _kg_class_definition))
 
     # NOTE: do NOT skip our `_development` collection just because other
     # projects on the host have their own. Each project's docs live in
@@ -13244,11 +13321,11 @@ def _seed_weaviate_shared_kg_only(
     # SHARED_KG_COLLECTION points at
     # the canonical VibeCodedOrchestrator_KnowledgeGraph).
     #
-    # Strategy: pick SHARED_KG_COLLECTION as canonical (predictable, matches
-    # public-shipping convention). Rebind both project_kg_bindings rows
-    # (primary + shared) and both env keys (KG_COLLECTION + SHARED_KG_COLLECTION)
-    # to that canonical name. Skip the shared-seed sync step — one collection
-    # serves both roles.
+    # Strategy: the canonical name is the caller's `root_kg_identity` decision
+    # (v0.2.103 — `_seed_weaviate_impl` passes it as BOTH names; it was "SHARED
+    # wins" before). Rebind both project_kg_bindings rows (primary + shared)
+    # and both env keys (KG_COLLECTION + SHARED_KG_COLLECTION) to that name.
+    # Skip the shared-seed sync step — one collection serves both roles.
     #
     # No re-embedding. No re-syncing. No collection renaming. Just rebind
     # pointers + update app_state.
@@ -13261,10 +13338,9 @@ def _seed_weaviate_shared_kg_only(
 
         # v0.2.44 V44-H/H2: orphan-detection must compare the PRE-resolution
         # KG name (the one this install replaced) against canonical, NOT the
-        # post-V44-G1 reassigned current_kg_collection. Otherwise once G1
-        # picks the same value for both env and resolved, the orphan check
-        # always sees canonical == current_kg_collection and the notice is
-        # silently masked (Reader-4 FN1 against the maintainer install's actual state).
+        # reassigned current_kg_collection (v0.2.103: the root_kg_identity
+        # decision sets both to the same value, which would always mask the
+        # notice — Reader-4 FN1 against the maintainer install's actual state).
         orphan_kg = orphan_candidate_kg or current_kg_collection
 
         # Diagnostic: report row counts on both physical collections.
@@ -13285,11 +13361,9 @@ def _seed_weaviate_shared_kg_only(
             f"primary={orphan_kg or '(unset)'}={primary_count} rows, "
             f"shared={current_shared_kg or '(unset)'}={shared_count} rows"
         )
-        # v0.2.44 V44-H/H8: removed misleading "(SHARED_KG_COLLECTION wins)"
-        # tail. The V44-G1 hybrid-SoT rationale line printed upstream already
-        # names the actual decision source — appending an unconditional
-        # "SHARED wins" was a lie when G1 picked via Weaviate-existence or
-        # the first-install heuristic.
+        # v0.2.44 V44-H/H8: no "(SHARED_KG_COLLECTION wins)" tail — the
+        # decision line printed upstream (v0.2.103: `root_kg_identity`, printed
+        # by `_root_kg_decision`) already names the actual decision source.
         print(f"  → canonical = {canonical}")
 
         # v0.2.44 fix-now-3 (+ V44-H/H2): notify user about orphan collection
@@ -13395,129 +13469,6 @@ def _seed_weaviate_shared_kg_only(
     return seed_errors
 
 
-def _resolve_orchestrator_root_canonical(
-    env_kg: str,
-    env_shared: str,
-    db_primary: "Optional[str]",
-    db_shared: "Optional[str]",
-    weaviate_url: str,
-) -> "tuple[str, str, str]":
-    """v0.2.44 V44-G1: hybrid env-vs-DB conflict resolution.
-
-    User directive (2026-06-01): when env and DB disagree on the canonical
-    KG collection name for orchestrator-root, resolve via this priority chain:
-
-      1. CHECK WEAVIATE first. If exactly ONE candidate collection actually
-         exists, pick it (preferring an extant-with-data candidate over an
-         extant-empty one when only one of each kind exists).
-      2. If MULTIPLE candidates exist (true tie), apply the first-install
-         heuristic: env wins on fresh install (``app_state.last_installed_
-         kg_collection`` unset), DB wins on subsequent update (key SET).
-      3. If NEITHER candidate exists, env wins (bootstrap case — nothing
-         in Weaviate to anchor on).
-
-    Replaces V44-F's silent "env-wins / DB-wins via WARNING print" behavior
-    with an explicit, observable decision logged via the returned rationale.
-
-    Args:
-        env_kg: KG_COLLECTION from process env (may be empty).
-        env_shared: SHARED_KG_COLLECTION from process env (may be empty).
-        db_primary: launcher.db primary binding for orchestrator-root (or None).
-        db_shared: launcher.db shared binding for orchestrator-root (or None).
-        weaviate_url: Weaviate base URL for existence checks.
-
-    Returns:
-        (canonical_kg, canonical_shared, rationale)
-        rationale is a short human-readable string naming which branch fired.
-        Suitable for direct ``print()`` into install logs.
-
-        v0.2.44 V44-H: when ``rationale.startswith("deferred:")`` the caller
-        MUST NOT trigger ``_rebind_orchestrator_root_to_canonical`` — the
-        resolver was unable to obtain authoritative existence signals (e.g.
-        Weaviate unreachable) and the returned values are the existing
-        bindings unchanged. Rebinding on a deferred signal would clobber
-        the last-known-good state with possibly-stale env values. See H1.
-    """
-    # v0.2.44 V44-H/H4: all-empty guard. When none of the four inputs are set
-    # we have nothing to resolve — this is a true bootstrap before any env or
-    # DB binding has been recorded. Returning empty strings here is correct
-    # (downstream callers already handle the empty-collection case) but we
-    # tag the rationale so observers can distinguish "bootstrap" from
-    # "no-conflict-empty".
-    if not (env_kg or env_shared or db_primary or db_shared):
-        return "", "", "no canonical resolvable; bootstrap path"
-
-    # No-conflict fast path: when env and DB agree (or DB has no value),
-    # fill empties from DB and preserve env where set. This matches the
-    # pre-V44-G1 V44-B "fill empties only" behavior.
-    env_disagreement_kg = bool(db_primary and env_kg and db_primary != env_kg)
-    env_disagreement_shared = bool(db_shared and env_shared and db_shared != env_shared)
-    if not env_disagreement_kg and not env_disagreement_shared:
-        out_kg = env_kg or (db_primary or "")
-        out_shared = env_shared or (db_shared or "")
-        return out_kg, out_shared, "no conflict (env wins when set, DB fills empties)"
-
-    # Disagreement — apply hybrid algorithm.
-    # Step 1: Weaviate existence check. Build the candidate set from all four
-    # values (env_kg, env_shared, db_primary, db_shared), excluding empties.
-    candidates = {env_kg, env_shared, db_primary or "", db_shared or ""} - {""}
-    counts: "dict[str, Optional[int]]" = {}
-    for c in candidates:
-        try:
-            n = _count_weaviate_class_objects(weaviate_url, c)
-            # n is int (>=0) on success, None on error/nonexistent.
-            counts[c] = n if isinstance(n, int) and n >= 0 else None
-        except Exception:
-            counts[c] = None  # treat as nonexistent on any error
-    extant_with_data = [c for c, n in counts.items() if n is not None and n > 0]
-    extant_any = [c for c, n in counts.items() if n is not None]
-    # v0.2.44 V44-H/H1: distinguish "all unreachable" (every count is None,
-    # i.e. Weaviate down or transient failure on every candidate) from
-    # "all empty" (every count is 0, candidates exist but have no rows).
-    # When unreachable, we have NO authoritative signal — rebinding would
-    # gamble the last-known-good state on a transient outage. Return a
-    # deferred rationale and prefer the DB-recorded names (last known good)
-    # so the caller can short-circuit the rebind.
-    all_unreachable = bool(counts) and all(c is None for c in counts.values())
-    if all_unreachable and candidates:
-        return (
-            (db_primary or env_kg),
-            (db_shared or env_shared),
-            "deferred: Weaviate unreachable; preserving existing bindings",
-        )
-
-    if len(extant_with_data) == 1:
-        winner = extant_with_data[0]
-        return winner, winner, (
-            f"weaviate (only '{winner}' has rows; counts={counts})"
-        )
-    if len(extant_any) == 1:
-        winner = extant_any[0]
-        return winner, winner, (
-            f"weaviate (only '{winner}' exists; rowcount=0)"
-        )
-    if len(extant_any) == 0:
-        # Neither exists in Weaviate (and we DID get reachable answers, so this
-        # isn't a transient outage) → genuine bootstrap; env wins.
-        return env_kg, env_shared, "env (no candidates exist in Weaviate yet)"
-
-    # Step 2: multiple candidates exist (true tie). Apply first-install heuristic.
-    try:
-        last_kg = _read_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION)
-    except Exception:
-        last_kg = None
-    if not last_kg:
-        return env_kg, env_shared, (
-            "env (fresh install; app_state.last_installed_kg_collection unset)"
-        )
-    # Subsequent update → DB wins (bindings are authoritative once recorded).
-    return (
-        (db_primary or env_kg),
-        (db_shared or env_shared),
-        "db (subsequent update; bindings authoritative)",
-    )
-
-
 def _enrich_slot_change(
     venv_py: Path,
     profile: str,
@@ -13566,6 +13517,45 @@ def _enrich_slot_change(
 _SEED_OWED_WORK_CONDITION_ID = _install_weaviate.SEED_OWED_WORK_CONDITION_ID
 
 
+def _root_kg_decision(existing_names=None) -> "_root_kg_identity.RootKgDecision | None":
+    """v0.2.103: the orchestrator root's KG name for this run
+    (``vco_lib.root_kg_identity`` — the ONE decision, printed and logged).
+    ``existing_names`` is a schema the caller already fetched. Recomputed at
+    each step rather than cached: the rule is deterministic over live state,
+    and a step-7b creation does not change its answer. None when this is not
+    a root install or the decision itself failed (logged)."""
+    if not _is_orchestrator_root_install():
+        return None
+    try:
+        decision = _root_kg_identity.gather(PROJECT_ROOT, live_names=existing_names)
+    except Exception as exc:  # noqa: BLE001 — never block the install on it
+        _log_install_event("root_kg_identity", "warn", f"decision failed: {type(exc).__name__}: {exc}")
+        return None
+    print(f"  → orchestrator-root KG: {decision.name} ({decision.source}: {decision.reason})")
+    _log_install_event("root_kg_identity", "ok", decision.name, data=decision.to_dict())
+    return decision
+
+
+def _root_kg_blocked_entry(decision) -> DeferralEntry:
+    """The consent deferral for a root KG name a case-only sibling blocks."""
+    return DeferralEntry(
+        condition_id="root_kg_blocked_by_case_sibling",
+        title="Orchestrator-root KG name blocked by a case-only sibling",
+        detected=(f"The orchestrator root's KG is '{decision.name}' ({decision.reason}), but "
+                  f"Weaviate holds '{decision.blocked_by}', which differs only in case, so "
+                  f"'{decision.name}' cannot be created. Nothing was created or rebound."),
+        why_deferred=("Adopting an existing class is your decision: it may hold another "
+                      "install's data, or vectors from another embedding model. VCO never "
+                      "drops it and never adopts it on its own."),
+        command_to_apply=(f"python -m vco_lib.root_kg_identity adopt --collection "
+                          f"{decision.blocked_by} --yes   # if it holds this root's knowledge "
+                          f"(refused unless written with the current embedding model); "
+                          f"otherwise remove '{decision.blocked_by}' yourself and re-run the update"),
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+
 def _seed_weaviate(
     args: argparse.Namespace,
     deferral_report: "DeferralReport | None" = None,
@@ -13597,7 +13587,7 @@ def _seed_weaviate(
 def _seed_weaviate_impl(
     args: argparse.Namespace,
     deferral_report: "DeferralReport | None" = None,
-) -> None:
+) -> "Optional[str]":
     """Seed Weaviate with bundled knowledge/ + docs/.
 
     v0.2.42 CI-10: on ``--update`` runs (not fresh install), gate the sync
@@ -13704,18 +13694,6 @@ def _seed_weaviate_impl(
     current_shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
     weaviate_url = _wh.weaviate_url_default()
 
-    # v0.2.44 V44-G1: hybrid env-vs-DB SoT resolution (replaces V44-B fill-only
-    # + V44-F disagreement-WARNING). Per user directive (2026-06-01): when env
-    # and DB disagree, check Weaviate first (pick the collection that actually
-    # exists), then fall back to "env wins on fresh install / DB wins on
-    # subsequent update". See _resolve_orchestrator_root_canonical for the full
-    # priority chain.
-    try:
-        from vco_lib.launcher_db_reader import get_orchestrator_root_bindings
-        _db_primary, _db_shared = get_orchestrator_root_bindings()
-    except Exception:
-        _db_primary, _db_shared = (None, None)
-
     # v0.2.44 V44-G2: dual-clone WARNING. Fires when launcher.db's
     # orchestrator-root project_id points at a folder different from
     # PROJECT_ROOT. User directive 2026-06-01: warn but proceed; the
@@ -13758,35 +13736,26 @@ def _seed_weaviate_impl(
     _rebind_deferred = False
     _rebind_deferred_rationale = ""
 
-    if _is_orchestrator_root_install():
-        if _db_primary or _db_shared:
-            resolved_kg, resolved_shared, rationale = (
-                _resolve_orchestrator_root_canonical(
-                    env_kg=current_kg_collection,
-                    env_shared=current_shared_kg,
-                    db_primary=_db_primary,
-                    db_shared=_db_shared,
-                    weaviate_url=weaviate_url,
-                )
-            )
-            if rationale.startswith("deferred:"):
-                _rebind_deferred = True
-                _rebind_deferred_rationale = rationale
-            if (
-                resolved_kg != current_kg_collection
-                or resolved_shared != current_shared_kg
-            ):
-                print(
-                    f"  → hybrid SoT resolution: KG={resolved_kg!r}, "
-                    f"SHARED={resolved_shared!r} ({rationale})"
-                )
-                current_kg_collection = resolved_kg
-                current_shared_kg = resolved_shared
-            else:
-                print(f"  → hybrid SoT: no disagreement ({rationale})")
-        else:
-            print("  WARNING: orchestrator-root install but launcher.db unavailable; "
-                  "falling back to env for KG collection resolution")
+    # v0.2.103 (owner ruling 2026-10-15): the root's KG — and the shared name,
+    # one class serving both roles — is `root_kg_identity`'s decision. It
+    # superseded the V44-G1 env-vs-DB-vs-Weaviate tiebreak, which could pick a
+    # case-sibling or another install's populated class. A blind read (Weaviate
+    # state unknown) keeps the bound name and defers the rebind (V44-H/H1).
+    root_kg = _root_kg_decision()
+    if root_kg is not None and root_kg.picked_refused and deferral_report is not None:
+        deferral_report.add_entry(_root_kg_identity.pick_refused_entry(root_kg))  # L-1
+    if root_kg is not None and root_kg.blocked_by:
+        if deferral_report is not None:
+            deferral_report.add_entry(_root_kg_blocked_entry(root_kg))
+        print(f"  Skipped: the root's KG '{root_kg.name}' cannot be created "
+              f"('{root_kg.blocked_by}' differs only in case) — deferral entry written.")
+        _log_install_event("7c/10", "skip", "root KG blocked by a case-only sibling",
+                           data=root_kg.to_dict())
+        return _install_weaviate.SKIPPED
+    if root_kg is not None:
+        if not root_kg.state_known:
+            _rebind_deferred, _rebind_deferred_rationale = True, f"deferred: {root_kg.reason}"
+        current_kg_collection = current_shared_kg = root_kg.name
 
     if is_update and sync_kg.exists():
         stored_embedding = _read_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
@@ -14117,8 +14086,20 @@ def _seed_weaviate_impl(
     #
     # v0.2.101 item 4: an ENQUEUED (not completed) seed does not weaken this —
     # see `_prune_stale_kg_rows`'s own note. It stays on.
+    #
+    # v0.2.103: the prune itself is delegated to the repo's ONE guarded home
+    # (vco_lib.collection_repair, via the wrapper). current_shared_kg arms the
+    # shared-identity skip — as do PROJECT_ROOT's orchestrator-clone markers,
+    # which every real install.py run carries (v0.2.103 R2, review H-2/L-3):
+    # on the orchestrator root the KG collection IS the shared collection,
+    # and sibling projects' shared-scope rows legitimately have no file under
+    # this root, so NOTHING is deleted there (the doctor census reports
+    # stored-only rows instead).
     if not seed_errors and current_kg_collection:
-        _prune_stale_kg_rows(current_kg_collection, weaviate_url)
+        _prune_stale_kg_rows(
+            current_kg_collection, weaviate_url,
+            shared_kg_collection=current_shared_kg,
+        )
 
     # 3. Cross-project shared KG seed (Step 7d).
     #
@@ -15207,6 +15188,9 @@ def _self_heal_kg_bindings_on_update(
          deferral entry (severity=info) per row rebound, naming each
          (project_id, role, old_name → new_name) so the user has an audit
          trail.
+      v0.2.103: the orchestrator root's own rows are never case-rebound or
+      prefix-adopted (owner ruling 2026-10-15 — its name is
+      `vco_lib.root_kg_identity`'s decision; adoption needs consent).
       5. For each binding row where `collection_name not in existing` AND
          no case-different sibling exists, LEAVE ALONE. That's a true
          missing-class state — the orphan-prune sync recreates the class
@@ -15717,19 +15701,17 @@ def _persist_orchestrator_root_kg_collection(
     name of the orchestrator-root shared KG collection into launcher.db
     `app_state['orchestrator_root_kg_collection']`.
 
-    Migration 028 (in vct-launcher-core) writes a default value of
-    `VibeCodedOrchestrator_KnowledgeGraph` via INSERT-OR-IGNORE on
-    every fresh DB. This helper provides the white-label / dev-clone
-    override path: when an env var `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION`
-    is set at install time, the launcher.db row is upserted to that
-    value (overriding the migration's default).
-
-    Resolution priority (highest → lowest):
-        1. `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env var (white-label
-           or dev-clone override). Trimmed; empty / whitespace-only
-           values are ignored.
-        2. Migration 028's default (`VibeCodedOrchestrator_
-           KnowledgeGraph`). Already written; nothing to do.
+    v0.2.103 (owner ruling 2026-10-15): the value is ALWAYS written — it is
+    `vco_lib.root_kg_identity`'s decision (the white-label override
+    `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` first, else the populated bound class
+    it keeps, else the folder-derived name). Migration 028 seeds a constant
+    default on every fresh DB, and for a clone whose folder-derived name
+    differs from that constant (even only in case) the launcher then seeded
+    the root binding with a class install never created. main() calls this
+    AFTER the hub has started, so a fresh install's just-created launcher.db
+    gets the decided name before the launcher's first boot reads it. A
+    decision resting on a blind read (Weaviate down) or blocked by a
+    case-only sibling is not persisted.
 
     Idempotent: re-running with the same env value is a no-op (the
     INSERT-OR-REPLACE writes the same row). Re-running with a CHANGED
@@ -15749,15 +15731,14 @@ def _persist_orchestrator_root_kg_collection(
     import sqlite3  # local import: matches the pattern used by other
                      # launcher.db touch sites in this file.
 
-    override = os.environ.get("VCT_ORCHESTRATOR_ROOT_KG_COLLECTION", "").strip()
-    if not override:
-        # No override → migration 028's default is authoritative.
-        # Skip the write to avoid touching launcher.db unnecessarily
-        # (matches the Bug N RO-first discipline: don't open RW unless
-        # we have something to do).
+    decision = _root_kg_decision()
+    value = decision.name if decision is not None and decision.persistable else ""
+    if not value:
         _log_install_event(
             "orchestrator_root_kg_collection", "skip",
-            "no override set; migration 028 default is canonical",
+            "no persistable root KG decision this run (not a root install, Weaviate "
+            "state unknown, or blocked by a case-only sibling)",
+            data=decision.to_dict() if decision is not None else None,
         )
         return
 
@@ -15765,18 +15746,18 @@ def _persist_orchestrator_root_kg_collection(
     if not db_path.is_file():
         # launcher.db missing — fresh first-install before vct-hub
         # has bootstrapped the schema. Migration 028 will write the
-        # default on first launcher boot; this run can't override it
+        # default on first launcher boot; this run can't write it
         # because there's no DB to write to yet. Log + defer.
         _log_install_event(
             "orchestrator_root_kg_collection", "skip",
             f"launcher.db not found at {db_path}; "
-            f"override deferred to first launcher boot",
-            data={"db_path": str(db_path), "override": override},
+            f"value deferred to first launcher boot",
+            data={"db_path": str(db_path), "override": value},
         )
         return
 
     # Open RO first per the Bug N discipline: check whether the
-    # current row already equals the override (no-op), and check that
+    # current row already equals the value (no-op), and check that
     # the app_state table actually exists (older launcher.db schemas
     # that pre-date migration 008 won't have it — soft-fail).
     try:
@@ -15803,7 +15784,7 @@ def _persist_orchestrator_root_kg_collection(
                     _log_install_event(
                         "orchestrator_root_kg_collection", "skip",
                         "app_state table absent (pre-migration-008 schema); "
-                        "override deferred to next install.py run",
+                        "value deferred to next install.py run",
                     )
                     return
                 raise
@@ -15817,12 +15798,12 @@ def _persist_orchestrator_root_kg_collection(
         )
         return
 
-    if existing_row is not None and existing_row[0] == override:
+    if existing_row is not None and existing_row[0] == value:
         # Idempotent path: the row already matches.
         _log_install_event(
             "orchestrator_root_kg_collection", "ok",
             "value already matches override; no write needed",
-            data={"value": override},
+            data={"value": value},
         )
         return
 
@@ -15839,15 +15820,15 @@ def _persist_orchestrator_root_kg_collection(
                 "ON CONFLICT(key) DO UPDATE SET "
                 "  value = excluded.value, "
                 "  updated_at = excluded.updated_at",
-                ("orchestrator_root_kg_collection", override, now_ms),
+                ("orchestrator_root_kg_collection", value, now_ms),
             )
             rw_conn.commit()
         finally:
             rw_conn.close()
         _log_install_event(
             "orchestrator_root_kg_collection", "ok",
-            f"set orchestrator-root KG collection to {override}",
-            data={"value": override},
+            f"set orchestrator-root KG collection to {value}",
+            data={"value": value},
         )
     except sqlite3.OperationalError as oe:
         # Most likely "database is locked" — vct-hub holds it.
@@ -15855,8 +15836,8 @@ def _persist_orchestrator_root_kg_collection(
         if "locked" in msg or "busy" in msg:
             _log_install_event(
                 "orchestrator_root_kg_collection", "warn",
-                "launcher.db is locked; deferring override write",
-                data={"db_path": str(db_path), "override": override},
+                "launcher.db is locked; deferring value write",
+                data={"db_path": str(db_path), "override": value},
             )
             try:
                 deferral_report.add_entry(
@@ -15864,17 +15845,17 @@ def _persist_orchestrator_root_kg_collection(
                         condition_id="orchestrator_root_kg_collection_locked",
                         title=(
                             "Could not persist orchestrator-root KG "
-                            "collection override (launcher.db locked)"
+                            "collection value (launcher.db locked)"
                         ),
                         detected=(
                             f"install.py tried to set the orchestrator-root "
-                            f"KG collection to '{override}' but launcher.db "
+                            f"KG collection to '{value}' but launcher.db "
                             f"at {db_path} was locked (vct-hub likely "
                             f"holds the writer lock as a detached service). "
-                            f"The override has NOT been applied."
+                            f"The value has NOT been applied."
                         ),
                         why_deferred=(
-                            "Override application requires exclusive write "
+                            "Writing it requires exclusive write "
                             "access. The current row remains at its "
                             "previous value (likely migration 028's "
                             "default 'VibeCodedOrchestrator_KnowledgeGraph')."
@@ -15896,7 +15877,7 @@ def _persist_orchestrator_root_kg_collection(
         _log_install_event(
             "orchestrator_root_kg_collection", "warn",
             f"sqlite operational error: {oe}",
-            data={"db_path": str(db_path), "override": override},
+            data={"db_path": str(db_path), "override": value},
         )
     except sqlite3.Error as se:
         _log_install_event(
@@ -19367,21 +19348,21 @@ def _auto_scrub_removed_mcp_entries(
     output_fn=print,
 ) -> list[str]:
     """v0.2.101: remove ``auto_scrub`` deprecated MCP entries from
-    ``~/.claude.json`` on the ordinary install/update and print one notice
-    line per removed entry.
-
-    Owner ruling (PLAN-V0300 item 15): ``search`` was DELETED, so its
-    now-orphaned registration is removed automatically — no consent prompt —
-    because the module it pointed at no longer exists (a leftover entry
-    guarantees a failing MCP subprocess every session). v0.2.102 (owner
-    ruling 2026-10-07) adds ``mermaid`` / ``excalidraw`` to the auto-scrub
-    set: both diagram wrapper modules were deleted outright. Idempotent
-    and soft-fail: no entry → no write, no print.
+    ``~/.claude.json`` on the ordinary install/update, one notice per entry
+    (owner ruling PLAN-V0300 item 15: ``search``; v0.2.102 adds ``mermaid`` /
+    ``excalidraw`` — their modules were deleted, so a leftover entry fails
+    every session). v0.2.103 F2: also strips retired env keys (e.g.
+    ``ACTIVE_EMBEDDING`` written by an older bundled launcher binary) from
+    VCO's own entries — ``vco_lib.install_mcp.strip_unallowlisted_global_env``.
+    Idempotent and soft-fail: nothing to do → no write, no print.
 
     Returns the removed names.
     """
+    from vco_lib.install_mcp import strip_unallowlisted_global_env
     try:
         claude_json = _user_home_for_install() / ".claude.json"
+        for name, keys in strip_unallowlisted_global_env(install_root, claude_json):
+            output_fn(f"  Removed retired env key(s) {', '.join(keys)} from MCP entry `{name}`.")
         removed = _auto_scrub_mcp_entries(install_root, claude_json)
     except Exception as exc:  # noqa: BLE001 — soft-fail: the install always completes
         _log_install_event(
@@ -20724,20 +20705,17 @@ def _configure_claude_settings(
     * ``adopt_project_mode == "no-adopt"`` and ``"dry-run"`` are handled
       upstream in ``main()`` before this function is reached.
 
-    The ``deferral_report`` kwarg is optional so existing fresh-install
-    callers don't break; deferrals are silently skipped when the report
-    isn't threaded.
+    * No sentinel but step 5b's bundle created the file THIS run (v0.2.103
+      F4) → VCO's own: defaults filled in, sentinel stamped, no deferral.
 
-    v0.2.46 V47-B (Gap B) addition: if ``.claude/`` is a symlink OR
-    ``.claude/settings.json`` is a symlink, VCO writes its content to a
-    sibling ``.vco-new`` path and emits a deferral entry. The original
-    symlink is preserved bit-for-bit. The rule is mode-AGNOSTIC (per user
-    decision 2026-06-03) — no ``adopt_project_mode`` short-circuits it.
+    ``deferral_report`` is optional (deferrals skipped when not threaded).
+    V47-B (Gap B): a symlinked ``.claude/`` or ``settings.json`` is never
+    written through — content goes to a ``.vco-new`` sibling + a deferral,
+    mode-AGNOSTIC (user decision 2026-06-03).
     """
     settings_dir = PROJECT_ROOT / ".claude"
 
-    # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, route the
-    # write to a sibling .vco-new directory. Never mkdir over a symlink.
+    # V47-B (Gap B): a symlinked .claude/ → write to a .vco-new sibling dir.
     if is_symlink_blocking(settings_dir):
         vco_new_dir = compute_vco_new_path(settings_dir)
         if deferral_report is not None:
@@ -20745,8 +20723,7 @@ def _configure_claude_settings(
                 deferral_report, settings_dir, vco_new_dir,
                 install_root=PROJECT_ROOT,
             )
-        # v0.2.46 post-adversarial L1: if the prior .vco-new dir from a
-        # previous install run is still here, refuse to clobber it.
+        # post-adversarial L1: never clobber a prior run's .vco-new dir.
         if check_vco_new_collision(
             vco_new_dir,
             install_root=PROJECT_ROOT,
@@ -20768,9 +20745,7 @@ def _configure_claude_settings(
 
     settings_file = settings_dir / "settings.json"
 
-    # v0.2.46 V47-B (Gap B): if settings.json is itself a symlink, write
-    # to sibling. Use lexists for "is this slot already occupied?" so
-    # dangling symlinks still trigger the skip.
+    # V47-B: a symlinked settings.json (dangling included) → .vco-new sibling.
     if is_symlink_blocking(settings_file):
         vco_new_file = compute_vco_new_path(settings_file)
         if deferral_report is not None:
@@ -20778,8 +20753,7 @@ def _configure_claude_settings(
                 deferral_report, settings_file, vco_new_file,
                 install_root=PROJECT_ROOT,
             )
-        # v0.2.46 post-adversarial L1: ditto for the settings.json.vco-new
-        # file from a prior run.
+        # post-adversarial L1: ditto for a prior settings.json.vco-new.
         if check_vco_new_collision(
             vco_new_file,
             install_root=PROJECT_ROOT,
@@ -20800,9 +20774,8 @@ def _configure_claude_settings(
     defaults = _build_vco_settings_defaults(embed_config)
     rendered_defaults = json.dumps(defaults, indent=2) + "\n"
 
-    # Case 1: file missing — write fresh VCO defaults. Use lexists so
-    # that a (hypothetical) dangling symlink at this path — already
-    # diverted to vco_new_file above — isn't treated as "missing".
+    # Case 1: file missing (lexists: a diverted dangling symlink is not
+    # "missing") — write fresh VCO defaults.
     if not os.path.lexists(os.fspath(settings_file)):
         settings_file.write_text(rendered_defaults, encoding="utf-8")
         return
@@ -20849,9 +20822,7 @@ def _configure_claude_settings(
         return
 
     if not isinstance(existing, dict):
-        # JSON parsed to a non-object (array, string, number) — treat the
-        # same as unparseable: VCO defaults are a dict, can't merge with
-        # a non-dict.
+        # A non-object JSON (array/string/number) cannot merge — as unparseable.
         print(
             "  Claude settings: existing file is not a JSON object; "
             "preserved on disk"
@@ -20892,8 +20863,19 @@ def _configure_claude_settings(
         print("  Claude settings: managed keys refreshed (user keys preserved)")
         return
 
-    # Case 5: file parsed but has no _vco_managed_keys — legacy / external.
-    # Land VCO defaults as `.vco-new` sibling and emit deferral.
+    # v0.2.103 F4: step 5b's bundle CREATED this file this run — VCO's own, so fill in the
+    # defaults and stamp the sentinel (vco_lib.self_install). Not a tautology: a symlinked
+    # .claude/ or settings.json diverted settings_file to a .vco-new sibling above.
+    if settings_file == PROJECT_ROOT / ".claude" / "settings.json" and \
+            _self_install.root_settings_created_this_run(PROJECT_ROOT):
+        adopted = _self_install.adopt_bundle_created_settings(
+            existing, defaults, _VCO_MANAGED_KEYS_SENTINEL)
+        settings_file.write_text(json.dumps(adopted, indent=2) + "\n", encoding="utf-8")
+        print("  Claude settings: VCO defaults added to the file install-bundle created")
+        return
+
+    # Case 5: no _vco_managed_keys, not created this run — legacy / external:
+    # VCO defaults land as a `.vco-new` sibling + a deferral.
     vco_new_path = settings_file.with_suffix(settings_file.suffix + ".vco-new")
     vco_new_path.write_text(rendered_defaults, encoding="utf-8")
     print(
@@ -21504,9 +21486,11 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     Removes ONLY orchestrator-managed paths. Never touches user source code.
 
     Categories (each prompted separately, unless --yes):
-      1. Stop containers (compose down — preserves volumes)
+      1. Stop containers (compose down — preserves volumes); 1b. remove
+         legacy VCO containers compose cannot reach (uninstall_containers.py)
       2. Remove container volumes (default: prompt; suppressed by --keep-data)
-      3. Remove launcher state (~/.vct/launcher.db)
+      3. Stop vct-hub + the VCO launcher GUI BEFORE any state removal
+         (vco_lib/uninstall_quiesce.py)
       4. Remove orchestrator MCP server entries from ~/.claude.json
          (preserves user's other MCP servers)
       5. Remove boot-time autostart entries (v0.2.54 Track G):
@@ -21517,7 +21501,11 @@ def _run_uninstall(args: argparse.Namespace) -> int:
          Without this, post-uninstall every boot retried
          `scripts/launch-claude-mcp-stack.*` from a deleted clone forever.
       6. (opt-in via --remove-projects) Remove .claude/ folders in registered projects
-      7. NEVER touches: ~/.vct-secrets/ (user's secret material)
+      7. Launcher binaries and shortcuts OUTSIDE the clone
+         (vco_lib/uninstall_artifacts.py — exact VCO names only)
+      8. The WHOLE VCO state dir (~/.vct / $VCT_STATE_DIR), RL training data
+         included (vco_lib/uninstall_state.py — refuses a dir not plainly VCO's)
+      NEVER touches: ~/.vct-secrets/ (user's secret material)
 
     Writes an audit log of what was removed to stdout and to
     ~/.vibecoded/uninstall_audit.log.
@@ -21544,6 +21532,12 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             print()
             return False
         return ans in {"y", "yes"}
+
+    def _confirm_strict(prompt: str) -> bool:  # R39 M3: a non-tty stdin alone never approves stops / [8]
+        if args.yes or (sys.stdin.isatty() and not args.quiet):
+            return _confirm(prompt)
+        print(f"  {prompt} [skipped — needs --yes {'with --quiet' if sys.stdin.isatty() else 'when stdin is not a terminal'}]")
+        return False
 
     # Plan: enumerate everything we WILL touch.
     print("This uninstaller will:")
@@ -21580,6 +21574,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         # Never silent: pre-v0.2.92 an unusable/absent runtime made step 1 a
         # no-op with no line in the plan at all.
         print(f"  [1] [skip] Containers not stopped — {_rt.reason}")
+    legacy = _uninstall_containers.find(_rt.runtime, current_compose_dir=compose_dir) if _rt.runtime else ([], [])
+    print("\n".join(_uninstall_containers.plan_lines(*legacy)))
 
     if not args.keep_data:
         print("  [2] Remove container volumes (Weaviate KG data + Ollama models + code embeddings)")
@@ -21587,13 +21583,12 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     else:
         print("  [2] [skip] Container volumes preserved (--keep-data)")
 
-    # Honour VCT_STATE_DIR / VCT_LAUNCHER_DB_PATH so a dev launcher's
-    # state isolates cleanly (v0.2.54: canonical resolver).
-    from vco_lib.paths import launcher_db_path
-    launcher_db = launcher_db_path()
-    will_remove_launcher_db = launcher_db.exists()
-    if will_remove_launcher_db:
-        print(f"  [3] Remove launcher state: {launcher_db}")
+    # [3]/[8] (owner ruling 2026-10-16): the hub + launcher GUI hold the state
+    # dir open, so they stop BEFORE the whole state dir is removed.
+    os_name = platform.system()
+    st_plan = _uninstall_state.build_plan(clone_root=PROJECT_ROOT)
+    launcher_exes = _uninstall_artifacts.launcher_exe_paths(os_name=os_name, home=Path.home(), clone_root=PROJECT_ROOT)
+    print("\n".join(_uninstall_quiesce.plan_lines(launcher_exes, install_root=PROJECT_ROOT)))
 
     claude_json = Path.home() / ".claude.json"
     will_clean_claude_json = claude_json.exists()
@@ -21603,7 +21598,6 @@ def _run_uninstall(args: argparse.Namespace) -> int:
 
     # Boot-service removal (v0.2.54 Track G): plan lines name the exact
     # OS-specific artefact so --dry-run output is auditable.
-    os_name = platform.system()
     if os_name == "Linux":
         boot_artefact = (
             f"systemd user unit ~/.config/systemd/user/{_BOOT_SERVICE_UNIT_NAME}"
@@ -21620,26 +21614,20 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     print("      + `vct-hub --unregister-boot` (no-op if never enabled)")
     print(f"      + model gateway autostart: {_gateway_boot_artefact(os_name)}")
 
-    # v0.2.92 (WP-10): the model gateway's runtime state. Until now this
-    # uninstaller removed exactly one file under the state root
-    # (launcher.db) and nothing else, so a gateway that had ever run left
-    # its token, pid, port, log and exported context table behind. Named
-    # files only — `~/.vct/` also holds hub.token, hub.port, services.toml
-    # and the launcher DB the user may want to keep, so the DIRECTORY is
-    # never removed and never walked.
-    gateway_state = _boot_service.gateway_state_paths()
-    gateway_present = [p for p in gateway_state if p.exists()]
-    if gateway_present:
-        print(f"  [5b] Remove model-gateway state files under {_paths.vct_root_dir()}:")
-        for path in gateway_present:
-            print(f"       - {path.name if path.parent == _paths.vct_root_dir() else path}")
-    else:
-        print(f"  [5b] [skip] No model-gateway state files under {_paths.vct_root_dir()}")
+    # The gateway's state files (v0.2.92 WP-10) go with the state dir [8]; by
+    # name only when [8] refused the dir.
+    gateway_present = [p for p in _boot_service.gateway_state_paths() if p.exists()] if st_plan.refused else []
 
     if args.remove_projects:
         print("  [6] Remove .claude/ folders in registered projects (--remove-projects)")
     else:
         print("  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
+
+    _ua_plan = _uninstall_artifacts.build_plan(os_name=os_name, home=Path.home(), vct_root=st_plan.root,
+                                               include_state=st_plan.refused is not None)
+    hub_bins = [*_ua_plan.hub_binaries, _try_bundled_vct_hub_binary(PROJECT_ROOT)]
+    print("\n".join(_uninstall_artifacts.plan_lines(_ua_plan)))
+    print("\n".join(_uninstall_state.plan_lines(st_plan, fallback_files=gateway_present)))
 
     print()
     print("  WILL NOT TOUCH: ~/.vct-secrets/ (your GitHub PAT and other secrets stay)")
@@ -21711,13 +21699,15 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             print(f"    {container_runtime} {removeop} <NAME>     # one at a time")
             print()
 
-    # Step 3: launcher.db.
-    if will_remove_launcher_db and _confirm(f"Remove {launcher_db}?"):
-        try:
-            launcher_db.unlink()
-            audit.append(f"removed {launcher_db}")
-        except OSError as e:
-            audit.append(f"WARN: could not remove {launcher_db}: {e}")
+    # Step 1b: legacy VCO containers (exact names + VCO compose labels; re-probed).
+    if legacy[0] and _rt.runtime and _confirm("Remove legacy VCO containers from an older install (volumes kept)?"):
+        audit.extend(_uninstall_containers.remove(_rt.runtime, current_compose_dir=compose_dir))
+
+    # Step 3: stop what holds the state dir open, before ANY state removal.
+    quiesced = _confirm_strict("Stop the model gateway, vct-hub and the VCO launcher before VCO state is removed?")
+    if quiesced:  # each stop guarded inside quiesce(): a failure WARNs, [8] re-checks
+        audit.extend(_uninstall_quiesce.quiesce(
+            launcher_exes, hub_bins, interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT))
 
     # Step 4: scrub orchestrator MCP entries from ~/.claude.json.
     #
@@ -21774,25 +21764,30 @@ def _run_uninstall(args: argparse.Namespace) -> int:
             _boot_service.model_gateway_spec(os_key=platform.system()),
         ))
 
-    # Step 5b: model-gateway runtime state (v0.2.92 WP-10).
-    #
-    # `~/.vct/` was never scrubbed by this uninstaller — only launcher.db
-    # was removed — so the gateway's token, pid, port, log and exported
-    # chat-model context table survived an uninstall and confused the next
-    # install (a stale pid file makes a fresh gateway refuse to start).
-    # Named files only; the state root itself belongs to other components
-    # and to the user.
-    if gateway_present and _confirm(
-        f"Remove model-gateway state files under {_paths.vct_root_dir()}?"
-    ):
-        audit.extend(_boot_service.remove_gateway_state())
-
     # Step 6: per-project .claude/ folders (opt-in).
     if args.remove_projects:
         registry = PROJECT_ROOT / ".claude" / "PROJECT_REGISTRY.md"
         if registry.exists() and _confirm("Remove .claude/ in registered projects?"):
             audit.append("project .claude/ removal: registry-based removal not implemented in v0.1.0; "
                          "remove manually from each project root if desired")
+
+    # Step 7: what install placed OUTSIDE the clone (review V02103-FINAL2 M-1).
+    if _ua_plan.remove and _confirm("Remove launcher binaries, shortcuts and VCO state files outside the clone?"):
+        audit.extend(_uninstall_artifacts.execute(_ua_plan, extra_hub_binaries=hub_bins[-1:]))
+
+    # Step 8: the whole VCO state dir (uninstall_state.py; exact names when refused).
+    if (st_plan.exists or st_plan.db_files or gateway_present) and _confirm_strict(
+            f"Remove the VCO state dir {st_plan.root} (RL training data included)?"):
+        if quiesced:  # again: its boot unit may have restarted it
+            audit.extend(_uninstall_quiesce.stop_gateway(
+                interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT, report_idle=False))
+        if busy := _uninstall_quiesce.still_running(launcher_exes, install_root=PROJECT_ROOT):  # R39 M2
+            audit.append(f"SKIPPED [8]: still running — {'; '.join(busy)}. Close it, then re-run the uninstall")
+            gateway_present = []
+        else:
+            audit.extend(_uninstall_state.execute(st_plan))
+        if gateway_present:
+            audit.extend(_boot_service.remove_gateway_state())
 
     # Write audit log.
     audit_dir = Path.home() / ".vibecoded"

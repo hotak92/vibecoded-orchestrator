@@ -139,6 +139,14 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; c
     reason: 'reused by project_state_cmd.rs commands; no direct GUI call',
     caller: 'src/commands/project_state_cmd.rs',
   },
+  // v0.2.103 (plan item 17): the project page now asks
+  // `plan_project_git_repo`; detection is reused by Rust (plan_repo and the
+  // create/attach commands' leave-alone re-checks).
+  detect_project_git_repo: {
+    class: 'rust-only',
+    reason: 'plan_repo + create_local_project_repo/attach_* re-check call it directly',
+    caller: 'src/commands/worktree_repo_mode.rs',
+  },
   get_cached_update_status: {
     class: 'tray',
     reason: 'tray.rs reads the cached status to label the tray update item',

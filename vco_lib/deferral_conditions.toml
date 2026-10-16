@@ -179,6 +179,65 @@ emit_surfaces = ["ledger"]
 notes = """The re-probe pass also re-checks reachability every --update; the \
 SIDE-EFFECTFUL `podman start` remediation stays behind --apply-deferred."""
 
+[conditions.install_python_env_broken]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103. The Weaviate collection bootstrap / KG seed \
+(`vco_lib.install_weaviate.collections_and_seed`) raised ImportError: the \
+interpreter running install.py lacks a module VCO's requirements ship. Before \
+v0.2.103 that read as `weaviate_unreachable_at_update` and restarted a healthy \
+container. action_required: the exit is an install/update run that repairs the \
+venv. Owned/drop-when-absent: every run re-attempts the seed, and a run whose \
+seed imports cleanly does not re-emit it. No dismiss_key — a broken install is \
+a real break, not a machine description to acknowledge."""
+
+[conditions.kg_seed_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103. The Weaviate collection bootstrap / KG seed raised an \
+exception that is neither a connection failure (→ weaviate_unreachable_at_update) \
+nor an ImportError (→ install_python_env_broken); the entry names its type and \
+message. No container start — the database was not the problem. \
+action_required (a non-transient error a human must read); owned/drop-when-absent: \
+the next run re-attempts the seed and a success does not re-emit it."""
+
+[conditions.root_kg_blocked_by_case_sibling]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (owner ruling 2026-10-15). The orchestrator root's KG name \
+(`vco_lib.root_kg_identity`'s decision: the white-label override, the populated \
+bound class it keeps, else the folder-derived name) cannot be created because \
+Weaviate holds a class differing from it only in case. VCO never adopts such a \
+class on its own (it may be another install's data or another model's vectors) \
+and never drops it; the seed is skipped. The exits are the user's: \
+`python -m vco_lib.root_kg_identity adopt --collection <sibling> --yes` (refused \
+unless written with the current embedding model) or removing the sibling. \
+Owned/drop-when-absent: step 7b (collection bootstrap) and step 7c (seed) both \
+re-decide and both emit it, so a run whose seed leg returns early still reports a \
+still-blocked root; the run after either exit does not re-emit it. A run that \
+skips BOTH steps (--skip-seed / --skip-collections) does not decide at all."""
+
+[conditions.root_kg_pick_wrong_embedding]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (review V02103-FINAL2 L-1). The launcher's Identity-tab shared-KG \
+pick (`app_state['shared_kg.collection_name']`) is followed by \
+`vco_lib.root_kg_identity`'s decision as the user's explicit choice, but only \
+under the embedding-profile rule `adopt` applies: a populated picked class \
+written with another model (and no fill toward the current one pending) is not \
+followed and the root keeps its own name. The hub and the launcher still serve \
+the pick as the shared name, so the user must re-pick or switch the profile. \
+Owned/drop-when-absent: steps 7b and 7c both re-decide and both emit it; the run \
+after either exit does not re-emit it."""
+
 [conditions.rebuild_pending_seed]
 class = "action_required"
 owner = "install.py"
@@ -1120,6 +1179,19 @@ owner = "vco_lib.project_init"
 clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
 
+[conditions.local_git_repo_pending]
+class = "action_required"
+owner = "vco_lib.local_repo_pending"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (plan item 17, review R11 B3). Every bundle run (launcher or \
+CLI) calls `local_repo_pending.reconcile`: emitted while the folder is not inside \
+a git repo and no worktree_repo_mode is recorded; resolved on the first run that \
+finds a repo or a recorded choice; an unanswerable question (git cannot run, \
+launcher.db unreadable) leaves the ledger untouched. The launcher's own Update \
+bundle creates the repo before the bundle install, so this mainly reaches users \
+who update from the command line."""
+
 [conditions.bundle_skipped_existing_files]
 class = "informational_record"
 owner = "vco_lib.project_init"
@@ -1395,6 +1467,31 @@ all pass it, and the dispatcher BLOCKS a stale verdict BEFORE writing the \
 STARTED row — a persistently stale image therefore burns NO retry budget and \
 the retry resumes by itself once the image is rebuilt and current."""
 
+[conditions.codegraph_orphan_interactions_pending]
+class = "action_required"
+owner = "vco_lib.codegraph_resync"
+clear_probe = "probe:py:codegraph_orphan_interactions_still_present"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (plan item 7 / R12-F4, clear hardened R14-B1): \
+CodeInteraction rows written before file anchors existed — no file_path, and \
+no source reference at all (or only dangling ones; a live target without a \
+path is UNCERTAIN, never proof). Provably dead, but no walk re-embeds them \
+and the pre-fix prune preserved every anchor-less row while any file was \
+skipped, so they survived forever while the convergence probe read "0 stale \
+rows" over them. action_required, NOT auto_retryable: only a manual \
+consented `--run-resync --prune-stale` walk removes them (that walk DELETES \
+every unvisited row — a destructive, user-consented action the retry engine \
+must never take), so the WP-H dispatcher can never clear it and would only \
+burn full walks. Clear: the `probe:py:` re-count through the SAME \
+predicate the reaping uses — a POSITIVE zero clears (the consented walk \
+reaped the rows, or there were none); an unknown count never clears. The \
+analyzer also clears the entry directly after a reaping-enabled full \
+--prune-stale walk whose re-count is zero, and the resync driver resolves \
+it in its converged branch — all three route through \
+`count_orphan_interaction_rows`, one counting home. Rows whose non-primary \
+`project_source` belongs to an extra code folder are never counted: the \
+consented cleanup walk covers the repo root only."""
+
 [conditions.residue_cleanup_pending]
 class = "action_required"
 owner = "vco_lib.knowledge_residue"
@@ -1441,12 +1538,40 @@ sidecar refreshed after a bulk sync, and the only trace was one stderr line \
 `(node-format refresh exited 2; summaries left as-is — non-fatal)`. The fix \
 runs the ROOT generator with `--knowledge-dir <project>/knowledge` — one \
 component, identical for root and non-root — and this condition is what stops \
-the remaining failure modes (no clone reachable, generator non-zero, 600 s \
-cap) from being invisible again. `retry_action` reuses the EXISTING \
+the remaining failure modes (no clone reachable, generator non-zero) from \
+being invisible again. v0.2.103 (review M-2) narrowed the trigger: the \
+generator's bulk mode now distinguishes exit 1 (a node ERRORED for a \
+non-refusal, potentially transient reason — retry-worthy, so this \
+auto-retryable entry is right) from `BULK_EXIT_NO_BACKEND` (3 — no backend \
+selectable at all, mapped to the sibling environmental condition \
+`kg_node_formats_backend_unavailable` instead, because a full-sync retry \
+cannot fix a missing backend and would compete with the code-graph walk). \
+A permanent model refusal is FINAL (owner ruling 2026-10-14) and exits 0 — \
+it never arms this retry. There is no whole-run wall-clock cap any more \
+(review H-3): per-LLM-call timeouts bound a hung backend and the sidecar is \
+saved incrementally after each node. `retry_action` reuses the EXISTING \
 `retry:py:kg_seed` handler rather than declaring a new one: that handler \
 re-runs `sync_knowledge_graph.py --all`, which re-runs this refresh — the \
 retry is real and already wired, so no HANDLERS edit is claimed. Cleared by \
 the paired `_clear_node_formats_deferral` on a refresh that exits 0."""
+
+[conditions.kg_node_formats_backend_unavailable]
+class = "environmental"
+owner = "templates/scripts/sync_knowledge_graph.py"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (batch review R2, M-2): the post-sync summary refresh \
+found NO selectable backend (local tier deferred by the free-VRAM / \
+code-graph-walk guard, no `claude` CLI, no cloud key) and exited \
+`BULK_EXIT_NO_BACKEND`. Environmental on purpose: while the machine has no \
+backend, retrying cannot succeed, and the pre-103 behaviour (exit 1 → the \
+auto-retryable `kg_node_formats_refresh_failed` → `retry:py:kg_seed` re-runs \
+a FULL `--all` sync) re-walked and re-pruned the tree to maybe find one — \
+competing with the very code-graph walk the deferral guard protects, and on \
+a permanently-backend-less machine it never cleared. The nodes stay owed \
+for the next organic sync or per-edit run; the paired \
+`_clear_node_formats_deferral` resolves this entry on the first refresh \
+that actually runs (exit 0)."""
 
 [conditions.kg_binding_missing]
 class = "action_required"
@@ -1551,7 +1676,11 @@ class = "action_required"
 owner = "vco_lib.project_init"
 clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "A clean migrate-collections dry-run clears it (project_init)."
+notes = """A clean migrate-collections dry-run clears it (project_init). Emitted by \
+the migrate-collections dry-run gate (vco_lib.migrate_deferral) and, since v0.2.103, \
+by the collection bootstrap for a schema-incompatible class that holds objects \
+(vco_lib.bootstrap_schema_guard — never dropped; an empty class is still rebuilt). \
+A shared-KG entry goes to the orchestrator root's ledger, whose dry-run covers it."""
 
 [conditions.chunker_preset_overhaul_pending]
 class = "action_required"
@@ -1561,8 +1690,8 @@ emit_surfaces = ["ledger"]
 notes = """v0.2.92 WP-D: the PER-PROJECT state-keyed gate \
 (`vco_lib.chunker_revision.gate` on the `.claude/state/chunker-revision.json` \
 sentinel) fires inside the ONE bundle engine on all four install/update \
-surfaces. v0.2.95 F1 gives it the clear mechanism it always ADVERTISED: both \
-emitters tell the user "once you run the re-sync commands below, this deferral \
+surfaces. v0.2.95 F1 gives it the clear mechanism it always ADVERTISED: its \
+emitters (both, before the v0.2.103 retirement of the semver one) tell the user "once you run the re-sync commands below, this deferral \
 self-resolves on the next bundle update", and nothing implemented that — the \
 row declared `paired-resolution` while naming a Rust site that has no resolve \
 call, and the gate re-stamps its own sentinel at EMIT time, so no later \
@@ -2044,6 +2173,24 @@ class = "informational_record"
 owner = "vco_lib.collection_repair"
 clear_probe = "manual-dismiss"
 emit_surfaces = ["ledger"]
+
+[conditions.collection_blocked_by_case_sibling]
+class = "action_required"
+owner = "vco_lib.project_init"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.103 (R24 HIGH-1). bootstrap_collections met a target (the \
+project's KG / Development class, or the machine's shared KG) that Weaviate \
+refuses to create because a class differing only in case exists, and that class \
+holds objects (or its count could not be read). Before v0.2.103 the case-conflict \
+recovery dropped the sibling and recreated it empty — on a clone whose root owns \
+the folder-derived name that destroyed the shared KG on the first project add. \
+It is never dropped now: the user binds it (root/shared: `python -m \
+vco_lib.root_kg_identity adopt --collection <sibling> --yes`; a project KG: the \
+launcher's Identity tab) or removes it, then re-runs bootstrap-collections. \
+Paired: the bootstrap run that meets no blocked target resolves it \
+(vco_lib.bootstrap_case_sibling.settle). An EMPTY case-sibling keeps the \
+pre-existing drop-and-recreate (nothing to lose)."""
 
 [conditions.weaviate_unreachable_at_bootstrap]
 class = "auto_retryable"

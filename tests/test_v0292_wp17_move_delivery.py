@@ -518,6 +518,10 @@ class TestKgSyncWrappers(unittest.TestCase):
         """OS-EXEMPT-PARITY: Windows PowerShell needs the UTF-8 BOM."""
         self.assertTrue(KG_SYNC_PS1.read_bytes().startswith(b"\xef\xbb\xbf"))
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash .sh leg; Windows runs the .ps1 sibling: "
+        "tests/test_v0292_kg_sync_wrapper_stream_parity.py::test_refusal_goes_to_stderr_not_the_host_stream")
     def test_bash_wrapper_refuses_with_no_env_channels_live(self):
         """The honest-failure path, executed rather than grepped."""
         import os

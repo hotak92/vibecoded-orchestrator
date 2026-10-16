@@ -31,10 +31,14 @@
   //
   // ── When it shows ───────────────────────────────────────────────────
   // ONLY when the workspace root is genuinely not inside any repo (detection
-  // via `git rev-parse --show-toplevel` failed). If an enclosing repo was
-  // detected, the parent silently records `use_existing` and never mounts
-  // this modal — showing a choice there is pure friction (per the design
-  // audit's auto-use-vs-show rule).
+  // via `git rev-parse --show-toplevel` failed) AND it holds nested repos —
+  // the real choice (v0.2.103 plan item 17; the parent asks the Rust
+  // `plan_project_git_repo`). If an enclosing repo was detected, the parent
+  // silently records `use_existing` and never mounts this modal — showing a
+  // choice there is pure friction (per the design audit's auto-use-vs-show
+  // rule). A repo-less root with nothing nested is not offered either: VCO
+  // creates its local-only repo itself at project add / the next bundle
+  // update (owner ruling 2026-10-14 — no approval needed there).
   //
   // ── Contract ────────────────────────────────────────────────────────
   //   props.open        — bindable; parent opens when root is repo-less.

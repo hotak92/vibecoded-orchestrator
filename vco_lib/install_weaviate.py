@@ -18,8 +18,12 @@ rather than reaching into install.py's module state:
 * ``log_event`` — optional ``(step, phase, detail, *, data=None)`` logger
   (install.py passes its ``_log_install_event``; other callers pass None).
   Same shape as ``vco_lib.project_init.rebuild_collections``'s ``log_event``.
-* ``is_orchestrator_root_install`` — callable returning whether this is an
-  orchestrator self-install (drives the prune dry-run default).
+* ``shared_kg_collection`` — the install's SHARED_KG_COLLECTION name. The
+  prune's shared-identity decision itself lives in the ONE home
+  (``vco_lib.collection_repair.is_shared_identity_collection``, v0.2.103 R2
+  review H-2): name match OR ``project_root`` carrying the orchestrator-clone
+  markers — a separate ``is_orchestrator_root_install`` callable parameter
+  was retired with that consolidation.
 
 install.py keeps thin same-signature wrappers over these so its existing
 call sites — and the ``install.<name>`` accessors the test suite uses —
@@ -383,6 +387,12 @@ def _path_resolves_on_disk(file_path_str: str, project_root: Path) -> bool:
     return False
 
 
+#: Cap on per-row "stale row" stdout lines in the prune report (the count
+#: line always prints the full total; a 400-row prune doesn't need 400 lines
+#: on the install console — the count and the forensic log carry it).
+_PRUNE_PRINT_CAP = 50
+
+
 def _prune_stale_kg_rows(
     collection_name: str,
     weaviate_url: str,
@@ -390,210 +400,151 @@ def _prune_stale_kg_rows(
     dry_run: bool | None = None,
     project_root: Path,
     log_event: Optional[Callable] = None,
-    is_orchestrator_root_install: Optional[Callable[[], bool]] = None,
+    shared_kg_collection: Optional[str] = None,
 ) -> None:
-    """V0243-6: delete Weaviate objects whose ``file_path`` has no matching
-    on-disk Markdown file in ``knowledge/**/*.md``.
+    """Delete Weaviate objects whose ``file_path`` has no matching on-disk
+    file — v0.2.103: through the repo's ONE prune home.
 
-    Called from the full-sync branch of ``_seed_weaviate`` after a successful
-    ``sync_knowledge_graph.py --all``.  The sync upserts every on-disk file
-    but never deletes rows for files that were removed from disk — this step
-    closes that gap.
+    This is now a thin adapter over
+    :func:`vco_lib.collection_repair.prune_foreign_rows` (the same home
+    ``kg-sync --all`` and the bundle update use). Before v0.2.103 the
+    enumerate → classify → delete pipeline lived here as a second
+    implementation, and it lacked the home's guards: on the orchestrator
+    root — where the KG collection IS the shared collection by construction
+    (v0.2.81 adopt-and-route) — sibling projects' shared-scope rows
+    legitimately have no file under this root (the MCP writes them with a
+    path RELATIVE TO THE WRITING PROJECT or absolute under its tree; see
+    ``store_knowledge_node`` in ``claude_mcp_servers/weaviate_mcp/server.py``),
+    so an unguarded root ``--update`` DELETED other projects' shared
+    knowledge. Routing through the one home applies, on install/update
+    exactly as everywhere else:
 
-    v0.2.101 item 4: the seed may now be ENQUEUED to the detached driver and
-    still running. That does not weaken this step: it deletes only rows whose
-    stored ``file_path`` fails to resolve to an on-disk markdown file (all
-    four strategies in :func:`_path_resolves_on_disk`), which is independent
-    of embedding state — a pending seed can only ever have written rows for
-    files that DO exist.
+    * **shared-identity skip** — never prune a collection that is (or is
+      named) the shared store; "file absent locally" is NORMAL there. The
+      root cannot provably separate its own stale rows from sibling
+      projects' legitimate ones, so they are KEPT and left to ``vco
+      doctor``'s ``kg_drift_census`` to report (stored-only dimension).
+      v0.2.103 R2 (review H-2): the decision is the home's ONE predicate,
+      :func:`vco_lib.collection_repair.is_shared_identity_collection` —
+      name match (case-insensitive) OR *project_root* being the
+      orchestrator clone — so the skip holds even when the shared NAME is
+      empty, unresolved or drifted.
+    * **defensive classification** — rows with an empty / absolute / UNC /
+      ``..`` file_path are never deleted (unresolvable to this root is not
+      evidence of staleness).
+    * **enumeration-failure rule** — no destructive action without an
+      authoritative row list.
+    * existence judged on the path AS THE SYNC STORES IT (lexical,
+      symlink-following, ``(project_root / path).exists()``), with
+      "resolves outside the root" treated as KEEP — a symlinked
+      ``knowledge/`` (vault layout) no longer reads as "every file gone"
+      (v0.2.103 R2, review H-1).
+
+    Production reachability (v0.2.103 R2, review L-3): install.py only ever
+    runs AS the orchestrator self-install, so its ``PROJECT_ROOT`` always
+    carries the clone markers and the shared-identity predicate's ROOT leg
+    fires on every real run — in production this adapter always skips, and
+    the home's deleting half is exercised by the bundle update and a full
+    ``kg-sync --all``, not by install.py. The non-root branch below is the
+    home's behaviour pinned by tests (a markerless *project_root*), kept
+    as defence in depth for any future non-clone caller.
 
     Args:
         collection_name: The Weaviate collection to prune (``KG_COLLECTION``).
-        weaviate_url: Base URL of the Weaviate instance.
-        dry_run: When True, print the stale count but do NOT delete.
-                 When False, batch-delete all stale rows via the Weaviate
-                 ``/v1/batch/objects`` endpoint.
-                 When None (default): False for orchestrator-root installs
-                 (``is_orchestrator_root_install()``), True otherwise.
+        weaviate_url: Base URL of the Weaviate instance; falsy values fall
+                 through to the shared env-resolving default.
+        dry_run: When True, report the stale count but do NOT delete.
+                 ``None`` (the install.py default) means DELETE for a
+                 non-shared-identity collection — unreachable in production
+                 (see above), live only for the markerless-root tests.
         project_root: Resolved project/install root (install.py's PROJECT_ROOT).
         log_event: Optional install-time logger, same shape as install.py's
                  ``_log_install_event``.
-        is_orchestrator_root_install: Callable returning whether this is an
-                 orchestrator self-install; drives the ``dry_run=None`` default.
+        shared_kg_collection: The install's SHARED_KG_COLLECTION name; when
+                 it equals *collection_name* (case-insensitive — Weaviate
+                 class names cannot differ by case only) the collection is
+                 shared-identity and the prune is skipped.
 
-    Soft-fail throughout: any error is logged but never raises into the caller.
+    Soft-fail throughout: any error — including a failed import of the
+    prune home — is logged but never raises into the caller.
     """
     _log = _install_log(log_event)
 
-    if dry_run is None:
-        dry_run = not (
-            is_orchestrator_root_install() if is_orchestrator_root_install else False
-        )
+    name = (collection_name or "").strip()
+    if not name:
+        _log("7c/10", "ok", "prune skipped: no collection name")
+        return
 
-    # v0.2.44 V44-A: existence is checked via _path_resolves_on_disk per row
-    # below (multi-strategy: relative, resolved, absolute, worktree-stripped).
-    # The earlier all_on_disk set-build is no longer needed.
-
-    # Fetch all stored (uuid, file_path) pairs from Weaviate.
-    stored: list[tuple[str, str]] = []  # (uuid, file_path)
+    # v0.2.44 V44-A kept this leg on for every --update; v0.2.103 keeps the
+    # "always prune on update" intent but routes it through the guarded home.
+    # Called from the full-sync/partial-sync branch of ``_seed_weaviate`` after
+    # the sync step: the sync upserts every on-disk file but never deletes rows
+    # for files that were removed from disk — the prune closes that gap. An
+    # ENQUEUED seed (v0.2.101 item 4) does not weaken it: only rows whose
+    # stored ``file_path`` fails to resolve on disk are deleted, independent
+    # of embedding state.
+    shared = (shared_kg_collection or "").strip()
     try:
-        base = (weaviate_url or _weaviate_url_default()).rstrip("/")
-        # v0.2.46 V46-A: dropped the broken `where: Like "%"` filter (same
-        # bug as CI-10 in _batch_query_weaviate_content_hashes — Weaviate's
-        # BM25 tokenizer rejects `%` as "only stopwords provided" and the
-        # null response was silently coalesced to []). With the filter
-        # dropped, the secondary `{ Get { ... } }` brace-balance issue that
-        # Investigator 1 reproduced live ("Expected Name, found EOF") also
-        # disappears because the string is now syntactically simpler.
-        # Bumped limit 2000 → 10000 (Weaviate's QUERY_MAXIMUM_RESULTS
-        # default); saturation warning below signals if we approach the cap.
-        gql_query = (
-            f"{{ Get {{ {collection_name}(limit: 10000) "
-            f"{{ _additional {{ id }} file_path }} }} }}"
+        from vco_lib.collection_repair import (
+            is_shared_identity_collection,
+            prune_foreign_rows,
         )
-        import json as _json
-        import urllib.request as _ur
-        data = _json.dumps({"query": gql_query}).encode()
-        req = _ur.Request(
-            f"{base}/v1/graphql",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with _ur.urlopen(req, timeout=15) as resp:  # noqa: S310
-            body = _json.loads(resp.read())
 
-        # v0.2.46 V46-A: inspect errors array BEFORE consuming data. See
-        # knowledge/concepts/mcp-loud-fail-error-pattern.md § GraphQL
-        # errors[] array. Non-empty errors → WARN + early return (prune
-        # check is best-effort; no destructive action is taken without
-        # an authoritative stored-rows list).
-        if body.get("errors"):
-            first_err = (body["errors"][0] or {}).get("message", "unknown")
+        if is_shared_identity_collection(name, shared, project_root):
+            print(
+                f"  prune skipped for {name!r}: shared-identity collection — "
+                "sibling projects' shared-scope rows live here and are kept "
+                "(vco doctor's kg_drift_census reports stored-only rows)"
+            )
             _log(
-                "7c/10", "warn",
-                f"V0243-6: GraphQL errors fetching prune candidates from "
-                f"{collection_name!r}: {first_err[:200]}",
-                data={
-                    "collection": collection_name,
-                    "errors": [
-                        (e or {}).get("message", "")[:200]
-                        for e in body["errors"][:3]
-                    ],
-                },
+                "7c/10", "ok",
+                f"prune skipped for {name!r}: shared-identity collection "
+                "(other projects' shared-scoped rows legitimately have no file "
+                "under this root; never pruned — the doctor census reports "
+                "stored-only rows)",
+                data={"collection": name, "skipped": "shared-identity collection"},
             )
             return
 
-        objects = (
-            body.get("data", {})
-            .get("Get", {})
-            .get(collection_name, [])
-        ) or []
+        result = prune_foreign_rows(
+            project_root, name,
+            weaviate_url=weaviate_url,
+            shared_kg_collection=shared,
+            dry_run=bool(dry_run),
+            log_event=log_event,
+            log_step="7c/10",
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail, as ever
+        _log(
+            "7c/10", "warn",
+            f"prune failed for {name!r}: {exc}",
+            data={"collection": name, "error": str(exc)[:200]},
+        )
+        return
 
-        # v0.2.46 V46-A: saturation warning — same caveat as CI-10. If we
-        # hit the cap, the prune set is INCOMPLETE; aborting is safer than
-        # deleting based on a truncated view (we might mark live rows as
-        # stale because they fell past the limit).
-        if len(objects) >= 10000:
-            _log(
-                "7c/10", "warn",
-                f"V0243-6: hit Weaviate QUERY_MAXIMUM_RESULTS cap (10000) "
-                f"for {collection_name!r}; aborting prune to avoid "
-                f"false-positives — consider cursor pagination",
-                data={"collection": collection_name, "rows": len(objects)},
+    if result.get("skipped"):
+        print(f"  prune skipped for {name!r}: {result['skipped']}")
+        return
+
+    stale_rows = result.get("stale_rows", [])
+    for row in stale_rows[:_PRUNE_PRINT_CAP]:
+        title = row.get("title") or ""
+        print(f"    → stale row file_path={row.get('path')!r}"
+              + (f" (title: {title!r})" if title else ""))
+    _hidden = len(stale_rows) - _PRUNE_PRINT_CAP
+    if _hidden > 0:
+        print(f"    → … and {_hidden} more stale row(s)")
+    deleted = result.get("deleted", 0)
+    if result.get("dry_run"):
+        if stale_rows:
+            print(
+                f"  (dry-run: {len(stale_rows)} row(s) would be deleted "
+                f"from {name!r})"
             )
-            return
-
-        for obj in objects:
-            uid = (obj.get("_additional") or {}).get("id") or ""
-            fp = (obj.get("file_path") or "").strip()
-            if uid and fp:
-                stored.append((uid, fp))
-    except Exception as exc:
-        _log(
-            "7c/10", "warn",
-            f"V0243-6: could not fetch stored file_paths for prune check: {exc}",
-            data={"collection": collection_name, "error": str(exc)[:200]},
-        )
-        return
-
-    stale_uuids: list[str] = []
-    stale_paths: list[str] = []
-    for uid, fp in stored:
-        if not _path_resolves_on_disk(fp, project_root):
-            stale_uuids.append(uid)
-            stale_paths.append(fp)
-            print(f"    → pruned orphan row file_path={fp!r}")
-
-    if not stale_uuids:
-        _log(
-            "7c/10", "ok",
-            f"V0243-6: prune check: no stale rows in {collection_name!r} "
-            f"({len(stored)} rows, all match on-disk)",
-            data={"collection": collection_name, "stored": len(stored), "stale": 0},
-        )
-        return
-
-    print(
-        f"  V0243-6: {len(stale_uuids)} stale KG row(s) found "
-        f"(file deleted from disk) in {collection_name!r}"
-    )
-    _log(
-        "7c/10", "info",
-        f"V0243-6: prune: {len(stale_uuids)} stale row(s) in {collection_name!r}",
-        data={"collection": collection_name, "stale": len(stale_uuids),
-              "dry_run": dry_run},
-    )
-
-    if dry_run:
-        print(f"  (dry-run: {len(stale_uuids)} row(s) would be deleted)")
-        return
-
-    # Batch-delete via Weaviate v1 batch/objects endpoint.
-    # v0.2.46 V46-A-followup: SECOND v0.2.43 bug caught by V46-B's live
-    # integration test — `valueText: <list>` returns HTTP 400 ("cannot
-    # unmarshal array into Go struct field of type string"). The
-    # correct field for `ContainsAny` with a list of UUIDs is
-    # `valueTextArray` (plural). Reproduced live 2026-06-03; the buggy
-    # form has been on disk since V0243-6 shipped in v0.2.43 (which is
-    # ALSO why the prune logic appeared to "no-op silently" — same
-    # silent-zero-fallback antipattern as the diff-gate fetch).
-    try:
-        base = (weaviate_url or _weaviate_url_default()).rstrip("/")
-        import json as _json
-        import urllib.request as _ur
-        delete_body = _json.dumps({
-            "match": {
-                "class": collection_name,
-                "where": {
-                    "path": ["id"],
-                    "operator": "ContainsAny",
-                    "valueTextArray": stale_uuids,
-                },
-            },
-            "output": "minimal",
-            "dryRun": False,
-        }).encode()
-        req = _ur.Request(
-            f"{base}/v1/batch/objects",
-            data=delete_body,
-            headers={"Content-Type": "application/json"},
-            method="DELETE",
-        )
-        with _ur.urlopen(req, timeout=30) as resp:  # noqa: S310
-            result_body = _json.loads(resp.read())
-        deleted_count = (result_body.get("results") or {}).get("successful", 0)
-        print(f"  V0243-6: pruned {deleted_count} stale row(s)")
-        _log(
-            "7c/10", "ok",
-            f"V0243-6: pruned {deleted_count} stale row(s) from {collection_name!r}",
-            data={"collection": collection_name, "deleted": deleted_count},
-        )
-    except Exception as exc:
-        _log(
-            "7c/10", "warn",
-            f"V0243-6: batch delete failed for {collection_name!r}: {exc}",
-            data={"collection": collection_name, "error": str(exc)[:200]},
+    elif deleted:
+        print(
+            f"  pruned {deleted} stale row(s) from {name!r} "
+            f"({len(result.get('stale_paths', []))} path(s))"
         )
 
 
@@ -2653,15 +2604,30 @@ def collections_and_seed(
 
     ``SKIPPED`` = the write gate refused (``seed`` returned :data:`SKIPPED`):
     the steps after it must not treat the collections as ready (L1-F18).
-    A Weaviate that raised gets ONE ``<runtime> start <container>`` and a
-    retry (PR 6); still down → ``weaviate_unreachable_at_update`` (+
-    ``rebuild_pending_seed`` when this run dropped a collection, HIGH-4).
+
+    A failure is classified into exactly one of three arms (v0.2.103 — before
+    it, every exception was reported as "Weaviate unreachable" and answered
+    with a container start, so a broken venv or a seed bug read as a database
+    outage and restarted a healthy container):
+
+    * connection-class (:func:`_is_unreachable`) — ONE ``<runtime> start
+      <container>`` and a retry (PR 6); still down →
+      ``weaviate_unreachable_at_update`` (+ ``rebuild_pending_seed`` when this
+      run dropped a collection, HIGH-4).
+    * ``ImportError`` — a BROKEN install (the venv lacks a module VCO ships):
+      one loud stderr line naming the module and the repair, an
+      ``install_python_env_broken`` row, NO container start.
+    * anything else — "KG seed failed: <type>: <msg>" and a ``kg_seed_failed``
+      row, NO container start (the database was not the problem).
     """
     try:
         ensure()
         return _seed_status(seed())
-    except Exception as exc:  # noqa: BLE001 — Weaviate down → deferral, not a crash
-        down_msg = str(exc)
+    except Exception as exc:  # noqa: BLE001 — classified below, never a crash
+        first = exc
+    if not _is_unreachable(first):
+        return _record_non_connection_failure(report, first, rebuild_performed)
+    down_msg = str(first)
     import subprocess
     import time as _time
 
@@ -2677,12 +2643,125 @@ def collections_and_seed(
         # raises (→ deferral) instead of hanging the re-embed.
         ensure()
         return _seed_status(seed())
-    except Exception:  # noqa: BLE001 — recovery is best-effort
-        pass
+    except Exception as retry_exc:  # noqa: BLE001 — recovery is best-effort
+        if not _is_unreachable(retry_exc):
+            # Weaviate came back and the RETRY hit a different failure: report
+            # that failure, not an outage that is no longer true.
+            return _record_non_connection_failure(report, retry_exc, rebuild_performed)
     hint = container if found else " | ".join(all_known_names("weaviate"))
     print(f"WARNING: Weaviate unreachable after restart attempt ({down_msg}). "
           "Collections not bootstrapped. Deferral entry written.")
     _record_weaviate_down(report, down_msg, rt, container, hint, rebuild_performed)
+    return FAILED
+
+
+# Message markers (lowercased) of a transport failure whose exception type
+# carries no "connect"/"timeout" in its name — e.g. the weaviate client's
+# ``WeaviateStartUpError("Could not connect to Weaviate ...")``. Extends
+# ``retry_after.is_connection_error``'s marker set; that helper deliberately
+# excludes timeouts (an embed timeout is a wedge guard), while HERE the
+# readiness gate's ``TimeoutError`` IS the "Weaviate is down" signal.
+_UNREACHABLE_MESSAGE_MARKERS: tuple[str, ...] = (
+    "could not connect",
+    "unreachable",
+    "timed out",
+    "name or service not known",
+    "nodename nor servname",
+)
+
+
+def _is_unreachable(exc: BaseException) -> bool:
+    """True when ``exc`` says Weaviate could not be REACHED (refused, reset,
+    timed out, DNS) — the only arm that earns a container start.
+
+    ``ImportError`` is never a connection error, and neither is a
+    ``FileNotFoundError`` / ``PermissionError`` (an ``OSError`` raised by a
+    missing script or an unreadable file, not by a socket)."""
+    import socket
+    import urllib.error
+
+    from vco_lib.retry_after import is_connection_error
+
+    if isinstance(exc, ImportError):
+        return False
+    if isinstance(exc, (ConnectionError, TimeoutError, socket.gaierror,
+                        urllib.error.URLError)):
+        return True
+    if is_connection_error(exc):
+        return True
+    if any("timeout" in k.__name__.lower() for k in type(exc).__mro__):
+        return True
+    # R24 LOW-4: the message markers exist for client exceptions whose TYPE
+    # says nothing (``WeaviateStartUpError("Could not connect …")``). A
+    # builtin programming-error type is never a transport failure, whatever
+    # its text — ``ValueError("embed timed out waiting for batch")`` is a seed
+    # bug, not an outage. Residual (accepted): a generic ``Exception`` /
+    # ``RuntimeError`` whose message carries a marker still reads as an outage
+    # and costs one container start.
+    if isinstance(exc, _PROGRAMMING_ERROR_TYPES):
+        return False
+    text = str(exc).lower()
+    return any(m in text for m in _UNREACHABLE_MESSAGE_MARKERS)
+
+
+#: Builtin exception types that signal a bug in the caller, never a socket
+#: failure (``_is_unreachable``'s message-marker leg does not apply to them).
+_PROGRAMMING_ERROR_TYPES: tuple[type, ...] = (
+    ValueError, TypeError, LookupError, AttributeError, AssertionError,
+    NotImplementedError, ArithmeticError,
+)
+
+
+def _record_non_connection_failure(report, exc: BaseException,
+                                   rebuild_performed: bool) -> str:
+    """Report a NON-connection failure of the collections/seed step honestly
+    (no container start — the database was not the problem) and return
+    :data:`FAILED`. ``rebuild_pending_seed`` still rides along when this run
+    dropped a collection: the drop is owed a re-seed whatever the cause."""
+    import sys
+
+    from vco_lib.deferral_report import DeferralEntry
+
+    if isinstance(exc, ImportError):
+        mod = getattr(exc, "name", None) or str(exc)
+        remedy = ("re-run the orchestrator update (`python install.py --update` from the "
+                  "orchestrator root), which installs VCO's Python requirements into the "
+                  "venv; if it repeats, recreate the venv (delete `.venv` and re-run "
+                  "install.py)")
+        line = (f"broken install: the KG seed could not import `{mod}` "
+                f"({type(exc).__name__}: {exc}) — {remedy}")
+        print(f"ERROR: {line}", file=sys.stderr)
+        report.add_entry(DeferralEntry(
+            condition_id="install_python_env_broken",
+            title="Broken install: a Python module VCO ships is missing",
+            detected=(f"The Weaviate collection bootstrap / KG seed could not import "
+                      f"`{mod}` ({type(exc).__name__}: {exc}). The interpreter running "
+                      f"install.py lacks a package VCO's requirements provide."),
+            why_deferred=("Collections and the KG seed need that module; the run continued "
+                          "without them. Weaviate itself was not restarted — it was not "
+                          "the problem."),
+            command_to_apply="python install.py --update",
+            severity="critical",
+            kg_node_refs=[],
+        ))
+    else:
+        line = f"KG seed failed: {type(exc).__name__}: {exc}"
+        print(f"ERROR: {line}. Collections/seed not completed; deferral entry written.",
+              file=sys.stderr)
+        report.add_entry(DeferralEntry(
+            condition_id="kg_seed_failed",
+            title="KG seed failed",
+            detected=(f"The Weaviate collection bootstrap / KG seed raised "
+                      f"{type(exc).__name__}: {exc}"),
+            why_deferred=("The error is not a connection failure, so restarting Weaviate "
+                          "would not help and was not attempted. The knowledge/ sources are "
+                          "intact; the next successful run seeds them."),
+            command_to_apply="python install.py --update --skip-rebuild-prompt",
+            severity="warning",
+            kg_node_refs=[],
+        ))
+    if rebuild_performed:
+        _record_rebuild_pending_seed(report, "python install.py --update --skip-rebuild-prompt")
     return FAILED
 
 
@@ -2708,6 +2787,12 @@ def _record_weaviate_down(report, down_msg: str, rt: str, container: str, hint: 
     ))
     if not rebuild_performed:
         return
+    _record_rebuild_pending_seed(report, retry)
+
+
+def _record_rebuild_pending_seed(report, retry: str) -> None:
+    from vco_lib.deferral_report import DeferralEntry
+
     report.add_entry(DeferralEntry(
         condition_id="rebuild_pending_seed",
         title="Rebuild dropped collections; seed pending",

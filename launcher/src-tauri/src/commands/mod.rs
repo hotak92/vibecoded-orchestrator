@@ -15,6 +15,7 @@ pub mod blocking;
 pub mod bundle_staleness;
 pub mod changes_cmd;
 pub mod claude_env;
+pub mod kg_reviewer_model;
 pub mod gpu;
 pub mod gpu_policy;
 pub mod codegraph;
@@ -28,9 +29,11 @@ pub mod codegraph_reanalyze;
 // per-project `.claude/`-index toggle (module_settings). Command fns are
 // wired into `generate_handler!` by the integrator.
 pub mod codegraph_settings;
-// v0.2.47 RL-7.5 (2026-06-04): chunker-revision deferral. Writes an
-// UPDATE_DEFERRED.md row when an upgrade crosses the v0.2.46 chunker
-// boundary so the user re-syncs KG / codegraph against the new presets.
+// v0.2.47 RL-7.5 (2026-06-04), revision-keyed since v0.2.92 R2-4:
+// chunker-revision deferral. Writes an UPDATE_DEFERRED.md row when the
+// `_CHUNKER_REVISION` sentinel changes so the user re-syncs KG / codegraph
+// against the new chunk boundaries. (The one-off v0.2.46 semver-boundary
+// half was retired in v0.2.103.)
 pub mod chunker_revision_deferral;
 // v0.2.92 WP-11: the version-keyed chat-model context table (migration 043)
 // plus its seed loader and its export to
@@ -105,6 +108,11 @@ pub mod manifest;
 // to `python -m vco_lib.vscode_settings`, which owns the byte layout of that
 // user-owned file.
 pub mod model_gateway;
+// v0.2.103 (plan item 12): the model-guidance refresh triggers (launcher
+// startup, Secrets-panel key changes) and the GUI status read. The refresh
+// itself is Python (`python -m vco_lib.model_guidance`); this module only
+// fires it and transports its payload.
+pub mod model_guidance;
 // v0.2.97: after an update, "is the running gateway still on the previous
 // release's code?" and the Continue that restarts it. Never automatic — a
 // restart ends every agent session routed through the gateway. The verdict
@@ -252,6 +260,11 @@ pub mod upstream_fetch;
 // its reader is `vco_lib/launcher_ensure.py`, running when this process is by
 // definition not.
 pub mod session_autostart;
+// v0.2.103 (review R19 F4): Preferences → Startup "Start the container
+// engine automatically" — the launcher.db switch for the engine auto-start
+// whose logic lives in `vco_lib/container_engine_start.py` and whose
+// readers are the hub, the launcher setup and the session hooks.
+pub mod engine_autostart_pref;
 // v0.2.91 decision #26: named process-wide single-flight guard. Refuses (does
 // NOT queue) a second concurrent run of a long-running destructive command —
 // `update_all_projects` and the orchestrator update (`run_orchestrator_update`
@@ -291,6 +304,6 @@ pub mod update_run;
 // v0.2.71 Track T-WT (modes extended v0.2.91): GUI-only per-project worktree-repo mode
 // backing the subagent-git modal. NOT hub-resolved (config_api.rs untouched);
 // the harness spawn pathway VCO would need to consume it cannot be
-// intercepted. The generate_handler! entries for set_/get_worktree_repo_mode
+// intercepted. The generate_handler! entries for set_worktree_repo_mode / plan_project_git_repo
 // are added to lib.rs by the integrator (T-D-launcher owns lib.rs).
 pub mod worktree_repo_mode;

@@ -205,9 +205,12 @@ The installer auto-selects three backends — code embeddings, KG / text embeddi
 | Tier                                    | Backend          | Model              | Notes                                                              |
 |-----------------------------------------|------------------|--------------------|--------------------------------------------------------------------|
 | `claude` CLI on PATH (authenticated)    | Claude CLI       | `haiku`            | Always preferred; costs come out of your Claude subscription quota.|
-| GPU, VRAM ≥ 16 GB                       | Ollama           | `qwen3.5:9b`       | Highest local quality.                                             |
-| GPU, VRAM ≥ 6 GB                        | Ollama           | `gemma4:e4b`       | Fast, low VRAM footprint.                                          |
-| CPU, RAM ≥ 12 GB & 6+ cores             | Ollama           | `gemma4:e4b`       | Pure-CPU fallback.                                                 |
+| GPU, VRAM ≥ 9.1 GB                      | Ollama           | `qwen3.5:9b`       | Highest local quality.                                             |
+| GPU, VRAM ≥ 4.9 GB                      | Ollama           | `qwen3.5:4b`       | Small-card rung (~3.2 GB).                                         |
+| No GPU; CPU, RAM ≥ 12 GB & 6+ cores     | Ollama           | `gemma4:e4b`       | Pure-CPU fallback.                                                 |
+| Any other machine                       | Ollama           | `qwen3.5:0.8b`     | Always-pulled floor.                                               |
+
+The GPU thresholds are not chosen by hand: a GPU rung is picked only when the card can hold the free-VRAM floor the summary runtime checks before loading the model (its on-disk size plus a max(1 GB, 40 %) KV-cache margin, plus ~0.5 GB an idle desktop already uses), so the table never assigns a model the runtime would refuse to load.
 | Anything below those tiers              | _none_           | _none_             | Summaries skipped; raw KG content still embedded + searchable.     |
 | OpenAI API (opt-in, requires consent)   | OpenAI           | `gpt-4o-mini`      | Off by default; toggle via Preferences → KG Summaries. Cost warning surfaced on enable. |
 

@@ -329,10 +329,6 @@ LOAD_OOM_BACKOFF_SECS = _resolve_load_oom_backoff_secs()
 UNLOAD_FREED_MIN_MB = _resolve_unload_freed_min_mb()
 #: Queue bound for over-capacity requests (see ``_resolve_queue_wait_secs``).
 QUEUE_WAIT_SECS = _resolve_queue_wait_secs()
-#: With ``QUEUE_WAIT_SECS == 0`` a wait_for timeout of exactly 0 would refuse
-#: even when a slot is FREE (the coroutine never gets scheduled); this ~1 ms
-#: grace lets a free-slot acquire complete while still refusing a queued one.
-_QUEUE_ZERO_GRACE_SECS = 0.001
 #: A genuine unload of a multi-GB model frees at least HALF the VRAM it held;
 #: less means a live reference still pins the weights — keep the handle rather
 #: than discard it and allocate a second copy on the next request.
@@ -707,6 +703,60 @@ def _dim_gpu() -> int:
 # ---------------------------------------------------------------------------
 # Backend: Ollama
 # ---------------------------------------------------------------------------
+#: The env key carrying the host-resolved Ollama embed body template. MUST
+#: MATCH ``vco_lib/ollama_embed_body.py`` ``CONTAINER_BODY_ENV_KEY`` and the
+#: ``code_embed`` environment in ``infrastructure/docker-compose.yml``
+#: (pinned by tests/test_v02103_code_embed_ollama_body.py).
+OLLAMA_BODY_ENV_KEY = "CODE_EMBED_OLLAMA_BODY"
+
+
+def _ollama_embed_request_body(model: str, text: str) -> dict:
+    """The Ollama ``/api/embeddings`` body for ``text`` — identical to every
+    other VCO caller's (one runner per model: same num_ctx, keep_alive and
+    ``truncate: false``).
+
+    * Host process (``VCO_LIB_AVAILABLE``): the ONE builder,
+      ``vco_lib.ollama_embed_body.embed_request_body`` (v0.2.102 W4-E).
+    * Container (no vco_lib, BY DESIGN — v0.2.103 F1: the bare import here
+      failed every embed and every /health with ``No module named
+      'vco_lib'``): the template install resolved from that same builder and
+      wrote to ``infrastructure/.env`` (A>B>C option B), plus the prompt.
+
+    A missing, unparseable or other-model template is REFUSED with the remedy
+    — never a body with a guessed ``num_ctx`` (Ollama's 2048 default would
+    silently truncate every chunk tail with a 200)."""
+    if VCO_LIB_AVAILABLE:
+        from vco_lib.ollama_embed_body import embed_request_body
+
+        return embed_request_body(model, prompt=text)
+    import json
+
+    raw = os.environ.get(OLLAMA_BODY_ENV_KEY, "").strip()
+    remedy = (
+        "re-run `python install.py --update` (or the launcher's Update) so "
+        f"install writes {OLLAMA_BODY_ENV_KEY} for this model into "
+        "infrastructure/.env, then recreate the code_embed container"
+    )
+    if not raw:
+        raise RuntimeError(
+            f"{OLLAMA_BODY_ENV_KEY} is not set — the ollama backend cannot "
+            f"build its embed request without vco_lib; {remedy}"
+        )
+    try:
+        template = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{OLLAMA_BODY_ENV_KEY} is not valid JSON ({exc}); {remedy}") from exc
+    if not isinstance(template, dict) or template.get("model") != model:
+        got = template.get("model") if isinstance(template, dict) else None
+        raise RuntimeError(
+            f"{OLLAMA_BODY_ENV_KEY} was resolved for model {got!r}, but this "
+            f"service serves {model!r}; {remedy}"
+        )
+    body = dict(template)
+    body["prompt"] = text
+    return body
+
+
 def _embed_ollama(
     texts: list[str], is_query: bool = False, task: str | None = None
 ) -> list[list[float]]:
@@ -717,19 +767,9 @@ def _embed_ollama(
     for text in texts:
         if is_query and instruction:
             text = instruction + text
-        # v0.2.102 W4-E: the body comes from the ONE shared builder
-        # (vco_lib.embedding_providers.ollama.embed_request_body — the same
-        # home the canonical adapter uses), so this Ollama tier sends the
-        # IDENTICAL load options per model as every other VCO caller and
-        # Ollama never loads a second runner of the same model. The builder
-        # also carries keep_alive (v0.2.77 task 6, default 10m since W4-E)
-        # and resolve num_ctx from the one table (chunking.MODEL_TOKEN_LIMITS
-        # — v0.2.92 R40: unset meant Ollama's 2048 default and silent tail
-        # truncation with a 200 response).
-        from vco_lib.embedding_providers.ollama import embed_request_body
         resp = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json=embed_request_body(MODEL_NAME, prompt=text),
+            json=_ollama_embed_request_body(MODEL_NAME, text),
             timeout=30,
         )
         if resp.status_code != 200:
@@ -1102,54 +1142,77 @@ async def _run_embed_guarded(
     _in_flight += 1  # counts queued AND executing; /health reports it
     _stamp_used()  # v0.2.79 §C: mark activity so the idle-unload timer resets
     try:
-        # Bounded FIFO queue wait for one of the MAX_CONCURRENT slots.
-        #
-        # The acquire runs in its own TASK, not as a bare coroutine handed to
-        # wait_for (v0.2.102 r3, re-review SHOULD-FIX): on Python 3.11 (the
-        # container base image) wait_for can raise TimeoutError for a future
-        # that ALREADY consumed a permit in the same event-loop step — the
-        # permit would be permanently leaked and effective capacity would
-        # decay (4 → 3 → …) under exactly the sustained saturation this queue
-        # exists for, with recovery only via restart. The ``acquired`` flag
-        # lets the timeout path give a raced permit BACK; the same shape also
-        # covers client-disconnect cancellation mid-acquire. (Python 3.12
-        # reimplemented wait_for over asyncio.timeout and is race-free, but
-        # ``requires-python = ">=3.11"`` means the guard must hold on both.)
         acquired = False
 
-        async def _acquire_slot() -> None:
-            nonlocal acquired
+        if QUEUE_WAIT_SECS <= 0:
+            # v0.2.103 (review R3 MEDIUM-4): decide WITHOUT a timer. The
+            # old ~1 ms ``wait_for`` grace was a wall-clock race against OS
+            # scheduling — under load the timer could mature before an
+            # UNCONTENDED acquire completed, shedding a request that had a
+            # free slot available (in production, not just in tests).
+            # ``Semaphore.locked()`` is exact in this single-threaded loop:
+            # True means every permit is taken → shed NOW (with
+            # Retry-After); False means a permit is free, and the plain
+            # ``await acquire()`` below then cannot block.
+            if sem.locked():
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Service at capacity ({MAX_CONCURRENT} concurrent "
+                        "request(s)) and no queue wait is configured "
+                        "(CODE_EMBED_QUEUE_WAIT_SECS=0). Retry later."
+                    ),
+                    headers={"Retry-After": str(_queue_retry_after_secs())},
+                )
             await sem.acquire()
             acquired = True
+        else:
+            # Bounded FIFO queue wait for one of the MAX_CONCURRENT slots.
+            #
+            # The acquire runs in its own TASK, not as a bare coroutine handed
+            # to wait_for (v0.2.102 r3, re-review SHOULD-FIX): on Python 3.11
+            # (the container base image) wait_for can raise TimeoutError for
+            # a future that ALREADY consumed a permit in the same event-loop
+            # step — the permit would be permanently leaked and effective
+            # capacity would decay (4 → 3 → …) under exactly the sustained
+            # saturation this queue exists for, with recovery only via
+            # restart. The ``acquired`` flag lets the timeout path give a
+            # raced permit BACK; the same shape also covers
+            # client-disconnect cancellation mid-acquire. (Python 3.12
+            # reimplemented wait_for over asyncio.timeout and is race-free,
+            # but ``requires-python = ">=3.11"`` means the guard must hold
+            # on both.)
 
-        try:
-            await asyncio.wait_for(
-                asyncio.ensure_future(_acquire_slot()),
-                timeout=(
-                    QUEUE_WAIT_SECS
-                    if QUEUE_WAIT_SECS > 0
-                    else _QUEUE_ZERO_GRACE_SECS
-                ),
-            )
-        except asyncio.CancelledError:
-            if acquired:
-                # The race: a permit was consumed despite the cancellation.
-                sem.release()
-            raise
-        except asyncio.TimeoutError:
-            if acquired:
-                # The race: a permit was consumed despite the timeout — give
-                # it back so capacity does not decay.
-                sem.release()
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"Service at capacity ({MAX_CONCURRENT} concurrent "
-                    f"request(s)) and the queue wait of {QUEUE_WAIT_SECS:.0f}s "
-                    "was exceeded. Retry later."
-                ),
-                headers={"Retry-After": str(_queue_retry_after_secs())},
-            )
+            async def _acquire_slot() -> None:
+                nonlocal acquired
+                await sem.acquire()
+                acquired = True
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.ensure_future(_acquire_slot()),
+                    timeout=QUEUE_WAIT_SECS,
+                )
+            except asyncio.CancelledError:
+                if acquired:
+                    # The race: a permit was consumed despite the
+                    # cancellation.
+                    sem.release()
+                raise
+            except asyncio.TimeoutError:
+                if acquired:
+                    # The race: a permit was consumed despite the timeout —
+                    # give it back so capacity does not decay.
+                    sem.release()
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Service at capacity ({MAX_CONCURRENT} concurrent "
+                        f"request(s)) and the queue wait of "
+                        f"{QUEUE_WAIT_SECS:.0f}s was exceeded. Retry later."
+                    ),
+                    headers={"Retry-After": str(_queue_retry_after_secs())},
+                )
         try:
             async with _get_lock():
                 # Run sync inference in a thread pool to avoid blocking the event

@@ -115,14 +115,20 @@ if ($env:VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS -match '^\d+$') {
 }
 if (Test-Path -LiteralPath $stateDir -PathType Container) {
     $extrasTsFile = Join-Path $stateDir "codegraph_extras_check.ts"
-    $extrasNow = [int][double]::Parse((Get-Date -UFormat %s))
+    $extrasNow = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $extrasLast = 0
     if (Test-Path -LiteralPath $extrasTsFile) {
         try {
             $rawTs = (Get-Content -LiteralPath $extrasTsFile -Raw -ErrorAction Stop).Trim()
-            if ($rawTs -match '^\d+$') { $extrasLast = [int]$rawTs }
+            if ($rawTs -match '^\d+$') { $extrasLast = [long]$rawTs }
         } catch { }
     }
+    # A stamp in the FUTURE is not a recent check: it is a pre-v0.2.103
+    # local-time stamp (Windows PowerShell 5.1 wrote local time, up to +14 h
+    # ahead of UTC) or a clock that moved back. Read as "no stamp" so the
+    # check is not suppressed until the wall clock catches up (R20 L1).
+    # MUST MATCH the .sh sibling's clamp.
+    if ($extrasLast -gt $extrasNow) { $extrasLast = 0 }
     if ($extrasLast -eq 0 -or (($extrasNow - $extrasLast) -ge $extrasInterval)) {
         Set-Content -LiteralPath $extrasTsFile -Value "$extrasNow" -NoNewline -ErrorAction SilentlyContinue
         if ((Resolve-DrainRuntime) -eq 0) {
@@ -174,14 +180,21 @@ if (-not (Test-Path -LiteralPath $queue) -and -not (Test-Path -LiteralPath $shar
 
 # --- RATE LIMIT ---
 $lastTsFile = Join-Path $stateDir "codegraph_drain_last_sync.ts"
-$now = [int][double]::Parse((Get-Date -UFormat %s))
+# True UTC unix seconds on every edition. `Get-Date -UFormat %s` is LOCAL
+# time on Windows PowerShell 5.1 (measured on an it-IT host: +7200 s), which
+# skewed every stamp the .sh sibling and Python read (v0.2.103 Windows run).
+$now = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $lastTs = 0
 if (Test-Path -LiteralPath $lastTsFile) {
     try {
         $raw = (Get-Content -LiteralPath $lastTsFile -Raw -ErrorAction Stop).Trim()
-        if ($raw -match '^\d+$') { $lastTs = [int]$raw }
+        if ($raw -match '^\d+$') { $lastTs = [long]$raw }
     } catch { }
 }
+# A future stamp (pre-v0.2.103 local-time stamp, or a clock moved back) is
+# no stamp: never let it rate-limit the drain for hours (R20 L1). MUST
+# MATCH the .sh sibling's clamp.
+if ($lastTs -gt $now) { $lastTs = 0 }
 if ($lastTs -gt 0 -and (($now - $lastTs) -lt $MinInterval)) {
     # Rate-limited: leave the queue for the next eligible drain.
     exit 0

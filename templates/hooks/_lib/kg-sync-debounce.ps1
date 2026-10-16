@@ -22,8 +22,22 @@
 #       - A re-edit DURING the sleep window finds the lock present ->
 #         no-op; the pending flusher syncs the file. The sync command
 #         re-reads the file FROM DISK at run time -> latest content.
-#       - A re-edit AFTER the lock cleared schedules a FRESH flusher ->
-#         the post-window edit also syncs. No edit is ever lost.
+#       - A re-edit AFTER the sync FINISHED finds no lock and no claim
+#         and schedules a FRESH flusher -> the post-window edit also
+#         syncs. No edit is ever lost.
+#       - A re-edit WHILE the sync RUNS (v0.2.103 single-flight): the lock
+#         dir is gone (renamed to "<lock>.claimed.<pid>" at sync start),
+#         so the plain New-Item gate cannot see it — the field defect
+#         (2026-10-14: ONE docs edit produced FOUR concurrent
+#         sync_knowledge_graph.py children of the debounce flusher, one
+#         per re-edit, each minutes-long on a large file). The schedule
+#         path now consults Test-KgDebounceInflight: while a LIVE claim
+#         for the same key exists it creates the lock as a FOLLOW-UP
+#         marker and starts NO second sync; the running sync's child
+#         serves that marker (starts one flusher for it) after it
+#         finishes. At most ONE in-flight sync per (project, path,
+#         channel); edits during a sync coalesce into exactly one
+#         follow-up that re-reads the file fresh -> latest content.
 #   * A file edited once then left alone syncs exactly once, N seconds
 #     later. Bounded delay, never "never".
 #
@@ -76,14 +90,14 @@
 #   Invoke-Expression. The reaper therefore ALSO sweeps stale
 #   ".claimed.<pid>" dirs: if the owning <pid> is no longer alive
 #   (Get-Process -Id fails) the claim is dead → re-claim and run. A
-#   still-alive <pid> is an in-flight claim → left untouched. The
+#   <pid> that is alive AND pre-dates the claim's stamp (see
+#   Test-KgDebouncePidLive) is an in-flight claim → left untouched; a
+#   RECYCLED pid (alive but started after the stamp) is not the claim's
+#   owner → recovered, so pid reuse never freezes the file's edits. The
 #   intermediate ".reaping.<token>" dir (used only to win the race before
 #   re-stamping to the real pid) is likewise swept by age if stranded.
 #   The grace clock is RESTARTED (LastWriteTime refreshed) at each claim
 #   transition so an in-flight claim is never re-tripped as stranded.
-#   (PID-reuse is a theoretical false-"alive": worst case a dead claim
-#   waits until the reused pid exits, then recovers — never dropped, only
-#   delayed, matching the eventually-consistent contract.)
 #
 # TUNING
 # ------
@@ -341,6 +355,71 @@ if (`$cmd) {
     }
 }
 Remove-Item -LiteralPath `$claimed -Recurse -Force -ErrorAction SilentlyContinue
+# v0.2.103 SINGLE-FLIGHT follow-up serve. Edits that arrived while OUR
+# eval ran left a plain "<base>" (.lock) dir as a follow-up marker (see
+# Invoke-KgDebounceSchedule). Serve it now: start ONE flusher for it — it
+# sleeps the quiet-window, claims the lock through the same atomic
+# Move-Item and re-runs the sync, which re-reads the file fresh → the
+# latest content syncs exactly once more. ORDER MATTERS: the claim is
+# removed BEFORE this check, so any editor whose inflight probe saw our
+# claim as LIVE created its follow-up lock before our Remove-Item — and
+# therefore before this check — so it can never be missed. (An editor
+# arriving after the removal takes the ordinary schedule path; if both
+# happen the two flushers claim the same lock via the atomic Move-Item
+# and exactly one runs — no double sync.)
+`$lockDir = Join-Path `$st `$base
+if (Test-Path -LiteralPath `$lockDir -PathType Container) {
+    if (`$dbLib -and (Test-Path -LiteralPath `$dbLib)) {
+        try {
+            . `$dbLib
+            # NOTE: single line on purpose — a backtick line-continuation
+            # inside this EXPANDING here-string is emitted as a newline in the
+            # child script, which would split the command ("-LockPath is not
+            # recognized") and silently drop the follow-up sync.
+            Start-KgDebounceFlusher -SleepSeconds (Get-KgDebounceWindow) -LockPath `$lockDir -StateDir `$st -Base `$base
+        } catch { }
+    } else {
+        # LOW-3 (review R3 2026-10-14): the lib file cannot be read → serve
+        # the follow-up ANYWAY, exactly like the .sh sibling's fallback
+        # (spawn_flusher → in-process flusher_body). This scriptblock is
+        # fully self-contained (no lib) and recursive for chained
+        # follow-ups; it runs IN-PROCESS in this already-detached child,
+        # so no further spawn is needed. [char]9 = TAB, kept out of a
+        # double-quoted string so the expanding here-string cannot mangle
+        # it. MUST MATCH the .sh sibling's fallback intent.
+        `$fallbackFlusher = {
+            param([string]`$fl, [string]`$fst, [string]`$fbase, [int]`$fwin)
+            Start-Sleep -Seconds `$fwin
+            `$ftok = "{0}.{1}" -f `$PID, (Get-Random)
+            `$fwon = Join-Path `$fst (`$fbase + '.reaping.' + `$ftok)
+            try { Move-Item -LiteralPath `$fl -Destination `$fwon -ErrorAction Stop } catch { return }
+            try { (Get-Item -LiteralPath `$fwon -ErrorAction Stop).LastWriteTime = Get-Date } catch { }
+            `$fclaimed = Join-Path `$fst ("{0}.claimed.{1}" -f `$fbase, `$PID)
+            try { Move-Item -LiteralPath `$fwon -Destination `$fclaimed -ErrorAction Stop } catch { `$fclaimed = `$fwon }
+            try { (Get-Item -LiteralPath `$fclaimed -ErrorAction Stop).LastWriteTime = Get-Date } catch { }
+            `$fwd = `$null; `$fcmd = `$null
+            `$fcmdFile = Join-Path `$fclaimed 'cmd'
+            if (Test-Path -LiteralPath `$fcmdFile) {
+                try {
+                    `$fline = (Get-Content -LiteralPath `$fcmdFile -TotalCount 1 -ErrorAction Stop)
+                    `$fparts = `$fline -split [char]9, 2
+                    if (`$fparts.Count -ge 2) { `$fwd = `$fparts[0]; `$fcmd = `$fparts[1] }
+                } catch { }
+            }
+            if (`$fwd) { Set-Location -LiteralPath `$fwd -ErrorAction SilentlyContinue }
+            if (`$fcmd) { try { Invoke-Expression `$fcmd } catch { } }
+            Remove-Item -LiteralPath `$fclaimed -Recurse -Force -ErrorAction SilentlyContinue
+            `$fnext = Join-Path `$fst `$fbase
+            if (Test-Path -LiteralPath `$fnext -PathType Container) {
+                & `$fallbackFlusher `$fnext `$fst `$fbase `$fwin
+            }
+        }
+        # Window resolution inline (no lib): MUST MATCH Get-KgDebounceWindow.
+        `$fwin = 5
+        if (`$env:VCO_KG_SYNC_DEBOUNCE_SECONDS -match '^[0-9]+$') { `$fwin = [int]`$env:VCO_KG_SYNC_DEBOUNCE_SECONDS }
+        & `$fallbackFlusher `$lockDir `$st `$base `$fwin
+    }
+}
 "@
 }
 
@@ -421,6 +500,68 @@ function Get-KgDebounceWindow {
 function Get-KgDebounceDir {
     param([string]$ProjectRoot)
     return (Join-Path $ProjectRoot ".claude/state/kg_sync_pending")
+}
+
+# v0.2.103 PID-REUSE GUARD (HIGH-3, review R3 2026-10-14). `Get-Process
+# -Id` alone answers "does SOME process have this pid?" — Windows recycles
+# pids fast in a small range (and Get-Process sees every user's and
+# session's processes), so a claim left by a DEAD sync whose pid was later
+# handed to an unrelated long-lived process (a SYSTEM service after a
+# reboot) used to look "alive" FOREVER: every later edit of that file was
+# parked as a follow-up that nothing served (and the reaper skipped it).
+# A pid now counts as the claim's live owner only if the process ALSO
+# started at/before the claim's stamp (the re-stamp LastWriteTime refresh
+# happens AFTER the child process started, so a genuine owner always
+# satisfies this; a recycled pid never does).
+# Read-only, never kills anything. Soft-fail policy, decided on evidence:
+# when the process exists but its StartTime cannot be read (access denied
+# for an elevated process, process exiting) we keep the pre-guard
+# semantics (treat as live) — mis-reporting a LIVE claim as dead would
+# resurrect the duplicate-sync field defect this single-flight pass exists
+# to fix, the worse failure.
+# MUST MATCH _kg_debounce_pid_live in _lib/kg-sync-debounce.sh.
+$script:KgDebouncePidSlackSecs = 5
+# Tolerance for clock/mtime coarseness between the re-stamp and the
+# StartTime reading; a recycled pid is seconds-to-years later than the
+# stamp. MUST MATCH $_KG_DEBOUNCE_PID_SLACK_SECS in the .sh sibling.
+function Test-KgDebouncePidLive {
+    param([int]$ClaimPid, [datetime]$ClaimStamp)
+    $p = Get-Process -Id $ClaimPid -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }
+    try { $start = $p.StartTime }
+    catch { return $true }   # start unreadable → soft-fail live (see above)
+    return ($start -le $ClaimStamp.AddSeconds($script:KgDebouncePidSlackSecs))
+}
+
+# v0.2.103 SINGLE-FLIGHT PROBE: is a sync for this lock key IN FLIGHT right
+# now? A claim dir "<base>.claimed.<pid>" whose pid is ALIVE AND PRE-DATES
+# the claim's stamp (see Test-KgDebouncePidLive — guards against pid REUSE)
+# is a sync in progress (each detached child is its own OS process, so $PID
+# is liveness-accurate — see the note on $PID above). A
+# "<base>.reaping.<token>" dir is the microsecond claim transition — treat
+# any as in flight. A claim whose pid is DEAD (or whose pid was recycled by
+# a process that started after the stamp) is NOT in flight (crash residual;
+# Sweep B recovers it separately), so a dead claim never blocks a fresh
+# schedule.
+# MUST MATCH _kg_debounce_inflight in _lib/kg-sync-debounce.sh.
+function Test-KgDebounceInflight {
+    param([string]$StateDir, [string]$Base)
+    if (-not $StateDir -or -not $Base) { return $false }
+    # The base name is "<chan>_<md5hex>.lock" — hex + underscore + dots,
+    # never a -Filter wildcard character, so embedding it is safe.
+    $claims = @(Get-ChildItem -LiteralPath $StateDir -Directory `
+        -Filter "$Base.claimed.*" -ErrorAction SilentlyContinue)
+    foreach ($c in $claims) {
+        if ($c.Name -match '\.claimed\.([0-9]+)$') {
+            if (Test-KgDebouncePidLive -ClaimPid ([int]$Matches[1]) -ClaimStamp $c.LastWriteTime) {
+                return $true
+            }
+        }
+    }
+    $reapings = @(Get-ChildItem -LiteralPath $StateDir -Directory `
+        -Filter "$Base.reaping.*" -ErrorAction SilentlyContinue)
+    if ($reapings.Count -gt 0) { return $true }
+    return $false
 }
 
 # Hash a file path → slash-free lock key (MD5 hex), matching the bash
@@ -533,6 +674,12 @@ function Invoke-KgDebounceReapStale {
         $age = ($now - $lock.LastWriteTime).TotalSeconds
         if ($age -ge $grace) {
             $base = $lock.Name                          # "kg_<md5>.lock"
+            # v0.2.103 SINGLE-FLIGHT: a follow-up lock parked while a sync
+            # of its key RUNS is not an orphan — it can legitimately
+            # outlive the grace window on a long sync, and reaping it would
+            # start a SECOND concurrent sync of the same path. The running
+            # sync's child serves it at sync end. MIRRORS the bash sibling.
+            if (Test-KgDebounceInflight -StateDir $dir -Base $base) { continue }
             $tok  = "{0}.{1}" -f $PID, (Get-Random)
             $won  = $lock.FullName + '.reaping.' + $tok
             # ATOMIC CLAIM: Move-Item on NTFS same-dir is atomic and throws
@@ -554,8 +701,9 @@ function Invoke-KgDebounceReapStale {
         $cpid = [int]$Matches[1]
         $age = ($now - $c.LastWriteTime).TotalSeconds
         if ($age -lt $grace) { continue }   # too fresh → leave in flight
-        # Owning pid still alive → in-flight claim → leave.
-        if (Get-Process -Id $cpid -ErrorAction SilentlyContinue) { continue }
+        # Owning pid still alive AND pre-dates the stamp (a recycled pid
+        # started later — see Test-KgDebouncePidLive) → in-flight → leave.
+        if (Test-KgDebouncePidLive -ClaimPid $cpid -ClaimStamp $c.LastWriteTime) { continue }
         $base = ($c.Name -replace '\.claimed\.[0-9]+$', '')   # strip ".claimed.<pid>"
         $tok  = "{0}.{1}" -f $PID, (Get-Random)
         $won  = (Join-Path $dir ($base + '.reaping.' + $tok))
@@ -638,6 +786,45 @@ function Invoke-KgDebounceSchedule {
         return
     }
 
+    $key = "${Channel}_" + (Get-KgDebounceKey -Path $FilePath)
+    $lock = Join-Path $dir "$key.lock"
+    $base = "$key.lock"
+
+    # v0.2.103 SINGLE-FLIGHT: if a sync of THIS (path, channel) is already
+    # running, never start a second one (field defect 2026-10-14: one docs
+    # edit produced FOUR concurrent sync children, one per re-edit during a
+    # minutes-long sync — the New-Item gate below cannot see the in-flight
+    # claim because the lock was renamed at sync start). Instead record a
+    # FOLLOW-UP: the plain lock dir itself, cmd included, which the running
+    # sync's child serves (one flusher) when it finishes. This branch runs
+    # BEFORE the flusher ceiling on purpose — a follow-up lock starts NO
+    # process now, so it cannot inflate the sleeper population the ceiling
+    # bounds (it merely counts toward other keys' ceiling checks, which is
+    # correct: it is real pending work). MIRRORS the bash sibling.
+    if (Test-KgDebounceInflight -StateDir $dir -Base $base) {
+        $followupClaimed = $false
+        try {
+            New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null
+            $followupClaimed = $true
+        } catch { }   # lock already held → a follow-up exists → coalesced
+        if ($followupClaimed) {
+            try {
+                Set-VcoUtf8Content -Path (Join-Path $lock "cmd") `
+                    -Value ("{0}`t{1}" -f $WorkingDir, $Command)
+            } catch { }
+            # Finish-race re-check: if the claim vanished between the probe
+            # and the New-Item, the runner may already have looked for (and
+            # missed) our follow-up lock. Serve it ourselves. If the runner
+            # DID see it, both flushers claim the same lock via the atomic
+            # Move-Item and exactly one runs — no double sync.
+            if (-not (Test-KgDebounceInflight -StateDir $dir -Base $base)) {
+                Start-KgDebounceFlusher -SleepSeconds $window -LockPath $lock `
+                    -StateDir $dir -Base $base
+            }
+        }
+        return
+    }
+
     # Item 2a (flusher cap): if too many flushers are already pending (one
     # ".lock" dir each), stop ACCUMULATING sleeping flusher processes and
     # instead sync THIS edit immediately (detached) in the background.
@@ -649,9 +836,6 @@ function Invoke-KgDebounceSchedule {
         Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command -Channel $Channel
         return
     }
-
-    $key = "${Channel}_" + (Get-KgDebounceKey -Path $FilePath)
-    $lock = Join-Path $dir "$key.lock"
 
     # Atomic claim: New-Item -ItemType Directory throws if it already
     # exists, so exactly one racer wins; the loser is a coalesced no-op.

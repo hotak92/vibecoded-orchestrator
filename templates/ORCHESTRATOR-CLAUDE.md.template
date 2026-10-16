@@ -337,7 +337,7 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
   - `qwen3-embedding:0.6b` — text embeddings (1024 dim, primary; `num_ctx` 10 240,
     resolved from the chunk-sizing table so window and chunks cannot drift)
   - KG-summary generation models (fallback only): `gemma4:e4b` (low-VRAM/CPU), `qwen3.5:9b` (16 GB+ VRAM).
-- **KG-summary generation** (`generate-kg-summary.py`) uses a three-tier fallback: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) the local Ollama models above, (3) Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|ollama|api|openai|skip` (`api` = Anthropic API, `openai` = OpenAI, consent-gated).
+- **KG-summary generation** (`generate-kg-summary.py`) walks a backend ladder: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) the z.ai GLM cloud tier, then (3) the QwenCloud cloud tier — each only when that vendor's key resolves on the machine, on the vendor's flash model, (4) the local Ollama models above (deferred while a code-graph embedding walk runs or free VRAM is low), (5) OpenAI (consent-gated), then Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|zai|qwen|ollama|api|openai|skip` (`api` = Anthropic API, `openai` = OpenAI, consent-gated).
 
 ### Code Embedding Service
 - **URL**: `{{CODE_EMBED_URL}}` (default `http://localhost:11440`)
@@ -378,7 +378,7 @@ The code-embedding FastAPI service is backend infrastructure, not an MCP.
 Located in `.claude/hooks/` — automated workflow actions. On Windows the bash hooks need WSL2 to fire automatically (the `.ps1` siblings are the native-Windows code path). The list below is a representative subset by event; `ls .claude/hooks/*.sh` enumerates the full set and `.claude/settings.json` shows the event and matcher each hook is registered with. Two ship **unregistered and uninvoked**, kept for users who want to wire them themselves: `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh` (which mirrors its resolution logic and calls the analyzer itself rather than calling the hook). Neither is dead code; both run standalone.
 
 **SessionStart (startup)**:
-- `ensure-containers.sh` — auto-start Podman/Docker containers (Weaviate, Ollama, code-embed) if not running (background).
+- `ensure-containers.sh` — auto-start the container ENGINE this install uses when it is down (`python -m vco_lib.container_engine_start ensure`, detached and idempotent; opt out with `VCT_CONTAINER_ENGINE_AUTOSTART=0`), then auto-start the VCO containers (Weaviate, Ollama, code-embed) if not running (background).
 - `session-start-ensure-hub.sh` — ensure `vct-hub` is running.
 - `session-start-kg-loader.sh` — display KG resource paths.
 - `context-size-check.sh` — warn (no truncation) if `CONTEXT_STATE.md` exceeds 500 lines.

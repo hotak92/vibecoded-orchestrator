@@ -347,6 +347,8 @@ def test_summary_backends_invalid_forced_value_falls_through(monkeypatch):
     monkeypatch.setenv("KG_SUMMARY_BACKEND", "bogus")
     # Auto-detect path: pin every probe to unavailable → "skip".
     monkeypatch.setattr(sb, "cli_available", lambda: False)
+    monkeypatch.setattr(sb, "zai_available", lambda: False)
+    monkeypatch.setattr(sb, "qwen_available", lambda: False)
     monkeypatch.setattr(sb, "ollama_available", lambda: False)
     monkeypatch.setattr(sb, "openai_available", lambda: False)
     monkeypatch.setattr(sb, "api_available", lambda: False)
@@ -356,15 +358,27 @@ def test_summary_backends_invalid_forced_value_falls_through(monkeypatch):
 def test_summary_backends_selection_order(monkeypatch):
     sb = _load("_m2_sb_order", _SB_PATH)
     monkeypatch.delenv("KG_SUMMARY_BACKEND", raising=False)
-    # CLI wins over Ollama; Ollama over API tiers; API last before skip.
+    # CLI wins over the cloud tiers, they over Ollama; Ollama over the API
+    # tiers; API last before skip (v0.2.103: zai → qwen between CLI and
+    # local Ollama).
     for probes, expected in [
-        ({"cli": True, "ollama": True, "openai": False, "api": True}, "cli"),
-        ({"cli": False, "ollama": True, "openai": False, "api": True}, "ollama"),
-        ({"cli": False, "ollama": False, "openai": False, "api": True}, "api"),
-        ({"cli": False, "ollama": False, "openai": False, "api": False}, "skip"),
+        ({"cli": True, "zai": True, "qwen": True, "ollama": True,
+          "openai": False, "api": True}, "cli"),
+        ({"cli": False, "zai": True, "qwen": True, "ollama": True,
+          "openai": False, "api": True}, "zai"),
+        ({"cli": False, "zai": False, "qwen": True, "ollama": True,
+          "openai": False, "api": True}, "qwen"),
+        ({"cli": False, "zai": False, "qwen": False, "ollama": True,
+          "openai": False, "api": True}, "ollama"),
+        ({"cli": False, "zai": False, "qwen": False, "ollama": False,
+          "openai": False, "api": True}, "api"),
+        ({"cli": False, "zai": False, "qwen": False, "ollama": False,
+          "openai": False, "api": False}, "skip"),
     ]:
         sb.reset_backend_cache()
         monkeypatch.setattr(sb, "cli_available", lambda p=probes: p["cli"])
+        monkeypatch.setattr(sb, "zai_available", lambda p=probes: p["zai"])
+        monkeypatch.setattr(sb, "qwen_available", lambda p=probes: p["qwen"])
         monkeypatch.setattr(sb, "ollama_available", lambda p=probes: p["ollama"])
         monkeypatch.setattr(sb, "openai_available", lambda p=probes: p["openai"])
         monkeypatch.setattr(sb, "api_available", lambda p=probes: p["api"])

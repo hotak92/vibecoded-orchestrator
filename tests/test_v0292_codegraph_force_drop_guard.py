@@ -569,44 +569,54 @@ class RegistryProbeTests(unittest.TestCase):
 
 
 class PrintedRemedyTests(unittest.TestCase):
-    """Both chunker emitters must print an identity-resolving invocation.
+    """The chunker emitter must print an identity-resolving invocation.
 
     The bare ``. --force-recreate`` shape is the defect itself; it must never
-    come back on either emitter (they share a ``condition_id``, so a
-    divergence would ship whichever ran first).
+    come back. (The retired v0.2.46 semver-boundary sibling emitter was
+    removed in v0.2.103 — the revision-keyed emitter below is the one live
+    writer of the shared ``condition_id``.)
     """
 
-    def _emit(self, which: str) -> str:
+    def _emit(self) -> str:
         from vco_lib import project_init
 
         with TemporaryDirectory() as td:
             folder = Path(td)
-            if which == "semver":
-                project_init._emit_chunker_resync_deferral(
-                    folder, "0.2.45", "0.2.46")
-            else:
-                project_init._emit_chunker_revision_resync_deferral(
-                    folder, "r-old", "r-new")
+            project_init._emit_chunker_revision_resync_deferral(
+                folder, "r-old", "r-new")
             return (folder / ".claude" / "context"
                     / "UPDATE_DEFERRED.md").read_text(encoding="utf-8")
 
-    def test_both_emitters_carry_from_resolver(self):
-        for which in ("semver", "revision"):
-            with self.subTest(emitter=which):
-                content = self._emit(which)
-                self.assertIn("--from-resolver --force-recreate", content)
-                self.assertNotIn(
-                    "code-graph-analyze . --force-recreate", content,
-                    "the basename-resolving shape must never come back",
-                )
+    def test_the_emitter_carries_from_resolver(self):
+        content = self._emit()
+        self.assertIn("--from-resolver --force-recreate", content)
+        self.assertNotIn(
+            "code-graph-analyze . --force-recreate", content,
+            "the basename-resolving shape must never come back",
+        )
+
+    def test_the_emitter_writes_one_info_entry(self):
+        """Severity ``info`` (searches still work; the re-sync is a quality
+        recommendation) and a repeat emit leaves ONE entry, not two — the
+        contract the retired v0.2.47 test file used to pin."""
+        from vco_lib import project_init
+
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            for _ in range(2):
+                project_init._emit_chunker_revision_resync_deferral(
+                    folder, "r-old", "r-new")
+            content = (folder / ".claude" / "context"
+                       / "UPDATE_DEFERRED.md").read_text(encoding="utf-8")
+        self.assertEqual(
+            content.count("## chunker_preset_overhaul_pending "), 1)
+        self.assertIn("## chunker_preset_overhaul_pending (info)", content)
 
     def test_remedy_has_no_cd_precondition(self):
         """The wrapper is named absolutely and the folder is the analyzer's
         positional ``repo_path`` — so the line works from any cwd, on any OS."""
-        for which in ("semver", "revision"):
-            with self.subTest(emitter=which):
-                content = self._emit(which)
-                self.assertNotIn("\ncd ", content)
+        content = self._emit()
+        self.assertNotIn("\ncd ", content)
 
     def test_schema_regenerate_reingest_remedy_carries_from_resolver(self):
         from vco_lib import schema_regenerate

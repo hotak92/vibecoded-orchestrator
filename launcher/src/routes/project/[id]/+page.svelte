@@ -52,11 +52,16 @@
   // page) because this is the surface a user opens BEFORE running subagent
   // work in that project, and it already has `project.folder_path` +
   // `project.id`. It self-gates: only shows when the workspace root is NOT
-  // inside any git repo AND the user has not already recorded a choice —
-  // detection via `detect_project_git_repo`, persistence via
-  // `get/set_worktree_repo_mode`. See the modal's docstring for the
+  // inside any git repo, HOLDS nested repos (the one real choice — v0.2.103
+  // plan item 17), and the user has not already recorded a choice —
+  // decided by `plan_project_git_repo`, persistence via
+  // `set_worktree_repo_mode`. See the modal's docstring for the
   // auto-use-vs-show rule.
   import SubagentGitRepoModal from '$lib/components/SubagentGitRepoModal.svelte';
+  import {
+    shouldOfferSubagentGitModal,
+    type GitRepoPlan,
+  } from '$lib/components/subagent-git-repo-logic';
   import type { ProjectView } from '$lib/types/launcher';
   // v0.2.91 WP-F3 (BUG 4, UI half): the header must not be a one-shot
   // snapshot. `project` below is loaded ONCE by `loadProject()` (onMount +
@@ -127,9 +132,11 @@
    * project load:
    *   1. If the root is INSIDE a repo (self or parent) → isolation already
    *      works. Auto-record `use_existing` (idempotent) and never prompt.
-   *   2. If the root is NOT inside a repo AND no choice is recorded yet →
-   *      surface the modal so the user picks create-local / connect-existing
-   *      (v0.2.91 #30) / opt-out.
+   *   2. If the root is NOT inside a repo, HOLDS nested repos, AND no choice
+   *      is recorded yet → surface the modal so the user picks create-local /
+   *      connect-existing (v0.2.91 #30) / opt-out. A repo-less root with
+   *      nothing nested is NOT prompted: VCO creates its local repo at add /
+   *      the next bundle update (v0.2.103, owner ruling 2026-10-14).
    *   3. If a choice is already recorded (`local_init` / `no_repo` /
    *      `use_existing` / `use_existing_at` / `use_existing_remote`) →
    *      respect it, never re-prompt.
@@ -138,28 +145,18 @@
    */
   async function maybeOfferSubagentGitRepo(id: string, folderPath: string) {
     try {
-      // Already decided? Respect it, don't re-prompt.
-      const existingMode = await invoke<string | null>('get_worktree_repo_mode', {
+      // v0.2.103 (plan item 17): the decision lives in ONE place, the Rust
+      // `plan_project_git_repo` (shared with the add/update-time automatic
+      // local repo). It respects a recorded mode, records `use_existing`
+      // for an enclosing repo, and answers `needs_choice` ONLY for a
+      // repo-less folder that holds nested repos — the one real choice. A
+      // repo-less folder with nothing nested gets its local repo from VCO
+      // at add / the next bundle update, so it is never prompted here.
+      const plan = await invoke<GitRepoPlan>('plan_project_git_repo', {
         projectId: id,
+        projectRoot: folderPath,
       });
-      if (existingMode) return;
-
-      const det = await invoke<{ inside_repo: boolean; toplevel: string | null }>(
-        'detect_project_git_repo',
-        { projectRoot: folderPath },
-      );
-      if (det.inside_repo) {
-        // Enclosing repo present → isolation works with zero config. Record
-        // `use_existing` so we never probe/prompt again (soft-fail on write).
-        try {
-          await invoke('set_worktree_repo_mode', { projectId: id, mode: 'use_existing' });
-        } catch (e) {
-          console.warn('[project-page] record use_existing failed:', e);
-        }
-        return;
-      }
-      // Repo-less + undecided → prompt.
-      showSubagentGitModal = true;
+      showSubagentGitModal = shouldOfferSubagentGitModal(plan);
     } catch (e) {
       // Never block the page on this best-effort probe.
       console.warn('[project-page] maybeOfferSubagentGitRepo failed:', e);

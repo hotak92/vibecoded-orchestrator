@@ -11,6 +11,7 @@
 
   import { goto } from '$app/navigation';
   import SecretsPanel from '$lib/components/SecretsPanel.svelte';
+  import ModelGuidanceStatus from '$lib/components/ModelGuidanceStatus.svelte';
 </script>
 
 <svelte:head>
@@ -35,6 +36,10 @@
         Import existing secrets from <code>~/.vct-secrets/</code> →
       </a>
     </section>
+
+    <!-- v0.2.103 (plan item 12): which model providers the keys below reach,
+         and when the per-project model guidance last followed them. -->
+    <ModelGuidanceStatus />
 
     <section class="sec-panel">
       <SecretsPanel />

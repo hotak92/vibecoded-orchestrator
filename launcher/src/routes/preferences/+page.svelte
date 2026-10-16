@@ -24,6 +24,12 @@
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
   import { parseSummaryTiers, type SummaryTier } from '$lib/preferences/summary_tiers';
+  import {
+    kgReviewerModelHint,
+    kgReviewerModelOptions,
+    kgReviewerModelToastText,
+    type KgReviewerModelInfo,
+  } from '$lib/preferences/kg_reviewer_model';
   import { get } from 'svelte/store';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
@@ -53,6 +59,11 @@
     resolveSessionAutostart,
     sessionAutostartHint,
   } from '$lib/session-autostart';
+  import {
+    DEFAULT_ENGINE_AUTOSTART,
+    resolveEngineAutostart,
+    engineAutostartHint,
+  } from '$lib/engine-autostart';
   import {
     resolveModuleUpdateAutoCheck,
     moduleUpdateAutoCheckHint,
@@ -1178,7 +1189,10 @@
   ];
   const KG_SUMMARY_DEFAULT_MODEL = 'gpt-4o-mini';
 
-  type KgSummaryOverride = '' | 'cli' | 'ollama' | 'openai' | 'skip';
+  // v0.2.103: 'zai' / 'qwen' — the cloud vendor tiers the summary ladder
+  // tries between the CLI and local Ollama. Same names as the Python
+  // VALID_BACKENDS (templates/scripts/summary_backends.py).
+  type KgSummaryOverride = '' | 'cli' | 'zai' | 'qwen' | 'ollama' | 'openai' | 'skip';
 
   // Result of the `recheck_summary_backend` Tauri command. Count fields are
   // null when the CLI's summary line did not parse.
@@ -1257,7 +1271,7 @@
         ? modelRes.value
         : KG_SUMMARY_DEFAULT_MODEL;
       const ov = (overrideRes.is_set ? (overrideRes.value ?? '') : '') as KgSummaryOverride;
-      kgSummaryOverride = (['', 'cli', 'ollama', 'openai', 'skip'].includes(ov) ? ov : '') as KgSummaryOverride;
+      kgSummaryOverride = (['', 'cli', 'zai', 'qwen', 'ollama', 'openai', 'skip'].includes(ov) ? ov : '') as KgSummaryOverride;
       kgSummaryOllamaModel = (ollamaRes.is_set && ollamaRes.value) ? ollamaRes.value : '';
     } catch (e) {
       kgSummaryError = String(e);
@@ -1340,6 +1354,33 @@
       kgSummaryError = String(e);
     } finally {
       kgSummarySaving = false;
+    }
+  }
+
+  // ── KG commit reviewer model (v0.2.103, machine-wide) ────────────────
+  let kgReviewerInfo = $state<KgReviewerModelInfo | null>(null);
+  let kgReviewerSaving = $state(false);
+  let kgReviewerError = $state<string | null>(null);
+
+  async function loadKgReviewerModel() {
+    kgReviewerError = null;
+    try {
+      kgReviewerInfo = await PREF_LOADERS.kgReviewerModel.load();
+    } catch (e) {
+      kgReviewerError = String(e);
+    }
+  }
+
+  async function saveKgReviewerModel(next: string) {
+    kgReviewerSaving = true;
+    kgReviewerError = null;
+    try {
+      kgReviewerInfo = await invoke<KgReviewerModelInfo>('set_kg_reviewer_model', { model: next });
+      toast.success(kgReviewerModelToastText(next));
+    } catch (e) {
+      kgReviewerError = String(e);
+    } finally {
+      kgReviewerSaving = false;
     }
   }
 
@@ -1716,6 +1757,44 @@
       target.checked = sessionAutostart;
     } finally {
       sessionAutostartBusy = false;
+    }
+  }
+
+  // v0.2.103 (review R19 F4): "Start the container engine automatically".
+  // The launcher.db switch for the engine auto-start whose one home is
+  // `vco_lib/container_engine_start.py` — the readers are the session hooks,
+  // the hub and this launcher's own setup, none of which see `.claude/env`,
+  // so the env override alone was unreachable for them.
+  let engineAutostart = $state(DEFAULT_ENGINE_AUTOSTART);
+  let engineAutostartBusy = $state(false);
+  let engineAutostartError = $state<string | null>(null);
+
+  async function loadEngineAutostart() {
+    try {
+      engineAutostart = resolveEngineAutostart(
+        await PREF_LOADERS.engineAutostart.load(),
+      );
+    } catch (e) {
+      // Unreachable command (browser mode / partial install): show the
+      // SHIPPED default, because that is what the starter will do.
+      engineAutostart = resolveEngineAutostart(null);
+      console.warn('get_container_engine_autostart failed', e);
+    }
+  }
+
+  async function toggleEngineAutostart(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const enable = target.checked;
+    engineAutostartBusy = true;
+    engineAutostartError = null;
+    try {
+      await invoke('set_container_engine_autostart', { enabled: enable });
+      engineAutostart = enable;
+    } catch (e) {
+      engineAutostartError = e instanceof Error ? e.message : String(e);
+      target.checked = engineAutostart;
+    } finally {
+      engineAutostartBusy = false;
     }
   }
 
@@ -2176,6 +2255,7 @@
     openAiKeyEvents: subscribeOpenAiEvents,
     artifactTool: () => { shownPanels.artifactTool = true; },
     kgSummary: loadKgSummarySettings,
+    kgReviewerModel: loadKgReviewerModel,
     codeEmbed: loadCodeEmbedSettings,
     codeEmbedStatus: loadCodeEmbedStatus,
     openAiEmbeddingsConsent: loadOpenAiEmbeddingsConsent,
@@ -2191,6 +2271,7 @@
     hardwareSnapshot: loadInitialHardwareSnapshot,
     bootAutostart: loadBootAutostart,
     sessionAutostart: loadSessionAutostart,
+    engineAutostart: loadEngineAutostart,
     moduleUpdateAutoCheck: loadModuleUpdateAutoCheck,
     services: refreshServices,
     activeEmbedding: loadActiveEmbedding,
@@ -2497,7 +2578,7 @@
               onchange={() => void saveKgSummaryOverride('')}
               disabled={kgSummarySaving}
             />
-            <span>Auto (claude CLI &gt; local Ollama &gt; OpenAI w/ consent)</span>
+            <span>Auto (claude CLI &gt; cloud vendor &gt; local Ollama &gt; OpenAI w/ consent)</span>
           </label>
           <label class="pr-kgsum-radio">
             <input
@@ -2509,6 +2590,28 @@
               disabled={kgSummarySaving}
             />
             <span>Claude CLI (best quality; uses your subscription)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value="zai"
+              checked={kgSummaryOverride === 'zai'}
+              onchange={() => void saveKgSummaryOverride('zai')}
+              disabled={kgSummarySaving}
+            />
+            <span>Z.ai GLM (flash model; uses your subscription key)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value="qwen"
+              checked={kgSummaryOverride === 'qwen'}
+              onchange={() => void saveKgSummaryOverride('qwen')}
+              disabled={kgSummarySaving}
+            />
+            <span>QwenCloud (flash model; uses your subscription key)</span>
           </label>
           <label class="pr-kgsum-radio">
             <input
@@ -2683,6 +2786,40 @@
         {/if}
         {#if kgSummaryError}
           <p class="pr-error">Couldn't save: {kgSummaryError}</p>
+        {/if}
+      {/if}
+    </section>
+
+    <!-- v0.2.103 (owner ruling 2026-10-15): the post-commit KG reviewer's
+         model — ONE machine-wide setting. Choices + default come from the
+         Rust command (the vco_lib/kg_reviewer_config.toml table). -->
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['kgReviewerModel'] }} aria-labelledby="pr-kgrev-title">
+      <h2 class="pr-section-title" id="pr-kgrev-title">KG commit reviewer</h2>
+      {#if kgReviewerError && !kgReviewerInfo}
+        <p class="pr-error">Couldn't load: {kgReviewerError}</p>
+      {:else if !kgReviewerInfo}
+        <p class="pr-hint">Loading…</p>
+      {:else}
+        <p class="pr-hint" style="margin-bottom: 10px;">{kgReviewerModelHint(kgReviewerInfo)}</p>
+        <div class="pr-kgsum-block">
+          <label for="pr-kgrev-model" class="pr-kgsum-label">Reviewer model</label>
+          <select
+            id="pr-kgrev-model"
+            class="pr-kgsum-select"
+            value={kgReviewerInfo.model}
+            onchange={(e) => {
+              const t = e.currentTarget as HTMLSelectElement;
+              void saveKgReviewerModel(t.value);
+            }}
+            disabled={kgReviewerSaving}
+          >
+            {#each kgReviewerModelOptions(kgReviewerInfo) as opt}
+              <option value={opt.value}>{opt.label}</option>
+            {/each}
+          </select>
+        </div>
+        {#if kgReviewerError}
+          <p class="pr-error">Couldn't save: {kgReviewerError}</p>
         {/if}
       {/if}
     </section>
@@ -3641,7 +3778,7 @@
     <!-- Startup: two independent switches — the background hub's OS boot
          registration (login), and the launcher's own tray-only start with
          a Claude Code session / VS Code folder open (v0.2.95, R2). -->
-    <section class="pr-section" use:lazySection={{ loaders, keys: ['bootAutostart', 'sessionAutostart'] }} aria-labelledby="pr-startup-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['bootAutostart', 'sessionAutostart', 'engineAutostart'] }} aria-labelledby="pr-startup-title">
       <h2 class="pr-section-title" id="pr-startup-title">Startup</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
@@ -3685,6 +3822,25 @@
           checked={sessionAutostart}
           disabled={sessionAutostartBusy}
           onchange={toggleSessionAutostart}
+        />
+      </div>
+
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Start the container engine automatically</strong>
+          <span class="pr-onboarding-hint">
+            {engineAutostartHint(engineAutostart)}
+          </span>
+          {#if engineAutostartError}
+            <span class="pr-onboarding-hint pr-startup-error">{engineAutostartError}</span>
+          {/if}
+        </div>
+        <input
+          type="checkbox"
+          data-testid="container-engine-autostart"
+          checked={engineAutostart}
+          disabled={engineAutostartBusy}
+          onchange={toggleEngineAutostart}
         />
       </div>
     </section>

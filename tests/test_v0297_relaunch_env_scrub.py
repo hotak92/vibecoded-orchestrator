@@ -46,6 +46,9 @@ RECORD = {
     ic.ENV_BASE_PYTHON_VERSION: "3.99",
     ic.ENV_PARENT_WAITS: "4242",
     ic.ENV_RELAUNCH_TOKEN: "feedfacecafebeef",
+    # v0.2.103: the post-venv hand-off record's path — inherited by a later,
+    # unrelated run it would replay a stale run's answers.
+    ic.ENV_POST_VENV_HANDOFF: "/tmp/vco-install-handoff-stale.json",
 }
 
 
@@ -186,13 +189,19 @@ def test_install_vct_updater_spawn(polluted, monkeypatch, tmp_path):
 
 
 def test_install_docker_desktop_start(polluted, monkeypatch, tmp_path):
+    """v0.2.103: the starter's BODY moved to
+    ``vco_lib.container_engine_start.try_start_docker_daemon`` (install.py
+    delegates), so the recording patches target that module now — the
+    assertion is unchanged: the long-lived child gets a scrubbed env."""
+    from vco_lib import container_engine_start as ces
+
     exe = tmp_path / "pf" / "Docker" / "Docker" / "Docker Desktop.exe"
     exe.parent.mkdir(parents=True)
     exe.write_bytes(b"x")
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "pf"))
-    monkeypatch.setattr(install.platform, "system", lambda: "Windows")
     seen: list = []
-    monkeypatch.setattr(install.subprocess, "Popen", _recording_popen(seen, stop=True))
+    monkeypatch.setattr(ces.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(ces.subprocess, "Popen", _recording_popen(seen, stop=True))
     with pytest.raises(_Spawned):
         install._try_start_docker_daemon()
     (env,) = seen

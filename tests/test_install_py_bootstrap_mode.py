@@ -27,6 +27,11 @@ import pytest
 
 from tests.common.child_env import child_env
 
+# W-MODEL-CLI (v0.2.103): the bootstrap envelope probes `claude --version`. On a
+# developer box that ran the REAL CLI; the conftest stub now refuses it. Give the
+# probe a benign fake so the envelope reports an installed CLI deterministically.
+pytestmark = pytest.mark.usefixtures("fake_claude_cli")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_PY = REPO_ROOT / "install.py"
 

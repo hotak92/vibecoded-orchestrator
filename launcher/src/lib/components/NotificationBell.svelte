@@ -1,9 +1,10 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
   //
-  // Error-notification bell. Persists error toasts (which auto-dismiss in
-  // 4 s) into a durable inbox the user can open here, so important errors
-  // aren't missed. Each entry has Copy + Trash actions; entries dedup by
+  // Error-notification bell. Persists error toasts (which auto-dismiss
+  // per the dwell policy in stores/toast.ts) into a durable inbox the
+  // user can open here, so important errors aren't missed. Each entry has
+  // Copy + Trash actions; entries dedup by
   // key (with a ×N counter) and auto-clear when the same action later
   // succeeds (see stores/notifications.ts). Lives in the MenuBar.
   //

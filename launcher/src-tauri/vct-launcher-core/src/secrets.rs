@@ -4348,12 +4348,12 @@ mod tests {
     /// another device (W6-KC R3, K3).
     #[cfg(target_os = "linux")]
     fn flock_holder_pids(dev: u64, ino: u64) -> Vec<u32> {
-        let (want_maj, want_min) = unsafe {
-            (
-                libc::major(dev as libc::dev_t),
-                libc::minor(dev as libc::dev_t),
-            )
-        };
+        // `libc::major` / `minor` are safe `const fn`s (pure bit arithmetic
+        // on a dev_t) — no `unsafe` block needed.
+        let (want_maj, want_min) = (
+            libc::major(dev as libc::dev_t),
+            libc::minor(dev as libc::dev_t),
+        );
         let table = std::fs::read_to_string("/proc/locks").expect("read /proc/locks");
         table
             .lines()

@@ -24,12 +24,13 @@ vi.mock('@tauri-apps/api/app', () => ({ getVersion: vi.fn(async () => '0.0.0') }
 
 // The shape `python -m vco_lib.summary_model --json` prints.
 const PAYLOAD = {
-  model: 'gemma4:e4b',
+  model: 'qwen3.5:4b',
   source: 'install-record',
   tiers: [
-    { model: 'qwen3.5:9b', when: '16 GB+ VRAM' },
-    { model: 'gemma4:e4b', when: '6 GB+ VRAM, or a CPU with 12 GB+ RAM and 6+ cores' },
-    { model: 'qwen3.5:0.8b', when: 'any other machine' },
+    { model: 'qwen3.5:9b', when: '9.1 GB+ VRAM' },
+    { model: 'qwen3.5:4b', when: '4.9 GB+ VRAM' },
+    { model: 'gemma4:e4b', when: 'no GPU, and a CPU with 12 GB+ RAM and 6+ cores' },
+    { model: 'qwen3.5:0.8b', when: 'any other machine (on a GPU it needs 2.8 GB+ VRAM)' },
   ],
 };
 
@@ -45,6 +46,7 @@ describe('parseSummaryTiers', () => {
   it('keeps every tier, the floor included', () => {
     expect(parseSummaryTiers(PAYLOAD).map((t) => t.model)).toEqual([
       'qwen3.5:9b',
+      'qwen3.5:4b',
       'gemma4:e4b',
       'qwen3.5:0.8b',
     ]);
@@ -62,7 +64,7 @@ describe('wiring', () => {
     calls.length = 0;
     const res = (await PREF_LOADERS.kgSummary.load()) as unknown[];
     expect(calls).toContain('get_summary_model_info');
-    expect(parseSummaryTiers(res[4]).length).toBe(3);
+    expect(parseSummaryTiers(res[4]).length).toBe(PAYLOAD.tiers.length);
   });
 
   it('the hint renders the tiers and names no model literally', () => {

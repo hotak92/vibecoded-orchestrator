@@ -43,12 +43,26 @@ common embedding-model name fragments).
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import requests
 
 from vco_lib.embedding_providers._http import bounded_post
+
+# v0.2.103 (Windows field run F1): the Ollama embed BODY policy — num_ctx
+# from the one table, keep_alive, truncate:false and the builder itself —
+# moved to the stdlib-only ``vco_lib.ollama_embed_body`` so install's
+# compose writer can project it into the code_embed container (which ships
+# without vco_lib) without importing ``requests``. Re-exported here so every
+# existing caller and the adapter below keep one name for it.
+from vco_lib.ollama_embed_body import (  # noqa: F401 — re-export
+    _KEEP_ALIVE_DEFAULT as _KEEP_ALIVE_DEFAULT,
+    _NUM_CTX_FALLBACK as _NUM_CTX_FALLBACK,
+    _keep_alive as _keep_alive,
+    _num_ctx_for_model,
+    _with_keep_alive as _with_keep_alive,
+    embed_request_body,
+)
 
 # Model-name substrings that flag an Ollama model as embedding-capable.
 # Ollama doesn't tell us via /api/tags whether a model can embed; the
@@ -81,137 +95,6 @@ KNOWN_OLLAMA_DIMS: dict[str, int] = {
     "nomic-embed-text:latest": 768,
     "unclemusclez/jina-embeddings-v2-base-code:latest": 768,
 }
-
-
-# v0.2.47 RL-7.5 (2026-06-04): default num_ctx we send to Ollama when the
-# caller doesn't override. Used when the model isn't registered in
-# MODEL_TOKEN_LIMITS (chunking.py). Conservative — matches the pre-v0.2.47
-# default so unknown models still embed at 8k rather than the Ollama
-# default of 4k (which silently truncates inputs > 4096 tokens).
-_NUM_CTX_FALLBACK: int = 8192
-
-
-def _num_ctx_for_model(model: str) -> int:
-    """Resolve the ``num_ctx`` to send to Ollama for a given embedding model.
-
-    Reads ``claude_mcp_servers.weaviate_mcp.chunking.MODEL_TOKEN_LIMITS``
-    when importable (the canonical source of truth for "what num_ctx do
-    we want for this model"), falling back to ``_NUM_CTX_FALLBACK``
-    otherwise. The chunking module is the SoT because chunk sizes must
-    match the context window we actually request — if they're out of
-    sync, oversized chunks get silently truncated by Ollama at num_ctx
-    and the embedding signal degrades.
-
-    Soft-fail: the lookup is best-effort. Any import error or missing
-    entry falls through to ``_NUM_CTX_FALLBACK`` (8192).
-    """
-    try:
-        from claude_mcp_servers.weaviate_mcp.chunking import MODEL_TOKEN_LIMITS
-    except Exception:
-        return _NUM_CTX_FALLBACK
-    val = MODEL_TOKEN_LIMITS.get(model)
-    if val is None:
-        # Partial match (e.g. caller passed "qwen3-embedding" while the dict
-        # has both "qwen3-embedding" AND "qwen3-embedding:0.6b").
-        for key, registered in MODEL_TOKEN_LIMITS.items():
-            if key in model or model in key:
-                val = registered
-                break
-    return int(val) if val is not None else _NUM_CTX_FALLBACK
-
-
-# v0.2.77 Part 9 task 6: keep the embedding model resident in Ollama between
-# calls. Ollama's default keep_alive is ~5 min; after any idle gap the next
-# embed pays a ~1.9 s model reload (measured in the hook-latency audit
-# 2026-07-11). Sending keep_alive on every embed request pins the model so the
-# recurring reload tax vanishes. This is a REQUEST-level fix (works regardless
-# of the compose env default) and it is IDEMPOTENT — Ollama refreshes the TTL on
-# every request that carries it.
-#
-# v0.2.102 W4-E: default dropped from "24h" to "10m" (owner ruling 2026-10-08,
-# after a live measurement: ONE KG search pinned qwen3-embedding 2.4 GB +
-# snowflake-arctic-embed2 1.15 GB in VRAM for 24 h each — 8.3 GB idle total).
-# 10 m accepts the ~1.9 s reload after a genuinely idle gap in exchange for
-# releasing idle VRAM, while still covering the multi-second cadence of a
-# search/sync session (models stay resident across consecutive calls). The user
-# can override via VCO_OLLAMA_KEEP_ALIVE (any value Ollama accepts: a duration
-# like "30m"/"2h", "-1" for never-evict, or "0" to opt back into immediate
-# unload). An empty override string means "send no keep_alive" (defer to
-# Ollama's own default / the OLLAMA_KEEP_ALIVE server env) — an explicit
-# opt-out.
-_KEEP_ALIVE_DEFAULT = "10m"
-
-
-def _keep_alive() -> str | None:
-    """Resolve the keep_alive value to attach to embed requests.
-
-    Returns the string to send, or ``None`` to send no keep_alive field
-    (explicit opt-out via an empty ``VCO_OLLAMA_KEEP_ALIVE``). Respecting an
-    explicit user override is required by the task-6 spec.
-    """
-    val = os.environ.get("VCO_OLLAMA_KEEP_ALIVE")
-    if val is None:
-        return _KEEP_ALIVE_DEFAULT
-    val = val.strip()
-    if val == "":
-        # Explicit opt-out: caller wants Ollama's own default behaviour.
-        return None
-    return val
-
-
-def _with_keep_alive(body: dict[str, Any]) -> dict[str, Any]:
-    """Return ``body`` with ``keep_alive`` added when one is configured.
-
-    Mutates a copy, never the caller's dict. Adding the key is a no-op when
-    the user opted out (``_keep_alive()`` returns ``None``).
-    """
-    ka = _keep_alive()
-    if ka is None:
-        return body
-    out = dict(body)
-    out["keep_alive"] = ka
-    return out
-
-
-def embed_request_body(
-    model: str,
-    *,
-    prompt: "str | None" = None,
-    input: "str | list[str] | None" = None,  # noqa: A002 — mirrors Ollama's field
-    num_ctx: "int | None" = None,
-) -> dict[str, Any]:
-    """ONE home for the body of a VCO Ollama EMBED request (v0.2.102 W4-E).
-
-    Owner ruling 2026-10-08: projects must share ONE copy of each embedding
-    model. Ollama loads a SECOND runner of the same model whenever load
-    options differ, so every caller must send an IDENTICAL body shape per
-    model: explicit ``num_ctx`` resolved from the ONE table
-    (``chunking.MODEL_TOKEN_LIMITS`` via :func:`_num_ctx_for_model`),
-    ``truncate: False`` (v0.2.92 — refuse, never silently drop the tail), and
-    the shared ``keep_alive`` policy (:func:`_with_keep_alive`). The canonical
-    adapter (:class:`OllamaAdapter`) and every inline fallback leg
-    (weaviate-MCP, code-embed service, migrate/search scripts) build their
-    request through THIS function so the shapes cannot drift apart.
-
-    Exactly one of ``prompt`` (legacy single-item endpoint) or ``input``
-    (modern ``/api/embed`` endpoint, str or batch) must be given.
-    """
-    if (prompt is None) == (input is None):
-        raise ValueError("pass exactly one of prompt= or input=")
-    if num_ctx is None:
-        num_ctx = _num_ctx_for_model(model)
-    body: dict[str, Any] = {
-        "model": model,
-        "options": {"num_ctx": num_ctx},
-        # v0.2.92: an explicit over-window refusal beats a 200 that dropped
-        # the tail (see the long note in OllamaAdapter.embed).
-        "truncate": False,
-    }
-    if prompt is not None:
-        body["prompt"] = prompt
-    else:
-        body["input"] = input
-    return _with_keep_alive(body)
 
 
 def looks_like_embedding_model(name: str) -> bool:

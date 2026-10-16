@@ -653,8 +653,10 @@ class BootstrapCollectionsRegenTests(unittest.TestCase):
             with mock.patch.object(project_init, "_create_class") as create_mock:
                 with mock.patch.object(project_init, "_delete_class") as delete_mock:
                     with mock.patch.object(
+                        # v0.2.103: only an EMPTY class is regenerated; a
+                        # populated one is deferred (test_v02103_bootstrap_schema_guard).
                         project_init, "_snapshot_collection_for_rebuild",
-                        return_value={"object_count": 42, "sample_uuids": []},
+                        return_value={"object_count": 0, "sample_uuids": []},
                     ):
                         result = project_init.bootstrap_collections("VideoFrames")
 
@@ -745,7 +747,9 @@ class BootstrapCollectionsRegenTests(unittest.TestCase):
                 return legacy
             return None
 
-        with mock.patch.object(project_init, "_fetch_schema", side_effect=fetcher):
+        with mock.patch.object(project_init, "_fetch_schema", side_effect=fetcher), \
+                mock.patch.object(project_init, "_snapshot_collection_for_rebuild",
+                                  return_value={"object_count": 0, "sample_uuids": []}):
             with mock.patch.object(project_init, "_create_class") as create_mock:
                 with mock.patch.object(project_init, "_delete_class") as delete_mock:
                     result = project_init.bootstrap_collections(

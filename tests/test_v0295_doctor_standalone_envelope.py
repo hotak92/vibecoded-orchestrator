@@ -37,6 +37,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 FAKE_INSTALL_PY = '''\
@@ -296,6 +298,9 @@ class BootstrapCommandIsRealTests(unittest.TestCase):
     is shipped code: prove the argv answers with the JSON envelope the
     probes consume, by driving the REAL install.py's bootstrap dispatch."""
 
+    # W-MODEL-CLI (v0.2.103): the envelope probes `claude --version`; the
+    # conftest stub refuses a real CLI, so the probe gets the benign fake.
+    @pytest.mark.usefixtures("fake_claude_cli")
     def test_the_command_is_a_real_cli_printing_the_envelope(self):
         spec = importlib.util.spec_from_file_location(
             "install_for_v0295_f4_tests", REPO_ROOT / "install.py"

@@ -31,7 +31,7 @@ Enable on agents that write source code:
 - `sre-incident-responder`, `postmortem-author` (ops-sre pack) — long-form artifacts drafted from live-incident state
 - `gui-expert` (design-ux pack) — designs AND implements Gradio applications
 - `ai-llm-expert` (ai-engineering pack) — designs AND implements production LLM integrations
-- `glm-implementer`, `glm-implementer-high`, `qwen-implementer`, `qwen-implementer-high`, `deepseek-implementer`, `kimi-implementer` (gateway module) — bounded, fully-specified code-fix lanes
+- `glm-implementer`, `glm-implementer-high`, `qwen-implementer`, `qwen-implementer-high`, `deepseek-implementer`, `kimi-implementer` (gateway module — delivered only when the model gateway is configured and that vendor's key resolves) — bounded, fully-specified code-fix lanes
 - `qwen-flash-sweeper` (gateway module) — fully-specified mechanical edits across named files
 
 NOT enabled (read-only or advisory agents). By rule: an agent whose only writes are report, spec or artifact documents — never source or config — is exempt; this list names every current exemption, and the frontmatter test in `tests/test_v02100_shipped_frontmatter_parses.py` holds the same set over write-capable agents (an agent with no Write/Edit tool would need no exemption; since v0.2.102 `code-reviewer` carries Write for its report file, so it is listed like the others):

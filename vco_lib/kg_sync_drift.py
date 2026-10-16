@@ -289,7 +289,13 @@ class DriftReport:
     #: ``file_path`` matches NO on-disk node (either spelling) — the inverse
     #: of ``missing``. Computed from the PROJECT hashes only: the shared
     #: collection legitimately holds every other project's shared-scope
-    #: nodes, so its keys are never this project's "stored-only".
+    #: nodes, so its keys are never this project's "stored-only". v0.2.103:
+    #: that includes the SHARED-IDENTITY case (kg == shared, the orchestrator
+    #: root) — there the project collection IS the shared store, so the
+    #: dimension is left EMPTY rather than counting sibling projects' rows
+    #: as this root's "stored-only" (they are legitimate; a prune there is
+    #: forbidden for exactly this reason — see
+    #: ``vco_lib.collection_repair``'s shared-identity skip).
     stored_only: tuple = field(default_factory=tuple)
     detail: str = ""
 
@@ -511,31 +517,53 @@ def scan_drift(
     # rows a later sync removes, or rows another writer left behind). Every
     # on-disk candidate's both spellings count as accounted for (archived and
     # invalid-type nodes included: their rows, when present, ARE theirs).
-    disk_shapes = {
-        shape
-        for rel_posix, _rel_parts, _content in candidates
-        for shape in _row_path_shapes(rel_posix[len("knowledge/"):])
-    }
-    stored_only = sorted(p for p in project_hashes if p not in disk_shapes)
+    #
+    # v0.2.103: a SHARED-IDENTITY collection (kg == shared, the orchestrator
+    # root) has NO honest stored-only answer — its "project" hashes include
+    # every sibling project's shared-scope rows, which legitimately have no
+    # file under THIS root. The dimension stays empty there instead of
+    # mis-counting siblings as this root's drift (mirrors the prune's
+    # shared-identity skip in vco_lib.collection_repair).
+    _shared_identity = bool(
+        (shared_kg_collection or "").strip()
+        and str(kg_collection).strip().lower()
+        == (shared_kg_collection or "").strip().lower()
+    )
+    if _shared_identity:
+        stored_only: list = []
+    else:
+        disk_shapes = {
+            shape
+            for rel_posix, _rel_parts, _content in candidates
+            for shape in _row_path_shapes(rel_posix[len("knowledge/"):])
+        }
+        stored_only = sorted(p for p in project_hashes if p not in disk_shapes)
 
-    # ``status`` keeps its PRE-v0.2.102 meaning (drift ⇔ missing/stale — the
-    # rows a re-sync REPAIRS): the bundle-update gate treats "drift" as "an
-    # `--all` pass is owed", and a stored-only shape is NOT cleared by one
-    # (the upsert only deletes rows for files that still exist), so folding
-    # it into ``status`` would make the gate re-spawn on every update
-    # forever. ``stored_only`` rides along as its own dimension; the doctor's
-    # drift census reports it with its own remedy.
+    # ``status`` keeps its PRE-v0.2.102 meaning (drift ⇔ missing/stale):
+    # the bundle-update gate treats "drift" as "an `--all` pass is owed",
+    # and a stored-only shape does not flip it. Since v0.2.103 a CLEAN
+    # `--all` DOES prune stored-only rows (sync_knowledge_graph.py delegates
+    # to vco_lib.collection_repair), but the shared-identity root can never
+    # clear its sibling rows that way — so the dimension stays separate from
+    # the gate's status rather than making the gate re-spawn forever on the
+    # one shape a re-sync cannot cure. The doctor's drift census reports
+    # stored-only with its own remedy.
     status = "drift" if (missing or stale) else "ok"
     detail = (
         f"{len(missing)} missing, {len(stale)} stale out of {len(checkable)} checked"
         if status == "drift"
         else f"{len(checkable)} node(s) verified in sync"
     )
-    if stored_only:
+    if _shared_identity:
+        detail += (
+            "; stored-only not computable: this KG collection IS the shared "
+            "collection (sibling projects' shared-scope rows live here)"
+        )
+    elif stored_only:
         detail += (
             f"; {len(stored_only)} stored-only row(s) whose file is gone "
-            "(a re-sync does not remove them — vco doctor's kg_drift_census "
-            "reports them)"
+            "(a clean kg-sync --all prunes them; rows with empty/absolute "
+            "file_path are left untouched)"
         )
     if invalid_type_skipped:
         # Loud, never silent: these nodes need a frontmatter fix, not a
@@ -745,10 +773,11 @@ def surface_drift(
         return  # "unknown" — say nothing rather than guess
     if not report.drifted:
         # v0.2.102 W4-C L2 belt-and-braces: unreachable by construction since
-        # ``status`` stays "ok" for a stored-only shape (see scan_drift), but
-        # this entry's remedy — re-run kg-sync — cannot clear stored-only
-        # rows, so an entry emitted for one would never resolve. The doctor's
-        # drift census reports that shape instead.
+        # ``status`` stays "ok" for a stored-only shape (see scan_drift).
+        # v0.2.103: a clean `--all` now PRUNES stored-only rows too, but the
+        # shape still doesn't emit this entry — the shared-identity root can
+        # never clear its sibling rows that way, and the doctor's drift
+        # census reports the dimension with its own remedy instead.
         return
 
     try:

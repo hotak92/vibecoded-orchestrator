@@ -29,8 +29,40 @@ from vco_lib import migration_plan_classify as _mpc
 
 __all__ = [
     "_emit_migrate_required_deferral",
+    "migrate_command",
     "reconcile_schema_migration_deferral",
 ]
+
+
+def migrate_command(project_name: str, weaviate_url: str, folder) -> str:
+    """The consent command block of a ``schema_migration_required`` entry —
+    ``migrate-collections`` scoped to ``project_name`` (smart, then the
+    ``--force-rebuild`` escape). ``folder`` None omits ``--project-folder``
+    (then nothing is re-ingested after a rebuild). Extracted from
+    :func:`_emit_migrate_required_deferral` (v0.2.103) so the collection
+    bootstrap's populated-class guard (``vco_lib.bootstrap_schema_guard``)
+    prints the SAME command."""
+    folder_arg = f"--project-folder {str(folder)!r} " if folder is not None else ""
+    cmd = (
+        f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
+        f"# NOT in this project's venv). The --name flag scopes the work to\n"
+        f"# THIS project's collections. Preserves vectors via copy where possible;\n"
+        f"# for legacy single-vector collections it drops, recreates with the\n"
+        f"# target schema, and re-ingests from knowledge/ + docs/ (requires the\n"
+        f"# embedding backend to be healthy; ~3-5 min).\n"
+        f"#   POSIX:   cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m ...\n"
+        f"#   Windows: cd $env:VCT_ORCHESTRATOR_ROOT; .venv\\Scripts\\python.exe -m ...\n"
+        f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
+        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
+        f"{folder_arg}--json\n"
+        f"# OR force the destructive drop+recreate+re-ingest for ALL collections\n"
+        f"# (slower; same embedding-backend requirement):\n"
+        f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
+        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
+        f"{folder_arg}--force-rebuild --json"
+    )
+
+    return cmd
 
 
 def _emit_migrate_required_deferral(
@@ -108,25 +140,7 @@ def _emit_migrate_required_deferral(
     # drop + recreate + re-ingest path. The smart `migrate-collections`
     # call preserves vectors via copy where possible and only rebuilds the
     # legacy collections; `--force-rebuild` is the all-collections escape.
-    folder_arg = f"--project-folder {str(folder)!r} "
-    cmd = (
-        f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
-        f"# NOT in this project's venv). The --name flag scopes the work to\n"
-        f"# THIS project's collections. Preserves vectors via copy where possible;\n"
-        f"# for legacy single-vector collections it drops, recreates with the\n"
-        f"# target schema, and re-ingests from knowledge/ + docs/ (requires the\n"
-        f"# embedding backend to be healthy; ~3-5 min).\n"
-        f"#   POSIX:   cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m ...\n"
-        f"#   Windows: cd $env:VCT_ORCHESTRATOR_ROOT; .venv\\Scripts\\python.exe -m ...\n"
-        f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
-        f"{folder_arg}--json\n"
-        f"# OR force the destructive drop+recreate+re-ingest for ALL collections\n"
-        f"# (slower; same embedding-backend requirement):\n"
-        f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
-        f"{folder_arg}--force-rebuild --json"
-    )
+    cmd = migrate_command(project_name, weaviate_url, folder)
 
     entry = DeferralEntry(
         condition_id="schema_migration_required",

@@ -212,4 +212,6 @@ touch "$SNAPSHOT_DIR/ctx_compact_flag_${SESSION_ID}"
 # from a compacted-away mid-answer state).
 SENTINEL="$PROJECT_DIR/.claude/state/rl_monitors_force_flush.flag"
 mkdir -p "$(dirname "$SENTINEL")"
+# Unix epoch seconds, UTC (`date +%s` is UTC everywhere) — must match the .ps1
+# sibling, which uses DateTimeOffset because PS 5.1 `Get-Date -UFormat %s` is local time.
 date +%s > "$SENTINEL"

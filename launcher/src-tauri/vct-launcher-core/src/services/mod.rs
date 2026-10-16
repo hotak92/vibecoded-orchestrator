@@ -39,6 +39,12 @@ pub mod deferral_bridge;
 // THIS table now; none may hand-roll a fourth.
 pub mod child_env;
 
+// v0.2.103: the ONE Rust spawner of `python -m vco_lib.container_engine_start
+// ensure` (the container-engine auto-start CLI) — used by BOTH the hub's
+// startup and the launcher's setup, so the two spawn the identical argv with
+// identical detach semantics. The start LOGIC is Python-only.
+pub mod engine_autostart;
+
 // v0.2.97: `adoption` (the `<vct_root_dir>/services.toml` reader/writer) is
 // RETIRED. What a service is — VCO-managed, an adopted container, an adopted
 // URL — is its launcher.db `service_endpoints` row (`crate::db::service_endpoints`,

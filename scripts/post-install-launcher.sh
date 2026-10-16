@@ -391,6 +391,103 @@ _fetch() {
     fi
 }
 
+# The interpreter that runs vco_lib's launcher_acquire CLI: the checkout's
+# venv when the install created it, else python3. Empty when neither exists.
+_launcher_acquire_python() {
+    if [ -n "${REPO_ROOT:-}" ] && [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+        printf '%s' "$REPO_ROOT/.venv/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        printf '%s' "python3"
+    fi
+}
+
+# Releases API URL for THIS checkout's version (vco_lib.launcher_acquire
+# api-url; must match first-install.bat). Falls back to the newest release
+# only when the helper cannot run.
+_launcher_release_api_url() {
+    local py url=""
+    py="$(_launcher_acquire_python)"
+    if [ -n "$py" ]; then
+        url="$(PYTHONPATH="${REPO_ROOT:-.}${PYTHONPATH:+:$PYTHONPATH}" \
+            "$py" -m vco_lib.launcher_acquire api-url --root "${REPO_ROOT:-.}" 2>/dev/null)"
+    fi
+    printf '%s' "${url:-https://api.github.com/repos/hotak92/vibecoded-orchestrator/releases/latest}"
+}
+
+# After the download attempt: prints "build" or "skip" (owner rule
+# 2026-10-15 — one home: vco_lib.launcher_acquire next-step, shared with
+# first-install.bat). Unattended (--yes) → build; interactive → ask; the
+# helper not runnable → ask when interactive, build under --yes (never block).
+# Messages go to stderr: stdout is the caller's captured answer.
+_launcher_after_download() {
+    local outcome="$1" py step="" ans
+    py="$(_launcher_acquire_python)"
+    if [ -n "$py" ]; then
+        local yes_arg=""
+        [ "${YES:-0}" -eq 1 ] && yes_arg="--yes"
+        step="$(PYTHONPATH="${REPO_ROOT:-.}${PYTHONPATH:+:$PYTHONPATH}" \
+            "$py" -m vco_lib.launcher_acquire next-step --outcome "$outcome" $yes_arg 2>/dev/null)"
+    fi
+    # The helper could not run (no interpreter): still never block an
+    # unattended run on `read` (review V02103-FINAL2 L-5). Must match
+    # vco_lib.launcher_acquire.next_step: --yes -> build.
+    if [ -z "$step" ] && [ "${YES:-0}" -eq 1 ]; then
+        step="build"
+    fi
+    case "$step" in
+        build) echo "[launcher] No prebuilt launcher available; building from source (unattended)." >&2
+               printf 'build'; return 0 ;;
+        launch) printf 'launch'; return 0 ;;
+    esac
+    echo "" >&2
+    echo "[launcher] No prebuilt launcher is available for this OS/arch/version." >&2
+    echo "  [b] Build from source (slower; needs Node + the Tauri toolchain)" >&2
+    echo "  [s] Skip (build later manually)" >&2
+    # Prompt printed explicitly: `read -p` stays silent when stdin is not
+    # a terminal, and the question must be visible either way.
+    printf 'Your choice [b]: ' >&2
+    read -r ans || ans="b"
+    case "${ans:-b}" in
+        s|S) printf 'skip' ;;
+        *) printf 'build' ;;
+    esac
+}
+
+# Integrity gate for a downloaded release asset (R20 M1): fetch the
+# `<asset>.sha256` sidecar release.yml publishes beside it and check the
+# download against it through the ONE verifier (vco_lib.launcher_acquire
+# verify-sha256, also called by scripts/lib/download-launcher-asset.ps1).
+# Returns 0 only on a verified match. A missing sidecar, a failed sidecar
+# fetch, no interpreter for the verifier, or a mismatch all return 1 with
+# the reason printed: the caller then neither unpacks nor runs the file and
+# treats it as "no prebuilt obtained".
+_verify_launcher_download() {
+    local file="$1" name="$2" sha_url="$3" py rc
+    if [ -z "$sha_url" ]; then
+        echo "[launcher] The release publishes no checksum for $name — not running an unverified download."
+        return 1
+    fi
+    py="$(_launcher_acquire_python)"
+    if [ -z "$py" ]; then
+        echo "[launcher] No Python to verify the checksum of $name — not running an unverified download."
+        return 1
+    fi
+    if ! _download "$sha_url" "$file.sha256" || [ ! -s "$file.sha256" ]; then
+        echo "[launcher] Could not fetch the checksum for $name — not running an unverified download."
+        return 1
+    fi
+    PYTHONPATH="${REPO_ROOT:-.}${PYTHONPATH:+:$PYTHONPATH}" \
+        "$py" -m vco_lib.launcher_acquire verify-sha256 \
+        --file "$file" --sidecar "$file.sha256" --name "$name" >/dev/null
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "[launcher] Checksum verification FAILED for $name (verifier exit $rc) — the download is discarded, never run."
+        return 1
+    fi
+    echo "[launcher] Checksum verified for $name."
+    return 0
+}
+
 _check_prerequisites
 echo ""
 
@@ -802,35 +899,13 @@ else
         exit 0
     fi
 
-    # ----- Step 3: prompt for path --------------------------------------------
-    echo "==============================================="
-    echo "  Launcher binary not found. Choose how to get it:"
-    echo "==============================================="
-    echo "  [1] Download prebuilt (recommended) — fast, ~30 MB"
-    echo "       (downloads from latest GitHub Release)"
-    echo "  [2] Build from source — slower, requires Node + Tauri toolchain"
-    echo "       (auto-installs Node if missing, then runs 'pnpm tauri build')"
-    echo "  [3] Skip (build later manually)"
-    echo ""
-
-    if [ "$YES" -eq 1 ]; then
-        choice=1
-        echo "[launcher] --yes / non-interactive: defaulting to [1] download"
-    else
-        read -r -p "Your choice [1]: " choice || choice=1
-        choice="${choice:-1}"
-    fi
-
-    case "$choice" in
-        2) MODE="build"  ;;
-        3) MODE="skip"   ;;
-        *) MODE="download" ;;
-    esac
-
-    if [ "$MODE" = "skip" ]; then
-        echo "[launcher] Skipped. Run 'pnpm tauri build' in launcher/ later, then start-launcher.sh."
-        exit 0
-    fi
+    # ----- Step 3: download first, ask only when no prebuilt exists -----------
+    # Owner rule 2026-10-15 (one home: vco_lib/launcher_acquire.py, shared
+    # with first-install.bat): a prebuilt for this OS/arch/version is
+    # downloaded WITHOUT a prompt; "build from source or skip?" is asked
+    # only after no prebuilt could be obtained (_launcher_after_download).
+    echo "[launcher] No usable launcher binary on disk — fetching the prebuilt one."
+    MODE="download"
 
     # ----- Step 4a: download prebuilt -----------------------------------------
     if [ "$MODE" = "download" ]; then
@@ -857,72 +932,40 @@ else
         echo ""
         echo "[launcher] Probing GitHub Releases..."
 
-        api_url="https://api.github.com/repos/hotak92/vibecoded-orchestrator/releases/latest"
-        release_json="$(_fetch "$api_url" 2>/dev/null || true)"
+        api_url="$(_launcher_release_api_url)"
 
+        # The release document lands in a FILE and the shared picker
+        # (vco_lib.launcher_acquire pick-asset) reads it from there: an env
+        # var or argv entry over 128 KiB makes execve fail with E2BIG and
+        # the pick silently empties (R20 L2); the here-doc-as-stdin form
+        # before it discarded the JSON altogether (v0.2.103).
         asset_url=""
         asset_name=""
-        if [ -n "$release_json" ]; then
-            # Pick the right asset for this OS. We prefer AppImage on Linux
-            # (portable, no apt/dnf coupling) and the dmg for macOS arm64.
-            asset_info="$(printf '%s' "$release_json" | python3 - "$OS" <<'PY'
-import json, sys
-os_name = sys.argv[1]
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-assets = d.get("assets", []) or []
-arch = ""
-try:
-    import platform
-    arch = platform.machine().lower()
-except Exception:
-    pass
-
-def pick(predicate):
-    for a in assets:
-        n = (a.get("name") or "").lower()
-        if predicate(n):
-            return a
-    return None
-
-picked = None
-# M-P0-3 (v0.2.53): release.yml currently ships .zip assets for both
-# macOS and Linux (vibecoded-orchestrator-<ver>-macos-arm64.zip,
-# vibecoded-orchestrator-<ver>-linux-x64.zip). The previous filter
-# only accepted .dmg (macOS) / .appimage (Linux), so picked was
-# always None → every user fell into the build path. Prefer .zip and
-# keep the legacy formats as a fallback for if/when CI starts shipping
-# them again.
-if os_name == "linux":
-    if arch in ("x86_64", "amd64", "x64"):
-        picked = pick(lambda n: n.endswith(".zip") and ("linux-x64" in n or "linux_x64" in n or "linux" in n))
-    if picked is None:
-        picked = pick(lambda n: n.endswith(".zip") and "linux" in n)
-    if picked is None:
-        # Legacy fallback (CI may resume publishing AppImages later).
-        picked = pick(lambda n: n.endswith(".appimage"))
-elif os_name == "macos":
-    if arch in ("arm64", "aarch64"):
-        picked = pick(lambda n: n.endswith(".zip") and ("arm64" in n or "aarch64" in n or "macos" in n))
-    if picked is None:
-        picked = pick(lambda n: n.endswith(".zip") and "macos" in n)
-    if picked is None:
-        # Legacy fallback (CI may resume publishing DMGs later).
-        if arch in ("arm64", "aarch64"):
-            picked = pick(lambda n: n.endswith(".dmg") and ("arm64" in n or "aarch64" in n))
-        if picked is None:
-            picked = pick(lambda n: n.endswith(".dmg"))
-
-if picked:
-    print(picked.get("browser_download_url", ""))
-    print(picked.get("name", ""))
-PY
-)"
-            asset_url="$(printf '%s' "$asset_info" | sed -n '1p')"
-            asset_name="$(printf '%s' "$asset_info" | sed -n '2p')"
+        asset_sha_url=""
+        release_tmp="$(mktemp -d -t vct-release.XXXXXX 2>/dev/null \
+                        || mktemp -d "${TMPDIR:-/tmp}/vct-release.XXXXXX")"
+        release_file="$release_tmp/release.json"
+        acq_py="$(_launcher_acquire_python)"
+        if ! _fetch "$api_url" >"$release_file" 2>/dev/null || [ ! -s "$release_file" ]; then
+            echo "[launcher] Could not fetch the release document ($api_url)."
+        elif [ -z "$acq_py" ]; then
+            echo "[launcher] No Python to read the release document."
+        else
+            asset_info="$(PYTHONPATH="${REPO_ROOT:-.}${PYTHONPATH:+:$PYTHONPATH}" \
+                "$acq_py" -m vco_lib.launcher_acquire pick-asset --os "$OS" \
+                --release-json "$release_file")"
+            pick_rc=$?
+            case "$pick_rc" in
+                0)
+                    asset_url="$(printf '%s\n' "$asset_info" | sed -n '1p')"
+                    asset_name="$(printf '%s\n' "$asset_info" | sed -n '2p')"
+                    asset_sha_url="$(printf '%s\n' "$asset_info" | sed -n '3p')"
+                    ;;
+                2) : ;;  # the release has no asset for this OS (message below)
+                *) echo "[launcher] The release document could not be read (pick-asset exit $pick_rc)." ;;
+            esac
         fi
+        rm -rf "$release_tmp"
 
         if [ -z "$asset_url" ]; then
             echo "[launcher] No prebuilt available yet for $OS. Falling back to build."
@@ -960,6 +1003,11 @@ PY
                 if ! _download "$asset_url" "$tmp_zip"; then
                     echo "[launcher] Download failed. Falling back to build."
                     _log_event "download" "error" "$OS zip download failed (curl/wget exit non-zero)"
+                    rm -rf "$tmp_dir"
+                    MODE="build"
+                elif ! _verify_launcher_download "$tmp_zip" "$asset_name" "$asset_sha_url"; then
+                    _log_event "download" "error" "$OS zip checksum not verified; download discarded" \
+                        "{\"asset\":\"$(_json_escape "$asset_name")\"}"
                     rm -rf "$tmp_dir"
                     MODE="build"
                 elif ! command -v unzip >/dev/null 2>&1; then
@@ -1054,7 +1102,15 @@ PY
                 target_dir="$HOME/.local/share/vct-launcher"
                 mkdir -p "$target_dir"
                 target_path="$target_dir/vct-launcher"
-                if _download "$asset_url" "$target_path"; then
+                tmp_img="$tmp_dir/launcher.appimage"
+                if ! _download "$asset_url" "$tmp_img"; then
+                    echo "[launcher] Download failed. Falling back to build."
+                    _log_event "download" "error" "linux appimage download failed (curl/wget exit non-zero)"
+                    MODE="build"
+                elif ! _verify_launcher_download "$tmp_img" "$asset_name" "$asset_sha_url"; then
+                    _log_event "download" "error" "linux appimage checksum not verified; download discarded"
+                    MODE="build"
+                elif mv -f "$tmp_img" "$target_path"; then
                     chmod +x "$target_path"
                     sz=$(stat -c%s "$target_path" 2>/dev/null || stat -f%z "$target_path" 2>/dev/null || echo 0)
                     if [ "${sz:-0}" -gt 10485760 ]; then
@@ -1070,8 +1126,8 @@ PY
                         MODE="build"
                     fi
                 else
-                    echo "[launcher] Download failed. Falling back to build."
-                    _log_event "download" "error" "linux appimage download failed (curl/wget exit non-zero)"
+                    echo "[launcher] Could not move the verified download to $target_path. Falling back to build."
+                    _log_event "download" "error" "linux appimage move failed"
                     MODE="build"
                 fi
                 rm -rf "$tmp_dir"
@@ -1086,7 +1142,16 @@ PY
                     MODE="build"
                 else
                     tmp_dmg="$tmp_dir/launcher.dmg"
-                    if _download "$asset_url" "$tmp_dmg"; then
+                    if ! _download "$asset_url" "$tmp_dmg"; then
+                        echo "[launcher] Download failed. Falling back to build."
+                        _log_event "download" "error" "macos download failed"
+                        rm -rf "$tmp_dir"
+                        MODE="build"
+                    elif ! _verify_launcher_download "$tmp_dmg" "$asset_name" "$asset_sha_url"; then
+                        _log_event "download" "error" "macos dmg checksum not verified; download discarded"
+                        rm -rf "$tmp_dir"
+                        MODE="build"
+                    else
                         mount_point="$(hdiutil attach -nobrowse -quiet "$tmp_dmg" 2>/dev/null \
                             | awk '/\/Volumes\// {for (i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}' \
                             | tail -1)"
@@ -1117,11 +1182,6 @@ PY
                             _log_event "download" "ok" "macos dmg installed" \
                                 "{\"path\":\"$(_json_escape "$LAUNCHER_BIN")\"}"
                         fi
-                    else
-                        echo "[launcher] Download failed. Falling back to build."
-                        _log_event "download" "error" "macos download failed"
-                        rm -rf "$tmp_dir"
-                        MODE="build"
                     fi
                 fi
             else
@@ -1131,6 +1191,15 @@ PY
                 rm -rf "$tmp_dir"
                 MODE="build"
             fi
+        fi
+    fi
+
+    # No prebuilt obtained: only NOW is the user asked about compiling.
+    if [ "$MODE" = "build" ]; then
+        MODE="$(_launcher_after_download no-prebuilt)"
+        if [ "$MODE" = "skip" ]; then
+            echo "[launcher] Skipped. Run 'pnpm tauri build' in launcher/ later, then start-launcher.sh."
+            exit 0
         fi
     fi
 

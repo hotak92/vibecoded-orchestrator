@@ -413,10 +413,11 @@ def query_prefix_for_model(model_name: str, task: "str | None" = None) -> str:
 # vco_lib/project_init.py::_emit_chunker_revision_resync_deferral (the emitter).
 # This SUPERSEDES the earlier "manual user action" note — bumping the string
 # below now actually fires the deferral. (The older semver-boundary check,
-# CHUNKER_BUMP_VERSION = "0.2.46", still exists but only ever fired across the
-# one-off v0.2.46 launcher-version crossing; the v0.2.75 `--force`-flag fix
-# applies to both emitters — the real drop+rebuild flag is `--force-recreate`,
-# guarded by tests/test_deferral_command_argparse_sweep.py.)
+# CHUNKER_BUMP_VERSION = "0.2.46", was retired in v0.2.103, owner decision
+# 2026-10-15 — it only ever fired across the one-off v0.2.46 launcher-version
+# crossing; the v0.2.75 `--force`-flag fix keeps applying to the revision
+# emitter — the real drop+rebuild flag is `--force-recreate`, guarded by
+# tests/test_deferral_command_argparse_sweep.py.)
 #
 # Revision history:
 #   v0.2.92.1 (2026-09-05, wiring-audit W1 — CodeSage served-window

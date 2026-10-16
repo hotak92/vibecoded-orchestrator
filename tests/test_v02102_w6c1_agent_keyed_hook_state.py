@@ -78,6 +78,10 @@ class TestAgentKeyParity:
             assert agent_state_key(sid, ag) == want, (sid, ag)
 
     @pytest.mark.skipif(not _has_bash(), reason="bash required")
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: "
+        "tests/test_v02102_w6c1_agent_keyed_hook_state.py::TestAgentKeyParity::test_ps1_leg")
     def test_bash_leg(self, tmp_path: Path) -> None:
         py = shutil.which("python3") or "python3"
         lines = [f'. "{HOOKS_LIB}/session-id.sh"']
@@ -169,15 +173,26 @@ class TestBudgetCaps:
 
 
 def _stub_producer(tmp_path: Path, name: str, body: str,
-                   sleep_s: float = 0.0) -> Path:
+                   sleep_s: float = 0.0,
+                   gate_env: str = "") -> Path:
     """A producer-stub shaped like the real ones: a main() whose stdout the
     leg runner captures (module-level side effects would fire at LOAD time
-    in the router's main thread, corrupting its stdout)."""
+    in the router's main thread, corrupting its stdout).
+
+    ``gate_env`` (v0.2.103 de-flake): when set, main() blocks until the
+    file named by that env var exists — an EVENT-gated "slow" producer, so
+    a leg's miss is caused by the gate's absence, never by a sleep racing
+    the join deadline under machine load."""
     stub = tmp_path / name
     stub.write_text(
-        "import sys, time\n"
+        "import os, sys, time\n"
         "def main():\n"
         + (f"    time.sleep({sleep_s})\n" if sleep_s else "")
+        + (f"    _gate = os.environ.get({gate_env!r})\n"
+           f"    if _gate:\n"
+           f"        _end = time.monotonic() + 300\n"
+           f"        while not os.path.exists(_gate) and time.monotonic() < _end:\n"
+           f"            time.sleep(0.02)\n" if gate_env else "")
         + f"    sys.stdout.write({body!r})\n",
         encoding="utf-8")
     return stub
@@ -586,17 +601,42 @@ class TestLegWarmer:
     def test_slow_leg_detached_then_next_call_hits(self, tmp_path: Path) -> None:
         """End to end: a producer slower than the leg deadline yields no
         injection on THIS call, the detached warmer fills the cache, and
-        the NEXT identical call injects from the cache."""
-        slow = _stub_producer(tmp_path, "kg_slow.py", _KG_BLOCK, sleep_s=1.5)
+        the NEXT identical call injects from the cache.
+
+        v0.2.103 de-flake: the "slow" producer is EVENT-gated (it blocks
+        until a gate file exists) instead of ``sleep(1.5)`` racing the
+        0.3 s join deadline, and the gate is created only AFTER r1 has
+        returned. Two races removed that way:
+
+        * the interactive miss was previously a wall-clock margin
+          (1.5 s sleep vs 0.3 s deadline) — safe in isolation, but the
+          whole test also depended on the DETACHED warmer finishing within
+          a fixed 30 s poll budget; under heavy machine load the warmer
+          (a fresh python + router-module import + producer run) could
+          exceed it and the test failed with "the detached warmer never
+          filled the cache". The gate makes both halves causal: r1's leg
+          provably had nothing to read (no gate → no output, ever), and
+          the warmer is provably still pending when the gate opens, so
+          observing the warmed cache is an EVENT, bounded only by the
+          machine's speed (120 s — the same budget every other subprocess
+          in this module gets), not by a margin chosen against one.
+        """
+        gate = tmp_path / "warm-gate.marker"
+        slow = _stub_producer(tmp_path, "kg_slow.py", _KG_BLOCK,
+                              gate_env="VCO_TEST_W6C1_GATE")
+        env = {"VCO_INJECT_LEG_TIMEOUT_S": "0.3",
+               "VCO_TEST_W6C1_GATE": str(gate)}
         r1 = _run_router(_prompt_payload("sessN", "pw", "", "warm"),
-                         tmp_path, "prompt", slow,
-                         extra_env={"VCO_INJECT_LEG_TIMEOUT_S": "0.3"})
+                         tmp_path, "prompt", slow, extra_env=env)
         assert r1.returncode == 0, r1.stderr
         assert "KG: W6C1Node" not in r1.stdout, (
             "the interactive run must still respect its deadline")
-        # The detached warmer fills the cache (bounded wait for a 1.5 s
-        # producer against a fast machine).
-        deadline = time.monotonic() + 30.0
+        # r1 has exited, so its interactive join provably expired while the
+        # producer was still gate-blocked. Open the gate: the detached
+        # warmer (spawned during r1, running the SAME gated producer with
+        # no deadline) now completes and writes the cache.
+        gate.write_text("go\n", encoding="utf-8")
+        deadline = time.monotonic() + 120.0
         warmed = False
         while time.monotonic() < deadline:
             for f in (tmp_path / ".claude" / "state" / "query_cache").glob("*"):
@@ -609,8 +649,7 @@ class TestLegWarmer:
             time.sleep(0.3)
         assert warmed, "the detached warmer never filled the cache"
         r2 = _run_router(_prompt_payload("sessN", "pw", "", "warm"),
-                         tmp_path, "prompt", slow,
-                         extra_env={"VCO_INJECT_LEG_TIMEOUT_S": "0.3"})
+                         tmp_path, "prompt", slow, extra_env=env)
         assert r2.returncode == 0, r2.stderr
         assert "KG: W6C1Node" in r2.stdout, (
             "the next identical call must be a cache HIT and inject")

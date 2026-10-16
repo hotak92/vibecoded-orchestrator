@@ -98,18 +98,7 @@ def read_events(path: Optional[Path]) -> list:
         raw = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
-    events = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(obj, dict):
-            events.append(obj)
-    return events
+    return parse_event_lines(raw.splitlines())
 
 
 def latest_session(events: list, *, now: Optional[datetime] = None) -> list:
@@ -138,18 +127,43 @@ def latest_session(events: list, *, now: Optional[datetime] = None) -> list:
     return session
 
 
+def parse_event_lines(lines) -> list:
+    """Every JSON-object line of ``lines`` (malformed lines skipped) — the
+    same reading :func:`read_events` applies to the file."""
+    events = []
+    for line in lines or ():
+        line = str(line).strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+    return events
+
+
 def load_session(path: Optional[Path], *, enabled: bool = True,
-                 now: Optional[datetime] = None) -> Session:
+                 now: Optional[datetime] = None, extra_lines=()) -> Session:
     """Parse ``install.jsonl`` → the most recent install.py session (<24 h).
 
     Only install.py's own events are read; the latest phase per step wins, so
     a later ``error`` demotes an earlier ``ok``. ``enabled=False``
     (``--no-resume``) reads nothing: no skips, no replayed choices.
+
+    ``extra_lines`` (v0.2.103) are log lines not yet on disk, read AFTER the
+    file's events: the post-venv hand-off child passes the lines its parent
+    buffered before step 8 created ``state/logs/`` (a fresh install has no log
+    yet), so the steps that parent just completed resume — by verification —
+    exactly as they would from the file. The child loads with ``enabled=True``
+    even under ``--no-resume``: those steps ran in this same run.
     """
     out = Session(enabled=enabled, loaded=True)
     if not enabled:
         return out
-    for ev in latest_session(read_events(path), now=now):
+    events = read_events(path) + parse_event_lines(extra_lines)
+    for ev in latest_session(events, now=now):
         step, phase = ev.get("step"), ev.get("phase")
         if not isinstance(step, str) or not isinstance(phase, str):
             continue

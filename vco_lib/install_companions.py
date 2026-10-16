@@ -770,6 +770,151 @@ def _stop_when_parent_ends(winapi: Any, handle, pid: int) -> None:
     os._exit(PARENT_GONE_EXIT)
 
 
+# --- the post-venv hand-off (v0.2.103) ----------------------------------------
+#
+# The V45-A relaunch (install.py ``_ensure_running_under_mcp_venv``) runs
+# before anything else and only when ``.venv`` already exists. On a FRESH
+# install it does not, so step 4 creates the venv and step 5 fills it while
+# this process stays on the interpreter that launched it — and every later
+# in-process step (the KG seed, compose, the bundle engine run through
+# ``sys.executable``) then misses the packages step 5 just installed.
+#
+# So once step 5 is done, install.py continues as the venv's python
+# (:func:`continue_in_venv`), through the same exec / spawn-and-wait primitive
+# as every other hop (:func:`hand_off`). The child restarts ``main()`` from the
+# top; what the parent already did or asked travels in a RECORD — an owner-only temp
+# JSON file named by :data:`ENV_POST_VENV_HANDOFF` — so the child neither
+# repeats a prompt nor loses state that lived only in this process:
+#
+#   * ``pending_events`` — the install-log lines buffered before step 8 creates
+#     ``state/logs/`` (a fresh install has no log yet). The child re-buffers
+#     them AND resumes from them, so steps 3/10 and 4/10 skip by verification
+#     (``install_resume.load_session(extra_lines=...)``);
+#   * ``decisions`` — answers already given: the adopt-project mode, the
+#     storage layout, that the ``.env`` secret-migration and lean-ctx offers
+#     were made, that ``--conflict-strategy`` was applied;
+#   * ``deferral_entries`` — the run report so far (an exec runs no exit-path
+#     flush; an owned entry the child does not re-detect would otherwise drop).
+#
+# The variable is a key of the relaunch record (``install_relaunch_env.toml``),
+# so a later, unrelated run that merely inherited it scrubs it in
+# :func:`adopt_relaunch`. Its presence in a GENUINE child is the loop guard: a
+# hand-off child never hands off again.
+
+#: Path of the hand-off record (see the section comment above).
+ENV_POST_VENV_HANDOFF = "VCT_INSTALL_POST_VENV_HANDOFF"
+_HANDOFF_FORMAT = 1
+
+
+class PostVenvHandoff:
+    """The record a hand-off child loaded (``active``), or the empty one of
+    every other run. ``has`` / ``replay`` read the parent's decisions."""
+
+    def __init__(self, *, active: bool = False, pending_events=(), decisions=None,
+                 deferral_entries=()) -> None:
+        self.active = active
+        self.pending_events: List[str] = [str(x) for x in pending_events]
+        self.decisions: dict = dict(decisions or {})
+        self.deferral_entries: List[dict] = [d for d in deferral_entries if isinstance(d, dict)]
+
+    def has(self, key: str) -> bool:
+        return key in self.decisions
+
+    def done(self, key: str) -> bool:
+        """True when the parent recorded ``key`` as already done."""
+        return bool(self.decisions.get(key))
+
+    def replay(self, key: str, compute: Callable[[], Any]) -> Any:
+        """The parent's answer for ``key`` when it gave one, else ``compute()``."""
+        return self.decisions[key] if key in self.decisions else compute()
+
+
+def write_post_venv_handoff(state: dict, *, tmp_dir: Optional[str] = None) -> str:
+    """Write the record to a fresh owner-only temp file and return its path.
+    (``mkstemp`` creates it owner-only on POSIX; on Windows the per-user temp
+    directory is the boundary — the record carries no secret either way.)"""
+    fd, path = tempfile.mkstemp(prefix="vco-install-handoff-", suffix=".json", dir=tmp_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"format": _HANDOFF_FORMAT, **state}, fh)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+    return path
+
+
+def load_post_venv_handoff(environ=None) -> PostVenvHandoff:
+    """The record of THIS run, read once and deleted. Called by ``main()``
+    right after :func:`adopt_relaunch` (which has already scrubbed an
+    inherited one). No variable → the empty record. A variable whose file is
+    missing or unreadable still yields ``active`` (the loop guard must hold)
+    with no replay, and says so on stderr: the child then asks again rather
+    than guessing."""
+    env = os.environ if environ is None else environ
+    path = env.get(ENV_POST_VENV_HANDOFF, "")
+    if not path:
+        return PostVenvHandoff()
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("format") != _HANDOFF_FORMAT:
+            raise ValueError(f"unsupported record format {raw.get('format')!r}"
+                             if isinstance(raw, dict) else "not a JSON object")
+    except (OSError, ValueError) as exc:
+        print(f"[vct] post-venv hand-off record {path} unreadable ({exc}); continuing "
+              "without the parent's answers — its prompts may be asked again", file=sys.stderr)
+        return PostVenvHandoff(active=True)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return PostVenvHandoff(
+        active=True,
+        pending_events=raw.get("pending_events") or (),
+        decisions=raw.get("decisions") if isinstance(raw.get("decisions"), dict) else None,
+        deferral_entries=raw.get("deferral_entries") or (),
+    )
+
+
+def continue_in_venv(venv_python, argv: List[str], state: dict, *,
+                     before_hand_off: Optional[Callable[[], None]] = None) -> bool:
+    """Continue this install.py run as ``venv_python`` once step 5 filled it.
+
+    Returns False — and does nothing — when this run already IS a hand-off
+    child (the loop guard), when it already runs inside that venv (a CLI user
+    with it active, or the V45-A relaunch), or when the interpreter is missing
+    (one stderr line; the run continues where it is). Otherwise it writes the
+    record, calls ``before_hand_off`` (install.py releases its singleton lock,
+    which the child must re-take — on Windows this process stays alive, waiting)
+    and hands off: on POSIX it never returns; on Windows it exits with the
+    child's code. Returns True only when :func:`hand_off` is replaced (tests).
+    """
+    if os.environ.get(ENV_POST_VENV_HANDOFF):
+        return False
+    if is_running_inside_venv(venv_python):
+        return False
+    if not Path(venv_python).is_file():
+        # R24 LOW-2: a warning, so stderr (a GUI-captured install log keeps the streams apart).
+        print(f"[vct] cannot continue under the venv ({venv_python} is missing) — proceeding "
+              f"on {sys.executable}; steps that import venv-only packages may fail",
+              file=sys.stderr, flush=True)
+        return False
+    env = os.environ.copy()
+    mark_relaunch(env)  # loop guard + token + (first hop) the launching interpreter
+    env[ENV_POST_VENV_HANDOFF] = write_post_venv_handoff(state)
+    if before_hand_off is not None:
+        before_hand_off()
+    print(f"[vct] dependencies installed — continuing install.py under the venv: {venv_python}")
+    sys.stdout.flush()
+    hand_off(str(venv_python), [str(venv_python), *argv], env)
+    return True
+
+
 #: install.py flags whose VALUE is a secret (v0.2.97). Any line that echoes
 #: or logs a command line goes through :func:`redact_secret_argv` — the ONE
 #: redactor (``vco_lib.openai_key`` re-exports it; install.py's session log and

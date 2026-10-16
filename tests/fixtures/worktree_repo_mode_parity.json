@@ -1,0 +1,13 @@
+{
+  "_comment": "Cross-language parity fixture for the per-project worktree_repo_mode record (v0.2.103, review R15). Consumed by BOTH the Rust unit test worktree_repo_mode_parity_fixture in launcher/src-tauri/src/commands/worktree_repo_mode.rs (VALID_MODES / SETTING_KEY / MODULE_ID — the authoritative writer) AND tests/test_local_repo_pending.py (vco_lib/local_repo_pending.py _VALID_MODES / _SETTING_KEY and launcher_db_reader.ORCHESTRATOR_CORE_MODULE_ID — the Python reader). Edit HERE when a mode is added or renamed: the Rust test fails until this list matches VALID_MODES, then the Python test fails until _VALID_MODES matches it.",
+  "_format_version": 1,
+  "module_id": "orchestrator-core",
+  "setting_key": "worktree_repo_mode",
+  "valid_modes": [
+    "use_existing",
+    "local_init",
+    "no_repo",
+    "use_existing_at",
+    "use_existing_remote"
+  ]
+}

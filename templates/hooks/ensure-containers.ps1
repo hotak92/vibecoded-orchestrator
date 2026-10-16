@@ -191,6 +191,96 @@ if ($VcoRt.state -ne "resolved") {
             [void](& $RunPy -m vco_lib.runtime_reconcile record-boot-refusal --source session --reason ($VcoRt.reason) 2>$null)
         } catch { }
     }
+    # v0.2.103 (owner 2026-10-15; parity with the .sh sibling): the engine
+    # itself may just be DOWN - the resolver's "absent" is often "installed
+    # but not running" (Docker Desktop not launched after a reboot, podman
+    # machine stopped, socket down). Start it in the background through the
+    # ONE home, `python -m vco_lib.container_engine_start ensure`:
+    # idempotent (an engine that answers is a no-op), starts ONLY the
+    # runtime this install uses (a refused pin is started, never swapped),
+    # soft-fail, honours VCT_CONTAINER_ENGINE_AUTOSTART=0. Start-Process
+    # returns immediately (never blocks the hook); -WindowStyle applies on
+    # Windows only, so it is dropped on other OSes. Only when a runtime
+    # binary exists ($VcoRt.installed) - with nothing installed there is
+    # nothing to start.
+    if ($VcoRt.installed) {
+        # V02103-VERIFY-R31 M-1 (parity with the .sh sibling): the CLI
+        # records its own outcome in <vct_root>\logs\engine-start.log (it
+        # rotates that file itself — sole ownership), but a child that dies
+        # before it can write anything leaves its stderr nowhere (a
+        # detached Start-Process discards it). The spawner therefore gives
+        # the child's stderr its OWN file,
+        # <vct_root>\logs\engine-start.stderr.log — MUST MATCH
+        # vco_lib.container_engine_start.ENGINE_START_STDERR_LOG, the .sh
+        # sibling and the Rust spawner — OVERWRITTEN on every spawn (2>),
+        # so it is bounded by construction (the latest spawn's stderr) and never
+        # shares a handle with the CLI's rotating engine-start.log (the
+        # parent pwsh used to hold the append-redirect target open while
+        # the CLI appended to and rotated the SAME file). Encoding: on Windows
+        # PowerShell 5.1 the inner `2>` of a native command writes UTF-16LE
+        # text wrapped in NativeCommandError records — acceptable in a raw
+        # per-spawn crash file (pwsh 7 writes plain UTF-8); this file is
+        # NOT the CLI's UTF-8 rotating log. What this capture sees on the
+        # HOOK path: the spawn is reached only after vco_lib has run twice
+        # (run-detached, containers resolve), so a fully-broken venv exits
+        # the hook earlier — this file captures failures specific to
+        # container_engine_start; the Rust spawner is the one that sees a
+        # fully-broken venv. The state dir is resolved exactly like the
+        # Python home (vco_lib.paths.vct_root_dir): $env:VCT_STATE_DIR
+        # trimmed of surrounding whitespace like Python's .strip(), or
+        # %USERPROFILE%\.vct. When the lib, the interpreter or the file is
+        # unavailable, fall back to the old direct discard spawn — a log
+        # problem must never stop an engine start or fail the hook.
+        $EngineStateDir = "$env:VCT_STATE_DIR".Trim()
+        $EngineRoot = if ($EngineStateDir) { $EngineStateDir }
+                      elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".vct" }
+                      else { Join-Path $HOME ".vct" }
+        $EngineLogDir = Join-Path $EngineRoot "logs"
+        $EngineErr = Join-Path $EngineLogDir "engine-start.stderr.log"
+        $EngineSpawned = $false
+        try {
+            $EnginePsLib = Join-Path $ScriptDir "_lib\resolve-powershell.ps1"
+            if (Test-Path $EnginePsLib) { . $EnginePsLib }
+            if (Get-Command Start-VcoDetachedPwsh -ErrorAction SilentlyContinue) {
+                try {
+                    New-Item -ItemType Directory -Path $EngineLogDir -Force -ErrorAction Stop | Out-Null
+                } catch { }
+                # Writability probe for the child's stderr target.
+                $EngineProbe = $null
+                try {
+                    $EngineProbe = [System.IO.File]::Open($EngineErr, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+                } catch { $EngineProbe = $null }
+                if ($EngineProbe) {
+                    $EngineProbe.Close()
+                    # PowerShell single quotes are LITERAL ('' escapes a
+                    # quote), so a path with $, spaces or backticks cannot
+                    # re-parse here (the same quoting stop-codegraph-drain.ps1
+                    # uses). 2> = the child's stderr ONLY, TRUNCATED per
+                    # spawn (bounded by construction; stdout stays
+                    # discarded), matching the .sh sibling.
+                    $q = { param($v) "'" + ($v -replace "'", "''") + "'" }
+                    $EngineInner = "& " + (& $q $RunPy) + " -m vco_lib.container_engine_start ensure 2> " + (& $q $EngineErr)
+                    # R31 L-4: Start-VcoDetachedPwsh NEVER throws — it
+                    # reports a failed spawn on stderr and returns nothing.
+                    # -PassThru hands back the process object, so
+                    # $EngineSpawned is set only when the wrapper really
+                    # spawned, and the direct fallback below runs when it
+                    # did not.
+                    $EngineProc = Start-VcoDetachedPwsh -Command $EngineInner -PowerShellExe $PsExe -PassThru
+                    $EngineSpawned = [bool]$EngineProc
+                }
+            }
+        } catch { $EngineSpawned = $false }
+        if (-not $EngineSpawned) {
+            try {
+                $startArgs = @{ FilePath = $RunPy
+                                ArgumentList = @('-m', 'vco_lib.container_engine_start', 'ensure')
+                                WindowStyle = 'Hidden' }
+                if ($IsWindows -eq $false) { $startArgs.Remove('WindowStyle') }
+                Start-Process @startArgs | Out-Null
+            } catch { }
+        }
+    }
     exit 0
 }
 $Runtime = $VcoRt.runtime

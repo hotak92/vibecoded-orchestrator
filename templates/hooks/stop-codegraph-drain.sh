@@ -193,6 +193,11 @@ if [ -d "$STATE_DIR" ]; then
         _CG_EXTRAS_LAST=$(cat "$_CG_EXTRAS_TS_FILE" 2>/dev/null || echo 0)
         case "$_CG_EXTRAS_LAST" in ''|*[!0-9]*) _CG_EXTRAS_LAST=0 ;; esac
     fi
+    # A stamp in the FUTURE is not a recent check — a pre-v0.2.103 local-time
+    # stamp the .ps1 sibling wrote on Windows PowerShell 5.1 into this same
+    # state dir, or a clock moved back: read it as "no stamp" (R20 L1).
+    # MUST MATCH the .ps1 sibling's clamp.
+    [ "$_CG_EXTRAS_LAST" -gt "$_CG_EXTRAS_NOW" ] && _CG_EXTRAS_LAST=0
     if [ "$_CG_EXTRAS_LAST" -eq 0 ] \
         || [ $(( _CG_EXTRAS_NOW - _CG_EXTRAS_LAST )) -ge "$_CG_EXTRAS_INTERVAL" ]; then
         printf '%s' "$_CG_EXTRAS_NOW" > "$_CG_EXTRAS_TS_FILE" 2>/dev/null || true
@@ -259,6 +264,8 @@ if [ -f "$LAST_TS_FILE" ]; then
     LAST_TS=$(cat "$LAST_TS_FILE" 2>/dev/null || echo 0)
     case "$LAST_TS" in ''|*[!0-9]*) LAST_TS=0 ;; esac
 fi
+# A future stamp is no stamp (R20 L1; MUST MATCH the .ps1 sibling's clamp).
+[ "$LAST_TS" -gt "$NOW" ] && LAST_TS=0
 if [ "$LAST_TS" -gt 0 ]; then
     _AGE=$(( NOW - LAST_TS ))
     if [ "$_AGE" -lt "$_CG_DRAIN_MIN_INTERVAL" ]; then

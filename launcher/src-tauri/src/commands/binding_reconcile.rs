@@ -182,6 +182,17 @@ pub(crate) fn decide_binding_repair(
     RepairDecision::Phantom
 }
 
+/// v0.2.103 F7 (Windows field run): is a `Phantom` outcome worth a
+/// `codegraph_binding_phantom` deferral? Only when a walk has EVER completed
+/// for the binding (`last_analyzed_at` set): then the bound classes existed
+/// once and their absence is a real defect. A binding no walk has finished —
+/// a fresh install whose code graph simply has not been built yet — has no
+/// classes by construction; telling that user "the binding points at classes
+/// that do not exist" is noise, and the first build resolves it on its own.
+pub(crate) fn phantom_is_reportable(last_analyzed_at: Option<i64>) -> bool {
+    last_analyzed_at.is_some()
+}
+
 /// §5.3 (second half) — should a v0.2.49 phantom access row be rewritten
 /// back to its binding-backed sibling? Pure gates:
 /// the two names differ, a row exists at the phantom name, the phantom
@@ -494,6 +505,18 @@ pub(crate) async fn reconcile_half_renamed_bindings_at_boot(
                     }
                 }
             }
+            RepairDecision::Phantom
+                if !phantom_is_reportable(
+                    binding.as_ref().and_then(|b| b.last_analyzed_at),
+                ) =>
+            {
+                tracing::debug!(
+                    "[vct] binding-reconcile: project {:?} has no code-graph \
+                     classes yet and no walk has ever completed — not built \
+                     yet, not a phantom; no deferral",
+                    project.name
+                );
+            }
             RepairDecision::Phantom => {
                 tracing::warn!(
                     "[vct] binding-reconcile: project {:?} has a phantom \
@@ -802,6 +825,14 @@ mod tests {
         assert_eq!(d, RepairDecision::Phantom);
     }
 
+    /// v0.2.103 F7: a never-built binding (no completed walk) is not
+    /// reported as a phantom; one whose walk once completed still is.
+    #[test]
+    fn phantom_deferral_only_after_a_completed_walk() {
+        assert!(!phantom_is_reportable(None));
+        assert!(phantom_is_reportable(Some(1_700_000_000)));
+    }
+
     // ── extract_cg_prefix_old ───────────────────────────────────────────
 
     #[test]
@@ -926,6 +957,35 @@ mod tests {
         });
         let addr = rx.recv().unwrap();
         (format!("http://{}", addr), handle)
+    }
+
+    /// v0.2.103 F7 (end-to-end): a bound prefix with no classes is reported
+    /// as `codegraph_binding_phantom` only when a walk once completed for it;
+    /// a never-built binding (fresh install) gets no deferral at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_reconcile_never_built_binding_is_not_a_phantom() {
+        let mut written = Vec::new();
+        for (name, last_analyzed_at) in [("NeverBuilt", None), ("OnceBuilt", Some(1_700_000_000))] {
+            let db = Db::open_in_memory().unwrap();
+            let pid = uuid::Uuid::new_v4().to_string();
+            let td = tempfile::TempDir::new().unwrap();
+            db.insert_project(&pid, name, &td.path().to_string_lossy(), ProjectHost::Base,
+                              &name.to_lowercase())
+                .unwrap();
+            db.set_project_codegraph_binding(&pid, name, Some("jina"), Some(768), None,
+                                             last_analyzed_at, true, &serde_json::json!({}))
+                .unwrap();
+            let (url, _server) = spawn_fake_weaviate_schema(vec![]);
+            let report = reconcile_half_renamed_bindings_at_boot(&db, &url).await;
+            assert!(!report.probe_failed);
+            let ledger = std::fs::read_to_string(
+                td.path().join(".claude").join("context").join("UPDATE_DEFERRED.md"),
+            )
+            .unwrap_or_default();
+            written.push((report.phantom_deferrals, ledger.contains("codegraph_binding_phantom")));
+        }
+        assert_eq!(written[0], (0, false), "never-built binding must not be a phantom");
+        assert_eq!(written[1], (1, true), "a once-built binding with no classes is reported");
     }
 
     /// ACT (end-to-end): phantom prefix + deferral naming the old prefix +

@@ -14,10 +14,10 @@ re-derived anything is permanently satisfied.
 Two shipped consequences, and the second is the expensive one:
 
 1. The row was permanent for every user who crossed a chunker revision — while
-   BOTH of its emitters promise, in the entry the user reads: *"Once you run
-   the re-sync commands below, this deferral self-resolves on the next bundle
-   update."* That is the INTENT this lane recovered, and the standing rule is
-   that a false promise is made TRUE, not deleted.
+   both of its then-emitters promised, in the entry the user reads: *"Once you
+   run the re-sync commands below, this deferral self-resolves on the next
+   bundle update."* That is the INTENT this lane recovered, and the standing
+   rule is that a false promise is made TRUE, not deleted.
 2. ``templates/scripts/sync_knowledge_graph.py`` arms a per-node chunk-plan
    comparison *while the ledger carries the cid*, commented "it clears through
    its existing lifecycle … at which point the comparison stops being paid".

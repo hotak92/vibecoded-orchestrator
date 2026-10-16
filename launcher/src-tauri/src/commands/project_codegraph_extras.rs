@@ -49,24 +49,17 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter, State};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::timeout;
 
 use crate::db::codegraph_extras::CodegraphExtraPathRow;
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ───────────────────────────────────────────────────────────
-
-/// Hard ceiling on analyzer subprocess lifetime. Mirrors the
-/// `REANALYSIS_TIMEOUT_SECS` in `codegraph_reanalyze.rs` — 30 minutes
-/// for the worst-case full re-walk of a large polyglot repo + extras.
-const ANALYZE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Tauri event name for progress lines emitted during sync / reindex.
 /// `ExtraCodegraphPathsPanel.svelte` subscribes and folds each event
@@ -1042,46 +1035,20 @@ where
 }
 
 /// Resolve `python` to use for the analyzer. Mirrors
-/// `codegraph_reanalyze::resolve_python_for_analyzer`. Walks up from
-/// the launcher binary looking for a `.venv`; falls back to
-/// `python3` / `python.exe` on PATH.
+/// `codegraph_reanalyze::resolve_python_for_analyzer`.
+///
+/// v0.2.103: REALLY delegates to the shared RT-4 ladder now
+/// (`vct_launcher_core::python_resolve::resolve_python_for_vco_lib`) — the
+/// spawn below routes through `-m vco_lib.codegraph_walk` (the per-project
+/// walk single-flight claim), whose module must be importable by the chosen
+/// interpreter, and the ladder is the one home that resolves exactly such an
+/// interpreter. The previous inline exe-walk claimed this docstring's
+/// mirror but lacked the `$VCT_VENV` / env-root tiers, and its bare
+/// `python3` last resort could import neither `vco_lib` nor `weaviate` —
+/// it only ever produced a walk that died on import. A clean "no
+/// interpreter" refusal replaces that dead spawn.
 fn resolve_python_for_analyzer() -> Option<PathBuf> {
-    let venv_in = |root: &Path| -> Option<PathBuf> {
-        for layout in [
-            root.join(".venv"),
-            root.join("claude_mcp_servers").join(".venv"),
-        ] {
-            for candidate in [
-                layout.join("bin").join("python"),
-                layout.join("bin").join("python3"),
-                layout.join("Scripts").join("python.exe"),
-            ] {
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    };
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut cur = parent.to_path_buf();
-            for _ in 0..8 {
-                if let Some(py) = venv_in(&cur) {
-                    return Some(py);
-                }
-                if !cur.pop() {
-                    break;
-                }
-            }
-        }
-    }
-    Some(PathBuf::from(if cfg!(target_os = "windows") {
-        "python.exe"
-    } else {
-        "python3"
-    }))
+    vct_launcher_core::python_resolve::resolve_python_for_vco_lib()
 }
 
 /// Resolve `analyze_code_graph.py`. Tries the project folder first,
@@ -1116,6 +1083,41 @@ fn resolve_analyzer_script(project_folder: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Build the analyzer spawn for an extra-path sync.
+///
+/// v0.2.103: the analyzer is spawned THROUGH the per-project walk
+/// single-flight claim (`-m vco_lib.codegraph_walk`, the Python SSOT —
+/// [`vct_launcher_core::process::claimed_walk_args`]). The sync argv carries
+/// `--project <prefix>` (the project's own codegraph prefix), so the claim
+/// serializes this sync against a full build / Re-analyze / resync-driver
+/// walk of the SAME project — the 2026-10-14 twin-walk defect. A refusal
+/// exits 75 and maps to the "already running" message below, not a failure.
+/// The claim module re-spawns the analyzer under `sys.executable` with
+/// inherited stdio, so `--json-progress` streaming is unaffected.
+/// Extracted from `run_analyzer_with_stream` so a unit test can inspect the
+/// argv hop (`tokio::process::Command::as_std`).
+fn build_extras_analyzer_command(
+    python: &Path,
+    script: &Path,
+    args: &[String],
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(python).silent();
+    cmd.args(vct_launcher_core::process::claimed_walk_args(script));
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Spawn the analyzer, stream progress events to the GUI, parse the
 /// final-report line, and return it. Mirrors the
 /// `run_reanalysis_with_stream` pattern in
@@ -1136,20 +1138,7 @@ async fn run_analyzer_with_stream(
             .to_string()
     })?;
 
-    let mut cmd = tokio::process::Command::new(&python).silent();
-    cmd.arg(&script);
-    for a in args {
-        cmd.arg(a);
-    }
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
+    let mut cmd = build_extras_analyzer_command(&python, &script, args);
 
     let mut child = cmd
         .spawn()
@@ -1174,34 +1163,42 @@ async fn run_analyzer_with_stream(
         }
     };
 
-    let timed = timeout(
-        Duration::from_secs(ANALYZE_TIMEOUT_SECS),
-        async {
-            read_fut.await;
-            child.wait().await
-        },
-    )
-    .await;
-
-    let status = match timed {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("wait analyzer: {}", e)),
-        Err(_) => {
-            let _ = child.start_kill();
-            return Err(format!(
-                "Analyze timed out after {}s; subprocess killed. Re-running is \
-                 safe (idempotent) — unchanged files are skipped.",
-                ANALYZE_TIMEOUT_SECS
-            ));
+    // v0.2.103 (owner rule "no timeout may cut valid long work"): the
+    // 30-minute ANALYZE_TIMEOUT_SECS deadline is GONE — an extras
+    // re-index is a full walk of the repo plus every enabled extra and
+    // may legitimately run for hours; killing a slow-but-working walk
+    // makes it look like a failure so the user clicks Sync again. With
+    // no deadline as a backstop, stderr is drained CONCURRENTLY with the
+    // stdout read (a piped stderr nobody reads fills its ~64 KiB kernel
+    // buffer and the child blocks on write(2) forever — an unkillable
+    // hang, not a slow walk). Both concerns live in the ONE shared home:
+    // `vct_launcher_core::process::{drain_child_stderr_capped,
+    // await_child_no_deadline}` (same composition as the Re-analyze
+    // modal's wait). The per-file progress events above are the
+    // liveness signal.
+    let stderr_drain = async {
+        match stderr {
+            Some(stream) => {
+                vct_launcher_core::process::drain_child_stderr_capped(
+                    stream,
+                    vct_launcher_core::process::STDERR_EVIDENCE_BYTES,
+                )
+                .await
+            }
+            None => String::new(),
         }
     };
+    let (status, stderr_text) =
+        vct_launcher_core::process::await_child_no_deadline(read_fut, stderr_drain, child.wait())
+            .await?;
 
     if !status.success() {
-        let stderr_text = if let Some(err_stream) = stderr {
-            read_stderr_capped(err_stream, 2048).await
-        } else {
-            String::new()
-        };
+        // v0.2.103: the walk-claim refusal is not a failure — the project's
+        // code graph is already being walked; say so (the Sync button's
+        // error surface shows this sentence).
+        if vct_launcher_core::process::is_walk_already_running(&status) {
+            return Err(vct_launcher_core::process::walk_already_running_message());
+        }
         return Err(format!(
             "analyzer {}",
             vct_launcher_core::process::failure_evidence(&status, &stderr_text, vct_launcher_core::process::StderrKeep::Whole)
@@ -1209,17 +1206,6 @@ async fn run_analyzer_with_stream(
     }
 
     Ok(final_report.unwrap_or_default())
-}
-
-async fn read_stderr_capped(
-    stderr: tokio::process::ChildStderr,
-    max_bytes: usize,
-) -> String {
-    let mut buf = Vec::with_capacity(max_bytes.min(4096));
-    let mut reader = BufReader::new(stderr);
-    let mut limited = (&mut reader).take(max_bytes as u64);
-    let _ = limited.read_to_end(&mut buf).await;
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 fn handle_analyzer_line(
@@ -1294,6 +1280,123 @@ mod tests {
         db
     }
 
+    // ─── analyzer wait: no wall-clock kill, concurrent stderr drain ────
+
+    /// Owner rule (2026-10-14): no timeout may cut valid long work — the
+    /// extras analyzer wait (formerly `ANALYZE_TIMEOUT_SECS`, 30 min) must
+    /// have NO deadline. BEHAVIOURAL (not a source scan): under paused
+    /// tokio time, six hours of virtual wall-clock advance must leave the
+    /// wait PENDING — any re-added deadline (a `timeout` wrapper, a
+    /// `select!` on a `sleep`) fires when time advances and this test goes
+    /// red. Only the child's own completion (the oneshots here) resolves
+    /// the wait.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn extras_analyzer_wait_has_no_wall_clock_kill() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+        let (wait_tx, wait_rx) = tokio::sync::oneshot::channel::<()>();
+        let read_fut = async {
+            let _ = read_rx.await;
+        };
+        let wait_fut = async {
+            let _ = wait_rx.await;
+            Ok::<_, std::io::Error>(std::process::ExitStatus::from_raw(0))
+        };
+        let drain_fut = async { String::new() };
+
+        let fut = vct_launcher_core::process::await_child_no_deadline(
+            read_fut, drain_fut, wait_fut,
+        );
+        let mut fut = std::pin::pin!(fut);
+
+        // Pending before anything fires...
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, fut.as_mut())
+                .await
+                .is_err(),
+            "wait must stay pending while the child runs"
+        );
+        // ...and still pending after 6 h of virtual wall-clock — a
+        // re-added deadline would fire here and fail the assert below.
+        tokio::time::advance(std::time::Duration::from_secs(6 * 3600)).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, fut.as_mut())
+                .await
+                .is_err(),
+            "wait must survive 6 h of wall-clock with no deadline firing"
+        );
+
+        // The child's own completion resolves it.
+        let _ = read_tx.send(());
+        let _ = wait_tx.send(());
+        let (status, tail) = fut.await.expect("wait completes when the child does");
+        assert!(status.success());
+        assert_eq!(tail, "");
+    }
+
+    /// A child writing MORE than the kernel pipe buffer (~64 KiB) to
+    /// stderr and then exiting must complete — not hang. With the
+    /// 30-minute timeout removed there is no backstop left, so the
+    /// CONCURRENT stderr drain is the only thing preventing the child
+    /// from blocking forever on its full stderr pipe. The real-time
+    /// watchdog turns that hang into a clean test failure. Uses the
+    /// exact composition `run_analyzer_with_stream` now uses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn huge_stderr_child_completes_rather_than_deadlocking() {
+        // ~2 MiB of stderr (32x a 64 KiB pipe buffer), then exit 0.
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("yes 'EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE' | head -c 2200000 >&2; echo done");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().expect("spawn fake analyzer");
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let stderr = child.stderr.take();
+
+        let mut reader = BufReader::new(stdout).lines();
+        let read_fut = async {
+            while let Ok(Some(_line)) = reader.next_line().await {}
+        };
+        let drain_fut = async {
+            match stderr {
+                Some(stream) => {
+                    vct_launcher_core::process::drain_child_stderr_capped(
+                        stream,
+                        vct_launcher_core::process::STDERR_EVIDENCE_BYTES,
+                    )
+                    .await
+                }
+                None => String::new(),
+            }
+        };
+
+        // Watchdog is TEST-ONLY: production (`await_child_no_deadline`) has no
+        // deadline; here it turns a deadlock into a red test instead of a
+        // hung suite (same 120 s watchdog as the Re-analyze sibling test).
+        let (status, tail) = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            vct_launcher_core::process::await_child_no_deadline(
+                read_fut, drain_fut, child.wait(),
+            ),
+        )
+        .await
+        .expect("child must complete, not deadlock on a full stderr pipe")
+        .expect("wait ok");
+        assert!(status.success());
+        // The capped tail keeps only the LAST STDERR_EVIDENCE_BYTES.
+        assert!(
+            tail.len() <= vct_launcher_core::process::STDERR_EVIDENCE_BYTES,
+            "tail len {}",
+            tail.len()
+        );
+        assert!(tail.ends_with('E'), "tail keeps the END of the stream");
+    }
+
     // ─── canonicalise_for_storage ───────────────────────────────────────
 
     #[test]
@@ -1302,6 +1405,46 @@ mod tests {
         assert!(err.contains("empty"), "got: {}", err);
         let err = canonicalise_for_storage("   ").unwrap_err();
         assert!(err.contains("empty"), "got: {}", err);
+    }
+
+    // ─── v0.2.103: walk single-flight claim ──────────────────────────────
+
+    #[test]
+    fn extras_analyzer_command_routes_through_the_walk_claim() {
+        let python = Path::new("/venv/bin/python");
+        let script = Path::new("/x/.claude/scripts/analyze_code_graph.py");
+        let sync_args = vec![
+            "/extra/checkout".to_string(),
+            "--project".to_string(),
+            "Acme".to_string(),
+            "--json-progress".to_string(),
+            "--as-extra-path".to_string(),
+        ];
+        let cmd = build_extras_analyzer_command(python, script, &sync_args);
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), std::ffi::OsStr::new("/venv/bin/python"));
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args[0], "-m", "the claim module hop comes first: {args:?}");
+        assert_eq!(args[1], "vco_lib.codegraph_walk");
+        assert_eq!(args[2], script.to_string_lossy());
+        // The sync argv follows the script, unchanged and in order.
+        assert_eq!(args[3..], sync_args[..], "analyzer args pass through verbatim");
+    }
+
+    /// Exit 75 (the vco_lib walk-claim refusal) is recognised by the shared
+    /// predicate this module's failure arm maps to the "already running"
+    /// sentence.
+    #[cfg(unix)]
+    #[test]
+    fn extras_failure_arm_recognises_the_claim_refusal() {
+        use std::os::unix::process::ExitStatusExt;
+        let refusal = std::process::ExitStatus::from_raw(75 << 8);
+        assert!(vct_launcher_core::process::is_walk_already_running(&refusal));
+        let failure = std::process::ExitStatus::from_raw(5 << 8);
+        assert!(!vct_launcher_core::process::is_walk_already_running(&failure));
     }
 
     #[test]

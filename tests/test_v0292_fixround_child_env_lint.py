@@ -64,6 +64,12 @@ _ALLOWLIST: dict[str, int] = {
     # child's path, which is precisely the state the fixture must NOT be in.
     # Reason recorded at the call site.
     "tests/test_v0294_python_exe_resolver.py": 1,
+    # DELIBERATELY UNPINNED (v0.2.103 Windows field run): the child proves the
+    # code-embed image's server.py runs with `vco_lib` BLOCKED and the checkout
+    # removed from sys.path. `child_env()` pins the checkout onto the child's
+    # PYTHONPATH — the exact state the test must exclude. Reason recorded at the
+    # call site.
+    "tests/test_v02103_code_embed_ollama_body.py": 1,
     "tests/test_codegraph_cli_readpath_v0270.py": 2,
     "tests/test_codegraph_naming.py": 1,
     "tests/test_detached_children_no_resourcewarning.py": 1,

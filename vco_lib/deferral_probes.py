@@ -1252,14 +1252,14 @@ def chunker_resync_still_owed(ctx: ProbeContext) -> Optional[bool]:
 
     A thin wrapper over :func:`vco_lib.chunker_revision.resync_still_owed`,
     which owns the whole chunker-resync lifecycle (the sentinel the gate
-    compares, the remedy text both emitters print, and the half-stamps the two
+    compares, the remedy text the emitter prints, and the half-stamps the two
     remedy scripts write). One home for the rule: a second reading here could
     clear an entry the gate would immediately re-emit.
 
     v0.2.95 F1 — this cid was the last IMMORTAL one. It declared
     ``paired-resolution`` and named a clearing site that does not exist in
-    either language, while its own emitters promise the user it
-    "self-resolves on the next bundle update". The registry-completeness test
+    either language, while its own emitters (two then, one since v0.2.103)
+    promised the user it "self-resolves on the next bundle update". The registry-completeness test
     validates only ``probe:py:`` names, so a sentinel family whose site is
     prose failed nothing.
 
@@ -1304,6 +1304,47 @@ def first_run_setup_sections_still_pending(ctx: ProbeContext) -> Optional[bool]:
     return bool(pending)
 
 
+def codegraph_orphan_interactions_still_present(ctx: ProbeContext) -> Optional[bool]:
+    """``codegraph_orphan_interactions_pending`` — do provable orphan
+    CodeInteraction rows still exist for the project?
+
+    R14-B1: the entry's printed remedy is a manual ``--prune-stale`` walk,
+    and nothing used to trigger a resync-driver run afterwards (the owed
+    gate sees no owed work once the orphans are gone), so the entry could
+    never clear itself. This probe re-counts through the SAME home the
+    reaping and the driver's post-walk probe use
+    (:func:`vco_lib.codegraph_resync.count_orphan_interaction_rows` → the
+    ONE predicate), so the probe can never clear a row the next driver run
+    would re-emit. The project name is parsed from the entry's ``detected``
+    prose (``project '<name>'``) — the ONE deferral builder writes it and a
+    test locks the shape.
+
+    Returns:
+        True  — the count is positive: provable orphans remain.
+        False — the count is POSITIVELY zero: the consented walk reaped
+                them (or there were none) — the entry describes a state
+                that is over.
+        None  — could not look (Weaviate down, prefix unresolvable, the
+                entry prose unparsable). Positive evidence only: an unknown
+                count never clears.
+    """
+    from vco_lib import codegraph_resync
+
+    entry = ctx.entry
+    match = re.search(
+        r"project '([^']+)'", getattr(entry, "detected", "") or "")
+    if not match:
+        return None
+    try:
+        count = codegraph_resync.count_orphan_interaction_rows(
+            match.group(1), repo_root=ctx.folder)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if count is None:
+        return None
+    return count > 0
+
+
 PROBES: dict[str, ProbeFn] = {
     "bash_env_cleanup_still_owed": bash_env_cleanup_still_owed,
     "first_run_setup_sections_still_pending": first_run_setup_sections_still_pending,
@@ -1332,6 +1373,8 @@ PROBES: dict[str, ProbeFn] = {
     "service_adoption_confirmation_still_pending": service_adoption_confirmation_still_pending,
     "container_runtime_still_unusable": container_runtime_still_unusable,
     "container_runtime_data_still_under_both": container_runtime_data_still_under_both,
+    "codegraph_orphan_interactions_still_present": (
+        codegraph_orphan_interactions_still_present),
 }
 
 
@@ -1911,5 +1954,6 @@ __all__ = [
     "resolvable_condition_ids",
     "retry_history_note",
     "run_probe",
+    "codegraph_orphan_interactions_still_present",
     "upstream_sidecar_paths",
 ]

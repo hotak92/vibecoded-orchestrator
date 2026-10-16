@@ -34,8 +34,12 @@ use std::path::PathBuf;
 ///      Mirrors the existing fallback at `db/mod.rs:36`.
 pub fn vct_root_dir() -> PathBuf {
     if let Ok(custom) = std::env::var("VCT_STATE_DIR") {
-        if !custom.is_empty() {
-            return PathBuf::from(custom);
+        // Trim like the Python home (`vco_lib.paths.vct_root_dir` uses
+        // `.strip()`): a whitespace-only value means "not set", never a
+        // literal whitespace directory name (review V02103-VERIFY-R31 L-6).
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
         }
     }
     directories::UserDirs::new()
@@ -395,6 +399,24 @@ mod tests {
             assert!(
                 resolved.ends_with(".vct"),
                 "expected ~/.vct fallback, got {:?}",
+                resolved
+            );
+        });
+    }
+
+    #[test]
+    fn whitespace_vct_state_dir_is_trimmed_like_the_python_home() {
+        // R31 L-6 parity with `vco_lib.paths.vct_root_dir` (`.strip()`):
+        // surrounding whitespace is stripped, and a whitespace-only value
+        // means "not set" (home fallback) — never a literal "  " dir.
+        with_env("VCT_STATE_DIR", Some("  /tmp/vct-test-override  \n"), || {
+            assert_eq!(vct_root_dir(), PathBuf::from("/tmp/vct-test-override"));
+        });
+        with_env("VCT_STATE_DIR", Some("   "), || {
+            let resolved = vct_root_dir();
+            assert!(
+                resolved.ends_with(".vct"),
+                "a whitespace-only VCT_STATE_DIR must mean ~/.vct, got {:?}",
                 resolved
             );
         });

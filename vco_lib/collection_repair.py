@@ -15,13 +15,32 @@ project are stale/foreign and are deleted.
 Guards (binding, from the 2026-07-30 wave-2 plan §7.3):
 
 * Rows whose file EXISTS on disk are NEVER touched (even if content
-  drifted — normal sync owns that).
+  drifted — normal sync owns that). Existence is judged on the path AS
+  THE SYNC STORES IT — lexically, ``(project_root / path).exists()``,
+  which FOLLOWS symlinks (v0.2.103 R2, review H-1): the sync stores
+  ``file_path`` lexically (``knowledge/x.md`` even when ``knowledge/``
+  is a symlink to an outside vault), so a resolve-and-contain check
+  read every such row as "file gone" and a full sync deleted the rows
+  it had just written. A stored path whose resolution ESCAPES the root
+  is unjudgeable by this tree's walk and is KEPT, never read as
+  missing.
 * **Shared-identity skip** (the load-bearing guard): when the project's KG
-  collection IS the shared collection (``kg_collection ==
-  shared_kg_collection`` — the orchestrator root), the KG leg is skipped
+  collection IS the shared collection, the KG leg is skipped
   entirely. BUG-6 shared-scoped nodes from OTHER projects make
   "absent locally" NORMAL in the shared store — pruning there would
-  destroy other projects' legitimate rows.
+  destroy other projects' legitimate rows. v0.2.103 R2 (review H-2):
+  the identity decision is ONE predicate,
+  :func:`is_shared_identity_collection` — name match
+  (case-insensitive) OR the walked root being the orchestrator clone
+  (root ≡ shared by construction, v0.2.81 adopt-and-route) — computed
+  INSIDE :func:`prune_foreign_rows`, so no caller can pass
+  ``is_shared_identity=False`` past a root clone or an
+  empty/unresolved shared name.
+* **Registered-owner gate** (v0.2.103; in this home since the final
+  review M-2): the pruned tree must BE the registered launcher.db owner of
+  the collection (:func:`collection_owner_refusal`) — a lane worktree or a
+  second clone resolves the same names but must never prune against its
+  own, different tree. Applies to both legs and every caller.
 * The Development leg has no shared variant, but keeps the root skip for
   symmetry.
 * ``file_path`` values that are absolute or contain ``..`` (after ``\\`` →
@@ -52,11 +71,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from vco_lib import weaviate_helpers as _wh
-from vco_lib.install_weaviate import _path_resolves_on_disk
 from vco_lib.knowledge_residue import (
     project_settings_env,
     weaviate_reachable,
 )
+from vco_lib.orchestrator_identity import is_orchestrator_clone
 
 #: Deferral condition ID owned by this module.
 CID_PRUNED = "foreign_rows_pruned"
@@ -108,11 +127,199 @@ def _classify_file_path(fp: str) -> str:
     return "relative"
 
 
+def is_shared_identity_collection(
+    kg_collection: "str | None",
+    shared_kg_collection: "str | None",
+    project_root: "Path | str | None",
+) -> bool:
+    """THE shared-identity predicate for every KG prune caller (v0.2.103
+    R2, review H-2 — previously three divergent copies: kg-sync matched
+    by name only, the install adapter matched name-or-root with its own
+    root rule, the bundle leg matched name only, and an EMPTY unresolved
+    shared name disarmed all three on the orchestrator root).
+
+    True when the collection IS the shared store, by either evidence:
+
+    * NAME — ``kg_collection`` equals ``shared_kg_collection``
+      case-insensitively (Weaviate class names cannot differ by case
+      only, and case-insensitive equality is the more conservative
+      reading); or
+    * ROOT — ``project_root`` is the orchestrator clone
+      (:func:`vco_lib.orchestrator_identity.is_orchestrator_clone`):
+      root ≡ shared by construction (v0.2.81 adopt-and-route), so the
+      skip must hold even when the shared NAME is empty or unresolved
+      (kg-sync resolves it hub → launcher.db → env, and ``""`` is a
+      legitimate answer with the hub down or a free-tier install).
+
+    An empty ``kg_collection`` is never shared-identity here — the
+    callers' "no collection name" skip owns that case.
+    ``is_orchestrator_clone`` never raises, and a ``None`` root simply
+    disarms the ROOT leg.
+    """
+    kg = (kg_collection or "").strip()
+    if not kg:
+        return False
+    shared = (shared_kg_collection or "").strip()
+    if shared and kg.lower() == shared.lower():
+        return True
+    if project_root is None:
+        return False
+    return is_orchestrator_clone(Path(project_root))
+
+
+def collection_owner_refusal(
+    project_root: "Path | str", collection: "str | None",
+) -> Optional[str]:
+    """``None`` when *project_root* may prune *collection*; a skip REASON
+    when it must not — the REGISTERED-OWNER gate (v0.2.103 R2 review M-3;
+    moved here, the prune home, by the final review M-2 so EVERY caller is
+    covered: the full kg-sync walk, a bundle update run on any folder, and
+    this module's own CLI).
+
+    A lane worktree or a second clone of a project carries the same
+    ``.claude/settings.json`` collection names, so a prune run there
+    resolves the SAME collection for a tree that is not its registered
+    owner — and pruning it against that tree deletes rows whose files exist
+    only in the real checkout (uncommitted work, gitignored ``knowledge/``,
+    nodes added on main after the branch point). The rule: *project_root*
+    must BE the registered folder of every registration that owns
+    *collection* — its KG ``primary`` or ``shared`` binding, or the
+    development / diagrams collection derived from its primary (the ONE
+    derivation, :func:`vco_lib.config_projection.resolve_project_collection_names`).
+
+    * no launcher.db at all (free tier, no registry) ⇒ proceed — no second
+      tree is registered to claim the collection;
+    * launcher.db present but unreadable ⇒ REFUSE — ownership is
+      unprovable this run, and a destructive path waits for proof;
+    * a registered project owns the name (case-insensitive): its folder IS
+      this root ⇒ proceed; a DIFFERENT folder ⇒ REFUSE, naming the owner;
+    * no registration owns the name ⇒ proceed (unregistered project).
+
+    Read-only. A failed ``vco_lib`` import propagates (a broken install is
+    loud, and the caller's prune does not run).
+    """
+    from vco_lib.config_projection import resolve_project_collection_names
+    from vco_lib.launcher_db_reader import (
+        _discover_db_path,
+        get_kg_binding,
+        list_registered_projects,
+    )
+    from vco_lib.module_gated_delivery import _canonical_path_eq
+
+    wanted = (collection or "").strip().lower()
+    if not wanted:
+        return None
+    db_path = _discover_db_path()
+    if db_path is None:
+        return None  # no registry exists ⇒ no second tree can claim it
+    unreadable = ("the launcher registry exists but could not be read — "
+                  "collection ownership is unprovable this run, so the "
+                  "prune is refused")
+    projects = list_registered_projects()
+    if projects is None:
+        return unreadable
+    for proj in projects:
+        owned = []
+        for role in ("primary", "shared"):
+            owned.append(get_kg_binding(proj.id, role) or "")
+        try:
+            names = resolve_project_collection_names(proj.id, db_path=db_path)
+        except Exception:  # noqa: BLE001 — unprovable ⇒ refuse, never guess
+            return unreadable
+        owned.extend([names.get("kg_collection", ""),
+                      names.get("development_collection", ""),
+                      names.get("diagrams_collection", "")])
+        if wanted not in {o.strip().lower() for o in owned if o}:
+            continue
+        if _canonical_path_eq(proj.folder, project_root):
+            continue  # this root IS the registered owner
+        return (f"'{collection}' is registered to {proj.folder!r} (project "
+                f"{proj.name!r}), not to the walked root {project_root} — a "
+                "worktree or second clone must not prune another tree's "
+                "collection")
+    return None
+
+
+#: Rows written from an isolated lane worktree carry the worktree prefix;
+#: the same file under the project root is what the prune must judge.
+_WORKTREE_PREFIX_RE = re.compile(r"\.claude/worktrees/agent-[^/]+/(.*)$")
+
+
+def _resolves_outside_root(candidate: Path, project_root: Path) -> bool:
+    """True when *candidate*'s RESOLUTION escapes *project_root* — or when
+    the question cannot be answered (OSError/ValueError ⇒ True, the keep
+    side).
+
+    The prune walks THIS tree; a stored path whose symlink chain lands
+    outside it (a vault-linked ``knowledge/``, a linked node) is
+    unjudgeable by that walk — the file's absence from the walk proves
+    nothing. "Outside" is therefore a KEEP verdict, never evidence of a
+    missing file (v0.2.103 R2, review H-1).
+    """
+    try:
+        return not candidate.resolve().is_relative_to(
+            project_root.resolve()
+        )
+    except (OSError, ValueError):
+        return True
+
+
+def _stored_file_exists_for_prune(file_path_str: str, project_root: Path) -> bool:
+    """Existence judged on the path AS THE SYNC STORES IT (v0.2.103 R2,
+    review H-1).
+
+    The sync stores ``file_path`` LEXICALLY (``knowledge/x.md`` even when
+    ``knowledge/`` is a symlink to an outside vault — the walk reports
+    the link's location, not its target). The pre-fix check re-resolved
+    the candidate and required the result INSIDE the root, so every row
+    of a symlinked ``knowledge/`` read as "file gone" and a full
+    ``kg-sync --all`` deleted the rows it had just written — on every
+    run.
+
+    Rule (any leg True ⇒ KEEP the row):
+
+      1. ``(project_root / path).exists()`` — lexical, FOLLOWS symlinks.
+      2. The candidate RESOLVES outside the root ⇒ keep (unjudgeable by
+         this tree's walk — :func:`_resolves_outside_root`).
+      3. Worktree-prefixed rows (``.claude/worktrees/agent-*/…``): the
+         stripped tail is judged by legs 1–2.
+      4. Any OS/value error while judging ⇒ keep (a destructive action
+         needs a positive "gone", never a guess).
+
+    The empty / absolute / UNC / ``..`` shapes never reach here —
+    :func:`_classify_file_path` already classifies them defensive.
+    """
+    try:
+        candidate = project_root / file_path_str
+        if candidate.exists():
+            return True
+        if _resolves_outside_root(candidate, project_root):
+            return True
+    except (OSError, ValueError):
+        # NUL bytes / invalid chars in a stored file_path — unjudgeable ⇒
+        # keep.
+        return True
+    m = _WORKTREE_PREFIX_RE.search(file_path_str)
+    if m:
+        try:
+            stripped = project_root / m.group(1)
+            if stripped.exists():
+                return True
+            if _resolves_outside_root(stripped, project_root):
+                return True
+        except (OSError, ValueError):
+            return True
+    return False
+
+
 def _enumerate_rows(
     weaviate_url: str,
     collection: str,
-) -> Optional[tuple[list[tuple[str, str]], bool]]:
-    """Fetch ``(uuid, file_path)`` pairs for every row in *collection*.
+) -> Optional[tuple[list[tuple[str, str, "str | None"]], bool]]:
+    """Fetch ``(uuid, file_path, title)`` triples for every row in
+    *collection* (v0.2.103: ``title`` joined so prune callers can log every
+    removed row by path AND title; rows whose stored title is absent report
+    ``None``).
 
     Returns ``(rows, saturated)`` or ``None`` on any transport / GraphQL
     failure (the caller skips the leg — no destructive action without an
@@ -123,7 +330,7 @@ def _enumerate_rows(
     gql = {
         "query": (
             f"{{ Get {{ {collection}(limit: {QUERY_MAX_LIMIT}) "
-            f"{{ _additional {{ id }} file_path }} }} }}"
+            f"{{ _additional {{ id }} file_path title }} }} }}"
         ),
     }
     try:
@@ -146,12 +353,17 @@ def _enumerate_rows(
     objects = (
         payload.get("data", {}).get("Get", {}).get(collection, [])
     ) or []
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, str, "str | None"]] = []
     for obj in objects:
         uid = ((obj or {}).get("_additional") or {}).get("id") or ""
         fp = (obj or {}).get("file_path")
+        title = (obj or {}).get("title")
         if uid:
-            rows.append((str(uid), fp if isinstance(fp, str) else ""))
+            rows.append((
+                str(uid),
+                fp if isinstance(fp, str) else "",
+                title if isinstance(title, str) else None,
+            ))
     return rows, len(objects) >= QUERY_MAX_LIMIT
 
 
@@ -207,14 +419,27 @@ def prune_foreign_rows(
     *,
     weaviate_url: Optional[str] = None,
     is_shared_identity: bool = False,
+    shared_kg_collection: Optional[str] = None,
     dry_run: bool = False,
     log_event: Optional[Callable[..., None]] = None,
+    log_step: str = "4.bundle.foreign_rows",
 ) -> dict:
     """Delete rows in *collection* whose ``file_path`` does not exist on disk
     under *project_root*.
 
-    See the module docstring for the guard contract. Returns a
-    JSON-serialisable dict::
+    See the module docstring for the guard contract. ``log_step`` is the
+    step id forwarded to ``log_event`` (the bundle-update default keeps its
+    historical value; the install-time adapter passes its own step id so the
+    forensic log names the phase that actually ran).
+
+    ``is_shared_identity`` remains accepted for callers that already proved
+    identity themselves, but the decision no longer depends on the caller:
+    v0.2.103 R2 (review H-2) computes
+    :func:`is_shared_identity_collection` HERE from *collection*,
+    *shared_kg_collection* and *project_root*, so a root clone or a name
+    match can never be pruned because a caller passed ``False``.
+
+    Returns a JSON-serialisable dict::
 
         {
           "collection": str,
@@ -222,6 +447,9 @@ def prune_foreign_rows(
           "rows": int,                 # rows enumerated
           "defensive_skipped": int,    # absolute / ``..`` / empty paths
           "stale_paths": [<fp>...],    # distinct foreign paths found
+          "stale_rows": [              # v0.2.103: per-ROW detail for logging
+            {"path": <fp>, "title": <title | None>}, ...
+          ],
           "deleted": int,              # rows actually deleted (0 in dry-run)
           "saturated": bool,
           "dry_run": bool,
@@ -235,6 +463,7 @@ def prune_foreign_rows(
         "rows": 0,
         "defensive_skipped": 0,
         "stale_paths": [],
+        "stale_rows": [],
         "deleted": 0,
         "saturated": False,
         "dry_run": bool(dry_run),
@@ -245,10 +474,10 @@ def prune_foreign_rows(
         if log_event is None:
             return
         try:
-            log_event("4.bundle.foreign_rows", phase, detail, data=data)
+            log_event(log_step, phase, detail, data=data)
         except TypeError:
             try:
-                log_event("4.bundle.foreign_rows", phase, detail)
+                log_event(log_step, phase, detail)
             except Exception:  # noqa: BLE001
                 pass
         except Exception:  # noqa: BLE001 — logging never breaks the prune
@@ -263,10 +492,25 @@ def prune_foreign_rows(
     # THE load-bearing guard (§7.3): in a shared-identity collection,
     # "file absent locally" is NORMAL — BUG-6 shared-scoped nodes from
     # other projects legitimately have no local file. Never prune there.
-    if is_shared_identity:
+    # v0.2.103 R2 (review H-2): the decision is COMPUTED here through the
+    # one predicate (name match OR orchestrator-clone root), BEFORE any
+    # enumeration — a caller passing is_shared_identity=False cannot
+    # disarm it.
+    if is_shared_identity or is_shared_identity_collection(
+        collection, shared_kg_collection, project_root
+    ):
         result["skipped"] = "shared-identity collection"
         _log("ok", f"prune skipped for {collection!r}: shared-identity "
                    "collection (other projects' shared-scoped rows live here)")
+        return result
+
+    # REGISTERED-OWNER gate (v0.2.103 final review M-2): computed HERE, in
+    # the prune home, so a worktree / second clone is refused on every
+    # caller path, BEFORE any enumeration.
+    not_owner = collection_owner_refusal(project_root, collection)
+    if not_owner is not None:
+        result["skipped"] = not_owner
+        _log("warn", f"prune skipped for {collection!r}: {not_owner}")
         return result
 
     url = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
@@ -287,20 +531,25 @@ def prune_foreign_rows(
              "remaining rows are caught on a later run")
 
     stale_uuids: list[str] = []
+    stale_rows: list[dict] = []
     stale_paths: set = set()
     defensive = 0
-    for uid, fp in rows:
+    for uid, fp, title in rows:
         kind = _classify_file_path(fp)
         if kind == "defensive":
             defensive += 1
             continue
         norm = fp.strip().replace("\\", "/")
-        if _path_resolves_on_disk(norm, project_root):
-            continue  # file exists ⇒ NEVER touched
+        if _stored_file_exists_for_prune(norm, project_root):
+            continue  # file exists (or is unjudgeable) ⇒ NEVER touched
         stale_uuids.append(uid)
         stale_paths.add(norm)
+        stale_rows.append({"path": norm, "title": title})
     result["defensive_skipped"] = defensive
     result["stale_paths"] = sorted(stale_paths)
+    result["stale_rows"] = sorted(
+        stale_rows, key=lambda r: (r["path"], r["title"] or "")
+    )
 
     if not stale_uuids:
         _log("ok", f"{collection!r}: no foreign rows "
@@ -336,10 +585,12 @@ def prune_foreign_rows_for_project(
     """Run both prune legs (KG + Development) for one project.
 
     Gate composition (§7.3):
-      * KG leg skipped when ``kg_collection == shared_kg_collection``
-        (case-insensitive — Weaviate class names cannot differ by case
-        only, and case-insensitive equality is the more conservative
-        reading).
+      * KG leg skipped on shared identity per the ONE predicate
+        (:func:`is_shared_identity_collection`): ``kg_collection ==
+        shared_kg_collection`` (case-insensitive — Weaviate class names
+        cannot differ by case only) OR *project_root* is the orchestrator
+        clone (root ≡ shared by construction; holds even with an empty or
+        unresolved shared name).
       * Development leg skipped on a root target (symmetry — the root's
         docs are the orchestrator's own).
       * Both legs skipped when Weaviate is unreachable (bounded probe).
@@ -351,7 +602,7 @@ def prune_foreign_rows_for_project(
     kg = (kg_collection or "").strip()
     dev = (development_collection or "").strip()
     shared = (shared_kg_collection or "").strip()
-    kg_shared_identity = bool(kg) and kg.lower() == shared.lower()
+    kg_shared_identity = is_shared_identity_collection(kg, shared, project_root)
 
     result: dict = {
         "skipped": None,
@@ -382,7 +633,8 @@ def prune_foreign_rows_for_project(
         if skip:
             leg = {
                 "collection": coll, "skipped": reason, "rows": 0,
-                "defensive_skipped": 0, "stale_paths": [], "deleted": 0,
+                "defensive_skipped": 0, "stale_paths": [], "stale_rows": [],
+                "deleted": 0,
                 "saturated": False, "dry_run": bool(dry_run), "errors": [],
             }
             result["legs"].append(leg)
@@ -391,7 +643,7 @@ def prune_foreign_rows_for_project(
             project_root,
             coll,
             weaviate_url=weaviate_url,
-            is_shared_identity=False,
+            shared_kg_collection=shared,
             dry_run=dry_run,
             log_event=log_event,
         )

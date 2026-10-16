@@ -8,8 +8,14 @@
 # is copied from the maintainer's "Model selection — which model for which
 # task" grid (2026-10-03, re-scored at medium effort the same day), with the
 # owner-approved 2026-10-08 revision (Haiku 5.5 replaces Haiku 4.5, GLM-5.3
-# Review 8, DeepSeek V4.1 Flash Docs 7, the GLM-implementer bullet and the
-# measured Kimi budget). Scores are copied EXACTLY and are pinned by
+# Review 8, DeepSeek V4.1 Flash Docs 7, the GLM-implementer bullet) and the
+# 2026-10-14 owner ruling that machine-local budget/quota facts (the measured
+# Kimi subscription budget) live only in the maintainer's own memory, never
+# in the shipped grid. The 2026-10-16 re-score (owner-requested, from this
+# setup's own reviewed-lane record, ~300 rows): GLM-5.3 Debug 6 -> 5,
+# DeepSeek V4.1 Flash Review 6 -> 7, and the `*` dropped from Opus Instr,
+# Kimi K3 Review and DeepSeek Instr (own reports now exceed three).
+# Scores are copied EXACTLY and are pinned by
 # tests/test_model_selection_grid.py — edit both together.
 #
 # `reach_via` names only agents that SHIP in templates/agents/: the gateway
@@ -41,7 +47,7 @@ columns = [
 intro = [
   "Delegate to subagents and **always name the model** — the gateway agents below pin it in their own file, so dispatch them without a `model` param; for the Claude rows, name the model on the Agent call (`model: opus` and so on).",
   "Scores are 1–10 within this set, **at medium effort** (what this setup runs), from effort-matched benchmarks, vendor model cards and head-to-head user comparisons. **`*`** = assumed (no benchmark and fewer than 3 comparison reports); **`†`** = this model has only xhigh/max benchmark results (no medium/high data) — weaker evidence.",
-  "Only the rows for model providers reachable on this machine at render time are listed — add a vendor key in the launcher's Secrets panel and re-run the update to add its rows.",
+  "Only the rows for model providers whose key resolves on this machine are listed — add a vendor key in the launcher's Secrets panel and its rows appear by themselves: the guidance refreshes automatically at launcher startup, on every key change, and at every install/update.",
 ]
 
 # The column legend, rendered after the table.
@@ -60,7 +66,7 @@ id = "opus"
 model = "Opus 5.5"
 reach_via = "model: opus"
 providers = ["anthropic"]
-scores = ["10", "10", "9", "9", "5", "10", "8*", "10", "9", "10", "4"]
+scores = ["10", "10", "9", "9", "5", "10", "8", "10", "9", "10", "4"]
 
 [[row]]
 id = "fable"
@@ -72,14 +78,17 @@ scores = ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"]
 [[row]]
 id = "glm-5.3"
 model = "GLM-5.3"
-dagger = true
+# No dagger since 2026-10-16 (owner): this setup's own ~110 reviewed GLM-5.3
+# lanes, all at medium effort, are real medium-effort evidence.
 reach_via = "glm-implementer / glm-implementer-high / glm-reviewer / glm-planner"
 providers = ["zai", "qwen"]
 # Review 7 -> 8 (owner 2026-10-08): this setup's own reviewed-lane record now
 # has more than three rows of GLM-5.3 reviews catching blockers / HIGH
 # findings, including ones a Claude review missed. Cost 8 is due a
 # re-measure (quota burn per lane) before it is kept or changed.
-scores = ["7", "6", "8", "6", "6", "6", "7*", "7", "7", "—", "8"]
+# Debug 6 -> 5 (2026-10-16): fixes to install-order / stateful code passed
+# their own tests and still failed in the real order across several rounds.
+scores = ["7", "5", "8", "6", "6", "6", "7*", "7", "7", "—", "8"]
 
 # Kimi K3 (v0.2.102) is NOT from the maintainer's grid: it was scored from
 # public evidence read 2026-10-07 — Moonshot's model card and Kimi Code docs,
@@ -95,17 +104,19 @@ model = "Kimi K3"
 dagger = true
 reach_via = "kimi-implementer / kimi-reviewer"
 providers = ["kimi"]
-scores = ["7", "6", "6*", "6*", "3", "7", "7*", "8", "8", "8", "3"]
+scores = ["7", "6", "6", "6*", "3", "7", "7*", "8", "8", "8", "3"]
 
 [[row]]
 id = "deepseek-v4.1-flash"
 model = "DeepSeek V4.1 Flash"
 reach_via = "deepseek-researcher / deepseek-implementer"
 providers = ["qwen"]
+# Review 6 -> 7 (2026-10-16): four read-only verify rounds of fix deltas,
+# every finding real, none overturned. Instr `*` dropped (own reports > 3).
 # Docs 6 -> 7 (owner 2026-10-08): its research / synthesis lanes in this
 # setup's reviewed-lane record were verified accurate, each with an explicit
 # could-not-verify list.
-scores = ["7", "6", "6", "6", "9", "6", "7*", "8", "7", "7", "10"]
+scores = ["7", "6", "7", "6", "9", "6", "7", "8", "7", "7", "10"]
 
 [[row]]
 id = "sonnet"
@@ -156,24 +167,37 @@ providers = ["anthropic"]
 scores = ["4", "4", "3*", "3", "8", "5", "6*", "7", "4*", "6", "9"]
 
 # Per-model notes, rendered (in file order) only when at least one of
-# `models` rendered. `models` entries are row `id`s. The source grid's one
-# combined GLM bullet is split per model here so the Flash guidance never
-# renders for a table that lacks the Flash row.
+# `models` rendered — or, with `all_of = true`, only when EVERY one did: a
+# note that compares models must never name a model the reader's grid lacks
+# (v0.2.103 final review L-3), so comparative prose lives in an `all_of`
+# note and the per-model note stays vendor-neutral. `models` entries are row
+# `id`s. The source grid's one combined GLM bullet is split per model here
+# so the Flash guidance never renders for a table that lacks the Flash row.
 [[note]]
 models = ["opus"]
-text = "**Opus 5.5** leads at medium on almost every axis and costs less per task than Fable 5.1 (≈$1.3 vs ≈$3.0); keep Fable for final reviews, plans and the hardest debugging."
+text = "**Opus 5.5** leads at medium on almost every axis and costs less per task than Fable 5.1 (≈$1.3 vs ≈$3.0); as a fix-round implementer it converges reliably, but its first-pass lanes still need an independent review. Keep Fable for final reviews, plans and the hardest debugging — a Fable delta review after each fix wave has kept finding issues that every per-lane review missed."
 
 [[note]]
 models = ["sonnet"]
-text = "**Sonnet 5.5** is the most effort-sensitive model: near Opus at max, but at medium it trails GLM-5.3 and DeepSeek V4.1 Flash on coding. Not a default choice."
+text = "**Sonnet 5.5** is the most effort-sensitive model: near Opus at max, but well behind it on coding at medium. Not a default choice."
+
+[[note]]
+models = ["sonnet", "glm-5.3", "deepseek-v4.1-flash"]
+all_of = true
+text = "At medium, **Sonnet 5.5** also trails GLM-5.3 and DeepSeek V4.1 Flash on coding."
 
 [[note]]
 models = ["haiku"]
-text = "**Haiku 5.5** — the fastest and cheapest Claude (≈165 tok/s, ≈$0.05 per task at medium) with a 1M window: good for bulk, classification, extraction and routing. Its headline vendor scores are at effort max; at medium it sits below the flash-tier vendor lanes on code, so keep coding, planning and review on larger models."
+text = "**Haiku 5.5** — the fastest and cheapest Claude (≈165 tok/s, ≈$0.05 per task at medium) with a 1M window: good for bulk, classification, extraction and routing. Its headline vendor scores are at effort max; at medium its code scores are low, so keep coding, planning and review on larger models."
+
+[[note]]
+models = ["haiku", "deepseek-v4.1-flash"]
+all_of = true
+text = "At medium, **Haiku 5.5** sits below the flash-tier vendor lanes on code."
 
 [[note]]
 models = ["deepseek-v4.1-flash"]
-text = "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s to first token) and cheapest per task: default for research, surveys, bulk and bounded implementation. Users report fragile tool calls / loops on long runs — keep tasks bounded."
+text = "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s to first token) and cheapest per task: default for research, surveys, bulk and bounded implementation. Users report fragile tool calls / loops on long runs — keep tasks bounded. Accurate as a read-only verifier of bounded fix deltas."
 
 [[note]]
 models = ["glm-5.3"]
@@ -181,11 +205,11 @@ text = "**GLM-5.3** — the non-Claude model users route review/audit to; text-o
 
 [[note]]
 models = ["glm-5.3"]
-text = "**GLM-5.3 as implementer** — strong on bounded lanes whose brief names the files and the acceptance criteria. Its recurring misses are \"every call-site\" coverage claims (check them with an independent grep), line-count / ASCII gates, and stray working-tree edits while proving a test red — name each in the brief."
+text = "**GLM-5.3 as implementer** — strong on bounded lanes whose brief names the files and the acceptance criteria. Its recurring misses are \"every call-site\" coverage claims (check them with an independent grep), line-count / ASCII gates, and stray working-tree edits while proving a test red — name each in the brief. Fixes to install-order or stateful code can pass their own tests and still fail in the real order: ask for a real-order check, and move a fix that two rounds closed only partly to another model family."
 
 [[note]]
 models = ["kimi-k3"]
-text = "**Kimi K3** — near-frontier code quality on real repos and strong long-context retrieval, but the slowest and most verbose lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about twice the median output tokens), so queue its work and review it later. Its measured subscription budget is ≈ one substantial lane per 5h window and ≈1–2% of the month per lane, so give it small, bounded lanes or audits. It always reasons; it can repeat the same tool call or stop on reasoning with no answer, and it guesses confidently when unsure (51% hallucination rate on uncertain questions), so demand quoted evidence in its reviews."
+text = "**Kimi K3** — near-frontier code quality on real repos and strong long-context retrieval, but the slowest and most verbose lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about twice the median output tokens), so queue its work and review it later. Give it small, bounded lanes or audits. It always reasons; it can repeat the same tool call or stop on reasoning with no answer, and it guesses confidently when unsure (51% hallucination rate on uncertain questions), so demand quoted evidence in its reviews."
 
 [[note]]
 models = ["glm-5.3-flash"]

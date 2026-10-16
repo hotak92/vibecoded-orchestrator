@@ -216,8 +216,18 @@ def test_source_never_auto_drops_offers_consented_rebuild() -> None:
     # v0.2.97: the printed remedy used to be `python -m vco_lib.project_init
     # drop-collection …`, a verb that has never existed (argparse exit 2). It
     # is now the real single-class drop, and the phantom verb must not return.
-    assert "/v1/schema/<Prefix>_CodeFunction" in src, (
-        "the operator remedy must name a command that drops ONE class"
+    # v0.2.103 (plan item 24): the curl lines are rendered per FAILING
+    # collection through vco_lib.codegraph_prune.format_prune_remedy_lines
+    # (real class name + real --project). The hard-coded
+    # `<Prefix>_CodeFunction` target named the WRONG collection in a real run
+    # whose failures were in <Prefix>_CodeInteraction — it must not return.
+    assert "_format_prune_remedy_lines(" in src, (
+        "the remedy must be rendered through the shared per-collection "
+        "formatter"
+    )
+    assert "/v1/schema/<Prefix>_CodeFunction" not in src, (
+        "the operator remedy must name the REAL failing class, not a "
+        "hard-coded one"
     )
     assert "project_init drop-collection" not in src, (
         "`project_init` has no `drop-collection` verb — a printed command "

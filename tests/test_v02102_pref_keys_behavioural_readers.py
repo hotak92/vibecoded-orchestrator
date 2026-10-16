@@ -113,7 +113,7 @@ def test_summary_openai_model_value_is_the_model(db):
 
 def test_summary_backend_override_value_is_the_pinned_tier(db):
     sb = _summary_backends()
-    for tier in ("cli", "ollama"):
+    for tier in ("cli", "zai", "qwen", "ollama"):
         set_app_state(db, "kg_summary_backend_override", tier)
         assert sb._forced_backend(("KG_SUMMARY_BACKEND",)) == tier
 

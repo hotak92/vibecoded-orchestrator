@@ -54,7 +54,7 @@
       </p>
     </div>
   {:else}
-    <ul class="grid">
+    <ul class="picker-grid">
       {#each pState.projects as p (p.id)}
         <li>
           <button class="card" onclick={() => pick(p.id)}>
@@ -103,7 +103,7 @@
   }
   .empty-title { font-size: 15px; font-weight: 700; color: var(--color-text); }
   .empty-text { font-size: 12px; color: var(--color-mid); margin-top: 6px; line-height: 1.5; }
-  .grid {
+  .picker-grid {
     list-style: none; padding: 0; margin: 0;
     display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: 12px;

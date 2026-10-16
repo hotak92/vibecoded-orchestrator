@@ -196,10 +196,13 @@ def _rebind_collection_names_to_on_disk_casing(
     extra_select_cols: tuple[str, ...] = (),
     do_rebind: Callable[..., None],
     resolve_conflict: Optional[Callable[..., None]] = None,
+    skip_row: Optional[Callable[[tuple], bool]] = None,
 ) -> list[tuple]:
     """Generic helper: rebind a SQLite table's ``collection_name`` column to
     the on-disk Weaviate casing when a case-different sibling exists in
-    ``existing_classes``.
+    ``existing_classes``. ``skip_row(row)`` True → the row is never rebound
+    (v0.2.103: the orchestrator root's rows — its name is never case-adopted,
+    owner ruling 2026-10-15).
 
     Algorithm (per row):
       1. ``SELECT project_id, collection_name, *extra_select_cols FROM <table>``.
@@ -246,6 +249,8 @@ def _rebind_collection_names_to_on_disk_casing(
         coll_name = row[1]
         if not coll_name:
             continue
+        if skip_row is not None and skip_row(row):
+            continue
         if coll_name in existing_classes:
             # Exact match — nothing to do.
             continue
@@ -282,12 +287,44 @@ def _rebind_collection_names_to_on_disk_casing(
     return rebinds
 
 
+def root_project_ids(cur) -> "set[str]":
+    """The orchestrator-root project id(s) (``projects.host``); empty when the
+    table cannot be read. v0.2.103: their binding rows are never adopted onto
+    another class by a heal pass — the root's name is
+    ``vco_lib.root_kg_identity``'s decision, and adopting an existing class is
+    an explicit consent step."""
+    try:
+        cur.execute("SELECT id FROM projects WHERE host = 'orchestrator_root'")
+        return {str(r[0]) for r in cur.fetchall() if r and r[0]}
+    except sqlite3.Error:
+        return set()
+
+
+def root_own_collection_names(cur, root_ids) -> "set[str]":
+    """The orchestrator root's OWN KG class names (lowercased), read from its
+    ``project_kg_bindings`` rows; empty when none / unreadable. v0.2.103
+    (R24 MEDIUM-1): the access-table heal skips a root row only when it names
+    one of these — the root's grants to OTHER projects' collections keep the
+    legacy case-heal."""
+    ids = [i for i in root_ids if i]
+    if not ids:
+        return set()
+    try:
+        cur.execute(
+            "SELECT collection_name FROM project_kg_bindings WHERE project_id IN (%s)"
+            % ",".join("?" * len(ids)), tuple(ids))
+        return {str(r[0]).lower() for r in cur.fetchall() if r and r[0]}
+    except sqlite3.Error:
+        return set()
+
+
 def _prefix_adopt_kg_bindings_pass(
     cur,
     *,
     existing_classes: set[str],
     existing_by_lower: dict[str, str],
     weaviate_url: str,
+    skip_project_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> dict[str, list]:
     """Second-pass cross-prefix adoption for ``project_kg_bindings``.
 
@@ -361,7 +398,7 @@ def _prefix_adopt_kg_bindings_pass(
 
     for row in rows:
         proj_id, role, coll_name, config_json = row
-        if not coll_name:
+        if not coll_name or proj_id in skip_project_ids:
             continue
         # Pass-1 already aligned exact-match and case-sibling rows.
         if coll_name in existing_classes:
@@ -1258,7 +1295,7 @@ _APP_STATE_LAST_SHARED_KG = "last_installed_shared_kg_collection"
 #:   * `launcher/src-tauri/src/commands/project_env_settings.rs::
 #:     APP_STATE_KEY_SHARED_KG_NAME`
 #:   * `launcher/src-tauri/vct-hub/src/config_api.rs` (app_state_get call)
-_APP_STATE_PICKER_SHARED_KG = "shared_kg.collection_name"
+from vco_lib.root_kg_identity import PICKER_KEY as _APP_STATE_PICKER_SHARED_KG  # noqa: E402 — the one home
 
 
 def _read_app_state(cur, key: str) -> str:
@@ -1702,6 +1739,17 @@ def _converge_on_explicit_pick(
     return changed
 
 
+def _refuse_unverified_pick(_name: str) -> bool:
+    """The DEFAULT ``pick_ok`` for :func:`heal_shared_kg_pointer_drift`:
+    refuse. This module holds no embedding-profile facts of its own
+    (launcher.db-metadata-only contract), and converging the machine's
+    shared-KG pointers onto a pick whose vectors it cannot prove are
+    searchable with the current profile is the exact decide/heal divergence
+    of review V02103-R29 N-8b — doing nothing and deferring is the
+    conservative, recoverable arm."""
+    return False
+
+
 def heal_shared_kg_pointer_drift(
     cur,
     *,
@@ -1710,6 +1758,7 @@ def heal_shared_kg_pointer_drift(
     deferral_report,
     deferral_entry_cls,
     now_ms: Optional[int] = None,
+    pick_ok: Optional[Callable[[str], bool]] = None,
 ) -> int:
     """R8 (v0.2.76): converge ``orchestrator_root_kg_collection`` to the real
     canonical shared collection when it has drifted, and rewrite the stale
@@ -1719,7 +1768,22 @@ def heal_shared_kg_pointer_drift(
     ``embed_revision`` changes. ``existing_classes`` is a read-only snapshot of
     the Weaviate schema (already fetched by the caller); the only Weaviate
     interaction anywhere in this heal is schema-existence membership, done by
-    the caller.
+    the caller. The caller-supplied ``pick_ok`` predicate may read Weaviate on
+    the CALLER's side (rows/model of the picked class — see
+    ``root_kg_identity.live_pick_ok``); the heal itself still issues none.
+
+    ``pick_ok(name)`` decides whether a LIVE Identity-tab pick may be
+    converged onto. v0.2.103 (review V02103-R29 N-8b): ``root_kg_identity.
+    decide`` refuses a populated pick written with another embedding model,
+    so the heal must apply the SAME rule or the two surfaces flip the
+    pointers back and forth across runs. Both real callers pass
+    ``root_kg_identity.live_pick_ok(weaviate_url)`` (the same gathers the
+    decide path uses). The DEFAULT refuses every pick: this module holds no
+    embedding-profile facts of its own and cannot PROVE a pick is
+    searchable with the current profile — converging the machine's shared
+    pointers onto an unverified pick is exactly the N-8b divergence, while
+    refusing merely leaves the drift to the triple-agreement legs or the
+    deferral (recoverable, honest). Unknown never guesses.
 
     Convergence is DIVERGENCE-based with TRIPLE agreement (conservative):
 
@@ -1727,13 +1791,16 @@ def heal_shared_kg_pointer_drift(
         path: both hold the machine default → nothing to do (leave-alone).
       * ``ptr != last`` AND the Identity-tab pick
         (``app_state['shared_kg.collection_name']``) names a LIVE Weaviate
-        class → converge onto the pick (v0.2.92 remedy fix). The pick is the
-        user's EXPLICIT canonical choice — it preempts the triple-agreement
-        heuristic, which exists only to guess in the pick's absence. See
+        class AND ``pick_ok(pick)`` accepts it → converge onto the pick
+        (v0.2.92 remedy fix). The pick is the user's EXPLICIT canonical
+        choice — it preempts the triple-agreement heuristic, which exists
+        only to guess in the pick's absence. See
         :func:`_converge_on_explicit_pick`. (Before this leg, the deferral's
         printed remedy named the picker although no code in the convergence
         path read the picker's key — a remedy that could be followed and
-        leave the entry standing.)
+        leave the entry standing.) A LIVE pick the predicate REFUSES is left
+        alone: nothing converges, the reasons below name it, and the drift
+        defers — never a convergence ``decide`` would refuse.
       * ``ptr != last`` AND all three agree:
           (1) ``last`` is non-empty AND RECORDED (v0.2.92 m-R6-4: an absent
               ``last`` returns early below — see the absence rule),
@@ -1829,17 +1896,24 @@ def heal_shared_kg_pointer_drift(
     # not touch the two keys compared here — so before this leg existed,
     # the deferral's printed remedy ("pick in the Identity tab") could be
     # followed to the letter and leave the entry standing: no code in the
-    # convergence path read the pick. When the pick names a LIVE class it
-    # IS the resolution: converge the pointer, the seed snapshot and the
-    # root's shared binding onto it (see _converge_on_explicit_pick for
-    # why all three are required for the convergence to survive the next
-    # install run).
+    # convergence path read the pick. When the pick names a LIVE class the
+    # pick_ok predicate accepts, it IS the resolution: converge the pointer,
+    # the seed snapshot and the root's shared binding onto it (see
+    # _converge_on_explicit_pick for why all three are required for the
+    # convergence to survive the next install run).
+    # v0.2.103 (review V02103-R29 N-8b): a LIVE pick the predicate REFUSES
+    # (wrong embedding model / unknown facts) is not converged onto —
+    # root_kg_identity.decide refuses the same pick, so converging here
+    # would flip the pointers back on the next install run. Fall through to
+    # the triple-agreement legs; the reasons name the refused pick.
     try:
         picker = _read_app_state(cur, _APP_STATE_PICKER_SHARED_KG)
     except sqlite3.OperationalError:
         # app_state unreadable for this key — treat as "no pick recorded".
         picker = ""
-    if picker and picker in existing_classes:
+    pick_accepted = bool(picker) and picker in existing_classes and \
+        (pick_ok or _refuse_unverified_pick)(picker)
+    if picker and picker in existing_classes and pick_accepted:
         return _converge_on_explicit_pick(
             cur,
             picker=picker,
@@ -1850,6 +1924,16 @@ def heal_shared_kg_pointer_drift(
         )
 
     reasons: list[str] = []
+    if picker and picker in existing_classes and not pick_accepted:
+        # N-8b: the pick is live but its profile was refused — the decision
+        # refuses it too. Name it so the deferral tells the user why
+        # following the remedy did not clear the entry THIS time.
+        reasons.append(
+            f"the Identity-tab pick {picker!r} was not converged onto — its "
+            "embedding profile does not match the current one (or its facts "
+            "could not be verified), so following it would point every "
+            "project's shared KG at the wrong vectors"
+        )
     if picker and picker not in existing_classes:
         # A recorded pick that names a class that is not live cannot be
         # converged onto (the access seeder would seed rows for a
@@ -1926,12 +2010,21 @@ def heal_shared_kg_pointer_drift(
                 command_to_apply=(
                     "Pick the canonical shared collection in the launcher's "
                     "Identity tab -> 'Manage shared KG collection' (a class "
-                    "that already exists in Weaviate), then re-run "
+                    "that already exists in Weaviate and was written with "
+                    "the current embedding profile), then re-run "
                     "`python install.py --update`. The self-heal reads that "
-                    "pick (app_state['shared_kg.collection_name']) and "
-                    "converges `orchestrator_root_kg_collection`, "
+                    "pick (app_state['shared_kg.collection_name']) and, when "
+                    "its vectors match the current profile, converges "
+                    "`orchestrator_root_kg_collection`, "
                     "`last_installed_shared_kg_collection` and the root's "
                     "shared binding onto it, which clears this entry. "
+                    "If the entry still stands after that, the pick was not "
+                    "followed: its embedding model could not be verified "
+                    "(unknown on either side) or differs — then a separate "
+                    "`root_kg_pick_wrong_embedding` entry, if present, names "
+                    "which and carries its own remedy — or its rows could "
+                    "not be counted (Weaviate busy; re-run the update), or "
+                    "VCT_ORCHESTRATOR_ROOT_KG_COLLECTION overrides it. "
                     "(VCT_ORCHESTRATOR_ROOT_KG_COLLECTION re-points the "
                     "pointer for white-label installs but does not converge "
                     "the other keys; the Identity pick is the remedy this "
@@ -2072,6 +2165,11 @@ def self_heal_kg_bindings(
                 )
                 rebinds.append((project_id, role, old_name, new_name))
 
+            # v0.2.103 (owner ruling 2026-10-15): never adopt another class
+            # onto the orchestrator root's rows (its name is root_kg_identity's
+            # decision; adoption is the explicit consent CLI).
+            _root_ids = root_project_ids(cur)
+            _root_own_lower = root_own_collection_names(cur, _root_ids)
             try:
                 binding_rebinds = _rebind_collection_names_to_on_disk_casing(
                     cur,
@@ -2082,6 +2180,7 @@ def self_heal_kg_bindings(
                     existing_by_lower=existing_by_lower,
                     extra_select_cols=("role",),
                     do_rebind=_bind_rebind,
+                    skip_row=lambda row: row[0] in _root_ids,
                 )
             except sqlite3.OperationalError as oe:
                 if "no such table" in str(oe).lower():
@@ -2169,6 +2268,11 @@ def self_heal_kg_bindings(
                     extra_select_cols=("access_level",),
                     do_rebind=_access_rebind,
                     resolve_conflict=_access_resolve_conflict,
+                    # R24 MEDIUM-1: only the root's grant on one of its OWN
+                    # classes is its identity; its grants to other projects'
+                    # collections are case-healed like everyone else's.
+                    skip_row=lambda row: (row[0] in _root_ids
+                                          and str(row[1]).lower() in _root_own_lower),
                 )
                 access_rebinds.extend(acc_rebinds)
             except sqlite3.OperationalError as oe:
@@ -2197,6 +2301,7 @@ def self_heal_kg_bindings(
                     existing_classes=existing_classes,
                     existing_by_lower=existing_by_lower,
                     weaviate_url=weaviate_url,
+                    skip_project_ids=_root_ids,  # v0.2.103: the root adopts only with consent
                 )
                 prefix_adopts.extend(prefix_outcomes["adopts"])
                 prefix_multi_candidates.extend(
@@ -2333,12 +2438,17 @@ def self_heal_kg_bindings(
             # triple agreement defers instead of guessing.
             _pointer_changed = 0
             try:
+                from vco_lib.root_kg_identity import live_pick_ok
+
                 _pointer_changed = heal_shared_kg_pointer_drift(
                     cur,
                     existing_classes=existing_classes,
                     log_event=log_event,
                     deferral_report=deferral_report,
                     deferral_entry_cls=deferral_entry_cls,
+                    # N-8b: the SAME pick-profile rule root_kg_identity.decide
+                    # applies, built from the same live facts it gathers.
+                    pick_ok=live_pick_ok(weaviate_url),
                 )
             except sqlite3.OperationalError as oe:
                 if "no such table" not in str(oe).lower():

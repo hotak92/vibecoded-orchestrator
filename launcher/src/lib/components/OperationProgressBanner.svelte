@@ -85,7 +85,7 @@
       {#if (vm?.warnings?.length ?? 0) > 0}
         <button
           type="button"
-          class="bg-btn-secondary"
+          class="sb-btn-secondary"
           onclick={() => (expanded = !expanded)}
           aria-expanded={expanded}
         >{expanded ? 'Hide details' : 'Show details'}</button>
@@ -93,7 +93,7 @@
       {#if vm?.status === 'failed' && vm.onRetry}
         <button
           type="button"
-          class="bg-btn-primary"
+          class="sb-btn-primary"
           onclick={handleRetry}
           disabled={retrying}
         >{retrying ? 'Retrying…' : 'Retry'}</button>
@@ -101,7 +101,7 @@
       {#if (vm?.status === 'done' || vm?.status === 'deferred') && vm.onDismiss}
         <button
           type="button"
-          class="bg-btn-x"
+          class="sb-btn-x"
           aria-label="Dismiss banner"
           onclick={vm.onDismiss}
         >×</button>
@@ -110,9 +110,9 @@
 
     {#snippet expandedContent()}
       {#if vm?.error}
-        <div class="bg-expand-row">
+        <div class="sb-expand-row">
           <strong>Error</strong>
-          <pre class="bg-pre">{vm.error}</pre>
+          <pre class="sb-pre">{vm.error}</pre>
         </div>
       {/if}
       <ul class="op-warn-list">

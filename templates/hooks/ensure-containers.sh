@@ -196,6 +196,53 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
         "$RUN_PY" -m vco_lib.runtime_reconcile record-boot-refusal --source session \
             --reason "$VCO_RUNTIME_REASON" >/dev/null 2>&1 || true
     fi
+    # v0.2.103 (owner 2026-10-15): the engine itself may just be DOWN — the
+    # resolver's "absent" is often "installed but not running" (Docker
+    # Desktop not launched after a reboot, podman machine stopped, socket
+    # down). Start it in the background through the ONE home,
+    # `python -m vco_lib.container_engine_start ensure`: idempotent (an
+    # engine that answers is a no-op), starts ONLY the runtime this install
+    # uses (a refused pin is started, never swapped), soft-fail, honours
+    # VCT_CONTAINER_ENGINE_AUTOSTART=0. Detached double-fork `( & )` so a
+    # kill aimed at this hook (its timeout, the lock relay) cannot reach the
+    # starter; only when a runtime binary exists ($VCO_RUNTIME_INSTALLED) —
+    # with nothing installed there is nothing to start.
+    if [ -n "${VCO_RUNTIME_INSTALLED:-}" ]; then
+        # V02103-VERIFY-R31 M-1: the CLI records its own outcome in
+        # <vct_root>/logs/engine-start.log (it rotates that file itself —
+        # sole ownership), but a child that dies before it can write
+        # anything leaves its stderr nowhere: it used to die in the
+        # >/dev/null 2>&1 below. The spawner therefore gives the child's
+        # stderr its OWN file, <vct_root>/logs/engine-start.stderr.log —
+        # MUST MATCH vco_lib.container_engine_start
+        # .ENGINE_START_STDERR_LOG, the .ps1 sibling and the Rust spawner —
+        # TRUNCATED on every spawn (2>), so it is bounded by construction
+        # (the latest spawn's stderr) and never shares a handle with the CLI's
+        # rotating engine-start.log (no rotation race, no writes to an
+        # unlinked post-rotation inode). What this capture sees on the HOOK
+        # path: the spawn is reached only after vco_lib.service_lifecycle
+        # and vco_lib.containers have both run, so a venv too broken to
+        # import vco_lib at all exits the hook earlier with its own stdout
+        # line — this file captures failures specific to
+        # container_engine_start (a broken import of THIS module, an
+        # unhandled exception); the Rust spawner is the one that sees a
+        # fully-broken venv. The state dir is resolved exactly like the
+        # Python home (vco_lib.paths.vct_root_dir): $VCT_STATE_DIR
+        # whitespace-stripped like Python's .strip(), or ~/.vct. If the
+        # file cannot be opened, spawn exactly as before (discard) — a log
+        # problem must never stop an engine start or fail the hook.
+        __vct_sd="${VCT_STATE_DIR:-$HOME/.vct}"
+        __vct_sd="${__vct_sd#"${__vct_sd%%[![:space:]]*}"}"
+        __vct_sd="${__vct_sd%"${__vct_sd##*[![:space:]]}"}"
+        __vct_engine_err_dir="${__vct_sd:-$HOME/.vct}/logs"
+        __vct_engine_err="$__vct_engine_err_dir/engine-start.stderr.log"
+        if mkdir -p "$__vct_engine_err_dir" 2>/dev/null && : >>"$__vct_engine_err" 2>/dev/null; then
+            ( "$RUN_PY" -m vco_lib.container_engine_start ensure </dev/null >/dev/null 2>"$__vct_engine_err" & )
+        else
+            ( "$RUN_PY" -m vco_lib.container_engine_start ensure </dev/null >/dev/null 2>&1 & )
+        fi
+        unset __vct_sd __vct_engine_err_dir __vct_engine_err
+    fi
     exit 0
 fi
 RUNTIME="$VCO_RUNTIME"

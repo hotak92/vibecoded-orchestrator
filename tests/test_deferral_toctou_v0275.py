@@ -338,8 +338,11 @@ class TestInstallPreWriteMergeStructure(unittest.TestCase):
         """A-2 seed + P1 pre-write re-merge: install.py holds exactly ONE
         flow.seed( and ONE flow.finalize( call site; both flow methods
         route through the single exclusion-scoped disk merge."""
+        # v0.2.103: the seed call lives in `_seed_run_report(flow)`, which
+        # main() calls exactly once.
+        self.assertEqual(len(self._code_lines(self.source, "flow.seed(")), 1)
         self.assertEqual(
-            len(self._code_lines(self.source, "_deferral_flow.seed(")), 1
+            len(self._code_lines(self.source, "_seed_run_report(_deferral_flow)")), 1
         )
         self.assertEqual(
             len(self._code_lines(self.source, "_deferral_flow.finalize(")), 1

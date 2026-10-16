@@ -85,6 +85,7 @@ import contextlib
 import errno
 import json
 import os
+import sys
 import shutil
 import stat
 import tempfile
@@ -141,6 +142,22 @@ def atomic_rewrite_text(path: Path, body: str, *, encoding: str = "utf-8") -> No
     except OSError:
         mode = None
     atomic_write_text(path, body, encoding=encoding, mode=mode)
+
+
+def warn_symlink_redirect(target, redirect) -> None:
+    """Tell the install log that a symlink-safe write was redirected (NEW-8).
+
+    The ONE wording of the notice every symlink-safe writer prints when
+    :func:`atomic_write_bytes` (``symlink_safe=True``) refused to write
+    through a symlink and wrote the ``.vco-new`` sibling instead.
+    """
+    sys.stderr.write(
+        f"[vct] NEW-8 symlink-blocking: refusing to write through symlink "
+        f"at {target}; redirecting to {redirect}. "
+        f"The .vco-new sibling holds the orchestrator's intended content; "
+        f"the symlink and its destination are untouched. Merge manually "
+        f"when ready.\n"
+    )
 
 
 def atomic_write_bytes(
@@ -632,40 +649,81 @@ class LockTimeout(TimeoutError):
 _LOCK_RETRY_INTERVAL_S = 0.1
 
 
-def _take_flock(fh: Any, timeout_s: Optional[float], lock_path: Path) -> bool:
-    """Take ``LOCK_EX`` on ``fh`` (bounded by ``timeout_s`` when given). ``True``
-    when held; ``False`` where flock does not exist (Windows / a filesystem
-    without it — the block runs without mutual exclusion, as before). Raises
-    :class:`LockTimeout` when the bound expires."""
+def _take_flock(fh: Any, timeout_s: Optional[float], lock_path: Path) -> str:
+    """Take an exclusive lock on ``fh`` (bounded by ``timeout_s`` when given).
+
+    Returns the mechanism that is holding the lock — ``"fcntl"`` (POSIX) or
+    ``"msvcrt"`` (Windows byte-region lock) — so the release path unlocks the
+    same way; ``""`` where NEITHER exists (an exotically stripped-down
+    platform — the block runs without mutual exclusion, the historical
+    best-effort degrade). Raises :class:`LockTimeout` when the bound expires.
+
+    v0.2.103: the Windows branch is new. Pre-v0.2.103 a platform without
+    ``fcntl`` degraded to NO locking; the per-project code-graph walk claim
+    (``vco_lib.codegraph_walk``) must exclude on Windows too, so the helper
+    now locks there via ``msvcrt.locking`` (LockFile under the hood — a real
+    cross-process exclusion, released on handle close / process death, i.e.
+    flock semantics). ``msvcrt.locking`` has no truly-blocking mode
+    (``LK_LOCK`` gives up after ~10 s), so both the bounded and the unbounded
+    case share the 0.1 s retry loop; ``timeout_s=None`` retries as long as
+    the holder keeps the lock, matching blocking ``LOCK_EX``.
+    """
     try:
         import fcntl  # noqa: PLC0415 — POSIX-only, deferred import
     except ImportError:
-        return False
-    if timeout_s is None:
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            return True
-        except (AttributeError, OSError):
-            return False
+        fcntl = None  # type: ignore[assignment]
+    if fcntl is not None:
+        if timeout_s is None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                return "fcntl"
+            except (AttributeError, OSError):
+                return ""
+        import time  # noqa: PLC0415
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return "fcntl"
+            except AttributeError:
+                return ""
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    return ""  # no flock on this filesystem — best effort, as before
+            if time.monotonic() >= deadline:
+                raise LockTimeout(f"{lock_path} is held by another process (waited {timeout_s:g}s)")
+            time.sleep(_LOCK_RETRY_INTERVAL_S)
+    try:
+        import msvcrt  # noqa: PLC0415 — Windows-only, deferred import
+    except ImportError:
+        return ""
     import time  # noqa: PLC0415
 
-    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    deadline = None if timeout_s is None else time.monotonic() + max(0.0, float(timeout_s))
     while True:
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except AttributeError:
-            return False
+            # The byte region starts at the CURRENT file position — pin it
+            # so the unlock below addresses the same byte (LK_UNLCK requires
+            # an identical range). The per-line ignores: pyright runs on
+            # Linux where the typeshed msvcrt stub is attribute-less (the
+            # try/except feature detection is deliberate — a sys.platform
+            # check would miss non-Windows fcntl platforms like cygwin).
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+            return "msvcrt"
         except OSError as exc:
-            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
-                return False  # no flock on this filesystem — best effort, as before
-        if time.monotonic() >= deadline:
+            if exc.errno not in (errno.EACCES, errno.EDEADLK, errno.EAGAIN):
+                return ""  # not a contention answer — degrade, never wedge the caller
+        if deadline is not None and time.monotonic() >= deadline:
             raise LockTimeout(f"{lock_path} is held by another process (waited {timeout_s:g}s)")
         time.sleep(_LOCK_RETRY_INTERVAL_S)
 
 
 @contextlib.contextmanager
-def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -> Iterator[None]:
+def exclusive_file_lock(
+    lock_path: Path, *, timeout_s: Optional[float] = None,
+) -> Iterator[Optional[int]]:
     """Hold an exclusive advisory lock on ``lock_path`` for the block.
 
     ``timeout_s`` (v0.2.97 R9 H7): ``None`` (the default) waits as long as the
@@ -676,16 +734,15 @@ def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -
     never stall — the boot wrapper's ledger write while an update holds the
     lock — passes one.
 
-    Cross-platform, best-effort: on POSIX the lock is a real
-    ``fcntl.flock(LOCK_EX)`` on a sidecar lockfile, so concurrent
-    processes serialize (the second blocks until the first exits the
-    ``with`` block). On Windows — or any platform / filesystem where
-    ``fcntl`` is unavailable — the lockfile is still opened but locking
-    is skipped (``ImportError`` / ``AttributeError`` / ``OSError``
-    fall-through); the block still runs, degrading to no mutual
-    exclusion. This mirrors the historical
-    ``resolver_warn._acquire_lock`` / ``_release_lock`` posture (v0.2.83
-    WP-B1 moved that idiom here so it lives once).
+    Cross-platform: on POSIX the lock is a real ``fcntl.flock(LOCK_EX)`` on a
+    sidecar lockfile, so concurrent processes serialize (the second blocks
+    until the first exits the ``with`` block). On Windows it is a real
+    ``msvcrt.locking`` byte-region lock (v0.2.103) — same cross-process
+    exclusion, same release-on-close/death semantics. Only a platform with
+    NEITHER degrades to no mutual exclusion (the block still runs). The
+    pre-v0.2.103 posture (no locking at all on Windows) mirrored the
+    historical ``resolver_warn._acquire_lock`` / ``_release_lock`` idiom
+    (v0.2.83 WP-B1 moved that idiom here so it lives once).
 
     The lockfile's parent directory is created if missing. The lockfile
     is opened in ``"a+"`` mode (created on first use, never truncated).
@@ -699,21 +756,36 @@ def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -
             disk between runs (typically under a git-ignored directory).
 
     Yields:
-        ``None`` — the caller does the locked work inside the ``with``.
+        The lockfile's descriptor when the lock is a POSIX ``flock`` — the
+        one mechanism whose ownership a child process SHARES when it
+        inherits that descriptor (``subprocess.Popen(pass_fds=...)``: the
+        lock then lives until the last holder of the open file description
+        exits; ``vco_lib.codegraph_walk`` relies on it, v0.2.103 final
+        review L-5) — else ``None`` (a Windows byte-range lock belongs to
+        this process alone). Most callers ignore it and just do the locked
+        work inside the ``with``.
     """
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+")  # noqa: SIM115 — handle closed in finally
-    locked = False
+    mechanism = ""
     try:
-        locked = _take_flock(fh, timeout_s, lock_path)
-        yield
+        mechanism = _take_flock(fh, timeout_s, lock_path)
+        yield fh.fileno() if mechanism == "fcntl" else None
     finally:
-        if locked:
+        if mechanism == "fcntl":
             try:
                 import fcntl  # noqa: PLC0415
 
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except (ImportError, AttributeError, OSError, ValueError):
+                pass
+        elif mechanism == "msvcrt":
+            try:
+                import msvcrt  # noqa: PLC0415
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined] — see _take_flock
             except (ImportError, AttributeError, OSError, ValueError):
                 pass
         try:

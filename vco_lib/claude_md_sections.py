@@ -40,6 +40,17 @@ UUID, so explicit rows never reached the render).
     search_pipeline.py``), so the section and the behaviour it describes can
     not drift apart.
 
+``provider_zai`` / ``provider_qwen`` / ``provider_kimi`` / ``provider_glm``
+    (v0.2.103, plan item 12) the provider-conditional prose of the project
+    template's Model-routing section (one vendor's lane description, the GLM
+    routing rule). Renders iff the ``model_gateway`` section itself renders
+    for the folder AND the vendor's key resolves through the ONE reachability
+    answer (``vco_lib.model_selection.reachable_providers`` — tri-state, with
+    the last-known-record fallback, so a transient store outage hides
+    nothing). ``provider_glm`` is the GLM routing rule: reachable when EITHER
+    GLM-serving vendor (zai, qwen) resolves. Owner ruling 2026-10-14: routing
+    guidance names only the models the user can actually call.
+
 Conservative failure contract (owner rule; plan D2 + risk 2): every probe
 that CANNOT answer renders its section. A detection failure must never make
 guidance for a feature that IS installed disappear; the render never crashes
@@ -71,6 +82,7 @@ __all__ = [
     "ALL_FEATURES",
     "LEAN_CTX",
     "MODEL_GATEWAY",
+    "PROVIDER_FEATURES",
     "RL_RETRIEVAL",
     "active_sections",
     "gateway_section_renders",
@@ -87,16 +99,28 @@ LEAN_CTX = "lean_ctx"
 #: The RL-reranking feature id (tag name in the root template).
 RL_RETRIEVAL = "rl_retrieval"
 
+#: The provider-conditional feature ids (tag names in the project template),
+#: mapped to the grid vendor ids whose reachability lights them
+#: (``provider_glm`` = the GLM routing rule, served by either GLM vendor).
+PROVIDER_FEATURES: dict[str, tuple[str, ...]] = {
+    "provider_zai": ("zai",),
+    "provider_qwen": ("qwen",),
+    "provider_kimi": ("kimi",),
+    "provider_glm": ("zai", "qwen"),
+}
+
 #: Every feature id this resolver knows. The completeness gate
 #: (``tests/test_template_materialization_complete.py``) renders every
 #: shipped template under this full set AND under the empty set.
 ALL_FEATURES: frozenset[str] = frozenset(
-    {MODEL_GATEWAY, LEAN_CTX, RL_RETRIEVAL}
+    {MODEL_GATEWAY, LEAN_CTX, RL_RETRIEVAL} | PROVIDER_FEATURES.keys()
 )
 
 #: Features with a dedicated probe below (everything else — any
 #: ``project_modules`` name — is answered by the modules verdict).
-_DEDICATED = frozenset({MODEL_GATEWAY, LEAN_CTX, RL_RETRIEVAL})
+_DEDICATED = frozenset(
+    {MODEL_GATEWAY, LEAN_CTX, RL_RETRIEVAL} | PROVIDER_FEATURES.keys()
+)
 
 #: The per-project settings file the lean-ctx probe reads.
 _SETTINGS_REL = Path(".claude") / "settings.json"
@@ -248,6 +272,32 @@ def _lean_ctx_renders(folder: Path) -> bool:
     return _mentions(hooks, _LEAN_CTX_HOOK_MARKER)
 
 
+def _provider_renders(folder: Path, vendors: tuple[str, ...], *,
+                      db_path: Optional[Path]) -> bool:
+    """Does a provider-conditional section render for ``folder``?
+
+    Two conditions, both through their ONE home: the ``model_gateway``
+    section itself renders for the folder (the delivery gate's verdict — a
+    project switched off gets no lane prose floating outside the section),
+    AND at least one of ``vendors`` is reachable per
+    ``vco_lib.model_selection.reachable_providers`` (the tri-state probe with
+    the last-known-record fallback — a transient store outage keeps the
+    section, never hides it). A probe that raises renders the section
+    (conservative direction, one stderr line).
+    """
+    if not _gateway_renders(folder, db_path=db_path):
+        return False
+    try:
+        from vco_lib import model_selection
+
+        reachable = model_selection.reachable_providers()
+    except Exception as exc:  # noqa: BLE001 — a probe answers, it never raises
+        _warn(f"provider probe failed for {folder}: {exc} — "
+              "rendering the provider section")
+        return True
+    return any(v in reachable for v in vendors)
+
+
 def _rl_renders() -> bool:
     """Is the paid RL reranking module enabled on this machine's license?
 
@@ -315,5 +365,10 @@ def active_sections(
 
     if RL_RETRIEVAL in probe and _rl_renders():
         sections.add(RL_RETRIEVAL)
+
+    for feature_id, vendors in PROVIDER_FEATURES.items():
+        if feature_id in probe and _provider_renders(
+                folder, vendors, db_path=db_path):
+            sections.add(feature_id)
 
     return frozenset(sections)

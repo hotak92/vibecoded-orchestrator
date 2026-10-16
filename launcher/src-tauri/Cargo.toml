@@ -18,7 +18,7 @@ members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 # propagated from this same logical version by `scripts/bump-version.sh`
 # and verified by `scripts/pre-ship-check.sh`.
 [workspace.package]
-version = "0.2.102"
+version = "0.2.103"
 
 # v0.2.92 (WP-19): SINGLE source of truth for the `serde_json` feature set.
 #
@@ -245,6 +245,12 @@ dunce = "1"
 # the parallel test pool. Same crate version vct-hub + vct-launcher-core use.
 [dev-dependencies]
 serial_test = "3"
+# v0.2.103: `test-util` enables `#[tokio::test(start_paused = true)]` +
+# `tokio::time::advance` for the behavioural no-wall-clock-kill test in
+# project_codegraph_extras.rs and codegraph_reanalyze.rs (owner rule: no timeout may cut
+# valid long work; review MEDIUM-1). Features are additive with the `full` set on the main
+# dependency — test-only, never shipped.
+tokio = { version = "1", features = ["test-util"] }
 
 # Bug 31: libc statvfs for free-space probe (Unix only — Windows path
 # returns None, see free_bytes_at in commands/storage_ux.rs).

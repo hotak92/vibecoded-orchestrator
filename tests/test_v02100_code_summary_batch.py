@@ -273,7 +273,13 @@ def test_every_summary_spawn_starts_without_mcp_servers_or_hooks(gen, monkeypatc
         settings = Path(argv[argv.index("--settings") + 1])
         assert json.loads(settings.read_text(encoding="utf-8")) == {"disableAllHooks": True}
     helps = [a for a in _calls(log) if a == ["--help"]]
-    assert len(helps) == 1, "the flag probe runs once per process, not per spawn"
+    # v0.2.103 8g: the probe RETRIES --help (the CLI's own writer
+    # intermittently truncates at an ~8 KiB pipe boundary; two identical
+    # consecutive reads certify completeness), so 1..CLI_HELP_ATTEMPTS reads
+    # per process is correct — a stable help text costs exactly two. The
+    # result stays cached per process: never one probe per spawn.
+    assert 1 <= len(helps) <= gen._sb.CLI_HELP_ATTEMPTS
+    assert len(helps) <= 2, helps
 
 
 def test_a_cli_without_the_flags_is_still_used_without_them(gen, monkeypatch, tmp_path):

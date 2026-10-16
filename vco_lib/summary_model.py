@@ -10,9 +10,9 @@ tier asked for a model that was never pulled and was skipped. Now ONE
 resolver answers, from ONE tier table
 (:func:`vco_lib.embedding_selection.summary_model_for_hardware`, the same
 function install's pull list is derived from), and every generate caller —
-``summary_backends`` (KG summaries), ``generate_node_formats`` and
-``process_documents`` — reads its answer through
-``summary_backends.OLLAMA_DEFAULT_MODEL``, so one machine keeps ONE
+``summary_backends`` (KG summaries, incl. ``generate-kg-summary``'s per-node
+and bulk modes through it) and ``process_documents`` — reads its answer
+through ``summary_backends.OLLAMA_DEFAULT_MODEL``, so one machine keeps ONE
 generation model resident.
 
 Precedence (first hit wins; :func:`resolve` returns the model AND which

@@ -162,7 +162,7 @@ KG nodes have structured metadata stored in `knowledge/.node_formats.json`:
 }
 ```
 
-Generation: the `kg-summary-generator.sh` PostToolUse hook spawns a background job that generates description + summary on each KG file edit (debounced 60s; skips regeneration if content hash unchanged). See [[KG-Summary Three-Tier Generation Pipeline]] for backend selection.
+Generation: the `kg-summary-generator.sh` PostToolUse hook spawns a background job that generates description + summary on each KG file edit (debounced 60s; skips regeneration if content hash unchanged). See [[KG-Summary Generation Pipeline — Backend Ladder]] for backend selection.
 
 Consumption:
 

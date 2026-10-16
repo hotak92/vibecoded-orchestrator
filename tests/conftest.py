@@ -387,6 +387,79 @@ if not _ALLOW_REAL_STATE:
         os.environ[_key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
 
 
+# ─── W-CODE-LADDER (v0.2.103 F1, pinned tighter by R41 M3/L1): the ───────────
+# resolver's hardware tail and install-record rung are FIXED, at the
+# resolver's OWN seams — never at vco_lib.host_probe's public probes.
+#
+# `vco_lib.code_embed_model.resolve_code_model_pick`'s last rung is no longer
+# a constant: since v0.2.103 it is the hardware ladder over the live probes
+# (`vco_lib.host_probe`), i.e. the SAME selector install uses. That is the
+# fix — the old builtin answered `codesage-large-v2` on every host — but it
+# means an unpinned test would branch on the machine the suite happens to
+# run on (an 8 GB laptop answers qwen3, a CI container jina, this dev box
+# codesage), and would SPAWN the GPU probe subprocesses (nvidia-smi /
+# rocm-smi / lspci) on every resolution.
+#
+# R41 M3: the v0.2.103 pin replaced `host_probe.probe_*` THEMSELVES at
+# conftest import — but `install.py` binds `probe_cpu_cores` /
+# `probe_system_ram_gb` BY NAME at import (install.py:262-263), so the stubs
+# leaked into every install-path test and the real probes were never
+# exercised anywhere. The pin now targets the resolver's own entry points
+# only: the ONE selected-card helper the resolver's hardware leg reads
+# (`host_probe.selected_gpu_specs`, fixed at a 16 GB NVIDIA card, whose
+# ladder answer is CodeSage — exactly what the pre-v0.2.103 builtin said, so
+# the resync / spawn tests that stub the container-health leg keep their
+# meaning) and the install-record rung (R41 L1: `recorded_code_model` →
+# None, so the suite never answers from the MACHINE's
+# `ollama_pull_profile.json`; record-rung tests pass `roots` / the
+# `install_record` seam explicitly, and `test_hardware_auto_selection.py`
+# still drives the REAL cpu/ram probes).
+# A test that needs another host stubs the seam itself
+# (`monkeypatch.setattr` runs later and wins, and restores the pin).
+# Re-established per test in `_redirect_user_state_dir` below, like the env
+# pins.
+from vco_lib import code_embed_model as _cem_for_ladder  # noqa: E402
+from vco_lib import host_probe as _host_probe_for_ladder  # noqa: E402
+
+#: The REAL functions the pins below replace — importable by tests that
+#: need to drive the unpinned behaviour (`from tests import conftest`).
+_REAL_CODE_HARDWARE_MODEL = _cem_for_ladder._hardware_code_model
+_REAL_RECORDED_CODE_MODEL = _cem_for_ladder.recorded_code_model
+_REAL_SELECTED_GPU_SPECS = _host_probe_for_ladder.selected_gpu_specs
+_REAL_SELECTED_GPU = _host_probe_for_ladder.selected_gpu
+
+
+class _PinnedGpuCard:
+    """The card the ``selected_gpu`` pin answers — the SAME card the
+    ``selected_gpu_specs`` pin describes (16 GB NVIDIA), so the two pins
+    cannot tell two different stories about the host (R43 N4/N5)."""
+
+    vendor = "nvidia"
+    name = "pinned (16 GB NVIDIA)"
+    vram_gb = 16.0
+    is_integrated = False
+
+
+_LADDER_PIN: "dict[tuple, object]" = {
+    (_host_probe_for_ladder, "selected_gpu_specs"): lambda: (16.0, "nvidia"),
+    (_host_probe_for_ladder, "selected_gpu"): lambda: _PinnedGpuCard(),
+    (_cem_for_ladder, "recorded_code_model"): lambda: None,
+}
+
+
+def _apply_ladder_pin() -> None:
+    for (module, name), stub in _LADDER_PIN.items():
+        setattr(module, name, stub)
+    # R43 N8: the once-per-process "ignoring CODE_EMBED_BACKEND=gpu" notice
+    # flag is per-TEST — reset it so a test that expects the stderr line
+    # does not depend on the order tests ran in.
+    _cem_for_ladder._gpu_backend_ignore_notice_shown = False
+
+
+if not _ALLOW_REAL_STATE:
+    _apply_ladder_pin()
+
+
 # ─── W-SESSION-RECONCILE (v0.2.97 SE-3): no hook test probes live ports ─────
 #
 # `ensure-containers.{sh,ps1}` runs `service_endpoints reconcile --phase
@@ -538,6 +611,249 @@ if not _ALLOW_REAL_STATE:
 TOOL_SEARCH_DIRS_ENV = "VCT_TOOL_SEARCH_DIRS"
 os.environ[TOOL_SEARCH_DIRS_ENV] = ""
 
+# ─── W-MODEL-CLI (v0.2.103): no test reaches a REAL model CLI ───────────────
+#
+# 2026-10-15 incident. A test that put its own fake `claude` on PATH, and then
+# removed only that fake, kept the INHERITED PATH — so the shipped code's
+# `shutil.which("claude")` found the maintainer's real CLI and the suite
+# launched two real `claude -p` Sonnet runs: paid model calls and a real
+# headless session against the real account. W-WEAVIATE (above) closed the
+# vector backend at its root; model CLIs had no equivalent.
+#
+# Same remedy, same shape: redirect the ROOT every consumer resolves through,
+# by default. That root is PATH resolution — `shutil.which` in Python
+# (`summary_backends`, `kg_reviewer_backend`, `vscode_settings`, install.py's
+# bootstrap probe), `command -v` / `Get-Command` in the hooks and scripts. A
+# REFUSING STUB directory goes FIRST on PATH at import and is RE-ESTABLISHED
+# per test, so every lookup — including a child built from `os.environ`, a
+# test that strips only its own fake directory, and a hook resolving via
+# `command -v` — finds the stub before any real binary, wherever that real
+# binary lives (`~/.local/bin`, `/usr/local/bin`, `/usr/bin`). Stripping the
+# real binary's directory from PATH instead would not be robust: it cannot
+# reach a test passing `env={"PATH": "/usr/bin:/bin"}`, and the directory
+# holding the CLI usually holds tools the suite needs.
+#
+# The stub exits `MODEL_CLI_STUB_EXIT` with a loud stderr line AND appends one
+# line per invocation to `_MODEL_CLI_HITS_LOG` (`PYTEST_CURRENT_TEST`, cwd,
+# argv). The per-test fixture reds a test whose run hit the stub, because the
+# shipped callers SOFT-FAIL on a non-zero CLI (a summary tier falls through, a
+# detached `nohup claude -p` is never waited for) — a refusal nobody sees
+# would leave the test green for the wrong reason, exactly the shape the
+# `~/.vct` and `~/.claude` tripwires guard against.
+#
+# Which binaries: every model CLI the shipped code spawns BY NAME. A grep of
+# `templates/`, `vco_lib/`, `claude_mcp_servers/`, `install.py` and the
+# launcher finds `claude` only (Ollama is reached over HTTP; `ollama` the CLI
+# is never spawned). A new model CLI joins `_BLOCKED_MODEL_CLIS` — one line.
+#
+# A test that installs its OWN fake keeps working: the existing fakes prepend
+# their directory to `os.environ["PATH"]` (or build `env["PATH"]` as
+# `<fakebin>:<inherited PATH>`) after this fixture's setup, so the fake sits
+# before the stub. The per-test re-establish only PREPENDS the stub when it is
+# missing from PATH entirely, so a module-scoped fake placed ahead of it is
+# never shadowed.
+#
+# Opt-in for the rare test that genuinely needs the real binary:
+# `@pytest.mark.allow_real_model_cli` (the stub directory is removed from PATH
+# for that test only). Used nowhere by default — a test carrying it makes real,
+# possibly paid, model calls on any machine with the CLI installed.
+#
+# Windows: `claude.cmd` covers `shutil.which` / `Get-Command` / `cmd /c`
+# lookups (PATHEXT walks each directory in order, so the stub directory wins).
+# A bare `CreateProcess("claude")` only resolves `.exe`, which a text stub
+# cannot provide; every shipped Python caller resolves the full path through
+# `shutil.which` first, which the `.cmd` stub does cover.
+_BLOCKED_MODEL_CLIS: tuple = ("claude",)
+MODEL_CLI_STUB_EXIT = 97
+MODEL_CLI_STUB_MESSAGE = "real model CLI blocked in tests (VCO conftest)"
+_MODEL_CLI_STUB_DIR = _VCO_TEST_STATE / "model_cli_stub_bin"
+_MODEL_CLI_HITS_LOG = _VCO_TEST_STATE / "model_cli_stub_hits.log"
+
+
+def _write_model_cli_stubs(stub_dir: Path, hits_log: Path) -> None:
+    """Write one refusing stub per blocked CLI (POSIX script + Windows .cmd)."""
+    import shlex
+
+    stub_dir.mkdir(parents=True, exist_ok=True)
+    hits_log.touch()
+    for name in _BLOCKED_MODEL_CLIS:
+        posix = stub_dir / name
+        posix.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\t%s\\t%s\\n' \"${{PYTEST_CURRENT_TEST:-?}}\" \"$PWD\" "
+            f"\"{name} $*\" >> {shlex.quote(str(hits_log))}\n"
+            f"echo \"{MODEL_CLI_STUB_MESSAGE}: {name} $*\" >&2\n"
+            f"exit {MODEL_CLI_STUB_EXIT}\n",
+            encoding="utf-8",
+        )
+        posix.chmod(0o755)
+        (stub_dir / f"{name}.cmd").write_text(
+            "@echo off\r\n"
+            f'>>"{hits_log}" echo %PYTEST_CURRENT_TEST%	%CD%	{name} %*\r\n'
+            f"echo {MODEL_CLI_STUB_MESSAGE}: {name} 1>&2\r\n"
+            f"exit /b {MODEL_CLI_STUB_EXIT}\r\n",
+            encoding="utf-8",
+        )
+
+
+def _path_without(path_value: str, entry: Path) -> str:
+    """``path_value`` with every occurrence of ``entry`` removed."""
+    target = os.path.normcase(os.path.abspath(str(entry)))
+    return os.pathsep.join(
+        p for p in path_value.split(os.pathsep)
+        if p and os.path.normcase(os.path.abspath(p)) != target
+    )
+
+
+def _ensure_model_cli_stub_on_path() -> None:
+    """Put the stub dir FIRST on PATH unless it is already somewhere on it.
+
+    Already-present is left alone on purpose: a fake a module-scoped setup
+    placed AHEAD of the stub must keep winning (see the block above)."""
+    current = os.environ.get("PATH", "")
+    stub = os.path.normcase(os.path.abspath(str(_MODEL_CLI_STUB_DIR)))
+    if any(os.path.normcase(os.path.abspath(p)) == stub
+           for p in current.split(os.pathsep) if p):
+        return
+    os.environ["PATH"] = (
+        str(_MODEL_CLI_STUB_DIR) + (os.pathsep + current if current else "")
+    )
+
+
+def _read_model_cli_hits(offset: int) -> "tuple[list, int]":
+    """Hit lines appended to the log since byte ``offset``, and the new end."""
+    try:
+        with open(_MODEL_CLI_HITS_LOG, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read()
+    except OSError:
+        return [], offset
+    lines = [ln for ln in data.decode("utf-8", "replace").splitlines() if ln]
+    return lines, offset + len(data)
+
+
+_write_model_cli_stubs(_MODEL_CLI_STUB_DIR, _MODEL_CLI_HITS_LOG)
+_ensure_model_cli_stub_on_path()
+
+#: Byte offset into the hits log up to which hits are already accounted for
+#: (by the per-test check, or drained by a test through `model_cli_stub_hits`).
+_model_cli_hits_seen = [0]
+
+
+class _ModelCliStubHits:
+    """Handle the `model_cli_stub_hits` fixture yields: ``drain()`` returns the
+    stub invocations since the last drain and marks them accounted for, so a
+    test that hits the stub ON PURPOSE (the guard's own tests) is not redded."""
+
+    stub_dir = _MODEL_CLI_STUB_DIR
+    exit_code = MODEL_CLI_STUB_EXIT
+    message = MODEL_CLI_STUB_MESSAGE
+    ensure_on_path = staticmethod(_ensure_model_cli_stub_on_path)
+    path_without = staticmethod(_path_without)
+
+    def drain(self) -> list:
+        lines, _model_cli_hits_seen[0] = _read_model_cli_hits(
+            _model_cli_hits_seen[0])
+        return lines
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "allow_real_model_cli: W-MODEL-CLI opt-in — this test may spawn the "
+        "REAL model CLI (e.g. `claude`); makes real, possibly paid, calls.",
+    )
+
+
+@pytest.fixture
+def model_cli_stub_hits() -> _ModelCliStubHits:
+    """The W-MODEL-CLI stub's hit log, for tests that hit it deliberately."""
+    return _ModelCliStubHits()
+
+
+_FAKE_CLAUDE_CLI_PY = """\
+import json, os, sys
+with open(os.environ["VCO_FAKE_CLAUDE_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:] == ["--version"]:
+    print("2.0.0 (Claude Code)")
+    sys.exit(0)
+sys.stderr.write("fake claude (VCO conftest fake_claude_cli): only --version "
+                 "is faked; give this test its own fake for %r\\n" % sys.argv[1:])
+sys.exit(1)
+"""
+
+
+class _FakeClaudeCli:
+    """Handle the `fake_claude_cli` fixture yields."""
+
+    def __init__(self, bindir: Path, log: Path) -> None:
+        self.bindir = bindir
+        self.log = log
+
+    def calls(self) -> list:
+        """argv (without the program name) of every call, in order."""
+        if not self.log.is_file():
+            return []
+        return [json.loads(ln) for ln in
+                self.log.read_text(encoding="utf-8").splitlines() if ln]
+
+
+@pytest.fixture
+def fake_claude_cli(tmp_path, monkeypatch) -> _FakeClaudeCli:
+    """A benign fake `claude` FIRST on PATH, for tests whose shipped code path
+    merely PROBES the CLI (`claude --version` in install.py's bootstrap
+    envelope / doctor). `--version` answers like an installed CLI; any other
+    argv fails loudly — a test exercising a real `-p` turn needs a fake that
+    knows what to answer. Every call is recorded (`.calls()`)."""
+    bindir = tmp_path / "fake_claude_cli_bin"
+    bindir.mkdir()
+    script = bindir / "fake_claude.py"
+    script.write_text(_FAKE_CLAUDE_CLI_PY, encoding="utf-8")
+    posix = bindir / "claude"
+    posix.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n',
+                     encoding="utf-8")
+    posix.chmod(0o755)
+    (bindir / "claude.cmd").write_text(
+        f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+    log = tmp_path / "fake_claude_cli_calls.jsonl"
+    monkeypatch.setenv("VCO_FAKE_CLAUDE_LOG", str(log))
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return _FakeClaudeCli(bindir, log)
+
+
+@pytest.fixture(autouse=True)
+def _block_real_model_cli(request):
+    """W-MODEL-CLI per test: stub first on PATH; red the test that hit it."""
+    allow_real = request.node.get_closest_marker("allow_real_model_cli")
+    prev_path = os.environ.get("PATH")
+    if allow_real is not None:
+        os.environ["PATH"] = _path_without(prev_path or "", _MODEL_CLI_STUB_DIR)
+    else:
+        _ensure_model_cli_stub_on_path()
+    _, _model_cli_hits_seen[0] = _read_model_cli_hits(_model_cli_hits_seen[0])
+    try:
+        yield
+    finally:
+        if allow_real is not None:
+            if prev_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = prev_path
+        hits, _model_cli_hits_seen[0] = _read_model_cli_hits(
+            _model_cli_hits_seen[0])
+        if hits:
+            raise AssertionError(
+                f"{len(hits)} spawn(s) of a model CLI reached the W-MODEL-CLI "
+                "stub during this test (tests/conftest.py). Without the stub "
+                "they would have run this machine's REAL CLI (`-p` = a real, "
+                "possibly paid, model call). Give the test a fake — the "
+                "`fake_claude_cli` fixture — or stub the caller. "
+                "Hits (test, cwd, argv):\n  "
+                + "\n  ".join(hits)
+            )
+
+
 # ─── W-PROJECT-DIR (v0.2.94): the suite never resolves THIS CHECKOUT as a project.
 #
 # `weaviate_mcp.server._resolution_context()` answers "whose project is this?"
@@ -680,6 +996,9 @@ def _redirect_user_state_dir(request):
     os.environ.update(claude_keys)
     os.environ.update(install_root_keys)
     os.environ.update(resync_keys)
+    # W-CODE-LADDER: re-established per test — a raw (un-restored) setattr in
+    # a test must not un-pin the hardware ladder for the rest of the session.
+    _apply_ladder_pin()
     try:
         yield
     finally:

@@ -54,7 +54,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, cast
+from typing import Any, Callable, Iterable, Optional
 
 # NEW-8 / B3 (v0.2.53) — symlink-blocking defense used by
 # ``_write_file_atomic``. Mirrors install.py's V47-B contract for the
@@ -80,8 +80,14 @@ from vco_lib import jsonc_edit as _jsonc_edit
 from vco_lib import manifest_paths as _manifest_paths
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
+# v0.2.103 (review L-1): the formats-migration deferral emitters (whose
+# printed recovery commands name the RESOLVED interpreter) — same-name
+# aliases are bound near their old call-sites below.
+from vco_lib import formats_migration_deferral
 from vco_lib import bundle_preserve as _bundle_preserve
 from vco_lib import weaviate_helpers as _wh
+from vco_lib import bootstrap_case_sibling as _bcs
+from vco_lib import bootstrap_schema_guard as _bsg
 # v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
 # configured-but-empty ``{slot: []}`` slots that weaviate rejects on re-insert).
 # LOUD-FAIL import (no fallback): a broken vco_lib install must surface, never
@@ -1375,17 +1381,11 @@ def _delete_class(name: str, weaviate_url: Optional[str] = None) -> None:
         raise RuntimeError(f"DELETE /v1/schema/{name} → HTTP {status}: {body[:300]!r}")
 
 
-def _count_objects(name: str, weaviate_url: Optional[str] = None) -> int:
-    """Count objects in a collection via v4 iterator. Lightweight: yields
-    object metadata only (no vectors) so it scales for the recovery
-    classification check. Returns 0 if collection missing or empty.
-
-    Delegates to :func:`vco_lib.weaviate_helpers.count_objects_v4` (v0.2.77
-    Part 7a convergence — the 0-on-failure variant). Kept as a module-level
-    delegator so ``mock.patch.object(project_init, "_count_objects", ...)``
-    keeps working.
-    """
-    return _wh.count_objects_v4(name, weaviate_url=weaviate_url)
+def _count_objects(name: str, weaviate_url: Optional[str] = None) -> Optional[int]:
+    """Object count for the staging-recovery classifier; None = could not count
+    (never 0 — an unreadable count must not read as "empty, safe to drop").
+    Module-level so tests can ``mock.patch.object(project_init, "_count_objects")``."""
+    return _wh.count_objects_v4_or_none(name, weaviate_url=weaviate_url)
 
 
 def _recover_or_drop_orphan_staging(
@@ -1441,6 +1441,11 @@ def _recover_or_drop_orphan_staging(
     name_present = _fetch_schema(name, weaviate_url=weaviate_url) is not None
     name_count = _count_objects(name, weaviate_url=weaviate_url) if name_present else 0
     staging_count = _count_objects(staging, weaviate_url=weaviate_url)
+    if name_count is None or staging_count is None:  # unreadable = may hold objects: touch neither
+        _log("7b.recover", "error", f"cannot count {name} / {staging}; both RETAINED",
+             data={"collection": name, "staging": staging, "name_count": name_count,
+                   "staging_count": staging_count, "branch": "ambiguous_uncountable"})
+        return "ambiguous"
 
     # RECOVER — staging is the only surviving copy.
     if (not name_present) or name_count == 0:
@@ -2576,8 +2581,8 @@ def _extract_similar_class_name(error_body: Optional[str]) -> Optional[str]:
     """Parse Weaviate's `class already exists: found similar class "X"` 422
     response. Returns the actual server-side name if present, else None.
 
-    Used by bootstrap_collections to recover from case-only name conflicts
-    by dropping the actual-named class and re-creating with the target name.
+    Used by bootstrap_collections to recover from case-only name conflicts by
+    dropping the actual-named class (only when EMPTY, v0.2.103) and re-creating.
 
     Handles both the unescaped form (`similar class "X"`) and the JSON-
     escaped form (`similar class \\"X\\"`) — Weaviate's REST error body is
@@ -2676,10 +2681,8 @@ def _drop_and_recreate(
     has diverged from the current spec in a non-additive way (different
     named-vector set, indexNullState missing, legacy single-vector).
 
-    Lossless from the user's perspective: the on-disk `knowledge/**/*.md`
-    is the source of truth and the subsequent kg-sync re-ingests.
-    Forensic snapshot is captured BEFORE the drop so a mid-drop crash
-    leaves a trail.
+    Callers reach it only for an EMPTY class (v0.2.103 — a populated one is
+    deferred, never dropped). The forensic snapshot is taken first anyway.
     """
     def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
         if log_event is None:
@@ -2836,16 +2839,16 @@ def bootstrap_collections(
         "actions": [{"collection": str, "action": "create"|"exists"|"would-create"|"regenerated", "ok": bool}],
         "regenerated": [{"collection": str, "reason": "case-conflict"|"multi-vector"|"legacy-single-vector"|"index-null-state"|"named-vector-mismatch", "dropped_name": str}],
         "errors": [{"collection": str, "error": str}],
+        "blocked": [{"collection": str, "sibling": str, "object_count": int|None}],
+        "schema_deferred": [{"collection", "reason", "object_count", "migrate_action"}],
       }
 
-    Bug-1 v0.2.4 (2026-05-12): when an existing collection's schema is
-    incompatible with the current spec (case-only name conflict, legacy
-    multi-vector config, missing indexNullState, etc.) the function
-    drops the old collection and recreates with the target schema. The
-    Rust caller parses ``regenerated[]`` to drive the banner's
-    "Migrating Weaviate schema for X..." state. Lossless: knowledge/**/*.md
-    on disk is the source of truth and the subsequent kg-sync step
-    re-populates Weaviate.
+    Bug-1 v0.2.4: an EMPTY existing class whose schema is incompatible (legacy
+    single-vector, missing core slots / indexNullState, case-only name clash)
+    is dropped and recreated; ``regenerated[]`` drives the launcher banner.
+    v0.2.103: a class that holds objects (or cannot be counted) is NEVER
+    dropped — ``schema_deferred[]`` / ``blocked[]`` + a consent deferral
+    (vco_lib/bootstrap_schema_guard.py, vco_lib/bootstrap_case_sibling.py).
 
     Soft-fail contract: the function NEVER raises for transport errors or
     for individual collection creation failures. A non-empty `errors`
@@ -2887,6 +2890,8 @@ def bootstrap_collections(
         # See _schema_incompatible for the regen trigger conditions.
         "regenerated": [],
         "errors": [],
+        "blocked": [],  # v0.2.103: targets a populated case-only sibling blocks (never dropped)
+        "schema_deferred": [],  # v0.2.103: populated schema-incompatible classes (never dropped)
     }
 
     # 1. Reachability probe + soft restart on failure.
@@ -2948,11 +2953,11 @@ def bootstrap_collections(
         # Existing `<Project>_Diagrams` collections on user machines are
         # untouched (still recognised by the migration / naming paths
         # below); nothing writes into them anymore.
-    # Shared KG: always created when missing (per coordinator: shared KG is
-    # READ by every project regardless of per-project opt-out, so creation
-    # is unconditional). The opt-out toggle is purely a write-gate enforced
-    # at MCP-call time, not a creation gate.
-    targets.append((_SHARED_KG_NAME, kg_class_definition))
+    # Shared KG: always created when missing (every project READS it; the opt-out is a write-gate
+    # only). v0.2.103 (R24 HIGH-1): THIS machine's shared class, never the constant — see
+    # vco_lib/bootstrap_case_sibling.py.
+    targets += [(n, kg_class_definition) for n in
+                _bcs.shared_targets(project_folder, derived["kg_collection"], _log)]
 
     # 3. Iterate: existence check + schema probe + POST.
     for name, target_def_fn in targets:
@@ -2970,10 +2975,7 @@ def bootstrap_collections(
             continue
 
         if existing is not None:
-            # Bug-1 v0.2.4: schema-incompatibility regen. Compare actual
-            # schema fields against the canonical target; if non-trivially
-            # divergent (different named-vector set, missing
-            # indexNullState, legacy single-vector), drop + recreate.
+            # Bug-1 v0.2.4: schema-incompatibility regen (drop + recreate) — EMPTY classes only.
             incompatible, reason = _schema_incompatible(
                 existing, target_def_fn, name,
             )
@@ -2985,9 +2987,10 @@ def bootstrap_collections(
                      f"{name}: already exists with compatible schema",
                      data={"collection": name, "action": "exists"})
                 continue
-
-            # Regen path. In dry-run mode we report the intent without
-            # mutating; the Rust caller surfaces the banner state.
+            if _bsg.defers(name, existing, target_def_fn, reason, result, _log, weaviate_url,
+                           dry_run=dry_run):
+                continue  # v0.2.103: populated → schema_migration_required, never dropped
+            # Regen path. Dry-run reports the intent without mutating.
             if dry_run:
                 result["regenerated"].append({
                     "collection": name,
@@ -3054,14 +3057,13 @@ def bootstrap_collections(
                  f"{name}: created with target schema",
                  data={"collection": name, "action": "create"})
         except Exception as e:
-            # Bug-1 v0.2.4: case-only name conflict path. Weaviate POSTs
-            # are case-sensitive (so our existence-probe missed the old
-            # `<Project>_development` lowercase variant), but the server-
-            # side dedup rejects creating `<Project>_Development` with
-            # HTTP 422 `class already exists: found similar class "<actual>"`.
-            # Extract the actual existing name, drop it, retry the POST.
+            # Bug-1 v0.2.4: case-only name conflict (HTTP 422 `found similar class "<actual>"`):
+            # drop the EMPTY sibling and retry the POST. v0.2.103 (R24 HIGH-1): a sibling that
+            # holds objects (or cannot be counted) is never dropped — `_bcs.blocks` defers it.
             err_str = str(e)
             actual_name = _extract_similar_class_name(err_str)
+            if _bcs.blocks(name, actual_name, result, _log, weaviate_url):
+                continue
             if actual_name and actual_name != name:
                 _log("7b.bootstrap", "warn",
                      f"{name}: case-conflict with existing {actual_name!r}; "
@@ -3118,6 +3120,10 @@ def bootstrap_collections(
             })
             result["errors"].append({"collection": name, "error": err})
 
+    _bcs.settle(project_folder, result, project_name=project_name, weaviate_url=weaviate_url,
+                kg_only=kg_only, dry_run=dry_run, log=_log)
+    _bsg.settle(result, project_name=project_name, project_folder=project_folder, derived=derived,
+                weaviate_url=weaviate_url, dry_run=dry_run, log=_log)
     return result
 
 
@@ -3195,13 +3201,12 @@ def _write_bootstrap_deferral(
     # otherwise list the two per-project collections plus the shared KG.
     # (v0.2.102: `<Project>_Diagrams` dropped from the list — the diagrams
     # bootstrap was removed with the diagrams integrations.)
+    _shared = _resolve_shared_kg_name(project_folder) or "(shared KG disabled)"  # v0.2.103
     if kg_only:
-        _collections_human = f"{derived['kg_collection']}, {_SHARED_KG_NAME}"
+        _collections_human = f"{derived['kg_collection']}, {_shared}"
     else:
         _collections_human = (
-            f"{derived['kg_collection']}, "
-            f"{derived['development_collection']}, "
-            f"{_SHARED_KG_NAME}"
+            f"{derived['kg_collection']}, {derived['development_collection']}, {_shared}"
         )
     entry = DeferralEntry(
         condition_id="weaviate_unreachable_at_bootstrap",
@@ -4409,7 +4414,7 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
     ``.claude/context/audits/project-bundle-install-audit-2026-06-10.md``
     §6.7 / B3.
     """
-    from vco_lib.atomic import atomic_write_bytes
+    from vco_lib.atomic import atomic_write_bytes, warn_symlink_redirect
 
     # chmod is a documented no-op on Windows inside the shared writer; a
     # chmod OSError never fails the write.
@@ -4417,13 +4422,7 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
         target, data, fsync=False, mode=mode, symlink_safe=True,
     )
     if redirect_target is not None:
-        sys.stderr.write(
-            f"[vct] NEW-8 symlink-blocking: refusing to write through symlink "
-            f"at {target}; redirecting to {redirect_target}. "
-            f"The .vco-new sibling holds the orchestrator's intended content; "
-            f"the symlink and its destination are untouched. Merge manually "
-            f"when ready.\n"
-        )
+        warn_symlink_redirect(target, redirect_target)
     return redirect_target
 
 
@@ -5789,145 +5788,6 @@ def _emit_bash_env_cleanup_deferral(
 
 
 # ---------------------------------------------------------------------------
-# v0.2.47 RL-7.5 (2026-06-04): chunker-preset overhaul
-# ---------------------------------------------------------------------------
-
-
-# Version (inclusive lower bound on the NEW side) at which the chunker-preset
-# overhaul lands. Anyone whose prior manifest's `vco_version` was strictly
-# less than this needs to re-sync KG + codegraph against the new presets.
-# Mirrors `CHUNKER_BUMP_VERSION` in
-# `launcher/src-tauri/src/commands/chunker_revision_deferral.rs`.
-_CHUNKER_BUMP_VERSION = "0.2.46"
-
-
-def _parse_semver(version: str) -> "tuple[int, int, int] | None":
-    """Parse "X.Y.Z" into (major, minor, patch). None on malformed input.
-
-    v0.2.92: delegates to
-    :func:`vco_lib.codegraph_extractor_generation.parse_semver` — ONE parser
-    for both boundary questions this file asks (chunker preset, extractor
-    generation). The name is kept because existing call sites + tests import
-    it. Loud-fail on the import is deliberate: vco_lib is part of every healthy
-    install, and a silent inline-copy degrade would re-create the very
-    duplication this delegation removes.
-    """
-    from vco_lib.codegraph_extractor_generation import parse_semver
-
-    return parse_semver(version)
-
-
-def _crosses_chunker_boundary(prev_version: str, running_version: str) -> bool:
-    """True iff this upgrade crosses the v0.2.46 chunker-preset boundary.
-
-    v0.2.92: the ``prev < bump <= running`` rule itself lives in
-    :func:`vco_lib.codegraph_extractor_generation.crosses_version_boundary`,
-    which the extractor-generation detector also uses. This function is now
-    just the chunker boundary's binding of that shared rule, so the two
-    "was this built by an older version of us" questions cannot drift apart.
-
-    **SUPERSEDED in v0.2.92 (WP-D) — no longer called by the bundle flow.**
-    As wired from v0.2.47 to v0.2.91 this gate compared the manifest's
-    ``vco_version`` (a git short SHA on every clone install, never semver)
-    against the semver constant ``_CHUNKER_BUMP_VERSION``, so it was
-    structurally inert: it has never fired for a real user, no matter how
-    they updated. The live replacement is :func:`vco_lib.chunker_revision.gate` —
-    state-keyed on the ``_CHUNKER_REVISION`` sentinel (R26/R27), firing on
-    all four install/update surfaces. This function survives only because
-    ``tests/test_v0247_chunker_deferral_python.py`` pins its boundary
-    arithmetic as the shared-rule binding; deleting it (and
-    ``_emit_chunker_resync_deferral`` below, which shares the supersession)
-    is pending the user's R28 removal ruling (wave-3 ASK batch).
-    """
-    from vco_lib.codegraph_extractor_generation import crosses_version_boundary
-
-    return crosses_version_boundary(
-        prev_version, running_version, _CHUNKER_BUMP_VERSION,
-    )
-
-
-def _emit_chunker_resync_deferral(
-    folder: Path,
-    prev_version: str,
-    running_version: str,
-) -> None:
-    """Emit `chunker_preset_overhaul_pending`: KG + codegraph need re-syncing
-    after an upgrade across the v0.2.46 chunker-preset boundary.
-
-    **SUPERSEDED in v0.2.92 (WP-D) — no longer called by the bundle flow.**
-    The live emitter is :func:`_emit_chunker_revision_resync_deferral`
-    (same condition_id, same commands, keyed on the state-keyed
-    ``_CHUNKER_REVISION`` sentinel instead of a semver boundary this
-    emitter's inputs could never satisfy — see
-    :func:`_crosses_chunker_boundary`'s supersession note). Retained for
-    the same reason + the argparse-sweep test that drives it; removal
-    pending the user's R28 ruling (wave-3 ASK batch).
-
-    Post-v0.2.46 the chunker uses MUCH larger chunks for qwen3-embedding
-    (target_tokens 9500 vs. legacy 1000) and a five-tier preset routing
-    (xsmall/small/medium/large/xlarge). Existing Weaviate rows synced under
-    the legacy presets have stale chunk boundaries: relevant content lives
-    in chunk N+1 that the new preset would have folded into chunk N. Search
-    recall degrades on long answers until the user re-syncs.
-
-    Per-project entry: each project's KG + codegraph are independent
-    Weaviate collections, so each gets its own deferral entry.
-
-    Severity is `info` — searches still WORK, they just return less
-    relevant top-k results. The user can defer the re-sync indefinitely.
-    """
-    from vco_lib.deferral_report import DeferralEntry
-    from vco_lib import chunker_revision as _chunker_revision
-    from vco_lib import deferral_emit as _de
-
-    detected = (
-        f"This project's `.vco-manifest.json` recorded `vco_version="
-        f"{prev_version}`; the current orchestrator is `{running_version}`. "
-        f"The chunker presets in `claude_mcp_servers/weaviate_mcp/chunking.py` "
-        f"changed at v{_CHUNKER_BUMP_VERSION} (target chunk size for qwen3 "
-        f"jumped from ~1000 tokens to ~9500). Existing Weaviate rows in this "
-        f"project's KG + code graph were chunked under the LEGACY presets — "
-        f"search recall degrades on long answers because relevant content "
-        f"lives in chunk N+1 that the new preset would have folded into "
-        f"chunk N."
-    )
-    # v0.2.75 (C-10 family fix): the previous commands named flags the target
-    # CLIs reject or ignore — `kg-sync --force` does not exist (kg-sync's
-    # manual argv loop silently ignored it) and `code-graph-analyze --force`
-    # is rejected by argparse ("unrecognized arguments"), so the remediation
-    # could never run as written. `--force-recreate` is the real drop+rebuild
-    # flag, which is exactly the "re-chunk everything" this deferral wants.
-    # Guarded by tests/test_deferral_command_argparse_sweep.py.
-    cmd = _chunker_revision.resync_commands(
-        folder,
-        "# Both commands are heavy I/O (re-embeds every chunk via Ollama).\n"
-        "# Consider running them when you're not actively coding.",
-    )
-
-    entry = DeferralEntry(
-        condition_id="chunker_preset_overhaul_pending",
-        title="KG + codegraph re-sync recommended (chunker presets changed)",
-        detected=detected,
-        why_deferred=(
-            "Auto-rechunking every KG row and code-graph entity at install "
-            "time would block the bundle update for minutes and consume "
-            "significant Ollama GPU time. We defer the decision so the user "
-            "can pick a quiet moment. Searches WORK in the meantime — they "
-            "just return less relevant top-k results than they would under "
-            "the new presets. Once you run the re-sync commands below, "
-            "this deferral self-resolves on the next bundle update."
-        ),
-        command_to_apply=cmd,
-        severity="info",
-        kg_node_refs=[
-            "knowledge/concepts/score-driven-retrieval-tiers.md",
-        ],
-    )
-    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-    _de.emit(folder, entry)
-
-
-# ---------------------------------------------------------------------------
 # v0.2.92: extractor-generation re-index trigger (per-project bundle update)
 # ---------------------------------------------------------------------------
 
@@ -6042,6 +5902,7 @@ def _trigger_extractor_generation_reindex(
     is_root_target: bool,
     result: dict,
     log: Callable[..., None],
+    had_prior_install: bool = True,
 ) -> None:
     """Decide + (when owed) launch the extractor-generation re-index.
 
@@ -6084,6 +5945,12 @@ def _trigger_extractor_generation_reindex(
         # tri-state the analyzer resolves — passed explicitly so the spawn's
         # probes classify `.claude/**` rows the same way the walk will.
         index_dot_claude=bool(is_root_target),
+        # v0.2.103 F3, tightened by R41 M1 and R43 N1 — see
+        # root_first_install_unknown_absent's docstring in
+        # codegraph_extractor_generation for the full gate rule.
+        unknown_graph_is_absent=_ceg.root_first_install_unknown_absent(
+            is_root_target=is_root_target, had_prior_install=had_prior_install,
+            project_name=project_name, install_root=folder),
     )
 
     phase = {
@@ -6102,31 +5969,14 @@ def _trigger_extractor_generation_reindex(
         }
         result["warnings"].append(
             f"code-graph re-index started in the background for "
-            f"{project_name} (v0.2.92 added Python API extraction and fixed C# "
-            f"route attribution; unchanged entities are NOT re-embedded). "
+            f"{project_name} ({outcome.reason_text or 'an extractor change'}; "
+            f"unchanged entities are NOT re-embedded). "
             f"Progress: <vct_root>/logs/resync-*.log"
         )
     elif outcome.status == "deferred" and outcome.deferral is not None:
-        try:
-            from vco_lib import deferral_emit as _de
-            from vco_lib.deferral_report import DeferralEntry as _DeferralEntry
-
-            # `codegraph_extractor_generation.ReindexResult.deferral` is
-            # declared `object` so that module keeps no import edge to
-            # `deferral_report`; the value it carries when `status ==
-            # "deferred"` is always a real `DeferralEntry` (see that module's
-            # own field comment and `_retarget_deferral`). The annotation is
-            # the only thing wider than reality, hence the cast — same
-            # convention as `codegraph_ref_dedup._http_request`. NOT an
-            # `isinstance` narrowing: the emit path here is duck-typed by
-            # contract and `tests/test_v0292_reindex_trigger.py` drives it with
-            # a sentinel to prove the wiring forwards whatever it is given.
-            # (Pre-existing `reportArgumentType`; fixed in v0.2.92 W18 because
-            # this file is exclusively held this wave and pyright is a gate.)
-            _de.emit(Path(folder), cast("_DeferralEntry", outcome.deferral))
-        except Exception as e:  # noqa: BLE001 — a deferral write never blocks
-            log("4.bundle.extractor_reindex", "warn",
-                f"extractor-reindex deferral write failed: {e}")
+        # R41 M1: the emission itself lives in ceg (one home, and this file
+        # is under a line ratchet).
+        _ceg.emit_reindex_deferral(Path(folder), outcome, log)
         result["warnings"].append(
             f"code-graph re-index deferred for {project_name}: "
             f"{outcome.message} — see UPDATE_DEFERRED.md"
@@ -6184,12 +6034,12 @@ def _emit_chunker_revision_resync_deferral(
 ) -> None:
     """Emit the chunker re-sync deferral keyed on a REVISION change (R2-4).
 
-    Parallel to ``_emit_chunker_resync_deferral`` (which keys on the v0.2.46
-    SEMVER boundary and therefore never fires again for current installs). This
-    variant fires whenever the ``_CHUNKER_REVISION`` sentinel string changes
-    across an update — the mechanism the sentinel's own contract comment always
-    promised but nothing consumed. Same condition_id + commands so the two paths
-    dedup to a single deferral entry and self-resolve identically.
+    Fires whenever the ``_CHUNKER_REVISION`` sentinel string changes across an
+    update — the mechanism the sentinel's own contract comment always promised.
+    (The v0.2.47 semver-boundary sibling ``_emit_chunker_resync_deferral`` —
+    keyed on the one-off v0.2.46 launcher-version crossing — was retired in
+    v0.2.103, owner decision 2026-10-15, as superseded by this revision-keyed
+    path and the per-project gate in :mod:`vco_lib.chunker_revision`.)
     """
     from vco_lib.deferral_report import DeferralEntry
     from vco_lib import chunker_revision as _chunker_revision
@@ -10071,12 +9921,11 @@ def install_project_bundle(
                     (_res_env.get("WEAVIATE_URL") or "").strip()
                     or _weaviate_url_default()
                 )
-                # SHARED_KG_COLLECTION: explicit empty string is a
-                # legitimate "no shared collection" choice — only an ABSENT
-                # key falls back to the canonical default name.
+                # SHARED_KG_COLLECTION: explicit "" = no shared collection; only an ABSENT key
+                # falls back — to THIS machine's shared class (v0.2.103), not the constant.
                 _res_shared = _res_env.get("SHARED_KG_COLLECTION")
                 if not isinstance(_res_shared, str):
-                    _res_shared = _SHARED_KG_NAME
+                    _res_shared = _resolve_shared_kg_name(folder)
 
                 result["residue_cleanup"] = (
                     _kres.cleanup_bundled_knowledge_residue(
@@ -10282,11 +10131,11 @@ def install_project_bundle(
             )
 
     # PR-7 (v0.2.11, addendum-4): backfill VS Code watcher / search /
-    # Pylance exclude blocks into the project's `.vscode/settings.json`.
-    # Without these excludes, large workspaces (>10 GB / >50k files —
-    # typical ML projects with venvs + cargo target/) OOM-kill VS Code
-    # via systemd-oomd during initial indexing. Idempotent: skipped
-    # entirely if every canonical key is already present (user-wins).
+    # Pylance exclude blocks into the project's `.vscode/settings.json`
+    # (large workspaces OOM-kill VS Code without them). Idempotent: adds
+    # only missing keys (user-wins per key) and, since v0.2.103, prunes
+    # the retired files.exclude build outputs from a block still matching
+    # VCO's legacy write signature (vco_lib/vscode_excludes.py).
     if not dry_run:
         try:
             vscode_backfill = _backfill_vscode_excludes_in_project(folder)
@@ -10580,6 +10429,7 @@ def install_project_bundle(
                 is_root_target=is_root_target,
                 result=result,
                 log=_log,
+                had_prior_install=_had_prior_install,
             )
         except Exception as e:  # noqa: BLE001 — never abort an install
             err = f"{type(e).__name__}: {e}"
@@ -11192,6 +11042,10 @@ def install_project_bundle(
                  f"G1 git-exclude failed: {err}", data={"error": err})
             result["warnings"].append(f"G1 git-exclude failed: {err}")
 
+    if not dry_run:  # v0.2.103 R11 B3: report a repo still owed by the launcher
+        from vco_lib import local_repo_pending as _local_repo_pending
+        _local_repo_pending.reconcile_into_result(folder, result)
+
     # v0.2.73 S-8 (ONE-TIME): scan for pre-fix user-secret VALUES in tree files
     # and emit a deferral notice if found. Triggered on every bundle-update run
     # (cheap pattern scan, no value parsing); self-clears once the next env
@@ -11733,71 +11587,16 @@ def _apply_canonical_env_via_config_projection(
 
 
 def _resolve_shared_kg_name(folder: Optional[Path] = None) -> str:
-    """Resolve THIS machine's shared-KG class name (v0.2.92 F-12).
+    """THIS machine's shared-KG class name for ``folder`` (v0.2.92 F-12).
 
-    ``_SHARED_KG_NAME`` (``VibeCodedOrchestrator_KnowledgeGraph``) is VCO's
-    LAST-RESORT default, not a description of the install. On an
-    adopt-and-route install the orchestrator root's own collection serves both
-    roles, so the generic literal names a class that does not exist — a state
-    field-observed on a live machine, where one project's shared-KG searches
-    returned nothing for three days and no component reported an error. Any
-    writer that hardcodes the literal manufactures that state.
-
-    Resolution order (first non-empty wins), all soft-fail:
-
-    1. This project's own ``shared`` KG binding in launcher.db.
-    2. The project's existing on-disk ``SHARED_KG_COLLECTION`` pin — a value
-       already in ``.claude/settings.json`` is a user/launcher decision, and an
-       explicit empty string is the documented "cross-project fan-out
-       intentionally disabled" choice, honoured verbatim.
-    3. The ORCHESTRATOR-ROOT project's ``shared`` binding, then its ``primary``
-       — on an adopt-and-route install the root's primary IS the machine's
-       canonical shared collection.
-    4. ``_SHARED_KG_NAME`` — unchanged behaviour when nothing resolves (a
-       genuinely launcher-less standalone install, where this name is also what
-       bootstrap will create).
-
-    Never raises.
+    The resolution order lives ONCE in
+    ``vco_lib.root_kg_identity.resolve_shared_name`` (review V02103-FINAL2
+    L-1: the Identity-tab pick first, as the hub and the launcher read it);
+    ``_SHARED_KG_NAME`` is only its last resort. Never raises.
     """
-    # v0.2.92 size-gate extraction: the reader moved to
-    # ``vco_lib.kg_binding_read``. Imported here
-    # — lazily, but OUTSIDE the swallow-all try below so a broken install
-    # surfaces loudly instead of silently skipping tier 1.
-    from vco_lib.kg_binding_read import _read_kg_binding_override
+    from vco_lib.root_kg_identity import resolve_shared_name
 
-    # 1. this project's own shared binding.
-    if folder is not None:
-        try:
-            override = _read_kg_binding_override(Path(folder))
-            val = (override.get("shared_kg_collection") or "").strip()
-            if val:
-                return val
-        except Exception:  # noqa: BLE001
-            pass
-
-        # 2. an existing on-disk pin (including the explicit-disable "").
-        try:
-            from vco_lib.knowledge_residue import project_settings_env
-            existing = project_settings_env(Path(folder)).get(
-                "SHARED_KG_COLLECTION"
-            )
-            if isinstance(existing, str):
-                return existing.strip()
-        except Exception:  # noqa: BLE001
-            pass
-
-    # 3. the orchestrator root's shared, then primary, binding.
-    try:
-        from vco_lib.launcher_db_reader import get_orchestrator_root_bindings
-        root_primary, root_shared = get_orchestrator_root_bindings()
-        for cand in (root_shared, root_primary):
-            if isinstance(cand, str) and cand.strip():
-                return cand.strip()
-    except Exception:  # noqa: BLE001
-        pass
-
-    # 4. last resort.
-    return _SHARED_KG_NAME
+    return resolve_shared_name(folder, fallback=_SHARED_KG_NAME)
 
 
 def probe_classes_exist(
@@ -12394,225 +12193,19 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
 # ---------------------------------------------------------------------------
 # .vscode/settings.json exclude-block backfill (PR-7 / v0.2.11)
 # ---------------------------------------------------------------------------
-#
-# Forensic context (00:56 live OOM-kill incident, 2026-05-16):
-#   Opening a large workspace (>10 GB / >50k files — common for ML
-#   projects with venvs, model weights, cargo target/) in VS Code with
-#   the Pylance extension active triggered:
-#     - file watcher scanning every file under the workspace root
-#     - Pylance indexing every Python file it discovered (including
-#       .venv/lib/python3.x/site-packages which is multi-GB of stdlib
-#       wheels)
-#     - Chromium renderer holding the full DOM for the file tree
-#   Result: systemd-oomd killed VS Code's Chromium scope at 86.46%
-#   memory pressure. Reproduced across multiple multi-GB project trees
-#   (47 GB scientific stack, 32 GB / 76k-file legacy clone, 33 GB cargo
-#   target). Local fix in each case
-#   was to add the canonical files.watcherExclude + python.analysis.*
-#   blocks. PR-7 ships those as launcher-managed defaults so every
-#   project the launcher registers (and `install-bundle --update`s)
-#   gets them automatically.
-#
-# Cross-OS notes:
-#   - JSON path patterns use forward slashes; VS Code normalizes on
-#     Windows, no per-OS branch needed.
-#   - `python.analysis.indexing: false` disables Pylance's persistent
-#     index — the in-memory analysis still works, just doesn't write
-#     a multi-GB cache under ~/.cache/. Users who want indexing back
-#     can override per-project.
-#
-# Coordination with the Rust writer:
-#   Pre-PR-27, the launcher's Rust env writer (retired v0.2.97; at
-#   commands/projects_v2.rs) wrote a `claude-code.env` sub-object
-#   inside `.vscode/settings.json`. That write was removed in PR-27
-#   (v0.2.12, 2026-05-16) because the key did NOT propagate to MCP
-#   subprocesses on Linux as of Claude Code 2.1.143 — empirical
-#   sentinel testing confirmed (.claude/settings.json env is the
-#   channel that actually reaches MCPs). See PR-27 commit message and
-#   docs/CLAUDE_CODE_COMPATIBILITY.md → "Per-project env files" for
-#   the full trace.
-#
-#   After PR-27 the Rust writer does not touch `.vscode/settings.json`
-#   at all from the env-write code path, so this Python helper is the
-#   ONLY writer of that file across the launcher's project-init flow.
-#   It still adds only top-level keys (files.watcherExclude, etc.) so
-#   any pre-existing `claude-code.env` block authored by the user (or
-#   by a pre-PR-27 launcher) is preserved verbatim — the by-key
-#   backfill never touches a key it doesn't own.
-
-_VSCODE_EXCLUDE_DEFAULTS: dict[str, object] = {
-    # Watcher: prevent inotify / FSEvents / ReadDirectoryChangesW from
-    # firing for these dirs. Heavy churn (cargo target/, node_modules/)
-    # otherwise saturates the watcher queue.
-    "files.watcherExclude": {
-        "**/.git/objects/**": True,
-        "**/.git/subtree-cache/**": True,
-        "**/node_modules/**": True,
-        "**/__pycache__/**": True,
-        "**/.pytest_cache/**": True,
-        "**/.ruff_cache/**": True,
-        "**/.mypy_cache/**": True,
-        "**/.venv/**": True,
-        "**/venv/**": True,
-        "**/site-packages/**": True,
-        "**/dist/**": True,
-        "**/build/**": True,
-        "**/target/**": True,
-        "**/state/**": True,
-        "**/.claude/logs/**": True,
-        "**/.claude/worktrees/**": True,
-    },
-    # File tree: hide noise from the explorer (still searchable via
-    # `search.exclude` carve-out below if user removes it).
-    "files.exclude": {
-        "**/.git": True,
-        "**/node_modules": True,
-        "**/__pycache__": True,
-        "**/.pytest_cache": True,
-        "**/.ruff_cache": True,
-        "**/.mypy_cache": True,
-        "**/.venv": True,
-        "**/dist": True,
-        "**/build": True,
-        "**/target": True,
-    },
-    # Quick-search exclude (Cmd/Ctrl+P, full-text find): skip the heavy
-    # build / cache / log dirs so search latency stays sub-second.
-    "search.exclude": {
-        "**/node_modules": True,
-        "**/__pycache__": True,
-        "**/.venv": True,
-        "**/dist": True,
-        "**/build": True,
-        "**/target": True,
-        "**/state": True,
-        "**/.claude/logs": True,
-        "**/.claude/worktrees": True,
-        "**/*.lock": True,
-    },
-    # Pylance: skip these dirs from type-analysis. Indexing OFF avoids
-    # the persistent multi-GB cache under ~/.cache.
-    "python.analysis.exclude": [
-        "**/.venv/**",
-        "**/venv/**",
-        "**/__pycache__/**",
-        "**/.pytest_cache/**",
-        "**/.mypy_cache/**",
-        "**/.claude/worktrees/**",
-    ],
-    "python.analysis.indexing": False,
-}
-
-# Keys the backfill helpers consider — exposed for tests + the
-# orchestrator-side mirror in install.py.
-_VSCODE_EXCLUDE_KEYS: tuple[str, ...] = (
-    "files.watcherExclude",
-    "files.exclude",
-    "search.exclude",
-    "python.analysis.exclude",
-    "python.analysis.indexing",
+# v0.2.103 (Item 25): the whole block — defaults, keys and the backfill —
+# moved to `vco_lib/vscode_excludes.py` (this module is ratchet-capped and
+# the backfill gained a retire-arm: `files.exclude` no longer hides the
+# user's dist/build/target outputs, and the entries VCO wrote into
+# existing projects are pruned at exactly the boolean it wrote). The names
+# stay here as the aliases the bundle tests and install.py's mirror
+# (`install._backfill_vscode_excludes`, which routes to the same helper)
+# use.
+from vco_lib.vscode_excludes import (  # noqa: E402
+    _VSCODE_EXCLUDE_DEFAULTS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (install.py + tests read it off this module)
+    _VSCODE_EXCLUDE_KEYS,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (install.py docstring + tests)
+    backfill_in_project as _backfill_vscode_excludes_in_project,
 )
-
-
-def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
-    """Idempotent: add VS Code watcher/search/Pylance exclude blocks to
-    a per-project `.vscode/settings.json` when keys are missing.
-
-    PR-7 (v0.2.11): without these excludes, opening a large workspace
-    (>10 GB / >50k files — typical for ML projects with venvs, cargo
-    target/, model weights) in VS Code triggers OOM kills (verified
-    live on multiple large project trees on 2026-05-16). The launcher now
-    ships the canonical exclude block as a backfill — existing projects
-    catch up on `install-bundle --update`.
-
-    Idempotency contract:
-      - Missing settings file → create it with just the exclude block
-        + a marker comment. `_template_origin: "vibecoded-orchestrator
-        v0.2.11+ — vscode-excludes backfill"` so the file is identifiable.
-      - File not valid JSON or JSONC → action="unparseable" (no-op,
-        preserves user file untouched). A JSONC file (comments, trailing
-        commas — the common hand-edited case) is READ and the missing keys
-        are inserted into its text, comments kept (v0.2.97); an insertion
-        that cannot be verified is action="jsonc_edit_refused", untouched.
-      - Top-level key already present → user-wins, leave alone (covers
-        the "user set `files.watcherExclude: {}` to explicitly disable
-        the feature" case the addendum calls out).
-      - Top-level key missing → add it with the canonical value.
-
-    Args:
-        folder: target user-project folder.
-
-    Returns:
-        `{"action": str, "added_keys": [str, ...], "path": str}`. Action
-        is one of:
-          - "created"     — file didn't exist, written from canonical defaults
-          - "backfilled"  — file existed; added one or more missing keys
-          - "noop"        — file existed; every canonical key already present
-          - "unparseable" — file existed but couldn't be parsed; left alone
-          - "jsonc_edit_refused" — JSONC file whose edit could not be
-            verified; left alone
-          - "write_failed:<ErrorClass>" — atomic write raised
-    """
-    settings_file = folder / ".vscode" / "settings.json"
-    result: dict = {
-        "action": "noop",
-        "added_keys": [],
-        "path": str(settings_file),
-    }
-
-    if not settings_file.exists():
-        # Fresh write: include just the exclude block (no claude-code.env
-        # — PR-27 (v0.2.12, 2026-05-16) removed the Rust launcher's
-        # write of that block from `.vscode/settings.json` because it
-        # didn't propagate to MCP subprocesses on Linux. The canonical
-        # channel for per-project MCP env is `.claude/settings.json`
-        # env, written by the launcher's config_projection apply.)
-        payload: dict = {
-            "_template_origin": (
-                "vibecoded-orchestrator v0.2.11+ — vscode-excludes backfill"
-            ),
-        }
-        for key, value in _VSCODE_EXCLUDE_DEFAULTS.items():
-            payload[key] = value
-        try:
-            settings_file.parent.mkdir(parents=True, exist_ok=True)
-            text = json.dumps(payload, indent=2) + "\n"
-            _write_file_atomic(settings_file, text.encode("utf-8"))
-        except OSError as e:
-            result["action"] = f"write_failed:{type(e).__name__}"
-            return result
-        result["action"] = "created"
-        result["added_keys"] = list(_VSCODE_EXCLUDE_DEFAULTS.keys())
-        return result
-
-    loaded = _jsonc_edit.load_object(settings_file)
-    if loaded is None:
-        result["action"] = "unparseable"
-        return result
-    data, raw = loaded
-
-    added: list[str] = []
-    for key, value in _VSCODE_EXCLUDE_DEFAULTS.items():
-        if key not in data:
-            data[key] = value
-            added.append(key)
-
-    if not added:
-        return result  # action stays "noop"
-
-    payload_text = _jsonc_edit.dumps_preserving(raw, data, indent=2)
-    if payload_text is None:
-        result["action"] = "jsonc_edit_refused"
-        return result
-    try:
-        _write_file_atomic(settings_file, payload_text.encode("utf-8"))
-    except OSError as e:
-        result["action"] = f"write_failed:{type(e).__name__}"
-        return result
-
-    result["action"] = "backfilled"
-    result["added_keys"] = added
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -13123,19 +12716,17 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
     targets.extend(derived.get("code_collections", []) or [])
     weaviate_url = args.weaviate_url
 
+    # Defense in depth: never drop a shared collection — the constant or THIS machine's shared
+    # class (v0.2.103: the root's decided name), case-insensitively.
+    machine_shared, protected = _bcs.protected_shared_names()
     result: dict = {
         "dropped": [],
-        "skipped_shared": _SHARED_KG_NAME,
+        "skipped_shared": machine_shared,
         "errors": [],
     }
 
     for name in targets:
-        # Defense in depth: refuse to drop anything that looks like a
-        # shared collection. The shared name is fixed at install time,
-        # but a future config knob could let users override it; if we
-        # ever ship that knob, the override has to flow through here so
-        # this guard stays correct.
-        if name == _SHARED_KG_NAME:
+        if name.lower() in protected:
             result["errors"].append({
                 "collection": name,
                 "error": (
@@ -13468,11 +13059,11 @@ def _bundle_update_pointer_heal() -> None:
     lock. Never raises — a bundle update must always exit on its own result.
     """
     import sqlite3
-    # `urllib.request` is already imported unconditionally at module scope
-    # (line 53); a second function-local import shadowed it for no reason.
+    # `urllib.request` is already imported at module scope — no local shadow.
 
     try:
         from vco_lib.kg_binding_heal import heal_shared_kg_pointer_drift
+        from vco_lib.root_kg_identity import live_pick_ok
     except Exception:
         return
 
@@ -13494,11 +13085,9 @@ def _bundle_update_pointer_heal() -> None:
         schema = json.loads(resp.read())
     except Exception:
         return  # Weaviate unreachable → can't verify existence → skip.
-    # v0.2.96: the ONE home (`weaviate_helpers.schema_class_names`). The
-    # walrus + isinstance dance this replaces existed because repeating
-    # `c.get("class")` in the element expression re-widens to `str | None`
-    # (CI caught exactly that on the v0.2.76 push) — a narrowing trick five
-    # call-sites had each rediscovered differently, and three had got wrong.
+    # v0.2.96: the ONE home (`weaviate_helpers.schema_class_names`); the
+    # hand-rolled narrowing tricks five call-sites had each got differently
+    # wrong were removed.
     from vco_lib.weaviate_helpers import schema_class_names
     existing_classes = schema_class_names(schema)
 
@@ -13526,6 +13115,8 @@ def _bundle_update_pointer_heal() -> None:
                 log_event=_log,
                 deferral_report=_Sink(),
                 deferral_entry_cls=_Entry,
+                # N-8b: root_kg_identity's pick rule + live facts (as decide).
+                pick_ok=live_pick_ok(weaviate_url),
             )
             if changed:
                 conn.commit()
@@ -14395,16 +13986,17 @@ def _regenerate_node_formats(folder: Path) -> tuple[bool, str]:
     KG-summary generator over every node. Returns (ok, detail).
 
     Returns ``ok=True`` ONLY when regeneration ACTUALLY happened — i.e.
-    every node's generator run exited 0 AND the cache file's content
+    the generator's bulk run exited 0 AND the cache file's content
     changed. Otherwise ``(False, <reason>)`` so the caller DEFERS and
     leaves the cache intact (no data loss, no false "migrated" registry
     row).
 
-    Why the content-change check (review B1): `generate-kg-summary.py`
-    exits 0 WITHOUT writing when no summary backend is available
+    Why the content-change check (review B1): the generator's bulk mode
+    exits non-zero when no summary backend is available
     (`select_backend() == "skip"` — the normal headless-update state: no
-    `claude` CLI, no Ollama, no API key). A per-node exit-code check alone
-    would then report success while nothing was regenerated, registering
+    `claude` CLI, no Ollama, no API key), but an exit-code check alone
+    cannot prove a WRITE happened — any future exit-0-without-writing path
+    would report success while nothing was regenerated, registering
     the artifact at the new schema version with a stale cache + no
     deferral — silently masking the migration. Hashing the cache
     before/after the `--force` pass detects this: a real regeneration
@@ -14414,7 +14006,7 @@ def _regenerate_node_formats(folder: Path) -> tuple[bool, str]:
     Why all-or-defer (review C2): a PARTIAL regen (some nodes succeed,
     some genuinely error) would leave a MIXED-schema cache that the
     registry would then mark fully-migrated, so the stale entries never
-    self-heal. Any per-node failure → defer; the registry stays at the old
+    self-heal. Any failed node → defer; the registry stays at the old
     version and the next update retries until it fully converges.
     """
     gen = folder / ".claude" / "scripts" / "generate-kg-summary.py"
@@ -14433,19 +14025,20 @@ def _regenerate_node_formats(folder: Path) -> tuple[bool, str]:
     from vco_lib.python_exe import resolve_or_current
 
     py = resolve_or_current()
-    failures = 0
-    for node in nodes:
-        try:
-            proc = _subprocess_run_quiet(
-                [py, str(gen), str(node), "--force"], cwd=folder
-            )
-            if proc != 0:
-                failures += 1
-        except Exception:
-            failures += 1
+    # v0.2.103: ONE bulk invocation (`--all --force`) instead of one process
+    # per node — the generator's merged bulk mode (absorbed from the retired
+    # Ollama-only bulk generator) skips/fails per node internally and exits
+    # non-zero when any node errored, which the check below turns into the
+    # same all-or-defer outcome as the old per-node loop.
+    try:
+        code = _subprocess_run_quiet(
+            [py, str(gen), "--all", "--force"], cwd=folder
+        )
+    except Exception as exc:  # noqa: BLE001 — spawn failure defers like a node failure
+        return (False, f"generator spawn failed ({type(exc).__name__}: {exc}) — deferring")
     # C2: any failure → defer (never register a half-migrated cache).
-    if failures:
-        return (False, f"{failures}/{len(nodes)} node regenerations failed — deferring")
+    if code != 0:
+        return (False, f"bulk regeneration exited {code} — deferring")
     # B1: all exited 0, but did anything actually get written? If the cache
     # is byte-identical, the backend was unavailable (exit-0-no-write) →
     # treat as NOT regenerated and defer.
@@ -14468,88 +14061,18 @@ def _subprocess_run_quiet(argv: list[str], cwd: Path) -> int:
     ).returncode
 
 
-def _write_formats_migration_deferral(
-    folder: Path,
-    canonical: int,
-    detail: str,
-    *,
-    condition_id: str,
-    title: str,
-    sidecar_desc: str,
-    derived_from: str,
-    regen_cmd: str,
-    log_tag: str,
-) -> None:
-    """INFO deferral: a regenerated-sidecar schema bumped but the migration
-    action couldn't run inline. The existing cache is untouched; this tells
-    the project's Claude how to regenerate manually. Generic home (v0.2.73
-    M2) — per-artifact wrappers below supply the artifact-specific text."""
-    try:
-        from vco_lib.deferral_report import DeferralEntry
-        from vco_lib import deferral_emit as _de
-        # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-        _de.emit(folder, DeferralEntry(
-            condition_id=condition_id,
-            severity="info",
-            title=title,
-            detected=(
-                f"`{sidecar_desc}` is at an older schema than "
-                f"this orchestrator's canonical v{canonical}. It is a "
-                f"regenerated cache (derived from {derived_from}), so it was "
-                f"NOT overwritten. Inline regeneration did not run: {detail}."
-            ),
-            why_deferred=(
-                "Regenerated-data files are re-derived, never blind-overwritten. "
-                "When the generator backend is available, re-running it rewrites "
-                "the cache in the new schema with no data loss."
-            ),
-            command_to_apply=(
-                f"{regen_cmd}\n"
-                f"# Then dismiss:\n"
-                f"python -m vco_lib.project_init dismiss-deferral --folder {str(folder)!r} "
-                f"--condition-id {condition_id}"
-            ),
-        ))
-    except Exception as exc:  # never block the update flow
-        print(f"[{log_tag}] deferral write failed (non-fatal): {exc}", file=sys.stderr)
-
-
-def _write_node_formats_migration_deferral(folder: Path, canonical: int, detail: str) -> None:
-    """INFO deferral `regenerated_data_schema_migration_pending`: the
-    .node_formats schema bumped but regeneration couldn't run inline. Thin
-    wrapper over the generic writer (v0.2.73 M2) — text unchanged."""
-    _write_formats_migration_deferral(
-        folder, canonical, detail,
-        condition_id="regenerated_data_schema_migration_pending",
-        title="KG-summary cache schema bumped — regeneration pending",
-        sidecar_desc="knowledge/.node_formats.json",
-        derived_from="your KG nodes",
-        regen_cmd=(
-            "# Regenerate every node summary in the new schema:\n"
-            "for f in knowledge/**/*.md; do "
-            "python .claude/scripts/generate-kg-summary.py \"$f\" --force; done"
-        ),
-        log_tag="node-formats",
-    )
-
-
-def _write_code_formats_migration_deferral(folder: Path, canonical: int, detail: str) -> None:
-    """INFO deferral `code_formats_schema_migration_pending`: the
-    .code_formats schema bumped but the keep-regenerated action (delete +
-    let the generator rebuild) couldn't complete."""
-    _write_formats_migration_deferral(
-        folder, canonical, detail,
-        condition_id="code_formats_schema_migration_pending",
-        title="Code-summary sidecar schema bumped — regeneration pending",
-        sidecar_desc=".claude/.code_formats.json",
-        derived_from="your project's code-graph rows",
-        regen_cmd=(
-            "# Delete the old-schema sidecar and regenerate:\n"
-            "rm .claude/.code_formats.json\n"
-            "python .claude/scripts/generate-code-summary.py --project <name> --force"
-        ),
-        log_tag="code-formats",
-    )
+# v0.2.103 (review L-1): the formats-migration deferral emitters moved to
+# ``vco_lib/formats_migration_deferral.py`` (the delivery ratchet forbids
+# growing this file). Same-name aliases keep every call-site working on the
+# SAME objects, per the settings_merge precedent — and their printed
+# recovery commands now name the RESOLVED orchestrator-venv interpreter
+# instead of a bare `python` a system shell cannot use to import vco_lib.
+_write_formats_migration_deferral = (
+    formats_migration_deferral.write_formats_migration_deferral)
+_write_node_formats_migration_deferral = (
+    formats_migration_deferral.write_node_formats_migration_deferral)
+_write_code_formats_migration_deferral = (
+    formats_migration_deferral.write_code_formats_migration_deferral)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

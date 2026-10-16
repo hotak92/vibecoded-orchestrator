@@ -235,12 +235,31 @@ describe('polling', () => {
 });
 
 describe('per-agent attribution (v0.2.102 G3 — who actually answered)', () => {
-  it('lists the identities the gateway named, one row per (session, agent)', () => {
+  it('lists the subagent identities the gateway named, one row per (session, agent)', () => {
     const rows = [
-      agentRow({ agent: null, model: 'claude-opus-5-5', route: 'anthropic' }),
       agentRow({ agent: 'agent-aaa', model: 'glm-5.3-flash' }),
+      agentRow({ session: 'chat-2', agent: 'agent-bbb', model: 'k3' }),
     ];
     expect(visibleAgents(snapshot([], false, rows))).toEqual(rows);
+  });
+
+  it('hides main-chat rows — the user knows their chat model; background Haiku calls flooded the list', () => {
+    const lane = agentRow({ agent: 'agent-aaa', model: 'glm-5.3' });
+    const rows = [
+      agentRow({ agent: null, model: 'claude-haiku-4-5-20251001', route: 'anthropic' }),
+      agentRow({ session: 'chat-2', agent: null, model: 'claude-opus-5-5', route: 'anthropic' }),
+      lane,
+    ];
+    expect(visibleAgents(snapshot([], false, rows))).toEqual([lane]);
+  });
+
+  it('keeps a main-chat row when a fallback served it — that is worth knowing', () => {
+    const fellBack = agentRow({
+      agent: null,
+      model: 'glm-5.3-flash',
+      fallback_from: 'anthropic:claude-haiku-4-5',
+    });
+    expect(visibleAgents(snapshot([], false, [fellBack]))).toEqual([fellBack]);
   });
 
   it('reads a snapshot from an older gateway (no agents block) as empty, never as an error', () => {

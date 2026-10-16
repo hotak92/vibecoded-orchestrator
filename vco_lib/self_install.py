@@ -344,4 +344,70 @@ def run_root_bundle_install(
             "errors": result.get("errors", []),
         },
     )
+    _record_root_settings_action(install_root, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# v0.2.103 F4 (Windows field run): the step-5b → step-9 settings.json handoff
+# ---------------------------------------------------------------------------
+#
+# On a fresh clone step 5b (this delegated bundle run) CREATES the root's
+# `.claude/settings.json` from the template; step 9 (`install.py
+# _configure_claude_settings`) then found a file with no `_vco_managed_keys`
+# and treated VCO's own fresh file as user-owned: `settings.json.vco-new` +
+# a `claude_settings_user_modified_preserved` deferral. The bundle's own
+# envelope says what it did; recording it here lets step 9 recognise a file
+# VCO created in THIS process — the run signal, not a guess from the file's
+# contents (an older root whose file was user-edited still carries the same
+# template keys).
+
+#: ``resolved install root → settings_action`` of the last delegated run in
+#: this process. Only ``"created"`` is acted on.
+_ROOT_SETTINGS_ACTION: dict[str, str] = {}
+
+
+def _record_root_settings_action(install_root: Path, result: dict) -> None:
+    try:
+        key = str(Path(install_root).resolve())
+    except OSError:
+        return
+    _ROOT_SETTINGS_ACTION[key] = str(result.get("settings_action", "") or "")
+
+
+def root_settings_created_this_run(install_root: Path) -> bool:
+    """True iff this process's delegated bundle run CREATED
+    ``<install_root>/.claude/settings.json`` (settings_action ``created``)."""
+    try:
+        key = str(Path(install_root).resolve())
+    except OSError:
+        return False
+    return _ROOT_SETTINGS_ACTION.get(key) == "created"
+
+
+def adopt_bundle_created_settings(existing: dict, defaults: dict,
+                                  sentinel: str) -> dict:
+    """Merge install's step-9 ``defaults`` into a settings.json the bundle
+    created this run, FILL-ONLY: every value already in the file wins (the
+    template's hooks/permissions, and any env the config projection wrote in
+    between — the canonical env writer), defaults fill what is missing,
+    ``permissions.allow`` is the ordered union, and the managed-keys
+    ``sentinel`` is stamped so later installs take the managed-block path.
+    Pure: returns a new dict."""
+    merged = dict(existing)
+    for key, value in defaults.items():
+        if key == sentinel:
+            continue
+        cur = merged.get(key)
+        if key not in merged:
+            merged[key] = value
+        elif isinstance(cur, dict) and isinstance(value, dict):
+            filled = dict(cur)
+            for k, v in value.items():
+                if k == "allow" and isinstance(filled.get(k), list) and isinstance(v, list):
+                    filled[k] = list(filled[k]) + [x for x in v if x not in filled[k]]
+                else:
+                    filled.setdefault(k, v)
+            merged[key] = filled
+    merged[sentinel] = list(defaults.get(sentinel) or [])
+    return merged

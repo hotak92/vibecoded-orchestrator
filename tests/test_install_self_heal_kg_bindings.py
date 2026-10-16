@@ -67,9 +67,17 @@ from tests.common.scratch_dirs import (  # noqa: E402
 
 
 class _StubSchemaHandler(http.server.BaseHTTPRequestHandler):
-    """Returns a fixed schema payload on GET /v1/schema."""
+    """Returns a fixed schema payload on GET /v1/schema.
+
+    v0.2.103 (review V02103-R29 N-8b): also answers POST /v1/graphql
+    Aggregate counts, because the pointer heal's caller-supplied pick
+    predicate (``root_kg_identity.live_pick_ok``) counts the picked class
+    before converging onto it. Counts default to 0 (an empty class is
+    followable without profile facts — same as ``decide``).
+    """
 
     schema: dict = {"classes": []}
+    counts: dict = {}
 
     def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler API
         if self.path == "/v1/schema":
@@ -82,6 +90,27 @@ class _StubSchemaHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler API
+        import re
+
+        if self.path != "/v1/graphql":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        query = self.rfile.read(length).decode("utf-8", "replace")
+        m = re.search(r"Aggregate\s*\{\s*(\w+)\s*\{", query)
+        klass = m.group(1) if m else ""
+        count = self.__class__.counts.get(klass, 0)
+        body = json.dumps(
+            {"data": {"Aggregate": {klass: [{"meta": {"count": count}}]}}}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, *args, **kwargs):
         # Silence per-request stderr noise.
@@ -97,6 +126,7 @@ def _start_stub_weaviate(classes: list[str]) -> tuple[http.server.HTTPServer, in
     _StubSchemaHandler.schema = {
         "classes": [{"class": name} for name in classes]
     }
+    _StubSchemaHandler.counts = {}
     # Bind to localhost ephemeral port — random so concurrent tests
     # don't collide.
     server = http.server.HTTPServer(("127.0.0.1", 0), _StubSchemaHandler)
@@ -208,6 +238,7 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         self._env_patch.stop()
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -782,6 +813,7 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
         self._env_patch.stop()
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -1363,6 +1395,7 @@ class SelfHealDeadRootRowSweepEndToEndTests(unittest.TestCase):
         self._env_patch.stop()
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -1479,6 +1512,7 @@ class SelfHealIdentityPickRemedyEndToEndTests(unittest.TestCase):
         self._env_patch.stop()
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)

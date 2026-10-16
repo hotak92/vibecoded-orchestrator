@@ -483,6 +483,29 @@ pub fn real_start_after_install() -> StartAfterInstall {
     })
 }
 
+/// The GLOBAL-row sibling of [`StartAfterInstall`]: `(manifest, module_id,
+/// db)` → the started container's name. Injected for the same reason —
+/// before it existed, a hub test that resumed a global row really ran
+/// `podman run` under the PRODUCTION global name (`vct-rl-reranker`,
+/// restart=unless-stopped, the user's real RL data dir mounted), replacing
+/// the user's own container on every Rust test run (2026-10-14).
+pub type StartGlobal = Box<
+    dyn for<'a> Fn(
+            &'a ModuleManifest,
+            &'a str,
+            &'a Db,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
+
+/// The production [`StartGlobal`]: [`start_global_container_supervisor`].
+pub fn real_start_global() -> StartGlobal {
+    Box::new(|manifest, module_id, db| {
+        Box::pin(async move { start_global_container_supervisor(manifest, module_id, db).await })
+    })
+}
+
 /// Iterate every `status='installed'` install row and ensure its
 /// container is running. Soft-fail per row. Called from
 /// `server.rs::start_hub_server` at hub boot.
@@ -537,8 +560,13 @@ pub async fn resume_containers_on_startup(db: &Db, resolve_manifest: ManifestRes
     // Soft-fail: errors don't block the sweep.
     reap_pathological_containers_for_resume(db, &resolve_manifest).await;
 
-    resume_containers_on_startup_with_starter(db, resolve_manifest, real_start_after_install())
-        .await
+    resume_containers_on_startup_with_starter(
+        db,
+        resolve_manifest,
+        real_start_after_install(),
+        real_start_global(),
+    )
+    .await
 }
 
 /// V52-D.2 (hub-side mirror): build the (claimed_names,
@@ -618,6 +646,7 @@ pub async fn resume_containers_on_startup_with_starter(
     db: &Db,
     resolve_manifest: ManifestResolver,
     start_after_install: StartAfterInstall,
+    start_global: StartGlobal,
 ) {
     let rows = match db.list_module_installs_needing_start() {
         Ok(v) => v,
@@ -735,9 +764,7 @@ pub async fn resume_containers_on_startup_with_starter(
                     continue;
                 }
 
-                if let Err(e) =
-                    start_global_container_supervisor(&manifest, &module_id, db).await
-                {
+                if let Err(e) = start_global(&manifest, &module_id, db).await {
                     tracing::error!(
                         module_id,
                         error = %e,
@@ -2100,7 +2127,8 @@ mod tests {
             let db = Db::open_in_memory().expect("DB");
             let resolver: ManifestResolver = Box::new(|_id: &str| None);
             // Should return without panicking.
-            resume_containers_on_startup(&db, resolver).await;
+            let (per_project, global, _starts) = recording_starters();
+            resume_containers_on_startup_with_starter(&db, resolver, per_project, global).await;
         });
     }
 
@@ -2218,6 +2246,26 @@ mod tests {
         m
     }
 
+    /// Hermetic resume starters: record every start request (`"project:<module>"`
+    /// / `"global:<module>"`) and fail it like a machine without podman does.
+    /// Every resume test uses these — calling the public
+    /// `resume_containers_on_startup` from a test ran a REAL `podman run`
+    /// (the global row under the production name `vct-rl-reranker`).
+    fn recording_starters() -> (StartAfterInstall, StartGlobal, Arc<Mutex<Vec<String>>>) {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let pp_calls = Arc::clone(&calls);
+        let per_project: StartAfterInstall = Box::new(move |manifest, _project, _db| {
+            pp_calls.lock().unwrap().push(format!("project:{}", manifest.id));
+            Box::pin(async move { Err("test stub: no real container start".to_string()) })
+        });
+        let g_calls = Arc::clone(&calls);
+        let global: StartGlobal = Box::new(move |_manifest, module_id, _db| {
+            g_calls.lock().unwrap().push(format!("global:{module_id}"));
+            Box::pin(async move { Err("test stub: no real container start".to_string()) })
+        });
+        (per_project, global, calls)
+    }
+
     /// Wrap a ManifestResolver in a tracker so tests can verify which
     /// module_ids the resume loop visited.
     fn tracking_resolver(
@@ -2308,7 +2356,8 @@ mod tests {
                 })
             });
 
-            resume_containers_on_startup_with_starter(&db, resolver, starter).await;
+            let (_, global, _) = recording_starters();
+            resume_containers_on_startup_with_starter(&db, resolver, starter, global).await;
 
             // Resolver was invoked for our row.
             let visited_ids = visited.lock().unwrap().clone();
@@ -2377,7 +2426,8 @@ mod tests {
             );
             let (resolver, visited) = tracking_resolver(manifests);
 
-            resume_containers_on_startup(&db, resolver).await;
+            let (per_project, global, _starts) = recording_starters();
+            resume_containers_on_startup_with_starter(&db, resolver, per_project, global).await;
 
             // Resolver WAS invoked (it runs before the gate).
             let visited_ids = visited.lock().unwrap().clone();
@@ -2452,7 +2502,8 @@ mod tests {
             );
             let (resolver, visited) = tracking_resolver(manifests);
 
-            resume_containers_on_startup(&db, resolver).await;
+            let (per_project, global, _starts) = recording_starters();
+            resume_containers_on_startup_with_starter(&db, resolver, per_project, global).await;
 
             // Resolver was called.
             assert!(
@@ -2512,7 +2563,8 @@ mod tests {
             );
             let (resolver, _visited) = tracking_resolver(manifests);
 
-            resume_containers_on_startup(&db, resolver).await;
+            let (per_project, global, _starts) = recording_starters();
+            resume_containers_on_startup_with_starter(&db, resolver, per_project, global).await;
 
             // Gate rejected → no last_error write.
             let row_after = db
@@ -2747,7 +2799,16 @@ mod tests {
             let (resolver, visited) = tracking_resolver(manifests);
 
             // Smoke: resume must not panic on a global row.
-            resume_containers_on_startup(&db, resolver).await;
+            let (per_project, global, starts) = recording_starters();
+            resume_containers_on_startup_with_starter(&db, resolver, per_project, global).await;
+
+            // The global row reached the GLOBAL starter — injected, so no
+            // real `podman run` under the production container name.
+            assert_eq!(
+                *starts.lock().unwrap(),
+                vec!["global:vct-rl-reranker".to_string()],
+                "a ContainerPull service global row must request exactly one global start"
+            );
 
             // Resolver was invoked even for global rows.
             assert!(
@@ -2797,7 +2858,8 @@ mod tests {
             );
             let (resolver, visited) = tracking_resolver(manifests);
 
-            resume_containers_on_startup(&db, resolver).await;
+            let (per_project, global, _starts) = recording_starters();
+            resume_containers_on_startup_with_starter(&db, resolver, per_project, global).await;
 
             assert!(visited.lock().unwrap().contains(&"vct-rl-reranker".to_string()));
 

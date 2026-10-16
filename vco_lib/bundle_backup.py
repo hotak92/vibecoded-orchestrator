@@ -60,8 +60,12 @@ def backup_bytes_for_adoption(
     join, no monolithic string that could overflow a Windows MAX_PATH check).
     """
     from vco_lib.paths import to_posix_rel
+    from vco_lib.project_backups import ensure_backups_dir
     from vco_lib.project_init import _ADOPT_BACKUPS_REL, _write_file_atomic
 
+    # The backup tree is self-ignoring (review R11 A1): a raise here is a
+    # backup failure like any other — the caller does not adopt.
+    ensure_backups_dir(folder)
     rel_parts = PurePosixPath(to_posix_rel(dest_rel)).parts
     backup_abs = folder / _ADOPT_BACKUPS_REL / ts
     for part in rel_parts:

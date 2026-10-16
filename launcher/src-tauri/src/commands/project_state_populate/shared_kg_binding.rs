@@ -193,8 +193,11 @@ pub fn decide_shared_binding_repair(
     }
 
     // Gate 3: the configured class must be POSITIVELY absent. (Case-
-    // insensitive: a case-different sibling resolves fine — the hub's casing
-    // rebind adopts on-disk casing — so it is not a phantom.)
+    // insensitive: a case-different sibling is never a repair target here.
+    // Since v0.2.103 the hub serves the shared name byte-for-byte and adopting
+    // a case-sibling is the explicit consent step
+    // `python -m vco_lib.root_kg_identity adopt --yes`; install.py reports the
+    // block as `root_kg_blocked_by_case_sibling`.)
     if classes_lower.contains(&current_name.to_lowercase()) {
         return SharedBindingDecision::Healthy;
     }

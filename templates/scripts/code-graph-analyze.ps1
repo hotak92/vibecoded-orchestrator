@@ -2,7 +2,10 @@
 # Usage: .\code-graph-analyze.ps1 C:\path\to\repo [--project NAME] [--incremental]
 #
 # Exit codes: whatever `analyze_code_graph.py` exits; 1 = REFUSAL - no Python
-# environment with the dependencies this wrapper needs (wrapper-only).
+# environment with the dependencies this wrapper needs (wrapper-only);
+# 75 = a code-graph walk is already running for this project (the
+# single-flight claim refused a twin - v0.2.103; nothing was started, retry
+# after the running walk finishes).
 #
 # RESILIENT INTERPRETER DISCOVERY (RT-4). The tiers live in ONE home
 # (`vct_venv_ladder.ps1`, v0.2.94) shared with the bash sibling and every
@@ -68,5 +71,13 @@ if (-not $VenvPython) {
     exit 1
 }
 
-& $VenvPython (Join-Path $ScriptDir "analyze_code_graph.py") @args
+# v0.2.103: the analyzer is spawned THROUGH the per-project walk
+# single-flight claim (the Python SSOT - vco_lib.codegraph_walk), so a
+# launcher build / Re-analyze / extras sync / CLI run of a project already
+# walking exits 75 ("already running") instead of starting a twin. The claim
+# module re-spawns the analyzer under its own interpreter - the SAME one the
+# ladder just qualified above. Scoped --only-file/--only-files-from runs
+# pass through unclaimed (the drain hook's own per-root lock serializes
+# those). PARITY: the bash sibling routes identically.
+& $VenvPython -m vco_lib.codegraph_walk (Join-Path $ScriptDir "analyze_code_graph.py") @args
 exit $LASTEXITCODE

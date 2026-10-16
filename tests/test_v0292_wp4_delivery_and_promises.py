@@ -486,11 +486,43 @@ class DeliveryAuditTests(unittest.TestCase):
         ``compose_override_filename_conflict`` emitter was retired as superseded
         by ``compose_override_pair_diverged``, whose one reading lives in
         ``vco_lib/compose_override_pair.py``.
+
+        v0.2.103 — LOWERED 15_136 -> 14_931 by two removals (net of +4 for the local-repo pending reconcile): (1) the one-off
+        v0.2.46 semver-boundary chunker re-sync path was retired (owner decision
+        2026-10-15; superseded by ``vco_lib/chunker_revision.py`` + the R2-4
+        launcher revision path): ``_emit_chunker_resync_deferral``,
+        ``_parse_semver`` and ``_CHUNKER_BUMP_VERSION`` left the file; (2) review
+        L-1: the three formats-migration emitters moved to
+        ``vco_lib/formats_migration_deferral.py`` with same-name aliases.
+
+        v0.2.103 (Item 25, vscode-excludes retire-arm) — LOWERED 14_931 ->
+        14_725: the ``files.exclude`` build-output retirement (dist/build/
+        target leave the shipped block; the entries VCO wrote into existing
+        projects are pruned only while the block is still VCO's) needed a prune arm in the
+        exclude backfill, and the gate caught the addition — the extraction took
+        the whole block (defaults, keys, ``_backfill_vscode_excludes_in_project``)
+        to ``vco_lib/vscode_excludes.py``, leaving same-name aliases. install.py's
+        mirror delegates to the same helper, so the prune is ONE home for the
+        orchestrator root and every project.
+        
+        v0.2.103 — LOWERED 14_725 -> 14_719: the NEW-8 symlink-redirect
+        notice moved to ``vco_lib.atomic.warn_symlink_redirect`` (one wording
+        for every symlink-safe writer).
+
+        v0.2.103 (review V02103-FINAL2 L-1) — LOWERED 14_719 -> 14_662: the
+        shared-KG name order moved to ``vco_lib.root_kg_identity.
+        resolve_shared_name`` (one home, Identity-tab pick first);
+        ``_resolve_shared_kg_name`` is a shim over it.
+
+        v0.2.103 (review V02103-R41 M1) — LOWERED 14_662 -> 14_653: the
+        re-index deferral emission moved to
+        ``codegraph_extractor_generation.emit_reindex_deferral`` (its
+        decision module's follow-up, not bundle plumbing).
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_136,
+            n, 14_653,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

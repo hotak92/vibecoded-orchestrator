@@ -977,6 +977,41 @@ pub async fn auto_migrate_per_project_to_global(
     db: &Db,
     resolve_manifest: impl Fn(&str) -> Option<ModuleManifest>,
 ) {
+    auto_migrate_per_project_to_global_with(db, resolve_manifest, &PodmanMigrationOps).await
+}
+
+/// The container side effects of [`auto_migrate_per_project_to_global`]:
+/// stopping the per-project containers and starting the global one. One
+/// seam so the migration's tests run its real row logic without a real
+/// `podman` call — they used to really start the PRODUCTION-named global
+/// `vct-rl-reranker` container (restart=unless-stopped, bind-mounting the
+/// user's real `~/.claude/retrieval_rl_data`) on every Rust test run, which
+/// replaced the user's own global container and crash-looped (2026-10-14).
+pub(crate) trait MigrationContainerOps {
+    async fn stop_per_project(&self, container_name: &str) -> Result<(), String>;
+    async fn start_global(&self, manifest: &ModuleManifest, db: &Db) -> Result<String, String>;
+}
+
+/// The production [`MigrationContainerOps`]: the real podman calls.
+struct PodmanMigrationOps;
+
+impl MigrationContainerOps for PodmanMigrationOps {
+    async fn stop_per_project(&self, container_name: &str) -> Result<(), String> {
+        stop_container_for_project(container_name).await
+    }
+
+    async fn start_global(&self, manifest: &ModuleManifest, db: &Db) -> Result<String, String> {
+        start_global_container_after_install(manifest, db).await
+    }
+}
+
+/// [`auto_migrate_per_project_to_global`] with its container side effects
+/// injected (see [`MigrationContainerOps`]).
+pub(crate) async fn auto_migrate_per_project_to_global_with(
+    db: &Db,
+    resolve_manifest: impl Fn(&str) -> Option<ModuleManifest>,
+    ops: &impl MigrationContainerOps,
+) {
     // Enumerate every distinct module_id that has at least one
     // per-project row. Using `list_module_installs_with_status` for all
     // three steady-state statuses gives us a small set per machine
@@ -1060,7 +1095,7 @@ pub async fn auto_migrate_per_project_to_global(
         for row in &per_project_rows {
             if let Some(container_name) = row.container_name.as_deref() {
                 if !container_name.is_empty() {
-                    if let Err(e) = stop_container_for_project(container_name).await {
+                    if let Err(e) = ops.stop_per_project(container_name).await {
                         tracing::error!(
                             "[auto_migrate] stop_container_for_project({}) failed: {}",
                             container_name, e
@@ -1127,7 +1162,7 @@ pub async fn auto_migrate_per_project_to_global(
             "container" | "service"
         ) && manifest.install.method == InstallMethod::ContainerPull
         {
-            match start_global_container_after_install(&manifest, db).await {
+            match ops.start_global(&manifest, db).await {
                 Ok(name) => {
                     tracing::info!(
                         "[auto_migrate] started global container {} for {}",
@@ -4105,11 +4140,41 @@ mod tests {
             .iter()
             .position(|a| a == "ghcr.io/hotak92/vct-rl-reranker:0.1.0")
             .expect("image arg present");
-        let cmd_idx = args
+        // v0.2.103 (Fix 5): the manifest's `command` is now passed via
+        // `--entrypoint` (BEFORE the image) instead of being appended
+        // after it as CMD — podman appends CMD to the image's ENTRYPOINT,
+        // which doubled the invocation on ENTRYPOINT-bearing images.
+        let entrypoint_idx = args
             .iter()
-            .position(|a| a == "python")
-            .expect("command arg present");
-        assert!(img_idx < cmd_idx, "image must precede command");
+            .position(|a| a == "--entrypoint")
+            .expect("--entrypoint flag present");
+        assert!(
+            entrypoint_idx < img_idx,
+            "--entrypoint must precede the image; got {:?}",
+            args
+        );
+        assert_eq!(
+            args.get(entrypoint_idx + 1).map(String::as_str),
+            Some("python"),
+            "the --entrypoint value is the manifest command's first word"
+        );
+        // After the image: the manifest's `args` as the CMD (the command
+        // word is NOT repeated after the image).
+        assert_eq!(
+            args[img_idx + 1..],
+            [
+                "-m",
+                "rl_server.rl_server",
+                "--port",
+                "11438",
+                "--project-root",
+                "/data",
+                "--log-path",
+                "/data/logs/rl_events_acme-corp.jsonl",
+            ],
+            "CMD after the image must be exactly runtime.args; got {:?}",
+            args
+        );
     }
 
     #[test]
@@ -5675,6 +5740,35 @@ mod tests {
 
     // ─── v0.2.49 Stream A: auto-migration tests ─────────────────────────
 
+    /// Records the migration's container calls instead of running podman.
+    /// Every auto-migration test goes through it: calling the public
+    /// `auto_migrate_per_project_to_global` from a test really started the
+    /// production-named global `vct-rl-reranker` container on the
+    /// developer's machine (see [`MigrationContainerOps`]).
+    #[derive(Default)]
+    struct RecordingMigrationOps {
+        stopped: std::sync::Mutex<Vec<String>>,
+        started: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MigrationContainerOps for RecordingMigrationOps {
+        async fn stop_per_project(&self, container_name: &str) -> Result<(), String> {
+            self.stopped.lock().unwrap().push(container_name.to_string());
+            Ok(())
+        }
+
+        async fn start_global(&self, manifest: &ModuleManifest, _db: &Db) -> Result<String, String> {
+            self.started.lock().unwrap().push(manifest.id.clone());
+            Ok(format!("{}-recorded", manifest.id))
+        }
+    }
+
+    impl RecordingMigrationOps {
+        fn started(&self) -> Vec<String> {
+            self.started.lock().unwrap().clone()
+        }
+    }
+
     /// Auto-migration is a NO-OP when no module declares scope=global.
     /// Per-project rows are untouched.
     #[test]
@@ -5704,13 +5798,12 @@ mod tests {
 
             // Resolver returns a manifest with scope=PerProject (default).
             let manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
-            auto_migrate_per_project_to_global(&db, |id: &str| {
-                if id == "vct-rl-reranker" {
-                    Some(manifest.clone())
-                } else {
-                    None
-                }
-            })
+            let ops = RecordingMigrationOps::default();
+            auto_migrate_per_project_to_global_with(
+                &db,
+                |id: &str| (id == "vct-rl-reranker").then(|| manifest.clone()),
+                &ops,
+            )
             .await;
 
             // Per-project row untouched.
@@ -5720,11 +5813,12 @@ mod tests {
                 .unwrap();
             assert_eq!(pp_row.module_id, "vct-rl-reranker");
             assert!(pp_row.project_id.is_some());
-            // No global row created.
+            // No global row created, no container started.
             assert!(db
                 .get_global_module_install("vct-rl-reranker")
                 .unwrap()
                 .is_none());
+            assert!(ops.started().is_empty(), "no-op migration must start nothing");
         });
     }
 
@@ -5760,13 +5854,12 @@ mod tests {
             // Manifest now declares scope=global.
             let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
             manifest.install.scope = crate::manifest::InstallScope::Global;
-            auto_migrate_per_project_to_global(&db, |id: &str| {
-                if id == "vct-rl-reranker" {
-                    Some(manifest.clone())
-                } else {
-                    None
-                }
-            })
+            let ops = RecordingMigrationOps::default();
+            auto_migrate_per_project_to_global_with(
+                &db,
+                |id: &str| (id == "vct-rl-reranker").then(|| manifest.clone()),
+                &ops,
+            )
             .await;
 
             // All per-project rows deleted.
@@ -5786,6 +5879,9 @@ mod tests {
                 .expect("global row exists");
             assert!(g_row.project_id.is_none());
             assert_eq!(g_row.module_version, "0.2.7");
+            // The global container is requested exactly once — through the
+            // injected ops, never a real `podman run`.
+            assert_eq!(ops.started(), vec!["vct-rl-reranker".to_string()]);
         });
     }
 
@@ -5824,15 +5920,14 @@ mod tests {
 
             let mut manifest = make_manifest(true, true, PROD_RL_LOGS_HOST);
             manifest.install.scope = crate::manifest::InstallScope::Global;
+            let ops = RecordingMigrationOps::default();
 
             // First run.
-            auto_migrate_per_project_to_global(&db, |id: &str| {
-                if id == "vct-rl-reranker" {
-                    Some(manifest.clone())
-                } else {
-                    None
-                }
-            })
+            auto_migrate_per_project_to_global_with(
+                &db,
+                |id: &str| (id == "vct-rl-reranker").then(|| manifest.clone()),
+                &ops,
+            )
             .await;
 
             let g_row_first = db
@@ -5842,13 +5937,11 @@ mod tests {
             let first_id = g_row_first.id.clone();
 
             // Second run — must be a no-op (same id preserved).
-            auto_migrate_per_project_to_global(&db, |id: &str| {
-                if id == "vct-rl-reranker" {
-                    Some(manifest.clone())
-                } else {
-                    None
-                }
-            })
+            auto_migrate_per_project_to_global_with(
+                &db,
+                |id: &str| (id == "vct-rl-reranker").then(|| manifest.clone()),
+                &ops,
+            )
             .await;
 
             let g_row_second = db
@@ -5858,6 +5951,11 @@ mod tests {
             assert_eq!(
                 g_row_second.id, first_id,
                 "global row id must be preserved across re-runs (idempotency)"
+            );
+            assert_eq!(
+                ops.started(),
+                vec!["vct-rl-reranker".to_string()],
+                "the re-run must not start the global container again"
             );
         });
     }
@@ -5878,7 +5976,8 @@ mod tests {
                 .expect("set installed");
 
             // Resolver returns None for everything.
-            auto_migrate_per_project_to_global(&db, |_| None).await;
+            let ops = RecordingMigrationOps::default();
+            auto_migrate_per_project_to_global_with(&db, |_| None, &ops).await;
 
             // Per-project row untouched.
             let pp = db
@@ -5887,6 +5986,7 @@ mod tests {
                 .unwrap();
             assert!(pp.project_id.is_some(), "per-project row preserved");
             assert!(db.get_global_module_install("unknown-mod").unwrap().is_none());
+            assert!(ops.started().is_empty());
         });
     }
 

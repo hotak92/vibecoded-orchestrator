@@ -23,7 +23,12 @@ Guards that make this a DETECTOR, not a substring match:
     ``git commitlog`` are False (the retired ``if: Bash(git commit *)``
     word-boundary rule);
   * git's own GLOBAL options (``-C``, ``-c``, ``--git-dir``, …) between the
-    verb and the subcommand are skipped, so ``git -C /repo commit`` is True.
+    verb and the subcommand are skipped, so ``git -C /repo commit`` is True;
+  * heredoc BODIES are stripped before the walk (v0.2.103: the walker
+    treats an unquoted newline as a command separator, so a body line
+    would otherwise become a segment — raw text, not a command);
+  * an unquoted newline separates commands (the walker's own rule), so
+    ``make\\ngit commit -m x`` is True.
 """
 from __future__ import annotations
 
@@ -33,6 +38,7 @@ import sys
 from typing import List, Optional
 
 from vco_lib.bash_command_walk import walk_command
+from vco_lib.bash_write_targets import strip_heredocs
 from vco_lib.powershell_command import BASH_TOOL, POWERSHELL_TOOL, command_for_bash_readers
 
 __all__ = ["command_has_git_commit"]
@@ -80,6 +86,7 @@ def command_has_git_commit(command: str, tool_name: str = BASH_TOOL) -> bool:
     cmd = command_for_bash_readers(tool_name, command or "")
     if not cmd.strip():
         return False
+    cmd, _bodies = strip_heredocs(cmd)
     return bool(walk_command(cmd, _segment_is_git_commit))
 
 

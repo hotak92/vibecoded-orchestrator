@@ -9,8 +9,10 @@
 // gone). Both were rebuilt; this file locks them so a future refactor
 // cannot drop either without a red test:
 //
-//   (a) card click → `/project/<id>/settings` (the project's settings
-//       page — the same surface the standalone route renders);
+//   (a) card click → `/project/<id>` (the project page / default tab —
+//       owner ruling 2026-10-15, reversing the v0.2.101 P299-C3 routing
+//       that sent every card click to settings); the explicit ⚙ Settings
+//       row action keeps `/project/<id>/settings` via `openSettings()`;
 //   (b) a per-row "Update" action that runs the EXISTING per-project
 //       bundle-update engine — `projects.update()` in the store, which
 //       invokes `update_project_v2` (projects_v2.rs → the one
@@ -135,15 +137,30 @@ function pageInvokeLiterals(): string[] {
 
 // ─── (a) the project card routes into the project's SETTINGS page ─────────
 
-describe('affordance (a) — card click routes into /project/<id>/settings', () => {
-  it("the page's open() navigates to the per-project settings route", () => {
+describe('affordance (a) — card click opens the project page; ⚙ opens settings', () => {
+  it("the page's open() navigates to the project page (default tab), never settings", () => {
     const open = findFunction('open');
     expect(open, 'the page has no open() handler at all').toBeTruthy();
     const targets = templateArgsOfCalls(open, 'goto');
     expect(
       targets,
-      'open() must goto(`/project/${id}/settings`) — the settings page, ' +
-        'not the project overview (P299-C3 regression)',
+      'open() must goto(`/project/${id}`) — a plain project open lands on ' +
+        'the project page, not settings (owner ruling 2026-10-15)',
+    ).toContainEqual(['/project/', '']);
+    for (const t of targets) {
+      expect(
+        t,
+        'open() routes to /settings — a plain project open must not',
+      ).not.toContain('/settings');
+    }
+  });
+
+  it("the page's openSettings() navigates to the per-project settings route", () => {
+    const fn = findFunction('openSettings');
+    expect(fn, 'the page has no openSettings() handler at all').toBeTruthy();
+    expect(
+      templateArgsOfCalls(fn, 'goto'),
+      'openSettings() must goto(`/project/${id}/settings`)',
     ).toContainEqual(['/project/', '/settings']);
   });
 
@@ -256,13 +273,13 @@ describe('affordance (b) — per-row Update via the existing bundle-update engin
     ).toContain('updatingId');
   });
 
-  it('a per-row Settings button exists beside it and routes through open()', () => {
+  it('a per-row Settings button exists beside it and routes through openSettings()', () => {
     const btn = buttonByTestId('project-row-settings');
     expect(btn, 'no button[data-testid=project-row-settings]').toBeTruthy();
     expect(
       identifiers(attr(btn!, 'onclick')),
-      'the row Settings button must call open (the settings route)',
-    ).toContain('open');
+      'the row Settings button must call openSettings (the settings route)',
+    ).toContain('openSettings');
   });
 
   it('a finished row update re-takes the bundle census (the page comment promises every bundle-changing action does)', () => {

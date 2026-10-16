@@ -177,6 +177,38 @@ class InstallDeferralFlow:
                 self._seeded_entries[entry.condition_id] = entry
         return merged
 
+    def adopt_carried(self, entries) -> int:
+        """v0.2.103: take the entries an install.py parent accumulated before
+        its post-venv hand-off (``install_companions.continue_in_venv``) as
+        THIS run's own detections. The parent's process image is gone (exec,
+        or a Windows parent that exits with the child's code) and no exit-path
+        flush ran, so without this an owned entry from a step the child does
+        not repeat would silently drop at finalize. Called after :meth:`seed`;
+        a carried entry supersedes a seeded copy of the same id (last write
+        wins), and a step that re-detects the condition supersedes it again.
+        Returns the number adopted; malformed dicts are skipped."""
+        from vco_lib.deferral_report import _entry_from_dict  # noqa: PLC0415
+
+        adopted = 0
+        for raw in entries or ():
+            entry = _entry_from_dict(raw) if isinstance(raw, dict) else None
+            if entry is None:
+                continue
+            self.report.add_entry(entry)
+            self._seeded_entries.pop(entry.condition_id, None)
+            adopted += 1
+        return adopted
+
+    def carried_state(self) -> list:
+        """This run's OWN entries as the dicts :meth:`adopt_carried` reads
+        back. A still-untouched copy the A-2 seed imported is left out: the
+        child seeds it from disk itself, and carrying it as a detection would
+        defeat the vanished-seed check at finalize."""
+        from vco_lib.deferral_report import _entry_to_dict  # noqa: PLC0415
+
+        return [_entry_to_dict(e) for e in self.report.entries
+                if self._seeded_entries.get(e.condition_id) is not e]
+
     def _vanished_seeded_ids(self, disk_ids: frozenset) -> list:
         """Seeded cids ANOTHER writer cleared from disk during this run.
 

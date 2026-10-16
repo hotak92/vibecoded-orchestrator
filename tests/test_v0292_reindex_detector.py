@@ -45,20 +45,23 @@ def test_crosses_version_boundary(prev, running, bump, expected):
 
 
 def test_chunker_boundary_uses_the_shared_primitive():
-    """``project_init`` must not carry its own copy of the rule (modularity).
+    """The v0.2.46 chunker boundary question is answered by the shared rule.
 
-    Both boundary questions in this codebase — the v0.2.46 chunker preset and
-    the v0.2.92 extractor generation — are ``prev < bump <= running``. Pinning
-    the delegation here is what stops a future edit to one from silently
-    diverging from the other.
+    The retired wrapper ``project_init._crosses_chunker_boundary`` (deleted
+    v0.2.103, owner removal ruling #26 — superseded by
+    ``chunker_revision.gate``, zero production callers) was only ever a
+    binding of this primitive; the primitive keeps the arithmetic. The
+    boundary question this codebase still asks — the v0.2.92 extractor
+    generation — is ``prev < bump <= running``, answered by the ONE
+    function so a future edit cannot diverge it. (The retired wrapper's
+    parser delegate ``project_init._parse_semver`` went with the v0.2.103
+    retirement of the semver-boundary chunker path; this primitive is the
+    parser.)
     """
-    from vco_lib import project_init
-
-    assert project_init._crosses_chunker_boundary("0.2.45", "0.2.46") is True
-    assert project_init._crosses_chunker_boundary("0.2.46", "0.2.92") is False
-    # And the parser is the same one.
-    assert project_init._parse_semver("0.2.91") == ceg.parse_semver("0.2.91")
-    assert project_init._parse_semver("garbage") is None
+    assert ceg.crosses_version_boundary("0.2.45", "0.2.46", "0.2.46") is True
+    assert ceg.crosses_version_boundary("0.2.46", "0.2.92", "0.2.46") is False
+    assert ceg.parse_semver("0.2.91") == (0, 2, 91)
+    assert ceg.parse_semver("garbage") is None
 
 
 # ---------------------------------------------------------------------------

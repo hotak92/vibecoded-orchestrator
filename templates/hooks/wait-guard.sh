@@ -17,9 +17,16 @@
 #   stdin → python -m vco_lib.wait_guard <mode> → deny JSON on stdout
 #
 # The DECISION MODULE (vco_lib/wait_guard.py) owns every check: foreground
-# sleep/watch/tail -f/timeout+bash -c polling shapes, self-wake tools in
-# subagents and unlocked-main sessions, and the Nth-identical status-check
-# repeat detector. This wrapper owns nothing but interpreter resolution and
+# sleep waits, watch/tail -f/timeout+bash -c polling shapes, loops that
+# wait, self-wake tools in subagents and unlocked-main sessions, and the
+# Nth-identical status-check repeat detector. Since v0.2.103 a LITERAL
+# fixed sleep BETWEEN other segments of one command (`start-x && sleep 3
+# && curl ...`; Start-Sleep -Seconds 2 on PowerShell) is allowed — a sleep
+# inside a loop (body or condition), a non-literal duration, a
+# sole/first/last sleep, or a wait hidden in a subshell, command
+# substitution, xargs per-item command or function-body loop is still
+# denied. `cmd & wait` is allowed (not a poll). This wrapper owns nothing
+# but interpreter resolution and
 # stdin/stdout plumbing — it forwards the module's stdout VERBATIM (the
 # deny envelope) and lets the module's stderr lines through so the denial
 # is visible in the transcript/logs.

@@ -340,9 +340,10 @@ class TestSummaryBackendSelector:
                 f"CLI should win at vram={vram}, ram={ram}, cores={cores}"
             )
 
-    @pytest.mark.parametrize("vram", [16.0, 24.0, 80.0])
-    def test_gpu_16gb_plus_picks_qwen35_9b(self, vram: float) -> None:
-        """VRAM >= 16 GB → qwen3.5:9b (highest local quality)."""
+    @pytest.mark.parametrize("vram", [10.0, 12.0, 16.0, 24.0, 80.0])
+    def test_gpu_fitting_the_9b_floor_picks_qwen35_9b(self, vram: float) -> None:
+        """A card that meets qwen3.5:9b's free-VRAM floor → qwen3.5:9b
+        (highest local quality; v0.2.103 derives the rung from the floor)."""
         got = select_summary_backend(
             gpu_vram_gb=vram, ram_gb=32.0, cores=16,
             claude_cli_available=False,
@@ -350,15 +351,17 @@ class TestSummaryBackendSelector:
         )
         assert got == _SUMMARY_BACKEND_QWEN35_9B
 
-    @pytest.mark.parametrize("vram", [6.0, 8.0, 12.0, 15.9])
-    def test_gpu_6_to_16gb_picks_gemma(self, vram: float) -> None:
-        """6 GB <= VRAM < 16 GB → gemma4:e4b."""
+    @pytest.mark.parametrize("vram", [6.0, 8.0, 9.0])
+    def test_gpu_below_the_9b_floor_picks_qwen35_4b(self, vram: float) -> None:
+        """6-9 GB cards → qwen3.5:4b, never gemma4:e4b (whose floor no
+        6-12 GB card meets — the v0.2.103 field case)."""
         got = select_summary_backend(
             gpu_vram_gb=vram, ram_gb=8.0, cores=4,
             claude_cli_available=False,
             openai_consent=False,
         )
-        assert got == _SUMMARY_BACKEND_GEMMA
+        assert got == "qwen3.5:4b"
+        assert got != _SUMMARY_BACKEND_GEMMA
 
     def test_no_gpu_high_ram_high_cores_picks_gemma(self) -> None:
         got = select_summary_backend(
@@ -569,6 +572,30 @@ class TestCpuCoresProbe:
         # outside contrived containerised CI.
         assert isinstance(n, int)
         assert n >= 1
+
+    def test_the_real_system_ram_probe_is_exercised(self) -> None:
+        """R41 M3: the suite must drive the REAL host probes (the
+        W-CODE-LADDER pin targets the resolver's seams only). A real host
+        reports a plausible RAM figure; 0 would mean every fallback
+        failed."""
+        from vco_lib import host_probe
+
+        ram = host_probe.probe_system_ram_gb()
+        assert isinstance(ram, float)
+        assert ram >= 1.0, "a real host has at least 1 GB of RAM"
+
+    def test_selected_gpu_specs_smoke_never_raises(self) -> None:
+        """The ONE selected-card helper (R41 M2; R43 N4 made it a thin
+        wrapper over ``selected_gpu``, which owns the per-process cache)
+        runs the real GPU probes and always answers a ``(float, str)``
+        pair, whatever the host."""
+        from vco_lib import host_probe
+
+        specs = host_probe.selected_gpu_specs
+        host_probe._selected_gpu_cached.cache_clear()
+        vram, vendor = specs()
+        assert isinstance(vram, float) and vram >= 0.0
+        assert vendor in ("nvidia", "amd", "intel", "metal", "unknown", "")
 
 
 # ────────────────────────────────────────────────────────────────────

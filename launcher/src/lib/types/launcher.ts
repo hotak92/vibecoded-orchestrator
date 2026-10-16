@@ -85,6 +85,12 @@ export interface CreateProjectResult {
   project: ProjectView;
   /** Non-fatal warnings (env-write failures, stale .env, etc.). */
   warnings: string[];
+  /**
+   * v0.2.103 (plan item 17): informational notices (success toasts, never
+   * red) — e.g. "Created a local git repository (no remote, nothing committed)". Optional so an
+   * older backend that omits the field still type-checks.
+   */
+  notices?: string[];
 }
 
 /**
@@ -219,6 +225,8 @@ export interface UpdateProjectResult {
   project: ProjectView;
   warnings: string[];
   summary: UpdateSummary;
+  /** v0.2.103: informational notices (info toasts) — see CreateProjectResult. */
+  notices?: string[];
 }
 
 /**
@@ -252,6 +260,8 @@ export interface UpdateAllProjectEntry {
   status: 'succeeded' | 'failed' | 'skipped';
   error: string | null;
   warnings: string[];
+  /** v0.2.103: informational notices, rendered apart from warnings. */
+  notices?: string[];
   summary: UpdateSummary | null;
   /** Why a `skipped` row was skipped, when the backend knows (v0.2.101). */
   skip_reason?: string | null;

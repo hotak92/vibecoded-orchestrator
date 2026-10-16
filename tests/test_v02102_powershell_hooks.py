@@ -28,6 +28,7 @@ import copy
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -317,31 +318,82 @@ class TestWaitGuard:
         assert "tail --pid" not in reason, "a PowerShell caller gets PowerShell advice"
 
     @pytest.mark.parametrize("cmd", [
+        "while ($true) { }",
+        "while (-not (Test-Path done.txt)) { }",
+        "do { Write-Output . } until (Test-Connection h -Quiet)",
+        "do { } until (Test-Path x)",
+        "for (;;) { }",
+        "foreach ($i in 1..[int]::MaxValue) { }",
+        # R14 A4: > $null / | Out-Null write nowhere — not work.
+        "while (-not (Test-Path x)) { Write-Host . > $null }",
+        "while (-not (Test-Path x)) { Write-Output . | Out-Null }",
+    ])
+    def test_powershell_busy_wait_loops_are_denied_without_a_sleep(self, cmd, tmp_path):
+        """W5D-2 + R10 parity: a loop keyword can match no `if` rule, so the
+        guard runs on every PowerShell call and judges the loop itself. A
+        loop whose BODY does no real work is a busy-wait — sleep or not —
+        exactly like its Bash twin; a loop doing real work passes now."""
+        reason = wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path)
+        assert reason, cmd
+        assert "PowerShell command" in reason and "loop" in reason
+        assert "WHY:" in reason and "WHAT TO DO INSTEAD" in reason
+        assert "VCO_WAIT_GUARD=off" in reason
+
+    @pytest.mark.parametrize("cmd", [
+        # R14 A4: the wait shapes the old blanket deny used to catch.
+        "while (-not (Test-Path x)) { [Threading.Thread]::Sleep(500) }",
+        "while (-not (Test-Path x)) { [System.Threading.Thread]::Sleep(1) }",
+        "while (-not (Test-Path x)) { ping -n 2 127.0.0.1 > $null }",
+        "while (-not (Test-Path x)) { timeout /t 30 }",
+    ])
+    def test_powershell_wait_shapes_in_loops_are_denied(self, cmd, tmp_path):
+        reason = wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path)
+        assert reason, cmd
+        assert "PowerShell command" in reason
+
+    @pytest.mark.parametrize("cmd", [
+        # R14 A3 (coordinator ruling): a loop whose only work re-fetches
+        # the value its own condition tests is a poll.
+        "do { $r = Invoke-WebRequest u } until ($r.StatusCode -eq 200)",
+        "while (-not $ok) { $ok = Test-Path x }",
+    ])
+    def test_powershell_condition_refresh_polls_are_denied(self, cmd, tmp_path):
+        reason = wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path)
+        assert reason, cmd
+        assert "condition-refresh poll" in reason
+
+    @pytest.mark.parametrize("cmd", [
+        # R10 parity: a loop doing real work is allowed, Bash-twin rule.
         "while ($true) { Get-Date }",
         "do { Get-Process } until ($false)",
         "do { Get-Job } while ($true)",
         "for (;;) { Get-Date }",
         "foreach ($i in 1..[int]::MaxValue) { Get-Date }",
         "foreach ($i in 1..10000000) { Test-Path x }",
-        "while (-not (Test-Path done.txt)) { }",
-    ])
-    def test_powershell_loops_are_denied_without_a_sleep(self, cmd, tmp_path):
-        """W5D-2: a loop keyword can match no `if` rule, so the guard runs on
-        every PowerShell call and judges the loop itself — sleep or not."""
-        reason = wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path)
-        assert reason, cmd
-        assert "PowerShell command" in reason and "loop" in reason
-        assert "WHY:" in reason and "WHAT TO DO INSTEAD" in reason
-        assert "while ($true)" in reason, "the teaching names the loop shape to avoid"
-        assert "VCO_WAIT_GUARD=off" in reason
-
-    @pytest.mark.parametrize("cmd", [
+        "foreach ($f in Get-ChildItem) { ruff check $f }",
+        # A condition that consumes input bounds the loop (`while read`
+        # twin) — whatever the body does with the lines.
+        "while (($l = $r.ReadLine()) -ne $null) { $l }",
+        "while (Read-Host q) { }",
         "foreach ($f in $files) { Get-Content $f }",
         "foreach ($i in 1..10) { $i }",
         "for ($i = 0; $i -lt 5; $i++) { $i }",
         "Get-ChildItem | foreach { $_.Name }",
         'Write-Output "while ($true) { }"',
         "Get-Content README.md",
+        # R14 A1: assignments, increments and method calls ARE work — the
+        # Bash twins of these shapes pass, and so must these.
+        "$i=0; while ($i -lt 5) { $i++ }",
+        "$i=0; do { $i++ } while ($i -lt 5)",
+        "while ($i -lt 5) { $out += Get-Item $i; $i++ }",
+        "while ($q.Count -gt 0) { $item = $q.Dequeue() }",
+        "while (-not $p.HasExited) { $p.Refresh() }",
+        # Counted loops are not polls: arithmetic/literal on the variable.
+        "while ($i -lt 5) { $i = $i + 1 }",
+        "while ($i -lt 5) { $i = 200 }",
+        # Real work beside a refresh; ping as work (no `-n` sleep shape).
+        "while (-not $ok) { $ok = Test-Path x; Write-Host w >> log.txt }",
+        "foreach ($s in $servers) { ping $s }",
     ])
     def test_bounded_powershell_is_allowed(self, cmd, tmp_path):
         assert wait_guard.evaluate(_ps(cmd), env={}, state_root=tmp_path) is None
@@ -379,8 +431,11 @@ class TestWaitGuard:
 
     @pytest.mark.skipif(BASH is None, reason="no bash")
     @pytest.mark.parametrize("wrapper", [
-        "sh", pytest.param("ps1", marks=pytest.mark.skipif(PWSH_FOUND is None, reason="pwsh absent"))])
-    @pytest.mark.parametrize("cmd", ["Start-Sleep 45", "while ($true) { Get-Date }"])
+        pytest.param("sh", marks=pytest.mark.skipif(
+            sys.platform == "win32",
+            reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
+        pytest.param("ps1", marks=pytest.mark.skipif(PWSH_FOUND is None, reason="pwsh absent"))])
+    @pytest.mark.parametrize("cmd", ["Start-Sleep 45", "while ($true) { Start-Sleep 1 }"])
     def test_wrappers_deny_a_powershell_sleep(self, wrapper, cmd, tmp_path):
         env = child_env()
         env.update(VCT_STATE_DIR=str(tmp_path / "state"), PYTHONPATH=str(REPO_ROOT),
@@ -572,7 +627,11 @@ def _pre_tool_use(impl: str, tmp_path: Path, payload: dict) -> subprocess.Comple
                           timeout=180, env=env, cwd=str(proj))
 
 
-_IMPLS = [pytest.param("sh", marks=pytest.mark.skipif(BASH is None, reason="no bash")),
+_IMPLS = [pytest.param("sh", marks=[
+              pytest.mark.skipif(BASH is None, reason="no bash"),
+              pytest.mark.skipif(
+                  sys.platform == "win32",
+                  reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")]),
           pytest.param("ps1", marks=pytest.mark.skipif(PWSH_FOUND is None, reason="pwsh absent"))]
 
 
