@@ -40,6 +40,7 @@ Never raises; every outcome is an audit line.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -460,12 +461,37 @@ def _same_path(a: str, b: str) -> bool:
         return False
 
 
+_PYTHON_NAME = re.compile(r"pythonw?(\d+(\.\d+)*)?(\.exe)?", re.IGNORECASE)
+
+
+def _is_python(token: str) -> bool:
+    """``token`` names a Python interpreter (``python3.12``, ``pythonw.exe`` …)."""
+    return bool(_PYTHON_NAME.fullmatch(re.split(r"[\\/]", token)[-1]))
+
+
+def _python_script_arg(toks: Sequence[str]) -> Optional[str]:
+    """The script a Python command line runs — the first argument after the
+    interpreter's own options (``python -S <script>``) — or ``None`` when
+    argv[0] is not a Python interpreter or it runs ``-m`` / ``-c`` / stdin."""
+    if not toks or not _is_python(toks[0]):
+        return None
+    i = 1
+    while i < len(toks) and toks[i].startswith("-") and toks[i] not in ("-m", "-c", "-"):
+        i += 2 if toks[i] in ("-W", "-X") else 1
+    if i >= len(toks) or toks[i] in ("-m", "-c", "-"):
+        return None
+    return toks[i]
+
+
 def is_vco_gateway(proc: GatewayProc, candidates: Sequence[Sequence[str]]) -> bool:
     """Does ``proc`` run one of VCO's gateway argvs?
 
-    * console-script candidate ``[script]``: the script is the executable or
-      one of the command-line tokens (a POSIX shebang runs
-      ``<venv python> <script> serve``; Windows runs ``<script>.exe serve``);
+    * console-script candidate ``[script]``: the script is the executable,
+      argv[0] (Windows runs ``<script>.exe serve``), or the first argument
+      after a Python interpreter and its options (a POSIX shebang runs
+      ``<venv python> <script> serve``; the Windows launcher's child runs
+      ``<python.exe> <script>.exe serve``). The script anywhere else on the
+      line (``cp <script> /tmp``, an editor) is NOT the gateway (review R39 L2);
     * module candidate ``[python, "-m", "model_router"]``: the command line
       starts with that interpreter followed by ``-m model_router``.
     """
@@ -475,9 +501,9 @@ def is_vco_gateway(proc: GatewayProc, candidates: Sequence[Sequence[str]]) -> bo
     for cand in candidates:
         cand = list(cand)
         if len(cand) == 1:
-            if (proc.exe is not None and _same_path(str(proc.exe), cand[0])) or any(
-                _same_path(t, cand[0]) for t in toks
-            ):
+            if (proc.exe is not None and _same_path(str(proc.exe), cand[0])) or _same_path(
+                toks[0], cand[0]
+            ) or ((script := _python_script_arg(toks)) is not None and _same_path(script, cand[0])):
                 return True
         elif len(cand) == 3 and cand[1] == "-m":
             if len(toks) >= 3 and _same_path(toks[0], cand[0]) and toks[1:3] == cand[1:]:

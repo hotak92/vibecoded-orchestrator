@@ -57,6 +57,19 @@ def _same_dir(a: str, b: Optional[Path]) -> bool:
         return False
 
 
+def _is_current_stack(ident: _containers.ComposeIdentity, current_compose_dir: Optional[Path]) -> bool:
+    """A canonical-named container belongs to the current install's stack:
+    its ``working_dir`` label is the current compose dir — or, when that label
+    is empty (some podman-compose versions leave it blank; review R39 L3), its
+    compose project is the one the current compose file runs under. Without
+    the label it is not provably legacy, so it is left to step [1]."""
+    if _same_dir(ident.working_dir, current_compose_dir):
+        return True
+    if ident.working_dir or current_compose_dir is None:
+        return False
+    return ident.project == _containers.compose_project_of(Path(current_compose_dir) / "docker-compose.yml")
+
+
 def find(
     runtime: str,
     *,
@@ -82,7 +95,7 @@ def find(
             shown = ident.service or "(none)"
             left.append((name, f"compose service label is {shown!r}, not VCO's {service!r}"))
             continue
-        if name == _containers.canonical_name(service) and _same_dir(ident.working_dir, current_compose_dir):
+        if name == _containers.canonical_name(service) and _is_current_stack(ident, current_compose_dir):
             continue  # the current stack — step [1] handles it
         remove.append(LegacyContainer(name, service, ident.project, ident.working_dir))
     return remove, left

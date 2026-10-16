@@ -21490,8 +21490,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
       1. Stop containers (compose down — preserves volumes); 1b. remove
          legacy VCO containers compose cannot reach (uninstall_containers.py)
       2. Remove container volumes (default: prompt; suppressed by --keep-data)
-      3. Stop vct-hub + the VCO launcher GUI BEFORE any state removal
-         (vco_lib/uninstall_quiesce.py)
+      3. Stop the VCO model gateway, vct-hub and the VCO launcher GUI BEFORE
+         any state removal (vco_lib/uninstall_quiesce.py)
       4. Remove orchestrator MCP server entries from ~/.claude.json
          (preserves user's other MCP servers)
       5. Remove boot-time autostart entries (v0.2.54 Track G):
@@ -21505,7 +21505,9 @@ def _run_uninstall(args: argparse.Namespace) -> int:
       7. Launcher binaries and shortcuts OUTSIDE the clone
          (vco_lib/uninstall_artifacts.py — exact VCO names only)
       8. The WHOLE VCO state dir (~/.vct / $VCT_STATE_DIR), RL training data
-         included (vco_lib/uninstall_state.py — refuses a dir not plainly VCO's)
+         included (vco_lib/uninstall_state.py — refuses a dir not plainly VCO's
+         or a linked one; a $VCT_STATE_DIR not named .vct loses only VCO's
+         own entries)
       NEVER touches: ~/.vct-secrets/ (user's secret material)
 
     Writes an audit log of what was removed to stdout and to
@@ -21625,7 +21627,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         print("  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
 
     _ua_plan = _uninstall_artifacts.build_plan(os_name=os_name, home=Path.home(), vct_root=st_plan.root,
-                                               include_state=st_plan.refused is not None)
+                                               include_state=st_plan.refused is not None or st_plan.selective)
     hub_bins = [*_ua_plan.hub_binaries, _try_bundled_vct_hub_binary(PROJECT_ROOT)]
     print("\n".join(_uninstall_artifacts.plan_lines(_ua_plan)))
     print("\n".join(_uninstall_state.plan_lines(st_plan, fallback_files=gateway_present)))
@@ -21778,7 +21780,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
 
     # Step 8: the whole VCO state dir (uninstall_state.py; exact names when refused).
     if (st_plan.exists or st_plan.db_files or gateway_present) and _confirm_strict(
-            f"Remove the VCO state dir {st_plan.root} (RL training data included)?"):
+            _uninstall_state.confirm_prompt(st_plan)):
         if quiesced:  # again: its boot unit may have restarted it
             audit.extend(_uninstall_quiesce.stop_gateway(
                 interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT, report_idle=False))
