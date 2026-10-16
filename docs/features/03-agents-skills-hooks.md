@@ -99,7 +99,7 @@ Display KG resource paths at session start. Optionally launches the RL server if
 Warn if `CONTEXT_STATE.md` exceeds configured thresholds (warn: 300 lines, max: 400 lines). Prompts to run `doc-maintainer` agent to trim.
 
 ### `compact-context-reinject.sh` — SessionStart (startup + compact)
-Re-inject `CONTEXT_STATE.md`, recent git commits and the active plan at session start and after context compaction (the pre-compact snapshot section is a compaction artefact and emits only on `compact`). Before v0.2.102 only the `compact` matcher was registered; v0.2.102 W6-F briefly added `resume` and W6-K withdrew it (owner 2026-10-11: a resumed chat already has CONTEXT_STATE in context) — the bundle update scrubs the resume group from installs that received it.
+Re-inject `CONTEXT_STATE.md`, recent git commits and the active plan at session start and after context compaction (the pre-compact snapshot section is a compaction artefact and emits only on `compact`). After a compaction (v0.2.104) it does not repeat what Claude Code restores itself: a section whose file the harness re-attached becomes a one-line pointer, and the recent commits and the snapshot's git-status block are dropped in favour of the harness's fresh git status. Before v0.2.102 only the `compact` matcher was registered; v0.2.102 W6-F briefly added `resume` and W6-K withdrew it (owner 2026-10-11: a resumed chat already has CONTEXT_STATE in context) — the bundle update scrubs the resume group from installs that received it.
 
 <details>
 <summary>Details</summary>
@@ -112,7 +112,7 @@ Uses LITM (Lost-In-The-Middle) ordering: most critical content placed at both st
 Save a snapshot of current working state before every compaction (`/compact` and auto-compact alike; matcher `*` — v0.2.102 widened it from `auto`, under which a manual `/compact` saved nothing and the re-inject later replayed a stale snapshot): git status (top 30 files), recently changed files, current open file list. Output written to `.claude/context/pre-compact-snapshot.md`.
 
 ### `post-compact.sh` — PostCompact
-Log compaction event and send desktop notification after compaction completes. Appends to `~/.claude/metrics/compactions.jsonl`. Resets the `diff-context-inject.sh` baseline.
+Log compaction event and send desktop notification after compaction completes. Appends to `compactions.jsonl` in the metrics directory. Resets the `diff-context-inject.sh` baseline and the injection dedupe state. The Build Anchor reads list is re-seeded (v0.2.104), not wiped: Claude Code re-attaches up to five recently read/edited files after a compaction (files over 5,000 tokens come back as a path only), so those stay writable without a redundant `Read`. The estimate lives in `vco_lib/compact_reattach.py` and errs towards asking for a `Read`.
 
 ### `user-prompt-submit-reminder.sh` — UserPromptSubmit (blocking)
 Inject workflow reminders (update CONTEXT_STATE.md, check KG-first policy) when session output volume suggests substantial work has occurred. The counter is the session's cumulative work units from the live transcript (incremental `claude_token_counter.py` scan, v0.2.102 — the pre-v0.2.102 hardwired `WORDS_THIS_TURN=0` meant the reminders could never fire).
@@ -139,7 +139,7 @@ Security enforcement + file backup.
 Three actions:
 1. **SSRF guard**: blocks WebFetch/fetch_page requests to private IP ranges.
 2. **Shell injection scan**: detects network-fetch-to-shell patterns (`curl | bash`, etc.).
-3. **Build Anchor Protocol**: tracks files read this session; blocks Write/Edit on files not yet read (prevents clobber). Creates a backup of existing files before Write/Edit in `.claude/state/tool_backups/`.
+3. **Build Anchor Protocol**: tracks files read this session; blocks a Write to an existing file not yet read (prevents clobber; Edit is left to Claude Code's own read-before-edit rule). After a compaction the list keeps only the files Claude Code re-attached. Creates a backup of existing files before Write/Edit in `.claude/state/tool_backups/`.
 
 Exit 2 blocks the tool call. Exit 0 allows it. Security events logged to `.claude/logs/security_events.jsonl`.
 

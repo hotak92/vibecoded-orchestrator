@@ -193,7 +193,9 @@ def _project(tmp_path: Path) -> Path:
         "# State\n\n## Current Status\nshort\n", encoding="utf-8")
     snap = proj / ".claude" / "context" / "pre-compact-snapshot.md"
     snap.write_text("# Pre-Compaction Snapshot\nSaved: now\n\n"
-                    "## Modified Files (git status, top 30)\nM src/fresh.py\n",
+                    "## Modified Files (git status, top 30)\nM src/fresh.py\n\n"
+                    "## Recently Modified Files (newest first, since the last "
+                    "compaction)\nsrc/recent.py\n",
                     encoding="utf-8")
     return proj
 
@@ -245,11 +247,14 @@ def test_resume_injects_context_state(impl, tmp_path):
 
 @pytest.mark.parametrize("impl", _SHELLS)
 def test_compact_keeps_the_snapshot_section(impl, tmp_path):
-    """Unchanged behaviour: after a compaction the snapshot IS replayed."""
+    """After a compaction the snapshot IS replayed — minus its git-status
+    block since v0.2.104 (the harness re-injects a fresh git status itself;
+    see vco_lib/compact_reattach.py)."""
     out = _reinject(impl, _project(tmp_path), "compact")
     assert "## Current Task State" in out
     assert "## Pre-Compaction Snapshot" in out
-    assert "src/fresh.py" in out
+    assert "src/recent.py" in out
+    assert "src/fresh.py" not in out
 
 
 # --- the comment tells the truth -------------------------------------------------

@@ -97,16 +97,44 @@ if ($SessionId -and $ProjectDir) {
     if (Test-Path $EditReminderAccum) { Remove-Item $EditReminderAccum -Force -ErrorAction SilentlyContinue }
 }
 
-# Same reasoning for pre-tool-use.ps1's per-session reads file (Build Anchor
-# Protocol dedup). After compaction the LLM has lost its memory of which
-# files it Read pre-compaction, so the reads list is no longer meaningful
-# — Build Anchor should re-require a fresh Read before the next Write/Edit.
+# pre-tool-use.ps1's per-session reads ledger (Build Anchor Protocol).
+# v0.2.104: NOT wiped any more. Right after a compaction Claude Code
+# re-attaches up to five recently read/edited files (documented harness rule
+# -- the facts, URL and the conservative estimate live in ONE home,
+# vco_lib/compact_reattach.py), so wiping made Build Anchor block a Write to
+# a file whose content was back in context. The ledger is RE-SEEDED with
+# exactly that estimated set; every other entry is cleared as before. The
+# module also persists the set for compact-context-reinject (SessionStart
+# compact). Any failure (no Python, broken vco_lib import, I/O error) falls
+# back to the pre-v0.2.104 wipe -- over-blocking is safe, under-blocking is
+# not. MUST MATCH post-compact.sh.
 # Note: we do NOT wipe $ProjectDir/.claude/state/tool_backups/ — those
 # have a different lifecycle (tool-call rollback, not dedup), and the
 # pre-tool-use hook runs its own 24h GC there.
 if ($SessionId -and $ProjectDir) {
     $ReadsFile = Join-Path $ProjectDir ".claude/state/reads_$SessionId.txt"
-    if (Test-Path $ReadsFile) {
+    $Reseeded = $false
+    if ($PY) {
+        # Prefer the VCO venv-Python so `import vco_lib` works; fall back to
+        # the portable interpreter (same order as wait-guard.ps1).
+        $PcPy = $PY
+        $VenvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
+        if (Test-Path $VenvLib) {
+            . $VenvLib
+            try {
+                $VcoVenvPython = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+                if ($VcoVenvPython -and (Test-Path $VcoVenvPython)) { $PcPy = $VcoVenvPython }
+            } catch { }
+        }
+        try {
+            & $PcPy -m vco_lib.compact_reattach reseed --project $ProjectDir --key $SessionId
+            if ($LASTEXITCODE -eq 0) { $Reseeded = $true }
+        } catch { }
+        if (-not $Reseeded) {
+            [Console]::Error.WriteLine("[VCO] post-compact: could not re-seed the Build Anchor reads list via vco_lib.compact_reattach (interpreter: $PcPy); cleared it instead")
+        }
+    }
+    if (-not $Reseeded -and (Test-Path $ReadsFile)) {
         Remove-Item $ReadsFile -Force -ErrorAction SilentlyContinue
     }
     # v0.2.70 Stream E (SF-1): also wipe the INJECTOR reads store
