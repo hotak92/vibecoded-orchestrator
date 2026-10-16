@@ -553,8 +553,11 @@ def test_driver_unconverged_records_one_time_deferral(monkeypatch, tmp_path):
     entry = [e for e in rep.entries
              if e.condition_id == "codegraph_embed_resync_pending"][0]
     assert "42" in entry.detected
-    # The resume command reruns the exact analyzer argv (incl. prune flag).
-    assert "--prune-stale" in entry.command_to_apply
+    # v0.2.104 (R1 L2): the printed recovery is the resync DRIVER and never
+    # carries --prune-stale (it deletes the rows an unconverged walk left
+    # unvisited) even though this run was started with it.
+    assert "--prune-stale" not in entry.command_to_apply
+    assert "--run-resync" in entry.command_to_apply
     assert "MyProj" in entry.command_to_apply
     # --prune-stale reached the analyzer argv too.
     assert "--prune-stale" in rec.calls[0]["argv"]

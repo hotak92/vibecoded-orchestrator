@@ -2603,23 +2603,41 @@ def _code_backend_down_service(
     return None, container_used, None
 
 
+def _service_row(service: str) -> Any:
+    """This machine's ``service_endpoints`` row for ``service``, or ``None``
+    (no launcher DB / no row / unreadable — the caller falls back to the
+    canonical container names). Never raises."""
+    try:
+        from vco_lib import service_endpoints
+
+        return service_endpoints.load_rows().get(service)
+    except Exception:  # noqa: BLE001 — an unreadable registry is "no row"
+        return None
+
+
 def _backend_container_running(service: str) -> bool:
     """True only when the container serving ``service`` positively EXISTS and
     is RUNNING — the one state in which a backend that does not answer is
     still starting (a model loading after a (re)start), so waiting can help.
     Absent, stopped, no runtime, or unreadable → False (conservative: no wait,
-    the caller defers exactly as before). Read-only; never raises."""
+    the caller defers exactly as before). Read-only; never raises.
+
+    The container is the one the machine's ``service_endpoints`` row names
+    (W4R-11: an adopted/renamed container is the service, a canonical-named
+    leftover beside it is not), through the shared
+    :func:`vco_lib.ollama_pull.service_container_run`; with no row (no
+    launcher DB, unreadable registry) it falls back to the canonical-first
+    lookup."""
     try:
         from vco_lib import containers as _containers
-        from vco_lib.ollama_pull import inspect_container_run
+        from vco_lib.ollama_pull import service_container_run
 
         runtime = _containers.installed_runtime()
         if not runtime:
             return False
-        name = _containers.find_existing_container(service, runtime=runtime)
-        if not name:
-            return False
-        state = inspect_container_run(runtime, name)
+        state = service_container_run(
+            Path(__file__).resolve().parent.parent, runtime, service, _service_row(service),
+        )
         return bool(state is not None and state.exists and state.running)
     except Exception as exc:  # noqa: BLE001 — a probe never gates the update
         logger.info("codegraph resync: container state of %s unreadable (%s)", service, exc)
@@ -2909,10 +2927,34 @@ def driver_argv(
     return argv
 
 
-def driver_resume_command(*args: Any, **kwargs: Any) -> str:
-    """:func:`driver_argv`, shell-quoted on one line (R-5 rider: the command
-    lands verbatim in UPDATE_DEFERRED.md and must survive spaces)."""
-    return " ".join(shlex.quote(part) for part in driver_argv(*args, **kwargs))
+def driver_resume_command(
+    python: str,
+    repo_root: Path,
+    analyzer: Path,
+    project_name: str,
+    *,
+    index_dot_claude: bool = True,
+    force_rewalk: bool = False,
+) -> str:
+    """:func:`driver_argv`, quoted on one line for the shell the user holds
+    (R-5 rider: the command lands verbatim in UPDATE_DEFERRED.md and must
+    survive spaces; :func:`vco_lib.remedy_shell.command_line` — POSIX
+    ``shlex``, Windows double quotes, since ``cmd.exe`` does not read single
+    quotes).
+
+    Deliberately NO ``prune_stale`` parameter (R1 L2): this line is the
+    recovery for ``codegraph_embed_resync_pending``, and ``--prune-stale``
+    DELETES the rows of files a walk did not visit — exactly the rows an
+    unconverged walk leaves behind. A printed command is shipped code, so a
+    run that was started with ``--prune-stale`` still prints the plain
+    driver; the orphan-interactions entry prints its own ``--prune-stale``
+    form for the one condition that needs it."""
+    from vco_lib.remedy_shell import command_line
+
+    return command_line(driver_argv(
+        python, repo_root, analyzer, project_name,
+        index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+    ))
 
 
 def _stale_image_resume_command(resync: str) -> str:
@@ -4122,7 +4164,6 @@ def _run_resync_and_verify_slotted(
         _record_stale_image_deferral(repo_root, project_name, driver_resume_command(
             _python_exe.resolve_or_current(), Path(repo_root), Path(analyzer_path),
             project_name, index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
-            prune_stale=prune_stale,
         ))
         # #31 discipline: the spawn's registration (when there was one — the
         # retry and manual paths register nothing) must not be left to the
@@ -4327,7 +4368,11 @@ def _run_resync_and_verify_slotted(
         print(f"[resync-driver] post-walk probe raised: {exc}", flush=True)
         counts = None
 
-    resume_cmd = " ".join(shlex.quote(p) for p in argv)
+    # Printed (the orphan entry below): the shell-aware join, same as
+    # `driver_resume_command` (R1 L3).
+    from vco_lib.remedy_shell import command_line
+
+    resume_cmd = command_line(argv)
     # v0.2.103 (defect 7): "0 stale rows" must not hide provable orphan
     # CodeInteraction rows — count_stale_rows classifies pathless rows
     # purgeable (no re-walk converges them), and pre-fix they also survived
@@ -4453,7 +4498,6 @@ def _run_resync_and_verify_slotted(
         repo_root, project_name, counts, driver_resume_command(
             argv[0], Path(repo_root), Path(analyzer_path), project_name,
             index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
-            prune_stale=prune_stale,
         ), stuck,
     )
     return 0
@@ -4785,7 +4829,7 @@ def spawn_background_resync(
             )
         py = str(resolved)
 
-    # R-5 rider (A-1): shlex-quote every part — the command lands verbatim in
+    # R-5 rider (A-1): quote every part — the command lands verbatim in
     # UPDATE_DEFERRED.md and must survive paths containing spaces.
     # v0.2.104 (G5): the DRIVER command (see `driver_argv`) — the bare
     # analyzer walk this used to print never clears the entry it is printed in.
