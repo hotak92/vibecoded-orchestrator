@@ -10,7 +10,11 @@ files back in the context and records each one in the transcript JSONL as a
 ledger (as v0.2.103 did); on a Write miss ``pre-tool-use`` asks
 ``vco_lib/compact_reattach.py`` whether the target was re-attached after the
 LATEST boundary, and allows (and records) only on a positive answer — every
-doubt blocks. These tests drive the pure function and the real hook scripts
+doubt blocks. The module is asked only when ``post-compact`` left this
+session's ``compacted_<key>.txt`` marker (no marker → blocked without
+spawning Python), and it answers "no" past its own wall-clock deadline: the
+hook's 3 s registration timeout must never be what ends the scan, because a
+hook the harness kills on timeout does not block the Write. These tests drive the pure function and the real hook scripts
 (bash, and pwsh where installed).
 """
 from __future__ import annotations
@@ -18,7 +22,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
+import sys
 import time
 import tracemalloc
 from pathlib import Path
@@ -227,6 +233,27 @@ def test_large_transcript_without_boundary_is_bounded(tmp_path: Path):
     assert peak < 16 * 1024 * 1024, peak
 
 
+def test_scan_past_the_deadline_is_no(tmp_path: Path):
+    # A file that WOULD be "yes" is "no" once the budget is spent.
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    assert cr.was_reattached(str(t), str(f)) is True
+    assert cr.was_reattached(str(t), str(f), deadline=-1.0) is False
+
+
+def test_deadline_hit_mid_scan_is_no(tmp_path: Path, monkeypatch):
+    # The boundary and the attachment sit at the START, behind ~3 MiB of
+    # filler: the backward scan needs several chunks. A clock that jumps past
+    # the deadline after the first chunk makes the answer "no".
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f),
+                    _user("y" * 1000) * 3000)
+    assert cr.was_reattached(str(t), str(f)) is True
+    ticks = iter([0.0, 0.0] + [100.0] * 10_000)
+    monkeypatch.setattr(cr.time, "monotonic", lambda: next(ticks))
+    assert cr.was_reattached(str(t), str(f)) is False
+
+
 def test_cli_answers_exact_words(tmp_path: Path):
     f = _file(tmp_path)
     t = _transcript(tmp_path, _boundary(), _attach("file", f))
@@ -272,17 +299,55 @@ def _hook(impl: str, name: str, proj: Path, payload: dict,
 
 
 def _write(impl: str, proj: Path, target: Path, transcript: Path | None,
+           env: dict | None = None,
            **payload_extra: str) -> subprocess.CompletedProcess:
     payload = {"session_id": SID, "tool_name": "Write",
                "tool_input": {"file_path": str(target), "content": "x = 9\n"}}
     if transcript is not None:
         payload["transcript_path"] = str(transcript)
     payload.update(payload_extra)
-    return _hook(impl, "pre-tool-use", proj, payload)
+    return _hook(impl, "pre-tool-use", proj, payload, **(env or {}))
 
 
 def _ledger(proj: Path) -> Path:
     return proj / ".claude" / "state" / f"reads_{SID}.txt"
+
+
+def _marker(proj: Path) -> Path:
+    return proj / ".claude" / "state" / f"compacted_{SID}.txt"
+
+
+def _compact(impl: str, proj: Path) -> None:
+    """Run the real post-compact hook for SID (the real order: compaction
+    first, the Write after)."""
+    res = _hook(impl, "post-compact", proj,
+                {"session_id": SID, "trigger": "auto", "compact_summary": "s"})
+    assert res.returncode == 0, res.stderr
+    assert _marker(proj).is_file()
+
+
+def _spy_venv(tmp_path: Path, runner: Path | None = None) -> tuple[Path, Path]:
+    """A fake venv whose python records every call, then runs the real
+    interpreter — or, for the compact_reattach call only, *runner* with the
+    same argv (the hook uses this python for its other helpers too).
+    Returns (venv, log)."""
+    venv = tmp_path / "spyvenv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "python_calls.log"
+    route = (f'[ "$1 $2" = "-m vco_lib.compact_reattach" ] && '
+             f'exec "{sys.executable}" "{runner}" "$@"\n') if runner else ""
+    shim = venv / "bin" / "python"
+    shim.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{log}"\n'
+                    f'{route}exec "{sys.executable}" "$@"\n', encoding="utf-8")
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return venv, log
+
+
+def _reattach_calls(log: Path) -> list[str]:
+    if not log.exists():
+        return []
+    return [ln for ln in log.read_text(encoding="utf-8").splitlines()
+            if "compact_reattach" in ln]
 
 
 @pytest.mark.parametrize("impl", _SHELLS)
@@ -294,6 +359,7 @@ def test_post_compact_wipes_the_ledger(impl: str, tmp_path: Path):
                 {"session_id": SID, "trigger": "auto", "compact_summary": "s"})
     assert res.returncode == 0, res.stderr
     assert not led.exists()
+    assert _marker(proj).is_file()
 
 
 @pytest.mark.parametrize("impl", _SHELLS)
@@ -302,6 +368,7 @@ def test_write_to_a_reattached_file_is_allowed_and_recorded(impl: str,
     proj = _project(tmp_path)
     f = _file(proj)
     t = _transcript(tmp_path, _user("read it"), _boundary(), _attach("file", f))
+    _compact(impl, proj)
     ok = _write(impl, proj, f, t)
     assert ok.returncode == 0, ok.stderr
     assert str(f) in _ledger(proj).read_text(encoding="utf-8").splitlines()
@@ -332,6 +399,7 @@ def test_write_is_blocked_unless_reattached(impl: str, scenario: str,
                                             tmp_path: Path):
     proj = _project(tmp_path)
     f = _file(proj)
+    _compact(impl, proj)
     res = _write(impl, proj, f, _scenario(scenario, tmp_path, f))
     assert res.returncode == 2, (res.stdout, res.stderr)
     assert "Build Anchor" in res.stderr
@@ -343,6 +411,7 @@ def test_subagent_write_is_blocked_even_when_the_parent_had_it(impl: str,
     proj = _project(tmp_path)
     f = _file(proj)
     t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    _compact(impl, proj)
     res = _write(impl, proj, f, t, agent_id="a123", agent_type="general")
     assert res.returncode == 2, (res.stdout, res.stderr)
 
@@ -353,6 +422,7 @@ def test_write_is_blocked_when_vco_lib_cannot_be_imported(impl: str,
     proj = _project(tmp_path)
     f = _file(proj)
     t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    _compact(impl, proj)
     payload = {"session_id": SID, "tool_name": "Write", "transcript_path": str(t),
                "tool_input": {"file_path": str(f), "content": "x = 9\n"}}
     res = _hook(impl, "pre-tool-use", proj, payload,
@@ -364,10 +434,101 @@ def test_hook_on_a_large_transcript_is_fast(tmp_path: Path):
     proj = _project(tmp_path)
     f = _file(proj)
     t = _big_transcript(tmp_path, f)
+    _compact("sh", proj)
     t0 = time.monotonic()
     res = _write("sh", proj, f, t)
     assert res.returncode == 0, res.stderr
     assert time.monotonic() - t0 < 20
+
+
+# ─── M1: never outlive the hook's 3 s registration timeout ─────────────────
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_no_compaction_marker_blocks_without_spawning_python(impl: str,
+                                                            tmp_path: Path):
+    # The transcript WOULD answer "reattached" — but this session never ran
+    # post-compact, so the hook must block without asking the module at all.
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    venv, log = _spy_venv(tmp_path)
+    res = _write(impl, proj, f, t, env={"VCT_VENV": str(venv)})
+    assert res.returncode == 2, (res.stdout, res.stderr)
+    assert "Build Anchor" in res.stderr
+    assert not _marker(proj).exists()
+    assert _reattach_calls(log) == []
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_marker_and_reattached_spawns_the_check_and_allows(impl: str,
+                                                          tmp_path: Path):
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    venv, log = _spy_venv(tmp_path)
+    _compact(impl, proj)
+    res = _write(impl, proj, f, t, env={"VCT_VENV": str(venv)})
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    assert len(_reattach_calls(log)) == 1
+
+
+_SLOW_RUNNER = """\
+import builtins, sys, time
+from vco_lib import compact_reattach as cr
+
+cr.CHUNK_BYTES = 4096
+
+
+class _Slow:
+    def __init__(self, fh):
+        self._fh = fh
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._fh.close()
+
+    def read(self, n=-1):
+        time.sleep(0.05)
+        return self._fh.read(n)
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+
+cr.open = lambda *a, **k: _Slow(builtins.open(*a, **k))
+args = sys.argv[1:]
+assert args[:2] == ["-m", "vco_lib.compact_reattach"], args
+t0 = time.monotonic()
+rc = cr._main(args[2:])
+with builtins.open(sys.argv[0] + ".elapsed", "w") as out:
+    out.write(str(time.monotonic() - t0))
+sys.exit(rc)
+"""
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_slow_scan_past_the_deadline_blocks(impl: str, tmp_path: Path):
+    # The file IS re-attached (boundary + row at the start), but every read
+    # is slow and the backward scan needs ~100 chunks (~5 s without a
+    # deadline — past the hook's 3 s timeout). The module must give up at
+    # its own deadline and answer "no", so the hook blocks.
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f),
+                    _user("y" * 1000) * 400)
+    runner = tmp_path / "slow_runner.py"
+    runner.write_text(_SLOW_RUNNER, encoding="utf-8")
+    venv, log = _spy_venv(tmp_path, runner)
+    _compact(impl, proj)
+    res = _write(impl, proj, f, t, env={"VCT_VENV": str(venv)})
+    assert len(_reattach_calls(log)) == 1
+    assert res.returncode == 2, (res.stdout, res.stderr)
+    assert "Build Anchor" in res.stderr
+    elapsed = float((tmp_path / "slow_runner.py.elapsed").read_text())
+    assert elapsed < cr.DEADLINE_SECONDS + 0.5, elapsed
 
 
 # ─── the compact re-inject ───────────────────────────────────────────────
