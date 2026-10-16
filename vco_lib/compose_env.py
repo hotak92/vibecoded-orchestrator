@@ -77,11 +77,14 @@ def code_embed_container_in_stack(embed_config: dict) -> bool:
     (``has_gpu``, else a probed ``gpu_vendor``) where a code model in use is
     served by it (:func:`vco_lib.code_embed_serving.code_embed_in_stack`)."""
     has_gpu = _host_gpu(embed_config)
-    install_model = str(embed_config.get("code_model") or "").strip()
-    if not install_model:
-        # No resolved install code model (a partial config): the pre-W6-B2
-        # rule — a GPU host runs the container. Never guessed away.
-        return bool(has_gpu)
+    # No resolved install code model (a partial config) is NOT a reason to run
+    # the container (v0.2.103 field run, diag 1d — the old fallback was "any
+    # GPU host"): the model is then the backend's pairing (``gpu`` → CodeSage,
+    # else none), and the one decision still answers from every other model in
+    # use (override, Preferences pin and default, recorded graphs) — in the
+    # stack only when one is CodeSage.
+    install_model = (str(embed_config.get("code_model") or "").strip()
+                     or code_embed_service_model(embed_config) or "")
     return code_embed_in_stack(bool(has_gpu), code_models_in_use(install_model))
 
 
@@ -136,6 +139,19 @@ def compose_substitution_env(embed_config: dict) -> dict[str, str]:
     model = code_embed_service_model(embed_config)
     if model:
         env["CODE_EMBED_MODEL"] = model
+    # v0.2.103 (Windows field run F1): an ``ollama``-backend container builds
+    # its Ollama embed body from THIS resolved template — the image carries no
+    # vco_lib, so it cannot call the one builder itself (A>B>C option B: the
+    # host resolves from the SSOT, the container parses). Written whenever the
+    # container serves an Ollama model; the service refuses a missing or
+    # other-model template rather than guessing a num_ctx.
+    if model and backend.strip().lower() == "ollama":
+        from vco_lib.ollama_embed_body import (  # noqa: PLC0415
+            CONTAINER_BODY_ENV_KEY,
+            container_body_template,
+        )
+
+        env[CONTAINER_BODY_ENV_KEY] = container_body_template(model)
     # v0.2.102 W6-B2: is the code_embed container part of this install at
     # all? ONE decision (vco_lib.code_embed_serving.code_embed_in_stack),
     # projected here so install's compose start and the hub watchdog
@@ -185,6 +201,27 @@ def write_infrastructure_env(
     ``(True, "")``.
     """
     return _write_managed_keys(infra_dir, compose_substitution_env(embed_config))
+
+
+def code_embed_body_template_drifted(infra_dir: Path, embed_config: dict) -> bool:
+    """Does ``<infra_dir>/.env`` carry a ``CODE_EMBED_OLLAMA_BODY`` other than
+    the template this checkout resolves for ``embed_config`` (v0.2.103 R42-L1)?
+
+    The template is built from HOST code (``MODEL_TOKEN_LIMITS``, the
+    keep_alive default) that is not part of the code_embed image, so a release
+    that edits either for an existing model changes the template without
+    changing the image digest: the running container would keep the old
+    num_ctx / keep_alive while host callers send the new one (two Ollama
+    runners with different load options). True only for an ``ollama``-backend
+    service (the only backend that reads the key) whose on-disk value is
+    missing or different; a ``gpu`` / ``openai`` backend is never drifted.
+    The on-disk value is read the way compose reads it (last occurrence)."""
+    from vco_lib.ollama_embed_body import CONTAINER_BODY_ENV_KEY  # noqa: PLC0415
+
+    wanted = compose_substitution_env(embed_config).get(CONTAINER_BODY_ENV_KEY)
+    if wanted is None:
+        return False
+    return _read_env_keys(infra_dir).get(CONTAINER_BODY_ENV_KEY) != wanted
 
 
 def _write_managed_keys(infra_dir: Path, managed: "dict[str, str]") -> "tuple[bool, str]":

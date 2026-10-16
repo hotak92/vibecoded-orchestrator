@@ -92,9 +92,26 @@ def test_a_preferences_pin_of_codesage_counts(monkeypatch):
     assert _marker(cfg) == "true"
 
 
-def test_a_partial_config_keeps_the_pre_marker_rule(no_db):
+def test_a_partial_config_answers_from_the_one_decision(no_db):
+    """v0.2.103 (diag 1d): no resolved code model is NOT "any GPU host runs
+    the container" — the model is the backend's pairing, and only CodeSage is
+    in the stack."""
+    assert compose_env.code_embed_container_in_stack({"has_gpu": True}) is False
+    assert compose_env.code_embed_container_in_stack(
+        {"has_gpu": True, "code_backend": "ollama"}) is False
+    assert compose_env.code_embed_container_in_stack(
+        {"has_gpu": True, "code_backend": "gpu"}) is True
+    assert compose_env.code_embed_container_in_stack({"has_gpu": False, "code_backend": "gpu"}) is False
+
+
+def test_a_partial_config_still_counts_a_codesage_graph(monkeypatch):
+    from vco_lib import launcher_db_reader as ldr
+
+    monkeypatch.delenv("CODE_EMBED_MODEL", raising=False)
+    monkeypatch.setattr(ldr, "read_app_state_value", lambda key, db_path=None: None)
+    monkeypatch.setattr(ldr, "list_codegraph_binding_rows", lambda: [
+        {"last_analyzed_at": "2026-10-01T00:00:00Z", "embedding_model": CODESAGE}])
     assert compose_env.code_embed_container_in_stack({"has_gpu": True}) is True
-    assert compose_env.code_embed_container_in_stack({"has_gpu": False}) is False
 
 
 # --- the projected marker drives the session hook / boot wrapper plan --------
@@ -129,10 +146,19 @@ def test_write_infrastructure_env_persists_the_marker(no_db, tmp_path):
 # --- install's compose start follows the same decision -----------------------
 
 
-def _drive_install(embed_config):
+def _drive_install(embed_config, identity=None):
     """Drive the production ``install._start_services`` through the identity-
-    guard suite's harness, with THIS embed config."""
+    guard suite's harness, with THIS embed config and a stale image.
+
+    The default identity is OURS (v0.2.103): with the guard suite's foreign
+    identity, ``apply_recreate_guard`` dropped code_embed for its own reason
+    and hid the field defect (the image-rebuild path re-adding
+    ``--build --force-recreate code_embed`` on an Ollama-served tier)."""
     from tests import test_v0293_compose_identity_guard as harness
+
+    if identity is None:
+        identity = harness.containers.ComposeIdentity(
+            "infrastructure", str(REPO_ROOT / "infrastructure"))
 
     case = harness.StartServicesIdentityGuardTests("test_foreign_owned_services_are_left_alone_and_ledgered")
     harness.StartServicesIdentityGuardTests.setUpClass()
@@ -148,17 +174,26 @@ def _drive_install(embed_config):
         return real(sysinfo, args, embed_config, **kw)
 
     with mock.patch.object(install, "_start_services", _with_config):
-        cmd, out, _entries = case._drive(
-            harness.containers.ComposeIdentity("vco", "/x", "docker-compose.yml"),
-            decisions=decisions)
+        cmd, out, _entries = case._drive(identity, decisions=decisions)
     return cmd, out
 
 
 def test_install_starts_code_embed_for_codesage_only(no_db):
     cmd, _out = _drive_install({"code_model": CODESAGE, "code_backend": "gpu"})
-    assert "code_embed" in cmd
-    cmd, _out = _drive_install({"code_model": QWEN3, "code_backend": "ollama"})
-    assert "code_embed" not in cmd
+    assert "code_embed" in cmd and "--build" in cmd
+    for model in (QWEN3, JINA):
+        cmd, out = _drive_install({"code_model": model, "code_backend": "ollama"})
+        assert cmd, out  # compose still ran (weaviate / ollama recreate)
+        assert "code_embed" not in cmd and "--build" not in cmd, (model, cmd)
+        assert "[rebuild]" not in out
+
+
+def test_install_builds_no_code_embed_under_a_foreign_identity_either(no_db):
+    from tests import test_v0293_compose_identity_guard as harness
+
+    foreign = harness.containers.ComposeIdentity("vco", "/x", "docker-compose.yml")
+    cmd, _out = _drive_install({"code_model": QWEN3, "code_backend": "ollama"}, foreign)
+    assert "code_embed" not in cmd and "--build" not in cmd
 
 
 # --- review F2: the resync / fill spawn gate is serving-aware ---------------

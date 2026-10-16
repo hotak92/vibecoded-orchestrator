@@ -535,6 +535,83 @@ class RegisterMcpsOrchestrationTests(unittest.TestCase):
             self.assertNotIn("ACTIVE_EMBEDDING", env)
             self.assertIn("WEAVIATE_URL", env)
 
+    @unittest.skipIf(_IS_WINDOWS, "the fake launcher binary is a POSIX script")
+    def test_stale_bundled_binary_active_embedding_is_stripped_by_the_update(self):
+        """v0.2.103 F2 (Windows field run) — the REAL writer path: install's
+        Path A runs the BUNDLED launcher binary, and a fresh clone's
+        ``launcher/dist`` binary was built at the previous tag, before item
+        31(d) — it writes ``weaviate-kg.env.ACTIVE_EMBEDDING=qwen3``. The
+        ordinary install/update sequence (``_register_mcps`` then
+        ``_auto_scrub_removed_mcp_entries``, main() order) must leave the
+        key gone, keep the allowlisted keys, and leave a user's own MCP (and
+        a user's same-named entry outside the install root) untouched.
+        Red-proof: make ``strip_unallowlisted_global_env`` return early →
+        this fails."""
+        with tempfile.TemporaryDirectory() as td:
+            root = _make_pseudo_install_root(Path(td))
+            fake_home = Path(td) / "fake_home"
+            fake_home.mkdir()
+            target = fake_home / ".claude.json"
+            server_py = root / "claude_mcp_servers" / "weaviate_mcp" / "server.py"
+            old_shape = {
+                "weaviate-kg": {
+                    "type": "stdio", "command": str(root / ".venv" / "bin" / "python"),
+                    "args": [str(server_py)],
+                    "env": {"WEAVIATE_URL": "http://localhost:8081",
+                            "OLLAMA_URL": "http://localhost:11435",
+                            "GRPC_PORT": "50052",
+                            "PYTHONPATH": str(root / "claude_mcp_servers"),
+                            "CODE_EMBED_SERVICE_URL": "http://localhost:11440",
+                            "ACTIVE_EMBEDDING": "qwen3"},
+                },
+                "mine": {"command": "/opt/mine/serve", "args": [], "env": {"X_MODE": "1"}},
+            }
+            shape_file = Path(td) / "old_shape.json"
+            shape_file.write_text(json.dumps({"mcpServers": old_shape}), encoding="utf-8")
+            fake_bin = Path(td) / "vct-launcher"
+            fake_bin.write_text(
+                f"#!{sys.executable}\n"
+                "import os, shutil, sys\n"
+                "assert sys.argv[1] == '--register-default-mcps'\n"
+                f"shutil.copy({str(shape_file)!r}, "
+                "os.path.join(os.environ['VCT_USER_HOME_OVERRIDE'], '.claude.json'))\n",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+            report = DeferralReport()
+            with mock.patch.dict(os.environ, {"VCT_USER_HOME_OVERRIDE": str(fake_home)}), \
+                    mock.patch.object(install, "_try_bundled_launcher_binary", return_value=fake_bin):
+                install._register_mcps(root, report)
+                written = json.loads(target.read_text(encoding="utf-8"))
+                self.assertEqual(  # the stale binary really wrote the retired key
+                    written["mcpServers"]["weaviate-kg"]["env"]["ACTIVE_EMBEDDING"], "qwen3")
+                lines: list[str] = []
+                install._auto_scrub_removed_mcp_entries(root, output_fn=lines.append)
+            data = json.loads(target.read_text(encoding="utf-8"))
+            env = data["mcpServers"]["weaviate-kg"]["env"]
+            self.assertNotIn("ACTIVE_EMBEDDING", env)
+            self.assertEqual(
+                {k: v for k, v in old_shape["weaviate-kg"]["env"].items() if k != "ACTIVE_EMBEDDING"},
+                env,
+            )
+            self.assertEqual(data["mcpServers"]["mine"], old_shape["mine"])
+            self.assertTrue(any("ACTIVE_EMBEDDING" in ln and "weaviate-kg" in ln for ln in lines), lines)
+
+    def test_strip_leaves_foreign_entries_and_clean_files_alone(self):
+        """A same-named entry OUTSIDE the install root is the user's (kept
+        verbatim), and a file with nothing retired is not rewritten at all."""
+        from vco_lib.install_mcp import strip_unallowlisted_global_env
+        with tempfile.TemporaryDirectory() as td:
+            root = _make_pseudo_install_root(Path(td))
+            target = Path(td) / ".claude.json"
+            foreign = {"command": "/elsewhere/python", "args": ["/elsewhere/server.py"],
+                       "env": {"ACTIVE_EMBEDDING": "arctic"}}
+            raw = json.dumps({"mcpServers": {"weaviate-kg": foreign}})
+            target.write_text(raw, encoding="utf-8")
+            self.assertEqual(strip_unallowlisted_global_env(root, target), [])
+            self.assertEqual(target.read_text(encoding="utf-8"), raw)
+            self.assertFalse(target.with_suffix(".json.bak").exists())
+
     def test_no_venv_emits_critical_deferral_and_does_not_crash(self):
         """No venv-python anywhere → soft-fail + critical deferral entry."""
         with tempfile.TemporaryDirectory() as td:

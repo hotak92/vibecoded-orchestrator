@@ -11788,7 +11788,7 @@ def _start_services(
             services_to_start.append("weaviate")
         if not detected["ollama_url"]:
             services_to_start.append("ollama")
-        if sysinfo.has_gpu and not detected["code_embed_url"]:
+        if code_embed_wanted and not detected["code_embed_url"]:  # the ONE in-stack decision
             services_to_start.append("code_embed")
 
     # ── v0.2.92 BLOCKER-1: rebuild the code_embed IMAGE when it is not
@@ -11804,16 +11804,9 @@ def _start_services(
     recreate_for_rebuild: list[str] = []
     from vco_lib import code_embed_image as _cei
     _rebuild = _cei.plan_rebuild(
-        decisions=decisions,
-        has_gpu=sysinfo.has_gpu,
-        force_separate=force_separate,
-        install_root=PROJECT_ROOT,
-        url=detected.get("code_embed_url"),
-        services_to_start=services_to_start,
-        services_to_recreate=services_to_recreate,
-        adopt_action=ACTION_ADOPT,
-        managed_probe=PROBE_VCT_MANAGED,
-    )
+        decisions=decisions, has_gpu=sysinfo.has_gpu, force_separate=force_separate, in_stack=code_embed_wanted,
+        install_root=PROJECT_ROOT, url=detected.get("code_embed_url"), services_to_start=services_to_start,
+        services_to_recreate=services_to_recreate, adopt_action=ACTION_ADOPT, managed_probe=PROBE_VCT_MANAGED)
     for _line in _rebuild.lines:
         print(_line)
     if _rebuild.build:
@@ -11827,6 +11820,11 @@ def _start_services(
                   "expected_sha": _rebuild.expected_sha,
                   "served_sha": _rebuild.served_sha},
         )
+    # v0.2.103 R42-L1: a stale CODE_EMBED_OLLAMA_BODY is rewritten + recreated BEFORE the guards below.
+    services_to_recreate.extend(_cei.plan_body_template_recreate(
+        _rebuild, force_separate=force_separate, url=detected.get("code_embed_url"), infra_dir=infra_dir,
+        embed_config=embed_config, services=services_to_start + services_to_recreate,
+        write_env=_write_infrastructure_env, log_event=_log_install_event))
 
     # Nothing to start or recreate → nothing to do. v0.2.93: a container
     # another compose identity created is never recreated.
@@ -19296,21 +19294,21 @@ def _auto_scrub_removed_mcp_entries(
     output_fn=print,
 ) -> list[str]:
     """v0.2.101: remove ``auto_scrub`` deprecated MCP entries from
-    ``~/.claude.json`` on the ordinary install/update and print one notice
-    line per removed entry.
-
-    Owner ruling (PLAN-V0300 item 15): ``search`` was DELETED, so its
-    now-orphaned registration is removed automatically — no consent prompt —
-    because the module it pointed at no longer exists (a leftover entry
-    guarantees a failing MCP subprocess every session). v0.2.102 (owner
-    ruling 2026-10-07) adds ``mermaid`` / ``excalidraw`` to the auto-scrub
-    set: both diagram wrapper modules were deleted outright. Idempotent
-    and soft-fail: no entry → no write, no print.
+    ``~/.claude.json`` on the ordinary install/update, one notice per entry
+    (owner ruling PLAN-V0300 item 15: ``search``; v0.2.102 adds ``mermaid`` /
+    ``excalidraw`` — their modules were deleted, so a leftover entry fails
+    every session). v0.2.103 F2: also strips retired env keys (e.g.
+    ``ACTIVE_EMBEDDING`` written by an older bundled launcher binary) from
+    VCO's own entries — ``vco_lib.install_mcp.strip_unallowlisted_global_env``.
+    Idempotent and soft-fail: nothing to do → no write, no print.
 
     Returns the removed names.
     """
+    from vco_lib.install_mcp import strip_unallowlisted_global_env
     try:
         claude_json = _user_home_for_install() / ".claude.json"
+        for name, keys in strip_unallowlisted_global_env(install_root, claude_json):
+            output_fn(f"  Removed retired env key(s) {', '.join(keys)} from MCP entry `{name}`.")
         removed = _auto_scrub_mcp_entries(install_root, claude_json)
     except Exception as exc:  # noqa: BLE001 — soft-fail: the install always completes
         _log_install_event(
@@ -20653,20 +20651,17 @@ def _configure_claude_settings(
     * ``adopt_project_mode == "no-adopt"`` and ``"dry-run"`` are handled
       upstream in ``main()`` before this function is reached.
 
-    The ``deferral_report`` kwarg is optional so existing fresh-install
-    callers don't break; deferrals are silently skipped when the report
-    isn't threaded.
+    * No sentinel but step 5b's bundle created the file THIS run (v0.2.103
+      F4) → VCO's own: defaults filled in, sentinel stamped, no deferral.
 
-    v0.2.46 V47-B (Gap B) addition: if ``.claude/`` is a symlink OR
-    ``.claude/settings.json`` is a symlink, VCO writes its content to a
-    sibling ``.vco-new`` path and emits a deferral entry. The original
-    symlink is preserved bit-for-bit. The rule is mode-AGNOSTIC (per user
-    decision 2026-06-03) — no ``adopt_project_mode`` short-circuits it.
+    ``deferral_report`` is optional (deferrals skipped when not threaded).
+    V47-B (Gap B): a symlinked ``.claude/`` or ``settings.json`` is never
+    written through — content goes to a ``.vco-new`` sibling + a deferral,
+    mode-AGNOSTIC (user decision 2026-06-03).
     """
     settings_dir = PROJECT_ROOT / ".claude"
 
-    # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, route the
-    # write to a sibling .vco-new directory. Never mkdir over a symlink.
+    # V47-B (Gap B): a symlinked .claude/ → write to a .vco-new sibling dir.
     if is_symlink_blocking(settings_dir):
         vco_new_dir = compute_vco_new_path(settings_dir)
         if deferral_report is not None:
@@ -20674,8 +20669,7 @@ def _configure_claude_settings(
                 deferral_report, settings_dir, vco_new_dir,
                 install_root=PROJECT_ROOT,
             )
-        # v0.2.46 post-adversarial L1: if the prior .vco-new dir from a
-        # previous install run is still here, refuse to clobber it.
+        # post-adversarial L1: never clobber a prior run's .vco-new dir.
         if check_vco_new_collision(
             vco_new_dir,
             install_root=PROJECT_ROOT,
@@ -20697,9 +20691,7 @@ def _configure_claude_settings(
 
     settings_file = settings_dir / "settings.json"
 
-    # v0.2.46 V47-B (Gap B): if settings.json is itself a symlink, write
-    # to sibling. Use lexists for "is this slot already occupied?" so
-    # dangling symlinks still trigger the skip.
+    # V47-B: a symlinked settings.json (dangling included) → .vco-new sibling.
     if is_symlink_blocking(settings_file):
         vco_new_file = compute_vco_new_path(settings_file)
         if deferral_report is not None:
@@ -20707,8 +20699,7 @@ def _configure_claude_settings(
                 deferral_report, settings_file, vco_new_file,
                 install_root=PROJECT_ROOT,
             )
-        # v0.2.46 post-adversarial L1: ditto for the settings.json.vco-new
-        # file from a prior run.
+        # post-adversarial L1: ditto for a prior settings.json.vco-new.
         if check_vco_new_collision(
             vco_new_file,
             install_root=PROJECT_ROOT,
@@ -20729,9 +20720,8 @@ def _configure_claude_settings(
     defaults = _build_vco_settings_defaults(embed_config)
     rendered_defaults = json.dumps(defaults, indent=2) + "\n"
 
-    # Case 1: file missing — write fresh VCO defaults. Use lexists so
-    # that a (hypothetical) dangling symlink at this path — already
-    # diverted to vco_new_file above — isn't treated as "missing".
+    # Case 1: file missing (lexists: a diverted dangling symlink is not
+    # "missing") — write fresh VCO defaults.
     if not os.path.lexists(os.fspath(settings_file)):
         settings_file.write_text(rendered_defaults, encoding="utf-8")
         return
@@ -20778,9 +20768,7 @@ def _configure_claude_settings(
         return
 
     if not isinstance(existing, dict):
-        # JSON parsed to a non-object (array, string, number) — treat the
-        # same as unparseable: VCO defaults are a dict, can't merge with
-        # a non-dict.
+        # A non-object JSON (array/string/number) cannot merge — as unparseable.
         print(
             "  Claude settings: existing file is not a JSON object; "
             "preserved on disk"
@@ -20821,8 +20809,19 @@ def _configure_claude_settings(
         print("  Claude settings: managed keys refreshed (user keys preserved)")
         return
 
-    # Case 5: file parsed but has no _vco_managed_keys — legacy / external.
-    # Land VCO defaults as `.vco-new` sibling and emit deferral.
+    # v0.2.103 F4: step 5b's bundle CREATED this file this run — VCO's own, so fill in the
+    # defaults and stamp the sentinel (vco_lib.self_install). Not a tautology: a symlinked
+    # .claude/ or settings.json diverted settings_file to a .vco-new sibling above.
+    if settings_file == PROJECT_ROOT / ".claude" / "settings.json" and \
+            _self_install.root_settings_created_this_run(PROJECT_ROOT):
+        adopted = _self_install.adopt_bundle_created_settings(
+            existing, defaults, _VCO_MANAGED_KEYS_SENTINEL)
+        settings_file.write_text(json.dumps(adopted, indent=2) + "\n", encoding="utf-8")
+        print("  Claude settings: VCO defaults added to the file install-bundle created")
+        return
+
+    # Case 5: no _vco_managed_keys, not created this run — legacy / external:
+    # VCO defaults land as a `.vco-new` sibling + a deferral.
     vco_new_path = settings_file.with_suffix(settings_file.suffix + ".vco-new")
     vco_new_path.write_text(rendered_defaults, encoding="utf-8")
     print(

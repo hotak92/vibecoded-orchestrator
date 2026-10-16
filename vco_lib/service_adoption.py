@@ -177,6 +177,8 @@ BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
     "OLLAMA_KV_CACHE_TYPE",
     "CODE_EMBED_BACKEND",
     "CODE_EMBED_MODEL",
+    # v0.2.103 F1: the ollama backend cannot embed without it.
+    "CODE_EMBED_OLLAMA_BODY",
     "CODE_EMBED_MAX_CONCURRENT",
     *WEAVIATE_RECLAIM_ENV_KEYS,
     "ENABLE_API_BASED_MODULES",

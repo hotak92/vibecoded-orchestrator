@@ -595,6 +595,8 @@ def test_uninstall_plan_builders_need_only_the_standard_library(tmp_path):
         "assert not [x for x in left if 'unreadable' in x or 'cannot check' in x], left;"
         "print('ok')"
     )
+    # `-S` + a minimal env is the base-Python shape under test; the child puts
+    # the checkout on sys.path itself (child_env only adds the test pins).
     env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
            "VCT_STATE_DIR": str(tmp_path / ".vct"), "PATH": os.environ.get("PATH", "")}
     from tests.common.child_env import child_env

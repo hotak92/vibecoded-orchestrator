@@ -102,6 +102,11 @@ class NumCtxIsAlwaysExplicitTests(unittest.TestCase):
             # explicit SSOT-resolved num_ctx. The exemption is backed by a
             # BEHAVIOURAL assertion (test_builder_output_sets_num_ctx), not
             # just the name: the guard's teeth stay where they were.
+            # v0.2.103 F1: the code_embed service's
+            # `_ollama_embed_request_body` (the builder on a host, the
+            # host-resolved template in the vco_lib-less container) matches
+            # the same name; its output is pinned EQUAL to the builder's for
+            # every table model by tests/test_v02103_code_embed_ollama_body.py.
             if "num_ctx" not in window and "embed_request_body" not in window:
                 rel = path.relative_to(REPO_ROOT)
                 offenders.append(f"{rel}:{line}")

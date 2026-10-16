@@ -365,6 +365,10 @@ class RebuildPlan:
     verdict: str = UNKNOWN
     expected_sha: Optional[str] = None
     served_sha: Optional[str] = None
+    #: :func:`rebuild_allowed`'s ownership verdict — False when this run must
+    #: not touch the service at all (CPU tier, a FOREIGN adopt). Read by
+    #: :func:`plan_body_template_recreate`, which follows the same rule.
+    owned: bool = True
 
 
 def rebuild_allowed(
@@ -374,11 +378,18 @@ def rebuild_allowed(
     *,
     adopt_action: str,
     managed_probe: str,
+    in_stack: bool = True,
 ) -> bool:
     """Pure: may this run rebuild the ``code_embed`` IMAGE?
 
     Ownership, in the same shape as install.py's weaviate reclaim-drift gate:
 
+    * ``in_stack`` False → the container is not part of this install at all
+      (v0.2.103 field run: the ONE in-stack decision,
+      :func:`vco_lib.compose_env.code_embed_container_in_stack`, said no — an
+      Ollama-served code model — yet this gate re-added ``--build
+      --force-recreate code_embed``). Never built, never recreated, on every
+      path below, ``force_separate`` and legacy callers included.
     * ``has_gpu`` False → the CPU tier does not run this service at all
       (the installer's disposition loop already skips it); nothing to build.
     * ``force_separate`` → no adopt classification exists on that path; the
@@ -393,7 +404,7 @@ def rebuild_allowed(
     the decision vocabulary belongs to install.py, and copying its constants
     here would be a second home for them.
     """
-    if not has_gpu:
+    if not in_stack or not has_gpu:
         return False
     if force_separate or not decisions:
         return True
@@ -415,6 +426,7 @@ def plan_rebuild(
     adopt_action: str,
     managed_probe: str,
     state: Optional[ImageState] = None,
+    in_stack: bool = True,
 ) -> RebuildPlan:
     """Decide whether the installer's compose-up must rebuild the image.
 
@@ -447,9 +459,9 @@ def plan_rebuild(
     """
     if not rebuild_allowed(
         decisions, has_gpu, force_separate,
-        adopt_action=adopt_action, managed_probe=managed_probe,
+        adopt_action=adopt_action, managed_probe=managed_probe, in_stack=in_stack,
     ):
-        return RebuildPlan(build=False)
+        return RebuildPlan(build=False, owned=False)
     if state is None:
         try:
             state = image_state(install_root, url=url)
@@ -495,6 +507,54 @@ def plan_rebuild(
         expected_sha=state.expected_sha,
         served_sha=state.served_sha,
     )
+
+
+def plan_body_template_recreate(
+    rebuild: RebuildPlan,
+    *,
+    force_separate: bool,
+    url: Optional[str],
+    infra_dir,
+    embed_config: dict,
+    services: Sequence[str],
+    write_env,
+    log_event=None,
+) -> tuple:
+    """v0.2.103 R42-L1: converge an existing ``ollama``-backend code_embed onto
+    the body template this checkout resolves. Returns the services to add to
+    ``services_to_recreate`` (``()`` or ``(COMPOSE_SERVICE,)``).
+
+    ``infrastructure/.env`` is otherwise rewritten only inside the compose
+    tail, which install skips when nothing needs starting — so a host-side
+    template change (``MODEL_TOKEN_LIMITS``, the keep_alive default) would
+    never reach a running container whose image digest did not move. When
+    :func:`vco_lib.compose_env.code_embed_body_template_drifted` says the
+    on-disk template differs, ``write_env(embed_config)`` (install's one
+    ``.env`` writer) rewrites it, and the service is named for recreate
+    when it is running and ours by :func:`rebuild_allowed`'s rule
+    (``rebuild.owned``, which includes the caller's ONE in-stack decision —
+    :func:`vco_lib.compose_env.code_embed_container_in_stack`, the
+    ``CODE_EMBED_IN_STACK`` marker's source; ``force_separate`` runs bring up
+    their own stack). A container VCO does not want is never recreated: only
+    its ``.env`` is refreshed (coordinator ruling, R42 fix round).
+    The caller runs this BEFORE its recreate / data-identity guards, so a
+    container another compose identity created is still never recreated.
+    """
+    from vco_lib.compose_env import code_embed_body_template_drifted  # noqa: PLC0415
+
+    if not code_embed_body_template_drifted(Path(infra_dir), embed_config):
+        return ()
+    write_env(embed_config)
+    if force_separate or not rebuild.owned or not url or COMPOSE_SERVICE in services:
+        print("  [env] code_embed: CODE_EMBED_OLLAMA_BODY in infrastructure/.env "
+              "refreshed to this checkout's template.")
+        return ()
+    print("  [recreate] code_embed: CODE_EMBED_OLLAMA_BODY in infrastructure/.env "
+          "differed from this checkout's template — rewritten; recreating the "
+          "container so it embeds with the same num_ctx/keep_alive as the host.")
+    if log_event is not None:
+        log_event("5/10", "recreate", "code_embed body-template drift → force-recreate")
+    return (COMPOSE_SERVICE,)
 
 
 def build_rejected_lines(failure, manual_cmd: str, infra_dir) -> tuple:
