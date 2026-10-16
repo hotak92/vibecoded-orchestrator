@@ -30,9 +30,9 @@ DEFAULT_PROBE_TIMEOUT_S = 10
 
 
 def _secrets_root_from_env() -> Path:
-    return Path(
-        os.environ.get("VCT_SECRETS_DIR") or (Path.home() / ".vct-secrets")
-    )
+    from vco_lib.paths import secrets_root  # one home
+
+    return secrets_root()
 
 
 def detect_secrets_envelope(

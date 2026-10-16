@@ -573,3 +573,25 @@ def test_still_running_uses_the_same_identification(tmp_path):
     assert busy[0] == "vct-hub" and len(busy) == 2 and "pid 5" in busy[1]  # foreign gateway/launcher: not ours
     assert uq.still_running([ours], hub_running=lambda: False, lister=lambda: [],
                             gateway_reader=lambda: None, gateway_candidates=cands) == []
+
+
+def test_uninstall_plan_builders_need_only_the_standard_library(tmp_path):
+    """Windows field run (v0.2.103): uninstall.bat runs on the base Python
+    (no venv in the clone, or the venv already gone) and step [8]'s plan
+    imported agent_secrets -> project_config -> requests and crashed. Every
+    uninstall plan builder must import and run with site-packages disabled."""
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[1]
+    code = (
+        "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]);"
+        "from vco_lib import uninstall_state, uninstall_quiesce, uninstall_artifacts;"
+        "import vco_lib.uninstall_containers;"
+        "uninstall_state.build_plan(clone_root=Path(sys.argv[1]));"
+        "print('ok')"
+    )
+    env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
+           "VCT_STATE_DIR": str(tmp_path / ".vct"), "PATH": os.environ.get("PATH", "")}
+    proc = subprocess.run([sys.executable, "-S", "-c", code, str(repo)],
+                          capture_output=True, text=True, env=env, timeout=60)
+    assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr[-2000:]

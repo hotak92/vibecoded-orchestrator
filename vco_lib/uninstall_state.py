@@ -206,7 +206,7 @@ def build_plan(
     """Read-only: what step [8] would remove. Defaults resolve the real
     machine (``vct_root_dir``, ``launcher_db_path``, the secrets resolver)."""
     from vco_lib import paths as _paths
-    from vco_lib.agent_secrets import _secrets_root
+    from vco_lib.paths import secrets_root as _secrets_root
 
     env = os.environ if env is None else env
     root = _paths.vct_root_dir() if root is None else root

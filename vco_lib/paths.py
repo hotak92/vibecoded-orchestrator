@@ -155,6 +155,14 @@ def vct_root_dir() -> Path:
     return Path.home() / ".vct"
 
 
+def secrets_root() -> Path:
+    """The file-store secrets dir: ``$VCT_SECRETS_DIR`` (stripped) else
+    ``~/.vct-secrets``. Standard library only — the uninstaller imports it on
+    a machine whose venv may already be gone (Windows field run, v0.2.103)."""
+    raw = os.environ.get("VCT_SECRETS_DIR", "").strip()
+    return Path(raw) if raw else (Path.home() / ".vct-secrets")
+
+
 def user_home() -> Path:
     """Return the user's home directory for VCO config reads/writes.
 
