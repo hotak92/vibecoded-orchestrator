@@ -21,12 +21,17 @@ from __future__ import annotations
 
 import os
 import random
+import json
 import re
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
+
+from tests.common.child_env import child_env
 
 REPO = Path(__file__).resolve().parents[1]
 SCANNER = REPO / "templates" / "scripts" / "bash_security.py"
@@ -265,6 +270,44 @@ def test_ps1_raw_net_matches_exactly_what_it_did(which: str) -> None:
         assert bool(new.search(s)) == want, (which, s)
         hits += want
     assert 0.02 * n < hits < 0.98 * n, (which, hits)
+
+
+_PWSH = shutil.which("pwsh")
+_PWSH_DIFF = r"""
+param([string]$Json, [string]$Old, [string]$New)
+$arr = Get-Content -Raw -Encoding utf8 $Json | ConvertFrom-Json
+$div = 0; $hits = 0
+foreach ($s in $arr) {
+    $o = [bool]($s -match $Old); $n = [bool]($s -match $New)
+    if ($o) { $hits++ }
+    if ($o -ne $n) { $div++ }
+}
+Write-Output ("{0} {1}" -f $hits, $div)
+"""
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh not installed")
+@pytest.mark.parametrize("which", sorted(PS1_RAW_OLD))
+def test_ps1_raw_net_matches_exactly_under_dotnet(which: str, tmp_path: Path) -> None:
+    """The same old-vs-new equivalence, evaluated by the engine the hook really
+    runs under (.NET via pwsh), on the newline/CRLF-bearing raw domain."""
+    rng = random.Random(f"r8-pwsh-{which}")
+    samples = [
+        _sample(rng, PS1_RAW_FRAGMENTS[which]).replace("&&", rng.choice(["\n", "\r\n", "&&"]))
+        for _ in range(int(os.environ.get("VCO_SCANNER_PWSH_N", "3000")))
+    ]
+    data = tmp_path / "samples.json"
+    data.write_text(json.dumps(samples), encoding="utf-8")
+    script = tmp_path / "diff.ps1"
+    script.write_text(_PWSH_DIFF, encoding="utf-8")
+    out = subprocess.run(
+        [str(_PWSH), "-NoProfile", "-NonInteractive", "-File", str(script),
+         "-Json", str(data), "-Old", PS1_RAW_OLD[which], "-New", _ps1_raw_patterns()[which]],
+        capture_output=True, text=True, timeout=300, check=True, env=child_env(),
+    ).stdout.split()
+    hits, div = int(out[-2]), int(out[-1])
+    assert div == 0, (which, div)
+    assert 0.02 * len(samples) < hits < 0.98 * len(samples), (which, hits)
 
 
 @pytest.mark.parametrize("which", sorted(PS1_RAW_OLD))
