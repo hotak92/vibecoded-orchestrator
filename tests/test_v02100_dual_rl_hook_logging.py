@@ -94,21 +94,16 @@ def world(project, monkeypatch):
 
 
 def _loss_lines():
-    from vco_lib.rl_telemetry_loss import loss_log_path
+    from tests.common.rl_loss_ledger import loss_records
 
-    p = loss_log_path()
-    if not p.exists():
-        return []
-    return [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
+    return loss_records()
 
 
 @pytest.fixture(autouse=True)
 def _clean_ledger():
-    from vco_lib.rl_telemetry_loss import loss_log_path
+    from tests.common.rl_loss_ledger import clean_loss_ledger
 
-    p = loss_log_path()
-    if p.exists():
-        p.unlink()
+    clean_loss_ledger()
     yield
 
 

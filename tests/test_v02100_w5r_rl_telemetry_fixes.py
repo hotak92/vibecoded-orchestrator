@@ -569,12 +569,41 @@ _WRITER = (
     "import vco_lib.rl_telemetry_loss as m\n"
     "m._MAX_BYTES = 1\n"          # rotate on every append
     "m._KEEP_LINES = 10 ** 6\n"   # ...keeping everything: any lost line is a race
+    # v0.2.104: a lock wait this short times out on ANY machine under four
+    # writers, so the lock-busy path runs on every pass, not only when the
+    # host happens to be loaded (where the pre-fix unlocked append lost lines).
+    "m._LOCK_TIMEOUT_S = 0.01\n"
     "for i in range(int(sys.argv[2])):\n"
     "    m.record_loss('dual_skip', 'race', seq=sys.argv[1] + '-' + str(i))\n"
 )
 
+_READ_SEQS = (
+    "import json, sys\n"
+    "import vco_lib.rl_telemetry_loss as m\n"
+    "print(json.dumps([r['seq'] for r in m.iter_records()]))\n"
+)
 
-@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX; Windows is best-effort by design")
+_LEDGER_SEQS_AFTER_ONE_MORE = (
+    "import json, sys\n"
+    "import vco_lib.rl_telemetry_loss as m\n"
+    "m.record_loss('dual_skip', 'race', seq='final')\n"
+    "print(json.dumps([json.loads(x)['seq'] for x in m.loss_log_path().read_text().splitlines()]))\n"
+)
+
+
+def _child_json(code, state):
+    """Run ``code`` in a child Python against the state dir ``state``; its
+    stdout is JSON."""
+    proc = subprocess.run([sys.executable, "-c", code],
+                          env=child_env(VCT_STATE_DIR=str(state)), capture_output=True,
+                          text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="rotation by os.replace of a file other "
+                    "writers reopen is the POSIX shape; the lock-busy spill is pinned "
+                    "cross-platform by the deterministic test below")
 def test_rotation_does_not_drop_lines_written_by_other_processes(tmp_path):
     state = tmp_path / "vct"
     env = child_env(VCT_STATE_DIR=str(state))
@@ -587,6 +616,75 @@ def test_rotation_does_not_drop_lines_written_by_other_processes(tmp_path):
     for p in procs:
         p.wait(timeout=120)
         assert p.returncode == 0, (p.stderr.read() if p.stderr else b"")[-2000:]
-    lines = (state / "metrics" / "rl_telemetry_loss.jsonl").read_text().splitlines()
-    seqs = {json.loads(x)["seq"] for x in lines}
-    assert len(seqs) == n_proc * per, f"{n_proc * per - len(seqs)} line(s) lost to a rotation race"
+    seqs = _child_json(_READ_SEQS, state)
+    assert len(seqs) == len(set(seqs)), "a spilled line was counted twice"
+    assert len(set(seqs)) == n_proc * per, (
+        f"{n_proc * per - len(set(seqs))} line(s) lost to a rotation race")
+    # The next locked append folds every spilled line into the ledger itself.
+    ledger = _child_json(_LEDGER_SEQS_AFTER_ONE_MORE, state)
+    assert sorted(ledger) == sorted(seqs + ["final"])
+
+
+_BUSY_WRITER = (
+    "import vco_lib.rl_telemetry_loss as m\n"
+    "m._LOCK_TIMEOUT_S = 0.05\n"
+    "m.record_loss('hub_post_failed', 'refused', seq='while-busy')\n"
+)
+
+
+def test_a_writer_that_finds_the_lock_busy_never_writes_into_a_rotation(tmp_path):
+    """v0.2.104 §I: the exact interleaving that lost lines, made deterministic.
+
+    The test process holds the ledger lock and is MID-ROTATION — it has read
+    the tail and not yet replaced the file. A writer in another process times
+    out on the lock. Pre-fix that writer appended to the ledger unlocked, into
+    the inode the rotation then replaced: the line was gone. Now it spills to
+    a pending file, which readers count and the next locked append drains.
+    """
+    from vco_lib import rl_telemetry_loss as m
+    from vco_lib.atomic import atomic_write_text, exclusive_file_lock
+
+    state = tmp_path / "vct"
+    env = child_env(VCT_STATE_DIR=str(state))
+    ledger = state / "metrics" / m.LOSS_FILE_NAME
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text('{"ts_ms":1,"kind":"dual_skip","reason":"r","seq":"old"}\n')
+
+    with exclusive_file_lock(m.lock_path(ledger)):
+        tail = ledger.read_text(encoding="utf-8")          # rotation: tail read
+        proc = subprocess.run([sys.executable, "-c", _BUSY_WRITER], env=env,
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        atomic_write_text(ledger, tail, fsync=False)       # rotation: replace
+
+    assert _child_json(_READ_SEQS, state) == ["old", "while-busy"]
+    assert m.summarize(path=ledger)["by_kind"] == {
+        "dual_skip": {"r": 1}, "hub_post_failed": {"refused": 1}}
+    # Drained by the next writer that holds the lock: into the ledger, once.
+    assert _child_json(_LEDGER_SEQS_AFTER_ONE_MORE, state) == ["old", "while-busy", "final"]
+    assert not list(m.pending_dir(ledger).glob("*.jsonl"))
+    assert _child_json(_READ_SEQS, state) == ["old", "while-busy", "final"]
+
+
+def test_episode_bump_finds_its_line_when_it_was_spilled(tmp_path, monkeypatch):
+    """v0.2.104 §I: the hub-down episode's in-place ``suppressed`` bump is the
+    ledger's other rewriter. It drains spilled lines under the lock first, so
+    an episode line that was spilled (lock busy at record time) is still
+    bumped — and kept — rather than missed."""
+    from claude_mcp_servers.rl_client import hub_writer
+    from vco_lib import rl_telemetry_loss as m
+
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "vct"))
+    ledger = m.loss_log_path()
+    m._spill(ledger, json.dumps({"ts_ms": 1, "kind": "hub_post_failed",
+                                 "reason": "refused", "episode": "ep-1"},
+                                separators=(",", ":")) + "\n")
+    assert not ledger.exists()
+    hub_writer._bump_episode_ledger_line("ep-1", 7)
+    recs = [json.loads(x) for x in ledger.read_text().splitlines()]
+    (sid,) = [r.pop(m.SPILL_ID_KEY) for r in recs]  # its idempotency key survives
+    assert sid
+    assert recs == [{"ts_ms": 1, "kind": "hub_post_failed", "reason": "refused",
+                     "episode": "ep-1", "suppressed": 7}]
+    assert [{k: v for k, v in r.items() if k != m.SPILL_ID_KEY}
+            for r in m.iter_records()] == recs
