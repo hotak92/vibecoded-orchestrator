@@ -477,8 +477,11 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
     as copied material. Both readings only ever UN-hide a path (it shows up
     in ``git status``, and the user re-adds the line); the opposite reading
     would leave VCO's own line hiding the user's file with nothing to repair
-    it. A block that has either line is exact on this point: a line after it
-    is the user's.
+    it. A BUNDLE block that has either line is exact on this point: a line
+    after it is the user's. A MOVE block is not: after its bundle part the old
+    move writer appended its copied-material lines, so a ``/knowledge/…``,
+    ``/CONTEXT_STATE.md`` or ``/MEMORY.md`` line there is still read as VCO's
+    (``legacy-move-tail``) — the same un-hide-only reading.
     """
     members: dict[int, str] = {}
     legacy_ends: list[int] = []
@@ -526,6 +529,11 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
                     break
             else:
                 in_header = False
+                # No pre-v0.2.104 writer indented an entry (bundle and move
+                # alike began every line with "/"), so a leading-whitespace
+                # line is the user's even when its stripped text looks legacy.
+                if lines[k][:1].isspace():
+                    break
                 legacy_shape = _is_legacy_vco_entry(s) or (
                     is_move and _is_legacy_move_copied_line(lines[k], s))
                 if not legacy_shape or s in vco_seen:

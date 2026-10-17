@@ -572,13 +572,21 @@ class G4R3LegacyBlockTests(unittest.TestCase):
     def test_a_move_block_line_the_old_writer_never_produced_ends_it(self):
         """Leading whitespace or a directory pattern was never the old move
         writer's shape: the line is the user's and ends the block."""
-        for odd in (" /knowledge/My Node.md", "/knowledge/my dir/"):
+        for odd in (" /knowledge/My Node.md", "/knowledge/my dir/",
+                    "\t/knowledge/b.md", " /CONTEXT_STATE.md"):
             text = f"# VCO project move: x\n/knowledge/a.md\n{odd}\n/MEMORY.md\n"
             new, removed = git_exclude._rewrite_vco_blocks(text)
             self.assertEqual(removed, ["/knowledge/a.md"], odd)
             self.assertEqual(
                 new, f"# VCO project move: x\n# VCO end\n{odd}\n/MEMORY.md\n", odd,
             )
+
+    def test_a_bundle_block_indented_legacy_line_ends_it(self):
+        """No old bundle writer indented a line either: an indented
+        legacy-looking entry is the user's and ends the block."""
+        text = "# VCO safe-add (v0.2.63): x\n/CLAUDE.md\n\t/AGENTS.md\n"
+        new, _removed = git_exclude._rewrite_vco_blocks(text)
+        self.assertIn("/CLAUDE.md\n# VCO end\n\t/AGENTS.md\n", new)
 
     def test_line_ending_is_the_dominant_one(self):
         le = git_exclude._line_ending
