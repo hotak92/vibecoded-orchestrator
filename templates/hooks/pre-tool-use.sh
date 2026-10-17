@@ -213,6 +213,11 @@ fi
 # truly resets at compaction).
 SESSION_STATE_DIR="$PROJECT_ROOT/.claude/state"
 SESSION_READS_FILE="$SESSION_STATE_DIR/reads_${ANCHOR_SESSION_KEY}.txt"
+# v0.2.104: written by post-compact (same key as the reads ledger it wipes)
+# when THIS session/agent has compacted. Its absence means nothing was
+# re-attached, so a Write miss blocks without asking compact_reattach.
+# MUST MATCH post-compact.{sh,ps1} + pre-tool-use.ps1.
+SESSION_COMPACTED_MARKER="$SESSION_STATE_DIR/compacted_${ANCHOR_SESSION_KEY}.txt"
 BACKUP_DIR="$SESSION_STATE_DIR/tool_backups"
 SECURITY_LOG="$PROJECT_ROOT/.claude/logs/security_events.jsonl"
 
@@ -234,6 +239,8 @@ find "$SESSION_STATE_DIR" -maxdepth 1 -name 'reads_*.txt' -mtime +14 -delete 2>/
 # v0.2.70 Stream E (SF-1): same 14-day GC for the INJECTOR reads store
 # (seen_reads_*.txt — distinct from the Build-Anchor reads_*.txt above).
 find "$SESSION_STATE_DIR" -maxdepth 1 -name 'seen_reads_*.txt' -mtime +14 -delete 2>/dev/null || true
+# v0.2.104: same 14-day GC for the post-compact markers (compacted_*.txt).
+find "$SESSION_STATE_DIR" -maxdepth 1 -name 'compacted_*.txt' -mtime +14 -delete 2>/dev/null || true
 
 # === HELPER: safe JSON field extraction ===
 _get_field() {
@@ -476,7 +483,14 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
                 # vco_lib, any error or doubt keeps the block (fail closed).
                 # The allowed path is appended to the ledger below, so later
                 # Writes do not rescan. MUST MATCH pre-tool-use.ps1.
-                if [[ "$ALREADY_READ" -eq 0 ]] && [[ -n "$TRANSCRIPT_PATH" ]]; then
+                # Asked ONLY when post-compact left this session's marker: a
+                # session that never compacted has nothing re-attached, and
+                # this hook's 3 s registration timeout must not be spent on a
+                # transcript scan — a hook killed on timeout does not block,
+                # so it would turn this block into an allow. The module also
+                # answers `no` past its own ~1 s deadline.
+                if [[ "$ALREADY_READ" -eq 0 ]] && [[ -n "$TRANSCRIPT_PATH" ]] \
+                        && [[ -f "$SESSION_COMPACTED_MARKER" ]]; then
                     # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
                     [[ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ]] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
                     VCO_VENV_PYTHON=""

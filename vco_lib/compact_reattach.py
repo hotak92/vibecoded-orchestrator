@@ -53,7 +53,14 @@ boundary within the window, a row that does not parse, an I/O error — is
 :data:`CHUNK_BYTES` blocks backwards from the end, looks only for the exact
 byte markers below, and parses at most one line of at most
 :data:`MAX_LINE_BYTES` per marker hit, so memory stays O(chunk + line) and the
-time is bounded by the window. A subagent's tool call is always "no": the
+work is bounded by the window. The wall-clock time is bounded too: past
+:data:`DEADLINE_SECONDS` the answer is "no" — the hook's own registration
+timeout is short, and a hook killed on timeout would ALLOW the Write.
+
+The scan is also not asked at all unless ``post-compact`` has written this
+session's ``.claude/state/compacted_<key>.txt`` marker: a session that never
+compacted has nothing re-attached, so ``pre-tool-use`` blocks it without
+spawning Python. A subagent's tool call is always "no": the
 payload's transcript is the parent's, whose re-attachments are not in the
 subagent's context.
 """
@@ -63,6 +70,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import BinaryIO
 
 # The scan window: the latest compact_boundary must lie within this many
@@ -76,6 +84,12 @@ CHUNK_BYTES = 1024 * 1024
 # A boundary row is ~1.5 KB and a re-attached file row carries < 5,000 tokens
 # (largest observed ~0.4 MB); a longer line is neither and is not parsed.
 MAX_LINE_BYTES = 4 * 1024 * 1024
+# Wall-clock budget for one answer. ``pre-tool-use`` is registered with a
+# 3-second timeout, and a hook the harness kills on timeout does not block
+# the tool call — so a scan that outlives the hook would turn the block into
+# an allow. Past this deadline the answer is "no" (fail closed); the budget
+# leaves room for interpreter start-up and the rest of the hook.
+DEADLINE_SECONDS = 1.0
 
 # Exact serialisations (compact JSON, no spaces). The same text inside a JSON
 # STRING is escaped (`\"subtype\":…`), so these bytes only match real rows;
@@ -85,6 +99,15 @@ _FILE_MARKER = b'"attachment":{"type":"file"'
 
 ANSWER_YES = "reattached"
 ANSWER_NO = "no"
+
+
+class _DeadlineExceeded(Exception):
+    """The scan ran past its wall-clock budget; the answer is "no"."""
+
+
+def _check_deadline(deadline_at: float) -> None:
+    if time.monotonic() > deadline_at:
+        raise _DeadlineExceeded
 
 
 def _norm(path: str) -> str:
@@ -119,13 +142,16 @@ def _parse(found: tuple[bytes, int] | None) -> dict | None:
     return row if isinstance(row, dict) else None
 
 
-def _last_boundary_end(fh: BinaryIO, size: int, window: int) -> int | None:
+def _last_boundary_end(fh: BinaryIO, size: int, window: int,
+                       deadline_at: float) -> int | None:
     """Offset just past the latest verified compact_boundary row within the
-    last *window* bytes; None when there is none."""
+    last *window* bytes; None when there is none. Raises
+    :class:`_DeadlineExceeded` past *deadline_at*."""
     floor = max(0, size - window)
     end = size
     overlap = len(_BOUNDARY_MARKER) - 1
     while end > floor:
+        _check_deadline(deadline_at)
         start = max(floor, end - CHUNK_BYTES)
         fh.seek(start)
         block = fh.read(min(size, end + overlap) - start)
@@ -134,6 +160,7 @@ def _last_boundary_end(fh: BinaryIO, size: int, window: int) -> int | None:
             idx = block.rfind(_BOUNDARY_MARKER, 0, idx)
             if idx < 0:
                 break
+            _check_deadline(deadline_at)
             found = _line_around(fh, start + idx, size)
             row = _parse(found)
             if found is not None and row is not None \
@@ -177,31 +204,36 @@ def _row_reattaches(row: dict | None, target: str) -> bool:
 
 
 def was_reattached(transcript_path: str, target_path: str, agent_id: str = "",
-                   window: int = SCAN_MAX_BYTES) -> bool:
+                   window: int = SCAN_MAX_BYTES,
+                   deadline: float = DEADLINE_SECONDS) -> bool:
     """Did the harness re-attach the whole of *target_path* after the latest
     compaction recorded in *transcript_path*? Fails closed (False) on every
-    doubt — see the module docstring."""
+    doubt, and when the scan runs past *deadline* seconds — see the module
+    docstring."""
     if agent_id or not transcript_path or not target_path:
         return False
+    deadline_at = time.monotonic() + deadline
     try:
         target = _norm(target_path)
         with open(transcript_path, "rb") as fh:
             size = os.fstat(fh.fileno()).st_size
-            pos = _last_boundary_end(fh, size, window)
+            pos = _last_boundary_end(fh, size, window, deadline_at)
             if pos is None:
                 return False
             overlap = len(_FILE_MARKER) - 1
             while pos < size:
+                _check_deadline(deadline_at)
                 fh.seek(pos)
                 block = fh.read(min(CHUNK_BYTES + overlap, size - pos))
                 idx = block.find(_FILE_MARKER)
                 while 0 <= idx < CHUNK_BYTES:
+                    _check_deadline(deadline_at)
                     found = _line_around(fh, pos + idx, size)
                     if _row_reattaches(_parse(found), target):
                         return True
                     idx = block.find(_FILE_MARKER, idx + 1)
                 pos += CHUNK_BYTES
-    except (OSError, ValueError):
+    except (OSError, ValueError, _DeadlineExceeded):
         return False
     return False
 

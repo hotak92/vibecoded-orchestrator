@@ -123,6 +123,12 @@ fi
 if [ -n "$SESSION_ID" ] && [ -n "$PROJECT_DIR" ]; then
     READS_FILE="$PROJECT_DIR/.claude/state/reads_${SESSION_ID}.txt"
     [ -f "$READS_FILE" ] && rm -f "$READS_FILE" 2>/dev/null || true
+    # v0.2.104: mark that THIS session/agent compacted (same key as the
+    # ledger just wiped). pre-tool-use asks vco_lib/compact_reattach.py only
+    # when this marker exists, so a session that never compacted never pays
+    # for a transcript scan. MUST MATCH pre-tool-use.{sh,ps1} + post-compact.ps1.
+    mkdir -p "$PROJECT_DIR/.claude/state" 2>/dev/null || true
+    : > "$PROJECT_DIR/.claude/state/compacted_${SESSION_ID}.txt" 2>/dev/null || true
     # v0.2.70 Stream E (SF-1): also wipe the INJECTOR reads store
     # (seen_reads_<id>.txt) the context-injection hooks consult for src dedup —
     # DISTINCT from the Build-Anchor reads_<id>.txt above. MUST MATCH the

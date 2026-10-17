@@ -144,6 +144,11 @@ if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyConti
 # at compaction).
 $SessionStateDir = Join-Path $ProjectRoot ".claude/state"
 $SessionReadsFile = Join-Path $SessionStateDir "reads_$AnchorSessionKey.txt"
+# v0.2.104: written by post-compact (same key as the reads ledger it wipes)
+# when THIS session/agent has compacted. Its absence means nothing was
+# re-attached, so a Write miss blocks without asking compact_reattach.
+# MUST MATCH post-compact.{sh,ps1} + pre-tool-use.sh.
+$SessionCompactedMarker = Join-Path $SessionStateDir "compacted_$AnchorSessionKey.txt"
 $BackupDir = Join-Path $SessionStateDir "tool_backups"
 $SecurityLog = Join-Path $ProjectRoot ".claude/logs/security_events.jsonl"
 
@@ -171,6 +176,10 @@ try {
         Remove-Item -Force -ErrorAction SilentlyContinue
     # v0.2.70 Stream E (SF-1): same GC for the INJECTOR reads store.
     Get-ChildItem -Path $SessionStateDir -Filter 'seen_reads_*.txt' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    # v0.2.104: same GC for the post-compact markers (compacted_*.txt).
+    Get-ChildItem -Path $SessionStateDir -Filter 'compacted_*.txt' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { }
@@ -432,7 +441,13 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
                 # vco_lib, any error or doubt keeps the block (fail closed).
                 # The allowed path is appended to the ledger below, so later
                 # Writes do not rescan. MUST MATCH pre-tool-use.sh.
-                if (-not $alreadyRead -and $TranscriptPath) {
+                # Asked ONLY when post-compact left this session's marker: a
+                # session that never compacted has nothing re-attached, and
+                # this hook's 3 s registration timeout must not be spent on a
+                # transcript scan -- a hook killed on timeout does not block,
+                # so it would turn this block into an allow. The module also
+                # answers `no` past its own ~1 s deadline.
+                if (-not $alreadyRead -and $TranscriptPath -and (Test-Path -LiteralPath $SessionCompactedMarker -PathType Leaf)) {
                     $raPy = ""
                     $venvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
                     if (Test-Path -LiteralPath $venvLib) {
