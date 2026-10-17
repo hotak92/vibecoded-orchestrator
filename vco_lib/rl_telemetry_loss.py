@@ -49,7 +49,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -142,9 +142,27 @@ def record_loss(kind: str, reason: str, **detail: Any) -> None:
 
 
 #: Bound on waiting for another PROCESS's rotate+append. Appends take
-#: microseconds; past this a writer appends WITHOUT rotating (an O_APPEND write
-#: of one short line is atomic on its own) rather than stall a hook.
+#: microseconds; past this a writer SPILLS its line to a pending file (see
+#: :func:`_spill`) rather than stall a hook.
 _LOCK_TIMEOUT_S = 1.0
+
+#: Suffix of a spilled line's file inside :func:`pending_dir`. Anything else in
+#: that directory (``atomic_write_text``'s ``*.tmp`` staging file, a
+#: ``*.drained`` file whose unlink failed) is never read as a record.
+_PENDING_SUFFIX = ".jsonl"
+_DRAINED_SUFFIX = ".drained"
+
+
+def lock_path(path: Optional[Path] = None) -> Path:
+    """The sidecar lock that serializes every rewrite of the ledger."""
+    p = path or loss_log_path()
+    return p.with_name(p.name + ".lock")
+
+
+def pending_dir(path: Optional[Path] = None) -> Path:
+    """``<ledger>.pending.d/`` — lines whose writer could not take the lock."""
+    p = path or loss_log_path()
+    return p.with_name(p.name + ".pending.d")
 
 
 def _rotate_and_append(path: Path, line: str) -> None:
@@ -154,23 +172,135 @@ def _rotate_and_append(path: Path, line: str) -> None:
     process rotate (read the tail, ``os.replace``) while another appended to
     the file being replaced, dropping that line at the 2 MiB boundary. The
     sidecar lock is the repo's one file-lock home,
-    ``vco_lib.atomic.exclusive_file_lock`` (POSIX flock; best-effort on
-    Windows, as everywhere else that uses it).
+    ``vco_lib.atomic.exclusive_file_lock`` (POSIX flock, Windows
+    ``msvcrt.locking``).
+
+    v0.2.104: a writer that cannot take the lock within ``_LOCK_TIMEOUT_S``
+    used to append to the ledger WITHOUT it. That is the very race the lock
+    exists for: the holder may be between reading the tail and
+    ``os.replace``-ing it, so the unlocked line went into the inode being
+    replaced and vanished (measured: 16 of 12 800 lines lost over four rounds
+    of 16 writers on a loaded machine). Now such a writer never touches the
+    ledger: it writes its line to its own pending file, complete on arrival,
+    and the next writer that DOES hold the lock moves pending lines into the
+    ledger (:func:`_drain_pending`). Readers (:func:`iter_records`) count
+    pending lines too, so a line is visible from the moment it is recorded.
     """
     from vco_lib.atomic import LockTimeout, exclusive_file_lock, rotate_tail_lines
 
     try:
-        with exclusive_file_lock(
-            path.with_name(path.name + ".lock"), timeout_s=_LOCK_TIMEOUT_S
-        ):
+        with exclusive_file_lock(lock_path(path), timeout_s=_LOCK_TIMEOUT_S):
+            _drain_pending(path)
             rotate_tail_lines(path, max_bytes=_MAX_BYTES, keep_lines=_KEEP_LINES)
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line)
         return
     except LockTimeout:
         pass
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
+    _spill(path, line)
+
+
+def _spill(path: Path, line: str) -> None:
+    """Write ``line`` to a fresh, uniquely-named file in :func:`pending_dir`.
+
+    One writer per file, written once through ``atomic_write_text`` (a staged
+    ``*.tmp`` then ``os.replace``), so a ``*.jsonl`` file in the directory is
+    always complete and never written to again — which is what lets the
+    drainer read and remove it without the race the ledger itself has.
+    """
+    from vco_lib.atomic import atomic_write_text
+
+    name = f"{os.getpid()}-{time.time_ns()}-{os.urandom(4).hex()}{_PENDING_SUFFIX}"
+    atomic_write_text(pending_dir(path) / name, line, fsync=False)
+
+
+def _pending_files(path: Path) -> list[Path]:
+    try:
+        entries = sorted(pending_dir(path).iterdir())
+    except OSError:  # no spill ever happened (the common case), or unreadable
+        return []
+    return [e for e in entries if e.name.endswith(_PENDING_SUFFIX)]
+
+
+def _drain_pending(path: Path) -> None:
+    """Move spilled lines into the ledger. Caller MUST hold :func:`lock_path`.
+
+    Per file: read it, rename it to ``*.drained`` (from then on no reader
+    counts it), append its content, unlink it. A rename that fails (Windows:
+    a reader has it open) leaves the file pending for the next drain, never
+    appended twice; a failed unlink leaves an inert ``*.drained`` file that a
+    later drain removes. Never raises.
+    """
+    try:
+        pdir = pending_dir(path)
+        for stale in pdir.glob("*" + _DRAINED_SUFFIX):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        for f in _pending_files(path):
+            try:
+                body = f.read_text(encoding="utf-8")
+                drained = f.with_name(f.name + _DRAINED_SUFFIX)
+                f.rename(drained)  # a pure rename of a complete file, not a write
+            except OSError:
+                continue
+            if body and not body.endswith("\n"):
+                body += "\n"
+            try:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(body)
+            except OSError:
+                # Ledger unwritable: put the line back so it is not lost.
+                try:
+                    drained.rename(f)
+                except OSError:
+                    pass
+                return
+            try:
+                drained.unlink()
+            except OSError:
+                pass
+    except OSError:
+        return
+
+
+def drain_pending_locked(path: Optional[Path] = None) -> None:
+    """Public entry for another ledger REWRITER that already holds
+    :func:`lock_path` (``rl_client.hub_writer``'s in-place episode bump): fold
+    spilled lines in first, so the rewrite sees and keeps them."""
+    _drain_pending(path or loss_log_path())
+
+
+def iter_records(path: Optional[Path] = None) -> Iterator[dict]:
+    """Every record of the ledger: its lines, then any still-pending spill.
+
+    Lock-free: a pending file is complete from the moment it exists, and the
+    drainer renames it away BEFORE appending its line to the ledger, so a
+    concurrent read can at worst miss a line in flight, never count one
+    twice. A missing ledger is no records; an unreadable one raises
+    ``OSError`` (see :func:`summarize`).
+    """
+    p = path or loss_log_path()
+    sources: list[Path] = [p] if p.exists() else []
+    sources += _pending_files(p)
+    for i, src in enumerate(sources):
+        try:
+            fh = open(src, encoding="utf-8")
+        except FileNotFoundError:
+            continue  # a pending file drained under our feet
+        except OSError:
+            if i == 0 and src == p:
+                raise
+            continue
+        with fh:
+            for raw in fh:
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    yield rec
 
 
 def summarize(since_ms: Optional[int] = None, path: Optional[Path] = None) -> dict:
@@ -179,7 +309,8 @@ def summarize(since_ms: Optional[int] = None, path: Optional[Path] = None) -> di
     lost EVENTS; partial twins are reported apart).
 
     ``since_ms`` limits the count to lines at or after that epoch-ms. Reads the
-    ledger as it stands (older lines beyond the rotation tail are gone). A missing file is an
+    ledger as it stands plus any not-yet-drained spilled line
+    (:func:`iter_records`; older lines beyond the rotation tail are gone). A missing file is an
     empty summary; an unreadable one raises ``OSError`` so a caller can report
     UNKNOWN rather than a false "no losses".
     """
@@ -192,32 +323,23 @@ def summarize(since_ms: Optional[int] = None, path: Optional[Path] = None) -> di
         "partial_twins": 0,
         "partial_missing_nodes": 0,
     }
-    if not p.exists():
-        return out
-    with open(p, encoding="utf-8") as fh:
-        for raw in fh:
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            ts = rec.get("ts_ms")
-            if since_ms is not None and (not isinstance(ts, int) or ts < since_ms):
-                continue
-            kind = str(rec.get("kind", "unknown"))
-            reason = str(rec.get("reason", "unknown"))
-            if isinstance(ts, int) and (out["last_ts_ms"] is None or ts > out["last_ts_ms"]):
-                out["last_ts_ms"] = ts
-            if kind == KIND_DUAL_PARTIAL:
-                out["partial_twins"] += 1
-                missing = rec.get("missing")
-                if isinstance(missing, int):
-                    out["partial_missing_nodes"] += missing
-                continue
-            bucket = out["by_kind"].setdefault(kind, {})
-            bucket[reason] = bucket.get(reason, 0) + 1
-            out["total"] += 1
+    for rec in iter_records(p):
+        ts = rec.get("ts_ms")
+        if since_ms is not None and (not isinstance(ts, int) or ts < since_ms):
+            continue
+        kind = str(rec.get("kind", "unknown"))
+        reason = str(rec.get("reason", "unknown"))
+        if isinstance(ts, int) and (out["last_ts_ms"] is None or ts > out["last_ts_ms"]):
+            out["last_ts_ms"] = ts
+        if kind == KIND_DUAL_PARTIAL:
+            out["partial_twins"] += 1
+            missing = rec.get("missing")
+            if isinstance(missing, int):
+                out["partial_missing_nodes"] += missing
+            continue
+        bucket = out["by_kind"].setdefault(kind, {})
+        bucket[reason] = bucket.get(reason, 0) + 1
+        out["total"] += 1
     return out
 
 
@@ -233,7 +355,11 @@ __all__ = [
     "KIND_WRITER_UNAVAILABLE",
     "KIND_OUTCOME_UNSENT",
     "LOSS_FILE_NAME",
+    "drain_pending_locked",
+    "iter_records",
+    "lock_path",
     "loss_log_path",
+    "pending_dir",
     "record_loss",
     "summarize",
 ]
