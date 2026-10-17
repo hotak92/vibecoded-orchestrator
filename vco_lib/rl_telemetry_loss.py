@@ -164,11 +164,6 @@ _SPILL_FAILED_LOCK_TIMEOUT_S = 5.0
 #: that directory (``atomic_write_text``'s ``*.tmp`` staging file) is never read
 #: as a record.
 _PENDING_SUFFIX = ".jsonl"
-#: v0.2.104 pre-release (commit 62ededab) drained a pending file by renaming it
-#: to ``<name>.jsonl.drained`` first; a drainer killed between that rename and
-#: its append left the only copy of the line under this suffix. Such a file is
-#: read as a pending spill (deduplicated by content), never deleted unread.
-_LEGACY_DRAINED_SUFFIX = ".jsonl.drained"
 
 #: The idempotency key a spilled record carries into the ledger.
 SPILL_ID_KEY = "spill_id"
@@ -330,42 +325,33 @@ def _spill(path: Path, line: str) -> None:
 
 def _spill_stem(f: Path) -> str:
     name = f.name
-    for suffix in (_LEGACY_DRAINED_SUFFIX, _PENDING_SUFFIX):
-        if name.endswith(suffix):
-            return name[: -len(suffix)]
-    return name
+    return name[: -len(_PENDING_SUFFIX)] if name.endswith(_PENDING_SUFFIX) else name
 
 
 def _spill_sort_key(f: Path) -> tuple[int, str]:
-    """Spill time in ns from the file name, then the name.
-
-    Current names are ``<time_ns:020d>-<pid>-<hex>``; 62ededab-era names were
-    ``<pid>-<time_ns>-<hex>`` (time in the SECOND field). Both sort by time.
-    """
-    parts = _spill_stem(f).split("-")
-    if len(parts[0]) == 20 and parts[0].isdigit():
-        return int(parts[0]), f.name
-    if len(parts) >= 2 and parts[1].isdigit():
-        return int(parts[1]), f.name
+    """Spill time in ns from the file name (``<time_ns:020d>-<pid>-<hex>``),
+    then the name; a name of any other shape sorts first with time 0."""
+    head = _spill_stem(f).split("-", 1)[0]
+    if len(head) == 20 and head.isdigit():
+        return int(head), f.name
     return 0, f.name
 
 
 def _pending_files(path: Path) -> list[Path]:
-    """Every pending spill — current ``*.jsonl`` and 62ededab-era
-    ``*.jsonl.drained`` leftovers — oldest first."""
+    """Every pending spill (``*.jsonl``), oldest first."""
     try:
         entries = list(pending_dir(path).iterdir())
     except OSError:  # no spill ever happened (the common case), or unreadable
         return []
-    keep = [e for e in entries
-            if e.name.endswith(_PENDING_SUFFIX) or e.name.endswith(_LEGACY_DRAINED_SUFFIX)]
-    return sorted(keep, key=_spill_sort_key)
+    return sorted((e for e in entries if e.name.endswith(_PENDING_SUFFIX)),
+                  key=_spill_sort_key)
 
 
 def _pending_records(f: Path) -> list[tuple[str, Optional[dict], str]]:
-    """``(raw_line, record_or_None, effective_spill_id)`` for each line of a
-    pending file. A record without its own ``spill_id`` (62ededab-era) gets the
-    file's stem as its effective id. Raises ``OSError`` if unreadable."""
+    """``(raw_line, record_or_None, spill_id)`` for each line of a pending
+    file; ``record_or_None`` is None for a line that is not a JSON object.
+    The id is the record's own ``spill_id``, else the file's stem (``_spill``
+    names the file after the id it writes). Raises ``OSError`` if unreadable."""
     out: list[tuple[str, Optional[dict], str]] = []
     stem = _spill_stem(f)
     for raw in f.read_text(encoding="utf-8").splitlines():
@@ -385,14 +371,11 @@ def _pending_records(f: Path) -> list[tuple[str, Optional[dict], str]]:
 
 
 class _LedgerIndex:
-    """What the ledger already holds, for the drain's and the reader's dedupe:
-    the ``spill_id`` of every parseable line, and (built only when a legacy
-    record without an id needs it) the set of raw lines."""
+    """What the ledger already holds, for the drain's dedupe: the
+    ``spill_id`` of every parseable line."""
 
     def __init__(self, lines: list[str]):
-        self._lines = lines
         self.ids: set[str] = set()
-        self._raw: Optional[set[str]] = None
         for raw in lines:
             self.note(raw)
 
@@ -408,15 +391,8 @@ class _LedgerIndex:
             if isinstance(sid, str) and sid:
                 self.ids.add(sid)
 
-    def holds(self, raw: str, rec: Optional[dict], sid: str) -> bool:
-        if sid in self.ids:
-            return True
-        if rec is not None and not rec.get(SPILL_ID_KEY):
-            # 62ededab-era record: its drainer appended the raw line verbatim.
-            if self._raw is None:
-                self._raw = {ln.strip() for ln in self._lines}
-            return raw in self._raw
-        return False
+    def holds(self, sid: str) -> bool:
+        return sid in self.ids
 
 
 def _drain_pending(path: Path) -> None:
@@ -431,10 +407,10 @@ def _drain_pending(path: Path) -> None:
     the ledger and only unlinks (no duplicate). An append that raises (a full
     disk) stops the drain with the file still pending; if part of it reached
     the ledger, a whole line is recognised by its id and a torn one is not a
-    record, so the retry neither duplicates nor loses it. A 62ededab-era
-    record (no ``spill_id``; a ``*.jsonl.drained`` leftover included) is
-    recognised by its exact line instead, and gains its file's stem as
-    ``spill_id`` when appended.
+    record, so the retry neither duplicates nor loses it. A pending line
+    that is not a JSON object cannot be a record (``_spill`` writes each file
+    whole, atomically), so it is dropped with one WARNING per process, as
+    :func:`iter_records` skips it, and never copied into the ledger.
 
     Residual, stated: the index is the ledger as it stands, i.e. at most the
     rotation tail (``_KEEP_LINES``). A pending file whose unlink keeps
@@ -459,13 +435,18 @@ def _drain_pending(path: Path) -> None:
             continue  # vanished, or unreadable (Windows: a reader has it open)
         out: list[str] = []
         for raw, rec, sid in recs:
-            if index.holds(raw, rec, sid):
+            if rec is None:
+                _warn_once(
+                    ("pending_unparseable",),
+                    "RL telemetry loss ledger: dropping a pending line that is "
+                    "not a record (%s): %.80r", f, raw,
+                )
                 continue
-            if rec is not None:
-                if not rec.get(SPILL_ID_KEY):
-                    rec[SPILL_ID_KEY] = sid
-                raw = json.dumps(rec, separators=(",", ":"), default=str)
-            out.append(raw)
+            if index.holds(sid):
+                continue
+            if not rec.get(SPILL_ID_KEY):
+                rec[SPILL_ID_KEY] = sid
+            out.append(json.dumps(rec, separators=(",", ":"), default=str))
         if out:
             try:
                 _append(path, "\n".join(out) + "\n")
@@ -490,7 +471,10 @@ def pending_stats(path: Optional[Path] = None) -> dict:
     """``{"files": n, "oldest_ms": epoch-ms or None}`` for :func:`pending_dir`.
 
     The age comes from the spill time in the file name. Never raises."""
-    files = _pending_files(path or loss_log_path())
+    return _stats_of(_pending_files(path or loss_log_path()))
+
+
+def _stats_of(files: list[Path]) -> dict:
     oldest = None
     if files:
         ns = _spill_sort_key(files[0])[0]
@@ -507,20 +491,22 @@ def iter_records(path: Optional[Path] = None) -> Iterator[dict]:
     either still in its pending file when that is read or already in the
     ledger when the ledger is read — a concurrent drain never hides one. A
     record seen in both (read mid-drain) is yielded once, matched by its
-    ``spill_id`` (62ededab-era records: by their exact line). A missing
-    ledger is no records; an unreadable one raises ``OSError`` (see
-    :func:`summarize`).
+    ``spill_id``. A missing ledger is no records; an unreadable one raises
+    ``OSError`` (see :func:`summarize`).
     """
     p = path or loss_log_path()
+    return _iter_records(p, _pending_files(p))
+
+
+def _iter_records(p: Path, files: list[Path]) -> Iterator[dict]:
+    """:func:`iter_records` over an already-listed pending dir."""
     pending: list[tuple[str, Optional[dict], str]] = []
-    for f in _pending_files(p):
+    for f in files:
         try:
             pending += _pending_records(f)
         except OSError:
             continue  # drained under our feet: its line is in the ledger now
-    want_raw = any(rec is not None and not rec.get(SPILL_ID_KEY) for _, rec, _ in pending)
     seen_ids: set[str] = set()
-    seen_raw: set[str] = set()
     try:
         fh = open(p, encoding="utf-8")
     except FileNotFoundError:
@@ -537,13 +523,9 @@ def iter_records(path: Optional[Path] = None) -> Iterator[dict]:
                 sid = rec.get(SPILL_ID_KEY)
                 if isinstance(sid, str) and sid:
                     seen_ids.add(sid)
-                if want_raw:
-                    seen_raw.add(raw.strip())
                 yield rec
-    for raw, rec, sid in pending:
+    for _raw, rec, sid in pending:
         if rec is None or sid in seen_ids:
-            continue
-        if not rec.get(SPILL_ID_KEY) and raw in seen_raw:
             continue
         seen_ids.add(sid)
         yield rec
@@ -572,10 +554,11 @@ def summarize(since_ms: Optional[int] = None, path: Optional[Path] = None) -> di
         "partial_twins": 0,
         "partial_missing_nodes": 0,
     }
-    stats = pending_stats(p)
+    files = _pending_files(p)  # listed once for both the stats and the read
+    stats = _stats_of(files)
     out["pending_files"] = stats["files"]
     out["pending_oldest_ms"] = stats["oldest_ms"]
-    for rec in iter_records(p):
+    for rec in _iter_records(p, files):
         ts = rec.get("ts_ms")
         if since_ms is not None and (not isinstance(ts, int) or ts < since_ms):
             continue

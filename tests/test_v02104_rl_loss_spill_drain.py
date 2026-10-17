@@ -8,8 +8,9 @@ A ``record_loss`` writer that finds the ledger lock busy spills its line to
 * F1 — a drainer killed at any step (before its append, mid-append, after the
   append and before the unlink) loses nothing and duplicates nothing: each
   spilled record carries a ``spill_id`` and the drain appends only ids the
-  ledger does not hold, then unlinks. A 62ededab-era ``*.jsonl.drained``
-  leftover is recovered, never deleted unread.
+  ledger does not hold, then unlinks.
+* N1 — a pending line that is not a record is dropped with a WARNING, never
+  copied into the ledger, and its file is unlinked.
 * F2 — an append that raises after writing some or all of its bytes is
   retried without a duplicate.
 * F3 — a spill that fails falls back to a longer locked wait, then to an
@@ -201,56 +202,31 @@ def test_a_leftover_not_in_the_ledger_is_appended_once(ledger):
 
 
 # ---------------------------------------------------------------------------
-# F1 — 62ededab-era leftovers
+# N1 — an unparseable pending line
 # ---------------------------------------------------------------------------
 
 
-def _legacy(ledger: Path, name: str, seq: str) -> str:
+def test_an_unparseable_pending_line_is_dropped_with_a_warning(ledger, caplog):
+    """Drain and reader agree on what a record is: a pending line that is not
+    a JSON object is skipped by ``iter_records`` and dropped by the drain
+    (WARNING once), never appended verbatim; its file is unlinked."""
     from vco_lib import rl_telemetry_loss as m
 
     d = m.pending_dir(ledger)
-    d.mkdir(parents=True, exist_ok=True)
-    body = _rec(seq)
-    (d / name).write_text(body)
-    return body
-
-
-def test_a_62ededab_drained_leftover_never_appended_is_recovered(ledger):
-    """A 62ededab drainer killed between its rename and its append left the
-    only copy under ``*.jsonl.drained``; it used to be unlinked unread."""
-    from vco_lib import rl_telemetry_loss as m
-
-    _legacy(ledger, "4242-1700000000000000000-aabbccdd.jsonl.drained", "legacy")
-    assert _seqs_read(ledger) == ["old", "legacy"]
-    m.record_loss("dual_skip", "race", seq="final")
-    assert _seqs_raw(ledger) == ["old", "legacy", "final"]
+    d.mkdir(parents=True)
+    (d / f"{1_700_000_000_000_000_000:020d}-1-aa.jsonl").write_text("this is not json\n")
+    (d / f"{1_700_000_000_000_000_001:020d}-1-bb.jsonl").write_text("[1, 2]\n")
+    assert _seqs_read(ledger) == ["old"]
+    with caplog.at_level(logging.WARNING, logger=m.__name__):
+        m.record_loss("dual_skip", "race", seq="final")
+        m.record_loss("dual_skip", "race", seq="final2")
+    assert _seqs_raw(ledger) == ["old", "final", "final2"]
+    assert "not json" not in ledger.read_text(encoding="utf-8")
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 3
     assert _pending(ledger) == []
-    recs = [json.loads(x) for x in ledger.read_text().splitlines()]
-    assert recs[1][m.SPILL_ID_KEY] == "4242-1700000000000000000-aabbccdd"
-
-
-def test_a_62ededab_drained_leftover_already_appended_is_not_duplicated(ledger):
-    """A 62ededab drainer that appended and died before its unlink left a
-    ``*.jsonl.drained`` copy of a line the ledger already holds verbatim."""
-    from vco_lib import rl_telemetry_loss as m
-
-    body = _legacy(ledger, "4242-1700000000000000000-aabbccdd.jsonl.drained", "legacy")
-    with open(ledger, "a") as fh:
-        fh.write(body)
-    assert _seqs_read(ledger) == ["old", "legacy"]
-    m.record_loss("dual_skip", "race", seq="final")
-    assert _seqs_raw(ledger) == ["old", "legacy", "final"]
-    assert _pending(ledger) == []
-
-
-def test_a_62ededab_pending_file_drains(ledger):
-    from vco_lib import rl_telemetry_loss as m
-
-    _legacy(ledger, "4242-1700000000000000000-aabbccdd.jsonl", "legacy")
-    assert _seqs_read(ledger) == ["old", "legacy"]
-    m.record_loss("dual_skip", "race", seq="final")
-    assert _seqs_raw(ledger) == ["old", "legacy", "final"]
-    assert _pending(ledger) == []
+    drops = [r for r in caplog.records
+             if r.levelno == logging.WARNING and "not a record" in r.getMessage()]
+    assert len(drops) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +260,8 @@ def test_an_append_that_fails_after_writing_is_retried_without_a_duplicate(ledge
 
 
 def test_pending_files_drain_in_spill_time_order(ledger):
-    """pid 9 spills first, pid 10 second: a pid-first name sorts "10-…"
-    before "9-…" and drained the later line first."""
+    """pid 9 spills first, pid 10 second: the name leads with the spill
+    time, so the earlier line drains first whatever the pids sort as."""
     from vco_lib import rl_telemetry_loss as m
 
     with mock.patch.object(os, "getpid", lambda: 9):
@@ -296,20 +272,6 @@ def test_pending_files_drain_in_spill_time_order(ledger):
     assert _seqs_read(ledger) == ["old", "first", "second"]
     m.record_loss("dual_skip", "race", seq="final")
     assert _seqs_raw(ledger) == ["old", "first", "second", "final"]
-
-
-def test_62ededab_names_sort_by_their_time_field_among_current_ones(ledger):
-    from vco_lib import rl_telemetry_loss as m
-
-    d = m.pending_dir(ledger)
-    d.mkdir(parents=True)
-    t0 = 1_700_000_000_000_000_000
-    (d / f"{t0 + 3:020d}-1-aa.jsonl").write_text(_rec("c"))
-    (d / f"99-{t0 + 1}-bb.jsonl.drained").write_text(_rec("a"))
-    (d / f"100-{t0 + 2}-cc.jsonl").write_text(_rec("b"))
-    assert _seqs_read(ledger) == ["old", "a", "b", "c"]
-    m.record_loss("dual_skip", "race", seq="final")
-    assert _seqs_raw(ledger) == ["old", "a", "b", "c", "final"]
 
 
 # ---------------------------------------------------------------------------
