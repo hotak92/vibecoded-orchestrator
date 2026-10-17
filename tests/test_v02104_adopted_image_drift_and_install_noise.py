@@ -388,7 +388,7 @@ def _gpu_own_world(tmp_path, devices, owning_files):
 
 
 def _hand_over_ollama(world, run):
-    with mock.patch.object(sa, "_host_gpu_vendor", create=True,
+    with mock.patch.object(sa, "_host_gpu_vendor",
                            side_effect=AssertionError("host probe not expected")):
         result, _ = world.adopt(run=run, services=("ollama",),
                                 container_refs={"ollama": "vco_ollama"},
@@ -493,3 +493,39 @@ def test_mixed_vendor_gpu_services_are_refused_not_guessed(tmp_path):
     assert result.adopted == []
     assert "different GPU vendors" in result.refused["ollama"]
     assert files == []
+
+
+# ─── R3 M1 / L3: a container naming BOTH vendors; the host probe is patchable ─
+
+@pytest.mark.parametrize("devices, expected", [
+    ([{"PathOnHost": "/dev/kfd"}, {"PathOnHost": "/dev/dri"}], ("amd",)),
+    (["nvidia.com/gpu=all"], ("nvidia",)),
+    (["/dev/kfd", "/dev/nvidia0"], ("amd", "nvidia")),   # both: evidence of both
+    ([{"PathOnHost": "/dev/dri"}], ()),
+    (None, ()),
+])
+def test_the_device_list_reports_every_vendor_it_names(devices, expected):
+    from vco_lib import gpu_verify
+    assert gpu_verify.vendors_of_devices(devices) == expected
+
+
+def test_a_live_container_holding_both_vendors_devices_is_refused_on_hand_over(tmp_path):
+    """Its own devices name AMD and NVIDIA: one chain carries one overlay, so
+    the hand-over refuses instead of asking the host and dropping the other
+    vendor's devices (the guard in ``_hand_over_ollama`` fails if the host
+    probe is reached)."""
+    both = _ROCM_DEVICES + [{"PathOnHost": "/dev/nvidia0", "PathInContainer": "/dev/nvidia0"}]
+    world, run = _gpu_own_world(tmp_path, both, "docker-compose.yml")
+    result, files = _hand_over_ollama(world, run)
+    assert result.adopted == []
+    assert "different GPU vendors" in result.refused["ollama"]
+    assert files == []
+
+
+def test_the_host_probe_is_resolved_when_called_so_a_patch_reaches_it():
+    """L3: ``choose_gpu_vendor`` must look ``_host_gpu_vendor`` up at call
+    time — a default argument bound at import would make every patch of the
+    module attribute (the hand-over guard above included) inert."""
+    with mock.patch.object(sa, "_host_gpu_vendor", return_value="amd") as probe:
+        assert sa.choose_gpu_vendor([None]) == ("amd", "")
+    probe.assert_called_once_with()

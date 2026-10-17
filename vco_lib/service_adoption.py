@@ -393,6 +393,16 @@ class LiveServiceState:
     #: /dev/kfd, "nvidia" for /dev/nvidia* / the CDI tag), else None —
     #: :func:`vco_lib.gpu_verify.vendor_of_devices`.
     gpu_vendor: Optional[str] = None
+    #: EVERY vendor the live device list names
+    #: (:func:`vco_lib.gpu_verify.vendors_of_devices`) — both for a container
+    #: carrying AMD and NVIDIA devices, which ``gpu_vendor`` reports as None.
+    #: A re-create feeds this to :func:`choose_gpu_vendor`, so such a
+    #: container is refused, never re-created under one vendor's overlay.
+    gpu_vendors: tuple[str, ...] = ()
+
+    def vendor_evidence(self) -> list[Optional[str]]:
+        """This container's vendor evidence for :func:`choose_gpu_vendor`."""
+        return list(self.gpu_vendors) or [self.gpu_vendor]
 
 
 def _inspect_json(ref: str, fmt: str, runtime: str, run: RunFn) -> Optional[Any]:
@@ -478,6 +488,7 @@ def live_service_state(ref: str, runtime: str, run: RunFn) -> Optional[LiveServi
         healthcheck=raw_hc if isinstance(raw_hc, dict) else None,
         restart=restart, host_ports=host_ports, has_devices=has_devices,
         gpu_vendor=_gpu_verify.vendor_of_devices(raw_dev) if has_devices else None,
+        gpu_vendors=_gpu_verify.vendors_of_devices(raw_dev) if has_devices else (),
     )
 
 
@@ -494,7 +505,7 @@ def _host_gpu_vendor() -> str:
 
 
 def choose_gpu_vendor(evidence: Sequence[Optional[str]],
-                      host_vendor: Callable[[], str] = _host_gpu_vendor,
+                      host_vendor: Optional[Callable[[], str]] = None,
                       ) -> tuple[Optional[str], str]:
     """The GPU vendor whose overlay a re-create composes, from the
     containers' OWN evidence first (their live devices, the owning compose
@@ -504,7 +515,11 @@ def choose_gpu_vendor(evidence: Sequence[Optional[str]],
     (``amd`` → ROCm), else NVIDIA — the pre-v0.2.104 answer, unchanged on
     NVIDIA and CPU hosts. A ROCm container is therefore re-created under
     the ROCm overlay (its ``-rocm`` image pin and ``/dev/kfd`` devices),
-    never the NVIDIA one."""
+    never the NVIDIA one.
+
+    ``host_vendor`` defaults to :func:`_host_gpu_vendor`, resolved at CALL
+    time (never bound as a default argument) so a test that patches the
+    module attribute reaches the probe this function actually runs."""
     named = {v for v in evidence if v in ("amd", "nvidia")}
     if len(named) > 1:
         return None, ("the GPU services name different GPU vendors (AMD and "
@@ -512,7 +527,8 @@ def choose_gpu_vendor(evidence: Sequence[Optional[str]],
                       "overlay; refusing rather than picking one")
     if named:
         return named.pop(), ""
-    return ("amd" if (host_vendor() or "").lower() == "amd" else "nvidia"), ""
+    probe = host_vendor if host_vendor is not None else _host_gpu_vendor
+    return ("amd" if (probe() or "").lower() == "amd" else "nvidia"), ""
 
 
 # ===========================================================================
@@ -1380,7 +1396,8 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
     vendor_refusal = ""
     if gpu_services:
         gpu_vendor, vendor_refusal = choose_gpu_vendor(
-            [p.live.gpu_vendor if p.live is not None else None for p in gpu_services]
+            [v for p in gpu_services
+             for v in (p.live.vendor_evidence() if p.live is not None else [None])]
             + [p.owning_gpu_vendor for p in gpu_services])
     gpu_overlay = _compose_provider.overlay_for_provider(
         _compose_provider.detect(runtime, argv=compose_argv, run=run)
