@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.child_env import child_env
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO = Path(__file__).resolve().parents[1]
 SCANNER = REPO / "templates" / "scripts" / "bash_security.py"
@@ -301,7 +302,7 @@ def test_ps1_raw_net_matches_exactly_under_dotnet(which: str, tmp_path: Path) ->
     script = tmp_path / "diff.ps1"
     script.write_text(_PWSH_DIFF, encoding="utf-8")
     out = subprocess.run(
-        [str(_PWSH), "-NoProfile", "-NonInteractive", "-File", str(script),
+        [str(_PWSH), *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(script),
          "-Json", str(data), "-Old", PS1_RAW_OLD[which], "-New", _ps1_raw_patterns()[which]],
         capture_output=True, text=True, timeout=300, check=True, env=child_env(),
     ).stdout.split()
