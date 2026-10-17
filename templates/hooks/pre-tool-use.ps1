@@ -330,9 +330,14 @@ if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     # time to exit. Returns @{Exit; Out; Err}, or $null on timeout / any
     # failure (= no verdict). The input is written as UTF-8 bytes, exactly.
     # MUST MATCH pre-tool-use.sh's _ptu_bounded (1 s classifier, 2 s
-    # scanner).
+    # scanner). v0.2.104 R7 N3: ONE deadline covers start-up, the stdin write
+    # and the exit, as `timeout` does on the sh side; the write and the exit
+    # waits used to get a full budget each (a scanner that never reads a large
+    # command took 2x the bound).
     function Invoke-PtuBoundedPython([string]$ArgTail, [string]$InputText, [int]$TimeoutMs) {
         $proc = $null
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $left = { [int][Math]::Max(0, $TimeoutMs - $clock.ElapsedMilliseconds) }
         try {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = [string]$PY
@@ -350,8 +355,8 @@ if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
             $errTask = $proc.StandardError.ReadToEndAsync()
             $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($InputText)
             $writeTask = $proc.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
-            if ($writeTask.Wait($TimeoutMs)) { $proc.StandardInput.Close() }
-            if (-not $proc.WaitForExit($TimeoutMs)) {
+            if ($writeTask.Wait((& $left))) { $proc.StandardInput.Close() }
+            if (-not $proc.WaitForExit((& $left))) {
                 try { $proc.Kill() } catch { }
                 return $null
             }
@@ -364,11 +369,16 @@ if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     }
 
     # The three raw-text patterns ALWAYS read the whole command (the v0.2.103
-    # guarantee) and run first.
+    # guarantee) and run first. v0.2.104 R7 N2: .NET backtracks where GNU
+    # grep (pre-tool-use.sh) does not, so the spans are tempered -- the span
+    # after a fetch/decode stops at the next one that could itself reach the
+    # pipe. Same match set as the plain `[^|]+` / `.*` forms (pinned in
+    # tests/test_v02104_scanner_linear_rules.py); 40k `base64 -d f;` took 58 s
+    # here before, past the hook's 3 s, and a killed hook checks nothing.
     function Get-PtuRawInjection([string]$Text) {
-        if ($Text -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { return "network fetch piped to shell" }
+        if ($Text -match '(?i)(curl|wget)\s(?:(?!(?:curl|wget)\s[^|])[^|])+\|\s*(ba)?sh\b') { return "network fetch piped to shell" }
         if ($Text -match '(?i)eval\s+["\$(]*(curl|wget)') { return "eval + network fetch" }
-        if ($Text -match '(?i)base64\s+-d.*\|\s*(ba)?sh\b') { return "base64-decoded pipe to shell" }
+        if ($Text -match '(?i)base64\s+-d(?:(?!base64\s+-d).)*\|\s*(ba)?sh\b') { return "base64-decoded pipe to shell" }
         return ""
     }
     $injection = Get-PtuRawInjection $cmd
