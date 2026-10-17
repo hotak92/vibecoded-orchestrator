@@ -41,7 +41,8 @@ user, Claude Code reads a committed ``.claude/settings.json`` and
 * :func:`append_git_info_exclude` removes the legacy ``/.claude/`` (and the
   never-matching root ``/.vco-manifest.json``) line from VCO's OWN blocks on
   every write, so a project upgraded from an older release is repaired by its
-  next bundle update; a user's own lines are never touched. Every block now
+  next bundle update; a user's own lines are never touched (the one case
+  that reads both ways is stated in :func:`_block_members`). Every block now
   ends with :data:`VCO_BLOCK_END_MARKER` (older blocks are closed on the next
   write), and a retired shipped file's line is dropped with the file.
 """
@@ -335,6 +336,30 @@ def _is_end_marker(stripped: str) -> bool:
     return stripped == VCO_BLOCK_END_MARKER
 
 
+#: The legacy glob VCO wrote up to v0.2.103 (one of
+#: :data:`LEGACY_VCO_EXCLUDE_LINES`).
+_LEGACY_CLAUDE_GLOB = "/.claude/"
+
+#: The safe-add ``.env`` reference sidecar's exclude line.
+_SIDECAR_EXCLUDE_LINE = "/.env" + SAFE_ADD_SIDECAR_SUFFIX
+
+
+def _is_legacy_vco_entry(stripped: str) -> bool:
+    """Could a pre-v0.2.104 release have written ``stripped`` as an entry?
+
+    Those releases wrote ``"/" + <created file>`` for every path outside
+    ``.claude/`` and collapsed the whole ``.claude/`` tree to the ONE glob
+    ``/.claude/``. So an entry is root-anchored, has no whitespace, never
+    names a path under ``.claude/`` (``/.claude/<path>`` is v0.2.104's shape)
+    and is never a directory pattern other than that glob.
+    """
+    if not stripped.startswith("/") or any(c.isspace() for c in stripped):
+        return False
+    if stripped == _LEGACY_CLAUDE_GLOB:
+        return True
+    return not stripped.startswith(_LEGACY_CLAUDE_GLOB) and not stripped.endswith("/")
+
+
 def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
     """Map each line VCO wrote inside one of its blocks to that block's kind.
 
@@ -345,32 +370,48 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
     marker); ``legacy_block_ends`` lists, per legacy block, the index of its
     last member line — where the end marker goes when the block is closed.
 
-    A legacy block's end is INFERRED, conservatively, because the user's own
-    ``echo '…' >> .git/info/exclude`` lands directly after VCO's last line with
-    no blank line between them. A line belongs to a legacy block only while it
-    is one VCO could have written there:
+    **An ended block is exact.** VCO writes it whole, header to end marker, in
+    one write; a line after the end marker is NEVER VCO's, whatever it says.
+
+    **A legacy block's end is INFERRED**, because the user's own
+    ``echo '…' >> .git/info/exclude`` lands directly after VCO's last line
+    with no blank line between them. A line belongs to a legacy block only
+    while it is one a pre-v0.2.104 release could have written there:
 
     * a ``#`` comment, only in the header run right after the marker;
-    * a root-anchored pattern (``/…``, no whitespace) that has NOT appeared
-      earlier in the file — VCO de-duplicates every entry against the whole
-      file, so a repeat is never VCO's;
-    * the legacy ``/.claude/`` glob only BEFORE any ``/.claude/<path>`` entry
-      in the same block — VCO wrote either the glob (up to v0.2.103) or the
-      per-path entries (v0.2.104 on), never the glob after them.
+    * an entry of the legacy shape (:func:`_is_legacy_vco_entry`): a
+      ``/.claude/<path>`` line or a directory pattern other than ``/.claude/``
+      is the user's (L3);
+    * not a repeat of a line earlier in the same block or in an EARLIER VCO
+      block — VCO de-duplicated against them. A repeat of a line the user
+      keeps OUTSIDE VCO's blocks does not count: the user may have put it
+      above the block with an editor after VCO wrote the block, and VCO's own
+      copy must still be found (L1);
+    * the legacy ``/.claude/`` glob never AFTER the ``/.env.vco.reference``
+      line (L2): the glob was only ever a bundle created-file entry and VCO
+      added the sidecar after all of those. A project move appended its
+      copied files after the sidecar, but every pre-v0.2.104 bundle run
+      listed ``.claude/hooks/_lib/`` (always overwritten) among its created
+      files, so the glob was already in that block or earlier in the file.
 
     The first line that fails ends the block; it and everything after it up
     to the next marker are the user's.
+
+    Stated residual ambiguity: a ``/.claude/`` the user appends directly after
+    a legacy block that has no glob and does not end with the sidecar line is
+    read as VCO's and removed. A pre-v0.2.104 bundle omitted the glob only
+    when the file already held one, so the user still has that earlier line
+    unless they deleted it; the reading never leaves VCO's own glob in place,
+    which would hide ``.claude/`` with no later update able to repair it.
     """
     members: dict[int, str] = {}
     legacy_ends: list[int] = []
-    seen: set[str] = set()
+    vco_seen: set[str] = set()  # entries inside VCO blocks so far
     i = 0
     n = len(lines)
     while i < n:
         stripped = lines[i].strip()
         if not stripped.startswith(VCO_BLOCK_MARKER) or _is_end_marker(stripped):
-            if stripped and not stripped.startswith("#"):
-                seen.add(stripped)
             i += 1
             continue
         # A block header. Closed by an end marker before the next blank line
@@ -390,13 +431,13 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
                 members[k] = "ended"
                 s = lines[k].strip()
                 if s and not s.startswith("#"):
-                    seen.add(s)
+                    vco_seen.add(s)
             i = end_at + 1
             continue
         members[i] = "legacy"
         last = i
         in_header = True
-        has_claude_subpath = False
+        after_sidecar = False
         k = i + 1
         while k < n:
             s = lines[k].strip()
@@ -407,13 +448,13 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
                     break
             else:
                 in_header = False
-                if not s.startswith("/") or any(c.isspace() for c in s) or s in seen:
+                if not _is_legacy_vco_entry(s) or s in vco_seen:
                     break
-                if s == "/.claude/" and has_claude_subpath:
+                if s == _LEGACY_CLAUDE_GLOB and after_sidecar:
                     break
-                if s.startswith("/.claude/") and s != "/.claude/":
-                    has_claude_subpath = True
-                seen.add(s)
+                if s == _SIDECAR_EXCLUDE_LINE:
+                    after_sidecar = True
+                vco_seen.add(s)
             members[k] = "legacy"
             last = k
             k += 1
@@ -485,7 +526,8 @@ def append_git_info_exclude(
         pre-v0.2.104 blocks, and the ``retired`` patterns inside any VCO
         block, are removed in the same write, and pre-v0.2.104 blocks are
         closed with :data:`VCO_BLOCK_END_MARKER` (see
-        :func:`_rewrite_vco_blocks`); the user's own lines never are touched.
+        :func:`_rewrite_vco_blocks`); the user's own lines never are touched
+        (the one ambiguous legacy case is stated in :func:`_block_members`).
       - Every new block ends with :data:`VCO_BLOCK_END_MARKER`, so a line the
         user appends later is never mistaken for VCO's.
       - Write failure -> ``action="write_failed:<ErrorClass>"``, no raise.
