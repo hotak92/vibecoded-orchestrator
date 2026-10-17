@@ -351,41 +351,102 @@ fi
 # `--shell powershell` rule set reads its syntax) ===
 if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
     CMD=$(_get_field "command")
-    INJECTION_FOUND=""
+    SECURITY_SCRIPT="$PROJECT_ROOT/.claude/scripts/bash_security.py"
 
-    # Pattern A: network fetch piped directly to a shell interpreter
-    if echo "$CMD" | grep -qiE "(curl|wget)\s[^|]+\|\s*(ba)?sh\b" 2>/dev/null; then
-        INJECTION_FOUND="network fetch piped to shell"
-    fi
+    # v0.2.104 R6: every Python call below is time-bounded. The harness
+    # kills this hook after its 3 s registration and a killed PreToolUse
+    # hook does NOT block, so a slow scan must end as "no verdict" while
+    # there is still time to exit. `timeout`/`gtimeout` when present; without
+    # either the call runs unbounded (the pre-v0.2.104 behaviour) — the raw
+    # patterns below have already run by then. MUST MATCH pre-tool-use.ps1's
+    # Invoke-PtuBoundedPython (1 s classifier, 2 s scanner; whole seconds,
+    # which every `timeout` implementation accepts).
+    _ptu_bounded() {
+        local secs="$1"; shift
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "$secs" "$@"
+        elif command -v gtimeout >/dev/null 2>&1; then
+            gtimeout "$secs" "$@"
+        else
+            "$@"
+        fi
+    }
 
-    # Pattern B: eval + network fetch (remote code execution)
-    if [[ -z "$INJECTION_FOUND" ]] && echo "$CMD" | grep -qiE "eval\s+[\"\$\(]*(curl|wget)" 2>/dev/null; then
-        INJECTION_FOUND="eval + network fetch"
-    fi
+    # The three raw-text patterns ALWAYS read the whole command (the v0.2.103
+    # guarantee) and run first. Sets INJECTION_FOUND.
+    _ptu_raw_injection() {
+        INJECTION_FOUND=""
+        # Pattern A: network fetch piped directly to a shell interpreter
+        if echo "$1" | grep -qiE "(curl|wget)\s[^|]+\|\s*(ba)?sh\b" 2>/dev/null; then
+            INJECTION_FOUND="network fetch piped to shell"
+        # Pattern B: eval + network fetch (remote code execution)
+        elif echo "$1" | grep -qiE "eval\s+[\"\$\(]*(curl|wget)" 2>/dev/null; then
+            INJECTION_FOUND="eval + network fetch"
+        # Pattern C: base64-decoded pipe to shell
+        elif echo "$1" | grep -qiE "base64\s+-d.*\|\s*(ba)?sh\b" 2>/dev/null; then
+            INJECTION_FOUND="base64-decoded pipe to shell"
+        fi
+    }
+    _ptu_raw_injection "$CMD"
 
-    # Pattern C: base64-decoded pipe to shell
-    if [[ -z "$INJECTION_FOUND" ]] && echo "$CMD" | grep -qiE "base64\s+-d.*\|\s*(ba)?sh\b" 2>/dev/null; then
-        INJECTION_FOUND="base64-decoded pipe to shell"
+    # v0.2.104 E-3: the ONE exception. A Bash command that bash_security.py
+    # positively recognises as a pure DATA here-doc write (`cat > f <<'EOF'`,
+    # `tee f <<'EOF'`, a plain `python3 - <<'EOF'` edit script — the strict
+    # allowlist is documented at data_heredoc_raw_text) has its BODY skipped:
+    # the patterns re-read only the opener line it hands back, and only when
+    # that line is exactly the command's first line. No interpreter, a
+    # timeout, any error or any doubt keeps the whole-text verdict. Asked only
+    # when a pattern matched, so an ordinary command pays nothing.
+    if [[ -n "$INJECTION_FOUND" && "$TOOL_NAME" == "Bash" && -f "$SECURITY_SCRIPT" && -n "${PY:-}" ]]; then
+        _DATA_OPENER=$(printf '%s' "$CMD" | _ptu_bounded 1 "$PY" "$SECURITY_SCRIPT" --data-heredoc 2>/dev/null) \
+            || _DATA_OPENER=""
+        if [[ -n "$_DATA_OPENER" && "$CMD" == "$_DATA_OPENER"$'\n'* ]]; then
+            _ptu_raw_injection "$_DATA_OPENER"
+        fi
     fi
 
     if [[ -n "$INJECTION_FOUND" ]]; then
         # Block messages route to stderr — see bash-security branch.
+        # MUST MATCH pre-tool-use.ps1's message.
         {
             echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in $TOOL_NAME command."
             echo "   Blocked command preview: ${CMD:0:120}"
-            echo "   If this is intentional, run the command manually in a terminal."
+            echo "   This check reads the whole command text. Only a plain heredoc file write (cat > file <<'EOF', tee file <<'EOF') or a plain python edit script (python3 - <<'EOF'), with a quoted delimiter and nothing else in the command, has its body exempted."
+            echo "   To write a file whose content mentions this text, use the Write tool or such a heredoc. If the command is intentional, run it manually in a terminal."
         } >&2
         echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"shell_injection_blocked\",\"pattern\":\"$INJECTION_FOUND\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
         exit 2
     fi
 
-    # Extended security scan via bash_security.py
-    SECURITY_SCRIPT="$PROJECT_ROOT/.claude/scripts/bash_security.py"
+    # Extended security scan via bash_security.py (bounded: only exit 2 is a
+    # block; any other exit is no verdict — a timeout is 124 under coreutils
+    # `timeout`, 143 under busybox, 137 after a KILL — and a small command
+    # proceeds, the raw patterns above having already run on it).
+    #
+    # v0.2.104 R10 F1: a command over PTU_SCAN_SIZE_CEILING_BYTES that the
+    # scanner could not finish in time is BLOCKED instead (fail-closed for
+    # that size class only): before the 2 s bound, an unbounded scan of a
+    # ~1.9-2.7 MB command still delivered its verdict inside the 3 s hook
+    # registration. MUST MATCH pre-tool-use.ps1's $PtuScanSizeCeilingBytes.
+    PTU_SCAN_SIZE_CEILING_BYTES=1048576
     if [[ -f "$SECURITY_SCRIPT" ]]; then
         _SEC_SHELL="bash"
         [[ "$TOOL_NAME" == "PowerShell" ]] && _SEC_SHELL="powershell"
-        SECURITY_RESULT=$(echo "$CMD" | "$PY" "$SECURITY_SCRIPT" --shell "$_SEC_SHELL" 2>&1)
+        SECURITY_RESULT=$(echo "$CMD" | _ptu_bounded 2 "$PY" "$SECURITY_SCRIPT" --shell "$_SEC_SHELL" 2>&1)
         SECURITY_EXIT=$?
+        if [[ -n "${PY:-}" ]] && [[ "$SECURITY_EXIT" -eq 124 || "$SECURITY_EXIT" -eq 137 || "$SECURITY_EXIT" -eq 143 ]]; then
+            _CMD_BYTES=$(printf '%s' "$CMD" | LC_ALL=C wc -c)
+            _CMD_BYTES=$((_CMD_BYTES + 0))
+            if (( _CMD_BYTES > PTU_SCAN_SIZE_CEILING_BYTES )); then
+                # MUST MATCH pre-tool-use.ps1's message.
+                {
+                    echo "🚨 $TOOL_NAME security check: this command is $_CMD_BYTES bytes, over the 1 MiB limit, and was too large to check in time."
+                    echo "   Write large content with the Write tool, or split the command into smaller ones."
+                } >&2
+                echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"bash_security_too_large_unchecked\",\"bytes\":$_CMD_BYTES}" >> "$SECURITY_LOG" 2>/dev/null || true
+                exit 2
+            fi
+        fi
         if [[ "$SECURITY_EXIT" -eq 2 ]]; then
             # Emit the block message to STDERR (not stdout). Claude
             # Code's PreToolUse hook runner discards plain stdout —

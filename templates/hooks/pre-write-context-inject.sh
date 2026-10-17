@@ -17,7 +17,9 @@
 # ~ms; a second wrapper cache layer would only add staleness.
 #
 # Registration: PreToolUse(Write), beside the Edit entry, timeout 10
-# (SF-1: above the router's 6 s inner budget)
+# (SF-1: above the router's 6 s inner budget, which since v0.2.104 E-2 is
+# counted from this wrapper's start — VCO_HOOK_STARTED_AT — not from the
+# router's own main())
 # (settings templates are owned by the Wave-2 HOOKS-READ-AGENT lane).
 #
 # Constraints: never exit non-zero (would block the write); always exit 0;
@@ -28,6 +30,18 @@
 # Scrub sensitive env vars (this hook doesn't need credentials)
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# v0.2.104 E-2: the hook's start, for the router's run deadline. The harness
+# timeout counts from HERE, so the router's inner budget must too (it caps
+# its anchor at this instant; see _run_deadline_anchor). EPOCHREALTIME is
+# bash 5+ and uses the locale's radix character; older bash falls back to
+# whole seconds (a coarser, never later, anchor).
+if [ -n "${EPOCHREALTIME:-}" ]; then
+    export VCO_HOOK_STARTED_AT="${EPOCHREALTIME/,/.}"
+else
+    VCO_HOOK_STARTED_AT="$(date +%s 2>/dev/null || true)"
+    export VCO_HOOK_STARTED_AT
+fi
 
 # VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
 #   delegate is claude_mcp_servers/scripts/hook_context_router.py (KG +
@@ -83,6 +97,22 @@ if [[ "$TOOL_NAME" != "Write" ]]; then
     exit 0
 fi
 [[ -z "$FILE_PATH" ]] && exit 0
+
+# v0.2.104 E-2: no KG / code-graph context for a file outside the project
+# (a /tmp scratch script, another repo): skip BEFORE resolving the venv and
+# spawning the router. "Inside" = under the project root or one of its
+# enabled extra code folders (vco_path_in_project, _lib/project-root.sh).
+# A relative path is left to the router; a missing helper skips nothing.
+# shellcheck source=_lib/project-root.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/project-root.sh" ] && . "$SCRIPT_DIR/_lib/project-root.sh"
+case "$FILE_PATH" in
+    /*)
+        if command -v vco_path_in_project >/dev/null 2>&1 \
+                && ! vco_path_in_project "$PROJECT_ROOT" "$FILE_PATH"; then
+            exit 0
+        fi
+        ;;
+esac
 
 if command -v vco_hook_session_id >/dev/null 2>&1; then
     SESSION_ID="$(vco_hook_session_id "$HOOK_STDIN")"

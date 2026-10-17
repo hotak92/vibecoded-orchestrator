@@ -140,7 +140,7 @@ if (-not $EditedFile) { exit 0 }
 # LLM-visible text in $script:VcoRouteNudge.
 if (Get-Command Invoke-VcoRouteTouchedPath -ErrorAction SilentlyContinue) {
     Initialize-VcoRoute -HooksDir $ScriptDir -ProjectRoot $ProjectRoot
-    Invoke-VcoRouteTouchedPath -Path $EditedFile -SessionId $SessionIdFromStdin
+    Invoke-VcoRouteTouchedPath -Path $EditedFile -SessionId $SessionIdFromStdin -AgentId $AgentId
     if ($script:VcoRouteNudge) { Add-Nudge $script:VcoRouteNudge }
 } elseif (Get-Command Emit-VcoMissingHookLibNotice -ErrorAction SilentlyContinue) {
     # The routing home is absent (or unreadable) -- a broken install, not a

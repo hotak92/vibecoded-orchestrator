@@ -246,7 +246,7 @@ _pbfs_json_esc() {
 
 while IFS= read -r _pbfs_path; do
     [ -z "$_pbfs_path" ] && continue
-    vco_route_touched_path "$_pbfs_path" "$SESSION_ID"
+    vco_route_touched_path "$_pbfs_path" "$SESSION_ID" "$AGENT_ID"
 
     # kg-summary parity. The shipped kg-summary-generator.sh is registered
     # on Edit|Write(knowledge/**/*.md) only, so a CLI-written node had no

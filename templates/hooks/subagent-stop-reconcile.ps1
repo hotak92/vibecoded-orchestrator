@@ -418,7 +418,7 @@ if ($kgFiles.Count -gt 0) {
         if ($SessionId) { $env:VCT_SESSION_ID = $SessionId }
         Initialize-VcoRoute -HooksDir $ScriptDir -ProjectRoot $ProjectRoot
         foreach ($kf in $kgFiles) {
-            try { Invoke-VcoRouteTouchedPath -Path $kf -SessionId $SessionId } catch { }
+            try { Invoke-VcoRouteTouchedPath -Path $kf -SessionId $SessionId -AgentId $AgentId } catch { }
         }
     } else {
         # A missing routing lib is a BROKEN install, not "nothing to sync".

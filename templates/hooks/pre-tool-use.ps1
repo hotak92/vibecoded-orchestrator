@@ -322,49 +322,141 @@ if ($ToolName -eq "WebFetch") {
 # `--shell powershell` rule set reads its syntax) ===
 if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     $cmd = Get-Field "command"
-    $injection = ""
-    if ($cmd -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { $injection = "network fetch piped to shell" }
-    elseif ($cmd -match '(?i)eval\s+["\$(]*(curl|wget)') { $injection = "eval + network fetch" }
-    elseif ($cmd -match '(?i)base64\s+-d.*\|\s*(ba)?sh\b') { $injection = "base64-decoded pipe to shell" }
+    $SecurityScript = Join-Path $ProjectRoot ".claude/scripts/bash_security.py"
+
+    # v0.2.104 R6: every Python call below is time-bounded. The harness kills
+    # this hook after its 3 s registration and a killed PreToolUse hook does
+    # NOT block, so a slow scan must end as "no verdict" while there is still
+    # time to exit. Returns @{Exit; Out; Err}, or $null on timeout / any
+    # failure (= no verdict). The input is written as UTF-8 bytes, exactly.
+    # MUST MATCH pre-tool-use.sh's _ptu_bounded (1 s classifier, 2 s
+    # scanner). v0.2.104 R7 N3: ONE deadline covers start-up, the stdin write
+    # and the exit, as `timeout` does on the sh side; the write and the exit
+    # waits used to get a full budget each (a scanner that never reads a large
+    # command took 2x the bound).
+    function Invoke-PtuBoundedPython([string]$ArgTail, [string]$InputText, [int]$TimeoutMs) {
+        $proc = $null
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $left = { [int][Math]::Max(0, $TimeoutMs - $clock.ElapsedMilliseconds) }
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = [string]$PY
+            $psi.Arguments = '"' + $SecurityScript + '" ' + $ArgTail
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($InputText)
+            $writeTask = $proc.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
+            if ($writeTask.Wait((& $left))) { $proc.StandardInput.Close() }
+            if (-not $proc.WaitForExit((& $left))) {
+                try { $proc.Kill() } catch { }
+                return $null
+            }
+            $proc.WaitForExit()
+            return @{ Exit = $proc.ExitCode; Out = $outTask.Result; Err = $errTask.Result }
+        } catch {
+            if ($proc) { try { $proc.Kill() } catch { } }
+            return $null
+        }
+    }
+
+    # The three raw-text patterns ALWAYS read the whole command (the v0.2.103
+    # guarantee) and run first. v0.2.104 R7 N2: .NET backtracks where GNU
+    # grep (pre-tool-use.sh) does not, so the spans are tempered -- the span
+    # after a fetch/decode stops at the next one that could itself reach the
+    # pipe. Same match set as the plain `[^|]+` / `.*` forms (pinned in
+    # tests/test_v02104_scanner_linear_rules.py); 40k `base64 -d f;` took 58 s
+    # here before, past the hook's 3 s, and a killed hook checks nothing.
+    function Get-PtuRawInjection([string]$Text) {
+        if ($Text -match '(?i)(curl|wget)\s(?:(?!(?:curl|wget)\s[^|])[^|])+\|\s*(ba)?sh\b') { return "network fetch piped to shell" }
+        if ($Text -match '(?i)eval\s+["\$(]*(curl|wget)') { return "eval + network fetch" }
+        if ($Text -match '(?i)base64\s+-d(?:(?!base64\s+-d).)*\|\s*(ba)?sh\b') { return "base64-decoded pipe to shell" }
+        return ""
+    }
+    $injection = Get-PtuRawInjection $cmd
+
+    # v0.2.104 E-3: the ONE exception (MUST MATCH pre-tool-use.sh). A Bash
+    # command that bash_security.py positively recognises as a pure DATA
+    # here-doc write (`cat > f <<'EOF'`, `tee f <<'EOF'`, a plain
+    # `python3 - <<'EOF'` edit script -- the strict allowlist is documented at
+    # data_heredoc_raw_text) has its BODY skipped: the patterns re-read only
+    # the opener line it hands back, and only when that line is exactly the
+    # command's first line. No interpreter, a timeout, any error or any doubt
+    # keeps the whole-text verdict. Asked only when a pattern matched.
+    if ($injection -and $ToolName -eq "Bash" -and $PY -and (Test-Path $SecurityScript)) {
+        $dataRes = Invoke-PtuBoundedPython "--data-heredoc" $cmd 1000
+        if ($dataRes -and $dataRes.Exit -eq 0) {
+            $opener = [string]$dataRes.Out
+            if ($opener -and $cmd.StartsWith($opener + "`n", [System.StringComparison]::Ordinal)) {
+                $injection = Get-PtuRawInjection $opener
+            }
+        }
+    }
 
     if ($injection) {
-        # Route the block message to STDERR (matches pre-tool-use.sh) —
+        # Route the block message to STDERR (matches pre-tool-use.sh) --
         # see the SSRF-guard branch above for why plain stdout is dropped.
         [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in $ToolName command.")
         $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
         [Console]::Error.WriteLine("   Blocked command preview: $preview")
-        [Console]::Error.WriteLine("   If this is intentional, run the command manually in a terminal.")
+        [Console]::Error.WriteLine("   This check reads the whole command text. Only a plain heredoc file write (cat > file <<'EOF', tee file <<'EOF') or a plain python edit script (python3 - <<'EOF'), with a quoted delimiter and nothing else in the command, has its body exempted.")
+        [Console]::Error.WriteLine("   To write a file whose content mentions this text, use the Write tool or such a heredoc. If the command is intentional, run it manually in a terminal.")
         $previewEsc = ($preview -replace '\\', '\\\\' -replace '"', '\"')
         Write-SecurityLine "{""timestamp"":""$ts"",""event"":""shell_injection_blocked"",""pattern"":""$injection"",""cmd_preview"":""$previewEsc""}"
         exit 2
     }
 
-    # Extended security scan via bash_security.py if available. It is Python,
-    # so with no interpreter it cannot run -- and says so (v0.2.100 WP-17)
-    # instead of being skipped in silence. The regex scan above already ran.
-    $SecurityScript = Join-Path $ProjectRoot ".claude/scripts/bash_security.py"
+    # Extended security scan via bash_security.py if available (bounded: a
+    # timeout is no verdict and a small command proceeds -- the raw patterns
+    # above already ran on it). It is Python, so with no interpreter it
+    # cannot run -- and says so (v0.2.100 WP-17) instead of being skipped in
+    # silence.
     if ((Test-Path $SecurityScript) -and -not $PY) {
         Write-VcoNoPythonNotice "The Bash security scanner (.claude/scripts/bash_security.py)"
     }
+    # v0.2.104 R10 F1: a command over $PtuScanSizeCeilingBytes that the
+    # scanner could not finish in time ($null = timed out / killed) is
+    # BLOCKED instead (fail-closed for that size class only): before the 2 s
+    # bound, an unbounded scan of a ~1.9-2.7 MB command still delivered its
+    # verdict inside the 3 s hook registration. A small command keeps "no
+    # verdict = proceeds". MUST MATCH pre-tool-use.sh's
+    # PTU_SCAN_SIZE_CEILING_BYTES.
+    $PtuScanSizeCeilingBytes = 1048576
     if ((Test-Path $SecurityScript) -and $PY) {
-        try {
-            $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
-            $secOut = $cmd | & $PY $SecurityScript --shell $secShell 2>&1
-            $secExit = $LASTEXITCODE
-            if ($secExit -eq 2) {
-                # Route to STDERR (matches pre-tool-use.sh's bash-security
-                # branch) — same stdout-discard rationale as the SSRF /
-                # injection guards above.
-                [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
-                [Console]::Error.WriteLine("   $secOut")
-                $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
-                $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'
-                $cmdPreview = if ($cmd.Length -gt 80) { $cmd.Substring(0,80) } else { $cmd }
-                $cmdPreviewEsc = $cmdPreview -replace '\\', '\\\\' -replace '"', '\"'
-                Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_blocked"",""detail"":""$detailEsc"",""cmd_preview"":""$cmdPreviewEsc""}"
+        $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
+        $secRes = Invoke-PtuBoundedPython "--shell $secShell" $cmd 2000
+        if ($null -eq $secRes) {
+            $cmdBytes = [System.Text.Encoding]::UTF8.GetByteCount([string]$cmd)
+            if ($cmdBytes -gt $PtuScanSizeCeilingBytes) {
+                # MUST MATCH pre-tool-use.sh's message.
+                [Console]::Error.WriteLine("$ToolName security check: this command is $cmdBytes bytes, over the 1 MiB limit, and was too large to check in time.")
+                [Console]::Error.WriteLine("   Write large content with the Write tool, or split the command into smaller ones.")
+                Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_too_large_unchecked"",""bytes"":$cmdBytes}"
                 exit 2
             }
-        } catch { }
+        }
+        if ($secRes -and $secRes.Exit -eq 2) {
+            $secOut = ("" + $secRes.Err + $secRes.Out).TrimEnd()
+            # Route to STDERR (matches pre-tool-use.sh's bash-security
+            # branch) — same stdout-discard rationale as the SSRF /
+            # injection guards above.
+            [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
+            [Console]::Error.WriteLine("   $secOut")
+            $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
+            $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'
+            $cmdPreview = if ($cmd.Length -gt 80) { $cmd.Substring(0,80) } else { $cmd }
+            $cmdPreviewEsc = $cmdPreview -replace '\\', '\\\\' -replace '"', '\"'
+            Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_blocked"",""detail"":""$detailEsc"",""cmd_preview"":""$cmdPreviewEsc""}"
+            exit 2
+        }
     }
 }
 

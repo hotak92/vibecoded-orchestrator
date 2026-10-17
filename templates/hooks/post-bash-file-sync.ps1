@@ -167,7 +167,7 @@ $summaryHook = Join-Path $ScriptDir "kg-summary-generator.ps1"
 foreach ($p in $Paths) {
     $path = $p.Trim()
     if (-not $path) { continue }
-    Invoke-VcoRouteTouchedPath -Path $path -SessionId $SessionId
+    Invoke-VcoRouteTouchedPath -Path $path -SessionId $SessionId -AgentId $AgentId
 
     # kg-summary parity. The shipped kg-summary-generator.ps1 is registered
     # on Edit|Write(knowledge/**/*.md) only, so a CLI-written node had no

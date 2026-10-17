@@ -84,3 +84,90 @@ vco_project_root() {
     fi
     vco_find_project_root "${1:-$PWD}"
 }
+
+# ---------------------------------------------------------------------------
+# Path containment (v0.2.104 E-1/E-2; R6 F5/F6). MUST MATCH the Test-VcoPath*
+# pair in _lib/project-root.ps1 — the same rule on both sides:
+#   * a `.` or `..` segment, or a backslash, in either path → not contained
+#     (a lexical `..` could escape; no caller hands such a path in);
+#   * both sides are symlink-resolved through their EXISTING part, the
+#     missing tail kept as given (a new file in a new directory still
+#     resolves), an existing symlinked leaf followed (40 hops at most);
+#   * <path> must then sit strictly below <root>: equal is not "under", and
+#     a symlink that leaves the root is outside. There is no raw fast path —
+#     the resolved comparison is the decision.
+#
+# _vco_pr_real_path <path> — print the resolved absolute form described
+# above, or return 1. No subprocess beyond the `cd -P` subshell.
+_vco_pr_real_path() {
+    local p="$1" hops=0 dir tail target phys
+    [ -n "$p" ] || return 1
+    case "$p" in *\\*) return 1 ;; esac
+    case "/$p/" in */./*|*/../*) return 1 ;; esac
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    while :; do
+        while [ "${p%/}" != "$p" ] && [ "$p" != "/" ]; do p="${p%/}"; done
+        dir="$p"
+        tail=""
+        while [ "$dir" != "/" ] && [ ! -e "$dir" ] && [ ! -L "$dir" ]; do
+            tail="/${dir##*/}$tail"
+            dir="${dir%/*}"
+            [ -n "$dir" ] || dir="/"
+        done
+        if [ -L "$dir" ] && [ ! -d "$dir" ]; then
+            # A symlink that is not a directory (to a file, or dangling):
+            # follow it and re-append the tail, as Resolve-VcoPrRealPath does.
+            hops=$((hops + 1))
+            [ "$hops" -le 40 ] || return 1
+            target="$(readlink -- "$dir")" || return 1
+            [ -n "$target" ] || return 1
+            case "$target" in
+                /*) p="$target$tail" ;;
+                *) p="${dir%/*}/$target$tail" ;;
+            esac
+            continue
+        fi
+        if [ -d "$dir" ]; then
+            phys="$(_vco_pr_phys "$dir")" || return 1
+        else
+            # An existing non-directory: resolve its directory and keep its
+            # name (plus any tail, which simply names nothing that exists).
+            phys="$(_vco_pr_phys "${dir%/*}/")" || return 1
+            tail="/${dir##*/}$tail"
+        fi
+        [ "$phys" = "/" ] && phys=""
+        printf '%s' "$phys$tail"
+        return 0
+    done
+}
+
+# vco_path_under_root <root> <path> — 0 when <path> sits strictly inside
+# <root> under the rule above. No subprocess beyond `cd -P`.
+vco_path_under_root() {
+    local proot pphys
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+    proot="$(_vco_pr_real_path "$1")" || return 1
+    pphys="$(_vco_pr_real_path "$2")" || return 1
+    case "$pphys" in
+        "$proot"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# vco_path_in_project <root> <path> — 0 when <path> belongs to the project:
+# under <root>, or under one of the project's ENABLED extra code folders as
+# listed in <root>/.claude/state/codegraph_extra_paths_cache.txt (one path
+# per line; the cache _lib/route-touched-path.sh maintains). A missing cache
+# means "no extras". Read-only — this never refreshes the cache.
+vco_path_in_project() {
+    local root="$1" p="$2" cache line
+    vco_path_under_root "$root" "$p" && return 0
+    cache="$root/.claude/state/codegraph_extra_paths_cache.txt"
+    [ -f "$cache" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [ -n "$line" ] || continue
+        vco_path_under_root "$line" "$p" && return 0
+    done < "$cache"
+    return 1
+}

@@ -189,3 +189,56 @@ function Get-VcoProjectRoot {
     }
     return Find-VcoProjectRoot -Start $Start
 }
+
+# ---------------------------------------------------------------------------
+# Path containment (v0.2.104 E-1/E-2; R6 F5/F6). MUST MATCH vco_path_under_root
+# / vco_path_in_project in _lib/project-root.sh -- the same rule on both sides:
+#   * a `.` or `..` segment in either path, or (off Windows, where `\` is a
+#     filename character the .sh never splits on) a backslash -> not
+#     contained (a lexical `..` could escape; no caller hands such a path in);
+#   * both sides are symlink-resolved through their EXISTING part, the
+#     missing tail kept as given (a new file in a new directory still
+#     resolves), an existing symlinked leaf followed (Resolve-VcoPrRealPath);
+#   * Path must then sit strictly below Root: equal is not "under", and a
+#     symlink that leaves the root is outside. There is no raw fast path --
+#     the resolved comparison is the decision.
+function Test-VcoPathUnderRoot {
+    param([string]$Root, [string]$Path)
+    if (-not $Root -or -not $Path) { return $false }
+    $onWindows = ($IsWindows -or $env:OS -eq 'Windows_NT')
+    $cmp = if ($onWindows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+    $sepPattern = if ($onWindows) { '[\\/]' } else { '/' }
+    foreach ($candidate in @($Root, $Path)) {
+        if (-not $onWindows -and $candidate.Contains('\')) { return $false }
+        foreach ($seg in ($candidate -split $sepPattern)) {
+            if ($seg -eq '.' -or $seg -eq '..') { return $false }
+        }
+    }
+    $rp = Resolve-VcoPrRealPath $Root
+    $pp = Resolve-VcoPrRealPath $Path
+    if (-not $rp -or -not $pp) { return $false }
+    $rp = $rp.TrimEnd('/', '\')
+    $seps = if ($onWindows) { @('/', '\') } else { @('/') }
+    foreach ($sep in $seps) {
+        if ($pp.StartsWith($rp + $sep, $cmp)) { return $true }
+    }
+    return $false
+}
+
+# Test-VcoPathInProject -Root <dir> -Path <file> - $true when Path is under
+# Root or under one of the ENABLED extra code folders listed in
+# <Root>/.claude/state/codegraph_extra_paths_cache.txt (the cache
+# _lib/route-touched-path.ps1 maintains). Missing cache = no extras.
+function Test-VcoPathInProject {
+    param([string]$Root, [string]$Path)
+    if (Test-VcoPathUnderRoot -Root $Root -Path $Path) { return $true }
+    $cache = Join-Path (Join-Path (Join-Path $Root '.claude') 'state') 'codegraph_extra_paths_cache.txt'
+    if (-not (Test-Path -LiteralPath $cache -PathType Leaf)) { return $false }
+    try { $lines = Get-Content -LiteralPath $cache -ErrorAction Stop } catch { return $false }
+    foreach ($line in $lines) {
+        $l = ([string]$line).TrimEnd("`r")
+        if (-not $l) { continue }
+        if (Test-VcoPathUnderRoot -Root $l -Path $Path) { return $true }
+    }
+    return $false
+}
