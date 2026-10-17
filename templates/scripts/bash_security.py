@@ -168,9 +168,17 @@ _rule(
     r"\b(printenv|env)\s+\w*(KEY|TOKEN|SECRET|PASS|CRED)\w*",
     "Reading a named secret env var directly (use vct-secrets)",
 )
+# v0.2.104 R6 F3: the span after the verb stops at the NEXT `echo`/`printf`
+# word as well as at `|`. The old `[^|]*` restarted at every verb and ran to
+# the end of the pipe-free run, so N `echo x` statements on the one-line
+# skeleton cost O(N^2) (40k lines took ~4 s, past the hook's 3 s timeout, and
+# a timed-out PreToolUse hook does not block). The match set is unchanged:
+# whenever some verb reaches a secret-shaped `$VAR` with no `|` between, the
+# LAST verb before that `$VAR` reaches it too, and each character is now
+# scanned from one verb only.
 _rule(
     "echo_secret_var",
-    r"\b(echo|printf)\b[^|]*\$\{?\w*(KEY|TOKEN|SECRET|PASS|CRED)\w*",
+    r"\b(echo|printf)\b(?:(?!\b(?:echo|printf)\b)[^|])*\$\{?\w*(KEY|TOKEN|SECRET|PASS|CRED)\w*",
     "Printing a secret-shaped env var (use vct-secrets)",
 )
 # v0.2.88 (FP-heredoc): a secret-SHAPED `$VAR`/`${VAR}` parameter expansion in an
@@ -665,12 +673,18 @@ _PYTHON_ENV_SECRET = re.compile(
 _MAX_INTERP_DEPTH = 5
 
 # v0.2.104 E-3: a here-doc whose body is FED TO AN INTERPRETER is code, not
-# data: `bash <<EOF … EOF`, `cat <<EOF | sh`, `python3 - <<'EOF' … EOF`. Every
-# other here-doc body (`cat > notes.md <<'EOF'`) stays inert — which is what
-# lets an ordinary file write through. The sink test runs on the opener line's
-# NEUTRALIZED text (quoted contents blanked), so an interpreter name inside a
-# quoted string on that line never counts. A command-position word: line
-# start or after a `|;&(` separator, optionally behind a launcher word.
+# data: `bash <<EOF … EOF`, `cat <<EOF | sh`, `python3 - <<'EOF' … EOF`. Such
+# bodies are scanned IN ADDITION to every other check (shell bodies as shell
+# commands, python bodies for secret reads); this is an extra net, never the
+# reason a command passes — the hooks' raw-text patterns still read every
+# here-doc body except a positively recognised data write
+# (:func:`data_heredoc_raw_text`). The sink test runs on the opener line as
+# `_neutralize_line(env_read=False)` renders it, which KEEPS quoted literal
+# text, so an interpreter name inside a quoted string on that line can count
+# too (`echo "x; bash" <<EOF` is treated as fed to a shell) — over-inclusive,
+# which only scans more. A command-position word: line start or after a
+# `|;&(` separator, optionally behind a launcher word (a short list; a sink
+# it misses is still read by the raw-text patterns).
 _CMD_POS = r"(?:^|[|;&(])\s*(?:(?:sudo|exec|env|command|nohup|time)\s+)*"
 _HEREDOC_SHELL_SINK = re.compile(
     _CMD_POS + _PATH_PREFIX + r"(?:ba|z|da|k)?sh(?=\s|$|[|;&<])", re.IGNORECASE
@@ -1334,6 +1348,140 @@ def check_command(cmd: str, _depth: int = 0, shell: str = "bash") -> tuple[bool,
     return True, ""
 
 
+# === v0.2.104 E-3 (R6 redesign): the pure DATA here-doc allowlist ===========
+# pre-tool-use.{sh,ps1} run three raw-text patterns (a download piped to a
+# shell, eval of a download, base64 piped to a shell) over the WHOLE command,
+# the v0.2.103 guarantee. Their one exception is decided HERE, once, for both
+# hooks: when the command is positively recognised as a pure data here-doc
+# write, the raw patterns skip that here-doc's BODY. Recognition is a strict
+# allowlist — anything that does not match EXACTLY is not data, and the raw
+# patterns read everything (when unsure, not data):
+#
+#   * the whole command is ONE simple command on its first line, exactly
+#     `cat > PATH <<'D'`, `cat >> PATH <<'D'`, `tee [-a] PATH [>/dev/null] <<'D'`
+#     (the `>/dev/null` before or after the opener), or `python3 - <<'D'` /
+#     `python - <<'D'` — no `;`, `&&`, `||`, `|`, `&`, substitution, backtick
+#     or subshell can appear on that line, because every character of it is
+#     spelled out by the patterns below;
+#   * the delimiter is QUOTED (`'D'` or `"D"`: bash expands nothing in the
+#     body) and a plain word `[A-Za-z_][A-Za-z0-9_]*`;
+#   * the body runs to the LAST line, which is exactly the delimiter; no body
+#     line is the delimiter (even with surrounding blanks); nothing follows
+#     the terminator; the command holds no carriage return or NUL;
+#   * PATH is a plain ASCII path word (or a single-quoted one that may hold
+#     spaces), never an option and never under /dev/ or /proc/ (a
+#     `/dev/tcp/…` redirect is a socket) — so the opener line is pure ASCII
+#     and both hooks compare it byte-for-byte;
+#   * a python body must parse (`ast`), import only plain file/text modules,
+#     and name no process-spawning, network or dynamic-code facility
+#     (`os.system`, `subprocess`, `os.popen`, `os.exec*`, `pty`, `urllib`,
+#     `http.client`, `requests`, `socket`, `exec`, `eval`, `__import__`, …).
+#     String literals are data to the parser, so documentation text inside
+#     them never decides anything.
+#
+# The scanner's own checks (check_command) are independent of this: they run
+# on every command whatever this returns.
+_DATA_DELIM = r"(?P<q>['\"])(?P<d>[A-Za-z_][A-Za-z0-9_]*)(?P=q)"
+_DATA_PATH = r"(?!-)(?!'?/(?:dev|proc)/)(?:[A-Za-z0-9_.,/@%+=:~-]+|'[A-Za-z0-9_.,/@%+=:~ -]+')"
+_DATA_HEREDOC = r"<<[ \t]*" + _DATA_DELIM
+_DATA_DEVNULL = r"[ \t]*>[ \t]*/dev/null"
+_DATA_OPENERS = (
+    re.compile(r"[ \t]*cat[ \t]*>>?[ \t]*" + _DATA_PATH + r"[ \t]*"
+               + _DATA_HEREDOC + r"[ \t]*"),
+    re.compile(r"[ \t]*tee[ \t]+(?:-a[ \t]+)?" + _DATA_PATH
+               + r"(?:" + _DATA_DEVNULL + r")?[ \t]*" + _DATA_HEREDOC
+               + r"(?:" + _DATA_DEVNULL + r")?[ \t]*"),
+)
+_DATA_PYTHON_OPENER = re.compile(
+    r"[ \t]*python3?[ \t]+-[ \t]*" + _DATA_HEREDOC + r"[ \t]*"
+)
+#: Modules a plain edit script imports. Anything else is not data.
+_DATA_PY_MODULES = frozenset({
+    "collections", "csv", "dataclasses", "datetime", "difflib", "enum",
+    "fnmatch", "functools", "glob", "hashlib", "io", "itertools", "json",
+    "math", "os", "pathlib", "re", "shutil", "stat", "string", "sys",
+    "textwrap", "time", "tomllib", "typing",
+})
+#: A name or attribute that spawns a process, opens the network, runs
+#: dynamic code, or reaches another module's attributes by string.
+_DATA_PY_FORBIDDEN = re.compile(
+    r"(?:exec|spawn|posix_spawn|fork|popen)\w*|system|startfile|eval|compile"
+    r"|getattr|setattr|delattr|globals|locals|vars|breakpoint|modules"
+    r"|builtins|subprocess|pty|socket|urllib\w*|http|requests|importlib"
+    r"|ctypes|__\w+__",
+    re.IGNORECASE,
+)
+_DATA_PY_DUNDER_NAMES = frozenset({"__name__", "__file__"})
+
+
+def _python_body_is_plain_edit(body: str) -> bool:
+    """True only for a python script that provably spawns nothing, opens no
+    network connection and runs no dynamic code (see the allowlist above)."""
+    import ast
+
+    try:
+        tree = ast.parse(body)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] not in _DATA_PY_MODULES:
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or not node.module:
+                return False
+            if node.module.split(".")[0] not in _DATA_PY_MODULES:
+                return False
+            for alias in node.names:
+                if alias.name == "*" or _DATA_PY_FORBIDDEN.fullmatch(alias.name):
+                    return False
+        elif isinstance(node, ast.Name):
+            if (node.id not in _DATA_PY_DUNDER_NAMES
+                    and _DATA_PY_FORBIDDEN.fullmatch(node.id)):
+                return False
+        elif isinstance(node, ast.Attribute):
+            if _DATA_PY_FORBIDDEN.fullmatch(node.attr):
+                return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            if _DATA_PY_FORBIDDEN.fullmatch(node.name):
+                return False
+    return True
+
+
+def data_heredoc_raw_text(cmd: str) -> str | None:
+    """The text the hooks' raw-text patterns must still read when ``cmd`` is a
+    pure data here-doc write (its first line, the opener), or None when it is
+    not one — then the raw patterns read the whole command. See the allowlist
+    above; every doubt answers None."""
+    if "\r" in cmd or "\x00" in cmd:
+        return None
+    lines = cmd.split("\n")
+    if len(lines) < 2:
+        return None
+    opener, body, terminator = lines[0], lines[1:-1], lines[-1]
+    match = None
+    for pattern in _DATA_OPENERS:
+        match = pattern.fullmatch(opener)
+        if match:
+            break
+    is_python = False
+    if match is None:
+        match = _DATA_PYTHON_OPENER.fullmatch(opener)
+        is_python = match is not None
+    if match is None:
+        return None
+    delim = match.group("d")
+    if terminator != delim:
+        return None
+    if any(line.strip() == delim for line in body):
+        return None
+    if is_python and not _python_body_is_plain_edit("\n".join(body)):
+        return None
+    return opener
+
+
 def main() -> int:
     # Accept command from argument or stdin; `--shell powershell` (first
     # arguments) selects the PowerShell rule set too.
@@ -1341,6 +1489,22 @@ def main() -> int:
     if args == ["--credential-file-globs"]:
         # One glob per line (worktree-guard's snapshot exclusion).
         print("\n".join(credential_file_globs()))
+        return 0
+    if args == ["--data-heredoc"]:
+        # v0.2.104 E-3 (pre-tool-use.{sh,ps1}): exit 0 and print the text the
+        # raw-text patterns must still read (the opener line, no newline)
+        # when stdin is a pure data here-doc write; exit 1, printing nothing,
+        # otherwise. One trailing newline (the sh hook's `echo`) is dropped.
+        try:
+            raw = sys.stdin.buffer.read().decode("utf-8")
+        except (UnicodeDecodeError, OSError, ValueError):
+            return 1
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+        opener = data_heredoc_raw_text(raw)
+        if opener is None:
+            return 1
+        sys.stdout.write(opener)
         return 0
     shell = "bash"
     if len(args) >= 2 and args[0] == "--shell" and args[1] in SHELLS:

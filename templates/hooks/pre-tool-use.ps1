@@ -322,58 +322,111 @@ if ($ToolName -eq "WebFetch") {
 # `--shell powershell` rule set reads its syntax) ===
 if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     $cmd = Get-Field "command"
-
-    # v0.2.104 E-3: ONE verdict home (MUST MATCH pre-tool-use.sh). The full
-    # scanner (bash_security.py) carries the same three network/base64 rules
-    # as the raw patterns below but reads quote state and here-doc bodies, so
-    # a heredoc file write whose BODY merely mentions such text passes and a
-    # heredoc fed to a shell is scanned as code. The raw regexes now run only
-    # when the scanner gave NO verdict (script missing, no Python, crash) --
-    # the strict safety net of a broken install.
-    $secVerdict = ""
     $SecurityScript = Join-Path $ProjectRoot ".claude/scripts/bash_security.py"
-    # It is Python, so with no interpreter it cannot run -- and says so
-    # (v0.2.100 WP-17) instead of being skipped in silence.
+
+    # v0.2.104 R6: every Python call below is time-bounded. The harness kills
+    # this hook after its 3 s registration and a killed PreToolUse hook does
+    # NOT block, so a slow scan must end as "no verdict" while there is still
+    # time to exit. Returns @{Exit; Out; Err}, or $null on timeout / any
+    # failure (= no verdict). The input is written as UTF-8 bytes, exactly.
+    # MUST MATCH pre-tool-use.sh's _ptu_bounded (1 s classifier, 2 s
+    # scanner).
+    function Invoke-PtuBoundedPython([string]$ArgTail, [string]$InputText, [int]$TimeoutMs) {
+        $proc = $null
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = [string]$PY
+            $psi.Arguments = '"' + $SecurityScript + '" ' + $ArgTail
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($InputText)
+            $writeTask = $proc.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
+            if ($writeTask.Wait($TimeoutMs)) { $proc.StandardInput.Close() }
+            if (-not $proc.WaitForExit($TimeoutMs)) {
+                try { $proc.Kill() } catch { }
+                return $null
+            }
+            $proc.WaitForExit()
+            return @{ Exit = $proc.ExitCode; Out = $outTask.Result; Err = $errTask.Result }
+        } catch {
+            if ($proc) { try { $proc.Kill() } catch { } }
+            return $null
+        }
+    }
+
+    # The three raw-text patterns ALWAYS read the whole command (the v0.2.103
+    # guarantee) and run first.
+    function Get-PtuRawInjection([string]$Text) {
+        if ($Text -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { return "network fetch piped to shell" }
+        if ($Text -match '(?i)eval\s+["\$(]*(curl|wget)') { return "eval + network fetch" }
+        if ($Text -match '(?i)base64\s+-d.*\|\s*(ba)?sh\b') { return "base64-decoded pipe to shell" }
+        return ""
+    }
+    $injection = Get-PtuRawInjection $cmd
+
+    # v0.2.104 E-3: the ONE exception (MUST MATCH pre-tool-use.sh). A Bash
+    # command that bash_security.py positively recognises as a pure DATA
+    # here-doc write (`cat > f <<'EOF'`, `tee f <<'EOF'`, a plain
+    # `python3 - <<'EOF'` edit script -- the strict allowlist is documented at
+    # data_heredoc_raw_text) has its BODY skipped: the patterns re-read only
+    # the opener line it hands back, and only when that line is exactly the
+    # command's first line. No interpreter, a timeout, any error or any doubt
+    # keeps the whole-text verdict. Asked only when a pattern matched.
+    if ($injection -and $ToolName -eq "Bash" -and $PY -and (Test-Path $SecurityScript)) {
+        $dataRes = Invoke-PtuBoundedPython "--data-heredoc" $cmd 1000
+        if ($dataRes -and $dataRes.Exit -eq 0) {
+            $opener = [string]$dataRes.Out
+            if ($opener -and $cmd.StartsWith($opener + "`n", [System.StringComparison]::Ordinal)) {
+                $injection = Get-PtuRawInjection $opener
+            }
+        }
+    }
+
+    if ($injection) {
+        # Route the block message to STDERR (matches pre-tool-use.sh) --
+        # see the SSRF-guard branch above for why plain stdout is dropped.
+        [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in $ToolName command.")
+        $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
+        [Console]::Error.WriteLine("   Blocked command preview: $preview")
+        [Console]::Error.WriteLine("   This check reads the whole command text. Only a plain heredoc file write (cat > file <<'EOF', tee file <<'EOF') or a plain python edit script (python3 - <<'EOF'), with a quoted delimiter and nothing else in the command, has its body exempted.")
+        [Console]::Error.WriteLine("   To write a file whose content mentions this text, use the Write tool or such a heredoc. If the command is intentional, run it manually in a terminal.")
+        $previewEsc = ($preview -replace '\\', '\\\\' -replace '"', '\"')
+        Write-SecurityLine "{""timestamp"":""$ts"",""event"":""shell_injection_blocked"",""pattern"":""$injection"",""cmd_preview"":""$previewEsc""}"
+        exit 2
+    }
+
+    # Extended security scan via bash_security.py if available (bounded: a
+    # timeout is no verdict and the command proceeds -- the raw patterns
+    # above already ran on it). It is Python, so with no interpreter it
+    # cannot run -- and says so (v0.2.100 WP-17) instead of being skipped in
+    # silence.
     if ((Test-Path $SecurityScript) -and -not $PY) {
         Write-VcoNoPythonNotice "The Bash security scanner (.claude/scripts/bash_security.py)"
     }
     if ((Test-Path $SecurityScript) -and $PY) {
-        try {
-            $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
-            $secOut = $cmd | & $PY $SecurityScript --shell $secShell 2>&1
-            $secExit = $LASTEXITCODE
-            if ($secExit -eq 2) {
-                # Route to STDERR (matches pre-tool-use.sh's bash-security
-                # branch) — same stdout-discard rationale as the SSRF guard.
-                [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
-                [Console]::Error.WriteLine("   $secOut")
-                $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
-                $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'
-                $cmdPreview = if ($cmd.Length -gt 80) { $cmd.Substring(0,80) } else { $cmd }
-                $cmdPreviewEsc = $cmdPreview -replace '\\', '\\\\' -replace '"', '\"'
-                Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_blocked"",""detail"":""$detailEsc"",""cmd_preview"":""$cmdPreviewEsc""}"
-                exit 2
-            } elseif ($secExit -eq 0) {
-                $secVerdict = "pass"
-            }
-        } catch { }
-    }
-
-    if ($secVerdict -ne "pass") {
-        $injection = ""
-        if ($cmd -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { $injection = "network fetch piped to shell" }
-        elseif ($cmd -match '(?i)eval\s+["\$(]*(curl|wget)') { $injection = "eval + network fetch" }
-        elseif ($cmd -match '(?i)base64\s+-d.*\|\s*(ba)?sh\b') { $injection = "base64-decoded pipe to shell" }
-
-        if ($injection) {
-            # Route the block message to STDERR (matches pre-tool-use.sh).
-            [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in $ToolName command.")
-            $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
-            [Console]::Error.WriteLine("   Blocked command preview: $preview")
-            [Console]::Error.WriteLine("   The full scanner (.claude/scripts/bash_security.py) gave no verdict, so this raw-text check decided; it cannot tell a heredoc file body from a command.")
-            [Console]::Error.WriteLine("   To write a file whose content mentions this text, use the Write tool. If the command is intentional, run it manually in a terminal.")
-            $previewEsc = ($preview -replace '\\', '\\\\' -replace '"', '\"')
-            Write-SecurityLine "{""timestamp"":""$ts"",""event"":""shell_injection_blocked"",""pattern"":""$injection"",""cmd_preview"":""$previewEsc""}"
+        $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
+        $secRes = Invoke-PtuBoundedPython "--shell $secShell" $cmd 2000
+        if ($secRes -and $secRes.Exit -eq 2) {
+            $secOut = ("" + $secRes.Err + $secRes.Out).TrimEnd()
+            # Route to STDERR (matches pre-tool-use.sh's bash-security
+            # branch) — same stdout-discard rationale as the SSRF /
+            # injection guards above.
+            [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
+            [Console]::Error.WriteLine("   $secOut")
+            $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
+            $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'
+            $cmdPreview = if ($cmd.Length -gt 80) { $cmd.Substring(0,80) } else { $cmd }
+            $cmdPreviewEsc = $cmdPreview -replace '\\', '\\\\' -replace '"', '\"'
+            Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_blocked"",""detail"":""$detailEsc"",""cmd_preview"":""$cmdPreviewEsc""}"
             exit 2
         }
     }

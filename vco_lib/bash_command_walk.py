@@ -1059,11 +1059,19 @@ def walk_segments(command: str, depth: int = 0, *,
     sub_budget = depth + 1 <= MAX_NESTING_DEPTH
     # v0.2.104 E-4: only substitutions bash would RUN are walked — a
     # `'$(sleep 5)'` grep pattern is literal text (live_substitution_keys).
-    live_keys = live_substitution_keys(command) if _with_substitutions else None
+    # The quote reading is trusted ONLY at depth 0, on the command exactly as
+    # the outer shell receives it. A `bash -c` body reaches a deeper level as
+    # a shlex token whose outer quoting was already removed (imperfectly: a
+    # `\$` survives), and a nested shell re-expands it — so every deeper
+    # level, and an `eval` argument at depth 0 (eval re-parses its words),
+    # keeps all its substitutions (the conservative pre-E-4 walk).
+    live_keys = (live_substitution_keys(command)
+                 if _with_substitutions and depth == 0 else None)
     out: List[ChainSegment] = []
     for segment, pos, size, in_loop in rows:
         if not segment:
             continue
+        seg_is_eval = False
         seg_assignments, rest = split_assignment_prefix(segment)
         # Without the opt-in the peeled tokens come from the ORIGINAL
         # env-prefix strip, byte-identical to the pre-R16 walk; with it,
@@ -1085,6 +1093,7 @@ def walk_segments(command: str, depth: int = 0, *,
                 rec = rec[1:]
             rec = strip_subshell_parens(rec)
             rec_verb = os.path.basename(rec[0]).lower() if rec else ""
+            seg_is_eval = rec_verb == "eval"
             sub_cmd: Optional[str] = None
             if rec_verb in SHELL_DASH_C_VERBS:
                 sub_cmd = dash_c_subcommand(rec)
@@ -1116,7 +1125,8 @@ def walk_segments(command: str, depth: int = 0, *,
                                     tuple(seg_assignments)))
         if _with_substitutions and sub_budget:
             for sub_body in substitution_bodies(subst_src):
-                if live_keys is not None and _normalize_body(sub_body) not in live_keys:
+                if (live_keys is not None and not seg_is_eval
+                        and _normalize_body(sub_body) not in live_keys):
                     continue
                 out.extend(walk_segments(
                     sub_body, depth + 1, _in_loop=in_loop,

@@ -45,6 +45,12 @@ LIVE = [
     "x=$(sleep 5)",
     'grep -n "$(sleep 5)" x',
     "grep -n '$(literal)' x $(sleep 5)",
+    # R6 F2: the quote reading holds only at depth 0. A `-c` body is
+    # re-parsed by a nested shell (its `\$` re-expands there) and `eval`
+    # re-parses its arguments, so their substitutions are live.
+    'bash -c "x=\\$(sleep 5)"',
+    "eval 'x=$(sleep 5)'",
+    "eval 'echo $(sleep 5)'",
 ]
 
 
