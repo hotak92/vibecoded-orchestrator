@@ -41,6 +41,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import install  # noqa: E402
+from tests.common.env import isolate_process_state  # noqa: E402
 
 
 # ─── Stub Weaviate HTTP server ────────────────────────────────────────────
@@ -132,6 +133,11 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
     place when the canonical default is capital-C."""
 
     def setUp(self):
+        # The seed writes KG_COLLECTION / DEVELOPMENT_COLLECTION /
+        # SHARED_KG_COLLECTION / WEAVIATE_PORT into os.environ; restore the
+        # env EXACTLY afterwards (a tearDown that popped them also removed
+        # the values the session had before this test — v0.2.104 W-IDENTITY).
+        isolate_process_state(self.addCleanup)
         # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
         # the seed machinery, not the gate; without this, runners with no live
         # Weaviate burn the 150s deadline and raise (and machines WITH one
@@ -147,11 +153,6 @@ class AdoptCaseDifferentSharedKgTests(unittest.TestCase):
         _Handler.schema = {"classes": []}
         _Handler.posted = []
         _Handler.fail_post = False
-
-    def tearDown(self):
-        for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-                  "SHARED_KG_COLLECTION", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
 
     def test_case_different_shared_class_is_never_adopted(self):
         """Pre-seed Weaviate with the lowercase-c v0.2.12–v0.2.22 shared
@@ -319,6 +320,11 @@ class AdoptCaseDifferentPerProjectKgTests(unittest.TestCase):
     per-project triple)."""
 
     def setUp(self):
+        # The seed writes KG_COLLECTION / DEVELOPMENT_COLLECTION /
+        # SHARED_KG_COLLECTION / WEAVIATE_PORT into os.environ; restore the
+        # env EXACTLY afterwards (a tearDown that popped them also removed
+        # the values the session had before this test — v0.2.104 W-IDENTITY).
+        isolate_process_state(self.addCleanup)
         # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
         # the seed machinery, not the gate; without this, runners with no live
         # Weaviate burn the 150s deadline and raise (and machines WITH one
@@ -334,11 +340,6 @@ class AdoptCaseDifferentPerProjectKgTests(unittest.TestCase):
         _Handler.schema = {"classes": []}
         _Handler.posted = []
         _Handler.fail_post = False
-
-    def tearDown(self):
-        for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-                  "SHARED_KG_COLLECTION", "WEAVIATE_PORT"):
-            os.environ.pop(k, None)
 
     def test_adopt_uses_case_different_per_project_kg(self):
         """A user with a manually-created per-project KG with weird

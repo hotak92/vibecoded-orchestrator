@@ -25,9 +25,10 @@ import sys
 import unittest
 from pathlib import Path
 
+from tests.common.env import IsolatedTestCase
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MCP_DIR = PROJECT_ROOT / "claude_mcp_servers"
-sys.path.insert(0, str(MCP_DIR))
 
 
 def _fresh_server(env_overrides: dict[str, str]):
@@ -56,10 +57,19 @@ def _clear_access_env() -> None:
         os.environ.pop(k, None)
 
 
-class KgAccessListTests(unittest.TestCase):
-    """`_kg_collections_to_search` honours VCT_KG_ACCESS_LIST."""
+class KgAccessListTests(IsolatedTestCase):
+    """`_kg_collections_to_search` honours VCT_KG_ACCESS_LIST.
+
+    Each test re-imports ``weaviate_mcp.server`` under fake env; the base
+    class puts env, the ``weaviate_mcp*`` modules and ``sys.path`` back
+    afterwards so neither the values nor the module built from them leak.
+    """
+
+    ISOLATED_MODULES = ("weaviate_mcp",)
+    ISOLATED_SYS_PATH = (str(MCP_DIR),)
 
     def setUp(self) -> None:
+        super().setUp()
         _clear_access_env()
 
     def test_kg_collections_to_search_includes_peers_from_access_list_env(self):

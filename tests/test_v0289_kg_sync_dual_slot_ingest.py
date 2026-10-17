@@ -41,6 +41,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from tests.common.env import isolate_process_state
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 
@@ -182,11 +184,11 @@ class _CountingServer:
         return {self.text_vector_slot: list(COMPUTED_VEC)}, []
 
 
-_ENV_KEYS = (
-    "KG_BASE_DIR", "KG_COLLECTION", "SHARED_KG_COLLECTION",
-    "DEVELOPMENT_COLLECTION", "DUAL_EMBEDDING_ENABLED",
-    "VCT_DISABLE_HUB_RESOLVER", "KG_SYNC_PROJECT_ROOT",
-)
+#: What `_load_sync_module` changes — the KG identity env and a unique module
+#: (which imports weaviate_mcp / kg_access) — is restored EXACTLY after each
+#: test; the old tearDown POPPED the keys, which also removed the session's
+#: own values (v0.2.104 W-IDENTITY).
+_ISOLATED_MODULES = ("_sync_kg_dual_*", "weaviate_mcp", "kg_access")
 
 
 def _load_sync_module(project_root: Path, *, dual: bool = True):
@@ -253,6 +255,7 @@ def _vco_lib_catalog_importable() -> bool:
 
 class DualSlotIngestTests(unittest.TestCase):
     def setUp(self):
+        isolate_process_state(self.addCleanup, modules=_ISOLATED_MODULES)
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.knowledge = self.root / "knowledge"
@@ -261,8 +264,6 @@ class DualSlotIngestTests(unittest.TestCase):
         _write_node(self.node, "Dual Slot", "A small single-chunk node body.")
 
     def tearDown(self):
-        for k in _ENV_KEYS:
-            os.environ.pop(k, None)
         self._tmp.cleanup()
 
     def _node_hash(self, mod) -> str:

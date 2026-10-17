@@ -2341,6 +2341,99 @@ def _pin_localhost_default_backends():
                 os.environ[key] = value
 
 
+# ─── W-IDENTITY (v0.2.104): no test leaves the project IDENTITY env behind ───
+#
+# The v0.2.104 merge-only failure: `test_kg_access_helper_module.py` popped
+# `PROJECT_NAME` / `CODE_GRAPH_PROJECT` in `setUp` and never put them back, so a
+# test several files later resolved a different project — passing alone,
+# failing only in the merged order. The R3 review then found ten more files
+# with the same shape (`_fresh_server`-style helpers SETTING `KG_COLLECTION` &
+# co. with no restore). These keys decide WHICH project's collections every
+# resolver touches, so a leak is never cosmetic.
+#
+# The guard rides on the per-test `_pin_weaviate_url` (the WEAVIATE_URL guard,
+# same moment, same "fail the test that did it, by name" contract), plus a
+# MODULE-scope twin (state a `setUpClass` / module fixture set and its teardown
+# did not undo) and a COLLECTION-time check (a module that changes them at
+# IMPORT, which would poison every file collected after it). Each one restores
+# the snapshot after reporting, so one leak fails one test, not the rest of the
+# session. Restore exactly with `monkeypatch`, `mock.patch.dict(os.environ)` or
+# `tests.common.env` (`IsolatedTestCase`, `isolated_process_state`,
+# `process_state_fixture`).
+_IDENTITY_ENV_KEYS: tuple = (
+    "PROJECT_NAME",
+    "CODE_GRAPH_PROJECT",
+    "KG_COLLECTION",
+    "SHARED_KG_COLLECTION",
+    "DEVELOPMENT_COLLECTION",
+    "VCT_KG_ACCESS_LIST",
+    "VCT_CODE_GRAPH_ACCESS_LIST",
+)
+
+
+class IdentityEnvLeak(AssertionError):
+    """A test (or test module) left a project-identity env key changed."""
+
+
+def _identity_env_snapshot() -> "dict[str, str | None]":
+    return {k: os.environ.get(k) for k in _IDENTITY_ENV_KEYS}
+
+
+def _identity_env_leak(where: str, before: "dict[str, str | None]") -> "str | None":
+    """The loud message when any identity key differs from *before*, or None.
+    Pure (reads os.environ only), so both branches are provable directly."""
+    changed = [(k, v, os.environ.get(k)) for k, v in before.items() if os.environ.get(k) != v]
+    if not changed:
+        return None
+    detail = ", ".join(f"{k}: {old!r} -> {new!r}" for k, old, new in changed)
+    return (
+        f"{where} left project-identity env changed ({detail}). These keys pick "
+        "the project every resolver and child process uses; restore them exactly "
+        "(monkeypatch / mock.patch.dict(os.environ) / tests.common.env "
+        "IsolatedTestCase or process_state_fixture)."
+    )
+
+
+def _restore_identity_env(before: "dict[str, str | None]") -> None:
+    for key, value in before.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _identity_env_module_guard(request):
+    """W-IDENTITY at MODULE scope: torn down after every class fixture, so a
+    ``setUpClass`` (or a module fixture) whose teardown forgot a key is named
+    here — the per-test guard cannot see it, the class set it before the
+    first test's snapshot."""
+    before = _identity_env_snapshot()
+    yield
+    leak = None if _ALLOW_REAL_STATE else _identity_env_leak(request.node.nodeid, before)
+    _restore_identity_env(before)
+    if leak:
+        raise IdentityEnvLeak(leak)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    """W-IDENTITY at COLLECTION: a test module whose IMPORT changes an
+    identity key fails to collect (and the key is restored), instead of
+    silently re-pointing every file collected after it."""
+    if not isinstance(collector, pytest.Module) or _ALLOW_REAL_STATE:
+        yield
+        return
+    before = _identity_env_snapshot()
+    outcome = yield
+    leak = _identity_env_leak(f"importing {collector.nodeid}", before)
+    if leak:
+        _restore_identity_env(before)
+        report = outcome.get_result()
+        report.outcome = "failed"
+        report.longrepr = f"IdentityEnvLeak: {leak}"
+
+
 @pytest.fixture(autouse=True)
 def _pin_weaviate_url(request):
     """W-WEAVIATE: re-establish the backend pin for EVERY test.
@@ -2359,6 +2452,8 @@ def _pin_weaviate_url(request):
     prev_allow = os.environ.get(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV)
     test_file = request.node.fspath.basename
     leak = None
+    identity_leak = None
+    identity_before = _identity_env_snapshot()
     with _weaviate_url_applied_for(test_file) as target:
         os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
         try:
@@ -2366,14 +2461,20 @@ def _pin_weaviate_url(request):
         finally:
             # v0.2.102 W6-B2 last round: the GUARD. Every other fixture (and
             # monkeypatch) has torn down by now, so anything but the pin is a
-            # leak this test caused — fail it loudly, by name.
-            leak = None if _ALLOW_REAL_STATE else _weaviate_url_leak(test_file, target)
+            # leak this test caused — fail it loudly, by name. v0.2.104
+            # W-IDENTITY: the project-identity keys get the same check.
+            if not _ALLOW_REAL_STATE:
+                leak = _weaviate_url_leak(test_file, target)
+                identity_leak = _identity_env_leak(request.node.nodeid, identity_before)
+            _restore_identity_env(identity_before)
             if prev_allow is None:
                 os.environ.pop(_fixture_guard.ALLOW_FIXTURE_WRITES_ENV, None)
             else:
                 os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = prev_allow
     if leak:
         raise WeaviateUrlLeak(leak)
+    if identity_leak:
+        raise IdentityEnvLeak(identity_leak)
 
 
 # Test files that EXPLICITLY exercise `spawn_background_resync`'s launch path

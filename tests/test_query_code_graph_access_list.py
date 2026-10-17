@@ -23,11 +23,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.common.env import IsolatedTestCase
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = PROJECT_ROOT / "templates" / "scripts"
 HELPER_DIR = PROJECT_ROOT / "claude_mcp_servers" / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
-sys.path.insert(0, str(HELPER_DIR))
 
 
 def _clear_env() -> None:
@@ -104,11 +104,17 @@ class _FakeClient:
         self._closed = True
 
 
-class QueryCodeGraphAccessListTests(unittest.TestCase):
+class QueryCodeGraphAccessListTests(IsolatedTestCase):
     """``CodeGraphQuery.search_by_concept`` fans out across the code
     graph access matrix."""
 
+    # Each test re-imports the CLI (and the weaviate_mcp it pulls in) under
+    # fake env; the base class restores env, these modules and sys.path after.
+    ISOLATED_MODULES = ("query_code_graph", "kg_access", "weaviate_mcp")
+    ISOLATED_SYS_PATH = (str(HELPER_DIR), str(SCRIPTS_DIR))
+
     def setUp(self) -> None:
+        super().setUp()
         _clear_env()
 
     def test_no_access_list_queries_self_only(self) -> None:

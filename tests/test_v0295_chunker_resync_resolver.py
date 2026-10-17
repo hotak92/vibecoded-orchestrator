@@ -41,6 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.env import isolate_process_state  # noqa: E402
 from vco_lib import chunker_revision as cr  # noqa: E402
 from vco_lib import codegraph_deferrals as cd  # noqa: E402
 from vco_lib import deferral_probes as dp  # noqa: E402
@@ -291,6 +292,13 @@ class TheKgHalf(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        # The loader writes the KG identity env and registers a unique module
+        # (which imports weaviate_mcp / kg_access); all restored EXACTLY at
+        # class teardown instead of leaking to later files (v0.2.104).
+        isolate_process_state(
+            cls.addClassCleanup,
+            modules=("_sync_kg_resolver_*", "weaviate_mcp", "kg_access"),
+        )
         cls.mod = _load_sync_module()
 
     def setUp(self) -> None:
@@ -418,7 +426,14 @@ class TheTransitionCostIsNoLongerPermanent(unittest.TestCase):
     a comment."""
 
     def test_the_comparison_is_armed_only_while_the_entry_lives(self) -> None:
-        mod = TheKgHalf.mod if hasattr(TheKgHalf, "mod") else _load_sync_module()
+        if hasattr(TheKgHalf, "mod"):
+            mod = TheKgHalf.mod
+        else:
+            isolate_process_state(
+                self.addCleanup,
+                modules=("_sync_kg_resolver_*", "weaviate_mcp", "kg_access"),
+            )
+            mod = _load_sync_module()
         with TemporaryDirectory() as td:
             folder = Path(td)
             with mock.patch.multiple(mod, PROJECT_ROOT=folder,

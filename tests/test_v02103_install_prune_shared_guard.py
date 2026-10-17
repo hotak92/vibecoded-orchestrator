@@ -61,6 +61,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.env import isolated_process_state  # noqa: E402
 from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
 import install  # noqa: E402
 from vco_lib import collection_repair  # noqa: E402
@@ -371,6 +372,10 @@ class _SeedDrive:
     wrapper + adapter run; only the Weaviate HTTP seam is faked)."""
 
     def __init__(self, tmp: Path, *, kg: str, shared: str):
+        # The env set below is restored EXACTLY by close(); popping the keys
+        # there also removed the session's own values (v0.2.104 W-IDENTITY).
+        self._isolation = isolated_process_state()
+        self._isolation.__enter__()
         os.environ["VCT_STATE_DIR"] = str(tmp)
         os.environ["ACTIVE_EMBEDDING"] = "qwen3"
         os.environ["KG_COLLECTION"] = kg
@@ -394,9 +399,7 @@ class _SeedDrive:
         fake_python.chmod(0o755)
 
     def close(self) -> None:
-        for k in ("VCT_STATE_DIR", "ACTIVE_EMBEDDING",
-                  "KG_COLLECTION", "SHARED_KG_COLLECTION"):
-            os.environ.pop(k, None)
+        self._isolation.__exit__(None, None, None)
 
 
 class InstallUpdateSeedPathPruneTest(unittest.TestCase):

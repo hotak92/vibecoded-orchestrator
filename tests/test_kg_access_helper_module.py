@@ -24,11 +24,11 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
+
+from tests.common.env import IsolatedTestCase
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HELPER_DIR = PROJECT_ROOT / "claude_mcp_servers" / "scripts"
-sys.path.insert(0, str(HELPER_DIR))
 
 
 def _fresh_helper(env_overrides: dict[str, str] | None = None):
@@ -56,29 +56,16 @@ def _clear_access_env() -> None:
         os.environ.pop(k, None)
 
 
-class _IsolatedTestCase(unittest.TestCase):
+class _IsolatedTestCase(IsolatedTestCase):
     """Every test here mutates ``os.environ`` (the helpers read env at call
     time) and ``sys.modules`` (fresh ``kg_access`` / ``weaviate_mcp``
-    imports). Both are process-global, so each test snapshots them and puts
-    them back on cleanup: without it, ``PROJECT_NAME`` / ``CODE_GRAPH_PROJECT``
-    popped here stayed popped for every later test in the same process."""
+    imports). Both are process-global, so each test runs inside
+    ``tests.common.env.isolated_process_state``: without it,
+    ``PROJECT_NAME`` / ``CODE_GRAPH_PROJECT`` popped here stayed popped for
+    every later test in the same process."""
 
-    def setUp(self) -> None:
-        env = mock.patch.dict(os.environ)
-        env.start()
-        self.addCleanup(env.stop)
-        saved = {m: mod for m, mod in sys.modules.items()
-                 if m == "kg_access" or m.startswith("weaviate_mcp")}
-        saved_path = list(sys.path)
-
-        def _restore_modules() -> None:
-            for m in [m for m in sys.modules
-                      if m == "kg_access" or m.startswith("weaviate_mcp")]:
-                del sys.modules[m]
-            sys.modules.update(saved)
-            sys.path[:] = saved_path
-
-        self.addCleanup(_restore_modules)
+    ISOLATED_MODULES = ("kg_access", "weaviate_mcp")
+    ISOLATED_SYS_PATH = (str(HELPER_DIR),)
 
 
 class ParseCsvEnvTests(_IsolatedTestCase):

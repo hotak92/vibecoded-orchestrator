@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.env import isolate_process_state  # noqa: E402
 from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
 import install  # noqa: E402
 
@@ -68,7 +69,10 @@ class PruneRunsOnPartialSyncTest(unittest.TestCase):
         self.addCleanup(_gate.stop)
         self._tmpdir = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmpdir.name)
-        # Stage env so the diff-gate's "context unchanged" check passes.
+        # Stage env so the diff-gate's "context unchanged" check passes —
+        # restored EXACTLY after the test (a tearDown that popped the keys
+        # also removed the session's own values — v0.2.104 W-IDENTITY).
+        isolate_process_state(self.addCleanup)
         os.environ["VCT_STATE_DIR"] = str(self.tmp)
         os.environ["ACTIVE_EMBEDDING"] = "qwen3"
         os.environ["KG_COLLECTION"] = "TestProject_KnowledgeGraph"
@@ -82,11 +86,6 @@ class PruneRunsOnPartialSyncTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        for k in (
-            "VCT_STATE_DIR", "ACTIVE_EMBEDDING",
-            "KG_COLLECTION", "SHARED_KG_COLLECTION",
-        ):
-            os.environ.pop(k, None)
         self._tmpdir.cleanup()
 
     def test_prune_runs_when_sync_all_is_false(self):

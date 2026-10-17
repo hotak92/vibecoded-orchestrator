@@ -32,6 +32,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from tests.common.env import isolate_process_state
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 
@@ -60,10 +62,11 @@ def _load_sync_module(project_root: Path, dev_docs_root: str | None = None):
     return mod
 
 
-_ENV_KEYS = (
-    "KG_BASE_DIR", "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-    "DUAL_EMBEDDING_ENABLED", "VCT_DISABLE_HUB_RESOLVER", "DEV_DOCS_ROOT",
-)
+#: What `_load_sync_module` changes — the KG identity env and a unique module
+#: (which imports weaviate_mcp / kg_access) — is restored EXACTLY by the
+#: isolation each class / test registers; the old teardowns POPPED the keys,
+#: which also removed the session's own values (v0.2.104 W-IDENTITY).
+_ISOLATED_MODULES = ("_sync_kg_paths_*", "weaviate_mcp", "kg_access")
 
 
 class ArchiveSegmentVariantsTest(unittest.TestCase):
@@ -72,14 +75,13 @@ class ArchiveSegmentVariantsTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        isolate_process_state(cls.addClassCleanup, modules=_ISOLATED_MODULES)
         os.environ["VCT_DISABLE_HUB_RESOLVER"] = "1"
         cls._tmp = tempfile.TemporaryDirectory()
         cls.mod = _load_sync_module(Path(cls._tmp.name))
 
     @classmethod
     def tearDownClass(cls):
-        for k in _ENV_KEYS:
-            os.environ.pop(k, None)
         cls._tmp.cleanup()
 
     def _archived(self, rel: str) -> bool:
@@ -117,13 +119,12 @@ class DevDocsPathClassificationTest(unittest.TestCase):
     DEV_DOCS_ROOT overrides the docs root."""
 
     def setUp(self):
+        isolate_process_state(self.addCleanup, modules=_ISOLATED_MODULES)
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         (self.root / "knowledge").mkdir(parents=True)
 
     def tearDown(self):
-        for k in _ENV_KEYS:
-            os.environ.pop(k, None)
         self._tmp.cleanup()
 
     def test_symlink_under_docs_classified_as_docs(self):

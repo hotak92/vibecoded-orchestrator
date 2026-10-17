@@ -59,6 +59,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from tests.common.env import isolate_process_state
+
 from tests.common.child_env import child_env
 from tests.common.wrapper_staging import LADDER_SH
 
@@ -153,14 +155,16 @@ class PreScanUnitTests(unittest.TestCase):
     manual positional dispatch never sees it; absent flag → argv untouched."""
 
     def setUp(self) -> None:
+        # _load_sync_module (and the tests) write the KG identity env and
+        # register a unique module; both are restored EXACTLY after the test.
+        # The old tearDown POPPED the keys, which also removed the session's
+        # own values (v0.2.104 W-IDENTITY).
+        isolate_process_state(
+            self.addCleanup, modules=("_sync_kg_root_*", "weaviate_mcp", "kg_access"),
+        )
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.addCleanup(self._tmp.cleanup)
-
-    def tearDown(self) -> None:
-        for k in ("KG_BASE_DIR", "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-                  "VCT_DISABLE_HUB_RESOLVER", "KG_SYNC_PROJECT_ROOT"):
-            os.environ.pop(k, None)
 
     def test_space_form_extracted_and_removed(self) -> None:
         mod = _load_sync_module(self.root)
