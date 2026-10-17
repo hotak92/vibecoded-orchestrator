@@ -8,6 +8,27 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
+# v0.2.104: this hook's clock. The harness kills it after the `timeout`
+# registered for pre-tool-use (3 s in both settings templates) and a killed
+# PreToolUse hook does NOT block -- so the Build Anchor's post-compaction
+# check below may only spend what is LEFT of that budget. Measured from the
+# PROCESS start when the OS reports it (it then includes the powershell
+# cold start, the costly part on Windows), else from this line; the larger
+# of the two counts. MUST MATCH pre-tool-use.sh's _ptu_clock_us.
+$PtuClock = [Diagnostics.Stopwatch]::StartNew()
+$PtuProcStart = $null
+try { $PtuProcStart = [Diagnostics.Process]::GetCurrentProcess().StartTime } catch { }
+function Get-PtuElapsedMs {
+    $ms = [double]$PtuClock.Elapsed.TotalMilliseconds
+    if ($PtuProcStart) {
+        try {
+            $fromProc = ((Get-Date) - $PtuProcStart).TotalMilliseconds
+            if ($fromProc -gt $ms) { $ms = $fromProc }
+        } catch { }
+    }
+    return [int][Math]::Ceiling($ms)
+}
+
 # VCO-CENTRALIZED-KG: NOT a KG consumer (v0.2.101 wave-3). The former
 #   section-5 KG-suggestion path was retired (double emission with the
 #   pre-edit/pre-write router wrappers -- review nit-6); every remaining
@@ -445,8 +466,8 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
                 # session that never compacted has nothing re-attached, and
                 # this hook's 3 s registration timeout must not be spent on a
                 # transcript scan -- a hook killed on timeout does not block,
-                # so it would turn this block into an allow. The module also
-                # answers `no` past its own ~1 s deadline.
+                # so it would turn this block into an allow. The module
+                # answers `no` past the deadline this hook hands it.
                 if (-not $alreadyRead -and $TranscriptPath -and (Test-Path -LiteralPath $SessionCompactedMarker -PathType Leaf)) {
                     $raPy = ""
                     $venvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
@@ -458,9 +479,24 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
                         } catch { }
                     }
                     if (-not $raPy -and $PY) { $raPy = [string]$PY }
-                    if ($raPy) {
+                    # The check gets only what is left of the registration
+                    # timeout: budget - elapsed since this hook started - a
+                    # margin for the interpreter's start and this hook's
+                    # exit. Under the floor there is no time for an answer:
+                    # skip the spawn and block. The module caps the value at
+                    # its own 1 s default. VCO_PRE_TOOL_USE_TIMEOUT_S (whole
+                    # seconds) MUST MATCH the `timeout` registered for
+                    # pre-tool-use in .claude/settings.json -- set it when you
+                    # change that registration. MUST MATCH pre-tool-use.sh.
+                    $ptuBudgetS = 3
+                    if ($env:VCO_PRE_TOOL_USE_TIMEOUT_S -match '^[0-9]+$' -and [int]$env:VCO_PRE_TOOL_USE_TIMEOUT_S -gt 0) {
+                        $ptuBudgetS = [int]$env:VCO_PRE_TOOL_USE_TIMEOUT_S
+                    }
+                    $ptuLeftMs = $ptuBudgetS * 1000 - (Get-PtuElapsedMs) - 700
+                    if ($raPy -and $ptuLeftMs -ge 200) {
+                        $ptuDeadline = ([double]$ptuLeftMs / 1000).ToString("0.000", [Globalization.CultureInfo]::InvariantCulture)
                         try {
-                            $raOut = @(& $raPy -m vco_lib.compact_reattach check "--transcript=$TranscriptPath" "--path=$filePath" "--agent-id=$AgentId" 2>$null)
+                            $raOut = @(& $raPy -m vco_lib.compact_reattach check "--transcript=$TranscriptPath" "--path=$filePath" "--agent-id=$AgentId" "--deadline=$ptuDeadline" 2>$null)
                             if ($LASTEXITCODE -eq 0 -and $raOut.Count -ge 1 -and ([string]$raOut[0]).Trim() -ceq "reattached") {
                                 $alreadyRead = $true
                             }

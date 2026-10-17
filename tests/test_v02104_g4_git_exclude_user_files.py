@@ -231,9 +231,11 @@ class G4BundleExcludeTests(unittest.TestCase):
         old block below still carries its own. VCO's copy must be migrated, so
         removing the user's line later really makes `.claude/` addable."""
         self._bundle(update_mode=False)
+        # VCO's block in the old writer's order: created files (the glob
+        # among them), then the manifest line.
         self.exclude.write_text(
             "/.claude/\n/.vco-manifest.json\n\n" + self._LEGACY_HEADER
-            + "/.vco-manifest.json\n/.claude/\n/CLAUDE.md\n",
+            + "/.claude/\n/CLAUDE.md\n/.vco-manifest.json\n",
             encoding="utf-8",
         )
         result = self._bundle(update_mode=True)
@@ -431,6 +433,133 @@ class G4PatternUnitTests(unittest.TestCase):
             git_exclude.exclude_pattern_for(".claude/specializations/review-kinds/code.md"),
             "/.claude/specializations/review-kinds/code.md",
         )
+
+
+@unittest.skipUnless(shutil.which("git"), "git is required")
+class G4R3LegacyBlockTests(unittest.TestCase):
+    """R3: the writer's order bounds a legacy block, a CRLF file stays CRLF,
+    and an old move block stops hiding the user's copied material."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.proj = Path(self._td.name)
+        self.assertEqual(_git(self.proj, "init", "-q").returncode, 0)
+        self.exclude = self.proj / ".git" / "info" / "exclude"
+        self.exclude.parent.mkdir(parents=True, exist_ok=True)
+
+    def _ignored(self, rel: str) -> bool:
+        target = self.proj / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x\n", encoding="utf-8")
+        return _ignored(self.proj, rel)
+
+    def test_a_users_line_after_the_manifest_line_survives_retirement(self):
+        """L2 reproduction: `/CLAUDE.md` appended after an old bundle block
+        that ends with the manifest line is the user's — a release retiring
+        the shipped CLAUDE.md in the same run must not delete it."""
+        self.exclude.write_text(
+            "# VCO safe-add (v0.2.63): x\n/.claude/\n/.vco-manifest.json\n/CLAUDE.md\n",
+            encoding="utf-8",
+        )
+        res = git_exclude.append_git_info_exclude(
+            self.proj, ("/.claude/hooks/a.sh",), retired=("/CLAUDE.md",),
+        )
+        self.assertEqual(sorted(res["removed"]), ["/.claude/", "/.vco-manifest.json"])
+        lines = self.exclude.read_text(encoding="utf-8").splitlines()
+        self.assertLess(lines.index("# VCO end"), lines.index("/CLAUDE.md"))
+        self.assertTrue(self._ignored("CLAUDE.md"))
+
+    def test_nothing_follows_the_sidecar_in_a_bundle_block(self):
+        text = "# VCO safe-add (v0.2.63): x\n/CLAUDE.md\n/.env.vco.reference\n/notes.txt\n"
+        new, removed = git_exclude._rewrite_vco_blocks(text, ["/notes.txt"])
+        self.assertEqual(removed, [])
+        self.assertEqual(
+            new,
+            "# VCO safe-add (v0.2.63): x\n/CLAUDE.md\n/.env.vco.reference\n"
+            "# VCO end\n/notes.txt\n",
+        )
+
+    def test_vcos_own_retired_line_before_the_manifest_still_goes(self):
+        text = "# VCO safe-add (v0.2.63): x\n/CLAUDE.md\n/.claude/\n/.vco-manifest.json\n"
+        new, removed = git_exclude._rewrite_vco_blocks(text, ["/CLAUDE.md"])
+        self.assertEqual(removed, ["/CLAUDE.md", "/.claude/", "/.vco-manifest.json"])
+        self.assertEqual(new, "# VCO safe-add (v0.2.63): x\n# VCO end\n")
+
+    def test_a_crlf_exclude_file_stays_crlf(self):
+        self.exclude.write_bytes(
+            b"*.swp\r\n\r\n# VCO safe-add (v0.2.63): x\r\n/.claude/\r\n/CLAUDE.md\r\n"
+        )
+        res = git_exclude.append_git_info_exclude(self.proj, ("/.claude/hooks/a.sh",))
+        self.assertEqual(res["action"], "appended")
+        data = self.exclude.read_bytes()
+        self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
+        self.assertIn(b"/CLAUDE.md\r\n# VCO end\r\n", data)
+        self.assertTrue(data.endswith(b"/.claude/hooks/a.sh\r\n# VCO end\r\n"), data)
+        again = git_exclude.append_git_info_exclude(self.proj, ("/.claude/hooks/a.sh",))
+        self.assertEqual(again["action"], "noop")
+        self.assertTrue(self._ignored(".claude/hooks/a.sh"))
+        self.assertFalse(self._ignored(".claude/CONTEXT_STATE.md"))
+
+    def test_an_old_move_block_stops_hiding_the_users_copied_material(self):
+        """NIT: a pre-v0.2.104 move block listed the copied knowledge nodes,
+        CONTEXT_STATE.md and MEMORY.md; the migration removes them (VCO
+        blocks only), like the `/.claude/` glob."""
+        self.exclude.write_text(
+            "/knowledge/private.md\n\n"
+            "# VCO safe-add (v0.2.63): x\n/CLAUDE.md\n/.claude/\n/.vco-manifest.json\n"
+            "\n# VCO project move: keep orchestrator-created files out of your commits.\n"
+            "# This is .git/info/exclude (LOCAL-only) — not the tracked .gitignore.\n"
+            "/.env.vco.reference\n/knowledge/my-node.md\n/knowledge/sub/b.md\n"
+            "/CONTEXT_STATE.md\n/MEMORY.md\n/.vscode/settings.json\n"
+            "\n# VCO safe-add: y\n/knowledge/curated.md\n# VCO end\n",
+            encoding="utf-8",
+        )
+        res = git_exclude.append_git_info_exclude(self.proj, ())
+        self.assertEqual(res["action"], "migrated")
+        self.assertEqual(
+            res["removed"],
+            ["/.claude/", "/.vco-manifest.json", "/knowledge/my-node.md",
+             "/knowledge/sub/b.md", "/CONTEXT_STATE.md", "/MEMORY.md"],
+        )
+        for rel in ("knowledge/my-node.md", "knowledge/sub/b.md", "CONTEXT_STATE.md",
+                    "MEMORY.md", ".claude/CONTEXT_STATE.md"):
+            self.assertFalse(self._ignored(rel), rel)
+        # The user's line outside every block, the copied VCO file and an
+        # ended block's line stay.
+        for rel in ("knowledge/private.md", ".vscode/settings.json", "knowledge/curated.md"):
+            self.assertTrue(self._ignored(rel), rel)
+
+    def test_a_shipped_knowledge_line_is_listed_again_by_the_same_write(self):
+        self.exclude.write_text(
+            "# VCO project move: x\n/knowledge/curated.md\n/.vco-manifest.json\n",
+            encoding="utf-8",
+        )
+        res = git_exclude.append_git_info_exclude(self.proj, ("/knowledge/curated.md",))
+        self.assertEqual(res["added"], ["/knowledge/curated.md"])
+        self.assertTrue(self._ignored("knowledge/curated.md"))
+
+    def test_retired_patterns_skip_a_move_blocks_copied_tail(self):
+        text = "# VCO project move: x\n/a.sh\n/.vco-manifest.json\n/b.md\n"
+        new, removed = git_exclude._rewrite_vco_blocks(text, ["/a.sh", "/b.md"])
+        self.assertEqual(removed, ["/a.sh", "/.vco-manifest.json"])
+        self.assertEqual(new, "# VCO project move: x\n/b.md\n# VCO end\n")
+
+    def test_legacy_move_user_lines_match_the_move_engines_adjacent_specs(self):
+        from vco_lib import project_move as pm
+
+        expected = tuple(
+            "/" + (spec[:-2] if spec.endswith("/**") else spec)
+            for spec in pm.USER_ADJACENT_SPECS if not spec.startswith(".claude/")
+        )
+        self.assertEqual(git_exclude._LEGACY_MOVE_USER_LINES, expected)
+
+    def test_no_shipped_template_path_contains_whitespace(self):
+        """`_is_legacy_vco_entry` rejects whitespace; the premise is that no
+        shipped path has any."""
+        bad = [str(p.relative_to(REPO_ROOT)) for p in (REPO_ROOT / "templates").rglob("*")
+               if any(c.isspace() for c in p.name)]
+        self.assertEqual(bad, [])
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
