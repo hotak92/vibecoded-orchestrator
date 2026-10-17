@@ -35,7 +35,10 @@ Every such loss appends ONE JSON line to
 ``<vct_root>/metrics/rl_telemetry_loss.jsonl`` (the shared metrics home, beside
 ``embedding_failures.jsonl``) and logs one WARNING per (kind, reason) per
 process — loud enough to be seen, rate-limited so a downed hub does not flood
-an MCP's stderr. The ledger's reader is :func:`summarize`, which ``vco doctor``
+an MCP's stderr. A writer that cannot take the ledger lock in time
+puts its line in ``rl_telemetry_loss.jsonl.pending.d/`` instead, and the next
+writer that holds the lock moves it into the ledger exactly once (v0.2.104;
+see :func:`_rotate_and_append`). The ledger's reader is :func:`summarize`, which ``vco doctor``
 renders as the ``rl_telemetry_loss`` probe.
 
 Never raises: recording a loss must never become a second failure on the path
@@ -138,7 +141,13 @@ def record_loss(kind: str, reason: str, **detail: Any) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             _rotate_and_append(path, line)
     except Exception as exc:  # noqa: BLE001 — a loss record never raises
-        logger.debug("record_loss: could not append (%s)", exc)
+        # The loss ledger failing to ledger is itself a loss: WARNING, once
+        # per process per error type (v0.2.104 R11 F3), never DEBUG.
+        _warn_once(
+            ("__record_failed__", type(exc).__name__),
+            "RL telemetry loss: could not record a %s (%s) line in %s: %s",
+            kind, reason, LOSS_FILE_NAME, exc,
+        )
 
 
 #: Bound on waiting for another PROCESS's rotate+append. Appends take
@@ -146,11 +155,23 @@ def record_loss(kind: str, reason: str, **detail: Any) -> None:
 #: :func:`_spill`) rather than stall a hook.
 _LOCK_TIMEOUT_S = 1.0
 
+#: Bound on the SECOND lock wait, taken only when the spill itself failed (the
+#: pending dir cannot be written). A locked append is the one path that cannot
+#: race a rotation, so it is worth waiting longer for before the last resort.
+_SPILL_FAILED_LOCK_TIMEOUT_S = 5.0
+
 #: Suffix of a spilled line's file inside :func:`pending_dir`. Anything else in
-#: that directory (``atomic_write_text``'s ``*.tmp`` staging file, a
-#: ``*.drained`` file whose unlink failed) is never read as a record.
+#: that directory (``atomic_write_text``'s ``*.tmp`` staging file) is never read
+#: as a record.
 _PENDING_SUFFIX = ".jsonl"
-_DRAINED_SUFFIX = ".drained"
+#: v0.2.104 pre-release (commit 62ededab) drained a pending file by renaming it
+#: to ``<name>.jsonl.drained`` first; a drainer killed between that rename and
+#: its append left the only copy of the line under this suffix. Such a file is
+#: read as a pending spill (deduplicated by content), never deleted unread.
+_LEGACY_DRAINED_SUFFIX = ".jsonl.drained"
+
+#: The idempotency key a spilled record carries into the ledger.
+SPILL_ID_KEY = "spill_id"
 
 
 def lock_path(path: Optional[Path] = None) -> Path:
@@ -160,7 +181,16 @@ def lock_path(path: Optional[Path] = None) -> Path:
 
 
 def pending_dir(path: Optional[Path] = None) -> Path:
-    """``<ledger>.pending.d/`` — lines whose writer could not take the lock."""
+    """``<ledger>.pending.d/`` — lines whose writer could not take the lock.
+
+    Unbounded by design: the owner rule is that RL training logs are ALWAYS
+    collected, so no cap or age-out deletes a spilled line. Every writer that
+    takes the lock drains the directory (:func:`_drain_pending`), so it only
+    grows while the lock stays busy for longer than ``_LOCK_TIMEOUT_S`` at a
+    time, and empties at the next uncontended write. ``vco doctor`` reports
+    how many files wait there and how old the oldest is
+    (:func:`pending_stats`), so a directory that is not emptying is visible.
+    """
     p = path or loss_log_path()
     return p.with_name(p.name + ".pending.d")
 
@@ -179,90 +209,274 @@ def _rotate_and_append(path: Path, line: str) -> None:
     used to append to the ledger WITHOUT it. That is the very race the lock
     exists for: the holder may be between reading the tail and
     ``os.replace``-ing it, so the unlocked line went into the inode being
-    replaced and vanished (measured: 16 of 12 800 lines lost over four rounds
-    of 16 writers on a loaded machine). Now such a writer never touches the
-    ledger: it writes its line to its own pending file, complete on arrival,
-    and the next writer that DOES hold the lock moves pending lines into the
-    ledger (:func:`_drain_pending`). Readers (:func:`iter_records`) count
-    pending lines too, so a line is visible from the moment it is recorded.
+    replaced and vanished. Now such a writer writes its line, tagged with a
+    ``spill_id``, to its own pending file (:func:`_spill`); the next writer
+    that holds the lock appends it to the ledger unless its ``spill_id`` is
+    already there, then unlinks the file (:func:`_drain_pending`). A drain
+    interrupted at any step is redone by the next one, and a line is appended
+    once. Readers (:func:`iter_records`) count pending lines too, once each.
+
+    If the spill itself fails (the pending dir cannot be written), see
+    :func:`_append_after_failed_spill`.
     """
-    from vco_lib.atomic import LockTimeout, exclusive_file_lock, rotate_tail_lines
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock
 
     try:
         with exclusive_file_lock(lock_path(path), timeout_s=_LOCK_TIMEOUT_S):
-            _drain_pending(path)
-            rotate_tail_lines(path, max_bytes=_MAX_BYTES, keep_lines=_KEEP_LINES)
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(line)
+            _locked_rotate_and_append(path, line)
         return
     except LockTimeout:
         pass
-    _spill(path, line)
+    try:
+        _spill(path, line)
+        return
+    except (OSError, ValueError) as exc:
+        spill_error = exc
+    _append_after_failed_spill(path, line, spill_error)
+
+
+def _locked_rotate_and_append(path: Path, line: str) -> None:
+    """Drain, rotate, append. Caller MUST hold :func:`lock_path`."""
+    from vco_lib.atomic import rotate_tail_lines
+
+    _drain_pending(path)
+    rotate_tail_lines(path, max_bytes=_MAX_BYTES, keep_lines=_KEEP_LINES)
+    _append(path, line)
+
+
+def _append_after_failed_spill(path: Path, line: str, spill_error: BaseException) -> None:
+    """The lock was busy AND the pending dir could not be written.
+
+    Order of preference, each step taken only when the one before failed:
+
+    1. Wait up to ``_SPILL_FAILED_LOCK_TIMEOUT_S`` more for the lock and do a
+       normal locked append — the one path that cannot race a rotation.
+    2. Append WITHOUT the lock. This can lose THIS line if a rotation is in
+       flight at that instant (the v0.2.104 race), but it touches no other
+       line and no other copy, whereas giving up loses the line every time.
+       The F1 lesson — never delete the only copy of a line — is not at stake
+       here: there is no other copy to delete.
+
+    Both are logged at WARNING (once per process): the loss ledger failing to
+    ledger is itself a loss signal. An ``OSError`` from step 2 propagates to
+    :func:`record_loss`, which logs it at WARNING.
+    """
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock
+
+    _warn_once(
+        ("__spill_failed__", type(spill_error).__name__),
+        "RL telemetry loss ledger: could not spill a line to %s (%s); waiting "
+        "up to %.0f s more for the ledger lock",
+        pending_dir(path), spill_error, _SPILL_FAILED_LOCK_TIMEOUT_S,
+    )
+    try:
+        with exclusive_file_lock(lock_path(path), timeout_s=_SPILL_FAILED_LOCK_TIMEOUT_S):
+            _locked_rotate_and_append(path, line)
+        return
+    except LockTimeout:
+        pass
+    _warn_once(
+        ("__unlocked_append__",),
+        "RL telemetry loss ledger: lock still busy and %s unwritable; "
+        "appending without the lock (the line can be lost to a concurrent "
+        "rotation)", pending_dir(path),
+    )
+    _append(path, line)
+
+
+def _warn_once(key: tuple, msg: str, *args: Any) -> None:
+    if key in _warned:
+        return
+    _warned.add(key)
+    logger.warning(msg, *args)
+
+
+def _append(path: Path, text: str) -> None:
+    """Append ``text`` to the ledger, first closing a torn last line.
+
+    A previous append cut short (a full disk, an I/O error after a partial
+    write) can leave the file without a trailing newline; appending straight
+    after it would glue the new record onto the fragment and make BOTH
+    unparseable. A newline first keeps the fragment on its own line, which
+    every reader skips.
+    """
+    data = text.encode("utf-8")
+    with open(path, "ab+") as fh:
+        if fh.seek(0, os.SEEK_END) > 0:
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":
+                data = b"\n" + data
+        fh.write(data)
 
 
 def _spill(path: Path, line: str) -> None:
     """Write ``line`` to a fresh, uniquely-named file in :func:`pending_dir`.
 
-    One writer per file, written once through ``atomic_write_text`` (a staged
+    The name starts with the zero-padded wall-clock ``time_ns`` so a name sort
+    is a time sort (:func:`_spill_sort_key`); the record gains
+    ``"spill_id": <the file's stem>``, its idempotency key in the ledger. One
+    writer per file, written once through ``atomic_write_text`` (a staged
     ``*.tmp`` then ``os.replace``), so a ``*.jsonl`` file in the directory is
-    always complete and never written to again — which is what lets the
-    drainer read and remove it without the race the ledger itself has.
+    always complete and never written to again.
     """
     from vco_lib.atomic import atomic_write_text
 
-    name = f"{os.getpid()}-{time.time_ns()}-{os.urandom(4).hex()}{_PENDING_SUFFIX}"
-    atomic_write_text(pending_dir(path) / name, line, fsync=False)
+    stem = f"{time.time_ns():020d}-{os.getpid()}-{os.urandom(4).hex()}"
+    rec = json.loads(line)
+    rec[SPILL_ID_KEY] = stem
+    body = json.dumps(rec, separators=(",", ":"), default=str) + "\n"
+    atomic_write_text(pending_dir(path) / (stem + _PENDING_SUFFIX), body, fsync=False)
+
+
+def _spill_stem(f: Path) -> str:
+    name = f.name
+    for suffix in (_LEGACY_DRAINED_SUFFIX, _PENDING_SUFFIX):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _spill_sort_key(f: Path) -> tuple[int, str]:
+    """Spill time in ns from the file name, then the name.
+
+    Current names are ``<time_ns:020d>-<pid>-<hex>``; 62ededab-era names were
+    ``<pid>-<time_ns>-<hex>`` (time in the SECOND field). Both sort by time.
+    """
+    parts = _spill_stem(f).split("-")
+    if len(parts[0]) == 20 and parts[0].isdigit():
+        return int(parts[0]), f.name
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1]), f.name
+    return 0, f.name
 
 
 def _pending_files(path: Path) -> list[Path]:
+    """Every pending spill — current ``*.jsonl`` and 62ededab-era
+    ``*.jsonl.drained`` leftovers — oldest first."""
     try:
-        entries = sorted(pending_dir(path).iterdir())
+        entries = list(pending_dir(path).iterdir())
     except OSError:  # no spill ever happened (the common case), or unreadable
         return []
-    return [e for e in entries if e.name.endswith(_PENDING_SUFFIX)]
+    keep = [e for e in entries
+            if e.name.endswith(_PENDING_SUFFIX) or e.name.endswith(_LEGACY_DRAINED_SUFFIX)]
+    return sorted(keep, key=_spill_sort_key)
+
+
+def _pending_records(f: Path) -> list[tuple[str, Optional[dict], str]]:
+    """``(raw_line, record_or_None, effective_spill_id)`` for each line of a
+    pending file. A record without its own ``spill_id`` (62ededab-era) gets the
+    file's stem as its effective id. Raises ``OSError`` if unreadable."""
+    out: list[tuple[str, Optional[dict], str]] = []
+    stem = _spill_stem(f)
+    for raw in f.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            rec = None
+        if not isinstance(rec, dict):
+            out.append((raw, None, stem))
+            continue
+        sid = rec.get(SPILL_ID_KEY)
+        out.append((raw, rec, sid if isinstance(sid, str) and sid else stem))
+    return out
+
+
+class _LedgerIndex:
+    """What the ledger already holds, for the drain's and the reader's dedupe:
+    the ``spill_id`` of every parseable line, and (built only when a legacy
+    record without an id needs it) the set of raw lines."""
+
+    def __init__(self, lines: list[str]):
+        self._lines = lines
+        self.ids: set[str] = set()
+        self._raw: Optional[set[str]] = None
+        for raw in lines:
+            self.note(raw)
+
+    def note(self, raw: str) -> None:
+        if SPILL_ID_KEY not in raw:
+            return
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            return  # a torn line is not a record: its spill is re-appended
+        if isinstance(rec, dict):
+            sid = rec.get(SPILL_ID_KEY)
+            if isinstance(sid, str) and sid:
+                self.ids.add(sid)
+
+    def holds(self, raw: str, rec: Optional[dict], sid: str) -> bool:
+        if sid in self.ids:
+            return True
+        if rec is not None and not rec.get(SPILL_ID_KEY):
+            # 62ededab-era record: its drainer appended the raw line verbatim.
+            if self._raw is None:
+                self._raw = {ln.strip() for ln in self._lines}
+            return raw in self._raw
+        return False
 
 
 def _drain_pending(path: Path) -> None:
     """Move spilled lines into the ledger. Caller MUST hold :func:`lock_path`.
 
-    Per file: read it, rename it to ``*.drained`` (from then on no reader
-    counts it), append its content, unlink it. A rename that fails (Windows:
-    a reader has it open) leaves the file pending for the next drain, never
-    appended twice; a failed unlink leaves an inert ``*.drained`` file that a
-    later drain removes. Never raises.
+    Per pending file, oldest first: append each of its records whose
+    ``spill_id`` the ledger does not already hold, THEN unlink the file. No
+    intermediate state, so a drainer killed at any step leaves something the
+    next drain finishes correctly: killed before the append, the file is
+    still pending and is appended next time (no loss); killed after the
+    append and before the unlink, the next drain finds the ``spill_id`` in
+    the ledger and only unlinks (no duplicate). An append that raises (a full
+    disk) stops the drain with the file still pending; if part of it reached
+    the ledger, a whole line is recognised by its id and a torn one is not a
+    record, so the retry neither duplicates nor loses it. A 62ededab-era
+    record (no ``spill_id``; a ``*.jsonl.drained`` leftover included) is
+    recognised by its exact line instead, and gains its file's stem as
+    ``spill_id`` when appended.
+
+    Residual, stated: the index is the ledger as it stands, i.e. at most the
+    rotation tail (``_KEEP_LINES``). A pending file whose unlink keeps
+    failing while more than that many newer lines are appended would be
+    appended a second time once its first copy rotates out.
+
+    Every locked writer runs this, so it is also the pending dir's only GC.
+    Never raises.
     """
-    try:
-        pdir = pending_dir(path)
-        for stale in pdir.glob("*" + _DRAINED_SUFFIX):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
-        for f in _pending_files(path):
-            try:
-                body = f.read_text(encoding="utf-8")
-                drained = f.with_name(f.name + _DRAINED_SUFFIX)
-                f.rename(drained)  # a pure rename of a complete file, not a write
-            except OSError:
-                continue
-            if body and not body.endswith("\n"):
-                body += "\n"
-            try:
-                with open(path, "a", encoding="utf-8") as fh:
-                    fh.write(body)
-            except OSError:
-                # Ledger unwritable: put the line back so it is not lost.
-                try:
-                    drained.rename(f)
-                except OSError:
-                    pass
-                return
-            try:
-                drained.unlink()
-            except OSError:
-                pass
-    except OSError:
+    files = _pending_files(path)
+    if not files:
         return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    except OSError:
+        return  # cannot dedupe against an unreadable ledger: leave every spill pending
+    index = _LedgerIndex(lines)
+    for f in files:
+        try:
+            recs = _pending_records(f)
+        except OSError:
+            continue  # vanished, or unreadable (Windows: a reader has it open)
+        out: list[str] = []
+        for raw, rec, sid in recs:
+            if index.holds(raw, rec, sid):
+                continue
+            if rec is not None:
+                if not rec.get(SPILL_ID_KEY):
+                    rec[SPILL_ID_KEY] = sid
+                raw = json.dumps(rec, separators=(",", ":"), default=str)
+            out.append(raw)
+        if out:
+            try:
+                _append(path, "\n".join(out) + "\n")
+            except OSError:
+                return  # ledger unwritable: every remaining spill stays pending
+            for raw in out:
+                index.note(raw)
+        try:
+            f.unlink()
+        except OSError:
+            pass  # inert: the next drain sees its id in the ledger and retries the unlink
 
 
 def drain_pending_locked(path: Optional[Path] = None) -> None:
@@ -272,41 +486,76 @@ def drain_pending_locked(path: Optional[Path] = None) -> None:
     _drain_pending(path or loss_log_path())
 
 
-def iter_records(path: Optional[Path] = None) -> Iterator[dict]:
-    """Every record of the ledger: its lines, then any still-pending spill.
+def pending_stats(path: Optional[Path] = None) -> dict:
+    """``{"files": n, "oldest_ms": epoch-ms or None}`` for :func:`pending_dir`.
 
-    Lock-free: a pending file is complete from the moment it exists, and the
-    drainer renames it away BEFORE appending its line to the ledger, so a
-    concurrent read can at worst miss a line in flight, never count one
-    twice. A missing ledger is no records; an unreadable one raises
-    ``OSError`` (see :func:`summarize`).
+    The age comes from the spill time in the file name. Never raises."""
+    files = _pending_files(path or loss_log_path())
+    oldest = None
+    if files:
+        ns = _spill_sort_key(files[0])[0]
+        oldest = ns // 1_000_000 if ns else None
+    return {"files": len(files), "oldest_ms": oldest}
+
+
+def iter_records(path: Optional[Path] = None) -> Iterator[dict]:
+    """Every record of the ledger: its lines, then any still-pending spill —
+    each spilled record ONCE.
+
+    Lock-free. Pending files are read FIRST, the ledger after: the drainer
+    appends a spill to the ledger before unlinking its file, so a record is
+    either still in its pending file when that is read or already in the
+    ledger when the ledger is read — a concurrent drain never hides one. A
+    record seen in both (read mid-drain) is yielded once, matched by its
+    ``spill_id`` (62ededab-era records: by their exact line). A missing
+    ledger is no records; an unreadable one raises ``OSError`` (see
+    :func:`summarize`).
     """
     p = path or loss_log_path()
-    sources: list[Path] = [p] if p.exists() else []
-    sources += _pending_files(p)
-    for i, src in enumerate(sources):
+    pending: list[tuple[str, Optional[dict], str]] = []
+    for f in _pending_files(p):
         try:
-            fh = open(src, encoding="utf-8")
-        except FileNotFoundError:
-            continue  # a pending file drained under our feet
+            pending += _pending_records(f)
         except OSError:
-            if i == 0 and src == p:
-                raise
-            continue
+            continue  # drained under our feet: its line is in the ledger now
+    want_raw = any(rec is not None and not rec.get(SPILL_ID_KEY) for _, rec, _ in pending)
+    seen_ids: set[str] = set()
+    seen_raw: set[str] = set()
+    try:
+        fh = open(p, encoding="utf-8")
+    except FileNotFoundError:
+        fh = None
+    if fh is not None:
         with fh:
             for raw in fh:
                 try:
                     rec = json.loads(raw)
                 except ValueError:
                     continue
-                if isinstance(rec, dict):
-                    yield rec
+                if not isinstance(rec, dict):
+                    continue
+                sid = rec.get(SPILL_ID_KEY)
+                if isinstance(sid, str) and sid:
+                    seen_ids.add(sid)
+                if want_raw:
+                    seen_raw.add(raw.strip())
+                yield rec
+    for raw, rec, sid in pending:
+        if rec is None or sid in seen_ids:
+            continue
+        if not rec.get(SPILL_ID_KEY) and raw in seen_raw:
+            continue
+        seen_ids.add(sid)
+        yield rec
 
 
 def summarize(since_ms: Optional[int] = None, path: Optional[Path] = None) -> dict:
     """Aggregate the ledger: ``{"total", "by_kind": {kind: {reason: n}}, "last_ts_ms",
-    "partial_twins", "partial_missing_nodes"}`` (``total`` / ``by_kind`` count
-    lost EVENTS; partial twins are reported apart).
+    "partial_twins", "partial_missing_nodes", "pending_files",
+    "pending_oldest_ms"}`` (``total`` / ``by_kind`` count lost EVENTS; partial
+    twins are reported apart; the two ``pending_*`` keys describe
+    :func:`pending_dir` regardless of ``since_ms`` — spilled lines not yet
+    drained, already counted in the totals).
 
     ``since_ms`` limits the count to lines at or after that epoch-ms. Reads the
     ledger as it stands plus any not-yet-drained spilled line
@@ -323,6 +572,9 @@ def summarize(since_ms: Optional[int] = None, path: Optional[Path] = None) -> di
         "partial_twins": 0,
         "partial_missing_nodes": 0,
     }
+    stats = pending_stats(p)
+    out["pending_files"] = stats["files"]
+    out["pending_oldest_ms"] = stats["oldest_ms"]
     for rec in iter_records(p):
         ts = rec.get("ts_ms")
         if since_ms is not None and (not isinstance(ts, int) or ts < since_ms):
@@ -355,11 +607,13 @@ __all__ = [
     "KIND_WRITER_UNAVAILABLE",
     "KIND_OUTCOME_UNSENT",
     "LOSS_FILE_NAME",
+    "SPILL_ID_KEY",
     "drain_pending_locked",
     "iter_records",
     "lock_path",
     "loss_log_path",
     "pending_dir",
+    "pending_stats",
     "record_loss",
     "summarize",
 ]

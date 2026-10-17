@@ -682,6 +682,9 @@ def test_episode_bump_finds_its_line_when_it_was_spilled(tmp_path, monkeypatch):
     assert not ledger.exists()
     hub_writer._bump_episode_ledger_line("ep-1", 7)
     recs = [json.loads(x) for x in ledger.read_text().splitlines()]
+    (sid,) = [r.pop(m.SPILL_ID_KEY) for r in recs]  # its idempotency key survives
+    assert sid
     assert recs == [{"ts_ms": 1, "kind": "hub_post_failed", "reason": "refused",
                      "episode": "ep-1", "suppressed": 7}]
-    assert list(m.iter_records()) == recs
+    assert [{k: v for k, v in r.items() if k != m.SPILL_ID_KEY}
+            for r in m.iter_records()] == recs

@@ -34,6 +34,7 @@ import pytest
 from claude_mcp_servers.rl_client import deferred_emit as de
 from claude_mcp_servers.rl_client import hub_writer
 from claude_mcp_servers.rl_client import telemetry_emit
+from tests.common.rl_loss_ledger import clean_loss_ledger, loss_records
 from vco_lib import rl_telemetry_loss
 
 EV = {"event_type": "retrieval", "task_id": "T1", "task_type": "pre_edit_kg_search",
@@ -46,22 +47,16 @@ EV = {"event_type": "retrieval", "task_id": "T1", "task_type": "pre_edit_kg_sear
 
 
 def _loss_lines():
-    p = rl_telemetry_loss.loss_log_path()
-    if not p.exists():
-        return []
-    return [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
+    return loss_records()
 
 
 @pytest.fixture(autouse=True)
 def _clean_state():
     hub_writer._reset_hub_down_bookkeeping_for_test()
     rl_telemetry_loss._reset_warned_for_test()
-    p = rl_telemetry_loss.loss_log_path()
-    if p.exists():
-        p.unlink()
+    clean_loss_ledger()
     yield
-    if p.exists():
-        p.unlink()
+    clean_loss_ledger()
 
 
 @pytest.fixture

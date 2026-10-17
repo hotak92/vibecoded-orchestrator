@@ -50,6 +50,7 @@ from claude_mcp_servers.rl_client import hub_writer, outcome_emit, telemetry_emi
 from claude_mcp_servers.rl_client.rl_logger import RLDataLogger
 from claude_mcp_servers.weaviate_mcp import rl_enrichment
 from claude_mcp_servers.weaviate_mcp import server as srv
+from tests.common.rl_loss_ledger import clean_loss_ledger, loss_records
 from vco_lib import rl_telemetry_loss
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -69,10 +70,7 @@ EV = {
 
 
 def _loss_lines():
-    p = rl_telemetry_loss.loss_log_path()
-    if not p.exists():
-        return []
-    return [json.loads(x) for x in p.read_text().splitlines() if x.strip()]
+    return loss_records()
 
 
 @pytest.fixture(autouse=True)
@@ -80,9 +78,7 @@ def _clean_state():
     hub_writer._reset_hub_down_bookkeeping_for_test()
     rl_telemetry_loss._reset_warned_for_test()
     rl_enrichment._reset_rl_telemetry_writers()
-    p = rl_telemetry_loss.loss_log_path()
-    if p.exists():
-        p.unlink()
+    clean_loss_ledger()
     # Absent on pre-fix sources (the W3R-9 identity cache is new); tolerant so
     # red-proof runs fail on ASSERTIONS, not on fixture AttributeErrors.
     idc_path = None
@@ -94,8 +90,7 @@ def _clean_state():
     yield
     hub_writer._reset_hub_down_bookkeeping_for_test()
     rl_enrichment._reset_rl_telemetry_writers()
-    if p.exists():
-        p.unlink()
+    clean_loss_ledger()
     if idc_path is not None and idc_path.exists():
         idc_path.unlink()
 
