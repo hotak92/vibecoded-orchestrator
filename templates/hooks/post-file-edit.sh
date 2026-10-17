@@ -172,7 +172,7 @@ sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 # leaves any LLM-visible text in $VCO_ROUTE_NUDGE.
 if command -v vco_route_touched_path >/dev/null 2>&1; then
     vco_route_init "$SCRIPT_DIR" "$PROJECT_ROOT" "$PY"
-    vco_route_touched_path "$EDITED_FILE" "$SESSION_ID_FROM_STDIN"
+    vco_route_touched_path "$EDITED_FILE" "$SESSION_ID_FROM_STDIN" "$AGENT_ID"
     if [ -n "${VCO_ROUTE_NUDGE:-}" ]; then
         _add_nudge "$VCO_ROUTE_NUDGE"
     fi

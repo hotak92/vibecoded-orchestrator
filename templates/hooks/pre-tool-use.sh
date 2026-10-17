@@ -351,35 +351,18 @@ fi
 # `--shell powershell` rule set reads its syntax) ===
 if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
     CMD=$(_get_field "command")
-    INJECTION_FOUND=""
 
-    # Pattern A: network fetch piped directly to a shell interpreter
-    if echo "$CMD" | grep -qiE "(curl|wget)\s[^|]+\|\s*(ba)?sh\b" 2>/dev/null; then
-        INJECTION_FOUND="network fetch piped to shell"
-    fi
-
-    # Pattern B: eval + network fetch (remote code execution)
-    if [[ -z "$INJECTION_FOUND" ]] && echo "$CMD" | grep -qiE "eval\s+[\"\$\(]*(curl|wget)" 2>/dev/null; then
-        INJECTION_FOUND="eval + network fetch"
-    fi
-
-    # Pattern C: base64-decoded pipe to shell
-    if [[ -z "$INJECTION_FOUND" ]] && echo "$CMD" | grep -qiE "base64\s+-d.*\|\s*(ba)?sh\b" 2>/dev/null; then
-        INJECTION_FOUND="base64-decoded pipe to shell"
-    fi
-
-    if [[ -n "$INJECTION_FOUND" ]]; then
-        # Block messages route to stderr — see bash-security branch.
-        {
-            echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in $TOOL_NAME command."
-            echo "   Blocked command preview: ${CMD:0:120}"
-            echo "   If this is intentional, run the command manually in a terminal."
-        } >&2
-        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"shell_injection_blocked\",\"pattern\":\"$INJECTION_FOUND\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
-        exit 2
-    fi
-
-    # Extended security scan via bash_security.py
+    # v0.2.104 E-3: ONE verdict home. The full scanner (bash_security.py)
+    # carries the same three network/base64 rules as the raw patterns below,
+    # but reads quote state and here-doc bodies: `cat > notes.md <<'EOF'`
+    # whose BODY mentions `curl … | sh` is data, not a command, and passes;
+    # `bash <<EOF` whose body runs it is scanned as the shell code it is.
+    # The raw grep used to run FIRST on the whole text and blocked every
+    # such file write (agents fell back to python edit scripts). It now runs
+    # only when the full scanner could NOT render a verdict (script missing,
+    # interpreter crash) — the strict safety net of a broken install.
+    # MUST MATCH pre-tool-use.ps1.
+    _SEC_VERDICT=""   # pass | "" (no verdict)
     SECURITY_SCRIPT="$PROJECT_ROOT/.claude/scripts/bash_security.py"
     if [[ -f "$SECURITY_SCRIPT" ]]; then
         _SEC_SHELL="bash"
@@ -401,6 +384,39 @@ if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
                 echo "   $SECURITY_RESULT"
             } >&2
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"bash_security_blocked\",\"detail\":\"${SECURITY_RESULT:0:200}\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
+            exit 2
+        elif [[ "$SECURITY_EXIT" -eq 0 ]]; then
+            _SEC_VERDICT="pass"
+        fi
+    fi
+
+    if [[ "$_SEC_VERDICT" != "pass" ]]; then
+        INJECTION_FOUND=""
+        # Pattern A: network fetch piped directly to a shell interpreter
+        if echo "$CMD" | grep -qiE "(curl|wget)\s[^|]+\|\s*(ba)?sh\b" 2>/dev/null; then
+            INJECTION_FOUND="network fetch piped to shell"
+        fi
+
+        # Pattern B: eval + network fetch (remote code execution)
+        if [[ -z "$INJECTION_FOUND" ]] && echo "$CMD" | grep -qiE "eval\s+[\"\$\(]*(curl|wget)" 2>/dev/null; then
+            INJECTION_FOUND="eval + network fetch"
+        fi
+
+        # Pattern C: base64-decoded pipe to shell
+        if [[ -z "$INJECTION_FOUND" ]] && echo "$CMD" | grep -qiE "base64\s+-d.*\|\s*(ba)?sh\b" 2>/dev/null; then
+            INJECTION_FOUND="base64-decoded pipe to shell"
+        fi
+
+        if [[ -n "$INJECTION_FOUND" ]]; then
+            # Block messages route to stderr — see bash-security branch.
+            # MUST MATCH pre-tool-use.ps1's fallback message.
+            {
+                echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in $TOOL_NAME command."
+                echo "   Blocked command preview: ${CMD:0:120}"
+                echo "   The full scanner (.claude/scripts/bash_security.py) gave no verdict, so this raw-text check decided; it cannot tell a heredoc file body from a command."
+                echo "   To write a file whose content mentions this text, use the Write tool. If the command is intentional, run it manually in a terminal."
+            } >&2
+            echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"shell_injection_blocked\",\"pattern\":\"$INJECTION_FOUND\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
             exit 2
         fi
     fi

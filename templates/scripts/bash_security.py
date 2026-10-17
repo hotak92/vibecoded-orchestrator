@@ -66,20 +66,27 @@ _rule(
 )
 
 # === 2. Network exfiltration ===
+# v0.2.104 E-3: the sanctioned alternative named in each block message. A
+# here-doc body written to a FILE is data and never matches (see
+# _heredoc_interp_payloads); these rules fire on a command, or on prose in
+# a double-quoted argument, where the Write tool is the clean route.
+_TEXT_WRITE_HINT = "; to write a FILE whose text only mentions this, use the Write tool or a quoted heredoc (cat > file <<'EOF')"
 _rule(
     "curl_pipe_shell",
     r"(curl|wget)\s[^|]*\|\s*(ba)?sh\b",
-    "Network fetch piped to shell interpreter",
+    "Network fetch piped to shell interpreter (download to a file and inspect it "
+    "before running it" + _TEXT_WRITE_HINT + ")",
 )
 _rule(
     "eval_network",
     r"eval\s+[\"$\(]*(curl|wget)",
-    "eval with network fetch (remote code execution)",
+    "eval with network fetch (remote code execution" + _TEXT_WRITE_HINT + ")",
 )
 _rule(
     "base64_pipe_shell",
     r"base64\s+-d.*\|\s*(ba)?sh\b",
-    "Base64-decoded content piped to shell",
+    "Base64-decoded content piped to shell (decode to a file and inspect it "
+    "first" + _TEXT_WRITE_HINT + ")",
 )
 _rule(
     "env_exfil_curl",
@@ -656,6 +663,53 @@ _PYTHON_ENV_SECRET = re.compile(
 )
 
 _MAX_INTERP_DEPTH = 5
+
+# v0.2.104 E-3: a here-doc whose body is FED TO AN INTERPRETER is code, not
+# data: `bash <<EOF … EOF`, `cat <<EOF | sh`, `python3 - <<'EOF' … EOF`. Every
+# other here-doc body (`cat > notes.md <<'EOF'`) stays inert — which is what
+# lets an ordinary file write through. The sink test runs on the opener line's
+# NEUTRALIZED text (quoted contents blanked), so an interpreter name inside a
+# quoted string on that line never counts. A command-position word: line
+# start or after a `|;&(` separator, optionally behind a launcher word.
+_CMD_POS = r"(?:^|[|;&(])\s*(?:(?:sudo|exec|env|command|nohup|time)\s+)*"
+_HEREDOC_SHELL_SINK = re.compile(
+    _CMD_POS + _PATH_PREFIX + r"(?:ba|z|da|k)?sh(?=\s|$|[|;&<])", re.IGNORECASE
+)
+_HEREDOC_PYTHON_SINK = re.compile(
+    _CMD_POS + _PATH_PREFIX + r"python[23]?(?:\.\d+)?(?=\s|$|[|;&<])", re.IGNORECASE
+)
+
+
+def _heredoc_interp_payloads(cmd: str) -> tuple[list[str], list[str]]:
+    """Return ``(shell_bodies, python_bodies)``: the bodies of here-docs whose
+    opener line feeds them to a shell / python interpreter (see the sink
+    patterns above). A body is collected whole (quoted or not — quoting only
+    governs ``$VAR`` expansion, never whether the interpreter executes it)."""
+    lines = cmd.split("\n")
+    shell_bodies: list[str] = []
+    python_bodies: list[str] = []
+    i = 0
+    while i < len(lines):
+        rendered, openers = _neutralize_line(lines[i], env_read=False)
+        i += 1
+        if not openers:
+            continue
+        to_shell = bool(_HEREDOC_SHELL_SINK.search(rendered))
+        to_python = bool(_HEREDOC_PYTHON_SINK.search(rendered))
+        for delim, _quoted in openers:
+            body: list[str] = []
+            while i < len(lines):
+                if lines[i].strip() == delim:
+                    i += 1
+                    break
+                body.append(lines[i])
+                i += 1
+            text = "\n".join(body)
+            if to_shell:
+                shell_bodies.append(text)
+            elif to_python:
+                python_bodies.append(text)
+    return shell_bodies, python_bodies
 
 
 def _strip_heredoc_bodies(cmd: str) -> str:
@@ -1245,6 +1299,10 @@ def check_command(cmd: str, _depth: int = 0, shell: str = "bash") -> tuple[bool,
     # `ssh`/`su`/`ksh`) closes the nine round-2 FNs. One extraction feeds both
     # the shell-recursion and the python-secret check.
     shell_payloads, python_payloads = _extract_interp_payloads(cmd)
+    # v0.2.104 E-3: here-doc bodies fed to an interpreter are payloads too.
+    heredoc_shell, heredoc_python = _heredoc_interp_payloads(cmd)
+    shell_payloads += heredoc_shell
+    python_payloads += heredoc_python
 
     # Recurse into interpreter `-c`/`eval` payloads. The quoted body of
     # `bash -c '…'` / `sh -c "…"` / `eval '…'` / `su -c '…'` / `ssh host '…'` is

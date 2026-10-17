@@ -245,6 +245,19 @@ class _PostLegStdout:
         return getattr(self._fallback, "errors", None)
 
 
+#: v0.2.104 E-2: set once any run_legs call abandoned a leg at its deadline.
+#: An abandoned leg may hold NON-daemon threads of its own (an executor pool
+#: inside the producer), which the interpreter joins at exit — so "the daemon
+#: thread dies with the process" holds only if the process exits HARD. The
+#: router reads this through legs_abandoned() and does exactly that.
+_LEGS_ABANDONED = False
+
+
+def legs_abandoned() -> bool:
+    """True when a :func:`run_legs` call in this process abandoned a leg."""
+    return _LEGS_ABANDONED
+
+
 def run_legs(
     legs: "Dict[str, Callable[[], None]]",
     leg_timeout_s: "float | None" = None,
@@ -258,7 +271,8 @@ def run_legs(
     caller of this function; its marker/argv/cap contracts are unchanged.
 
     ``leg_timeout_s`` bounds the JOIN, not the legs: a leg still running at
-    the deadline is abandoned (daemon thread — it dies with the process) and
+    the deadline is abandoned (daemon thread — it dies with the process,
+    which the caller ends hard when :func:`legs_abandoned` says so) and
     its result stays "". An abandoned leg that prints LATER is fenced by
     :class:`_PostLegStdout`: when any leg was abandoned, ``sys.stdout`` is
     left set to a pass-through that DROPS the abandoned threads' writes, so
@@ -266,6 +280,7 @@ def run_legs(
     timeout (the legacy ``main()`` path) every leg is joined, no fence is
     needed, and the real stdout is restored exactly as before.
     """
+    global _LEGS_ABANDONED
     real_stdout = sys.stdout
     proxy = _ThreadRoutedStdout(real_stdout)
     results: "dict[str, str]" = {name: "" for name in legs}
@@ -295,6 +310,7 @@ def run_legs(
     finally:
         abandoned = [t for t in threads if t.is_alive()]
         if abandoned:
+            _LEGS_ABANDONED = True
             # SF-1 fence: keep a guarded stream installed so late writes from
             # the abandoned daemon threads are dropped instead of hitting the
             # caller's real stdout during its emit window.

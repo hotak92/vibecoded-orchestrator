@@ -25,7 +25,7 @@
 # CONTRACT FOR CALLERS
 #   . _lib/route-touched-path.sh
 #   vco_route_init "<hooks_dir>" "<project_root>" "<python>"
-#   vco_route_touched_path "<absolute_path>" "<session_id>"
+#   vco_route_touched_path "<absolute_path>" "<session_id>" ["<agent_id>"]
 #   # then: append "$VCO_ROUTE_NUDGE" to whatever the hook emits.
 #
 # Every function is exit-0 / soft-fail: a PostToolUse hook can never block
@@ -36,6 +36,11 @@ if [ -n "${_VCO_ROUTE_TOUCHED_PATH_SOURCED:-}" ]; then
     return 0 2>/dev/null || true
 fi
 _VCO_ROUTE_TOUCHED_PATH_SOURCED=1
+
+# v0.2.104 E-1: path containment (vco_path_under_root) for the reminder gate.
+# shellcheck source=project-root.sh disable=SC1091
+[ -f "$(dirname "${BASH_SOURCE[0]}")/project-root.sh" ] \
+    && . "$(dirname "${BASH_SOURCE[0]}")/project-root.sh"
 
 # Accumulates LLM-visible text the caller should emit (currently only the
 # pending duplicate-scan report). Callers read it after the call.
@@ -473,13 +478,43 @@ vco_route_init() {
 }
 
 # ===========================================================================
-# vco_route_touched_path <absolute_path> [session_id]
+# Should this code edit be listed in the end-of-turn "[Code edit reminder]"?
+# v0.2.104 E-1. The reminder is drained by stop-codegraph-reminder.sh, a
+# STOP hook — it fires for the MAIN agent only (a subagent ends on
+# SubagentStop, which drains nothing). A subagent's PostToolUse payload
+# carries the PARENT's session_id plus a non-empty agent_id, so before this
+# fix every lane edit (in its own worktree, in /tmp) landed in the parent's
+# accumulator and the parent was told it edited files it never touched.
+#   - agent_id non-empty -> NOT listed (skip, rather than key per agent: a
+#     per-agent accumulator would have no drainer and grow forever).
+#   - path outside the project root (raw OR symlink-resolved) and not under
+#     an enabled extra code folder -> NOT listed: a /tmp scratch script is
+#     not "this project's work item"; a registered code folder is.
+# The code-graph drain queues are NOT gated by this — a lane's edit still
+# reaches the code graph exactly as before. MUST MATCH
+# Test-VcoRouteReminderWanted in route-touched-path.ps1.
+# $1 = absolute touched path, $2 = agent_id, $3 = the extra queue the edit
+# was routed to (empty = none). Returns 0 = list it.
+# Containment is decided by vco_path_under_root (_lib/project-root.sh, the
+# one home for "is this path inside the project"); without that helper (a
+# partial install) nothing outside an extra is listed — the conservative side.
+_vco_route_reminder_wanted() {
+    local touched="$1" agent_id="${2:-}" extra_queue="${3:-}"
+    [ -z "$agent_id" ] || return 1
+    [ -z "$extra_queue" ] || return 0
+    command -v vco_path_under_root >/dev/null 2>&1 || return 1
+    vco_path_under_root "$_VCO_ROUTE_PROJECT_ROOT" "$touched"
+}
+
+# ===========================================================================
+# vco_route_touched_path <absolute_path> [session_id] [agent_id]
 # ===========================================================================
 # The whole routing decision for ONE file. Idempotent per file per debounce
 # window; safe to call in a loop over several paths.
 vco_route_touched_path() {
     local touched="${1:-}"
     local session_id="${2:-}"
+    local agent_id="${3:-}"
     [ -n "$touched" ] || return 0
     [ -n "${_VCO_ROUTE_PROJECT_ROOT:-}" ] || return 0
 
@@ -556,8 +591,6 @@ vco_route_touched_path() {
         # session (empty id) just skips accumulation.
         if [ -n "$session_id" ]; then
             mkdir -p "$PROJECT_ROOT/.claude/state" 2>/dev/null || true
-            local _EDIT_ACCUM="$PROJECT_ROOT/.claude/state/edit_reminder_${session_id}.txt"
-            printf '%s\n' "$touched" >> "$_EDIT_ACCUM" 2>/dev/null || true
             # v0.2.73 (FIX-B): SEPARATE code-graph drain queue. The reminder
             # accumulator above is drained + cleared EVERY turn by
             # stop-codegraph-reminder.sh; the drain queue below is drained by
@@ -580,6 +613,14 @@ vco_route_touched_path() {
             if [ -z "$_EXTRA_QUEUE" ]; then
                 local _CG_DRAIN_QUEUE="$PROJECT_ROOT/.claude/state/codegraph_drain_${session_id}.txt"
                 printf '%s\n' "$touched" >> "$_CG_DRAIN_QUEUE" 2>/dev/null || true
+            fi
+            # v0.2.104 E-1: only the MAIN agent's edits inside the project
+            # (its root, or an enabled extra code folder) feed the reminder —
+            # see _vco_route_reminder_wanted. The drain queues above are
+            # unaffected, so a lane's edit still reaches the code graph.
+            if _vco_route_reminder_wanted "$touched" "$agent_id" "$_EXTRA_QUEUE"; then
+                local _EDIT_ACCUM="$PROJECT_ROOT/.claude/state/edit_reminder_${session_id}.txt"
+                printf '%s\n' "$touched" >> "$_EDIT_ACCUM" 2>/dev/null || true
             fi
         fi
     fi

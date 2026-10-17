@@ -84,3 +84,49 @@ vco_project_root() {
     fi
     vco_find_project_root "${1:-$PWD}"
 }
+
+# ---------------------------------------------------------------------------
+# Path containment (v0.2.104 E-1/E-2). MUST MATCH the Test-VcoPath* pair in
+# _lib/project-root.ps1.
+#
+# vco_path_under_root <root> <path> — 0 when <path> sits strictly inside
+# <root>, compared raw first and then with both sides symlink-resolved (the
+# path through its parent directory, which must exist for that leg). A path
+# EQUAL to the root is not "under" it. No subprocess.
+vco_path_under_root() {
+    local root="${1%/}" p="${2:-}" proot pdir pphys
+    [ -n "$root" ] && [ -n "$p" ] || return 1
+    case "$p" in
+        "$root"/*) return 0 ;;
+    esac
+    proot="$(_vco_pr_phys "$root")" || return 1
+    case "$p" in
+        */*) pdir="${p%/*}" ;;
+        *) return 1 ;;
+    esac
+    [ -n "$pdir" ] || pdir="/"
+    pphys="$(_vco_pr_phys "$pdir")" || return 1
+    [ "$pphys" = "/" ] && pphys=""
+    case "$pphys/${p##*/}" in
+        "${proot%/}"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# vco_path_in_project <root> <path> — 0 when <path> belongs to the project:
+# under <root>, or under one of the project's ENABLED extra code folders as
+# listed in <root>/.claude/state/codegraph_extra_paths_cache.txt (one path
+# per line; the cache _lib/route-touched-path.sh maintains). A missing cache
+# means "no extras". Read-only — this never refreshes the cache.
+vco_path_in_project() {
+    local root="$1" p="$2" cache line
+    vco_path_under_root "$root" "$p" && return 0
+    cache="$root/.claude/state/codegraph_extra_paths_cache.txt"
+    [ -f "$cache" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [ -n "$line" ] || continue
+        vco_path_under_root "$line" "$p" && return 0
+    done < "$cache"
+    return 1
+}

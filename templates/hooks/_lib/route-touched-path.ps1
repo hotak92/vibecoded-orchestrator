@@ -17,7 +17,7 @@
 # CONTRACT FOR CALLERS
 #   . $PSScriptRoot/_lib/route-touched-path.ps1
 #   Initialize-VcoRoute -HooksDir <dir> -ProjectRoot <dir>
-#   Invoke-VcoRouteTouchedPath -Path <abs> -SessionId <id>
+#   Invoke-VcoRouteTouchedPath -Path <abs> -SessionId <id> [-AgentId <id>]
 #   # then: emit $script:VcoRouteNudge through Emit-AdditionalContext.
 #
 # Dot-sourced, never executed. Library, not a hook.
@@ -28,6 +28,9 @@ $script:VcoRouteTouchedPathSourced = $true
 . (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
 # The detached dup-scan child dot-sources the same helper by absolute path.
 $script:VcoUtf8NoBomLib = Join-Path $PSScriptRoot "utf8-nobom.ps1"
+# v0.2.104 E-1: path containment (Test-VcoPathUnderRoot) for the reminder gate.
+$script:VcoRouteProjectRootLib = Join-Path $PSScriptRoot "project-root.ps1"
+if (Test-Path -LiteralPath $script:VcoRouteProjectRootLib) { . $script:VcoRouteProjectRootLib }
 
 # Accumulates LLM-visible text the caller should emit (currently only the
 # pending duplicate-scan report).
@@ -524,10 +527,33 @@ function Add-VcoRouteExtraQueue {
 }
 
 
+# Should this code edit be listed in the end-of-turn "[Code edit reminder]"?
+# v0.2.104 E-1. The reminder is drained by stop-codegraph-reminder.ps1, a
+# STOP hook -- it fires for the MAIN agent only (a subagent ends on
+# SubagentStop, which drains nothing). A subagent's PostToolUse payload
+# carries the PARENT's session_id plus a non-empty agent_id, so before this
+# fix every lane edit (in its own worktree, in a temp dir) landed in the
+# parent's accumulator.
+#   - AgentId non-empty -> NOT listed (skip, rather than key per agent: a
+#     per-agent accumulator would have no drainer and grow forever).
+#   - path outside the project root (raw OR symlink-resolved) and not under
+#     an enabled extra code folder -> NOT listed.
+# The code-graph drain queues are NOT gated by this. MUST MATCH
+# _vco_route_reminder_wanted in route-touched-path.sh.
+function Test-VcoRouteReminderWanted {
+    param([string]$Path, [string]$AgentId = "", [string]$ExtraQueue = "")
+    if ($AgentId) { return $false }
+    if ($ExtraQueue) { return $true }
+    # Containment: Test-VcoPathUnderRoot (_lib/project-root.ps1, the one
+    # home); absent helper (partial install) -> not listed.
+    if (-not (Get-Command Test-VcoPathUnderRoot -ErrorAction SilentlyContinue)) { return $false }
+    return (Test-VcoPathUnderRoot -Root $script:VcoRouteProjectRoot -Path $Path)
+}
+
 # Invoke-VcoRouteTouchedPath: the whole routing decision for ONE file.
 # Idempotent per file per debounce window; safe to call in a loop.
 function Invoke-VcoRouteTouchedPath {
-    param([string]$Path, [string]$SessionId = "")
+    param([string]$Path, [string]$SessionId = "", [string]$AgentId = "")
 
     if (-not $Path) { return }
     if (-not $script:VcoRouteProjectRoot) { return }
@@ -752,8 +778,6 @@ try {
                 if (-not (Test-Path -LiteralPath $stateDir)) {
                     New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction Stop | Out-Null
                 }
-                $accum = Join-Path $stateDir ("edit_reminder_{0}.txt" -f $SessionId)
-                Add-Content -LiteralPath $accum -Value $Path -ErrorAction Stop
                 # v0.2.102 S16-7: a code file under an ENABLED extra code-graph
                 # path goes to the PER-EXTRA queue instead -- a path outside
                 # the primary root must never be analyzed under the primary's
@@ -767,6 +791,13 @@ try {
                 if (-not $extraQueue) {
                     $cgQueue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
                     Add-Content -LiteralPath $cgQueue -Value $Path -ErrorAction SilentlyContinue
+                }
+                # v0.2.104 E-1: only the MAIN agent's edits inside the project
+                # (its root, or an enabled extra code folder) feed the
+                # reminder. The drain queues above are unaffected.
+                if (Test-VcoRouteReminderWanted -Path $Path -AgentId $AgentId -ExtraQueue $extraQueue) {
+                    $accum = Join-Path $stateDir ("edit_reminder_{0}.txt" -f $SessionId)
+                    Add-Content -LiteralPath $accum -Value $Path -ErrorAction Stop
                 }
             } catch { }
         }

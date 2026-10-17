@@ -66,7 +66,11 @@ Env seams (tests + Wave 2):
   checkout's ``templates/scripts/query_code_graph.py``);
 * ``VCO_INJECT_BUDGET_S`` (default 6) — whole-run inner bound (fits under
   the smallest shipped surface timeout; injection is the deliberately
-  bounded, silence-safe class per the 2026-10-06 owner ruling);
+  bounded, silence-safe class per the 2026-10-06 owner ruling); counted
+  from the hook's start since v0.2.104 E-2 (see ``VCO_HOOK_STARTED_AT``);
+* ``VCO_HOOK_STARTED_AT`` — the wrapper's start, epoch seconds, exported by
+  a wrapper just before it spawns this script so the budget covers the
+  wrapper's own pre-spawn work (:func:`_run_deadline_anchor`);
 * ``VCO_INJECT_LEG_TIMEOUT_S`` (default 4) — per-leg join bound;
 * ``VCO_QUERY_CACHE_TTL`` (default 900) — the router's cache window; the
   knob's OTHER reader is the pre-edit wrapper's replay cache
@@ -100,6 +104,13 @@ import sys
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+
+#: v0.2.104 E-2: the moment this interpreter reached its first statement —
+#: taken BEFORE the vco_lib / producer imports below, so the run deadline
+#: covers them. Used as the deadline anchor only for a real hook run
+#: (``__main__``); an in-process caller anchors at its own call time.
+_PROCESS_T0 = time.monotonic()
+_DEADLINE_ANCHOR: Optional[float] = None
 
 _HERE = Path(__file__).resolve().parent          # claude_mcp_servers/scripts
 _ORCH_ROOT = _HERE.parent.parent
@@ -963,11 +974,16 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
     warm_kg: Dict[str, object] = {}
     warm_cg: Dict[str, object] = {}
 
+    # v0.2.104 E-2: the producer modules are LOADED inside their leg (the
+    # worker thread), never here in the main thread. A cold producer import
+    # (weaviate-client, grpc, pydantic: 4.7-11.6 s measured cold) used to run
+    # BEFORE the join deadline existed, so a cold Write took import + legs
+    # and overran the 10 s PreToolUse registration. Inside the leg it is
+    # bounded by the same deadline as the query itself.
     if kg_key:
         kg_script = _resolve_kg_script()
         if kg_script.is_file():
             try:
-                kg_mod = _hds._load_cg_module(kg_script)
                 # v0.2.102 W6-F fix-round (review MEDIUM): the producer's
                 # lazy weaviate_mcp.server import runs inside the leg, i.e.
                 # in run_legs' WORKER thread, and that module registers a
@@ -985,10 +1001,11 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                         "--task-type", task_type_for(plan.kg_profile)]
                 if transcript_path:
                     argv += ["--transcript", transcript_path]
-                _hds._pin_argv(kg_mod, argv)
                 warm_kg = {"script": str(kg_script), "argv": [str(a) for a in argv]}
 
-                def _kg_leg(mod=kg_mod) -> None:
+                def _kg_leg(script=kg_script, kg_argv=tuple(argv)) -> None:
+                    mod = _hds._load_cg_module(script)
+                    _hds._pin_argv(mod, list(kg_argv))
                     # rl_kg_search.main is async; the VCO_ROUTER_KG_SCRIPT
                     # test seam may point at a SYNC stub producer — accept
                     # both (the documented producer contract is "a main()
@@ -999,14 +1016,13 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
 
                 legs["kg"] = _kg_leg
             except BaseException as exc:  # noqa: BLE001 — never block the tool
-                print(f"[hook_context_router] KG leg load failed: {exc!r}",
+                print(f"[hook_context_router] KG leg setup failed: {exc!r}",
                       file=sys.stderr)
 
     if cg_keys:
         cg_script = _resolve_cg_script(project_root)
         if cg_script is not None:
             try:
-                cg_mod = _hds._load_cg_module(cg_script)
                 if len(cg_keys) == 1:
                     # L4: only the sole-symbol run is cached (mirroring the
                     # cache write below), so only it is warmable.
@@ -1017,7 +1033,8 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                                "argv": [str(a) for a in _cg_argv(
                                    only_sym, only_src, policy, plan.cg_profile)]}
 
-                def _cg_leg(mod=cg_mod, items=tuple(cg_keys.items()), pol=policy) -> None:
+                def _cg_leg(script=cg_script, items=tuple(cg_keys.items()), pol=policy) -> None:
+                    mod = _hds._load_cg_module(script)
                     for symbol, _key in items:
                         source_file = next(
                             (sf for sym, sf in plan.cg_symbols if sym == symbol), "")
@@ -1026,7 +1043,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
 
                 legs["cg"] = _cg_leg
             except BaseException as exc:  # noqa: BLE001
-                print(f"[hook_context_router] CG leg load failed: {exc!r}",
+                print(f"[hook_context_router] CG leg setup failed: {exc!r}",
                       file=sys.stderr)
 
     if legs:
@@ -1622,6 +1639,58 @@ def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str,
     _budget_charge(budget_path, len(text) + 1)
 
 
+def _run_deadline_anchor() -> float:
+    """The monotonic instant the run's budget is counted from (v0.2.104 E-2).
+
+    The harness timeout (10 s for every injection registration) runs from
+    the moment it spawned the WRAPPER, not from when this function body
+    starts: interpreter start-up, the module imports and the wrapper's own
+    pre-spawn work all spend it. So the anchor is the EARLIEST trustworthy
+    start we know of:
+
+    * a real hook run (``__main__``) — this interpreter's first statement
+      (``_PROCESS_T0``), not the call to ``_main``;
+    * ``VCO_HOOK_STARTED_AT`` — the wrapper's own start, epoch seconds,
+      exported just before it spawns this script. Honoured only when it is
+      plausible (in the past, under 60 s ago); a stale or garbage value from
+      an ambient env is ignored rather than collapsing the budget.
+
+    An in-process caller (tests, embedders) anchors at the call itself.
+    """
+    now = time.monotonic()
+    anchor = _DEADLINE_ANCHOR if _DEADLINE_ANCHOR is not None else now
+    raw = (os.environ.get("VCO_HOOK_STARTED_AT") or "").strip()
+    if raw and _DEADLINE_ANCHOR is not None:
+        try:
+            elapsed = time.time() - float(raw)
+        except ValueError:
+            elapsed = -1.0
+        if 0.0 <= elapsed <= 60.0:
+            anchor = min(anchor, now - elapsed)
+    return anchor
+
+
+def _hard_exit_if_legs_abandoned(rc: int) -> None:
+    """End a hook run NOW when a producer leg was abandoned (v0.2.104 E-2).
+
+    ``run_legs`` abandons a leg that misses the deadline on a daemon thread,
+    but a producer that itself started NON-daemon threads (asyncio's default
+    executor, a ``concurrent.futures`` pool inside a client library) keeps
+    the interpreter alive at exit: ``concurrent.futures`` joins its workers
+    in an exit hook, so the process outlived its deadline by the producer's
+    own network timeout (measured: a 4 s leg deadline, a 15 s process). The
+    output was already written; flush it and leave without the joins."""
+    if not _hds.legs_abandoned():
+        return
+    for stream in (sys.stdout, sys.__stdout__, sys.stderr, sys.__stderr__):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:  # noqa: BLE001 — exiting anyway
+            pass
+    os._exit(rc)
+
+
 def _main(argv: List[str]) -> int:
     surface = argv[0] if argv else ""
     if surface not in SURFACES:
@@ -1761,7 +1830,7 @@ def _main(argv: List[str]) -> int:
     # timeout fails OPEN to silence — accepted for this bounded class, and
     # never a licence to tighten the LONG-operation timeouts elsewhere
     # (kg-sync / code-graph analysis / install / seed stay generous).
-    deadline = time.monotonic() + env_float("VCO_INJECT_BUDGET_S", 6.0, above=0)
+    deadline = _run_deadline_anchor() + env_float("VCO_INJECT_BUDGET_S", 6.0, above=0)
     # W3R-10: the citation pending files the legs stage during THIS run are
     # amended after the suppression decisions below — the pre-legs snapshot
     # bounds which files this run owns (new or re-staged since).
@@ -1882,4 +1951,7 @@ def _main(argv: List[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _DEADLINE_ANCHOR = _PROCESS_T0
+    _rc = main()
+    _hard_exit_if_legs_abandoned(_rc)
+    raise SystemExit(_rc)

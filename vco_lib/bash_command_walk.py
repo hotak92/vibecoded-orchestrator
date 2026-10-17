@@ -218,6 +218,72 @@ def substitution_bodies(tokens: List[str]) -> List[str]:
     )
 
 
+def _normalize_body(body: str) -> str:
+    """A substitution body in the token-joined shape :func:`substitution_bodies`
+    yields (quotes removed, whitespace collapsed); best-effort."""
+    try:
+        return " ".join(shlex.split(body, posix=True))
+    except ValueError:
+        return " ".join(body.split())
+
+
+def live_substitution_keys(command: str) -> Optional[set]:
+    """The normalized bodies of the substitutions bash would actually RUN in
+    ``command`` (v0.2.104 E-4), or None when the quoting cannot be read.
+
+    :func:`substitution_bodies` works on tokens, after ``shlex`` has removed
+    the quotes — so ``grep -n '$(sleep 5)' f`` (a LITERAL pattern in single
+    quotes) looked exactly like ``echo $(sleep 5)`` and a one-off grep was
+    denied as a sole wait. This scan reads the raw text with quote state:
+    single-quoted and ANSI-C ``$'…'`` contents and backslash-escaped
+    characters are literal; inside double quotes ``$(…)`` and backticks
+    still run but ``<(`` / ``>(`` do not. Callers keep a token-derived body
+    only when its normalized text is in this set; None means "keep all"
+    (the conservative pre-fix behaviour)."""
+    out: List[str] = []
+    i = 0
+    n = len(command)
+    in_double = False
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            out.append("  ")
+            i += 2
+            continue
+        if not in_double and ch == "$" and i + 1 < n and command[i + 1] == "'":
+            _body, end = _ansi_c_body(command, i + 2)
+            if end >= n:
+                return None
+            out.append(" " * (end + 1 - i))
+            i = end + 1
+            continue
+        if not in_double and ch == "'":
+            end = command.find("'", i + 1)
+            if end == -1:
+                return None
+            out.append(" " * (end + 1 - i))
+            i = end + 1
+            continue
+        if ch == '"':
+            in_double = not in_double
+            out.append(" ")
+            i += 1
+            continue
+        if in_double and ch in "<>" and i + 1 < n and command[i + 1] == "(":
+            out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    if in_double:
+        return None
+    live = "".join(out)
+    bodies = ([m.group(1) for m in _SUBST_PAREN_RE.finditer(live)]
+              + [m.group(1) for m in _SUBST_BACKTICK_RE.finditer(live)]
+              + [m.group(1) for m in _PROC_SUBST_RE.finditer(live)])
+    return {_normalize_body(b) for b in bodies}
+
+
 class ChainSegment(NamedTuple):
     """One peeled chain segment plus its structural context (v0.2.103).
 
@@ -991,6 +1057,9 @@ def walk_segments(command: str, depth: int = 0, *,
         rows = _function_body_layout(rows)
 
     sub_budget = depth + 1 <= MAX_NESTING_DEPTH
+    # v0.2.104 E-4: only substitutions bash would RUN are walked — a
+    # `'$(sleep 5)'` grep pattern is literal text (live_substitution_keys).
+    live_keys = live_substitution_keys(command) if _with_substitutions else None
     out: List[ChainSegment] = []
     for segment, pos, size, in_loop in rows:
         if not segment:
@@ -1047,6 +1116,8 @@ def walk_segments(command: str, depth: int = 0, *,
                                     tuple(seg_assignments)))
         if _with_substitutions and sub_budget:
             for sub_body in substitution_bodies(subst_src):
+                if live_keys is not None and _normalize_body(sub_body) not in live_keys:
+                    continue
                 out.extend(walk_segments(
                     sub_body, depth + 1, _in_loop=in_loop,
                     _with_substitutions=True,

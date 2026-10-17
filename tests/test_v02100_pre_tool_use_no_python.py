@@ -105,9 +105,16 @@ def test_ps1_injection_scan_runs_without_python(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(PWSH is None, reason="pwsh not installed")
 def test_ps1_injection_scan_still_blocks_with_python(tmp_path: Path) -> None:
-    res = _run("ps1", _project(tmp_path), INJECTION, _env(tmp_path, no_python=False))
+    """With Python the verdict is the FULL scanner's (v0.2.104 E-3: the raw
+    regexes are only the no-verdict safety net), so this project carries the
+    real shipped scanner rather than the inert stub."""
+    proj = _project(tmp_path)
+    shutil.copyfile(REPO / "templates" / "scripts" / "bash_security.py",
+                    proj / ".claude" / "scripts" / "bash_security.py")
+    res = _run("ps1", proj, INJECTION, _env(tmp_path, no_python=False))
     assert res.returncode == 2, (res.returncode, res.stderr)
-    assert "Shell injection guard" in res.stderr
+    assert "security scanner blocked" in res.stderr
+    assert "curl_pipe_shell" in res.stderr
 
 
 @pytest.mark.parametrize("impl", _SHELLS)

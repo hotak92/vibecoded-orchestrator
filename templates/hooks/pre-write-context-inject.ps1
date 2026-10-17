@@ -23,6 +23,11 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
+# v0.2.104 E-2: the hook's start, for the router's run deadline (the harness
+# timeout counts from HERE). Invariant culture: a "1,5" radix would be
+# ignored by the router.
+$env:VCO_HOOK_STARTED_AT = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+
 # VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
 #   delegate is claude_mcp_servers/scripts/hook_context_router.py (KG +
 #   code-graph legs loaded in-process, both access-aware via the weaviate_mcp
@@ -76,6 +81,20 @@ try {
 
 if ($ToolName -ne "Write") { exit 0 }
 if (-not $FilePath) { exit 0 }
+
+# v0.2.104 E-2: no KG / code-graph context for a file outside the project
+# (a temp-dir scratch script, another repo): skip BEFORE resolving the venv
+# and spawning the router. "Inside" = under the project root or one of its
+# enabled extra code folders (Test-VcoPathInProject, _lib/project-root.ps1).
+# A relative path is left to the router; a missing helper skips nothing.
+# MUST MATCH the .sh sibling.
+$ProjectRootLib = Join-Path $LibDir "project-root.ps1"
+if (Test-Path -LiteralPath $ProjectRootLib) { . $ProjectRootLib }
+if ([System.IO.Path]::IsPathRooted($FilePath) -and
+    (Get-Command Test-VcoPathInProject -ErrorAction SilentlyContinue) -and
+    -not (Test-VcoPathInProject -Root $ProjectRoot -Path $FilePath)) {
+    exit 0
+}
 
 if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
     $SessionId = Get-VcoHookSessionId -Stdin $HookStdin

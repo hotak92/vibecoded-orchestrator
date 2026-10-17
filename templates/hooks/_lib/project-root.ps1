@@ -189,3 +189,46 @@ function Get-VcoProjectRoot {
     }
     return Find-VcoProjectRoot -Start $Start
 }
+
+# ---------------------------------------------------------------------------
+# Path containment (v0.2.104 E-1/E-2). MUST MATCH vco_path_under_root /
+# vco_path_in_project in _lib/project-root.sh.
+#
+# Test-VcoPathUnderRoot -Root <dir> -Path <file> - $true when Path sits
+# strictly inside Root, compared raw first and then with both sides
+# symlink-resolved. A path EQUAL to the root is not "under" it.
+function Test-VcoPathUnderRoot {
+    param([string]$Root, [string]$Path)
+    if (-not $Root -or -not $Path) { return $false }
+    $cmp = if ($IsWindows -or $env:OS -eq 'Windows_NT') { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
+    $r = $Root.TrimEnd('/', '\')
+    foreach ($sep in @('/', '\')) {
+        if ($Path.StartsWith($r + $sep, $cmp)) { return $true }
+    }
+    $rp = Resolve-VcoPrRealPath $Root
+    $pp = Resolve-VcoPrRealPath $Path
+    if (-not $rp -or -not $pp) { return $false }
+    $rp = $rp.TrimEnd('/', '\')
+    foreach ($sep in @('/', '\')) {
+        if ($pp.StartsWith($rp + $sep, $cmp)) { return $true }
+    }
+    return $false
+}
+
+# Test-VcoPathInProject -Root <dir> -Path <file> - $true when Path is under
+# Root or under one of the ENABLED extra code folders listed in
+# <Root>/.claude/state/codegraph_extra_paths_cache.txt (the cache
+# _lib/route-touched-path.ps1 maintains). Missing cache = no extras.
+function Test-VcoPathInProject {
+    param([string]$Root, [string]$Path)
+    if (Test-VcoPathUnderRoot -Root $Root -Path $Path) { return $true }
+    $cache = Join-Path (Join-Path (Join-Path $Root '.claude') 'state') 'codegraph_extra_paths_cache.txt'
+    if (-not (Test-Path -LiteralPath $cache -PathType Leaf)) { return $false }
+    try { $lines = Get-Content -LiteralPath $cache -ErrorAction Stop } catch { return $false }
+    foreach ($line in $lines) {
+        $l = ([string]$line).TrimEnd("`r")
+        if (-not $l) { continue }
+        if (Test-VcoPathUnderRoot -Root $l -Path $Path) { return $true }
+    }
+    return $false
+}

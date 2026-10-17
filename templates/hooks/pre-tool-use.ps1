@@ -322,27 +322,18 @@ if ($ToolName -eq "WebFetch") {
 # `--shell powershell` rule set reads its syntax) ===
 if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     $cmd = Get-Field "command"
-    $injection = ""
-    if ($cmd -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { $injection = "network fetch piped to shell" }
-    elseif ($cmd -match '(?i)eval\s+["\$(]*(curl|wget)') { $injection = "eval + network fetch" }
-    elseif ($cmd -match '(?i)base64\s+-d.*\|\s*(ba)?sh\b') { $injection = "base64-decoded pipe to shell" }
 
-    if ($injection) {
-        # Route the block message to STDERR (matches pre-tool-use.sh) —
-        # see the SSRF-guard branch above for why plain stdout is dropped.
-        [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in $ToolName command.")
-        $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
-        [Console]::Error.WriteLine("   Blocked command preview: $preview")
-        [Console]::Error.WriteLine("   If this is intentional, run the command manually in a terminal.")
-        $previewEsc = ($preview -replace '\\', '\\\\' -replace '"', '\"')
-        Write-SecurityLine "{""timestamp"":""$ts"",""event"":""shell_injection_blocked"",""pattern"":""$injection"",""cmd_preview"":""$previewEsc""}"
-        exit 2
-    }
-
-    # Extended security scan via bash_security.py if available. It is Python,
-    # so with no interpreter it cannot run -- and says so (v0.2.100 WP-17)
-    # instead of being skipped in silence. The regex scan above already ran.
+    # v0.2.104 E-3: ONE verdict home (MUST MATCH pre-tool-use.sh). The full
+    # scanner (bash_security.py) carries the same three network/base64 rules
+    # as the raw patterns below but reads quote state and here-doc bodies, so
+    # a heredoc file write whose BODY merely mentions such text passes and a
+    # heredoc fed to a shell is scanned as code. The raw regexes now run only
+    # when the scanner gave NO verdict (script missing, no Python, crash) --
+    # the strict safety net of a broken install.
+    $secVerdict = ""
     $SecurityScript = Join-Path $ProjectRoot ".claude/scripts/bash_security.py"
+    # It is Python, so with no interpreter it cannot run -- and says so
+    # (v0.2.100 WP-17) instead of being skipped in silence.
     if ((Test-Path $SecurityScript) -and -not $PY) {
         Write-VcoNoPythonNotice "The Bash security scanner (.claude/scripts/bash_security.py)"
     }
@@ -353,8 +344,7 @@ if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
             $secExit = $LASTEXITCODE
             if ($secExit -eq 2) {
                 # Route to STDERR (matches pre-tool-use.sh's bash-security
-                # branch) — same stdout-discard rationale as the SSRF /
-                # injection guards above.
+                # branch) — same stdout-discard rationale as the SSRF guard.
                 [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
                 [Console]::Error.WriteLine("   $secOut")
                 $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
@@ -363,8 +353,29 @@ if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
                 $cmdPreviewEsc = $cmdPreview -replace '\\', '\\\\' -replace '"', '\"'
                 Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_blocked"",""detail"":""$detailEsc"",""cmd_preview"":""$cmdPreviewEsc""}"
                 exit 2
+            } elseif ($secExit -eq 0) {
+                $secVerdict = "pass"
             }
         } catch { }
+    }
+
+    if ($secVerdict -ne "pass") {
+        $injection = ""
+        if ($cmd -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { $injection = "network fetch piped to shell" }
+        elseif ($cmd -match '(?i)eval\s+["\$(]*(curl|wget)') { $injection = "eval + network fetch" }
+        elseif ($cmd -match '(?i)base64\s+-d.*\|\s*(ba)?sh\b') { $injection = "base64-decoded pipe to shell" }
+
+        if ($injection) {
+            # Route the block message to STDERR (matches pre-tool-use.sh).
+            [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in $ToolName command.")
+            $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
+            [Console]::Error.WriteLine("   Blocked command preview: $preview")
+            [Console]::Error.WriteLine("   The full scanner (.claude/scripts/bash_security.py) gave no verdict, so this raw-text check decided; it cannot tell a heredoc file body from a command.")
+            [Console]::Error.WriteLine("   To write a file whose content mentions this text, use the Write tool. If the command is intentional, run it manually in a terminal.")
+            $previewEsc = ($preview -replace '\\', '\\\\' -replace '"', '\"')
+            Write-SecurityLine "{""timestamp"":""$ts"",""event"":""shell_injection_blocked"",""pattern"":""$injection"",""cmd_preview"":""$previewEsc""}"
+            exit 2
+        }
     }
 }
 
