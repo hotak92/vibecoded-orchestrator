@@ -62,6 +62,7 @@ __all__ = [
     "GPU_OK", "GPU_MISSING", "GPU_UNKNOWN", "GPU_SKIP",
     "OLLAMA_CONTAINER", "REASON_OVERLAY", "REASON_DEGRADED", "REASON_NO_CDI_TOOL",
     "GPUVerdict", "probe", "decide", "deferral_entry", "main",
+    "vendor_of_devices", "vendor_of_compose_service",
 ]
 
 #: The registered deferral condition (deferral_conditions.toml).
@@ -137,6 +138,50 @@ def _matching_device(paths: Sequence[str], raw: str, vendor: str) -> Optional[st
         if tag in raw:
             return tag
     return None
+
+
+def vendor_of_devices(devices: Any) -> Optional[str]:
+    """The GPU vendor a container's (or a compose stanza's) DEVICE list
+    positively names, or ``None``: ``"amd"`` for the ROCm compute node
+    ``/dev/kfd`` or an ``amd.com/gpu`` CDI tag, ``"nvidia"`` for a
+    ``/dev/nvidia*`` node or an ``nvidia.com/gpu`` CDI tag. ``/dev/dri``
+    alone names no vendor (Intel and AMD both expose it), and a list naming
+    BOTH vendors is ambiguous → ``None``. Accepts the ``inspect
+    .HostConfig.Devices`` dicts and plain compose ``devices:`` strings
+    (``/dev/kfd:/dev/kfd``, ``nvidia.com/gpu=all``)."""
+    paths = _device_paths(devices)
+    named: set[str] = set()
+    for p in paths:
+        if p.startswith("/dev/kfd") or "amd.com/gpu" in p:
+            named.add("amd")
+        if p.startswith("/dev/nvidia") or "nvidia.com/gpu" in p:
+            named.add("nvidia")
+    return named.pop() if len(named) == 1 else None
+
+
+def vendor_of_compose_service(stanza: Any) -> Optional[str]:
+    """The GPU vendor a compose SERVICE stanza positively declares, or
+    ``None``: its ``devices:`` list (:func:`vendor_of_devices`) and its
+    ``deploy.resources.reservations.devices`` requests (``driver: nvidia`` /
+    ``amd``-family, or a vendor CDI tag in ``device_ids``). Both vendors
+    named → ``None`` (ambiguous, never a guess)."""
+    if not isinstance(stanza, Mapping):
+        return None
+    named: set[str] = set()
+    direct = vendor_of_devices(stanza.get("devices"))
+    if direct:
+        named.add(direct)
+    deploy = stanza.get("deploy")
+    resources = deploy.get("resources") if isinstance(deploy, Mapping) else None
+    reservations = resources.get("reservations") if isinstance(resources, Mapping) else None
+    requests = reservations.get("devices") if isinstance(reservations, Mapping) else None
+    for req in requests if isinstance(requests, list) else []:
+        if isinstance(req, Mapping):
+            vendor = _request_vendor({"Driver": req.get("driver"),
+                                      "DeviceIDs": req.get("device_ids")})
+            if vendor:
+                named.add(vendor)
+    return named.pop() if len(named) == 1 else None
 
 
 def _request_vendor(req: Mapping) -> Optional[str]:
