@@ -60,9 +60,12 @@ timeout is short, and a hook killed on timeout would ALLOW the Write.
 The scan is also not asked at all unless ``post-compact`` has written this
 session's ``.claude/state/compacted_<key>.txt`` marker: a session that never
 compacted has nothing re-attached, so ``pre-tool-use`` blocks it without
-spawning Python. A subagent's tool call is always "no": the
-payload's transcript is the parent's, whose re-attachments are not in the
-subagent's context.
+spawning Python. A subagent's tool call is always "no". Why is UNVERIFIED:
+no vendor page states which transcript a subagent's PreToolUse payload names
+(subagents keep separate transcript files, so it may well be their own) or
+whether the harness re-attaches files into a subagent's context after a
+compaction. The refusal is the fail-closed answer to that unknown — the
+subagent re-Reads the file — not a claim about the payload.
 """
 from __future__ import annotations
 
@@ -276,6 +279,9 @@ def _main(argv: list[str] | None = None) -> int:
     chk.add_argument("--transcript", default="")
     chk.add_argument("--path", required=True)
     chk.add_argument("--agent-id", default="")
+    chk.add_argument("--deadline", type=float, default=DEADLINE_SECONDS,
+                     help="seconds the calling hook has left; capped at "
+                     f"{DEADLINE_SECONDS}, and 0 or less answers 'no'")
     snap = sub.add_parser("snapshot-body")
     snap.add_argument("--path", required=True)
     args = parser.parse_args(argv)
@@ -283,7 +289,9 @@ def _main(argv: list[str] | None = None) -> int:
         for line in snapshot_body(args.path):
             print(line)
         return 0
-    if was_reattached(args.transcript, args.path, args.agent_id):
+    deadline = min(args.deadline, DEADLINE_SECONDS)
+    if deadline > 0 and was_reattached(args.transcript, args.path,
+                                       args.agent_id, deadline=deadline):
         print(ANSWER_YES)
         return 0
     print(ANSWER_NO)

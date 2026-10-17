@@ -41,10 +41,12 @@ user, Claude Code reads a committed ``.claude/settings.json`` and
 * :func:`append_git_info_exclude` removes the legacy ``/.claude/`` (and the
   never-matching root ``/.vco-manifest.json``) line from VCO's OWN blocks on
   every write, so a project upgraded from an older release is repaired by its
-  next bundle update; a user's own lines are never touched (the one case
-  that reads both ways is stated in :func:`_block_members`). Every block now
+  next bundle update; a user's own lines are never touched (the two cases
+  that read both ways are stated in :func:`_block_members`). Every block now
   ends with :data:`VCO_BLOCK_END_MARKER` (older blocks are closed on the next
-  write), and a retired shipped file's line is dropped with the file.
+  write), a retired shipped file's line is dropped with the file, and an old
+  project-move block's lines for the user's copied knowledge nodes,
+  ``CONTEXT_STATE.md`` and ``MEMORY.md`` are removed. A CRLF file stays CRLF.
 """
 
 from __future__ import annotations
@@ -344,6 +346,35 @@ _LEGACY_CLAUDE_GLOB = "/.claude/"
 _SIDECAR_EXCLUDE_LINE = "/.env" + SAFE_ADD_SIDECAR_SUFFIX
 
 
+#: The pre-v0.2.104 root-anchored manifest line (one of
+#: :data:`LEGACY_VCO_EXCLUDE_LINES`).
+_LEGACY_MANIFEST_LINE = "/" + MANIFEST_BASENAME
+
+#: Header prefix of the blocks the project-move engine wrote (v0.2.92 on). In
+#: such a block the bundle's entries were followed by an exclude line per
+#: COPIED file; every other VCO block is a bundle (safe-add / update) block.
+_MOVE_BLOCK_HEADER = VCO_BLOCK_MARKER + "project move"
+
+#: Lines a pre-v0.2.104 project move wrote for the user's own copied material
+#: outside ``.claude/`` — the non-``.claude/`` entries of
+#: ``project_move.USER_ADJACENT_SPECS`` (``knowledge/**``, ``CONTEXT_STATE.md``,
+#: ``MEMORY.md``; parity-tested). v0.2.104 no longer hides that material at
+#: the new folder, and the migration removes these lines from old move blocks
+#: just as it removes the ``/.claude/`` glob. A prefix ends with ``/``.
+_LEGACY_MOVE_USER_LINES: tuple[str, ...] = (
+    "/knowledge/",
+    "/CONTEXT_STATE.md",
+    "/MEMORY.md",
+)
+
+
+def _is_legacy_move_user_line(stripped: str) -> bool:
+    return any(
+        stripped.startswith(p) if p.endswith("/") else stripped == p
+        for p in _LEGACY_MOVE_USER_LINES
+    )
+
+
 def _is_legacy_vco_entry(stripped: str) -> bool:
     """Could a pre-v0.2.104 release have written ``stripped`` as an entry?
 
@@ -366,9 +397,12 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
     Returns ``(members, legacy_block_ends)``: ``members`` maps a line index to
     ``"ended"`` (a block closed by :data:`VCO_BLOCK_END_MARKER`, written whole
     by v0.2.104 or later — every line from the header to the end marker is
-    VCO's) or ``"legacy"`` (a block from an older release, which has no end
-    marker); ``legacy_block_ends`` lists, per legacy block, the index of its
-    last member line — where the end marker goes when the block is closed.
+    VCO's), ``"legacy"`` (a bundle block from an older release, which has no
+    end marker), ``"legacy-move"`` (an older project-move block's bundle
+    part) or ``"legacy-move-tail"`` (an older move block's lines after its
+    bundle part: the files the move COPIED, never a shipped file's line);
+    ``legacy_block_ends`` lists, per legacy block, the index of its last
+    member line — where the end marker goes when the block is closed.
 
     **An ended block is exact.** VCO writes it whole, header to end marker, in
     one write; a line after the end marker is NEVER VCO's, whatever it says.
@@ -387,12 +421,16 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
       keeps OUTSIDE VCO's blocks does not count: the user may have put it
       above the block with an editor after VCO wrote the block, and VCO's own
       copy must still be found (L1);
-    * the legacy ``/.claude/`` glob never AFTER the ``/.env.vco.reference``
-      line (L2): the glob was only ever a bundle created-file entry and VCO
-      added the sidecar after all of those. A project move appended its
-      copied files after the sidecar, but every pre-v0.2.104 bundle run
-      listed ``.claude/hooks/_lib/`` (always overwritten) among its created
-      files, so the glob was already in that block or earlier in the file.
+    * the writer's ORDER: a pre-v0.2.104 bundle block listed its created
+      files (the ``/.claude/`` glob among them), then ``/.vco-manifest.json``,
+      then ``/.env.vco.reference`` LAST — each only when not already in the
+      file. So in a bundle block only the sidecar line may follow the
+      manifest line and nothing follows the sidecar line (R3 L2). A project
+      move appended a line per COPIED file after that bundle part, so a move
+      block goes on past it, as its ``legacy-move-tail``; the glob is never
+      in that tail (L2): every pre-v0.2.104 bundle run listed
+      ``.claude/hooks/_lib/`` (always overwritten) among its created files,
+      so the glob was already in the bundle part or earlier in the file.
 
     The first line that fails ends the block; it and everything after it up
     to the next marker are the user's.
@@ -403,6 +441,18 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
     when the file already held one, so the user still has that earlier line
     unless they deleted it; the reading never leaves VCO's own glob in place,
     which would hide ``.claude/`` with no later update able to repair it.
+
+    A second reading of the same kind (R3 L2): a root-level line the user
+    appends directly after a legacy block whose bundle part never reached the
+    manifest or sidecar line (both already in the file from an earlier
+    block) is read as VCO's, so it is pruned when it equals the pattern of a
+    shipped file a release retires in the same run, and in a move block a
+    ``/knowledge/…``, ``/CONTEXT_STATE.md`` or ``/MEMORY.md`` line is removed
+    as copied material. Both readings only ever UN-hide a path (it shows up
+    in ``git status``, and the user re-adds the line); the opposite reading
+    would leave VCO's own line hiding the user's file with nothing to repair
+    it. A block that has either line is exact on this point: a line after it
+    is the user's.
     """
     members: dict[int, str] = {}
     legacy_ends: list[int] = []
@@ -434,10 +484,12 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
                     vco_seen.add(s)
             i = end_at + 1
             continue
-        members[i] = "legacy"
+        is_move = stripped.startswith(_MOVE_BLOCK_HEADER)
+        kind = "legacy-move" if is_move else "legacy"
+        members[i] = kind
         last = i
         in_header = True
-        after_sidecar = False
+        manifest_seen = sidecar_seen = False
         k = i + 1
         while k < n:
             s = lines[k].strip()
@@ -450,12 +502,20 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
                 in_header = False
                 if not _is_legacy_vco_entry(s) or s in vco_seen:
                     break
-                if s == _LEGACY_CLAUDE_GLOB and after_sidecar:
+                past_bundle = manifest_seen or sidecar_seen
+                if s == _LEGACY_CLAUDE_GLOB and past_bundle:
                     break
-                if s == _SIDECAR_EXCLUDE_LINE:
-                    after_sidecar = True
+                if not is_move and (sidecar_seen or (
+                        manifest_seen and s != _SIDECAR_EXCLUDE_LINE)):
+                    break
+                if is_move and past_bundle:
+                    kind = "legacy-move-tail"
+                if s == _LEGACY_MANIFEST_LINE:
+                    manifest_seen = True
+                elif s == _SIDECAR_EXCLUDE_LINE:
+                    sidecar_seen = True
                 vco_seen.add(s)
-            members[k] = "legacy"
+            members[k] = kind
             last = k
             k += 1
         legacy_ends.append(last)
@@ -471,16 +531,23 @@ def _rewrite_vco_blocks(
     * Removes :data:`LEGACY_VCO_EXCLUDE_LINES` from LEGACY blocks (v0.2.104 G4
       migration). An ended block never carries them, so one found there was
       put there by the user and stays.
+    * Removes, from LEGACY project-move blocks, the lines that hid the user's
+      own copied material outside ``.claude/`` (:data:`_LEGACY_MOVE_USER_LINES`)
+      — v0.2.104 no longer hides it. A path VCO still ships is listed again
+      by the same write.
     * Removes the ``retired`` patterns — lines for shipped files a release
-      stopped shipping — from any VCO block.
+      stopped shipping — from any VCO block, except a legacy move block's
+      copied-file tail (no shipped file's line is there).
     * Closes every legacy block with :data:`VCO_BLOCK_END_MARKER`, so a line
-      the user appends afterwards is unambiguously outside it.
+      the user appends afterwards is unambiguously outside it. The marker
+      takes the file's own line ending (``\r\n`` in a CRLF file).
 
     See :func:`_block_members` for what counts as a VCO line. Returns
     ``(new_text, removed_lines)``; ``new_text is existing`` when nothing
     changed.
     """
     retired_set = set(retired)
+    eol = _line_ending(existing)
     lines = existing.splitlines(keepends=True)
     members, legacy_ends = _block_members(lines)
     close_after = set(legacy_ends)
@@ -490,20 +557,28 @@ def _rewrite_vco_blocks(
         stripped = line.strip()
         kind = members.get(idx)
         drop = kind is not None and (
-            (kind == "legacy" and stripped in LEGACY_VCO_EXCLUDE_LINES)
-            or stripped in retired_set
+            (kind.startswith("legacy") and stripped in LEGACY_VCO_EXCLUDE_LINES)
+            or (kind.startswith("legacy-move") and _is_legacy_move_user_line(stripped))
+            or (kind != "legacy-move-tail" and stripped in retired_set)
         )
         if drop:
             removed.append(stripped)
         else:
-            if idx in close_after and not line.endswith("\n"):
-                line += "\n"
+            if idx in close_after and not line.endswith(("\n", "\r")):
+                line += eol
             out.append(line)
         if idx in close_after:
-            out.append(VCO_BLOCK_END_MARKER + "\n")
+            out.append(VCO_BLOCK_END_MARKER + eol)
     if not removed and not close_after:
         return existing, []
     return "".join(out), removed
+
+
+def _line_ending(text: str) -> str:
+    """The line ending of *text*'s first line (``\n`` when it has none), so
+    what VCO adds to a CRLF exclude file is CRLF too."""
+    nl = text.find("\n")
+    return "\r\n" if nl > 0 and text[nl - 1] == "\r" else "\n"
 
 
 def append_git_info_exclude(
@@ -527,7 +602,7 @@ def append_git_info_exclude(
         block, are removed in the same write, and pre-v0.2.104 blocks are
         closed with :data:`VCO_BLOCK_END_MARKER` (see
         :func:`_rewrite_vco_blocks`); the user's own lines never are touched
-        (the one ambiguous legacy case is stated in :func:`_block_members`).
+        (the two ambiguous legacy cases are stated in :func:`_block_members`).
       - Every new block ends with :data:`VCO_BLOCK_END_MARKER`, so a line the
         user appends later is never mistaken for VCO's.
       - Write failure -> ``action="write_failed:<ErrorClass>"``, no raise.
@@ -572,8 +647,10 @@ def append_git_info_exclude(
     result["path"] = str(exclude_path)
 
     try:
+        # Bytes, decoded without newline translation: a CRLF file keeps its
+        # line endings (read_text would turn every one into LF on rewrite).
         existing = (
-            exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+            exclude_path.read_bytes().decode("utf-8") if exclude_path.exists() else ""
         )
     except OSError as e:
         result["action"] = f"write_failed:{type(e).__name__}"
@@ -612,14 +689,15 @@ def append_git_info_exclude(
         # The migration finds VCO's blocks by this marker; a block without it
         # would leave its lines unrepairable by a later release.
         header.insert(0, VCO_BLOCK_MARKER + "exclude block (orchestrator-managed).")
+    eol = _line_ending(existing)
     block = ""
     if to_add:
-        block = "\n".join(["", *header, *to_add, VCO_BLOCK_END_MARKER]) + "\n"
+        block = eol.join(["", *header, *to_add, VCO_BLOCK_END_MARKER]) + eol
 
     # Ensure we don't glue onto a non-newline-terminated last line.
     prefix = existing
-    if prefix and not prefix.endswith("\n") and block:
-        prefix += "\n"
+    if prefix and not prefix.endswith(("\n", "\r")) and block:
+        prefix += eol
 
     try:
         info_dir.mkdir(parents=True, exist_ok=True)

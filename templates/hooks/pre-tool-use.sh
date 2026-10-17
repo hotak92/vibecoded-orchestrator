@@ -6,6 +6,32 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
+# v0.2.104: this hook's clock. The harness kills it after the `timeout`
+# registered for pre-tool-use (3 s in both settings templates) and a killed
+# PreToolUse hook does NOT block — so the Build Anchor's post-compaction
+# check below may only spend what is LEFT of that budget. Microseconds since
+# the epoch in _PTU_CLOCK_US: $EPOCHREALTIME (bash 5+; either decimal mark),
+# else GNU `date +%s%N`, else whole seconds with _PTU_CLOCK_COARSE=1 (the
+# caller then charges one extra second — overestimating is the safe side).
+# MUST MATCH pre-tool-use.ps1's $PtuClock.
+_ptu_clock_us() {
+    _PTU_CLOCK_COARSE=0
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        _PTU_CLOCK_US="${EPOCHREALTIME//[.,]/}"
+        return
+    fi
+    _PTU_CLOCK_US="$(date +%s%N 2>/dev/null)"
+    case "$_PTU_CLOCK_US" in
+        ''|*[!0-9]*)
+            _PTU_CLOCK_US=$(( $(date +%s) * 1000000 ))
+            _PTU_CLOCK_COARSE=1 ;;
+        *) _PTU_CLOCK_US=$(( _PTU_CLOCK_US / 1000 )) ;;
+    esac
+}
+_ptu_clock_us
+_PTU_T0_US="$_PTU_CLOCK_US"
+_PTU_T0_COARSE="$_PTU_CLOCK_COARSE"
+
 # VCO-CENTRALIZED-KG: NOT a KG consumer (v0.2.101 wave-3). The former §5
 #   KG-suggestion path was retired (double emission with the pre-edit/pre-
 #   write router wrappers — review nit-6); every remaining branch (SSRF
@@ -487,8 +513,8 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
                 # session that never compacted has nothing re-attached, and
                 # this hook's 3 s registration timeout must not be spent on a
                 # transcript scan — a hook killed on timeout does not block,
-                # so it would turn this block into an allow. The module also
-                # answers `no` past its own ~1 s deadline.
+                # so it would turn this block into an allow. The module
+                # answers `no` past the deadline this hook hands it.
                 if [[ "$ALREADY_READ" -eq 0 ]] && [[ -n "$TRANSCRIPT_PATH" ]] \
                         && [[ -f "$SESSION_COMPACTED_MARKER" ]]; then
                     # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
@@ -498,10 +524,29 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
                         resolve_vco_venv_python "$SCRIPT_DIR" 2>/dev/null || true
                     fi
                     _PTU_RA_PY="${VCO_VENV_PYTHON:-${PY:-}}"
-                    if [[ -n "$_PTU_RA_PY" ]]; then
+                    # The check gets only what is left of the registration
+                    # timeout: budget − elapsed since this hook started −
+                    # a margin for the interpreter's start and this hook's
+                    # exit. Under the floor there is no time for an answer:
+                    # skip the spawn and block. The module caps the value
+                    # at its own 1 s default. VCO_PRE_TOOL_USE_TIMEOUT_S
+                    # (whole seconds) MUST MATCH the `timeout` registered for
+                    # pre-tool-use in .claude/settings.json — set it when you
+                    # change that registration. MUST MATCH pre-tool-use.ps1.
+                    _PTU_BUDGET_S="${VCO_PRE_TOOL_USE_TIMEOUT_S:-3}"
+                    case "$_PTU_BUDGET_S" in ''|*[!0-9]*|0) _PTU_BUDGET_S=3 ;; esac
+                    _ptu_clock_us
+                    _PTU_ELAPSED_MS=$(( (_PTU_CLOCK_US - _PTU_T0_US) / 1000 ))
+                    if [[ "$_PTU_T0_COARSE" == 1 || "$_PTU_CLOCK_COARSE" == 1 ]]; then
+                        _PTU_ELAPSED_MS=$(( _PTU_ELAPSED_MS + 1000 ))
+                    fi
+                    _PTU_LEFT_MS=$(( _PTU_BUDGET_S * 1000 - _PTU_ELAPSED_MS - 700 ))
+                    if [[ -n "$_PTU_RA_PY" ]] && (( _PTU_LEFT_MS >= 200 )); then
+                        _PTU_DEADLINE="$(( _PTU_LEFT_MS / 1000 )).$(printf '%03d' $(( _PTU_LEFT_MS % 1000 )))"
                         _PTU_RA=$("$_PTU_RA_PY" -m vco_lib.compact_reattach check \
                             "--transcript=$TRANSCRIPT_PATH" "--path=$FILE_PATH" \
-                            "--agent-id=$AGENT_ID" 2>/dev/null) || _PTU_RA=""
+                            "--agent-id=$AGENT_ID" "--deadline=$_PTU_DEADLINE" \
+                            2>/dev/null) || _PTU_RA=""
                         [[ "$_PTU_RA" == "reattached" ]] && ALREADY_READ=1
                     fi
                 fi

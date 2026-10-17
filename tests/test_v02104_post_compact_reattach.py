@@ -14,7 +14,9 @@ doubt blocks. The module is asked only when ``post-compact`` left this
 session's ``compacted_<key>.txt`` marker (no marker → blocked without
 spawning Python), and it answers "no" past its own wall-clock deadline: the
 hook's 3 s registration timeout must never be what ends the scan, because a
-hook the harness kills on timeout does not block the Write. These tests drive the pure function and the real hook scripts
+hook the harness kills on timeout does not block the Write — so the hook
+hands the module only what is LEFT of that budget (``--deadline``), and skips
+the spawn and blocks when too little is left. These tests drive the pure function and the real hook scripts
 (bash, and pwsh where installed).
 """
 from __future__ import annotations
@@ -262,6 +264,30 @@ def test_cli_answers_exact_words(tmp_path: Path):
                      f"--path={tmp_path / 'other.py'}"]) == 1
 
 
+def test_cli_deadline_is_capped_and_a_spent_one_is_no(tmp_path: Path,
+                                                      monkeypatch):
+    f = _file(tmp_path)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    seen: list[float] = []
+    real = cr.was_reattached
+
+    def spy(*a, **k):
+        seen.append(k["deadline"])
+        return real(*a, **k)
+
+    monkeypatch.setattr(cr, "was_reattached", spy)
+    base = ["check", f"--transcript={t}", f"--path={f}"]
+    assert cr._main(base + ["--deadline=0.4"]) == 0
+    assert cr._main(base + ["--deadline=9"]) == 0
+    assert cr._main(base) == 0
+    assert seen == [0.4, cr.DEADLINE_SECONDS, cr.DEADLINE_SECONDS]
+    # Nothing left: "no" without scanning.
+    assert cr._main(base + ["--deadline=0"]) == 1
+    assert cr._main(base + ["--deadline=-1"]) == 1
+    assert cr._main(base + ["--deadline=nan"]) == 1
+    assert len(seen) == 3
+
+
 def test_snapshot_body_drops_the_git_status_block(tmp_path: Path):
     snap = tmp_path / "snap.md"
     snap.write_text("# Pre-Compaction Snapshot\nSaved: now\n\n"
@@ -326,19 +352,26 @@ def _compact(impl: str, proj: Path) -> None:
     assert _marker(proj).is_file()
 
 
-def _spy_venv(tmp_path: Path, runner: Path | None = None) -> tuple[Path, Path]:
+def _spy_venv(tmp_path: Path, runner: Path | None = None,
+              prelude_sleep: float = 0.0) -> tuple[Path, Path]:
     """A fake venv whose python records every call, then runs the real
     interpreter — or, for the compact_reattach call only, *runner* with the
-    same argv (the hook uses this python for its other helpers too).
+    same argv (the hook uses this python for its other helpers too). With
+    *prelude_sleep*, the FIRST ``-c`` call (the bash hook's payload decode)
+    sleeps that long first: a hook whose prelude ate its budget.
     Returns (venv, log)."""
     venv = tmp_path / "spyvenv"
     (venv / "bin").mkdir(parents=True)
     log = tmp_path / "python_calls.log"
     route = (f'[ "$1 $2" = "-m vco_lib.compact_reattach" ] && '
              f'exec "{sys.executable}" "{runner}" "$@"\n') if runner else ""
+    flag = tmp_path / "prelude_slept"
+    slow = (f'if [ "$1" = "-c" ] && [ ! -e "{flag}" ]; then : > "{flag}"; '
+            f'sleep {prelude_sleep}; fi\n') if prelude_sleep else ""
     shim = venv / "bin" / "python"
     shim.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{log}"\n'
-                    f'{route}exec "{sys.executable}" "$@"\n', encoding="utf-8")
+                    f'{slow}{route}exec "{sys.executable}" "$@"\n',
+                    encoding="utf-8")
     shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return venv, log
 
@@ -529,6 +562,103 @@ def test_slow_scan_past_the_deadline_blocks(impl: str, tmp_path: Path):
     assert "Build Anchor" in res.stderr
     elapsed = float((tmp_path / "slow_runner.py.elapsed").read_text())
     assert elapsed < cr.DEADLINE_SECONDS + 0.5, elapsed
+
+
+# ─── L1 (R3): the deadline is what is LEFT of the hook's budget ───────────
+#
+# The hook measures its own elapsed time and hands the module
+# budget − elapsed − 0.7 s (interpreter start + exit); under 0.2 s it skips
+# the spawn and blocks. Never an allow on exhaustion.
+
+_BUDGET_S = 3
+_MARGIN_S = 0.7
+
+
+def _deadline_arg(log: Path) -> float:
+    calls = _reattach_calls(log)
+    assert len(calls) == 1, calls
+    vals = [tok.split("=", 1)[1] for tok in calls[0].split()
+            if tok.startswith("--deadline=")]
+    assert len(vals) == 1, calls[0]
+    return float(vals[0])
+
+
+def test_hook_budget_matches_the_registered_timeout():
+    # The hooks' default budget is the `timeout` both settings templates
+    # register for pre-tool-use.
+    for os_name, hook in (("linux", "pre-tool-use.sh"),
+                          ("windows", "pre-tool-use.ps1")):
+        data = json.loads((REPO / "templates" /
+                           f"settings.json.{os_name}.template").read_text(
+                               encoding="utf-8"))
+        timeouts = [h.get("timeout")
+                    for group in data["hooks"]["PreToolUse"]
+                    for h in group["hooks"] if hook in h["command"]]
+        assert timeouts == [_BUDGET_S], (os_name, timeouts)
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_hook_passes_the_budget_it_has_left(impl: str, tmp_path: Path):
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    venv, log = _spy_venv(tmp_path)
+    _compact(impl, proj)
+    res = _write(impl, proj, f, t, env={"VCT_VENV": str(venv)})
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    d = _deadline_arg(log)
+    assert 0.2 <= d <= _BUDGET_S - _MARGIN_S, d
+
+
+def test_registered_timeout_override_shrinks_the_deadline(tmp_path: Path):
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    venv, log = _spy_venv(tmp_path)
+    _compact("sh", proj)
+    res = _write("sh", proj, f, t, env={"VCT_VENV": str(venv),
+                                        "VCO_PRE_TOOL_USE_TIMEOUT_S": "2"})
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    d = _deadline_arg(log)
+    assert 0.2 <= d <= 2 - _MARGIN_S, d
+
+
+def test_slow_prelude_hands_a_shorter_deadline(tmp_path: Path):
+    # The payload decode (the hook's first python call) takes 1.2 s: the
+    # module may only get 3 − 1.2 − 0.7 = 1.1 s or less.
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    venv, log = _spy_venv(tmp_path, prelude_sleep=1.2)
+    _compact("sh", proj)
+    res = _write("sh", proj, f, t, env={"VCT_VENV": str(venv)})
+    assert (tmp_path / "prelude_slept").exists()
+    d = _deadline_arg(log)
+    assert 0.2 <= d <= _BUDGET_S - 1.2 - _MARGIN_S, d
+    assert res.returncode == 0, (res.stdout, res.stderr)
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_exhausted_budget_skips_the_check_and_blocks(impl: str,
+                                                     tmp_path: Path):
+    # The transcript WOULD answer "reattached", but nothing is left of the
+    # budget: bash — the payload decode took 2.2 s; pwsh (no python in its
+    # prelude) — the registered timeout is 1 s and the powershell start
+    # alone is over 0.1 s. No spawn, and the Write is blocked.
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    if impl == "sh":
+        venv, log = _spy_venv(tmp_path, prelude_sleep=2.2)
+        env = {"VCT_VENV": str(venv)}
+    else:
+        venv, log = _spy_venv(tmp_path)
+        env = {"VCT_VENV": str(venv), "VCO_PRE_TOOL_USE_TIMEOUT_S": "1"}
+    _compact(impl, proj)
+    res = _write(impl, proj, f, t, env=env)
+    assert res.returncode == 2, (res.stdout, res.stderr)
+    assert "Build Anchor" in res.stderr
+    assert _reattach_calls(log) == []
 
 
 # ─── the compact re-inject ───────────────────────────────────────────────
