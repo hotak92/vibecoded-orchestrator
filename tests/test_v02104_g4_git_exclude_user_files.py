@@ -219,6 +219,89 @@ class G4BundleExcludeTests(unittest.TestCase):
         self.assertFalse(_ignored(self.proj, ".claude/scripts/notify.py"))
         self.assertTrue(_ignored(self.proj, ".claude/scripts/kg-search"))
 
+    # -- R2 L1/L2/L3: a legacy block's end is inferred conservatively --------
+
+    _LEGACY_HEADER = (
+        "# VCO safe-add (v0.2.63): keep orchestrator-created files out of your commits.\n"
+        "# This is .git/info/exclude (LOCAL-only) — not the tracked .gitignore.\n"
+    )
+
+    def test_vcos_legacy_glob_goes_even_when_the_user_duplicated_it_above(self):
+        """L1: the user adds `/.claude/` at the TOP with an editor while VCO's
+        old block below still carries its own. VCO's copy must be migrated, so
+        removing the user's line later really makes `.claude/` addable."""
+        self._bundle(update_mode=False)
+        self.exclude.write_text(
+            "/.claude/\n/.vco-manifest.json\n\n" + self._LEGACY_HEADER
+            + "/.vco-manifest.json\n/.claude/\n/CLAUDE.md\n",
+            encoding="utf-8",
+        )
+        result = self._bundle(update_mode=True)
+        self.assertEqual(
+            sorted(result["g1_git_exclude"]["removed"]), ["/.claude/", "/.vco-manifest.json"],
+        )
+        lines = self.exclude.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[:2], ["/.claude/", "/.vco-manifest.json"])  # the user's
+        self.assertEqual(lines.count("/.claude/"), 1)
+        self.assertLess(lines.index("/CLAUDE.md"), lines.index("# VCO end"))
+        # The user now removes their own line: nothing of VCO's hides .claude/.
+        self.exclude.write_text("\n".join(lines[2:]) + "\n", encoding="utf-8")
+        self._assert_split()
+
+    def test_a_users_glob_after_a_block_ending_with_the_sidecar_is_kept(self):
+        """L2: an old block with no glob (VCO wrote the sidecar line last)
+        must not absorb the `/.claude/` the user appended after it."""
+        self._bundle(update_mode=False)
+        self.exclude.write_text(
+            self._LEGACY_HEADER + "/.env.vco.reference\n/.claude/\n", encoding="utf-8",
+        )
+        result = self._bundle(update_mode=True)
+        self.assertEqual(result["g1_git_exclude"]["removed"], [])
+        lines = self.exclude.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines.count("/.claude/"), 1)
+        self.assertLess(lines.index("# VCO end"), lines.index("/.claude/"))
+        self._touch((".claude/CONTEXT_STATE.md",))
+        self.assertTrue(_ignored(self.proj, ".claude/CONTEXT_STATE.md"))
+
+    def test_a_users_claude_path_after_a_legacy_block_survives_retirement(self):
+        """L3: no pre-v0.2.104 release wrote a `/.claude/<path>` line, so one
+        after an old block is the user's — retiring a shipped file of the same
+        name must not delete the user's hand-written exclude."""
+        self._bundle(update_mode=False)
+        self.exclude.write_text(
+            self._LEGACY_HEADER + "/.claude/\n/CLAUDE.md\n/.claude/scripts/notify.py\n",
+            encoding="utf-8",
+        )
+        (self.orch / "templates" / "scripts" / "notify.py").unlink()
+        result = self._bundle(update_mode=True)
+        self.assertIn(".claude/scripts/notify.py", result["actions"]["orphan-deleted"])
+        self.assertEqual(result["g1_git_exclude"]["removed"], ["/.claude/"])
+        lines = self.exclude.read_text(encoding="utf-8").splitlines()
+        self.assertLess(lines.index("# VCO end"), lines.index("/.claude/scripts/notify.py"))
+        self._touch((".claude/scripts/notify.py",))
+        self.assertTrue(_ignored(self.proj, ".claude/scripts/notify.py"))
+
+    def test_user_lines_appended_after_a_legacy_block_stay_outside_it(self):
+        """L3: a directory pattern is never a legacy VCO entry, so it and every
+        line after it stay outside the closed block for good."""
+        self._bundle(update_mode=False)
+        self.exclude.write_text(
+            self._LEGACY_HEADER + "/.claude/\n/.vco-manifest.json\n/my-secrets/\n/notes.txt\n",
+            encoding="utf-8",
+        )
+        result = self._bundle(update_mode=True)
+        self.assertEqual(
+            sorted(result["g1_git_exclude"]["removed"]), ["/.claude/", "/.vco-manifest.json"],
+        )
+        lines = self.exclude.read_text(encoding="utf-8").splitlines()
+        end = lines.index("# VCO end")
+        self.assertLess(end, lines.index("/my-secrets/"))
+        self.assertLess(end, lines.index("/notes.txt"))
+        self._touch(("my-secrets/k.txt", "notes.txt"))
+        self.assertTrue(_ignored(self.proj, "my-secrets/k.txt"))
+        self.assertTrue(_ignored(self.proj, "notes.txt"))
+        self._assert_split()
+
 
 class G4PatternUnitTests(unittest.TestCase):
     def test_user_owned_paths_are_never_patterns(self):
@@ -287,8 +370,9 @@ class G4PatternUnitTests(unittest.TestCase):
         )
 
     def test_a_claude_line_after_vcos_newer_entries_is_the_users(self):
-        """M2 (review reproduction): VCO never wrote `/.claude/` AFTER a
-        per-path `/.claude/<file>` entry, so that line is the user's."""
+        """M2 (review reproduction) + R2 L3: no pre-v0.2.104 release wrote a
+        per-path `/.claude/<file>` entry, so that line and everything after it
+        (the `/.claude/` included) are the user's."""
         text = (
             "# VCO safe-add (v0.2.63): x\n# This is .git/info/exclude\n"
             "/.claude/hooks/a.sh\n/.claude/\n/my-own-private-notes/\n"
@@ -299,7 +383,8 @@ class G4PatternUnitTests(unittest.TestCase):
         self.assertLess(new.index("# VCO end"), new.index("/.claude/\n"))
 
     def test_a_repeated_line_is_never_vcos(self):
-        """VCO de-duplicates against the whole file: a repeat ends its block."""
+        """VCO de-duplicated against its own earlier lines: a repeat of one
+        (same block or an earlier VCO block) ends the legacy block."""
         text = "# VCO safe-add: x\n/.claude/\n/CLAUDE.md\n/.claude/\n"
         new, removed = git_exclude._rewrite_vco_blocks(text)
         self.assertEqual(removed, ["/.claude/"])
