@@ -1,7 +1,7 @@
 """v0.2.104 — an adopted container on an old image, and first-install noise.
 
-G3 (field case 2026-10-16): VCO_dev's Ollama container was ADOPTED on an
-earlier install, so no update recreated it. v0.2.103 pinned Ollama 0.40.5
+G3 (field case 2026-10-16): the maintainer's Ollama container was ADOPTED
+on an earlier install, so no update recreated it. v0.2.103 pinned Ollama 0.40.5
 (older Ollama cannot pull the summary-tier models) but the adopted container
 kept 0.20.2, and the ``adopted_service_config_drift`` entry named only env
 drift; its clear probe answered "undetermined". Pinned here:
@@ -359,3 +359,137 @@ def test_a_configured_vendors_missing_key_still_warns(tmp_path, capsys):
     assert all(f"vendor {v!r} resolved before" not in err for v in vendors[1:])
     # said on the round that records the change, not on every later one
     assert _providers(tmp_path, capsys, {v: KeyState.PRESENT for v in vendors[1:]}) == ""
+
+
+# ─── R2 M2: hand-to-vco on a ROCm host composes the ROCm overlay ──────────
+
+_REPO_INFRA = Path(__file__).resolve().parents[1] / "infrastructure"
+
+
+def _gpu_own_world(tmp_path, devices, owning_files):
+    """VCO's own Ollama under VCO's project, with the SHIPPED overlays on disk
+    and *devices* as its live ``HostConfig.Devices``."""
+    world = _own_project_world(tmp_path)
+    for name in ("docker-compose.gpu.yml", "docker-compose.rocm.yml"):
+        (world.infra / name).write_text(
+            (_REPO_INFRA / name).read_text(encoding="utf-8"), encoding="utf-8")
+    world.config_files["vco_ollama"] = owning_files
+
+    def run(argv, **kw):
+        argv = list(argv)
+        if argv[1:2] == ["inspect"] and "{{json .Id}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, '"abc123"', "")
+        if argv[1:2] == ["inspect"] and "{{json .HostConfig.Devices}}" in argv \
+                and argv[-1] == "vco_ollama":
+            world.all_argv.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(devices), "")
+        return world.run(argv, **kw)
+    return world, run
+
+
+def _hand_over_ollama(world, run):
+    with mock.patch.object(sa, "_host_gpu_vendor", create=True,
+                           side_effect=AssertionError("host probe not expected")):
+        result, _ = world.adopt(run=run, services=("ollama",),
+                                container_refs={"ollama": "vco_ollama"},
+                                commit_rows=lambda rows: None)
+    ups = [a for a in world.all_argv if "compose" in a and "up" in a]
+    files = [up[i + 1] for up in ups for i, tok in enumerate(up) if tok == "-f"]
+    return result, files
+
+
+def _merged_ollama_image(files):
+    env = sa.infrastructure_env_for_substitution(Path(files[0]).parent)
+    cfg: dict = {}
+    for f in files:
+        doc = sa.load_compose_doc(Path(f), env) or {}
+        cfg = sa.merge_compose(cfg, doc) if cfg else doc
+    return cfg["services"]["ollama"]["image"]
+
+
+_ROCM_DEVICES = [{"PathOnHost": "/dev/kfd", "PathInContainer": "/dev/kfd"},
+                 {"PathOnHost": "/dev/dri", "PathInContainer": "/dev/dri"}]
+
+
+def test_a_rocm_container_is_handed_over_under_the_rocm_overlay_and_image(tmp_path):
+    world, run = _gpu_own_world(tmp_path, _ROCM_DEVICES,
+                                "docker-compose.yml,docker-compose.rocm.yml")
+    result, files = _hand_over_ollama(world, run)
+    assert result.refused == {}
+    assert result.adopted == ["ollama"]
+    names = [Path(f).name for f in files]
+    assert "docker-compose.rocm.yml" in names
+    assert "docker-compose.gpu.yml" not in names
+    assert _merged_ollama_image(files).endswith("-rocm")
+
+
+def test_an_nvidia_container_is_still_handed_over_under_the_nvidia_overlay(tmp_path):
+    world, run = _gpu_own_world(
+        tmp_path, [{"PathOnHost": "/dev/nvidia0", "PathInContainer": "/dev/nvidia0"}],
+        "docker-compose.yml,docker-compose.gpu.yml")
+    result, files = _hand_over_ollama(world, run)
+    assert result.adopted == ["ollama"]
+    names = [Path(f).name for f in files]
+    assert "docker-compose.gpu.yml" in names
+    assert "docker-compose.rocm.yml" not in names
+    assert not _merged_ollama_image(files).endswith("-rocm")
+
+
+def test_a_cpu_container_is_handed_over_with_no_gpu_overlay(tmp_path):
+    world, run = _gpu_own_world(tmp_path, [], "docker-compose.yml")
+    result, files = _hand_over_ollama(world, run)
+    assert result.adopted == ["ollama"]
+    names = [Path(f).name for f in files]
+    assert not any(n in names for n in ("docker-compose.gpu.yml", "docker-compose.rocm.yml"))
+
+
+@pytest.mark.parametrize("devices, expected", [
+    ([{"PathOnHost": "/dev/kfd"}, {"PathOnHost": "/dev/dri"}], "amd"),
+    (["/dev/kfd:/dev/kfd"], "amd"),
+    (["amd.com/gpu=all"], "amd"),
+    ([{"PathOnHost": "/dev/nvidia0"}, {"PathOnHost": "/dev/nvidiactl"}], "nvidia"),
+    (["nvidia.com/gpu=all"], "nvidia"),
+    ([{"PathOnHost": "/dev/dri"}], None),        # Intel or AMD: no verdict
+    (["/dev/kfd", "/dev/nvidia0"], None),        # both: ambiguous
+    ([], None),
+    (None, None),
+])
+def test_the_device_list_names_its_vendor_only_positively(devices, expected):
+    from vco_lib import gpu_verify
+    assert gpu_verify.vendor_of_devices(devices) == expected
+
+
+def test_a_compose_stanza_names_its_vendor_from_devices_or_deploy_requests():
+    from vco_lib import gpu_verify
+    nvidia_deploy = {"deploy": {"resources": {"reservations": {"devices": [
+        {"driver": "nvidia", "count": "all", "capabilities": ["gpu"]}]}}}}
+    assert gpu_verify.vendor_of_compose_service(nvidia_deploy) == "nvidia"
+    assert gpu_verify.vendor_of_compose_service({"devices": ["/dev/kfd", "/dev/dri"]}) == "amd"
+    assert gpu_verify.vendor_of_compose_service({"image": "x"}) is None
+    bare = {"deploy": {"resources": {"reservations": {"devices": [
+        {"count": "all", "capabilities": ["gpu"]}]}}}}
+    assert gpu_verify.vendor_of_compose_service(bare) is None
+
+
+def test_the_vendor_choice_reads_the_containers_first_then_the_host():
+    never = mock.Mock(side_effect=AssertionError("host not asked"))
+    assert sa.choose_gpu_vendor(["amd", None], host_vendor=never) == ("amd", "")
+    assert sa.choose_gpu_vendor([None, "nvidia"], host_vendor=never) == ("nvidia", "")
+    # no container evidence: the host's selected card decides
+    assert sa.choose_gpu_vendor([None], host_vendor=lambda: "amd") == ("amd", "")
+    assert sa.choose_gpu_vendor([None], host_vendor=lambda: "nvidia") == ("nvidia", "")
+    assert sa.choose_gpu_vendor([], host_vendor=lambda: "") == ("nvidia", "")
+    vendor, reason = sa.choose_gpu_vendor(["amd", "nvidia"], host_vendor=never)
+    assert vendor is None and "refusing" in reason
+
+
+def test_mixed_vendor_gpu_services_are_refused_not_guessed(tmp_path):
+    world, run = _gpu_own_world(tmp_path, _ROCM_DEVICES,
+                                "docker-compose.yml,docker-compose.gpu.yml")
+    # the owning file declares NVIDIA, the live container holds /dev/kfd
+    gpu_doc = (world.infra / "docker-compose.gpu.yml").read_text(encoding="utf-8")
+    assert "nvidia" in gpu_doc
+    result, files = _hand_over_ollama(world, run)
+    assert result.adopted == []
+    assert "different GPU vendors" in result.refused["ollama"]
+    assert files == []

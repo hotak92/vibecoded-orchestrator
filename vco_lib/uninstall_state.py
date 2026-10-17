@@ -30,7 +30,7 @@ step [7]'s state files) when the dir is not plainly VCO's:
 
 An explicit ``VCT_STATE_DIR`` with another name that DOES hold VCO's files
 (review R39 M1) is not removed whole either: only VCO's own top-level entries
-go (:data:`VCO_OWNED_NAMES` / :data:`VCO_OWNED_PREFIXES`), the dir itself and
+go (:data:`VCO_OWNED_NAMES` + the exact shapes of :func:`_is_vco_owned`), the dir itself and
 everything else in it stay — ``VCT_STATE_DIR=~/Documents`` must not cost the
 user their documents. Entries with a generic name VCO also uses (``logs``,
 ``data`` …) are listed as left in place: they may be the user's.
@@ -46,6 +46,7 @@ copies of the user's own files.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
@@ -74,10 +75,25 @@ VCO_OWNED_NAMES = frozenset({
     "license.key", "telemetry.json", "rl_archive", "bundled_manifests", "wait_guard",
     "diagrams.token", "rl_project_identity_cache.json", "orchestrator.json", "projects.json",
 })
-#: Name prefixes only VCO uses (database siblings and backups, per-project hub
-#: tokens, atomic-write temp files of its caches).
-VCO_OWNED_PREFIXES = ("launcher.db", "hub.db", "hub.token.", "model-gateway.",
-                      "rl_project_identity_cache.json.", "services.toml.")
+#: Derived names VCO writes beside those entries, as EXACT shapes — never an
+#: open prefix, so a user's ``hub.db-notes.txt`` in a shared dir stays
+#: (v0.2.104 R2 L4). Each pattern names its writer:
+#:
+#: * ``launcher.db`` / ``hub.db`` + :data:`DB_SIBLING_SUFFIXES` (SQLite);
+#: * ``<db>.bak-<tag>`` (+ its own SQLite siblings) — VCO's backup convention
+#:   (``vco_lib.transcript_repair`` / ``vscode_settings``: ``<file>.bak-<ts>``);
+#: * ``hub.token.<project-id>`` — the hub's per-project token
+#:   (``vct-hub/src/project_tokens.rs`` ``PROJECT_TOKEN_PREFIX``), the id a
+#:   launcher project row's UUID (``project_setups.rs`` ``Uuid::new_v4``);
+#: * ``<owned>.<8 chars>.tmp`` — :func:`vco_lib.atomic.atomic_write_text`'s
+#:   ``mkstemp(prefix=name + ".", suffix=".tmp")`` temp of any owned file;
+#: * ``<owned>.lock`` — the lock file beside an owned cache;
+#: * ``services.toml.migrated-v0297`` — must match
+#:   ``vco_lib.service_reconcile.MIGRATED_SUFFIX`` (parity-tested).
+VCO_OWNED_DBS = ("launcher.db", "hub.db")
+SERVICES_TOML_MIGRATED = "services.toml.migrated-v0297"
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_MKSTEMP_TMP_RE = re.compile(r"(?P<base>.+)\.[a-z0-9_]{8}\.tmp")
 #: Generic names VCO also writes at the top of its state dir: in a dir not
 #: named ``.vct`` they may be the user's own, so they are left and listed.
 VCO_GENERIC_NAMES = frozenset({"logs", "metrics", "state", "locks", "cache", "data", "modules",
@@ -233,7 +249,23 @@ def _remove_tree(d: Path, keep: set[str], failed: list[tuple[Path, str]]) -> int
 # --------------------------------------------------------------------------
 
 def _is_vco_owned(name: str) -> bool:
-    return name in VCO_OWNED_NAMES or name.startswith(VCO_OWNED_PREFIXES)
+    """Is *name* a top-level entry only VCO writes in its state dir — an
+    owned name, or one of the exact derived shapes documented at
+    :data:`VCO_OWNED_DBS`? Anything else (``hub.db-notes.txt``,
+    ``model-gateway.howto.md``, ``launcher.dbx``) is the user's."""
+    if name in VCO_OWNED_NAMES or name == SERVICES_TOML_MIGRATED:
+        return True
+    for db in VCO_OWNED_DBS:
+        if name in (db + s for s in DB_SIBLING_SUFFIXES):
+            return True
+        if name.startswith(db + ".bak-") and len(name) > len(db + ".bak-"):
+            return True
+    if name.startswith("hub.token.") and _UUID_RE.fullmatch(name[len("hub.token."):]):
+        return True
+    if name.endswith(".lock") and name[:-len(".lock")] in VCO_OWNED_NAMES:
+        return True
+    tmp = _MKSTEMP_TMP_RE.fullmatch(name)
+    return bool(tmp) and tmp.group("base") != name and _is_vco_owned(tmp.group("base"))
 
 
 def _measure_paths(paths: Sequence[Path]) -> tuple[int, int]:

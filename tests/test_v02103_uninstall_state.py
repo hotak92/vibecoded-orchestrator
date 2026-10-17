@@ -969,7 +969,7 @@ def test_an_explicit_state_dir_not_named_vct_loses_only_vcos_entries(home, tmp_p
     folder itself stay."""
     root = _state(tmp_path / "Documents")
     (root / "thesis.docx").write_text("user")
-    (root / "hub.token.0123").write_text("x")
+    (root / f"hub.token.{_PROJECT_ID}").write_text("x")
     (root / "launcher.db.bak-old").write_text("x")
     plan = us.build_plan(root=root, home=home, env={"VCT_STATE_DIR": str(root)},
                          launcher_db=root / "launcher.db")
@@ -982,10 +982,46 @@ def test_an_explicit_state_dir_not_named_vct_loses_only_vcos_entries(home, tmp_p
     assert (root / "thesis.docx").read_text() == "user"
     assert (root / "logs" / "model-gateway.log").exists() and (root / "state").is_dir()
     for gone in ("launcher.db", "launcher.db-wal", "launcher.db-shm", "hub.db", "hub.pid", "hub.token",
-                 "model-gateway.token", "retrieval_rl_data", "hub.token.0123", "launcher.db.bak-old"):
+                 "model-gateway.token", "retrieval_rl_data", f"hub.token.{_PROJECT_ID}",
+                 "launcher.db.bak-old"):
         assert not (root / gone).exists(), (gone, audit)
     assert root.is_dir()
     assert any("left in place" in a for a in audit)
+
+
+_PROJECT_ID = "3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f"
+
+#: Derived names VCO really writes (each shape's writer is named at
+#: ``uninstall_state.VCO_OWNED_DBS``) — the act arm of the exact-shape rule.
+_VCO_DERIVED = ("hub.db-wal", "hub.db-shm", "launcher.db-journal", "launcher.db.bak-pre-x",
+                "launcher.db.bak-pre-x-wal", f"hub.token.{_PROJECT_ID}",
+                "rl_project_identity_cache.json.0bxawabr.tmp",
+                "rl_project_identity_cache.json.lock", "services.toml.ab_12xyz.tmp",
+                f"hub.token.{_PROJECT_ID}.k3j9_x0q.tmp", "services.toml.migrated-v0297")
+#: Near-miss names a user may keep beside VCO's files — the leave-alone arm
+#: (v0.2.104 R2 L4: the open prefixes deleted every one of these).
+_USER_NEAR_MISS = ("hub.db-notes.txt", "model-gateway.notes", "model-gateway.howto.md",
+                   "launcher.dbx", "launcher.db.bak-", "hub.token.mine", "hub.token.0123",
+                   "services.toml.orig", "rl_project_identity_cache.json.old",
+                   "thesis.docx.abcdefgh.tmp", "services.toml.ABCDEFGH.tmp", "notes.lock")
+
+
+def test_a_selective_dir_removes_vcos_derived_names_and_keeps_near_miss_user_files(home, tmp_path):
+    root = _state(tmp_path / "Documents")
+    for name in (*_VCO_DERIVED, *_USER_NEAR_MISS):
+        (root / name).write_text("x")
+    us.execute(us.build_plan(root=root, home=home, env={"VCT_STATE_DIR": str(root)},
+                             launcher_db=root / "launcher.db"))
+    for name in _VCO_DERIVED:
+        assert not (root / name).exists(), name
+    for name in _USER_NEAR_MISS:
+        assert (root / name).read_text() == "x", name
+    assert root.is_dir()
+
+
+def test_the_migrated_services_toml_name_matches_its_writer():
+    from vco_lib import service_reconcile
+    assert us.SERVICES_TOML_MIGRATED == "services.toml" + service_reconcile.MIGRATED_SUFFIX
 
 
 def test_a_selective_dir_never_follows_a_link_named_like_vcos(home, tmp_path):
