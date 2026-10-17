@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterator
 
 # Each rule: (name, compiled regex, explanation)
 # Rules are ordered roughly by severity.
@@ -32,6 +33,30 @@ _RULES: list[tuple[str, re.Pattern[str], str]] = []
 
 def _rule(name: str, pattern: str, explanation: str) -> None:
     _RULES.append((name, re.compile(pattern, re.IGNORECASE), explanation))
+
+
+# v0.2.104 R7 N2 — every rule is LINEAR in the length of the scan surface.
+# The surfaces are whitespace-collapsed one-liners (no newline), so a command
+# repeating one verb tens of thousands of times is a single long line, and a
+# rule written `A.*B` restarts at EVERY `A` and runs to the end of the line:
+# O(n^2) (`A.*B.*C`: O(n^3)). Past the hook's 2 s scanner bound that means no
+# verdict at all. Two rewrites keep each rule's match set unchanged (each one
+# is pinned against its old pattern by a randomized differential test in
+# tests/test_v02104_scanner_linear_rules.py) while scanning each character from
+# O(1) starting points:
+#   * last-start tempering, `A _span(A) B` — the span after `A` stops at the
+#     next `A`. Whenever some `A` reaches `B`, the LAST `A` before `B` reaches it
+#     too (no `A` can overlap `B` in these rules), and spans of successive `A`s
+#     are disjoint. Used for two-part rules and segment-bounded spans
+#     (`[^|]`, `[^;|]`).
+#   * first-occurrence chains, `^ _span(A) A _span(B) B .* C` — anchored at the
+#     start (of the line, or of the `;`/`&` segment), each part is the FIRST
+#     occurrence after the previous one. The earliest `A` ends earliest, so if
+#     any `A … B … C` exists, the chain finds one; the anchor makes it one
+#     attempt per line/segment. Used for three-part rules.
+def _span(stop: str, cls: str = ".") -> str:
+    """``cls*`` that never steps onto a position where ``stop`` matches."""
+    return rf"(?:(?!{stop}){cls})*"
 
 
 # === 1. Destructive filesystem operations ===
@@ -51,7 +76,7 @@ _rule(
 )
 _rule(
     "dd_device",
-    r"\bdd\b.*\bof=/dev/",
+    r"\bdd\b" + _span(r'\bdd\b') + r"\bof=/dev/",
     "Direct device write via dd",
 )
 _rule(
@@ -73,7 +98,7 @@ _rule(
 _TEXT_WRITE_HINT = "; to write a FILE whose text only mentions this, use the Write tool or a quoted heredoc (cat > file <<'EOF')"
 _rule(
     "curl_pipe_shell",
-    r"(curl|wget)\s[^|]*\|\s*(ba)?sh\b",
+    r"(curl|wget)\s" + _span(r'(?:curl|wget)\s', r'[^|]') + r"\|\s*(ba)?sh\b",
     "Network fetch piped to shell interpreter (download to a file and inspect it "
     "before running it" + _TEXT_WRITE_HINT + ")",
 )
@@ -84,7 +109,7 @@ _rule(
 )
 _rule(
     "base64_pipe_shell",
-    r"base64\s+-d.*\|\s*(ba)?sh\b",
+    r"base64\s+-d" + _span(r'base64\s+-d') + r"\|\s*(ba)?sh\b",
     "Base64-decoded content piped to shell (decode to a file and inspect it "
     "first" + _TEXT_WRITE_HINT + ")",
 )
@@ -102,7 +127,10 @@ _rule(
     # As a mid-command ARGUMENT (`grep env config | curl`, `cat env.list | curl`)
     # `env` produces no environment dump, so those benign shapes no longer
     # false-positive. `\b…\b` still rejects the `set` substring of `reset`/`unset`.
-    r"(?:^|[|&;(])\s*(env|printenv|set)\b[^;&|\n]*\|\s*(curl|wget|nc|ncat)\b",
+    # v0.2.104 R7 N2: the span stops at the next `(env`-style start (the only
+    # command-position start a `[^;&|\n]` span can contain).
+    r"(?:^|[|&;(])\s*(env|printenv|set)\b" +
+    _span(r'\(\s*(?:env|printenv|set)\b', r'[^;&|\n]') + r"\|\s*(curl|wget|nc|ncat)\b",
     "Environment dump piped to network tool",
 )
 _rule(
@@ -111,7 +139,9 @@ _rule(
     # `$(env)` / `$(printenv X)` / `$(cat /proc/…)` AND the backtick form
     # `` `env` `` / `` `printenv X` `` — as the env/proc source spliced into the
     # request body. The prior regex only matched `$(`, so `curl -d \`env\`` leaked.
-    r"(curl|wget).*(-d|--data).*(?:\$\(|`)\s*(env|printenv|cat\s+/proc)",
+    # v0.2.104 R7 N2: first-occurrence chain (the old `A.*B.*C` was cubic).
+    r"^" + _span('curl|wget') + r"(curl|wget)" + _span('-d|--data') + r"(-d|--data)"
+    r".*(?:\$\(|`)\s*(env|printenv|cat\s+/proc)",
     "Env or proc data sent via HTTP request body",
 )
 _rule(
@@ -130,14 +160,21 @@ _rule(
     # of `env` (`cat env.list | base64 | curl`) does not false-positive. A non-env
     # source (`cat foo | base64 | curl`) never matches, and an env dump with no
     # network sink (`env | grep PATH | sort`) never matches.
-    r"(?:^|[|&;(])\s*(env|printenv|set)\b[^;&\n]*\|[^;&\n]*\b(curl|wget|nc|ncat)\b",
+    # v0.2.104 R7 N2: one attempt per `;`/`&` segment, from its FIRST env
+    # start (at the segment's head, or after a `|`/`(` inside it), then the
+    # first `|` after it, then a sink — the old form restarted at every
+    # `| printenv` and was cubic on a long pipeline.
+    r"(?:^|(?<=[;&]))(?:\s*(env|printenv|set)\b"
+    r"|" + _span(r'[|(]\s*(?:env|printenv|set)\b', r'[^;&\n]') + r"[|(]\s*(env|printenv|set)\b)"
+    r"[^;&|\n]*\|[^;&\n]*\b(curl|wget|nc|ncat)\b",
     "Environment dump exfiltrated to network tool through an intermediate hop",
 )
 
 # === 3. Credential access ===
 _rule(
     "read_ssh_keys",
-    r"cat\s+~?/?(\.ssh/(id_|authorized_keys|known_hosts|config)|\bssh\b.*private)",
+    r"cat\s+~?/?\.ssh/(id_|authorized_keys|known_hosts|config)"
+    r"|cat\s+~?/?\bssh\b" + _span(r'cat\s+~?/?\bssh\b') + r"private",
     "Reading SSH private keys or config",
 )
 _rule(
@@ -147,7 +184,8 @@ _rule(
 )
 _rule(
     "env_grep_secrets",
-    r"(env|printenv|set)\s*\|.*grep.*(KEY|TOKEN|SECRET|PASS|CRED)",
+    r"^" + _span(r'(?:env|printenv|set)\s*\|') + r"(env|printenv|set)\s*\|" + _span('grep') + r"grep"
+    r".*(KEY|TOKEN|SECRET|PASS|CRED)",
     "Searching environment for secrets/credentials",
 )
 # D-13 (v0.2.75): `printenv GITHUB_TOKEN` and `echo $OPENAI_API_KEY`
@@ -233,19 +271,26 @@ _rule(
     # a compound. The negative lookahead `(?![^;&|\n]*>)` rejects a redirect
     # between `cat` and the extension; `[^;&|\n]*` keeps the filename inside the
     # same simple command. `cat ~/.env` / `cat .env.local` still match.
-    rf"cat\s+(?![^;&|\n]*>)[^;&|\n]*\.({_CRED_EXT_ALT})\b",
+    # v0.2.104 R7 N2: the old lookahead re-read the segment from EVERY `cat`
+    # (O(n^2) on one long segment). Same set, one pass per segment: only a
+    # `cat` after the segment's LAST `>` has no `>` after it, so skip past that
+    # `>` (atomically) and take the first `cat` there.
+    r"(?:^|(?<=[;&|\n]))(?>(?:[^;&|\n]*>)?)" + _span(r'cat\s', r'[^;&|\n]') +
+    rf"cat\s+[^;&|\n]*\.({_CRED_EXT_ALT})\b",
     "Reading credential files",
 )
 
 # === 4. Privilege escalation ===
 _rule(
     "chmod_world_writable",
-    r"chmod\s+(-[a-zA-Z]+\s+)*777\b",
+    # v0.2.104 R7 N2: a flag may not hold a fresh `chmod ` start (that start
+    # then reaches the same `777`), so runs of `-chmod` flags are read once.
+    r"chmod\s+(-" + _span(r'chmod\s', '[a-zA-Z]') + r"[a-zA-Z]\s+)*777\b",
     "Setting world-writable permissions",
 )
 _rule(
     "chown_root",
-    r"chown\s+(-[a-zA-Z]+\s+)*root\b",
+    r"chown\s+(-" + _span(r'chown\s', '[a-zA-Z]') + r"[a-zA-Z]\s+)*root\b",
     "Changing ownership to root",
 )
 # The `sudo_su` rule was REMOVED in v0.2.21 (2026-05-20). Rationale:
@@ -272,38 +317,42 @@ _rule(
 # === 5. Package supply chain ===
 _rule(
     "pip_install_url",
-    r"pip\s+install\s+.*https?://(?!.*pypi\.org)",
+    # v0.2.104 R7 N2: from the FIRST `pip install`, only the LAST URL can
+    # decide (no `pypi.org` after an earlier URL implies none after the last),
+    # so the URL search is atomic: one pass, no retry per URL.
+    r"^" + _span(r'pip\s+install\s') + r"pip\s+install\s+(?>.*https?://)(?!.*pypi\.org)",
     "pip install from non-PyPI URL",
 )
 _rule(
     "pip_install_git",
-    r"pip\s+install\s+.*git\+",
+    r"pip\s+install\s+" + _span(r'pip\s+install\s') + r"git\+",
     "pip install from git repository",
 )
 _rule(
     "npm_install_url",
-    r"npm\s+install\s+.*https?://",
+    r"npm\s+install\s+" + _span(r'npm\s+install\s') + r"https?://",
     "npm install from URL",
 )
 
 # === 6. History/log access with secrets ===
 _rule(
     "read_bash_history",
-    r"cat\s+.*\.(bash_history|zsh_history|history)",
+    r"cat\s+" + _span(r'cat\s') + r"\.(bash_history|zsh_history|history)",
     "Reading shell history (may contain secrets)",
 )
 
 # === 7. Symlink attacks ===
 _rule(
     "ln_s_etc",
-    r"ln\s+-s.*/(etc/passwd|etc/shadow|proc/)",
+    r"ln\s+-s" + _span(r'ln\s+-s') + r"/(etc/passwd|etc/shadow|proc/)",
     "Symlink targeting sensitive system files",
 )
 
 # === 8. Reverse shells ===
 _rule(
     "reverse_shell",
-    r"(bash\s+-i\s+>&|/dev/tcp/|nc\s+-[a-zA-Z]*e\s|ncat\s+-[a-zA-Z]*e\s|python.*socket.*connect)",
+    r"(bash\s+-i\s+>&|/dev/tcp/|nc\s+-[a-zA-Z]*e\s|ncat\s+-[a-zA-Z]*e\s)"
+    r"|^" + _span('python') + r"python" + _span('socket') + r"socket.*connect",
     "Possible reverse shell pattern",
 )
 
@@ -466,36 +515,47 @@ def _neutralize(cmd: str, *, env_read: bool) -> str:
     both surfaces — that is the real command skeleton.
     """
     out: list[str] = []
-    lines = cmd.split("\n")
+    for _line, rendered, bodies in _heredoc_walk(cmd, env_read=env_read):
+        out.append(rendered)
+        for _delim, quoted, body in bodies:
+            if not quoted and env_read:
+                # Unquoted heredoc body: keep only `$VAR` expansions.
+                out.append(_extract_expansions("\n".join(body)))
+            # quoted body, or non-env-read surface → body is fully inert: drop.
+    return "\n".join(out)
 
-    # Pass 1 pre-scan: nothing to do — heredocs are handled line-by-line below
-    # because a heredoc body starts on the line AFTER its opener.
+
+#: One here-doc body: ``(delimiter, quoted, body_lines)``.
+_HeredocBody = tuple[str, bool, list[str]]
+
+
+def _heredoc_walk(cmd: str, *, env_read: bool) -> Iterator[tuple[str, str, list[_HeredocBody]]]:
+    """The ONE walk over a command's lines and here-doc bodies (v0.2.104 R7
+    N4: ``_neutralize``, ``_heredoc_interp_payloads`` and
+    ``_strip_heredoc_bodies`` each had their own copy). Yields, for every line
+    OUTSIDE a body, ``(line, rendered, bodies)``: the raw line, the line as
+    :func:`_neutralize_line` renders it for ``env_read``, and the bodies of the
+    here-docs it opens, in order. A body starts on the line after its opener
+    and ends at a line that is its delimiter alone (any leading/trailing
+    whitespace accepted — a superset of ``<<-``'s tab stripping, safe here) or
+    at the end of the command."""
+    lines = cmd.split("\n")
     i = 0
     while i < len(lines):
         line = lines[i]
-        # Scan this line char-by-char for quotes and heredoc openers.
-        rendered, opened = _neutralize_line(line, env_read=env_read)
-        out.append(rendered)
+        rendered, openers = _neutralize_line(line, env_read=env_read)
         i += 1
-        # If this line opened one or more here-docs, consume their bodies.
-        for op in opened:
-            delim, quoted = op
+        bodies: list[_HeredocBody] = []
+        for delim, quoted in openers:
             body: list[str] = []
             while i < len(lines):
-                # A here-doc terminator is the delimiter alone on a line
-                # (leading whitespace allowed for `<<-`; we accept any leading
-                # whitespace — a superset that is safe for neutralization).
                 if lines[i].strip() == delim:
                     i += 1
                     break
                 body.append(lines[i])
                 i += 1
-            if not quoted and env_read:
-                # Unquoted heredoc body: keep only `$VAR` expansions.
-                out.append(_extract_expansions("\n".join(body)))
-            # quoted body, or non-env-read surface → body is fully inert: drop.
-
-    return "\n".join(out)
+            bodies.append((delim, quoted, body))
+        yield line, rendered, bodies
 
 
 def _neutralize_line(line: str, *, env_read: bool) -> tuple[str, list[tuple[str, bool]]]:
@@ -699,25 +759,14 @@ def _heredoc_interp_payloads(cmd: str) -> tuple[list[str], list[str]]:
     opener line feeds them to a shell / python interpreter (see the sink
     patterns above). A body is collected whole (quoted or not — quoting only
     governs ``$VAR`` expansion, never whether the interpreter executes it)."""
-    lines = cmd.split("\n")
     shell_bodies: list[str] = []
     python_bodies: list[str] = []
-    i = 0
-    while i < len(lines):
-        rendered, openers = _neutralize_line(lines[i], env_read=False)
-        i += 1
-        if not openers:
+    for _line, rendered, bodies in _heredoc_walk(cmd, env_read=False):
+        if not bodies:
             continue
         to_shell = bool(_HEREDOC_SHELL_SINK.search(rendered))
         to_python = bool(_HEREDOC_PYTHON_SINK.search(rendered))
-        for delim, _quoted in openers:
-            body: list[str] = []
-            while i < len(lines):
-                if lines[i].strip() == delim:
-                    i += 1
-                    break
-                body.append(lines[i])
-                i += 1
+        for _delim, _quoted, body in bodies:
             text = "\n".join(body)
             if to_shell:
                 shell_bodies.append(text)
@@ -737,21 +786,7 @@ def _strip_heredoc_bodies(cmd: str) -> str:
     env-read rules handle `$VAR` expansion inside unquoted bodies on their own
     surface; that is orthogonal to this walk.)
     """
-    lines = cmd.split("\n")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        openers = _neutralize_line(line, env_read=False)[1]
-        i += 1
-        for delim, _quoted in openers:
-            while i < len(lines):
-                if lines[i].strip() == delim:
-                    i += 1
-                    break
-                i += 1
-    return "\n".join(out)
+    return "\n".join(line for line, _rendered, _bodies in _heredoc_walk(cmd, env_read=False))
 
 
 def _capture_quoted_word(cmd: str, pos: int) -> tuple[str | None, int]:
@@ -1163,44 +1198,54 @@ def _ps_rule(name: str, pattern: str, explanation: str) -> None:
 
 _ps_rule(
     "ps_download_exec",
-    rf"\b{_PS_FETCH}\b.*\b{_PS_EXEC}\b|\b{_PS_EXEC}\b.*\b{_PS_FETCH}\b",
+    rf"\b{_PS_FETCH}\b" + _span(rf'\b{_PS_FETCH}\b') + rf"\b{_PS_EXEC}\b"
+    rf"|\b{_PS_EXEC}\b" + _span(rf'\b{_PS_EXEC}\b') + rf"\b{_PS_FETCH}\b",
     "Network fetch executed as code (download-and-invoke)",
 )
 _ps_rule(
     "ps_base64_exec",
-    rf"frombase64string.*\b{_PS_EXEC}\b|\b{_PS_EXEC}\b.*frombase64string",
+    r"frombase64string" + _span('frombase64string') + rf"\b{_PS_EXEC}\b"
+    rf"|\b{_PS_EXEC}\b" + _span(rf'\b{_PS_EXEC}\b') + r"frombase64string",
     "Base64-decoded content executed as code",
 )
 _ps_rule(
     "ps_encoded_command",
-    r"\b(?:powershell|pwsh)(?:\.exe)?\b[^;|]*\s-(?:e|ec|en|enc|enco|encodedcommand)\s+['\"]?[A-Za-z0-9+/=]{16,}",
+    r"\b(?:powershell|pwsh)(?:\.exe)?\b" + _span(r'\b(?:powershell|pwsh)(?:\.exe)?\b', r'[^;|]') +
+    r"\s-(?:e|ec|en|enc|enco|encodedcommand)\s+['\"]?[A-Za-z0-9+/=]{16,}",
     "Encoded PowerShell payload (cannot be inspected; run the plain command instead)",
 )
 _ps_rule(
     "ps_env_secret_read",
     rf"\$\{{?env:{_SECRET_NAME}(?!\s*=(?!=))"
     rf"|getenvironmentvariable\(\s*['\"]{_SECRET_NAME}"
-    rf"|\b{_PS_READ_VERB}\s+[^;|]*\benv:[\\/]?[\w*]*(?:KEY|TOKEN|SECRET|PASS|CRED)",
+    rf"|\b{_PS_READ_VERB}\s+" + _span(rf'\b{_PS_READ_VERB}\s', r'[^;|]') +
+    r"\benv:[\\/]?[\w*]*(?:KEY|TOKEN|SECRET|PASS|CRED)",
     "Reading a secret-shaped env var (use vct-secrets)",
 )
 _ps_rule(
     "ps_env_grep_secrets",
-    rf"\b{_PS_READ_VERB}\s+[^;|]*\benv:.*\|.*(?:KEY|TOKEN|SECRET|PASS|CRED)",
+    # v0.2.104 R7 N2: anchored; the atomic group settles on the EARLIEST
+    # `env:` that follows a read verb in its segment, then the first `|`, then
+    # a secret name — one pass instead of a rescan per verb.
+    rf"^(?>.*?\b{_PS_READ_VERB}\s+" + _span(rf'\b{_PS_READ_VERB}\s', r'[^;|]') + r"?\benv:)" +
+    _span(r'\|') + r"\|.*(?:KEY|TOKEN|SECRET|PASS|CRED)",
     "Searching the environment for secrets/credentials",
 )
 _ps_rule(
     "ps_env_exfil",
-    rf"\benv:.*\|.*\b(?:{_PS_FETCH}|curl|wget)\b",
+    r"^" + _span(r'\benv:') + r"\benv:" + _span(r'\|') + rf"\|.*\b(?:{_PS_FETCH}|curl|wget)\b",
     "Environment dump sent to a network tool",
 )
 _ps_rule(
     "ps_read_ssh_keys",
-    r"\b(?:get-content|gc|cat|type)\s+[^;|]*\.ssh[\\/](?:id_|authorized_keys|known_hosts|config)",
+    r"\b(?:get-content|gc|cat|type)\s+" + _span(r'\b(?:get-content|gc|cat|type)\s', r'[^;|]') +
+    r"\.ssh[\\/](?:id_|authorized_keys|known_hosts|config)",
     "Reading SSH private keys or config",
 )
 _ps_rule(
     "ps_read_env_files",
-    rf"\b(?:get-content|gc|cat|type)\s+[^;|>]*\.(?:{_CRED_EXT_ALT})\b",
+    r"\b(?:get-content|gc|cat|type)\s+" + _span(r'\b(?:get-content|gc|cat|type)\s', r'[^;|>]') +
+    rf"\.(?:{_CRED_EXT_ALT})\b",
     "Reading credential files",
 )
 _ps_rule(
@@ -1210,7 +1255,8 @@ _ps_rule(
 )
 _ps_rule(
     "ps_remove_root",
-    r"\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\s+[^;|]*?"
+    r"\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\s+" +
+    _span(r'\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\s', r'[^;|]') + r"?"
     r"(?:(?<![\w.\\/])[a-z]:[\\/]?\*?(?=[\s'\"]|$)"
     r"|[a-z]:[\\/](?:windows|users|program files(?: \(x86\))?)[\\/]?\*?(?=[\s'\"]|$)"
     r"|\$env:(?:userprofile|systemroot|windir|homedrive)[\\/]?\*?(?=[\s'\"]|$)"

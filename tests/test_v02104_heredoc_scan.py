@@ -273,6 +273,38 @@ def test_hook_bounds_a_hung_scanner(impl: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("impl", _SHELLS)
+def test_hook_bound_is_one_deadline_when_the_scanner_never_reads(impl: str, tmp_path: Path) -> None:
+    """R7 N3 — RED pre-fix on ps1 (~4 s over the baseline): a 200 KiB command
+    fills the pipe of a scanner that never reads stdin, so the write blocks;
+    the write wait and the exit wait each got the full 2 s. One deadline now
+    covers both, as `timeout` does on the sh side."""
+    cmd = "echo " + "a" * (200 * 1024)
+    fast = _project(tmp_path / "fast", "import sys\nsys.stdin.buffer.read()\nsys.exit(0)\n")
+    t0 = time.monotonic()
+    assert _run(impl, fast, cmd, tmp_path).returncode == 0
+    baseline = time.monotonic() - t0
+    stalled = _project(tmp_path / "stalled", "import time\ntime.sleep(30)\n")
+    t0 = time.monotonic()
+    res = _run(impl, stalled, cmd, tmp_path)
+    extra = time.monotonic() - t0 - baseline
+    assert res.returncode == 0, res.stderr
+    assert extra < 3.0, (baseline, extra)  # the 2 s scanner bound, plus slack
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+@pytest.mark.parametrize("tok", ["base" + "64 -d f", "cu" + "rl x"])
+def test_hook_raw_net_is_fast_on_40k_repeats(impl: str, tok: str, tmp_path: Path) -> None:
+    """R7 N2 — RED pre-fix on ps1: .NET backtracking made the raw base64
+    pattern take ~58 s on this command, so the harness killed the hook and
+    nothing after the raw net (the whole scanner) ever ran."""
+    proj = _project(tmp_path, SCANNER.read_text(encoding="utf-8"))
+    t0 = time.monotonic()
+    res = _run(impl, proj, "; ".join([tok] * 40000), tmp_path)
+    assert res.returncode == 0, res.stderr[-500:]
+    assert time.monotonic() - t0 < 10
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
 def test_hook_handles_a_40k_line_data_heredoc_fast(impl: str, tmp_path: Path) -> None:
     proj = _project(tmp_path, SCANNER.read_text(encoding="utf-8"))
     body = "\n".join(f"line {i}: never pipe a download into sh" for i in range(40000))
