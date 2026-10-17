@@ -375,6 +375,29 @@ def _is_legacy_move_user_line(stripped: str) -> bool:
     )
 
 
+def _is_legacy_move_copied_line(line: str, stripped: str) -> bool:
+    """Could a pre-v0.2.104 project move have written *line* for a file it
+    COPIED outside ``.claude/`` (a ``knowledge/**`` node, ``CONTEXT_STATE.md``,
+    ``MEMORY.md``)?
+
+    That writer emitted ``"/" + <copied path>`` verbatim, one per line: no
+    escaping and no trimming, so a user's node named ``My Node.md`` became the
+    line ``/knowledge/My Node.md``. git reads such a line literally — inner
+    spaces are part of the pattern; only TRAILING spaces are dropped unless
+    escaped with a backslash — so the line did hide that node, and the migration
+    must find it. What the writer never produced: a line starting with
+    whitespace (it began with ``/``) or a directory pattern (copies are
+    files). Bundle blocks keep the stricter :func:`_is_legacy_vco_entry`: no
+    shipped path has whitespace (pinned by a test), so a whitespace line
+    there is the user's.
+    """
+    return (
+        line[:1] == "/"
+        and not stripped.endswith("/")
+        and _is_legacy_move_user_line(stripped)
+    )
+
+
 def _is_legacy_vco_entry(stripped: str) -> bool:
     """Could a pre-v0.2.104 release have written ``stripped`` as an entry?
 
@@ -415,7 +438,10 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
     * a ``#`` comment, only in the header run right after the marker;
     * an entry of the legacy shape (:func:`_is_legacy_vco_entry`): a
       ``/.claude/<path>`` line or a directory pattern other than ``/.claude/``
-      is the user's (L3);
+      is the user's (L3). In a MOVE block a copied-material line
+      (:func:`_is_legacy_move_copied_line`) also qualifies even with inner
+      whitespace: the old writer listed a copied ``knowledge/My Node.md``
+      verbatim (R4 L1);
     * not a repeat of a line earlier in the same block or in an EARLIER VCO
       block — VCO de-duplicated against them. A repeat of a line the user
       keeps OUTSIDE VCO's blocks does not count: the user may have put it
@@ -500,7 +526,9 @@ def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
                     break
             else:
                 in_header = False
-                if not _is_legacy_vco_entry(s) or s in vco_seen:
+                legacy_shape = _is_legacy_vco_entry(s) or (
+                    is_move and _is_legacy_move_copied_line(lines[k], s))
+                if not legacy_shape or s in vco_seen:
                     break
                 past_bundle = manifest_seen or sidecar_seen
                 if s == _LEGACY_CLAUDE_GLOB and past_bundle:
@@ -575,10 +603,14 @@ def _rewrite_vco_blocks(
 
 
 def _line_ending(text: str) -> str:
-    """The line ending of *text*'s first line (``\n`` when it has none), so
-    what VCO adds to a CRLF exclude file is CRLF too."""
-    nl = text.find("\n")
-    return "\r\n" if nl > 0 and text[nl - 1] == "\r" else "\n"
+    """The DOMINANT line ending of *text*, so what VCO adds to a CRLF exclude
+    file is CRLF too: ``\r\n`` when more lines end in CRLF than in a bare
+    LF, else ``\n`` (also when no line has an ending yet, e.g. a one-line
+    file without a final newline). Counting every line rather than reading
+    the first one keeps a file whose first line is LF but whose body is CRLF
+    (an editor that converted only what it touched) on CRLF."""
+    crlf = text.count("\r\n")
+    return "\r\n" if crlf > text.count("\n") - crlf else "\n"
 
 
 def append_git_info_exclude(

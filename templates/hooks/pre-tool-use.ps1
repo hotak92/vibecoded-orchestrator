@@ -487,10 +487,17 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
                     # its own 1 s default. VCO_PRE_TOOL_USE_TIMEOUT_S (whole
                     # seconds) MUST MATCH the `timeout` registered for
                     # pre-tool-use in .claude/settings.json -- set it when you
-                    # change that registration. MUST MATCH pre-tool-use.sh.
+                    # change that registration. MUST MATCH pre-tool-use.sh:
+                    # digits only, read as decimal, 1..999999; anything else
+                    # -- empty, non-digit, 0, over-range -- reads as 3,
+                    # silently (TryParse: an over-range value must not throw
+                    # a red error line into the hook's stderr).
                     $ptuBudgetS = 3
-                    if ($env:VCO_PRE_TOOL_USE_TIMEOUT_S -match '^[0-9]+$' -and [int]$env:VCO_PRE_TOOL_USE_TIMEOUT_S -gt 0) {
-                        $ptuBudgetS = [int]$env:VCO_PRE_TOOL_USE_TIMEOUT_S
+                    $ptuBudgetParsed = [long]0
+                    if ([string]$env:VCO_PRE_TOOL_USE_TIMEOUT_S -match '^[0-9]+$' -and
+                        [long]::TryParse([string]$env:VCO_PRE_TOOL_USE_TIMEOUT_S, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$ptuBudgetParsed) -and
+                        $ptuBudgetParsed -ge 1 -and $ptuBudgetParsed -le 999999) {
+                        $ptuBudgetS = [int]$ptuBudgetParsed
                     }
                     $ptuLeftMs = $ptuBudgetS * 1000 - (Get-PtuElapsedMs) - 700
                     if ($raPy -and $ptuLeftMs -ge 200) {

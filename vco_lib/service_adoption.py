@@ -522,8 +522,12 @@ def choose_gpu_vendor(evidence: Sequence[Optional[str]],
     module attribute reaches the probe this function actually runs."""
     named = {v for v in evidence if v in ("amd", "nvidia")}
     if len(named) > 1:
-        return None, ("the GPU services name different GPU vendors (AMD and "
-                      "NVIDIA devices) — one compose chain carries one GPU "
+        # The evidence is flattened across containers, so the text covers
+        # both cases: one container holding both device families, or two
+        # containers naming one vendor each.
+        return None, ("the GPU evidence names both GPU vendors (AMD and "
+                      "NVIDIA devices, in one container or across the GPU "
+                      "services) — one compose chain carries one GPU "
                       "overlay; refusing rather than picking one")
     if named:
         return named.pop(), ""

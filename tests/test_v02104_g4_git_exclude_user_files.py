@@ -530,6 +530,86 @@ class G4R3LegacyBlockTests(unittest.TestCase):
         for rel in ("knowledge/private.md", ".vscode/settings.json", "knowledge/curated.md"):
             self.assertTrue(self._ignored(rel), rel)
 
+    def test_a_space_named_copied_node_does_not_end_an_old_move_block(self):
+        """R4 L1: the pre-v0.2.104 move wrote `"/" + <copied path>` verbatim,
+        so a node named `My Node.md` gave `/knowledge/My Node.md`, which git
+        reads literally (inner spaces are part of the pattern) and which did
+        hide the node. The walk must not stop there: every copied line goes."""
+        self.exclude.write_text(
+            "# VCO project move: x\n/knowledge/My Node.md\n/knowledge/b.md\n"
+            "/CONTEXT_STATE.md\n",
+            encoding="utf-8",
+        )
+        # The premise, asked of git itself: the old line hid the node.
+        self.assertTrue(self._ignored("knowledge/My Node.md"))
+        res = git_exclude.append_git_info_exclude(self.proj, ())
+        self.assertEqual(res["action"], "migrated")
+        self.assertEqual(
+            res["removed"],
+            ["/knowledge/My Node.md", "/knowledge/b.md", "/CONTEXT_STATE.md"],
+        )
+        self.assertEqual(
+            self.exclude.read_text(encoding="utf-8"),
+            "# VCO project move: x\n# VCO end\n",
+        )
+        for rel in ("knowledge/My Node.md", "knowledge/b.md", "CONTEXT_STATE.md"):
+            self.assertFalse(self._ignored(rel), rel)
+
+    def test_a_space_named_line_still_ends_a_bundle_block(self):
+        """A bundle block never listed a path with whitespace (no shipped path
+        has any), so such a line there is the user's: it ends the block and
+        stays, like every line after it."""
+        text = ("# VCO safe-add (v0.2.63): x\n/CLAUDE.md\n/knowledge/My Node.md\n"
+                "/knowledge/b.md\n")
+        new, removed = git_exclude._rewrite_vco_blocks(text, ["/knowledge/b.md"])
+        self.assertEqual(removed, [])
+        self.assertEqual(
+            new,
+            "# VCO safe-add (v0.2.63): x\n/CLAUDE.md\n# VCO end\n"
+            "/knowledge/My Node.md\n/knowledge/b.md\n",
+        )
+
+    def test_a_move_block_line_the_old_writer_never_produced_ends_it(self):
+        """Leading whitespace or a directory pattern was never the old move
+        writer's shape: the line is the user's and ends the block."""
+        for odd in (" /knowledge/My Node.md", "/knowledge/my dir/"):
+            text = f"# VCO project move: x\n/knowledge/a.md\n{odd}\n/MEMORY.md\n"
+            new, removed = git_exclude._rewrite_vco_blocks(text)
+            self.assertEqual(removed, ["/knowledge/a.md"], odd)
+            self.assertEqual(
+                new, f"# VCO project move: x\n# VCO end\n{odd}\n/MEMORY.md\n", odd,
+            )
+
+    def test_line_ending_is_the_dominant_one(self):
+        le = git_exclude._line_ending
+        self.assertEqual(le(""), "\n")
+        self.assertEqual(le("/a"), "\n")  # the only line has no ending
+        self.assertEqual(le("/a\r\n/b"), "\r\n")
+        # first line LF, the body CRLF: the body decides
+        self.assertEqual(le("*.swp\n/a\r\n/b\r\n"), "\r\n")
+        # first line CRLF, the body LF
+        self.assertEqual(le("*.swp\r\n/a\n/b\n"), "\n")
+
+    def test_a_file_whose_first_line_has_no_crlf_gets_crlf_markers(self):
+        self.exclude.write_bytes(
+            b"*.swp\n# VCO safe-add (v0.2.63): x\r\n/.claude/\r\n/CLAUDE.md\r\n"
+        )
+        res = git_exclude.append_git_info_exclude(self.proj, ("/.claude/hooks/a.sh",))
+        self.assertEqual(res["action"], "appended")
+        data = self.exclude.read_bytes()
+        self.assertIn(b"/CLAUDE.md\r\n# VCO end\r\n", data)
+        self.assertTrue(data.endswith(b"/.claude/hooks/a.sh\r\n# VCO end\r\n"), data)
+
+    def test_a_one_line_file_without_an_ending_gets_lf(self):
+        self.exclude.write_bytes(b"*.swp")
+        res = git_exclude.append_git_info_exclude(self.proj, ("/.claude/hooks/a.sh",))
+        self.assertEqual(res["action"], "appended")
+        data = self.exclude.read_bytes()
+        self.assertNotIn(b"\r", data)
+        self.assertTrue(data.startswith(b"*.swp\n"), data)
+        self.assertTrue(self._ignored(".claude/hooks/a.sh"))
+        self.assertFalse(self._ignored("x.swp.not"))
+
     def test_a_shipped_knowledge_line_is_listed_again_by_the_same_write(self):
         self.exclude.write_text(
             "# VCO project move: x\n/knowledge/curated.md\n/.vco-manifest.json\n",

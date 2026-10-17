@@ -1437,7 +1437,7 @@ def _preload_install_for_containment():
     only meet the tripwire)."""
     if not _ALLOW_REAL_STATE:
         try:
-            import install  # noqa: F401
+            import install  # noqa: F401  # pyright: ignore[reportUnusedImport]
         except Exception:  # noqa: BLE001 — a suite that cannot import it has nothing to contain
             pass
     yield
@@ -2407,7 +2407,15 @@ def _identity_env_module_guard(request):
     """W-IDENTITY at MODULE scope: torn down after every class fixture, so a
     ``setUpClass`` (or a module fixture) whose teardown forgot a key is named
     here — the per-test guard cannot see it, the class set it before the
-    first test's snapshot."""
+    first test's snapshot.
+
+    Constraint this relies on: every session-scoped fixture lives in this
+    conftest and is ``autouse=True``, so all of them are set up before the
+    first module guard snapshots. A session- or package-scoped fixture that
+    sets an identity key and is first instantiated INSIDE a module would be
+    read here as that module's leak and undone for the rest of the session
+    — keep such a fixture autouse in this file (none exists elsewhere under
+    ``tests/`` today)."""
     before = _identity_env_snapshot()
     yield
     leak = None if _ALLOW_REAL_STATE else _identity_env_leak(request.node.nodeid, before)
@@ -2420,7 +2428,9 @@ def _identity_env_module_guard(request):
 def pytest_make_collect_report(collector):
     """W-IDENTITY at COLLECTION: a test module whose IMPORT changes an
     identity key fails to collect (and the key is restored), instead of
-    silently re-pointing every file collected after it."""
+    silently re-pointing every file collected after it. When the import
+    ALSO failed, its own error is kept and the leak is appended to it — the
+    import error is usually the cause, and hiding it would hide the fix."""
     if not isinstance(collector, pytest.Module) or _ALLOW_REAL_STATE:
         yield
         return
@@ -2430,8 +2440,15 @@ def pytest_make_collect_report(collector):
     if leak:
         _restore_identity_env(before)
         report = outcome.get_result()
-        report.outcome = "failed"
-        report.longrepr = f"IdentityEnvLeak: {leak}"
+        msg = f"IdentityEnvLeak: {leak}"
+        original = report.longrepr
+        if report.failed and hasattr(original, "addsection"):
+            original.addsection("IdentityEnvLeak", msg)
+        elif report.failed and original is not None:
+            report.longrepr = f"{original}\n\n{msg}"
+        else:
+            report.outcome = "failed"
+            report.longrepr = msg
 
 
 @pytest.fixture(autouse=True)
