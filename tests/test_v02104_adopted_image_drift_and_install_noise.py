@@ -491,7 +491,7 @@ def test_mixed_vendor_gpu_services_are_refused_not_guessed(tmp_path):
     assert "nvidia" in gpu_doc
     result, files = _hand_over_ollama(world, run)
     assert result.adopted == []
-    assert "different GPU vendors" in result.refused["ollama"]
+    assert "names both GPU vendors" in result.refused["ollama"]
     assert files == []
 
 
@@ -518,7 +518,7 @@ def test_a_live_container_holding_both_vendors_devices_is_refused_on_hand_over(t
     world, run = _gpu_own_world(tmp_path, both, "docker-compose.yml")
     result, files = _hand_over_ollama(world, run)
     assert result.adopted == []
-    assert "different GPU vendors" in result.refused["ollama"]
+    assert "names both GPU vendors" in result.refused["ollama"]
     assert files == []
 
 

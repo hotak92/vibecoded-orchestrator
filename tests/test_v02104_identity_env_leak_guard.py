@@ -123,6 +123,32 @@ def test_the_guard_fails_a_module_that_leaks_identity_at_import(tmp_path):
     assert "importing test_identity_import_probe.py" in out and "SHARED_KG_COLLECTION" in out, out[-2000:]
 
 
+def test_an_import_error_is_kept_when_the_import_also_leaks(tmp_path):
+    """Red before: the leak message REPLACED the import error's report."""
+    out = _run_child(tmp_path, "test_identity_import_error_probe.py", (
+        "import os\n"
+        "os.environ['SHARED_KG_COLLECTION'] = 'Alpha_KnowledgeGraph'\n"
+        "import vco_no_such_module_marker_r4\n"
+        "def test_x():\n    pass\n"
+    ))
+    assert "rc=0" not in out, out[-2000:]
+    assert "vco_no_such_module_marker_r4" in out, out[-2000:]
+    assert "IdentityEnvLeak" in out and "SHARED_KG_COLLECTION" in out, out[-2000:]
+
+
+def test_a_raising_import_is_kept_when_it_also_leaks(tmp_path):
+    """Same, for an exception other than ImportError (a different longrepr
+    shape: pytest renders it as an exception chain)."""
+    out = _run_child(tmp_path, "test_identity_raise_probe.py", (
+        "import os\n"
+        "os.environ['PROJECT_NAME'] = 'Alpha'\n"
+        "raise RuntimeError('r4_marker_import_boom')\n"
+    ))
+    assert "rc=0" not in out, out[-2000:]
+    assert "r4_marker_import_boom" in out, out[-2000:]
+    assert "IdentityEnvLeak" in out and "PROJECT_NAME" in out, out[-2000:]
+
+
 # ── helper: restores everything, leaves the rest alone ───────────────────────
 
 

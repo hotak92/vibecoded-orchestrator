@@ -506,7 +506,7 @@ class GpuPortMoveTests(_Base):
         with self.host("nvidia"):
             result = self.migrate(w, _row("ollama", port=11500))
         self.assertEqual(result.status, "refused")
-        self.assertIn("different GPU vendors", result.reason)
+        self.assertIn("names both GPU vendors", result.reason)
         self.assertEqual((w.ups(), w.stops()), ([], []))
         self.assertEqual(self.host_calls, [])
 

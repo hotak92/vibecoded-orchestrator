@@ -623,6 +623,29 @@ def test_registered_timeout_override_shrinks_the_deadline(tmp_path: Path):
     assert 0.2 <= d <= 2 - _MARGIN_S, d
 
 
+@pytest.mark.parametrize("impl", _SHELLS)
+@pytest.mark.parametrize("value,low,high", [
+    # Over-range: no error line on stderr, the 3 s default applies.
+    ("99999999999999999999", 0.2, _BUDGET_S - _MARGIN_S),
+    ("1000000", 0.2, _BUDGET_S - _MARGIN_S),
+    # Leading zero: read as DECIMAL 8 (bash would read `08` as a bad octal).
+    ("08", _BUDGET_S, 8 - _MARGIN_S),
+])
+def test_timeout_override_is_parsed_safely(impl: str, value: str, low: float,
+                                           high: float, tmp_path: Path):
+    proj = _project(tmp_path)
+    f = _file(proj)
+    t = _transcript(tmp_path, _boundary(), _attach("file", f))
+    venv, log = _spy_venv(tmp_path)
+    _compact(impl, proj)
+    res = _write(impl, proj, f, t, env={"VCT_VENV": str(venv),
+                                        "VCO_PRE_TOOL_USE_TIMEOUT_S": value})
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    assert res.stderr.strip() == "", res.stderr
+    d = _deadline_arg(log)
+    assert low <= d <= high, d
+
+
 def test_slow_prelude_hands_a_shorter_deadline(tmp_path: Path):
     # The payload decode (the hook's first python call) takes 1.2 s: the
     # module may only get 3 − 1.2 − 0.7 = 1.1 s or less.

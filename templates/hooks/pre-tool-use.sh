@@ -532,9 +532,21 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
                     # at its own 1 s default. VCO_PRE_TOOL_USE_TIMEOUT_S
                     # (whole seconds) MUST MATCH the `timeout` registered for
                     # pre-tool-use in .claude/settings.json — set it when you
-                    # change that registration. MUST MATCH pre-tool-use.ps1.
-                    _PTU_BUDGET_S="${VCO_PRE_TOOL_USE_TIMEOUT_S:-3}"
-                    case "$_PTU_BUDGET_S" in ''|*[!0-9]*|0) _PTU_BUDGET_S=3 ;; esac
+                    # change that registration. MUST MATCH pre-tool-use.ps1:
+                    # digits only, read as DECIMAL (leading zeros dropped, so
+                    # `08` is 8, not a bash octal error), 1..999999; anything
+                    # else -- empty, non-digit, 0, over-range -- reads as 3,
+                    # silently.
+                    _PTU_BUDGET_S="${VCO_PRE_TOOL_USE_TIMEOUT_S:-}"
+                    case "$_PTU_BUDGET_S" in
+                        ''|*[!0-9]*) _PTU_BUDGET_S=3 ;;
+                        *)
+                            _PTU_BUDGET_S="${_PTU_BUDGET_S#"${_PTU_BUDGET_S%%[!0]*}"}"
+                            if [[ -z "$_PTU_BUDGET_S" || ${#_PTU_BUDGET_S} -gt 6 ]]; then
+                                _PTU_BUDGET_S=3
+                            fi
+                            ;;
+                    esac
                     _ptu_clock_us
                     _PTU_ELAPSED_MS=$(( (_PTU_CLOCK_US - _PTU_T0_US) / 1000 ))
                     if [[ "$_PTU_T0_COARSE" == 1 || "$_PTU_CLOCK_COARSE" == 1 ]]; then
