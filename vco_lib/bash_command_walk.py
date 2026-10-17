@@ -92,6 +92,11 @@ WRAPPER_VERBS: frozenset[str] = frozenset({
     "chronic",
     "stdbuf",
     "exec",  # `exec rm foo` re-execs as rm; same target set.
+    # `command [-pvV] <cmd>` / `builtin <cmd>` run the next word as the
+    # command (v0.2.104 R7 N1: `command eval '…'` hid the eval from the
+    # substitution-liveness decision). Their only flags are value-less.
+    "command",
+    "builtin",
 })
 
 # `bash -c "<sub-command>"` / `sh -c "<sub-command>"` -- recognised by
@@ -218,70 +223,74 @@ def substitution_bodies(tokens: List[str]) -> List[str]:
     )
 
 
-def _normalize_body(body: str) -> str:
-    """A substitution body in the token-joined shape :func:`substitution_bodies`
-    yields (quotes removed, whitespace collapsed); best-effort."""
-    try:
-        return " ".join(shlex.split(body, posix=True))
-    except ValueError:
-        return " ".join(body.split())
+#: Literal-opener neutralisation (v0.2.104 E-4 / R7 N1). The substitution
+#: scan (:func:`substitution_bodies`) reads tokens AFTER ``shlex`` removed
+#: the quotes, so ``grep -n '$(sleep 5)' f`` — a LITERAL pattern — read
+#: exactly like ``echo $(sleep 5)``. Bash runs a substitution only outside
+#: single quotes / ``$'…'`` and when its opener is not escaped; inside
+#: double quotes ``$(…)`` and backticks run but ``<(`` / ``>(`` do not. The
+#: ONE quote-aware scanner (:func:`_newlines_as_separators`) therefore
+#: swaps, in those literal regions only, each character that could open or
+#: close a substitution for a private-use placeholder — so the regexes
+#: cannot match there — and :func:`walk_segments` swaps them back on every
+#: token it emits or re-parses. The liveness decision is made AT THE
+#: CHARACTER, never by comparing normalised text: the previous design
+#: (a set of live body texts) dropped every live body whose text differed
+#: from its token-side shape (``$(sleep '5')``, ``$(sleep \\5)``, an
+#: ``eval`` argument behind a wrapper — R7 N1).
+_LITERAL_OPENER_PLACEHOLDERS: dict = {
+    "$": "\ue000",
+    "`": "\ue001",
+    "(": "\ue002",
+    ")": "\ue003",
+    "<": "\ue004",
+    ">": "\ue005",
+}
+_RESTORE_TABLE = str.maketrans(
+    {v: k for k, v in _LITERAL_OPENER_PLACEHOLDERS.items()})
+_PLACEHOLDER_RE = re.compile("[" + "".join(_LITERAL_OPENER_PLACEHOLDERS.values()) + "]")
+#: What is neutralised where. Single-quoted / ANSI-C text: everything that
+#: forms ``$(``, a backtick pair or ``<(``/``>(`` is literal there — the
+#: parens and backticks suffice (``$`` and ``<``/``>`` alone open nothing).
+#: Double-quoted text: ``$(`` and backticks RUN, so the parens of a live
+#: ``$(…)`` (nesting tracked) stay; every other paren, an escaped ``\$`` /
+#: ``\``` and a process-substitution ``<``/``>`` before ``(`` are literal.
+#: An escaped character outside quotes is literal.
+_LITERAL_IN_SINGLE = "`()"
+_LITERAL_IN_DOUBLE_ESCAPED = "$`"
+_LITERAL_IN_DOUBLE_PARENS = "()"
+_LITERAL_ESCAPED = "$`()<>"
 
 
-def live_substitution_keys(command: str) -> Optional[set]:
-    """The normalized bodies of the substitutions bash would actually RUN in
-    ``command`` (v0.2.104 E-4), or None when the quoting cannot be read.
+def _neutralise(text: str, chars: str) -> str:
+    """``text`` with every character in ``chars`` swapped for its
+    placeholder (characters outside ``chars`` untouched)."""
+    return "".join(_LITERAL_OPENER_PLACEHOLDERS[c] if c in chars else c
+                   for c in text)
 
-    :func:`substitution_bodies` works on tokens, after ``shlex`` has removed
-    the quotes — so ``grep -n '$(sleep 5)' f`` (a LITERAL pattern in single
-    quotes) looked exactly like ``echo $(sleep 5)`` and a one-off grep was
-    denied as a sole wait. This scan reads the raw text with quote state:
-    single-quoted and ANSI-C ``$'…'`` contents and backslash-escaped
-    characters are literal; inside double quotes ``$(…)`` and backticks
-    still run but ``<(`` / ``>(`` do not. Callers keep a token-derived body
-    only when its normalized text is in this set; None means "keep all"
-    (the conservative pre-fix behaviour)."""
-    out: List[str] = []
-    i = 0
-    n = len(command)
-    in_double = False
-    while i < n:
-        ch = command[i]
-        if ch == "\\" and i + 1 < n:
-            out.append("  ")
-            i += 2
-            continue
-        if not in_double and ch == "$" and i + 1 < n and command[i + 1] == "'":
-            _body, end = _ansi_c_body(command, i + 2)
-            if end >= n:
-                return None
-            out.append(" " * (end + 1 - i))
-            i = end + 1
-            continue
-        if not in_double and ch == "'":
-            end = command.find("'", i + 1)
-            if end == -1:
-                return None
-            out.append(" " * (end + 1 - i))
-            i = end + 1
-            continue
-        if ch == '"':
-            in_double = not in_double
-            out.append(" ")
-            i += 1
-            continue
-        if in_double and ch in "<>" and i + 1 < n and command[i + 1] == "(":
-            out.append(" ")
-            i += 1
-            continue
-        out.append(ch)
-        i += 1
-    if in_double:
-        return None
-    live = "".join(out)
-    bodies = ([m.group(1) for m in _SUBST_PAREN_RE.finditer(live)]
-              + [m.group(1) for m in _SUBST_BACKTICK_RE.finditer(live)]
-              + [m.group(1) for m in _PROC_SUBST_RE.finditer(live)])
-    return {_normalize_body(b) for b in bodies}
+
+def restore_literal_openers(text: str) -> str:
+    """``text`` with every literal-opener placeholder swapped back to the
+    character it stood for — the exact bytes :func:`tokenize` would have
+    produced without the neutralisation (a no-op on text without
+    placeholders)."""
+    return text.translate(_RESTORE_TABLE)
+
+
+def _restore_tokens(tokens: List[str]) -> List[str]:
+    return [restore_literal_openers(t) for t in tokens]
+
+
+def _without_token(tokens: List[str], value: Optional[str],
+                   restore: Callable[[str], str]) -> List[str]:
+    """``tokens`` minus the FIRST token whose restored text is ``value``
+    (``None`` → unchanged)."""
+    if value is None:
+        return tokens
+    for i, t in enumerate(tokens):
+        if restore(t) == value:
+            return tokens[:i] + tokens[i + 1:]
+    return tokens
 
 
 class ChainSegment(NamedTuple):
@@ -587,7 +596,8 @@ def _double_quoted_literal(body: str) -> str:
     return '"' + escaped + '"'
 
 
-def _newlines_as_separators(command: str) -> str:
+def _newlines_as_separators(command: str, *,
+                            literal_openers: bool = False) -> str:
     """An UNQUOTED newline is a command separator, exactly like ``;``
     (v0.2.103): ``make\\nsleep 5`` is judged like ``make; sleep 5``, and a
     multi-line loop/condition like its one-line form. A newline inside a
@@ -603,27 +613,71 @@ def _newlines_as_separators(command: str) -> str:
     real only when the backslash run before it is EVEN (``\\\\"`` is a
     backslash then a CLOSE, ``\\\\"`` … an odd run escapes it). Quote-aware
     character scan — the one home for this rule (every :func:`tokenize`
-    consumer, including the wait guard, gets it)."""
+    consumer, including the wait guard, gets it).
+
+    ``literal_openers`` (v0.2.104 E-4): swap the substitution-opener
+    characters of every LITERAL region (single quotes, ``$'…'``, escaped
+    characters, the escaped ``\\$`` / ``\\``` and ``<(``/``>(`` inside
+    double quotes) for their placeholders
+    (:data:`_LITERAL_OPENER_PLACEHOLDERS`) — the output tokenises exactly
+    as before, but a ``$(…)`` bash would not run can no longer be read as
+    a substitution. Off by default: every other consumer sees the same
+    bytes it always has."""
     out: List[str] = []
     quote: Optional[str] = None
+    dq_subst = 0  # open live `$(` depth inside the current double quotes
     i = 0
     n = len(command)
     word_start = True
     while i < n:
         ch = command[i]
-        if quote is not None:
-            out.append(ch)
-            if ch == quote and (
-                quote == "'" or _backslash_run_before(command, i) % 2 == 0
-            ):
+        if quote == "'":
+            out.append(_LITERAL_OPENER_PLACEHOLDERS[ch]
+                       if literal_openers and ch in _LITERAL_IN_SINGLE else ch)
+            if ch == "'":
                 quote = None
+        elif quote == '"':
+            if ch == "\\" and i + 1 < n and command[i + 1] in '\\$`"':
+                # An escape inside double quotes: the pair is one unit
+                # (an escaped backslash before `$(` leaves that `$(` live),
+                # and an escaped `$` or backtick is literal.
+                nxt = command[i + 1]
+                out.append(ch)
+                out.append(_LITERAL_OPENER_PLACEHOLDERS[nxt]
+                           if literal_openers and nxt in _LITERAL_IN_DOUBLE_ESCAPED
+                           else nxt)
+                i += 1
+            elif (literal_openers and ch in "<>" and i + 1 < n
+                  and command[i + 1] == "("):
+                # No process substitution inside double quotes.
+                out.append(_LITERAL_OPENER_PLACEHOLDERS[ch])
+            elif literal_openers and ch == "$" and i + 1 < n and command[i + 1] == "(":
+                out.append("$(")  # a live `$(…)` (also `$((…))`): its parens stay
+                dq_subst += 1
+                i += 1
+            elif literal_openers and ch in _LITERAL_IN_DOUBLE_PARENS:
+                if dq_subst > 0:
+                    out.append(ch)
+                    dq_subst += 1 if ch == "(" else -1
+                else:
+                    out.append(_LITERAL_OPENER_PLACEHOLDERS[ch])
+            else:
+                out.append(ch)
+                if ch == '"' and _backslash_run_before(command, i) % 2 == 0:
+                    quote = None
+                    dq_subst = 0
         elif ch == "#" and word_start:
             while i < n and command[i] != "\n":
                 i += 1
             continue  # the newline (if any) is handled on the next pass
         elif ch == "$" and i + 1 < n and command[i + 1] == "'":
             body, end = _ansi_c_body(command, i + 2)
-            out.append(_double_quoted_literal(body))
+            lit = _double_quoted_literal(body)
+            if literal_openers:
+                # After the re-emission, so the backslash it puts before a
+                # backtick survives the round trip byte for byte.
+                lit = _neutralise(lit, _LITERAL_IN_SINGLE)
+            out.append(lit)
             i = end
         elif ch in ("'", '"'):
             quote = ch
@@ -633,7 +687,9 @@ def _newlines_as_separators(command: str) -> str:
         elif ch == "\\" and i + 1 < n:
             out.append(ch)
             i += 1
-            out.append(command[i])
+            nxt = command[i]
+            out.append(_LITERAL_OPENER_PLACEHOLDERS[nxt]
+                       if literal_openers and nxt in _LITERAL_ESCAPED else nxt)
         elif ch == "\n":
             out.append(" ; ")
         else:
@@ -643,7 +699,7 @@ def _newlines_as_separators(command: str) -> str:
     return "".join(out)
 
 
-def tokenize(command: str) -> Optional[List[str]]:
+def tokenize(command: str, *, literal_openers: bool = False) -> Optional[List[str]]:
     """`shlex.split` the command, returning None on malformed quoting.
 
     An unquoted newline is rewritten to ``;`` FIRST (one home — see
@@ -662,8 +718,13 @@ def tokenize(command: str) -> Optional[List[str]]:
 
     Callers treat None as "unparseable -- collect nothing", which keeps
     every consumer's soft-fail contract identical.
+
+    ``literal_openers`` (v0.2.104 E-4) is the opt-in described at
+    :func:`_newlines_as_separators`: the tokens carry placeholders where a
+    quoted or escaped substitution opener stood, and the caller swaps them
+    back with :func:`restore_literal_openers` before handing a token on.
     """
-    prepared = _newlines_as_separators(command)
+    prepared = _newlines_as_separators(command, literal_openers=literal_openers)
     try:
         tokens = shlex.split(prepared, posix=True)
     except ValueError:
@@ -1037,9 +1098,29 @@ def walk_segments(command: str, depth: int = 0, *,
     if depth > MAX_NESTING_DEPTH:
         return []
 
-    tokens = tokenize(command)
+    # v0.2.104 E-4: only substitutions bash would RUN are walked — a
+    # `'$(sleep 5)'` grep pattern is literal text. The quote-aware scanner
+    # swaps every quoted / escaped opener for a placeholder
+    # (:data:`_LITERAL_OPENER_PLACEHOLDERS`) so :func:`substitution_bodies`
+    # cannot see it, and every token / body that leaves this function is
+    # restored first — emitted tokens are byte-identical to the plain
+    # walk. The quote reading is trusted ONLY at depth 0, on the command
+    # exactly as the outer shell receives it: a `bash -c` body reaches a
+    # deeper level as a shlex token whose outer quoting was already removed
+    # (imperfectly: a `\$` survives), and a nested shell re-expands it —
+    # so every deeper level keeps all its substitutions (the conservative
+    # pre-E-4 walk), and so does an `eval` argument at depth 0 (eval
+    # re-parses its words). A command that already carries a placeholder
+    # character is walked plainly (keep all) — it could not be restored.
+    literal = (_with_substitutions and depth == 0
+               and _PLACEHOLDER_RE.search(command) is None)
+    tokens = tokenize(command, literal_openers=literal)
     if not tokens:
         return []
+    # Restore only what THIS walk neutralised: a placeholder character the
+    # command itself carried (walked plainly, above) must come back as is.
+    _restore: Callable[[List[str]], List[str]] = _restore_tokens if literal else list
+    _restore_text: Callable[[str], str] = restore_literal_openers if literal else str
 
     segments = split_chain(tokens)
     chain_size = len(segments)
@@ -1057,16 +1138,6 @@ def walk_segments(command: str, depth: int = 0, *,
         rows = _function_body_layout(rows)
 
     sub_budget = depth + 1 <= MAX_NESTING_DEPTH
-    # v0.2.104 E-4: only substitutions bash would RUN are walked — a
-    # `'$(sleep 5)'` grep pattern is literal text (live_substitution_keys).
-    # The quote reading is trusted ONLY at depth 0, on the command exactly as
-    # the outer shell receives it. A `bash -c` body reaches a deeper level as
-    # a shlex token whose outer quoting was already removed (imperfectly: a
-    # `\$` survives), and a nested shell re-expands it — so every deeper
-    # level, and an `eval` argument at depth 0 (eval re-parses its words),
-    # keeps all its substitutions (the conservative pre-E-4 walk).
-    live_keys = (live_substitution_keys(command)
-                 if _with_substitutions and depth == 0 else None)
     out: List[ChainSegment] = []
     for segment, pos, size, in_loop in rows:
         if not segment:
@@ -1086,8 +1157,10 @@ def walk_segments(command: str, depth: int = 0, *,
             # (v0.2.103, owner ruling 2026-10-15): `do bash -c '…'`
             # recurses exactly like a bare `bash -c '…'`. The emitted
             # tokens are unchanged — collectors still receive the
-            # keyword-prefixed segment for non-shell verbs.
-            rec = peeled
+            # keyword-prefixed segment for non-shell verbs. The decision
+            # reads the RESTORED tokens: a `-c` / eval body is re-parsed by
+            # another shell, so its quoting is not this level's.
+            rec = _restore(peeled)
             while rec and (os.path.basename(rec[0]).lower()
                            in LEADING_COMPOUND_KEYWORDS):
                 rec = rec[1:]
@@ -1113,23 +1186,30 @@ def walk_segments(command: str, depth: int = 0, *,
                         _with_assignments=_with_assignments))
                 # Consumed either way: no sub-command (`bash script.sh`)
                 # or over budget → nothing emitted, exactly as parse_dash_c
-                # has always done.
+                # has always done. Everything else in the segment — the
+                # prefix AND the arguments around the sub-command
+                # (`bash -c 'x' $(sleep 5)`) — runs in THIS shell, so its
+                # substitutions are scanned here (R7 N1: a quote-stripped
+                # `-c` body re-parsed at depth 1 carries its inner
+                # substitution as a trailing argument).
+                subst_src = _without_token(segment, sub_cmd, _restore_text)
             else:
-                out.append(ChainSegment(peeled, pos, size, in_loop, depth,
-                                        tuple(seg_assignments)))
+                out.append(ChainSegment(_restore(peeled), pos, size, in_loop,
+                                        depth, tuple(_restore(seg_assignments))))
                 subst_src = segment
         elif _with_assignments and seg_assignments:
             # An assignment-only statement: emitted with EMPTY tokens
             # (collectors skip those) and its re-joined assignments.
             out.append(ChainSegment([], pos, size, in_loop, depth,
-                                    tuple(seg_assignments)))
+                                    tuple(_restore(seg_assignments))))
         if _with_substitutions and sub_budget:
+            # `eval` re-parses its words, so a quoted `$(…)` among them is
+            # live after all: its bodies are read from the restored tokens.
+            if seg_is_eval:
+                subst_src = _restore(subst_src)
             for sub_body in substitution_bodies(subst_src):
-                if (live_keys is not None and not seg_is_eval
-                        and _normalize_body(sub_body) not in live_keys):
-                    continue
                 out.extend(walk_segments(
-                    sub_body, depth + 1, _in_loop=in_loop,
+                    _restore_text(sub_body), depth + 1, _in_loop=in_loop,
                     _with_substitutions=True,
                     _with_function_bodies=_with_function_bodies,
                     _with_assignments=_with_assignments))
@@ -1170,6 +1250,7 @@ __all__ = [
     "literal_eval_body",
     "parse_dash_c",
     "peel_wrapper_verbs",
+    "restore_literal_openers",
     "split_chain",
     "strip_env_assignments",
     "strip_subshell_parens",

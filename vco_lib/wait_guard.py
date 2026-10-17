@@ -483,6 +483,18 @@ def _scan_wrapped(tokens: List[str], depth: int,
                 return static_pattern(
                     sub, depth=depth + 1, _in_loop=seg.in_loop,
                     _position_override=(seg.position, seg.chain_size))
+            # A NON-literal body (`timeout 5 eval 'x=$(sleep 5)'`, R7 N1):
+            # eval re-parses its words, so the tail is walked as a command
+            # of its own one level down, where every substitution it
+            # carries is live (the walker's quoting reading applies at
+            # depth 0 only). Nothing found there → the tail scan goes on
+            # (`timeout 5 eval sleep 30` is caught by its `sleep` word, as
+            # before); `eval "$cmd"` carries nothing and stays allowed.
+            found = static_pattern(
+                " ".join(tokens[i:]), depth=depth + 1, _in_loop=seg.in_loop,
+                _position_override=(seg.position, seg.chain_size))
+            if found is not None:
+                return found
     return None
 
 
@@ -808,11 +820,14 @@ def static_pattern(command: str, depth: int = 0, *,
     command is positioned WITHIN the body (both opt-in walker surfaces;
     the wait guard is the consumer). ``_in_loop`` /
     ``_position_override`` are the recursion's inherited context; callers
-    pass nothing."""
+    pass nothing. ``depth`` reaches the walker (v0.2.104 R7 N1): a body
+    this guard re-parses itself — behind ``timeout``/``nohup``/``setsid``,
+    ``xargs``, a loop condition — is a nested shell's text, and the
+    walker's literal-quoting reading applies only at depth 0."""
     if not isinstance(command, str) or not command.strip():
         return None
     command, _heredoc_bodies = strip_heredocs(command)
-    segments = walk_segments(command, _in_loop=_in_loop,
+    segments = walk_segments(command, depth, _in_loop=_in_loop,
                              _position_override=_position_override,
                              _with_substitutions=True,
                              _with_function_bodies=True,
