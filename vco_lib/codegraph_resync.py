@@ -2486,6 +2486,39 @@ def report_trigger_result(
         _log("warn", f"resync skipped for {project_name}: {result.message}")
 
 
+def trigger_update_resync(root: Path, project_name: str, deferral_report, log_event) -> None:
+    """The update's code-graph resync, start to finish (v0.2.104 extraction).
+
+    Moved out of install.py's ``_trigger_codegraph_embed_resync`` shim so the
+    v0.2.104 additions (the starting-backend wait, the ledger folder) did not
+    grow the mega-file: resolve the root venv python (has weaviate-client +
+    vco_lib, so the spawned analyzer can import its deps; ``None`` falls back
+    to the spawner's own resolver ladder), launch :func:`spawn_background_resync`
+    with ``wait_for_starting_backend=True`` (the same update may just have
+    restarted the code_embed container — a running-but-silent service is
+    waited for, not deferred on), then :func:`report_trigger_result` with
+    ``root`` as the ledger folder. ``log_event`` is install.py's
+    ``_log_install_event(step, level, msg)``. Soft-fail: an error becomes a
+    log line, never a crash — the resync is a best-effort refresh.
+    """
+    try:
+        from vco_lib.python_exe import resolve_root_venv_python
+
+        venv_py = resolve_root_venv_python(root)
+        result = spawn_background_resync(
+            root, project_name,
+            python_exe=str(venv_py) if venv_py is not None else None,
+            wait_for_starting_backend=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — never crash the update
+        try:
+            log_event("codegraph_resync", "warn", f"codegraph resync trigger raised: {exc}")
+        except Exception:  # noqa: BLE001 — logging never gates
+            logger.debug("resync trigger: log_event failed: %s", exc)
+        return
+    report_trigger_result(result, project_name, deferral_report, log_event, root)
+
+
 def code_embed_service_healthy(
     code_embed_url: Optional[str] = None,
     *,

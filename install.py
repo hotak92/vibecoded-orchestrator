@@ -14375,55 +14375,23 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
     """v0.2.72 (P7) thin shim: trigger the revision-gated code-graph resync.
 
     All real logic lives in ``vco_lib.codegraph_resync`` (install.py is a
-    mega-file — per the modularity rule, >50-line additions go to a helper
-    module). This shim only:
-      1. resolves the orchestrator's own code-graph project name,
-      2. calls ``spawn_background_resync`` (background, non-blocking, no global
-         timeout; R-6: gated on the owed-probe — fires only when stale rows
-         exist; self-degrades when the code-embed service is down),
-      3. hands the result to ``report_trigger_result`` (v0.2.96 M-2
-         extraction, install line ratchet): the prints, the event log, the
-         deferred ``DeferralEntry`` recording and the ``not_owed`` resolve of
-         the pending ``codegraph_embed_resync_pending`` ledger entry.
-
-    Soft-fail throughout: any error here converts to a log line, never a crash —
-    the resync is a best-effort background refresh, not a gating step.
+    mega-file — per the modularity rule, new logic goes to a helper module).
+    This shim only resolves the orchestrator's own code-graph project name and
+    hands it to ``trigger_update_resync`` (v0.2.104 extraction, install line
+    ratchet): the venv-python probe, ``spawn_background_resync`` (background,
+    no global timeout; R-6 owed-probe gated; waits for a code_embed this update
+    just restarted) and ``report_trigger_result`` (prints, event log, the
+    deferred entry, the ``not_owed`` resolve of
+    ``codegraph_embed_resync_pending``). Soft-fail throughout: an error here is
+    a log line, never a crash — the resync is not a gating step.
     """
     try:
-        from vco_lib.codegraph_resync import (
-            report_trigger_result,
-            spawn_background_resync,
-        )
-        from vco_lib.python_exe import resolve_root_venv_python
+        from vco_lib.codegraph_resync import trigger_update_resync
     except Exception as exc:  # noqa: BLE001 — missing helper must not wedge update
-        _log_install_event(
-            "codegraph_resync", "warn",
-            f"codegraph_resync helper unavailable: {exc}",
-        )
+        _log_install_event("codegraph_resync", "warn", f"codegraph_resync helper unavailable: {exc}")
         return
-
-    project_name = _derive_orchestrator_project_name()
-    # Prefer the orchestrator venv python (has weaviate-client + vco_lib) so
-    # the spawned analyze can import its deps; None falls back to the helper's
-    # resolver ladder. v0.2.96 (M-2): probed via python_exe — ONE home.
-    _root_venv_py = resolve_root_venv_python(PROJECT_ROOT)
-    venv_python = str(_root_venv_py) if _root_venv_py is not None else None
-
-    try:
-        result = spawn_background_resync(
-            PROJECT_ROOT,
-            project_name,
-            python_exe=venv_python,
-            wait_for_starting_backend=True,
-        )
-    except Exception as exc:  # noqa: BLE001 — never crash the update
-        _log_install_event(
-            "codegraph_resync", "warn",
-            f"codegraph resync trigger raised: {exc}",
-        )
-        return
-
-    report_trigger_result(result, project_name, deferral_report, _log_install_event, PROJECT_ROOT)
+    trigger_update_resync(PROJECT_ROOT, _derive_orchestrator_project_name(),
+                          deferral_report, _log_install_event)
 
 
 def _trigger_codegraph_identity_sweep(deferral_report: "DeferralReport") -> None:

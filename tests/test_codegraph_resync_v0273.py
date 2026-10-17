@@ -476,13 +476,18 @@ def test_install_shim_resolves_ledger_on_not_owed():
     out of install.py into ``codegraph_resync.report_trigger_result`` (the
     install line ratchet answered by EXTRACTION, per its own rule), so the
     guard pins BOTH halves — the vco_lib home owns the branch (via the
-    module's ONE condition-id constant), and install.py delegates to it."""
+    module's ONE condition-id constant), and install.py delegates to it.
+    v0.2.104: the spawn + report chain moved on into
+    ``codegraph_resync.trigger_update_resync`` (install line ratchet again);
+    install.py hands it PROJECT_ROOT, and the end-to-end behaviour is pinned
+    by ``test_v0283_embed_resync_selfclear_pin``."""
     src = (REPO_ROOT / "vco_lib" / "codegraph_resync.py").read_text(encoding="utf-8")
     assert 'result.status == "not_owed"' in src
     assert 'mark_resolved(_CONDITION_ID)' in src
     assert '_CONDITION_ID = "codegraph_embed_resync_pending"' in src
+    assert "report_trigger_result(result, project_name, deferral_report" in src
     install_src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
-    assert "report_trigger_result(result, project_name, deferral_report" in install_src
+    assert "trigger_update_resync(PROJECT_ROOT," in install_src
 
 
 # ─────────── R-7: driver runs analyzer, verifies, defers one-time ───────────

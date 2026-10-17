@@ -75,11 +75,24 @@ class _Runner:
         return 0
 
 
-def _dispatch(folder: Path, monkeypatch) -> "tuple[list, _Runner]":
+def _stage_resync(folder: Path, monkeypatch) -> None:
+    """Everything the resync handler needs before it will run its child: an
+    analyzer to point at, a current code_embed image, and an EXPLICIT project
+    name. The handler resolves the name through ``paths.resolve_project_name``
+    (hub, then ``CODE_GRAPH_PROJECT``, then ``PROJECT_NAME``); the suite gates
+    the hub off, so without pinning the env here the test passed only when the
+    developer's own shell exported a project name — and failed whenever an
+    earlier test in the process had popped it."""
     scripts = folder / ".claude" / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
     (scripts / "analyze_code_graph.py").write_text("# stub\n", encoding="utf-8")
     monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
+    monkeypatch.setenv("CODE_GRAPH_PROJECT", "MyProj")
+    monkeypatch.delenv("PROJECT_NAME", raising=False)
+
+
+def _dispatch(folder: Path, monkeypatch) -> "tuple[list, _Runner]":
+    _stage_resync(folder, monkeypatch)
     runner = _Runner()
     with mock.patch.object(dr, "_record_resolution"):
         results = dr.dispatch(folder, condition_ids=[CID],
@@ -200,10 +213,7 @@ def test_record_episode_end_records_the_attempt_context(tmp_path, monkeypatch):
 def test_a_dispatched_childs_own_clear_is_tied_to_its_attempt(tmp_path, monkeypatch):
     """End to end: the child clears (in-process stand-in) and re-emits; three
     dispatches reach the cap, and the env marker does not leak out."""
-    scripts = tmp_path / ".claude" / "scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
-    (scripts / "analyze_code_graph.py").write_text("# stub\n", encoding="utf-8")
-    monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
+    _stage_resync(tmp_path, monkeypatch)
     monkeypatch.delenv(dr.ATTEMPT_ENV, raising=False)
 
     def child(argv, cwd):
@@ -227,10 +237,7 @@ def test_a_handler_that_raises_still_writes_a_verdict(tmp_path, monkeypatch):
     def boom(argv, cwd):
         raise RuntimeError("kaboom")
 
-    scripts = tmp_path / ".claude" / "scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
-    (scripts / "analyze_code_graph.py").write_text("# stub\n", encoding="utf-8")
-    monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
+    _stage_resync(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError):
         dr.dispatch(tmp_path, condition_ids=[CID], backend_probe=lambda *_a: True,
                     runner=boom, single_instance=False)
@@ -318,10 +325,7 @@ def test_a_running_container_that_never_answers_is_bounded(backend):
 
 def _spawn(tmp_path, monkeypatch, **kw):
     monkeypatch.delenv("VCT_RESYNC_SPAWN_DISABLED", raising=False)
-    scripts = tmp_path / ".claude" / "scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
-    (scripts / "analyze_code_graph.py").write_text("# stub\n", encoding="utf-8")
-    monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
+    _stage_resync(tmp_path, monkeypatch)
     spawned = []
     monkeypatch.setattr(cr.subprocess, "Popen",
                         lambda argv, **k: spawned.append(argv) or mock.Mock(pid=4321))

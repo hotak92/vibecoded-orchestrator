@@ -409,7 +409,11 @@ _MAIN_SPAN_MAX = 1442
 # tiebreak `_resolve_orchestrator_root_canonical` was superseded by
 # `vco_lib.root_kg_identity`; the post-venv hand-off record lives in
 # `vco_lib.install_companions`.
-_TOTAL_LINES_MAX = 21826
+# v0.2.104 integration — re-pinned DOWN 21826 -> 21796 (measured with `wc -l`;
+# the merged lanes measured 21828). The resync shim's venv probe + spawn +
+# report chain moved to `codegraph_resync.trigger_update_resync`, which also
+# carries the lanes' starting-backend wait and ledger folder.
+_TOTAL_LINES_MAX = 21796
 
 
 def _measure() -> tuple:
