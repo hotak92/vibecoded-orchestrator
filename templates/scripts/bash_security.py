@@ -1540,7 +1540,10 @@ def main() -> int:
         # v0.2.104 E-3 (pre-tool-use.{sh,ps1}): exit 0 and print the text the
         # raw-text patterns must still read (the opener line, no newline)
         # when stdin is a pure data here-doc write; exit 1, printing nothing,
-        # otherwise. One trailing newline (the sh hook's `echo`) is dropped.
+        # otherwise. One trailing newline is dropped: the sh hook pipes the
+        # command with `printf '%s'` (no newline) and the ps1 hook writes
+        # the exact bytes, so this only tolerates a newline the harness
+        # itself left at the end of the command.
         try:
             raw = sys.stdin.buffer.read().decode("utf-8")
         except (UnicodeDecodeError, OSError, ValueError):

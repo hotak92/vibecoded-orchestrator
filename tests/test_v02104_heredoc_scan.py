@@ -313,3 +313,52 @@ def test_hook_handles_a_40k_line_data_heredoc_fast(impl: str, tmp_path: Path) ->
     res = _run(impl, proj, cmd, tmp_path)
     assert res.returncode == 0, res.stderr[-500:]
     assert time.monotonic() - t0 < 10
+
+
+# --- R10 F1: a command too large to scan in time is refused -------------------
+#: Just over the 1 MiB ceiling both hooks share (PTU_SCAN_SIZE_CEILING_BYTES /
+#: $PtuScanSizeCeilingBytes) -- an inert one-line command.
+_LARGE_CMD = "echo " + "a" * (1024 * 1024 + 16)
+_SMALL_CMD = "echo " + "a" * 4096
+_SLOW_SCANNER = "import time\ntime.sleep(30)\n"
+_TOO_LARGE_MSG = "too large to check in time"
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_hook_refuses_a_large_command_the_scanner_could_not_finish(
+        impl: str, tmp_path: Path) -> None:
+    """R10 F1 -- RED at e83e24c2: the 2 s bound turned "no verdict" into
+    "proceeds" for every size, where v0.2.103's unbounded scan still blocked a
+    ~1.9-2.7 MB command inside the 3 s registration."""
+    proj = _project(tmp_path, _SLOW_SCANNER)
+    t0 = time.monotonic()
+    res = _run(impl, proj, _LARGE_CMD, tmp_path)
+    assert res.returncode == 2, res.stderr[-500:]
+    assert _TOO_LARGE_MSG in res.stderr
+    assert "Write tool" in res.stderr
+    assert "split the command" in res.stderr
+    assert time.monotonic() - t0 < 10
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_hook_small_command_with_a_slow_scanner_still_proceeds(
+        impl: str, tmp_path: Path) -> None:
+    proj = _project(tmp_path, _SLOW_SCANNER)
+    res = _run(impl, proj, _SMALL_CMD, tmp_path)
+    assert res.returncode == 0, res.stderr[-500:]
+    assert _TOO_LARGE_MSG not in res.stderr
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+@pytest.mark.parametrize("verdict", [0, 2], ids=["scanner-passes", "scanner-blocks"])
+def test_hook_large_command_answered_in_time_gets_the_normal_verdict(
+        impl: str, verdict: int, tmp_path: Path) -> None:
+    proj = _project(tmp_path, (
+        "import sys\nsys.stdin.buffer.read()\n"
+        + ("print('R10 stub verdict: blocked')\n" if verdict == 2 else "")
+        + f"sys.exit({verdict})\n"))
+    res = _run(impl, proj, _LARGE_CMD, tmp_path)
+    assert res.returncode == verdict, res.stderr[-500:]
+    assert _TOO_LARGE_MSG not in res.stderr
+    if verdict == 2:
+        assert "R10 stub verdict: blocked" in res.stderr

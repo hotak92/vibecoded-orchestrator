@@ -418,14 +418,35 @@ if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
         exit 2
     fi
 
-    # Extended security scan via bash_security.py (bounded: exit 124 on
-    # timeout = no verdict, the command proceeds — the raw patterns above
-    # already ran on it).
+    # Extended security scan via bash_security.py (bounded: only exit 2 is a
+    # block; any other exit is no verdict — a timeout is 124 under coreutils
+    # `timeout`, 143 under busybox, 137 after a KILL — and a small command
+    # proceeds, the raw patterns above having already run on it).
+    #
+    # v0.2.104 R10 F1: a command over PTU_SCAN_SIZE_CEILING_BYTES that the
+    # scanner could not finish in time is BLOCKED instead (fail-closed for
+    # that size class only): before the 2 s bound, an unbounded scan of a
+    # ~1.9-2.7 MB command still delivered its verdict inside the 3 s hook
+    # registration. MUST MATCH pre-tool-use.ps1's $PtuScanSizeCeilingBytes.
+    PTU_SCAN_SIZE_CEILING_BYTES=1048576
     if [[ -f "$SECURITY_SCRIPT" ]]; then
         _SEC_SHELL="bash"
         [[ "$TOOL_NAME" == "PowerShell" ]] && _SEC_SHELL="powershell"
         SECURITY_RESULT=$(echo "$CMD" | _ptu_bounded 2 "$PY" "$SECURITY_SCRIPT" --shell "$_SEC_SHELL" 2>&1)
         SECURITY_EXIT=$?
+        if [[ -n "${PY:-}" ]] && [[ "$SECURITY_EXIT" -eq 124 || "$SECURITY_EXIT" -eq 137 || "$SECURITY_EXIT" -eq 143 ]]; then
+            _CMD_BYTES=$(printf '%s' "$CMD" | LC_ALL=C wc -c)
+            _CMD_BYTES=$((_CMD_BYTES + 0))
+            if (( _CMD_BYTES > PTU_SCAN_SIZE_CEILING_BYTES )); then
+                # MUST MATCH pre-tool-use.ps1's message.
+                {
+                    echo "🚨 $TOOL_NAME security check: this command is $_CMD_BYTES bytes, over the 1 MiB limit, and was too large to check in time."
+                    echo "   Write large content with the Write tool, or split the command into smaller ones."
+                } >&2
+                echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"bash_security_too_large_unchecked\",\"bytes\":$_CMD_BYTES}" >> "$SECURITY_LOG" 2>/dev/null || true
+                exit 2
+            fi
+        fi
         if [[ "$SECURITY_EXIT" -eq 2 ]]; then
             # Emit the block message to STDERR (not stdout). Claude
             # Code's PreToolUse hook runner discards plain stdout —

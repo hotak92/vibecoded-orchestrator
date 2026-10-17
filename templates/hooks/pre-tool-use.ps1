@@ -415,16 +415,34 @@ if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     }
 
     # Extended security scan via bash_security.py if available (bounded: a
-    # timeout is no verdict and the command proceeds -- the raw patterns
+    # timeout is no verdict and a small command proceeds -- the raw patterns
     # above already ran on it). It is Python, so with no interpreter it
     # cannot run -- and says so (v0.2.100 WP-17) instead of being skipped in
     # silence.
     if ((Test-Path $SecurityScript) -and -not $PY) {
         Write-VcoNoPythonNotice "The Bash security scanner (.claude/scripts/bash_security.py)"
     }
+    # v0.2.104 R10 F1: a command over $PtuScanSizeCeilingBytes that the
+    # scanner could not finish in time ($null = timed out / killed) is
+    # BLOCKED instead (fail-closed for that size class only): before the 2 s
+    # bound, an unbounded scan of a ~1.9-2.7 MB command still delivered its
+    # verdict inside the 3 s hook registration. A small command keeps "no
+    # verdict = proceeds". MUST MATCH pre-tool-use.sh's
+    # PTU_SCAN_SIZE_CEILING_BYTES.
+    $PtuScanSizeCeilingBytes = 1048576
     if ((Test-Path $SecurityScript) -and $PY) {
         $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
         $secRes = Invoke-PtuBoundedPython "--shell $secShell" $cmd 2000
+        if ($null -eq $secRes) {
+            $cmdBytes = [System.Text.Encoding]::UTF8.GetByteCount([string]$cmd)
+            if ($cmdBytes -gt $PtuScanSizeCeilingBytes) {
+                # MUST MATCH pre-tool-use.sh's message.
+                [Console]::Error.WriteLine("$ToolName security check: this command is $cmdBytes bytes, over the 1 MiB limit, and was too large to check in time.")
+                [Console]::Error.WriteLine("   Write large content with the Write tool, or split the command into smaller ones.")
+                Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_too_large_unchecked"",""bytes"":$cmdBytes}"
+                exit 2
+            }
+        }
         if ($secRes -and $secRes.Exit -eq 2) {
             $secOut = ("" + $secRes.Err + $secRes.Out).TrimEnd()
             # Route to STDERR (matches pre-tool-use.sh's bash-security
