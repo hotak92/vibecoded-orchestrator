@@ -19,27 +19,22 @@ WORKTREE FOOTGUN (a lesson first learned in the wave-1 diagram tests):
 these tests do NOT spawn
 venv-resolving hooks, but we defensively clear ambient ``VCT_VENV`` /
 ``VCT_DISABLE_HUB_RESOLVER`` at import time so a hook-spawning sibling in
-the same process can't leak state.
+the same process can't leak state. That hygiene is per TEST (``setUp``,
+inside ``tests.common.env.IsolatedTestCase``) — it used to run at import
+time, which changed the env for every file collected after this one.
 """
 from __future__ import annotations
 
 import asyncio
 import importlib
 import os
-import sys
 import unittest
 from pathlib import Path
 
-# Defensive env hygiene (wave-1 lesson): never inherit an ambient venv
-# pin that would repoint EmbeddingService construction.
-os.environ.pop("VCT_VENV", None)
-os.environ.setdefault("VCT_DISABLE_HUB_RESOLVER", "1")
+from tests.common.env import IsolatedTestCase
 
 _REPO = Path(__file__).resolve().parents[1]
 _MCP = _REPO / "claude_mcp_servers"
-for _p in (str(_REPO), str(_MCP)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 
 # Every ladder tier the two surfaces must agree on.
@@ -71,15 +66,23 @@ class _FakeService:
         return self._vec()
 
 
-class CodeQueryEmbeddingParityTests(unittest.TestCase):
+class CodeQueryEmbeddingParityTests(IsolatedTestCase):
+    # Whatever these imports register (a first import happens under the env
+    # set below) is rolled back to the pre-test entries after each test, so
+    # neither the env nor a module built from it outlives the test.
+    ISOLATED_MODULES = ("claude_mcp_servers.weaviate_mcp", "query_code_graph", "kg_access")
+    ISOLATED_SYS_PATH = (str(_REPO / "templates" / "scripts"), str(_MCP), str(_REPO))
+
     def setUp(self):
-        import claude_mcp_servers.weaviate_mcp.server as server  # noqa: E402
+        super().setUp()
+        # Defensive env hygiene (wave-1 lesson): never inherit an ambient venv
+        # pin that would repoint EmbeddingService construction.
+        os.environ.pop("VCT_VENV", None)
+        os.environ.setdefault("VCT_DISABLE_HUB_RESOLVER", "1")
+        import claude_mcp_servers.weaviate_mcp.server as server
 
         self.server = server
         # Import the CLI module from templates/scripts.
-        scripts_dir = str(_REPO / "templates" / "scripts")
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
         self.cli = importlib.import_module("query_code_graph")
 
     def _run(self, coro):

@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.env import isolate_process_state  # noqa: E402
 from tests.common.launcher_db_fixture import (  # noqa: E402
     create_empty_launcher_db,
     set_app_state,
@@ -72,7 +73,7 @@ def _make_launcher_db(
 
 class IsolatedEnvMixin:
     """Per-test env isolation: clear ACTIVE_EMBEDDING + EMBEDDING_MODEL +
-    VCT_STATE_DIR + VCT_LAUNCHER_DB_PATH; restore in tearDown.
+    VCT_STATE_DIR + VCT_LAUNCHER_DB_PATH; the whole env is restored after.
 
     Without this mixin, the developer's real $HOME / $VCT_STATE_DIR
     bleeds into the tests and you get spurious passes (or failures)
@@ -81,7 +82,10 @@ class IsolatedEnvMixin:
 
     def setUp(self) -> None:  # noqa: N802 — unittest naming
         super().setUp()  # type: ignore[misc]
-        self._saved_env = {}
+        # v0.2.104: the WHOLE env is restored after the test, not only the
+        # keys cleared below — tests here also set KG_COLLECTION & co., which
+        # a key-list restore left behind for every later file.
+        isolate_process_state(self.addCleanup)  # type: ignore[attr-defined]
         for key in (
             "ACTIVE_EMBEDDING",
             "EMBEDDING_MODEL",
@@ -90,7 +94,7 @@ class IsolatedEnvMixin:
             "HOME",
             "USERPROFILE",
         ):
-            self._saved_env[key] = os.environ.pop(key, None)
+            os.environ.pop(key, None)
         self._tmpdir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self._tmpdir.name)
         # Point both Linux/mac ($HOME) and Windows ($USERPROFILE) at tmp_path
@@ -101,11 +105,6 @@ class IsolatedEnvMixin:
 
     def tearDown(self) -> None:  # noqa: N802 — unittest naming
         self._tmpdir.cleanup()
-        for key, val in self._saved_env.items():
-            if val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = val
         super().tearDown()  # type: ignore[misc]
 
 

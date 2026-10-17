@@ -38,6 +38,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.env import isolate_process_state  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -128,18 +130,39 @@ def _load_module(name: str, path: Path):
     return mod
 
 
+class _OrchestratorRootTestCase(unittest.TestCase):
+    """Sets ``VCT_ORCHESTRATOR_ROOT`` for the class — the scripts resolve the
+    MCP package through it — inside ``isolate_process_state`` at CLASS scope,
+    so the env, ``sys.path`` (the loaded scripts prepend to it) and the
+    modules the loads register (unique ``_test_*`` names, plus the
+    ``weaviate_mcp`` / ``kg_access`` they import) are put back at
+    ``tearDownClass`` instead of leaking to every later file."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        isolate_process_state(cls.addClassCleanup, modules=_LOADED_MODULES)
+        os.environ["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
+
+
+#: Module patterns the classes below register or re-import.
+_LOADED_MODULES = (
+    "weaviate_mcp",
+    "kg_access",
+    "_test_sync_kg_*",
+    "_test_analyze_cg_*",
+    "_test_migrate_emb_*",
+    "_test_search_kg_*",
+)
+
+
 # ---------------------------------------------------------------------------
 # sync_knowledge_graph
 # ---------------------------------------------------------------------------
 
 
-class SyncKnowledgeGraphTests(unittest.TestCase):
+class SyncKnowledgeGraphTests(_OrchestratorRootTestCase):
     """v0.2.18 changes to sync_knowledge_graph.py."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        # Set VCT_ORCHESTRATOR_ROOT so the script resolves the MCP package.
-        os.environ["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
 
     def _import_module(self):
         # Each test gets a fresh import so module-level state doesn't leak.
@@ -233,12 +256,8 @@ class SyncKnowledgeGraphTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class AnalyzeCodeGraphTests(unittest.TestCase):
+class AnalyzeCodeGraphTests(_OrchestratorRootTestCase):
     """v0.2.18 changes to analyze_code_graph.py."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        os.environ["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
 
     def _import_module(self):
         script_path = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
@@ -336,12 +355,12 @@ class AnalyzeCodeGraphTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class MCPServerEmbedDispatchTests(unittest.TestCase):
+class MCPServerEmbedDispatchTests(_OrchestratorRootTestCase):
     """v0.2.18 changes to claude_mcp_servers/weaviate_mcp/server.py."""
 
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
+        super().setUpClass()  # isolation first: the sys.path edits below are inside it
         # server.py uses relative + bare `chunking` import — both
         # claude_mcp_servers/ and claude_mcp_servers/weaviate_mcp/ must
         # be on sys.path so the import works whether the loader treats
@@ -418,12 +437,8 @@ class MCPServerEmbedDispatchTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class MigrateToNewEmbeddingsTests(unittest.TestCase):
+class MigrateToNewEmbeddingsTests(_OrchestratorRootTestCase):
     """v0.2.18 changes to claude_mcp_servers/scripts/migrate_to_new_embeddings.py."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        os.environ["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
 
     def _import_module(self):
         script_path = REPO_ROOT / "claude_mcp_servers" / "scripts" / "migrate_to_new_embeddings.py"
@@ -479,12 +494,8 @@ class MigrateToNewEmbeddingsTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class SearchKnowledgeTests(unittest.TestCase):
+class SearchKnowledgeTests(_OrchestratorRootTestCase):
     """v0.2.18 changes to templates/scripts/search_knowledge.py."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        os.environ["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
 
     def _import_module(self):
         script_path = REPO_ROOT / "templates" / "scripts" / "search_knowledge.py"

@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import sys
 import uuid
 from pathlib import Path
@@ -356,16 +355,19 @@ def test_the_no_backend_exit_code_pin_matches_the_generator_constant():
 # Caller wiring — the REAL parser must accept what each caller spawns
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _load_sync(project_root: Path):
-    os.environ["KG_BASE_DIR"] = str(project_root)
-    os.environ["KG_COLLECTION"] = "TestProject_KnowledgeGraph"
-    os.environ["DEVELOPMENT_COLLECTION"] = "TestProject_Development"
-    os.environ["DUAL_EMBEDDING_ENABLED"] = "false"
-    os.environ["VCT_DISABLE_HUB_RESOLVER"] = "1"
+def _load_sync(project_root: Path, monkeypatch):
+    # Through monkeypatch so the KG identity env and the unique module are
+    # restored after the test (they used to stay set for every later file —
+    # v0.2.104 W-IDENTITY).
+    monkeypatch.setenv("KG_BASE_DIR", str(project_root))
+    monkeypatch.setenv("KG_COLLECTION", "TestProject_KnowledgeGraph")
+    monkeypatch.setenv("DEVELOPMENT_COLLECTION", "TestProject_Development")
+    monkeypatch.setenv("DUAL_EMBEDDING_ENABLED", "false")
+    monkeypatch.setenv("VCT_DISABLE_HUB_RESOLVER", "1")
     mod_name = f"_skg_merge_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(mod_name, SYNC_SCRIPT)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
+    monkeypatch.setitem(sys.modules, mod_name, mod)
     spec.loader.exec_module(mod)
     return mod
 
@@ -378,7 +380,7 @@ def test_kg_sync_spawns_the_merged_generator_with_a_parseable_argv(
     merged generator's REAL argparse."""
     root = tmp_path / "proj"
     _seed_project(root, 1)
-    mod = _load_sync(root)
+    mod = _load_sync(root, monkeypatch)
 
     install_root = tmp_path / "orchestrator-clone"
     gen = install_root / "templates" / "scripts" / "generate-kg-summary.py"
@@ -456,7 +458,7 @@ def _drive_regen_with_stub(tmp_path, monkeypatch, exit_code):
     clone whose generator exits ``exit_code``; returns the project root."""
     root = tmp_path / "proj"
     _seed_project(root, 1)
-    mod = _load_sync(root)
+    mod = _load_sync(root, monkeypatch)
     install_root = tmp_path / "orchestrator-clone"
     gen = install_root / "templates" / "scripts" / "generate-kg-summary.py"
     gen.parent.mkdir(parents=True, exist_ok=True)

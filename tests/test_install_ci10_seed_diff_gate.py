@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.env import isolate_process_state  # noqa: E402
 from tests.common.launcher_db_fixture import (  # noqa: E402
     connect,
     create_empty_launcher_db,
@@ -125,6 +126,10 @@ class SeedDiffGateTest(unittest.TestCase):
     """CI-10: _seed_weaviate diff gate logic tests."""
 
     def setUp(self):
+        # The env this fixture sets (VCT_STATE_DIR, ACTIVE_EMBEDDING, the KG
+        # identity) is restored EXACTLY after the test; the old tearDown POPPED
+        # it, which also removed the session's own values (v0.2.104).
+        isolate_process_state(self.addCleanup)
         # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
         # the seed machinery, not the gate; without this, runners with no live
         # Weaviate burn the 150s deadline and raise (and machines WITH one
@@ -167,10 +172,6 @@ class SeedDiffGateTest(unittest.TestCase):
 
     def tearDown(self):
         self._db_patcher.stop()
-        os.environ.pop("VCT_STATE_DIR", None)
-        os.environ.pop("ACTIVE_EMBEDDING", None)
-        os.environ.pop("KG_COLLECTION", None)
-        os.environ.pop("SHARED_KG_COLLECTION", None)
         try:
             os.unlink(str(self.db_path))
         except OSError:
@@ -537,6 +538,10 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
     """
 
     def setUp(self):
+        # The env this fixture sets (VCT_STATE_DIR, ACTIVE_EMBEDDING, the KG
+        # identity) is restored EXACTLY after the test; the old tearDown POPPED
+        # it, which also removed the session's own values (v0.2.104).
+        isolate_process_state(self.addCleanup)
         # v0.2.89: stub the bounded Weaviate-readiness gate. These tests stub
         # the seed machinery, not the gate; without this, runners with no live
         # Weaviate burn the 150s deadline and raise (and machines WITH one
@@ -572,9 +577,6 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
 
     def tearDown(self):
         self._db_patcher.stop()
-        for k in ("VCT_STATE_DIR", "ACTIVE_EMBEDDING", "KG_COLLECTION",
-                  "SHARED_KG_COLLECTION"):
-            os.environ.pop(k, None)
         try:
             os.unlink(str(self.db_path))
         except OSError:

@@ -15,15 +15,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from tests.common.child_env import child_env
+from tests.common.env import process_state_fixture
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MCP = REPO_ROOT / "claude_mcp_servers"
-for _p in (str(REPO_ROOT), str(MCP)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
-from tests.common.child_env import child_env  # noqa: E402
+#: Per test: ``weaviate_mcp`` importable (MCP dir prepended), and on exit the
+#: env, ``sys.path`` and the ``weaviate_mcp*`` modules a test imported are put
+#: back. Replaces an import-time ``sys.path`` insert and an import-time
+#: ``os.environ.setdefault`` that changed the env for every later file.
+_isolate = process_state_fixture("function", modules=("weaviate_mcp",), prepend_sys_path=(MCP, REPO_ROOT))
 
-os.environ.setdefault("VCT_DISABLE_HUB_RESOLVER", "1")
+
+@pytest.fixture(autouse=True)
+def _hub_resolver_disabled(process_state_isolation):  # noqa: ARG001 (ordering)
+    """The in-process import must not consult the hub (restored by the isolation)."""
+    os.environ.setdefault("VCT_DISABLE_HUB_RESOLVER", "1")
 
 
 def _import_server_with_env(env_overrides: dict[str, str]):
@@ -92,5 +102,4 @@ def test_d10_prefers_claude_project_dir_for_relative_path(tmp_path, monkeypatch)
 
 
 if __name__ == "__main__":
-    import pytest
     sys.exit(pytest.main([__file__, "-q"]))

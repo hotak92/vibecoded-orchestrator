@@ -28,13 +28,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common.env import isolate_process_state  # noqa: E402
 from vco_lib.weaviate_schema import KG_NAMED_VECTORS  # noqa: E402
 
 
-def _load_sync_module(test_id: int):
+def _load_sync_module(test_id: int, register_cleanup):
     """Load `templates/scripts/sync_knowledge_graph.py` as a module
     without executing its __main__ guard. Each test gets a unique
     sys.modules entry so module-level mutations don't leak."""
+    # Everything the load changes — the env var, the sys.path entries the
+    # script prepends, the unique module and the weaviate_mcp / kg_access it
+    # imports — is restored by *register_cleanup* (the caller's
+    # ``addClassCleanup``), not left to leak into later files.
+    isolate_process_state(
+        register_cleanup, modules=("_test_kg_parity_sync_*", "weaviate_mcp", "kg_access"),
+    )
     os.environ["VCT_ORCHESTRATOR_ROOT"] = str(REPO_ROOT)
     script_path = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
     mod_name = f"_test_kg_parity_sync_{test_id}"
@@ -52,7 +60,7 @@ class EnsureKgCollectionV0218Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._test_id = id(cls)
-        cls._mod = _load_sync_module(cls._test_id)
+        cls._mod = _load_sync_module(cls._test_id, cls.addClassCleanup)
 
     def _make_server_with_no_existing_collection(
         self, kg_name: str = "Foo_KnowledgeGraph",

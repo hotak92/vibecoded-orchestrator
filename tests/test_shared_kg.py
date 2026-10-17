@@ -23,18 +23,18 @@ import importlib
 import json
 import os
 
-import pytest
 import sys
 import unittest
 from pathlib import Path
 
+from tests.common.env import process_state_fixture
+
 # Server module lives under claude_mcp_servers/weaviate_mcp/. Make sure both
 # its parent (so `from chunking import Chunker` works in the script-style
 # import inside server.py) and the project root are on sys.path before
-# importing.
+# importing — ``_isolate_module_env`` below prepends it for each test only.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MCP_DIR = PROJECT_ROOT / "claude_mcp_servers"
-sys.path.insert(0, str(MCP_DIR))
 
 
 def _fresh_server(env_overrides: dict[str, str]):
@@ -47,7 +47,8 @@ def _fresh_server(env_overrides: dict[str, str]):
 
     Note: env_overrides are applied to ``os.environ`` directly (NOT via a
     context manager) because some sidecar lookups read env at runtime, not
-    just at import. Tests are responsible for cleaning up if needed.
+    just at import. The autouse ``_isolate_module_env`` below restores the
+    env, these modules and ``sys.path`` after every test.
     """
     # Drop any cached version of the server module so the env is re-read.
     for mod in list(sys.modules):
@@ -59,34 +60,33 @@ def _fresh_server(env_overrides: dict[str, str]):
     return importlib.import_module("weaviate_mcp.server")
 
 
-@pytest.fixture(autouse=True)
-def _isolate_module_env():
-    """Undo, after EVERY test in this file, what its overrides wrote.
-
-    ``_fresh_server`` applies its overrides to the REAL process env — it must,
-    because some lookups read it at runtime rather than at import — and
-    ``_clear_shared_env`` only POPS three keys. So the value of any other key a
-    test set (``KG_BASE_DIR``, ``KG_COLLECTION``, ``SHARED_KG_NODE_FORMATS``,
-    the sidecar paths …) stayed in the shared pytest process for the rest of the
-    session. Concretely: ``SidecarPerCollectionTests`` left
-    ``KG_BASE_DIR=<repo>/tests/_tmp_shared_kg/project`` — a path its tearDown
-    DELETES — and the KG sync script resolves its project root from
-    ``KG_BASE_DIR`` at import, so a later suite
-    (``test_v02101_seed_and_data_keys``) loaded a script pinned to a vanished
-    tmp tree and its root-scoped assertions failed only in the full-suite order
-    (v0.2.101).
-
-    Restoring the WHOLE environment (not a key list) is deliberate: the set of
-    keys these helpers may write is open, and a list would drift out of date the
-    way this one did. Autouse fixtures apply to ``unittest.TestCase`` tests too,
-    which is why this is a fixture rather than another tearDown.
-    """
-    snapshot = dict(os.environ)
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(snapshot)
+#: Undo, after EVERY test in this file, what its overrides wrote.
+#:
+#: ``_fresh_server`` applies its overrides to the REAL process env — it must,
+#: because some lookups read it at runtime rather than at import — and
+#: ``_clear_shared_env`` only POPS three keys. So the value of any other key a
+#: test set (``KG_BASE_DIR``, ``KG_COLLECTION``, ``SHARED_KG_NODE_FORMATS``,
+#: the sidecar paths …) stayed in the shared pytest process for the rest of the
+#: session. Concretely: ``SidecarPerCollectionTests`` left
+#: ``KG_BASE_DIR=<repo>/tests/_tmp_shared_kg/project`` — a path its tearDown
+#: DELETES — and the KG sync script resolves its project root from
+#: ``KG_BASE_DIR`` at import, so a later suite
+#: (``test_v02101_seed_and_data_keys``) loaded a script pinned to a vanished
+#: tmp tree and its root-scoped assertions failed only in the full-suite order
+#: (v0.2.101).
+#:
+#: Restoring the WHOLE environment (not a key list) is deliberate: the set of
+#: keys these helpers may write is open, and a list would drift out of date the
+#: way this one did. Autouse fixtures apply to ``unittest.TestCase`` tests too,
+#: which is why this is a fixture rather than another tearDown.
+#:
+#: v0.2.104: the ``weaviate_mcp*`` modules re-imported under the fake env and
+#: the ``sys.path`` entry are restored too (``tests.common.env``) — the
+#: module object built from a fake ``KG_COLLECTION`` was the other half of
+#: the leak.
+_isolate_module_env = process_state_fixture(
+    "function", modules=("weaviate_mcp",), prepend_sys_path=(MCP_DIR,),
+)
 
 
 def _clear_shared_env() -> None:

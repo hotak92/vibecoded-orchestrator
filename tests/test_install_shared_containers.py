@@ -27,6 +27,7 @@ from unittest import mock
 # in argparse / urllib stdlibs only, so import-cost is fine.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import install  # type: ignore  # noqa: E402
+from tests.common.env import isolate_process_state  # noqa: E402
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -330,6 +331,10 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
     """Adopt-mode safety: per-install naming, skip-if-exists, --skip-seed."""
 
     def setUp(self):
+        # _ensure_collections writes the KG identity env; restore it EXACTLY
+        # (a cleanup that popped the keys also removed the session's own
+        # values — v0.2.104 W-IDENTITY).
+        isolate_process_state(self.addCleanup)
         _Handler.schema = {"classes": []}
         _Handler.posted = []
         _Handler.fail_post = False
@@ -400,10 +405,6 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
                 f"expected a project-scoped *_KnowledgeGraph or *_Development; got {posted_classes}",
             )
         finally:
-            # Clean up env mutations done by _ensure_collections.
-            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-                      "SHARED_KG_COLLECTION"):
-                os.environ.pop(k, None)
             server.shutdown()
 
     def test_adopt_creates_own_dev_even_when_sibling_dev_exists(self):
@@ -453,9 +454,6 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
                 "must not re-post a sibling project's existing collection",
             )
         finally:
-            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-                      "SHARED_KG_COLLECTION"):
-                os.environ.pop(k, None)
             server.shutdown()
 
     def test_skip_seed_skips_collection_creation(self):
@@ -528,9 +526,6 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             self.assertNotIn("KnowledgeGraph", posted_classes)
             self.assertNotIn("Development", posted_classes)
         finally:
-            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-                      "SHARED_KG_COLLECTION"):
-                os.environ.pop(k, None)
             server.shutdown()
 
 

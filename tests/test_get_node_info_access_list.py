@@ -24,11 +24,26 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.common.env import IsolatedTestCase
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = PROJECT_ROOT / "templates" / "scripts"
 HELPER_DIR = PROJECT_ROOT / "claude_mcp_servers" / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
-sys.path.insert(0, str(HELPER_DIR))
+
+
+class _IsolatedTestCase(IsolatedTestCase):
+    """Each test re-imports ``get_node_info`` (and the ``kg_access`` /
+    ``weaviate_mcp`` it pulls in) under a fake env; the base class restores
+    the env, those modules and ``sys.path`` EXACTLY afterwards. The old
+    tearDown POPPED the keys, which also removed the session's own values
+    (v0.2.104 W-IDENTITY)."""
+
+    ISOLATED_MODULES = ("get_node_info", "kg_access", "weaviate_mcp")
+    ISOLATED_SYS_PATH = (str(HELPER_DIR), str(SCRIPTS_DIR))
+
+    def setUp(self) -> None:
+        super().setUp()
+        _clear_env()
 
 
 def _clear_env() -> None:
@@ -128,18 +143,9 @@ class _FakeClient:
         self._closed = True
 
 
-class CollectionLabelTests(unittest.TestCase):
+class CollectionLabelTests(_IsolatedTestCase):
     """``_collection_label`` produces the right ``[self|shared|peer:Name]``
     rendering. Pinning this guards the user-visible output format."""
-
-    def setUp(self) -> None:
-        _clear_env()
-
-    def tearDown(self) -> None:
-        # Symmetric: clear the test-stability env var that _fresh_get_node_info
-        # sets, so it doesn't leak into other test files that run after this
-        # one (which mock their own hub and DO want resolve() to make HTTP calls).
-        _clear_env()
 
     def test_self_collection(self) -> None:
         gni = _fresh_get_node_info({"KG_COLLECTION": "Alpha_KnowledgeGraph"})
@@ -170,16 +176,9 @@ class CollectionLabelTests(unittest.TestCase):
         self.assertEqual(gni._collection_label("WeirdName"), "[WeirdName]")
 
 
-class GetNodeInfoAccessListTests(unittest.TestCase):
+class GetNodeInfoAccessListTests(_IsolatedTestCase):
     """``get_node_info.get_node_info(...)`` queries every collection
     in the access matrix."""
-
-    def setUp(self) -> None:
-        _clear_env()
-
-    def tearDown(self) -> None:
-        # Symmetric cleanup — see CollectionLabelTests.tearDown above.
-        _clear_env()
 
     def test_no_access_list_queries_self_only(self) -> None:
         """Negative direction: no shared, no peers → just self."""
