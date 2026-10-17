@@ -738,8 +738,12 @@ def migrate_managed_service(
         # The overlay FILE follows the compose that parses it — the DETECTED
         # provider, never the bare form (v0.2.100 F-W1-13 / L1-F10); the
         # VENDOR follows the live devices, then the host's card (v0.2.104
-        # R2 M2 — one rule, service_adoption.choose_gpu_vendor).
-        vendor, _refusal = _sa.choose_gpu_vendor([live.gpu_vendor])
+        # R2 M2 — one rule, service_adoption.choose_gpu_vendor). A container
+        # whose devices name BOTH vendors is refused: one chain carries one
+        # overlay, and either would drop the other vendor's devices (R3 M1).
+        vendor, vendor_refusal = _sa.choose_gpu_vendor(live.vendor_evidence())
+        if vendor is None:
+            return refuse(vendor_refusal)
         overlay = _cp.overlay_for_provider(
             _cp.detect(runtime, argv=compose_argv, run=run)
             or _cp.provider_from_form(compose_form, runtime=runtime), vendor, infra)

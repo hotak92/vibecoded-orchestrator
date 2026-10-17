@@ -62,7 +62,7 @@ __all__ = [
     "GPU_OK", "GPU_MISSING", "GPU_UNKNOWN", "GPU_SKIP",
     "OLLAMA_CONTAINER", "REASON_OVERLAY", "REASON_DEGRADED", "REASON_NO_CDI_TOOL",
     "GPUVerdict", "probe", "decide", "deferral_entry", "main",
-    "vendor_of_devices", "vendor_of_compose_service",
+    "vendors_of_devices", "vendor_of_devices", "vendor_of_compose_service",
 ]
 
 #: The registered deferral condition (deferral_conditions.toml).
@@ -140,6 +140,23 @@ def _matching_device(paths: Sequence[str], raw: str, vendor: str) -> Optional[st
     return None
 
 
+def vendors_of_devices(devices: Any) -> tuple[str, ...]:
+    """EVERY GPU vendor a device list positively names, sorted: ``"amd"``
+    for the ROCm compute node ``/dev/kfd`` or an ``amd.com/gpu`` CDI tag,
+    ``"nvidia"`` for a ``/dev/nvidia*`` node or an ``nvidia.com/gpu`` CDI
+    tag; ``()`` when it names none (``/dev/dri`` alone: Intel and AMD both
+    expose it). Both vendors in one list is evidence of BOTH — a caller
+    that must pick one overlay refuses on it
+    (:func:`vco_lib.service_adoption.choose_gpu_vendor`)."""
+    named: set[str] = set()
+    for p in _device_paths(devices):
+        if p.startswith("/dev/kfd") or "amd.com/gpu" in p:
+            named.add("amd")
+        if p.startswith("/dev/nvidia") or "nvidia.com/gpu" in p:
+            named.add("nvidia")
+    return tuple(sorted(named))
+
+
 def vendor_of_devices(devices: Any) -> Optional[str]:
     """The GPU vendor a container's (or a compose stanza's) DEVICE list
     positively names, or ``None``: ``"amd"`` for the ROCm compute node
@@ -149,14 +166,8 @@ def vendor_of_devices(devices: Any) -> Optional[str]:
     BOTH vendors is ambiguous → ``None``. Accepts the ``inspect
     .HostConfig.Devices`` dicts and plain compose ``devices:`` strings
     (``/dev/kfd:/dev/kfd``, ``nvidia.com/gpu=all``)."""
-    paths = _device_paths(devices)
-    named: set[str] = set()
-    for p in paths:
-        if p.startswith("/dev/kfd") or "amd.com/gpu" in p:
-            named.add("amd")
-        if p.startswith("/dev/nvidia") or "nvidia.com/gpu" in p:
-            named.add("nvidia")
-    return named.pop() if len(named) == 1 else None
+    named = vendors_of_devices(devices)
+    return named[0] if len(named) == 1 else None
 
 
 def vendor_of_compose_service(stanza: Any) -> Optional[str]:

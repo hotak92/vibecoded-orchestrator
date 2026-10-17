@@ -80,8 +80,14 @@ VCO_OWNED_NAMES = frozenset({
 #: (v0.2.104 R2 L4). Each pattern names its writer:
 #:
 #: * ``launcher.db`` / ``hub.db`` + :data:`DB_SIBLING_SUFFIXES` (SQLite);
-#: * ``<db>.bak-<tag>`` (+ its own SQLite siblings) — VCO's backup convention
-#:   (``vco_lib.transcript_repair`` / ``vscode_settings``: ``<file>.bak-<ts>``);
+#: * ``<db>.bak-<tag>`` (+ its own SQLite siblings) — NO current writer: a
+#:   grep of the Python and Rust trees (v0.2.104 R3) finds none for
+#:   ``launcher.db`` / ``hub.db``. The shape is VCO's backup naming for OTHER
+#:   files (``<file>.bak-<ts>``: ``vco_lib.transcript_repair``,
+#:   ``vscode_settings``, ``boot_service``; ``install.py``'s
+#:   ``.claude.json.bak-rewrite-<ts>``), so a DB copy under that name — a hand
+#:   backup made the same way, or one left by an older release — is taken as
+#:   VCO's, while ``launcher.db.bak-`` with nothing after it is kept;
 #: * ``hub.token.<project-id>`` — the hub's per-project token
 #:   (``vct-hub/src/project_tokens.rs`` ``PROJECT_TOKEN_PREFIX``), the id a
 #:   launcher project row's UUID (``project_setups.rs`` ``Uuid::new_v4``);
