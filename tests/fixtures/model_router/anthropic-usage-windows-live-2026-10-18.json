@@ -1,0 +1,45 @@
+{
+  "_note": "LIVE capture 2026-10-18 from a scratch vct-model-gateway (worktree code) GET /usage/windows: the Claude subscription entry as the gateway snapshots /api/oauth/usage (5h, weekly, per-model weekly). Scrubbed: nothing secret in this shape.",
+  "generated_at": "2026-10-18T16:52:44Z",
+  "refresh_interval_s": 240,
+  "vendor": {
+    "id": "anthropic",
+    "label": "Claude",
+    "name": "Claude subscription",
+    "state": "ok",
+    "problem": null,
+    "plan": null,
+    "windows": [
+      {
+        "id": "5h",
+        "label": "5h",
+        "kind": "percent",
+        "percent": 18.0,
+        "resets_at": "2026-10-18T19:40:00Z",
+        "source": "oauth_usage",
+        "fetched_at": "2026-10-18T16:52:36Z",
+        "unknown_reason": null
+      },
+      {
+        "id": "weekly",
+        "label": "wk",
+        "kind": "percent",
+        "percent": 94.0,
+        "resets_at": "2026-10-20T05:00:00Z",
+        "source": "oauth_usage",
+        "fetched_at": "2026-10-18T16:52:36Z",
+        "unknown_reason": null
+      },
+      {
+        "id": "weekly:Fable",
+        "label": "Fable",
+        "kind": "percent",
+        "percent": 49.0,
+        "resets_at": "2026-10-20T05:00:00Z",
+        "source": "oauth_usage",
+        "fetched_at": "2026-10-18T16:52:36Z",
+        "unknown_reason": null
+      }
+    ]
+  }
+}

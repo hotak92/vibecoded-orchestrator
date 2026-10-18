@@ -194,6 +194,7 @@ from .routing import (
     Route,
     RouteError,
     api_key_fallback_route,
+    api_key_remainder,
     fallback_route,
     route as route_model,
 )
@@ -1493,8 +1494,8 @@ def _one_m_table(
       derivation only ever widens, so a table row saying 200K, or no row,
       keeps the 200K default rather than guessing.
     """
-    if facts.one_m_client or not decision.is_anthropic:
-        return False
+    if facts.one_m_client or not decision.is_anthropic or api_key_remainder(requested):
+        return False  # an API-key-namespaced id is not one the client natively knows
     try:
         row = gateway.context.current().lookup_id(requested)
     except Exception:  # noqa: BLE001 — a monitor may never break a relay

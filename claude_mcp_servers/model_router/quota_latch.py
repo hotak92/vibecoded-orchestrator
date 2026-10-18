@@ -333,9 +333,11 @@ class QuotaLatch:
                 armed.append(latch)
         for latch in armed:
             logger.info(
-                "model-gateway: subscription %s limit exhausted until %s; sending "
-                "%s to the Claude API key (source=%s)",
-                latch.limit, _iso(latch.until), latch.scope_text(), latch.source,
+                "model-gateway: subscription %s until %s; sending %s to the "
+                "Claude API key (source=%s)",
+                "quota refusal names no limit" if latch.limit == LIMIT_UNKNOWN
+                else f"{latch.limit} limit exhausted",
+                _iso(latch.until), latch.scope_text(), latch.source,
             )
         return armed
 

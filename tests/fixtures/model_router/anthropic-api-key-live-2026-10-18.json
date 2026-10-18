@@ -1,0 +1,113 @@
+{
+  "_note": "LIVE capture 2026-10-18 through a scratch vct-model-gateway on the Claude API-key route (claude-gw/api/<id>, Console key resolved inside the gateway only). Scrubbed: request ids, organization id, any auth header; only the rate-limit headers are kept.",
+  "success": {
+    "request_model": "claude-gw/api/claude-haiku-5-5",
+    "status": 200,
+    "ratelimit_headers": {
+      "anthropic-ratelimit-input-tokens-limit": "2000000",
+      "anthropic-ratelimit-input-tokens-remaining": "2000000",
+      "anthropic-ratelimit-input-tokens-reset": "2026-10-18T16:53:00Z",
+      "anthropic-ratelimit-output-tokens-limit": "400000",
+      "anthropic-ratelimit-output-tokens-remaining": "400000",
+      "anthropic-ratelimit-output-tokens-reset": "2026-10-18T16:53:00Z",
+      "anthropic-ratelimit-requests-limit": "1000",
+      "anthropic-ratelimit-requests-remaining": "999",
+      "anthropic-ratelimit-requests-reset": "2026-10-18T16:53:00Z",
+      "anthropic-ratelimit-tokens-limit": "2400000",
+      "anthropic-ratelimit-tokens-remaining": "2400000",
+      "anthropic-ratelimit-tokens-reset": "2026-10-18T16:53:00Z"
+    },
+    "usage": {
+      "input_tokens": 13,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "output_tokens": 8,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "service_tier": "standard",
+      "inference_geo": "global",
+      "speed": "standard"
+    }
+  },
+  "unified_headers_on_api_key_route": [],
+  "effort": {
+    "low": 200,
+    "high": 200
+  },
+  "count_tokens": {
+    "status": 200,
+    "body": {
+      "input_tokens": 13
+    }
+  },
+  "invalid_model": {
+    "request_model": "claude-gw/api/claude-nonexistent-model-9",
+    "status": 404,
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "not_found_error",
+        "message": "model: claude-nonexistent-model-9"
+      }
+    }
+  },
+  "one_m_beta": {
+    "request_model": "claude-gw/api/claude-sonnet-5-5[1m]",
+    "status": 200,
+    "prompt_tokens": 13
+  },
+  "latch_live": {
+    "_note": "Fallback switched ON in the scratch launcher-DB copy; one plain claude-haiku-5-5 OAuth request (a probe client, not Claude Code) got a subscription 429 the gateway classified rate_limited with NO unified rate-limit headers and no reset hint -> the conservative 300 s latch for the Haiku family; the next request went straight to the key. (The latch's INFO wording for an unnamed limit was refined after this capture: it now reads 'subscription quota refusal names no limit until ...'.)",
+    "health_quota_latch": [
+      {
+        "limit": "unknown",
+        "scope": "haiku",
+        "until": "2026-10-18T17:03:06Z",
+        "since": "2026-10-18T16:58:06Z",
+        "source": "conservative"
+      }
+    ],
+    "log_lines": [
+      "INFO model_router.quota_latch: model-gateway: subscription unknown limit exhausted until 2026-10-18T17:03:06Z; sending Haiku models to the Claude API key (source=conservative)",
+      "INFO model_router.server: model-gateway: requested='claude-haiku-5-5' route=anthropic-api forward='claude-haiku-5-5' status=200 ms=1292 stream=false images=0 bytes=562 note=api_key_fallback fallback_from=anthropic:claude-haiku-5-5 upstream_status=429 quota_class=rate_limited effort_req=- effort_fwd=- in=13 cache_c=0 cache_r=0 out=8 ctx=13",
+      "INFO model_router.server: model-gateway: requested='claude-haiku-5-5' route=anthropic-api forward='claude-haiku-5-5' status=200 ms=653 stream=false images=0 bytes=562 note=quota_latched latch=unknown scope=haiku fallback_from=anthropic:claude-haiku-5-5 effort_req=- effort_fwd=- in=13 cache_c=0 cache_r=0 out=8 ctx=13"
+    ],
+    "ledger_rows": [
+      {
+        "requested": "claude-haiku-5-5",
+        "route": "anthropic-api",
+        "forward": "claude-haiku-5-5",
+        "auth": "api_key",
+        "fallback_from": "anthropic:claude-haiku-5-5",
+        "latched": false,
+        "window_client": 1000000,
+        "window_actual": 1000000,
+        "window_source": "table",
+        "context_tokens": 13,
+        "effort_requested": null,
+        "effort_forwarded": null,
+        "status": 200
+      },
+      {
+        "requested": "claude-haiku-5-5",
+        "route": "anthropic-api",
+        "forward": "claude-haiku-5-5",
+        "auth": "api_key",
+        "fallback_from": "anthropic:claude-haiku-5-5",
+        "latched": true,
+        "window_client": 1000000,
+        "window_actual": 1000000,
+        "window_source": "table",
+        "context_tokens": 13,
+        "effort_requested": null,
+        "effort_forwarded": null,
+        "status": 200
+      }
+    ]
+  }
+}

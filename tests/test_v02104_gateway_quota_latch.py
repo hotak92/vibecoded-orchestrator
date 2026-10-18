@@ -18,6 +18,7 @@ import json
 import logging
 import time
 import unittest
+from pathlib import Path
 from typing import Any
 
 from model_router import quota_latch as ql
@@ -156,6 +157,66 @@ class DerivationTests(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# The REAL usage-windows shape (live capture, 2026-10-18)
+# ══════════════════════════════════════════════════════════════════════════
+LIVE_WINDOWS = (
+    Path(__file__).resolve().parent / "fixtures" / "model_router"
+    / "anthropic-usage-windows-live-2026-10-18.json"
+)
+
+
+def _live_windows(**percent: float) -> tuple[list[Window], float]:
+    """The captured Claude windows as the gateway holds them (``Window``),
+    with ``percent`` overrides by window id; and the capture's own clock."""
+    capture = json.loads(LIVE_WINDOWS.read_text(encoding="utf-8"))
+    now = uw._reset_epoch(capture["generated_at"])
+    assert now is not None
+    windows = []
+    for row in capture["vendor"]["windows"]:
+        seen = uw._reset_epoch(row["fetched_at"])
+        assert seen is not None
+        windows.append(Window(
+            row["id"], row["label"], percent.get(row["id"], row["percent"]),
+            uw._reset_epoch(row["resets_at"]), row["source"], seen,
+        ))
+    return windows, now
+
+
+class LiveWindowsTests(unittest.TestCase):
+
+    def test_the_capture_carries_5h_weekly_and_a_per_model_window(self) -> None:
+        windows, _now = _live_windows()
+        self.assertEqual([w.id for w in windows], ["5h", "weekly", "weekly:Fable"])
+        self.assertTrue(all(w.resets_at for w in windows))
+
+    def test_none_at_100_percent_means_the_refusal_alone_decides(self) -> None:
+        windows, now = _live_windows()
+        [latch] = ql.latches_for_refusal(OPUS, _refusal(), windows, now=now)
+        self.assertEqual((latch.limit, latch.source), (ql.LIMIT_UNKNOWN, ql.SOURCE_CONSERVATIVE))
+
+    def test_a_full_per_model_window_latches_only_its_model_until_its_reset(self) -> None:
+        windows, now = _live_windows(**{"weekly:Fable": 100.0})
+        [latch] = ql.latches_for_refusal(FABLE, _refusal(), windows, now=now)
+        self.assertEqual((latch.limit, latch.scope), ("weekly:Fable", "fable"))
+        self.assertEqual(latch.until, uw._reset_epoch("2026-10-20T05:00:00Z"))
+        self.assertFalse(latch.covers(OPUS))
+
+    def test_a_full_weekly_window_latches_every_model(self) -> None:
+        windows, now = _live_windows(weekly=100.0)
+        [latch] = ql.latches_for_refusal(HAIKU, _refusal(), windows, now=now)
+        self.assertEqual((latch.limit, latch.scope, latch.source), ("weekly", "all", ql.SOURCE_USAGE_WINDOWS))
+        self.assertTrue(latch.covers(SONNET))
+
+    def test_a_later_real_reading_under_100_clears_an_unknown_latch(self) -> None:
+        windows, now = _live_windows()
+        clock = [now - 60]
+        latch = ql.QuotaLatch(clock=lambda: clock[0])
+        latch.note_refusal(OPUS, _refusal(), [])
+        clock[0] = now
+        self.assertIsNone(latch.active_for(OPUS, windows))
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # The latch's life (fake clock)
 # ══════════════════════════════════════════════════════════════════════════
 class LatchLifecycleTests(unittest.TestCase):
@@ -171,6 +232,7 @@ class LatchLifecycleTests(unittest.TestCase):
             self.assertIsNone(self.latch.active_for(OPUS))
         self.assertEqual(len(cm.output), 2)
         self.assertIn("subscription 5h limit exhausted until", cm.output[0])
+        self.assertNotIn("names no limit", cm.output[0])
         self.assertIn("sending every Claude model to the Claude API key", cm.output[0])
         self.assertIn("latch cleared (its reset time passed)", cm.output[1])
 

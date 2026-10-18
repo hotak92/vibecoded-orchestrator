@@ -178,6 +178,27 @@ def split_namespace(
     return best
 
 
+def api_key_remainder(
+    model_id: str,
+    vendors: Mapping[str, Vendor] = VENDORS,
+    anthropic: AnthropicFamily = ANTHROPIC_FAMILY,
+) -> Optional[str]:
+    """The Claude id after the API-key namespace, or ``None`` when
+    ``model_id`` is not on that route. The longest namespace wins, as between
+    vendor rows: the API-key namespace may EXTEND a vendor's
+    without being shadowed by it. The ONE home of that rule — the router, the
+    id parser and the context table all ask here, so ``<API-key namespace><id>``
+    reads the first-party ``<id>`` row everywhere (v0.2.104: the ledger's
+    ``window_actual`` read ``unknown`` on every API-key row before)."""
+    api = anthropic.api_key
+    if api is None or not model_id.startswith(api.namespace):
+        return None
+    vendor, _rest = split_namespace(model_id, vendors)
+    if vendor is not None and len(vendor.namespace) >= len(api.namespace):
+        return None
+    return model_id[len(api.namespace):]
+
+
 def _bare_prefix_match(
     model_id: str,
     vendors: Mapping[str, Vendor],
@@ -458,14 +479,9 @@ def route(
 
     vendor, remainder = split_namespace(model_id, vendors)
     api = anthropic.api_key
-    if (
-        api is not None
-        and model_id.startswith(api.namespace)
-        and (vendor is None or len(api.namespace) > len(vendor.namespace))
-    ):
-        # The longest namespace wins, as between vendor rows: the API-key
-        # namespace may extend a vendor's without being shadowed by it.
-        return _api_key_route(anthropic, api, model_id[len(api.namespace):])
+    api_rest = api_key_remainder(model_id, vendors, anthropic)
+    if api is not None and api_rest is not None:
+        return _api_key_route(anthropic, api, api_rest)
     if vendor is not None:
         return _vendor_route(
             vendor, remainder, raw_id=model_id, vendors=vendors,
