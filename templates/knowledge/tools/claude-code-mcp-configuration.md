@@ -41,7 +41,7 @@ Per-project env that must reach MCP subprocesses goes in the project's Claude Co
 }
 ```
 
-If git already tracks `settings.local.json`, VCO writes all keys to `settings.json` instead and records a `settings_local_json_tracked` deferral. A value you put in `settings.local.json` yourself is kept.
+If git already tracks `settings.local.json`, VCO writes all keys to `settings.json` instead and records a `settings_local_json_tracked` deferral. If git cannot answer (for example it refuses the folder as unsafe), VCO also keeps all keys in `settings.json`, logs a warning and records a `settings_local_layer_unknown` entry until git answers. A value you put in `settings.local.json` yourself is kept.
 
 MCP server registrations themselves (command, args, machine-invariant env like `WEAVIATE_URL`) live in `~/.claude.json` `mcpServers`, written by the orchestrator install flow (`mcp_registration.rs::build_default_mcp_entries`). Per-project `KG_COLLECTION`-shape keys are intentionally dropped from that surface (`ALLOWED_ENV_KEYS`) so they can't leak across projects; they resolve from the project's settings `env` instead.
 
