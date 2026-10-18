@@ -3194,6 +3194,8 @@ pub fn run() {
             commands::codegraph_parsers::codegraph_parsers_decline,
             commands::codegraph_parsers::codegraph_parsers_install,
             commands::gateway_usage::model_gateway_usage_windows,
+            commands::gateway_anthropic_auth::model_gateway_anthropic_auth_get,
+            commands::gateway_anthropic_auth::model_gateway_anthropic_auth_set,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.

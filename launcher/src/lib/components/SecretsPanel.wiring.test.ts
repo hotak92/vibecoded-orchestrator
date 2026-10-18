@@ -330,3 +330,27 @@ describe('SecretsPanel suggests the dedicated VCO OpenAI key (OD-4)', () => {
     ).toBe(true);
   });
 });
+
+// ─── v0.2.104: the model gateway's Claude API key slot ────────────────────
+// The gateway resolves exactly `ANTHROPIC_API_KEY_GATEWAY` in the SHARED scope
+// (model_router/vendors.py ANTHROPIC_API_KEY_ROUTE); the shared add form
+// spells that name for the user.
+describe('SecretsPanel suggests the Claude API key slot (v0.2.104)', () => {
+  it('a shared-scope branch renders the ANTHROPIC_API_KEY_GATEWAY suggestion', () => {
+    const arm = ifBlocks().find(
+      (n) => n.test && subtreeHasLiteral(n.test, 'shared') && subtreeHasLiteral(n.consequent, 'ANTHROPIC_API_KEY_GATEWAY'),
+    );
+    expect(arm, "no {#if scope === 'shared'} branch suggests ANTHROPIC_API_KEY_GATEWAY").toBeTruthy();
+    expect(renderedText(arm!.consequent)).toContain('claude api key');
+  });
+
+  it('clicking it fills the KEY field with the exact name', () => {
+    const assignments = NODES.filter(
+      (n) =>
+        n.type === 'AssignmentExpression' &&
+        (n.left as Record<string, unknown> | undefined)?.type === 'Identifier' &&
+        (n.left as Record<string, unknown>).name === 'newKey',
+    );
+    expect(assignments.some((n) => subtreeHasLiteral(n.right, 'ANTHROPIC_API_KEY_GATEWAY'))).toBe(true);
+  });
+});

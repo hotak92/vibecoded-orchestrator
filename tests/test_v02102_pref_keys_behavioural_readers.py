@@ -37,6 +37,9 @@ READERS: dict[str, str] = {
     "openai_embeddings_consent": "test_embeddings_consent_value_drives_the_gate",
     "embedding.active_profile": "test_active_profile_value_drives_the_text_model",
     "launcher.hardware_snapshot": "rust:hardware_snapshot_key_value_drives_the_read_gpu_mode",
+    # v0.2.104: the gateway's opt-in subscription -> API-key fallback; the
+    # row ON makes a quota refusal retry with the key, absent leaves it alone.
+    "model_gateway.api_key_fallback": "tests/test_v02104_gateway_api_key_route.py::SubscriptionFallbackTests::test_on_through_the_launcher_db_row",
 }
 
 

@@ -1398,3 +1398,88 @@ export function describeUsageLedger(s: ModelGatewayStatus | null): string {
   }
   return `${ledger.rows_written} row${ledger.rows_written === 1 ? '' : 's'} written to ${ledger.path}`;
 }
+
+// ─── v0.2.104: the GLOBAL first-party auth mode (homepage switch) ─────────
+//
+// "Anthropic: OAuth | API key". The choice is persisted by the Rust command
+// (`gateway_anthropic_auth.rs`, launcher.db app_state) and read by the
+// gateway itself within seconds — no restart. Whether the API key RESOLVES is
+// the gateway's answer (`/health` → `anthropic_auth`), never guessed here.
+
+/** MUST MATCH `ANTHROPIC_AUTH_MODES` in model_router/config.py and the Rust
+ *  command module (parity-tested from Python). */
+export type AnthropicAuthMode = 'oauth' | 'api_key';
+export const ANTHROPIC_AUTH_MODES: readonly AnthropicAuthMode[] = ['oauth', 'api_key'];
+
+export const ANTHROPIC_AUTH_LABEL: Record<AnthropicAuthMode, string> = {
+  oauth: 'OAuth',
+  api_key: 'API key',
+};
+
+export const ANTHROPIC_AUTH_TOOLTIP: Record<AnthropicAuthMode, string> = {
+  oauth:
+    'Claude requests through the gateway use your Claude login (subscription). Applies within seconds, no restart.',
+  api_key:
+    'Every Claude request through the gateway uses your Claude API key (Secrets → Shared). Your client headers are sent unchanged; Anthropic decides which credit pool pays — check the Console. Applies within seconds, no restart.',
+};
+
+export async function getAnthropicAuthMode(): Promise<AnthropicAuthMode> {
+  const mode = await invoke<string>('model_gateway_anthropic_auth_get');
+  return mode === 'api_key' ? 'api_key' : 'oauth';
+}
+
+export async function setAnthropicAuthMode(mode: AnthropicAuthMode): Promise<AnthropicAuthMode> {
+  const stored = await invoke<string>('model_gateway_anthropic_auth_set', { mode });
+  return stored === 'api_key' ? 'api_key' : 'oauth';
+}
+
+/**
+ * Why a mode pill cannot be clicked, or `''`. OAuth is always selectable.
+ * API key needs a live gateway that reports the key as resolvable: choosing
+ * it otherwise would show "API key" while every Claude request is refused.
+ * `unknown` (the gateway has not resolved it yet) also disables, with a
+ * reason that says to retry — the next status probe answers it.
+ */
+export function anthropicAuthDisabledReason(
+  target: AnthropicAuthMode,
+  gw: ModelGatewayStatus | null,
+): string {
+  if (target === 'oauth') return '';
+  if (!gatewayIsLive(gw)) return 'The model gateway is not running.';
+  const auth = gw?.health?.anthropic_auth;
+  if (!auth) return 'This gateway is older than the API-key switch; update VCO first.';
+  const secret = auth.api_key_secret ?? 'ANTHROPIC_API_KEY_GATEWAY';
+  if (auth.api_key === 'missing') {
+    return `No Claude API key: add it in Secrets → Shared as ${secret}.`;
+  }
+  if (auth.api_key !== 'available') {
+    return 'Checking the Claude API key… try again in a moment.';
+  }
+  return '';
+}
+
+/**
+ * A warning to show beside the switch, or `null`: the stored choice is API
+ * key but the gateway cannot use it (key missing — Claude requests are being
+ * REFUSED, not quietly sent with the login), or the gateway reports a
+ * different mode than the one stored (an older gateway that ignores it).
+ */
+export function anthropicAuthWarning(
+  stored: AnthropicAuthMode | null,
+  gw: ModelGatewayStatus | null,
+): string | null {
+  if (!stored || !gatewayIsLive(gw)) return null;
+  const auth = gw?.health?.anthropic_auth;
+  if (!auth) {
+    return stored === 'api_key'
+      ? 'This gateway does not support the API-key mode yet — Claude requests still use OAuth. Update VCO.'
+      : null;
+  }
+  if (stored === 'api_key' && auth.api_key === 'missing') {
+    return `API key mode is on but no key resolves (${auth.api_key_secret ?? 'ANTHROPIC_API_KEY_GATEWAY'}) — Claude requests through the gateway are refused until you add it or switch to OAuth.`;
+  }
+  if (auth.mode !== stored) {
+    return `The gateway still reports ${auth.mode}; it applies the change within a few seconds.`;
+  }
+  return null;
+}

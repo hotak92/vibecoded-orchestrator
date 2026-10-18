@@ -21,6 +21,7 @@
     APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL,
     APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT,
     APP_STATE_KEY_ACTIVE_EMBEDDING,
+    APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK,
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
   import { parseSummaryTiers, type SummaryTier } from '$lib/preferences/summary_tiers';
@@ -1104,6 +1105,42 @@
       toast.error(e);
     } finally {
       rlOnlineTrainingGlobalSaving = false;
+    }
+  }
+
+  // v0.2.104: the model gateway's opt-in subscription -> Claude API key
+  // fallback. Absent row = OFF (the default): it bills the Console
+  // organisation, so it is never on by accident. The gateway re-reads the row
+  // within seconds — no restart.
+  let gatewayApiKeyFallback = $state(false);
+  let gatewayApiKeyFallbackSaving = $state(false);
+
+  async function loadGatewayApiKeyFallback() {
+    try {
+      gatewayApiKeyFallback = (await PREF_LOADERS.gatewayApiKeyFallback.load()) === true;
+    } catch (e) {
+      console.debug('loadGatewayApiKeyFallback failed', e);
+    }
+  }
+
+  async function toggleGatewayApiKeyFallback() {
+    gatewayApiKeyFallbackSaving = true;
+    const next = !gatewayApiKeyFallback;
+    try {
+      await invoke<void>('app_state_set_bool', {
+        key: APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK,
+        value: next,
+      });
+      gatewayApiKeyFallback = next;
+      toast.success(
+        next
+          ? 'Claude API key fallback ON — subscription quota refusals retry once with the API key (billed to your Console organisation)'
+          : 'Claude API key fallback OFF',
+      );
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      gatewayApiKeyFallbackSaving = false;
     }
   }
 
@@ -2266,6 +2303,7 @@
     rlLocal: loadRlLocalState,
     rlUploadConsent: loadRlUploadConsent,
     rlGlobalTelemetry: loadRlGlobalTelemetryState,
+    gatewayApiKeyFallback: loadGatewayApiKeyFallback,
     dualFlags: () => { shownPanels.dualFlags = true; },
     logLevel: loadLogLevel,
     hardwareSnapshot: loadInitialHardwareSnapshot,
@@ -3190,6 +3228,33 @@
         <button class="pr-btn" onclick={() => goto('/preferences/chat-model-context')}>
           Open
         </button>
+      </div>
+    </section>
+
+    <!-- v0.2.104: the model gateway's Claude API key route + its opt-in
+         subscription fallback. The key itself lives in Secrets (shared scope,
+         name ANTHROPIC_API_KEY_GATEWAY); this switch only decides whether a
+         subscription quota refusal may spend it. -->
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['gatewayApiKeyFallback'] }} aria-labelledby="pr-gateway-apikey-title">
+      <h2 class="pr-section-title" id="pr-gateway-apikey-title">Model gateway — Claude API key</h2>
+      <div class="pr-rl-row">
+        <label class="pr-rl-toggle"
+               title="When ON, a Claude request whose subscription answer is a quota refusal (the same rule the gateway's fallback ladder uses) is retried once on the same model with the Claude API key saved in Secrets as ANTHROPIC_API_KEY_GATEWAY. Billed to the Console organisation that key belongs to.">
+          <input type="checkbox" checked={gatewayApiKeyFallback}
+            disabled={gatewayApiKeyFallbackSaving}
+            onchange={() => void toggleGatewayApiKeyFallback()} />
+          <strong>Use the Claude API key when the subscription is out</strong>
+          <small>
+            OFF (default). ON: a subscription quota refusal is retried once on
+            the same model with your Claude API key (Secrets → Shared,
+            <code>ANTHROPIC_API_KEY_GATEWAY</code>), before any other fallback. The
+            same key also adds <code>claude-gw/api/…</code> models to the
+            picker. Requests go out with your client's own headers; Anthropic
+            decides which credit pool pays — check the Console after the first
+            use. Every such request is marked <code>auth: api_key</code> in the
+            gateway usage log.
+          </small>
+        </label>
       </div>
     </section>
 

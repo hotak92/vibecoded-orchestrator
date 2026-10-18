@@ -119,20 +119,22 @@ LEDGER_MAX_BYTES = 50 * 1024 * 1024
 #: ``request_bytes``, the longest ``fallback_from`` label
 #: (``vendor:qwen:deepseek-v4.1-flash``), and the LONGEST effort spelling
 #: (``budget_tokens=8192`` on both sides of the pair; a named tier is
-#: shorter). That case serialises to 776 bytes + the newline. Used only to
+#: shorter), and — v0.2.104 — the longest ``auth`` value (``vendor_key``).
+#: That case serialises to 796 bytes + the newline. Used only to
 #: turn a byte cap into a LINE count for
 #: :func:`vco_lib.atomic.rotate_tail_lines`, which keeps lines rather than
 #: bytes — a TYPICAL row is smaller, so the surviving tail is at most about a
 #: quarter of the cap, never more. Re-measured at v0.2.102 when the effort
 #: pair (``effort_requested`` / ``effort_forwarded``) joined the row; the
-#: pre-pair figure of 545 was itself a derived underestimate.
-LEDGER_ROW_BYTES = 777
+#: pre-pair figure of 545 was itself a derived underestimate. v0.2.104: +20
+#: for ``,"auth":"vendor_key"``.
+LEDGER_ROW_BYTES = 797
 
 #: What fraction of :data:`LEDGER_MAX_BYTES` survives a rotation. A quarter:
 #: enough recent history that a monitor restarted after a rotation still has
 #: context to show, and small enough that rotations are rare rather than one
-#: per write. At the default cap that is ``(52428800 // 4) // 777`` =
-#: **16 868 lines**, about 12.5 MiB when every row is a maximal
+#: per write. At the default cap that is ``(52428800 // 4) // 797`` =
+#: **16 445 lines**, about 12.5 MiB when every row is a maximal
 #: :data:`LEDGER_ROW_BYTES` row — at most a quarter of the cap, as intended;
 #: typical (smaller) rows keep the same LINE count and proportionally fewer
 #: bytes.
@@ -590,6 +592,14 @@ class UsageRecord:
     #: differ because of a fallback (and from where). Empty on every ordinary
     #: row, so its absence means "no fallback", never "unknown".
     fallback_from: str = ""
+    #: v0.2.104: how the answering route authenticated upstream —
+    #: ``oauth`` (the Claude login), ``api_key`` (the Console API key: the
+    #: ``claude-gw/api/`` route, or the opt-in subscription fallback, which
+    #: then also sets ``fallback_from``) or ``vendor_key`` (a vendor row).
+    #: The one field that says a turn was billed to the API key, so it is
+    #: never left to inference from ``route``. Empty only on rows written by
+    #: a caller that does not know (none in the gateway).
+    auth: str = ""
     #: v0.2.102 (register item 2026-10-10): the effort selector this request
     #: carried, both directions. ``effort_requested`` is what the CLIENT sent
     #: (``output_config.effort``, or the older ``thinking.budget_tokens`` as
@@ -651,6 +661,7 @@ def build_record(
     fallback_from: str = "",
     effort_requested: Optional[str] = None,
     effort_forwarded: Optional[str] = None,
+    auth: str = "",
 ) -> UsageRecord:
     """Assemble one row. Pure — no clock unless the caller declines to pass one.
 
@@ -708,6 +719,7 @@ def build_record(
         usage_complete=usage_complete,
         request_bytes=max(0, int(request_bytes)),
         fallback_from=str(fallback_from or ""),
+        auth=str(auth or ""),
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
     )
@@ -1177,7 +1189,7 @@ class UsageLedger:
         A PROJECTION of the same in-memory rows :meth:`sessions` serves,
         keyed by identity rather than by chat, and reduced to the fields
         attribution needs: who (session, agent), what answered (model,
-        route, fallback_from) and when (at). Newest last, LRU-bounded with
+        route, fallback_from, auth) and when (at). Newest last, LRU-bounded with
         the rest of the ledger's memory. Reads the lock-protected map only;
         never touches the file.
         """
@@ -1191,6 +1203,7 @@ class UsageLedger:
                 "model": record.forward,
                 "route": record.route,
                 "fallback_from": record.fallback_from,
+                "auth": record.auth,
                 "at": record.ts,
             }
             for record in items

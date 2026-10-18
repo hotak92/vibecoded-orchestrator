@@ -51,6 +51,24 @@ export interface GatewayHealth {
   usage_ledger?: GatewayUsageLedger | null;
   /** `owner_only` | `broader` | `unknown` for the gateway's token file. */
   token_file_permissions: string;
+  /**
+   * v0.2.104: which credential first-party Claude requests use NOW, as the
+   * running gateway reads the launcher setting, and whether the Claude API
+   * key resolves. Absent from an older gateway.
+   */
+  anthropic_auth?: GatewayAnthropicAuth | null;
+}
+
+/** `/health`'s `anthropic_auth` block (v0.2.104). */
+export interface GatewayAnthropicAuth {
+  /** The mode in force: `oauth` | `api_key` (a later release may add more). */
+  mode: string;
+  /** `available` | `missing` | `unknown` (not resolved yet — ask again). */
+  api_key: string;
+  /** The opt-in subscription -> API-key fallback (Preferences). */
+  api_key_fallback: boolean;
+  /** The secret name the gateway resolves the key from. */
+  api_key_secret: string | null;
 }
 
 /** `/health`'s `secret_scope` block. */
