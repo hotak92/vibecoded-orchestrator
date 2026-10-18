@@ -305,9 +305,19 @@ mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 #     is carried to the next one.
 # The marker is written once the payload is decoded (the key needs it); the
 # harness kills at the timeout, so only a decode slower than the whole
-# budget goes unreported. MUST MATCH pre-tool-use.ps1's section 0.
+# budget goes unreported.
+# "In time" (see _ptu_finished_late) errs toward CLEARING: a run that
+# completed normally keeps its marker only when its own clock proves it ran
+# past the budget. Grey zone: the harness counts from the spawn, this hook
+# from its first clock reading (after bash start-up, a few ms), so a run
+# that finishes within those few ms of the budget may have been killed yet
+# clears its marker — the one case left unreported, never a false warning.
+# A marker of ANOTHER key older than a day belongs to a session or subagent
+# that never made another call (a kill on its last call): the GC below logs
+# it as `session_ended` before deleting it, so the audit line still exists.
+# MUST MATCH pre-tool-use.ps1's section 0.
 PTU_STALE_MARGIN_MS=2000
-PTU_LATE_MARGIN_MS=100
+PTU_GC_AGE_MS=86400000
 PTU_CARRY_MAX=20
 _ptu_budget_s
 _PTU_MARKER=""
@@ -332,7 +342,7 @@ if [ -n "$_PTU_MARKER" ]; then
     for _ptu_m in "$SESSION_STATE_DIR/ptu_inflight_${_PTU_KEY}."*; do
         [ -f "$_ptu_m" ] || continue
         [ "$_ptu_m" = "$_PTU_MARKER" ] && continue
-        _ptu_rest="${_ptu_m##*/ptu_inflight_${_PTU_KEY}.}"
+        _ptu_rest="${_ptu_m##*/ptu_inflight_"${_PTU_KEY}".}"
         _ptu_mpid="${_ptu_rest%%.*}"
         _ptu_mms="${_ptu_rest#*.}"
         case "$_ptu_mpid" in ''|*[!0-9]*) continue ;; esac
@@ -371,6 +381,23 @@ if [ -n "$_PTU_MARKER" ]; then
     fi
 fi
 
+# _ptu_finished_late: true only when this run's own clock proves it ended
+# past the harness timeout (its answer was then discarded). Uses the RAW
+# clock difference — the +1 s coarse inflation of _ptu_elapsed_ms is the
+# safe side for a deadline but the unsafe side here (R13 MEDIUM-1: on macOS
+# bash 3.2 + BSD date a successful 2 s reading kept the marker and the next
+# call warned falsely). A coarse difference of d whole seconds means a real
+# elapsed anywhere between d-1 and d+1 s, so only d > budget proves it.
+# MUST MATCH pre-tool-use.ps1's Exit-PtuHook test.
+_ptu_finished_late() {
+    _ptu_clock_us
+    if [[ "$_PTU_T0_COARSE" == 1 || "$_PTU_CLOCK_COARSE" == 1 ]]; then
+        (( (_PTU_CLOCK_US - _PTU_T0_US) / 1000000 > _PTU_BUDGET_S ))
+    else
+        (( (_PTU_CLOCK_US - _PTU_T0_US) / 1000 >= _PTU_BUDGET_S * 1000 ))
+    fi
+}
+
 # _ptu_exit <code>: every exit of this hook from here on. Removes this run's
 # marker when the run completed in time with an answer the harness acts on
 # (0 allow, 2 block), and delivers a pending stale-marker report on that
@@ -378,8 +405,7 @@ fi
 _ptu_exit() {
     local rc="$1"
     if [ -n "$_PTU_MARKER" ] && { [ "$rc" = 0 ] || [ "$rc" = 2 ]; }; then
-        _ptu_elapsed_ms
-        if (( _PTU_ELAPSED_MS < _PTU_BUDGET_S * 1000 - PTU_LATE_MARGIN_MS )); then
+        if ! _ptu_finished_late; then
             rm -f "$_PTU_MARKER" 2>/dev/null
             if [ -n "$_PTU_PRIOR_MSG" ]; then
                 if [ "$rc" = 0 ]; then
@@ -407,11 +433,35 @@ find "$SESSION_STATE_DIR" -maxdepth 1 -name 'reads_*.txt' -mtime +14 -delete 2>/
 # v0.2.70 Stream E (SF-1): same 14-day GC for the INJECTOR reads store
 # (seen_reads_*.txt — distinct from the Build-Anchor reads_*.txt above).
 find "$SESSION_STATE_DIR" -maxdepth 1 -name 'seen_reads_*.txt' -mtime +14 -delete 2>/dev/null || true
-# v0.2.104: same 14-day GC for the post-compact markers (compacted_*.txt),
-# and a 1-day GC for in-progress markers (ptu_inflight_*, section 0) no later
-# run of their session claimed — that session is over. One find, no new spawn.
+# v0.2.104: in-progress markers (ptu_inflight_*, section 0) of any key whose
+# start stamp is over a day old: no later run of that session/subagent came
+# to claim it, so it is LOGGED (reason session_ended, tools from the file)
+# and deleted — R13 LOW-1, a killed hook on a session's last call must
+# still leave its audit line. Pure-bash glob; age from the file name's
+# start stamp, so no stat spawn. MUST MATCH pre-tool-use.ps1's GC.
+for _ptu_g in "$SESSION_STATE_DIR"/ptu_inflight_*; do
+    [ -f "$_ptu_g" ] || continue
+    _ptu_gn="${_ptu_g##*/ptu_inflight_}"
+    _ptu_gkey="${_ptu_gn%%.*}"
+    _ptu_gms="${_ptu_gn##*.}"
+    case "$_ptu_gms" in ''|*[!0-9]*) continue ;; esac
+    case "$_ptu_gkey" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+    (( _PTU_T0_MS - _ptu_gms > PTU_GC_AGE_MS )) || continue
+    _ptu_gtools=""
+    while IFS= read -r _ptu_t || [ -n "$_ptu_t" ]; do
+        _ptu_t="${_ptu_t//[!A-Za-z0-9_.:-]/}"
+        [ -n "$_ptu_t" ] && _ptu_gtools="${_ptu_gtools:+$_ptu_gtools }${_ptu_t:0:100}"
+    done < "$_ptu_g" 2>/dev/null
+    rm "$_ptu_g" 2>/dev/null || continue   # the delete is the claim
+    echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"pre_tool_use_incomplete\",\"tools\":\"${_ptu_gtools:-unknown}\",\"session_key\":\"$_ptu_gkey\",\"age_ms\":$(( _PTU_T0_MS - _ptu_gms )),\"reason\":\"session_ended\"}" >> "$SECURITY_LOG" 2>/dev/null || true
+done
+# v0.2.104: same 14-day GC for the post-compact markers (compacted_*.txt).
+# The same find backstops the marker loop above (it runs AFTER it): a
+# ptu_inflight_* file untouched for two days that the loop could not parse
+# (a malformed name) is removed silently — every well-formed one was
+# already logged and deleted by the loop.
 find "$SESSION_STATE_DIR" -maxdepth 1 \( -name 'compacted_*.txt' -mtime +14 \
-    -o -name 'ptu_inflight_*' -mmin +1440 \) -delete 2>/dev/null || true
+    -o -name 'ptu_inflight_*' -mmin +2880 \) -delete 2>/dev/null || true
 
 # === HELPER: safe JSON field extraction ===
 _get_field() {

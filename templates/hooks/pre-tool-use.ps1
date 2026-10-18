@@ -229,9 +229,18 @@ function Write-SecurityLine([string]$json) {
 #     is carried to the next one.
 # The start stamp is the PROCESS start when the OS reports it (the
 # powershell cold start counts against the harness timeout too).
+# "In time" (Exit-PtuHook) errs toward CLEARING: a run that completed
+# normally keeps its marker only when its elapsed time (from the process
+# start, else from the hook's first line) reaches the budget. Grey zone: the
+# harness counts from the spawn, slightly before the process start, so a run
+# finishing within that gap of the budget may have been killed yet clears
+# its marker -- the one case left unreported, never a false warning.
+# A marker of ANOTHER key older than a day belongs to a session or subagent
+# that never made another call (a kill on its last call): the GC below logs
+# it as `session_ended` before deleting it.
 # MUST MATCH pre-tool-use.sh's section 0.
 $PtuStaleMarginMs = 2000
-$PtuLateMarginMs = 100
+$PtuGcAgeMs = 86400000
 $PtuCarryMax = 20
 $script:PtuBudgetS = Get-PtuBudgetS
 $script:PtuMarker = ""
@@ -323,7 +332,9 @@ if ($script:PtuMarker) {
 function Exit-PtuHook([int]$Code) {
     $prior = ""
     if ($script:PtuMarker -and ($Code -eq 0 -or $Code -eq 2)) {
-        if ((Get-PtuElapsedMs) -lt ($script:PtuBudgetS * 1000 - $PtuLateMarginMs)) {
+        # Not late = cleared (MUST MATCH pre-tool-use.sh's _ptu_finished_late;
+        # this clock is never coarse: Stopwatch + process start).
+        if ((Get-PtuElapsedMs) -lt ($script:PtuBudgetS * 1000)) {
             try { [IO.File]::Delete($script:PtuMarker) } catch { }
             $prior = $script:PtuPriorMsg
         }
@@ -368,11 +379,38 @@ try {
     Get-ChildItem -Path $SessionStateDir -Filter 'compacted_*.txt' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
-    # v0.2.104: 1-day GC for in-progress markers (ptu_inflight_*, section 0)
-    # no later run of their session claimed -- that session is over.
-    # MUST MATCH the .sh sibling's find.
+    # v0.2.104: in-progress markers (ptu_inflight_*, section 0) of any key
+    # whose start stamp is over a day old: no later run of that session /
+    # subagent came to claim it, so it is LOGGED (reason session_ended, tools
+    # from the file) and deleted -- R13 LOW-1, a killed hook on a session's
+    # last call must still leave its audit line. Age from the file name's
+    # start stamp. MUST MATCH pre-tool-use.sh's GC loop.
+    $gcFiles = @()
+    try { $gcFiles = @([IO.Directory]::GetFiles($SessionStateDir, "ptu_inflight_*")) } catch { }
+    foreach ($g in $gcFiles) {
+        $gn = [IO.Path]::GetFileName($g)
+        if ($gn -notmatch '^ptu_inflight_([A-Za-z0-9_-]+)\.([0-9]+)\.([0-9]+)$') { continue }
+        $gKey = $Matches[1]
+        $gMs = [long]0
+        if (-not [long]::TryParse($Matches[3], [ref]$gMs)) { continue }
+        $gAge = $ptuT0Ms - $gMs
+        if ($gAge -le $PtuGcAgeMs) { continue }
+        $gTools = @()
+        try {
+            foreach ($t in [IO.File]::ReadAllLines($g)) {
+                $t = $t -replace '[^A-Za-z0-9_.:-]', ''
+                if ($t.Length -gt 100) { $t = $t.Substring(0, 100) }
+                if ($t) { $gTools += $t }
+            }
+        } catch { }
+        try { Remove-Item -LiteralPath $g -Force -ErrorAction Stop } catch { continue }   # the delete is the claim
+        $gToolText = if ($gTools.Count -gt 0) { $gTools -join ' ' } else { 'unknown' }
+        Write-SecurityLine ("{{""timestamp"":""{0}"",""event"":""pre_tool_use_incomplete"",""tools"":""{1}"",""session_key"":""{2}"",""age_ms"":{3},""reason"":""session_ended""}}" -f $ts, $gToolText, $gKey, $gAge)
+    }
+    # Backstop (MUST MATCH the .sh find): a ptu_inflight_* file untouched
+    # for two days that the loop could not parse is removed silently.
     Get-ChildItem -Path $SessionStateDir -Filter 'ptu_inflight_*' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-2) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { }
 

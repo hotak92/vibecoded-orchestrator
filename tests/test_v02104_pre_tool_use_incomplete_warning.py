@@ -393,3 +393,89 @@ def test_ps1_pid_live_rules():
     r = subprocess.run([PWSH, *PWSH_BASE_FLAGS, "-NonInteractive", "-Command", script],
                        capture_output=True, text=True, timeout=60)
     assert r.stdout.split() == ["True", "False", "False", "True"], r.stderr
+
+
+# ─── R13: coarse clocks, ended sessions ──────────────────────────────────
+
+
+def _coarse_env(tmp_path: Path, delta_s: int) -> dict[str, str]:
+    """Emulate macOS bash 3.2 + BSD date: no EPOCHREALTIME, `date +%s%N`
+    prints a literal N, and `date +%s` advances `delta_s` seconds between the
+    hook's first and later readings (the coarse clock path)."""
+    bindir = tmp_path / "coarse-bin"
+    bindir.mkdir()
+    cnt = tmp_path / "coarse-cnt"
+    real = shutil.which("date") or "/usr/bin/date"
+    shim = bindir / "date"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  +%s%N) printf '%%N\\n' ;;\n"
+        f"  +%s) n=$(cat '{cnt}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{cnt}';"
+        f" if [ $n -ge 2 ]; then echo {1_000_000 + delta_s}; else echo 1000000; fi ;;\n"
+        f'  *) exec {real} "$@" ;;\n'
+        "esac\n", encoding="utf-8")
+    shim.chmod(0o755)
+    benv = tmp_path / "bashenv.sh"
+    benv.write_text("unset EPOCHREALTIME\n", encoding="utf-8")
+    return {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "BASH_ENV": str(benv)}
+
+
+def test_coarse_clock_successful_run_clears_its_marker(tmp_path: Path):
+    # R13 MEDIUM-1: a 2 s coarse reading on a 3 s budget is a run that
+    # finished in time; it must not leave a marker (false warning next call).
+    proj = _project(tmp_path)
+    res = _grep("sh", proj, **_coarse_env(tmp_path, 2))
+    assert res.returncode == 0, res.stderr
+    assert _markers(proj) == []
+    assert _context(_grep("sh", proj)) == ""
+
+
+def test_coarse_clock_overdue_run_keeps_its_marker(tmp_path: Path):
+    # A 5 s coarse reading on a 3 s budget is past the timeout for certain:
+    # the harness discarded the answer, so the marker stays and is reported.
+    proj = _project(tmp_path)
+    res = _grep("sh", proj, **_coarse_env(tmp_path, 5))
+    assert res.returncode == 0, res.stderr
+    assert len(_markers(proj)) == 1
+    assert "(Grep)" in _context(_grep("sh", proj))
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_an_ended_sessions_marker_is_logged_when_collected(tmp_path: Path, impl: str):
+    # R13 LOW-1: a killed hook on a session's LAST call has no later run of
+    # its key to report it; the day-old GC records it before deleting it.
+    proj = _project(tmp_path)
+    old = _plant(proj, "goneSession__agentx", DEAD_PID,
+                 _now_ms() - 2 * 86_400_000, "Write\nBash\n")
+    t = time.time() - 2 * 86_400
+    os.utime(old, (t, t))
+    res = _grep(impl, proj)
+    assert _context(res) == ""   # not this session's call: no model warning
+    assert not old.exists()
+    ev = [e for e in _security_events(proj) if e.get("event") == "pre_tool_use_incomplete"]
+    assert len(ev) == 1, ev
+    assert ev[0]["reason"] == "session_ended"
+    assert ev[0]["tools"] == "Write Bash"
+    assert ev[0]["session_key"] == "goneSession__agentx"
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_a_young_marker_of_another_session_is_not_collected(tmp_path: Path, impl: str):
+    proj = _project(tmp_path)
+    m = _plant(proj, "otherSession", DEAD_PID, _now_ms() - 3_600_000)
+    _grep(impl, proj)
+    assert m.exists()
+    assert not [e for e in _security_events(proj) if e.get("event") == "pre_tool_use_incomplete"]
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_a_malformed_marker_name_is_still_collected(tmp_path: Path, impl: str):
+    proj = _project(tmp_path)
+    junk = proj / ".claude" / "state" / "ptu_inflight_bad.name.x"
+    junk.write_text("Bash\n", encoding="utf-8")
+    t = time.time() - 3 * 86_400
+    os.utime(junk, (t, t))
+    _grep(impl, proj)
+    assert not junk.exists()
