@@ -248,6 +248,18 @@ def save_one_entry(rel_path: str, entry: dict) -> None:
     save_formats(current)
 
 
+def drop_one_entry(rel_path: str) -> bool:
+    """Remove ONE node's key from the CURRENT sidecar (re-read, then save
+    atomically). Sibling of :func:`save_one_entry`: the same read-merge-write
+    home, so an archived drop never erases a concurrent run's entry. True
+    when the key was present (and the file rewritten)."""
+    current = load_formats()
+    if not _drop_sidecar_entry(rel_path, current):
+        return False
+    save_formats(current)
+    return True
+
+
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -885,7 +897,13 @@ def _run_bulk(args: argparse.Namespace) -> int:
             status in ("generated", "archived_dropped")
             or status.startswith("refused:")
         ):
-            save_formats(formats)
+            # Merge ONLY this node's key into the sidecar as it is on disk
+            # now (a concurrent single-mode run may have written others
+            # since this pass loaded it) — never the pass's whole dict.
+            if status == "archived_dropped":
+                drop_one_entry(rel)
+            else:
+                save_one_entry(rel, formats[rel])
 
     print(
         f"\nDone in {time.time() - started:.1f}s — "
@@ -967,7 +985,7 @@ def main():
             if args.dry_run:
                 print(f"  {title}: dry-run — would drop the stale sidecar entry")
             else:
-                save_formats(formats)
+                drop_one_entry(rel_path)
                 log(f"  {title}: dropped the stale sidecar entry for the archived node")
         sys.exit(0)
 

@@ -376,3 +376,82 @@ def test_single_mode_keeps_an_entry_a_concurrent_run_wrote_meanwhile(
     db = json.loads(sidecar.read_text(encoding="utf-8"))
     assert "knowledge/concepts/node-b.md" in db, "run B's entry was dropped"
     assert "knowledge/concepts/node-a.md" in db, "run A's own entry is missing"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# R16 A-N1 (coordinator extension): the archived drop and the bulk
+# incremental saves also merge into the CURRENT sidecar
+# ═══════════════════════════════════════════════════════════════════════════
+
+B_KEY = "knowledge/concepts/node-b.md"
+Z_KEY = "knowledge/concepts/z-archived.md"
+ARCHIVED_TEXT = NODE_TEXT.replace("status: active", "status: archived")
+
+
+def _project(tmp_path: Path, monkeypatch, names):
+    root = tmp_path / "proj"
+    kn = root / "knowledge" / "concepts"
+    kn.mkdir(parents=True)
+    for name, text in names.items():
+        (kn / name).write_text(text, encoding="utf-8")
+    monkeypatch.setenv("KG_PROJECT_ROOT", str(root))
+    mod = _load(f"_v02104_gks_merge_{uuid.uuid4().hex}", GENERATOR)
+    mod._sb.reset_backend_cache()
+    monkeypatch.setattr(
+        mod._sb, "select_backend",
+        lambda **_kw: mod._sb._BACKEND_CACHE.setdefault("choice", "cli") or "cli",
+    )
+    monkeypatch.setattr(mod, "get_chunks_from_weaviate", lambda *_a, **_k: [])
+    return root, mod
+
+
+def _concurrent_b(mod):
+    b = mod.load_formats()
+    b[B_KEY] = {"title": "B", "summary": "s", "description": "d", "content_hash": "x"}
+    mod.save_formats(b)
+
+
+def test_single_mode_archived_drop_keeps_a_concurrent_entry(clean_env, monkeypatch, tmp_path):
+    root, mod = _project(tmp_path, monkeypatch, {"z-archived.md": ARCHIVED_TEXT})
+    sidecar = root / "knowledge" / ".node_formats.json"
+    sidecar.write_text(json.dumps({Z_KEY: {"title": "Z", "summary": "old"}}), encoding="utf-8")
+    real = mod.rekey_separator_entries
+
+    def _rekey_then_race(formats):  # runs right after run A's read of the sidecar
+        _concurrent_b(mod)
+        return real(formats)
+
+    monkeypatch.setattr(mod, "rekey_separator_entries", _rekey_then_race)
+    monkeypatch.setattr(sys, "argv", ["generate-kg-summary.py", str(root / "knowledge/concepts/z-archived.md")])
+    with pytest.raises(SystemExit):
+        mod.main()
+    db = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert Z_KEY not in db, "the archived node's own entry must be dropped"
+    assert B_KEY in db, "the concurrent run's entry was erased"
+
+
+def test_bulk_incremental_saves_keep_concurrent_entries(clean_env, monkeypatch, tmp_path):
+    """A single-mode run writes node-b while the bulk pass is mid-LLM-call; the
+    bulk pass's generated save AND its later archived drop must keep it."""
+    root, mod = _project(tmp_path, monkeypatch, {
+        "node-a.md": NODE_TEXT, "z-archived.md": ARCHIVED_TEXT})
+    sidecar = root / "knowledge" / ".node_formats.json"
+    sidecar.write_text(json.dumps({Z_KEY: {"title": "Z", "summary": "old"}}), encoding="utf-8")
+    state = {"raced": False}
+
+    def _llm(prompt, **_kw):
+        if not state["raced"]:
+            state["raced"] = True
+            _concurrent_b(mod)
+        return "a usable answer"
+
+    monkeypatch.setattr(mod, "call_llm", _llm)
+    monkeypatch.setattr(sys, "argv", ["generate-kg-summary.py", "--all",
+                                      "--knowledge-dir", str(root / "knowledge")])
+    with pytest.raises(SystemExit) as ei:
+        mod.main()
+    assert ei.value.code == 0
+    db = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert B_KEY in db, "the concurrent single-mode entry was erased"
+    assert "knowledge/concepts/node-a.md" in db, "this run's generated entry is missing"
+    assert Z_KEY not in db, "the archived entry must be dropped"
