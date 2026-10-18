@@ -536,7 +536,7 @@ VCO itself never sets `CLAUDE_CODE_SUBAGENT_MODEL`, nor any Claude tier slot (`A
 
 **Don't Spawn**:
 - <5 min tasks.
-- Needs immediate back-and-forth.
+- Needs immediate back-and-forth (a subagent cannot ask mid-run).
 - Exploring/brainstorming.
 
 **Handoff Format** (300–500 tokens):
@@ -551,14 +551,14 @@ Output: Where to save
 
 **Parallel agents on the same git repo**: when spawning 2+ agents that will edit the same working tree, either give each one an isolated git worktree (Agent-tool `isolation: "worktree"`, or instruct the agent to `git worktree add` and work there) OR assign strictly disjoint file sets and forbid ALL git commands in their briefs (the coordinator runs git). Concurrent `git checkout` / `stash` / staging operations are tree-global and clobber each other — that is the failure the rule prevents. The cap of 3 concurrent agents applies to agents that EDIT the same tree; read-only agents (audits, searches) and agents on different repos may fan out wider.
 
-**Isolated agents in another repo (lane reservations)**: an `isolation: "worktree"` agent normally gets a detached worktree of THIS project's repo at HEAD. When a lane's work belongs in another repo — this project itself on a chosen branch, or one of its enabled code folders (launcher: Identity tab → **Add code folder**) — reserve the worktree first, then dispatch the isolated agent:
+**Isolated agents in another repo (lane reservations)**: an `isolation: "worktree"` agent normally gets a detached worktree of THIS project's repo at the SESSION's HEAD (not main: a session tree that is behind main gives the lane an old base; a lane reservation pins `--base`). When a lane's work belongs in another repo — this project itself on a chosen branch, or one of its enabled code folders (launcher: Identity tab → **Add code folder**) — reserve the worktree first, then dispatch the isolated agent:
 
 1. `python -m vco_lib.lane_reservation reserve --project <this project> --repo <repo> --base <commit> --branch <new-branch>` — prints a reservation id (`--id` to choose one, `--existing-path` to adopt a worktree of that repo you already created on that branch; `list` / `cancel --id` manage pending ones). The repo must be the project itself or an ENABLED code folder, checked through the launcher hub — with the hub down, reservations are refused (ordinary isolation is unaffected).
 2. Put the id in the lane's brief and dispatch **one isolated agent per message**: `worktree-guard` hands the OLDEST pending reservation to the next isolated launch, creating `<repo parent>/<repo name>.vco-lanes/<branch>-<id>` with `git worktree add -b <branch> … <base>`. A reservation expires after 15 minutes unused; one that fails validation at launch aborts the launch with the reason, never falling back to a worktree of this project.
 3. The agent is told its reservation id, worktree, repo, branch and base when it starts, and stops if its brief names a different id.
 4. Review the result. When the agent finishes, a worktree with changes or commits is KEPT for you to review and merge; an unchanged one is removed together with its new branch. An adopted (`--existing-path`) worktree is never removed.
 
-The harness holds only Edit/Write to the worktree — **Bash is not confined** — so the brief must keep every Bash command (`cd`, redirects, `git`) inside the worktree path.
+The harness holds only Edit/Write to the worktree — **Bash is not confined** — so the brief must keep every Bash command (`cd`, redirects, `git`) inside the worktree path. A lane in a worktree that saves a knowledge node must pass an ABSOLUTE `file_path` inside its worktree to `store_knowledge_node` (or Write the `.md` itself): a relative path resolves against the main checkout, where the node lands untracked. A subagent cannot ask the coordinator anything mid-run (it has no SendMessage), so its brief must be complete. The pre-tool-use security hook may refuse an agent's `rm`: the lane lists the paths to delete in its report and the coordinator deletes them, instead of working around the refusal.
 
 **Waiting on long-running work**: when you need to wait for something to finish (a test suite, a build, a background agent), start it with `run_in_background` and continue or end your turn — its completion notification wakes you when it is done.
 

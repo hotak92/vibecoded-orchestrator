@@ -5048,9 +5048,11 @@ def _linked_worktree_root(md_path: Path, base: Path) -> Optional[Path]:
     contains ``md_path``, or ``None``.
 
     The positive signal is exact: some ancestor of ``md_path`` holds a ``.git``
-    FILE (a linked worktree's marker) whose ``gitdir:`` line points under
-    ``<base>/.git/worktrees/``. Anything else (no marker, another repo's
-    worktree, an unreadable marker) is ``None`` -- never a guess.
+    FILE (a linked worktree's marker) whose ``gitdir:`` line points at an
+    EXISTING directory under ``<base>/.git/worktrees/`` whose own ``gitdir``
+    file points back at that marker (the reciprocal pointer git writes). A
+    marker without it -- a hand-written ``.git`` file, or one left behind by
+    ``git worktree prune`` -- is ``None``. Never a guess.
     """
     try:
         wt_gitdirs = (base / ".git" / "worktrees").resolve()
@@ -5071,6 +5073,11 @@ def _linked_worktree_root(md_path: Path, base: Path) -> Optional[Path]:
                     gitdir = parent / gitdir
                 try:
                     gitdir.resolve().relative_to(wt_gitdirs)
+                    if not gitdir.is_dir():
+                        return None
+                    back = (gitdir / "gitdir").read_text(encoding="utf-8").strip()
+                    if Path(back).resolve() != marker.resolve():
+                        return None
                 except (ValueError, OSError):
                     return None
                 return parent
@@ -5376,7 +5383,10 @@ async def store_knowledge_node(
         path_note: Optional[str] = None
 
         if file_path:
-            fp = Path(file_path)
+            # Lexical `..` is folded first (never resolve(): a symlinked
+            # base must keep behaving as before), so the containment checks
+            # below judge where the file really lands.
+            fp = Path(os.path.normpath(file_path))
             if fp.is_absolute():
                 md_path = fp
                 # Compute relative path for Weaviate storage
@@ -5403,10 +5413,8 @@ async def store_knowledge_node(
             elif KG_BASE_DIR:
                 md_path = Path(KG_BASE_DIR) / file_path
                 path_note = (
-                    f"relative file_path resolved against KG_BASE_DIR "
-                    f"({KG_BASE_DIR}) -- the MAIN checkout. A lane working in a "
-                    f"git worktree must pass an ABSOLUTE file_path inside its "
-                    f"worktree (or Write the file itself)."
+                    f"relative file_path resolved against KG_BASE_DIR="
+                    f"{KG_BASE_DIR} (worktree lanes: pass an absolute path)"
                 )
             else:
                 # D-10 (v0.2.73): before falling back to the SERVER-inferred

@@ -56,7 +56,7 @@ def test_relative_path_reports_main_checkout(monkeypatch, tmp_path):
     res = _store(_server())
     assert res["absolute_path"] == str(tmp_path / "knowledge/concepts/sample_a.md")
     assert "KG_BASE_DIR" in res["path_note"]
-    assert "ABSOLUTE" in res["path_note"]
+    assert "absolute path" in res["path_note"]
     assert str(tmp_path) in res["path_note"]
 
 
@@ -115,3 +115,102 @@ def test_every_git_forbidding_agent_carries_the_commit_handoff():
     assert len(forbidding) >= 7
     for p in forbidding:
         assert HANDOFF in p.read_text(encoding="utf-8"), p.name
+
+
+# ---------------------------------------------------------------------------
+# Review round fixes (B-M1 matcher migration, B-M2/L2 path containment, L4 note)
+# ---------------------------------------------------------------------------
+
+OLD_MATCHER = "ScheduleWakeup|CronCreate|Monitor"
+NEW_MATCHER = "ScheduleWakeup|CronCreate"
+
+
+def _wait_guard_matchers(doc: dict) -> list:
+    return [g.get("matcher") for g in doc["hooks"]["PreToolUse"]
+            if any("wait-guard" in h.get("command", "") for h in g["hooks"])]
+
+
+@pytest.mark.parametrize("flavour", ["linux", "windows"])
+def test_installed_old_self_wake_group_is_migrated_not_duplicated(flavour):
+    import copy
+    import json
+
+    from vco_lib import settings_merge
+
+    template = json.loads((REPO_ROOT / "templates" /
+                           f"settings.json.{flavour}.template").read_text(encoding="utf-8"))
+    installed = copy.deepcopy(template)  # the 5b896ee0 shape: old matcher
+    for g in installed["hooks"]["PreToolUse"]:
+        if g.get("matcher") == NEW_MATCHER:
+            g["matcher"] = OLD_MATCHER
+    assert OLD_MATCHER in _wait_guard_matchers(installed)
+
+    merged = settings_merge.smart_merge_settings(installed, template)
+    got = _wait_guard_matchers(merged)
+    assert OLD_MATCHER not in got
+    assert got.count(NEW_MATCHER) == 1
+    assert sorted(got, key=str) == sorted(_wait_guard_matchers(template), key=str)
+    # fixed point
+    assert settings_merge.smart_merge_settings(copy.deepcopy(merged), template) == merged
+
+
+def test_user_group_with_own_hook_keeps_its_matcher():
+    import copy
+    import json
+
+    from vco_lib import settings_merge
+
+    template = json.loads((REPO_ROOT / "templates" /
+                           "settings.json.linux.template").read_text(encoding="utf-8"))
+    installed = copy.deepcopy(template)
+    for g in installed["hooks"]["PreToolUse"]:
+        if g.get("matcher") == NEW_MATCHER:
+            g["matcher"] = OLD_MATCHER
+            g["hooks"].append({"type": "command", "command": "bash ~/mine.sh"})
+    merged = settings_merge.smart_merge_settings(installed, template)
+    assert OLD_MATCHER in [g.get("matcher") for g in merged["hooks"]["PreToolUse"]]
+
+
+def test_spoofed_git_file_with_nonexistent_gitdir_is_rejected(repo_and_worktree, tmp_path):
+    main, _wt = repo_and_worktree
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / ".git").write_text(f"gitdir: {main}/.git/worktrees/does-not-exist\n")
+    assert _server()._linked_worktree_root(evil / "k" / "n.md", main) is None
+
+
+def test_gitdir_without_reciprocal_pointer_is_rejected(repo_and_worktree, tmp_path):
+    main, _wt = repo_and_worktree
+    real = next((main / ".git" / "worktrees").iterdir())
+    evil = tmp_path / "evil2"
+    evil.mkdir()
+    (evil / ".git").write_text(f"gitdir: {real}\n")  # exists, but points back at lane
+    assert _server()._linked_worktree_root(evil / "k" / "n.md", main) is None
+
+
+def test_pruned_worktree_stale_marker_is_rejected(repo_and_worktree):
+    import shutil
+
+    main, wt = repo_and_worktree
+    gitdir = next((main / ".git" / "worktrees").iterdir())
+    moved = main.parent / "pruned-gitdir"
+    shutil.move(str(gitdir), str(moved))  # what `git worktree prune` leaves
+    assert _server()._linked_worktree_root(wt / "k" / "n.md", main) is None
+
+
+def test_dotdot_cannot_escape_the_worktree_while_claiming_it(
+        monkeypatch, repo_and_worktree):
+    main, wt = repo_and_worktree
+    _patch_server_for_store(monkeypatch, main, _FakeCollection())
+    sneaky = f"{wt}/knowledge/../../main/knowledge/x.md"
+    res = _store(_server(), file_path=sneaky)
+    assert ".." not in res["absolute_path"]
+    assert res["absolute_path"] == str(main / "knowledge" / "x.md")
+    assert res["file_path"] == "knowledge/x.md"
+    assert "worktree" not in res.get("path_note", "")
+
+
+def test_relative_path_note_is_short(monkeypatch, tmp_path):
+    _patch_server_for_store(monkeypatch, tmp_path, _FakeCollection())
+    res = _store(_server())
+    assert len(res["path_note"]) < 160
