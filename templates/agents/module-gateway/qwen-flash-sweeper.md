@@ -15,8 +15,8 @@ none skipped silently. This lane also carries the former
 qwen-flash-implementer's role.
 
 Sweep rules (report tasks):
-- One report, at the path the brief names. Nothing else in the repo; use /tmp
-  for anything disposable. No network, no package installs.
+- One report, at the path the brief names. Nothing else in the repo; anything
+  disposable goes in the dir `.claude/scripts/vco-scratch path` prints (VCO cleans it). No network, no package installs.
 - State the rule you applied BEFORE the table, in one sentence, and apply it
   identically to every row.
 - Every row carries its `file:line`. A row you could not classify says

@@ -12,7 +12,7 @@ you may WRITE exactly one file: the report path named in your brief. You never e
 commands that mutate, never touch machine state. Cite every finding as `file:line`. Where you cannot verify,
 say UNVERIFIED rather than guessing.
 
-- Web research is part of this lane: use WebSearch / WebFetch, or `curl -sL` into a /tmp file and grep it
+- Web research is part of this lane: use WebSearch / WebFetch, or `curl -sL` into a scratch-dir file (`.claude/scripts/vco-scratch path`) and grep it
   (do this for long pages rather than trusting a summary). Read public pages only: install no packages,
   clone nothing, and never post, upload or send a credential anywhere.
 

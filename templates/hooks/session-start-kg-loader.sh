@@ -60,6 +60,22 @@ if [ -n "$USER_HOME" ] && [ -x "$RL_LAUNCHER" ]; then
     bash "$RL_LAUNCHER" 2>/dev/null || true
 fi
 
+# v0.2.104: TTL sweep of the sanctioned scratch dir
+# (<project>/.claude/state/scratch/, vco_lib/scratch_dir.py is the ONE home of
+# every rule: TTL knob VCO_SCRATCH_TTL_HOURS, never leaves its root, never
+# follows a symlink). Once per session start, never on the per-tool-call path.
+# Needs the VCO venv (vco_lib); without one it is skipped - `vco doctor` still
+# reports the scratch size. Soft-fail: a SessionStart hook never blocks.
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+    resolve_vco_venv_python "$SCRIPT_DIR" || true
+    if [ -n "${VCO_VENV_PYTHON:-}" ]; then
+        "$VCO_VENV_PYTHON" -m vco_lib.scratch_dir sweep --project "$PROJECT_DIR" \
+            >/dev/null 2>&1 || true
+    fi
+fi
+
 # Display available resources (paths only, no content loading)
 cat << EOF
 
@@ -72,6 +88,9 @@ cat << EOF
 
    Recent Work:
    - .claude/scripts/kg-search recent --days 7
+
+   Scratch (use instead of /tmp; VCO cleans it):
+   - .claude/scripts/vco-scratch path [--name LANE]
 
    Project Context:
    - .claude/CONTEXT_STATE.md (current task state)

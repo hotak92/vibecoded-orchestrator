@@ -4755,6 +4755,13 @@ def probe_playwright_browser(folder: Path, res: DoctorResolvers, ctx: dict) -> l
     return playwright_mcp.probe_browser(folder, res, ctx)
 
 
+def probe_scratch_dir(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.scratch_dir` (v0.2.104)."""
+    from vco_lib import scratch_dir  # noqa: PLC0415
+
+    return scratch_dir.probe_scratch(folder, res, ctx)
+
+
 def _playwright_browser_entry(finding: Finding):
     from vco_lib import playwright_mcp  # noqa: PLC0415
 
@@ -4862,6 +4869,10 @@ PROBES: dict = {
     # are the user's files; nothing VCO runs can clear the finding), so the
     # boot counter must never point at it (the v0.2.92 promise reason).
     "agent_model_ids": (probe_agent_model_ids, (SCOPE_FULL,)),
+    # v0.2.104: full-only, informational — the sanctioned scratch dir's lane
+    # count, total size and oldest age. No registered condition (VCO's own
+    # SessionStart sweep cleans it; the count is reported, not graded).
+    "scratch_dir": (probe_scratch_dir, (SCOPE_FULL,)),
 }
 
 
@@ -5672,6 +5683,7 @@ __all__ = [
     "probe_agent_model_ids",
     "probe_diagnostic_files",
     "probe_disk_space",
+    "probe_scratch_dir",
     "probe_install_completeness",
     "probe_kg_binding_evidence",
     "probe_last_update_run",

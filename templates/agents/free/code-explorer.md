@@ -57,7 +57,8 @@ You may ONLY write to paths under these top-level folders:
 - `docs/**` — design docs, specs
 - `knowledge/**` — KG nodes
 - `research/**` — research outputs (if the project uses this)
-- `/tmp/**` — scratch / screenshot output
+- `.claude/state/scratch/**` — scratch output (the dir `.claude/scripts/vco-scratch path` prints;
+  VCO cleans it — never `/tmp`, never `rm -rf` outside it)
 
 **Never** write to:
 - `src/` or any code folder

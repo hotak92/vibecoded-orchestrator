@@ -1,0 +1,58 @@
+#!/bin/bash
+# The per-project scratch directory VCO creates and cleans (v0.2.104).
+#
+# Agents and lanes put disposable files here instead of /tmp:
+#   <project>/.claude/state/scratch/<session-or-lane-id>/
+# It is private (0700; owner-only ACL on Windows), git-excluded, transient to
+# the code graph, and TTL-cleaned by VCO at session start
+# (VCO_SCRATCH_TTL_HOURS, default 168 h, 0 = keep). Never `rm -rf` outside it.
+#
+# Usage:
+#   .claude/scripts/vco-scratch path [--name LANE]   # create + print the dir
+#   .claude/scripts/vco-scratch report [--json]      # count, size, oldest
+#   .claude/scripts/vco-scratch sweep [--json]       # TTL sweep now
+#
+# Exit codes: whatever `python -m vco_lib.scratch_dir` exits (0 ok, 1 refused,
+# 2 usage); 1 = REFUSAL - no Python environment with vco_lib (wrapper-only).
+# Every rule lives in ONE home (`vco_lib/scratch_dir.py`); this wrapper is a
+# dumb forwarder that pins the project it is shipped in.
+#
+# PARITY: this file and `vco-scratch.ps1` must stay in lockstep (same tiers,
+# same refusal text, same forwarding).
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The probe a candidate interpreter must pass, verbatim as it is executed.
+# `vco_lib.scratch_dir` needs only the standard library plus vco_lib itself.
+LADDER_IMPORT="import vco_lib"
+
+# The ladder lives in ONE home, shipped beside this wrapper. A missing lib is
+# a broken install, not a reason to fall back to a bare interpreter.
+if [ ! -r "$SCRIPT_DIR/vct_venv_ladder.sh" ]; then
+    echo "vco-scratch: ERROR - missing $SCRIPT_DIR/vct_venv_ladder.sh" >&2
+    echo "vco-scratch: (broken install - re-run the orchestrator install)" >&2
+    echo "⚠️  vco-scratch did NOT run (exit 1): its shared venv ladder is missing. See the lines above." >&2
+    exit 1
+fi
+# shellcheck source=vct_venv_ladder.sh
+. "$SCRIPT_DIR/vct_venv_ladder.sh"
+
+vct_venv_ladder_resolve "$SCRIPT_DIR" "$LADDER_IMPORT"
+
+# NO BARE `python` FALLBACK - a shipped component does not get a silent
+# fallback (standing rule). PARITY: the .ps1 sibling refuses identically.
+if [ -z "$LADDER_PYTHON" ]; then
+    vct_venv_ladder_refusal "vco-scratch" "$LADDER_IMPORT" "$SCRIPT_DIR"
+    {
+        echo "vco-scratch: Refusing to run with an unqualified interpreter - use"
+        echo "vco-scratch: the system temp dir for this run and report the refusal."
+    } >&2
+    vct_venv_ladder_refusal_summary "vco-scratch" 1
+    exit 1
+fi
+
+# The project this wrapper ships in (.claude/scripts/ -> project root).
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SUB="${1:-path}"
+[ "$#" -gt 0 ] && shift
+exec "$LADDER_PYTHON" -m vco_lib.scratch_dir "$SUB" --project "$PROJECT_ROOT" "$@"

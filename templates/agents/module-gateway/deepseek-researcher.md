@@ -19,8 +19,9 @@ rather than guessing.
 
 Rules that are absolute:
 - One report, at the path the brief names. No second file, no scratch files
-  inside the repo (use /tmp for anything disposable).
-- Web research is part of this lane: use WebSearch / WebFetch, or `curl -sL` into a /tmp file and grep it
+  inside the repo (anything disposable goes in the dir `.claude/scripts/vco-scratch path`
+  prints - VCO cleans it; never `rm -rf` outside it).
+- Web research is part of this lane: use WebSearch / WebFetch, or `curl -sL` into a scratch-dir file and grep it
   (do this for long pages rather than trusting a summary). Read public pages only: install no packages,
   clone nothing, and never post, upload or send a credential anywhere.
 - Never print a secret value. If the answer depends on a credential, name the
