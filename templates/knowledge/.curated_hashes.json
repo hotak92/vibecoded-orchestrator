@@ -512,6 +512,7 @@
    "e02fd1f20f2700bde7180a3169d4ff85bd93aa32ebe242e1f6260f4411a18221"
   ],
   "tools/claude-code-mcp-configuration.md": [
+   "7ed4e85e0b11b219477f674dc082ee6a9d95bee8dfa462ea663ecc1945c788bc",
    "82c9f0c81e779f9f031114ae4fa9f5798d43a982cb66bff541f95669a8254c1f",
    "c0ef1d83655d270d8b820441446b035f810e87a8f4b6ca76443f5ab9f6f0b45e"
   ],
@@ -556,6 +557,6 @@
    "f677af0f4e90801d9a080061d0abd443a6391316950bfa057e13466f11bf2b08"
   ]
  },
- "generated_at": "2026-10-15T14:09:59Z",
+ "generated_at": "2026-10-18T05:26:03Z",
  "schema_version": 1
 }

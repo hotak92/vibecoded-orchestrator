@@ -139,3 +139,16 @@ def test_watcher_surface_names_match_the_python_surface_table() -> None:
     assert {s for _f, s in pairs} == {
         cp._SURFACE_CLAUDE_SETTINGS, cp._SURFACE_CLAUDE_SETTINGS_LOCAL,
     }
+
+
+def test_unregister_strips_every_python_routing_key_not_only_the_rust_list() -> None:
+    """R14B B5: the launcher hands ``strip-routing`` its Rust list, a SUBSET
+    of the Python canonical set. The strip itself widens to the ONE table
+    (``unregister_env.routing_keys``), so every machine-local key — several of
+    which the Rust list lacks — is removed from settings.local.json."""
+    from vco_lib.config_projection import MACHINE_LOCAL_ENV_KEYS
+    from vco_lib.unregister_env import routing_keys
+
+    rust = set(_extract_rust_canonical_keys()) - {"GITHUB_TOKEN"}
+    assert set(MACHINE_LOCAL_ENV_KEYS) - rust, "precondition: the Rust list misses machine keys"
+    assert set(MACHINE_LOCAL_ENV_KEYS) | rust <= routing_keys()

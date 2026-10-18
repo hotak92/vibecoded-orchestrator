@@ -2698,20 +2698,30 @@ def _write_local_settings_surface(
     merge as ``settings.json``: every other setting and every non-VCO env key
     in the file is kept, a machine key the bundle omits is removed, JSONC is
     edited in place, a file that cannot be edited safely is refused and
-    recorded. ``None`` when refused.
+    recorded. ``None`` when refused — or when the file may not carry machine
+    values at all: git tracks it, or cannot say (review R14B B1; the tracked
+    case is recorded as ``settings_local_json_tracked``).
+
+    A machine key whose value there is the user's (neither VCO's projection
+    nor a value VCO wrote before) is left as it is (review R14B B6) — the
+    rules live in :mod:`vco_lib.settings_local_env`.
 
     A project with no such file and nothing to write gets no file (no
-    ``{"env": {}}`` litter): the projection always carries ``KG_BASE_DIR``, so
-    in practice the file is created on the first apply.
+    ``{"env": {}}`` litter). Every bundle carries at least one machine key
+    (the DB path ``KG_BASE_DIR`` and ``VCT_PROJECT_ID``, the launcher-less path
+    ``KG_BASE_DIR`` and the service URLs), so in practice the guard only
+    matters to a direct caller with a hand-built bundle.
     """
-    path = project_root / ".claude" / "settings.local.json"
+    from vco_lib import settings_local_env as _sle
+
+    state = _sle.layer_state(project_root)
+    _sle.sync_tracked_entry(project_root, state, project_id=project_id)
+    if state != _sle.USABLE:
+        return None
     local_keys = sorted(surface_keys(_SURFACE_CLAUDE_SETTINGS_LOCAL))
     local_env = {k: env[k] for k in env if k in MACHINE_LOCAL_ENV_KEYS}
-    if not local_env and not path.exists():
-        return []
-    return _write_json_surface(
-        project_root, _SURFACE_CLAUDE_SETTINGS_LOCAL, refusals, project_id,
-        lambda: _write_json_env_block(path, local_env, local_keys, env_key="env"),
+    return _sle.write_local_env(
+        project_root, local_env, local_keys, refusals=refusals, project_id=project_id,
     )
 
 
@@ -2842,6 +2852,9 @@ def apply_project_env(
     # names them, so an absent key is removed — the migration of an existing
     # project, idempotent); a refused local file leaves `settings.json`
     # carrying the full set exactly as before, so routing never breaks.
+    # The same pre-L5 layout is kept while git TRACKS settings.local.json, or
+    # cannot say whether it does (review R14B B1 — see
+    # vco_lib.settings_local_env.layer_state).
     local_written = False
     if _SURFACE_CLAUDE_SETTINGS_LOCAL in surfaces_seq:
         keys = _write_local_settings_surface(

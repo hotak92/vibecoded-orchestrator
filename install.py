@@ -6281,18 +6281,17 @@ def main() -> int:
         # managed-block merge can emit `claude_settings_user_modified_preserved`
         # and `claude_settings_unparseable` entries when it leaves the file
         # alone.
-        _configure_claude_settings(embed_config,
-                                   adopt_project_mode=adopt_project_mode,
-                                   deferral_report=_deferral_report)
+        _configure_claude_settings(embed_config, adopt_project_mode=adopt_project_mode, deferral_report=_deferral_report)
+        _self_install.route_root_machine_env(PROJECT_ROOT, lambda: _build_vco_settings_defaults(embed_config)["env"], log=_log_install_event)
     else:
         print("[skip] Claude settings (preserved during update)")
         # 0.2.11 / PR-1: pre-0.2.11 installs wired BASH_ENV in
         # .claude/settings.json to the lean-ctx shim, which became
         # fork-bomb-prone on lean-ctx 3.x. Idempotently strip that key +
-        # disable the shim file so an upgraded orchestrator clone
-        # doesn't carry the legacy fuse alive. Fresh installs never see
-        # this code path (`mode == "install"` above).
+        # disable the shim file so an upgraded orchestrator clone doesn't carry
+        # the legacy fuse alive. Fresh installs never see this path (see above).
         _cleanup_legacy_bash_env_shim(args)
+        _self_install.route_root_machine_env(PROJECT_ROOT, lambda: _build_vco_settings_defaults(embed_config)["env"], log=_log_install_event)
 
         # Phase 0.B Part 2 (2026-05-25): projects the FULL canonical env for
         # the orchestrator root via vco_lib.config_projection.apply_project_env

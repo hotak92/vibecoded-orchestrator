@@ -23,7 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-__all__ = ["SETTINGS_ENV_FILES", "read_settings_env"]
+__all__ = ["SETTINGS_ENV_FILES", "read_settings_env", "settings_env_sources"]
 
 #: Lowest precedence first — the order Claude Code applies them in.
 SETTINGS_ENV_FILES: tuple[str, ...] = (
@@ -51,3 +51,14 @@ def read_settings_env(folder: Path) -> dict[str, Any]:
     for rel in SETTINGS_ENV_FILES:
         merged.update(_env_block(Path(folder) / rel))
     return merged
+
+
+def settings_env_sources(folder: Path) -> dict[str, str]:
+    """``{key: rel}`` — the file each merged key's value comes from (the
+    later file wins, as in :func:`read_settings_env`). For diagnostics that
+    name where a value was read."""
+    sources: dict[str, str] = {}
+    for rel in SETTINGS_ENV_FILES:
+        for key in _env_block(Path(folder) / rel):
+            sources[key] = rel
+    return sources

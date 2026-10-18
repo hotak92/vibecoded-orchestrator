@@ -101,7 +101,7 @@ def surface_label(surface: str) -> str:
 
 
 def _surface_expectation(
-    canonical_env: Mapping[str, str], surface: str,
+    canonical_env: Mapping[str, str], surface: str, *, local_layer: bool = True,
 ) -> tuple[list[str], dict[str, str]]:
     """``(keys to compare, expected values)`` for ``surface`` (v0.2.104 L5).
 
@@ -111,7 +111,20 @@ def _surface_expectation(
     in it is the user's); a committable surface over EVERY canonical key, so a
     machine-local key still sitting in ``settings.json`` is drift (``apply``
     moves it). Order: the bundle's first, then the rest sorted.
+
+    ``local_layer`` False (git tracks ``settings.local.json`` or cannot say —
+    :func:`vco_lib.settings_local_env.layer_state`): ``apply`` keeps the
+    pre-L5 layout, so ``settings.json`` is expected to carry every key and
+    ``settings.local.json`` is not compared at all.
     """
+    if not local_layer:
+        if surface == _cp._SURFACE_CLAUDE_SETTINGS_LOCAL:
+            return [], {}
+        if surface == _cp._SURFACE_CLAUDE_SETTINGS:
+            compared = _cp.list_canonical_keys()
+            keys = [k for k in canonical_env if k in compared] + sorted(
+                k for k in compared if k not in canonical_env)
+            return keys, dict(canonical_env)
     carried = _cp.surface_keys(surface)
     expected = {k: v for k, v in canonical_env.items() if k in carried}
     compared = carried if surface == _cp._SURFACE_CLAUDE_SETTINGS_LOCAL else _cp.list_canonical_keys()
@@ -131,7 +144,7 @@ def _row(label: str, key: str, want: Optional[str], have: Any) -> dict:
 
 
 def _check_json(folder: Path, surface: str, canonical_env: Mapping[str, str],
-                out: EnvCheck) -> None:
+                out: EnvCheck, *, local_layer: bool = True) -> None:
     rel, env_key = _cp._JSON_SURFACE_FILES[surface]
     path = folder / rel
     block: dict = {}
@@ -143,7 +156,13 @@ def _check_json(folder: Path, surface: str, canonical_env: Mapping[str, str],
             return
         found = data.get(env_key)
         block = found if isinstance(found, dict) else {}
-    keys, expected = _surface_expectation(canonical_env, surface)
+    keys, expected = _surface_expectation(canonical_env, surface, local_layer=local_layer)
+    if surface == _cp._SURFACE_CLAUDE_SETTINGS_LOCAL and keys:
+        # A value the user put there is kept by ``apply`` (review R14B B6) —
+        # the same rule, so it is not drift.
+        from vco_lib.settings_local_env import user_kept_keys
+
+        expected = {**expected, **user_kept_keys(folder, expected, keys)}
     for key in keys:
         want, have = expected.get(key), block.get(key)
         if have != want:
@@ -183,9 +202,14 @@ def check_env_surfaces(
     names = tuple(surfaces) if surfaces is not None else applied_surfaces()
     out = EnvCheck(surfaces=names)
     folder = Path(folder)
+    local_layer = True
+    if _cp._SURFACE_CLAUDE_SETTINGS_LOCAL in names or _cp._SURFACE_CLAUDE_SETTINGS in names:
+        from vco_lib.settings_local_env import USABLE, layer_state
+
+        local_layer = layer_state(folder) == USABLE
     for surface in names:
         if surface in _cp._JSON_SURFACE_FILES:
-            _check_json(folder, surface, canonical_env, out)
+            _check_json(folder, surface, canonical_env, out, local_layer=local_layer)
         elif surface == _cp._SURFACE_CLAUDE_ENV:
             _check_shell_env(folder, canonical_env, out)
         else:

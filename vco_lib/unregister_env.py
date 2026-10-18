@@ -46,6 +46,13 @@ from vco_lib.envfile import parse_env_line
 CLAUDE_ENV_REL = ".claude/env"
 
 
+def routing_keys() -> set[str]:
+    """Every routing key the unregister strip considers: the canonical set
+    minus the secret-valued keys (those go only on stored-value evidence, in
+    ``strip-proven-secret-values``)."""
+    return cp.list_canonical_keys() - cp._LEGACY_SECRET_ENV_KEYS
+
+
 def projected_env(
     project_id: str,
     *,
@@ -127,7 +134,13 @@ def strip_routing_keys(
     "projection_error": str|None, "errors": [message]}`` — names only. A
     surface that cannot be edited is refused (and recorded in the project's
     deferral ledger), reported in ``errors``; the others still run."""
-    keys = sorted(set(keys))
+    # The launcher passes its own key list (Rust ``CANONICAL_INSTALL_ENV_KEYS``,
+    # a SUBSET of the Python canonical set — it lacks e.g. VCT_PROJECT_ID and
+    # VCT_INSTALL_ROOT). The canonical set has ONE home, this package, so the
+    # strip always considers all of it (review R14B B5): every machine-local
+    # key VCO writes into settings.local.json goes too. Value evidence still
+    # decides each removal, so widening the NAMES removes nothing of the user's.
+    keys = sorted(set(keys) | routing_keys())
     expected: Optional[dict[str, str]] = None
     projection_error: Optional[str] = None
     if project_id:
