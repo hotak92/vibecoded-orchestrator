@@ -271,18 +271,22 @@ API_KEY_FALLBACK_APP_STATE_KEY = "model_gateway.api_key_fallback"
 
 
 def api_key_fallback_enabled(db_path: Optional[Path] = None) -> bool:
-    """Whether the opt-in subscription -> API-key fallback is ON. Never raises.
+    """Whether the opt-in subscription -> API-key fallback is ON.
 
-    Absent row, unreadable DB, any other value: OFF. A setting that bills the
-    user must be positively ON, never on by accident. ``db_path`` overrides the
+    Absent row, no launcher DB, any other value: OFF — a setting that bills
+    the user must be positively ON, never on by accident. A launcher DB that
+    EXISTS but cannot be read raises
+    :class:`vco_lib.launcher_db_reader.LauncherDbUnreadable`: that is not an
+    answer, and the gateway keeps its previous value rather than guess
+    (``api_key_route.CachedSetting``). ``db_path`` overrides the
     launcher DB discovery (``VCT_LAUNCHER_DB_PATH`` → the state dir's
     ``launcher.db``) for tests.
     """
     # Deferred: ``launcher_db_reader`` opens SQLite, which nothing else in
     # this module needs at import time.
-    from vco_lib.launcher_db_reader import read_app_state_value  # noqa: PLC0415
+    from vco_lib.launcher_db_reader import read_app_state_value_strict  # noqa: PLC0415
 
-    raw = read_app_state_value(API_KEY_FALLBACK_APP_STATE_KEY, db_path=db_path)
+    raw = read_app_state_value_strict(API_KEY_FALLBACK_APP_STATE_KEY, db_path=db_path)
     return raw is not None and raw.strip().lower() in ("true", "1")
 
 
@@ -306,15 +310,17 @@ ANTHROPIC_AUTH_MODES = (ANTHROPIC_AUTH_OAUTH, ANTHROPIC_AUTH_API_KEY)
 
 
 def anthropic_auth_mode(db_path: Optional[Path] = None) -> str:
-    """The persisted first-party auth mode. Never raises.
+    """The persisted first-party auth mode.
 
     Anything but a known mode — no row, no DB, a typo — is
     :data:`ANTHROPIC_AUTH_OAUTH`: the mode that bills a different pool is
-    never reached by accident.
+    never reached by accident. An existing but unreadable launcher DB raises
+    :class:`vco_lib.launcher_db_reader.LauncherDbUnreadable` (see
+    :func:`api_key_fallback_enabled`).
     """
-    from vco_lib.launcher_db_reader import read_app_state_value  # noqa: PLC0415
+    from vco_lib.launcher_db_reader import read_app_state_value_strict  # noqa: PLC0415
 
-    raw = read_app_state_value(ANTHROPIC_AUTH_APP_STATE_KEY, db_path=db_path)
+    raw = read_app_state_value_strict(ANTHROPIC_AUTH_APP_STATE_KEY, db_path=db_path)
     value = (raw or "").strip().lower()
     return value if value in ANTHROPIC_AUTH_MODES else ANTHROPIC_AUTH_OAUTH
 

@@ -163,10 +163,7 @@ from .config import (
     SERVICE_NAME,
     UPSTREAM_CONNECT_TIMEOUT_S,
     ANTHROPIC_AUTH_API_KEY,
-    ANTHROPIC_AUTH_OAUTH,
     GatewayConfig,
-    anthropic_auth_mode,
-    api_key_fallback_enabled,
     context_guard_margin,
 )
 from .context_table import (
@@ -223,10 +220,10 @@ from .api_key_route import (
     API_KEY_REFUSED_STATUS,
     API_KEY_ROUTE_LABEL,
     ApiKeyRefused,
-    CachedSetting,
     api_key_headers,
     api_key_refusal_is_key_level,
     api_key_refused_message,
+    launcher_settings,
 )
 from .vendors import (
     ANTHROPIC_FAMILY,
@@ -652,20 +649,14 @@ class Gateway:
             static_ttl_s=config.static_retry_ttl_s,
             api_key_present=self._api_key_present,
         )
-        #: The two launcher settings the first-party route reads (v0.2.104),
-        #: each consulted on EVERY first-party request and so cached for
-        #: :data:`LAUNCHER_SETTING_TTL_S` — a launcher change still applies
-        #: within seconds, without a gateway restart. ``reader`` is injectable
-        #: (tests); production reads the launcher DB through ``config``.
-        #: The opt-in subscription -> API-key fallback (default OFF):
-        self.api_key_fallback: CachedSetting[bool] = CachedSetting(
-            api_key_fallback_enabled, False, "the API-key fallback setting",
-        )
-        #: The GLOBAL first-party auth mode (default ``oauth``):
-        self.anthropic_auth: CachedSetting[str] = CachedSetting(
-            anthropic_auth_mode, ANTHROPIC_AUTH_OAUTH,
-            "the Anthropic auth mode setting",
-        )
+        #: The two launcher settings the first-party route reads (v0.2.104):
+        #: the opt-in subscription -> API-key fallback (default OFF) and the
+        #: GLOBAL auth mode (default ``oauth``). Primed by :meth:`start` and
+        #: kept current by a background task every
+        #: :data:`~model_router.api_key_route.LAUNCHER_SETTING_REFRESH_S`, so a
+        #: launcher change applies within seconds, no restart; a request only
+        #: reads the cache. ``reader`` is injectable (tests).
+        self.api_key_fallback, self.anthropic_auth = launcher_settings()
         #: The one in-flight background resolution of the API-key route's
         #: key that ``/health`` may schedule (never awaited there).
         self._api_key_probe: Optional[asyncio.Task] = None

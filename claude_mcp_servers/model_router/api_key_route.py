@@ -30,16 +30,25 @@ from .vendors import (
 logger = logging.getLogger(__name__)
 
 
-#: How often a :class:`CachedSetting` re-reads its launcher setting in the
-#: background, whether or not any request arrives (review R17 MEDIUM-1: a
-#: refresh triggered only by a request left the FIRST request after an idle
-#: gap on the old value). Worst case for a flipped switch to apply: this
-#: interval plus one launcher-DB read (milliseconds; at most the reader's
-#: 5 s SQLite busy timeout on a locked DB) — about 5 s, 10 s at the very
-#: worst — independent of traffic or idle time.
-LAUNCHER_SETTING_TTL_S = 5.0
+#: The INTERVAL (not a time-to-live: nothing expires on it) at which a
+#: :class:`CachedSetting` re-reads its launcher setting in the background,
+#: whether or not any request arrives (review R17 MEDIUM-1). A flipped switch
+#: applies within this interval plus one launcher-DB read: milliseconds
+#: normally; a read that waits on a locked DB gives up after the reader's 5 s
+#: busy timeout, the PREVIOUS value is kept (never the default — review R19
+#: LOW-1), and the next tick retries. So: about 5 s, 10 s when one read hits
+#: a lock, and longer only while the launcher DB stays unreadable — during
+#: which the gateway keeps applying the last value it read.
+LAUNCHER_SETTING_REFRESH_S = 5.0
 
 _T = TypeVar("_T")
+
+
+class _Unreadable:
+    """A failed read — not a value (see :class:`CachedSetting`)."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
 
 
 class CachedSetting(Generic[_T]):
@@ -53,12 +62,16 @@ class CachedSetting(Generic[_T]):
     ``Gateway.start`` after it awaited :meth:`refresh` to prime the value
     before the first request): every :attr:`interval_s` it re-reads through
     ``asyncio.to_thread``. So the value a request sees is never older than
-    :data:`LAUNCHER_SETTING_TTL_S` plus one read, however long the gateway
+    :data:`LAUNCHER_SETTING_REFRESH_S` plus one read, however long the gateway
     sat idle — the first request after a switch is flipped already sees it.
 
-    Before any value exists (priming failed or has not run), :meth:`get`
-    answers ``default`` — ``oauth`` / OFF, the choices that never bill a
-    different pool. Never raises: a reader failure also answers ``default``.
+    A reader that RAISES (the launcher DB exists but cannot be read) is not
+    an answer: :meth:`refresh` keeps the cached value and logs once per
+    failure streak (and once on recovery). An absent row or DB IS an answer
+    (the reader returns the default itself). Before any value exists
+    (priming failed or has not run), :meth:`get` answers ``default`` —
+    ``oauth`` / OFF, the choices that never bill a different pool. Never
+    raises.
     """
 
     def __init__(self, reader: Callable[[], _T], default: _T, what: str) -> None:
@@ -67,24 +80,38 @@ class CachedSetting(Generic[_T]):
         self._what = what
         self._cache: Optional[tuple[float, _T]] = None
         self._periodic: Optional[asyncio.Task] = None
+        #: Inside a streak of failed reads (one log line per streak).
+        self._failing = False
         #: Seconds between background re-reads (tests shorten it).
-        self.interval_s = LAUNCHER_SETTING_TTL_S
+        self.interval_s = LAUNCHER_SETTING_REFRESH_S
 
-    def _read(self) -> _T:
+    def _read(self) -> "_T | _Unreadable":
         try:
             return self.reader()
-        except Exception:  # noqa: BLE001 — see the class docstring
-            logger.exception(
-                "model-gateway: could not read %s; using its default",
-                self._what,
-            )
-            return self.default
+        except Exception as exc:  # noqa: BLE001 — see the class docstring
+            return _Unreadable(exc)
 
-    async def refresh(self) -> _T:
-        """Re-read now, off the loop, and cache the answer."""
-        value = await asyncio.to_thread(self._read)
+    def _settle(self, value: "_T | _Unreadable") -> _T:
+        """Apply one read: cache an answer; on a failure keep the cache."""
+        if isinstance(value, _Unreadable):
+            if not self._failing:
+                self._failing = True
+                logger.warning(
+                    "model-gateway: could not read %s (%s); keeping %s until "
+                    "it reads again", self._what, value.error,
+                    "its last value" if self._cache is not None
+                    else "its default",
+                )
+            return self._cache[1] if self._cache is not None else self.default
+        if self._failing:
+            self._failing = False
+            logger.info("model-gateway: %s reads again", self._what)
         self._cache = (time.monotonic(), value)
         return value
+
+    async def refresh(self) -> _T:
+        """Re-read now, off the loop; returns the value now in force."""
+        return self._settle(await asyncio.to_thread(self._read))
 
     async def _refresh_forever(self) -> None:
         while True:
@@ -109,17 +136,18 @@ class CachedSetting(Generic[_T]):
 
     def get(self) -> _T:
         """The cached value; never reads on a running loop."""
-        cached = self._cache
-        if cached is not None:
-            return cached[1]
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # No loop (a synchronous caller such as ``--check``): nothing
-            # shares this thread, so the read may run here.
-            self._cache = (time.monotonic(), self._read())
-            return self._cache[1]
-        return self.default
+            # No loop: a synchronous caller (``vct-model-gateway --check``)
+            # shares this thread with nothing, so it reads the row directly
+            # — every call, nothing cached for it (it has no refresh task).
+            value = self._read()
+            if isinstance(value, _Unreadable):
+                return self._cache[1] if self._cache is not None else self.default
+            return value
+        cached = self._cache
+        return cached[1] if cached is not None else self.default
 
     async def stop(self) -> None:
         """Cancel the background refresh (gateway shutdown)."""
@@ -148,14 +176,23 @@ API_KEY_REFUSAL_STATUSES = (401, 403)
 
 
 def api_key_refusal_is_key_level(status: int, raw: bytes) -> bool:
-    """Whether a refusal condemns the KEY itself (review R17 LOW-1).
+    """Whether a refusal condemns the KEY itself (reviews R17 LOW-1, R19 NIT-2).
 
-    A 401 is credential-level by definition. A 403 ``permission_error`` is
-    often MODEL-level — a Console workspace restricting which models a key
-    may call names the model (``"... model: claude-opus-5-5"``) — and says
-    nothing about the key's other uses, so it must not mark the key
-    ``rejected`` machine-wide. Such a 403 still gets the local answer for
-    THAT request. A 403 that names no model is treated as key-level.
+    * 401 — credential-level by definition: yes.
+    * 403 — yes only for Anthropic's ``permission_error`` whose message names
+      no model. Claude Code itself treats a ``permission_error`` 403 whose
+      message carries ``model:`` as a MODEL refusal (a workspace restricting
+      which models a key may call); this check is wider — any "model" in the
+      message — so the colon-less phrasing ("The requested model is not
+      available in your workspace") counts as model-level too. A 403 of
+      another type, or not JSON at all (an edge/WAF page), is not about the
+      key either.
+
+    The bias is deliberate: when in doubt the key is NOT condemned. A wrong
+    "available" costs one explicit local 503 per request, quoting Anthropic's
+    own text; a wrong "rejected" tells the user to replace a working key and
+    disables the launcher's API-key choice. The request that got the 403
+    receives the local answer either way.
     """
     if status == 401:
         return True
@@ -164,9 +201,11 @@ def api_key_refusal_is_key_level(status: int, raw: bytes) -> bool:
     try:
         parsed = json.loads(raw.decode("utf-8", "replace"))
     except ValueError:
-        return True
+        return False
     error = parsed.get("error") if isinstance(parsed, dict) else None
-    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(error, dict) or error.get("type") != "permission_error":
+        return False
+    message = error.get("message")
     return not (isinstance(message, str) and "model" in message.lower())
 
 
@@ -270,3 +309,20 @@ def api_key_headers(
     return out
 
 
+
+
+def launcher_settings(
+) -> "tuple[CachedSetting[bool], CachedSetting[str]]":
+    """The two launcher settings the first-party route reads, built ONCE here
+    for every consumer (the gateway, ``--check``): the opt-in subscription
+    fallback (default OFF) and the global auth mode (default ``oauth``)."""
+    from .config import (  # noqa: PLC0415 — config imports vco_lib
+        ANTHROPIC_AUTH_OAUTH,
+        anthropic_auth_mode,
+        api_key_fallback_enabled,
+    )
+
+    return (
+        CachedSetting(api_key_fallback_enabled, False, "the API-key fallback setting"),
+        CachedSetting(anthropic_auth_mode, ANTHROPIC_AUTH_OAUTH, "the Anthropic auth mode setting"),
+    )

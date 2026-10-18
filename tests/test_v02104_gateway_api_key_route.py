@@ -58,6 +58,10 @@ from model_router.routing import (
     api_key_fallback_route,
 )
 from model_router.usage import UsageLedger, build_record
+from vco_lib.launcher_db_reader import (
+    LauncherDbUnreadable,
+    read_app_state_value_strict,
+)
 from model_router.vendors import (
     ANTHROPIC_API_KEY_ROUTE,
     ANTHROPIC_FAMILY,
@@ -285,6 +289,53 @@ def _launcher_db(
     conn.commit()
     conn.close()
     return path
+
+
+class LauncherDbStrictReaderTests(unittest.TestCase):
+    """The ONE reader that tells ABSENT from UNREADABLE (R19 LOW-1)."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory(prefix="apigw-strict-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_missing_db_is_absent_not_an_error(self) -> None:
+        self.assertIsNone(read_app_state_value_strict("k", db_path=self.root / "none.db"))
+        self.assertEqual(anthropic_auth_mode(db_path=self.root / "none.db"), ANTHROPIC_AUTH_OAUTH)
+        self.assertFalse(api_key_fallback_enabled(db_path=self.root / "none.db"))
+
+    def test_a_db_without_the_table_is_absent(self) -> None:
+        db = self.root / "fresh.db"
+        sqlite3.connect(db).close()
+        self.assertIsNone(read_app_state_value_strict("k", db_path=db))
+
+    def test_a_corrupt_db_raises_and_the_soft_reader_still_answers_none(self) -> None:
+        from vco_lib.launcher_db_reader import read_app_state_value
+
+        db = self.root / "corrupt.db"
+        db.write_bytes(b"not sqlite at all" * 100)
+        with self.assertRaises(LauncherDbUnreadable):
+            read_app_state_value_strict("k", db_path=db)
+        self.assertIsNone(read_app_state_value("k", db_path=db))
+
+
+class CachedSettingSyncPathTests(unittest.TestCase):
+    """The no-loop path of ``get`` (``--check``): reads every call, caches
+    nothing (R19 NIT-1)."""
+
+    def test_reads_every_call_without_a_loop(self) -> None:
+        values = iter(["api_key", "oauth"])
+        setting = akr.CachedSetting(lambda: next(values), "oauth", "test")
+        self.assertEqual(setting.get(), "api_key")
+        self.assertEqual(setting.get(), "oauth")
+
+    def test_an_unreadable_db_without_a_loop_answers_the_default(self) -> None:
+        def locked() -> str:
+            raise LauncherDbUnreadable("locked")
+
+        self.assertEqual(akr.CachedSetting(locked, "oauth", "test").get(), "oauth")
 
 
 class FallbackSettingTests(unittest.TestCase):
@@ -759,17 +810,53 @@ class SubscriptionFallbackTests(ApiKeyGatewayBase):
             client = await self.client_with(key=True, fallback=False)
         self.assertTrue(client.app[srv.APP_KEY].api_key_mode_on())
 
-    async def test_a_broken_setting_reader_means_off(self) -> None:
+    async def test_a_reader_failure_before_any_value_means_off(self) -> None:
         client = await self.client_with(key=True, fallback=True)
         gateway = client.app[srv.APP_KEY]
 
         def boom() -> bool:
-            raise RuntimeError("db gone")
+            raise LauncherDbUnreadable("db gone")
 
         gateway.api_key_fallback.reader = boom
-        with self.assertLogs("model_router", level="ERROR"):
+        gateway.api_key_fallback.expire()
+        with self.assertLogs("model_router", level="WARNING"):
             self.assertFalse(await gateway.api_key_fallback.refresh())
         self.assertFalse(gateway.api_key_fallback_on())
+
+    async def test_a_transient_db_error_keeps_the_primed_mode(self) -> None:
+        """R19 LOW-1: a primed api_key mode survives an unreadable launcher
+        DB (busy / EACCES / swapped mid-update) — the previous value is kept,
+        never the OAuth default — and one warning is logged per streak."""
+        db = _launcher_db(self.root / "busy.db", "api_key", ANTHROPIC_AUTH_APP_STATE_KEY)
+        with mock.patch.dict(os.environ, {"VCT_LAUNCHER_DB_PATH": str(db)}):
+            client = await self.client_with(key=True, fallback=False)
+        gateway = client.app[srv.APP_KEY]
+        self.assertTrue(gateway.api_key_mode_on())
+        setting = gateway.anthropic_auth
+
+        def locked() -> str:
+            raise LauncherDbUnreadable("database is locked")
+
+        setting.reader = locked
+        with self.assertLogs("model_router", level="WARNING") as cm:
+            for _ in range(3):
+                await setting.refresh()
+        self.assertEqual(len([r for r in cm.records if r.levelname == "WARNING"]), 1)
+        self.assertTrue(gateway.api_key_mode_on())
+        # A row that CHANGES is applied as before.
+        setting.reader = lambda: ANTHROPIC_AUTH_OAUTH
+        await setting.refresh()
+        self.assertFalse(gateway.api_key_mode_on())
+
+    async def test_an_unreadable_production_db_raises_and_is_kept_over(self) -> None:
+        """The production reader itself: a directory where the DB file
+        should be is an EXISTING but unreadable DB -> it raises (not None)."""
+        bad = self.root / "not-a-db.db"
+        bad.write_bytes(b"this is not sqlite")
+        with self.assertRaises(LauncherDbUnreadable):
+            anthropic_auth_mode(db_path=bad)
+        with self.assertRaises(LauncherDbUnreadable):
+            api_key_fallback_enabled(db_path=bad)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -907,12 +994,25 @@ class ApiKeyRefusalTests(ApiKeyGatewayBase):
         self.assertEqual(gateway.api_key_state(), "rejected")
 
     def test_the_refusal_classifier(self) -> None:
-        self.assertTrue(akr.api_key_refusal_is_key_level(401, b"anything"))
-        self.assertTrue(akr.api_key_refusal_is_key_level(403, NO_PERMISSION))
-        self.assertTrue(akr.api_key_refusal_is_key_level(403, b"not json"))
-        self.assertFalse(akr.api_key_refusal_is_key_level(
-            403, b'{"error":{"message":"no access to model: x"}}',
-        ))
+        key_level = akr.api_key_refusal_is_key_level
+        self.assertTrue(key_level(401, b"anything"))
+        self.assertTrue(key_level(403, NO_PERMISSION))
+        self.assertTrue(key_level(403, (
+            b'{"type":"error","error":{"type":"permission_error","message":'
+            b'"Your API key does not have permission to use the specified resource."}}'
+        )))
+        # Model-level, with and without the "model:" spelling.
+        self.assertFalse(key_level(403, (
+            b'{"error":{"type":"permission_error","message":"no access to model: x"}}'
+        )))
+        self.assertFalse(key_level(403, (
+            b'{"error":{"type":"permission_error","message":'
+            b'"The requested model is not available in your workspace."}}'
+        )))
+        # Not a permission_error, or not JSON (an edge page): not the key.
+        self.assertFalse(key_level(403, b'{"error":{"type":"forbidden","message":"x"}}'))
+        self.assertFalse(key_level(403, b"<html>blocked</html>"))
+        self.assertFalse(key_level(500, b""))
 
     async def test_a_replaced_key_is_no_longer_reported_rejected(self) -> None:
         gateway = self.client.app[srv.APP_KEY]

@@ -858,8 +858,9 @@ def run_check(stream=sys.stdout) -> int:
         resolve_port,
         token_path,
     )
+    from .api_key_route import launcher_settings
     from .context_table import ContextTableLoader, load_seed
-    from .vendors import VENDORS, RegistryError, validate_registry
+    from .vendors import ANTHROPIC_FAMILY, VENDORS, RegistryError, validate_registry
 
     problems: list[str] = []
 
@@ -896,6 +897,16 @@ def run_check(stream=sys.stdout) -> int:
         problems.append(f"static catalog {STATIC_CATALOG_PATH} unreadable: {exc}")
         static_line = "INVALID"
 
+    # The two launcher settings the first-party route applies, read straight
+    # from the launcher DB (the synchronous path of CachedSetting.get): what
+    # the gateway would use right now — the answer to "the switch says API
+    # key, what does the gateway see?". A read failure shows the default.
+    fallback_setting, mode_setting = launcher_settings()
+    api_key_secret = (
+        ANTHROPIC_FAMILY.api_key.secret_keys[0]
+        if ANTHROPIC_FAMILY.api_key is not None else "-"
+    )
+
     creds = credentials_path()
     creds_line = "present" if creds.exists() else "absent (a Claude login will be needed)"
 
@@ -912,6 +923,8 @@ def run_check(stream=sys.stdout) -> int:
         "context_export_path": str(export_path()),
         "static_catalog": static_line,
         "vendor_keys": "not resolved (lazy at request time, by design)",
+        "anthropic_auth": f"{mode_setting.get()} (launcher switch; key {api_key_secret})",
+        "api_key_fallback": "on" if fallback_setting.get() else "off",
     }
     width = max(len(k) for k in report)
     for key, value in report.items():

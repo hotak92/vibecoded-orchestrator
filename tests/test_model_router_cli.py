@@ -120,6 +120,40 @@ class SelfTestTests(_StateDirCase):
         cli.run_check(stream=buffer)
         self.assertIn("not resolved", buffer.getvalue())
 
+    def test_check_reports_the_launcher_settings_read_directly(self) -> None:
+        """v0.2.104 (R19 NIT-1): --check prints the global auth mode and the
+        API-key fallback as the launcher DB says NOW (the synchronous read
+        path — read on every call, nothing cached)."""
+        import sqlite3
+
+        db = self.dir / "launcher.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER)")
+        conn.execute("INSERT INTO app_state VALUES ('model_gateway.anthropic_auth', 'api_key', 0)")
+        conn.execute("INSERT INTO app_state VALUES ('model_gateway.api_key_fallback', 'true', 0)")
+        conn.commit()
+        conn.close()
+        self.set_env("VCT_LAUNCHER_DB_PATH", str(db))
+        buffer = io.StringIO()
+        cli.run_check(stream=buffer)
+        out = buffer.getvalue()
+        self.assertRegex(out, r"anthropic_auth\s+api_key")
+        self.assertRegex(out, r"api_key_fallback\s+on")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE app_state SET value='oauth' WHERE key='model_gateway.anthropic_auth'")
+        conn.commit()
+        conn.close()
+        buffer = io.StringIO()
+        cli.run_check(stream=buffer)
+        self.assertRegex(buffer.getvalue(), r"anthropic_auth\s+oauth")
+
+    def test_check_reports_defaults_without_a_launcher_db(self) -> None:
+        self.set_env("VCT_LAUNCHER_DB_PATH", str(self.dir / "absent.db"))
+        buffer = io.StringIO()
+        cli.run_check(stream=buffer)
+        self.assertRegex(buffer.getvalue(), r"anthropic_auth\s+oauth")
+        self.assertRegex(buffer.getvalue(), r"api_key_fallback\s+off")
+
     def test_check_writes_nothing(self) -> None:
         before = sorted(p.name for p in self.dir.iterdir())
         cli.run_check(stream=io.StringIO())
