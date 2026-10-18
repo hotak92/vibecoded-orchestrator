@@ -201,6 +201,7 @@ from vco_lib.powershell_command import (
     command_for_bash_readers,
 )
 from vco_lib.env_values import env_int
+from vco_lib.wait_guard_literal import literal_text_only
 
 __all__ = [
     "DEFAULT_REPEAT_MAX",
@@ -209,6 +210,7 @@ __all__ = [
     "UNLOCK_COMMANDS",
     "evaluate",
     "record_expansion_event",
+    "shell_static_pattern",
     "static_pattern",
     "main",
 ]
@@ -827,6 +829,27 @@ def static_pattern(command: str, depth: int = 0, *,
     return None
 
 
+def shell_static_pattern(tool: str, command: str,
+                         readable: Optional[str] = None) -> Optional[tuple]:
+    """The static (wait-shape) decision for one shell command — the ONE
+    place :func:`evaluate` asks it. ``readable`` is the Bash reading
+    (:func:`~vco_lib.powershell_command.command_for_bash_readers`).
+
+    The literal-text exception (v0.2.104 E-4, owner-approved allowlist
+    inversion) is consulted FIRST and only for the Bash tool: when every
+    simple command is an allowlisted program that never runs its arguments
+    as code, and no substitution in the line would be expanded
+    (:func:`vco_lib.wait_guard_literal.literal_text_only`), a ``$(sleep 5)``
+    in it is quoted search text — ``grep -n '$(sleep 5)' f`` — and no wait.
+    Every other command gets :func:`static_pattern`, the v0.2.103 reading,
+    unchanged."""
+    if readable is None:
+        readable = command_for_bash_readers(tool, command)
+    if tool != POWERSHELL_TOOL and literal_text_only(command):
+        return None
+    return static_pattern(readable)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Repeat-detector keys
 # ═══════════════════════════════════════════════════════════════════════
@@ -1155,7 +1178,7 @@ def evaluate(
         # PowerShell (v0.2.102 W5-D): read through its Bash-equivalent form
         # — one detector for both shells (vco_lib.powershell_command).
         readable = command_for_bash_readers(tool, command)
-        pattern = static_pattern(readable)
+        pattern = shell_static_pattern(str(tool), command, readable)
         if pattern is not None:
             return static_deny_reason(command, pattern, str(tool))
         if tool == POWERSHELL_TOOL:
