@@ -858,8 +858,9 @@ def run_check(stream=sys.stdout) -> int:
         resolve_port,
         token_path,
     )
+    from .api_key_route import launcher_settings
     from .context_table import ContextTableLoader, load_seed
-    from .vendors import VENDORS, RegistryError, validate_registry
+    from .vendors import ANTHROPIC_FAMILY, VENDORS, RegistryError, validate_registry
 
     problems: list[str] = []
 
@@ -896,6 +897,25 @@ def run_check(stream=sys.stdout) -> int:
         problems.append(f"static catalog {STATIC_CATALOG_PATH} unreadable: {exc}")
         static_line = "INVALID"
 
+    # The two launcher settings the first-party route applies, read straight
+    # from the launcher DB now: the answer to "the switch says API key, what
+    # does the gateway see?". A DB that exists but cannot be read is a
+    # PROBLEM — the running gateway then keeps its last read value, which this
+    # process cannot know, so no value is claimed for it.
+    fallback_setting, mode_setting = launcher_settings()
+    mode_value, mode_error = mode_setting.read_now()
+    fallback_value, fallback_error = fallback_setting.read_now()
+    for name, error in (("anthropic_auth", mode_error), ("api_key_fallback", fallback_error)):
+        if error:
+            problems.append(
+                f"launcher setting {name} unreadable ({error}): the running "
+                "gateway keeps the last value it read; check the launcher DB",
+            )
+    api_key_secret = (
+        ANTHROPIC_FAMILY.api_key.secret_keys[0]
+        if ANTHROPIC_FAMILY.api_key is not None else "-"
+    )
+
     creds = credentials_path()
     creds_line = "present" if creds.exists() else "absent (a Claude login will be needed)"
 
@@ -912,6 +932,14 @@ def run_check(stream=sys.stdout) -> int:
         "context_export_path": str(export_path()),
         "static_catalog": static_line,
         "vendor_keys": "not resolved (lazy at request time, by design)",
+        "anthropic_auth": (
+            f"unreadable ({mode_error})" if mode_error
+            else f"{mode_value} (launcher switch; key {api_key_secret})"
+        ),
+        "api_key_fallback": (
+            f"unreadable ({fallback_error})" if fallback_error
+            else ("on" if fallback_value else "off")
+        ),
     }
     width = max(len(k) for k in report)
     for key, value in report.items():

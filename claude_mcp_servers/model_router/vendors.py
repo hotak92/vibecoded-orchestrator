@@ -32,14 +32,17 @@ Two things intentionally live here rather than in ``routing.py``:
   own credentials file rather than a key resolved from vct-secrets, and its
   catalog is fetched with a different auth header. Modelling it as a "vendor
   with a weird auth mode" would have pushed an ``if vendor.is_anthropic``
-  branch into every consumer — the opposite of the registry's purpose.
+  branch into every consumer — the opposite of the registry's purpose. Its
+  one variant, the same route billed to a Console API key
+  (:data:`ANTHROPIC_API_KEY_ROUTE`, v0.2.104), is therefore a field of the
+  family, not a vendor row.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Protocol
 
 #: Substrings Claude Code's gateway-model discovery keeps in a ``/v1/models``
 #: response, matched case-insensitively (Anthropic's gateway-protocol doc,
@@ -59,6 +62,20 @@ DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 #: The beta header the Claude OAuth route requires. Verified live: without it
 #: an OAuth bearer is rejected; with it the request returns HTTP 200.
 OAUTH_BETA = "oauth-2025-04-20"
+
+#: The beta header that actually buys the 1M context window. The ``[1m]``
+#: suffix on a model id is a CLIENT-side spelling (see
+#: :func:`model_router.routing.route`); ``api.anthropic.com`` 404s on it and
+#: reads the window off this header instead. Added only when the requested id
+#: carried the suffix and the client did not send the header itself.
+CONTEXT_1M_BETA = "context-1m-2025-08-07"
+
+#: The prefix every spelling of the 1M beta shares, including future-dated
+#: ones. How the client's OWN request for the window is recognised — both on
+#: the forward path (does the gateway need to add the header?) and on the
+#: ledger path (did the client BUDGET 1M this turn?), so the two never drift
+#: into two different spellings of the same question.
+CONTEXT_1M_BETA_MARKER = "context-1m"
 
 #: How the vendor's OWN maximum is read out of a matched context-overflow
 #: message. QwenCloud's refusal states the accepted input range,
@@ -93,6 +110,58 @@ def context_overflow_maximum(
     return maximum if maximum > 0 else None
 
 
+class KeyedCredential(Protocol):
+    """What the key resolver needs from a route: an id and its key names.
+
+    :class:`Vendor` rows satisfy it, and so does :class:`AnthropicApiKey` —
+    the one first-party route whose credential is a vct-secrets key rather
+    than the Claude login. Structural, so neither type has to know about the
+    other and ``model_router.secrets`` stays vendor-neutral.
+    """
+
+    @property
+    def vendor_id(self) -> str: ...
+
+    @property
+    def secret_keys(self) -> tuple[str, ...]: ...
+
+
+@dataclass(frozen=True)
+class AnthropicApiKey:
+    """The first-party Claude route billed to a Claude Console API key.
+
+    The SAME upstream, the SAME model ids and the SAME first-party handling
+    (catalog, betas, the ``[1m]`` window header, the tool-block repair) as the
+    OAuth route — the only difference is the credential. That is why it is a
+    field of :class:`AnthropicFamily` and not a :class:`Vendor` row: a vendor
+    row gets the vendor shaping (id restoration, effort translation, context
+    guard) and the honest-naming guard REFUSES Claude ids on it, both of which
+    are wrong for Anthropic's own endpoint.
+
+    Attributes:
+        vendor_id: the credential's id — the key resolver's cache key and the
+            name its log lines use. Never a :data:`VENDORS` key.
+        namespace: picker/route prefix (``<namespace><claude id>``). MUST
+            contain a :data:`CLAUDE_ID_MARKERS` entry, end with a separator,
+            and differ from every vendor namespace; it may EXTEND one
+            (longest namespace wins in :func:`model_router.routing.route`).
+        display_suffix: appended to each picker row's display name, so the
+            route that bills the request is visible on the row itself.
+        label: the subscription label the row ``description`` starts with.
+        secret_keys: vct-secrets key names tried in order (shared scope).
+        auth_header: how the key is presented to the upstream.
+        docs_url: cited in user-facing copy about this route.
+    """
+
+    vendor_id: str
+    namespace: str
+    display_suffix: str
+    label: str
+    secret_keys: tuple[str, ...]
+    auth_header: str = "x-api-key"
+    docs_url: str = ""
+
+
 @dataclass(frozen=True)
 class AnthropicFamily:
     """The first-party Claude route (OAuth passthrough, no vct-secrets key)."""
@@ -103,6 +172,9 @@ class AnthropicFamily:
     #: Query appended to the catalog fetch. Anthropic pages ``/v1/models``.
     catalog_query: str
     docs_url: str
+    #: The same route billed to a Console API key instead of the Claude
+    #: login (``None`` = not offered). See :class:`AnthropicApiKey`.
+    api_key: Optional[AnthropicApiKey] = None
 
 
 @dataclass(frozen=True)
@@ -298,12 +370,38 @@ class Vendor:
     context_overflow_markers: tuple[str, ...] = ()
 
 
+#: The Claude API-key route (owner order 2026-10-18): the first-party models
+#: under ``claude-gw/api/<id>``, sent to the same upstream with the key from
+#: the shared vct-secrets slot ``ANTHROPIC_API_KEY_GATEWAY`` as ``x-api-key`` — the
+#: Console key a Claude subscription's monthly API credits are attached to.
+#: The client's own headers (user-agent, ``x-app``, the other betas) travel
+#: unchanged; only the credential differs from the OAuth route, and how
+#: Anthropic bills that traffic is Anthropic's decision. Its rows appear in
+#: the picker only while the key resolves. The same slot is the one the
+#: opt-in subscription fallback uses (``model_router.config``,
+#: ``API_KEY_FALLBACK_APP_STATE_KEY``).
+ANTHROPIC_API_KEY_ROUTE = AnthropicApiKey(
+    vendor_id="anthropic_api",
+    namespace="claude-gw/api/",
+    display_suffix=" (API key)",
+    label="Anthropic API key",
+    # ONE name, the owner's (2026-10-18). ``ANTHROPIC_API_KEY`` /
+    # ``anthropic_api_key`` are deliberately NOT tried: those are the names a
+    # project stores ITS OWN Anthropic key under, and VCO only ever spends
+    # its own slot — never a project's key (the kimi row's MOONSHOT_API_KEY
+    # rule, for the same reason).
+    secret_keys=("ANTHROPIC_API_KEY_GATEWAY",),
+    auth_header="x-api-key",
+    docs_url="https://platform.claude.com/docs/en/api/overview",
+)
+
 ANTHROPIC_FAMILY = AnthropicFamily(
     family_id="anthropic",
     upstream="https://api.anthropic.com",
     catalog_path="/v1/models",
     catalog_query="limit=100",
     docs_url="https://platform.claude.com/docs/en/about-claude/models/overview",
+    api_key=ANTHROPIC_API_KEY_ROUTE,
 )
 
 #: The namespace shared by every shipped vendor. Kept as one value because the
@@ -578,14 +676,56 @@ class RegistryError(ValueError):
     """A vendor row cannot work as written."""
 
 
-def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
+def _validate_api_key_route(
+    api: AnthropicApiKey, rows: Mapping[str, Vendor],
+) -> None:
+    """The :class:`AnthropicApiKey` half of :func:`validate_registry`."""
+    if not api.namespace:
+        raise RegistryError("API-key route: empty namespace")
+    if not any(marker in api.namespace.lower() for marker in CLAUDE_ID_MARKERS):
+        raise RegistryError(
+            f"API-key route: namespace {api.namespace!r} contains none of "
+            f"{CLAUDE_ID_MARKERS!r}, so Claude Code's gateway-model discovery "
+            "would drop every one of its entries",
+        )
+    if api.namespace[-1].isalnum():
+        raise RegistryError(
+            f"API-key route: namespace {api.namespace!r} must end with a "
+            "separator (e.g. '/') so the model id splits unambiguously",
+        )
+    for vendor in rows.values():
+        if vendor.namespace == api.namespace:
+            raise RegistryError(
+                f"API-key route and vendor {vendor.vendor_id!r} share "
+                f"namespace {api.namespace!r} — routing would be ambiguous",
+            )
+        if vendor.vendor_id == api.vendor_id:
+            raise RegistryError(
+                f"API-key route id {api.vendor_id!r} is also a vendor id — "
+                "the two credentials would share one key-resolver cache slot",
+            )
+    if not api.secret_keys or not all(k.strip() for k in api.secret_keys):
+        raise RegistryError("API-key route: no (or a blank) secret_keys entry")
+    if not api.auth_header.strip():
+        raise RegistryError("API-key route: empty auth_header")
+
+
+def validate_registry(
+    vendors: Mapping[str, Vendor] | None = None,
+    anthropic: Optional[AnthropicFamily] = None,
+) -> None:
     """Raise :class:`RegistryError` if any row would silently misbehave.
 
     Called by ``vct-model-gateway --check`` and by the server factory, so a
     user who adds a row gets a named error at startup instead of a model that
-    quietly never appears in the picker.
+    quietly never appears in the picker. ``anthropic`` (default
+    :data:`ANTHROPIC_FAMILY`) is checked too: its API-key route shares the
+    namespace space with the vendor rows.
     """
     rows = VENDORS if vendors is None else vendors
+    family = ANTHROPIC_FAMILY if anthropic is None else anthropic
+    if family.api_key is not None:
+        _validate_api_key_route(family.api_key, rows)
     seen_namespaces: dict[str, str] = {}
     seen_prefixes: dict[str, str] = {}
     for key, vendor in rows.items():
@@ -849,9 +989,14 @@ FALLBACK_LADDER: tuple[FallbackRung, ...] = (
 
 
 __all__ = [
+    "ANTHROPIC_API_KEY_ROUTE",
     "ANTHROPIC_FAMILY",
+    "AnthropicApiKey",
     "AnthropicFamily",
+    "KeyedCredential",
     "CLAUDE_ID_MARKERS",
+    "CONTEXT_1M_BETA",
+    "CONTEXT_1M_BETA_MARKER",
     "CONTEXT_OVERFLOW_MAX_RE",
     "DEFAULT_ANTHROPIC_VERSION",
     "FALLBACK_LADDER",

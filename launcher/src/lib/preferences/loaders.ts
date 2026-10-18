@@ -51,6 +51,12 @@ export const APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL = 'code_embed_ollama_model';
 // MUST MATCH vco_lib/openai_consent.py APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT.
 export const APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT = 'openai_embeddings_consent';
 export const APP_STATE_KEY_ACTIVE_EMBEDDING = 'embedding.active_profile';
+// v0.2.104: the model gateway's opt-in subscription -> Claude API key
+// fallback (default OFF — it bills the Console organisation). Read by the
+// gateway at request time (cached a few seconds), so no restart is needed.
+// MUST MATCH claude_mcp_servers/model_router/config.py
+// API_KEY_FALLBACK_APP_STATE_KEY (parity: tests/test_v02104_gateway_api_key_route.py).
+export const APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK = 'model_gateway.api_key_fallback';
 export const APP_STATE_KEY_HARDWARE_SNAPSHOT = 'launcher.hardware_snapshot';
 
 /** Default Ollama URL. The launcher pins this to 11435 (not 11434) to avoid
@@ -259,6 +265,12 @@ export const PREF_LOADERS = {
         appStateGetBool(APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL),
         appStateGetBool(APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL),
       ]),
+  },
+  gatewayApiKeyFallback: {
+    eager: false,
+    section: 'Model gateway (Claude API key fallback)',
+    /** `null` = no row = OFF (the default). */
+    load: () => appStateGetBool(APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK),
   },
   dualFlags: {
     eager: false,

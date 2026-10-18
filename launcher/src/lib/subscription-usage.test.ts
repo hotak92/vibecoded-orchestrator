@@ -318,6 +318,28 @@ describe('per-agent attribution (v0.2.102 G3 — who actually answered)', () => 
       ),
     ).toBe('glm-5.3-flash (fallback from anthropic:claude-haiku-4-5)');
   });
+
+  it('says when a turn was billed to the Claude API key (v0.2.104)', () => {
+    const viaKey = agentRow({
+      agent: null,
+      model: 'claude-opus-5-5',
+      fallback_from: 'anthropic:claude-opus-5-5',
+      auth: 'api_key',
+    });
+    expect(agentAnswer(viaKey)).toBe(
+      'claude-opus-5-5 via Claude API key (fallback from anthropic:claude-opus-5-5)',
+    );
+    expect(agentAnswer(agentRow({ model: 'claude-opus-5-5', auth: 'api_key' }))).toBe(
+      'claude-opus-5-5 via Claude API key',
+    );
+    expect(agentAnswer(agentRow({ auth: 'vendor_key' }))).toBe('glm-5.3');
+  });
+
+  it('keeps a main-chat row billed to the API key even without a fallback', () => {
+    const picked = agentRow({ agent: null, model: 'claude-opus-5-5', auth: 'api_key' });
+    const plain = agentRow({ agent: null, model: 'claude-opus-5-5', auth: 'oauth' });
+    expect(visibleAgents(snapshot([], false, [picked, plain]))).toEqual([picked]);
+  });
 });
 
 describe('fetchUsage (review F4/F15: the bridge error is surfaced, not swallowed)', () => {

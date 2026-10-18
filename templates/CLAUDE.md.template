@@ -149,6 +149,15 @@ key and a gateway, the `claude-gw/*` ids are unreachable and only the Anthropic
 rows apply. Add a key in the launcher's Secrets panel and its rows appear on the
 next automatic guidance refresh (launcher startup, key changes, install/update).
 
+**Claude via API key.** With a Claude Console API key saved as `ANTHROPIC_API_KEY_GATEWAY`
+(Secrets, Shared), the gateway also offers each Claude model as
+`claude-gw/api/<model id>` — the same model, billed to that key instead of the
+Claude login. A launcher switch can send EVERY Claude request that way, and an
+opt-in Preferences switch (off by default) retries a subscription quota refusal
+once on that key. The client's own headers are sent
+unchanged, so whether Anthropic counts this traffic against the subscription's
+API credits is Anthropic's call; pick these ids only when the user asks for them.
+
 **Window size is known. Competence across it is not. Keep the two apart.**
 
 *Capacity* is settled data, version-keyed and cited — never guess it and never

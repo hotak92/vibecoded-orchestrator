@@ -87,6 +87,13 @@ export interface UsageAgentRow {
   model: string;
   route: string;
   fallback_from: string;
+  /**
+   * v0.2.104: how the answering route authenticated — `oauth` (Claude
+   * login), `api_key` (Claude Console API key: the `claude-gw/api/` route or
+   * the opt-in subscription fallback) or `vendor_key`. Absent from an older
+   * gateway.
+   */
+  auth?: string;
   at: string;
 }
 
@@ -300,7 +307,11 @@ export function nextPollMs(result: UsageBridgeResult | null): number {
  * this list exists for. A fallback is the one main-chat fact worth showing.
  */
 export function visibleAgents(snapshot: UsageSnapshot): UsageAgentRow[] {
-  return (snapshot.agents ?? []).filter((row) => row.agent !== null || row.fallback_from);
+  // v0.2.104: a main-chat turn billed to the Claude API key is shown too —
+  // money left a different pool, which the user must be able to see.
+  return (snapshot.agents ?? []).filter(
+    (row) => row.agent !== null || row.fallback_from || row.auth === 'api_key',
+  );
 }
 
 /** The identity's name: the agent id, or "main chat" for the null agent. */
@@ -314,7 +325,8 @@ export function agentIdentity(row: UsageAgentRow): string {
  * served the turn (no hidden remaps).
  */
 export function agentAnswer(row: UsageAgentRow): string {
+  const via = row.auth === 'api_key' ? ' via Claude API key' : '';
   return row.fallback_from
-    ? `${row.model} (fallback from ${row.fallback_from})`
-    : row.model;
+    ? `${row.model}${via} (fallback from ${row.fallback_from})`
+    : `${row.model}${via}`;
 }

@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .vendors import Vendor
+from .vendors import KeyedCredential
 
 logger = logging.getLogger(__name__)
 
@@ -551,6 +551,46 @@ class VendorKeyResolver:
             )
         )
 
+    def peek(self, vendor_id: str) -> Optional[bool]:
+        """What the cache already knows about ``vendor_id``'s key. No store
+        is touched, so ``/health`` may call it.
+
+        ``True``: a key is cached (or the last-known-good one is being
+        served); ``False``: the last resolution was a definite miss and is
+        still within its negative TTL; ``None``: nothing fresh is known (never
+        resolved, expired, or the store was only transiently busy).
+        """
+        if vendor_id in self._serving_stale:
+            return True
+        entry = self._cache.get(vendor_id)
+        if entry is None:
+            return None
+        age = self._clock() - entry.fetched_at
+        if entry.result.key:
+            return True if age < self._ttl_s else None
+        if entry.result.transient:
+            return None
+        return False if age < min(self._ttl_s, NEGATIVE_TTL_CAP_S) else None
+
+    @staticmethod
+    def fingerprint_of(value: str) -> str:
+        """A one-way identity for a key value — compared, never shown. The
+        ONE spelling of it, so a fingerprint taken from a request header and
+        one taken from this cache always agree."""
+        import hashlib  # noqa: PLC0415 — only fingerprints need it
+
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def fingerprint(self, vendor_id: str) -> Optional[str]:
+        """:meth:`fingerprint_of` the key this cache would serve for
+        ``vendor_id``, or ``None``. Cache only; the value never leaves."""
+        key = None
+        for entry in (self._cache.get(vendor_id), self._last_good.get(vendor_id)):
+            if entry is not None and entry.result.key:
+                key = entry.result.key
+                break
+        return self.fingerprint_of(key) if key else None
+
     def serving_stale_ids(self) -> tuple[str, ...]:
         """Vendor ids currently answered from the last-known-good store.
 
@@ -583,7 +623,7 @@ class VendorKeyResolver:
             self._transient_logged.discard(vendor_id)
 
     def _serve_stale(
-        self, vendor: Vendor, now: float, *, fresh: KeyResult
+        self, vendor: KeyedCredential, now: float, *, fresh: KeyResult
     ) -> Optional[KeyResult]:
         """Answer a FAILED resolution with the last-known-good key (issue 12).
 
@@ -670,7 +710,7 @@ class VendorKeyResolver:
                 else " after answering failures",
             )
 
-    def resolve(self, vendor: Vendor) -> KeyResult:
+    def resolve(self, vendor: KeyedCredential) -> KeyResult:
         """Blocking resolution. Callers on the event loop use :meth:`aresolve`."""
         now = self._clock()
         entry = self._cache.get(vendor.vendor_id)
@@ -707,7 +747,7 @@ class VendorKeyResolver:
             return stale
         return result
 
-    async def aresolve(self, vendor: Vendor) -> KeyResult:
+    async def aresolve(self, vendor: KeyedCredential) -> KeyResult:
         """Resolve off the event loop.
 
         A cache hit is answered inline (no thread hop) so the common path
@@ -748,7 +788,7 @@ class VendorKeyResolver:
             )
         return await asyncio.to_thread(self.resolve, vendor)
 
-    def _start_refresh(self, vendor: Vendor) -> None:
+    def _start_refresh(self, vendor: KeyedCredential) -> None:
         """Start (at most one) background re-resolution for ``vendor``."""
         task = self._refreshing.get(vendor.vendor_id)
         if task is not None and not task.done():
@@ -779,7 +819,7 @@ class VendorKeyResolver:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    def _resolve_uncached(self, vendor: Vendor) -> KeyResult:
+    def _resolve_uncached(self, vendor: KeyedCredential) -> KeyResult:
         getter = self._getter
         if getter is None:
             try:
@@ -891,7 +931,7 @@ class VendorKeyResolver:
         return KeyResult(problem=problem)
 
     def _transient_result(
-        self, vendor: Vendor, unavailable: list[str], failures: list[str]
+        self, vendor: KeyedCredential, unavailable: list[str], failures: list[str]
     ) -> KeyResult:
         """The answer for "the secret store could not be asked right now" (the
         hub's 503 ``keychain_unavailable``, or — v0.2.102 W6-AB — a hub that did

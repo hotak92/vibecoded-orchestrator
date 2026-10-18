@@ -1016,6 +1016,8 @@ class CatalogService:
             surface without a network and without patching a client library.
         oauth_token: callable returning the current Claude bearer, or ``None``.
         vendor_key: async callable returning a vendor's key, or ``None``.
+        api_key_present: async callable answering whether the first-party
+            API-key route's key resolves; its rows are published only then.
         live_ttl_s / static_ttl_s: see the module docstring.
     """
 
@@ -1030,12 +1032,17 @@ class CatalogService:
         live_ttl_s: int,
         static_ttl_s: int,
         clock: Callable[[], float] = time.monotonic,
+        api_key_present: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> None:
         self._vendors = vendors
         self._anthropic = anthropic
         self._fetch_json = fetch_json
         self._oauth_token = oauth_token
         self._vendor_key = vendor_key
+        #: Answers "does the first-party API-key route's key resolve now?".
+        #: ``None`` (the default, and every embedder that does not pass one)
+        #: publishes no API-key rows at all.
+        self._api_key_present = api_key_present
         self._live_ttl_s = max(1, int(live_ttl_s))
         self._static_ttl_s = max(1, int(static_ttl_s))
         self._clock = clock
@@ -1320,6 +1327,20 @@ class CatalogService:
         self._cache[vendor.vendor_id] = result
         return result
 
+    async def _api_key_ready(self) -> bool:
+        """Whether the API-key route's rows may be published. Never raises:
+        a resolver failure means "not offered", like a vendor without a key."""
+        if self._api_key_present is None or self._anthropic.api_key is None:
+            return False
+        try:
+            return bool(await self._api_key_present())
+        except Exception:  # noqa: BLE001 — a picker must not fail on this
+            logger.exception(
+                "model-gateway: API-key route presence check failed; its "
+                "rows are not published this time",
+            )
+            return False
+
     @property
     def first_party_label(self) -> str:
         """The vendor label a first-party row carries in its description.
@@ -1398,10 +1419,13 @@ class CatalogService:
         # ``source`` field records), so an exception here would be a defect
         # worth surfacing rather than a vendor being down.
         vendors = list(self._vendors.values())
+        # The API-key presence check runs beside the fetches, not after them.
+        api_key_check = asyncio.ensure_future(self._api_key_ready())
         first, *vendor_families = await asyncio.gather(
             self._anthropic_entries(),
             *(self._vendor_entries(vendor, user_agent) for vendor in vendors),
         )
+        api_key_ready = await api_key_check
 
         sources[self._anthropic.family_id] = first.source
         published, withheld = _publish_family(
@@ -1416,6 +1440,30 @@ class CatalogService:
         # sit together; vendor rows keep the order their upstream listed.
         entries.extend(sorted(published, key=lambda e: e.id))
         hidden.extend(withheld)
+
+        api = self._anthropic.api_key
+        if api is not None and api_key_ready:
+            # The SAME first-party rows, once more under the API-key
+            # namespace — rendered by the same function with the route's own
+            # label, so window, [1m] and latest-only decisions cannot drift
+            # between the two credentials of one upstream.
+            api_published, api_withheld = _publish_family(
+                entries=first.entries,
+                table=table,
+                label=api.label,
+                vendor=None,
+                catalog_filter=catalog_filter,
+                window_rows=window_rows,
+            )
+            entries.extend(
+                replace(
+                    entry,
+                    id=f"{api.namespace}{entry.id}",
+                    display_name=f"{entry.display_name}{api.display_suffix}",
+                )
+                for entry in sorted(api_published, key=lambda e: e.id)
+            )
+            hidden.extend(f"{api.namespace}{model_id}" for model_id in api_withheld)
 
         for vendor, family in zip(vendors, vendor_families):
             sources[vendor.vendor_id] = family.source

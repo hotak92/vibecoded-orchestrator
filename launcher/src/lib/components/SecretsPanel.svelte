@@ -902,6 +902,29 @@
           </span>
         </div>
       {/if}
+      {#if scope === 'shared'}
+        <!-- v0.2.104: the model gateway's Claude API key slot. Shared scope,
+             exact name `ANTHROPIC_API_KEY_GATEWAY` — the name the gateway resolves
+             (model_router/vendors.py ANTHROPIC_API_KEY_ROUTE). Pinned by
+             SecretsPanel.wiring.test.ts. -->
+        <div class="add-row key-suggest">
+          <button
+            type="button"
+            class="chip"
+            onclick={() => {
+              newKey = 'ANTHROPIC_API_KEY_GATEWAY';
+            }}
+            disabled={busy}
+            title="Fill the KEY field with the name the model gateway reads for the Claude API key"
+          >Claude API key</button>
+          <span class="key-suggest-hint">
+            <code>ANTHROPIC_API_KEY_GATEWAY</code> — your Claude Console API key; the
+            model gateway offers <code>claude-gw/api/…</code> models with it
+            and, if enabled in Preferences, falls back to it when the
+            subscription is out
+          </span>
+        </div>
+      {/if}
       <div class="add-row">
         <input
           type="password"
