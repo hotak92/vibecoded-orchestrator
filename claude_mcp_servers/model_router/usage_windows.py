@@ -110,6 +110,14 @@ STALE_AFTER_S = 30 * 60
 FETCH_TIMEOUT_S = 10.0
 #: Largest quota answer read. Both real answers are under 4 KiB.
 MAX_BODY_BYTES = 256 * 1024
+#: Distinct client user-agents remembered for a user-agent-gated quota
+#: endpoint (the kimi row), most recent first when asked.
+MAX_CLIENT_USER_AGENTS = 4
+#: How long a client user-agent the quota endpoint REFUSED (HTTP 403 at the
+#: vendor's edge) is skipped before it is offered again. A library UA (the
+#: launcher's ``Python-urllib`` read of ``/usage/windows``) is refused every
+#: time; a real client's UA refused by a transient edge rule must come back.
+REFUSED_USER_AGENT_RETRY_S = 60 * 60
 
 ANTHROPIC_USAGE_PATH = "/api/oauth/usage"
 
@@ -441,23 +449,59 @@ _KIMI_5H_DURATION_MINUTES = 300
 _KIMI_TIME_UNIT_MINUTE = "TIME_UNIT_MINUTE"
 
 
+def _kimi_5h_from_detail(detail: Mapping[str, Any]) -> Optional[float]:
+    """The 5h percent from one ``limits[].detail`` block, else ``None``.
+
+    The block is proto3 JSON (``TIME_UNIT_MINUTE`` enum names, int64 as
+    strings), and proto3 JSON OMITS a field at its default value: an unused
+    window carries ``limit`` and ``remaining`` but no ``used`` at all. So
+    ``used`` is read when present, else derived as ``limit - remaining``
+    when BOTH of those are present (an unused window: remaining == limit,
+    0 %). With neither, nothing is known and nothing is invented.
+    """
+    cap = _number(detail.get("limit"))
+    if cap is None or cap <= 0:
+        return None
+    used = _number(detail.get("used"))
+    if used is None:
+        remaining = _number(detail.get("remaining"))
+        if remaining is None or remaining > cap:
+            return None
+        used = cap - remaining
+    return round(used * 100.0 / cap, 1)
+
+
 def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list[Window]]":
     """``(None, windows)`` from Kimi Code's usages endpoint. Always yields
     ``5h``, ``monthly`` and ``monthly_code``.
 
-    The live shape (probe 2026-10-07 with the owner's key, saved verbatim as
-    ``tests/fixtures/model_router/kimi-usages.json``): ``limits[]`` carries
-    the 5h window — ``window.duration`` 300, ``timeUnit TIME_UNIT_MINUTE``
-    — whose ``detail`` reports ``used`` / ``limit`` as STRINGS and a
-    ``resetTime``; ``usages.limit_month_total`` / ``limit_month_code``
-    carry a ``used_ratio`` FRACTION (x100 here) and a ``reset_time``. The
-    two 5h readings DISAGREED in the probe — ``usages.limit_5h.used_ratio``
-    read 0 while ``limits[0].detail`` read 9 of 100 used — so the 5h percent
-    is derived from ``limits[].detail`` and ``usages.limit_5h`` is
-    deliberately NOT read; the monthly windows have only the one reading.
-    Like every quota source this is undocumented, so each field is read
-    defensively: a missing or unparseable window is present and unknown,
-    never absent, never 0 %.
+    The live shape (probes 2026-10-07 and 2026-10-18 with the owner's key,
+    saved as ``tests/fixtures/model_router/kimi-usages.json`` and
+    ``kimi-usages-2026-10-18.json``): ``limits[]`` carries the 5h window —
+    ``window.duration`` 300, ``timeUnit TIME_UNIT_MINUTE`` — whose
+    ``detail`` reports ``limit`` / ``used`` / ``remaining`` as STRINGS and a
+    ``resetTime``; ``usages.limit_5h`` / ``limit_month_total`` /
+    ``limit_month_code`` carry a ``used_ratio`` FRACTION (x100 here) and a
+    ``reset_time``.
+
+    The 5h percent, in order of preference:
+
+    1. ``limits[].detail`` — ``used / limit``, or ``(limit - remaining) /
+       limit`` when ``used`` is absent (proto3 JSON omits a zero ``used``:
+       an unused window must read 0 %, see :func:`_kimi_5h_from_detail`).
+       Preferred because the two readings DISAGREE: 2026-10-07
+       ``limit_5h.used_ratio`` read 0 while the detail read 9 of 100 used,
+       2026-10-18 the ratio read 0.0135 against 1 of 100. The detail is
+       the count the vendor enforces.
+    2. ``usages.limit_5h.used_ratio`` — ONLY when ``limits[]`` yields no
+       readable 5h window (no matching entry, or a detail with neither
+       ``used`` nor ``remaining``), so a missing detail never leaves the
+       window unknown while the vendor did report a ratio.
+
+    The monthly windows have only the one reading. Like every quota source
+    this is undocumented, so each field is read defensively: a missing or
+    unparseable window is present and unknown, never absent, and never a
+    number nobody reported.
     """
     found: dict[str, Window] = {}
     if isinstance(payload, Mapping):
@@ -476,22 +520,20 @@ def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list
                 detail = item.get("detail")
                 if not isinstance(detail, Mapping):
                     continue
-                used = _number(detail.get("used"))
-                cap = _number(detail.get("limit"))
-                pct = (
-                    round(used * 100.0 / cap, 1)
-                    if used is not None and cap is not None and cap > 0
-                    else None
-                )
+                pct = _kimi_5h_from_detail(detail)
+                if pct is None:
+                    continue
                 found.setdefault("5h", Window(
                     "5h", "5h", pct,
                     _reset_epoch(detail.get("resetTime")),
-                    SOURCE_KIMI_USAGES, now,
-                    None if pct is not None else UNKNOWN_NOT_REPORTED,
+                    SOURCE_KIMI_USAGES, now, None,
                 ))
         usages = payload.get("usages")
         if isinstance(usages, Mapping):
             for key, window_id, label in (
+                # limit_5h is the FALLBACK for the 5h window: setdefault
+                # keeps a reading limits[] already produced (see above).
+                ("limit_5h", "5h", "5h"),
                 ("limit_month_total", "monthly", "mo"),
                 ("limit_month_code", "monthly_code", "mo-code"),
             ):
@@ -499,11 +541,12 @@ def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list
                 if not isinstance(block, Mapping):
                     continue
                 pct = _fraction_percent(block.get("used_ratio"))
+                if pct is None:
+                    continue
                 found.setdefault(window_id, Window(
                     window_id, label, pct,
                     _reset_epoch(block.get("reset_time")),
-                    SOURCE_KIMI_USAGES, now,
-                    None if pct is not None else UNKNOWN_NOT_REPORTED,
+                    SOURCE_KIMI_USAGES, now, None,
                 ))
     windows = [
         found.get(window_id) or _unknown(window_id, label, SOURCE_KIMI_USAGES, now)
@@ -538,6 +581,13 @@ def _kimi_quota_headers(key: str, user_agent: Optional[str]) -> Optional[dict[st
     refuses, so it is not sent at all and the vendor reads unknown with the
     reason beside it, instead of 403-ing on every refresh until the first
     chat or read relays one.
+
+    Not every relayed user-agent is one the edge accepts: ``/usage/windows``
+    is also read by the launcher's usage card through ``Python-urllib``,
+    which the edge refuses (403 "error code: 1010", live 2026-10-18, while
+    ``claude-cli/...`` and ``curl/...`` answered 200). WHICH relayed UA is
+    sent is :meth:`UsageWindows._refresh_quota_vendor`'s choice — the most
+    recent one the edge has not refused.
     """
     if not user_agent:
         return None
@@ -732,7 +782,11 @@ class UsageWindows:
         self._next_due = 0.0
         self._last_refresh: Optional[float] = None
         self._last_activity: Optional[float] = None
-        self._client_user_agent: Optional[str] = None
+        #: Distinct client user-agents relayed by refresh signals, most
+        #: recent LAST, at most :data:`MAX_CLIENT_USER_AGENTS`.
+        self._client_user_agents: list[str] = []
+        #: user-agent -> when a user-agent-gated quota endpoint refused it.
+        self._refused_user_agents: dict[str, float] = {}
         self._header_windows: dict[str, Window] = {}
         self._usage: dict[str, VendorUsage] = {
             ANTHROPIC_ID: VendorUsage(ANTHROPIC_ID, ANTHROPIC_LABEL, "Claude subscription"),
@@ -779,17 +833,36 @@ class UsageWindows:
         return self._schedule_if_due()
 
     def _remember_client_user_agent(self, user_agent: Optional[str]) -> None:
-        """Keep the most recent client user-agent a refresh signal carried.
+        """Remember the client user-agent a refresh signal carried.
 
         A quota endpoint behind a client-identity gate (the kimi row) is
-        asked as the client whose read or traffic scheduled the refresh —
-        the same relay rule as the catalog fetch, and the honest one: the
-        gateway never invents a user-agent. Last writer wins; a signal
-        carrying none keeps what an earlier one saw. Never logged, never
-        snapshotted.
+        asked as a client whose read or traffic reached this gateway — the
+        same relay rule as the catalog fetch, and the honest one: the
+        gateway never invents a user-agent. The few most recent DISTINCT
+        ones are kept (not just the last): the readers of this snapshot are
+        not all clients the vendor's edge accepts, and a refused one must
+        not displace the one it does accept. A signal carrying none keeps
+        what earlier ones saw. Never logged, never snapshotted.
         """
-        if user_agent:
-            self._client_user_agent = user_agent
+        if not user_agent:
+            return
+        agents = self._client_user_agents
+        if user_agent in agents:
+            agents.remove(user_agent)
+        agents.append(user_agent)
+        del agents[:-MAX_CLIENT_USER_AGENTS]
+
+    def _usable_user_agents(self, now: float) -> list[str]:
+        """Remembered client user-agents the quota edge has not refused
+        within :data:`REFUSED_USER_AGENT_RETRY_S`, most recent first."""
+        usable = []
+        for agent in reversed(self._client_user_agents):
+            refused_at = self._refused_user_agents.get(agent)
+            if refused_at is not None and now - refused_at < REFUSED_USER_AGENT_RETRY_S:
+                continue
+            self._refused_user_agents.pop(agent, None)
+            usable.append(agent)
+        return usable
 
     def _schedule_if_due(self) -> bool:
         """The ONE gate both signals go through. Due means: never refreshed,
@@ -866,22 +939,55 @@ class UsageWindows:
         headers_for, parse = _QUOTA_DIALECTS.get(
             vendor.vendor_id, _ZAI_QUOTA_DIALECT,
         )
-        headers = headers_for(key, self._client_user_agent)
-        if headers is None:
-            # The dialect declined to ask: a user-agent-gated endpoint with
-            # no client user-agent relayed yet (v0.2.102, X2). Sending the
-            # UA-less fetch would 403 at the edge on every refresh until
-            # the first chat or read relays one — and a user-agent is
-            # relayed, never invented (vendor ToS), so the honest answer
-            # until then is unknown-with-a-reason, not a refusal loop.
+        plain = headers_for(key, None)
+        if plain is not None:
+            # No user-agent gate (the Z.ai dialect): one plain fetch.
+            status, payload = await self._fetch(vendor.quota_url, plain)
+            self._apply(
+                usage, status, payload, vendor.vendor_id,
+                lambda body: parse(body, now=self._clock()),
+            )
+            return
+        # A user-agent-gated endpoint: asked as a relayed client, never an
+        # invented one (vendor ToS). With none relayed yet the fetch is NOT
+        # sent (v0.2.102, X2) — it would 403 at the edge on every refresh.
+        candidates = self._usable_user_agents(self._clock())
+        if not candidates:
             _note_problem(
                 usage,
                 f"{vendor.vendor_id} usage source not asked: no client "
                 "user-agent relayed yet, and the vendor's edge refuses "
-                "library user-agents",
+                "library user-agents"
+                if not self._client_user_agents
+                else f"{vendor.vendor_id} usage source not asked: the "
+                "vendor's edge refused (HTTP 403) every client user-agent "
+                "relayed so far; retried after "
+                f"{REFUSED_USER_AGENT_RETRY_S // 60} min or when a new one "
+                "is relayed" + _kept_reading_note(usage),
             )
             return
-        status, payload = await self._fetch(vendor.quota_url, headers)
+        # Most recent first; a 403 marks that user-agent refused and the
+        # next one is tried in the SAME refresh, so a refused reader (the
+        # launcher's Python-urllib) costs one extra request per retry
+        # interval and never the reading.
+        status: Optional[int] = None
+        payload: Any = None
+        for agent in candidates:
+            headers = headers_for(key, agent)
+            if headers is None:  # the dialect declined even with a UA
+                continue
+            status, payload = await self._fetch(vendor.quota_url, headers)
+            if status != 403:
+                break
+            self._refused_user_agents[agent] = self._clock()
+        if status == 403:
+            _note_problem(
+                usage,
+                f"{vendor.vendor_id} usage source answered HTTP 403 to every "
+                f"relayed client user-agent ({len(candidates)} tried) — "
+                "the vendor's edge refused them" + _kept_reading_note(usage),
+            )
+            return
         self._apply(
             usage, status, payload, vendor.vendor_id,
             lambda body: parse(body, now=self._clock()),
@@ -979,6 +1085,12 @@ class UsageWindows:
             "refresh_interval_s": int(self._refresh_s),
             "vendors": vendors,
         }
+
+
+def _kept_reading_note(usage: VendorUsage) -> str:
+    """Tell the reader a failed refresh did not erase the last good reading
+    (each window keeps its own ``fetched_at``; :func:`_effective` ages it)."""
+    return "; the last good reading is kept" if usage.windows else ""
 
 
 def _note_problem(usage: VendorUsage, problem: str) -> None:
