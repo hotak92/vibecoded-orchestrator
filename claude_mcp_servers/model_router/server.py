@@ -225,6 +225,7 @@ from .api_key_route import (
     ApiKeyRefused,
     CachedSetting,
     api_key_headers,
+    api_key_refusal_is_key_level,
     api_key_refused_message,
 )
 from .vendors import (
@@ -695,6 +696,10 @@ class Gateway:
         await asyncio.gather(
             self.api_key_fallback.refresh(), self.anthropic_auth.refresh(),
         )
+        # ...and keep them current whether or not requests arrive, so the
+        # first request after an idle gap already sees a flipped switch.
+        self.api_key_fallback.start_periodic()
+        self.anthropic_auth.start_periodic()
 
     def request_started(self) -> None:
         self._inflight += 1
@@ -3692,7 +3697,12 @@ async def _proxy(
                 # and skip the ladder. Never relayed: see
                 # :func:`_api_key_refused_answer` and _api_key_escalation.
                 held = await _peek_quota_body(upstream)
-                gateway.note_api_key_refused(headers.get(decision.api_key.auth_header, ""))
+                if api_key_refusal_is_key_level(upstream.status, held):
+                    # Only a credential-level refusal marks the key
+                    # ``rejected`` machine-wide; a per-model 403 does not.
+                    gateway.note_api_key_refused(
+                        headers.get(decision.api_key.auth_header, ""),
+                    )
                 if defer_api_key_refusal:
                     raise ApiKeyRefused(upstream.status)
                 return _api_key_refused_answer(

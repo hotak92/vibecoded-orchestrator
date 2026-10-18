@@ -30,25 +30,31 @@ from .vendors import (
 logger = logging.getLogger(__name__)
 
 
-
-#: How long a :class:`CachedSetting` trusts its last read of a launcher
-#: setting. Short: a user who turns a paying route OFF must stop paying
-#: within seconds, not at the next gateway restart.
+#: How often a :class:`CachedSetting` re-reads its launcher setting in the
+#: background, whether or not any request arrives (review R17 MEDIUM-1: a
+#: refresh triggered only by a request left the FIRST request after an idle
+#: gap on the old value). Worst case for a flipped switch to apply: this
+#: interval plus one launcher-DB read (milliseconds; at most the reader's
+#: 5 s SQLite busy timeout on a locked DB) — about 5 s, 10 s at the very
+#: worst — independent of traffic or idle time.
 LAUNCHER_SETTING_TTL_S = 5.0
 
 _T = TypeVar("_T")
 
 
 class CachedSetting(Generic[_T]):
-    """One launcher setting, refreshed OFF the event loop (review R15 LOW-1).
+    """One launcher setting, refreshed OFF the event loop (reviews R15 LOW-1,
+    R17 MEDIUM-1).
 
     The reader opens the launcher's SQLite DB — blocking file I/O that must
-    never run on the loop every in-flight stream shares. So :meth:`get` never
-    reads: it answers the cached value and, once it is older than
-    :data:`LAUNCHER_SETTING_TTL_S`, schedules ONE background re-read
-    (``asyncio.to_thread``, single-flight) — serve-stale, the key resolver's
-    discipline. :meth:`refresh` (awaited by :meth:`Gateway.start`, before the
-    first request) primes it, so the switch is honoured from the first turn.
+    never run on the loop every in-flight stream shares. So on the loop
+    :meth:`get` never reads: it answers the cache. The cache is kept current
+    by ONE periodic background task (:meth:`start_periodic`, started by
+    ``Gateway.start`` after it awaited :meth:`refresh` to prime the value
+    before the first request): every :attr:`interval_s` it re-reads through
+    ``asyncio.to_thread``. So the value a request sees is never older than
+    :data:`LAUNCHER_SETTING_TTL_S` plus one read, however long the gateway
+    sat idle — the first request after a switch is flipped already sees it.
 
     Before any value exists (priming failed or has not run), :meth:`get`
     answers ``default`` — ``oauth`` / OFF, the choices that never bill a
@@ -60,7 +66,9 @@ class CachedSetting(Generic[_T]):
         self.default = default
         self._what = what
         self._cache: Optional[tuple[float, _T]] = None
-        self._refreshing: Optional[asyncio.Task] = None
+        self._periodic: Optional[asyncio.Task] = None
+        #: Seconds between background re-reads (tests shorten it).
+        self.interval_s = LAUNCHER_SETTING_TTL_S
 
     def _read(self) -> _T:
         try:
@@ -78,26 +86,44 @@ class CachedSetting(Generic[_T]):
         self._cache = (time.monotonic(), value)
         return value
 
-    def get(self) -> _T:
-        cached = self._cache
-        if cached is not None and time.monotonic() - cached[0] < LAUNCHER_SETTING_TTL_S:
-            return cached[1]
-        task = self._refreshing
-        if task is None or task.done():
+    async def _refresh_forever(self) -> None:
+        while True:
+            await asyncio.sleep(self.interval_s)
             try:
-                self._refreshing = asyncio.get_running_loop().create_task(
-                    self.refresh(), name="model-gateway-setting-refresh",
+                await self.refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — the loop must outlive one bad read
+                logger.exception(
+                    "model-gateway: background refresh of %s failed; keeping "
+                    "the last value", self._what,
                 )
-            except RuntimeError:
-                # No loop (a synchronous caller): nothing is in flight to
-                # protect, so the read may run here.
-                self._cache = (time.monotonic(), self._read())
-                return self._cache[1]
-        return cached[1] if cached is not None else self.default
+
+    def start_periodic(self) -> None:
+        """Start the ONE background refresh task (idempotent)."""
+        task = self._periodic
+        if task is None or task.done():
+            self._periodic = asyncio.get_running_loop().create_task(
+                self._refresh_forever(), name="model-gateway-setting-refresh",
+            )
+
+    def get(self) -> _T:
+        """The cached value; never reads on a running loop."""
+        cached = self._cache
+        if cached is not None:
+            return cached[1]
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop (a synchronous caller such as ``--check``): nothing
+            # shares this thread, so the read may run here.
+            self._cache = (time.monotonic(), self._read())
+            return self._cache[1]
+        return self.default
 
     async def stop(self) -> None:
-        """Cancel an in-flight refresh (gateway shutdown)."""
-        task = self._refreshing
+        """Cancel the background refresh (gateway shutdown)."""
+        task = self._periodic
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -107,7 +133,7 @@ class CachedSetting(Generic[_T]):
 
     def expire(self) -> None:
         """Forget the cached value (tests): ``get`` answers the default
-        until a refresh lands."""
+        until the next refresh lands."""
         self._cache = None
 
 #: The route label (access line ``route=``, ledger ``route``) of the
@@ -121,6 +147,29 @@ API_KEY_ROUTE_LABEL = "anthropic-api"
 API_KEY_REFUSAL_STATUSES = (401, 403)
 
 
+def api_key_refusal_is_key_level(status: int, raw: bytes) -> bool:
+    """Whether a refusal condemns the KEY itself (review R17 LOW-1).
+
+    A 401 is credential-level by definition. A 403 ``permission_error`` is
+    often MODEL-level — a Console workspace restricting which models a key
+    may call names the model (``"... model: claude-opus-5-5"``) — and says
+    nothing about the key's other uses, so it must not mark the key
+    ``rejected`` machine-wide. Such a 403 still gets the local answer for
+    THAT request. A 403 that names no model is treated as key-level.
+    """
+    if status == 401:
+        return True
+    if status != 403:
+        return False
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return True
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return not (isinstance(message, str) and "model" in message.lower())
+
+
 class ApiKeyRefused(Exception):
     """Raised by :func:`_proxy` on the subscription FALLBACK's key attempt,
     so the escalation can continue the ladder instead of relaying it."""
@@ -130,8 +179,11 @@ class ApiKeyRefused(Exception):
         self.status = status
 
 
-#: Headers on the gateway's answer to a refused key: no automatic SDK
-#: retries — re-sending a key Anthropic rejected cannot succeed.
+#: Headers on the gateway's answer to a refused key: the Anthropic SDK reads
+#: ``x-should-retry: false`` and does not retry (re-sending a key Anthropic
+#: rejected cannot succeed). Claude Code itself may re-send a 503 ONCE with a
+#: dispatch header (a latched, single re-send — no loop); that re-send gets
+#: the same local answer, and refusals are not billed.
 API_KEY_REFUSED_HEADERS = {"x-should-retry": "false"}
 
 #: The client-facing status / error type for a refused key. Chosen

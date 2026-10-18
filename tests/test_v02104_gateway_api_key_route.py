@@ -26,6 +26,7 @@ No network: the upstreams are the loopback stubs of
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -213,7 +214,7 @@ class ApiKeyRouteRegistryTests(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# The header swap (the ONE home: server._api_key_headers)
+# The header swap (the ONE home: api_key_route.api_key_headers)
 # ══════════════════════════════════════════════════════════════════════════
 class HeaderSwapTests(unittest.TestCase):
 
@@ -677,42 +678,59 @@ class SubscriptionFallbackTests(ApiKeyGatewayBase):
         self.assertEqual((await resp.json())["model"], HAIKU)
         self.assertEqual(self.vendor_up.message_requests, [])
 
-    async def test_the_setting_is_reread_after_its_short_cache(self) -> None:
-        """Serve-stale (R15 LOW-1): past the TTL the OLD value is answered
-        and ONE background re-read is scheduled; its result lands next."""
+    async def _fast_refresh(self, setting: Any) -> None:
+        """Restart the setting's background refresh at a test-sized interval."""
+        await setting.stop()
+        setting.interval_s = 0.02
+        setting.start_periodic()
+
+    async def test_the_background_refresh_applies_a_change_with_no_request(self) -> None:
+        """R17 MEDIUM-1: the cache is kept current by the periodic task, not
+        by the next request — nothing calls ``get`` while the value moves."""
         client = await self.client_with(key=True, fallback=True)
         gateway = client.app[srv.APP_KEY]
         setting = gateway.api_key_fallback
-        self.assertTrue(gateway.api_key_fallback_on())
+        self.assertIsNotNone(setting._periodic, "started by Gateway.start")
+        await self._fast_refresh(setting)
         setting.reader = lambda: False
-        self.assertTrue(gateway.api_key_fallback_on())  # within the TTL
-        later = akr.time.monotonic() + akr.LAUNCHER_SETTING_TTL_S + 1
-        with mock.patch.object(akr.time, "monotonic", return_value=later):
-            self.assertTrue(gateway.api_key_fallback_on())  # stale, refreshing
-            first = setting._refreshing
-            self.assertTrue(gateway.api_key_fallback_on())
-            self.assertIs(setting._refreshing, first, "single-flight")
-            assert first is not None
-            await first
+        await asyncio.sleep(0.15)
         self.assertFalse(gateway.api_key_fallback_on())
 
-    async def test_the_reader_never_runs_on_the_event_loop(self) -> None:
+    async def test_after_an_idle_gap_the_first_request_uses_the_switched_mode(self) -> None:
+        """The reviewer's case: API-key mode primed, the user flips back to
+        OAuth, the gateway sits idle past the interval, then ONE request —
+        it must already carry the login, not the key."""
+        client = await self.client_with(key=True, fallback=False)
+        setting = client.app[srv.APP_KEY].anthropic_auth
+        setting.reader = lambda: ANTHROPIC_AUTH_API_KEY
+        await setting.refresh()
+        await self._fast_refresh(setting)
+        setting.reader = lambda: ANTHROPIC_AUTH_OAUTH
+        await asyncio.sleep(0.15)  # idle: no request in between
+        self.script((200, json.dumps(_success(OPUS)).encode()))
+        resp = await client.post("/v1/messages", json=self.ask(OPUS), headers=self.headers())
+        self.assertEqual(resp.status, 200)
+        h = self.first.message_requests[0]["headers"]
+        self.assertEqual(_header(h, "authorization"), f"Bearer {FAKE_OAUTH}")
+        self.assertIsNone(_header(h, "x-api-key"))
+
+    async def test_get_never_reads_on_the_loop_and_the_refresh_runs_off_it(self) -> None:
         import threading
 
         client = await self.client_with(key=True, fallback=True)
         setting = client.app[srv.APP_KEY].anthropic_auth
         threads: list[int] = []
         setting.reader = lambda: threads.append(threading.get_ident()) or "oauth"
-        setting.expire()
-        setting.get()
-        assert setting._refreshing is not None
-        await setting._refreshing
+        for _ in range(5):
+            setting.get()
+        self.assertEqual(threads, [], "get() read on the event loop")
+        await setting.refresh()
         self.assertTrue(threads)
         self.assertNotIn(threading.get_ident(), threads)
 
     async def test_before_any_value_the_safe_default_is_answered(self) -> None:
         """No cached value yet: ``get`` answers OAuth / OFF even when the row
-        says otherwise — and the refresh it schedules then applies it."""
+        says otherwise — and the next background refresh then applies it."""
         client = await self.client_with(key=True, fallback=False)
         gateway = client.app[srv.APP_KEY]
         gateway.anthropic_auth.reader = lambda: ANTHROPIC_AUTH_API_KEY
@@ -722,10 +740,18 @@ class SubscriptionFallbackTests(ApiKeyGatewayBase):
         self.assertFalse(gateway.api_key_mode_on())
         self.assertFalse(gateway.api_key_fallback_on())
         for setting in (gateway.anthropic_auth, gateway.api_key_fallback):
-            assert setting._refreshing is not None
-            await setting._refreshing
+            await self._fast_refresh(setting)
+        await asyncio.sleep(0.15)
         self.assertTrue(gateway.api_key_mode_on())
         self.assertTrue(gateway.api_key_fallback_on())
+
+    async def test_stop_cancels_the_background_refresh(self) -> None:
+        client = await self.client_with(key=True, fallback=False)
+        setting = client.app[srv.APP_KEY].anthropic_auth
+        task = setting._periodic
+        assert task is not None
+        await setting.stop()
+        self.assertTrue(task.done())
 
     async def test_the_gateway_primes_the_settings_before_serving(self) -> None:
         db = _launcher_db(self.root / "prime.db", "api_key", ANTHROPIC_AUTH_APP_STATE_KEY)
@@ -852,6 +878,41 @@ class ApiKeyRefusalTests(ApiKeyGatewayBase):
         )
         auth = (await (await self.client.get("/health")).json())["anthropic_auth"]
         self.assertEqual(auth["api_key"], "available")
+
+    async def test_a_model_level_403_does_not_flag_the_key(self) -> None:
+        """R17 LOW-1: a workspace model restriction refuses ONE model — the
+        request gets the local answer, the key stays ``available``."""
+        gateway = self.client.app[srv.APP_KEY]
+        await gateway._api_key_present()
+        model_403 = (
+            b'{"type":"error","error":{"type":"permission_error","message":'
+            b'"Your organization does not have access to model: claude-opus-5-5"}}'
+        )
+        self.script((403, model_403))
+        resp = await self.client.post(
+            "/v1/messages", json=self.ask(f"{API_NS}{OPUS}"), headers=self.headers(),
+        )
+        self.assertEqual(resp.status, 503)
+        self.assertIn("model: claude-opus-5-5", (await resp.json())["error"]["message"])
+        auth = (await (await self.client.get("/health")).json())["anthropic_auth"]
+        self.assertEqual(auth["api_key"], "available")
+
+    async def test_a_key_level_403_does_flag_the_key(self) -> None:
+        gateway = self.client.app[srv.APP_KEY]
+        await gateway._api_key_present()
+        self.script((403, NO_PERMISSION))
+        await self.client.post(
+            "/v1/messages", json=self.ask(f"{API_NS}{OPUS}"), headers=self.headers(),
+        )
+        self.assertEqual(gateway.api_key_state(), "rejected")
+
+    def test_the_refusal_classifier(self) -> None:
+        self.assertTrue(akr.api_key_refusal_is_key_level(401, b"anything"))
+        self.assertTrue(akr.api_key_refusal_is_key_level(403, NO_PERMISSION))
+        self.assertTrue(akr.api_key_refusal_is_key_level(403, b"not json"))
+        self.assertFalse(akr.api_key_refusal_is_key_level(
+            403, b'{"error":{"message":"no access to model: x"}}',
+        ))
 
     async def test_a_replaced_key_is_no_longer_reported_rejected(self) -> None:
         gateway = self.client.app[srv.APP_KEY]
