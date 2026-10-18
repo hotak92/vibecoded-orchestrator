@@ -5,7 +5,7 @@
 ONE home for every decision about agents "waiting" by polling: foreground
 ``sleep`` waits, ``watch`` / ``tail -f`` / ``timeout ... bash -c
 '...sleep...'`` polling shapes, loops that wait, self-scheduling tools
-(``ScheduleWakeup`` / ``CronCreate`` / ``Monitor``), and repeated identical
+(``ScheduleWakeup`` / ``CronCreate``), and repeated identical
 status checks (``tail``/``head``/``cat``/``ls``/``wc``/``grep`` on the same
 target, ``Read`` of the same file_path+offset+limit). Every poll is a new
 request that re-sends the whole conversation; the sanctioned way to wait
@@ -219,7 +219,11 @@ __all__ = [
 #: (hook input carries ``agent_id``) they are ALWAYS denied; in the main
 #: chat only after the UserPromptSubmit recorder saw the user type
 #: ``/loop`` / ``/schedule`` in that session.
-SELF_WAKE_TOOLS = frozenset({"ScheduleWakeup", "CronCreate", "Monitor"})
+#: ``Monitor`` is deliberately NOT here (v0.2.104): it is Claude Code's
+#: sanctioned streaming tool (``tail -f ... | grep --line-buffered``, poll
+#: loops with sleep run as a background event stream, not as a foreground
+#: wait), so the guard neither registers on it nor judges it.
+SELF_WAKE_TOOLS = frozenset({"ScheduleWakeup", "CronCreate"})
 
 #: First-verb table of the repeat detector: a read-only command whose
 #: normalized form repeats (same verb, same tokens) N times in the window.

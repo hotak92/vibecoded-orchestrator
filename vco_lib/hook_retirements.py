@@ -946,6 +946,19 @@ def _matcher_migrations() -> Tuple[MatcherMigration, ...]:
                 "so the pre-compact snapshot went stale and the reinject "
                 "hook replayed it after every manual compaction"
             )),
+        # v0.2.104: Monitor left the wait-loop guard's self-wake group (it is
+        # Claude Code's sanctioned streaming tool); an installed group keeps
+        # the old matcher unless this row moves it.
+        MatcherMigration(
+            event="PreToolUse", old="ScheduleWakeup|CronCreate|Monitor",
+            new="ScheduleWakeup|CronCreate",
+            targets=both("wait-guard"),
+            retired_in="v0.2.104",
+            reason=(
+                "Monitor is the sanctioned streaming tool, event-delivered "
+                "rather than polled, so the wait-loop guard no longer "
+                "registers on it"
+            )),
     )
 
 

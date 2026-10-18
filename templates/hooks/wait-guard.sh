@@ -9,7 +9,9 @@
 #                    PowerShell (NO if: a PowerShell loop keyword is not a
 #                    command, so no if rule could match it -- the module
 #                    judges loops itself; v0.2.102 review W5D-2),
-#                    Read, and ScheduleWakeup|CronCreate|Monitor
+#                    Read, and ScheduleWakeup|CronCreate
+#                    (the Monitor tool is deliberately NOT guarded -- it is the
+#                    sanctioned streaming tool, v0.2.104)
 #   record-expansion UserPromptExpansion, matcher loop|schedule (records a
 #                    user-typed /loop or /schedule — the documented direct
 #                    path for a typed slash command)

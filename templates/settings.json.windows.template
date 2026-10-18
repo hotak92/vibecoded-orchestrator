@@ -685,7 +685,7 @@
         ]
       },
       {
-        "matcher": "ScheduleWakeup|CronCreate|Monitor",
+        "matcher": "ScheduleWakeup|CronCreate",
         "hooks": [
           {
             "type": "command",

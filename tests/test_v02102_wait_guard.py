@@ -165,7 +165,7 @@ class TestStaticPatterns:
 
 
 class TestSelfWakeTools:
-    @pytest.mark.parametrize("tool", ["ScheduleWakeup", "CronCreate", "Monitor"])
+    @pytest.mark.parametrize("tool", ["ScheduleWakeup", "CronCreate"])
     def test_denied_inside_subagent(self, tmp_path, tool):
         from vco_lib import wait_guard as wg
 
@@ -176,6 +176,31 @@ class TestSelfWakeTools:
         assert reason, f"{tool} in a subagent must be denied"
         assert "subagent" in reason
         assert "END YOUR TURN" in reason
+
+    @pytest.mark.parametrize("agent", [None, "agent-7"])
+    @pytest.mark.parametrize("command", [
+        "tail -f app.log | grep --line-buffered ERROR",
+        "while true; do curl -s localhost:1/h; sleep 30; done",
+        "sleep 30",
+    ])
+    def test_monitor_tool_is_never_guarded(self, tmp_path, agent, command):
+        """Monitor is the sanctioned streaming tool (v0.2.104): allowed in the
+        main chat and in a subagent, whatever its command looks like."""
+        from vco_lib import wait_guard as wg
+
+        extra = {"agent_id": agent} if agent else {}
+        assert wg.evaluate(
+            _payload("Monitor", {"command": command}, **extra),
+            env=dict(ENV_DEFAULT), state_root=tmp_path, now=1000.0,
+        ) is None
+
+    def test_same_command_via_bash_still_denied(self, tmp_path):
+        from vco_lib import wait_guard as wg
+
+        assert wg.evaluate(
+            _payload("Bash", {"command": "sleep 30"}),
+            env=dict(ENV_DEFAULT), state_root=tmp_path, now=1000.0,
+        )
 
     def test_denied_in_main_chat_without_recorded_loop(self, tmp_path):
         from vco_lib import wait_guard as wg
@@ -289,7 +314,7 @@ class TestDocumentedExpansionShape:
             self.DOC_PAYLOAD, env=dict(ENV_DEFAULT), state_root=tmp_path, now=1000.0
         )
         assert wg.evaluate(
-            {"session_id": "abc123", "tool_name": "Monitor", "tool_input": {}},
+            {"session_id": "abc123", "tool_name": "CronCreate", "tool_input": {}},
             env=dict(ENV_DEFAULT), state_root=tmp_path, now=1010.0,
         ) is None
 
@@ -302,7 +327,7 @@ class TestDocumentedExpansionShape:
             payload, env=dict(ENV_DEFAULT), state_root=tmp_path, now=1000.0
         )
         assert wg.evaluate(
-            {"session_id": "abc123", "tool_name": "Monitor", "tool_input": {}},
+            {"session_id": "abc123", "tool_name": "CronCreate", "tool_input": {}},
             env=dict(ENV_DEFAULT), state_root=tmp_path, now=1010.0,
         )
 
@@ -450,10 +475,10 @@ class TestDenyMessagesTeach:
         from vco_lib import wait_guard as wg
 
         reason = wg.evaluate(
-            _payload("Monitor", {"condition": "file exists"}),
+            _payload("ScheduleWakeup", {"condition": "file exists"}),
             env=dict(ENV_DEFAULT), state_root=tmp_path, now=1000.0,
         )
-        self._assert_all_four(reason, "Monitor")
+        self._assert_all_four(reason, "ScheduleWakeup")
 
     def test_repeat_message(self, tmp_path):
         from vco_lib import wait_guard as wg
@@ -696,7 +721,7 @@ class TestRegistrations:
 
     def test_self_wake_matcher_registration(self, tpl):
         (g,) = _wait_guard_groups(_load(tpl), "PreToolUse",
-                                  "ScheduleWakeup|CronCreate|Monitor")
+                                  "ScheduleWakeup|CronCreate")
         (h,) = g["hooks"]
         assert h.get("timeout") == 10
 
