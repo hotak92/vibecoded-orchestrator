@@ -91,8 +91,10 @@ from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import aiohttp
 
+from vco_lib.atomic import atomic_write_json
 from vco_lib.env_values import env_int
 
+from .config import usage_resets_path
 from .vendors import (
     DEFAULT_ANTHROPIC_VERSION,
     OAUTH_BETA,
@@ -642,8 +644,8 @@ def _kimi_quota_headers(key: str, user_agent: Optional[str]) -> Optional[dict[st
     is also read by the launcher's usage card through ``Python-urllib``,
     which the edge refuses (403 "error code: 1010", live 2026-10-18, while
     ``claude-cli/...`` and ``curl/...`` answered 200). WHICH relayed UA is
-    sent is :meth:`UsageWindows._refresh_quota_vendor`'s choice — the most
-    recent one the edge has not refused.
+    sent is :meth:`UsageWindows._refresh_quota_vendor`'s choice — the one
+    the edge last accepted, else the most recent one it has not refused.
     """
     if not user_agent:
         return None
@@ -856,6 +858,7 @@ class UsageWindows:
         clock: Callable[[], float] = time.time,
         rng: Callable[[], float] = random.random,
         kimi_5h_budget: Optional[int] = None,
+        resets_path: Callable[[], Optional[Path]] = usage_resets_path,
     ) -> None:
         self._anthropic_upstream = anthropic_upstream.rstrip("/")
         self._vendors = vendors
@@ -875,6 +878,9 @@ class UsageWindows:
         #: Distinct client user-agents relayed by refresh signals, most
         #: recent LAST, at most :data:`MAX_CLIENT_USER_AGENTS`.
         self._client_user_agents: list[str] = []
+        #: The user-agent the quota edge last ACCEPTED (HTTP 200): asked
+        #: first, and never evicted by newer unproven ones.
+        self._accepted_user_agent: Optional[str] = None
         #: user-agent -> when a user-agent-gated quota endpoint refused it.
         self._refused_user_agents: dict[str, float] = {}
         self._header_windows: dict[str, Window] = {}
@@ -891,7 +897,12 @@ class UsageWindows:
             {"kimi": budget} if budget > 0 and "kimi" in vendors else {}
         )
         #: The last 5h reset time a good vendor answer named, per vendor id.
-        self._last_5h_reset: dict[str, float] = {}
+        #: PERSISTED (``resets_path``, owner-only): the grid is fixed, so one
+        #: reset seen before a restart still rolls forward to today's window
+        #: — and the estimate exists for the case where no fresh answer
+        #: arrives (the vendor refusing the gateway).
+        self._resets_path = resets_path
+        self._last_5h_reset: dict[str, float] = self._load_resets()
         #: The last computed estimate per vendor id.
         self._estimates: dict[str, _Estimate] = {}
         self._usage: dict[str, VendorUsage] = {
@@ -956,11 +967,19 @@ class UsageWindows:
         if user_agent in agents:
             agents.remove(user_agent)
         agents.append(user_agent)
-        del agents[:-MAX_CLIENT_USER_AGENTS]
+        # Evict the OLDEST unproven one, never the accepted one: four
+        # distinct readers (curl, Python-urllib, a browser, a second
+        # launcher) must not push out the client UA the edge accepts.
+        while len(agents) > MAX_CLIENT_USER_AGENTS:
+            victim = next(
+                (a for a in agents if a != self._accepted_user_agent), agents[0],
+            )
+            agents.remove(victim)
 
     def _usable_user_agents(self, now: float) -> list[str]:
         """Remembered client user-agents the quota edge has not refused
-        within :data:`REFUSED_USER_AGENT_RETRY_S`, most recent first."""
+        within :data:`REFUSED_USER_AGENT_RETRY_S`: the last ACCEPTED one
+        first, then the rest most recent first."""
         usable = []
         for agent in reversed(self._client_user_agents):
             refused_at = self._refused_user_agents.get(agent)
@@ -968,6 +987,10 @@ class UsageWindows:
                 continue
             self._refused_user_agents.pop(agent, None)
             usable.append(agent)
+        accepted = self._accepted_user_agent
+        if accepted in usable:
+            usable.remove(accepted)
+            usable.insert(0, accepted)
         return usable
 
     def _schedule_if_due(self) -> bool:
@@ -1083,9 +1106,13 @@ class UsageWindows:
             if headers is None:  # the dialect declined even with a UA
                 continue
             status, payload = await self._fetch(vendor.quota_url, headers)
+            if status == 200:
+                self._accepted_user_agent = agent
             if status != 403:
                 break
             self._refused_user_agents[agent] = self._clock()
+            if self._accepted_user_agent == agent:
+                self._accepted_user_agent = None
         if status == 403:
             _note_problem(
                 usage,
@@ -1120,7 +1147,9 @@ class UsageWindows:
         if who in self._estimate_budgets:
             for window in windows:
                 if window.id == "5h" and window.resets_at is not None:
-                    self._last_5h_reset[who] = window.resets_at
+                    if self._last_5h_reset.get(who) != window.resets_at:
+                        self._last_5h_reset[who] = window.resets_at
+                        self._save_resets()
         if not any(w.percent is not None for w in windows):
             _note_problem(
                 usage, f"{who} usage source answered in a shape this gateway cannot read",
@@ -1151,6 +1180,45 @@ class UsageWindows:
             usage.tokens = TokenWindow(tokens, requests, period, since, now)
             usage.state = STATE_OK if path is not None else STATE_UNKNOWN
             usage.problem = None if path is not None else "the usage ledger has no home"
+
+    # ── the persisted 5h reset times ────────────────────────────────────
+    def _load_resets(self) -> dict[str, float]:
+        """The reset times a previous daemon saved, for vendors that still
+        have an estimate. A missing, unreadable or malformed file is an
+        empty start — never an error: the next good answer rewrites it."""
+        path = self._resets_path()
+        if path is None or not self._estimate_budgets:
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        resets = data.get("5h_resets") if isinstance(data, Mapping) else None
+        if not isinstance(resets, Mapping):
+            return {}
+        out: dict[str, float] = {}
+        for vendor_id in self._estimate_budgets:
+            epoch = _reset_epoch(resets.get(vendor_id))
+            if epoch is not None:
+                out[vendor_id] = epoch
+        return out
+
+    def _save_resets(self) -> None:
+        """Persist the reset times, owner-only (mode 0600, like the daemon's
+        token, pid and port files). Best effort: a failed write is one log
+        line and the estimate simply restarts from the next good answer."""
+        path = self._resets_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                path,
+                {"5h_resets": dict(self._last_5h_reset)},
+                mode=0o600,
+            )
+        except OSError as exc:
+            logger.info("model-gateway: could not save the 5h reset times: %s", exc)
 
     def _refresh_estimates(self, now: float, *, have_ledger: bool) -> None:
         """Recompute each vendor's 5h ledger estimate from the scan just made.

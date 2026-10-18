@@ -302,6 +302,7 @@ LAST_PORT_BASENAME = "model-gateway.last-port"
 FALLBACK_PORT_RANGE = range(11460, 11469)
 _STATE_SUBDIR = "model-gateway"
 _EXPORT_BASENAME = "chat_model_context.json"
+_USAGE_RESETS_BASENAME = "usage_window_resets.json"
 _LOG_BASENAME = "model-gateway.log"
 
 
@@ -329,6 +330,14 @@ def export_path() -> Path:
     if custom:
         return Path(custom)
     return vct_root_dir() / _STATE_SUBDIR / _EXPORT_BASENAME
+
+
+def usage_resets_path() -> Path:
+    """Where :mod:`model_router.usage_windows` keeps the last 5h reset time a
+    vendor reported (owner-only), so the Kimi 5h ledger estimate survives a
+    daemon restart. Removed by the uninstall with the other state files
+    (``vco_lib.boot_service.GATEWAY_STATE_FILES``)."""
+    return vct_root_dir() / _STATE_SUBDIR / _USAGE_RESETS_BASENAME
 
 
 def log_path() -> Path:

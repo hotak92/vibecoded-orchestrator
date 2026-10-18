@@ -186,6 +186,7 @@ def _service(fetch: _EdgeFetch, clock: _Clock) -> UsageWindows:
         ledger_path=lambda: None,
         clock=clock,
         rng=lambda: 0.5,
+        resets_path=lambda: None,
     )
 
 
@@ -231,11 +232,13 @@ class KimiUserAgentChoiceTests(unittest.IsolatedAsyncioTestCase):
         clock.now += 10 * 60
         await service.refresh()
         self.assertEqual(fetch.agents, [CLAUDE_UA], "a refused UA is not re-asked")
-        # Past the retry interval it is offered once more (and refused again).
+        # Past the retry interval it is usable again, but the ACCEPTED UA is
+        # asked first, so while that one keeps answering the refused reader
+        # costs no request at all.
         fetch.agents.clear()
         clock.now += uw.REFUSED_USER_AGENT_RETRY_S
         await service.refresh()
-        self.assertEqual(fetch.agents, [LIBRARY_UA, CLAUDE_UA])
+        self.assertEqual(fetch.agents, [CLAUDE_UA])
 
     async def test_the_most_recent_accepted_ua_is_used_first(self) -> None:
         """Leave-alone: with every UA accepted, one fetch, most recent UA."""
@@ -258,7 +261,8 @@ class KimiUserAgentChoiceTests(unittest.IsolatedAsyncioTestCase):
         await self._signal(service, reads=[LIBRARY_UA])
         clock.now += 5 * 60
         await service.refresh()
-        self.assertEqual(fetch.agents, [CLAUDE_UA, LIBRARY_UA, CLAUDE_UA])
+        # The accepted UA is asked first, then the other one.
+        self.assertEqual(fetch.agents, [CLAUDE_UA, CLAUDE_UA, LIBRARY_UA])
         kimi = _kimi(service)
         self.assertEqual(kimi["state"], "ok")
         self.assertIn("HTTP 403", kimi["problem"])
@@ -303,7 +307,9 @@ def _row(ts: str, route: str, **tokens: int) -> str:
     return json.dumps({"ts": ts, "route": route, "status": 200, **tokens}) + "\n"
 
 
-class KimiLedgerEstimateTests(unittest.IsolatedAsyncioTestCase):
+class _LedgerCase(unittest.IsolatedAsyncioTestCase):
+    """A synthetic ledger + reset file in a temp dir; no tests of its own."""
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.ledger = Path(self._tmp.name) / "gateway-usage.jsonl"
@@ -319,6 +325,7 @@ class KimiLedgerEstimateTests(unittest.IsolatedAsyncioTestCase):
             _row("2026-10-18T03:00:00Z", "anthropic", input_tokens=77_777),
             _row("2026-10-18T03:10:00Z", "vendor:zai", input_tokens=55_555),
         )), encoding="utf-8")
+        self.resets = Path(self._tmp.name) / "usage_window_resets.json"
         #: What the service's ledger_path answers (None = no ledger home).
         self.ledger_home: Optional[Path] = self.ledger
         self.clock = _Clock(NOW_1018)
@@ -344,6 +351,7 @@ class KimiLedgerEstimateTests(unittest.IsolatedAsyncioTestCase):
             clock=self.clock,
             rng=lambda: 0.5,
             kimi_5h_budget=budget,
+            resets_path=lambda: self.resets,
         )
 
     async def _good_then_refused(self, service: UsageWindows, *, after_s: float) -> None:
@@ -358,6 +366,8 @@ class KimiLedgerEstimateTests(unittest.IsolatedAsyncioTestCase):
     def _five(service: UsageWindows) -> dict:
         return {w["id"]: w for w in _kimi(service)["windows"]}["5h"]
 
+
+class KimiLedgerEstimateTests(_LedgerCase):
     async def test_the_live_reading_wins_while_it_is_known(self) -> None:
         service = self._make()
         service.note_activity(CLAUDE_UA)
@@ -454,6 +464,90 @@ class KimiLedgerEstimateTests(unittest.IsolatedAsyncioTestCase):
         }))
         self.assertIsNone(window.percent)
         self.assertEqual(window.resets_at, RESET_1018)
+
+
+class KimiResetPersistenceTests(_LedgerCase):
+    """LOW-1 (R14A): the last 5h reset survives a daemon restart."""
+
+    async def test_a_restarted_gateway_estimates_from_the_saved_reset(self) -> None:
+        first = self._make()
+        first.note_activity(CLAUDE_UA)
+        await first.stop()
+        await first.refresh()  # a good answer: reset 06:13:09.844464Z saved
+        saved = json.loads(self.resets.read_text(encoding="utf-8"))
+        self.assertEqual(saved, {"5h_resets": {"kimi": RESET_1018}})
+        if os.name == "posix":
+            self.assertEqual(self.resets.stat().st_mode & 0o777, 0o600)
+        # A new daemon, hours later, whose every fetch is refused: the saved
+        # reset rolls forward on the fixed grid and the estimate stands.
+        self.fetch.refused = {CLAUDE_UA}
+        self.clock.now += 3 * 3600  # 07:00Z, past the saved reset
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write(_row("2026-10-18T06:30:00Z", "vendor:kimi", input_tokens=5000))
+        second = self._make()
+        second.note_activity(CLAUDE_UA)
+        await second.stop()
+        await second.refresh()
+        five = self._five(second)
+        self.assertEqual(five["source"], uw.SOURCE_LEDGER_ESTIMATE)
+        self.assertEqual(five["resets_at"], uw._iso(RESET_1018 + uw.KIMI_5H_SPAN_S))
+        self.assertEqual(five["estimate"]["tokens"], 5000)
+
+    async def test_an_unreadable_saved_file_is_an_empty_start(self) -> None:
+        for body in ("not json", '{"5h_resets": "x"}', '{"5h_resets": {"kimi": "soon"}}', "[]"):
+            with self.subTest(body=body):
+                self.resets.write_text(body, encoding="utf-8")
+                self.fetch.refused = {CLAUDE_UA}
+                service = self._make()
+                service.note_activity(CLAUDE_UA)
+                await service.stop()
+                await service.refresh()
+                self.assertEqual(_kimi(service)["windows"], [])
+
+
+class KimiAcceptedUserAgentTests(unittest.IsolatedAsyncioTestCase):
+    """LOW-2 (R14A): the accepted UA is never evicted by unproven ones."""
+
+    async def test_four_new_reader_uas_do_not_evict_the_accepted_one(self) -> None:
+        clock = _Clock(NOW_1018)
+        readers = [f"reader-{n}/1.0" for n in range(uw.MAX_CLIENT_USER_AGENTS)]
+        fetch = _EdgeFetch(set(readers))
+        service = _service(fetch, clock)
+        service.note_activity(CLAUDE_UA)
+        await service.stop()
+        await service.refresh()  # CLAUDE_UA accepted
+        for agent in readers:
+            service.request_refresh(agent)
+        await service.stop()
+        self.assertIn(CLAUDE_UA, service._client_user_agents)
+        self.assertEqual(len(service._client_user_agents), uw.MAX_CLIENT_USER_AGENTS)
+        fetch.agents.clear()
+        clock.now += 10 * 60
+        await service.refresh()
+        self.assertEqual(fetch.agents, [CLAUDE_UA], "the accepted UA is asked first")
+        self.assertIsNone(_kimi(service)["problem"])
+
+    async def test_a_refused_accepted_ua_loses_its_pin(self) -> None:
+        clock = _Clock(NOW_1018)
+        fetch = _EdgeFetch(set())
+        service = _service(fetch, clock)
+        service.note_activity(CLAUDE_UA)
+        await service.stop()
+        await service.refresh()
+        self.assertEqual(service._accepted_user_agent, CLAUDE_UA)
+        fetch.refused = {CLAUDE_UA}
+        service.request_refresh(CURL_UA)
+        await service.stop()
+        fetch.agents.clear()
+        clock.now += 10 * 60
+        await service.refresh()
+        self.assertEqual(fetch.agents, [CLAUDE_UA, CURL_UA])
+        self.assertEqual(service._accepted_user_agent, CURL_UA)
+        # Refused too: no UA keeps a pin it no longer earns.
+        fetch.refused = {CLAUDE_UA, CURL_UA}
+        clock.now += uw.REFUSED_USER_AGENT_RETRY_S + 60
+        await service.refresh()
+        self.assertIsNone(service._accepted_user_agent)
 
 
 if __name__ == "__main__":  # pragma: no cover
