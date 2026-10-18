@@ -72,11 +72,15 @@ _SHELL_ENV_REL = ".claude/env"
 @dataclass(frozen=True)
 class EnvCheck:
     """``drift`` rows ``{surface, key, expected, actual}`` and ``unreadable``
-    rows ``{surface, path, reason}``. :attr:`verdict` is the tri-state."""
+    rows ``{surface, path, reason}``. :attr:`verdict` is the tri-state.
+    ``notices`` rows ``{surface, condition, reason}`` change no verdict: they
+    say why a layout ``apply`` chose on purpose is the expected one (git
+    gives no answer about ``settings.local.json`` — review R18 LOW-3)."""
 
     surfaces: tuple[str, ...]
     drift: list[dict] = field(default_factory=list)
     unreadable: list[dict] = field(default_factory=list)
+    notices: list[dict] = field(default_factory=list)
 
     @property
     def verdict(self) -> Optional[bool]:
@@ -204,9 +208,15 @@ def check_env_surfaces(
     folder = Path(folder)
     local_layer = True
     if _cp._SURFACE_CLAUDE_SETTINGS_LOCAL in names or _cp._SURFACE_CLAUDE_SETTINGS in names:
-        from vco_lib.settings_local_env import USABLE, layer_state
+        from vco_lib.settings_local_env import CID_UNKNOWN, UNKNOWN, USABLE, layer_probe
 
-        local_layer = layer_state(folder) == USABLE
+        state, git_error = layer_probe(folder)
+        local_layer = state == USABLE
+        if state == UNKNOWN:
+            # The same answer `apply` gates on and records as CID_UNKNOWN.
+            out.notices.append({"surface": _cp._JSON_SURFACE_FILES[
+                _cp._SURFACE_CLAUDE_SETTINGS_LOCAL][0], "condition": CID_UNKNOWN,
+                "reason": git_error})
     for surface in names:
         if surface in _cp._JSON_SURFACE_FILES:
             _check_json(folder, surface, canonical_env, out, local_layer=local_layer)

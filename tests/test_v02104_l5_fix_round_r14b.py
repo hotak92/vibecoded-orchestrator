@@ -5,7 +5,8 @@
 * B1 — a git-TRACKED ``.claude/settings.local.json`` gets no machine value
   (pre-L5 layout kept, ``settings_local_json_tracked`` recorded and cleared
   once untracked); an untracked one is written with no entry; git that cannot
-  answer writes nothing and records nothing.
+  answer writes nothing, logs why and records ``settings_local_layer_unknown``
+  (review R18 LOW-3).
 * B6 — a value the user put in ``settings.local.json`` is kept (and listed);
   a value VCO wrote before is VCO's and is replaced; the drift check agrees.
 * B5 — unregister clears every machine-local key from the new file even when
@@ -105,14 +106,47 @@ def test_untracked_local_file_in_a_repo_is_written_without_an_entry(repo: Path):
     assert not _has(repo, sle.CID_TRACKED)
 
 
-def test_git_that_cannot_answer_writes_nothing_and_records_nothing(tmp_path, monkeypatch):
+_DUBIOUS = ("fatal: detected dubious ownership in repository at '/srv/proj'\n"
+            "To add an exception for this directory, call: ...\n")
+
+
+def _git_refusing(folder, *args):
+    return subprocess.CompletedProcess(["git", *args], 128, "", _DUBIOUS)
+
+
+def test_git_that_cannot_answer_writes_nothing_and_says_why(tmp_path, monkeypatch, caplog):
+    """R18 LOW-3: git refuses the repository (``safe.directory``) → no machine
+    value is written (no guess), but the run logs one WARNING and records the
+    environmental entry naming git's error and the remedy; verify agrees."""
     project = tmp_path / "proj"
     project.mkdir()
-    monkeypatch.setattr(sle, "layer_state", lambda _folder: sle.UNKNOWN)
-    cp.apply_project_env(_bundle(project))
+    monkeypatch.setattr(sle, "_git", _git_refusing)
+    assert sle.layer_probe(project) == (sle.UNKNOWN, _DUBIOUS.splitlines()[0])
+    with caplog.at_level("WARNING", logger=sle.__name__):
+        cp.apply_project_env(_bundle(project))
     assert not (project / LOCAL).exists()
     assert _env(project / SETTINGS)["VCT_PROJECT_ID"] == "r14b-uuid"
     assert not _has(project, sle.CID_TRACKED)
+    assert any("dubious ownership" in r.getMessage() for r in caplog.records)
+    entry = next(e for e in DeferralReport.read(project).entries
+                 if e.condition_id == sle.CID_UNKNOWN)
+    assert "dubious ownership" in entry.detected
+    assert "safe.directory" in entry.command_to_apply
+    assert entry.dismiss_fields == {"git_error": _DUBIOUS.splitlines()[0]}
+    assert sle.layer_unknown_still(project) is True
+
+    from vco_lib.env_projection_check import check_env_surfaces
+    check = check_env_surfaces(project, _bundle(project)["canonical_env"])
+    assert check.verdict is True, "apply's layout is the expected one"
+    assert [n["condition"] for n in check.notices] == [sle.CID_UNKNOWN]
+    assert "dubious ownership" in check.notices[0]["reason"]
+
+    # git answers again → the next apply writes the layer and clears the entry.
+    monkeypatch.undo()
+    cp.apply_project_env(_bundle(project))
+    assert _env(project / LOCAL)["VCT_PROJECT_ID"] == "r14b-uuid"
+    assert not _has(project, sle.CID_UNKNOWN)
+    assert sle.layer_unknown_still(project) is False
 
 
 def test_the_tracked_condition_is_declared_with_its_probe():
@@ -121,6 +155,8 @@ def test_the_tracked_condition_is_declared_with_its_probe():
     text = (Path(cp.__file__).parent / "deferral_conditions.toml").read_text(encoding="utf-8")
     assert f"[conditions.{sle.CID_TRACKED}]" in text
     assert f"[conditions.{sle.CID_USER_KEPT}]" in text
+    assert f"[conditions.{sle.CID_UNKNOWN}]" in text
+    assert "settings_local_layer_still_unknown" in deferral_probes.PROBES
     assert "settings_local_json_still_tracked" in deferral_probes.PROBES
     assert "settings_local_user_values_still_kept" in deferral_probes.PROBES
 

@@ -114,8 +114,13 @@ def test_bundle_update_delivers_the_key_to_an_existing_project(tmp_path, monkeyp
     assert result["settings_action"] == "merged"
     data = json.loads((folder / ".claude" / "settings.json").read_text(encoding="utf-8"))
     assert data["idleCompaction"] is False
-    # Only the project's settings.json: no local file, nothing in the user's home.
-    assert not (folder / ".claude" / "settings.local.json").exists()
+    # Only the project's settings.json: not the local file (since L5 it holds
+    # this machine's env keys and nothing else), nothing in the user's home.
+    local = folder / ".claude" / "settings.local.json"
+    if local.exists():
+        local_data = json.loads(local.read_text(encoding="utf-8"))
+        assert "idleCompaction" not in local_data
+        assert set(local_data) <= {"env"}
     assert not (tmp_path / "home" / ".claude" / "settings.json").exists()
 
 

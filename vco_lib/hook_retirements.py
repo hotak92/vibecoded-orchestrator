@@ -977,6 +977,18 @@ def migrated_matcher(event: str, matcher: str, target: Optional[str]) -> str:
     return matcher
 
 
+def migration_sources(event: str, matcher: str, target: Optional[str]) -> Tuple[str, ...]:
+    """The OLD matchers a :data:`MATCHER_MIGRATIONS` row moves a ``target``
+    script's group FROM into ``matcher`` (its new matcher) in ``event`` —
+    ``()`` when no row does. The inverse of :func:`migrated_matcher`, for the
+    merge's append pass: a user group :func:`migrate_group_matcher` left
+    under the old matcher (it carries the user's own hook too) still
+    registers the script, so the template's group under the new matcher must
+    not register it a second time (review R18 LOW-1). Never raises."""
+    return tuple(row.old for row in MATCHER_MIGRATIONS
+                 if row.event == event and row.new == matcher and target in row.targets)
+
+
 def migrate_group_matcher(event: str, group: Any, template_matchers: Any) -> Optional[str]:
     """The new matcher for a user ``group`` of ``event``, or ``None`` when it
     must stay as it is.
@@ -1782,6 +1794,7 @@ __all__ = [
     "KIND_HOOK_SCRIPT",
     "MATCHER_MIGRATIONS",
     "MatcherMigration",
+    "migration_sources",
     "PRIOR_SHIPPED_SHAPES",
     "PriorShippedShape",
     "RETIRED_REGISTRATIONS",

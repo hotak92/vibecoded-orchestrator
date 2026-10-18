@@ -5051,8 +5051,9 @@ def _linked_worktree_root(md_path: Path, base: Path) -> Optional[Path]:
     FILE (a linked worktree's marker) whose ``gitdir:`` line points at an
     EXISTING directory under ``<base>/.git/worktrees/`` whose own ``gitdir``
     file points back at that marker (the reciprocal pointer git writes). A
-    marker without it -- a hand-written ``.git`` file, or one left behind by
-    ``git worktree prune`` -- is ``None``. Never a guess.
+    marker without it -- a hand-written ``.git`` file, one left behind by
+    ``git worktree prune``, or a symlink to another worktree's marker -- is
+    ``None``. Never a guess.
     """
     try:
         wt_gitdirs = (base / ".git" / "worktrees").resolve()
@@ -5076,7 +5077,10 @@ def _linked_worktree_root(md_path: Path, base: Path) -> Optional[Path]:
                     if not gitdir.is_dir():
                         return None
                     back = (gitdir / "gitdir").read_text(encoding="utf-8").strip()
-                    if Path(back).resolve() != marker.resolve():
+                    # The unresolved marker's parent: a SYMLINKED `.git`
+                    # aimed at a real worktree's marker must not pass (R18
+                    # LOW-2); a symlinked worktree DIRECTORY still does.
+                    if Path(back).resolve() != parent.resolve() / ".git":
                         return None
                 except (ValueError, OSError):
                     return None
@@ -5107,16 +5111,14 @@ async def store_knowledge_node(
     "shared"; shared writes are REFUSED, not rerouted, when
     SHARED_KG_WRITE_DISABLED=true).
 
-    WORKTREE LANES: a relative file_path resolves against KG_BASE_DIR, i.e.
-    the MAIN checkout -- this server is shared by the session and its
-    subagents and cannot see the caller's cwd. A lane working in a git
-    worktree must pass an ABSOLUTE file_path inside its worktree (or Write
-    the .md file itself); the stored path is then made relative to that
-    worktree.
+    WORKTREE LANES: a relative file_path resolves against KG_BASE_DIR (the
+    MAIN checkout -- this server is shared and cannot see the caller's cwd).
+    A lane in a git worktree must pass an ABSOLUTE file_path inside it (or
+    Write the .md itself); it is then stored relative to that worktree.
 
     Returns: JSON — success, file_written, absolute_path; a `warning` when the
     folder is not registered; `path_note` when a relative file_path was
-    resolved against KG_BASE_DIR (names the directory it landed in).
+    resolved against KG_BASE_DIR (names that directory).
     """
     # v0.2.95 R6: computed inside the try (it needs the resolved collection)
     # but declared HERE, because the failure payload must carry it too — the
@@ -5384,9 +5386,24 @@ async def store_knowledge_node(
 
         if file_path:
             # Lexical `..` is folded first (never resolve(): a symlinked
-            # base must keep behaving as before), so the containment checks
-            # below judge where the file really lands.
+            # base must keep behaving as before), so every arm below judges
+            # and stores where the file really lands. A RELATIVE path whose
+            # `..` climbs out of its base is refused (R18 NIT-3).
             fp = Path(os.path.normpath(file_path))
+            if not fp.is_absolute() and fp.parts and fp.parts[0] == "..":
+                return json.dumps({
+                    "status": "error",
+                    "success": False,
+                    "error": (
+                        f"relative file_path '{file_path}' climbs out of the "
+                        "knowledge base with '..'; pass a path inside it "
+                        "(e.g. knowledge/concepts/<name>.md) or an absolute path"
+                    ),
+                    "scope": scope,
+                    "file_written": False,
+                }, indent=2)
+            if not fp.is_absolute():
+                rel_file_path = fp.as_posix()
             if fp.is_absolute():
                 md_path = fp
                 # Compute relative path for Weaviate storage
@@ -5411,7 +5428,7 @@ async def store_knowledge_node(
                             f"storing absolute path in Weaviate (may affect cleanup script)"
                         )
             elif KG_BASE_DIR:
-                md_path = Path(KG_BASE_DIR) / file_path
+                md_path = Path(KG_BASE_DIR) / fp
                 path_note = (
                     f"relative file_path resolved against KG_BASE_DIR="
                     f"{KG_BASE_DIR} (worktree lanes: pass an absolute path)"
@@ -5428,13 +5445,13 @@ async def store_knowledge_node(
                 # is present.
                 _proj_root = _resolve_project_root_for_deferral()
                 if _proj_root is not None:
-                    md_path = _proj_root / file_path
+                    md_path = _proj_root / fp
                     logger.info(
                         f"KG_BASE_DIR not set — resolved via CLAUDE_PROJECT_DIR/"
                         f"KG_BASE_DIR fallback chain to project root: {md_path}"
                     )
                 else:
-                    md_path = _SERVER_INFERRED_BASE / file_path
+                    md_path = _SERVER_INFERRED_BASE / fp
                     wrote_outside_project = True
                     logger.warning(
                         "KG_BASE_DIR and CLAUDE_PROJECT_DIR both unset — writing "
@@ -5444,7 +5461,7 @@ async def store_knowledge_node(
                         "noise. Set KG_BASE_DIR or pass an absolute file_path.",
                         md_path,
                     )
-            # rel_file_path stays as file_path for relative inputs (already correct)
+            # rel_file_path is the `..`-folded relative path (set above)
 
         # C-7 (v0.2.75): normalize the STORED spelling to canonical POSIX
         # (forward-slash) at WRITE, and match BOTH spellings at DELETE. A node

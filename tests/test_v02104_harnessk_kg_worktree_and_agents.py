@@ -130,19 +130,26 @@ def _wait_guard_matchers(doc: dict) -> list:
             if any("wait-guard" in h.get("command", "") for h in g["hooks"])]
 
 
+#: The settings templates as shipped at 5b896ee0 (before the Monitor matcher
+#: left the self-wake group) — byte-for-byte what an installed project carries.
+_OLD_TEMPLATES = REPO_ROOT / "tests" / "fixtures" / "settings_templates_5b896ee0"
+
+
+def _templates(flavour: str) -> tuple:
+    import json
+
+    name = f"settings.json.{flavour}.template"
+    return (json.loads((_OLD_TEMPLATES / name).read_text(encoding="utf-8")),
+            json.loads((REPO_ROOT / "templates" / name).read_text(encoding="utf-8")))
+
+
 @pytest.mark.parametrize("flavour", ["linux", "windows"])
 def test_installed_old_self_wake_group_is_migrated_not_duplicated(flavour):
     import copy
-    import json
 
     from vco_lib import settings_merge
 
-    template = json.loads((REPO_ROOT / "templates" /
-                           f"settings.json.{flavour}.template").read_text(encoding="utf-8"))
-    installed = copy.deepcopy(template)  # the 5b896ee0 shape: old matcher
-    for g in installed["hooks"]["PreToolUse"]:
-        if g.get("matcher") == NEW_MATCHER:
-            g["matcher"] = OLD_MATCHER
+    installed, template = _templates(flavour)
     assert OLD_MATCHER in _wait_guard_matchers(installed)
 
     merged = settings_merge.smart_merge_settings(installed, template)
@@ -154,21 +161,26 @@ def test_installed_old_self_wake_group_is_migrated_not_duplicated(flavour):
     assert settings_merge.smart_merge_settings(copy.deepcopy(merged), template) == merged
 
 
-def test_user_group_with_own_hook_keeps_its_matcher():
+@pytest.mark.parametrize("flavour", ["linux", "windows"])
+def test_user_group_with_own_hook_keeps_its_matcher_and_is_not_doubled(flavour):
+    """A self-wake group that also holds the user's own hook is theirs: it
+    keeps the old matcher (W5-D contract) — and the template's new-matcher
+    group must not register wait-guard a second time (review R18 LOW-1)."""
     import copy
-    import json
 
     from vco_lib import settings_merge
 
-    template = json.loads((REPO_ROOT / "templates" /
-                           "settings.json.linux.template").read_text(encoding="utf-8"))
-    installed = copy.deepcopy(template)
+    installed, template = _templates(flavour)
     for g in installed["hooks"]["PreToolUse"]:
-        if g.get("matcher") == NEW_MATCHER:
-            g["matcher"] = OLD_MATCHER
+        if g.get("matcher") == OLD_MATCHER:
             g["hooks"].append({"type": "command", "command": "bash ~/mine.sh"})
     merged = settings_merge.smart_merge_settings(installed, template)
-    assert OLD_MATCHER in [g.get("matcher") for g in merged["hooks"]["PreToolUse"]]
+    got = _wait_guard_matchers(merged)
+    assert OLD_MATCHER in got, "the user's group keeps its matcher"
+    assert NEW_MATCHER not in got, "wait-guard registered twice on ScheduleWakeup/CronCreate"
+    mine = [g for g in merged["hooks"]["PreToolUse"] if g.get("matcher") == OLD_MATCHER]
+    assert any(h.get("command") == "bash ~/mine.sh" for h in mine[0]["hooks"])
+    assert settings_merge.smart_merge_settings(copy.deepcopy(merged), template) == merged
 
 
 def test_spoofed_git_file_with_nonexistent_gitdir_is_rejected(repo_and_worktree, tmp_path):
@@ -214,3 +226,38 @@ def test_relative_path_note_is_short(monkeypatch, tmp_path):
     _patch_server_for_store(monkeypatch, tmp_path, _FakeCollection())
     res = _store(_server())
     assert len(res["path_note"]) < 160
+
+
+def test_symlinked_git_marker_does_not_claim_a_worktree(repo_and_worktree, tmp_path):
+    """R18 LOW-2: ``evil/.git`` symlinked to a real worktree's marker passes
+    the reciprocal check only if the marker is resolved — it must not."""
+    main, wt = repo_and_worktree
+    evil = tmp_path / "evil3"
+    evil.mkdir()
+    (evil / ".git").symlink_to(wt / ".git")
+    assert _server()._linked_worktree_root(evil / "knowledge" / "x.md", main) is None
+
+
+def test_symlinked_worktree_directory_still_resolves(repo_and_worktree, tmp_path):
+    main, wt = repo_and_worktree
+    lnk = tmp_path / "lnk"
+    lnk.symlink_to(wt, target_is_directory=True)
+    assert _server()._linked_worktree_root(lnk / "knowledge" / "x.md", main) == lnk
+
+
+def test_relative_dotdot_escaping_the_base_is_refused(monkeypatch, tmp_path):
+    """R18 NIT-3: the relative arm folds ``..`` too, and a path that climbs
+    out of KG_BASE_DIR is refused, never written outside it."""
+    base = tmp_path / "proj"
+    base.mkdir()
+    _patch_server_for_store(monkeypatch, base, _FakeCollection())
+    res = _store(_server(), file_path="knowledge/concepts/../../../x.md")
+    assert res.get("success") is False and res["file_written"] is False
+    assert not (tmp_path / "x.md").exists()
+
+
+def test_relative_dotdot_inside_the_base_is_folded(monkeypatch, tmp_path):
+    _patch_server_for_store(monkeypatch, tmp_path, _FakeCollection())
+    res = _store(_server(), file_path="knowledge/concepts/sub/../sample_b.md")
+    assert ".." not in res["file_path"] and ".." not in res["absolute_path"]
+    assert res["absolute_path"] == str(tmp_path / "knowledge" / "concepts" / "sample_b.md")

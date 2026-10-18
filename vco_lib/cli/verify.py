@@ -702,6 +702,7 @@ def _verify_env_projection_for_project(
             "overall": "ok",
             "surfaces": _surface_labels(check),
             "expected_keys": sorted(expected.keys()),
+            "notices": list(check.notices),
         }
 
     if not fix:
@@ -712,6 +713,7 @@ def _verify_env_projection_for_project(
             "overall": "drift",
             "surfaces": _surface_labels(check),
             "drift": check.drift,
+            "notices": list(check.notices),
         }
 
     # --fix path: re-project from the DB. Aborts on failure with exit 3.
@@ -757,6 +759,7 @@ def _verify_env_projection_for_project(
         "overall": "ok_after_fix",
         "surfaces": _surface_labels(after),
         "expected_keys": sorted(expected.keys()),
+        "notices": list(after.notices),
     }
 
 
@@ -847,6 +850,10 @@ def cmd_verify_env_projection(args: argparse.Namespace) -> int:
 def _print_env_projection_human(payload: Mapping[str, Any]) -> None:
     overall = payload.get("overall", "")
     pid = payload.get("project_id", "<unknown>")
+    for row in payload.get("notices", []):
+        print(f"NOTE — {pid}: {row.get('surface')} is not used ({row.get('condition')}): "
+              f"git gave no clean answer ({row.get('reason')}), so this machine's paths "
+              "stay in .claude/settings.json.", file=sys.stderr)
     if overall in {"ok", "ok_after_fix"}:
         label = "OK" if overall == "ok" else "OK (after --fix)"
         keys = payload.get("expected_keys", [])

@@ -14,8 +14,10 @@ decide WHETHER and WHAT VCO may write there:
   machine value into it — the project keeps the pre-L5 layout (every key in
   ``settings.json``) so routing works — and records the action-required
   :data:`CID_TRACKED` entry, whose remedy is ``git rm --cached``. When git's
-  answer is not a clean yes/no the layer is not used either (no guess), and no
-  entry is written.
+  answer is not a clean yes/no (it refuses the repository — ``safe.directory``
+  "dubious ownership" — or is broken) the layer is not used either (no guess):
+  one WARNING log line and the environmental :data:`CID_UNKNOWN` entry name
+  git's error and the remedy (review R18 LOW-3).
 * **A value the user put there stays** (review R14B B6). Claude Code merges
   ``settings.local.json`` over ``settings.json``, so before L5 that file was
   the user's per-machine override channel. A machine key VCO finds there is
@@ -33,6 +35,7 @@ can never disagree about the file.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -40,12 +43,15 @@ from typing import Any, Iterable, Mapping, Optional
 
 __all__ = [
     "CID_TRACKED",
+    "CID_UNKNOWN",
     "CID_USER_KEPT",
     "LOCAL_REL",
     "NON_CANONICAL_MACHINE_ENV_KEYS",
     "WRITTEN_REL",
     "is_machine_env_key",
+    "layer_probe",
     "layer_state",
+    "layer_unknown_still",
     "move_machine_env_out_of_settings",
     "sync_tracked_entry",
     "tracked_still",
@@ -61,6 +67,7 @@ LOCAL_REL = ".claude/settings.local.json"
 WRITTEN_REL = ".claude/state/settings-local-vco-values.json"
 
 CID_TRACKED = "settings_local_json_tracked"
+CID_UNKNOWN = "settings_local_layer_unknown"
 CID_USER_KEPT = "settings_local_user_value_kept"
 
 #: Machine-endpoint env keys VCO writes that are NOT canonical projection keys
@@ -74,6 +81,8 @@ TRACKED = "tracked"
 UNKNOWN = "unknown"
 
 _GIT_TIMEOUT_S = 15
+
+_log = logging.getLogger(__name__)
 
 
 def is_machine_env_key(key: str) -> bool:
@@ -100,34 +109,53 @@ def _git(folder: Path, *args: str) -> Optional[subprocess.CompletedProcess]:
         return subprocess.CompletedProcess(args, 128, "", "git could not run")
 
 
-def layer_state(folder: Path) -> str:
-    """:data:`USABLE`, :data:`TRACKED` or :data:`UNKNOWN` for ``folder``'s
-    ``.claude/settings.local.json``. Local only (no network); read-only.
+def _git_error(proc: subprocess.CompletedProcess, what: str) -> str:
+    err = (proc.stderr or "").strip().splitlines()
+    return err[0].strip() if err else f"git {what} exited {proc.returncode}"
+
+
+def layer_probe(folder: Path) -> tuple[str, str]:
+    """``(state, git_error)`` for ``folder``'s ``.claude/settings.local.json``:
+    :data:`USABLE`, :data:`TRACKED` or :data:`UNKNOWN`, and — for
+    :data:`UNKNOWN` only — git's own error line (else ``""``). Local only (no
+    network); read-only.
 
     * not a git work tree, or no git on the machine → usable (nothing to commit
       it with; the exclude line covers the file once a repository appears);
     * ``git ls-files --error-unmatch`` exit 0 → tracked; exit 1 → usable;
-    * anything else (git broke, timed out) → unknown — the caller must not
-      write a machine value it cannot prove stays private.
+    * anything else (git refuses the repository, broke, timed out) → unknown —
+      the caller must not write a machine value it cannot prove stays private.
     """
     folder = Path(folder)
     inside = _git(folder, "rev-parse", "--is-inside-work-tree")
     if inside is None:
-        return USABLE
+        return USABLE, ""
     if inside.returncode != 0:
         # 128 = not a git repository; anything else is git failing.
-        return USABLE if inside.returncode == 128 and "not a git repository" in (
-            inside.stderr or "").lower() else UNKNOWN
+        if inside.returncode == 128 and "not a git repository" in (inside.stderr or "").lower():
+            return USABLE, ""
+        return UNKNOWN, _git_error(inside, "rev-parse")
     if inside.stdout.strip() != "true":
-        return USABLE  # inside a .git dir or a bare repo — no work tree to commit from
+        return USABLE, ""  # inside a .git dir or a bare repo — no work tree to commit from
     probe = _git(folder, "ls-files", "--error-unmatch", "--", LOCAL_REL)
     if probe is None:
-        return USABLE
+        return USABLE, ""
     if probe.returncode == 0:
-        return TRACKED
+        return TRACKED, ""
     if probe.returncode == 1:
-        return USABLE
-    return UNKNOWN
+        return USABLE, ""
+    return UNKNOWN, _git_error(probe, "ls-files")
+
+
+def layer_state(folder: Path) -> str:
+    """The state half of :func:`layer_probe`."""
+    return layer_probe(folder)[0]
+
+
+def layer_unknown_still(folder: Path) -> bool:
+    """Clear probe for :data:`CID_UNKNOWN`: does git still give no clean
+    answer for ``folder``? The SAME probe the writer gates on."""
+    return layer_state(folder) == UNKNOWN
 
 
 def tracked_still(folder: Path) -> Optional[bool]:
@@ -137,25 +165,32 @@ def tracked_still(folder: Path) -> Optional[bool]:
     return None if state == UNKNOWN else state == TRACKED
 
 
-def sync_tracked_entry(folder: Path, state: str, *, project_id: Optional[str] = None) -> None:
+def sync_tracked_entry(folder: Path, state: str, *, project_id: Optional[str] = None,
+                       git_error: str = "") -> None:
     """Emit :data:`CID_TRACKED` for a tracked file; clear it once the file is
-    usable again (paired resolution). ``unknown`` changes nothing. Best-effort:
-    the ledger never fails a write."""
+    usable again (paired resolution). ``unknown`` leaves that entry as it is
+    and records :data:`CID_UNKNOWN` instead (``git_error`` from
+    :func:`layer_probe`), cleared once git answers. Best-effort: the ledger
+    never fails a write."""
+    if state == UNKNOWN:
+        _log.warning(
+            "settings.local.json: git gave no clean answer for %s (%s) — this "
+            "machine's paths stay in .claude/settings.json", folder, git_error or "unknown error")
+        _emit_unknown_entry(Path(folder), git_error, project_id)
+        return
     try:
         from vco_lib.deferral_emit import emit, resolve_conditions
         from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
+        if DeferralReport.read(folder).has_condition(CID_UNKNOWN):
+            resolve_conditions(folder, [CID_UNKNOWN])
         if state == USABLE:
             if DeferralReport.read(folder).has_condition(CID_TRACKED):
                 resolve_conditions(folder, [CID_TRACKED])
             return
         if state != TRACKED:
             return
-        retry = (
-            f"python -m vco_lib.config_projection apply --project-id {project_id}\n"
-            if project_id else
-            "# then refresh the project's env (launcher: Settings → Re-render this project's env)\n"
-        )
+        retry = _refresh_line(project_id)
         emit(folder, DeferralEntry(
             condition_id=CID_TRACKED,
             title="`.claude/settings.local.json` is committed to git — VCO keeps this machine's paths out of it",
@@ -164,7 +199,7 @@ def sync_tracked_entry(folder: Path, state: str, *, project_id: Optional[str] = 
                 "machine's absolute paths (your home folder, so your username), launcher ids "
                 "and local service ports into that file's `env` — Claude Code's per-machine "
                 "settings, which are never meant to be committed. Because the file is "
-                "committed, VCO did NOT write them there: they stay in `.claude/settings.json`, "
+                "committed, VCO writes no new values there: they stay in `.claude/settings.json`, "
                 "as before v0.2.104, so the project keeps working."
             ),
             why_deferred=(
@@ -180,6 +215,50 @@ def sync_tracked_entry(folder: Path, state: str, *, project_id: Optional[str] = 
                 + "# This entry clears itself once git no longer tracks the file."
             ),
             severity="warning",
+        ), keep_first_detected=True)
+    except Exception:  # noqa: BLE001 — the ledger is best-effort
+        pass
+
+
+def _refresh_line(project_id: Optional[str]) -> str:
+    return (
+        f"python -m vco_lib.config_projection apply --project-id {project_id}\n"
+        if project_id else
+        "# then refresh the project's env (launcher: Settings → Re-render this project's env)\n"
+    )
+
+
+def _emit_unknown_entry(folder: Path, git_error: str, project_id: Optional[str]) -> None:
+    """Record :data:`CID_UNKNOWN` (environmental, review R18 LOW-3)."""
+    try:
+        from vco_lib.deferral_emit import emit
+        from vco_lib.deferral_report import DeferralEntry
+
+        reason = git_error or "git returned an unexpected error"
+        emit(folder, DeferralEntry(
+            condition_id=CID_UNKNOWN,
+            title="Git gives no answer for this project, so its machine paths stay in `.claude/settings.json`",
+            detected=(
+                "VCO asks git whether `.claude/settings.local.json` is committed before it writes "
+                "this machine's absolute paths, launcher ids and local service ports there. Git "
+                f"did not answer cleanly: `{reason}`. VCO writes no machine value into a file it "
+                "cannot prove stays private, so those values remain in the committable "
+                "`.claude/settings.json`, as before v0.2.104 (the project keeps working)."
+            ),
+            why_deferred=(
+                "The fix is a change to your git setup. The usual cause is git's `safe.directory` "
+                "check (\"detected dubious ownership\": the folder is owned by another user, on a "
+                "mounted drive or under WSL); a damaged `.git` is the other. Trusting a folder is "
+                "your decision, so VCO does not do it."
+            ),
+            command_to_apply=(
+                f"git -C \"{folder}\" status   # shows the same error\n"
+                f"git config --global --add safe.directory \"{folder}\"   # only if you trust the folder\n"
+                + _refresh_line(project_id)
+                + "# This entry clears itself once git answers."
+            ),
+            severity="warning",
+            dismiss_fields={"git_error": reason},
         ), keep_first_detected=True)
     except Exception:  # noqa: BLE001 — the ledger is best-effort
         pass
@@ -385,8 +464,8 @@ def move_machine_env_out_of_settings(
     present = {k: v for k, v in machine.items() if env.get(k) == v}
     if not present:
         return []
-    state = layer_state(folder)
-    sync_tracked_entry(folder, state)
+    state, git_error = layer_probe(folder)
+    sync_tracked_entry(folder, state, git_error=git_error)
     if state != USABLE:
         return []
     refusals: list = []

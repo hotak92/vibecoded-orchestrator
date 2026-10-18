@@ -455,3 +455,29 @@ def test_bulk_incremental_saves_keep_concurrent_entries(clean_env, monkeypatch, 
     assert B_KEY in db, "the concurrent single-mode entry was erased"
     assert "knowledge/concepts/node-a.md" in db, "this run's generated entry is missing"
     assert Z_KEY not in db, "the archived entry must be dropped"
+
+
+@pytest.mark.parametrize("concurrent_drop", [False, True])
+def test_single_mode_archived_drop_logs_from_the_re_read(
+        clean_env, monkeypatch, tmp_path, concurrent_drop):
+    """R18 NIT-1: the "dropped" line follows what the re-read found — a
+    concurrent run that already dropped the key leaves nothing to report."""
+    root, mod = _project(tmp_path, monkeypatch, {"z-archived.md": ARCHIVED_TEXT})
+    sidecar = root / "knowledge" / ".node_formats.json"
+    sidecar.write_text(json.dumps({Z_KEY: {"title": "Z", "summary": "old"}}), encoding="utf-8")
+    real = mod.rekey_separator_entries
+
+    def _rekey_then_race(formats):  # runs right after run A's read of the sidecar
+        if concurrent_drop:
+            mod.drop_one_entry(Z_KEY)
+        return real(formats)
+
+    lines: list = []
+    monkeypatch.setattr(mod, "log", lambda msg, *a, **k: lines.append(msg))
+    monkeypatch.setattr(mod, "rekey_separator_entries", _rekey_then_race)
+    monkeypatch.setattr(sys, "argv", ["generate-kg-summary.py", str(root / "knowledge/concepts/z-archived.md")])
+    with pytest.raises(SystemExit):
+        mod.main()
+    assert Z_KEY not in json.loads(sidecar.read_text(encoding="utf-8"))
+    dropped = [ln for ln in lines if "dropped the stale sidecar entry" in ln]
+    assert len(dropped) == (0 if concurrent_drop else 1)

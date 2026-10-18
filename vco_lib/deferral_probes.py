@@ -877,6 +877,18 @@ def settings_local_json_still_tracked(ctx: ProbeContext) -> Optional[bool]:
         return None
 
 
+def settings_local_layer_still_unknown(ctx: ProbeContext) -> Optional[bool]:
+    """``settings_local_layer_unknown`` — does git still give no clean answer
+    about the project's ``.claude/settings.local.json``? The SAME probe the env
+    writer gates on (:func:`vco_lib.settings_local_env.layer_unknown_still`)."""
+    from vco_lib.settings_local_env import layer_unknown_still
+
+    try:
+        return layer_unknown_still(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def settings_local_user_values_still_kept(ctx: ProbeContext) -> Optional[bool]:
     """``settings_local_user_value_kept`` — does a machine key in
     ``settings.local.json`` still hold a value VCO did not write? The SAME
@@ -1390,6 +1402,7 @@ PROBES: dict[str, ProbeFn] = {
     "settings_write_refusal_still_applies": settings_write_refusal_still_applies,
     "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
     "settings_local_json_still_tracked": settings_local_json_still_tracked,
+    "settings_local_layer_still_unknown": settings_local_layer_still_unknown,
     "settings_local_user_values_still_kept": settings_local_user_values_still_kept,
     "code_embed_image_still_stale": code_embed_image_still_stale,
     "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,

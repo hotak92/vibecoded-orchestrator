@@ -993,6 +993,11 @@ def test_f9_prune_spawned_by_background_resync(monkeypatch, tmp_path):
     # Weaviate on developer machines (absent TProj collections → not_owed).
     monkeypatch.setattr(mod, "count_stale_rows", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_register_spawn_with_hub", lambda *a, **k: None)
+    # v0.2.104: hermetic too — the walk's model resolves from machine state
+    # (launcher DB, env) and a resolved jina/qwen3 model probes the live
+    # Ollama instead of the patched container probe above; in a full-suite
+    # chunk that made the result order-dependent ("deferred").
+    monkeypatch.setattr(mod, "_walk_code_models", lambda *a, **k: [])
     scripts = tmp_path / ".claude" / "scripts"
     scripts.mkdir(parents=True)
     (scripts / "analyze_code_graph.py").write_text("# stub\n")

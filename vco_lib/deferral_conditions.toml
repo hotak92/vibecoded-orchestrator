@@ -1261,6 +1261,24 @@ cleared by the same writer once git no longer tracks the file (paired) and by th
 probe (None — keep — when git cannot say). Remedy: `git rm --cached \
 .claude/settings.local.json` + commit, then an env refresh."""
 
+[conditions.settings_local_layer_unknown]
+class = "environmental"
+owner = "vco_lib.settings_local_env"
+clear_probe = "probe:py:settings_local_layer_still_unknown"
+emit_surfaces = ["ledger"]
+dismiss_key = ["git_error"]
+notes = """v0.2.104 (review R18 LOW-3). Git gave no clean answer about the \
+project's `.claude/settings.local.json` — it refuses the repository (`safe.directory` \
+"detected dubious ownership": another owner, a mounted drive, WSL) or the `.git` is \
+damaged — so VCO cannot prove the per-machine file stays out of commits and writes \
+NO machine value there: the pre-L5 layout stays (every key in `.claude/settings.json`). \
+A true description of the machine while git keeps refusing; the entry names git's \
+error line and the remedy (inspect with `git status`; trust the folder with \
+`safe.directory` only if the user does). Emitted with one WARNING log line by the same \
+writers as `settings_local_json_tracked` (`settings_local_env.sync_tracked_entry`); \
+cleared by them once git answers (paired) and by the probe, which re-asks the SAME \
+`layer_state` the writer gates on. `vco verify-env-projection` lists it as a notice."""
+
 [conditions.settings_local_user_value_kept]
 class = "informational_record"
 owner = "vco_lib.settings_local_env"

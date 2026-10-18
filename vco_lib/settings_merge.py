@@ -61,6 +61,7 @@ from typing import Any, Optional
 from vco_lib.hook_retirements import (
     match_prior_shipped_shape,
     migrate_group_matcher,
+    migration_sources,
     scrub_retired_registrations,
     vco_hook_script_identity,
 )
@@ -482,7 +483,13 @@ def merge_hooks_block(
                     return (t_matcher, c, t_hook["if"]) in present_if_rules
             ident = vco_hook_script_identity(c)
             if ident is not None and len(template_matchers.get(ident, ())) > 1:
-                return (t_matcher, ident) in present_idents or (t_matcher, c) in present_cmds
+                # A user group the matcher migration left under its OLD
+                # matcher (it also holds the user's own hook — theirs, kept
+                # as it is) already registers the script: no second copy
+                # under the new matcher (review R18 LOW-1).
+                return ((t_matcher, ident) in present_idents or (t_matcher, c) in present_cmds
+                        or any((old, ident) in present_idents
+                               for old in migration_sources(event, t_matcher, ident)))
             if c in existing_cmds:
                 return True
             return ident is not None and ident in superseded_identities

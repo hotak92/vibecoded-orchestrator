@@ -2699,8 +2699,8 @@ def _write_local_settings_surface(
     in the file is kept, a machine key the bundle omits is removed, JSONC is
     edited in place, a file that cannot be edited safely is refused and
     recorded. ``None`` when refused — or when the file may not carry machine
-    values at all: git tracks it, or cannot say (review R14B B1; the tracked
-    case is recorded as ``settings_local_json_tracked``).
+    values at all: git tracks it, or cannot say (review R14B B1; recorded as
+    ``settings_local_json_tracked`` / ``settings_local_layer_unknown``).
 
     A machine key whose value there is the user's (neither VCO's projection
     nor a value VCO wrote before) is left as it is (review R14B B6) — the
@@ -2714,8 +2714,8 @@ def _write_local_settings_surface(
     """
     from vco_lib import settings_local_env as _sle
 
-    state = _sle.layer_state(project_root)
-    _sle.sync_tracked_entry(project_root, state, project_id=project_id)
+    state, git_error = _sle.layer_probe(project_root)
+    _sle.sync_tracked_entry(project_root, state, project_id=project_id, git_error=git_error)
     if state != _sle.USABLE:
         return None
     local_keys = sorted(surface_keys(_SURFACE_CLAUDE_SETTINGS_LOCAL))

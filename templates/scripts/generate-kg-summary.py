@@ -981,12 +981,13 @@ def main():
     archived = _archived_reason(file_path, full_text)
     if archived:
         print(f"  {title}: {ARCHIVED_SKIP_MARKER} ({archived})")
-        if _drop_sidecar_entry(rel_path, formats):
-            if args.dry_run:
+        if args.dry_run:
+            if rel_path in formats:
                 print(f"  {title}: dry-run — would drop the stale sidecar entry")
-            else:
-                drop_one_entry(rel_path)
-                log(f"  {title}: dropped the stale sidecar entry for the archived node")
+        elif drop_one_entry(rel_path):
+            # Logged from the re-read's answer, not the pre-call dict: a
+            # concurrent run may already have dropped it (review R18 NIT-1).
+            log(f"  {title}: dropped the stale sidecar entry for the archived node")
         sys.exit(0)
 
     existing = formats.get(rel_path, {})
