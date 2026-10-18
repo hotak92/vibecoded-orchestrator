@@ -174,13 +174,17 @@ from .context_table import (
     load_seed,
 )
 from .fileperms import OwnerOnlyState
-from .quota import (
+from .quota import (  # the ladder names are re-exported (moved v0.2.104)
     CLASS_EXHAUSTED,
     CLIENT_QUOTA_STATUS,
+    FALLBACK_RETRY_AFTER_MAX_DEFAULT_S,
+    FALLBACK_RETRY_AFTER_MAX_ENV,
+    LADDER_FALLBACK,
+    LADDER_RETRY,
     QUOTA_STATUSES,
-    _find_reset_value,
-    _reset_distance_s,
+    _ladder_verdict,
     classify_quota,
+    fallback_retry_after_max_s,
     find_reset_hint,
     is_quota_refusal,
     quota_error_body,
@@ -213,12 +217,14 @@ from .usage import (
     note_count_substitution,
     read_identity,
 )
+from .quota_latch import QuotaLatch, QuotaRefusal
 from .api_key_route import (
     API_KEY_REFUSAL_STATUSES,
     API_KEY_REFUSED_ERROR_TYPE,
     API_KEY_REFUSED_HEADERS,
     API_KEY_REFUSED_STATUS,
     API_KEY_ROUTE_LABEL,
+    ApiKeyEscalation,
     ApiKeyRefused,
     api_key_headers,
     api_key_refusal_is_key_level,
@@ -365,71 +371,6 @@ _AUTH_BODY_LIMIT_BYTES = 64 * 1024
 #: has: the two bound different decisions, and the day one moves is not the
 #: day the other does.
 _VENDOR_ERROR_BODY_LIMIT_BYTES = 64 * 1024
-
-#: The fallback ladder's retry-after threshold, in seconds (OD-9): a 429 that
-#: carries ``retry-after`` at or below this is retried ONCE on the same rung
-#: before the ladder falls back; one without a retry-after, or with a
-#: quota-exhausted body, falls back immediately. Above the threshold the
-#: window is too long to hold a chat request for, so it falls back too — the
-#: reading of OD-9 that keeps the ladder what it is for (chat continuity),
-#: recorded here rather than in the ruling. Env-tunable because the right
-#: wait is a per-workload judgement, like the context guard's margin.
-FALLBACK_RETRY_AFTER_MAX_DEFAULT_S = 30
-
-#: The env var that overrides :data:`FALLBACK_RETRY_AFTER_MAX_DEFAULT_S`.
-FALLBACK_RETRY_AFTER_MAX_ENV = "VCT_GATEWAY_FALLBACK_RETRY_AFTER_MAX_S"
-
-
-def fallback_retry_after_max_s() -> float:
-    """The ladder's retry-after threshold, in seconds. Never raises.
-
-    An unset, non-numeric or non-positive value answers the default — a typo
-    in the knob must not disable the same-rung retry (which a ``0`` would:
-    every short rate limit would fall straight through to the next vendor).
-    """
-    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
-
-    return env_float(FALLBACK_RETRY_AFTER_MAX_ENV, FALLBACK_RETRY_AFTER_MAX_DEFAULT_S, above=0)
-
-
-#: The two answers :func:`_ladder_verdict` can give.
-LADDER_FALLBACK = "fallback"
-LADDER_RETRY = "retry"
-
-
-def _ladder_verdict(
-    status: int,
-    body: bytes,
-    headers: "Mapping[str, str] | None",
-) -> "tuple[str, Optional[float]]":
-    """OD-9's trigger, as one decision for a quota-status answer.
-
-    Returns ``(LADDER_FALLBACK, None)`` or ``(LADDER_RETRY, delay_s)``. The
-    owner's rule (2026-10-07): fall back when the answer is a 429 WITHOUT a
-    readable ``retry-after``, or with a quota-exhausted body; on a 429 WITH
-    ``retry-after`` <= :func:`fallback_retry_after_max_s`, retry the same
-    rung once and fall back if it refuses again (the "once" is the caller's
-    recursion bound, not this function's). A window LONGER than the threshold
-    also falls back — waiting it out is what the ladder exists to spare the
-    chat. The evidence reading is :mod:`model_router.quota`'s, through the
-    same helpers ``_quota_response`` uses, so the ladder and the substituted
-    quota message can never disagree about what a vendor said. 402 is a
-    balance condition and classifies exhausted, so it falls back with the
-    rest.
-    """
-    if classify_quota(status, body, headers) == CLASS_EXHAUSTED:
-        return LADDER_FALLBACK, None
-    distance = _reset_distance_s(_find_reset_value(body, headers))
-    # ``0 <=`` on purpose (batch-6 B-2): a ``retry-after: 0`` means "retry
-    # immediately" — a free same-rung retry — and must not be read as
-    # no-retry-after, which would spend the next rung's quota where the same
-    # vendor offered to serve a moment later. A NEGATIVE distance (a reset
-    # epoch already in the past) still falls back: it is not a delay the
-    # vendor quoted for a retry.
-    if distance is None or not 0 <= distance <= fallback_retry_after_max_s():
-        return LADDER_FALLBACK, None
-    return LADDER_RETRY, distance
-
 
 #: What a GATEWAY-side 502 carries. Anthropic's SDKs read ``x-should-retry``
 #: to decide whether a status is worth another attempt, and every 502 this
@@ -678,6 +619,12 @@ class Gateway:
             fetch=session_fetcher(lambda: self.session),
             ledger_path=lambda: self.usage.path,
         )
+        #: The subscription-out latch (v0.2.104): which subscription limit is
+        #: exhausted, for which models, until when. See :mod:`model_router.quota_latch`.
+        self.quota_latch = QuotaLatch()
+        self.usage_windows.latch_report = lambda: self.quota_latch.report(
+            self.usage_windows.anthropic_readings(),
+        )
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -792,6 +739,7 @@ class Gateway:
     def note_api_key_accepted(self) -> None:
         """A 2xx on the API-key route: whatever was refused before is fine."""
         self._api_key_refused_fp = None
+        self.quota_latch.key_accepted()
 
     def api_key_state(self) -> str:
         """``available`` / ``missing`` / ``unknown`` for the API-key route's
@@ -1087,7 +1035,9 @@ async def health_handler(request: web.Request) -> web.Response:
     — the secret NAME the key resolves from, never a value; ``launcher_db`` —
     ``ok``, or ``unreadable`` with ``launcher_db_error`` and
     ``launcher_db_unreadable_since`` while the launcher DB cannot be read and
-    the LAST value read is being applied),
+    the LAST value read is being applied; ``quota_latch`` — the
+    subscription-out latches in force, each ``limit`` / ``scope`` / ``until``
+    / ``since`` / ``source``, empty when none),
     ``secret_scope`` (``project`` — the scope vendor keys resolve in, which is
     the pin when there is one and this process's working directory when there
     is not, because that is what the resolver itself falls back to;
@@ -1181,6 +1131,7 @@ async def health_handler(request: web.Request) -> web.Response:
                     if gateway.anthropic.api_key is not None else None
                 ),
                 **launcher_db_report(gateway.anthropic_auth, gateway.api_key_fallback),
+                "quota_latch": gateway.usage_windows.latch_report(),
             },
             # In-memory counter — the alias-tripwire of issue 9.
             "model_echo_mismatches": gateway.model_echo_mismatches,
@@ -1503,6 +1454,7 @@ def _submit_usage(
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
         auth=decision.auth,
+        latched=decision.latched,
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -2418,7 +2370,8 @@ async def _stream_after(
 
 
 #: The escalation callable shape the proxy's ladder branch invokes.
-Escalation = Callable[[str], Awaitable[Optional[web.StreamResponse]]]
+#: Called as ``escalate(evidence, refusal=QuotaRefusal | None)``.
+Escalation = Callable[..., Awaitable[Optional[web.StreamResponse]]]
 
 
 def _ladder_escalation(
@@ -2500,8 +2453,15 @@ def _api_key_escalation(
     rung: "Optional[Escalation]",
     effort_requested: Optional[str],
     effort_forwarded: Optional[str],
-) -> "Escalation":
+) -> "ApiKeyEscalation":
     """The subscription -> API-key retry, as an escalation callable.
+
+    v0.2.104 subscription-out latch: the escalation hands the qualifying
+    refusal to :meth:`QuotaLatch.note_refusal` before it sends, and its
+    ``serve_latched`` entry is what the handler calls INSTEAD of a
+    subscription attempt while a latch covers the model (``latched: true`` on
+    the ledger row, ``note=quota_latched`` on the access line). A refused key
+    clears the latch (:meth:`QuotaLatch.key_refused`).
 
     Re-sends the SAME bytes the subscription attempt sent (same model, same
     repaired body) to the same upstream with the Console key
@@ -2525,7 +2485,38 @@ def _api_key_escalation(
     assert api is not None  # noqa: S101 — guaranteed by api_key_fallback_route
     from_label = f"{_route_label(decision)}:{decision.forward_model}"
 
-    async def escalate(evidence: str) -> "Optional[web.StreamResponse]":
+    async def send(key: str, route_used: Route, note: str) -> web.StreamResponse:
+        headers = api_key_headers(
+            gateway.forward_headers(request), api, key,
+            one_m_requested=decision.one_m_requested,
+        )
+        headers["Content-Type"] = "application/json"
+        headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
+        url = f"{api_decision.upstream}{_canonical_path(request)}"
+        if request.query_string:
+            url = f"{url}?{request.query_string}"
+        return await _proxy(
+            request, gateway, route_used, url, headers, body,
+            requested_model=requested_model, stream_requested=stream_requested,
+            started=started, note=note.strip(), images=images, facts=facts,
+            allow_oauth_retry=False, ladder_escalate=rung,
+            fallback_from=from_label, effort_requested=effort_requested,
+            effort_forwarded=effort_forwarded, defer_api_key_refusal=True,
+        )
+
+    def key_refused(refused: ApiKeyRefused, then: str) -> None:
+        # Back to the subscription: no latch may send requests to this key.
+        gateway.quota_latch.key_refused()
+        logger.info(
+            "model-gateway: API-key fallback for %s: Anthropic refused the "
+            "Claude API key %s (HTTP %d); %s",
+            _log_safe(decision.forward_model), api.secret_keys[0],
+            refused.status, then,
+        )
+
+    async def escalate(
+        evidence: str, refusal: Optional[QuotaRefusal] = None,
+    ) -> "Optional[web.StreamResponse]":
         key_result = await gateway.keys.aresolve(api)
         if not key_result.key:
             logger.info(
@@ -2534,59 +2525,50 @@ def _api_key_escalation(
                 _log_safe(decision.forward_model), key_result.problem or "-",
             )
             return await rung(evidence) if rung is not None else None
+        if refusal is not None:
+            # The subscription-out latch: later requests in scope skip the
+            # subscription until the limit resets (model_router.quota_latch).
+            gateway.quota_latch.note_refusal(
+                decision.forward_model, refusal,
+                gateway.usage_windows.anthropic_readings(),
+            )
         logger.info(
             "model-gateway: subscription refused %s with a quota verdict (%s); "
             "retrying once with the Claude API key (fallback enabled — billed "
             "to the Console organisation)",
             _log_safe(decision.forward_model), evidence,
         )
-        headers = api_key_headers(
-            gateway.forward_headers(request), api, key_result.key,
-            one_m_requested=decision.one_m_requested,
-        )
-        headers["Content-Type"] = "application/json"
-        headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
-        url = f"{api_decision.upstream}{_canonical_path(request)}"
-        if request.query_string:
-            url = f"{url}?{request.query_string}"
         try:
-            return await _proxy(
-                request,
-                gateway,
-                api_decision,
-                url,
-                headers,
-                body,
-                requested_model=requested_model,
-                stream_requested=stream_requested,
-                started=started,
-                note=(
-                    f"note=api_key_fallback fallback_from={from_label} {evidence}"
-                ).strip(),
-                images=images,
-                facts=facts,
-                allow_oauth_retry=False,
-                ladder_escalate=rung,
-                fallback_from=from_label,
-                effort_requested=effort_requested,
-                effort_forwarded=effort_forwarded,
-                defer_api_key_refusal=True,
+            return await send(
+                key_result.key, api_decision,
+                f"note=api_key_fallback fallback_from={from_label} {evidence}",
             )
         except ApiKeyRefused as refused:
             # The key is the fallback's problem, not the client's: carry on
             # exactly as if the fallback were unavailable — the rung with
             # the SUBSCRIPTION's evidence, or (``None``) the subscription's
             # own refusal, relayed by the ladder branch that called us.
-            logger.info(
-                "model-gateway: API-key fallback for %s: Anthropic refused the "
-                "Claude API key %s (HTTP %d); continuing as if the fallback "
-                "were unavailable",
-                _log_safe(decision.forward_model), api.secret_keys[0],
-                refused.status,
-            )
+            key_refused(refused, "continuing as if the fallback were unavailable")
             return await rung(evidence) if rung is not None else None
 
-    return escalate
+    async def serve_latched(latch: Any) -> "Optional[web.StreamResponse]":
+        """While the subscription is latched out: STRAIGHT to the key, no
+        subscription attempt. ``None`` (no key, or the key refused) sends the
+        caller down the ordinary subscription path."""
+        key_result = await gateway.keys.aresolve(api)
+        if not key_result.key:
+            return None
+        try:
+            return await send(
+                key_result.key, dataclasses.replace(api_decision, latched=True),
+                f"note=quota_latched latch={latch.limit} scope={latch.scope} "
+                f"fallback_from={from_label}",
+            )
+        except ApiKeyRefused as refused:
+            key_refused(refused, "latch cleared; sending this request to the subscription")
+            return None
+
+    return ApiKeyEscalation(escalate, serve_latched)
 
 
 def _rung_escalation(
@@ -2652,7 +2634,9 @@ def _rung_escalation(
     assert vendor is not None  # noqa: S101 — guaranteed by fallback_route
     from_label = f"{_route_label(decision)}:{decision.forward_model}"
 
-    async def escalate(evidence: str) -> "Optional[web.StreamResponse]":
+    async def escalate(
+        evidence: str, refusal: object = None,
+    ) -> "Optional[web.StreamResponse]":
         key_result = await gateway.keys.aresolve(vendor)
         if not key_result.key:
             logger.info(
@@ -3357,6 +3341,15 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         effort_forwarded=effort_forwarded,
         api_key_by_mode=api_key_by_mode,
     )
+    if isinstance(ladder_hook, ApiKeyEscalation):
+        # The subscription-out latch: an ApiKeyEscalation exists only for a
+        # subscription request with the fallback ON and a re-sendable body.
+        latch = gateway.quota_latch.active_for(
+            decision.forward_model, gateway.usage_windows.anthropic_readings(),
+        )
+        served = await ladder_hook.serve_latched(latch) if latch else None
+        if served is not None:
+            return served
     return await _proxy(
         request,
         gateway,
@@ -4528,7 +4521,7 @@ async def _ladder_quota_branch(
     access: Callable[..., None],
     *,
     stream_requested: bool,
-    escalate: Callable[[str], Awaitable[Optional[web.StreamResponse]]],
+    escalate: "Escalation",
     retry: Optional[Callable[[str], Awaitable[web.StreamResponse]]],
     raw: Optional[bytes] = None,
 ) -> web.StreamResponse:
@@ -4590,7 +4583,9 @@ async def _ladder_quota_branch(
         # that is still in force.
         await asyncio.sleep(delay)
         return await retry(evidence)
-    escalated = await escalate(evidence)
+    escalated = await escalate(
+        evidence, refusal=QuotaRefusal(upstream.status, upstream.headers, raw),
+    )
     if escalated is not None:
         return escalated
     if decision.vendor is not None:
@@ -4969,6 +4964,11 @@ def create_app(
 __all__ = [
     "APP_KEY",
     "COUNT_TOKENS_PATH",
+    # Re-exported from .quota (moved there v0.2.104; callers import them here).
+    "FALLBACK_RETRY_AFTER_MAX_DEFAULT_S",
+    "FALLBACK_RETRY_AFTER_MAX_ENV",
+    "LADDER_FALLBACK",
+    "LADDER_RETRY",
     "RETRYABLE_HEADERS",
     "REWRITE_BUFFER_NOTE",
     "SCOPE_PROBE_TASK_KEY",
@@ -4976,6 +4976,7 @@ __all__ = [
     "Gateway",
     "RequestFacts",
     "create_app",
+    "fallback_retry_after_max_s",
     "loopback_only_middleware",
     "usage_handler",
     "usage_windows_handler",

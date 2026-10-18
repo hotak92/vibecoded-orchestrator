@@ -19,6 +19,7 @@ import {
   fetchUsage,
   isEstimate,
   INITIAL_CARD_STATE,
+  latchNote,
   nextPollMs,
   percentText,
   restartOffered,
@@ -377,5 +378,30 @@ describe('fetchUsage (review F4/F15: the bridge error is surfaced, not swallowed
     vi.mocked(tauriAvailable).mockReturnValue(false);
     await expect(fetchUsage()).resolves.toBeNull();
     expect(invoke).not.toHaveBeenCalled();
+  });
+});
+
+describe('latchNote (v0.2.104: the subscription-out latch)', () => {
+  const latch = {
+    limit: '5h',
+    scope: 'all',
+    until: '2026-10-18T14:00:00Z',
+    since: '2026-10-18T11:00:00Z',
+    source: 'refusal_headers',
+  };
+
+  it('shows the gateway text verbatim while a latch is reported', () => {
+    const v = vendor({ api_key_latch: [latch], api_key_latch_text: '→ API key until 16:00' });
+    expect(latchNote(v)).toBe('→ API key until 16:00');
+  });
+
+  it('is null when there is no latch, including from an older gateway', () => {
+    expect(latchNote(vendor())).toBeNull();
+    expect(latchNote(vendor({ api_key_latch: [] }))).toBeNull();
+    expect(latchNote(vendor({ api_key_latch_text: 'stale text' }))).toBeNull();
+  });
+
+  it('still says something when the text is missing', () => {
+    expect(latchNote(vendor({ api_key_latch: [latch] }))).toContain('API key');
   });
 });

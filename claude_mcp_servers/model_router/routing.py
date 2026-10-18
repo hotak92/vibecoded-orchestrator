@@ -104,6 +104,10 @@ class Route:
     #: fallback); ``None``
     #: on the OAuth route and on every vendor route.
     api_key: Optional[AnthropicApiKey] = None
+    #: v0.2.104: this API-key attempt was sent STRAIGHT to the key because the
+    #: subscription is latched out of quota (:mod:`model_router.quota_latch`)
+    #: — no subscription attempt preceded it. Rides into the ledger row.
+    latched: bool = False
 
     @property
     def auth(self) -> str:

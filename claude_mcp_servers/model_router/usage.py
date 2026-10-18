@@ -120,21 +120,22 @@ LEDGER_MAX_BYTES = 50 * 1024 * 1024
 #: (``vendor:qwen:deepseek-v4.1-flash``), and the LONGEST effort spelling
 #: (``budget_tokens=8192`` on both sides of the pair; a named tier is
 #: shorter), and — v0.2.104 — the longest ``auth`` value (``vendor_key``).
-#: That case serialises to 796 bytes + the newline. Used only to
+#: That case serialises to 812 bytes + the newline. Used only to
 #: turn a byte cap into a LINE count for
 #: :func:`vco_lib.atomic.rotate_tail_lines`, which keeps lines rather than
 #: bytes — a TYPICAL row is smaller, so the surviving tail is at most about a
 #: quarter of the cap, never more. Re-measured at v0.2.102 when the effort
 #: pair (``effort_requested`` / ``effort_forwarded``) joined the row; the
 #: pre-pair figure of 545 was itself a derived underestimate. v0.2.104: +20
-#: for ``,"auth":"vendor_key"``.
-LEDGER_ROW_BYTES = 797
+#: for ``,"auth":"vendor_key"``; then +16 for ``,"latched":false`` (the
+#: subscription-out latch marker, on every row).
+LEDGER_ROW_BYTES = 813
 
 #: What fraction of :data:`LEDGER_MAX_BYTES` survives a rotation. A quarter:
 #: enough recent history that a monitor restarted after a rotation still has
 #: context to show, and small enough that rotations are rare rather than one
-#: per write. At the default cap that is ``(52428800 // 4) // 797`` =
-#: **16 445 lines**, about 12.5 MiB when every row is a maximal
+#: per write. At the default cap that is ``(52428800 // 4) // 813`` =
+#: **16 122 lines**, about 12.5 MiB when every row is a maximal
 #: :data:`LEDGER_ROW_BYTES` row — at most a quarter of the cap, as intended;
 #: typical (smaller) rows keep the same LINE count and proportionally fewer
 #: bytes.
@@ -600,6 +601,11 @@ class UsageRecord:
     #: never left to inference from ``route``. Empty only on rows written by
     #: a caller that does not know (none in the gateway).
     auth: str = ""
+    #: v0.2.104: the API-key attempt went STRAIGHT to the key because the
+    #: subscription was latched out of quota (:mod:`model_router.quota_latch`)
+    #: — ``fallback_from`` names the subscription route as on any fallback,
+    #: and this says no subscription attempt was made for THIS turn.
+    latched: bool = False
     #: v0.2.102 (register item 2026-10-10): the effort selector this request
     #: carried, both directions. ``effort_requested`` is what the CLIENT sent
     #: (``output_config.effort``, or the older ``thinking.budget_tokens`` as
@@ -662,6 +668,7 @@ def build_record(
     effort_requested: Optional[str] = None,
     effort_forwarded: Optional[str] = None,
     auth: str = "",
+    latched: bool = False,
 ) -> UsageRecord:
     """Assemble one row. Pure — no clock unless the caller declines to pass one.
 
@@ -720,6 +727,7 @@ def build_record(
         request_bytes=max(0, int(request_bytes)),
         fallback_from=str(fallback_from or ""),
         auth=str(auth or ""),
+        latched=bool(latched),
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
     )

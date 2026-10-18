@@ -19,7 +19,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Callable, Generic, Mapping, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Generic, Mapping, Optional, TypeVar
 
 from .vendors import (
     CONTEXT_1M_BETA,
@@ -253,6 +253,29 @@ class ApiKeyRefused(Exception):
     def __init__(self, status: int) -> None:
         super().__init__(f"API key refused (HTTP {status})")
         self.status = status
+
+
+class ApiKeyEscalation:
+    """The subscription -> API-key escalation (``server._api_key_escalation``):
+    called like every escalation, ``await esc(evidence, refusal=...)``, plus
+    :meth:`serve_latched` — the subscription-out latch's entry, which sends a
+    request STRAIGHT to the key (no subscription attempt) and answers ``None``
+    when it could not (no key, or the key refused), so the caller takes the
+    ordinary subscription path."""
+
+    def __init__(
+        self,
+        escalate: Callable[..., Awaitable[Any]],
+        serve_latched: Callable[[Any], Awaitable[Any]],
+    ) -> None:
+        self._escalate = escalate
+        self._serve_latched = serve_latched
+
+    async def __call__(self, evidence: str, refusal: Any = None) -> Any:
+        return await self._escalate(evidence, refusal)
+
+    async def serve_latched(self, latch: Any) -> Any:
+        return await self._serve_latched(latch)
 
 
 #: Headers on the gateway's answer to a refused key: the Anthropic SDK reads

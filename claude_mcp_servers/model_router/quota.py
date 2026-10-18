@@ -516,12 +516,86 @@ def quota_error_body(
     }
 
 
+# ── the fallback ladder's trigger (OD-9) ─────────────────────────────────
+# Moved here from ``server.py`` (v0.2.104, size budget): it is a pure
+# reading of the same evidence as :func:`classify_quota`, and ``server``
+# re-exports every name below.
+#: The fallback ladder's retry-after threshold, in seconds (OD-9): a 429 that
+#: carries ``retry-after`` at or below this is retried ONCE on the same rung
+#: before the ladder falls back; one without a retry-after, or with a
+#: quota-exhausted body, falls back immediately. Above the threshold the
+#: window is too long to hold a chat request for, so it falls back too — the
+#: reading of OD-9 that keeps the ladder what it is for (chat continuity),
+#: recorded here rather than in the ruling. Env-tunable because the right
+#: wait is a per-workload judgement, like the context guard's margin.
+FALLBACK_RETRY_AFTER_MAX_DEFAULT_S = 30
+
+#: The env var that overrides :data:`FALLBACK_RETRY_AFTER_MAX_DEFAULT_S`.
+FALLBACK_RETRY_AFTER_MAX_ENV = "VCT_GATEWAY_FALLBACK_RETRY_AFTER_MAX_S"
+
+
+def fallback_retry_after_max_s() -> float:
+    """The ladder's retry-after threshold, in seconds. Never raises.
+
+    An unset, non-numeric or non-positive value answers the default — a typo
+    in the knob must not disable the same-rung retry (which a ``0`` would:
+    every short rate limit would fall straight through to the next vendor).
+    """
+    from vco_lib.env_values import env_float  # noqa: PLC0415 — the one env-float reader
+
+    return env_float(FALLBACK_RETRY_AFTER_MAX_ENV, FALLBACK_RETRY_AFTER_MAX_DEFAULT_S, above=0)
+
+
+#: The two answers :func:`_ladder_verdict` can give.
+LADDER_FALLBACK = "fallback"
+LADDER_RETRY = "retry"
+
+
+def _ladder_verdict(
+    status: int,
+    body: bytes,
+    headers: "Mapping[str, str] | None",
+) -> "tuple[str, Optional[float]]":
+    """OD-9's trigger, as one decision for a quota-status answer.
+
+    Returns ``(LADDER_FALLBACK, None)`` or ``(LADDER_RETRY, delay_s)``. The
+    owner's rule (2026-10-07): fall back when the answer is a 429 WITHOUT a
+    readable ``retry-after``, or with a quota-exhausted body; on a 429 WITH
+    ``retry-after`` <= :func:`fallback_retry_after_max_s`, retry the same
+    rung once and fall back if it refuses again (the "once" is the caller's
+    recursion bound, not this function's). A window LONGER than the threshold
+    also falls back — waiting it out is what the ladder exists to spare the
+    chat. The evidence reading is :mod:`model_router.quota`'s, through the
+    same helpers ``server._quota_response`` uses, so the ladder and the substituted
+    quota message can never disagree about what a vendor said. 402 is a
+    balance condition and classifies exhausted, so it falls back with the
+    rest.
+    """
+    if classify_quota(status, body, headers) == CLASS_EXHAUSTED:
+        return LADDER_FALLBACK, None
+    distance = _reset_distance_s(_find_reset_value(body, headers))
+    # ``0 <=`` on purpose (batch-6 B-2): a ``retry-after: 0`` means "retry
+    # immediately" — a free same-rung retry — and must not be read as
+    # no-retry-after, which would spend the next rung's quota where the same
+    # vendor offered to serve a moment later. A NEGATIVE distance (a reset
+    # epoch already in the past) still falls back: it is not a delay the
+    # vendor quoted for a retry.
+    if distance is None or not 0 <= distance <= fallback_retry_after_max_s():
+        return LADDER_FALLBACK, None
+    return LADDER_RETRY, distance
+
+
 __all__ = [
     "CLASS_EXHAUSTED",
+    "FALLBACK_RETRY_AFTER_MAX_DEFAULT_S",
+    "FALLBACK_RETRY_AFTER_MAX_ENV",
+    "LADDER_FALLBACK",
+    "LADDER_RETRY",
     "CLASS_RATE_LIMITED",
     "CLIENT_QUOTA_STATUS",
     "QUOTA_STATUSES",
     "classify_quota",
+    "fallback_retry_after_max_s",
     "find_reset_hint",
     "is_quota_refusal",
     "quota_error_body",

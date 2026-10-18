@@ -567,7 +567,7 @@ class LedgerTests(unittest.TestCase):
         )
 
     def test_keep_lines_is_about_a_quarter_of_the_cap(self) -> None:
-        """The documented figure, at the shipped default: 16 445 lines.
+        """The documented figure, at the shipped default: 16 122 lines.
 
         Re-measured at v0.2.102 (review LOW H1): the constant is the LONGEST
         realistic fully-populated row across every route (776 bytes of JSON +
@@ -575,10 +575,11 @@ class LedgerTests(unittest.TestCase):
         token counts, the longest fallback label, the ``budget_tokens=``
         effort spelling), so the line count at the same quarter-cap moved
         with it. The pre-pair figure of 545 was a derived underestimate.
-        v0.2.104: +20 bytes for the ``auth`` field (``"vendor_key"``) — 797.
+        v0.2.104: +20 bytes for the ``auth`` field (``"vendor_key"``) — 797;
+        +16 for the subscription-out latch marker (``"latched":false``) — 813.
         """
         ledger = U.UsageLedger(self.path)
-        self.assertEqual(ledger._keep_lines(), 16_445)
+        self.assertEqual(ledger._keep_lines(), 16_122)
         surviving = ledger._keep_lines() * U.LEDGER_ROW_BYTES
         self.assertAlmostEqual(
             surviving / U.LEDGER_MAX_BYTES, 0.25, places=2,

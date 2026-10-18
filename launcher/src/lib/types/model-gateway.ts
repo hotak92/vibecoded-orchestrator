@@ -79,6 +79,26 @@ export interface GatewayAnthropicAuth {
   launcher_db_error?: string | null;
   /** UTC ISO start of the unreadable streak. */
   launcher_db_unreadable_since?: string | null;
+  /**
+   * The subscription-out latches in force (empty when none): Claude requests
+   * in `scope` go straight to the API key until `until`. Absent from a
+   * gateway older than the latch.
+   */
+  quota_latch?: GatewayQuotaLatch[];
+}
+
+/** One subscription-out latch (`model_router.quota_latch.Latch.as_dict`). */
+export interface GatewayQuotaLatch {
+  /** `5h` | `weekly` | `weekly:<Model>` | `unknown`. */
+  limit: string;
+  /** `all`, or the model word it covers (`opus`). */
+  scope: string;
+  /** UTC ISO end of the latch. */
+  until: string;
+  /** UTC ISO start. */
+  since: string;
+  /** `refusal_headers` | `usage_windows` | `reset_hint` | `conservative`. */
+  source: string;
 }
 
 /** `/health`'s `secret_scope` block. */

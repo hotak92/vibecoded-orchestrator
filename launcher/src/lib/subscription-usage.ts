@@ -22,6 +22,7 @@
 //     never as a plain vendor reading.
 
 import { invoke, tauriAvailable } from '$lib/tauri';
+import type { GatewayQuotaLatch } from '$lib/types/model-gateway';
 
 /** Mirrors the `estimate` block of `UsageWindows._estimate_dict`. */
 export interface UsageEstimate {
@@ -72,6 +73,12 @@ export interface UsageVendor {
   plan: string | null;
   windows: UsageWindow[];
   tokens?: UsageTokens;
+  /** v0.2.104: the subscription-out latch (Claude entry only; absent from
+   *  an older gateway or when nothing is latched). */
+  api_key_latch?: GatewayQuotaLatch[];
+  /** The gateway's own rendering of it (`usage_windows.latch_text`), e.g.
+   *  "→ API key until 14:00" — shown verbatim, never re-derived here. */
+  api_key_latch_text?: string;
 }
 
 /**
@@ -280,11 +287,22 @@ export function vendorStatus(vendor: UsageVendor): string | null {
   }
 }
 
+/**
+ * The subscription-out latch note beside a vendor's name, or `null`: the
+ * gateway's own text ("→ API key until 14:00"), only when it reports a latch.
+ */
+export function latchNote(vendor: UsageVendor): string | null {
+  if (!vendor.api_key_latch?.length) return null;
+  return vendor.api_key_latch_text?.trim() || '→ API key (subscription limit reached)';
+}
+
 /** Vendors worth a row: anything with a window or a status to say. A
  * tokens-only vendor is not one — the ledger total is collected but never
  * rendered (owner 2026-09-28). */
 export function visibleVendors(snapshot: UsageSnapshot): UsageVendor[] {
-  return snapshot.vendors.filter((v) => v.windows.length > 0 || v.state !== 'ok');
+  return snapshot.vendors.filter(
+    (v) => v.windows.length > 0 || v.state !== 'ok' || latchNote(v) !== null,
+  );
 }
 
 /** When to poll next: soon while the gateway is still fetching. */
