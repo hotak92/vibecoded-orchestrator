@@ -70,6 +70,15 @@ export interface GatewayAnthropicAuth {
   api_key_fallback: boolean;
   /** The secret name the gateway resolves the key from. */
   api_key_secret: string | null;
+  /**
+   * `ok`, or `unreadable` while the gateway cannot read the launcher DB and
+   * keeps applying the LAST setting it read. Absent from older gateways.
+   */
+  launcher_db?: string;
+  /** Short error class / SQLite text while `launcher_db` is `unreadable`. */
+  launcher_db_error?: string | null;
+  /** UTC ISO start of the unreadable streak. */
+  launcher_db_unreadable_since?: string | null;
 }
 
 /** `/health`'s `secret_scope` block. */

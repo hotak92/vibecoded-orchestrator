@@ -73,6 +73,19 @@ describe('anthropicAuthWarning', () => {
     expect(anthropicAuthWarning('api_key', gw(AUTH('rejected', 'api_key')))).toMatch(/rejected the key/);
   });
 
+  it('says the gateway cannot read the launcher settings instead of promising seconds', () => {
+    const auth = {
+      ...AUTH('available', 'api_key'),
+      launcher_db: 'unreadable',
+      launcher_db_error: 'OperationalError: database is locked',
+    };
+    const warning = anthropicAuthWarning('oauth', gw(auth));
+    expect(warning).toMatch(/can't read the launcher settings/);
+    expect(warning).toMatch(/keeps using api_key/);
+    expect(warning).toMatch(/database is locked/);
+    expect(warning).not.toMatch(/within a few seconds/);
+  });
+
   it('is quiet when the gateway applies the stored mode', () => {
     expect(anthropicAuthWarning('api_key', gw(AUTH('available', 'api_key')))).toBeNull();
     expect(anthropicAuthWarning('oauth', gw(AUTH('available', 'oauth')))).toBeNull();

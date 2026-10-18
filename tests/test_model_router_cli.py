@@ -147,6 +147,21 @@ class SelfTestTests(_StateDirCase):
         cli.run_check(stream=buffer)
         self.assertRegex(buffer.getvalue(), r"anthropic_auth\s+oauth")
 
+    def test_check_flags_an_existing_but_unreadable_launcher_db(self) -> None:
+        """R20 LOW-1: a corrupt launcher DB is not reported as the default —
+        it is ``unreadable (...)`` plus a PROBLEM line and a non-zero exit."""
+        db = self.dir / "launcher.db"
+        db.write_bytes(b"not a sqlite database" * 50)
+        self.set_env("VCT_LAUNCHER_DB_PATH", str(db))
+        buffer = io.StringIO()
+        code = cli.run_check(stream=buffer)
+        out = buffer.getvalue()
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"anthropic_auth\s+unreadable \(")
+        self.assertRegex(out, r"api_key_fallback\s+unreadable \(")
+        self.assertIn("PROBLEM: launcher setting anthropic_auth unreadable", out)
+        self.assertNotIn(str(db), out.split("PROBLEM")[0].split("anthropic_auth")[1])
+
     def test_check_reports_defaults_without_a_launcher_db(self) -> None:
         self.set_env("VCT_LAUNCHER_DB_PATH", str(self.dir / "absent.db"))
         buffer = io.StringIO()

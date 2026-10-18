@@ -306,6 +306,11 @@ class LauncherDbStrictReaderTests(unittest.TestCase):
         self.assertEqual(anthropic_auth_mode(db_path=self.root / "none.db"), ANTHROPIC_AUTH_OAUTH)
         self.assertFalse(api_key_fallback_enabled(db_path=self.root / "none.db"))
 
+    def test_a_directory_at_the_db_path_is_absent(self) -> None:
+        folder = self.root / "dir.db"
+        folder.mkdir()
+        self.assertIsNone(read_app_state_value_strict("k", db_path=folder))
+
     def test_a_db_without_the_table_is_absent(self) -> None:
         db = self.root / "fresh.db"
         sqlite3.connect(db).close()
@@ -848,9 +853,67 @@ class SubscriptionFallbackTests(ApiKeyGatewayBase):
         await setting.refresh()
         self.assertFalse(gateway.api_key_mode_on())
 
-    async def test_an_unreadable_production_db_raises_and_is_kept_over(self) -> None:
-        """The production reader itself: a directory where the DB file
-        should be is an EXISTING but unreadable DB -> it raises (not None)."""
+    async def test_health_reports_an_unreadable_launcher_db_and_the_kept_mode(self) -> None:
+        """R20 LOW-1: while the DB cannot be read, /health says so (short
+        error, no path) and still reports the mode being applied."""
+        client = await self.client_with(key=True, fallback=False)
+        gateway = client.app[srv.APP_KEY]
+        setting = gateway.anthropic_auth
+        setting.reader = lambda: ANTHROPIC_AUTH_API_KEY
+        await setting.refresh()
+        auth = (await (await client.get("/health")).json())["anthropic_auth"]
+        self.assertEqual(auth["launcher_db"], "ok")
+
+        def locked() -> str:
+            raise LauncherDbUnreadable("/secret/path/launcher.db: locked") from (
+                sqlite3.OperationalError("database is locked")
+            )
+
+        setting.reader = locked
+        await setting.refresh()
+        auth = (await (await client.get("/health")).json())["anthropic_auth"]
+        self.assertEqual(auth["launcher_db"], "unreadable")
+        self.assertEqual(auth["launcher_db_error"], "OperationalError: database is locked")
+        self.assertTrue(auth["launcher_db_unreadable_since"].endswith("Z"))
+        self.assertNotIn("/secret/path", json.dumps(auth))
+        self.assertEqual(auth["mode"], ANTHROPIC_AUTH_API_KEY)
+        setting.reader = lambda: ANTHROPIC_AUTH_API_KEY
+        await setting.refresh()
+        auth = (await (await client.get("/health")).json())["anthropic_auth"]
+        self.assertEqual(auth["launcher_db"], "ok")
+
+    async def test_a_reader_defect_is_logged_with_its_traceback_once(self) -> None:
+        """R20 NIT-2: a non-DB failure (a bug in the reader) logs its type
+        and traceback, once per streak; a DB error logs without one."""
+        client = await self.client_with(key=True, fallback=False)
+        setting = client.app[srv.APP_KEY].anthropic_auth
+
+        def buggy() -> str:
+            raise KeyError("x")
+
+        setting.reader = buggy
+        with self.assertLogs("model_router", level="WARNING") as cm:
+            await setting.refresh()
+            await setting.refresh()
+        warnings = [r for r in cm.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIsNotNone(warnings[0].exc_info)
+        self.assertIn("KeyError", warnings[0].getMessage())
+        setting.reader = lambda: "oauth"
+        await setting.refresh()
+
+        def locked() -> str:
+            raise LauncherDbUnreadable("locked")
+
+        setting.reader = locked
+        with self.assertLogs("model_router", level="WARNING") as cm:
+            await setting.refresh()
+        self.assertIsNone([r for r in cm.records if r.levelname == "WARNING"][0].exc_info)
+
+    async def test_an_unreadable_production_db_raises(self) -> None:
+        """The production readers themselves: a file that is not a SQLite
+        database (corrupt, or swapped mid-update) raises — not None. (Keeping
+        the last value over such a failure is the test above.)"""
         bad = self.root / "not-a-db.db"
         bad.write_bytes(b"this is not sqlite")
         with self.assertRaises(LauncherDbUnreadable):

@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Callable, Generic, Mapping, Optional, TypeVar
 
 from .vendors import (
@@ -50,6 +51,23 @@ class _Unreadable:
     def __init__(self, error: BaseException) -> None:
         self.error = error
 
+    @property
+    def is_db_error(self) -> bool:
+        """The launcher DB was unreadable (vs. a defect in the reader)."""
+        from vco_lib.launcher_db_reader import LauncherDbUnreadable  # noqa: PLC0415
+
+        return isinstance(self.error, LauncherDbUnreadable)
+
+    @property
+    def short(self) -> str:
+        """A short description safe for ``/health`` and the launcher: the
+        error CLASS, plus SQLite's own text for a DB error ("database is
+        locked") — never the DB path the strict reader's message carries."""
+        cause = self.error.__cause__ if self.is_db_error else None
+        if cause is not None:
+            return f"{type(cause).__name__}: {str(cause)[:120]}"
+        return type(self.error).__name__
+
 
 class CachedSetting(Generic[_T]):
     """One launcher setting, refreshed OFF the event loop (reviews R15 LOW-1,
@@ -80,8 +98,12 @@ class CachedSetting(Generic[_T]):
         self._what = what
         self._cache: Optional[tuple[float, _T]] = None
         self._periodic: Optional[asyncio.Task] = None
-        #: Inside a streak of failed reads (one log line per streak).
+        #: Inside a streak of failed reads (one log line per streak):
+        #: when it started (wall clock) and what failed (``_Unreadable.short``),
+        #: so ``/health`` can say the gateway is running on a kept value.
         self._failing = False
+        self.failing_since: Optional[float] = None
+        self.failure: Optional[str] = None
         #: Seconds between background re-reads (tests shorten it).
         self.interval_s = LAUNCHER_SETTING_REFRESH_S
 
@@ -94,17 +116,24 @@ class CachedSetting(Generic[_T]):
     def _settle(self, value: "_T | _Unreadable") -> _T:
         """Apply one read: cache an answer; on a failure keep the cache."""
         if isinstance(value, _Unreadable):
+            self.failure = value.short
             if not self._failing:
                 self._failing = True
+                self.failing_since = time.time()
                 logger.warning(
-                    "model-gateway: could not read %s (%s); keeping %s until "
+                    "model-gateway: could not read %s (%r); keeping %s until "
                     "it reads again", self._what, value.error,
                     "its last value" if self._cache is not None
                     else "its default",
+                    # A DB error explains itself; anything else is a defect
+                    # in the reader and gets its traceback, once per streak.
+                    exc_info=None if value.is_db_error else value.error,
                 )
             return self._cache[1] if self._cache is not None else self.default
         if self._failing:
             self._failing = False
+            self.failing_since = None
+            self.failure = None
             logger.info("model-gateway: %s reads again", self._what)
         self._cache = (time.monotonic(), value)
         return value
@@ -142,12 +171,20 @@ class CachedSetting(Generic[_T]):
             # No loop: a synchronous caller (``vct-model-gateway --check``)
             # shares this thread with nothing, so it reads the row directly
             # — every call, nothing cached for it (it has no refresh task).
-            value = self._read()
-            if isinstance(value, _Unreadable):
-                return self._cache[1] if self._cache is not None else self.default
+            value, _error = self.read_now()
             return value
         cached = self._cache
         return cached[1] if cached is not None else self.default
+
+    def read_now(self) -> "tuple[_T, Optional[str]]":
+        """Read the row NOW on this thread (synchronous callers only:
+        ``--check``): ``(value, None)``, or — the DB exists but cannot be
+        read — ``(the kept/default value, short error)``. Caches nothing."""
+        value = self._read()
+        if isinstance(value, _Unreadable):
+            kept = self._cache[1] if self._cache is not None else self.default
+            return kept, value.short
+        return value, None
 
     async def stop(self) -> None:
         """Cancel the background refresh (gateway shutdown)."""
@@ -326,3 +363,20 @@ def launcher_settings(
         CachedSetting(api_key_fallback_enabled, False, "the API-key fallback setting"),
         CachedSetting(anthropic_auth_mode, ANTHROPIC_AUTH_OAUTH, "the Anthropic auth mode setting"),
     )
+
+
+def launcher_db_report(*settings: "CachedSetting") -> dict:
+    """``/health``'s view of the launcher-setting reads: ``launcher_db`` is
+    ``ok`` or ``unreadable`` (the gateway is then applying the LAST value it
+    read, possibly long ago); ``launcher_db_error`` the short error and
+    ``launcher_db_unreadable_since`` the UTC start of the streak."""
+    failing = [s for s in settings if s.failing_since is not None]
+    if not failing:
+        return {"launcher_db": "ok"}
+    first = min(failing, key=lambda s: s.failing_since or 0.0)
+    since = datetime.fromtimestamp(first.failing_since or 0.0, tz=timezone.utc)
+    return {
+        "launcher_db": "unreadable",
+        "launcher_db_error": first.failure,
+        "launcher_db_unreadable_since": since.isoformat().replace("+00:00", "Z"),
+    }

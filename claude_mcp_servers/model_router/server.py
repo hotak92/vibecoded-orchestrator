@@ -223,6 +223,7 @@ from .api_key_route import (
     api_key_headers,
     api_key_refusal_is_key_level,
     api_key_refused_message,
+    launcher_db_report,
     launcher_settings,
 )
 from .vendors import (
@@ -1083,7 +1084,10 @@ async def health_handler(request: web.Request) -> web.Response:
     scheduling one background resolution so a later probe can answer, or
     ``rejected`` while the resolved key is the one Anthropic last refused;
     ``api_key_fallback`` — the opt-in subscription fallback; ``api_key_secret``
-    — the secret NAME the key resolves from, never a value),
+    — the secret NAME the key resolves from, never a value; ``launcher_db`` —
+    ``ok``, or ``unreadable`` with ``launcher_db_error`` and
+    ``launcher_db_unreadable_since`` while the launcher DB cannot be read and
+    the LAST value read is being applied),
     ``secret_scope`` (``project`` — the scope vendor keys resolve in, which is
     the pin when there is one and this process's working directory when there
     is not, because that is what the resolver itself falls back to;
@@ -1176,6 +1180,7 @@ async def health_handler(request: web.Request) -> web.Response:
                     gateway.anthropic.api_key.secret_keys[0]
                     if gateway.anthropic.api_key is not None else None
                 ),
+                **launcher_db_report(gateway.anthropic_auth, gateway.api_key_fallback),
             },
             # In-memory counter — the alias-tripwire of issue 9.
             "model_echo_mismatches": gateway.model_echo_mismatches,

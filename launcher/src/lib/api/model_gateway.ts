@@ -1486,6 +1486,10 @@ export function anthropicAuthWarning(
   if (stored === 'api_key' && auth.api_key === 'missing') {
     return `API key mode is on but no key resolves (${auth.api_key_secret ?? 'ANTHROPIC_API_KEY_GATEWAY'}) — Claude requests through the gateway are refused until you add it or switch to OAuth.`;
   }
+  if (auth.launcher_db === 'unreadable') {
+    // The gateway cannot see the switch at all: no "within seconds" promise.
+    return `The gateway can't read the launcher settings (${auth.launcher_db_error ?? 'unreadable'}) — it keeps using ${auth.mode}. Check the launcher database (launcher.db in the VCO state folder: permissions, disk) and restart the gateway.`;
+  }
   if (auth.mode !== stored) {
     return `The gateway still reports ${auth.mode}; it applies the change within a few seconds.`;
   }
