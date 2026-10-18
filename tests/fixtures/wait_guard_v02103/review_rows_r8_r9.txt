@@ -1,0 +1,370 @@
+## R8/R9 review rows (V02104-R8/R9 wait-guard reviews), one command per line;
+## '## ' lines are comments; a 'U:' prefix decodes backslash escapes (\n).
+## ---- rows.txt ----
+## nested double quotes inside a double-quoted $( )
+echo "$(sleep "5")"
+x="$(sleep "5")"
+echo "$(sleep "$N")"
+r="$(timeout "10" sleep 5)"
+echo "$(sleep 5 "x")"
+echo "a $(sleep 5 "(")"
+echo "$(echo "x"; sleep 5)"
+echo "$(sleep "5")" && ls
+echo "`sleep "5"`"
+echo "$(sleep $(echo "5"))"
+## arithmetic
+echo "$(( $(sleep 5) + 1 ))"
+echo $(( $(sleep 5) + 1 ))
+echo "$((1+2))" $(sleep 5)
+## single quotes inside dq subst
+echo "$(sleep '5')"
+echo "$(echo ')' ; sleep 5)"
+echo "$(printf '%s' ')')$(sleep 5)"
+## here-strings and comments
+cat <<< "$(sleep 5)"
+cat <<< '$(sleep 5)'
+bash <<< 'sleep 5'
+echo hi # $(sleep 5)
+echo "#" $(sleep 5)
+## eval behind if / ! / wrappers
+if eval 'x=$(sleep 5)'; then :; fi
+! eval 'x=$(sleep 5)'
+time eval 'x=$(sleep 5)'
+exec eval 'x=$(sleep 5)'
+env eval 'x=$(sleep 5)'
+if command eval 'x=$(sleep 5)'; then :; fi
+xargs eval 'x=$(sleep 5)'
+## command / builtin peeling
+command -v sleep
+command -v sleep && echo ok
+type sleep
+command -V sleep
+command -v timeout
+builtin type sleep
+command sleep 5
+builtin sleep 5
+ls && command -v watch
+## ansi-c
+echo $'\x24(sleep 5)'
+echo $'$(sleep 5)' $(sleep 5)
+## double quoted -c argument with live subst
+bash -c "echo $(sleep 5)"
+bash -c 'echo hi' "$(sleep 5)"
+bash -c 'echo hi' '$(sleep 5)'
+## literal grep variants that annoy
+grep -n "(sleep 5)" f
+grep -n 'x=$(sleep 5)' f | head
+git log -S'$(sleep 5)'
+git commit -m 'avoid $(sleep 5) in loops'
+git commit -m "avoid \$(sleep 5) in loops"
+python -c 'import os; os.system("sleep 5")'
+## stricter rows
+x='(' sleep 5
+bash script.sh $(sleep 5)
+echo ok; x='(' ; sleep 5
+## backtick escape
+echo "\`sleep 5\`"
+echo \`sleep 5\`
+## process subst inside dq subst
+echo "$(cat <(sleep 5))"
+## placeholder injection
+U:grep -n '$(sleep 5)' f \ue003
+U:echo \ue000\ue002sleep 5\ue003
+U:echo '\ue000(sleep 5)'
+## ---- rows3.txt ----
+find . -name '*.py' -exec sh -c 'echo $(sleep 5)' \;
+find . -exec bash -c 'x=$(sleep 5)' _ {} +
+flock /tmp/l bash -c 'x=$(sleep 5)'
+su -c 'x=$(sleep 5)'
+script -qc 'x=$(sleep 5)' /dev/null
+ssh host 'x=$(sleep 5)'
+docker exec c sh -c 'x=$(sleep 5)'
+podman exec c sh -c 'echo $(sleep 5)'
+trap 'x=$(sleep 5)' EXIT
+parallel 'echo $(sleep 5)' ::: a
+xargs -I{} sh -c 'echo $(sleep 5)'
+watch -n1 'echo $(sleep 5)'
+timeout 5 sh -c 'echo $(sleep 5)'
+find . -exec sh -c 'sleep 5' \;
+flock /tmp/l bash -c 'sleep 5'
+su -c 'sleep 5'
+docker exec c sh -c 'sleep 5'
+## ---- rows4.txt ----
+timeout 5 bash -c 'x=$(sleep 5)'
+timeout 5 bash -c 'timeout 5 bash -c "x=\$(sleep 5)"'
+timeout 5 nohup timeout 5 bash -c 'x=$(sleep 5)'
+timeout 5 timeout 5 timeout 5 bash -c 'x=$(sleep 5)'
+while timeout 5 bash -c 'x=$(sleep 5)'; do :; done
+xargs -I{} sh -c 'timeout 5 sh -c "x=\$(sleep 5)"'
+bash -c 'bash -c "bash -c \"x=\\\$(sleep 5)\""'
+timeout 5 bash -c 'bash -c "x=\$(sleep 5)"'
+timeout 5 bash -c 'bash -c "bash -c \"x=\\\$(sleep 5)\""'
+## ---- rows9.txt ----
+## A. dq subst frames
+echo "$(echo '"'; sleep 5)"
+echo "$(echo "$(sleep 5)")"
+echo "$(echo "a" "b" "$(sleep "5")")"
+x="$(printf "%s" "x")$(sleep 5)"
+echo "$(case x in a) echo;; esac; sleep 5)"
+echo "$(case x in (a) echo;; esac; sleep 5)"
+echo "$( (sleep 5) )"
+echo "$(echo ")"; sleep 5)"
+echo "$(echo \"; sleep 5)"
+echo "$(echo $'\''; sleep 5)"
+echo "$(echo $'"'; sleep 5)"
+echo "$(# comment )
+sleep 5)"
+U:echo "$(echo x\nsleep 5)"
+echo "${x:-$(sleep 5)}"
+echo "${x:-"$(sleep 5)"}"
+echo "$((1 + $(sleep 5)))"
+echo "`echo "x"; sleep 5`"
+echo "`echo \`sleep 5\``"
+echo "`echo '`'; sleep 5`"
+echo "a`sleep 5`b"
+echo "`sleep "$N"`"
+echo "$(echo `sleep 5`)"
+echo "$(cat <(sleep 5))"
+echo "$(cat <(echo "x"; sleep 5))"
+echo "$(echo '$(sleep 5)')"
+echo "$(grep '$(sleep 5)' f)"
+echo "$(echo \$(sleep 5))"
+echo "\$(sleep 5)"
+echo "x" '$(sleep 5)' "$(date)"
+echo "$(date)" '$(sleep 5)'
+echo "$(echo '(' ; sleep 5)"
+echo "$(echo "(" ; sleep 5)"
+echo "$(echo "\")" ; sleep 5)"
+## B. second programs: should deny (real waits)
+ssh host 'sleep 5'
+ssh -p 22 host sleep 5
+ssh -o ConnectTimeout=5 host 'x=$(sleep 5)'
+ssh -i key -l user host "tail -f /var/log/x"
+ssh host -- 'sleep 5'
+ssh -vp 22 host sleep 5
+ssh host bash -c "'sleep 5'"
+trap 'sleep 5' EXIT
+trap -- 'x=$(sleep 5)' INT
+find . -exec sleep 1 \;
+find . -execdir sh -c 'x=$(sleep 5)' \;
+find . -ok sleep 1 \;
+find . -exec ls {} \; -exec sleep 1 \;
+flock -w 10 /tmp/l sleep 5
+flock -n /tmp/l -c 'sleep 5'
+flock /tmp/l timeout 5 bash -c 'x=$(sleep 5)'
+su -c 'sleep 5' user
+su - user -c 'x=$(sleep 5)'
+runuser -u u -- sleep 5
+runuser -l u -c 'sleep 5'
+script -qc 'tail -f x' /dev/null
+script -c 'sleep 5'
+chroot /mnt sleep 5
+chroot /mnt /bin/bash -c 'x=$(sleep 5)'
+docker run --rm img sleep 5
+docker exec -it c sh -c 'x=$(sleep 5)'
+docker exec c tail -f log
+kubectl exec -it pod -- sh -c 'sleep 5'
+kubectl exec pod -- sleep 5
+podman run --rm -e X=1 img watch df
+docker-compose exec web sh -c 'sleep 5'
+parallel sleep ::: 1 2
+parallel -j4 'x=$(sleep 5)' ::: a
+xargs -I{} timeout 5 sleep 1
+xargs eval 'x=$(sleep 5)'
+xargs -n1 sh -c 'echo $(sleep 5)'
+xargs tail -f
+## C. second programs: should stay allowed
+ssh host ls
+ssh -o ConnectTimeout=5 host 'cat /etc/hostname'
+ssh host "grep -c foo f"
+find . -name sleep
+find . -exec grep -l foo {} +
+find . -name '*.py' -exec echo sleep {} \;
+find . -newer x -exec ls {} \;
+trap 'rm -f x' EXIT
+trap - EXIT
+trap -p
+trap '' INT
+flock /tmp/l make
+flock -w 5 /tmp/l ls
+flock -x 3
+su - user -c 'ls'
+script log.txt
+script -q /dev/null
+chroot /mnt ls
+docker run --name sleep img
+docker run --rm img ls
+docker ps --filter name=sleep
+docker logs --tail 100 c
+docker exec c tail -n 5 f
+kubectl exec pod -- ls
+kubectl exec -it pod -- sh -c 'ls'
+kubectl logs -f pod
+parallel echo ::: a b
+parallel -j4 'gzip {}' ::: a.log
+xargs -0 rm
+xargs grep sleep
+docker run -d img sleep infinity
+docker run -d --name t alpine sleep 1000
+docker exec -d c sleep 5
+kubectl run x --image=busybox -- sleep 3600
+docker stop sleep
+docker rm -f sleep
+flock /tmp/l grep -c sleep f
+command -v sleep
+command -V watch
+command -pv sleep && echo ok
+if command -v timeout >/dev/null; then echo y; fi
+## D. stdin fallback / code-carrying data
+echo '$(sleep 5)' | bash script.sh
+echo 'x=$(sleep 5)' | bash
+echo 'x=$(sleep 5)' | sudo bash
+echo 'x=$(sleep 5)' | bash -s -- arg
+bash <<< 'x=$(sleep 5)'
+bash -s <<< 'x=$(sleep 5)'
+echo 'x=$(sleep 5)' | ssh host
+echo 'x=$(sleep 5)' | ssh host bash
+echo 'x=$(sleep 5)' | ssh host sh -s
+echo 'x=$(sleep 5)' | docker exec -i c sh
+echo 'x=$(sleep 5)' | kubectl exec -i pod -- sh
+echo 'x=$(sleep 5)' | xargs -0 bash -c
+echo 'x=$(sleep 5)' | parallel
+echo 'x=$(sleep 5)' | eval "$(cat)"
+echo 'x=$(sleep 5)' | bash -c "$(cat)"
+echo 'x=$(sleep 5)' | source /dev/stdin
+echo 'x=$(sleep 5)' | bash /dev/stdin
+echo 'x=$(sleep 5)' | timeout 5 bash
+echo 'x=$(sleep 5)' | nohup bash
+echo 'x=$(sleep 5)' | flock /tmp/l bash
+echo 'x=$(sleep 5)' | su user
+ssh host bash <<< 'x=$(sleep 5)'
+c='x=$(sleep 5)'; eval "$c"
+c='$(sleep 5)'; bash -c "$c"
+export X='$(sleep 5)'; bash -c 'eval "$X"'
+printf -v x '%s' '$(sleep 5)'; eval "$x"
+f() { eval "$1"; }; f 'x=$(sleep 5)'
+set -- 'x=$(sleep 5)'; eval "$1"
+## E. wrapped command parsing
+timeout -s KILL 5 bash -c 'x=$(sleep 5)'
+timeout --signal=KILL 5 bash -c 'x=$(sleep 5)'
+timeout -k 2 5 bash -c 'x=$(sleep 5)'
+timeout .5 bash -c 'x=$(sleep 5)'
+timeout 1e1 bash -c 'x=$(sleep 5)'
+timeout 5 sudo -u root bash -c 'x=$(sleep 5)'
+timeout 5 env -u VAR bash -c 'x=$(sleep 5)'
+timeout 5 env X=1 bash -c 'x=$(sleep 5)'
+timeout 5 nice -n 10 bash -c 'x=$(sleep 5)'
+timeout 5 stdbuf -oL bash -c 'x=$(sleep 5)'
+sudo -u postgres bash -c 'x=$(sleep 5)'
+sudo -u postgres sh -c 'sleep 5'
+env -u VAR bash -c 'x=$(sleep 5)'
+nice -n 10 bash -c 'x=$(sleep 5)'
+stdbuf -oL bash -c 'x=$(sleep 5)'
+sudo -E bash -c 'x=$(sleep 5)'
+nohup bash -c 'x=$(sleep 5)'
+setsid -f bash -c 'x=$(sleep 5)'
+timeout 5 grep eval '$(sleep 5)' f
+timeout 5 grep bash f
+timeout 5 grep sleep f
+timeout 5 bash script.sh sleep 5
+timeout 5 eval 'x=$(sleep 5)'
+timeout 5 sudo -u root eval 'x=$(sleep 5)'
+## F. if/elif + wrapper re-peel
+if eval 'x=$(sleep 5)'; then :; fi
+if sudo eval 'x=$(sleep 5)'; then :; fi
+if ! eval 'x=$(sleep 5)'; then :; fi
+if true; then :; elif command eval 'x=$(sleep 5)'; then :; fi
+if (eval 'x=$(sleep 5)'); then :; fi
+if { eval 'x=$(sleep 5)'; }; then :; fi
+if sudo -u x bash -c 'x=$(sleep 5)'; then :; fi
+if timeout 5 bash -c 'x=$(sleep 5)'; then :; fi
+if [ -f x ]; then grep -n '$(sleep 5)' f; fi
+if grep -q '$(sleep 5)' f; then echo found; fi
+time eval 'x=$(sleep 5)'
+! command eval 'x=$(sleep 5)'
+while sudo eval 'x=$(sleep 5)'; do :; done
+case x in a) eval 'x=$(sleep 5)';; esac
+x=1 eval 'y=$(sleep 5)'
+## G. eval non-literal
+eval "sleep $N"
+eval "sleep 5"
+eval sleep 5 '$(true)'
+eval "$cmd"
+eval "echo $x"
+eval 'x=$(sleep 5)' "$y"
+## ---- rows9b.txt ----
+## H. structural positions for eval / -c with quoted subst
+case x in a) bash -c 'x=$(sleep 5)';; esac
+case x in a|b) eval 'x=$(sleep 5)' ;; esac
+case x in (a) eval 'x=$(sleep 5)';; esac
+exec bash -c 'x=$(sleep 5)'
+exec eval 'x=$(sleep 5)'
+coproc eval 'x=$(sleep 5)'
+coproc bash -c 'x=$(sleep 5)'
+function f { eval 'x=$(sleep 5)'; }; f
+f() ( eval 'x=$(sleep 5)' ); f
+select x in a; do eval 'y=$(sleep 5)'; done
+for i in 1; do sudo -u x eval 'y=$(sleep 5)'; done
+true && eval 'x=$(sleep 5)'
+true || eval 'x=$(sleep 5)'
+true | eval 'x=$(sleep 5)'
+builtin eval 'x=$(sleep 5)'
+command -p eval 'x=$(sleep 5)'
+doas bash -c 'x=$(sleep 5)'
+sudo -iu x bash -c 'x=$(sleep 5)'
+sudo --user=x bash -c 'x=$(sleep 5)'
+sudo -g grp bash -c 'x=$(sleep 5)'
+nice -10 bash -c 'x=$(sleep 5)'
+ionice -c 2 -n 7 bash -c 'x=$(sleep 5)'
+taskset -c 0 bash -c 'x=$(sleep 5)'
+chronic bash -c 'x=$(sleep 5)'
+time -p bash -c 'x=$(sleep 5)'
+env bash -c 'x=$(sleep 5)'
+env -i PATH=/bin bash -c 'x=$(sleep 5)'
+env -C /tmp bash -c 'x=$(sleep 5)'
+command -v x $(sleep 5)
+command -v x "$(sleep 5)"
+X=$(sleep 5) command -v x
+bash -o pipefail -c 'x=$(sleep 5)'
+bash --norc -c 'x=$(sleep 5)'
+bash -x -c 'x=$(sleep 5)'
+bash -euxc 'x=$(sleep 5)'
+watch -n1 'x=$(sleep 5)'
+nohup sh -c 'x=$(sleep 5)' &
+## ---- rows9c.txt ----
+## I. ordinary commands, must stay allowed (false-positive watch)
+git log --oneline -5
+grep -rn 'sleep' src/
+grep -n '$(sleep 5)' f
+rg -n '\$\(sleep' .
+ssh host 'systemctl status nginx'
+ssh -t host 'cd /srv && make'
+find . -type f -name '*.sh' -exec grep -l 'sleep' {} +
+find . -exec chmod 644 {} \;
+trap 'rm -rf "$tmp"' EXIT
+trap 'echo interrupted' INT TERM
+kubectl exec deploy/web -- ls /app
+kubectl exec -it pod -c sidecar -- cat /etc/hosts
+docker exec -it c bash
+docker run --rm -v "$PWD":/w img make test
+docker compose up -d
+podman logs --since 5m c
+su - postgres -c 'psql -c "select 1"'
+flock -n /tmp/l ./deploy.sh
+xargs -n1 basename
+parallel --dry-run echo ::: a
+script -q -c 'ls' /dev/null
+chroot /mnt /bin/ls
+echo "$(git rev-parse HEAD)"
+x="$(jq -r '.a' f.json)"
+out="$(curl -s "$u")"
+echo "`date`"
+if command -v jq >/dev/null 2>&1; then echo y; fi
+command git status
+command cp a b
+ssh-keygen -t ed25519
+bash --version
+sh -n script.sh
+docker run --rm img timeout 5 ls
+timeout 30 pytest -q
+nohup python app.py > log 2>&1
