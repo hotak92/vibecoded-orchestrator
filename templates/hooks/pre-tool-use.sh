@@ -307,11 +307,17 @@ mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 # harness kills at the timeout, so only a decode slower than the whole
 # budget goes unreported.
 # "In time" (see _ptu_finished_late) errs toward CLEARING: a run that
-# completed normally keeps its marker only when its own clock proves it ran
-# past the budget. Grey zone: the harness counts from the spawn, this hook
-# from its first clock reading (after bash start-up, a few ms), so a run
-# that finishes within those few ms of the budget may have been killed yet
-# clears its marker — the one case left unreported, never a false warning.
+# completed normally keeps its marker only when its own clock says it ran
+# past the budget. What holds exactly: a run whose own clock reads under
+# the budget always clears its marker, and a run the harness killed never
+# gets to clear it. Grey zone, a few ms wide on both sides of the budget:
+# the harness counts from the spawn while this hook counts from its first
+# clock reading (after bash start-up), and the harness's kill timer can
+# also fire late (event-loop latency). So a run finishing just under the
+# budget by its own clock may have been killed yet clears its marker (left
+# unreported), and a run finishing just over it may have had its answer
+# accepted yet keeps its marker (a warning for a call whose checks did
+# apply). Outside that band the marker is exact.
 # A marker of ANOTHER key older than a day belongs to a session or subagent
 # that never made another call (a kill on its last call): the GC below logs
 # it as `session_ended` before deleting it, so the audit line still exists.
@@ -443,7 +449,13 @@ for _ptu_g in "$SESSION_STATE_DIR"/ptu_inflight_*; do
     [ -f "$_ptu_g" ] || continue
     _ptu_gn="${_ptu_g##*/ptu_inflight_}"
     _ptu_gkey="${_ptu_gn%%.*}"
+    _ptu_gpid="${_ptu_gn#*.}"
+    _ptu_gpid="${_ptu_gpid%%.*}"
     _ptu_gms="${_ptu_gn##*.}"
+    # Exactly <key>.<pid>.<start-ms> (MUST MATCH the ps1 regex): anything
+    # else is left to the 2-day find backstop below.
+    [ "$_ptu_gn" = "$_ptu_gkey.$_ptu_gpid.$_ptu_gms" ] || continue
+    case "$_ptu_gpid" in ''|*[!0-9]*) continue ;; esac
     case "$_ptu_gms" in ''|*[!0-9]*) continue ;; esac
     case "$_ptu_gkey" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
     (( _PTU_T0_MS - _ptu_gms > PTU_GC_AGE_MS )) || continue

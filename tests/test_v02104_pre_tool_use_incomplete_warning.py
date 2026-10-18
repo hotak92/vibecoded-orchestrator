@@ -479,3 +479,35 @@ def test_a_malformed_marker_name_is_still_collected(tmp_path: Path, impl: str):
     os.utime(junk, (t, t))
     _grep(impl, proj)
     assert not junk.exists()
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+@pytest.mark.parametrize("name", ["otherKey.abc", "otherKey.12.34", "otherKey."])
+def test_the_gc_logs_only_well_formed_marker_names(tmp_path: Path, impl: str, name: str):
+    # R14A NIT: <key>.<pid>.<start-ms> with a numeric pid, the same rule in
+    # both shells. Anything else is not logged; the 2-day backstop removes
+    # it later (mtime here is 1.5 days, inside the backstop's window).
+    proj = _project(tmp_path)
+    junk = proj / ".claude" / "state" / f"ptu_inflight_{name}.{_now_ms() - 2 * 86_400_000}"
+    junk.write_text("Bash\n", encoding="utf-8")
+    t = time.time() - 1.5 * 86_400
+    os.utime(junk, (t, t))
+    _grep(impl, proj)
+    assert junk.exists()
+    assert not [e for e in _security_events(proj) if e.get("event") == "pre_tool_use_incomplete"]
+
+
+def test_gc_and_warning_hold_under_bash_compat_32(tmp_path: Path):
+    # R14A: no bash 3.2 binary is available to CI or here; BASH_COMPAT=3.2
+    # is the closest executable check (bash's own 3.2 compatibility level).
+    # It is NOT a 3.2 parser — the syntax review is what covers that.
+    proj = _project(tmp_path)
+    old = _plant(proj, "goneS", DEAD_PID, _now_ms() - 2 * 86_400_000, "Write\n")
+    _plant(proj, SID, DEAD_PID, _now_ms() - 500, "Edit\n")
+    res = _grep("sh", proj, BASH_COMPAT="3.2")
+    assert res.returncode == 0, res.stderr
+    assert "(Edit)" in _context(res)
+    assert not old.exists() and _markers(proj) == []
+    reasons = sorted(e["reason"] for e in _security_events(proj)
+                     if e.get("event") == "pre_tool_use_incomplete")
+    assert reasons == ["owner_gone", "session_ended"]
