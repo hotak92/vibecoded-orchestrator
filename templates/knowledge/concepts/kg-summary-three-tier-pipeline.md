@@ -74,7 +74,7 @@ The bulk pass saves the sidecar atomically after each generated node (a kill mid
 
 | Exit | Meaning | What kg-sync records |
 |---|---|---|
-| `0` | the pass completed — nodes may be skipped (unchanged, archived) or refused (final) | nothing |
+| `0` | the pass completed — nodes may be skipped (unchanged, archived) or refused (flagged in the sidecar, retried by the next sync) | nothing |
 | `1` | a node errored for a non-refusal reason (transport, parse) — possibly transient | `kg_node_formats_refresh_failed` (auto-retryable) |
 | `3` | no summary backend was selectable (deferred or unconfigured) — nothing written, nodes stay owed | `kg_node_formats_backend_unavailable` (environmental), never an auto-retry of a full sync |
 
