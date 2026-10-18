@@ -62,7 +62,7 @@
     "prompt_tokens": 13
   },
   "latch_live": {
-    "_note": "Fallback switched ON in the scratch launcher-DB copy; one plain claude-haiku-5-5 OAuth request (a probe client, not Claude Code) got a subscription 429 the gateway classified rate_limited with NO unified rate-limit headers and no reset hint -> the conservative 300 s latch for the Haiku family; the next request went straight to the key. (The latch's INFO wording for an unnamed limit was refined after this capture: it now reads 'subscription quota refusal names no limit until ...'.)",
+    "_note": "Fallback switched ON in the scratch launcher-DB copy; one plain claude-haiku-5-5 OAuth request (a probe client, not Claude Code) got a subscription 429 the gateway classified rate_limited with NO unified rate-limit headers and no reset hint -> the conservative 300 s latch for the Haiku family; the next request went straight to the key. (The latch's INFO wording for an unnamed limit was refined after this capture: it now reads 'subscription quota refusal names no limit until ...'.) Review R23 (same day) changed the rule this capture exposed: a rate_limited 429 with no rejected window no longer latches at all (test_the_live_case_18_94_percent_and_a_bare_429_does_not_latch).",
     "health_quota_latch": [
       {
         "limit": "unknown",

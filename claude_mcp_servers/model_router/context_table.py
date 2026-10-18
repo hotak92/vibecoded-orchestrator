@@ -244,7 +244,6 @@ class AssumedWindow:
     inherited_from: Optional[str] = None
 
 
-
 def _namespace_vendor_id(model_id: str) -> Optional[str]:
     """The vendor whose namespace ``model_id`` carries, or ``None`` — also
     ``None`` on the API-key route (``<API-key namespace><id>`` is a first-party id
@@ -255,6 +254,7 @@ def _namespace_vendor_id(model_id: str) -> Optional[str]:
         return None
     vendor, _rest = split_namespace(bare, VENDORS)
     return vendor.vendor_id if vendor is not None else None
+
 
 @dataclass(frozen=True)
 class ContextTable:

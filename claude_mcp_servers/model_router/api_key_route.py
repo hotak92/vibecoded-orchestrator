@@ -250,9 +250,12 @@ class ApiKeyRefused(Exception):
     """Raised by :func:`_proxy` on the subscription FALLBACK's key attempt,
     so the escalation can continue the ladder instead of relaying it."""
 
-    def __init__(self, status: int) -> None:
+    def __init__(self, status: int, *, key_level: bool = True) -> None:
         super().__init__(f"API key refused (HTTP {status})")
         self.status = status
+        #: ``False`` for a per-model 403 (the key works for other models):
+        #: the subscription-out latch then clears only that model's scope.
+        self.key_level = key_level
 
 
 class ApiKeyEscalation:
@@ -302,14 +305,7 @@ def api_key_refused_message(api: AnthropicApiKey, status: int, raw: bytes) -> st
     Names the secret and both remedies; quotes Anthropic's own error message
     (which never contains the key); the key itself never appears.
     """
-    detail = ""
-    try:
-        parsed = json.loads(raw.decode("utf-8", "replace"))
-        error = parsed.get("error") if isinstance(parsed, dict) else None
-        if isinstance(error, dict) and isinstance(error.get("message"), str):
-            detail = f" Anthropic said: {error['message'][:300]}"
-    except ValueError:
-        pass
+    detail = _anthropic_said(raw)
     secret = api.secret_keys[0]
     return (
         f"Anthropic refused the Claude API key the model gateway uses "
@@ -317,6 +313,32 @@ def api_key_refused_message(api: AnthropicApiKey, status: int, raw: bytes) -> st
         f"Replace the key in the launcher (Secrets → Shared → {secret}), or "
         "switch the launcher status bar to \"Anthropic: OAuth\" / pick a model "
         f"without the {api.namespace} prefix."
+    )
+
+
+def _anthropic_said(raw: bytes) -> str:
+    """`` Anthropic said: <its error message>`` from an error body, or ``""``
+    — the one reader both key answers quote (it never contains the key)."""
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return ""
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        return f" Anthropic said: {error['message'][:300]}"
+    return ""
+
+
+def api_key_balance_message(api: AnthropicApiKey, raw: bytes) -> str:
+    """The text of the gateway's 429 when Anthropic answers the Claude API
+    key with 402 (the Console organisation's credits are used up). Quotes
+    Anthropic's own message; the key itself never appears."""
+    detail = _anthropic_said(raw)
+    return (
+        f"The Claude API key the model gateway uses ({api.secret_keys[0]}) is "
+        f"out of credits (HTTP 402) — your Claude login is not affected.{detail} "
+        "Add credits in the Claude Console, or switch the launcher status bar "
+        "to \"Anthropic: OAuth\" (this request was billed to nobody)."
     )
 
 
