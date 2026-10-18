@@ -1546,8 +1546,10 @@ auto-retryable entry is right) from `BULK_EXIT_NO_BACKEND` (3 — no backend \
 selectable at all, mapped to the sibling environmental condition \
 `kg_node_formats_backend_unavailable` instead, because a full-sync retry \
 cannot fix a missing backend and would compete with the code-graph walk). \
-A permanent model refusal is FINAL (owner ruling 2026-10-14) and exits 0 — \
-it never arms this retry. There is no whole-run wall-clock cap any more \
+A model's content refusal exits 0 and never arms this retry: the node is \
+flagged `refused` in the sidecar, kept without a summary and retried by the \
+next ordinary sync (owner ruling 2026-10-18, superseding the 2026-10-14 \
+"final" ruling). There is no whole-run wall-clock cap any more \
 (review H-3): per-LLM-call timeouts bound a hung backend and the sidecar is \
 saved incrementally after each node. `retry_action` reuses the EXISTING \
 `retry:py:kg_seed` handler rather than declaring a new one: that handler \

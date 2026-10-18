@@ -491,6 +491,18 @@ class NonAnswerResponse(RuntimeError):
     """
 
 
+class ContentRefusal(NonAnswerResponse):
+    """A REFUSAL-shaped non-answer: the model declined the content
+    ("I cannot summarize this", "Sorry, …", "As an AI …").
+
+    A subclass of ``NonAnswerResponse``, so every existing catch site keeps
+    working; the KG summary generator catches it FIRST to record the node as
+    refused (a flag in its per-node sidecar — owner ruling 2026-10-18: flag
+    it, do not fall through to a lower tier, and the NEXT ordinary sync
+    retries it). Non-refusal non-answers keep the old contract exactly.
+    """
+
+
 def _now() -> float:
     """Wall clock, as one seam so tests can advance it."""
     return time.time()
@@ -1014,12 +1026,14 @@ NON_ANSWER_MIN_CHARS = 8
 #: raises ``NonAnswerResponse`` without demoting the tier and without
 #: descending — deliberately, since a CONTENT condition must not demote a
 #: healthy tier, and answering it with a weaker model would be a silent
-#: substitution. So a legitimate summary that opens with one of these
-#: prefixes (e.g. "Error: ..." as a heading) or is shorter than
-#: ``NON_ANSWER_MIN_CHARS`` (e.g. "Caching") is refused on EVERY run: the
-#: caller exits non-zero and the node stays unsummarised until its text
-#: changes. Bounded, not looping — but permanent for that text, not a
-#: retry. Widen these lists only with that cost in mind.
+#: substitution (owner ruling 2026-10-18). So a legitimate summary that
+#: opens with one of these prefixes (e.g. "Error: ..." as a heading) or is
+#: shorter than ``NON_ANSWER_MIN_CHARS`` (e.g. "Caching") is refused while
+#: its text stays byte-identical: the KG generator caches nothing usable
+#: (a REFUSAL shape is flagged in the sidecar, other shapes are not cached
+#: at all), so each ordinary sync RETRIES the node and refuses it again —
+#: bounded per run, visible in the log, never a silent cache poison. Widen
+#: these lists only with that cost in mind.
 NON_ANSWER_PREFIXES = (
     "ready. what", "ready, what", "ready! what", "ready — what", "ready. how",
     "i cannot", "i can't", "i can not", "i am unable", "i'm unable",
@@ -1035,6 +1049,28 @@ NON_ANSWER_PREFIXES = (
 )
 NON_ANSWER_EXACT = frozenset({"ok", "n/a", "na", "none", "null", "todo", "tbd"})
 
+#: The REFUSAL subset of ``NON_ANSWER_PREFIXES`` (v0.2.104, owner ruling
+#: 2026-10-18): the shapes where the model DECLINED the content, as opposed
+#: to the degenerate conversational shapes ("Ready. What do you need
+#: summarized?", "please provide …"). Only the declining shapes earn the
+#: ``ContentRefusal`` subclass; every other non-answer keeps the old
+#: contract. Same prefix anchoring and same asymmetry argument as
+#: ``NON_ANSWER_PREFIXES`` — widen only with that cost in mind.
+REFUSAL_PREFIXES = (
+    "i cannot", "i can't", "i can not", "i am unable", "i'm unable",
+    "i am not able", "i'm not able", "i do not have", "i don't have",
+    "sorry", "i'm sorry", "i am sorry", "as an ai",
+)
+
+
+def _normalized_reply(text: "str | None") -> str:
+    """The one normalization both non-answer predicates share (stripped,
+    quote-fenced, whitespace-folded, lowercased)."""
+    if text is None:
+        return ""
+    stripped = text.strip().strip("`\"'*# \t")
+    return " ".join(stripped.split()).lower()
+
 
 def is_non_answer(text: "str | None") -> bool:
     """True when *text* is a model NON-ANSWER rather than a summary.
@@ -1045,15 +1081,21 @@ def is_non_answer(text: "str | None") -> bool:
     """
     if text is None:
         return True
-    stripped = text.strip().strip("`\"'*# \t")
-    if not stripped:
+    normalized = _normalized_reply(text)
+    if not normalized:
         return True
-    normalized = " ".join(stripped.split()).lower()
     if normalized in NON_ANSWER_EXACT:
         return True
     if len(normalized) < NON_ANSWER_MIN_CHARS:
         return True
     return normalized.startswith(NON_ANSWER_PREFIXES)
+
+
+def is_content_refusal(text: "str | None") -> bool:
+    """True when *text* is a REFUSAL-shaped non-answer (the model declined
+    the content) rather than a degenerate conversational one. Always a
+    subset of :func:`is_non_answer`."""
+    return _normalized_reply(text).startswith(REFUSAL_PREFIXES)
 
 
 def _classify_exit_zero_text(text: str) -> "tuple[str, str]":
@@ -2419,13 +2461,18 @@ def call_llm(
         clear_backend_trip(backend)
         if is_non_answer(text):
             # CONTENT condition, not a tier condition: no demotion (see
-            # classify_backend_failure). The caller must not cache it.
-            # The message reports the reply's SHAPE (length), never the
+            # classify_backend_failure) and NO descent to a lower tier (a
+            # refusal answered by a weaker model would be a silent
+            # substitution — owner ruling 2026-10-18). A REFUSAL-shaped
+            # reply raises the ContentRefusal subclass so the KG generator
+            # can flag the node; every other non-answer raises the plain
+            # class. The caller must not cache either. The message reports
+            # the reply's SHAPE (length), never the
             # reply: the callers LOG this line (generate-kg-summary.py
             # writes it to the project log) and model output on this path
             # quotes node content — the same rule the breaker's ``signal``
             # field follows.
-            raise NonAnswerResponse(
+            raise (ContentRefusal if is_content_refusal(text) else NonAnswerResponse)(
                 f"{label}: backend '{backend}' returned a non-answer "
                 f"({len((text or '').strip())} chars) — not cached"
             )
