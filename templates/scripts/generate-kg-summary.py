@@ -38,7 +38,9 @@ Backend ladder (in order; one home: templates/scripts/summary_backends.py):
                                  Summaries). Bypass via `--force-api`. Costs apply.
   6. ANTHROPIC_API_KEY direct  → legacy opt-in fallback. Cost warning logged.
   7. Silent skip               → friendly log line, exits 0
-A model refusal is FINAL (never re-asked on a lower tier).
+A model refusal never descends to a lower tier (owner ruling 2026-10-18):
+the node is left without a summary, flagged as refused in the sidecar, and
+the NEXT ordinary sync tries it again — the flag is a record, not a skip.
 
 Env overrides:
   KG_SUMMARY_BACKEND        → force "cli" | "zai" | "qwen" | "ollama" | "openai" | "api" | "skip"
@@ -74,10 +76,14 @@ v0.2.92 WP-Q: two behaviours arrive from that shared module.
     spawning another doomed `claude -p`. The latch is cross-process
     because this script runs ONCE PER NODE.
   * A model NON-ANSWER ("Ready. What do you need summarized?", a refusal,
-    an empty reply) is never written to the sidecar, and an EXISTING entry
-    holding one is regenerated even though its content hash still matches
-    — a row that never held a valid summary is not "satisfied" by it. The
-    hash gate itself is unchanged and still skips healthy unchanged nodes.
+    an empty reply) is never written to the sidecar AS A SUMMARY, and an
+    EXISTING entry holding one is regenerated even though its content hash
+    still matches — a row that never held a valid summary is not
+    "satisfied" by it. The hash gate itself is unchanged and still skips
+    healthy unchanged nodes. v0.2.104 (owner ruling 2026-10-18): a
+    REFUSAL-shaped non-answer additionally leaves a `refused` flag entry in
+    the sidecar (no summary text — the flag is a record, and never a usable
+    entry, so the next ordinary sync retries the node).
 """
 
 import argparse
@@ -127,6 +133,7 @@ call_openai = _sb.call_openai
 is_non_answer = _sb.is_non_answer
 BackendUnavailable = _sb.BackendUnavailable
 NonAnswerResponse = _sb.NonAnswerResponse
+ContentRefusal = _sb.ContentRefusal
 
 
 def __getattr__(name: str):
@@ -618,21 +625,49 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _record_refusal(formats: dict, rel_path: str, title: str, c_hash: str,
+                    exc: "Exception") -> None:
+    """Flag the node as REFUSED in the sidecar (owner ruling 2026-10-18).
+
+    The entry deliberately carries NO ``description``/``summary``: the
+    refusal text is never cached, and ``stored_entry_is_usable`` rejects the
+    entry, so the content-hash gate can NOT skip the node — the NEXT
+    ordinary sync tries it again. The flag is a visible record (which node,
+    when, which backend, the reply's shape), not a skip marker. The stored
+    ``refusal`` string is the ladder's own message, which reports the
+    reply's SHAPE (char count), never its text.
+    """
+    formats[rel_path] = {
+        "title": title,
+        "refused": True,
+        "refused_at": datetime.now(timezone.utc).isoformat(),
+        "refusal": str(exc),
+        "content_hash": c_hash,
+        "backend": _BACKEND_CACHE.get("choice", "?"),
+    }
+
+
 def _process_node_bulk(
     file_path: Path, *, force: bool, dry_run: bool, formats: dict
 ) -> str:
     """Process one node in ``--all`` mode. Returns a status string.
 
     Status values: ``"skipped"``, ``"generated"``, ``"dry_run"``,
-    ``"archived"``, ``"archived_dropped"``, ``"nonanswer:<msg>"``,
-    ``"error:<msg>"`` (the first four keep the retired bulk generator's
-    contract, so the progress/tally lines callers parse are unchanged). Every
-    LLM call goes through the shared ladder; a non-answer raises
-    :class:`summary_backends.NonAnswerResponse` there and is reported
-    as a ``nonanswer:`` status here, never cached — and, per the owner
-    ruling of 2026-10-14 (a model refusal is FINAL), it is not an error
-    either: retrying or deferring it would only build a never-clearing
-    owed loop over content no backend will ever answer.
+    ``"archived"``, ``"archived_dropped"``, ``"refused:<msg>"``,
+    ``"nonanswer:<msg>"``, ``"error:<msg>"`` (the first four keep the
+    retired bulk generator's contract, so the progress/tally lines callers
+    parse are unchanged). Every LLM call goes through the shared ladder.
+
+    A REFUSAL (the model declined the content) raises
+    :class:`summary_backends.ContentRefusal` there and is reported as a
+    ``refused:`` status here: the node is left without a summary, flagged in
+    the sidecar (``_record_refusal``), and retried by the next ordinary sync
+    — the flag is never a usable entry, so the hash gate cannot freeze it
+    (owner ruling 2026-10-18). It is NOT an error for the exit code: an
+    error would arm the auto-retry/deferral machinery over content this
+    backend may never answer, and the ruling asks only for the next ORDINARY
+    sync to retry. A non-refusal non-answer keeps the old contract:
+    ``nonanswer:`` status, nothing cached.
     """
     title, full_text, body = read_node(file_path)
     if not title:
@@ -663,10 +698,17 @@ def _process_node_bulk(
     try:
         description = generate_description(title, body)
         summary = generate_summary(title, body)
+    except _sb.ContentRefusal as exc:
+        # Owner ruling 2026-10-18: a refusal does NOT descend tiers and is
+        # NOT an error — the node is flagged refused in the sidecar (a
+        # record, never a cached answer) and the next ordinary sync retries
+        # it, since the flagged entry is never a usable one.
+        _record_refusal(formats, rel_path, title, c_hash, exc)
+        return f"refused:{exc}"
     except _sb.NonAnswerResponse as exc:
-        # A refusal is FINAL (owner ruling 2026-10-14) — done-with-this-node-
-        # skipped, not owed: nothing is cached (the hash gate must not freeze
-        # a non-answer) and the status is NOT an error for the exit code.
+        # A non-refusal non-answer: never cached (the hash gate must not
+        # freeze it) and NOT an error for the exit code — with nothing
+        # cached the next ordinary sync retries the node anyway.
         return f"nonanswer:{exc}"
     except RuntimeError as exc:
         return f"error:{exc}"
@@ -720,9 +762,10 @@ def _run_bulk(args: argparse.Namespace) -> int:
     Returns the process exit code:
 
     * ``0`` — the pass COMPLETED. Nodes may have been skipped (unchanged,
-      archived) or permanently refused (``nonanswer:`` — a model refusal is
-      final, owner ruling 2026-10-14): that IS success; the tally line names
-      the counts so nothing is invisible.
+      archived), refused (``refused:`` — flagged in the sidecar, retried by
+      the next ordinary sync; owner ruling 2026-10-18) or unanswered
+      (``nonanswer:`` — nothing cached): those ARE success; the tally line
+      names the counts so nothing is invisible.
     * ``1`` — a node errored for a non-refusal reason (a tier's transport
       failed, a parse broke). Potentially transient → the bulk callers
       (kg-sync's post-sync refresh, the schema-migration regeneration)
@@ -779,7 +822,7 @@ def _run_bulk(args: argparse.Namespace) -> int:
 
     total = len(files)
     skipped = generated = errors = dry_count = archived_count = 0
-    nonanswers = 0
+    nonanswers = refused = 0
     started = time.time()
     for i, file_path in enumerate(files, 1):
         node_start = time.time()
@@ -802,12 +845,20 @@ def _run_bulk(args: argparse.Namespace) -> int:
         elif status == "generated":
             generated += 1
             print(f"[{i}/{total}] OK    {rel}  ({elapsed:.1f}s)")
+        elif status.startswith("refused:"):
+            # One plain line naming the node (owner ruling 2026-10-18).
+            refused += 1
+            print(
+                f"[{i}/{total}] REFUSED {rel}: "
+                f"{status.removeprefix('refused:')} "
+                f"(flagged; the next sync retries it)"
+            )
         elif status.startswith("nonanswer:"):
             nonanswers += 1
             print(
-                f"[{i}/{total}] REFUSED {rel}: "
-                f"{status.removeprefix('nonanswer:')} (final — not retried, "
-                f"not deferred)"
+                f"[{i}/{total}] NON-ANSWER {rel}: "
+                f"{status.removeprefix('nonanswer:')} (not cached; the next "
+                f"sync retries it)"
             )
         else:
             errors += 1
@@ -816,16 +867,20 @@ def _run_bulk(args: argparse.Namespace) -> int:
         # is on disk before the next one starts. Atomic (shared home), so a
         # kill mid-run leaves a valid sidecar holding everything finished so
         # far. Dry-run writes nothing; unchanged runs rewrite nothing.
-        if not args.dry_run and status in ("generated", "archived_dropped"):
+        if not args.dry_run and (
+            status in ("generated", "archived_dropped")
+            or status.startswith("refused:")
+        ):
             save_formats(formats)
 
     print(
         f"\nDone in {time.time() - started:.1f}s — "
         f"generated: {generated}, skipped: {skipped}, "
+        f"refused: {refused}, "
         f"non-answer: {nonanswers}, "
         f"dry-run: {dry_count}, errors: {errors}, archived: {archived_count}"
     )
-    if not args.dry_run and (generated or archived_count):
+    if not args.dry_run and (generated or archived_count or refused):
         print(f"Sidecar saved incrementally to {FORMATS_PATH}")
     return 1 if errors else 0
 
@@ -910,9 +965,14 @@ def main():
         # Wording deliberately avoids the phrase the launcher and
         # tests/test_v0270_shipped_kg_summaries.py match on ("hash match"):
         # this is the REGENERATE path, and a reader (or a grep) must not
-        # mistake it for the skip path.
-        log(f"  {title}: cached entry holds a non-answer, not a summary — "
-            f"regenerating it now")
+        # mistake it for the skip path. A REFUSED flag (owner ruling
+        # 2026-10-18) is never usable, so it lands here: the next ordinary
+        # sync retries the node.
+        if existing.get("refused"):
+            log(f"  {title}: flagged refused on an earlier run — retrying now")
+        else:
+            log(f"  {title}: cached entry holds a non-answer, not a summary — "
+                f"regenerating it now")
 
     if args.dry_run:
         # Before backend selection: a dry run neither probes nor calls a model.
@@ -927,6 +987,17 @@ def main():
     try:
         description = generate_description(title, body)
         summary = generate_summary(title, body)
+    except _sb.ContentRefusal as exc:
+        # Owner ruling 2026-10-18: the model REFUSED the content. Do not
+        # descend tiers, do not cache anything as a summary — flag the node
+        # refused in the sidecar (a record, not a usable entry, so the next
+        # ordinary sync retries it), log one plain line naming the node, and
+        # exit 0: a recorded refusal is not a run failure.
+        log(f"  {title}: refused by the model ({exc}) — flagged; "
+            f"the next sync retries it")
+        _record_refusal(formats, rel_path, title, c_hash, exc)
+        save_formats(formats)
+        sys.exit(0)
     except _sb.NonAnswerResponse as exc:
         # Writing this would poison the sidecar and the hash gate would
         # then freeze it. Fail loudly instead: the launcher records the

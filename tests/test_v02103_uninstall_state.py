@@ -1059,6 +1059,72 @@ def test_gateway_console_script_matches_only_at_argv0_or_after_python(cmdline, e
     assert uq.is_vco_gateway(proc, cands) is ours
 
 
+# ── step [3] on macOS: `ps -o args=` gives ONE joined line (no argv array) ──
+
+VENV_SP = "/Users/u/My Proj/vco/.venv/bin"
+CANDS_SP = [[f"{VENV_SP}/vct-model-gateway"], [f"{VENV_SP}/python", "-m", "model_router"]]
+
+
+class _PsRes:
+    def __init__(self, out, rc=0):
+        self.stdout, self.returncode = out, rc
+
+
+def _fake_macos_ps(args_line: str, comm: str = ""):
+    def run(cmd, **_kw):
+        assert cmd[:2] == ["ps", "-o"]
+        return _PsRes(args_line if cmd[2] == "args=" else comm)
+    return run
+
+
+@pytest.mark.parametrize("line,ours", [
+    # the gateway run from a spaced install root: script as argv[0]…
+    (f"{VENV_SP}/vct-model-gateway serve --port 11460", True),
+    # …as the first argument after a Python interpreter (its own path
+    # spaced too)…
+    (f"/usr/bin/python3 {VENV_SP}/vct-model-gateway serve", True),
+    (f"{VENV_SP}/python {VENV_SP}/vct-model-gateway serve", True),
+    # …as the pinned interpreter + `-m model_router` module form…
+    (f"{VENV_SP}/python -m model_router serve", True),
+    # interpreter options before the script are still the script position…
+    (f"/usr/bin/python3 -S {VENV_SP}/vct-model-gateway serve", True),
+    # …but the script anywhere ELSE on the line is not the gateway (R39 L2)
+    (f"cp {VENV_SP}/vct-model-gateway /tmp/gateway-copy", False),
+    (f"vim {VENV_SP}/vct-model-gateway", False),
+    (f"/usr/bin/python3 tool.py {VENV_SP}/vct-model-gateway", False),
+    # a DIFFERENT venv's interpreter for the module form is not ours
+    ("/usr/bin/python3 -m model_router serve", False),
+    # -c / -m consume the next token: the script is then an argument, not
+    # the script position
+    (f"/usr/bin/python3 -c {VENV_SP}/vct-model-gateway", False),
+    # a same-named script in another (spaced) tree
+    ("/Users/u/Other Proj/vco/.venv/bin/vct-model-gateway serve", False),
+])
+def test_macos_ps_line_matches_a_spaced_gateway_path_without_loosening(line, ours):
+    """Review FINAL4 left-open (macOS stdlib path): a gateway whose path
+    contains spaces was not recognised by the whitespace split, so the
+    uninstaller left it running. The raw-line fallback recognises it —
+    candidate-anchored, same argv0 / first-arg-after-python rule."""
+    proc = uq._stdlib_identity(42, platform="darwin", run=_fake_macos_ps(line))
+    assert proc is not None and proc.raw_line == line
+    assert uq.is_vco_gateway(proc, CANDS_SP) is ours
+
+
+def test_macos_ps_split_alone_breaks_on_spaces():
+    """The precondition: the naive split alone does NOT match (the tokens
+    are torn inside the path) — the raw line is what saves the match."""
+    line = f"{VENV_SP}/vct-model-gateway serve --port 11460"
+    proc = uq._stdlib_identity(42, platform="darwin", run=_fake_macos_ps(line))
+    assert proc.cmdline != (f"{VENV_SP}/vct-model-gateway", "serve", "--port", "11460")
+    assert uq.is_vco_gateway(uq.GatewayProc(proc.pid, proc.cmdline, proc.exe),
+                             CANDS_SP) is False
+
+
+def test_macos_ps_unknown_pid_is_none():
+    gone = uq._stdlib_identity(42, platform="darwin", run=_fake_macos_ps(""))
+    assert gone is None
+
+
 def test_a_current_stack_container_with_a_blank_working_dir_label_is_step_1s(tmp_path):
     """R39 L3: some podman-compose versions leave ``working_dir`` blank; the
     current stack's canonical container is then matched by compose project
