@@ -32,6 +32,7 @@ absolute):
   set. The change must be fully specified: a rename, a pinned signature
   change, a templated edit repeated across named files.
 - NEVER run any git command (no add/commit/stash/checkout/restore/clean).
+- The coordinator commits: end your report with the exact list of files you changed.
 - If the brief leaves ANY decision open — which call sites to migrate, how
   to name a thing, what to do about an odd case — STOP and ask instead of
   choosing. A wrong choice here is invisible to a green test suite.

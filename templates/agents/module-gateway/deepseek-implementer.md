@@ -17,6 +17,7 @@ Rules that are absolute:
   coordinator reviews and merges the worktree branch. Never `cd` to the
   parent checkout. If the brief names a different repository or worktree
   to work in, work only there.
+- The coordinator commits: end your report with the exact list of files you changed.
 - Red-proof every fix: show the new test FAILING against the pre-fix source,
   then PASSING. Restore the pre-fix source with a `cp` copy aside, never with
   a VCS command. Report both outputs verbatim.

@@ -5043,6 +5043,41 @@ async def _hybrid_search_body(
 # `.excalidraw` JSON scene directly if you ever need to.
 
 
+def _linked_worktree_root(md_path: Path, base: Path) -> Optional[Path]:
+    """The root of the git LINKED WORKTREE of the ``base`` checkout that
+    contains ``md_path``, or ``None``.
+
+    The positive signal is exact: some ancestor of ``md_path`` holds a ``.git``
+    FILE (a linked worktree's marker) whose ``gitdir:`` line points under
+    ``<base>/.git/worktrees/``. Anything else (no marker, another repo's
+    worktree, an unreadable marker) is ``None`` -- never a guess.
+    """
+    try:
+        wt_gitdirs = (base / ".git" / "worktrees").resolve()
+    except OSError:
+        return None
+    for parent in md_path.parents:
+        marker = parent / ".git"
+        try:
+            if not marker.is_file():
+                continue
+            text = marker.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("gitdir:"):
+                gitdir = Path(line.split(":", 1)[1].strip())
+                if not gitdir.is_absolute():
+                    gitdir = parent / gitdir
+                try:
+                    gitdir.resolve().relative_to(wt_gitdirs)
+                except (ValueError, OSError):
+                    return None
+                return parent
+        return None
+    return None
+
+
 @mcp.tool()
 async def store_knowledge_node(
     title: str,
@@ -5065,8 +5100,16 @@ async def store_knowledge_node(
     "shared"; shared writes are REFUSED, not rerouted, when
     SHARED_KG_WRITE_DISABLED=true).
 
+    WORKTREE LANES: a relative file_path resolves against KG_BASE_DIR, i.e.
+    the MAIN checkout -- this server is shared by the session and its
+    subagents and cannot see the caller's cwd. A lane working in a git
+    worktree must pass an ABSOLUTE file_path inside its worktree (or Write
+    the .md file itself); the stored path is then made relative to that
+    worktree.
+
     Returns: JSON — success, file_written, absolute_path; a `warning` when the
-    folder is not registered.
+    folder is not registered; `path_note` when a relative file_path was
+    resolved against KG_BASE_DIR (names the directory it landed in).
     """
     # v0.2.95 R6: computed inside the try (it needs the resolved collection)
     # but declared HERE, because the failure payload must carry it too — the
@@ -5330,6 +5373,7 @@ async def store_knowledge_node(
         md_path: Optional[Path] = None
         rel_file_path: str = file_path  # default: use as-is if already relative
         wrote_outside_project: bool = False
+        path_note: Optional[str] = None
 
         if file_path:
             fp = Path(file_path)
@@ -5340,14 +5384,30 @@ async def store_knowledge_node(
                 try:
                     rel_file_path = str(md_path.relative_to(base))
                 except ValueError:
-                    # Absolute path not under known base — store as-is (best effort)
-                    rel_file_path = file_path
-                    logger.warning(
-                        f"Absolute file_path '{file_path}' is not under base '{base}'; "
-                        f"storing absolute path in Weaviate (may affect cleanup script)"
-                    )
+                    # A linked worktree of the same checkout (a lane's own
+                    # tree): its relative path is the node's real identity.
+                    _wt_root = _linked_worktree_root(md_path, base)
+                    if _wt_root is not None:
+                        rel_file_path = str(md_path.relative_to(_wt_root))
+                        path_note = (
+                            f"absolute file_path is inside the git worktree "
+                            f"{_wt_root}; stored as '{rel_file_path}' relative to it"
+                        )
+                    else:
+                        # Absolute path not under known base — store as-is (best effort)
+                        rel_file_path = file_path
+                        logger.warning(
+                            f"Absolute file_path '{file_path}' is not under base '{base}'; "
+                            f"storing absolute path in Weaviate (may affect cleanup script)"
+                        )
             elif KG_BASE_DIR:
                 md_path = Path(KG_BASE_DIR) / file_path
+                path_note = (
+                    f"relative file_path resolved against KG_BASE_DIR "
+                    f"({KG_BASE_DIR}) -- the MAIN checkout. A lane working in a "
+                    f"git worktree must pass an ABSOLUTE file_path inside its "
+                    f"worktree (or Write the file itself)."
+                )
             else:
                 # D-10 (v0.2.73): before falling back to the SERVER-inferred
                 # base (which lands the .md inside the ORCHESTRATOR CLONE, not
@@ -5728,6 +5788,8 @@ async def store_knowledge_node(
         }
         if md_path is not None:
             result["absolute_path"] = str(md_path)
+        if path_note:
+            result["path_note"] = path_note
         if wrote_outside_project:
             # D-10: make the boundary violation visible in the tool result,
             # not just a log line the hook contract hides.
