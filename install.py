@@ -20671,8 +20671,11 @@ def _configure_claude_settings(
       sibling, emit deferral entry, leave original alone.
     * File exists + parse fails → emit deferral entry, leave file alone.
     * ``adopt_project_mode == "replace-all"`` → unconditionally overwrite
-      with VCO defaults (advanced/explicit opt-in via
-      ``--adopt-project-replace-all``).
+      with what a fresh install lands — the shipped settings template plus
+      VCO defaults (``vco_lib.self_install.replace_all_settings``; advanced /
+      explicit opt-in via ``--adopt-project-replace-all``). Every user edit is
+      reset; no template key is dropped. A missing template leaves the file
+      alone with a stderr error.
     * ``adopt_project_mode in (None, "adopt")`` → use the safe matrix above.
     * ``adopt_project_mode == "no-adopt"`` and ``"dry-run"`` are handled
       upstream in ``main()`` before this function is reached.
@@ -20752,9 +20755,22 @@ def _configure_claude_settings(
         settings_file.write_text(rendered_defaults, encoding="utf-8")
         return
 
-    # Case 2: --adopt-project-replace-all — overwrite outright.
+    # Case 2: --adopt-project-replace-all — overwrite outright, from what a
+    # fresh install lands (the shipped template + these defaults; v0.2.104 —
+    # it used to write `defaults` alone and drop every template-only key).
     if adopt_project_mode == "replace-all":
-        settings_file.write_text(rendered_defaults, encoding="utf-8")
+        try:
+            replaced = _self_install.replace_all_settings(
+                PROJECT_ROOT, defaults, _VCO_MANAGED_KEYS_SENTINEL)
+        except (OSError, ValueError) as exc:
+            print(
+                "  Claude settings: NOT replaced — the shipped settings template "
+                f"could not be read ({type(exc).__name__}: {exc}); the install "
+                "looks broken, re-clone or repair templates/ and re-run",
+                file=sys.stderr,
+            )
+            return
+        settings_file.write_text(json.dumps(replaced, indent=2) + "\n", encoding="utf-8")
         print("  Claude settings: replaced (--adopt-project-replace-all)")
         return
 
