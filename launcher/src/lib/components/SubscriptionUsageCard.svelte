@@ -15,9 +15,11 @@
     barWidth,
     cardVisible,
     describeCountdown,
+    estimateNote,
     fetchUsage,
     INITIAL_CARD_STATE,
     nextPollMs,
+    percentText,
     restartOffered,
     settle,
     unknownLabel,
@@ -113,8 +115,11 @@
                        aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(w.percent)}>
                     <div class="usage-fill tone-{barTone(w.percent)}" style:width={barWidth(w.percent)}></div>
                   </div>
-                  <span class="usage-pct">{Math.round(w.percent)}%</span>
+                  <span class="usage-pct" title={estimateNote(w) ?? undefined}>{percentText({ ...w, percent: w.percent })}</span>
                   <span class="usage-reset">{describeCountdown(w.resets_at, now)}</span>
+                  {#if estimateNote(w)}
+                    <span class="usage-estimate">{estimateNote(w)}</span>
+                  {/if}
                 {:else}
                   <span class="usage-unknown">{unknownLabel(w.unknown_reason)}</span>
                 {/if}
@@ -234,6 +239,12 @@
     grid-column: 2 / 4;
     font-size: 11px;
     color: var(--color-muted, #475569);
+  }
+  .usage-estimate {
+    grid-column: 2 / 4;
+    font-size: 11px;
+    font-style: italic;
+    color: var(--color-mid, #94a3b8);
   }
   .usage-unknown {
     grid-column: 2 / 4;

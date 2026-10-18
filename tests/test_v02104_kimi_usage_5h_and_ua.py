@@ -25,7 +25,10 @@ Two live defects (owner report 2026-10-18; gateway log from 2026-10-17):
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -290,6 +293,167 @@ class KimiUserAgentChoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service._client_user_agents[-1], agents[-2])
         self.assertEqual(len(set(service._client_user_agents)),
                          uw.MAX_CLIENT_USER_AGENTS)
+
+
+# ── the ledger FALLBACK ESTIMATE of the 5h window (owner 2026-10-18) ─────
+RESET_1018 = datetime(2026, 10, 18, 6, 13, 9, 844464, tzinfo=timezone.utc).timestamp()
+
+
+def _row(ts: str, route: str, **tokens: int) -> str:
+    return json.dumps({"ts": ts, "route": route, "status": 200, **tokens}) + "\n"
+
+
+class KimiLedgerEstimateTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ledger = Path(self._tmp.name) / "gateway-usage.jsonl"
+        self.ledger.write_text("".join((
+            # Before the window (01:13:09Z start): ignored.
+            _row("2026-10-18T01:00:00Z", "vendor:kimi", input_tokens=99_999),
+            # Inside: input + cache-creation + output count, cache-read not.
+            _row("2026-10-18T02:00:00Z", "vendor:kimi", input_tokens=500),
+            _row("2026-10-18T03:49:05.811171Z", "vendor:kimi", input_tokens=1000,
+                 cache_creation_input_tokens=200, cache_read_input_tokens=5000,
+                 output_tokens=300),
+            # Another route inside the window: ignored.
+            _row("2026-10-18T03:00:00Z", "anthropic", input_tokens=77_777),
+            _row("2026-10-18T03:10:00Z", "vendor:zai", input_tokens=55_555),
+        )), encoding="utf-8")
+        #: What the service's ledger_path answers (None = no ledger home).
+        self.ledger_home: Optional[Path] = self.ledger
+        self.clock = _Clock(NOW_1018)
+        self.fetch = _EdgeFetch(set())
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _make(self, budget: Optional[int] = 100_000) -> UsageWindows:
+        kimi = VENDORS["kimi"]
+        vendor = type(kimi)(**{**kimi.__dict__, "quota_url": "https://kimi.example/v1/usages"})
+
+        async def vendor_key(_vendor: Any) -> Optional[str]:
+            return "synthetic-key"
+
+        return UsageWindows(
+            anthropic_upstream="https://anthropic.example/",
+            vendors={"kimi": vendor},
+            oauth_token=lambda: None,
+            vendor_key=vendor_key,
+            fetch=self.fetch,
+            ledger_path=lambda: self.ledger_home,
+            clock=self.clock,
+            rng=lambda: 0.5,
+            kimi_5h_budget=budget,
+        )
+
+    async def _good_then_refused(self, service: UsageWindows, *, after_s: float) -> None:
+        service.note_activity(CLAUDE_UA)
+        await service.stop()
+        await service.refresh()  # a good live reading: reset 06:13:09Z
+        self.fetch.refused = {CLAUDE_UA}
+        self.clock.now += after_s
+        await service.refresh()  # the edge refuses from now on
+
+    @staticmethod
+    def _five(service: UsageWindows) -> dict:
+        return {w["id"]: w for w in _kimi(service)["windows"]}["5h"]
+
+    async def test_the_live_reading_wins_while_it_is_known(self) -> None:
+        service = self._make()
+        service.note_activity(CLAUDE_UA)
+        await service.stop()
+        await service.refresh()
+        five = self._five(service)
+        self.assertEqual(five["source"], uw.SOURCE_KIMI_USAGES)
+        self.assertEqual(five["percent"], 1.0)
+        self.assertNotIn("estimate", five)
+
+    async def test_the_estimate_stands_in_when_the_live_reading_is_unknown(self) -> None:
+        service = self._make()
+        await self._good_then_refused(service, after_s=uw.STALE_AFTER_S + 60)
+        five = self._five(service)
+        self.assertEqual(five["source"], uw.SOURCE_LEDGER_ESTIMATE)
+        # 500 + (1000 + 200 + 300) of 100,000: the window's kimi rows only,
+        # cache reads excluded, the row before the window start excluded.
+        self.assertEqual(five["estimate"]["tokens"], 2000)
+        self.assertEqual(five["estimate"]["requests"], 2)
+        self.assertEqual(five["percent"], 2.0)
+        self.assertIsNone(five["unknown_reason"])
+        self.assertEqual(five["resets_at"], uw._iso(RESET_1018))
+        self.assertEqual(five["estimate"]["window_start"],
+                         uw._iso(RESET_1018 - uw.KIMI_5H_SPAN_S))
+        self.assertEqual(five["estimate"]["scope"], "this_gateway")
+        # The monthly windows are not estimated: they stay the vendor's.
+        monthly = {w["id"]: w for w in _kimi(service)["windows"]}["monthly"]
+        self.assertEqual(monthly["source"], uw.SOURCE_KIMI_USAGES)
+        # Every surface marks it as an estimate.
+        line = uw.render_line(service.snapshot())
+        self.assertIn("5h ~2%", line)
+        self.assertIn("5h ~2%", uw.label_suffixes(service.snapshot())["kimi"])
+
+    async def test_the_window_rolls_forward_past_the_stored_reset(self) -> None:
+        service = self._make()
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write(_row("2026-10-18T06:30:00Z", "vendor:kimi",
+                              input_tokens=3000, output_tokens=1000))
+        # 04:00 -> 07:00: past the 06:13 reset; the next window ends 11:13.
+        await self._good_then_refused(service, after_s=3 * 3600)
+        five = self._five(service)
+        self.assertEqual(five["source"], uw.SOURCE_LEDGER_ESTIMATE)
+        self.assertEqual(five["resets_at"], uw._iso(RESET_1018 + uw.KIMI_5H_SPAN_S))
+        self.assertEqual(five["estimate"]["tokens"], 4000)
+        self.assertEqual(five["percent"], 4.0)
+
+    def test_roll_window_end(self) -> None:
+        span = uw.KIMI_5H_SPAN_S
+        self.assertEqual(uw.roll_window_end(RESET_1018, RESET_1018 - 1, span), RESET_1018)
+        self.assertEqual(uw.roll_window_end(RESET_1018, RESET_1018, span), RESET_1018 + span)
+        self.assertEqual(
+            uw.roll_window_end(RESET_1018, RESET_1018 + 2 * span + 5, span),
+            RESET_1018 + 3 * span,
+        )
+
+    async def test_budget_zero_disables_the_estimate(self) -> None:
+        service = self._make(budget=0)
+        await self._good_then_refused(service, after_s=uw.STALE_AFTER_S + 60)
+        five = self._five(service)
+        self.assertIsNone(five["percent"])
+        self.assertEqual(five["unknown_reason"], uw.UNKNOWN_STALE)
+        self.assertNotIn("estimate", five)
+
+    async def test_the_budget_env_is_read_when_none_is_injected(self) -> None:
+        for raw, expected in (("0", None), ("50000", 4.0), ("garbage", 0.2)):
+            with self.subTest(raw=raw), mock.patch.dict(
+                os.environ, {uw.KIMI_5H_BUDGET_ENV: raw},
+            ):
+                self.clock.now = NOW_1018
+                self.fetch.refused = set()
+                service = self._make(budget=None)
+                await self._good_then_refused(service, after_s=uw.STALE_AFTER_S + 60)
+                self.assertEqual(self._five(service)["percent"], expected)
+
+    async def test_no_reset_ever_seen_means_no_estimate(self) -> None:
+        self.fetch.refused = {CLAUDE_UA}
+        service = self._make()
+        service.note_activity(CLAUDE_UA)
+        await service.stop()
+        await service.refresh()
+        self.assertEqual(_kimi(service)["windows"], [])
+
+    async def test_no_ledger_means_no_estimate(self) -> None:
+        service = self._make()
+        self.ledger_home = None  # the ledger has no home
+        await self._good_then_refused(service, after_s=uw.STALE_AFTER_S + 60)
+        five = self._five(service)
+        self.assertIsNone(five["percent"])
+        self.assertNotIn("estimate", five)
+
+    def test_an_unknown_5h_reading_keeps_its_reset_time(self) -> None:
+        window = _five_hour(_detail_payload({
+            "limit": "100", "resetTime": "2026-10-18T06:13:09.844464Z",
+        }))
+        self.assertIsNone(window.percent)
+        self.assertEqual(window.resets_at, RESET_1018)
 
 
 if __name__ == "__main__":  # pragma: no cover

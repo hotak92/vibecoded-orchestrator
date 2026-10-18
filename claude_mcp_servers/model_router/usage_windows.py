@@ -25,7 +25,11 @@ QwenCloud  none — no quota source       the gateway ledger's routed-token tota
 Kimi Code  5h, monthly, monthly code    ``Vendor.quota_url`` (``x-api-key``
                                         raw, the relayed client user-agent —
                                         the same Cloudflare edge gate as its
-                                        messages endpoint, live 2026-10-07)
+                                        messages endpoint, live 2026-10-07);
+                                        when its 5h reading is unknown or
+                                        stale, a ``~`` ESTIMATE from this
+                                        gateway's ledger against a token
+                                        budget (``ledger_estimate``)
 ========== ============================ ======================================
 
 Four rules shape everything below.
@@ -87,6 +91,8 @@ from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import aiohttp
 
+from vco_lib.env_values import env_int
+
 from .vendors import (
     DEFAULT_ANTHROPIC_VERSION,
     OAUTH_BETA,
@@ -119,6 +125,41 @@ MAX_CLIENT_USER_AGENTS = 4
 #: time; a real client's UA refused by a transient edge rule must come back.
 REFUSED_USER_AGENT_RETRY_S = 60 * 60
 
+#: The Kimi 5h FALLBACK ESTIMATE's token budget (owner 2026-10-18: "Kimi's
+#: budget is pretty much 1M tokens over a 5h window", read off the vendor's
+#: website against this gateway's own subagent traffic). ``0`` disables the
+#: estimate. Read once, when :class:`UsageWindows` is built at daemon start.
+KIMI_5H_BUDGET_ENV = "VCT_MODEL_GATEWAY_KIMI_5H_TOKEN_BUDGET"
+DEFAULT_KIMI_5H_TOKEN_BUDGET = 1_000_000
+#: Kimi's 5h windows sit on a FIXED 5-hour grid: the 2026-10-07 probe reset
+#: at 05:13:09.844464Z and the 2026-10-18 one at 06:13:09.844464Z, exactly
+#: 53 x 5 h apart — so a past reset rolls forward in 5 h steps.
+KIMI_5H_SPAN_S = 5 * 60 * 60
+#: How far back the ledger reader keeps individual rows for window estimates:
+#: one 5h window plus slack.
+RECENT_LEDGER_KEEP_S = 6 * 60 * 60
+#: The ledger's four token fields, in the order a recent row stores them.
+LEDGER_TOKEN_FIELDS: tuple[str, ...] = (
+    "input_tokens", "cache_creation_input_tokens",
+    "cache_read_input_tokens", "output_tokens",
+)
+#: Which ledger fields the Kimi 5h estimate counts. CALIBRATION (2026-10-18):
+#: the only evidence is two live readings 14 s apart in a window whose
+#: ledger held 2 then 3 kimi rows (the 2026-10-07 window predates the
+#: ledger's oldest row). ``limit_5h.used_ratio`` read 0.0135 then 0.015;
+#: the ledger held input 44,491 / output 488 / cache-read 38,656, then input
+#: 45,257 / output 962 / cache-read 82,944 (cache-creation 0 throughout).
+#: No field set fits both with one budget — input+output implies 3.3M then
+#: 3.1M per window but 0.83M for the step between; adding cache-read implies
+#: 6.2M then 8.6M — and Kimi's detail count ("1 of 100") is too coarse to
+#: help. The evidence cannot decide, so the rule is input + cache-creation
+#: + output (cache reads excluded), as the owner asked in that case. Against
+#: the 1M default it read ~4.5 % where Kimi said 1.35 %: the estimate errs
+#: HIGH, the safe side for deciding whether a lane may run.
+KIMI_5H_ESTIMATE_FIELDS: tuple[str, ...] = (
+    "input_tokens", "cache_creation_input_tokens", "output_tokens",
+)
+
 ANTHROPIC_USAGE_PATH = "/api/oauth/usage"
 
 SOURCE_OAUTH_USAGE = "oauth_usage"
@@ -126,6 +167,9 @@ SOURCE_UNIFIED_HEADERS = "unified_headers"
 SOURCE_ZAI_QUOTA = "zai_quota"
 SOURCE_KIMI_USAGES = "kimi_usages"
 SOURCE_LEDGER = "gateway_ledger"
+#: A window percent ESTIMATED from this gateway's own ledger (the Kimi 5h
+#: fallback) — never the vendor's reading; rendered with a ``~``.
+SOURCE_LEDGER_ESTIMATE = "ledger_estimate"
 
 #: Vendor states. ``pending`` = no refresh has completed yet; ``unconfigured``
 #: = no credential to ask with; ``unknown`` = asked and got nothing usable.
@@ -501,9 +545,13 @@ def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list
     The monthly windows have only the one reading. Like every quota source
     this is undocumented, so each field is read defensively: a missing or
     unparseable window is present and unknown, never absent, and never a
-    number nobody reported.
+    number nobody reported. An unknown 5h window still carries the reset
+    time the answer named, when it named one: the ledger estimate
+    (:meth:`UsageWindows._refresh_ledger`) needs the window's edges even
+    when its count is missing.
     """
     found: dict[str, Window] = {}
+    reset_hint: Optional[float] = None
     if isinstance(payload, Mapping):
         limits = payload.get("limits")
         if isinstance(limits, list):
@@ -522,6 +570,7 @@ def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list
                     continue
                 pct = _kimi_5h_from_detail(detail)
                 if pct is None:
+                    reset_hint = reset_hint or _reset_epoch(detail.get("resetTime"))
                     continue
                 found.setdefault("5h", Window(
                     "5h", "5h", pct,
@@ -542,12 +591,19 @@ def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list
                     continue
                 pct = _fraction_percent(block.get("used_ratio"))
                 if pct is None:
+                    if window_id == "5h":
+                        reset_hint = reset_hint or _reset_epoch(block.get("reset_time"))
                     continue
                 found.setdefault(window_id, Window(
                     window_id, label, pct,
                     _reset_epoch(block.get("reset_time")),
                     SOURCE_KIMI_USAGES, now, None,
                 ))
+    if "5h" not in found and reset_hint is not None:
+        found["5h"] = Window(
+            "5h", "5h", None, reset_hint, SOURCE_KIMI_USAGES, now,
+            UNKNOWN_NOT_REPORTED,
+        )
     windows = [
         found.get(window_id) or _unknown(window_id, label, SOURCE_KIMI_USAGES, now)
         for window_id, label in _KIMI_WINDOWS
@@ -641,7 +697,16 @@ class LedgerMonthCounter:
     than the month — so the total is labelled as covering only that span
     rather than presented as the whole month.
 
-    Called on an executor thread, never on the event loop.
+    The same single pass also keeps the rows of the last
+    :data:`RECENT_LEDGER_KEEP_S` individually (route, timestamp, the four
+    token fields) for :meth:`tokens_between` — the Kimi 5h estimate's
+    reading. One reader, one parse: a window that straddles the month start
+    still sees its rows, because a month change rescans the file from the
+    top and recent rows are kept whatever their month.
+
+    ``scan`` runs on an executor thread, never on the event loop; the
+    refresh is single-flight, so :meth:`tokens_between` (called after the
+    scan returned) never races it.
     """
 
     def __init__(self) -> None:
@@ -650,6 +715,9 @@ class LedgerMonthCounter:
         self._period: Optional[float] = None
         self._first_ts: Optional[float] = None
         self._totals: dict[str, list[int]] = {}
+        #: ``(ts, route, (input, cache_creation, cache_read, output))`` for
+        #: rows newer than ``now - RECENT_LEDGER_KEEP_S`` at the last scan.
+        self._recent: list[tuple[float, str, tuple[int, ...]]] = []
 
     def _reset(self, identity: Optional[tuple[int, int]], period: float) -> None:
         self._identity = identity
@@ -657,6 +725,7 @@ class LedgerMonthCounter:
         self._period = period
         self._first_ts = None
         self._totals = {}
+        self._recent = []
 
     def scan(self, path: Optional[Path], now: float) -> "tuple[float, Optional[float], dict[str, tuple[int, int]]]":
         """``(period_start, counted_since, {route: (tokens, requests)})``."""
@@ -678,14 +747,32 @@ class LedgerMonthCounter:
                 chunk = handle.read(st.st_size - self._offset)
             end = chunk.rfind(b"\n")
             if end >= 0:
-                self._consume(chunk[: end + 1], period)
+                self._consume(chunk[: end + 1], period, now - RECENT_LEDGER_KEEP_S)
                 self._offset += end + 1
+        keep_from = now - RECENT_LEDGER_KEEP_S
+        self._recent = [row for row in self._recent if row[0] >= keep_from]
         counted_since = (
             self._first_ts if self._first_ts is not None and self._first_ts > period else None
         )
         return period, counted_since, {k: (v[0], v[1]) for k, v in self._totals.items()}
 
-    def _consume(self, blob: bytes, period: float) -> None:
+    def tokens_between(
+        self, route: str, start: float, end: float, fields: "tuple[str, ...]",
+    ) -> "tuple[int, int]":
+        """``(tokens, requests)`` the ledger holds for ``route`` with
+        ``start <= ts < end``, counting only ``fields`` (names from
+        :data:`LEDGER_TOKEN_FIELDS`). Covers only what the last scan kept:
+        rows newer than :data:`RECENT_LEDGER_KEEP_S` before it."""
+        picks = [LEDGER_TOKEN_FIELDS.index(name) for name in fields]
+        tokens = requests = 0
+        for ts, row_route, counts in self._recent:
+            if row_route != route or not start <= ts < end:
+                continue
+            tokens += sum(counts[i] for i in picks)
+            requests += 1
+        return tokens, requests
+
+    def _consume(self, blob: bytes, period: float, keep_from: float) -> None:
         for raw in blob.splitlines():
             try:
                 row = json.loads(raw)
@@ -698,17 +785,19 @@ class LedgerMonthCounter:
                 continue
             if self._first_ts is None or ts < self._first_ts:
                 self._first_ts = ts
-            if ts < period:
-                continue
             route = row.get("route")
             if not isinstance(route, str):
                 continue
-            tokens = 0
-            for name in ("input_tokens", "cache_creation_input_tokens",
-                         "cache_read_input_tokens", "output_tokens"):
-                value = row.get(name)
-                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                    tokens += value
+            counts = tuple(
+                value if isinstance(value, int) and not isinstance(value, bool)
+                and value > 0 else 0
+                for value in (row.get(name) for name in LEDGER_TOKEN_FIELDS)
+            )
+            if ts >= keep_from:
+                self._recent.append((ts, route, counts))
+            if ts < period:
+                continue
+            tokens = sum(counts)
             bucket = self._totals.setdefault(route, [0, 0])
             bucket[0] += tokens
             bucket[1] += 1
@@ -766,6 +855,7 @@ class UsageWindows:
         jitter_s: float = DEFAULT_JITTER_S,
         clock: Callable[[], float] = time.time,
         rng: Callable[[], float] = random.random,
+        kimi_5h_budget: Optional[int] = None,
     ) -> None:
         self._anthropic_upstream = anthropic_upstream.rstrip("/")
         self._vendors = vendors
@@ -788,6 +878,22 @@ class UsageWindows:
         #: user-agent -> when a user-agent-gated quota endpoint refused it.
         self._refused_user_agents: dict[str, float] = {}
         self._header_windows: dict[str, Window] = {}
+        #: The ledger FALLBACK ESTIMATE per vendor id: ``{id: budget}`` for
+        #: every vendor that has one (only kimi). ``kimi_5h_budget`` is the
+        #: injected value; ``None`` reads :data:`KIMI_5H_BUDGET_ENV` (a
+        #: non-negative int; garbage keeps the default). ``0`` disables it.
+        budget = (
+            env_int(KIMI_5H_BUDGET_ENV, DEFAULT_KIMI_5H_TOKEN_BUDGET, minimum=0)
+            if kimi_5h_budget is None
+            else max(0, int(kimi_5h_budget))
+        )
+        self._estimate_budgets: dict[str, int] = (
+            {"kimi": budget} if budget > 0 and "kimi" in vendors else {}
+        )
+        #: The last 5h reset time a good vendor answer named, per vendor id.
+        self._last_5h_reset: dict[str, float] = {}
+        #: The last computed estimate per vendor id.
+        self._estimates: dict[str, _Estimate] = {}
         self._usage: dict[str, VendorUsage] = {
             ANTHROPIC_ID: VendorUsage(ANTHROPIC_ID, ANTHROPIC_LABEL, "Claude subscription"),
         }
@@ -1011,6 +1117,10 @@ class UsageWindows:
             # A previous good reading stays; _effective() ages it out.
             return
         plan, windows = parse(payload)
+        if who in self._estimate_budgets:
+            for window in windows:
+                if window.id == "5h" and window.resets_at is not None:
+                    self._last_5h_reset[who] = window.resets_at
         if not any(w.percent is not None for w in windows):
             _note_problem(
                 usage, f"{who} usage source answered in a shape this gateway cannot read",
@@ -1032,6 +1142,7 @@ class UsageWindows:
         except (OSError, ValueError) as exc:
             logger.info("model-gateway: usage ledger month scan failed: %s", exc)
             return
+        self._refresh_estimates(now, have_ledger=path is not None)
         for vendor in self._vendors.values():
             if vendor.quota_url:
                 continue
@@ -1040,6 +1151,59 @@ class UsageWindows:
             usage.tokens = TokenWindow(tokens, requests, period, since, now)
             usage.state = STATE_OK if path is not None else STATE_UNKNOWN
             usage.problem = None if path is not None else "the usage ledger has no home"
+
+    def _refresh_estimates(self, now: float, *, have_ledger: bool) -> None:
+        """Recompute each vendor's 5h ledger estimate from the scan just made.
+
+        The window is the 5 h ending at the last reset a good answer named,
+        rolled forward in 5 h steps once that reset has passed; with no reset
+        ever seen there is no window and no estimate. ``used`` is what THIS
+        gateway routed to the vendor inside it (:data:`KIMI_5H_ESTIMATE_FIELDS`)
+        — another machine's, or the vendor's own app's, traffic is invisible
+        here, so the estimate can only read low for that reason (and reads
+        high for the calibration reason given at that constant). With no
+        ledger there is no count at all — no estimate, never a 0 %.
+        """
+        if not have_ledger:
+            self._estimates.clear()
+            return
+        for vendor_id, budget in self._estimate_budgets.items():
+            reset = self._last_5h_reset.get(vendor_id)
+            if reset is None:
+                continue
+            end = roll_window_end(reset, now, KIMI_5H_SPAN_S)
+            start = end - KIMI_5H_SPAN_S
+            tokens, requests = self._ledger.tokens_between(
+                f"vendor:{vendor_id}", start, end, KIMI_5H_ESTIMATE_FIELDS,
+            )
+            self._estimates[vendor_id] = _Estimate(
+                start, end, tokens, requests, budget, now,
+            )
+
+    def _estimate_dict(self, vendor_id: str, now: float) -> Optional[dict]:
+        """The estimated 5h window as a snapshot window, or ``None`` when
+        there is no estimate, its window has ended, or it is stale."""
+        estimate = self._estimates.get(vendor_id)
+        if estimate is None or now >= estimate.end or now - estimate.computed_at > STALE_AFTER_S:
+            return None
+        return {
+            "id": "5h",
+            "label": "5h",
+            "kind": "percent",
+            "percent": round(estimate.tokens * 100.0 / estimate.budget, 1),
+            "resets_at": _iso(estimate.end),
+            "source": SOURCE_LEDGER_ESTIMATE,
+            "fetched_at": _iso(estimate.computed_at),
+            "unknown_reason": None,
+            "estimate": {
+                "tokens": estimate.tokens,
+                "requests": estimate.requests,
+                "budget": estimate.budget,
+                "window_start": _iso(estimate.start),
+                "counted": list(KIMI_5H_ESTIMATE_FIELDS),
+                "scope": "this_gateway",
+            },
+        }
 
     # ── reading ──────────────────────────────────────────────────────────
     def snapshot(self) -> dict:
@@ -1059,6 +1223,15 @@ class UsageWindows:
                 "plan": usage.plan,
                 "windows": [_window_dict(w, now) for w in windows],
             }
+            estimated = self._estimate_dict(usage.id, now)
+            if estimated is not None:
+                # FALLBACK ONLY: a live 5h reading that is known always wins.
+                rows = entry["windows"]
+                index = next((i for i, w in enumerate(rows) if w["id"] == "5h"), None)
+                if index is None:
+                    rows.insert(0, estimated)
+                elif rows[index]["percent"] is None:
+                    rows[index] = estimated
             if usage.id == ANTHROPIC_ID and usage.state != STATE_OK and any(
                 w["percent"] is not None for w in entry["windows"]
             ):
@@ -1085,6 +1258,27 @@ class UsageWindows:
             "refresh_interval_s": int(self._refresh_s),
             "vendors": vendors,
         }
+
+
+@dataclass(frozen=True)
+class _Estimate:
+    """One ledger estimate of a vendor's 5h window (epoch seconds)."""
+
+    start: float
+    end: float
+    tokens: int
+    requests: int
+    budget: int
+    computed_at: float
+
+
+def roll_window_end(reset: float, now: float, span_s: float) -> float:
+    """The end of the fixed-grid window holding ``now``: ``reset`` while it
+    is still ahead, else ``reset`` moved forward in whole ``span_s`` steps to
+    the first point strictly after ``now``."""
+    if reset > now:
+        return reset
+    return reset + (math.floor((now - reset) / span_s) + 1) * span_s
 
 
 def _kept_reading_note(usage: VendorUsage) -> str:
@@ -1151,16 +1345,20 @@ def _known(window: Mapping[str, Any]) -> bool:
 
 def _window_text(window: Mapping[str, Any]) -> str:
     """``5h 31%`` — the one spelling of a known window, shared by the status
-    line and the picker label so the two cannot round differently."""
-    return f"{window['label']} {window['percent']:.0f}%"
+    line and the picker label so the two cannot round differently. A ledger
+    ESTIMATE reads ``5h ~31%``: the ``~`` is the one mark that it is this
+    gateway's count against a budget, not the vendor's reading."""
+    mark = "~" if window.get("source") == SOURCE_LEDGER_ESTIMATE else ""
+    return f"{window['label']} {mark}{window['percent']:.0f}%"
 
 
 def render_line(snapshot: Mapping[str, Any]) -> str:
     """One compact line, e.g. ``Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10%``.
 
     Silent degrade: an unknown window is left out, and a vendor with nothing
-    known is left out entirely — the line never says "error" and never shows
-    a guess. The ONE renderer, so the bash and PowerShell status-line scripts
+    known is left out entirely — the line never says "error". The one number
+    that is not a vendor reading, the Kimi 5h ledger estimate, is marked
+    ``~`` (see :func:`_window_text`). The ONE renderer, so the bash and PowerShell status-line scripts
     cannot drift from each other: both print what this returns.
 
     WINDOWS only. A vendor's ledger total is collected and still rides the
@@ -1252,8 +1450,12 @@ def label_suffixes(snapshot: Mapping[str, Any]) -> dict[str, str]:
 
 __all__ = [
     "DEFAULT_JITTER_S",
+    "DEFAULT_KIMI_5H_TOKEN_BUDGET",
     "DEFAULT_REFRESH_S",
+    "KIMI_5H_BUDGET_ENV",
+    "KIMI_5H_ESTIMATE_FIELDS",
     "LedgerMonthCounter",
+    "SOURCE_LEDGER_ESTIMATE",
     "STALE_AFTER_S",
     "UsageWindows",
     "label_suffix",
@@ -1264,5 +1466,6 @@ __all__ = [
     "parse_unified_headers",
     "parse_zai_quota",
     "render_line",
+    "roll_window_end",
     "session_fetcher",
 ]
