@@ -74,7 +74,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # measured 1462 under the stale pin). The A-2 seed and the storage prompt moved
 # to `_seed_run_report` / `_storage_choice_step`; the post-venv hand-off is one
 # call (`_continue_in_venv_after_deps`).
-_MAIN_SPAN_MAX = 1442
+# v0.2.104 integration fix round (R18 LOW-4): re-pinned DOWN (1442 -> 1426,
+# measured; the merged lanes measured 1445 under the pin). Step 9 — the
+# install-arm settings write, the update-arm shim cleanup and the L5 machine-env
+# routing both modes run — is one call (`_root_settings_step`).
+_MAIN_SPAN_MAX = 1426
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -413,7 +417,12 @@ _MAIN_SPAN_MAX = 1442
 # the merged lanes measured 21828). The resync shim's venv probe + spawn +
 # report chain moved to `codegraph_resync.trigger_update_resync`, which also
 # carries the lanes' starting-backend wait and ledger folder.
-_TOTAL_LINES_MAX = 21796
+# v0.2.104 integration fix round (R18 LOW-4) — re-pinned DOWN 21796 -> 21596
+# (measured with `wc -l`; the merged idlecompact + l5paths lanes measured
+# 21822). The step-9 settings matrix `_configure_claude_settings` moved to
+# `vco_lib.self_install.configure_root_settings` (install.py keeps a thin shim
+# supplying PROJECT_ROOT, the defaults, the sentinel and the merge).
+_TOTAL_LINES_MAX = 21596
 
 
 def _measure() -> tuple:
