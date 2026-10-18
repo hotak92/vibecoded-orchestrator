@@ -685,6 +685,7 @@ def test_the_scrub_list_matches_the_paths_the_gateway_actually_uses(sandbox):
         gateway_config.port_path(),
         gateway_config.log_path(),
         gateway_config.export_path(),
+        gateway_config.usage_resets_path(),
     }
     scrubbed = set(bs.gateway_state_paths(state))
     assert expected <= scrubbed, (

@@ -15,11 +15,26 @@
 //     with its reason, never as an empty (0 %) or full (100 %) bar;
 //   * a vendor with no programmatic quota has no row here: the gateway's own
 //     token ledger stays in the snapshot (still collected) but is never
-//     rendered — it measures what this gateway routed, not plan usage.
+//     rendered — it measures what this gateway routed, not plan usage;
+//   * the one exception is NAMED as one: Kimi's 5h window, when its live
+//     reading is unknown, may carry a ledger ESTIMATE (`source:
+//     'ledger_estimate'`, v0.2.104) — shown as `~N%` with what it counted,
+//     never as a plain vendor reading.
 
 import { invoke, tauriAvailable } from '$lib/tauri';
 
-/** Mirrors `model_router.usage_windows._window_dict`. */
+/** Mirrors the `estimate` block of `UsageWindows._estimate_dict`. */
+export interface UsageEstimate {
+  tokens: number;
+  requests: number;
+  budget: number;
+  window_start: string;
+  counted: string[];
+  /** Always `this_gateway`: only this machine's gateway traffic is counted. */
+  scope: string;
+}
+
+/** Mirrors `model_router.usage_windows._window_dict` (and `_estimate_dict`). */
 export interface UsageWindow {
   id: string;
   label: string;
@@ -29,7 +44,12 @@ export interface UsageWindow {
   source: string;
   fetched_at: string;
   unknown_reason: string | null;
+  /** Present only on a ledger estimate (`source: 'ledger_estimate'`). */
+  estimate?: UsageEstimate;
 }
+
+/** Mirrors `model_router.usage_windows.SOURCE_LEDGER_ESTIMATE`. */
+export const SOURCE_LEDGER_ESTIMATE = 'ledger_estimate';
 
 /** Mirrors the `tokens` block of `UsageWindows.snapshot`. */
 export interface UsageTokens {
@@ -202,6 +222,31 @@ export function describeCountdown(resetsAt: string | null, nowMs: number): strin
   if (days > 0) return `resets in ${days}d ${hours}h`;
   if (hours > 0) return `resets in ${hours}h ${mins}m`;
   return `resets in ${mins}m`;
+}
+
+/** Is this window the gateway's own estimate rather than the vendor's reading? */
+export function isEstimate(window: UsageWindow): boolean {
+  return window.source === SOURCE_LEDGER_ESTIMATE;
+}
+
+/**
+ * `37%` for a vendor reading, `~37%` for an estimate — the same `~` the
+ * gateway's status line and picker label use (`usage_windows._window_text`).
+ */
+export function percentText(window: UsageWindow & { percent: number }): string {
+  return `${isEstimate(window) ? '~' : ''}${Math.round(window.percent)}%`;
+}
+
+/** What an estimate is made of, for the row's note; `null` for a reading. */
+export function estimateNote(window: UsageWindow): string | null {
+  if (!isEstimate(window)) return null;
+  const est = window.estimate;
+  if (!est) return "estimate from this machine's gateway traffic";
+  const n = (value: number) => value.toLocaleString('en-US');
+  return (
+    `estimate: ${n(est.tokens)} of ${n(est.budget)} tokens routed by this ` +
+    "machine's gateway — not the vendor's reading"
+  );
 }
 
 const UNKNOWN_REASONS: Record<string, string> = {

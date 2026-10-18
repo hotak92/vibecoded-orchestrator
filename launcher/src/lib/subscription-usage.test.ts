@@ -15,9 +15,12 @@ import {
   barWidth,
   cardVisible,
   describeCountdown,
+  estimateNote,
   fetchUsage,
+  isEstimate,
   INITIAL_CARD_STATE,
   nextPollMs,
+  percentText,
   restartOffered,
   settle,
   unknownLabel,
@@ -30,6 +33,7 @@ import {
   type UsageBridgeResult,
   type UsageSnapshot,
   type UsageVendor,
+  type UsageWindow,
 } from './subscription-usage';
 
 function vendor(over: Partial<UsageVendor> = {}): UsageVendor {
@@ -161,6 +165,41 @@ describe('bars', () => {
     expect(unknownLabel('stale')).toBe('unknown — last reading is too old');
     expect(unknownLabel('reset_passed')).toContain('reset');
     expect(unknownLabel(null)).toBe('unknown — no reading');
+  });
+});
+
+describe('ledger estimate (v0.2.104: Kimi 5h fallback)', () => {
+  const reading: UsageWindow = {
+    id: '5h', label: '5h', kind: 'percent', percent: 37.4,
+    resets_at: '2026-10-18T06:13:09Z', source: 'kimi_usages',
+    fetched_at: '2026-10-18T04:00:00Z', unknown_reason: null,
+  };
+  const estimate: UsageWindow = {
+    ...reading,
+    source: 'ledger_estimate',
+    estimate: {
+      tokens: 374_000, requests: 12, budget: 1_000_000,
+      window_start: '2026-10-18T01:13:09Z',
+      counted: ['input_tokens', 'cache_creation_input_tokens', 'output_tokens'],
+      scope: 'this_gateway',
+    },
+  };
+
+  it('marks an estimate with ~ and a vendor reading without', () => {
+    expect(isEstimate(reading)).toBe(false);
+    expect(isEstimate(estimate)).toBe(true);
+    expect(percentText({ ...reading, percent: 37.4 })).toBe('37%');
+    expect(percentText({ ...estimate, percent: 37.4 })).toBe('~37%');
+  });
+
+  it("names what an estimate counted, and only this machine's gateway", () => {
+    expect(estimateNote(reading)).toBeNull();
+    const note = estimateNote(estimate) ?? '';
+    expect(note).toContain('374,000 of 1,000,000 tokens');
+    expect(note).toContain("this machine's gateway");
+    expect(note).toContain("not the vendor's reading");
+    const bare: UsageWindow = { ...estimate, estimate: undefined };
+    expect(estimateNote(bare)).toContain('estimate');
   });
 });
 

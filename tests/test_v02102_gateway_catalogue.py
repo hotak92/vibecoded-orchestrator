@@ -46,7 +46,8 @@
 * **X2 — the Kimi usage-window refresh reuses the last relayed client
   user-agent.** Its quota endpoint sits behind the same Cloudflare
   user-agent gate as its messages endpoint (403 "error code: 1010" to a
-  library UA). The relay itself shipped earlier (``_client_user_agent``);
+  library UA). The relay itself shipped earlier (``_client_user_agent``,
+  a short recency list since v0.2.104);
   what this lane adds is the missing arm: with NO client user-agent relayed
   yet, the fetch is SKIPPED and the vendor reads unknown — a UA is relayed,
   never invented (vendor ToS), so a 403-ing UA-less fetch is never sent.

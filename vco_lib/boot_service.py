@@ -2144,6 +2144,9 @@ GATEWAY_STATE_FILES = (
     # case. Absent on every healthy machine; removed when present because
     # it is a copy of a file we are removing.
     "model-gateway/chat_model_context.json.pre-vco",
+    # The last 5h reset time per quota vendor (model_router.config
+    # .usage_resets_path), kept so the Kimi 5h estimate survives a restart.
+    "model-gateway/usage_window_resets.json",
 )
 
 #: Emptied-then-removed if and only if nothing else is left inside it.
