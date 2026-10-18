@@ -63,6 +63,20 @@ DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 #: an OAuth bearer is rejected; with it the request returns HTTP 200.
 OAUTH_BETA = "oauth-2025-04-20"
 
+#: The beta header that actually buys the 1M context window. The ``[1m]``
+#: suffix on a model id is a CLIENT-side spelling (see
+#: :func:`model_router.routing.route`); ``api.anthropic.com`` 404s on it and
+#: reads the window off this header instead. Added only when the requested id
+#: carried the suffix and the client did not send the header itself.
+CONTEXT_1M_BETA = "context-1m-2025-08-07"
+
+#: The prefix every spelling of the 1M beta shares, including future-dated
+#: ones. How the client's OWN request for the window is recognised — both on
+#: the forward path (does the gateway need to add the header?) and on the
+#: ledger path (did the client BUDGET 1M this turn?), so the two never drift
+#: into two different spellings of the same question.
+CONTEXT_1M_BETA_MARKER = "context-1m"
+
 #: How the vendor's OWN maximum is read out of a matched context-overflow
 #: message. QwenCloud's refusal states the accepted input range,
 #: ``"Range of input length should be [1, 983616]"`` (live 400, 2026-10-06),
@@ -981,6 +995,8 @@ __all__ = [
     "AnthropicFamily",
     "KeyedCredential",
     "CLAUDE_ID_MARKERS",
+    "CONTEXT_1M_BETA",
+    "CONTEXT_1M_BETA_MARKER",
     "CONTEXT_OVERFLOW_MAX_RE",
     "DEFAULT_ANTHROPIC_VERSION",
     "FALLBACK_LADDER",

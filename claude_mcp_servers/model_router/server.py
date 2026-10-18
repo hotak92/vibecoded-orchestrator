@@ -139,11 +139,9 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
-    Generic,
     Mapping,
     NamedTuple,
     Optional,
-    TypeVar,
 )
 
 import aiohttp
@@ -218,8 +216,21 @@ from .usage import (
     note_count_substitution,
     read_identity,
 )
+from .api_key_route import (
+    API_KEY_REFUSAL_STATUSES,
+    API_KEY_REFUSED_ERROR_TYPE,
+    API_KEY_REFUSED_HEADERS,
+    API_KEY_REFUSED_STATUS,
+    API_KEY_ROUTE_LABEL,
+    ApiKeyRefused,
+    CachedSetting,
+    api_key_headers,
+    api_key_refused_message,
+)
 from .vendors import (
     ANTHROPIC_FAMILY,
+    CONTEXT_1M_BETA,
+    CONTEXT_1M_BETA_MARKER,
     DEFAULT_ANTHROPIC_VERSION,
     OAUTH_BETA,
     VENDORS,
@@ -303,20 +314,6 @@ _HOP_BY_HOP_RESPONSE = frozenset(
 
 _STREAM_CHUNK_HINT = "event-stream"
 
-#: The beta header that actually buys the 1M context window. The ``[1m]``
-#: suffix on a model id is a CLIENT-side spelling (see
-#: :func:`model_router.routing.route`); ``api.anthropic.com`` 404s on it and
-#: reads the window off this header instead. Added only when the requested id
-#: carried the suffix and the client did not send the header itself.
-CONTEXT_1M_BETA = "context-1m-2025-08-07"
-
-#: The prefix every spelling of the 1M beta shares, including future-dated
-#: ones. How the client's OWN request for the window is recognised — both on
-#: the forward path (does the gateway need to add the header?) and on the
-#: ledger path (did the client BUDGET 1M this turn?), so the two never drift
-#: into two different spellings of the same question.
-CONTEXT_1M_BETA_MARKER = "context-1m"
-
 #: Passed to aiohttp as the application's ``client_max_size``. Zero is
 #: aiohttp's "no limit" (``web_request.BaseRequest.read`` guards the size
 #: check with ``if self._client_max_size:``), and no limit is the correct
@@ -395,54 +392,6 @@ def fallback_retry_after_max_s() -> float:
 
     return env_float(FALLBACK_RETRY_AFTER_MAX_ENV, FALLBACK_RETRY_AFTER_MAX_DEFAULT_S, above=0)
 
-
-#: How long a :class:`CachedSetting` trusts its last read of a launcher
-#: setting. Short: a user who turns a paying route OFF must stop paying
-#: within seconds, not at the next gateway restart.
-LAUNCHER_SETTING_TTL_S = 5.0
-
-_T = TypeVar("_T")
-
-
-class CachedSetting(Generic[_T]):
-    """One launcher setting, re-read at most every :data:`LAUNCHER_SETTING_TTL_S`.
-
-    Never raises: a reader failure answers ``default`` — both settings that
-    use this select a route that SPENDS money, and "could not tell" must
-    never mean "yes".
-    """
-
-    def __init__(self, reader: Callable[[], _T], default: _T, what: str) -> None:
-        self.reader = reader
-        self.default = default
-        self._what = what
-        self._cache: Optional[tuple[float, _T]] = None
-
-    def get(self) -> _T:
-        now = time.monotonic()
-        cached = self._cache
-        if cached is not None and now - cached[0] < LAUNCHER_SETTING_TTL_S:
-            return cached[1]
-        try:
-            value = self.reader()
-        except Exception:  # noqa: BLE001 — see the class docstring
-            logger.exception(
-                "model-gateway: could not read %s; using its default",
-                self._what,
-            )
-            value = self.default
-        self._cache = (now, value)
-        return value
-
-    def expire(self) -> None:
-        """Forget the cached read (tests; the next ``get`` re-reads)."""
-        self._cache = None
-
-#: The route label (access line ``route=``, ledger ``route``) of the
-#: first-party route billed to the Console API key. Distinct from
-#: ``anthropic`` so the ledger's per-route token totals never fold API-billed
-#: turns into the subscription's.
-API_KEY_ROUTE_LABEL = "anthropic-api"
 
 #: The two answers :func:`_ladder_verdict` can give.
 LADDER_FALLBACK = "fallback"
@@ -719,6 +668,11 @@ class Gateway:
         #: The one in-flight background resolution of the API-key route's
         #: key that ``/health`` may schedule (never awaited there).
         self._api_key_probe: Optional[asyncio.Task] = None
+        #: SHA-256 of the key value Anthropic last REFUSED (401/403), or
+        #: ``None``. A fingerprint, never the key: ``/health`` reports the key
+        #: as ``rejected`` only while the resolved key is that same one, so
+        #: replacing it in Secrets clears the state by itself.
+        self._api_key_refused_fp: Optional[str] = None
         #: Subscription usage windows (``/usage/windows``). Its secrets come
         #: through THIS gateway's reader and resolver — no second resolver —
         #: and its fetches run in a background task a read schedules, never
@@ -736,6 +690,11 @@ class Gateway:
     async def start(self) -> None:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
+        # Prime both launcher settings before the first request, off the
+        # loop: the global API-key switch must hold from the first turn.
+        await asyncio.gather(
+            self.api_key_fallback.refresh(), self.anthropic_auth.refresh(),
+        )
 
     def request_started(self) -> None:
         self._inflight += 1
@@ -765,6 +724,11 @@ class Gateway:
         await self.quiesce()
         # Before the session closes: an in-flight usage refresh holds it.
         await self.usage_windows.stop()
+        await self.api_key_fallback.stop()
+        await self.anthropic_auth.stop()
+        probe = self._api_key_probe
+        if probe is not None and not probe.done():
+            probe.cancel()
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -822,6 +786,16 @@ class Gateway:
             and self.anthropic_auth.get() == ANTHROPIC_AUTH_API_KEY
         )
 
+    def note_api_key_refused(self, presented: str) -> None:
+        """Anthropic refused the Console key that was presented."""
+        self._api_key_refused_fp = (
+            self.keys.fingerprint_of(presented) if presented else None
+        )
+
+    def note_api_key_accepted(self) -> None:
+        """A 2xx on the API-key route: whatever was refused before is fine."""
+        self._api_key_refused_fp = None
+
     def api_key_state(self) -> str:
         """``available`` / ``missing`` / ``unknown`` for the API-key route's
         key, from the resolver's cache only (``/health`` must never block).
@@ -831,6 +805,12 @@ class Gateway:
         if api is None:
             return "missing"
         known = self.keys.peek(api.vendor_id)
+        if (
+            known
+            and self._api_key_refused_fp is not None
+            and self.keys.fingerprint(api.vendor_id) == self._api_key_refused_fp
+        ):
+            return "rejected"
         if known is None:
             probe = self._api_key_probe
             if probe is None or probe.done():
@@ -1104,7 +1084,8 @@ async def health_handler(request: web.Request) -> web.Response:
     daemon is applying, ``oauth`` or ``api_key``, as it reads the launcher's
     global switch; ``api_key`` — ``available`` / ``missing`` / ``unknown`` for
     the Claude API key, from the resolver's CACHE only, an unknown state
-    scheduling one background resolution so a later probe can answer;
+    scheduling one background resolution so a later probe can answer, or
+    ``rejected`` while the resolved key is the one Anthropic last refused;
     ``api_key_fallback`` — the opt-in subscription fallback; ``api_key_secret``
     — the secret NAME the key resolves from, never a value),
     ``secret_scope`` (``project`` — the scope vendor keys resolve in, which is
@@ -2529,7 +2510,15 @@ def _api_key_escalation(
     ``auth=api_key``. Its own escalation is ``rung``: an API-key answer that
     is itself a qualifying quota refusal walks on to the ladder's next rung.
     No key resolved -> straight to ``rung`` (or ``None``: relay the original
-    refusal).
+    refusal). A key Anthropic REFUSES (401/403) is handled the same way
+    (:class:`ApiKeyRefused`) — never relayed as if the client's login failed.
+
+    Upper bound on Anthropic sends for one client turn (review R15 NIT-1):
+    the subscription attempt, its OD-9 same-rung retry on a short
+    ``retry-after``, the key attempt, and the key's own OD-9 same-rung retry
+    — the key is a rung and keeps a rung's one retry — then the ladder rung.
+    Each retry fires only on a quota refusal with a stated wait within
+    ``VCT_GATEWAY_FALLBACK_RETRY_AFTER_MAX_S``; refusals are not billed.
     """
     api = api_decision.api_key
     assert api is not None  # noqa: S101 — guaranteed by api_key_fallback_route
@@ -2550,7 +2539,7 @@ def _api_key_escalation(
             "to the Console organisation)",
             _log_safe(decision.forward_model), evidence,
         )
-        headers = _api_key_headers(
+        headers = api_key_headers(
             gateway.forward_headers(request), api, key_result.key,
             one_m_requested=decision.one_m_requested,
         )
@@ -2559,27 +2548,42 @@ def _api_key_escalation(
         url = f"{api_decision.upstream}{_canonical_path(request)}"
         if request.query_string:
             url = f"{url}?{request.query_string}"
-        return await _proxy(
-            request,
-            gateway,
-            api_decision,
-            url,
-            headers,
-            body,
-            requested_model=requested_model,
-            stream_requested=stream_requested,
-            started=started,
-            note=(
-                f"note=api_key_fallback fallback_from={from_label} {evidence}"
-            ).strip(),
-            images=images,
-            facts=facts,
-            allow_oauth_retry=False,
-            ladder_escalate=rung,
-            fallback_from=from_label,
-            effort_requested=effort_requested,
-            effort_forwarded=effort_forwarded,
-        )
+        try:
+            return await _proxy(
+                request,
+                gateway,
+                api_decision,
+                url,
+                headers,
+                body,
+                requested_model=requested_model,
+                stream_requested=stream_requested,
+                started=started,
+                note=(
+                    f"note=api_key_fallback fallback_from={from_label} {evidence}"
+                ).strip(),
+                images=images,
+                facts=facts,
+                allow_oauth_retry=False,
+                ladder_escalate=rung,
+                fallback_from=from_label,
+                effort_requested=effort_requested,
+                effort_forwarded=effort_forwarded,
+                defer_api_key_refusal=True,
+            )
+        except ApiKeyRefused as refused:
+            # The key is the fallback's problem, not the client's: carry on
+            # exactly as if the fallback were unavailable — the rung with
+            # the SUBSCRIPTION's evidence, or (``None``) the subscription's
+            # own refusal, relayed by the ladder branch that called us.
+            logger.info(
+                "model-gateway: API-key fallback for %s: Anthropic refused the "
+                "Claude API key %s (HTTP %d); continuing as if the fallback "
+                "were unavailable",
+                _log_safe(decision.forward_model), api.secret_keys[0],
+                refused.status,
+            )
+            return await rung(evidence) if rung is not None else None
 
     return escalate
 
@@ -3078,7 +3082,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                     if api_key_result.transient else None
                 ),
             )
-        headers = _api_key_headers(
+        headers = api_key_headers(
             headers, decision.api_key, api_key_result.key,
             one_m_requested=decision.one_m_requested,
         )
@@ -3371,53 +3375,27 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     )
 
 
-def _api_key_headers(
-    headers: Mapping[str, str],
+def _api_key_refused_answer(
     api: AnthropicApiKey,
-    key: str,
-    *,
-    one_m_requested: bool,
-) -> dict[str, str]:
-    """Forwarded headers for the first-party route billed to the API key.
-
-    The ONE home of the auth swap, used by the explicit ``claude-gw/api/``
-    route and by the subscription fallback alike. The client's headers travel
-    as they arrived — ``user-agent``, ``x-app`` and every other header that
-    identifies the client are NOT touched: how Anthropic classifies and bills
-    this traffic is its decision, and a gateway that disguised the client
-    would be making it instead. Exactly three things change:
-
-    * any ``Authorization`` / ``x-api-key`` is dropped (the Claude login is
-      not this route's credential — the fallback copies headers that carry
-      it);
-    * the Console key is set under ``api.auth_header``;
-    * the OAuth beta is removed from ``anthropic-beta`` — it marks an OAuth
-      request — while every other beta is kept, and the 1M-window beta is
-      added when the requested id carried ``[1m]`` and the client did not
-      already ask for the window.
-    """
-    out: dict[str, str] = {}
-    beta_values: list[str] = []
-    for name, value in headers.items():
-        lowered = name.lower()
-        if lowered in ("authorization", "x-api-key"):
-            continue
-        if lowered == "anthropic-beta":
-            beta_values.append(value)
-            continue
-        out[name] = value
-    betas = [
-        token.strip()
-        for value in beta_values
-        for token in value.split(",")
-        if token.strip() and token.strip() != OAUTH_BETA
-    ]
-    if one_m_requested and not any(CONTEXT_1M_BETA_MARKER in b for b in betas):
-        betas.append(CONTEXT_1M_BETA)
-    if betas:
-        out["anthropic-beta"] = ",".join(betas)
-    out[api.auth_header] = key
-    return out
+    status: int,
+    raw: bytes,
+    stream_requested: bool,
+    access: Callable[..., None],
+) -> web.Response:
+    """The client's answer when Anthropic refuses the key on the explicit
+    API-key route or under the global API-key mode — envelope and text from
+    :mod:`model_router.api_key_route` (why 503 + ``x-should-retry: false``
+    is documented at :data:`~model_router.api_key_route.API_KEY_REFUSED_STATUS`)."""
+    access(
+        API_KEY_REFUSED_STATUS, stream=stream_requested,
+        extra=f"note=api_key_refused upstream_status={status}",
+    )
+    return _json_error(
+        API_KEY_REFUSED_STATUS,
+        API_KEY_REFUSED_ERROR_TYPE,
+        api_key_refused_message(api, status, raw),
+        headers=API_KEY_REFUSED_HEADERS,
+    )
 
 
 def _reread_oauth_headers(
@@ -3469,6 +3447,7 @@ async def _proxy(
     allow_ladder_retry: bool = True,
     effort_requested: Optional[str] = None,
     effort_forwarded: Optional[str] = None,
+    defer_api_key_refusal: bool = False,
 ) -> web.StreamResponse:
     """Forward one request upstream and relay the answer.
 
@@ -3702,6 +3681,26 @@ async def _proxy(
                         effort_requested=effort_requested,
                         effort_forwarded=effort_forwarded,
                     )
+            if (
+                decision.api_key is not None
+                and upstream.status in API_KEY_REFUSAL_STATUSES
+            ):
+                # Anthropic refused the CONSOLE KEY (review R15 MEDIUM-1).
+                # Relaying its 401/403 verbatim would tell Claude Code its
+                # own login failed — the user's login is fine — and, on the
+                # fallback, would replace the subscription's quota answer
+                # and skip the ladder. Never relayed: see
+                # :func:`_api_key_refused_answer` and _api_key_escalation.
+                held = await _peek_quota_body(upstream)
+                gateway.note_api_key_refused(headers.get(decision.api_key.auth_header, ""))
+                if defer_api_key_refusal:
+                    raise ApiKeyRefused(upstream.status)
+                return _api_key_refused_answer(
+                    decision.api_key, upstream.status, held, stream_requested,
+                    access,
+                )
+            if decision.api_key is not None and 200 <= upstream.status < 300:
+                gateway.note_api_key_accepted()
             vendor = decision.vendor
             # The owner's fallback ladder (OD-9). Armed only for a route
             # with a next rung and a body that can be re-sent. Defined before
@@ -3731,6 +3730,7 @@ async def _proxy(
                     allow_ladder_retry=False,
                     effort_requested=effort_requested,
                     effort_forwarded=effort_forwarded,
+                    defer_api_key_refusal=defer_api_key_refusal,
                 )
 
             async def _quota_in_disguise(

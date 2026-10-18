@@ -63,7 +63,8 @@ export interface GatewayHealth {
 export interface GatewayAnthropicAuth {
   /** The mode in force: `oauth` | `api_key` (a later release may add more). */
   mode: string;
-  /** `available` | `missing` | `unknown` (not resolved yet — ask again). */
+  /** `available` | `missing` | `rejected` (Anthropic refused this key) |
+   *  `unknown` (not resolved yet — ask again). */
   api_key: string;
   /** The opt-in subscription -> API-key fallback (Preferences). */
   api_key_fallback: boolean;

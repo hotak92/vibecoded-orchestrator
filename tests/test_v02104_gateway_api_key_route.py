@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from model_router import api_key_route as akr
 from model_router import routing
 from model_router import server as srv
 from model_router.config import (
@@ -226,7 +227,7 @@ class HeaderSwapTests(unittest.TestCase):
     }
 
     def test_auth_is_swapped_and_nothing_else_is_touched(self) -> None:
-        out = srv._api_key_headers(
+        out = akr.api_key_headers(
             self.CLIENT, ANTHROPIC_API_KEY_ROUTE, FAKE_API_KEY,
             one_m_requested=False,
         )
@@ -242,7 +243,7 @@ class HeaderSwapTests(unittest.TestCase):
             self.assertEqual(_header(out, name), self.CLIENT[name], name)
 
     def test_a_client_x_api_key_is_replaced_never_forwarded(self) -> None:
-        out = srv._api_key_headers(
+        out = akr.api_key_headers(
             {"X-Api-Key": "local-host-token"}, ANTHROPIC_API_KEY_ROUTE,
             FAKE_API_KEY, one_m_requested=False,
         )
@@ -251,14 +252,14 @@ class HeaderSwapTests(unittest.TestCase):
         )
 
     def test_the_1m_beta_is_added_when_the_suffix_asked_for_it(self) -> None:
-        out = srv._api_key_headers(
+        out = akr.api_key_headers(
             {"anthropic-beta": OAUTH_BETA}, ANTHROPIC_API_KEY_ROUTE,
             FAKE_API_KEY, one_m_requested=True,
         )
         self.assertEqual(_header(out, "anthropic-beta"), srv.CONTEXT_1M_BETA)
 
     def test_no_beta_header_when_nothing_is_left(self) -> None:
-        out = srv._api_key_headers(
+        out = akr.api_key_headers(
             {"anthropic-beta": OAUTH_BETA}, ANTHROPIC_API_KEY_ROUTE,
             FAKE_API_KEY, one_m_requested=False,
         )
@@ -402,7 +403,9 @@ class ApiKeyGatewayBase(GatewayTestBase):
             vendors={"zai": self.zai, "qwen": self.qwen}, key_getter=getter,
         )
         if fallback is not None:
-            client.app[srv.APP_KEY].api_key_fallback.reader = lambda: fallback
+            setting = client.app[srv.APP_KEY].api_key_fallback
+            setting.reader = lambda: fallback
+            await setting.refresh()
         return client
 
     def headers(self) -> dict[str, str]:
@@ -675,17 +678,60 @@ class SubscriptionFallbackTests(ApiKeyGatewayBase):
         self.assertEqual(self.vendor_up.message_requests, [])
 
     async def test_the_setting_is_reread_after_its_short_cache(self) -> None:
+        """Serve-stale (R15 LOW-1): past the TTL the OLD value is answered
+        and ONE background re-read is scheduled; its result lands next."""
         client = await self.client_with(key=True, fallback=True)
         gateway = client.app[srv.APP_KEY]
+        setting = gateway.api_key_fallback
         self.assertTrue(gateway.api_key_fallback_on())
-        gateway.api_key_fallback.reader = lambda: False
-        # Within the TTL the cached answer stands; past it, the new one.
+        setting.reader = lambda: False
+        self.assertTrue(gateway.api_key_fallback_on())  # within the TTL
+        later = akr.time.monotonic() + akr.LAUNCHER_SETTING_TTL_S + 1
+        with mock.patch.object(akr.time, "monotonic", return_value=later):
+            self.assertTrue(gateway.api_key_fallback_on())  # stale, refreshing
+            first = setting._refreshing
+            self.assertTrue(gateway.api_key_fallback_on())
+            self.assertIs(setting._refreshing, first, "single-flight")
+            assert first is not None
+            await first
+        self.assertFalse(gateway.api_key_fallback_on())
+
+    async def test_the_reader_never_runs_on_the_event_loop(self) -> None:
+        import threading
+
+        client = await self.client_with(key=True, fallback=True)
+        setting = client.app[srv.APP_KEY].anthropic_auth
+        threads: list[int] = []
+        setting.reader = lambda: threads.append(threading.get_ident()) or "oauth"
+        setting.expire()
+        setting.get()
+        assert setting._refreshing is not None
+        await setting._refreshing
+        self.assertTrue(threads)
+        self.assertNotIn(threading.get_ident(), threads)
+
+    async def test_before_any_value_the_safe_default_is_answered(self) -> None:
+        """No cached value yet: ``get`` answers OAuth / OFF even when the row
+        says otherwise — and the refresh it schedules then applies it."""
+        client = await self.client_with(key=True, fallback=False)
+        gateway = client.app[srv.APP_KEY]
+        gateway.anthropic_auth.reader = lambda: ANTHROPIC_AUTH_API_KEY
+        gateway.anthropic_auth.expire()
+        gateway.api_key_fallback.reader = lambda: True
+        gateway.api_key_fallback.expire()
+        self.assertFalse(gateway.api_key_mode_on())
+        self.assertFalse(gateway.api_key_fallback_on())
+        for setting in (gateway.anthropic_auth, gateway.api_key_fallback):
+            assert setting._refreshing is not None
+            await setting._refreshing
+        self.assertTrue(gateway.api_key_mode_on())
         self.assertTrue(gateway.api_key_fallback_on())
-        with mock.patch.object(
-            srv.time, "monotonic",
-            return_value=srv.time.monotonic() + srv.LAUNCHER_SETTING_TTL_S + 1,
-        ):
-            self.assertFalse(gateway.api_key_fallback_on())
+
+    async def test_the_gateway_primes_the_settings_before_serving(self) -> None:
+        db = _launcher_db(self.root / "prime.db", "api_key", ANTHROPIC_AUTH_APP_STATE_KEY)
+        with mock.patch.dict(os.environ, {"VCT_LAUNCHER_DB_PATH": str(db)}):
+            client = await self.client_with(key=True, fallback=False)
+        self.assertTrue(client.app[srv.APP_KEY].api_key_mode_on())
 
     async def test_a_broken_setting_reader_means_off(self) -> None:
         client = await self.client_with(key=True, fallback=True)
@@ -695,9 +741,125 @@ class SubscriptionFallbackTests(ApiKeyGatewayBase):
             raise RuntimeError("db gone")
 
         gateway.api_key_fallback.reader = boom
-        gateway.api_key_fallback.expire()
-        with self.assertLogs(LOGGER, level="ERROR"):
-            self.assertFalse(gateway.api_key_fallback_on())
+        with self.assertLogs("model_router", level="ERROR"):
+            self.assertFalse(await gateway.api_key_fallback.refresh())
+        self.assertFalse(gateway.api_key_fallback_on())
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# A key Anthropic REFUSES (401/403) — review R15 MEDIUM-1
+# ══════════════════════════════════════════════════════════════════════════
+INVALID_KEY = (
+    b'{"type":"error","error":{"type":"authentication_error",'
+    b'"message":"invalid x-api-key"}}'
+)
+NO_PERMISSION = (
+    b'{"type":"error","error":{"type":"permission_error",'
+    b'"message":"This organization has been disabled."}}'
+)
+REFUSALS = ((401, INVALID_KEY), (403, NO_PERMISSION))
+
+
+class ApiKeyRefusalTests(ApiKeyGatewayBase):
+
+    async def _assert_local_answer(self, resp: Any, status: int) -> None:
+        """Not Claude Code's login-failure shape: 503 api_error, no retry,
+        naming the secret and the switch, never the key."""
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(resp.headers.get("x-should-retry"), "false")
+        body = await resp.json()
+        self.assertEqual(body["error"]["type"], "api_error")
+        message = body["error"]["message"]
+        self.assertIn("ANTHROPIC_API_KEY_GATEWAY", message)
+        self.assertIn("Anthropic: OAuth", message)
+        self.assertIn(f"HTTP {status}", message)
+        self.assertNotIn(FAKE_API_KEY, message)
+        self.assertEqual(len(self.first.message_requests), 1)
+
+    async def test_explicit_route_refusal_is_a_local_non_login_error(self) -> None:
+        for status, raw in REFUSALS:
+            with self.subTest(status=status):
+                self.first.requests.clear()
+                self.script((status, raw))
+                resp = await self.client.post(
+                    "/v1/messages", json=self.ask(f"{API_NS}{OPUS}"),
+                    headers=self.headers(),
+                )
+                await self._assert_local_answer(resp, status)
+
+    async def test_api_key_mode_refusal_is_a_local_non_login_error(self) -> None:
+        client = await self.client_with(key=True, fallback=False)
+        setting = client.app[srv.APP_KEY].anthropic_auth
+        setting.reader = lambda: ANTHROPIC_AUTH_API_KEY
+        await setting.refresh()
+        for status, raw in REFUSALS:
+            with self.subTest(status=status):
+                self.first.requests.clear()
+                self.script((status, raw))
+                resp = await client.post(
+                    "/v1/messages", json=self.ask(HAIKU), headers=self.headers(),
+                )
+                await self._assert_local_answer(resp, status)
+                # Not rerouted either: the user chose the key for everything.
+                self.assertEqual(self.vendor_up.message_requests, [])
+
+    async def test_fallback_refusal_walks_on_to_the_rung(self) -> None:
+        client = await self.client_with(key=True, fallback=True)
+        self.vendor_up.messages_body = _success("glm-5.3-flash")
+        for status, raw in REFUSALS:
+            with self.subTest(status=status):
+                self.first.requests.clear()
+                self.vendor_up.requests.clear()
+                self.script((429, EXHAUSTED), (status, raw))
+                with self.assertLogs(LOGGER, level="INFO") as cm:
+                    resp = await client.post(
+                        "/v1/messages", json=self.ask(HAIKU), headers=self.headers(),
+                    )
+                self.assertEqual(resp.status, 200)
+                self.assertEqual((await resp.json())["model"], "glm-5.3-flash")
+                self.assertEqual(len(self.first.message_requests), 2)
+                self.assertEqual(len(self.vendor_up.message_requests), 1)
+                joined = "\n".join(cm.output)
+                self.assertIn("refused the Claude API key", joined)
+                self.assertNotIn(FAKE_API_KEY, joined)
+
+    async def test_fallback_refusal_without_a_rung_relays_the_subscription_refusal(self) -> None:
+        client = await self.client_with(key=True, fallback=True)
+        for status, raw in REFUSALS:
+            with self.subTest(status=status):
+                self.first.requests.clear()
+                self.script((429, RATE_LIMITED), (status, raw))
+                resp = await client.post(
+                    "/v1/messages", json=self.ask(OPUS), headers=self.headers(),
+                )
+                # The SUBSCRIPTION's quota answer, not the key's 401/403.
+                self.assertEqual(resp.status, 429)
+                self.assertEqual(await resp.read(), RATE_LIMITED)
+                self.assertEqual(len(self.first.message_requests), 2)
+
+    async def test_health_says_rejected_until_the_key_works_again(self) -> None:
+        gateway = self.client.app[srv.APP_KEY]
+        await gateway._api_key_present()  # the key is cached
+        self.script((401, INVALID_KEY))
+        await self.client.post(
+            "/v1/messages", json=self.ask(f"{API_NS}{OPUS}"), headers=self.headers(),
+        )
+        auth = (await (await self.client.get("/health")).json())["anthropic_auth"]
+        self.assertEqual(auth["api_key"], "rejected")
+        self.script((200, json.dumps(_success(OPUS)).encode()))
+        await self.client.post(
+            "/v1/messages", json=self.ask(f"{API_NS}{OPUS}"), headers=self.headers(),
+        )
+        auth = (await (await self.client.get("/health")).json())["anthropic_auth"]
+        self.assertEqual(auth["api_key"], "available")
+
+    async def test_a_replaced_key_is_no_longer_reported_rejected(self) -> None:
+        gateway = self.client.app[srv.APP_KEY]
+        await gateway._api_key_present()
+        gateway.note_api_key_refused("test-an-older-fake-key")  # vco-secret-scan: test-placeholder
+        self.assertEqual(gateway.api_key_state(), "available")
+        gateway.note_api_key_refused(FAKE_API_KEY)
+        self.assertEqual(gateway.api_key_state(), "rejected")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -746,7 +908,9 @@ class AuthModeGatewayTests(ApiKeyGatewayBase):
 
     async def client_mode(self, mode: str, *, key: bool = True) -> Any:
         client = await self.client_with(key=key, fallback=False)
-        client.app[srv.APP_KEY].anthropic_auth.reader = lambda: mode
+        setting = client.app[srv.APP_KEY].anthropic_auth
+        setting.reader = lambda: mode
+        await setting.refresh()
         return client
 
     async def test_api_key_mode_sends_every_first_party_slot_with_the_key(self) -> None:

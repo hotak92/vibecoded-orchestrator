@@ -1447,10 +1447,15 @@ export function anthropicAuthDisabledReason(
   if (target === 'oauth') return '';
   if (!gatewayIsLive(gw)) return 'The model gateway is not running.';
   const auth = gw?.health?.anthropic_auth;
-  if (!auth) return 'This gateway is older than the API-key switch; update VCO first.';
+  if (!auth) {
+    return 'The running gateway predates the API-key switch — restart it (Services page) so the updated version runs.';
+  }
   const secret = auth.api_key_secret ?? 'ANTHROPIC_API_KEY_GATEWAY';
   if (auth.api_key === 'missing') {
     return `No Claude API key: add it in Secrets → Shared as ${secret}.`;
+  }
+  if (auth.api_key === 'rejected') {
+    return `Anthropic rejected the Claude API key (${secret}): replace it in Secrets → Shared.`;
   }
   if (auth.api_key !== 'available') {
     return 'Checking the Claude API key… try again in a moment.';
@@ -1472,8 +1477,11 @@ export function anthropicAuthWarning(
   const auth = gw?.health?.anthropic_auth;
   if (!auth) {
     return stored === 'api_key'
-      ? 'This gateway does not support the API-key mode yet — Claude requests still use OAuth. Update VCO.'
+      ? 'The running gateway predates the API-key switch, so Claude requests still use OAuth — restart the gateway (Services page).'
       : null;
+  }
+  if (stored === 'api_key' && auth.api_key === 'rejected') {
+    return `API key mode is on but Anthropic rejected the key (${auth.api_key_secret ?? 'ANTHROPIC_API_KEY_GATEWAY'}) — Claude requests through the gateway fail until you replace it or switch to OAuth.`;
   }
   if (stored === 'api_key' && auth.api_key === 'missing') {
     return `API key mode is on but no key resolves (${auth.api_key_secret ?? 'ANTHROPIC_API_KEY_GATEWAY'}) — Claude requests through the gateway are refused until you add it or switch to OAuth.`;

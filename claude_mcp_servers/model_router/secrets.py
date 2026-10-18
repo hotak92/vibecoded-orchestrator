@@ -572,6 +572,25 @@ class VendorKeyResolver:
             return None
         return False if age < min(self._ttl_s, NEGATIVE_TTL_CAP_S) else None
 
+    @staticmethod
+    def fingerprint_of(value: str) -> str:
+        """A one-way identity for a key value — compared, never shown. The
+        ONE spelling of it, so a fingerprint taken from a request header and
+        one taken from this cache always agree."""
+        import hashlib  # noqa: PLC0415 — only fingerprints need it
+
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def fingerprint(self, vendor_id: str) -> Optional[str]:
+        """:meth:`fingerprint_of` the key this cache would serve for
+        ``vendor_id``, or ``None``. Cache only; the value never leaves."""
+        key = None
+        for entry in (self._cache.get(vendor_id), self._last_good.get(vendor_id)):
+            if entry is not None and entry.result.key:
+                key = entry.result.key
+                break
+        return self.fingerprint_of(key) if key else None
+
     def serving_stale_ids(self) -> tuple[str, ...]:
         """Vendor ids currently answered from the last-known-good store.
 

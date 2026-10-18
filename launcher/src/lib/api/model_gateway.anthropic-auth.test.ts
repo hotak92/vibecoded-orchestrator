@@ -49,6 +49,14 @@ describe('anthropicAuthDisabledReason', () => {
     expect(why).toContain('ANTHROPIC_API_KEY_GATEWAY');
   });
 
+  it('a key Anthropic rejected disables the choice and says so', () => {
+    expect(anthropicAuthDisabledReason('api_key', gw(AUTH('rejected')))).toMatch(/rejected/);
+  });
+
+  it('an older running gateway names the restart as the remedy', () => {
+    expect(anthropicAuthDisabledReason('api_key', gw(null))).toMatch(/restart/);
+  });
+
   it('a not-yet-resolved key, a stopped or an older gateway all disable it', () => {
     expect(anthropicAuthDisabledReason('api_key', gw(AUTH('unknown')))).not.toBe('');
     expect(anthropicAuthDisabledReason('api_key', gw(AUTH('available'), false))).not.toBe('');
@@ -61,6 +69,10 @@ describe('anthropicAuthWarning', () => {
     expect(anthropicAuthWarning('api_key', gw(AUTH('missing', 'api_key')))).toMatch(/refused/);
   });
 
+  it('warns when API key mode is on and Anthropic rejected the key', () => {
+    expect(anthropicAuthWarning('api_key', gw(AUTH('rejected', 'api_key')))).toMatch(/rejected the key/);
+  });
+
   it('is quiet when the gateway applies the stored mode', () => {
     expect(anthropicAuthWarning('api_key', gw(AUTH('available', 'api_key')))).toBeNull();
     expect(anthropicAuthWarning('oauth', gw(AUTH('available', 'oauth')))).toBeNull();
@@ -68,7 +80,7 @@ describe('anthropicAuthWarning', () => {
 
   it('reports a gateway still on the other mode, and an older gateway', () => {
     expect(anthropicAuthWarning('api_key', gw(AUTH('available', 'oauth')))).toMatch(/oauth/);
-    expect(anthropicAuthWarning('api_key', gw(null))).toMatch(/still use OAuth/);
+    expect(anthropicAuthWarning('api_key', gw(null))).toMatch(/restart the gateway/);
     expect(anthropicAuthWarning('oauth', gw(null))).toBeNull();
   });
 });
