@@ -2,7 +2,8 @@
 
 Pins the behavior matrix documented in install.py::_configure_claude_settings:
 
-* File missing → write VCO defaults (including `_vco_managed_keys`).
+* File missing → write the shipped template + VCO defaults (including
+  `_vco_managed_keys`; v0.2.104 — the same result as replace-all).
 * File parses + has `_vco_managed_keys` → managed-block merge (refresh
   listed keys, preserve every other top-level key).
 * File parses + no `_vco_managed_keys` → legacy: write VCO defaults as
@@ -56,6 +57,7 @@ def embed_config() -> dict:
 def isolated_project_root(tmp_path: Path, monkeypatch):
     """Re-point install_py.PROJECT_ROOT at a fresh tmp dir for each test."""
     monkeypatch.setattr(install_py, "PROJECT_ROOT", tmp_path)
+    _ship_templates(tmp_path)
     return tmp_path
 
 

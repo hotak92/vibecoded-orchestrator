@@ -164,3 +164,41 @@ def test_build_defaults_is_unchanged_for_the_merge_callers():
     hooks on every install (``hooks`` is a managed key)."""
     d = install_py._build_vco_settings_defaults(_EMBED)
     assert set(d) == {"_vco_managed_keys", "permissions", "env"}
+
+
+# ─── Case 1 (R14A NIT-1): a MISSING settings.json gets the same result ─────
+# Reachable at the root when step 5b's bundle did not create the file (a
+# failed bundle run, or a `.claude/` symlink diverting the write to a fresh
+# `.claude.vco-new/`). It used to write the defaults alone.
+
+
+def test_a_missing_file_gets_what_replace_all_writes(root):
+    install_py._configure_claude_settings(_EMBED)
+    created = json.loads((root / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    _user_file(root)
+    assert created == _replace_all(root)
+    assert created["idleCompaction"] is False
+    assert created["hooks"] == _template(root)["hooks"]
+
+
+def test_skip_materialize_writes_the_defaults_alone(root):
+    """--skip-materialize-claude-dir: the run materialized no hook scripts,
+    so the template's hooks would name missing files — the defaults alone
+    are what a fresh install with that flag lands, for both whole-file
+    writes."""
+    defaults = install_py._build_vco_settings_defaults(_EMBED)
+    install_py._configure_claude_settings(_EMBED, settings_template_skipped=True)
+    path = root / ".claude" / "settings.json"
+    assert json.loads(path.read_text(encoding="utf-8")) == defaults
+    _user_file(root)
+    install_py._configure_claude_settings(
+        _EMBED, adopt_project_mode="replace-all", settings_template_skipped=True)
+    assert json.loads(path.read_text(encoding="utf-8")) == defaults
+
+
+def test_a_missing_file_with_no_template_stays_missing(root, capsys):
+    for t in (root / "templates").iterdir():
+        t.unlink()
+    install_py._configure_claude_settings(_EMBED)
+    assert not (root / ".claude" / "settings.json").exists()
+    assert "NOT created" in capsys.readouterr().err
