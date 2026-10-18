@@ -513,6 +513,8 @@ Code graph rows are not cross-project value by default. Source code from one pro
 
 **Compaction**: critical context is preserved by `PreCompact` / `PostCompact` hooks. Before compacting manually, update `CONTEXT_STATE.md` with current state, modified files, open blockers. Use `/compact focus on <topic>` to guide the summary.
 
+**Idle compaction is off in every VCO project.** The shipped `.claude/settings.json` carries `"idleCompaction": false`: Claude Code otherwise compacts a 200k+ token conversation left idle for about an hour (before the prompt cache expires), and the user resumes into a summary that can drop context not yet written down. Normal auto-compact near the context limit is unaffected. A bundle update adds the key only when it is absent (a user's own value, true or false, is kept), and only in VCO projects, never in `~/.claude/settings.json`. To turn it back on for a project, set `"idleCompaction": true` in its `.claude/settings.local.json`.
+
 ---
 
 ## Agents & Skills

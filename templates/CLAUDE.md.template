@@ -87,6 +87,8 @@ Four layers carry state across sessions — future-you, future agents, and the u
 
 **Concrete rule**: if you've done >2 hours of substantive work or learned a non-obvious thing, write the KG node BEFORE the user has to ask.
 
+**Idle compaction is off in this project.** VCO ships `"idleCompaction": false` in `.claude/settings.json`: Claude Code otherwise compacts a large conversation (200k+ tokens) left idle for about an hour, and you would resume into a summary that can drop context not yet written to `CONTEXT_STATE.md` or the KG. Normal auto-compact near the context limit is unaffected. A bundle update adds the key only when it is absent, so your own value always stands; to turn idle compaction back on, set `"idleCompaction": true` in `.claude/settings.local.json`.
+
 ---
 
 ## Search before you answer project questions
