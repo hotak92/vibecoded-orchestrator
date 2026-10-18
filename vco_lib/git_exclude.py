@@ -107,7 +107,6 @@ USER_OWNED_CLAUDE_PATHS: tuple[str, ...] = (
     ".claude/CLAUDE.md",  # Claude Code project instructions
     ".claude/MEMORY.md",
     ".claude/settings.json",  # VCO merges into it; teams commit it
-    ".claude/settings.local.json",  # Claude Code's own; its rules, not ours
     ".claude/context/",  # plans, handoffs, reviews, per-session state
     ".claude/rules/",
     ".claude/commands/",
@@ -125,6 +124,13 @@ VCO_RUNTIME_EXCLUDES: tuple[str, ...] = (
     "/.claude/agents.disabled/",  # launcher's disable toggle parks agents here
     "/.claude/skills.disabled/",  # ... and skills here
     "/.claude/env",  # machine-local env file (absolute paths, hub routing)
+    # v0.2.104 L5: Claude Code's per-machine settings file, never committed by
+    # its own convention. VCO writes this machine's absolute paths, launcher
+    # ids and service ports into its `env`, so it must stay out of git even
+    # when Claude Code did not create it (Claude Code ignores it only for a
+    # file IT creates). An exclude line never un-tracks a file the user
+    # already committed.
+    "/.claude/settings.local.json",
     "/.claude/.code_formats.json",  # code-graph format sidecar
     # Machine-local files VCO writes into the otherwise user-owned
     # `.claude/context/` — named one by one, never the directory.

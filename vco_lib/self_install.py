@@ -367,6 +367,44 @@ def run_root_bundle_install(
 _ROOT_SETTINGS_ACTION: dict[str, str] = {}
 
 
+def route_root_machine_env(
+    install_root: Path,
+    expected_env: Callable[[], dict],
+    *,
+    log: Optional[Callable[..., Any]] = None,
+) -> list[str]:
+    """v0.2.104 L5 (review R14B B2): move this machine's service URLs and
+    ports out of the root ``.claude/settings.json`` ``env`` into
+    ``.claude/settings.local.json``, as the env projection does for every
+    project.
+
+    ``install.py``'s ``_build_vco_settings_defaults`` and the managed-block
+    merge that applies it (hooks included) stay as they are: this runs AFTER
+    that write and moves only the machine keys whose value EQUALS what the
+    defaults put there (``expected_env()`` — ``WEAVIATE_URL``, ``OLLAMA_URL``,
+    ``CODE_EMBED_SERVICE_URL``, ``GRPC_PORT``), the evidence rule, so a value
+    the user set stays. Nothing moves through a symlinked ``.claude/`` or
+    ``settings.json``, or while git tracks the local file (then a
+    ``settings_local_json_tracked`` entry is recorded). Soft-fail: returns
+    the keys moved, ``[]`` on any failure (logged through ``log``).
+    """
+    from vco_lib.settings_local_env import move_machine_env_out_of_settings
+    from vco_lib.symlink_handler import is_symlink_blocking
+
+    claude = Path(install_root) / ".claude"
+    if is_symlink_blocking(claude) or is_symlink_blocking(claude / "settings.json"):
+        return []
+    try:
+        moved = move_machine_env_out_of_settings(Path(install_root), expected_env())
+    except Exception as exc:  # noqa: BLE001 — never fail the install over this
+        if log is not None:
+            log("9/10", "warn", f"route_root_machine_env: {exc}")
+        return []
+    if moved:
+        print(f"  Claude settings: machine-specific env moved to settings.local.json: {', '.join(moved)}")
+    return moved
+
+
 def _record_root_settings_action(install_root: Path, result: dict) -> None:
     try:
         key = str(Path(install_root).resolve())

@@ -848,9 +848,13 @@ def test_reproject_all_migrates_stale_slug_access_list_to_names(
     assert grantee_outcome["status"] == "migrated"
 
     data = json.loads((claude / "settings.json").read_text())
-    # Migrated from stale slug-form → name-form. Slug is GONE.
-    assert data["env"]["VCT_CODE_GRAPH_ACCESS_LIST"] == "Beta,Proj A Alpha"
-    assert "proj-a-alpha" not in data["env"]["VCT_CODE_GRAPH_ACCESS_LIST"]
+    local = json.loads((claude / "settings.local.json").read_text())
+    # Migrated from stale slug-form → name-form. Slug is GONE — and (v0.2.104
+    # L5) the list names this machine's other projects, so it moved out of
+    # the committable settings.json into settings.local.json.
+    assert "VCT_CODE_GRAPH_ACCESS_LIST" not in data["env"]
+    assert local["env"]["VCT_CODE_GRAPH_ACCESS_LIST"] == "Beta,Proj A Alpha"
+    assert "proj-a-alpha" not in local["env"]["VCT_CODE_GRAPH_ACCESS_LIST"]
 
 
 def test_reproject_all_defers_on_per_project_failure_without_aborting(
@@ -1050,8 +1054,12 @@ def test_apply_creates_claude_settings_json_fresh(tmp_path: Path) -> None:
     data = json.loads(settings_path.read_text())
     assert "env" in data
     assert data["env"]["KG_COLLECTION"] == "TestKG"
-    assert data["env"]["WEAVIATE_PORT"] == "8081"
+    # v0.2.104 L5: a machine service port goes to the per-machine file.
+    assert "WEAVIATE_PORT" not in data["env"]
+    local = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
+    assert local["env"]["WEAVIATE_PORT"] == "8081"
     assert "KG_COLLECTION" in report["claude_settings_json"]
+    assert "WEAVIATE_PORT" in report["claude_settings_local_json"]
 
 
 def test_apply_preserves_user_keys_in_settings_json(tmp_path: Path) -> None:
@@ -1276,7 +1284,10 @@ def test_apply_returns_audit_report(tmp_path: Path) -> None:
     """The returned dict lists which canonical keys landed per surface."""
     bundle = _bundle(tmp_path)
     report = apply_project_env(bundle, surfaces=["claude_settings_json", "claude_env"])
-    assert set(report.keys()) == {"claude_settings_json", "claude_env"}
+    # v0.2.104 L5: settings.json always brings its per-machine half.
+    assert set(report.keys()) == {
+        "claude_settings_local_json", "claude_settings_json", "claude_env",
+    }
     assert "KG_COLLECTION" in report["claude_settings_json"]
     assert "KG_COLLECTION" in report["claude_env"]
     # Audit is sorted for deterministic logging.

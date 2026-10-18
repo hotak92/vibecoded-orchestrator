@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""The unregister's strip of VCO's routing keys from ``.claude/env`` and the
-two JSON settings env blocks — the evidence rule (v0.2.97 review R6).
+"""The unregister's strip of VCO's routing keys from ``.claude/env`` and
+the JSON settings env blocks — the evidence rule (v0.2.97 review R6).
 
 An unregister removes what VCO wrote and nothing else:
 
@@ -9,7 +9,8 @@ An unregister removes what VCO wrote and nothing else:
   ``# vco-managed-end``) goes WHOLE — its markers prove it is VCO's. Outside
   it, a routing key's line goes only when its value EQUALS what VCO projects
   for this project; a ``# KEY=`` comment sets nothing and stays.
-* ``.claude/settings.json`` ``env`` / ``.vscode/settings.json``
+* ``.claude/settings.json`` ``env`` / ``.claude/settings.local.json``
+  ``env`` (v0.2.104 L5: the machine-local keys) / ``.vscode/settings.json``
   ``claude-code.env`` (no block): a routing key goes only when its value
   equals VCO's.
 
@@ -43,6 +44,13 @@ from vco_lib.atomic import atomic_rewrite_text
 from vco_lib.envfile import parse_env_line
 
 CLAUDE_ENV_REL = ".claude/env"
+
+
+def routing_keys() -> set[str]:
+    """Every routing key the unregister strip considers: the canonical set
+    minus the secret-valued keys (those go only on stored-value evidence, in
+    ``strip-proven-secret-values``)."""
+    return cp.list_canonical_keys() - cp._LEGACY_SECRET_ENV_KEYS
 
 
 def projected_env(
@@ -121,12 +129,18 @@ def strip_routing_keys(
     db_path: Optional[Path] = None,
     orchestrator_root: Optional[Path] = None,
 ) -> dict[str, object]:
-    """Run the strip on all three surfaces. Returns ``{"removed": {file:
+    """Run the strip on every surface. Returns ``{"removed": {file:
     [KEY]}, "left": {file: [KEY]}, "projection": "resolved"|"unavailable",
     "projection_error": str|None, "errors": [message]}`` — names only. A
     surface that cannot be edited is refused (and recorded in the project's
     deferral ledger), reported in ``errors``; the others still run."""
-    keys = sorted(set(keys))
+    # The launcher passes its own key list (Rust ``CANONICAL_INSTALL_ENV_KEYS``,
+    # a SUBSET of the Python canonical set — it lacks e.g. VCT_PROJECT_ID and
+    # VCT_INSTALL_ROOT). The canonical set has ONE home, this package, so the
+    # strip always considers all of it (review R14B B5): every machine-local
+    # key VCO writes into settings.local.json goes too. Value evidence still
+    # decides each removal, so widening the NAMES removes nothing of the user's.
+    keys = sorted(set(keys) | routing_keys())
     expected: Optional[dict[str, str]] = None
     projection_error: Optional[str] = None
     if project_id:

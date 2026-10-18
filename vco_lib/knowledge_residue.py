@@ -166,14 +166,16 @@ def weaviate_reachable(weaviate_url: str, *, timeout: float = 4.0) -> bool:
 
 
 def project_settings_env(folder: Path) -> dict:
-    """Return the ``env`` dict from ``<folder>/.claude/settings.json``.
+    """Return the project's Claude Code settings ``env``: ``.claude/settings.json``
+    merged with ``.claude/settings.local.json`` (local wins per key — v0.2.104
+    L5 moved the machine-local keys there), through the ONE merged reader
+    :func:`vco_lib.claude_settings_env.read_settings_env`.
 
-    Soft-fail: ``{}`` on a missing / unparseable file or a non-dict ``env``
-    key. This is the canonical per-project env surface (CLAUDE.md: the
-    channel that propagates to MCP subprocesses on every Claude Code
-    surface).
+    Soft-fail: ``{}`` when neither file carries an ``env`` object. This is the
+    canonical per-project env surface (CLAUDE.md: the channel that propagates
+    to MCP subprocesses on every Claude Code surface).
     """
-    from vco_lib.jsonc_edit import load_object
+    from vco_lib.claude_settings_env import read_settings_env
 
     # JSONC through the ONE reader (v0.2.97): Claude Code accepts comments and
     # trailing commas here, and a strict ``json.loads`` read such a file as
@@ -183,17 +185,13 @@ def project_settings_env(folder: Path) -> dict:
     # IN, so a bundle update could delete its on-disk curated copies — its
     # only curated access. (The MCP's read gate reads its process env, which
     # Claude Code builds from the JSONC file itself; it was never affected.)
-    try:
-        loaded = load_object(Path(folder) / ".claude" / "settings.json")
-    except Exception:  # noqa: BLE001 — settings read is best-effort
-        return {}
-    env = loaded[0].get("env") if loaded is not None else None
-    return env if isinstance(env, dict) else {}
+    return read_settings_env(Path(folder))
 
 
 def project_env_value(folder: Path, key: str) -> Optional[str]:
     """``key`` from the project's own env, LOCALLY (no hub, no DB): the
-    ``.claude/settings.json`` ``env`` block, then the shell-sourced
+    settings ``env`` (``.claude/settings.json`` merged with
+    ``.claude/settings.local.json``), then the shell-sourced
     ``.claude/env`` (whole file, LAST assignment wins — the value a shell
     holds after ``source``-ing it, so a user's own export after the managed
     block overrides the block here exactly as it does in every hook; until

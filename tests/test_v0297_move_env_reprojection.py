@@ -75,8 +75,12 @@ def moved_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _settings_env(dst: Path) -> dict:
-    data = json.loads((dst / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    return data.get("env", {})
+    """Claude Code's settings env as it merges it: ``settings.json`` overlaid
+    by ``settings.local.json`` (v0.2.104 L5 — where the machine-absolute
+    ``KG_BASE_DIR`` now lives)."""
+    from vco_lib.claude_settings_env import read_settings_env
+
+    return read_settings_env(dst)
 
 
 def test_mover_reprojection_argv_is_accepted_and_writes_the_new_root(moved_project):

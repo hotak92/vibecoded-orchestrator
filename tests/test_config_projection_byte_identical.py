@@ -350,18 +350,23 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     assert first == second, "second apply must be byte-identical to first"
 
     parsed = json.loads(first)
+    local = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
     # Genuinely user-added key survived.
     assert parsed["env"]["MY_CUSTOM_USER_VAR"] == "keep-me"
-    # A-8: KG_BASE_DIR is now managed — overwritten with the bundle value.
-    assert parsed["env"]["KG_BASE_DIR"] == "/home/user/code/project-a"
+    # A-8: KG_BASE_DIR is managed — overwritten with the bundle value; v0.2.104
+    # L5: as a machine-absolute path it now lives in settings.local.json and
+    # the stale copy left the committable settings.json.
+    assert "KG_BASE_DIR" not in parsed["env"]
+    assert local["env"]["KG_BASE_DIR"] == "/home/user/code/project-a"
     # Sibling top-level blocks survived.
     assert "hooks" in parsed
     assert parsed["permissions"] == {"allow": ["Read(/)", "Bash(*)"]}
     # Canonical key honoured (matches bundle value).
     assert parsed["env"]["KG_COLLECTION"] == "VCODev_KnowledgeGraph"
-    # New canonical keys from the bundle were added.
+    # New canonical keys from the bundle were added — each to its own file.
     assert parsed["env"]["ACTIVE_EMBEDDING"] == "qwen3"
-    assert parsed["env"]["WEAVIATE_URL"] == "http://localhost:8081"
+    assert local["env"]["WEAVIATE_URL"] == "http://localhost:8081"
+    assert "WEAVIATE_URL" not in parsed["env"]
 
 
 # ─── v0.2.73 WRITE INVARIANT parity (Rust ↔ Python agree on strip) ──────

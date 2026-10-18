@@ -363,22 +363,34 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return dict(parse_env_lines(text))
 
 
+#: The endpoint keys :func:`_continuity` reads (the settings layer when it
+#: carries any of them, else ``.claude/env``).
+_CONTINUITY_URL_KEYS: tuple[str, ...] = (
+    "WEAVIATE_URL", "OLLAMA_URL", "CODE_EMBED_SERVICE_URL", "CODE_EMBED_URL",
+)
+
+
 def _continuity(orchestrator_root: Path) -> dict[str, Statement]:
     """The endpoints the root project's projected env pointed clients at."""
+    from vco_lib.claude_settings_env import read_settings_env, settings_env_sources
+
     root = Path(orchestrator_root)
-    settings = root / ".claude" / "settings.json"
-    env: dict[str, str] = {}
-    source = ""
-    try:
-        data = json.loads(settings.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("env"), dict):
-            env = {str(k): str(v) for k, v in data["env"].items()}
-            source = f"continuity:{settings}"
-    except (OSError, ValueError):
-        env = {}
-    if not env:
+    # v0.2.104 L5: the endpoint keys live in `.claude/settings.local.json`
+    # (machine-local); the merged reader sees them wherever they are, and each
+    # statement names the file its value actually came from.
+    env: dict[str, str] = {
+        str(k): str(v) for k, v in read_settings_env(root).items()
+    }
+    origins = settings_env_sources(root)
+    fallback: Optional[str] = None
+    if not any(env.get(k) for k in _CONTINUITY_URL_KEYS):
         env = _read_env_file(root / ".claude" / "env")
-        source = f"continuity:{root / '.claude' / 'env'}"
+        fallback = f"continuity:{root / '.claude' / 'env'}"
+
+    def source_of(key: str) -> str:
+        if fallback is not None:
+            return fallback
+        return f"continuity:{root / origins.get(key, '.claude/settings.json')}"
     grpc = (env.get("WEAVIATE_GRPC_PORT") or env.get("GRPC_PORT") or "").strip()
     out: dict[str, Statement] = {}
     for service, keys in (
@@ -391,7 +403,7 @@ def _continuity(orchestrator_root: Path) -> dict[str, Statement]:
             kw: dict[str, Any] = {}
             if service == "weaviate" and grpc.isdigit():
                 kw["grpc_port"] = int(grpc)
-            stmt = _stmt_from_url(service, source, value, **kw) if value else None
+            stmt = _stmt_from_url(service, source_of(key), value, **kw) if value else None
             if stmt is not None:
                 out[service] = stmt
                 break

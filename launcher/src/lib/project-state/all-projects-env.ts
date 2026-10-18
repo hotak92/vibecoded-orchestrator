@@ -30,7 +30,8 @@ export function refreshAllProjectsEnvConfirmText(projectCount: number): string {
   const n = projectCount > 0 ? `${projectCount} project(s)` : 'every project';
   return (
     `Re-render the environment files of ${n} at once? This rewrites each ` +
-    `project's .claude/env and the env block of .claude/settings.json from ` +
+    `project's .claude/env and the env blocks of .claude/settings.json and ` +
+    `.claude/settings.local.json (this machine's paths and ports) from ` +
     `the launcher's current settings, and can take a while (one subprocess ` +
     `per project). The per-project repair on each project's Settings tab ` +
     `covers a single project if you only need one.`

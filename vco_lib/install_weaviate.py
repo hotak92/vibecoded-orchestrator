@@ -1147,25 +1147,21 @@ def weaviate_urls_equivalent(a: str, b: str) -> bool:
 
 
 def resolve_settings_weaviate_env(project_root: Path) -> "Optional[dict]":
-    """Return the migrated weaviate-relevant env from `.claude/settings.json`.
+    """Return the migrated weaviate-relevant env from the project's Claude
+    Code settings layer.
 
-    VCO writes a TOP-LEVEL ``env`` block in ``.claude/settings.json`` (see
-    install.py ``_build_vco_settings_defaults`` / ``_VCO_SETTINGS_MANAGED_KEYS``);
-    the MCP subprocess inherits it. Returns a dict of the present keys in
-    :data:`MCP_JSON_STALE_ENV_KEYS`, or ``None`` when the file is
-    missing/unreadable / carries no comparable env — in which case the caller
-    CANNOT prove staleness and must leave `.mcp.json` untouched.
+    VCO writes a TOP-LEVEL ``env`` block in ``.claude/settings.json`` and —
+    since v0.2.104 L5, for the machine-local keys such as ``WEAVIATE_URL`` —
+    in ``.claude/settings.local.json``; Claude Code merges the two (local
+    wins) and the MCP subprocess inherits the result. Read through the ONE
+    merged JSONC reader (:func:`vco_lib.claude_settings_env.read_settings_env`).
+    Returns a dict of the present keys in :data:`MCP_JSON_STALE_ENV_KEYS`, or
+    ``None`` when neither file carries comparable env — in which case the
+    caller CANNOT prove staleness and must leave `.mcp.json` untouched.
     """
-    settings_path = project_root / ".claude" / "settings.json"
-    if not settings_path.is_file():
-        return None
-    try:
-        # JSONC, through the same reader as the orphan check (v0.2.97) — a
-        # commented settings.json used to read as "no env", so a stale
-        # `.mcp.json` could never be proven stale there.
-        env = _settings_json_env(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):  # ValueError: not UTF-8
-        return None
+    from vco_lib.claude_settings_env import read_settings_env
+
+    env = read_settings_env(project_root)
     if not env:
         return None
     out: dict = {}

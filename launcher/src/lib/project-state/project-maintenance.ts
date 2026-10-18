@@ -27,7 +27,8 @@ export interface MaintenanceDeps {
 export function refreshEnvConfirmText(projectName: string): string {
   return (
     `Re-render the environment files of "${projectName}"? This rewrites ` +
-    `its .claude/env and the env block of .claude/settings.json from the ` +
+    `its .claude/env and the env blocks of .claude/settings.json and ` +
+    `.claude/settings.local.json (this machine's paths and ports) from the ` +
     `launcher's current settings. Only this project is touched.`
   );
 }

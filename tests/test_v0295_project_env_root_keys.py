@@ -163,6 +163,10 @@ class BundleBackfillTests(unittest.TestCase):
         self.assertNotIn("/gone/stale/clone", after)
 
     def test_settings_env_block_carries_them_too(self):
+        """v0.2.104 L5: the root keys are machine-absolute paths, so they reach
+        Claude Code's settings env through the per-machine
+        ``.claude/settings.local.json`` — never the committable
+        ``settings.json``."""
         project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch,
             update_mode=False, write_env=True, project_name="EnvRootProj",
@@ -170,10 +174,14 @@ class BundleBackfillTests(unittest.TestCase):
         settings = json.loads(
             (self.proj / ".claude" / "settings.json").read_text(encoding="utf-8")
         )
-        env = settings.get("env", {})
+        local = json.loads(
+            (self.proj / ".claude" / "settings.local.json").read_text(encoding="utf-8")
+        )
+        env, local_env = settings.get("env", {}), local.get("env", {})
         for key in ROOT_KEYS:
-            self.assertIn(key, env, settings)
-        self.assertEqual(env["VCT_ORCHESTRATOR_ROOT"], str(self.orch))
+            self.assertNotIn(key, env, settings)
+            self.assertIn(key, local_env, local)
+        self.assertEqual(local_env["VCT_ORCHESTRATOR_ROOT"], str(self.orch))
 
 
 class CallerRootStillWinsTests(unittest.TestCase):

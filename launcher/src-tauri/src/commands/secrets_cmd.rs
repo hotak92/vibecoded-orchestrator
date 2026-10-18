@@ -2301,23 +2301,42 @@ mod tests {
     fn assert_refreshed_without_secret(folder: &std::path::Path, project_id: &str, key: &str, canary: &str) {
         assert_refreshed_without_secret_in(
             folder, project_id, key, canary,
-            &[".claude/settings.json", ".claude/env", ".env", ".vscode/settings.json"],
+            &[
+                ".claude/settings.json",
+                ".claude/settings.local.json",
+                ".claude/env",
+                ".env",
+                ".vscode/settings.json",
+            ],
         );
     }
 
     fn assert_refreshed_without_secret_in(
         folder: &std::path::Path, project_id: &str, key: &str, canary: &str, rels: &[&str],
     ) {
+        // v0.2.104 L5: VCT_PROJECT_ID is machine-local, so the projection
+        // writes it to `.claude/settings.local.json` (never the committable
+        // settings.json).
+        let local: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join(".claude/settings.local.json"))
+                .unwrap_or_else(|_| panic!("the re-projection did not run for {}", project_id)),
+        )
+        .unwrap();
+        assert_eq!(
+            local["env"]["VCT_PROJECT_ID"], project_id,
+            "the canonical env landed — the refresh really ran for {}: {}",
+            project_id, local["env"]
+        );
         let cs_path = folder.join(".claude/settings.json");
         let cs: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&cs_path)
                 .unwrap_or_else(|_| panic!("the re-projection did not run for {}", project_id)),
         )
         .unwrap();
-        assert_eq!(
-            cs["env"]["VCT_PROJECT_ID"], project_id,
-            "the canonical env landed — the refresh really ran for {}: {}",
-            project_id, cs["env"]
+        assert!(
+            cs["env"].get("VCT_PROJECT_ID").is_none(),
+            "a machine id must never land in the committable settings.json: {}",
+            cs["env"]
         );
         if rels.contains(&".claude/settings.json") {
             assert!(cs["env"].get(key).is_none(), "the secret KEY was projected into {}: {}", project_id, cs["env"]);
@@ -2366,7 +2385,8 @@ mod tests {
         assert_eq!(cs["env"]["USER_OWN_KEY"], "keep", "a key VCO never wrote is untouched");
     }
 
-    const NOT_SETTINGS: &[&str] = &[".claude/env", ".env", ".vscode/settings.json"];
+    const NOT_SETTINGS: &[&str] =
+        &[".claude/settings.local.json", ".claude/env", ".env", ".vscode/settings.json"];
 
 
     /// `remove_secret_v2` against the per-project user bucket: the refresh

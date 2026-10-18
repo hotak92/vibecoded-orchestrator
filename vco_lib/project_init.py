@@ -11892,6 +11892,7 @@ def _apply_standalone_env(
         "CODE_EMBED_URL": urls["code_embed_url"],
         "CODE_EMBED_SERVICE_URL": urls["code_embed_url"],
         "CODE_EMBED_PORT": str(urls["code_embed_port"]),
+        "KG_BASE_DIR": str(folder.resolve()),  # as the DB path projects it (R14B B4)
     }
 
     if orchestrator_root is not None:

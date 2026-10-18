@@ -734,14 +734,13 @@ def after_walk(collections: Iterable[str], folder: Any, svc: Any, *, full_tree: 
 
 
 def _project_env(folder: Path) -> "dict[str, str]":
-    """The project's projected env (``.claude/settings.json`` ``env``) — the
+    """The project's projected env (``.claude/settings.json`` ``env`` merged
+    with ``.claude/settings.local.json``, as Claude Code merges them — the ONE
+    reader, :func:`vco_lib.claude_settings_env.read_settings_env`) — the
     channel its ACTIVE_EMBEDDING / EMBEDDING_MODEL reach its own processes by."""
-    try:
-        data = json.loads((Path(folder) / ".claude" / "settings.json").read_text(encoding="utf-8"))
-        env = data.get("env") if isinstance(data, dict) else None
-        return {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {}
-    except Exception:  # noqa: BLE001
-        return {}
+    from vco_lib.claude_settings_env import read_settings_env
+
+    return {str(k): str(v) for k, v in read_settings_env(Path(folder)).items()}
 
 
 def folder_collections(folder: Any) -> "tuple[list[str], Optional[str]]":

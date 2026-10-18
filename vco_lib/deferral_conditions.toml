@@ -1245,6 +1245,36 @@ nothing (review R2 F18). The refresh also clears the entry (paired) once \
 nothing remains, trailing each removed key NAME in auto-resolutions.jsonl; an \
 unanswerable check keeps it (reconciler reads None as "keep")."""
 
+[conditions.settings_local_json_tracked]
+class = "action_required"
+owner = "vco_lib.settings_local_env"
+clear_probe = "probe:py:settings_local_json_still_tracked"
+emit_surfaces = ["ledger"]
+notes = """v0.2.104 L5 (review R14B B1). Git tracks the project's \
+`.claude/settings.local.json`, the per-machine file VCO's env projection writes \
+this machine's absolute paths, launcher ids and service ports into. An exclude \
+line never un-tracks a committed file, so VCO writes NO machine value there and \
+keeps the pre-L5 layout (every key in `.claude/settings.json`) for routing. \
+Emitted by the env projection (`config_projection._write_local_settings_surface`) \
+and by `settings_local_env.move_machine_env_out_of_settings` (root install); \
+cleared by the same writer once git no longer tracks the file (paired) and by the \
+probe (None — keep — when git cannot say). Remedy: `git rm --cached \
+.claude/settings.local.json` + commit, then an env refresh."""
+
+[conditions.settings_local_user_value_kept]
+class = "informational_record"
+owner = "vco_lib.settings_local_env"
+clear_probe = "probe:py:settings_local_user_values_still_kept"
+emit_surfaces = ["ledger"]
+notes = """v0.2.104 L5 (review R14B B6). A machine-local key in \
+`.claude/settings.local.json` holds a value VCO did not write (neither its \
+projection nor a value recorded in `.claude/state/settings-local-vco-values.json`, \
+VCO's `.claude/env` managed block or `settings.json`). Claude Code gives that \
+file precedence, so it is the user's override; VCO keeps it and records the \
+keys here. Nothing is pending. Cleared by the writer when no such key remains \
+(paired) and by the probe, which compares with VCO's last projection (the \
+`.claude/env` managed block)."""
+
 [conditions.user_owned_secret_value_in_tree]
 class = "action_required"
 owner = "vco_lib.user_owned_secrets"

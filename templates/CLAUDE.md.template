@@ -237,7 +237,9 @@ anything.
    `infrastructure/`, `knowledge/` — existing destination files are never
    overwritten.
 3. **Rewrite path-bearing values** in the destination: `KG_BASE_DIR` in
-   `.claude/settings.json` and `.claude/env`, AND the deferral ledger's
+   `.claude/settings.local.json` and `.claude/env` (and in
+   `.claude/settings.json` if an older VCO version wrote it there — the next
+   env refresh moves it out), AND the deferral ledger's
    apply commands (`.claude/context/UPDATE_DEFERRED.md` + `.json` embed
    absolute paths — a stale `source <old>/.claude/env` would poison a
    session). Grep the old path across the whole destination afterwards —

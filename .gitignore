@@ -123,6 +123,9 @@ claude_mcp_servers/weaviate_mcp/*_tool_usage.jsonl
 .claude/hooks/
 .claude/scripts/
 .claude/settings.json
+# v0.2.104 L5: the env projection writes this machine's absolute paths,
+# launcher ids and service ports into the per-machine settings file.
+.claude/settings.local.json
 CLAUDE.local.md
 # v0.2.81 Step 4d: the curated KG set is shipped ONLY in templates/knowledge/
 # and materialized into the orchestrator root's knowledge/ at install time

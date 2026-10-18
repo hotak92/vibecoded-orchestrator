@@ -460,9 +460,8 @@
             disabled={saving || redetecting}
           />
           <small class="ps-form-hint">
-            Sets <code>KG_COLLECTION</code> in all three env surfaces
-            (<code>.claude/env</code>, <code>.claude/settings.json::env</code>,
-            <code>.vscode/settings.json::claude-code.env</code>). Used by the
+            Sets <code>KG_COLLECTION</code> in the project's env surfaces
+            (<code>.claude/env</code> and <code>.claude/settings.json::env</code>). Used by the
             project's hooks, MCP server, and search scripts to read / write the
             per-project KG. Must start with a letter; A–Z, a–z, 0–9, _ only.
           </small>
