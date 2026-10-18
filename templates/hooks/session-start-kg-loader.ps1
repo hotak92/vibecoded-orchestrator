@@ -53,23 +53,6 @@ if ($UserHome -and (Test-Path $RlLauncher)) {
     }
 }
 
-# v0.2.104: TTL sweep of the sanctioned scratch dir
-# (<project>/.claude/state/scratch/, vco_lib/scratch_dir.py is the ONE home of
-# every rule: TTL knob VCO_SCRATCH_TTL_HOURS, never leaves its root, never
-# follows a symlink). Once per session start, never on the per-tool-call path.
-# Needs the VCO venv (vco_lib); without one it is skipped - `vco doctor` still
-# reports the scratch size. Soft-fail: a SessionStart hook never blocks.
-$VenvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
-if (Test-Path $VenvLib) {
-    try {
-        . $VenvLib
-        $VcoVenvPython = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
-        if ($VcoVenvPython -and (Test-Path $VcoVenvPython)) {
-            & $VcoVenvPython -m vco_lib.scratch_dir sweep --project "$ProjectDir" 2>$null | Out-Null
-        }
-    } catch { }
-}
-
 @"
 
 KG Resources Available:
@@ -83,7 +66,7 @@ KG Resources Available:
    - .claude/scripts/kg-search recent --days 7
 
    Scratch (use instead of the temp dir; VCO cleans it):
-   - .claude/scripts/vco-scratch.ps1 path [--name LANE]
+   - .claude/scripts/vco-scratch.ps1 path --name LANE  (subagents share the session id: always name the lane)
 
    Project Context:
    - .claude/CONTEXT_STATE.md (current task state)
@@ -117,4 +100,29 @@ except Exception:
         if ($out) { Write-Output $out }
     } catch { }
 }
+# v0.2.104: TTL sweep of the sanctioned scratch dir
+# (<project>/.claude/state/scratch/; vco_lib/scratch_dir.py is the ONE home of
+# every rule: TTL knob VCO_SCRATCH_TTL_HOURS, never leaves its root, never
+# follows a symlink). It runs AFTER the listing above and DETACHED, so a slow
+# disk or a huge lane can never push this hook past its timeout and lose the
+# listing. The same run pre-creates the private lanes shell-less agents use
+# (--ensure-precreated). A lane it cannot remove is recorded and logged to
+# .claude/logs/scratch-sweep.log, and `vco doctor` names it. Needs the VCO
+# venv (vco_lib); without one it is skipped. Never on the per-tool-call path.
+# PARITY: session-start-kg-loader.sh detaches the same command.
+$VenvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
+if (Test-Path $VenvLib) {
+    try {
+        . $VenvLib
+        $VcoVenvPython = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+        if ($VcoVenvPython -and (Test-Path $VcoVenvPython)) {
+            # The ONE detached-spawn home (_lib/resolve-powershell.ps1, dotted
+            # above): never throws, no pipes left to the exiting hook.
+            Start-VcoDetachedProcess -FilePath $VcoVenvPython -ArgumentList @(
+                '-m', 'vco_lib.scratch_dir', 'sweep', '--project', "$ProjectDir",
+                '--ensure-precreated') | Out-Null
+        }
+    } catch { }
+}
+
 exit 0

@@ -90,7 +90,8 @@ def test_default_name_is_the_sanitised_session_id(tmp_path: Path) -> None:
     assert scratch_dir.lane_name(env={}) == "default"
 
 
-@pytest.mark.parametrize("bad", ["", ".", "..", ".hidden", "a/b", "a\\b", "x" * 129])
+@pytest.mark.parametrize("bad", ["", ".", "..", ".hidden", "a/b", "a\\b", "x" * 129,
+                                 "lane.", "CON", "nul", "Com1", "LPT9.txt", "aux.log"])
 def test_an_unsafe_name_is_a_usage_error(tmp_path: Path, bad: str) -> None:
     with pytest.raises(ValueError):
         scratch_dir.scratch_path(_project(tmp_path), bad)
@@ -495,50 +496,90 @@ def test_ps1_wrapper_matches_the_bash_one(tmp_path: Path) -> None:
     assert Path(proc.stdout.strip()) == (proj / ".claude" / "state" / "scratch" / "w2").resolve()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="bash .sh leg; Windows runs the .ps1 sibling: tests/test_v02104_scratch_dir.py::test_session_start_hook_ps1_sweeps_old_lanes")
-def test_session_start_hook_sweeps_old_lanes(tmp_path: Path) -> None:
+HOOK_SH = REPO / "templates" / "hooks" / "session-start-kg-loader.sh"
+HOOK_PS1 = REPO / "templates" / "hooks" / "session-start-kg-loader.ps1"
+
+
+def _hook_argv(flavour: str) -> list[str]:
+    if flavour == "sh":
+        return ["bash", str(HOOK_SH)]
+    return ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOK_PS1)]
+
+
+def _wait_for(predicate, timeout: float = 60.0) -> bool:
+    """The hook DETACHES the sweep, so its effect lands after the hook exits:
+    wait (bounded) for it instead of asserting at once."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.2)
+    return predicate()
+
+
+_FLAVOURS = [
+    pytest.param("sh", marks=pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
+    pytest.param("ps1", marks=pytest.mark.skipif(
+        shutil.which("pwsh") is None, reason="pwsh not installed")),
+]
+
+
+@pytest.mark.parametrize("flavour", _FLAVOURS)
+def test_session_start_hook_sweeps_old_lanes_and_precreates_private_lanes(
+    tmp_path: Path, flavour: str,
+) -> None:
     proj = _project(tmp_path)
     old = scratch_dir.scratch_path(proj, "old")
     _age(old, 30 * DAY)
     keep = scratch_dir.scratch_path(proj, "new")
-    hook = REPO / "templates" / "hooks" / "session-start-kg-loader.sh"
     proc = subprocess.run(
-        ["bash", str(hook)], capture_output=True, text=True, timeout=120, input="",
+        _hook_argv(flavour), capture_output=True, text=True, timeout=120, input="",
         env=_venv_env(CLAUDE_PROJECT_DIR=str(proj), VCO_SCRATCH_TTL_HOURS="24"),
     )
     assert proc.returncode == 0, proc.stderr
-    assert not old.exists() and keep.exists()
-    assert "vco-scratch path" in proc.stdout
+    assert "path --name LANE" in proc.stdout
+    gui = proj / ".claude" / "state" / "scratch" / "vct-gui-report"
+    assert _wait_for(lambda: not old.exists() and gui.is_dir()), proc.stderr
+    assert keep.exists()
+    if sys.platform != "win32":
+        assert stat.S_IMODE(gui.stat().st_mode) == 0o700
 
 
-@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
-def test_session_start_hook_ps1_sweeps_old_lanes(tmp_path: Path) -> None:
+@POSIX_ONLY  # a #!/bin/sh fake interpreter
+@pytest.mark.parametrize("flavour", _FLAVOURS)
+def test_a_slow_sweep_never_delays_the_hook_listing(tmp_path: Path, flavour: str) -> None:
+    """A1: the sweep is detached AFTER the listing, so even an interpreter that
+    takes 20 s cannot hold the hook (10 s budget) or lose its output.
+    Red-proof: run the sweep synchronously and this fails on the elapsed time."""
     proj = _project(tmp_path)
-    old = scratch_dir.scratch_path(proj, "old")
-    _age(old, 30 * DAY)
-    keep = scratch_dir.scratch_path(proj, "new")
-    hook = REPO / "templates" / "hooks" / "session-start-kg-loader.ps1"
+    slow = tmp_path / "slow-python"
+    slow.write_text("#!/bin/sh\nexec sleep 20\n", encoding="utf-8")
+    slow.chmod(0o755)
+    start = time.monotonic()
     proc = subprocess.run(
-        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(hook)], capture_output=True, text=True,
-        timeout=120, input="",
-        env=_venv_env(CLAUDE_PROJECT_DIR=str(proj), VCO_SCRATCH_TTL_HOURS="24"),
+        _hook_argv(flavour), capture_output=True, text=True, timeout=120, input="",
+        env=_min_env(CLAUDE_PROJECT_DIR=str(proj), VCT_VENV=str(slow)),
     )
+    elapsed = time.monotonic() - start
     assert proc.returncode == 0, proc.stderr
-    assert not old.exists() and keep.exists()
-    assert "vco-scratch.ps1 path" in proc.stdout
+    assert "KG Resources Available" in proc.stdout or "Knowledge Graph Resources" in proc.stdout
+    assert elapsed < 10, f"hook waited {elapsed:.1f}s for the sweep"
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="bash .sh leg; Windows runs the .ps1 sibling: tests/test_v02104_scratch_dir.py::test_session_start_hook_ps1_sweeps_old_lanes")
+@pytest.mark.skipif(sys.platform == "win32", reason="bash .sh leg; Windows runs the .ps1 sibling: tests/test_v02104_scratch_dir.py::test_session_start_hook_sweeps_old_lanes_and_precreates_private_lanes[ps1]")
 def test_session_start_hook_leaves_scratch_alone_under_disable_hooks(tmp_path: Path) -> None:
     proj = _project(tmp_path)
     old = scratch_dir.scratch_path(proj, "old")
     _age(old, 30 * DAY)
-    hook = REPO / "templates" / "hooks" / "session-start-kg-loader.sh"
     subprocess.run(
-        ["bash", str(hook)], capture_output=True, text=True, timeout=120, input="",
+        ["bash", str(HOOK_SH)], capture_output=True, text=True, timeout=120, input="",
         env=_venv_env(CLAUDE_PROJECT_DIR=str(proj), VCO_SCRATCH_TTL_HOURS="24",
                      VCT_DISABLE_HOOKS="1"),
     )
+    gui = proj / ".claude" / "state" / "scratch" / "vct-gui-report"
+    assert not _wait_for(gui.exists, timeout=3.0)
     assert old.exists()
 
 
@@ -554,3 +595,181 @@ def test_scratch_is_git_excluded_and_transient_to_the_code_graph() -> None:
     assert "/.claude/state/" in VCO_RUNTIME_EXCLUDES
     rel = "/".join(scratch_dir.SCRATCH_REL) + "/lane/x.py"
     assert TRANSIENT_STATE_MARKER in rel
+
+
+# ---------------------------------------------------------------------------
+# Review R14B fix round (A2-A8)
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_name_lookalikes_are_still_allowed(tmp_path: Path) -> None:
+    for ok in ("console", "CON1", "nullable", "a", "lane.v2", "COM10"):
+        assert scratch_dir.lane_name(ok) == ok
+
+
+def test_sweep_walks_each_lane_once(tmp_path: Path, monkeypatch) -> None:
+    """A2: one tree walk per lane (newest mtime and size together).
+    Red-proof: a second walk for the size makes the count 2."""
+    proj = _project(tmp_path)
+    for name in ("a", "b"):
+        lane = scratch_dir.scratch_path(proj, name)
+        (lane / "d").mkdir()
+        (lane / "d" / "f").write_text("x", encoding="utf-8")
+    real_walk = os.walk
+    seen: list[str] = []
+
+    def counting_walk(top, *args, **kwargs):
+        seen.append(os.path.basename(os.fspath(top)))
+        return real_walk(top, *args, **kwargs)
+
+    monkeypatch.setattr(scratch_dir.os, "walk", counting_walk)
+    scratch_dir.sweep(proj, ttl_hours=1)
+    assert sorted(seen) == ["a", "b"]
+
+
+def test_every_shipped_text_names_the_lane() -> None:
+    """A3: subagents share the parent's session id, so every shipped call of
+    the wrapper passes --name. Red-proof: drop `--name <lane>` from any agent."""
+    shipped = list((REPO / "templates" / "agents").rglob("*.md")) + [
+        REPO / "templates" / "CLAUDE.md.template",
+        REPO / "templates" / "ORCHESTRATOR-CLAUDE.md.template",
+    ]
+    offenders = []
+    users = 0
+    for path in shipped:
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if "vco-scratch path" in line or "vco-scratch.ps1 path" in line:
+                users += 1
+                if "--name" not in line:
+                    offenders.append(f"{path.relative_to(REPO)}:{n}")
+    assert users >= 7 and not offenders, offenders
+
+
+def test_gui_tester_lane_is_a_precreated_private_lane(tmp_path: Path) -> None:
+    """A4: the shell-less gui-tester saves in a lane VCO pre-creates 0700.
+    Red-proof: drop the lane from PRECREATED_LANES and both halves fail."""
+    text = (REPO / "templates" / "agents" / "free" / "gui-tester.md").read_text(encoding="utf-8")
+    assert ".claude/state/scratch/vct-gui-report/" in text
+    assert "vct-gui-report" in scratch_dir.PRECREATED_LANES
+    assert "do NOT create it" in text
+    proj = _project(tmp_path)
+    assert scratch_dir.ensure_precreated(proj) == []
+    gui = proj / ".claude" / "state" / "scratch" / "vct-gui-report"
+    assert gui.is_dir()
+    if sys.platform != "win32":
+        assert stat.S_IMODE(gui.stat().st_mode) == 0o700
+
+
+def test_cli_sweep_ensure_precreated_recreates_after_removal(tmp_path: Path) -> None:
+    proj = _project(tmp_path)
+    scratch_dir.ensure_precreated(proj)
+    gui = proj / ".claude" / "state" / "scratch" / "vct-gui-report"
+    _age(gui, 30 * DAY)
+    code, out, _ = _cli("sweep", "--project", str(proj), "--ttl-hours", "1", "--json",
+                        "--ensure-precreated")
+    assert code == 0 and json.loads(out)["removed"] == ["vct-gui-report"]
+    assert gui.is_dir()  # recreated fresh in the same run
+
+
+@pytest.fixture
+def stuck_lane(tmp_path: Path):
+    """An old lane holding a directory the sweep cannot empty (mode 000)."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses the mode-000 directory this fixture relies on")
+    proj = _project(tmp_path)
+    lane = scratch_dir.scratch_path(proj, "locked")
+    sub = lane / "sub"
+    sub.mkdir()
+    (sub / "f").write_text("x", encoding="utf-8")
+    _age(lane, 30 * DAY)
+    os.chmod(sub, 0o000)
+    try:
+        yield proj, lane
+    finally:
+        if sub.exists():
+            os.chmod(sub, 0o700)
+
+
+@POSIX_ONLY  # mode-000 directory
+def test_a_lane_that_cannot_be_removed_is_recorded_logged_and_named_by_doctor(
+    stuck_lane, tmp_path: Path,
+) -> None:
+    """A5. Red-proof: skip record_sweep in the CLI and the log line, the state
+    and the doctor problem all disappear."""
+    proj, lane = stuck_lane
+    code, _, err = _cli("sweep", "--project", str(proj), "--ttl-hours", "24")
+    assert code == 0 and "cannot remove lane locked" in err
+    assert lane.exists()
+    log = proj.joinpath(*scratch_dir.SWEEP_LOG_REL).read_text(encoding="utf-8")
+    assert log.count("\n") == 1 and "could not remove 1 lane(s)" in log and "locked:" in log
+    last = scratch_dir.last_sweep(proj)
+    assert last is not None and "locked" in last["errors"]
+
+    [finding] = doctor.probe_scratch_dir(proj, doctor.DoctorResolvers(), {})
+    assert finding.status == doctor.STATUS_PROBLEM
+    assert "could not be removed" in finding.summary and "locked" in finding.summary
+    assert "Permission denied" in finding.summary
+    assert "python -m vco_lib.scratch_dir sweep --project" in finding.command
+    assert finding.detail["stuck"].keys() == {"locked"}
+
+
+@POSIX_ONLY  # mode-000 directory
+def test_a_clean_sweep_clears_the_stuck_report(stuck_lane) -> None:
+    proj, lane = stuck_lane
+    _cli("sweep", "--project", str(proj), "--ttl-hours", "24")
+    os.chmod(lane / "sub", 0o700)
+    code, _, _ = _cli("sweep", "--project", str(proj), "--ttl-hours", "24")
+    assert code == 0 and not lane.exists()
+    [finding] = doctor.probe_scratch_dir(proj, doctor.DoctorResolvers(), {})
+    assert finding.status == doctor.STATUS_OK
+
+
+def test_an_overdue_lane_no_sweep_tried_is_due_not_a_problem(tmp_path: Path) -> None:
+    proj = _project(tmp_path)
+    lane = scratch_dir.scratch_path(proj, "aged")
+    _age(lane, 30 * DAY)
+    [finding] = doctor.probe_scratch_dir(proj, doctor.DoctorResolvers(), {})
+    assert finding.status == doctor.STATUS_OK
+    assert "1 lane(s) due for removal" in finding.summary
+
+
+def test_a_successful_sweep_writes_no_log_line(tmp_path: Path) -> None:
+    proj = _project(tmp_path)
+    _age(scratch_dir.scratch_path(proj, "old"), 30 * DAY)
+    _cli("sweep", "--project", str(proj), "--ttl-hours", "1")
+    assert not proj.joinpath(*scratch_dir.SWEEP_LOG_REL).exists()
+    last = scratch_dir.last_sweep(proj)
+    assert last is not None and last["removed"] == ["old"]
+
+
+@POSIX_ONLY
+def test_a_symlinked_dot_claude_gets_nothing_created_through_it(tmp_path: Path) -> None:
+    """A8: the symlink check runs BEFORE any mkdir.
+    Red-proof: move the check after `state.mkdir` and `state/` appears."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (proj / ".claude").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ScratchError):
+        scratch_dir.scratch_path(proj, "lane")
+    assert list(outside.iterdir()) == []
+
+
+def test_the_acl_block_is_self_contained() -> None:
+    """A7: scratch_dir RUNS the S5 block on its own, so every command it
+    invokes must be defined inside it or be a built-in cmdlet, and it must
+    not dot-source or read script-scope state. Red-proof: make
+    Set-OwnerOnlyAcl call a helper defined elsewhere in the tee lib."""
+    import re
+
+    text = REPO.joinpath(*scratch_dir.ACL_LIB_REL).read_text(encoding="utf-8-sig")
+    block = text[text.index(scratch_dir.ACL_BEGIN):text.index(scratch_dir.ACL_END)]
+    code = "\n".join(line.split("#", 1)[0] for line in block.splitlines())
+    defined = set(re.findall(r"^\s*function\s+([A-Za-z]+-[A-Za-z]+)", code, re.M))
+    builtins = {"Set-Acl"}
+    invoked = set(re.findall(r"(?<![\w.:\[$-])([A-Z][a-z]+-[A-Z][A-Za-z]+)\b", code))
+    assert defined == {"New-OwnerOnlyAcl", "Set-OwnerOnlyAcl"}
+    assert invoked - defined - builtins == set(), invoked - defined - builtins
+    assert "$script:" not in code and "$global:" not in code
+    assert not re.search(r"^\s*\.\s", code, re.M), "the block must not dot-source"

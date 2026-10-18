@@ -1,4 +1,4 @@
-﻿# lean-ctx-tee.ps1 - LOSSLESS compression wrapper for allow-listed commands.
+# lean-ctx-tee.ps1 - LOSSLESS compression wrapper for allow-listed commands.
 # Windows sibling of templates/hooks/_lib/lean-ctx-tee.sh - see that file
 # for the full flow rationale (v0.2.101 allow-list + tee/pointer design).
 #

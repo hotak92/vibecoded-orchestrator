@@ -21,12 +21,24 @@ the ONE home of the replacement:
   is older than the TTL (``VCO_SCRATCH_TTL_HOURS``, default 168 h = 7 days,
   ``0`` = keep forever — the same knob shape as the tee's
   ``VCO_LEAN_CTX_TEE_TTL_HOURS``, read from the environment or
-  ``<project>/.claude/env``). It runs once per session from the SessionStart
-  hook ``session-start-kg-loader`` — never on the per-tool-call path.
+  ``<project>/.claude/env``). It runs once per session, DETACHED, from the
+  SessionStart hook ``session-start-kg-loader`` after that hook has printed
+  its listing — never on the per-tool-call path, never inside the hook's
+  time budget. The same run pre-creates the :data:`PRECREATED_LANES` (lanes
+  for agents with no shell, which cannot call the wrapper themselves).
 * **Never leaves its root.** The sweep refuses a scratch root that is (or sits
   under) a symlink, removes a symlinked lane entry as a LINK (its target is
   never touched), and deletes trees with :func:`shutil.rmtree`, which unlinks
-  inner symlinks instead of descending into them.
+  inner symlinks instead of descending into them. On POSIX ``rmtree`` is the
+  fd-based walker (``rmtree.avoids_symlink_attacks``), so an entry swapped for
+  a symlink mid-delete is refused too; on Windows CPython has no fd-based
+  walker, so that last guarantee is best-effort there (the per-entry
+  ``is_dir(follow_symlinks=False)`` check still never descends a link or a
+  junction).
+* **Never silent about what it cannot remove.** A lane the sweep fails to
+  delete is recorded (:data:`SWEEP_STATE_REL`), logged once per sweep to
+  :data:`SWEEP_LOG_REL`, and reported by ``vco doctor`` as a problem naming
+  the lane and the reason.
 * **Invisible to git and the code graph.** ``.claude/state/`` is written to
   ``.git/info/exclude`` at bundle add/update (:mod:`vco_lib.git_exclude`) and
   is transient to the code graph
@@ -34,11 +46,17 @@ the ONE home of the replacement:
 * **Reported.** ``vco doctor`` shows the lane count, total size and the oldest
   lane's age (:func:`probe_scratch`).
 
+Lane names: the session id is shared by a session and EVERY subagent it
+spawns (the harness gives subagents the parent's id and no agent id in the
+shell environment), so the default lane is the coordinator's; parallel lanes
+must pass ``--name``. Names are compared case-insensitively on Windows/macOS
+filesystems — ``Foo`` and ``foo`` are the same lane there.
+
 CLI (``python -m vco_lib.scratch_dir``; the shipped wrapper is
 ``.claude/scripts/vco-scratch`` / ``vco-scratch.ps1``)::
 
     path   [--project DIR] [--name LANE]   create + print the scratch dir
-    sweep  [--project DIR] [--ttl-hours N] [--json]
+    sweep  [--project DIR] [--ttl-hours N] [--json] [--ensure-precreated]
     report [--project DIR] [--json]
 
 Exit codes: 0 ok · 1 refused (unsafe root, cannot make private, no project)
@@ -74,8 +92,26 @@ SESSION_ENV_VARS: tuple[str, ...] = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_I
 DEFAULT_LANE = "default"
 
 #: A ``--name`` must be ONE safe path component: no separator, no leading dot
-#: (so ``.`` / ``..`` are impossible), at most 128 characters.
-_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
+#: (so ``.`` / ``..`` are impossible), no trailing dot (Windows drops it, so
+#: ``lane.`` would silently be ``lane``), at most 128 characters.
+_NAME_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9_-])?$")
+
+#: Windows reserved device names (with or without an extension) — refused on
+#: every OS so a lane name means the same thing everywhere.
+_RESERVED_RE = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.IGNORECASE)
+
+#: Lanes the session-start sweep pre-creates (private) for shipped agents that
+#: have no shell to call the wrapper with: ``gui-tester`` saves screenshots in
+#: ``vct-gui-report``.
+PRECREATED_LANES: tuple[str, ...] = ("vct-gui-report",)
+
+#: The last sweep's outcome (overwritten each sweep) and the append-only log of
+#: sweeps that could not remove a lane — both relative to the project root,
+#: outside the scratch root so a sweep never deletes its own record.
+SWEEP_STATE_REL: tuple[str, ...] = (".claude", "state", "scratch-sweep.json")
+SWEEP_LOG_REL: tuple[str, ...] = (".claude", "logs", "scratch-sweep.log")
+_SWEEP_LOG_MAX_BYTES = 256 * 1024
+_SWEEP_LOG_KEEP_LINES = 500
 
 #: The one home of the Windows owner-only ACL idiom (see module docstring).
 ACL_LIB_REL: tuple[str, ...] = ("templates", "hooks", "_lib", "lean-ctx-tee.ps1")
@@ -137,10 +173,11 @@ def lane_name(name: Optional[str] = None,
     a usage error, never silently rewritten), else the sanitised session id,
     else :data:`DEFAULT_LANE`."""
     if name is not None:
-        if not _NAME_RE.match(name):
+        if not _NAME_RE.match(name) or _RESERVED_RE.match(name):
             raise ValueError(
                 f"invalid scratch name {name!r}: use letters, digits, '.', '_' "
-                "or '-' (no path separator, no leading dot, at most 128 chars)"
+                "or '-' (no path separator, no leading or trailing dot, not a "
+                "Windows device name such as CON or NUL, at most 128 chars)"
             )
         return name
     from vco_lib.inject_intent import sanitize_session_id  # noqa: PLC0415
@@ -276,6 +313,11 @@ def scratch_path(project: "str | Path", name: Optional[str] = None,
     lane = lane_name(name, env)
     root = scratch_root(project_path)
     state = root.parent
+    # Refuse a redirected component BEFORE creating anything: a symlinked
+    # `.claude` must not get a `state/` made through it.
+    bad = _symlinked_component(project_path, root)
+    if bad is not None:
+        raise ScratchError(f"{bad} is a symlink - refusing to place scratch through it")
     try:
         state.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -289,30 +331,21 @@ def scratch_path(project: "str | Path", name: Optional[str] = None,
     return target
 
 
-def _newest_mtime(lane_dir: str) -> float:
-    """Newest mtime anywhere in a lane tree, by ``lstat`` (links never followed)."""
+def _walk_lane(lane_dir: str) -> tuple[float, int]:
+    """ONE walk of a lane tree: its newest mtime and the bytes of its regular
+    files, both by ``lstat`` (links never followed)."""
     newest = os.lstat(lane_dir).st_mtime
+    total = 0
     for dirpath, dirnames, filenames in os.walk(lane_dir, followlinks=False):
         for entry in dirnames + filenames:
-            try:
-                mtime = os.lstat(os.path.join(dirpath, entry)).st_mtime
-            except OSError:
-                continue
-            newest = max(newest, mtime)
-    return newest
-
-
-def _tree_bytes(lane_dir: str) -> int:
-    total = 0
-    for dirpath, _dirnames, filenames in os.walk(lane_dir, followlinks=False):
-        for entry in filenames:
             try:
                 st = os.lstat(os.path.join(dirpath, entry))
             except OSError:
                 continue
+            newest = max(newest, st.st_mtime)
             if stat.S_ISREG(st.st_mode):
                 total += st.st_size
-    return total
+    return newest, total
 
 
 @dataclass
@@ -335,8 +368,8 @@ def _scan(root: Path) -> list[LaneInfo]:
             if stat.S_ISLNK(st.st_mode) or _is_junction(Path(entry.path)):
                 lanes.append(LaneInfo(entry.name, "symlink", st.st_mtime, 0))
             elif stat.S_ISDIR(st.st_mode):
-                lanes.append(LaneInfo(entry.name, "dir", _newest_mtime(entry.path),
-                                      _tree_bytes(entry.path)))
+                newest, size = _walk_lane(entry.path)
+                lanes.append(LaneInfo(entry.name, "dir", newest, size))
             else:
                 size = st.st_size if stat.S_ISREG(st.st_mode) else 0
                 lanes.append(LaneInfo(entry.name, "file", st.st_mtime, size))
@@ -363,7 +396,8 @@ class SweepResult:
     ttl_hours: int
     removed: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    #: ``{lane: reason}`` for every lane the sweep tried and failed to remove.
+    errors: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {"root": self.root, "ttl_hours": self.ttl_hours,
@@ -413,8 +447,62 @@ def sweep(project: "str | Path", ttl_hours: Optional[int] = None,
             _remove_lane(root, lane)
             result.removed.append(lane.name)
         except OSError as exc:
-            result.errors.append(f"{lane.name}: {exc}")
+            result.errors[lane.name] = str(exc)
     return result
+
+
+def record_sweep(project: "str | Path", result: SweepResult,
+                 now: Optional[float] = None) -> None:
+    """Persist ``result`` as the last sweep (:data:`SWEEP_STATE_REL`) and, when
+    a lane could not be removed, append ONE line naming every such lane and
+    its reason to :data:`SWEEP_LOG_REL`. Best-effort: a failed write is
+    reported on stderr, never raised (the sweep itself already ran)."""
+    from vco_lib.atomic import atomic_write_json, rotate_tail_lines  # noqa: PLC0415
+
+    project_path = Path(project)
+    stamp = time.time() if now is None else now
+    state = project_path.joinpath(*SWEEP_STATE_REL)
+    try:
+        if not state.parent.is_symlink():
+            atomic_write_json(state, dict(result.to_dict(), at=stamp))
+    except OSError as exc:
+        print(f"scratch_dir: cannot record the sweep in {state}: {exc}", file=sys.stderr)
+    if not result.errors:
+        return
+    log = project_path.joinpath(*SWEEP_LOG_REL)
+    when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
+    detail = "; ".join(f"{name}: {why}" for name, why in sorted(result.errors.items()))
+    line = (f"{when} scratch sweep could not remove {len(result.errors)} lane(s) "
+            f"under {result.root}: {detail}\n")
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(line)
+        rotate_tail_lines(log, max_bytes=_SWEEP_LOG_MAX_BYTES,
+                          keep_lines=_SWEEP_LOG_KEEP_LINES)
+    except OSError as exc:
+        print(f"scratch_dir: cannot append to {log}: {exc}", file=sys.stderr)
+
+
+def last_sweep(project: "str | Path") -> Optional[dict]:
+    """The recorded last sweep, or ``None`` when absent or unreadable."""
+    try:
+        data = json.loads(Path(project).joinpath(*SWEEP_STATE_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def ensure_precreated(project: "str | Path") -> list[str]:
+    """Create every :data:`PRECREATED_LANES` lane (private). Returns the
+    problems, one string per lane that could not be made."""
+    problems: list[str] = []
+    for lane in PRECREATED_LANES:
+        try:
+            scratch_path(project, lane)
+        except (ScratchError, ValueError) as exc:
+            problems.append(f"{lane}: {exc}")
+    return problems
 
 
 def report(project: "str | Path", now: Optional[float] = None) -> dict:
@@ -425,6 +513,18 @@ def report(project: "str | Path", now: Optional[float] = None) -> dict:
     lanes = _scan(root) if root is not None else []
     current = time.time() if now is None else now
     oldest = min(lanes, key=lambda item: item.newest_mtime) if lanes else None
+    overdue = (
+        sorted(lane.name for lane in lanes if lane.newest_mtime < current - ttl * _HOUR)
+        if ttl > 0 else []
+    )
+    last = last_sweep(project_path)
+    last_errors = last.get("errors") if last else None
+    if not isinstance(last_errors, dict):
+        last_errors = {}
+    # A lane is "stuck" when it is overdue AND the last sweep tried and failed
+    # to remove it — the reason is that sweep's error. An overdue lane the last
+    # sweep did not try (it aged past the TTL since) is merely "due".
+    stuck = {name: str(last_errors[name]) for name in overdue if name in last_errors}
     return {
         "root": str(scratch_root(project_path)),
         "exists": root is not None,
@@ -435,6 +535,9 @@ def report(project: "str | Path", now: Optional[float] = None) -> dict:
             round(max(0.0, current - oldest.newest_mtime) / _HOUR, 1) if oldest else None
         ),
         "ttl_hours": ttl,
+        "overdue": overdue,
+        "stuck": stuck,
+        "last_sweep_at": last.get("at") if last else None,
     }
 
 
@@ -452,17 +555,29 @@ def summarize(rep: dict) -> str:
     ttl_text = "kept forever (TTL 0)" if ttl == 0 else f"cleaned after {ttl} h"
     if not rep["count"]:
         return f"scratch dir empty ({rep['root']}; {ttl_text})"
-    return (
+    line = (
         f"scratch dir: {rep['count']} entr{'y' if rep['count'] == 1 else 'ies'}, "
         f"{_fmt_bytes(rep['total_bytes'])}, oldest {rep['oldest_name']} "
         f"{rep['oldest_age_hours']} h old ({rep['root']}; {ttl_text})"
     )
+    stuck = rep.get("stuck") or {}
+    if stuck:
+        reasons = "; ".join(f"{name}: {why}" for name, why in sorted(stuck.items()))
+        line += f"; {len(stuck)} lane(s) past the TTL could not be removed - {reasons}"
+    due = [name for name in rep.get("overdue") or [] if name not in stuck]
+    if due:
+        line += f"; {len(due)} lane(s) due for removal at the next session start"
+    return line
 
 
 def probe_scratch(folder: Path, res: object, ctx: dict) -> list:
-    """``vco doctor`` probe: reported, never graded (an informational ``ok``),
-    or ``unknown`` when the root is redirected / unreadable."""
-    from vco_lib.doctor import STATUS_OK, STATUS_UNKNOWN, Finding  # noqa: PLC0415
+    """``vco doctor`` probe: an informational ``ok`` (count, size, oldest age);
+    a ``problem`` naming each lane past the TTL that the last sweep FAILED to
+    remove, with the reason and the command that retries it; ``unknown`` when
+    the root is redirected / unreadable."""
+    from vco_lib.doctor import (  # noqa: PLC0415
+        FIX_DEFER, STATUS_OK, STATUS_PROBLEM, STATUS_UNKNOWN, Finding,
+    )
 
     try:
         rep = report(folder)
@@ -470,6 +585,14 @@ def probe_scratch(folder: Path, res: object, ctx: dict) -> list:
         return [Finding(probe="scratch_dir", status=STATUS_UNKNOWN,
                         summary=f"scratch dir not measured: {exc}",
                         detail={"root": str(scratch_root(folder))})]
+    if rep["stuck"]:
+        return [Finding(
+            probe="scratch_dir", status=STATUS_PROBLEM, summary=summarize(rep),
+            fix=FIX_DEFER,
+            command=("# fix the reason named above (permissions, a file in use), then:\n"
+                     f"python -m vco_lib.scratch_dir sweep --project \"{Path(folder)}\""),
+            detail=rep,
+        )]
     return [Finding(probe="scratch_dir", status=STATUS_OK,
                     summary=summarize(rep), detail=rep)]
 
@@ -493,6 +616,8 @@ def _parser() -> argparse.ArgumentParser:
     p_sweep.add_argument("--project", default=None)
     p_sweep.add_argument("--ttl-hours", type=int, default=None)
     p_sweep.add_argument("--json", action="store_true")
+    p_sweep.add_argument("--ensure-precreated", action="store_true",
+                         help="also (re)create the private lanes in PRECREATED_LANES")
     p_rep = sub.add_parser("report", help="count, size and oldest lane")
     p_rep.add_argument("--project", default=None)
     p_rep.add_argument("--json", action="store_true")
@@ -511,13 +636,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("scratch_dir: --ttl-hours must be >= 0", file=sys.stderr)
                 return 2
             result = sweep(project, args.ttl_hours)
+            record_sweep(project, result)
             if args.json:
                 print(json.dumps(result.to_dict()))
             elif result.removed or result.errors:
                 print(f"scratch sweep: removed {len(result.removed)}, "
                       f"kept {len(result.kept)}, errors {len(result.errors)}")
-            for err in result.errors:
-                print(f"scratch_dir: {err}", file=sys.stderr)
+            for name, why in sorted(result.errors.items()):
+                print(f"scratch_dir: cannot remove lane {name}: {why}", file=sys.stderr)
+            if args.ensure_precreated:
+                for problem in ensure_precreated(project):
+                    print(f"scratch_dir: cannot pre-create lane {problem}", file=sys.stderr)
             return 0
         rep = report(project)
         print(json.dumps(rep) if args.json else summarize(rep))

@@ -31,7 +31,7 @@ You are a GUI testing specialist. You use Playwright browser automation to visua
 1. **Navigate** to the target URL
 2. **Screenshot** the full page and key sections
 3. **Interact** with UI elements (click tabs, fill inputs, etc.)
-4. **Document** findings with screenshots saved to the project's scratch dir, `<project>/.claude/state/scratch/vct-gui-report/` (an absolute path from the project root, the same on every OS; git-excluded, and VCO deletes it once untouched for 7 days — never the system temp dir)
+4. **Document** findings with screenshots saved in the private scratch lane VCO pre-creates for you at every session start, `<project>/.claude/state/scratch/vct-gui-report/` (an absolute path from the project root, the same on every OS; owner-only, git-excluded, deleted once untouched for 7 days — never the system temp dir). If that folder does not exist, do NOT create it (a folder you create is not private): stop and report that the caller must run `.claude/scripts/vco-scratch path --name vct-gui-report` (`vco-scratch.ps1` on Windows) first
 5. **Write** a structured report to the output path given
 
 ## Generic testing checklist
@@ -87,7 +87,7 @@ Save report to the specified output path as markdown:
 ```
 
 ## Screenshot naming
-Save to `<project>/.claude/state/scratch/vct-gui-report/YYYYMMDD_HHMMSS_{name}.png` — `<project>` is the absolute project root (do NOT use `/tmp`: VCO cannot clean it, and it does not exist on native Windows).
+Save to `<project>/.claude/state/scratch/vct-gui-report/YYYYMMDD_HHMMSS_{name}.png` — `<project>` is the absolute project root, and the folder must already exist (see step 4; do NOT use `/tmp`: VCO cannot clean it, and it does not exist on native Windows).
 Always include a timestamp prefix.
 
 ## Error reporting
