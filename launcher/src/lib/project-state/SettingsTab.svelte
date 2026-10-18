@@ -958,7 +958,7 @@
         class="ps-btn"
         onclick={rerenderEnv}
         disabled={maintenanceBusy || !project}
-        title="Rewrite this project's .claude/env and the env block of .claude/settings.json"
+        title="Rewrite this project's .claude/env and the env blocks of .claude/settings.json and .claude/settings.local.json"
       >
         {maintenanceBusy ? 'Re-rendering…' : "Re-render this project's env"}
       </button>
@@ -1038,6 +1038,7 @@
               infra compose YAMLs, VCO's managed blocks in your
               <code>.env</code> / <code>.claude/env</code>, the launcher's
               routing keys in <code>.claude/settings.json</code> /
+              <code>.claude/settings.local.json</code> /
               <code>.vscode/settings.json</code> where they still hold the
               value the launcher writes, and a secret value in them only where
               it equals the one the launcher stores (so VCO wrote it). A value

@@ -112,7 +112,7 @@ If you see any of these in your global `~/.claude/settings.json`, move them to t
 Per-project env vars (KG / codegraph / embedding selections, service URLs) flow through a fixed 5-level precedence chain. Higher levels override lower ones; consumers (MCP subprocesses, hooks, install.py, the launcher) all resolve through this chain so the active workspace's identity is consistent:
 
 1. **vct-hub resolved values** (highest precedence). When the hub is running on `http://127.0.0.1:7700` (port configurable via `VCT_HUB_PORT`), MCP startup queries `GET /api/v1/projects/{id}/config` and uses the hub's resolved per-project record from `launcher.db`.
-2. **`.claude/settings.json` `env` block**. The canonical per-project channel — written by the launcher's env projection (`python -m vco_lib.config_projection apply`), read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. (`.vscode/settings.json` `claude-code.env` is NOT part of this chain — that surface does not propagate to MCP subprocesses on Linux.)
+2. **`.claude/settings.json` `env` block, overlaid by `.claude/settings.local.json` `env`**. The canonical per-project channel — written by the launcher's env projection (`python -m vco_lib.config_projection apply`), read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. Claude Code merges the two files key by key, `settings.local.json` winning. Since v0.2.104 VCO writes the keys whose value describes this machine (absolute paths such as `KG_BASE_DIR` and `VCT_ORCHESTRATOR_ROOT`, the launcher's `VCT_PROJECT_ID`, peer access lists, service URLs and ports — `MACHINE_LOCAL_ENV_KEYS` in `vco_lib/config_projection.py`) only into `settings.local.json`, which VCO keeps out of git, so a committed `settings.json` never carries your home directory, username or local ports; the next env refresh moves any such key an older version left in `settings.json`. (`.vscode/settings.json` `claude-code.env` is NOT part of this chain — that surface does not propagate to MCP subprocesses on Linux.)
 3. **`.claude/env`** (POSIX shell-sourceable). Same keys as #2; used by CLI users sourcing it from a shell rc via the `tools/claude` wrapper.
 4. **`~/.claude.json` `mcpServers.<name>.env`**. The launcher intentionally restricts this surface to machine-invariant keys (e.g. `WEAVIATE_URL`); per-project keys like `KG_COLLECTION` are dropped here. See `launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS`.
 5. **Bundled defaults** baked into `claude_mcp_servers/weaviate_mcp/server.py` (lowest precedence). Reaching this layer is logged at WARNING level. Explicit empty-string env values for `KG_COLLECTION` are coerced to the default rather than used literally.
@@ -382,7 +382,7 @@ Bounded and non-destructive: exactly one extra request, nothing restarts or loop
 
 The `pre-tool-use` hook checks every WebFetch URL against a private-address guard (`vco_lib/ssrf_url.py` is the one implementation). Alongside the local services (Weaviate, Ollama, code-embed), `http://localhost:<hub port>` — the port resolved by the same `VCT_HUB_PORT` → `hub.port` → `7700` ladder above — is **deliberately allowlisted** so WebFetch can reach the hub's `/api/v1/...` routes locally; this is safe because every `/api/v1/*` route except the `/api/v1/health` liveness probe requires the bearer token from `<vct_root_dir>/hub.token` (mode `0o600`), with the per-project `/env` and `/config` routes additionally requiring a project-scoped token, so an allowlisted fetch without the token learns nothing (v0.2.102 NB-H4 / OD-18).
 
-A project that runs its own local service (its own Ollama on `11436`, say) can let WebFetch reach it by declaring the port on the launcher's Identity tab (**Infrastructure this project owns → Local ports**). The declaration is projected into that project's `.claude/settings.json` `env` as `VCT_SSRF_EXTRA_LOCAL_PORTS` (comma-separated); the guard allows each listed port as a loopback pair (`localhost` / `127.0.0.1` / `[::1]`) for that project only. Invalid entries are ignored, and a port nobody declared stays blocked. On a launcher-less install, export the variable in the shell that starts Claude Code instead — VCO's env projection owns the key in `.claude/settings.json` and removes a hand-added copy on the next apply.
+A project that runs its own local service (its own Ollama on `11436`, say) can let WebFetch reach it by declaring the port on the launcher's Identity tab (**Infrastructure this project owns → Local ports**). The declaration is projected into that project's `.claude/settings.local.json` `env` (machine-local, never the committable `settings.json`) as `VCT_SSRF_EXTRA_LOCAL_PORTS` (comma-separated); the guard allows each listed port as a loopback pair (`localhost` / `127.0.0.1` / `[::1]`) for that project only. Invalid entries are ignored, and a port nobody declared stays blocked. On a launcher-less install, export the variable in the shell that starts Claude Code instead — VCO's env projection owns the key in `.claude/settings.json` / `.claude/settings.local.json` and removes a hand-added copy on the next apply.
 
 ## Paid-module license framework
 
@@ -1005,11 +1005,14 @@ stays: any future `[npm.*]` pin is verified the same way.)
 
 ### `vco verify-env-projection <project_slug_or_id>`
 
-Confirms `.claude/settings.json env`, `.claude/env`, and
-`.vscode/settings.json claude-code.env` all match the canonical projection
-emitted by `vco_lib.config_projection.project_env_from_db(project_id)`.
-This is the source-of-truth contract: every env value in those three
-surfaces is a projection of launcher DB state, never authored by hand.
+Confirms the surfaces `apply` writes by default — `.claude/settings.json env`
+(the portable keys), `.claude/settings.local.json env` (the machine-local
+keys) and `.claude/env` (every key) — all match the canonical projection
+emitted by `vco_lib.config_projection.project_env_from_db(project_id)`. A
+machine-local key still sitting in `settings.json` is reported as drift (the
+next apply moves it). This is the source-of-truth contract: every canonical
+env value in those surfaces is a projection of launcher DB state, never
+authored by hand.
 
 | Flag    | Behaviour                                                        |
 | ------- | ---------------------------------------------------------------- |

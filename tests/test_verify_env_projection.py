@@ -73,17 +73,22 @@ def _write_canonical_surfaces(folder: Path, bundle: Mapping[str, str]) -> None:
     not write unless asked, holding a value from long ago — so every test
     here also proves the verifier does not compare it.
     """
-    from vco_lib.config_projection import _build_managed_block
+    from vco_lib.config_projection import MACHINE_LOCAL_ENV_KEYS, _build_managed_block
 
     claude_dir = folder / ".claude"
     vscode_dir = folder / ".vscode"
     claude_dir.mkdir(parents=True, exist_ok=True)
     vscode_dir.mkdir(parents=True, exist_ok=True)
 
-    # .claude/settings.json — top-level "env" mapping.
-    settings = {"env": dict(bundle)}
+    # .claude/settings.json — top-level "env" mapping: the portable keys.
+    # .claude/settings.local.json — the machine-local ones (v0.2.104 L5).
+    settings = {"env": {k: v for k, v in bundle.items() if k not in MACHINE_LOCAL_ENV_KEYS}}
     (claude_dir / "settings.json").write_text(
         json.dumps(settings, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    local = {"env": {k: v for k, v in bundle.items() if k in MACHINE_LOCAL_ENV_KEYS}}
+    (claude_dir / "settings.local.json").write_text(
+        json.dumps(local, indent=2, sort_keys=True), encoding="utf-8"
     )
 
     # .claude/env — the managed block, plus a user line outside it.
@@ -198,6 +203,22 @@ def test_mutation_claude_env_detected(stub_db, project_folder, capsys):
     assert ".claude/env" in out
     assert "PROJECT_NAME" in out
     assert "Tampered" in out
+
+
+def test_a_machine_key_left_in_settings_json_is_drift(stub_db, project_folder, capsys):
+    """v0.2.104 L5: a machine-local key (here the peer access list, which
+    names this machine's other projects) belongs in settings.local.json; a
+    copy still in the committable settings.json is drift (``apply`` moves
+    it), even when its value is right."""
+    settings_path = project_folder / ".claude" / "settings.json"
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    payload["env"]["VCT_KG_ACCESS_LIST"] = CANONICAL_BUNDLE["VCT_KG_ACCESS_LIST"]
+    settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    assert verify.cmd_verify_env_projection(_args(json_mode=True)) == verify.EXIT_DRIFT
+    obj = json.loads(capsys.readouterr().out.strip())
+    assert obj["drift"] == [{"surface": ".claude/settings.json", "key": "VCT_KG_ACCESS_LIST",
+                             "expected": "<absent>",
+                             "actual": CANONICAL_BUNDLE["VCT_KG_ACCESS_LIST"]}]
 
 
 def test_vscode_settings_is_not_compared(stub_db, project_folder, capsys):

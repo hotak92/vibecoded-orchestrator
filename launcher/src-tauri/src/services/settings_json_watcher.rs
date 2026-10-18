@@ -84,6 +84,29 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 /// MCP-process startup costs dwarf this anyway.
 const PROJECT_LIST_RE_POLL: Duration = Duration::from_secs(30);
 
+/// The files of Claude Code's project settings layer the watcher follows,
+/// each with the `vco_lib.env_projection_check read-env` surface name its env
+/// object is read under. v0.2.104 L5: the env projection writes the
+/// machine-local keys (absolute paths, launcher ids, service URLs/ports —
+/// `vco_lib.config_projection.MACHINE_LOCAL_ENV_KEYS`) into
+/// `settings.local.json`, which Claude Code merges over `settings.json` for
+/// the MCP subprocesses — so a port change now lands THERE, and a watcher
+/// following `settings.json` alone would never reload the MCPs for it. Each
+/// file keeps its own diff-guard baseline.
+const WATCHED_SETTINGS_FILES: &[(&str, &str)] = &[
+    ("settings.json", "claude_settings_json"),
+    ("settings.local.json", "claude_settings_local_json"),
+];
+
+/// The `read-env` surface of a watched settings file (`None` for any other).
+fn settings_surface_of(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    WATCHED_SETTINGS_FILES
+        .iter()
+        .find(|(file, _)| *file == name)
+        .map(|(_, surface)| *surface)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // v0.2.102 (L6 / OD-6): the install-boundary refresh gate.
 // ═══════════════════════════════════════════════════════════════════════
@@ -425,19 +448,19 @@ fn jsonc_hashes(
     root: Option<&Path>,
     bodies: &HashMap<PathBuf, String>,
 ) -> HashMap<PathBuf, u64> {
-    let jsonc: Vec<(&PathBuf, PathBuf)> = bodies
+    let jsonc: Vec<(&PathBuf, PathBuf, &'static str)> = bodies
         .iter()
         .filter(|(_, body)| !body.trim().is_empty() && hash_mcp_env(body).is_none())
         .filter_map(|(path, _)| {
             let folder = path.parent()?.parent()?.to_path_buf();
-            Some((path, folder))
+            Some((path, folder, settings_surface_of(path)?))
         })
         .collect();
     let mut out = HashMap::new();
     if jsonc.is_empty() {
         return out;
     }
-    let folders: Vec<&Path> = jsonc.iter().map(|(_, f)| f.as_path()).collect();
+    let folders: Vec<&Path> = jsonc.iter().map(|(_, f, _)| f.as_path()).collect();
     let blocks = match crate::services::vco_lib_bridge::read_settings_env_blocks(root, &folders) {
         Ok(b) => b,
         Err(e) => {
@@ -448,9 +471,9 @@ fn jsonc_hashes(
             return out;
         }
     };
-    for (path, folder) in jsonc {
+    for (path, folder, surface) in jsonc {
         if let Ok(Some(env)) =
-            crate::services::vco_lib_bridge::env_block_of(&blocks, &folder, "claude_settings_json")
+            crate::services::vco_lib_bridge::env_block_of(&blocks, &folder, surface)
         {
             out.insert(path.clone(), hash_env_subset(Some(&env)));
         }
@@ -548,9 +571,11 @@ impl WatchState {
         let mut cache = self.last_mcp_env_hash.lock().await;
         let mut pending = self.pending.lock().await;
         for dir in removed_dirs {
-            let settings_path = dir.join("settings.json");
-            cache.remove(&settings_path);
-            pending.remove(&settings_path);
+            for (file, _) in WATCHED_SETTINGS_FILES {
+                let settings_path = dir.join(file);
+                cache.remove(&settings_path);
+                pending.remove(&settings_path);
+            }
         }
     }
 }
@@ -748,8 +773,8 @@ async fn sync_watches<R: Runtime + 'static>(
                 );
                 continue;
             }
-            Ok(pre_watch_body) => {
-                added.insert(dir.clone(), pre_watch_body);
+            Ok(pre_watch_bodies) => {
+                added.extend(pre_watch_bodies);
             }
         }
     }
@@ -782,21 +807,31 @@ async fn sync_watches<R: Runtime + 'static>(
 /// post-write hash, the queued event drained the same body → "unchanged" →
 /// skip, and the live MCPs silently kept stale env. With a pre-watch
 /// baseline, any write after registration is always a diff.
+///
+/// v0.2.104 L5: one body per [`WATCHED_SETTINGS_FILES`] entry, keyed by the
+/// file's path — both read before the single `watch(dir)`.
 fn capture_pre_watch_body(
     dir: &Path,
     read_body: impl Fn(&Path) -> String,
     mut watch: impl FnMut(&Path) -> Result<(), String>,
-) -> Result<String, String> {
-    let body = read_body(&dir.join("settings.json"));
+) -> Result<HashMap<PathBuf, String>, String> {
+    let bodies: HashMap<PathBuf, String> = WATCHED_SETTINGS_FILES
+        .iter()
+        .map(|(file, _)| {
+            let path = dir.join(file);
+            let body = read_body(&path);
+            (path, body)
+        })
+        .collect();
     watch(dir)?;
-    Ok(body)
+    Ok(bodies)
 }
 
 /// v0.2.102 (W4-F defect A): IO/lock wrapper around [`seed_baselines`] for
-/// the dirs `sync_watches` just added to the watch set, keyed on the watch
-/// DIR with the body captured BEFORE `watcher.watch(dir)` registered (the
-/// pre-watch baseline — see `sync_watches`). Maps each dir to its
-/// `<project>/.claude/settings.json` path (absent file → empty body → no
+/// the dirs `sync_watches` just added to the watch set, keyed on each watched
+/// settings FILE (`settings.json` and, v0.2.104 L5, `settings.local.json`)
+/// with the body captured BEFORE `watcher.watch(dir)` registered (the
+/// pre-watch baseline — see `sync_watches`; absent file → empty body → no
 /// seed → that path keeps the fail-open first event), hashes non-strict-JSON
 /// bodies through the SAME bridge rule as fire-time, and seeds the cache
 /// under its lock. Soft-fail throughout: a bridge error just seeds fewer
@@ -809,10 +844,7 @@ async fn seed_new_watch_baselines<R: Runtime>(
     if pre_watch_bodies.is_empty() {
         return;
     }
-    let bodies: HashMap<PathBuf, String> = pre_watch_bodies
-        .iter()
-        .map(|(dir, body)| (dir.join("settings.json"), body.clone()))
-        .collect();
+    let bodies: HashMap<PathBuf, String> = pre_watch_bodies.clone();
     let root = app
         .try_state::<Db>()
         .and_then(|db| crate::services::vco_lib_bridge::resolve_orchestrator_root(&db));
@@ -866,15 +898,13 @@ fn any_path_is_settings_json(paths: &[PathBuf]) -> bool {
 /// settings.json to read + hash at fire-time (the per-project cache is
 /// keyed on this path). Returns `None` when no path in the event is the
 /// target file (sibling writes → ignored).
+///
+/// v0.2.104 L5: `.claude/settings.local.json` counts too (see
+/// [`WATCHED_SETTINGS_FILES`]).
 fn first_settings_json_path(paths: &[PathBuf]) -> Option<PathBuf> {
     paths
         .iter()
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n == "settings.json")
-                .unwrap_or(false)
-        })
+        .find(|p| settings_surface_of(p).is_some())
         .cloned()
 }
 
@@ -1256,6 +1286,46 @@ mod tests {
     fn first_settings_json_path_none_for_siblings_only() {
         let paths = vec![PathBuf::from("/p/.claude/agents/architect.md")];
         assert_eq!(first_settings_json_path(&paths), None);
+    }
+
+    /// v0.2.104 L5: the machine-local keys (service URLs/ports among them)
+    /// are projected into `settings.local.json`; a write there must reach
+    /// the diff-guard, or a port change would never reload the MCPs.
+    #[test]
+    fn settings_local_json_is_watched_with_its_own_surface() {
+        let paths = vec![
+            PathBuf::from("/p/.claude/hooks/x.sh"),
+            PathBuf::from("/p/.claude/settings.local.json"),
+        ];
+        assert_eq!(
+            first_settings_json_path(&paths),
+            Some(PathBuf::from("/p/.claude/settings.local.json"))
+        );
+        assert_eq!(
+            settings_surface_of(Path::new("/p/.claude/settings.local.json")),
+            Some("claude_settings_local_json")
+        );
+        assert_eq!(
+            settings_surface_of(Path::new("/p/.claude/settings.json")),
+            Some("claude_settings_json")
+        );
+        assert_eq!(settings_surface_of(Path::new("/p/.claude/settings.json.tmp")), None);
+    }
+
+    /// v0.2.104 L5 red-proof: a WEAVIATE_URL change written to
+    /// `settings.local.json` reloads; the same file rewritten with the same
+    /// relevant env is skipped.
+    #[test]
+    fn a_port_change_in_settings_local_json_reloads() {
+        let path = PathBuf::from("/p/.claude/settings.local.json");
+        let before = settings_with_env(&[("WEAVIATE_URL", "http://localhost:8081")], "s");
+        let after = settings_with_env(&[("WEAVIATE_URL", "http://localhost:9091")], "s");
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        seed_baselines(&[(path.clone(), before.clone())].into(), &HashMap::new(), &mut cache);
+        let same = evaluate_drained_paths(&[path.clone()], &mut cache, |_| before.clone(), |_| None);
+        assert!(!same.reload, "an idempotent rewrite must be skipped");
+        let moved = evaluate_drained_paths(&[path], &mut cache, |_| after.clone(), |_| None);
+        assert!(moved.reload, "a port change in settings.local.json must reload the MCPs");
     }
 
     // ─── v0.2.72 (C-P8) diff-guard decision tests ───────────────────────
@@ -1674,25 +1744,26 @@ mod tests {
         let gone_dir = PathBuf::from("/gone-proj/.claude");
         let kept_dir = PathBuf::from("/kept-proj/.claude");
         let gone_settings = gone_dir.join("settings.json");
+        let gone_local = gone_dir.join("settings.local.json");
         let kept_settings = kept_dir.join("settings.json");
 
-        state
-            .last_mcp_env_hash
-            .lock()
-            .await
-            .extend([(gone_settings.clone(), 1u64), (kept_settings.clone(), 2u64)]);
+        state.last_mcp_env_hash.lock().await.extend([
+            (gone_settings.clone(), 1u64),
+            (gone_local.clone(), 3u64),
+            (kept_settings.clone(), 2u64),
+        ]);
         state
             .pending
             .lock()
             .await
-            .extend([gone_settings.clone(), kept_settings.clone()]);
+            .extend([gone_settings.clone(), gone_local.clone(), kept_settings.clone()]);
 
         state.prune_removed_dirs(&[gone_dir]).await;
 
         let cache = state.last_mcp_env_hash.lock().await;
         assert!(
-            !cache.contains_key(&gone_settings),
-            "removed project's cache entry must be pruned"
+            !cache.contains_key(&gone_settings) && !cache.contains_key(&gone_local),
+            "removed project's cache entries (both settings files) must be pruned"
         );
         assert!(
             cache.contains_key(&kept_settings),
@@ -1701,8 +1772,8 @@ mod tests {
         drop(cache);
         let pending = state.pending.lock().await;
         assert!(
-            !pending.contains(&gone_settings),
-            "removed project's pending event must be pruned"
+            !pending.contains(&gone_settings) && !pending.contains(&gone_local),
+            "removed project's pending events must be pruned"
         );
         assert!(
             pending.contains(&kept_settings),
@@ -1912,9 +1983,13 @@ mod tests {
 
         let calls: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
         let read_body = |p: &Path| {
-            assert_eq!(p, dir.join("settings.json"));
             calls.borrow_mut().push("read");
-            at_start.clone()
+            if p == dir.join("settings.json") {
+                at_start.clone()
+            } else {
+                assert_eq!(p, dir.join("settings.local.json"));
+                String::new() // no per-machine file yet
+            }
         };
         let watch = |d: &Path| {
             assert_eq!(d, dir);
@@ -1924,19 +1999,15 @@ mod tests {
         let captured = capture_pre_watch_body(dir, read_body, watch).expect("watch must succeed");
         assert_eq!(
             *calls.borrow(),
-            vec!["read", "watch"],
-            "the baseline body MUST be captured BEFORE the watch is registered"
+            vec!["read", "read", "watch"],
+            "both baseline bodies MUST be captured BEFORE the watch is registered"
         );
 
         // Seeding uses the PRE-watch body; the drained event reads the
         // POST-write body → changed → the SIGHUP fires (never a skip).
         let path = dir.join("settings.json");
         let mut cache: HashMap<PathBuf, u64> = HashMap::new();
-        seed_baselines(
-            &[(path.clone(), captured)].into(),
-            &HashMap::new(),
-            &mut cache,
-        );
+        seed_baselines(&captured, &HashMap::new(), &mut cache);
         assert!(cache.contains_key(&path), "the pre-watch body must seed");
         let decision = evaluate_drained_paths(
             &[path.clone()],
@@ -1963,7 +2034,7 @@ mod tests {
         let calls: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
         let read_body = |p: &Path| {
             calls.borrow_mut().push("read");
-            assert_eq!(p, dir.join("settings.json"));
+            assert!(settings_surface_of(p).is_some() && p.parent() == Some(dir));
             body.clone()
         };
         let watch = |d: &Path| {
@@ -1972,15 +2043,11 @@ mod tests {
             Ok(())
         };
         let captured = capture_pre_watch_body(dir, read_body, watch).expect("watch must succeed");
-        assert_eq!(*calls.borrow(), vec!["read", "watch"]);
+        assert_eq!(*calls.borrow(), vec!["read", "read", "watch"]);
 
         let path = dir.join("settings.json");
         let mut cache: HashMap<PathBuf, u64> = HashMap::new();
-        seed_baselines(
-            &[(path.clone(), captured)].into(),
-            &HashMap::new(),
-            &mut cache,
-        );
+        seed_baselines(&captured, &HashMap::new(), &mut cache);
         // The idempotent re-projection writes the SAME MCP-relevant env.
         let decision = evaluate_drained_paths(&[path], &mut cache, |_| body.clone(), |_| None);
         assert!(

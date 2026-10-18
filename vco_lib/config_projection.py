@@ -141,8 +141,15 @@ Cross-OS rules (non-negotiable)
 Deep-merge contract
 ~~~~~~~~~~~~~~~~~~~
 
-For JSON surfaces (.claude/settings.json, .vscode/settings.json):
+For JSON surfaces (.claude/settings.json, .claude/settings.local.json,
+.vscode/settings.json):
 
+  * Each surface carries its own slice of the canonical keys
+    (:func:`surface_keys`, v0.2.104 L5): the machine-local keys
+    (:data:`MACHINE_LOCAL_ENV_KEYS` — absolute paths, launcher ids, service
+    endpoints) go to the per-machine ``settings.local.json`` only; the
+    committable ``settings.json`` / ``.vscode/settings.json`` get the rest,
+    and a machine-local key found there is removed (moved).
   * The TOP-LEVEL object is preserved verbatim except for the env
     sub-block.
   * The env sub-block is treated as a flat string-to-string map.
@@ -416,6 +423,65 @@ def list_canonical_keys() -> set[str]:
     without affecting other callers.
     """
     return set(_CANONICAL_KEYS)
+
+
+# ─── Machine-local canonical keys (v0.2.104 L5) ─────────────────────────
+#
+# ``.claude/settings.json`` is committable: teams commit it and Claude Code
+# reads the committed copy. A value that describes THIS machine must
+# therefore never be written there — a user who commits and pushes would
+# publish their home directory (and so their username), this machine's
+# launcher-DB ids, the names of the other projects registered on it and its
+# local service ports. Those keys go to ``.claude/settings.local.json``
+# ``env`` instead: Claude Code's documented per-machine file, which it merges
+# key by key OVER ``settings.json`` (local wins) for the session, its hooks
+# and its MCP subprocesses (verified on Claude Code 2.1.285, CLI), and which
+# VCO keeps out of git (``vco_lib.git_exclude``). ``.claude/env`` (already
+# git-excluded) keeps carrying every key, as before.
+#
+# Membership is by VALUE CLASS, never by writer:
+#
+# * machine-absolute path — the value embeds this machine's filesystem
+#   layout (home dir, username);
+# * machine identity / state — an id or a list that exists only in this
+#   machine's launcher DB (another machine registers the same project under
+#   another id, with other peers, containers and collections);
+# * machine service endpoint — a URL or port of a service on this machine.
+#
+# Every other canonical key (collection names, project name, gates, the
+# embedding profile, flags) is PORTABLE and stays in ``settings.json``.
+# ``GITHUB_TOKEN`` is neither: no bundle ever carries it (secret values are
+# never projected), so it is never written anywhere.
+MACHINE_LOCAL_ENV_KEYS: frozenset[str] = frozenset({
+    # machine-absolute paths
+    "KG_BASE_DIR",
+    "VCT_ORCHESTRATOR_ROOT",
+    "VCT_INSTALL_ROOT",
+    "VCT_INFRASTRUCTURE_DIR",
+    # machine identity / launcher-DB state
+    "VCT_PROJECT_ID",
+    "VCT_KG_ACCESS_LIST",
+    "VCT_CODE_GRAPH_ACCESS_LIST",
+    "VCT_EXTERNAL_COLLECTIONS",
+    "VCT_UNMANAGED_CONTAINERS",
+    # machine service endpoints
+    "WEAVIATE_URL",
+    "WEAVIATE_PORT",
+    "OLLAMA_URL",
+    "OLLAMA_PORT",
+    "CODE_EMBED_URL",
+    "CODE_EMBED_PORT",
+    "CODE_EMBED_SERVICE_URL",
+    "VCT_SSRF_EXTRA_LOCAL_PORTS",
+})
+
+
+def list_machine_local_keys() -> set[str]:
+    """The canonical keys whose value describes THIS machine — written to
+    ``.claude/settings.local.json`` ``env``, never to the committable
+    ``.claude/settings.json`` (see :data:`MACHINE_LOCAL_ENV_KEYS`). A fresh
+    ``set`` each call."""
+    return set(MACHINE_LOCAL_ENV_KEYS)
 
 
 # ─── Bracket markers for the .claude/env surface ────────────────────────
@@ -2448,14 +2514,24 @@ def resolve_collection_names_for_folder(
 
 
 _SURFACE_CLAUDE_SETTINGS = "claude_settings_json"
+#: v0.2.104 L5: the per-machine half of Claude Code's project settings layer.
+#: It is never requested on its own — it is written whenever
+#: :data:`_SURFACE_CLAUDE_SETTINGS` is (the two files are ONE layer, split by
+#: value class: :data:`MACHINE_LOCAL_ENV_KEYS` here, every other canonical key
+#: in ``settings.json``), so a caller naming only ``claude_settings_json``
+#: can never strip the machine keys from ``settings.json`` without writing
+#: them here.
+_SURFACE_CLAUDE_SETTINGS_LOCAL = "claude_settings_local_json"
 _SURFACE_CLAUDE_ENV = "claude_env"
 _SURFACE_VSCODE_SETTINGS = "vscode_settings_json"
 
 _DEFAULT_SURFACES: tuple[str, ...] = (
+    _SURFACE_CLAUDE_SETTINGS_LOCAL,
     _SURFACE_CLAUDE_SETTINGS,
     _SURFACE_CLAUDE_ENV,
 )
 _ALL_SURFACES: tuple[str, ...] = (
+    _SURFACE_CLAUDE_SETTINGS_LOCAL,
     _SURFACE_CLAUDE_SETTINGS,
     _SURFACE_CLAUDE_ENV,
     _SURFACE_VSCODE_SETTINGS,
@@ -2463,8 +2539,27 @@ _ALL_SURFACES: tuple[str, ...] = (
 #: The JSON surfaces: ``surface -> (path relative to the project, env key)``.
 _JSON_SURFACE_FILES: dict[str, tuple[str, str]] = {
     _SURFACE_CLAUDE_SETTINGS: (".claude/settings.json", "env"),
+    _SURFACE_CLAUDE_SETTINGS_LOCAL: (".claude/settings.local.json", "env"),
     _SURFACE_VSCODE_SETTINGS: (".vscode/settings.json", "claude-code.env"),
 }
+
+
+def surface_keys(surface: str) -> frozenset[str]:
+    """The canonical keys ``surface`` carries (v0.2.104 L5) — the ONE split
+    the writer and :mod:`vco_lib.env_projection_check` both apply.
+
+    ``settings.local.json``: the machine-local keys only. ``settings.json``
+    and ``.vscode/settings.json`` (both committable): every canonical key but
+    those. ``.claude/env`` (git-excluded, machine-local by nature): all.
+    """
+    canonical = frozenset(list_canonical_keys())
+    if surface == _SURFACE_CLAUDE_SETTINGS_LOCAL:
+        return canonical & MACHINE_LOCAL_ENV_KEYS
+    if surface in (_SURFACE_CLAUDE_SETTINGS, _SURFACE_VSCODE_SETTINGS):
+        return canonical - MACHINE_LOCAL_ENV_KEYS
+    if surface == _SURFACE_CLAUDE_ENV:
+        return canonical
+    raise ConfigProjectionError(f"unknown surface {surface!r}; valid: {sorted(_ALL_SURFACES)}")
 
 
 # v0.2.84 D2 (P2) — env-repoint audit.
@@ -2576,6 +2671,69 @@ def _emit_repoint_audit_rows(
             pass
 
 
+def _with_local_settings_layer(surfaces_seq: tuple[str, ...]) -> tuple[str, ...]:
+    """``surfaces_seq`` with ``settings.local.json`` written whenever
+    ``settings.json`` is, and BEFORE it (v0.2.104 L5 — see
+    :data:`_SURFACE_CLAUDE_SETTINGS_LOCAL`). Order of the rest is kept."""
+    if _SURFACE_CLAUDE_SETTINGS not in surfaces_seq:
+        return surfaces_seq
+    rest = tuple(s for s in surfaces_seq if s != _SURFACE_CLAUDE_SETTINGS_LOCAL)
+    return (_SURFACE_CLAUDE_SETTINGS_LOCAL, *rest)
+
+
+def _portable_env(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` without the machine-local keys — what a committable JSON
+    surface may carry (v0.2.104 L5)."""
+    return {k: v for k, v in env.items() if k not in MACHINE_LOCAL_ENV_KEYS}
+
+
+def _write_local_settings_surface(
+    project_root: Path,
+    env: Mapping[str, str],
+    refusals: list["settings_refusal.Refusal"],
+    project_id: Optional[str],
+) -> Optional[list[str]]:
+    """Write the machine-local keys into ``.claude/settings.local.json``
+    ``env`` (v0.2.104 L5) through the ONE JSON env writer — the same deep
+    merge as ``settings.json``: every other setting and every non-VCO env key
+    in the file is kept, a machine key the bundle omits is removed, JSONC is
+    edited in place, a file that cannot be edited safely is refused and
+    recorded. ``None`` when refused.
+
+    A project with no such file and nothing to write gets no file (no
+    ``{"env": {}}`` litter): the projection always carries ``KG_BASE_DIR``, so
+    in practice the file is created on the first apply.
+    """
+    path = project_root / ".claude" / "settings.local.json"
+    local_keys = sorted(surface_keys(_SURFACE_CLAUDE_SETTINGS_LOCAL))
+    local_env = {k: env[k] for k in env if k in MACHINE_LOCAL_ENV_KEYS}
+    if not local_env and not path.exists():
+        return []
+    return _write_json_surface(
+        project_root, _SURFACE_CLAUDE_SETTINGS_LOCAL, refusals, project_id,
+        lambda: _write_json_env_block(path, local_env, local_keys, env_key="env"),
+    )
+
+
+def _strip_legacy_vscode_machine_keys(
+    project_root: Path,
+    env: Mapping[str, str],
+    refusals: list["settings_refusal.Refusal"],
+) -> None:
+    """Remove from a legacy ``.vscode/settings.json`` ``claude-code.env`` block
+    the machine-local keys whose value EQUALS what VCO projects now (the
+    evidence rule — a different value is the user's and stays). Touches the
+    file only when the soft read finds such a key."""
+    block = _json_env_block(project_root / ".vscode" / "settings.json", "claude-code.env")
+    expected = {k: v for k, v in env.items() if k in MACHINE_LOCAL_ENV_KEYS}
+    if not any(block.get(k) == v for k, v in expected.items()):
+        return
+    try:
+        strip_env_keys_holding(project_root, _SURFACE_VSCODE_SETTINGS, expected, expected)
+    except SettingsWriteRefused as exc:
+        refusals.extend(exc.refusals)
+
+
 def apply_project_env(
     bundle: ProjectEnvBundle,
     *,
@@ -2622,6 +2780,7 @@ def apply_project_env(
             raise ConfigProjectionError(
                 f"unknown surface {s!r}; valid: {sorted(_ALL_SURFACES)}"
             )
+    surfaces_seq = _with_local_settings_layer(surfaces_seq)
 
     project_root = bundle["project_root"]
     env = bundle["canonical_env"]
@@ -2676,12 +2835,31 @@ def apply_project_env(
     refusals: list[settings_refusal.Refusal] = []
     project_id = bundle.get("project_id")
 
+    # v0.2.104 L5: the machine-local keys go to `.claude/settings.local.json`
+    # FIRST, so there is no moment in which a key VCO is moving out of the
+    # committable `settings.json` is in neither file. Only when that write
+    # landed does `settings.json` drop them (its canonical key set still
+    # names them, so an absent key is removed — the migration of an existing
+    # project, idempotent); a refused local file leaves `settings.json`
+    # carrying the full set exactly as before, so routing never breaks.
+    local_written = False
+    if _SURFACE_CLAUDE_SETTINGS_LOCAL in surfaces_seq:
+        keys = _write_local_settings_surface(
+            project_root, env, refusals, project_id,
+        )
+        if keys is not None:
+            report[_SURFACE_CLAUDE_SETTINGS_LOCAL] = keys
+            local_written = True
+
     if _SURFACE_CLAUDE_SETTINGS in surfaces_seq:
         path = project_root / ".claude" / "settings.json"
+        settings_env = (
+            _portable_env(env) if local_written else dict(env)
+        )
         keys = _write_json_surface(
             project_root, _SURFACE_CLAUDE_SETTINGS, refusals, project_id,
             lambda: _write_json_env_block(
-                path, env, canonical_keys, env_key="env",
+                path, settings_env, canonical_keys, env_key="env",
                 user_secret_pairs=us_pairs,
                 user_secret_strip_keys=us_strip_keys,
             ),
@@ -2703,10 +2881,12 @@ def apply_project_env(
 
     if _SURFACE_VSCODE_SETTINGS in surfaces_seq:
         vscode_path = project_root / ".vscode" / "settings.json"
+        # Committable like settings.json (v0.2.104 L5): portable keys only.
+        vscode_env = _portable_env(env)
         keys = _write_json_surface(
             project_root, _SURFACE_VSCODE_SETTINGS, refusals, project_id,
             lambda: _write_json_env_block(
-                vscode_path, env, canonical_keys, env_key="claude-code.env",
+                vscode_path, vscode_env, canonical_keys, env_key="claude-code.env",
                 user_secret_pairs=us_pairs,
                 user_secret_strip_keys=vscode_strip_keys,
             ),
@@ -2724,6 +2904,12 @@ def apply_project_env(
             strip_env_keys(project_root, _SURFACE_VSCODE_SETTINGS, vscode_strip_keys)
         except SettingsWriteRefused as exc:
             refusals.extend(exc.refusals)
+    # v0.2.104 L5: the same legacy block may still carry this machine's paths,
+    # ids and ports in a file teams commit. Removed on value evidence only —
+    # the in-file value EQUALS what VCO projects now — and only when such a
+    # key is there (a project without that legacy block costs no write).
+    if _SURFACE_VSCODE_SETTINGS not in surfaces_seq and local_written:
+        _strip_legacy_vscode_machine_keys(project_root, env, refusals)
 
     # v0.2.84 D2 (P2): emit a `dev_collection_env_repointed` audit row for
     # each audited key whose existing on-disk value the write just changed
@@ -4128,7 +4314,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--surfaces", default=None,
         help="comma-separated subset of "
              "claude_settings_json,claude_env,vscode_settings_json "
-             "(default: claude_settings_json,claude_env)",
+             "(default: claude_settings_json,claude_env; claude_settings_json "
+             "always writes .claude/settings.local.json too — the machine-local "
+             "keys live there)",
     )
     p_apply.add_argument(
         "--orchestrator-root", default=None,
@@ -4188,7 +4376,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--surfaces", default=None,
         help="comma-separated subset of "
              "claude_settings_json,claude_env,vscode_settings_json "
-             "(default: claude_settings_json,claude_env)",
+             "(default: claude_settings_json,claude_env; claude_settings_json "
+             "always writes .claude/settings.local.json too — the machine-local "
+             "keys live there)",
     )
     p_reproj.set_defaults(handler=_cli_reproject_all)
 

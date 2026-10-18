@@ -363,20 +363,25 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return dict(parse_env_lines(text))
 
 
+#: The endpoint keys :func:`_continuity` reads (the settings layer when it
+#: carries any of them, else ``.claude/env``).
+_CONTINUITY_URL_KEYS: tuple[str, ...] = (
+    "WEAVIATE_URL", "OLLAMA_URL", "CODE_EMBED_SERVICE_URL", "CODE_EMBED_URL",
+)
+
+
 def _continuity(orchestrator_root: Path) -> dict[str, Statement]:
     """The endpoints the root project's projected env pointed clients at."""
+    from vco_lib.claude_settings_env import read_settings_env
+
     root = Path(orchestrator_root)
-    settings = root / ".claude" / "settings.json"
-    env: dict[str, str] = {}
-    source = ""
-    try:
-        data = json.loads(settings.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("env"), dict):
-            env = {str(k): str(v) for k, v in data["env"].items()}
-            source = f"continuity:{settings}"
-    except (OSError, ValueError):
-        env = {}
-    if not env:
+    # v0.2.104 L5: the endpoint keys live in `.claude/settings.local.json`
+    # (machine-local); the merged reader sees them wherever they are.
+    env: dict[str, str] = {
+        str(k): str(v) for k, v in read_settings_env(root).items()
+    }
+    source = f"continuity:{root / '.claude' / 'settings.local.json'}"
+    if not any(env.get(k) for k in _CONTINUITY_URL_KEYS):
         env = _read_env_file(root / ".claude" / "env")
         source = f"continuity:{root / '.claude' / 'env'}"
     grpc = (env.get("WEAVIATE_GRPC_PORT") or env.get("GRPC_PORT") or "").strip()

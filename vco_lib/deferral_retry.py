@@ -644,12 +644,11 @@ def _shared_collection_for(folder: Path, env: Optional[Mapping[str, str]] = None
     carried = (source.get(SEED_CTX_ENV_SHARED_KG_COLLECTION) or "").strip()
     if carried:
         return carried
-    try:
-        data = json.loads((folder / ".claude" / "settings.json").read_text(encoding="utf-8"))
-        value = (data.get("env") or {}).get("SHARED_KG_COLLECTION") or ""
-        return str(value).strip()
-    except Exception:  # noqa: BLE001 — unreadable config ⇒ nothing to target
-        return ""
+    from vco_lib.claude_settings_env import read_settings_env
+
+    # The settings layer as Claude Code merges it (settings.json, then
+    # settings.local.json — v0.2.104 L5); soft-fail ⇒ nothing to target.
+    return str(read_settings_env(folder).get("SHARED_KG_COLLECTION") or "").strip()
 
 
 def retry_kg_seed_shared(ctx: RetryContext) -> RetryResult:

@@ -184,12 +184,19 @@ class TestInstallBundleStandaloneWriteEnv(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_settings_json_env_block_written(self) -> None:
-        """.claude/settings.json env block must contain VCT_ORCHESTRATOR_ROOT
-        and KG_COLLECTION after --write-env."""
+        """After --write-env Claude Code's settings env carries
+        VCT_ORCHESTRATOR_ROOT and KG_COLLECTION — v0.2.104 L5: the
+        machine-absolute VCT_ORCHESTRATOR_ROOT in the per-machine
+        .claude/settings.local.json, KG_COLLECTION in the committable
+        .claude/settings.json (and never the other way round)."""
         self._run()
         settings_env = _read_settings_env(self.project)
-        self.assertIn("VCT_ORCHESTRATOR_ROOT", settings_env,
-                      "settings.json env missing VCT_ORCHESTRATOR_ROOT")
+        local_path = self.project / ".claude" / "settings.local.json"
+        local_env = dict(json.loads(local_path.read_text(encoding="utf-8")).get("env", {}))
+        self.assertIn("VCT_ORCHESTRATOR_ROOT", local_env,
+                      "settings.local.json env missing VCT_ORCHESTRATOR_ROOT")
+        self.assertNotIn("VCT_ORCHESTRATOR_ROOT", settings_env,
+                         "a machine path leaked into the committable settings.json")
         self.assertIn("KG_COLLECTION", settings_env,
                       "settings.json env missing KG_COLLECTION")
 

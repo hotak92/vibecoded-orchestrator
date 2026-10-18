@@ -27,6 +27,12 @@ projection owns; anything else in a surface is the user's and never looked at:
 * a key the bundle omits must be absent (``apply`` deletes it — "signal to
   remove").
 
+v0.2.104 L5: each JSON surface is compared over ITS keys only
+(:func:`vco_lib.config_projection.surface_keys`) — the machine-local keys in
+``.claude/settings.local.json``, every other canonical key in
+``.claude/settings.json``; a machine key still in ``settings.json`` is drift
+(``apply`` moves it).
+
 A JSON surface is read with the ONE JSONC reader (:mod:`vco_lib.jsonc_edit`);
 ``.claude/env`` with the projection's own reader of its managed block. A
 missing file is not unreadable — it holds nothing, so every value the bundle
@@ -94,9 +100,25 @@ def surface_label(surface: str) -> str:
     raise ValueError(f"unknown env surface {surface!r}")
 
 
-def _keys_in_order(canonical_env: Mapping[str, str]) -> list[str]:
-    owned = _cp.list_canonical_keys()
-    return list(canonical_env) + sorted(k for k in owned if k not in canonical_env)
+def _surface_expectation(
+    canonical_env: Mapping[str, str], surface: str,
+) -> tuple[list[str], dict[str, str]]:
+    """``(keys to compare, expected values)`` for ``surface`` (v0.2.104 L5).
+
+    The expected values are the bundle's keys that ``surface`` carries
+    (:func:`vco_lib.config_projection.surface_keys` — the writer's own split).
+    ``settings.local.json`` is compared over its own keys only (any other key
+    in it is the user's); a committable surface over EVERY canonical key, so a
+    machine-local key still sitting in ``settings.json`` is drift (``apply``
+    moves it). Order: the bundle's first, then the rest sorted.
+    """
+    carried = _cp.surface_keys(surface)
+    expected = {k: v for k, v in canonical_env.items() if k in carried}
+    compared = carried if surface == _cp._SURFACE_CLAUDE_SETTINGS_LOCAL else _cp.list_canonical_keys()
+    keys = [k for k in canonical_env if k in compared] + sorted(
+        k for k in compared if k not in canonical_env
+    )
+    return keys, expected
 
 
 def _row(label: str, key: str, want: Optional[str], have: Any) -> dict:
@@ -121,8 +143,9 @@ def _check_json(folder: Path, surface: str, canonical_env: Mapping[str, str],
             return
         found = data.get(env_key)
         block = found if isinstance(found, dict) else {}
-    for key in _keys_in_order(canonical_env):
-        want, have = canonical_env.get(key), block.get(key)
+    keys, expected = _surface_expectation(canonical_env, surface)
+    for key in keys:
+        want, have = expected.get(key), block.get(key)
         if have != want:
             out.drift.append(_row(rel, key, want, have))
 
@@ -136,8 +159,9 @@ def _check_shell_env(folder: Path, canonical_env: Mapping[str, str], out: EnvChe
             out.unreadable.append(
                 {"surface": _SHELL_ENV_REL, "path": str(path), "reason": str(exc)})
             return
-    for key in _keys_in_order(canonical_env):
-        want = canonical_env.get(key)
+    keys, expected = _surface_expectation(canonical_env, _cp._SURFACE_CLAUDE_ENV)
+    for key in keys:
+        want = expected.get(key)
         have = _cp._read_managed_env_canonical_value(path, key)
         if have != want:
             out.drift.append(_row(_SHELL_ENV_REL, key, want, have))

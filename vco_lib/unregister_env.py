@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""The unregister's strip of VCO's routing keys from ``.claude/env`` and the
-two JSON settings env blocks — the evidence rule (v0.2.97 review R6).
+"""The unregister's strip of VCO's routing keys from ``.claude/env`` and
+the JSON settings env blocks — the evidence rule (v0.2.97 review R6).
 
 An unregister removes what VCO wrote and nothing else:
 
@@ -9,7 +9,8 @@ An unregister removes what VCO wrote and nothing else:
   ``# vco-managed-end``) goes WHOLE — its markers prove it is VCO's. Outside
   it, a routing key's line goes only when its value EQUALS what VCO projects
   for this project; a ``# KEY=`` comment sets nothing and stays.
-* ``.claude/settings.json`` ``env`` / ``.vscode/settings.json``
+* ``.claude/settings.json`` ``env`` / ``.claude/settings.local.json``
+  ``env`` (v0.2.104 L5: the machine-local keys) / ``.vscode/settings.json``
   ``claude-code.env`` (no block): a routing key goes only when its value
   equals VCO's.
 
@@ -121,7 +122,7 @@ def strip_routing_keys(
     db_path: Optional[Path] = None,
     orchestrator_root: Optional[Path] = None,
 ) -> dict[str, object]:
-    """Run the strip on all three surfaces. Returns ``{"removed": {file:
+    """Run the strip on every surface. Returns ``{"removed": {file:
     [KEY]}, "left": {file: [KEY]}, "projection": "resolved"|"unavailable",
     "projection_error": str|None, "errors": [message]}`` — names only. A
     surface that cannot be edited is refused (and recorded in the project's

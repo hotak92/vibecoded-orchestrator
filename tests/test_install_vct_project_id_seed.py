@@ -171,9 +171,12 @@ def test_apply_project_env_writes_vct_project_id_to_claude_env(
 def test_apply_project_env_settings_json_includes_vct_project_id(
     tmp_path: Path,
 ) -> None:
-    """Mirror of the above for ``.claude/settings.json``'s env block:
-    the canonical key MUST also appear in the JSON surface so VS Code
-    + the launcher both see the same value on every editor.
+    """Mirror of the above for Claude Code's settings env: the canonical key
+    MUST also reach the JSON settings layer so every Claude Code surface sees
+    it. v0.2.104 L5: ``VCT_PROJECT_ID`` is this machine's launcher id, so it
+    lands in the per-machine ``.claude/settings.local.json`` (merged over
+    ``settings.json`` by Claude Code) and never in the committable
+    ``settings.json``.
     """
     import json
     from vco_lib.config_projection import apply_project_env
@@ -197,8 +200,14 @@ def test_apply_project_env_settings_json_includes_vct_project_id(
     assert settings_file.exists(), ".claude/settings.json was not written"
 
     parsed = json.loads(settings_file.read_text(encoding="utf-8"))
-    assert parsed["env"]["VCT_PROJECT_ID"] == "json-seed-uuid", (
-        "VCT_PROJECT_ID missing from .claude/settings.json env block — "
+    assert "VCT_PROJECT_ID" not in parsed["env"], (
+        "a machine id must never land in the committable settings.json"
+    )
+    local = json.loads(
+        (project_folder / ".claude" / "settings.local.json").read_text(encoding="utf-8")
+    )
+    assert local["env"]["VCT_PROJECT_ID"] == "json-seed-uuid", (
+        "VCT_PROJECT_ID missing from .claude/settings.local.json env block — "
         "Phase-8 gate's empty-PID branch will fire for VS Code users"
     )
 
