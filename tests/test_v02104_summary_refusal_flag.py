@@ -329,3 +329,50 @@ def test_single_mode_a_plain_non_answer_still_fails_loudly(clean_env, monkeypatc
         mod.main()
     assert ei.value.code == 1
     assert not (root / "knowledge" / ".node_formats.json").exists()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# R16 A-N1: single mode merges ITS entry into the CURRENT sidecar
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("arm", ["refusal", "generated"])
+def test_single_mode_keeps_an_entry_a_concurrent_run_wrote_meanwhile(
+        clean_env, monkeypatch, tmp_path, arm):
+    """Run A reads the sidecar, then (during its LLM call) run B writes ITS
+    entry; A's save must not drop B's. Red-proof: with the old whole-dict
+    save of the pre-call read, 'node-b' vanishes."""
+    root = tmp_path / "proj"
+    kn = root / "knowledge" / "concepts"
+    kn.mkdir(parents=True)
+    node = kn / "node-a.md"
+    node.write_text(NODE_TEXT, encoding="utf-8")
+    monkeypatch.setenv("KG_PROJECT_ROOT", str(root))
+    mod = _load(f"_v02104_gks_race_{uuid.uuid4().hex}", GENERATOR)
+    mod._sb.reset_backend_cache()
+    monkeypatch.setattr(
+        mod._sb, "select_backend",
+        lambda **_kw: mod._sb._BACKEND_CACHE.setdefault("choice", "cli") or "cli",
+    )
+    monkeypatch.setattr(mod, "get_chunks_from_weaviate", lambda *_a, **_k: [])
+    sidecar = root / "knowledge" / ".node_formats.json"
+
+    def _llm(prompt, **_kw):
+        # Run B: reads the (empty) sidecar and saves its own entry.
+        b = mod.load_formats()
+        b["knowledge/concepts/node-b.md"] = {"title": "B", "summary": "s",
+                                             "description": "d", "content_hash": "x"}
+        mod.save_formats(b)
+        if arm == "refusal":
+            raise mod.ContentRefusal("backend 'cli' returned a non-answer (37 chars)")
+        return "a usable answer"
+
+    monkeypatch.setattr(mod, "call_llm", _llm)
+    monkeypatch.setattr(sys, "argv", ["generate-kg-summary.py", str(node)])
+    if arm == "refusal":
+        with pytest.raises(SystemExit):
+            mod.main()
+    else:
+        mod.main()
+    db = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert "knowledge/concepts/node-b.md" in db, "run B's entry was dropped"
+    assert "knowledge/concepts/node-a.md" in db, "run A's own entry is missing"

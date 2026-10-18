@@ -234,6 +234,20 @@ def save_formats(data: dict) -> None:
     atomic_write_text(FORMATS_PATH, payload)
 
 
+def save_one_entry(rel_path: str, entry: dict) -> None:
+    """Merge ONE node's entry into the CURRENT sidecar and save atomically.
+
+    Single-mode runs read the sidecar before a tens-of-seconds LLM call;
+    saving that stale dict would drop every entry a concurrent per-node run
+    (the PostToolUse hook fires one per edited node) wrote meanwhile. So
+    re-read just before saving and replace only this run's key (this run's
+    entry is the freshest word on its own node; every other key is kept).
+    """
+    current = load_formats()
+    current[rel_path] = entry
+    save_formats(current)
+
+
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -996,7 +1010,7 @@ def main():
         log(f"  {title}: refused by the model ({exc}) — flagged; "
             f"the next sync retries it")
         _record_refusal(formats, rel_path, title, c_hash, exc)
-        save_formats(formats)
+        save_one_entry(rel_path, formats[rel_path])
         sys.exit(0)
     except _sb.NonAnswerResponse as exc:
         # Writing this would poison the sidecar and the hash gate would
@@ -1041,8 +1055,7 @@ def main():
             entry["chunk_summaries"] = chunk_summaries
         entry["total_chunks"] = total_chunks
 
-    formats[rel_path] = entry
-    save_formats(formats)
+    save_one_entry(rel_path, entry)
     log(f"  Saved {rel_path} via {entry['backend']}")
 
 

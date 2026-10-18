@@ -488,18 +488,31 @@ def _python_script_arg(toks: Sequence[str]) -> Optional[str]:
     return toks[i]
 
 
-def _python_invocation_prefix(prefix: str) -> bool:
+def _python_invocation_prefix(prefix: str, known_interps: Sequence[str] = ()) -> bool:
     """True when *prefix* — everything on a raw command line BEFORE the
     gateway script — is a Python interpreter followed only by its own
     options. Mirrors :func:`_python_script_arg`'s rule without tokenising,
     so an interpreter path containing spaces still qualifies (``_is_python``
-    judges the basename)."""
+    judges the basename).
+
+    *known_interps* are interpreter paths the caller KNOWS (the venv python
+    of the install being uninstalled). A prefix that STARTS with one of them
+    is split exactly there, so a known interpreter path containing `` -``
+    (``/Users/u/Proj -beta/.venv/bin/python``) is still recognised; an
+    unknown interpreter keeps the first-``\\s+-\\S`` cut, so nothing else is
+    loosened."""
     prefix = prefix.strip()
     if not prefix:
         return False
-    m = re.search(r"\s+-\S", prefix)
-    interp, optstr = (prefix, "") if m is None else (prefix[: m.start()],
-                                                     prefix[m.start():])
+    interp = optstr = ""
+    for known in known_interps:
+        if prefix == known or prefix.startswith(known + " "):
+            interp, optstr = known, prefix[len(known):]
+            break
+    else:
+        m = re.search(r"\s+-\S", prefix)
+        interp, optstr = (prefix, "") if m is None else (prefix[: m.start()],
+                                                         prefix[m.start():])
     if not _is_python(interp):
         return False
     toks = optstr.split()
@@ -531,9 +544,11 @@ def _raw_line_match(raw: str, cand: Sequence[str]) -> bool:
         script = cand[0]
         if raw == script or raw.startswith(script + " "):
             return True  # argv[0] (== the executable on a shebang run)
+        # The install's own venv python sits beside its console script.
+        interps = [str(Path(script).parent / n) for n in ("python", "python3")]
         for m in re.finditer(re.escape(script) + r"(?=\s|$)", raw):
             if (m.start() > 0 and raw[m.start() - 1].isspace()
-                    and _python_invocation_prefix(raw[: m.start()])):
+                    and _python_invocation_prefix(raw[: m.start()], interps)):
                 return True
         return False
     if len(cand) == 3 and cand[1] == "-m":
@@ -643,12 +658,12 @@ def _stdlib_identity(pid: int, *, platform: Optional[str] = None,
             exe = None
         return GatewayProc(pid, toks or None, exe)
     runner = run or subprocess.run
-    res: Any = runner(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+    res: Any = runner(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True,
                       text=True, errors="replace", timeout=30)
     line = res.stdout.strip()
     if res.returncode != 0 or not line:
         return None  # ps exits 1 for an unknown pid
-    comm_res: Any = runner(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True,
+    comm_res: Any = runner(["ps", "-ww", "-o", "comm=", "-p", str(pid)], capture_output=True,
                            text=True, errors="replace", timeout=30)
     comm = comm_res.stdout.strip()
     # `ps` gives ONE joined line, not argv: the whitespace split below breaks
