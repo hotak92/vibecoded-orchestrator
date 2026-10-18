@@ -53,7 +53,12 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: test sends real POSIX signals and reads /proc — a POSIX-only primitive with
 #: no .ps1 sibling; its Windows leg is unit-tested with a fake runner
 #: (tests/test_v02103_uninstall_state.py::test_windows_listing_survives_*).
-NON_CONVENTION_BASELINE = 178
+#: 178 -> 179 (v0.2.104 scratch dir): tests/test_v02104_scratch_dir.py's
+#: POSIX_ONLY marker guards 0700 mode bits and unprivileged symlinks (the
+#: sweep's never-follow arms) — POSIX-only primitives; the Windows ACL arm is
+#: unit-tested with a fake runner (test_windows_arm_*) and its bash legs use
+#: the sibling convention.
+NON_CONVENTION_BASELINE = 179
 
 
 # -- which conditions skip on Windows --------------------------------------

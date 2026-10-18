@@ -23,11 +23,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.pwsh import PWSH_BASE_FLAGS
 from vco_lib import doctor, scratch_dir
 from vco_lib.scratch_dir import ScratchError
 
 REPO = Path(__file__).resolve().parents[1]
-POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits / bash leg")
+POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only primitive (mode bits / unprivileged symlinks)")
 DAY = 86400.0
 
 
@@ -40,10 +41,15 @@ def _project(tmp_path: Path) -> Path:
 def _age(path: Path, seconds: float) -> None:
     """Back-date ``path`` and everything under it (lstat times, no follow)."""
     stamp = time.time() - seconds
+    nofollow = os.utime in os.supports_follow_symlinks
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
         for name in dirnames + filenames:
-            os.utime(os.path.join(dirpath, name), (stamp, stamp), follow_symlinks=False)
-    os.utime(path, (stamp, stamp), follow_symlinks=False)
+            entry = os.path.join(dirpath, name)
+            if nofollow:
+                os.utime(entry, (stamp, stamp), follow_symlinks=False)
+            elif not os.path.islink(entry):
+                os.utime(entry, (stamp, stamp))
+    os.utime(path, (stamp, stamp))
 
 
 # ---------------------------------------------------------------------------
@@ -438,17 +444,11 @@ def test_the_composed_acl_script_runs_under_pwsh(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _shim_venv(tmp_path: Path) -> Path:
-    """A venv-shaped dir whose python runs THIS interpreter with the checkout
-    on PYTHONPATH (never an installed, possibly stale, vco_lib)."""
-    venv = tmp_path / "shim-venv"
-    (venv / "bin").mkdir(parents=True, exist_ok=True)
-    py = venv / "bin" / "python"
-    py.write_text(
-        f'#!/bin/sh\nPYTHONPATH="{REPO}" exec "{sys.executable}" "$@"\n', encoding="utf-8"
-    )
-    py.chmod(0o755)
-    return venv
+def _venv_env(**extra: str) -> dict:
+    """``VCT_VENV`` names THIS interpreter directly (a ladder tier on both
+    OSes) with the checkout first on ``PYTHONPATH`` — never an installed,
+    possibly stale, vco_lib."""
+    return _min_env(VCT_VENV=sys.executable, PYTHONPATH=str(REPO), **extra)
 
 
 def _min_env(**extra: str) -> dict:
@@ -458,7 +458,7 @@ def _min_env(**extra: str) -> dict:
     return env
 
 
-@POSIX_ONLY
+@pytest.mark.skipif(sys.platform == "win32", reason="bash .sh leg; Windows runs the .ps1 sibling: tests/test_v02104_scratch_dir.py::test_ps1_wrapper_matches_the_bash_one")
 def test_bash_wrapper_prints_the_lane_dir_of_the_project_it_ships_in(tmp_path: Path) -> None:
     from tests.common.wrapper_staging import stage_scripts
 
@@ -467,35 +467,35 @@ def test_bash_wrapper_prints_the_lane_dir_of_the_project_it_ships_in(tmp_path: P
     proc = subprocess.run(
         ["bash", str(scripts / "vco-scratch"), "path", "--name", "w1"],
         capture_output=True, text=True, timeout=120, cwd=str(tmp_path),
-        env=_min_env(VCT_VENV=str(_shim_venv(tmp_path))),
+        env=_venv_env(),
     )
     assert proc.returncode == 0, proc.stderr
     assert Path(proc.stdout.strip()) == (proj / ".claude" / "state" / "scratch" / "w1").resolve()
     # No subcommand defaults to `path` with the session id as the lane.
     proc = subprocess.run(
         ["bash", str(scripts / "vco-scratch")], capture_output=True, text=True, timeout=120,
-        env=_min_env(VCT_VENV=str(_shim_venv(tmp_path)), CLAUDE_CODE_SESSION_ID="sid1"),
+        env=_venv_env(CLAUDE_CODE_SESSION_ID="sid1"),
     )
     assert proc.returncode == 0 and proc.stdout.strip().endswith("/scratch/sid1"), proc.stderr
 
 
-@pytest.mark.skipif(shutil.which("pwsh") is None or sys.platform == "win32",
-                    reason="pwsh leg on a POSIX host (shim venv is a sh script)")
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
 def test_ps1_wrapper_matches_the_bash_one(tmp_path: Path) -> None:
     from tests.common.wrapper_staging import stage_scripts
 
     proj = _project(tmp_path)
     scripts = stage_scripts(proj / ".claude" / "scripts", "vco-scratch.ps1")
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(scripts / "vco-scratch.ps1"), "path", "--name", "w2"],
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(scripts / "vco-scratch.ps1"), "path",
+         "--name", "w2"],
         capture_output=True, text=True, timeout=120, cwd=str(tmp_path),
-        env=_min_env(VCT_VENV=str(_shim_venv(tmp_path))),
+        env=_venv_env(),
     )
     assert proc.returncode == 0, proc.stderr
     assert Path(proc.stdout.strip()) == (proj / ".claude" / "state" / "scratch" / "w2").resolve()
 
 
-@POSIX_ONLY
+@pytest.mark.skipif(sys.platform == "win32", reason="bash .sh leg; Windows runs the .ps1 sibling: tests/test_v02104_scratch_dir.py::test_session_start_hook_ps1_sweeps_old_lanes")
 def test_session_start_hook_sweeps_old_lanes(tmp_path: Path) -> None:
     proj = _project(tmp_path)
     old = scratch_dir.scratch_path(proj, "old")
@@ -504,16 +504,14 @@ def test_session_start_hook_sweeps_old_lanes(tmp_path: Path) -> None:
     hook = REPO / "templates" / "hooks" / "session-start-kg-loader.sh"
     proc = subprocess.run(
         ["bash", str(hook)], capture_output=True, text=True, timeout=120, input="",
-        env=_min_env(CLAUDE_PROJECT_DIR=str(proj), VCT_VENV=str(_shim_venv(tmp_path)),
-                     VCO_SCRATCH_TTL_HOURS="24"),
+        env=_venv_env(CLAUDE_PROJECT_DIR=str(proj), VCO_SCRATCH_TTL_HOURS="24"),
     )
     assert proc.returncode == 0, proc.stderr
     assert not old.exists() and keep.exists()
     assert "vco-scratch path" in proc.stdout
 
 
-@pytest.mark.skipif(shutil.which("pwsh") is None or sys.platform == "win32",
-                    reason="pwsh leg on a POSIX host (shim venv is a sh script)")
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
 def test_session_start_hook_ps1_sweeps_old_lanes(tmp_path: Path) -> None:
     proj = _project(tmp_path)
     old = scratch_dir.scratch_path(proj, "old")
@@ -521,17 +519,16 @@ def test_session_start_hook_ps1_sweeps_old_lanes(tmp_path: Path) -> None:
     keep = scratch_dir.scratch_path(proj, "new")
     hook = REPO / "templates" / "hooks" / "session-start-kg-loader.ps1"
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(hook)], capture_output=True, text=True,
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(hook)], capture_output=True, text=True,
         timeout=120, input="",
-        env=_min_env(CLAUDE_PROJECT_DIR=str(proj), VCT_VENV=str(_shim_venv(tmp_path)),
-                     VCO_SCRATCH_TTL_HOURS="24"),
+        env=_venv_env(CLAUDE_PROJECT_DIR=str(proj), VCO_SCRATCH_TTL_HOURS="24"),
     )
     assert proc.returncode == 0, proc.stderr
     assert not old.exists() and keep.exists()
     assert "vco-scratch.ps1 path" in proc.stdout
 
 
-@POSIX_ONLY
+@pytest.mark.skipif(sys.platform == "win32", reason="bash .sh leg; Windows runs the .ps1 sibling: tests/test_v02104_scratch_dir.py::test_session_start_hook_ps1_sweeps_old_lanes")
 def test_session_start_hook_leaves_scratch_alone_under_disable_hooks(tmp_path: Path) -> None:
     proj = _project(tmp_path)
     old = scratch_dir.scratch_path(proj, "old")
@@ -539,8 +536,8 @@ def test_session_start_hook_leaves_scratch_alone_under_disable_hooks(tmp_path: P
     hook = REPO / "templates" / "hooks" / "session-start-kg-loader.sh"
     subprocess.run(
         ["bash", str(hook)], capture_output=True, text=True, timeout=120, input="",
-        env=_min_env(CLAUDE_PROJECT_DIR=str(proj), VCT_VENV=str(_shim_venv(tmp_path)),
-                     VCO_SCRATCH_TTL_HOURS="24", VCT_DISABLE_HOOKS="1"),
+        env=_venv_env(CLAUDE_PROJECT_DIR=str(proj), VCO_SCRATCH_TTL_HOURS="24",
+                     VCT_DISABLE_HOOKS="1"),
     )
     assert old.exists()
 
