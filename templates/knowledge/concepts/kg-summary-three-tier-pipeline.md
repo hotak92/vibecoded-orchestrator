@@ -3,7 +3,7 @@ title: KG-Summary Generation Pipeline — Backend Ladder
 type: concept
 tags: [orchestrator, kg, hooks, ollama, claude-code, summarization, low-level-implementation, cross-platform]
 created: 2026-04-27T05:30:00Z
-updated: 2026-10-15T00:00:00Z
+updated: 2026-10-18T00:00:00Z
 status: active
 ---
 
@@ -39,7 +39,7 @@ The order above says which tier is preferred. Until v0.2.92 nothing said how to 
 
 The latch is a JSON file in the VCT state dir, not an in-process dict, because the generator runs **one process per node** — an in-process latch would be re-armed once per node. It expires rather than persisting: a recovered endpoint must work again without the user deleting a file. Kill switch `VCO_SUMMARY_BREAKER=off`. A backend named explicitly via `KG_SUMMARY_BACKEND` is never auto-demoted or substituted.
 
-**2. Non-answer gate — a CONTENT condition.** A reply that is a refusal or a canned prompt-back (`"Ready. What do you need summarized?"`, `"I cannot..."`, an empty or sub-8-character string) is **not** a summary. `is_non_answer()` is prefix-anchored on purpose: a real technical summary may *mention* a refusal phrase, it does not *begin* with one. A non-answer **raises** and is never cached; it deliberately does **not** demote the tier and does **not** fall through to the next one — falling through is what would have hidden the Windows defect below, by quietly re-answering on Ollama. A refusal is **final**: the per-node run exits 1 so the launcher records the node as failed, and the bulk `--all` pass reports it as `REFUSED … (final — not retried, not deferred)` without counting it as an error — retrying or deferring content no backend will answer would only build a never-clearing owed loop.
+**2. Non-answer gate — a CONTENT condition.** A reply that is a refusal or a canned prompt-back (`"Ready. What do you need summarized?"`, `"I cannot..."`, an empty or sub-8-character string) is **not** a summary. `is_non_answer()` is prefix-anchored on purpose: a real technical summary may *mention* a refusal phrase, it does not *begin* with one. A non-answer **raises** and is never cached; it deliberately does **not** demote the tier and does **not** fall through to the next one — falling through is what would have hidden the Windows defect below, by quietly re-answering on Ollama. A content refusal (since v0.2.104) is **flagged, not final**: the node gets a `refused` entry in the `.node_formats.json` sidecar with no summary, one plain `REFUSED <path>` line is printed, the run exits 0 and never arms the auto-retry deferral — and the next ordinary sync tries the node again (a model may answer later, and a flagged entry is never treated as a usable summary). Other non-answers keep the old rule: not cached, and the per-node run exits 1.
 
 The read side matters as much as the write side: the generator (in both its per-node and `--all` modes) treats a *stored* non-answer as **not satisfied**, so poisoned rows regenerate on the next ordinary run with no user action. A stored non-answer chunk summary invalidates its entry; a **missing** chunk summary does not — absent is not poisoned, and treating it as such would re-run two whole-node LLM calls on every sync for any node whose chunk fetch keeps failing.
 
