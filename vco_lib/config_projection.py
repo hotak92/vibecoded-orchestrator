@@ -2733,7 +2733,12 @@ def _strip_legacy_vscode_machine_keys(
     """Remove from a legacy ``.vscode/settings.json`` ``claude-code.env`` block
     the machine-local keys whose value EQUALS what VCO projects now (the
     evidence rule — a different value is the user's and stays). Touches the
-    file only when the soft read finds such a key."""
+    file only when the soft read finds such a key.
+
+    Unlike ``settings.json``, this legacy surface is stripped even when the
+    ``settings.local.json`` layer is tracked, unknown or refused: nothing
+    reads routing from ``.vscode/settings.json`` any more, and the file is
+    commonly committed, so a machine path there is only a leak."""
     block = _json_env_block(project_root / ".vscode" / "settings.json", "claude-code.env")
     expected = {k: v for k, v in env.items() if k in MACHINE_LOCAL_ENV_KEYS}
     if not any(block.get(k) == v for k, v in expected.items()):

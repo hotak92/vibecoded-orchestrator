@@ -444,7 +444,10 @@ def move_machine_env_out_of_settings(
     without the projection (``install.py``'s root defaults). Nothing moves
     while the layer is not :data:`USABLE`. Returns the keys moved. Raises
     :class:`vco_lib.config_projection.SettingsWriteRefused` when a file
-    cannot be edited (both are then left as they were).
+    cannot be edited. The local file is written first, so a refusal on
+    ``settings.json`` leaves the moved keys in BOTH files with identical
+    values (harmless: the local value wins in the merge, and the next run
+    retries the strip); a refusal on the local file changes nothing.
     """
     from vco_lib import config_projection as cp
     from vco_lib.claude_settings_env import SETTINGS_ENV_FILES

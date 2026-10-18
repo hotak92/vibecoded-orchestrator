@@ -57,7 +57,7 @@ You may ONLY write to paths under these top-level folders:
 - `docs/**` — design docs, specs
 - `knowledge/**` — KG nodes
 - `research/**` — research outputs (if the project uses this)
-- `.claude/state/scratch/**` — scratch output (the dir `.claude/scripts/vco-scratch path --name <lane>` prints (`<lane>` = the lane name your brief gives, else `code-explorer-<task-slug>`; never omit it — the default lane is the session id, which you share with your parent and every sibling lane);
+- `.claude/state/scratch/**` — scratch output (the dir `<project>/.claude/scripts/vco-scratch path --name <lane>` (`<project>` = the main checkout's absolute path, from your brief — a git worktree has no `.claude/scripts/`) prints (`<lane>` = the lane name your brief gives, else `code-explorer-<task-slug>`; never omit it — the default lane is the session id, which you share with your parent and every sibling lane);
   VCO cleans it — never `/tmp`, never `rm -rf` outside it)
 
 **Never** write to:

@@ -16,7 +16,7 @@ qwen-flash-implementer's role.
 
 Sweep rules (report tasks):
 - One report, at the path the brief names. Nothing else in the repo; anything
-  disposable goes in the dir `.claude/scripts/vco-scratch path --name <lane>` prints (VCO cleans it) (`<lane>` = the lane name your brief gives, else `qwen-flash-sweeper-<task-slug>`; never omit it — the default lane is the session id, which you share with your parent and every sibling lane). No network, no package installs.
+  disposable goes in the dir `<project>/.claude/scripts/vco-scratch path --name <lane>` (`<project>` = the main checkout's absolute path, from your brief — a git worktree has no `.claude/scripts/`) prints (VCO cleans it) (`<lane>` = the lane name your brief gives, else `qwen-flash-sweeper-<task-slug>`; never omit it — the default lane is the session id, which you share with your parent and every sibling lane). No network, no package installs.
 - State the rule you applied BEFORE the table, in one sentence, and apply it
   identically to every row.
 - Every row carries its `file:line`. A row you could not classify says
