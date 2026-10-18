@@ -3251,11 +3251,16 @@
             same switch also covers VCO's background <code>claude -p</code> jobs
             (knowledge-graph and code summaries, the post-commit KG review):
             when the subscription is out of usage, each retries its failed
-            call once with that key, passed to the job's environment only.
+            call once with that key, passed to the job's environment only;
+            once the key serves, the rest of that run uses it directly, and a
+            key Anthropic refuses is not tried again until the 5-hour quota
+            cooldown has passed. Only the Shared slot answers for this name —
+            a project's own secret of the same name is never used.
             The same key also adds <code>claude-gw/api/…</code> models to the
             picker. Requests go out with your client's own headers; Anthropic
             decides which credit pool pays — check the Console after the first
-            use. Every such request is marked <code>auth: api_key</code> in the
+            use, including that a background job's call appears there. Every
+            such request is marked <code>auth: api_key</code> in the
             gateway usage log.
           </small>
         </label>
