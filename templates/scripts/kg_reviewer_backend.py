@@ -88,6 +88,7 @@ try:
     from vco_lib import kg_reviewer_guard as _guard  # noqa: E402
     from vco_lib import kg_reviewer_model as _model  # noqa: E402
     from vco_lib import kg_reviewer_prompt as _prompt  # noqa: E402
+    from vco_lib import claude_cli_api_key as _cli_api_key  # noqa: E402
 except ImportError as _exc:  # pragma: no cover — exercised by the hook tests
     print(f"kg_reviewer_backend: BROKEN INSTALL - vco_lib is not importable "
           f"({_exc}); the KG reviewer cannot run its guarded review. Repair "
@@ -582,6 +583,79 @@ def _project_root(raw: "Optional[str]") -> Path:
     return Path(top).resolve() if proc.returncode == 0 and top else Path.cwd()
 
 
+def run_with_quota_fallback(
+    cmd: "list[str]",
+    prompt: str,
+    env: "dict[str, str]",
+    cwd: Path,
+    timeout_s: int,
+    *,
+    direct_rung: bool,
+    log: Callable[[str], None],
+) -> "tuple[str, str, int]":
+    """Run the reviewer's ``claude -p`` once, with the v0.2.104 API-1 quota
+    fallback: when the run failed and the existing classification
+    (:func:`summary_backends.classify_backend_failure` over
+    :func:`run_failure_evidence`'s text — the same machinery the breaker's
+    latch reads) says ``quota`` (the subscription out of usage), the run is
+    retried ONCE with the shared ``ANTHROPIC_API_KEY_GATEWAY`` Console key in
+    the child environment (``vco_lib.claude_cli_api_key``), provided the
+    launcher's API-key fallback switch is ON and the key resolves.
+
+    Only the DIRECT rung retries (``direct_rung``): a gateway rung's quota
+    refusal is already retried server-side by the gateway's own API-key
+    fallback on the very same launcher setting, and its model ids are
+    gateway-namespaced (``claude-gw/…``), which api.anthropic.com does not
+    serve. The gateway rung's forced ``ANTHROPIC_API_KEY=""`` (which keeps
+    the subscription in charge — :func:`_gateway_auth_env`) is untouched for
+    the normal attempt; only the retry's env carries the key, and
+    :func:`vco_lib.claude_cli_api_key.child_env_with_key` strips the gateway
+    routing vars so the retry reaches Anthropic directly.
+
+    A refused key (auth-shaped output) or any other retry failure is NOT
+    retried again: one log line, and the caller proceeds with the retry's
+    outcome exactly as if it were the only run (the usual latch/fallback
+    behaviour). Returns ``(stdout, stderr, exit_code)`` of the LAST run.
+    """
+    proc = subprocess.run(cmd, input=prompt, env=env, cwd=cwd,
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          timeout=timeout_s)
+    stdout, stderr, exit_code = proc.stdout or "", proc.stderr or "", proc.returncode
+    if not direct_rung or exit_code == 0:
+        return stdout, stderr, exit_code
+    served, evidence = run_failure_evidence(stdout, stderr)
+    if served:
+        return stdout, stderr, exit_code
+    reason, _signal = _sb.classify_backend_failure(text=evidence)
+    if reason != _sb.REASON_QUOTA:
+        return stdout, stderr, exit_code
+    if not _cli_api_key.fallback_enabled():
+        return stdout, stderr, exit_code
+    key = _cli_api_key.resolve_key()
+    if key is None:
+        return stdout, stderr, exit_code
+    log("run on the subscription hit its quota — retrying with the Claude "
+        "API key (ANTHROPIC_API_KEY_GATEWAY)")
+    proc = subprocess.run(
+        cmd, input=prompt,
+        env=_cli_api_key.child_env_with_key(env, key), cwd=cwd,
+        capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        timeout=timeout_s)
+    stdout, stderr, exit_code = proc.stdout or "", proc.stderr or "", proc.returncode
+    if exit_code != 0:
+        served2, evidence2 = run_failure_evidence(stdout, stderr)
+        reason2 = "" if served2 else _sb.classify_backend_failure(text=evidence2)[0]
+        if reason2 == _sb.REASON_AUTH:
+            log("the Claude API key was refused — no second retry; the "
+                "run's outcome is recorded as usual")
+        elif not served2:
+            log("the API-key retry did not serve either — no second retry; "
+                "the run's outcome is recorded as usual")
+    return stdout, stderr, exit_code
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     log = _file_logger(args.log)
     root = _project_root(args.project_root)
@@ -638,11 +712,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     snap = _guard.take_snapshot(root)
     try:
         try:
-            proc = subprocess.run(cmd, input=prompt, env=env, cwd=root,
-                                  capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace",
-                                  timeout=args.timeout_s)
-            stdout, stderr, exit_code = proc.stdout or "", proc.stderr or "", proc.returncode
+            stdout, stderr, exit_code = run_with_quota_fallback(
+                cmd, prompt, env, root, args.timeout_s,
+                direct_rung=not decision["base_url"], log=log)
             served, evidence = run_failure_evidence(stdout, stderr)
             _record_outcome(model, exit_code, evidence, log, served=served)
             with open(args.log, "ab") as fh:

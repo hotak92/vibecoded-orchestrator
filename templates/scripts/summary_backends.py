@@ -1379,6 +1379,36 @@ def cli_available() -> bool:
     return ok
 
 
+def _quota_retry_env(base_env: dict) -> "dict | None":
+    """The child env for the ONE quota retry on the Console API key, or None.
+
+    v0.2.104 API-1: when the subscription is out of usage, the launcher
+    setting that arms the model gateway's subscription -> API-key fallback
+    (``model_gateway.api_key_fallback``) also allows this job ONE retry with
+    the shared ``ANTHROPIC_API_KEY_GATEWAY`` secret, handed to the child as
+    ``ANTHROPIC_API_KEY`` in its environment only (never argv, never a file,
+    never a log line). All of it lives in
+    :mod:`vco_lib.claude_cli_api_key`; this module is stdlib-only by contract
+    (it runs inside user projects' ``.claude/scripts/`` with no ``vco_lib``
+    on ``sys.path``), so the import is lazy and a context without ``vco_lib``
+    simply has no retry — exactly the pre-fallback behaviour.
+    """
+    try:
+        from vco_lib.claude_cli_api_key import (  # noqa: PLC0415
+            child_env_with_key,
+            fallback_enabled,
+            resolve_key,
+        )
+    except ImportError:
+        return None
+    if not fallback_enabled():
+        return None
+    key = resolve_key()
+    if key is None:
+        return None
+    return child_env_with_key(base_env, key)
+
+
 def call_cli(prompt: str) -> str:
     """Run one headless ``claude -p`` turn. Prompt goes over STDIN.
 
@@ -1399,6 +1429,13 @@ def call_cli(prompt: str) -> str:
 
     v0.2.100 WP-13: the argv also carries :func:`cli_isolation_args` (no MCP
     server, no hook), each flag only when this CLI lists it in ``--help``.
+
+    v0.2.104 API-1: a failure the classifier reads as ``quota`` (the
+    subscription out of usage) gets ONE retry with the shared
+    ``ANTHROPIC_API_KEY_GATEWAY`` Console key when the launcher's API-key
+    fallback switch is ON — see :func:`_quota_retry_env`. Every other
+    failure class, the switch OFF, or no key resolvable: exactly the
+    pre-fallback behaviour.
     """
     import subprocess
 
@@ -1411,45 +1448,82 @@ def call_cli(prompt: str) -> str:
         raise RuntimeError("claude CLI not found on PATH at call time")
 
     full_prompt = SYSTEM_PROMPT + "\n\n" + prompt
-    try:
-        # --no-session-persistence: without it every one-shot summary call
-        # persists a transcript into the user's session list (943 machine-
-        # generated transcripts / 1.05 GB measured on one install). Verified
-        # on Claude CLI 2.1.258+; post-git-commit-kg-sync.{sh,ps1} already
-        # use this flag.
+    # --no-session-persistence: without it every one-shot summary call
+    # persists a transcript into the user's session list (943 machine-
+    # generated transcripts / 1.05 GB measured on one install). Verified
+    # on Claude CLI 2.1.258+; post-git-commit-kg-sync.{sh,ps1} already
+    # use this flag.
+    argv = [claude_path, "-p", "--model", "haiku", "--max-turns", "1",
+            "--no-session-persistence", *cli_isolation_args(claude_path)]
+    base_env = {**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+
+    def _attempt(env: dict) -> "tuple[str | None, str, str, str]":
+        """One spawn, classified: ``(answer, reason, signal, message)``.
+
+        ``answer`` is None on any failure; ``message`` is then the
+        ready-made :class:`BackendUnavailable` text (never the model's
+        words beyond the short stderr snippet the pre-existing messages
+        already carried).
+        """
         result = subprocess.run(
-            [claude_path, "-p", "--model", "haiku", "--max-turns", "1",
-             "--no-session-persistence", *cli_isolation_args(claude_path)],
+            argv,
             input=full_prompt,
             capture_output=True,
             text=True,
             timeout=TIMEOUT,
-            env={**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
+            env=env,
         )
+        if result.returncode != 0:
+            reason, signal = classify_backend_failure(
+                text=f"{result.stderr}\n{result.stdout}",
+            )
+            return None, reason, signal, f"claude CLI failed: {result.stderr[:200]}"
+        out = result.stdout.strip()
+        # Exit 0 but the "answer" is a usage-limit / auth notice: a tier
+        # failure wearing a success exit code. Caching it would poison the
+        # sidecar AND hide the outage.
+        reason, signal = _classify_exit_zero_text(out)
+        if reason != REASON_OTHER:
+            return None, reason, signal, (
+                "claude CLI returned a backend notice instead of an answer "
+                f"({reason})"
+            )
+        return out, REASON_OTHER, "", ""
+
+    try:
+        out, reason, signal, message = _attempt(base_env)
     except subprocess.TimeoutExpired as exc:
         raise BackendUnavailable(
             "cli", REASON_CAPACITY, "timeout",
             f"claude CLI timed out after {TIMEOUT}s",
         ) from exc
-    if result.returncode != 0:
-        reason, signal = classify_backend_failure(
-            text=f"{result.stderr}\n{result.stdout}",
-        )
-        raise BackendUnavailable(
-            "cli", reason, signal,
-            f"claude CLI failed: {result.stderr[:200]}",
-        )
-    out = result.stdout.strip()
-    # Exit 0 but the "answer" is a usage-limit / auth notice: a tier
-    # failure wearing a success exit code. Caching it would poison the
-    # sidecar AND hide the outage.
-    reason, signal = _classify_exit_zero_text(out)
-    if reason != REASON_OTHER:
-        raise BackendUnavailable(
-            "cli", reason, signal,
-            f"claude CLI returned a backend notice instead of an answer "
-            f"({reason})",
-        )
+    if out is None and reason == REASON_QUOTA:
+        # v0.2.104 API-1 — the ONE fallback retry: only a quota-classified
+        # failure triggers it, only when the launcher setting is ON and the
+        # shared key resolves (``_quota_retry_env`` decides both). The key
+        # reaches the child through its environment alone.
+        retry_env = _quota_retry_env(base_env)
+        if retry_env is not None:
+            original = (reason, signal, message)
+            _log("  summary: subscription quota exhausted — retrying with "
+                 "the Claude API key (ANTHROPIC_API_KEY_GATEWAY)")
+            try:
+                out, reason, signal, message = _attempt(retry_env)
+            except subprocess.TimeoutExpired:
+                out = None
+            if out is None:
+                if reason == REASON_AUTH:
+                    _log("  summary: the Claude API key was refused — no "
+                         "second retry; the quota outage handling proceeds")
+                else:
+                    _log("  summary: the API-key retry did not serve — no "
+                         "second retry; the quota outage handling proceeds")
+                # The breaker must still hear about the ORIGINAL quota
+                # failure: on the subscription this tier is out, and the
+                # ladder descends exactly as when no retry was attempted.
+                reason, signal, message = original
+    if out is None:
+        raise BackendUnavailable("cli", reason, signal, message)
     return out
 
 

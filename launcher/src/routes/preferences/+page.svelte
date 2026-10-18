@@ -3248,7 +3248,11 @@
             OFF (default). ON: a subscription quota refusal is retried once on
             the same model with your Claude API key (Secrets → Shared,
             <code>ANTHROPIC_API_KEY_GATEWAY</code>), before any other fallback. The
-            same key also adds <code>claude-gw/api/…</code> models to the
+            same switch also covers VCO's background <code>claude -p</code> jobs
+            (knowledge-graph and code summaries, the post-commit KG review):
+            when the subscription is out of usage, each retries its failed
+            call once with that key, passed to the job's environment only.
+            The same key also adds <code>claude-gw/api/…</code> models to the
             picker. Requests go out with your client's own headers; Anthropic
             decides which credit pool pays — check the Console after the first
             use. Every such request is marked <code>auth: api_key</code> in the
