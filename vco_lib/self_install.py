@@ -411,3 +411,29 @@ def adopt_bundle_created_settings(existing: dict, defaults: dict,
             merged[key] = filled
     merged[sentinel] = list(defaults.get(sentinel) or [])
     return merged
+
+
+def replace_all_settings(install_root: Path, defaults: dict, sentinel: str) -> dict:
+    """The root ``settings.json`` that ``install.py --adopt-project-replace-all``
+    writes: what a fresh install lands — the shipped settings template (minus
+    the hooks the launcher has parked for the root, exactly like the bundle's
+    create branch, :func:`vco_lib.bundle_settings_io.fresh_settings_from_template`)
+    with step 9's ``defaults`` filled in through
+    :func:`adopt_bundle_created_settings`, the merge a fresh install's step 9
+    applies to the file the bundle created.
+
+    What replace-all resets is every user edit: nothing of the existing file is
+    read. What it no longer does (v0.2.104) is drop the template's own keys —
+    ``hooks``, ``skillOverrides``, ``idleCompaction``, the permission denies —
+    until the next bundle update.
+
+    Raises ``OSError`` / ``ValueError`` when the shipped template cannot be read
+    or parsed (a broken install; the caller leaves the file alone and says so).
+    """
+    from vco_lib.bundle_settings_io import fresh_settings_from_template, settings_template_path
+    from vco_lib.parked_hooks import read_parked_hooks
+
+    fresh = fresh_settings_from_template(
+        settings_template_path(install_root),
+        parked=read_parked_hooks(Path(install_root)), kept_out=[])
+    return adopt_bundle_created_settings(fresh, defaults, sentinel)

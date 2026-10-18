@@ -89,6 +89,14 @@ Four layers carry state across sessions — future-you, future agents, and the u
 
 ---
 
+## Compaction
+
+**Compaction**: critical context is preserved by the `PreCompact` / `PostCompact` hooks. Before compacting manually, update `CONTEXT_STATE.md` with the current state, modified files and open blockers. Use `/compact focus on <topic>` to guide the summary.
+
+**Idle compaction is off in this project.** VCO ships `"idleCompaction": false` in `.claude/settings.json`: Claude Code otherwise compacts a large conversation (200k+ tokens) left idle for about an hour, and you would resume into a summary that can drop context not yet written to `CONTEXT_STATE.md` or the KG. Normal auto-compact near the context limit is unaffected. A bundle update adds the key only when it is absent, so your own value always stands; to turn idle compaction back on, set `"idleCompaction": true` in `.claude/settings.local.json`.
+
+---
+
 ## Search before you answer project questions
 
 For questions about this project's state, decisions, patterns, or architecture, look it up before answering — never explain from memory what the codebase does, what patterns exist, or what was previously decided. For general coding questions, syntax, or files already in context, answer directly; searching first there costs tokens and finds nothing.

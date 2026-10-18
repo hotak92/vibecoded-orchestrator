@@ -41,6 +41,7 @@
       "Bash(wget * | sh*)"
     ]
   },
+  "idleCompaction": false,
   "skillOverrides": {
     "loop": "user-invocable-only"
   },

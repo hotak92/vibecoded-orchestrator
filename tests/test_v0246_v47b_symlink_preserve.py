@@ -50,6 +50,15 @@ from vco_lib import symlink_handler  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 
+def _ship_settings_templates(root: Path) -> None:
+    """A missing settings.json is written from the shipped template +
+    defaults (v0.2.104), which live under the install root's templates/."""
+    import shutil
+    (root / "templates").mkdir(parents=True, exist_ok=True)
+    for name in ("settings.json.linux.template", "settings.json.windows.template"):
+        shutil.copy(REPO_ROOT / "templates" / name, root / "templates" / name)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -494,6 +503,7 @@ def test_configure_claude_settings_redirects_when_settings_is_symlink(tmp_path):
 
     settings_link = claude_dir / "settings.json"
     _make_symlink_or_skip(real_settings, settings_link)
+    _ship_settings_templates(fake_project)
 
     embed_config = {
         "text_model": "qwen3-embedding:0.6b",
@@ -534,6 +544,7 @@ def test_configure_claude_settings_redirects_when_claude_dir_is_symlink(tmp_path
 
     claude_link = fake_project / ".claude"
     _make_symlink_or_skip(real_claude, claude_link)
+    _ship_settings_templates(fake_project)
 
     embed_config = {
         "text_model": "qwen3-embedding:0.6b",
@@ -577,6 +588,7 @@ def test_configure_claude_settings_adopt_project_mode_is_agnostic(tmp_path):
     real_settings.write_text("{}")
     settings_link = claude_dir / "settings.json"
     _make_symlink_or_skip(real_settings, settings_link)
+    _ship_settings_templates(fake_project)
 
     embed_config = {
         "text_model": "qwen3-embedding:0.6b",

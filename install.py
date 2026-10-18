@@ -6283,7 +6283,9 @@ def main() -> int:
         # alone.
         _configure_claude_settings(embed_config,
                                    adopt_project_mode=adopt_project_mode,
-                                   deferral_report=_deferral_report)
+                                   deferral_report=_deferral_report,
+                                   settings_template_skipped=bool(getattr(
+                                       args, "skip_materialize_claude_dir", False)))
     else:
         print("[skip] Claude settings (preserved during update)")
         # 0.2.11 / PR-1: pre-0.2.11 installs wired BASH_ENV in
@@ -20658,12 +20660,17 @@ def _configure_claude_settings(
     embed_config: dict,
     adopt_project_mode: str | None = None,
     deferral_report: "DeferralReport | None" = None,
+    settings_template_skipped: bool = False,
 ) -> None:
     """Create or refresh ``.claude/settings.json`` with MCP server configuration.
 
     v0.2.46 V47-A (Gap A) — managed-block merge. Behavior matrix:
 
-    * File missing → write VCO defaults (including ``_vco_managed_keys``).
+    * File missing → write what a fresh install lands: the shipped settings
+      template + VCO defaults (including ``_vco_managed_keys``), the same
+      result as replace-all below — or the defaults alone when
+      ``settings_template_skipped`` (``--skip-materialize-claude-dir``: the
+      template's hooks would name scripts this run did not materialize).
     * File exists + parses + has ``_vco_managed_keys`` → managed-block merge:
       refresh listed keys from defaults, preserve every other top-level key.
     * File exists + parses + no ``_vco_managed_keys`` (legacy / external) →
@@ -20671,8 +20678,11 @@ def _configure_claude_settings(
       sibling, emit deferral entry, leave original alone.
     * File exists + parse fails → emit deferral entry, leave file alone.
     * ``adopt_project_mode == "replace-all"`` → unconditionally overwrite
-      with VCO defaults (advanced/explicit opt-in via
-      ``--adopt-project-replace-all``).
+      with what a fresh install lands — the shipped settings template plus
+      VCO defaults (``vco_lib.self_install.replace_all_settings``; advanced /
+      explicit opt-in via ``--adopt-project-replace-all``). Every user edit is
+      reset; no template key is dropped. A missing template leaves the file
+      alone (or absent) with a stderr error.
     * ``adopt_project_mode in (None, "adopt")`` → use the safe matrix above.
     * ``adopt_project_mode == "no-adopt"`` and ``"dry-run"`` are handled
       upstream in ``main()`` before this function is reached.
@@ -20746,16 +20756,31 @@ def _configure_claude_settings(
     defaults = _build_vco_settings_defaults(embed_config)
     rendered_defaults = json.dumps(defaults, indent=2) + "\n"
 
-    # Case 1: file missing (lexists: a diverted dangling symlink is not
-    # "missing") — write fresh VCO defaults.
-    if not os.path.lexists(os.fspath(settings_file)):
-        settings_file.write_text(rendered_defaults, encoding="utf-8")
-        return
-
-    # Case 2: --adopt-project-replace-all — overwrite outright.
-    if adopt_project_mode == "replace-all":
-        settings_file.write_text(rendered_defaults, encoding="utf-8")
-        print("  Claude settings: replaced (--adopt-project-replace-all)")
+    # Cases 1 and 2 write the WHOLE file: both write what a fresh install
+    # lands (v0.2.104) — the shipped template + these defaults, or the
+    # defaults alone under --skip-materialize-claude-dir (the template's
+    # hooks would name scripts this run never materialized).
+    whole_file = not os.path.lexists(os.fspath(settings_file)) or adopt_project_mode == "replace-all"
+    if whole_file:
+        # Case 1: file missing (lexists: a diverted dangling symlink is not
+        # "missing"). Case 2: --adopt-project-replace-all — overwrite outright
+        # (it used to write `defaults` alone and drop every template-only key).
+        verb = "replaced" if os.path.lexists(os.fspath(settings_file)) else "created"
+        try:
+            fresh = (defaults if settings_template_skipped else
+                     _self_install.replace_all_settings(
+                         PROJECT_ROOT, defaults, _VCO_MANAGED_KEYS_SENTINEL))
+        except (OSError, ValueError) as exc:
+            print(
+                f"  Claude settings: NOT {verb} — the shipped settings template "
+                f"could not be read ({type(exc).__name__}: {exc}); the install "
+                "looks broken, re-clone or repair templates/ and re-run",
+                file=sys.stderr,
+            )
+            return
+        settings_file.write_text(json.dumps(fresh, indent=2) + "\n", encoding="utf-8")
+        if verb == "replaced":
+            print("  Claude settings: replaced (--adopt-project-replace-all)")
         return
 
     # Case 3: file exists — try to parse and decide.
