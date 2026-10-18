@@ -118,7 +118,7 @@ USER_OWNED_CLAUDE_PATHS: tuple[str, ...] = (
 #: run or not (most are written at runtime, never by the bundle copy).
 VCO_RUNTIME_EXCLUDES: tuple[str, ...] = (
     _MANIFEST_EXCLUDE_PATTERN,  # the bundle manifest
-    "/.claude/state/",  # hook/launcher runtime state, the lean-ctx tee dir
+    "/.claude/state/",  # hook/launcher runtime state, lean-ctx tee, scratch dir
     "/.claude/logs/",  # run logs, the auto-resolution trail
     "/.claude/backups/",  # bundle-adoption backups
     "/.claude/worktrees/",  # isolated-subagent worktrees

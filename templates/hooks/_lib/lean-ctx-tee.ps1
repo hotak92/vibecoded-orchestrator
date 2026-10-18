@@ -94,7 +94,10 @@ function Set-PosixMode([string]$Path, [string]$Mode) {
 # arm; it never writes to stdout/stderr (the conservative arms of this lib
 # are silent, exit codes preserved). Both are no-ops returning $true on
 # non-Win32 hosts - POSIX modes govern there. Tests extract this block:
-# keep it between the S5-ACL-BEGIN/END markers.
+# keep it between the S5-ACL-BEGIN/END markers. So does vco_lib/scratch_dir.py
+# (v0.2.104), which RUNS this block to make the per-project scratch dir
+# owner-only on Windows - the markers have a live reader; keep the block
+# self-contained (no dependency on anything else in this file).
 function New-OwnerOnlyAcl([switch]$Directory) {
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
     $acl = if ($Directory) {
