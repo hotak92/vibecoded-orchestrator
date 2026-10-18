@@ -32,6 +32,35 @@ _ptu_clock_us
 _PTU_T0_US="$_PTU_CLOCK_US"
 _PTU_T0_COARSE="$_PTU_CLOCK_COARSE"
 
+# _ptu_elapsed_ms -> _PTU_ELAPSED_MS: milliseconds since this hook started,
+# plus one second when either reading was coarse (the safe side).
+_ptu_elapsed_ms() {
+    _ptu_clock_us
+    _PTU_ELAPSED_MS=$(( (_PTU_CLOCK_US - _PTU_T0_US) / 1000 ))
+    if [[ "$_PTU_T0_COARSE" == 1 || "$_PTU_CLOCK_COARSE" == 1 ]]; then
+        _PTU_ELAPSED_MS=$(( _PTU_ELAPSED_MS + 1000 ))
+    fi
+}
+
+# _ptu_budget_s -> _PTU_BUDGET_S: the harness's kill timeout for this hook.
+# VCO_PRE_TOOL_USE_TIMEOUT_S (whole seconds) MUST MATCH the `timeout`
+# registered for pre-tool-use in .claude/settings.json. MUST MATCH
+# pre-tool-use.ps1's Get-PtuBudgetS: digits only, read as DECIMAL (leading
+# zeros dropped, so `08` is 8, not a bash octal error), 1..999999; anything
+# else -- empty, non-digit, 0, over-range -- reads as 3, silently.
+_ptu_budget_s() {
+    _PTU_BUDGET_S="${VCO_PRE_TOOL_USE_TIMEOUT_S:-}"
+    case "$_PTU_BUDGET_S" in
+        ''|*[!0-9]*) _PTU_BUDGET_S=3 ;;
+        *)
+            _PTU_BUDGET_S="${_PTU_BUDGET_S#"${_PTU_BUDGET_S%%[!0]*}"}"
+            if [[ -z "$_PTU_BUDGET_S" || ${#_PTU_BUDGET_S} -gt 6 ]]; then
+                _PTU_BUDGET_S=3
+            fi
+            ;;
+    esac
+}
+
 # VCO-CENTRALIZED-KG: NOT a KG consumer (v0.2.101 wave-3). The former §5
 #   KG-suggestion path was retired (double emission with the pre-edit/pre-
 #   write router wrappers — review nit-6); every remaining branch (SSRF
@@ -251,6 +280,119 @@ mkdir -p "$PROJECT_ROOT/.claude/logs"
 mkdir -p "$SESSION_STATE_DIR" 2>/dev/null || true
 mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 
+# === 0. INCOMPLETE-RUN WARNING (v0.2.104) ===================================
+# A PreToolUse hook the harness kills on its `timeout` (or that crashes) does
+# NOT block: the tool call proceeds and this hook's output is discarded, so
+# the Build Anchor, SSRF guard and shell-injection scan silently did not
+# apply to that call. Owner ruling 2026-10-18: no `onFailure: "block"` —
+# tell the model instead. A killed hook cannot speak, so the NEXT run does:
+#   * every run leaves an in-progress marker
+#       ptu_inflight_<key>.<pid>.<start-epoch-ms>
+#     keyed like the Build-Anchor reads ledger (session + agent), holding
+#     only tool names (never command text — it may carry secrets);
+#   * `_ptu_exit` removes it on every normal exit (allow AND block), unless
+#     the run ended past the harness timeout (its answer was discarded) or
+#     with an exit code the harness treats as a hook error;
+#   * a marker of the same key left by a PREVIOUS run is stale when its
+#     owner is gone (pid + start-time check, _lib/pid-live.sh) or it is older
+#     than the timeout plus a margin — never while a concurrent sibling run
+#     (parallel tool calls) is still working. A stale marker is claimed by
+#     an atomic delete (one reporter even under concurrency), logged to the
+#     security log, and reported through this run's answer: the
+#     additionalContext envelope on an allow, stderr on a block (the two
+#     channels Claude Code shows the model). Its tool names are copied into
+#     this run's own marker first, so a report lost to THIS run being killed
+#     is carried to the next one.
+# The marker is written once the payload is decoded (the key needs it); the
+# harness kills at the timeout, so only a decode slower than the whole
+# budget goes unreported. MUST MATCH pre-tool-use.ps1's section 0.
+PTU_STALE_MARGIN_MS=2000
+PTU_LATE_MARGIN_MS=100
+PTU_CARRY_MAX=20
+_ptu_budget_s
+_PTU_MARKER=""
+_PTU_PRIOR_MSG=""
+case "$ANCHOR_SESSION_KEY" in
+    ''|*[!A-Za-z0-9_-]*) _PTU_KEY="default" ;;
+    *) _PTU_KEY="$ANCHOR_SESSION_KEY" ;;
+esac
+_PTU_TOOL_SAFE="${TOOL_NAME//[!A-Za-z0-9_.:-]/}"
+_PTU_TOOL_SAFE="${_PTU_TOOL_SAFE:0:100}"
+[ -n "$_PTU_TOOL_SAFE" ] || _PTU_TOOL_SAFE="unknown"
+_PTU_T0_MS=$(( _PTU_T0_US / 1000 ))
+if [ -d "$SESSION_STATE_DIR" ]; then
+    _PTU_MARKER="$SESSION_STATE_DIR/ptu_inflight_${_PTU_KEY}.$$.${_PTU_T0_MS}"
+    printf '%s\n' "$_PTU_TOOL_SAFE" > "$_PTU_MARKER" 2>/dev/null || _PTU_MARKER=""
+fi
+if [ -n "$_PTU_MARKER" ]; then
+    # shellcheck source=_lib/pid-live.sh disable=SC1091
+    [ -f "$SCRIPT_DIR/_lib/pid-live.sh" ] && . "$SCRIPT_DIR/_lib/pid-live.sh"
+    _PTU_PRIOR_TOOLS=""
+    _PTU_PRIOR_N=0
+    for _ptu_m in "$SESSION_STATE_DIR/ptu_inflight_${_PTU_KEY}."*; do
+        [ -f "$_ptu_m" ] || continue
+        [ "$_ptu_m" = "$_PTU_MARKER" ] && continue
+        _ptu_rest="${_ptu_m##*/ptu_inflight_${_PTU_KEY}.}"
+        _ptu_mpid="${_ptu_rest%%.*}"
+        _ptu_mms="${_ptu_rest#*.}"
+        case "$_ptu_mpid" in ''|*[!0-9]*) continue ;; esac
+        case "$_ptu_mms" in ''|*[!0-9]*) continue ;; esac
+        _ptu_age_ms=$(( _PTU_T0_MS - _ptu_mms ))
+        _ptu_why=""
+        if (( _ptu_age_ms > _PTU_BUDGET_S * 1000 + PTU_STALE_MARGIN_MS )); then
+            _ptu_why="overdue"
+        elif command -v vco_pid_live >/dev/null 2>&1 \
+                && ! vco_pid_live "$_ptu_mpid" "$(( _ptu_mms / 1000 ))"; then
+            _ptu_why="owner_gone"
+        fi
+        [ -n "$_ptu_why" ] || continue   # a sibling still at work: leave it
+        _ptu_tools=()
+        while IFS= read -r _ptu_t || [ -n "$_ptu_t" ]; do
+            _ptu_t="${_ptu_t//[!A-Za-z0-9_.:-]/}"
+            [ -n "$_ptu_t" ] && _ptu_tools+=("${_ptu_t:0:100}")
+        done < "$_ptu_m" 2>/dev/null
+        # The delete IS the claim: of two concurrent runs, one reports.
+        rm "$_ptu_m" 2>/dev/null || continue
+        [ "${#_ptu_tools[@]}" -gt 0 ] || _ptu_tools=("unknown")
+        for _ptu_t in "${_ptu_tools[@]}"; do
+            # Bounded: at most PTU_CARRY_MAX names are reported and carried,
+            # so a run of killed hooks cannot grow a marker without limit.
+            (( _PTU_PRIOR_N < PTU_CARRY_MAX )) || break
+            _PTU_PRIOR_N=$(( _PTU_PRIOR_N + 1 ))
+            _PTU_PRIOR_TOOLS="${_PTU_PRIOR_TOOLS:+$_PTU_PRIOR_TOOLS, }$_ptu_t"
+            printf '%s\n' "$_ptu_t" >> "$_PTU_MARKER" 2>/dev/null || true
+        done
+        echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"pre_tool_use_incomplete\",\"tools\":\"${_ptu_tools[*]}\",\"session_key\":\"$_PTU_KEY\",\"age_ms\":$_ptu_age_ms,\"reason\":\"$_ptu_why\"}" >> "$SECURITY_LOG" 2>/dev/null || true
+    done
+    if [ "$_PTU_PRIOR_N" -gt 0 ]; then
+        # Fixed ASCII text; tool names are [A-Za-z0-9_.:-] only, so the
+        # message embeds in JSON as-is. MUST MATCH pre-tool-use.ps1.
+        _PTU_PRIOR_MSG="[VCO safety check incomplete] VCO's pre-tool-use safety check did not finish for $_PTU_PRIOR_N earlier tool call(s) in this session ($_PTU_PRIOR_TOOLS): it timed out or crashed, so its checks (Build Anchor, SSRF guard, shell-injection scan) did not apply to those calls. If one of them wrote or ran something risky, review it."
+    fi
+fi
+
+# _ptu_exit <code>: every exit of this hook from here on. Removes this run's
+# marker when the run completed in time with an answer the harness acts on
+# (0 allow, 2 block), and delivers a pending stale-marker report on that
+# answer's channel. MUST MATCH pre-tool-use.ps1's Exit-PtuHook.
+_ptu_exit() {
+    local rc="$1"
+    if [ -n "$_PTU_MARKER" ] && { [ "$rc" = 0 ] || [ "$rc" = 2 ]; }; then
+        _ptu_elapsed_ms
+        if (( _PTU_ELAPSED_MS < _PTU_BUDGET_S * 1000 - PTU_LATE_MARGIN_MS )); then
+            rm -f "$_PTU_MARKER" 2>/dev/null
+            if [ -n "$_PTU_PRIOR_MSG" ]; then
+                if [ "$rc" = 0 ]; then
+                    printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "%s"}}\n' "$_PTU_PRIOR_MSG"
+                else
+                    printf '%s\n' "$_PTU_PRIOR_MSG" >&2
+                fi
+            fi
+        fi
+    fi
+    exit "$rc"
+}
+
 # Best-effort 14-day GC of stale per-session reads files. Sessions that
 # haven't been touched in two weeks are almost certainly abandoned;
 # keeping them around just wastes inodes. Errors suppressed: this is a
@@ -265,8 +407,11 @@ find "$SESSION_STATE_DIR" -maxdepth 1 -name 'reads_*.txt' -mtime +14 -delete 2>/
 # v0.2.70 Stream E (SF-1): same 14-day GC for the INJECTOR reads store
 # (seen_reads_*.txt — distinct from the Build-Anchor reads_*.txt above).
 find "$SESSION_STATE_DIR" -maxdepth 1 -name 'seen_reads_*.txt' -mtime +14 -delete 2>/dev/null || true
-# v0.2.104: same 14-day GC for the post-compact markers (compacted_*.txt).
-find "$SESSION_STATE_DIR" -maxdepth 1 -name 'compacted_*.txt' -mtime +14 -delete 2>/dev/null || true
+# v0.2.104: same 14-day GC for the post-compact markers (compacted_*.txt),
+# and a 1-day GC for in-progress markers (ptu_inflight_*, section 0) no later
+# run of their session claimed — that session is over. One find, no new spawn.
+find "$SESSION_STATE_DIR" -maxdepth 1 \( -name 'compacted_*.txt' -mtime +14 \
+    -o -name 'ptu_inflight_*' -mmin +1440 \) -delete 2>/dev/null || true
 
 # === HELPER: safe JSON field extraction ===
 _get_field() {
@@ -295,7 +440,7 @@ if [[ "$TOOL_NAME" == "WebFetch" ]]; then
             echo "   Retry; if it persists this is a broken VCO install — re-run the orchestrator's update (\`python install.py --update\` in the orchestrator root, or the launcher's Update)."
         } >&2
         echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"\",\"reason\":\"url_extraction_failed\"}" >> "$SECURITY_LOG" 2>/dev/null || true
-        exit 2
+        _ptu_exit 2
     fi
     if [[ -n "$URL" ]]; then
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
@@ -341,7 +486,7 @@ if [[ "$TOOL_NAME" == "WebFetch" ]]; then
             _SSRF_URL_ESC="${URL//\\/\\\\}"
             _SSRF_URL_ESC="${_SSRF_URL_ESC//\"/\\\"}"
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"$_SSRF_URL_ESC\"}" >> "$SECURITY_LOG" 2>/dev/null || true
-            exit 2
+            _ptu_exit 2
         fi
     fi
 fi
@@ -415,7 +560,7 @@ if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
             echo "   To write a file whose content mentions this text, use the Write tool or such a heredoc. If the command is intentional, run it manually in a terminal."
         } >&2
         echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"shell_injection_blocked\",\"pattern\":\"$INJECTION_FOUND\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
-        exit 2
+        _ptu_exit 2
     fi
 
     # Extended security scan via bash_security.py (bounded: only exit 2 is a
@@ -444,7 +589,7 @@ if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
                     echo "   Write large content with the Write tool, or split the command into smaller ones."
                 } >&2
                 echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"bash_security_too_large_unchecked\",\"bytes\":$_CMD_BYTES}" >> "$SECURITY_LOG" 2>/dev/null || true
-                exit 2
+                _ptu_exit 2
             fi
         fi
         if [[ "$SECURITY_EXIT" -eq 2 ]]; then
@@ -462,7 +607,7 @@ if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
                 echo "   $SECURITY_RESULT"
             } >&2
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"bash_security_blocked\",\"detail\":\"${SECURITY_RESULT:0:200}\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
-            exit 2
+            _ptu_exit 2
         fi
     fi
 fi
@@ -524,7 +669,7 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
         # The ledger writes ABOVE stay: they must happen PreToolUse so
         # same-turn Write-anchor checks and seen-store suppression see them.
     fi
-    exit 0
+    _ptu_exit 0
 fi
 
 # === v0.2.70 Stream C Surface 4 (Grep) — RETIRED (v0.2.101 §C6) ============
@@ -593,26 +738,9 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
                     # at its own 1 s default. VCO_PRE_TOOL_USE_TIMEOUT_S
                     # (whole seconds) MUST MATCH the `timeout` registered for
                     # pre-tool-use in .claude/settings.json — set it when you
-                    # change that registration. MUST MATCH pre-tool-use.ps1:
-                    # digits only, read as DECIMAL (leading zeros dropped, so
-                    # `08` is 8, not a bash octal error), 1..999999; anything
-                    # else -- empty, non-digit, 0, over-range -- reads as 3,
-                    # silently.
-                    _PTU_BUDGET_S="${VCO_PRE_TOOL_USE_TIMEOUT_S:-}"
-                    case "$_PTU_BUDGET_S" in
-                        ''|*[!0-9]*) _PTU_BUDGET_S=3 ;;
-                        *)
-                            _PTU_BUDGET_S="${_PTU_BUDGET_S#"${_PTU_BUDGET_S%%[!0]*}"}"
-                            if [[ -z "$_PTU_BUDGET_S" || ${#_PTU_BUDGET_S} -gt 6 ]]; then
-                                _PTU_BUDGET_S=3
-                            fi
-                            ;;
-                    esac
-                    _ptu_clock_us
-                    _PTU_ELAPSED_MS=$(( (_PTU_CLOCK_US - _PTU_T0_US) / 1000 ))
-                    if [[ "$_PTU_T0_COARSE" == 1 || "$_PTU_CLOCK_COARSE" == 1 ]]; then
-                        _PTU_ELAPSED_MS=$(( _PTU_ELAPSED_MS + 1000 ))
-                    fi
+                    # change that registration (parsed by _ptu_budget_s).
+                    _ptu_budget_s
+                    _ptu_elapsed_ms
                     _PTU_LEFT_MS=$(( _PTU_BUDGET_S * 1000 - _PTU_ELAPSED_MS - 700 ))
                     if [[ -n "$_PTU_RA_PY" ]] && (( _PTU_LEFT_MS >= 200 )); then
                         _PTU_DEADLINE="$(( _PTU_LEFT_MS / 1000 )).$(printf '%03d' $(( _PTU_LEFT_MS % 1000 )))"
@@ -633,7 +761,7 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
                         echo "    Use the Read tool on this file before overwriting it with Write."
                     } >&2
                     echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"anchor_blocked\",\"file\":\"$FILE_PATH\",\"tool\":\"Write\"}" >> "$SECURITY_LOG" 2>/dev/null || true
-                    exit 2
+                    _ptu_exit 2
                 fi
             fi
 
@@ -667,4 +795,4 @@ fi
 # tests/test_v02101_query_cache_poison_fix.py). The pre_tool_use_kg_search
 # task type stays registered in rl_kg_search's KNOWN_TASK_TYPES — the
 # historical RL corpus keeps its partition label.
-exit 0
+_ptu_exit 0

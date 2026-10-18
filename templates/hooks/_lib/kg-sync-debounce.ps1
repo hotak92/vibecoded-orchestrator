@@ -502,35 +502,18 @@ function Get-KgDebounceDir {
     return (Join-Path $ProjectRoot ".claude/state/kg_sync_pending")
 }
 
-# v0.2.103 PID-REUSE GUARD (HIGH-3, review R3 2026-10-14). `Get-Process
-# -Id` alone answers "does SOME process have this pid?" — Windows recycles
-# pids fast in a small range (and Get-Process sees every user's and
-# session's processes), so a claim left by a DEAD sync whose pid was later
-# handed to an unrelated long-lived process (a SYSTEM service after a
-# reboot) used to look "alive" FOREVER: every later edit of that file was
-# parked as a follow-up that nothing served (and the reaper skipped it).
-# A pid now counts as the claim's live owner only if the process ALSO
-# started at/before the claim's stamp (the re-stamp LastWriteTime refresh
-# happens AFTER the child process started, so a genuine owner always
-# satisfies this; a recycled pid never does).
-# Read-only, never kills anything. Soft-fail policy, decided on evidence:
-# when the process exists but its StartTime cannot be read (access denied
-# for an elevated process, process exiting) we keep the pre-guard
-# semantics (treat as live) — mis-reporting a LIVE claim as dead would
-# resurrect the duplicate-sync field defect this single-flight pass exists
-# to fix, the worse failure.
+# v0.2.103 PID-REUSE GUARD (HIGH-3): a claim's pid counts as live only if
+# the process also started at/before the claim's stamp (the re-stamp
+# LastWriteTime refresh happens AFTER the child process started). v0.2.104:
+# the check moved to its one home, _lib/pid-live.ps1 (Test-VcoPidLive), when
+# pre-tool-use's in-progress markers became its second caller; this name is
+# kept for the call-sites below. Dot-sourced unconditionally: a missing lib
+# is a broken install and must fail loudly, not degrade.
 # MUST MATCH _kg_debounce_pid_live in _lib/kg-sync-debounce.sh.
-$script:KgDebouncePidSlackSecs = 5
-# Tolerance for clock/mtime coarseness between the re-stamp and the
-# StartTime reading; a recycled pid is seconds-to-years later than the
-# stamp. MUST MATCH $_KG_DEBOUNCE_PID_SLACK_SECS in the .sh sibling.
+. (Join-Path $PSScriptRoot "pid-live.ps1")
 function Test-KgDebouncePidLive {
     param([int]$ClaimPid, [datetime]$ClaimStamp)
-    $p = Get-Process -Id $ClaimPid -ErrorAction SilentlyContinue
-    if (-not $p) { return $false }
-    try { $start = $p.StartTime }
-    catch { return $true }   # start unreadable → soft-fail live (see above)
-    return ($start -le $ClaimStamp.AddSeconds($script:KgDebouncePidSlackSecs))
+    return (Test-VcoPidLive -OwnerPid $ClaimPid -Stamp $ClaimStamp)
 }
 
 # v0.2.103 SINGLE-FLIGHT PROBE: is a sync for this lock key IN FLIGHT right

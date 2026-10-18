@@ -71,6 +71,10 @@ def test_no_unbounded_every_tool_call_writer_introduced() -> None:
         '>> "$SECURITY_LOG"',
         '>> "$SESSION_READS_FILE"',
         '>> "$_UNIFIED_READS"',
+        # v0.2.104 section 0: the in-progress marker gets carried tool names
+        # only when an earlier run was killed, capped at PTU_CARRY_MAX lines,
+        # and is deleted on every normal exit.
+        '>> "$_PTU_MARKER"',
     }
     # Collect every `>> "$..."` append target in the hook.
     import re
