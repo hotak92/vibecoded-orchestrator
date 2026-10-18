@@ -119,12 +119,9 @@ HAND_LITERAL = [
      'grep -e "`sleep 5`" f 2>&1 | head -n 5 > out.txt'),
     ("grep '$(sleep 5)' f\nwc -l f", "grep $(sleep 5) f\nwc -l f"),
     ("grep '$(sleep 5)' \\\n f", "grep $(sleep 5) \\\n f"),
-    ("echo $'\\'$(sleep 5)'", "echo $'\\\\'$(sleep 5)''"),
     ("echo '\\''$(sleep 5)'", "echo '\\'$(sleep 5)"),
-    ("grep '$(sleep 5)'$'\\n''`sleep 5`' f", "grep '$(sleep 5)'$'\\n'`sleep 5` f"),
     ("cat f | grep -c '$(sleep 5)' |& head", 'cat f | grep -c "$(sleep 5)" |& head'),
     ("grep '<(sleep 5)' f", "grep <(sleep 5) f"),
-    ("grep \"$HOME\"'$(sleep 5)' f", "grep \"$HOME$(sleep 5)\" f"),
     ("tail -n 5 '$(sleep 5)'; head -c 3 f", 'tail -n 5 "$(sleep 5)"; head -c 3 f'),
     ("git grep -n -e '$(sleep 5)'", 'git grep -n -e "$(sleep 5)"'),
     ("git log -1 --format='$(sleep 5)'", 'git log -1 --format="$(sleep 5)"'),
@@ -263,6 +260,27 @@ DEVICE_ROWS = [
     f"grep -r -D read {A} .", f"grep --devices=read -r {A} .", f"grep -rD read {A} .",
     f"git log --grep={A} -- /dev/zero", f"rg {A} /dev/zero",
 ]
+#: R14A MEDIUM-1 (Fable): spellings whose VALUE is not their text — a glob,
+#: an ANSI-C escape, a `$VAR`, `~`, `$"…"` — slipped past the device check,
+#: which read the raw text. The exception is now an allowlist: every
+#: argument and redirection target must be a plain word, so these get the
+#: base decision whatever path they would name, and the device check then
+#: reads plain words case-folded (`/DEV/zero` on a case-insensitive volume).
+PLAIN_WORD_ROWS = [
+    f"cat {A} /*/zero", f"cat {A} /d*/zero", f"cat {A} /de?/zero",
+    f"cat {A} /[d]ev/zero", f"cat {A} ../../../../../*/zero",
+    f"cat {A} $'\\x2fdev/zero'", f"cat {A} $'\\057dev/zero'",
+    f"cat {A} /dev$'\\x2f'zero", f"cat {A} < $'\\x2fdev/zero'",
+    f"cat {A} /DEV/zero", f"cat {A} /Dev/Zero", f"cat {A} /PROC/self/fd/0",
+    f"cat {A} < /DEV/ZERO", f"grep {A} *.py", f"grep {A} f > *.out",
+    f"cat {A} ~/x", f"cat {A} $F", f"cat {A} \"$F\"", f"cat {A} $\"x\"",
+    f"echo {A} > $OUT", f"echo {A} > $'\\x2fdev/null'",
+    # former HAND_LITERAL rows: an escape-bearing `$'…'` / a `$HOME` is not
+    # plain, so they keep the v0.2.103 (deny) reading now
+    "echo $'\\'$(sleep 5)'", "grep '$(sleep 5)'$'\\n''`sleep 5`' f",
+    "grep \"$HOME\"'$(sleep 5)' f",
+]
+DEVICE_ROWS += PLAIN_WORD_ROWS
 MUST_STAY_DENIED += DEVICE_ROWS
 
 
@@ -493,6 +511,7 @@ def test_a_blocking_device_gets_the_base_decision(cmd):
     ("$HOME/../../dev/tty", True), ("${X}/dev/zero", True), ("--file=/dev/stdin", True),
     ("-f/dev/stdin", True), ("-if/proc/kmsg", True), ("--x=src/dev/zero", False),
     ("/dev/null/../zero", True), ("devices", False), ("/home/u/dev/zero", False),
+    ("/DEV/zero", True), ("/Dev/NULL", False), ("/PROC/self", True),
 ])
 def test_device_path_reading(text, expected):
     from vco_lib.wait_guard_literal import _names_device_path
@@ -511,17 +530,21 @@ def _best_ms(cmd: str) -> float:
     return best
 
 
-@pytest.mark.parametrize("shape", ["quoted", "words", "ansi", "dquoted", "reject_late"])
+@pytest.mark.parametrize("shape", ["quoted", "words", "ansi", "dquoted", "reject_late",
+                                   "ansi_escape", "dquoted_var"])
 def test_200kb_command_is_linear_and_fast(shape):
     unit = {
         "quoted": "grep -n '$(sleep 5) aaaa' f | ",
         "words": "grep -n abc def ghi jkl f \\$ | ",
-        "ansi": "grep $'$(sleep 5) \\x41' f | ",
-        "dquoted": 'grep "\\$(sleep 5) $x" f | ',
+        "ansi": "grep $'$(sleep 5) A' f | ",
+        "dquoted": 'grep "\\$(sleep 5) x" f | ',
+        # not plain (an escape / a `$x`): refused, still in linear time
+        "ansi_escape": "grep $'$(sleep 5) \\x41' f | ",
+        "dquoted_var": 'grep "\\$(sleep 5) $x" f | ',
     }.get(shape, "grep -n '$(sleep 5)' f | ")
     body = unit * (200_000 // len(unit) + 1)
     cmd = body + ("wc -l" if shape != "reject_late" else "sleep 5")
     assert len(cmd) >= 200_000
-    expected: Optional[bool] = False if shape == "reject_late" else True
+    expected: Optional[bool] = shape not in ("reject_late", "ansi_escape", "dquoted_var")
     assert literal_text_only(cmd) is expected
     assert _best_ms(cmd) < 50, shape

@@ -21,16 +21,23 @@ skips the guard's static check:
 "Never run their arguments as shell code" is a statement about CODE, not
 about time: these programs DO wait when the file they read never ends or
 never answers (``cat /dev/zero``, ``grep x /dev/stdin``, a redirection to
-bash's ``/dev/tcp/<host>/<port>``). The exception therefore also refuses
-(the guard's own decision applies) any argument or redirection target that
-names a device or a ``/proc`` file — see :func:`_names_device_path`:
-everything under ``/dev/`` except ``/dev/null``, ``/dev/stdout`` and
-``/dev/stderr``, and everything under ``/proc/`` — written absolute,
-reached by climbing with ``..``, or after an unknown ``~`` / ``$VAR`` base.
-What it cannot see is a path that only an expansion produces
-(``cat "$F"``), a symlink to a device, or a named pipe (FIFO) in the
-project tree: the same boundary the guard had without the quoted text
-(``grep x "$F"`` was always allowed).
+bash's ``/dev/tcp/<host>/<port>``). So the exception reads paths the
+ALLOWLIST way: every argument and redirection target must be a PLAIN word,
+whose value is exactly its text once quotes are removed — no unquoted glob
+(``* ? [``), no ``~``, no ``$VAR`` / ``${…}``, no ``$"…"``, no ``$'…'``
+carrying an escape (brace expansion, ``$(…)`` and backticks are refused by
+the scanner itself). Anything else gets the guard's own decision; the
+quoted wait text itself is plain (``'$(sleep 5)'``, ``$'$(sleep 5)'``,
+a backslash-escaped ``$``). Then the plain words are checked, case-folded (a
+case-insensitive volume reads ``/DEV/zero`` as ``/dev/zero``), for a device
+or a ``/proc`` file — see :func:`_names_device_path`: everything under
+``/dev/`` except ``/dev/null``, ``/dev/stdout`` and ``/dev/stderr``, and
+everything under ``/proc/``, written absolute or reached by climbing with
+``..``. What it cannot see is a symlink to a device or a named pipe (FIFO)
+in the project tree, and a recursive walk from ``/`` (``grep -r x /``
+walks ``/proc`` and ``/sys`` — a long walk, not a device read): the same
+boundary the guard had without the quoted text (``grep -r x /`` was
+always allowed).
 
 Anything that does not match exactly answers ``False`` and the guard's
 v0.2.103 decision applies unchanged. The scanner is a single linear pass
@@ -226,6 +233,8 @@ def _path_names_device(path: str) -> bool:
             continue                          # `/..` is `/`
         else:
             parts.append(part)
+    # case-folded: `/DEV/zero` IS `/dev/zero` on a case-insensitive volume
+    parts = [p.lower() for p in parts]
     # an unknown base (`~`, `~user`, `$HOME`, `${X}`) may be `/` or empty
     unknown_base = bool(parts) and (parts[0].startswith("~") or "$" in parts[0])
     k = 1 if unknown_base else 0
@@ -250,7 +259,8 @@ def _names_device_path(text: str) -> bool:
     or a FIFO under ``/dev``) and anything under ``/proc/``
     (``/proc/self/fd/0``, ``/proc/kmsg``). A glob counts as its text:
     ``/dev/z*`` is refused."""
-    if "dev" not in text and "proc" not in text:
+    folded = text.lower()
+    if "dev" not in folded and "proc" not in folded:
         return False                          # the common case: one scan
     return any(_path_names_device(c) for c in _device_candidates(text))
 
@@ -287,8 +297,9 @@ def _scan(command: str) -> Optional[List[List[_Word]]]:
                 target = "".join(buf)
                 if dup_pending and not (plain and _FD_DUP_TARGET.match(target)):
                     broken = True
+                # only a plain target (its value is its text) is read, and
                 # a network device connects, `< /dev/zero` never ends
-                if _names_device_path(target):
+                if live or _names_device_path(target):
                     broken = True
                 dup_pending = False
             else:
@@ -402,7 +413,9 @@ def _scan(command: str) -> Optional[List[List[_Word]]]:
                 live = live or "\\" in body
                 i = m.end()
             elif nxt == '"':
-                i += 1                        # $"…" — a double-quoted string
+                # $"…" is a locale-TRANSLATED string: its value is not its text
+                in_word, plain, live = True, False, True
+                i += 1
             elif nxt in ("(", "{", "["):
                 return None
             elif nxt and _PARAM_START.match(nxt):
@@ -461,15 +474,20 @@ def _segment_allowed(words: List[_Word]) -> bool:
     name, _live, plain = words[0]
     if not plain or not _BARE_NAME.match(name) or name not in LITERAL_ALLOWLIST:
         return False
-    if any(_names_device_path(t) for t, _l, _p in words[1:]):
+    # Every argument must be a PLAIN word — its value is exactly its text
+    # (quotes removed): no glob, no `~`, no `$VAR`, no `$"…"`, no `$'…'` with
+    # an escape. Only then can the device check below read the path it
+    # names; `/d*/zero`, `$'\x2fdev/zero'` would otherwise slip past it.
+    if any(live for _t, live, _p in words[1:]):
+        return False
+    args = [t for t, _l, _p in words[1:]]
+    if any(_names_device_path(t) for t in args):
         return False                          # `cat /dev/zero` never ends
-    if name in _GREP_FAMILY and not _grep_devices_ok([t for t, _l, _p in words[1:]]):
+    if name in _GREP_FAMILY and not _grep_devices_ok(args):
         return False
     if name in _INERT:
         return True
-    if any(live for _t, live, _p in words[1:]):
-        return False
-    return _CHECKED[name]([t for t, _l, _p in words[1:]])
+    return _CHECKED[name](args)
 
 
 def literal_text_only(command: str) -> bool:
