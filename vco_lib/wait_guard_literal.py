@@ -18,6 +18,20 @@ skips the guard's static check:
     would expand — so that any ``$(…)`` / backtick text in it can only sit
     inside single quotes, ``$'…'``, or a backslash escape?
 
+"Never run their arguments as shell code" is a statement about CODE, not
+about time: these programs DO wait when the file they read never ends or
+never answers (``cat /dev/zero``, ``grep x /dev/stdin``, a redirection to
+bash's ``/dev/tcp/<host>/<port>``). The exception therefore also refuses
+(the guard's own decision applies) any argument or redirection target that
+names a device or a ``/proc`` file — see :func:`_names_device_path`:
+everything under ``/dev/`` except ``/dev/null``, ``/dev/stdout`` and
+``/dev/stderr``, and everything under ``/proc/`` — written absolute,
+reached by climbing with ``..``, or after an unknown ``~`` / ``$VAR`` base.
+What it cannot see is a path that only an expansion produces
+(``cat "$F"``), a symlink to a device, or a named pipe (FIFO) in the
+project tree: the same boundary the guard had without the quoted text
+(``grep x "$F"`` was always allowed).
+
 Anything that does not match exactly answers ``False`` and the guard's
 v0.2.103 decision applies unchanged. The scanner is a single linear pass
 over the raw text (regex jumps over ordinary runs, ``str.find`` over quoted
@@ -54,6 +68,23 @@ _INERT = frozenset({
     "grep", "egrep", "fgrep", "cat", "head", "wc", "uniq", "cut", "tr",
     "ls", "echo",
 })
+
+
+_GREP_FAMILY = frozenset({"grep", "egrep", "fgrep"})
+
+
+def _grep_devices_ok(args: List[str]) -> bool:
+    # `-D read` / `--devices=read` makes a recursive grep READ every device
+    # and FIFO it meets (a FIFO blocks, `/dev/zero` never ends); getopt
+    # abbreviates, so refuse every `--de…` and any short cluster with `D`.
+    for a in args:
+        if a == "--":
+            return True
+        if a.startswith("--de"):
+            return False
+        if a.startswith("-") and not a.startswith("--") and "D" in a:
+            return False
+    return True
 
 
 def _tail_ok(args: List[str]) -> bool:
@@ -167,6 +198,63 @@ _FD_DUP_TARGET = re.compile(r"^(?:[0-9]+-?|-)$")
 #: A bare program name — no quoting, expansion, glob or path.
 _BARE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_+.-]*$")
 
+#: The only device files the exception accepts: they never block.
+_SAFE_DEVICES = frozenset({"null", "stdout", "stderr"})
+
+
+def _device_candidates(text: str) -> List[str]:
+    """The strings in one word that could be a path: the word, the value of
+    an ``--opt=value`` / ``opt=value`` form, and every tail of a short-option
+    cluster (``-f/dev/stdin`` names ``/dev/stdin``)."""
+    out = [text]
+    if "=" in text:
+        out.append(text.split("=", 1)[1])
+    if text.startswith("-") and not text.startswith("--"):
+        out.extend(text[k:] for k in range(1, len(text)))
+    return out
+
+
+def _path_names_device(path: str) -> bool:
+    absolute = path.startswith("/")
+    parts: List[str] = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == ".." and parts and parts[-1] != "..":
+            parts.pop()
+        elif part == ".." and absolute and not parts:
+            continue                          # `/..` is `/`
+        else:
+            parts.append(part)
+    # an unknown base (`~`, `~user`, `$HOME`, `${X}`) may be `/` or empty
+    unknown_base = bool(parts) and (parts[0].startswith("~") or "$" in parts[0])
+    k = 1 if unknown_base else 0
+    climbed = False
+    while k < len(parts) and parts[k] == "..":
+        k += 1
+        climbed = True
+    if k >= len(parts) or not (absolute or climbed or unknown_base):
+        return False
+    if parts[k] == "proc":
+        return True
+    # `/dev` itself too: `grep -r -D read x /dev` reads every device in it
+    return parts[k] == "dev" and (k + 1 >= len(parts) or parts[k + 1] not in _SAFE_DEVICES)
+
+
+def _names_device_path(text: str) -> bool:
+    """True when ``text`` (one word or redirection target, quotes removed)
+    can name a file that blocks or never ends: anything under ``/dev/``
+    except ``/dev/null`` / ``/dev/stdout`` / ``/dev/stderr`` (``/dev/zero``,
+    ``/dev/random``, ``/dev/urandom``, ``/dev/full``, ``/dev/stdin``,
+    ``/dev/tty``, ``/dev/fd/N``, bash's ``/dev/tcp`` / ``/dev/udp``, a pts
+    or a FIFO under ``/dev``) and anything under ``/proc/``
+    (``/proc/self/fd/0``, ``/proc/kmsg``). A glob counts as its text:
+    ``/dev/z*`` is refused."""
+    if "dev" not in text and "proc" not in text:
+        return False                          # the common case: one scan
+    return any(_path_names_device(c) for c in _device_candidates(text))
+
+
 _Word = Tuple[str, bool, bool]   # (text, live, plain)
 
 
@@ -196,7 +284,11 @@ def _scan(command: str) -> Optional[List[List[_Word]]]:
                 # `>&word` with a word that is not an fd number is bash's
                 # `&>word`, and bash EXPANDS that word a second time —
                 # `echo x >&'$(sleep 5)'` RUNS the sleep (probed, bash 5.2).
-                if dup_pending and not (plain and _FD_DUP_TARGET.match("".join(buf))):
+                target = "".join(buf)
+                if dup_pending and not (plain and _FD_DUP_TARGET.match(target)):
+                    broken = True
+                # a network device connects, `< /dev/zero` never ends
+                if _names_device_path(target):
                     broken = True
                 dup_pending = False
             else:
@@ -368,6 +460,10 @@ def _scan(command: str) -> Optional[List[List[_Word]]]:
 def _segment_allowed(words: List[_Word]) -> bool:
     name, _live, plain = words[0]
     if not plain or not _BARE_NAME.match(name) or name not in LITERAL_ALLOWLIST:
+        return False
+    if any(_names_device_path(t) for t, _l, _p in words[1:]):
+        return False                          # `cat /dev/zero` never ends
+    if name in _GREP_FAMILY and not _grep_devices_ok([t for t, _l, _p in words[1:]]):
         return False
     if name in _INERT:
         return True

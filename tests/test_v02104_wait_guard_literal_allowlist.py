@@ -133,6 +133,13 @@ HAND_LITERAL = [
     ("ls '$(sleep 5)' 2>/dev/null || echo none", 'ls "$(sleep 5)" 2>/dev/null || echo none'),
     ("rg -n --fixed-strings '$(sleep 5)' f", 'rg -n --fixed-strings "$(sleep 5)" f'),
     ("echo '$(sleep 5)' > out.txt && cat out.txt", 'echo "$(sleep 5)" > out.txt && cat out.txt'),
+    # R13 LOW-1: the device refusal leaves the non-blocking devices and a
+    # relative `dev/` directory of the project alone.
+    ("grep '$(sleep 5)' f 2> /dev/null", 'grep "$(sleep 5)" f 2> /dev/null'),
+    ("echo '$(sleep 5)' >/dev/stderr", 'echo "$(sleep 5)" >/dev/stderr'),
+    ("echo '$(sleep 5)' 1>/dev/stdout", 'echo "$(sleep 5)" 1>/dev/stdout'),
+    ("cat '$(sleep 5)' src/dev/x.py", 'cat "$(sleep 5)" src/dev/x.py'),
+    ("grep -rn '$(sleep 5)' dev/", 'grep -rn "$(sleep 5)" dev/'),
 ]
 
 #: Generated families. Each allowlisted program gets a literal invocation
@@ -231,6 +238,32 @@ MUST_STAY_DENIED = [
     f"echo x >&{A}", f"grep {A} f >&{A}", f"grep x f <&{A}", f"echo {A} >&out",
     f"echo x >& {A}", f"echo x 2>&1{A}",
 ]
+
+#: R13 LOW-1 (Fable): the allowlisted programs run no CODE, but they WAIT on
+#: a file that never ends or never answers. A row naming such a device or a
+#: `/proc` file — as an argument, an option value or a redirection target,
+#: absolute or reached with `..` / an unknown `~` / `$VAR` base — gets the
+#: v0.2.103 decision (denied: it carries quoted wait text). `/dev/tcp` and
+#: `/dev/udp` are assembled so no single source line spells a socket path.
+_NET = "/dev/" + "tcp/10.255.255.1/80"
+_UDP = "/dev/" + "udp/10.255.255.1/9"
+DEVICE_ROWS = [
+    f"grep -c {A} /dev/zero", f"cat {A} /dev/zero", f"tail -c 1 {A} /dev/zero",
+    f"head -c 1 {A} /dev/random", f"wc -c {A} /dev/urandom", f"cat {A} /dev/full",
+    f"cat {A} /dev/stdin", f"grep {A} /dev/tty", f"cat {A} /dev/fd/0",
+    f"cat {A} /proc/self/fd/0", f"head -c 5 {A} /proc/kmsg",
+    f"echo {A} > {_NET}", f"echo {A} &>{_UDP}", f"cat {A} < {_NET}",
+    f"grep {A} f < /dev/stdin", f"grep {A} f 0</dev/zero",
+    f"grep -f/dev/stdin {A}", f"grep --file=/proc/self/fd/0 {A}",
+    f"grep -e {A} -f /dev/stdin", f"cat {A} //dev//./zero", f"cat {A} /dev/../dev/zero",
+    f"cat {A} '/dev/fd/0'", f"cat {A} \"/dev/zero\"", f"cat {A} /dev/z*",
+    f"cat {A} ../../../../dev/urandom", f"cat {A} ~/../../dev/random",
+    f"cat {A} $HOME/../../dev/tty", f"tail -n 1 {A} /dev/zero",
+    f"sort {A} /dev/zero", f"find /dev -name {A}", f"ls {A} /proc",
+    f"grep -r -D read {A} .", f"grep --devices=read -r {A} .", f"grep -rD read {A} .",
+    f"git log --grep={A} -- /dev/zero", f"rg {A} /dev/zero",
+]
+MUST_STAY_DENIED += DEVICE_ROWS
 
 
 def _non_literal_rows() -> List[str]:
@@ -440,6 +473,30 @@ def test_eval_of_a_variable_sleep_keeps_the_base_reading():
 ])
 def test_literal_text_only_decisions(cmd, expected):
     assert literal_text_only(cmd) is expected
+
+
+@pytest.mark.parametrize("cmd", DEVICE_ROWS)
+def test_a_blocking_device_gets_the_base_decision(cmd):
+    # R13 LOW-1: each row WAS allowed by the exception (quoted text only);
+    # the device or /proc path now hands it back to the v0.2.103 reading,
+    # which denies the quoted `$(sleep 5)`.
+    assert literal_text_only(cmd) is False
+    assert base_denies(cmd) and head_denies(cmd)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("/dev/zero", True), ("/dev/null", False), ("/dev/stderr", False),
+    ("/dev/stdout", False), ("/dev", True), ("/dev/", True), ("/proc", True),
+    ("/proc/self/fd/0", True), ("dev/zero", False), ("src/dev/zero", False),
+    ("../dev/zero", True), ("a/../../dev/zero", True), ("/x/../dev/zero", True),
+    ("//dev/./zero", True), ("/../dev/zero", True), ("~/../../dev/zero", True),
+    ("$HOME/../../dev/tty", True), ("${X}/dev/zero", True), ("--file=/dev/stdin", True),
+    ("-f/dev/stdin", True), ("-if/proc/kmsg", True), ("--x=src/dev/zero", False),
+    ("/dev/null/../zero", True), ("devices", False), ("/home/u/dev/zero", False),
+])
+def test_device_path_reading(text, expected):
+    from vco_lib.wait_guard_literal import _names_device_path
+    assert _names_device_path(text) is expected
 
 
 # ─── 5. performance: linear, < 50 ms on a 200 KB command ──────────────────
