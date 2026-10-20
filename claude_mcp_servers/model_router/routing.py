@@ -46,7 +46,7 @@ window exists at all.
 from __future__ import annotations
 
 import difflib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Collection, Mapping, Optional
 
 from .vendors import (
@@ -54,7 +54,6 @@ from .vendors import (
     FALLBACK_LADDER,
     FallbackRung,
     VENDORS,
-    AnthropicApiKey,
     AnthropicFamily,
     CLAUDE_ID_MARKERS,
     Vendor,
@@ -62,13 +61,6 @@ from .vendors import (
 
 #: Claude Code's 1M-context-variant suffix.
 ONE_M_SUFFIX = "[1m]"
-
-#: How a route authenticates upstream — the ``auth`` field of the usage
-#: ledger row and the reason it exists: a request billed to a Console API key
-#: must be distinguishable from one served by the Claude login after the fact.
-AUTH_OAUTH = "oauth"
-AUTH_API_KEY = "api_key"
-AUTH_VENDOR_KEY = "vendor_key"
 
 
 @dataclass(frozen=True)
@@ -85,7 +77,7 @@ class Route:
         vendor: the vendor row, or ``None`` for the first-party Claude route.
         family_id: ``vendor_id`` or the Anthropic family id; used as the
             per-family key in logs, catalog caches and ``/health``.
-        is_anthropic: True for the first-party route (OAuth or API key).
+        is_anthropic: True for the first-party OAuth route.
         one_m_requested: the requested id carried ``[1m]``.
     """
 
@@ -99,26 +91,6 @@ class Route:
     #: this flag is the only surviving record that the user asked for the
     #: 1M-context variant. The server turns it into the beta header.
     one_m_requested: bool = False
-    #: Set on the first-party route billed to a Console API key
-    #: (the ``AnthropicApiKey`` namespace, or the opt-in subscription
-    #: fallback); ``None``
-    #: on the OAuth route and on every vendor route.
-    api_key: Optional[AnthropicApiKey] = None
-    #: v0.2.104: this API-key attempt was sent STRAIGHT to the key because the
-    #: subscription is latched out of quota (:mod:`model_router.quota_latch`)
-    #: — no subscription attempt preceded it. Rides into the ledger row.
-    latched: bool = False
-
-    @property
-    def auth(self) -> str:
-        """:data:`AUTH_VENDOR_KEY`, :data:`AUTH_API_KEY` or :data:`AUTH_OAUTH`.
-
-        Derived, never stored, so a route cannot claim one credential while
-        carrying the fields of another.
-        """
-        if self.vendor is not None:
-            return AUTH_VENDOR_KEY
-        return AUTH_API_KEY if self.api_key is not None else AUTH_OAUTH
 
 
 @dataclass(frozen=True)
@@ -176,27 +148,6 @@ def split_namespace(
             best = (vendor, model_id[len(vendor.namespace):])
             best_len = len(vendor.namespace)
     return best
-
-
-def api_key_remainder(
-    model_id: str,
-    vendors: Mapping[str, Vendor] = VENDORS,
-    anthropic: AnthropicFamily = ANTHROPIC_FAMILY,
-) -> Optional[str]:
-    """The Claude id after the API-key namespace, or ``None`` when
-    ``model_id`` is not on that route. The longest namespace wins, as between
-    vendor rows: the API-key namespace may EXTEND a vendor's
-    without being shadowed by it. The ONE home of that rule — the router, the
-    id parser and the context table all ask here, so ``<API-key namespace><id>``
-    reads the first-party ``<id>`` row everywhere (v0.2.104: the ledger's
-    ``window_actual`` read ``unknown`` on every API-key row before)."""
-    api = anthropic.api_key
-    if api is None or not model_id.startswith(api.namespace):
-        return None
-    vendor, _rest = split_namespace(model_id, vendors)
-    if vendor is not None and len(vendor.namespace) >= len(api.namespace):
-        return None
-    return model_id[len(api.namespace):]
 
 
 def _bare_prefix_match(
@@ -382,64 +333,6 @@ def _vendor_route(
     )
 
 
-def _api_key_route(
-    anthropic: AnthropicFamily,
-    api: AnthropicApiKey,
-    raw_remainder: str,
-) -> Route | RouteError:
-    """The first-party route billed to the Console API key.
-
-    Serves first-party Claude ids ONLY: the namespace is a credential choice
-    for Anthropic's own endpoint, so a non-Claude remainder is refused here
-    (it would only come back as Anthropic's ``not_found_error``).
-    """
-    remainder = strip_1m(raw_remainder).strip()
-    if not remainder:
-        return RouteError(
-            400,
-            f"model id {api.namespace!r} names a namespace but no model. "
-            f"Use {api.namespace}<claude-model-id>.",
-            "empty_namespaced_id",
-        )
-    if not has_claude_marker(remainder):
-        return RouteError(
-            400,
-            f"{api.namespace}<id> serves first-party Claude models through "
-            f"the API key; {remainder!r} is not one. Pick a Claude model "
-            "under this prefix, or the vendor model under its own prefix.",
-            "non_claude_id_to_api_key",
-        )
-    return Route(
-        upstream=anthropic.upstream,
-        forward_model=remainder,
-        vendor=None,
-        family_id=anthropic.family_id,
-        is_anthropic=True,
-        one_m_requested=raw_remainder.endswith(ONE_M_SUFFIX),
-        api_key=api,
-    )
-
-
-def api_key_fallback_route(
-    decision: Route, anthropic: AnthropicFamily = ANTHROPIC_FAMILY,
-) -> Optional[Route]:
-    """The SAME model on the API-key route, for the subscription fallback.
-
-    ``None`` unless ``decision`` is the first-party OAuth route with a model
-    to forward and ``anthropic`` offers an API-key route. WHERE only — whether
-    to take it (the opt-in setting, the quota verdict, a resolvable key) is
-    the server's decision, like :func:`fallback_route`.
-    """
-    if (
-        not decision.is_anthropic
-        or decision.api_key is not None
-        or anthropic.api_key is None
-        or not decision.forward_model
-    ):
-        return None
-    return replace(decision, api_key=anthropic.api_key)
-
-
 def route(
     model_id: str,
     vendors: Mapping[str, Vendor] = VENDORS,
@@ -450,9 +343,6 @@ def route(
 
     Resolution order, first match wins:
 
-    0. the API-key namespace (``anthropic.api_key``), when it is the longest
-       matching namespace -> the first-party route with the Console key
-       (Claude ids only);
     1. an explicit vendor namespace (``<namespace><id>``) — refused with the
        closest valid ids when the row is not known to serve the remainder
        (see :func:`_vendor_route`);
@@ -478,10 +368,6 @@ def route(
     model_id = model_id.strip()
 
     vendor, remainder = split_namespace(model_id, vendors)
-    api = anthropic.api_key
-    api_rest = api_key_remainder(model_id, vendors, anthropic)
-    if api is not None and api_rest is not None:
-        return _api_key_route(anthropic, api, api_rest)
     if vendor is not None:
         return _vendor_route(
             vendor, remainder, raw_id=model_id, vendors=vendors,
@@ -636,15 +522,11 @@ def _rung_route(
 
 
 __all__ = [
-    "AUTH_API_KEY",
-    "AUTH_OAUTH",
-    "AUTH_VENDOR_KEY",
     "MAX_SUGGESTIONS",
     "ONE_M_SUFFIX",
     "Route",
     "RouteError",
     "advertised_id",
-    "api_key_fallback_route",
     "fallback_route",
     "has_claude_marker",
     "route",

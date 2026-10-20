@@ -1413,8 +1413,8 @@ def _quota_retry_env(base_env: dict) -> "dict | None":
     """The child env for the ONE quota retry on the Console API key, or None.
 
     v0.2.104 API-1: when the subscription is out of usage, the launcher
-    setting that arms the model gateway's subscription -> API-key fallback
-    (``model_gateway.api_key_fallback``) also allows this job ONE retry with
+    setting for background jobs' API-key retry
+    (``model_gateway.api_key_fallback``) allows this job ONE retry with
     VCO's shared ``ANTHROPIC_API_KEY_GATEWAY`` secret, handed to the child as
     ``ANTHROPIC_API_KEY`` in its environment only (never argv, never a file,
     never a log line). The decision lives in
@@ -1487,9 +1487,9 @@ def call_cli(prompt: str) -> str:
 
     v0.2.104 API-1: a failure the classifier reads as ``quota`` (the
     subscription out of usage) gets ONE retry with the shared
-    ``ANTHROPIC_API_KEY_GATEWAY`` Console key when the launcher's API-key
-    fallback switch is ON — see :func:`_quota_retry_env`. When that retry
-    serves, the rest of THIS process goes straight to the key
+    ``ANTHROPIC_API_KEY_GATEWAY`` Console key when the launcher's
+    background-job API-key switch is ON — see :func:`_quota_retry_env`.
+    When that retry serves, the rest of THIS process goes straight to the key
     (:data:`_API_KEY_MEMO`): one subscription spawn per process during an
     outage, not one per node. A key refusal (auth, or quota on the key)
     ends that for the process and the call falls back to the subscription;

@@ -51,54 +51,6 @@ export interface GatewayHealth {
   usage_ledger?: GatewayUsageLedger | null;
   /** `owner_only` | `broader` | `unknown` for the gateway's token file. */
   token_file_permissions: string;
-  /**
-   * v0.2.104: which credential first-party Claude requests use NOW, as the
-   * running gateway reads the launcher setting, and whether the Claude API
-   * key resolves. Absent from an older gateway.
-   */
-  anthropic_auth?: GatewayAnthropicAuth | null;
-}
-
-/** `/health`'s `anthropic_auth` block (v0.2.104). */
-export interface GatewayAnthropicAuth {
-  /** The mode in force: `oauth` | `api_key` (a later release may add more). */
-  mode: string;
-  /** `available` | `missing` | `rejected` (Anthropic refused this key) |
-   *  `unknown` (not resolved yet — ask again). */
-  api_key: string;
-  /** The opt-in subscription -> API-key fallback (Preferences). */
-  api_key_fallback: boolean;
-  /** The secret name the gateway resolves the key from. */
-  api_key_secret: string | null;
-  /**
-   * `ok`, or `unreadable` while the gateway cannot read the launcher DB and
-   * keeps applying the LAST setting it read. Absent from older gateways.
-   */
-  launcher_db?: string;
-  /** Short error class / SQLite text while `launcher_db` is `unreadable`. */
-  launcher_db_error?: string | null;
-  /** UTC ISO start of the unreadable streak. */
-  launcher_db_unreadable_since?: string | null;
-  /**
-   * The subscription-out latches in force (empty when none): Claude requests
-   * in `scope` go straight to the API key until `until`. Absent from a
-   * gateway older than the latch.
-   */
-  quota_latch?: GatewayQuotaLatch[];
-}
-
-/** One subscription-out latch (`model_router.quota_latch.Latch.as_dict`). */
-export interface GatewayQuotaLatch {
-  /** `5h` | `weekly` | `weekly:<Model>` | `unknown`. */
-  limit: string;
-  /** `all`, or the model word it covers (`opus`). */
-  scope: string;
-  /** UTC ISO end of the latch. */
-  until: string;
-  /** UTC ISO start. */
-  since: string;
-  /** `refusal_headers` | `usage_windows` | `reset_hint` | `conservative`. */
-  source: string;
 }
 
 /** `/health`'s `secret_scope` block. */

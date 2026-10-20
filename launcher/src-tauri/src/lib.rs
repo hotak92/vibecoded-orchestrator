@@ -3194,8 +3194,6 @@ pub fn run() {
             commands::codegraph_parsers::codegraph_parsers_decline,
             commands::codegraph_parsers::codegraph_parsers_install,
             commands::gateway_usage::model_gateway_usage_windows,
-            commands::gateway_anthropic_auth::model_gateway_anthropic_auth_get,
-            commands::gateway_anthropic_auth::model_gateway_anthropic_auth_set,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.
@@ -3294,6 +3292,7 @@ pub fn run() {
             // GAP-2 (2026-07-14): per-project bulk "disable shared secrets"
             // opt-out toggle (mirror of the shared-KG read gate).
             commands::secrets_cmd::get_shared_secrets_read_disabled_cmd,
+            commands::secrets_cmd::list_slot_exclusive_secret_names,
             commands::secrets_cmd::set_shared_secrets_read_disabled,
             // 0.2.x backlog #3: shared-tab key-collision shadow badge.
             commands::secrets_cmd::list_user_secret_keys_v2,

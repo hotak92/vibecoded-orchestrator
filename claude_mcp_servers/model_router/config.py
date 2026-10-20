@@ -258,73 +258,6 @@ def context_guard_margin() -> int:
     """
     return env_int(CONTEXT_GUARD_MARGIN_ENV, CONTEXT_GUARD_MARGIN_DEFAULT, minimum=1)
 
-#: The launcher ``app_state`` key (``~/.vct/launcher.db``) that turns on the
-#: SUBSCRIPTION -> API-KEY fallback: a first-party Claude request whose
-#: subscription answer is a qualifying quota refusal (the OD-9 trigger) is
-#: retried once on the same model through the Console API key
-#: (``vendors.ANTHROPIC_API_KEY_ROUTE``). It spends money, so it is OFF unless
-#: the row says ``true``/``1`` — the spelling the launcher's
-#: ``app_state_set_bool`` writes. Written by Preferences → Model gateway.
-#: MUST MATCH ``APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK`` in
-#: ``launcher/src/lib/preferences/loaders.ts`` (parity-tested).
-API_KEY_FALLBACK_APP_STATE_KEY = "model_gateway.api_key_fallback"
-
-
-def api_key_fallback_enabled(db_path: Optional[Path] = None) -> bool:
-    """Whether the opt-in subscription -> API-key fallback is ON.
-
-    Absent row, no launcher DB, any other value: OFF — a setting that bills
-    the user must be positively ON, never on by accident. A launcher DB that
-    EXISTS but cannot be read raises
-    :class:`vco_lib.launcher_db_reader.LauncherDbUnreadable`: that is not an
-    answer, and the gateway keeps its previous value rather than guess
-    (``api_key_route.CachedSetting``). ``db_path`` overrides the
-    launcher DB discovery (``VCT_LAUNCHER_DB_PATH`` → the state dir's
-    ``launcher.db``) for tests.
-    """
-    # Deferred: ``launcher_db_reader`` opens SQLite, which nothing else in
-    # this module needs at import time.
-    from vco_lib.launcher_db_reader import read_app_state_value_strict  # noqa: PLC0415
-
-    raw = read_app_state_value_strict(API_KEY_FALLBACK_APP_STATE_KEY, db_path=db_path)
-    return raw is not None and raw.strip().lower() in ("true", "1")
-
-
-#: The launcher ``app_state`` key holding the GLOBAL first-party auth mode
-#: (owner order 2026-10-18; the homepage "Anthropic: OAuth | API key"
-#: switch): which credential EVERY first-party Claude request through the
-#: gateway uses. A mode VALUE, not a boolean, so a later mode (another account,
-#: another key) is one more value rather than a redesign. Written by the
-#: launcher's ``model_gateway_set_anthropic_auth`` command. MUST MATCH
-#: ``ANTHROPIC_AUTH_APP_STATE_KEY`` in
-#: ``launcher/src-tauri/src/commands/gateway_anthropic_auth.rs`` (parity-tested).
-ANTHROPIC_AUTH_APP_STATE_KEY = "model_gateway.anthropic_auth"
-
-#: The modes. ``oauth`` (the default, today's behaviour): the Claude login.
-#: ``api_key``: the Console key of ``vendors.ANTHROPIC_API_KEY_ROUTE`` — with
-#: no key resolvable a first-party request is then REFUSED (503), never
-#: quietly sent with the login instead.
-ANTHROPIC_AUTH_OAUTH = "oauth"
-ANTHROPIC_AUTH_API_KEY = "api_key"
-ANTHROPIC_AUTH_MODES = (ANTHROPIC_AUTH_OAUTH, ANTHROPIC_AUTH_API_KEY)
-
-
-def anthropic_auth_mode(db_path: Optional[Path] = None) -> str:
-    """The persisted first-party auth mode.
-
-    Anything but a known mode — no row, no DB, a typo — is
-    :data:`ANTHROPIC_AUTH_OAUTH`: the mode that bills a different pool is
-    never reached by accident. An existing but unreadable launcher DB raises
-    :class:`vco_lib.launcher_db_reader.LauncherDbUnreadable` (see
-    :func:`api_key_fallback_enabled`).
-    """
-    from vco_lib.launcher_db_reader import read_app_state_value_strict  # noqa: PLC0415
-
-    raw = read_app_state_value_strict(ANTHROPIC_AUTH_APP_STATE_KEY, db_path=db_path)
-    value = (raw or "").strip().lower()
-    return value if value in ANTHROPIC_AUTH_MODES else ANTHROPIC_AUTH_OAUTH
-
-
 _TOKEN_BASENAME = "model-gateway.token"
 _PID_BASENAME = "model-gateway.pid"
 _PORT_BASENAME = "model-gateway.port"
@@ -754,15 +687,8 @@ __all__ = [
     "UPSTREAM_CONNECT_TIMEOUT_S",
     "SERVICE_NAME",
     "LAST_PORT_BASENAME",
-    "ANTHROPIC_AUTH_API_KEY",
-    "ANTHROPIC_AUTH_APP_STATE_KEY",
-    "ANTHROPIC_AUTH_MODES",
-    "ANTHROPIC_AUTH_OAUTH",
-    "API_KEY_FALLBACK_APP_STATE_KEY",
     "GatewayConfig",
     "HostNotLoopbackError",
-    "anthropic_auth_mode",
-    "api_key_fallback_enabled",
     "context_guard_margin",
     "credentials_path",
     "explicit_port",

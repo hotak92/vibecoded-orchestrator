@@ -19,7 +19,6 @@ import {
   fetchUsage,
   isEstimate,
   INITIAL_CARD_STATE,
-  latchNote,
   nextPollMs,
   percentText,
   restartOffered,
@@ -319,28 +318,6 @@ describe('per-agent attribution (v0.2.102 G3 — who actually answered)', () => 
       ),
     ).toBe('glm-5.3-flash (fallback from anthropic:claude-haiku-4-5)');
   });
-
-  it('says when a turn was billed to the Claude API key (v0.2.104)', () => {
-    const viaKey = agentRow({
-      agent: null,
-      model: 'claude-opus-5-5',
-      fallback_from: 'anthropic:claude-opus-5-5',
-      auth: 'api_key',
-    });
-    expect(agentAnswer(viaKey)).toBe(
-      'claude-opus-5-5 via Claude API key (fallback from anthropic:claude-opus-5-5)',
-    );
-    expect(agentAnswer(agentRow({ model: 'claude-opus-5-5', auth: 'api_key' }))).toBe(
-      'claude-opus-5-5 via Claude API key',
-    );
-    expect(agentAnswer(agentRow({ auth: 'vendor_key' }))).toBe('glm-5.3');
-  });
-
-  it('keeps a main-chat row billed to the API key even without a fallback', () => {
-    const picked = agentRow({ agent: null, model: 'claude-opus-5-5', auth: 'api_key' });
-    const plain = agentRow({ agent: null, model: 'claude-opus-5-5', auth: 'oauth' });
-    expect(visibleAgents(snapshot([], false, [picked, plain]))).toEqual([picked]);
-  });
 });
 
 describe('fetchUsage (review F4/F15: the bridge error is surfaced, not swallowed)', () => {
@@ -378,30 +355,5 @@ describe('fetchUsage (review F4/F15: the bridge error is surfaced, not swallowed
     vi.mocked(tauriAvailable).mockReturnValue(false);
     await expect(fetchUsage()).resolves.toBeNull();
     expect(invoke).not.toHaveBeenCalled();
-  });
-});
-
-describe('latchNote (v0.2.104: the subscription-out latch)', () => {
-  const latch = {
-    limit: '5h',
-    scope: 'all',
-    until: '2026-10-18T14:00:00Z',
-    since: '2026-10-18T11:00:00Z',
-    source: 'refusal_headers',
-  };
-
-  it('shows the gateway text verbatim while a latch is reported', () => {
-    const v = vendor({ api_key_latch: [latch], api_key_latch_text: '→ API key until 16:00' });
-    expect(latchNote(v)).toBe('→ API key until 16:00');
-  });
-
-  it('is null when there is no latch, including from an older gateway', () => {
-    expect(latchNote(vendor())).toBeNull();
-    expect(latchNote(vendor({ api_key_latch: [] }))).toBeNull();
-    expect(latchNote(vendor({ api_key_latch_text: 'stale text' }))).toBeNull();
-  });
-
-  it('still says something when the text is missing', () => {
-    expect(latchNote(vendor({ api_key_latch: [latch] }))).toContain('API key');
   });
 });

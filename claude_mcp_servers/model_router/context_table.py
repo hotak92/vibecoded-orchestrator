@@ -102,7 +102,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from .model_family import is_older_sibling, parse_model_id
-from .routing import api_key_remainder, split_namespace, strip_1m
+from .routing import split_namespace, strip_1m
 from .vendors import VENDORS
 
 logger = logging.getLogger(__name__)
@@ -244,18 +244,6 @@ class AssumedWindow:
     inherited_from: Optional[str] = None
 
 
-def _namespace_vendor_id(model_id: str) -> Optional[str]:
-    """The vendor whose namespace ``model_id`` carries, or ``None`` — also
-    ``None`` on the API-key route (``<API-key namespace><id>`` is a first-party id
-    even though it extends a vendor's namespace; see
-    :func:`model_router.routing.api_key_remainder`)."""
-    bare = strip_1m((model_id or "").strip())
-    if api_key_remainder(bare) is not None:
-        return None
-    vendor, _rest = split_namespace(bare, VENDORS)
-    return vendor.vendor_id if vendor is not None else None
-
-
 @dataclass(frozen=True)
 class ContextTable:
     """An immutable snapshot of the table plus where it came from."""
@@ -284,7 +272,10 @@ class ContextTable:
         figures and ``<zai namespace>glm-5.3`` the z.ai ones.
         """
         parts = parse_model_id(model_id)
-        return self.lookup(parts.bare_id, _namespace_vendor_id(model_id) or vendor_id)
+        vendor, _rest = split_namespace(strip_1m((model_id or "").strip()), VENDORS)
+        return self.lookup(
+            parts.bare_id, vendor.vendor_id if vendor is not None else vendor_id,
+        )
 
     def lookup(
         self, model_id: str, vendor_id: Optional[str] = None,
@@ -493,7 +484,8 @@ class ContextTable:
         ``None`` when no sibling qualifies.
         """
         parts = parse_model_id(model_id)
-        vendor_id = _namespace_vendor_id(model_id)
+        vendor, _remainder = split_namespace(model_id, VENDORS)
+        vendor_id = vendor.vendor_id if vendor is not None else None
         best: Optional[ModelContext] = None
         for candidate in self._known_rows():
             if vendor_id is not None and candidate.vendor != vendor_id:

@@ -35,12 +35,6 @@ overridable per project" needs no new mechanism: it needs the daemon to ask as
 a REGISTERED project, which is what :func:`_default_install_root` supplies and
 ``VCT_MODEL_GATEWAY_SECRET_PROJECT`` replaces. Nothing here reaches past those
 two stores, and the hub's auth surface is untouched by this.
-The one exception is a credential that is VCO's OWN rather than a vendor
-key a project may also hold — the Claude API-key route
-(``AnthropicApiKey.shared_only``): it resolves from the shared slot ONLY
-(``shared_only=True, allow_dotenv=False`` here, ``slot_exclusive`` on the
-hub), so no project's secret of the same name, and no project override,
-ever answers for it (owner rule: a project's secrets are the project's).
 
 The import of ``vco_lib.agent_secrets`` is deliberately deferred to first use
 rather than done at module scope, so that importing this module (for the
@@ -56,7 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .vendors import KeyedCredential
+from .vendors import Vendor
 
 logger = logging.getLogger(__name__)
 
@@ -557,46 +551,6 @@ class VendorKeyResolver:
             )
         )
 
-    def peek(self, vendor_id: str) -> Optional[bool]:
-        """What the cache already knows about ``vendor_id``'s key. No store
-        is touched, so ``/health`` may call it.
-
-        ``True``: a key is cached (or the last-known-good one is being
-        served); ``False``: the last resolution was a definite miss and is
-        still within its negative TTL; ``None``: nothing fresh is known (never
-        resolved, expired, or the store was only transiently busy).
-        """
-        if vendor_id in self._serving_stale:
-            return True
-        entry = self._cache.get(vendor_id)
-        if entry is None:
-            return None
-        age = self._clock() - entry.fetched_at
-        if entry.result.key:
-            return True if age < self._ttl_s else None
-        if entry.result.transient:
-            return None
-        return False if age < min(self._ttl_s, NEGATIVE_TTL_CAP_S) else None
-
-    @staticmethod
-    def fingerprint_of(value: str) -> str:
-        """A one-way identity for a key value — compared, never shown. The
-        ONE spelling of it, so a fingerprint taken from a request header and
-        one taken from this cache always agree."""
-        import hashlib  # noqa: PLC0415 — only fingerprints need it
-
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-    def fingerprint(self, vendor_id: str) -> Optional[str]:
-        """:meth:`fingerprint_of` the key this cache would serve for
-        ``vendor_id``, or ``None``. Cache only; the value never leaves."""
-        key = None
-        for entry in (self._cache.get(vendor_id), self._last_good.get(vendor_id)):
-            if entry is not None and entry.result.key:
-                key = entry.result.key
-                break
-        return self.fingerprint_of(key) if key else None
-
     def serving_stale_ids(self) -> tuple[str, ...]:
         """Vendor ids currently answered from the last-known-good store.
 
@@ -629,7 +583,7 @@ class VendorKeyResolver:
             self._transient_logged.discard(vendor_id)
 
     def _serve_stale(
-        self, vendor: KeyedCredential, now: float, *, fresh: KeyResult
+        self, vendor: Vendor, now: float, *, fresh: KeyResult
     ) -> Optional[KeyResult]:
         """Answer a FAILED resolution with the last-known-good key (issue 12).
 
@@ -716,7 +670,7 @@ class VendorKeyResolver:
                 else " after answering failures",
             )
 
-    def resolve(self, vendor: KeyedCredential) -> KeyResult:
+    def resolve(self, vendor: Vendor) -> KeyResult:
         """Blocking resolution. Callers on the event loop use :meth:`aresolve`."""
         now = self._clock()
         entry = self._cache.get(vendor.vendor_id)
@@ -753,7 +707,7 @@ class VendorKeyResolver:
             return stale
         return result
 
-    async def aresolve(self, vendor: KeyedCredential) -> KeyResult:
+    async def aresolve(self, vendor: Vendor) -> KeyResult:
         """Resolve off the event loop.
 
         A cache hit is answered inline (no thread hop) so the common path
@@ -794,7 +748,7 @@ class VendorKeyResolver:
             )
         return await asyncio.to_thread(self.resolve, vendor)
 
-    def _start_refresh(self, vendor: KeyedCredential) -> None:
+    def _start_refresh(self, vendor: Vendor) -> None:
         """Start (at most one) background re-resolution for ``vendor``."""
         task = self._refreshing.get(vendor.vendor_id)
         if task is not None and not task.done():
@@ -825,7 +779,7 @@ class VendorKeyResolver:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    def _resolve_uncached(self, vendor: KeyedCredential) -> KeyResult:
+    def _resolve_uncached(self, vendor: Vendor) -> KeyResult:
         getter = self._getter
         if getter is None:
             try:
@@ -855,20 +809,11 @@ class VendorKeyResolver:
         # resolves. Resolved once per call so a moved cwd cannot make two
         # keys in the same request answer from two different scopes.
         scope_arg = self.effective_project
-        # A credential that is VCO's OWN (``shared_only`` — the Claude
-        # API-key route) resolves from the shared slot alone: no file-store
-        # project leg, no project ``.env``; the hub's ``slot_exclusive``
-        # declaration covers tier 1. A vendor row keeps the shared-by-default,
-        # project-overridable chain described in the module docstring.
-        shared_only = bool(getattr(vendor, "shared_only", False))
-        getter_kwargs: dict = (
-            {"shared_only": True, "allow_dotenv": False} if shared_only else {}
-        )
         failures: list[str] = []
         unavailable: list[str] = []
         for key_name in vendor.secret_keys:
             try:
-                value = getter(key_name, project=scope_arg, **getter_kwargs)
+                value = getter(key_name, project=scope_arg)
             except Exception as exc:  # noqa: BLE001 — every resolver error is a miss
                 if _is_store_unavailable(exc):
                     # v0.2.102: NOT a miss — the store could not be read right
@@ -927,15 +872,9 @@ class VendorKeyResolver:
             "Put it in the SHARED scope: the launcher's Secrets panel with "
             "scope 'shared' (OS keychain), or `vct set --shared --key "
             f"{vendor.secret_keys[0]}` (file store, ~/.vct-secrets/shared/). "
-            + (
-                "This key is VCO's own: only the shared slot answers for it, "
-                "never a project's secret of the same name. "
-                if shared_only else
-                f"To use one project's OWN key instead, set {SCOPE_ENV}=<that "
-                "project's path> for the gateway — a project key outranks the "
-                "shared one. "
-            )
-            + "The gateway picks any of these up "
+            f"To use one project's OWN key instead, set {SCOPE_ENV}=<that "
+            "project's path> for the gateway — a project key outranks the "
+            "shared one. The gateway picks any of these up "
             "within its key-cache TTL without a restart. "
             f"Resolver detail: {'; '.join(failures) if failures else 'no attempt made'}"
             f"{scope_note}"
@@ -952,7 +891,7 @@ class VendorKeyResolver:
         return KeyResult(problem=problem)
 
     def _transient_result(
-        self, vendor: KeyedCredential, unavailable: list[str], failures: list[str]
+        self, vendor: Vendor, unavailable: list[str], failures: list[str]
     ) -> KeyResult:
         """The answer for "the secret store could not be asked right now" (the
         hub's 503 ``keychain_unavailable``, or — v0.2.102 W6-AB — a hub that did

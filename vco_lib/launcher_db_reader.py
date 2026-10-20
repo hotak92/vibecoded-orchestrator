@@ -818,50 +818,6 @@ def read_app_state_default_text_embedding(
     )
 
 
-class LauncherDbUnreadable(Exception):
-    """The launcher DB EXISTS but could not be read (locked past the busy
-    timeout, permission denied, swapped mid-update, corrupt). Distinct from
-    "no DB / no table / no row", which is an answer (absent), not a failure."""
-
-
-def read_app_state_value_strict(
-    key: str, db_path: Optional[Path] = None
-) -> Optional[str]:
-    """Read one ``app_state`` key, telling ABSENT from UNREADABLE.
-
-    Returns the value, or ``None`` when there is no launcher DB, no
-    ``app_state`` table, or no row for ``key`` — the states in which the
-    caller's default IS the setting. Raises :class:`LauncherDbUnreadable`
-    when a DB exists but the read fails — a caller that holds a previous
-    value should keep it rather than fall back to the default (the model
-    gateway's settings do: a transient lock must not flip a chosen mode).
-    :func:`read_app_state_value` is the soft-fail wrapper over this.
-    """
-    if not key:
-        return None
-    if db_path is not None:
-        path: Optional[Path] = db_path if Path(db_path).is_file() else None
-    else:
-        path = _discover_db_path()
-    if path is None:
-        return None
-    try:
-        conn = sqlite3.connect(sqlite_ro_uri(path), uri=True, timeout=5.0)
-        try:
-            row = conn.execute(
-                "SELECT value FROM app_state WHERE key = ? LIMIT 1", (key,)
-            ).fetchone()
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
-                return None  # a fresh DB the launcher has not migrated yet
-            raise
-        finally:
-            conn.close()
-    except sqlite3.Error as exc:
-        raise LauncherDbUnreadable(f"{path}: {exc}") from exc
-    return row[0] if row else None
-
-
 def read_app_state_value(
     key: str, db_path: Optional[Path] = None
 ) -> Optional[str]:
@@ -882,12 +838,23 @@ def read_app_state_value(
         the SAME db they operate on). ``None`` runs the module's default
         discovery (``VCT_LAUNCHER_DB_PATH`` env → ``~/.vct/launcher.db``).
     """
-    try:
-        return read_app_state_value_strict(key, db_path=db_path)
-    except LauncherDbUnreadable:
+    if not key:
         return None
+    conn = _open_db_readonly(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = ? LIMIT 1", (key,)
+        ).fetchone()
+        return row["value"] if row else None
     except Exception:
         return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _read_app_state_key_normalized(

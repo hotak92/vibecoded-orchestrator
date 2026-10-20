@@ -1108,10 +1108,10 @@
     }
   }
 
-  // v0.2.104: the model gateway's opt-in subscription -> Claude API key
-  // fallback. Absent row = OFF (the default): it bills the Console
-  // organisation, so it is never on by accident. The gateway re-reads the row
-  // within seconds — no restart.
+  // v0.2.104 API-1: VCO's background `claude -p` jobs retry once with the
+  // Claude API key when the subscription is out. Absent row = OFF (the
+  // default): it bills the Console organisation, so it is never on by
+  // accident. Each job reads the row when it starts — no restart.
   let gatewayApiKeyFallback = $state(false);
   let gatewayApiKeyFallbackSaving = $state(false);
 
@@ -1134,8 +1134,8 @@
       gatewayApiKeyFallback = next;
       toast.success(
         next
-          ? 'Claude API key fallback ON — subscription quota refusals retry once with the API key (billed to your Console organisation)'
-          : 'Claude API key fallback OFF',
+          ? 'Claude API key for background jobs ON — a background job refused for subscription quota retries once with the API key (billed to your Console organisation)'
+          : 'Claude API key for background jobs OFF',
       );
     } catch (e) {
       toast.error(e);
@@ -3231,37 +3231,31 @@
       </div>
     </section>
 
-    <!-- v0.2.104: the model gateway's Claude API key route + its opt-in
-         subscription fallback. The key itself lives in Secrets (shared scope,
-         name ANTHROPIC_API_KEY_GATEWAY); this switch only decides whether a
-         subscription quota refusal may spend it. -->
+    <!-- v0.2.104 API-1: VCO's background `claude -p` jobs retry once with the
+         Claude API key when the subscription is out. The key itself lives in
+         Secrets (shared scope, name ANTHROPIC_API_KEY_GATEWAY); this switch
+         only decides whether a subscription quota refusal may spend it. -->
     <section class="pr-section" use:lazySection={{ loaders, keys: ['gatewayApiKeyFallback'] }} aria-labelledby="pr-gateway-apikey-title">
-      <h2 class="pr-section-title" id="pr-gateway-apikey-title">Model gateway — Claude API key</h2>
+      <h2 class="pr-section-title" id="pr-gateway-apikey-title">Claude API key for background jobs</h2>
       <div class="pr-rl-row">
         <label class="pr-rl-toggle"
-               title="When ON, a Claude request whose subscription answer is a quota refusal (the same rule the gateway's fallback ladder uses) is retried once on the same model with the Claude API key saved in Secrets as ANTHROPIC_API_KEY_GATEWAY. Billed to the Console organisation that key belongs to.">
+               title="When ON, a VCO background claude -p job (knowledge-graph and code summaries, the post-commit KG review) refused because the Claude subscription is out of usage retries once with the Claude API key saved in Secrets → Shared as ANTHROPIC_API_KEY_GATEWAY. Billed to the Console organisation that key belongs to.">
           <input type="checkbox" checked={gatewayApiKeyFallback}
             disabled={gatewayApiKeyFallbackSaving}
             onchange={() => void toggleGatewayApiKeyFallback()} />
-          <strong>Use the Claude API key when the subscription is out</strong>
+          <strong>Retry background jobs with the Claude API key when the subscription is out</strong>
           <small>
-            OFF (default). ON: a subscription quota refusal is retried once on
-            the same model with your Claude API key (Secrets → Shared,
-            <code>ANTHROPIC_API_KEY_GATEWAY</code>), before any other fallback. The
-            same switch also covers VCO's background <code>claude -p</code> jobs
-            (knowledge-graph and code summaries, the post-commit KG review):
-            when the subscription is out of usage, each retries its failed
-            call once with that key, passed to the job's environment only;
-            once the key serves, the rest of that run uses it directly, and a
-            key Anthropic refuses is not tried again until the 5-hour quota
-            cooldown has passed. Only the Shared slot answers for this name —
-            a project's own secret of the same name is never used.
-            The same key also adds <code>claude-gw/api/…</code> models to the
-            picker. Requests go out with your client's own headers; Anthropic
-            decides which credit pool pays — check the Console after the first
-            use, including that a background job's call appears there. Every
-            such request is marked <code>auth: api_key</code> in the
-            gateway usage log.
+            OFF (default). ON: when the subscription is out of usage, VCO's
+            background <code>claude -p</code> jobs (knowledge-graph and code
+            summaries, the post-commit KG review) each retry their failed call
+            once with your Claude API key (Secrets → Shared,
+            <code>ANTHROPIC_API_KEY_GATEWAY</code>), passed to the job's
+            environment only; once the key serves, the rest of that run uses
+            it directly, and a key Anthropic refuses is not tried again until
+            the 5-hour quota cooldown has passed. Only the Shared slot answers
+            for this name — a project's own secret of the same name is never
+            used. The retry runs as a plain headless job, so Anthropic bills
+            it to the key; chat sessions are not affected by this switch.
           </small>
         </label>
       </div>

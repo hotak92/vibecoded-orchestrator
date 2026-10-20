@@ -18,7 +18,6 @@
     estimateNote,
     fetchUsage,
     INITIAL_CARD_STATE,
-    latchNote,
     nextPollMs,
     percentText,
     restartOffered,
@@ -107,9 +106,6 @@
               {#if vendorStatus(vendor)}
                 <span class="usage-muted usage-status">{vendorStatus(vendor)}</span>
               {/if}
-              {#if latchNote(vendor)}
-                <span class="usage-latch" title="Subscription limit reached: these Claude requests go straight to the Claude API key (billed to the Console) until the limit resets.">{latchNote(vendor)}</span>
-              {/if}
             </div>
             {#each vendor.windows as w (w.id)}
               <div class="usage-row">
@@ -190,10 +186,6 @@
   .usage-vendor-name {
     font-weight: 600;
     color: var(--color-text, #f1f5f9);
-  }
-  .usage-latch {
-    font-size: 11px;
-    color: var(--color-pink, #ff4fa0);
   }
   .usage-plan {
     font-size: 11px;

@@ -605,12 +605,6 @@ pub struct GatewayHealth {
     /// `owner_only` / `broader` / `unknown` for the gateway's token file.
     #[serde(default)]
     pub token_file_permissions: String,
-    /// v0.2.104: the first-party auth mode the gateway is applying and
-    /// whether its Claude API key resolves (`mode`, `api_key`,
-    /// `api_key_fallback`, `api_key_secret`). Relayed verbatim so the
-    /// homepage switch shows what the gateway actually does.
-    #[serde(default)]
-    pub anthropic_auth: Option<serde_json::Value>,
 }
 
 // ─── Login registration: the THIRD state ──────────────────────────────────
@@ -2327,22 +2321,6 @@ mod tests {
         assert_eq!(parsed.catalog_source.get("zai").map(String::as_str), Some("static"));
         assert_eq!(parsed.token_file_permissions, "owner_only");
         assert_eq!(parsed.oauth_state, "absent");
-    }
-
-    #[test]
-    fn health_payload_relays_the_anthropic_auth_block() {
-        // v0.2.104: the homepage switch reads the mode the GATEWAY applies
-        // and whether its API key resolves — relayed, never dropped.
-        let json = r#"{"ok": true, "service": "vct-model-gateway",
-            "anthropic_auth": {"mode": "api_key", "api_key": "available",
-                               "api_key_fallback": false,
-                               "api_key_secret": "ANTHROPIC_API_KEY_GATEWAY"}}"#;
-        let parsed: GatewayHealth = serde_json::from_str(json).unwrap();
-        let auth = parsed.anthropic_auth.expect("anthropic_auth must survive the parse");
-        assert_eq!(auth["mode"], "api_key");
-        assert_eq!(auth["api_key"], "available");
-        let older: GatewayHealth = serde_json::from_str(r#"{"ok": true}"#).unwrap();
-        assert!(older.anthropic_auth.is_none(), "an older gateway reads as absent");
     }
 
     #[test]

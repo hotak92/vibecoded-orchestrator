@@ -22,7 +22,6 @@
 //     never as a plain vendor reading.
 
 import { invoke, tauriAvailable } from '$lib/tauri';
-import type { GatewayQuotaLatch } from '$lib/types/model-gateway';
 
 /** Mirrors the `estimate` block of `UsageWindows._estimate_dict`. */
 export interface UsageEstimate {
@@ -73,12 +72,6 @@ export interface UsageVendor {
   plan: string | null;
   windows: UsageWindow[];
   tokens?: UsageTokens;
-  /** v0.2.104: the subscription-out latch (Claude entry only; absent from
-   *  an older gateway or when nothing is latched). */
-  api_key_latch?: GatewayQuotaLatch[];
-  /** The gateway's own rendering of it (`usage_windows.latch_text`), e.g.
-   *  "→ API key until 14:00" — shown verbatim, never re-derived here. */
-  api_key_latch_text?: string;
 }
 
 /**
@@ -94,13 +87,6 @@ export interface UsageAgentRow {
   model: string;
   route: string;
   fallback_from: string;
-  /**
-   * v0.2.104: how the answering route authenticated — `oauth` (Claude
-   * login), `api_key` (Claude Console API key: the `claude-gw/api/` route or
-   * the opt-in subscription fallback) or `vendor_key`. Absent from an older
-   * gateway.
-   */
-  auth?: string;
   at: string;
 }
 
@@ -287,22 +273,11 @@ export function vendorStatus(vendor: UsageVendor): string | null {
   }
 }
 
-/**
- * The subscription-out latch note beside a vendor's name, or `null`: the
- * gateway's own text ("→ API key until 14:00"), only when it reports a latch.
- */
-export function latchNote(vendor: UsageVendor): string | null {
-  if (!vendor.api_key_latch?.length) return null;
-  return vendor.api_key_latch_text?.trim() || '→ API key (subscription limit reached)';
-}
-
 /** Vendors worth a row: anything with a window or a status to say. A
  * tokens-only vendor is not one — the ledger total is collected but never
  * rendered (owner 2026-09-28). */
 export function visibleVendors(snapshot: UsageSnapshot): UsageVendor[] {
-  return snapshot.vendors.filter(
-    (v) => v.windows.length > 0 || v.state !== 'ok' || latchNote(v) !== null,
-  );
+  return snapshot.vendors.filter((v) => v.windows.length > 0 || v.state !== 'ok');
 }
 
 /** When to poll next: soon while the gateway is still fetching. */
@@ -325,11 +300,7 @@ export function nextPollMs(result: UsageBridgeResult | null): number {
  * this list exists for. A fallback is the one main-chat fact worth showing.
  */
 export function visibleAgents(snapshot: UsageSnapshot): UsageAgentRow[] {
-  // v0.2.104: a main-chat turn billed to the Claude API key is shown too —
-  // money left a different pool, which the user must be able to see.
-  return (snapshot.agents ?? []).filter(
-    (row) => row.agent !== null || row.fallback_from || row.auth === 'api_key',
-  );
+  return (snapshot.agents ?? []).filter((row) => row.agent !== null || row.fallback_from);
 }
 
 /** The identity's name: the agent id, or "main chat" for the null agent. */
@@ -343,8 +314,7 @@ export function agentIdentity(row: UsageAgentRow): string {
  * served the turn (no hidden remaps).
  */
 export function agentAnswer(row: UsageAgentRow): string {
-  const via = row.auth === 'api_key' ? ' via Claude API key' : '';
   return row.fallback_from
-    ? `${row.model}${via} (fallback from ${row.fallback_from})`
-    : `${row.model}${via}`;
+    ? `${row.model} (fallback from ${row.fallback_from})`
+    : row.model;
 }

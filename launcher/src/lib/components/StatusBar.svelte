@@ -3,15 +3,8 @@
   import { currentUser } from '$lib/stores/auth';
   import { tauriAvailable } from '$lib/tauri';
   import {
-    ANTHROPIC_AUTH_LABEL,
-    ANTHROPIC_AUTH_MODES,
-    ANTHROPIC_AUTH_TOOLTIP,
     MODE_PILL_TOOLTIP,
-    anthropicAuthDisabledReason,
-    anthropicAuthWarning,
     clearPanelDefaultModel,
-    getAnthropicAuthMode,
-    setAnthropicAuthMode,
     describeModeReport,
     describeModeResult,
     describeSwitchOutcome,
@@ -28,11 +21,7 @@
     switchToMultimodel,
     vendorDefaultWarning,
   } from '$lib/api/model_gateway';
-  import type {
-    AnthropicAuthMode,
-    PanelModeReport,
-    SettablePanelMode,
-  } from '$lib/api/model_gateway';
+  import type { PanelModeReport, SettablePanelMode } from '$lib/api/model_gateway';
   import type { ModelGatewayStatus, VSCodeTarget } from '$lib/types/model-gateway';
 
   let appCount = $derived($currentUser?.apps?.length ?? 0);
@@ -106,43 +95,6 @@
   // Copy + the mode test live in `$lib/api/model_gateway`.
   const remoteControlGate = $derived(remoteControlGateNotice(report));
 
-  // v0.2.104: the GLOBAL "Anthropic: OAuth | API key" switch, beside the
-  // panel-mode switch and in the same frame for the same reason — it is
-  // machine-wide. The choice is stored by the Rust command and read by the
-  // gateway within seconds (no restart); whether the key resolves is the
-  // gateway's own answer (`/health` → anthropic_auth). Copy and the
-  // disabled-reasons live in `$lib/api/model_gateway` (vitest-covered).
-  let authMode = $state<AnthropicAuthMode | null>(null);
-  const authWarning = $derived(anthropicAuthWarning(authMode, gw));
-
-  function authPillTitle(target: AnthropicAuthMode): string {
-    if (busy) return 'Applying…';
-    const why = anthropicAuthDisabledReason(target, gw);
-    if (why) return why;
-    const base = ANTHROPIC_AUTH_TOOLTIP[target];
-    return authMode === target ? `${base} (current)` : base;
-  }
-
-  async function applyAuth(target: AnthropicAuthMode) {
-    if (busy || authMode === target) return;
-    if (anthropicAuthDisabledReason(target, gw)) return;
-    busy = true;
-    try {
-      authMode = await setAnthropicAuthMode(target);
-      notice = {
-        tone: 'ok',
-        text:
-          authMode === 'api_key'
-            ? 'Claude requests through the gateway now use your Claude API key (applies within seconds).'
-            : 'Claude requests through the gateway now use your Claude login (applies within seconds).',
-      };
-    } catch (e) {
-      notice = { tone: 'err', text: String(e) };
-    } finally {
-      busy = false;
-    }
-  }
-
   function pillTitle(target: SettablePanelMode, disabledReason: string): string {
     if (busy) return 'Applying…';
     if (disabledReason) return disabledReason;
@@ -165,11 +117,6 @@
     // Review R2 #7: a focus/visibility probe landing during apply() must not
     // race apply's own re-probe and leave the pill on the old mode.
     if (busy) return;
-    try {
-      authMode = await getAnthropicAuthMode();
-    } catch {
-      authMode = null;
-    }
     try {
       gw = await getModelGatewayStatus();
     } catch (e) {
@@ -341,29 +288,6 @@
           <span class="mode-neutral" title={neutralTooltip}>{mode.label}</span>
         {/if}
       </div>
-      {#if authMode !== null}
-        <div class="mode-switch" role="group" aria-label="Anthropic credential the gateway uses">
-          <span class="mode-neutral" title="Which credential the model gateway uses for Claude requests">Anthropic:</span>
-          {#each ANTHROPIC_AUTH_MODES as target (target)}
-            <button
-              type="button"
-              class="mode-pill"
-              class:active={authMode === target}
-              title={authPillTitle(target)}
-              aria-pressed={authMode === target}
-              disabled={busy || (authMode !== target && !!anthropicAuthDisabledReason(target, gw))}
-              onclick={() => applyAuth(target)}
-            >
-              {ANTHROPIC_AUTH_LABEL[target]}
-            </button>
-          {/each}
-        </div>
-      {/if}
-      {#if authWarning}
-        <span class="mode-warning" role="status">
-          <span class="mode-notice-text" title={authWarning}>{authWarning}</span>
-        </span>
-      {/if}
       {#if remoteControlGate}
         <span class="mode-gate" role="note">
           <span class="mode-notice-text" title={remoteControlGate}>{remoteControlGate}</span>

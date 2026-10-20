@@ -72,7 +72,7 @@ import re
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
-from .routing import api_key_remainder, split_namespace, strip_1m
+from .routing import split_namespace, strip_1m
 from .vendors import VENDORS, Vendor
 
 #: The separators an upstream uses inside a model id. Data, not a literal in a
@@ -160,12 +160,7 @@ def parse_model_id(
     raw = (model_id or "").strip()
     bare_with_namespace = strip_1m(raw)
     one_m = bare_with_namespace != raw
-    api_rest = api_key_remainder(bare_with_namespace, vendors)
-    if api_rest is not None:
-        # ``<API-key namespace><id>`` is the first-party ``<id>`` (v0.2.104).
-        bare_id = api_rest
-    else:
-        _vendor, bare_id = split_namespace(bare_with_namespace, vendors)
+    _vendor, bare_id = split_namespace(bare_with_namespace, vendors)
 
     family_parts: list[str] = []
     version: list[int] = []

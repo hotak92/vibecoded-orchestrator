@@ -12,19 +12,22 @@ environment variable only:
   through the shared ladder — pinned here by driving
   ``generate-code-summary.call_llm``),
 * the post-commit KG reviewer (``kg_reviewer_backend.run_with_quota_fallback``,
-  direct subscription rung only — a gateway rung's quota refusal is already
-  retried server-side by the gateway's own fallback on the same switch).
+  direct subscription rung only — a gateway rung's ``claude-gw/`` model ids
+  are not served by api.anthropic.com).
 
 All of it is gated on the launcher row ``model_gateway.api_key_fallback``
-(the model gateway's own switch) and on the key resolving. The tests pin:
+(Preferences → Claude API key for background jobs; the model gateway itself
+neither reads the row nor resolves the key) and on the key resolving. The tests pin:
 the retry fires ONLY on the existing quota classification; the key lives in
 the retry child's env alone (never argv, never the parent env, never a log
 line); fallback OFF / no key / a non-quota failure / a foreign routing env
 mean no retry; a refused key is not retried twice and, in the reviewer,
 latches the direct rung on QUOTA (5 h); after a served retry the rest of a
 summary process goes straight to the key (one resolve, one subscription
-spawn); the key resolves from VCO's shared slot only, on this helper's path
-AND the model gateway's; and the helper's constants are the gateway's.
+spawn); the retry's env drops the inherited ``CLAUDE_CODE_ENTRYPOINT``
+(with ``claude-vscode`` the CLI ignores the key) while the first run's env
+is untouched; the key resolves from VCO's shared slot only; and the helper's
+constants match the launcher and ``vct-module.json``.
 
 No network, no real secrets: the ``claude`` binary and ``subprocess.run``
 are fakes, the key is an obvious placeholder.
@@ -131,7 +134,7 @@ def _assert_logs_clean(lines: "list[str]") -> None:
 # ──────────────────────────────────────────────────────────────────────
 class TestHelper:
 
-    def test_fallback_enabled_reads_the_gateway_row(self, tmp_path: Path):
+    def test_fallback_enabled_reads_the_launcher_row(self, tmp_path: Path):
         db = make_launcher_db(
             tmp_path / "on.db",
             app_state={"model_gateway.api_key_fallback": "true"})
@@ -208,21 +211,22 @@ class TestHelper:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Parity: the helper's constants are the gateway's (and the launcher's)
+# Parity: the helper's constants are the launcher's and the manifest's
 # ──────────────────────────────────────────────────────────────────────
 class TestParity:
 
-    def test_app_state_key_matches_the_gateway(self):
-        from model_router.config import API_KEY_FALLBACK_APP_STATE_KEY
+    def test_the_model_gateway_never_resolves_the_key(self):
+        """v0.2.104 (owner 2026-10-20): the gateway's Claude API-key route is
+        removed — no gateway credential may name VCO's background-job key."""
+        from model_router.vendors import VENDORS
 
-        assert cak.APP_STATE_KEY == API_KEY_FALLBACK_APP_STATE_KEY
+        for vendor in VENDORS.values():
+            assert cak.SECRET_KEY_NAME not in vendor.secret_keys, vendor.vendor_id
 
-    def test_secret_name_matches_the_gateway_route(self):
-        from model_router.vendors import ANTHROPIC_API_KEY_ROUTE
-
-        # The gateway reads secret_keys[0] (api_key_route.py) — pin the one
-        # name, not mere membership.
-        assert ANTHROPIC_API_KEY_ROUTE.secret_keys == (cak.SECRET_KEY_NAME,)
+    def test_the_secrets_panel_suggests_the_same_name(self):
+        panel = (REPO_ROOT / "launcher/src/lib/components/SecretsPanel.svelte"
+                 ).read_text(encoding="utf-8")
+        assert f"newKey = '{cak.SECRET_KEY_NAME}'" in panel
 
     def test_the_hub_declares_the_key_slot_exclusive(self):
         """LOW-1 (hub tier): ``vct-module.json`` declares VCO's key as a
@@ -292,6 +296,29 @@ class TestSummaryCliFallback:
         assert sb.call_cli("node body") == SUCCESS.stdout
         _assert_env_only(run.calls, retried=True)
         _assert_logs_clean(sb.log_lines)
+
+    def test_the_launcher_row_drives_the_retry(self, sb, monkeypatch, tmp_path):
+        """The Preferences row's behavioural reader (pinned by
+        ``test_v02102_pref_keys_behavioural_readers``): row ON → the quota
+        refusal is retried with the key; row OFF → no retry."""
+        monkeypatch.setattr(cak, "resolve_key", lambda: FAKE_KEY)
+        on = make_launcher_db(tmp_path / "on.db",
+                              app_state={cak.APP_STATE_KEY: "true"})
+        monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(on))
+        run = _ScriptedRun(monkeypatch, [QUOTA_FAILURE, SUCCESS])
+        assert sb.call_cli("node") == SUCCESS.stdout
+        _assert_env_only(run.calls, retried=True)
+
+        sb.reset_backend_cache()  # a fresh process: the memo re-reads the row
+        sb.reset_breaker(persisted=True)
+        sb._CLI_ISOLATION[sb.shutil.which("claude")] = []
+        off = make_launcher_db(tmp_path / "off.db",
+                               app_state={cak.APP_STATE_KEY: "false"})
+        monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(off))
+        run = _ScriptedRun(monkeypatch, [QUOTA_FAILURE])
+        with pytest.raises(sb.BackendUnavailable):
+            sb.call_cli("node")
+        _assert_env_only(run.calls, retried=False)
 
     def test_fallback_off_means_no_retry(self, sb, monkeypatch):
         _arm_fallback(monkeypatch, enabled=False, key=FAKE_KEY)
@@ -429,9 +456,9 @@ class TestKgReviewerFallback:
         _assert_logs_clean(lines)
 
     def test_a_gateway_rung_is_not_retried(self, reviewer, monkeypatch):
-        """A gateway rung's quota refusal is the GATEWAY's fallback to make
-        (same switch, server-side); its claude-gw/ model ids are not served
-        by api.anthropic.com anyway."""
+        """A gateway rung's claude-gw/ model ids are not served by
+        api.anthropic.com; the gateway answers its own quota refusals through
+        its fallback ladder."""
         _arm_fallback(monkeypatch, enabled=True, key=FAKE_KEY)
         run = _ScriptedRun(monkeypatch, [
             _out(1, "", "Claude AI usage limit reached."),
@@ -743,26 +770,9 @@ class TestVcoSlotOnly:
             FAKE_KEY + "\n", encoding="utf-8")
         assert cak.resolve_key() == FAKE_KEY
 
-    def test_the_gateway_never_takes_a_projects_secret(
-            self, project_with_stand_ins):
-        from model_router.secrets import VendorKeyResolver
-        from model_router.vendors import ANTHROPIC_API_KEY_ROUTE
-
-        from vco_lib.agent_secrets import get as real_get
-
-        store, project = project_with_stand_ins
-        # Scoped AS the project (the VCT_MODEL_GATEWAY_SECRET_PROJECT shape):
-        # a vendor row would take that project's key; VCO's own may not.
-        resolver = VendorKeyResolver(project=str(project), getter=real_get)
-        assert resolver.resolve(ANTHROPIC_API_KEY_ROUTE).key is None
-        (store / "shared").mkdir()
-        (store / "shared" / cak.SECRET_KEY_NAME).write_text(
-            FAKE_KEY + "\n", encoding="utf-8")
-        resolver = VendorKeyResolver(project=str(project), getter=real_get)
-        assert resolver.resolve(ANTHROPIC_API_KEY_ROUTE).key == FAKE_KEY
-
     def test_a_vendor_row_keeps_its_project_override(self):
-        """The shared-only rule is the API-key route's, not every vendor's."""
+        """The shared-only rule is this helper's, not the gateway's vendor
+        rows' (they keep the project-overridable chain)."""
         from model_router.secrets import VendorKeyResolver
         from model_router.vendors import VENDORS
 
@@ -815,6 +825,30 @@ class TestRetryBlocker:
         env = {"ANTHROPIC_BASE_URL": "https://proxy.example.invalid"}
         assert cak.child_env_with_key(env, FAKE_KEY)["ANTHROPIC_BASE_URL"] == (
             "https://proxy.example.invalid")
+
+    def test_an_unimportable_gateway_rule_is_said_not_blamed_on_the_url(
+            self, monkeypatch):
+        """R22 LOW-A: a broken ``vco_lib.vscode_settings`` import is "cannot
+        tell", never "not the VCO gateway"; nothing is stripped either."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_vscode_settings(name, *args, **kwargs):
+            if name == "vco_lib.vscode_settings":
+                raise ImportError("broken (test)")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_vscode_settings)
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11460",
+               "ANTHROPIC_AUTH_TOKEN": "gateway-token"}
+        why = cak.retry_blocker(env)
+        assert why == (
+            "cannot tell whether ANTHROPIC_BASE_URL is the VCO gateway: "
+            "vco_lib.vscode_settings is not importable (ImportError) — not "
+            "retried")
+        child = cak.child_env_with_key(env, FAKE_KEY)
+        assert child["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:11460"
 
     def test_a_users_own_auth_token_blocks(self):
         assert cak.retry_blocker({"ANTHROPIC_AUTH_TOKEN": "t"}) is not None
@@ -879,3 +913,56 @@ class TestBrokenInstallIsLoud:
         assert err.count("vco_lib is not importable") == 1
         assert "API-key retry is unavailable" in err
         assert len(run.calls) == 2  # no retry spawned
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.104 REL: the retry carries no inherited CLAUDE_CODE_ENTRYPOINT
+# ──────────────────────────────────────────────────────────────────────
+class TestEntrypointDropped:
+    """Measured 2026-10-20: with ``CLAUDE_CODE_ENTRYPOINT=claude-vscode`` in
+    its env (what a job spawned inside a VS Code session inherits),
+    ``claude -p`` ignores ``ANTHROPIC_API_KEY`` and stays on the OAuth login;
+    without it, the key is used. The retry drops the variable (no fake value);
+    the first (subscription) run's env keeps it."""
+
+    def test_the_helper_drops_it_and_leaves_the_input_alone(self):
+        base = {"PATH": "/usr/bin", "CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}
+        child = cak.child_env_with_key(base, FAKE_KEY)
+        assert "CLAUDE_CODE_ENTRYPOINT" not in child
+        assert child["ANTHROPIC_API_KEY"] == FAKE_KEY
+        assert base["CLAUDE_CODE_ENTRYPOINT"] == "claude-vscode"
+
+    def test_the_summary_retry_env_lacks_it(self, sb, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "claude-vscode")
+        _arm_fallback(monkeypatch, enabled=True, key=FAKE_KEY)
+        run = _ScriptedRun(monkeypatch, [QUOTA_FAILURE, SUCCESS])
+        assert sb.call_cli("node body") == SUCCESS.stdout
+        assert run.calls[0]["kwargs"]["env"].get(
+            "CLAUDE_CODE_ENTRYPOINT") == "claude-vscode"
+        assert "CLAUDE_CODE_ENTRYPOINT" not in run.calls[1]["kwargs"]["env"]
+        assert os.environ["CLAUDE_CODE_ENTRYPOINT"] == "claude-vscode"
+
+    def test_the_summary_key_first_env_lacks_it(self, sb, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "claude-vscode")
+        _arm_fallback(monkeypatch, enabled=True, key=FAKE_KEY)
+        run = _ScriptedRun(monkeypatch, [QUOTA_FAILURE, SUCCESS, SUCCESS])
+        sb.call_cli("node one")
+        sb.call_cli("node two")  # key-first: straight to the key
+        assert len(run.calls) == 3
+        assert run.calls[2]["kwargs"]["env"].get("ANTHROPIC_API_KEY") == FAKE_KEY
+        assert "CLAUDE_CODE_ENTRYPOINT" not in run.calls[2]["kwargs"]["env"]
+
+    def test_the_reviewer_retry_env_lacks_it(self, reviewer, monkeypatch):
+        _arm_fallback(monkeypatch, enabled=True, key=FAKE_KEY)
+        run = _ScriptedRun(monkeypatch, [
+            QUOTA_FAILURE,
+            _out(0, '{"type": "result", "result": "reviewed", "num_turns": 4}', ""),
+        ])
+        env = {"PATH": "/usr/bin", "CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}
+        reviewer.run_with_quota_fallback(
+            ["/fake/claude", "-p"], "p", env, Path("/tmp"), 60,
+            direct_rung=True, log=[].append)
+        assert run.calls[0]["kwargs"]["env"]["CLAUDE_CODE_ENTRYPOINT"] == (
+            "claude-vscode")
+        assert "CLAUDE_CODE_ENTRYPOINT" not in run.calls[1]["kwargs"]["env"]
+        assert env["CLAUDE_CODE_ENTRYPOINT"] == "claude-vscode"

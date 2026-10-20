@@ -126,9 +126,6 @@ pub mod codegraph_parsers;
 // are the gateway's (`GET /usage/windows`), read through
 // `python -m vco_lib.gateway_usage` so the host token never enters Rust.
 pub mod gateway_usage;
-// v0.2.104: the gateway's GLOBAL first-party auth mode (homepage switch
-// "Anthropic: OAuth | API key"), persisted in app_state; the gateway reads it.
-pub mod gateway_anthropic_auth;
 // v0.2.33 Agent A (L0): public-catalog endpoint client. Fetches paid-module
 // catalog metadata from the launcher-controlled Supabase edge function with
 // retry-with-backoff + 15min app_state-backed cache + schema_version

@@ -42,6 +42,7 @@
     lifecycleOf,
     badgeOf,
     isForked,
+    listSlotExclusiveSecretNames,
     type SecretEntry,
     type SecretScope,
   } from '$lib/stores/secrets';
@@ -68,6 +69,15 @@
   let newSensitive = $state(true);
   let newError = $state<string | null>(null);
   let busy = $state(false);
+
+  // v0.2.104 (R22 NIT-C): names the hub serves from the Shared slot ONLY
+  // (`slot_exclusive` in vct-module.json). Typed into a project's (or the
+  // global) add form, such a row would be skipped by the hub without a
+  // word — the hint below says so before the user saves it.
+  let slotExclusiveNames = $state<string[]>([]);
+  const sharedOnlyName = $derived(
+    scope !== 'shared' && slotExclusiveNames.includes(newKey.trim()) ? newKey.trim() : null,
+  );
 
   // The module bucket new UI-created entries land in. Pre-existing
   // entries keep their original module_id (e.g. "licensing"). This
@@ -138,6 +148,9 @@
   }
 
   onMount(async () => {
+    void listSlotExclusiveSecretNames().then((names) => {
+      slotExclusiveNames = names;
+    });
     seedKnownKeys();
     // Pull the registered-projects list so the per-project dropdown
     // populates immediately (other parts of the app may not have
@@ -878,6 +891,15 @@
           autocomplete="off"
         />
       </div>
+      {#if sharedOnlyName}
+        <!-- R22 NIT-C: a Shared-only (slot_exclusive) name outside the Shared
+             tab. Pinned by SecretsPanel.wiring.test.ts. -->
+        <div class="msg msg-warning shared-only-hint" role="note">
+          <code>{sharedOnlyName}</code> is served from Shared only — VCO reads
+          it from Secrets → Shared, so a copy saved here is never used. Switch
+          to the Shared tab to set it.
+        </div>
+      {/if}
       {#if scope === 'per_project'}
         <!-- v0.2.102 (OD-4 refinement, owner 2026-10-09): the ONE dedicated
              name a project gives VCO its own OpenAI key under. A per-project
@@ -903,9 +925,10 @@
         </div>
       {/if}
       {#if scope === 'shared'}
-        <!-- v0.2.104: the model gateway's Claude API key slot. Shared scope,
-             exact name `ANTHROPIC_API_KEY_GATEWAY` — the name the gateway resolves
-             (model_router/vendors.py ANTHROPIC_API_KEY_ROUTE). Pinned by
+        <!-- v0.2.104: the Claude API key VCO's background `claude -p` jobs
+             retry with when the subscription is out (vco_lib/claude_cli_api_key.py
+             SECRET_KEY_NAME). Shared scope, exact name `ANTHROPIC_API_KEY_GATEWAY`
+             (historical name; the model gateway does not read it). Pinned by
              SecretsPanel.wiring.test.ts. -->
         <div class="add-row key-suggest">
           <button
@@ -915,13 +938,13 @@
               newKey = 'ANTHROPIC_API_KEY_GATEWAY';
             }}
             disabled={busy}
-            title="Fill the KEY field with the name the model gateway reads for the Claude API key"
+            title="Fill the KEY field with the name VCO's background jobs read for the Claude API key"
           >Claude API key</button>
           <span class="key-suggest-hint">
-            <code>ANTHROPIC_API_KEY_GATEWAY</code> — your Claude Console API key; the
-            model gateway offers <code>claude-gw/api/…</code> models with it
-            and, if enabled in Preferences, falls back to it when the
-            subscription is out
+            <code>ANTHROPIC_API_KEY_GATEWAY</code> — your Claude Console API key;
+            if enabled in Preferences, VCO's background <code>claude -p</code>
+            jobs (knowledge-graph and code summaries, the post-commit KG
+            review) retry with it when the subscription is out
           </span>
         </div>
       {/if}

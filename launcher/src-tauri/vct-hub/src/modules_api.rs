@@ -800,12 +800,7 @@ fn mark_keychain_degraded(flag: &mut bool) {
 fn slot_exclusive_keys(
     orch_manifest: &vct_launcher_core::orchestrator_manifest::OrchestratorManifest,
 ) -> std::collections::HashSet<String> {
-    orch_manifest
-        .bundled_secrets
-        .iter()
-        .filter(|bs| bs.scope == "shared" && bs.slot_exclusive)
-        .map(|bs| bs.key.clone())
-        .collect()
+    orch_manifest.slot_exclusive_shared_keys().into_iter().collect()
 }
 
 async fn project_env(
@@ -3536,8 +3531,8 @@ mod tests {
     }
 
     /// v0.2.104 (R21 LOW-1): `ANTHROPIC_API_KEY_GATEWAY` — the Claude
-    /// Console key VCO's model gateway and background `claude -p` retry
-    /// spend — is slot-exclusive: a per-project binding of the same name
+    /// Console key VCO's background `claude -p` retry spends (the name is
+    /// historical; the model gateway does not read it) — is slot-exclusive: a per-project binding of the same name
     /// never answers, and the shared slot does.
     #[tokio::test]
     async fn anthropic_gateway_key_refuses_per_project_stand_in() {
@@ -3659,8 +3654,8 @@ mod tests {
             set
         );
         // v0.2.104 (R21 LOW-1): VCO's Claude Console key is VCO's own slot
-        // too — the model gateway and the background `claude -p` retry
-        // spend it, never a project's same-named secret.
+        // too — the background `claude -p` retry spends it, never a
+        // project's same-named secret.
         assert!(
             set.contains("ANTHROPIC_API_KEY_GATEWAY"),
             "helper set must contain ANTHROPIC_API_KEY_GATEWAY; got {:?}",

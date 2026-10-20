@@ -158,8 +158,8 @@ describe('the registry holds every loader exactly once', () => {
     // + `openAiEmbeddingsConsent` (v0.2.102 W6-B2, owner ruling 2026-10-10):
     // the OpenAI EMBEDDINGS consent, separate from the summaries one.
     expect(PREF_LOADER_KEYS).toContain('openAiEmbeddingsConsent');
-    // + `gatewayApiKeyFallback` (v0.2.104): the model gateway's opt-in
-    // subscription -> Claude API key fallback, lazy, one app_state read.
+    // + `gatewayApiKeyFallback` (v0.2.104): background `claude -p` jobs'
+    // opt-in subscription -> Claude API key retry, lazy, one app_state read.
     expect(PREF_LOADER_KEYS).toContain('gatewayApiKeyFallback');
     expect(PREF_LOADERS.gatewayApiKeyFallback.eager).toBe(false);
     // + `kgReviewerModel` (v0.2.103, owner ruling 2026-10-15): the machine-wide

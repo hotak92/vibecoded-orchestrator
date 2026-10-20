@@ -706,8 +706,6 @@ class HealthTests(GatewayTestBase):
         "oauth_state", "oauth_expires_in_s", "vendors", "vendor_keys_cached",
         "vendor_keys_stale",
         "secret_scope",
-        # v0.2.104: the first-party auth mode + Claude API key state.
-        "anthropic_auth",
         "model_echo_mismatches",
         "token_file_permissions", "host_token_file", "usage_ledger",
     }

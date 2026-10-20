@@ -625,14 +625,15 @@ def run_with_quota_fallback(
     latch reads) says ``quota`` (the subscription out of usage), the run is
     retried ONCE with VCO's shared ``ANTHROPIC_API_KEY_GATEWAY`` Console key
     in the child environment (``vco_lib.claude_cli_api_key.retry_env``:
-    the launcher's API-key fallback switch ON, no cloud-provider switch or
-    foreign ``ANTHROPIC_BASE_URL`` in the job's env, the key resolves).
+    the launcher's background-job API-key switch ON, no cloud-provider
+    switch or foreign ``ANTHROPIC_BASE_URL`` in the job's env, the key
+    resolves; the inherited ``CLAUDE_CODE_ENTRYPOINT`` is dropped from the
+    retry's env, without which the CLI would ignore the key).
 
-    Only the DIRECT rung retries (``direct_rung``): a gateway rung's quota
-    refusal is already retried server-side by the gateway's own API-key
-    fallback on the very same launcher setting, and its model ids are
-    gateway-namespaced (``claude-gw/…``), which api.anthropic.com does not
-    serve. The gateway rung's forced ``ANTHROPIC_API_KEY=""`` (which keeps
+    Only the DIRECT rung retries (``direct_rung``): a gateway rung's model
+    ids are gateway-namespaced (``claude-gw/…``), which api.anthropic.com
+    does not serve, and the gateway answers its own quota refusals through
+    its fallback ladder. The gateway rung's forced ``ANTHROPIC_API_KEY=""`` (which keeps
     the subscription in charge — :func:`_gateway_auth_env`) is untouched for
     the normal attempt; only the retry's env carries the key.
 

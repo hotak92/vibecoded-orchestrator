@@ -6,21 +6,22 @@ VCO runs background jobs through ``claude -p`` on the user's Claude
 subscription: the KG summary generator's CLI tier
 (``templates/scripts/summary_backends.py``) and the post-commit KG reviewer
 (``templates/scripts/kg_reviewer_backend.py``; code summaries ride the
-summary ladder's CLI tier). When the subscription is OUT OF USAGE, the same
-launcher setting that arms the model gateway's subscription -> API-key
-fallback also allows each such job ONE retry with the Anthropic Console API
-key the owner stored as the SHARED secret ``ANTHROPIC_API_KEY_GATEWAY`` (the
-key the model gateway's own API-key route uses). ``claude -p`` reads
-``ANTHROPIC_API_KEY`` from its environment, so the key is passed ONLY in the
-child process environment — never argv, never a file, never a log line.
+summary ladder's CLI tier). When the subscription is OUT OF USAGE, the
+launcher setting ``model_gateway.api_key_fallback`` (Preferences → "Claude
+API key for background jobs") allows each such job ONE retry with the
+Anthropic Console API key the owner stored as the SHARED secret
+``ANTHROPIC_API_KEY_GATEWAY`` (the name is historical — the model gateway
+itself never reads it). ``claude -p`` reads ``ANTHROPIC_API_KEY`` from its
+environment, so the key is passed ONLY in the child process environment —
+never argv, never a file, never a log line. This module is the one home of
+both the setting key and the secret name on the Python side.
 
 One home for the decision (the callers are stdlib-oriented scripts that
 lazy-import this module):
 
 * :func:`fallback_enabled` — the launcher setting, soft-read: an absent or
-  unreadable launcher DB is OFF (these jobs have no "previous value" to
-  keep, unlike the long-running gateway, which reads the same row through
-  the strict reader and keeps its last value on a locked DB).
+  unreadable launcher DB is OFF (these jobs start fresh and have no
+  "previous value" to keep).
 * :func:`resolve_key` — VCO's own shared slot through the sanctioned
   resolver (``vco_lib.agent_secrets.get``, hub-first then the file store),
   ``None`` on any miss; never raises to the caller.
@@ -37,26 +38,38 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 #: The launcher ``app_state`` key (``~/.vct/launcher.db``) that turns the
-#: subscription -> API-key fallback on. MUST MATCH
-#: ``API_KEY_FALLBACK_APP_STATE_KEY`` in
-#: ``claude_mcp_servers/model_router/config.py`` and
+#: background jobs' subscription -> API-key retry on (the ``model_gateway.``
+#: prefix is historical; the gateway does not read it). MUST MATCH
 #: ``APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK`` in
 #: ``launcher/src/lib/preferences/loaders.ts`` (parity-tested in
-#: ``tests/test_v02104_claude_cli_api_key_fallback.py``). Not imported from
-#: the gateway: importing ``model_router`` from ``vco_lib`` would pull the
-#: gateway package into every caller of this small helper.
+#: ``tests/test_v02104_claude_cli_api_key_fallback.py``).
 APP_STATE_KEY = "model_gateway.api_key_fallback"
 
-#: The shared vct-secrets slot holding the Console API key. MUST MATCH the
-#: ``secret_keys`` of ``ANTHROPIC_API_KEY_ROUTE`` in
-#: ``claude_mcp_servers/model_router/vendors.py`` (parity-tested). ONE name,
-#: the owner's (2026-10-18): the generic ``ANTHROPIC_API_KEY`` /
+#: The shared vct-secrets slot holding the Console API key — its one Python
+#: home. MUST MATCH the ``slot_exclusive`` entry in ``vct-module.json``
+#: ``bundled_secrets`` and the launcher SecretsPanel suggestion
+#: (parity-tested in ``tests/test_v02104_claude_cli_api_key_fallback.py``).
+#: ONE name, the owner's (2026-10-18): the generic ``ANTHROPIC_API_KEY`` /
 #: ``anthropic_api_key`` slots are a PROJECT's own key and VCO only ever
 #: spends its own slot.
 SECRET_KEY_NAME = "ANTHROPIC_API_KEY_GATEWAY"
 
 #: The env var the ``claude`` CLI reads its API key from.
 CHILD_ENV_VAR = "ANTHROPIC_API_KEY"
+
+#: Removed from the retry's env, ALWAYS (never replaced by another value).
+#: Claude Code exports it to everything it spawns (``claude-vscode`` inside
+#: the VS Code extension, ``cli`` in a terminal), so a hook-spawned job
+#: inherits the panel's entrypoint. Measured 2026-10-20: with
+#: ``CLAUDE_CODE_ENTRYPOINT=claude-vscode`` in its env, ``claude -p``
+#: IGNORES ``ANTHROPIC_API_KEY`` and keeps using the OAuth login (a
+#: deliberately invalid key still answered 200, on the subscription); with the
+#: variable removed the key is used (the same invalid key -> 401 "Invalid API
+#: key"). Anthropic also refuses Console API credits for requests that carry
+#: the VS Code entrypoint. The retry IS a headless run, so it carries no
+#: entrypoint of its own and the CLI applies its headless defaults; the
+#: user-agent is left exactly as the CLI builds it.
+ENTRYPOINT_ENV_VAR = "CLAUDE_CODE_ENTRYPOINT"
 
 #: Gateway routing keys removed from the retry's env — ONLY when
 #: ``ANTHROPIC_BASE_URL`` names the local VCO model gateway
@@ -81,24 +94,38 @@ PROVIDER_SWITCHES = (
 )
 
 #: Values of a provider switch that mean "off" (anything else non-empty is
-#: read as ON — when in doubt the retry is NOT attempted).
+#: read as ON — when in doubt the retry is NOT attempted). Checked against the
+#: live CLI 2026-10-20 (NIT-B): ``CLAUDE_CODE_USE_BEDROCK=0`` and ``=false``
+#: (fresh ``CLAUDE_CONFIG_DIR``, no entrypoint/base URL/auth token, a
+#: deliberately invalid Anthropic key) both printed "Invalid API key · Fix
+#: external API key" — the key went to api.anthropic.com, not to Bedrock — so
+#: the CLI reads them as OFF, as this tuple does.
 _SWITCH_OFF_VALUES = ("", "0", "false", "no", "off")
+
+
+class GatewayCheckUnavailable(Exception):
+    """``vco_lib.vscode_settings`` (the gateway-URL rule) cannot be imported —
+    a broken install, so whether ``ANTHROPIC_BASE_URL`` is the VCO gateway is
+    UNKNOWN. Carries the exception class name for the blocker text."""
 
 
 def _is_vco_gateway_url(url: str) -> bool:
     """Whether *url* is the local VCO model gateway, by the gateway's own
     rule (:func:`vco_lib.vscode_settings.is_vco_gateway_base_url`: an http(s)
     loopback URL on the port :func:`~vco_lib.vscode_settings.resolve_gateway_ports`
-    resolves). An answer that cannot be computed is ``False`` — the URL is
-    then treated as the user's own routing, which is left alone."""
+    resolves).
+
+    Raises :class:`GatewayCheckUnavailable` when that module cannot be
+    imported (R22 LOW-A): "cannot tell" is a different answer from "not the
+    gateway", and :func:`retry_blocker` says so instead of blaming the URL.
+    """
     try:
         from vco_lib.vscode_settings import (  # noqa: PLC0415
             is_vco_gateway_base_url,
         )
-
-        return bool(is_vco_gateway_base_url(url))
-    except Exception:  # noqa: BLE001 — undecidable means "not ours"
-        return False
+    except ImportError as exc:
+        raise GatewayCheckUnavailable(type(exc).__name__) from exc
+    return bool(is_vco_gateway_base_url(url))
 
 
 def retry_blocker(env: Mapping[str, str]) -> Optional[str]:
@@ -122,7 +149,13 @@ def retry_blocker(env: Mapping[str, str]) -> Optional[str]:
                     "cloud provider, not an Anthropic API key")
     base_url = (env.get("ANTHROPIC_BASE_URL") or "").strip()
     if base_url:
-        if not _is_vco_gateway_url(base_url):
+        try:
+            ours = _is_vco_gateway_url(base_url)
+        except GatewayCheckUnavailable as exc:
+            return ("cannot tell whether ANTHROPIC_BASE_URL is the VCO "
+                    "gateway: vco_lib.vscode_settings is not importable "
+                    f"({exc}) — not retried")
+        if not ours:
             return ("ANTHROPIC_BASE_URL points at an endpoint that is not the "
                     "local VCO model gateway — the job's own routing is left "
                     "alone")
@@ -136,15 +169,13 @@ def retry_blocker(env: Mapping[str, str]) -> Optional[str]:
 def fallback_enabled(db_path: "Optional[Path]" = None) -> bool:
     """Whether the subscription -> API-key fallback is ON for these jobs.
 
-    Reads the SAME launcher setting the model gateway's fallback uses
+    Reads the launcher setting Preferences writes
     (``app_state[model_gateway.api_key_fallback]``; truthy = ``true``/``1``,
     the spelling the launcher's ``app_state_set_bool`` writes) through the
     SOFT reader: no row, no launcher DB, an unreadable DB — all OFF. A
     setting that bills the user must be positively ON, never on by accident,
-    and a background job has no previously-read value worth keeping (the
-    gateway's strict-reader/keep-last-value discipline does not apply to a
-    process that starts fresh). ``db_path`` overrides launcher DB discovery
-    for tests.
+    and a background job starts fresh, so it has no previously-read value
+    worth keeping. ``db_path`` overrides launcher DB discovery for tests.
     """
     # Deferred: the soft reader opens SQLite, which nothing else in this
     # module needs at import time (the scripts that import this module are
@@ -165,10 +196,8 @@ def resolve_key() -> Optional[str]:
     declared ``slot_exclusive`` in ``vct-module.json`` ``bundled_secrets``,
     so the hub's ``/env`` serves it ONLY from VCO's shared slot — a secret a
     user saves under the same name in a project's own bucket (or grants from
-    another project) never answers for it. The model gateway's resolver
-    applies the same rule (``model_router.secrets``, ``shared_only`` on
-    ``ANTHROPIC_API_KEY_ROUTE``). Owner rule: a project's secrets are the
-    project's; VCO spends only its own slot.
+    another project) never answers for it. Owner rule: a project's secrets
+    are the project's; VCO spends only its own slot.
 
     Returns ``None`` on EVERY miss (absent, paused, denied, store
     unavailable, resolver itself broken): the callers treat ``None`` as "no
@@ -189,7 +218,9 @@ def resolve_key() -> Optional[str]:
 def child_env_with_key(env: Mapping[str, str], key: str) -> "dict[str, str]":
     """A COPY of *env* for the one fallback retry, with the key applied.
 
-    ``ANTHROPIC_API_KEY`` is set to *key*; the gateway routing vars
+    ``ANTHROPIC_API_KEY`` is set to *key*; :data:`ENTRYPOINT_ENV_VAR` is
+    always removed (with an inherited ``claude-vscode`` entrypoint the CLI
+    ignores the key — see its comment); the gateway routing vars
     (:data:`_GATEWAY_ROUTING_VARS`) are removed ONLY when
     ``ANTHROPIC_BASE_URL`` is the local VCO gateway, so the retry reaches
     Anthropic directly (see their comment). Callers check
@@ -199,8 +230,13 @@ def child_env_with_key(env: Mapping[str, str], key: str) -> "dict[str, str]":
     the one retried child process.
     """
     child = dict(env)
+    child.pop(ENTRYPOINT_ENV_VAR, None)
     base_url = (child.get("ANTHROPIC_BASE_URL") or "").strip()
-    if base_url and _is_vco_gateway_url(base_url):
+    try:
+        ours = bool(base_url) and _is_vco_gateway_url(base_url)
+    except GatewayCheckUnavailable:
+        ours = False  # undecidable: the job's routing is left as it is
+    if ours:
         for name in _GATEWAY_ROUTING_VARS:
             child.pop(name, None)
     child[CHILD_ENV_VAR] = key
@@ -243,6 +279,8 @@ def retry_env(
 __all__ = [
     "APP_STATE_KEY",
     "CHILD_ENV_VAR",
+    "ENTRYPOINT_ENV_VAR",
+    "GatewayCheckUnavailable",
     "PROVIDER_SWITCHES",
     "SECRET_KEY_NAME",
     "child_env_with_key",

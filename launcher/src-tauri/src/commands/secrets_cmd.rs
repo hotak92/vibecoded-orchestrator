@@ -1724,6 +1724,16 @@ mod tests {
         Db(Mutex::new(conn))
     }
 
+    /// R22 NIT-C: the panel hint's names come from `vct-module.json` — both
+    /// Shared-only keys VCO spends, never the per-project-capable PAT.
+    #[test]
+    fn slot_exclusive_names_come_from_the_manifest() {
+        let names = tauri::async_runtime::block_on(list_slot_exclusive_secret_names());
+        assert!(names.iter().any(|n| n == "openai_api_key"), "{names:?}");
+        assert!(names.iter().any(|n| n == "ANTHROPIC_API_KEY_GATEWAY"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "github_pat"), "{names:?}");
+    }
+
     /// R7b F2: a module setting is written through the one write path
     /// (`module_gui::write_setting`, the body of `set_module_setting`) — an invalid
     /// value for a declared setting, and a setting whose live value lives
@@ -4190,6 +4200,19 @@ pub async fn migrate_env_secrets_from_dotenv(
 pub struct SharedSecretsToggleResult {
     pub read_disabled: bool,
     pub warnings: Vec<String>,
+}
+
+/// v0.2.104 (R22 NIT-C): the secret names the hub serves ONLY from VCO's
+/// Shared slot (`slot_exclusive` in `vct-module.json` `bundled_secrets`).
+/// The Secrets panel shows "served from Shared only" when such a name is
+/// typed into a project's (or global) add form — a row the hub would
+/// otherwise skip silently. No manifest readable = no names (the hint is
+/// advisory; nothing else depends on it).
+#[command]
+pub async fn list_slot_exclusive_secret_names() -> Vec<String> {
+    vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest()
+        .map(|m| m.slot_exclusive_shared_keys())
+        .unwrap_or_default()
 }
 
 /// Read the per-project SHARED_SECRETS_READ_DISABLED gate for the launcher

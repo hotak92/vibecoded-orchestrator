@@ -87,7 +87,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import aiohttp
 
@@ -908,10 +908,6 @@ class UsageWindows:
         self._usage: dict[str, VendorUsage] = {
             ANTHROPIC_ID: VendorUsage(ANTHROPIC_ID, ANTHROPIC_LABEL, "Claude subscription"),
         }
-        #: The subscription-out latch's report (``QuotaLatch.report`` dicts),
-        #: set by the gateway; the snapshot carries it on the Claude entry as
-        #: ``api_key_latch`` and :func:`render_line` names it.
-        self.latch_report: Callable[[], list[dict]] = lambda: []
         for vendor in vendors.values():
             self._usage[vendor.vendor_id] = VendorUsage(
                 vendor.vendor_id,
@@ -920,12 +916,6 @@ class UsageWindows:
             )
 
     # ── passive capture (request path: sync, cheap, never raises) ───────
-    def anthropic_readings(self) -> list[Window]:
-        """The Claude windows as last observed (endpoint and relayed headers
-        merged, newest known wins) — a pure read of memory, for the quota
-        latch (:mod:`model_router.quota_latch`)."""
-        return _merge_headers(self._usage[ANTHROPIC_ID].windows, self._header_windows)
-
     def observe_anthropic_headers(self, headers: Mapping[str, str]) -> None:
         """Take the unified rate-limit headers off a relayed first-party answer."""
         for window in parse_unified_headers(headers, now=self._clock()):
@@ -1291,7 +1281,7 @@ class UsageWindows:
         for usage in self._usage.values():
             windows = usage.windows
             if usage.id == ANTHROPIC_ID:
-                windows = self.anthropic_readings()
+                windows = _merge_headers(windows, self._header_windows)
             entry: dict[str, Any] = {
                 "id": usage.id,
                 "label": usage.label,
@@ -1315,14 +1305,6 @@ class UsageWindows:
             ):
                 # The endpoint failed but the relayed headers answered.
                 entry["state"] = STATE_OK
-            latches = self.latch_report() if usage.id == ANTHROPIC_ID else []
-            if latches:
-                # v0.2.104: the subscription-out latch — Claude requests
-                # (all, or one model's) go straight to the API key until then.
-                # The text is rendered HERE (the one renderer, local clock)
-                # so the launcher card shows it verbatim, never a mirror.
-                entry["api_key_latch"] = latches
-                entry["api_key_latch_text"] = latch_text(latches)
             if usage.tokens is not None:
                 t = usage.tokens
                 entry["tokens"] = {
@@ -1409,13 +1391,6 @@ def _effective(window: Window, now: float) -> "tuple[Optional[float], Optional[s
     return window.percent, None
 
 
-def effective_percent(window: Window, now: float) -> Optional[float]:
-    """The reading as it stands at ``now`` — ``None`` when unknown, stale or
-    past its reset: the same aging the snapshot applies (the quota latch
-    reads windows through this, never their raw ``percent``)."""
-    return _effective(window, now)[0]
-
-
 def _window_dict(window: Window, now: float) -> dict:
     percent, reason = _effective(window, now)
     return {
@@ -1464,31 +1439,9 @@ def render_line(snapshot: Mapping[str, Any]) -> str:
     segments: list[str] = []
     for vendor in snapshot.get("vendors") or ():
         parts = [_window_text(w) for w in vendor.get("windows") or () if _known(w)]
-        latch = latch_text(vendor.get("api_key_latch") or ())
-        if parts or latch:
-            text = " · ".join(parts)
-            segments.append(
-                f"{vendor.get('label', vendor.get('id', '?'))} "
-                + (f"{text} {latch}" if text and latch else text or latch),
-            )
+        if parts:
+            segments.append(f"{vendor.get('label', vendor.get('id', '?'))} " + " · ".join(parts))
     return " │ ".join(segments)
-
-
-def latch_text(latches: "Sequence[Mapping[str, Any]]") -> str:
-    """``→ API key until 14:00`` (every model) / ``→ Opus on API key until
-    Mon 14:00`` (one model's weekly limit) for the snapshot's
-    ``api_key_latch`` entries, or ``""``. Local clock time; the weekday is
-    added when the reset is more than 20 hours away."""
-    parts: list[str] = []
-    for latch in latches:
-        until = _reset_epoch(latch.get("until"))
-        if until is None:
-            continue
-        scope = str(latch.get("scope") or "")
-        fmt = "%a %H:%M" if until - time.time() > 20 * 3600 else "%H:%M"
-        who = "" if scope in ("", "all") else f"{scope.capitalize()} on "
-        parts.append(f"→ {who}API key until {time.strftime(fmt, time.localtime(until))}")
-    return " · ".join(parts)
 
 
 # ── the picker-label suffix (what /v1/models appends to a vendor row) ────
@@ -1580,8 +1533,6 @@ __all__ = [
     "parse_kimi_usages",
     "parse_unified_headers",
     "parse_zai_quota",
-    "effective_percent",
-    "latch_text",
     "render_line",
     "roll_window_end",
     "session_fetcher",
