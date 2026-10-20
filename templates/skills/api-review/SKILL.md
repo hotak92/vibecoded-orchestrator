@@ -90,6 +90,9 @@ servers. The `edit` policy is an ordinary session with your settings.
     commands such as `git diff <base>...<head> -- <path>`;
   - the model cannot write files: the report is written by the tool from
     the model's final answer, and only when the run succeeded.
+- On Windows, `review` needs Git Bash (Git for Windows, or
+  `CLAUDE_CODE_GIT_BASH_PATH`): Claude Code runs the guard hook through it,
+  so without it the tool refuses to start.
 - `edit`: the full tool set with `--permission-mode acceptEdits`, for a
   bounded task that must change files in `--cwd`. It runs with your project
   and user settings like any session (their allow rules and hooks apply) and

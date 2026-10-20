@@ -1399,7 +1399,14 @@ _API_KEY_MEMO: dict = {}
 
 def _memo_enabled(fallback_enabled) -> bool:
     if "enabled" not in _API_KEY_MEMO:
-        _API_KEY_MEMO["enabled"] = bool(fallback_enabled())
+        try:
+            _API_KEY_MEMO["enabled"] = bool(fallback_enabled())
+        except Exception:
+            # A broken reader is said ONCE per process (FINAL3 NIT): the
+            # failure is memoised as "off", then raised so ``retry_env``
+            # logs its one line; later nodes see False and stay silent.
+            _API_KEY_MEMO["enabled"] = False
+            raise
     return _API_KEY_MEMO["enabled"]
 
 

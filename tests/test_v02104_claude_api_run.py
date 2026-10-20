@@ -59,9 +59,12 @@ keys = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_BASE_URL",
 mcp = None
 if "--mcp-config" in sys.argv:
     mcp = json.load(open(sys.argv[sys.argv.index("--mcp-config") + 1]))
+settings = None
+if "--settings" in sys.argv:
+    settings = json.load(open(sys.argv[sys.argv.index("--settings") + 1]))
 with open(rec, "w") as fh:
     json.dump({{"argv": sys.argv[1:], "stdin": sys.stdin.read(),
-               "cwd": os.getcwd(), "mcp": mcp,
+               "cwd": os.getcwd(), "mcp": mcp, "settings": settings,
                "env": {{k: os.environ.get(k) for k in keys}}}}, fh)
 out = open(os.environ["FAKE_CLAUDE_OUT"]).read()
 if os.environ.get("FAKE_CLAUDE_LEAK"):
@@ -214,8 +217,10 @@ class TestChildEnvAndArgv:
                      "Bash(git commit *)", "Bash(rm *)",
                      "mcp__weaviate-kg__store_knowledge_node"):
             assert rule in denied, rule
-        # The guard hook rides in --settings, on every tool.
-        settings = json.loads(argv[argv.index("--settings") + 1])
+        # The guard hook rides in --settings, on every tool — as a FILE
+        # (FINAL3 finding 1: no argv element may carry the hook's ``||``).
+        assert not any("|" in a for a in argv), argv
+        settings = rec["settings"]
         (group,) = settings["hooks"]["PreToolUse"]
         assert group["matcher"] == "*"
         (hook,) = group["hooks"]
@@ -626,3 +631,34 @@ def test_the_fixture_carries_no_account_identifiers():
     assert d["session_id"].startswith("00000000-")
     assert d["uuid"].startswith("00000000-")
     assert "sk-ant" not in text
+
+
+class TestWindowsHookShell:
+    """FINAL3 finding 4: under Claude Code's PowerShell hook fallback the
+    bash-syntax guard command cannot run, so ``review`` needs Git Bash."""
+
+    def test_pinned_git_bash_counts(self, tmp_path):
+        bash = tmp_path / "bash.exe"
+        bash.write_text("")
+        assert car.windows_hook_shell_is_bash(
+            {"CLAUDE_CODE_GIT_BASH_PATH": str(bash), "PATH": ""})
+
+    def test_git_with_its_bash_counts(self, tmp_path):
+        (tmp_path / "Git" / "cmd").mkdir(parents=True)
+        (tmp_path / "Git" / "bin").mkdir()
+        git = tmp_path / "Git" / "cmd" / "git"
+        git.write_text("#!/bin/sh\n")
+        git.chmod(0o755)
+        (tmp_path / "Git" / "bin" / "bash.exe").write_text("")
+        assert car.windows_hook_shell_is_bash(
+            {"PATH": str(tmp_path / "Git" / "cmd")})
+
+    def test_nothing_found_is_false(self, tmp_path):
+        assert not car.windows_hook_shell_is_bash({"PATH": str(tmp_path)})
+
+    def test_review_on_windows_without_git_bash_refuses_before_the_key(
+            self, harness, monkeypatch):
+        monkeypatch.setattr(car, "_on_windows", lambda: True)
+        monkeypatch.setattr(car, "windows_hook_shell_is_bash", lambda env: False)
+        assert harness.run() == car.EXIT_REFUSED
+        assert not harness.record.exists()

@@ -67,6 +67,10 @@ ALLOWED = [
 ]
 
 DENIED = [
+    # FINAL3 LOW: %G signature placeholders spawn gpg / ssh-keygen
+    "git log --format=%GG",
+    "git log --pretty=format:%h%GS",
+    "git show --format=%GK HEAD",
     # the review's examples
     "git -C . commit",
     "git -C . status",
