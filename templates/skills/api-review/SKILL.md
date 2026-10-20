@@ -10,9 +10,11 @@ model: sonnet
 # api-review — a bounded task on Console API credits
 
 `claude-api-run` runs ONE headless `claude -p` task in a project directory,
-billed to your Claude Console API key, then prints what it cost. The run is
-a normal Claude Code session (your MCP servers, hooks and project settings
-apply); only the billing, the bounds and the tool policy differ.
+billed to your Claude Console API key, then prints what it cost. In the
+default `review` policy the run is read-only and sandboxed: your user and
+project settings files (their allow rules, hooks, `apiKeyHelper`) do NOT
+apply, and only VCO's KG / code-graph search tools come from your MCP
+servers. The `edit` policy is an ordinary session with your settings.
 
 ## When to use it
 
@@ -63,27 +65,53 @@ apply); only the billing, the bounds and the tool policy differ.
    `--policy review`. Add `--max-turns N` to cap turns, `--cwd DIR` to run
    elsewhere, `--json` for a machine-readable summary.
 4. **Read the report**, verify each finding in the source before acting on
-   it, and relay the cost line to the user.
+   it, and relay the cost line to the user. A failed run writes no report:
+   read the summary's `ERROR:` line instead.
 
 ## Tool policy
 
-- `review` (default): only `Read`, `Grep`, `Glob` and `Bash`; Bash is
-  pre-approved for read-only git (`diff`, `log`, `show`, `status`, `blame`,
-  `ls-files`, `rev-parse`, `merge-base`), VCO's KG / code-graph search tools
-  are pre-approved, and everything else is refused without a prompt
-  (`--permission-mode dontAsk`) — except what your own settings' allow rules
-  already permit, which still applies outside the deny list. Git's mutating subcommands, `rm`, `Edit`
-  and `Write` are denied outright. The model cannot write files: the
-  report is written by the tool from the model's final answer.
+- `review` (default) — read-only, whatever your settings allow:
+  - runs in the CLI's `--restricted` mode: your user, project and local
+    settings files are ignored (their allow rules, hooks and `apiKeyHelper`
+    do not apply; managed settings do), and file reads stay inside the
+    working directory;
+  - tools: `Read`, `Grep`, `Glob`, `Bash`, and the `weaviate-kg` MCP
+    server's search tools (`hybrid_search`, `semantic_graph_search`,
+    `search_code_graph`, `query_code_structure`). No other MCP server is
+    loaded; `store_knowledge_node`, `Edit` and `Write` are denied;
+  - Bash runs only a single plain `git diff`, `log`, `show`, `status`,
+    `blame`, `ls-files`, `rev-parse` or `merge-base` command: no option
+    before the subcommand (`git -C`, `git -c` …), no quotes, pipes,
+    redirection, `;`/`&&` or substitution, only read-only options (no
+    `--output`, `--ext-diff`, `--textconv`, `--no-index` …) and no path
+    outside the repository. A VCO hook (run by the same Python) enforces
+    this allowlist and denies every other tool call; if the hook cannot
+    run, the tool call is blocked. Write review prompts that ask for plain
+    commands such as `git diff <base>...<head> -- <path>`;
+  - the model cannot write files: the report is written by the tool from
+    the model's final answer, and only when the run succeeded.
 - `edit`: the full tool set with `--permission-mode acceptEdits`, for a
-  bounded task that must change files in `--cwd`. Review the diff after.
+  bounded task that must change files in `--cwd`. It runs with your project
+  and user settings like any session (their allow rules and hooks apply) and
+  is NOT sandboxed — anything your settings allow, it may do. Review the
+  diff after.
+
+## Proof of billing
+
+The tool reads which credential the CLI used (`apiKeySource` in the run's
+init event). If it is not the API key — your login, an `apiKeyHelper`, or
+unknown — the run counts as FAILED ("the run did not use the API key:
+<source>") and no report is written, so a cost line never claims API
+billing that did not happen.
 
 ## Cost and ledger
 
 After the run the tool prints the total cost, per-model tokens (input,
 output, cache read, cache write) and cost, turns, duration, and the API
-error if there was one (e.g. `API status 400; Credit balance is too low`).
+error if there was one (e.g. `API status 400; Credit balance is too low`)
+and the credential (`ANTHROPIC_API_KEY`).
 Each run appends one JSON line — no prompt, no key; a failed run keeps one short error line — to
 `claude_api_runs.jsonl` in VCO's metrics directory (`~/.vct/metrics/` by
 default, `$VCT_STATE_DIR/metrics` when set). Exit codes: 0 ok, 1 the run
-failed, 2 usage, 3 refused before anything was spawned.
+failed (including a credential other than the key), 2 usage (also `--cwd`
+or `--project` not a directory), 3 refused before anything was spawned.

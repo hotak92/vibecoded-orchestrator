@@ -3,9 +3,11 @@
 """v0.2.104 — ``vco_lib.claude_api_run``: a headless ``claude -p`` on the
 Console API key, with a cost summary and a ledger line.
 
-A fake ``claude`` on PATH records its argv, its stdin and the env keys that
-matter, and prints a canned JSON result (the success shape is a scrubbed copy
-of a REAL ``claude -p --output-format json`` answer, 2026-10-20). Pinned:
+A fake ``claude`` on PATH records its argv, its stdin, the env keys that
+matter and the ``--mcp-config`` file, and prints a canned stream: the
+``system``/``init`` event of a REAL ``--output-format stream-json --verbose``
+review run and a REAL result object (both scrubbed copies, 2026-10-20).
+Pinned:
 
 * the child env drops ``CLAUDE_CODE_ENTRYPOINT`` and VCO's gateway routing
   and carries the key ONLY there (never argv, never the parent env);
@@ -14,7 +16,12 @@ of a REAL ``claude -p --output-format json`` answer, 2026-10-20). Pinned:
 * ``--max-budget-usd`` is always passed; the tool policy flags;
 * the cost summary and the ledger line parse the real shape and an error
   result (the 400 "credit balance is too low" refusal);
-* the key never appears in stdout, stderr, the report or the ledger.
+* the key never appears in stdout, stderr, the report or the ledger;
+* (R27, Fable FINAL2) ``review`` runs ``--restricted`` with the guard hook
+  in ``--settings``, no Bash allow rule, the KG write tool denied and only
+  the ``weaviate-kg`` MCP server; a credential other than the env key, or no
+  init event, fails the run; ``--report`` is written only on success;
+  ``CLAUDE_CODE_OAUTH_TOKEN`` never reaches the child.
 
 No network, no real secret: the key is an obvious placeholder.
 """
@@ -37,6 +44,10 @@ from vco_lib import claude_api_run as car
 REPO = Path(__file__).resolve().parent.parent
 FIXTURE = REPO / "tests" / "fixtures" / "claude_api_run" / \
     "result_success_live_2026-10-20.json"
+STREAM_FIXTURE = REPO / "tests" / "fixtures" / "claude_api_run" / \
+    "stream_init_result_live_2026-10-20.jsonl"
+INIT_EVENT = json.loads(
+    STREAM_FIXTURE.read_text(encoding="utf-8").splitlines()[0])
 FAKE_KEY = "test-not-a-real-console-key-7f3a"  # vco-secret-scan: test-placeholder
 GATEWAY_URL = "http://127.0.0.1:11460"
 
@@ -44,10 +55,13 @@ _FAKE_CLAUDE = """#!{python}
 import json, os, sys
 rec = os.environ["FAKE_CLAUDE_RECORD"]
 keys = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_AUTH_TOKEN"]
+        "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]
+mcp = None
+if "--mcp-config" in sys.argv:
+    mcp = json.load(open(sys.argv[sys.argv.index("--mcp-config") + 1]))
 with open(rec, "w") as fh:
     json.dump({{"argv": sys.argv[1:], "stdin": sys.stdin.read(),
-               "cwd": os.getcwd(),
+               "cwd": os.getcwd(), "mcp": mcp,
                "env": {{k: os.environ.get(k) for k in keys}}}}, fh)
 out = open(os.environ["FAKE_CLAUDE_OUT"]).read()
 if os.environ.get("FAKE_CLAUDE_LEAK"):
@@ -56,6 +70,20 @@ if os.environ.get("FAKE_CLAUDE_LEAK"):
 sys.stdout.write(out)
 sys.exit(int(os.environ.get("FAKE_CLAUDE_RC", "0")))
 """
+
+
+def _stream(result: "dict | None" = None, init: "dict | None" = None) -> str:
+    """A stream-json stdout: the init event, then the result event."""
+    if result is None:
+        result = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    lines = [json.dumps(init if init is not None else INIT_EVENT),
+             json.dumps({"type": "assistant", "message": {"content": []}}),
+             json.dumps(result)]
+    return "\n".join(lines) + "\n"
+
+
+KG_ENTRY = {"type": "stdio", "command": "/opt/vco/.venv/bin/python",
+            "args": ["server.py"], "env": {"WEAVIATE_URL": "http://x:1"}}
 
 
 def _error_result() -> dict:
@@ -81,7 +109,7 @@ def harness(tmp_path, monkeypatch):
     claude.chmod(0o755)
     record = tmp_path / "record.json"
     out = tmp_path / "out.json"
-    shutil.copy(FIXTURE, out)
+    out.write_text(_stream(), encoding="utf-8")
     work = tmp_path / "work"
     work.mkdir()
 
@@ -95,6 +123,9 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_BASE_URL", GATEWAY_URL)
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "loopback-gateway-bearer")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "subscription-token-placeholder")
+    monkeypatch.setattr(car, "_user_mcp_servers", lambda: {
+        "weaviate-kg": KG_ENTRY, "playwright": {"command": "npx"}})
     for v in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
               "CLAUDE_CODE_USE_FOUNDRY", "FAKE_CLAUDE_LEAK", "FAKE_CLAUDE_RC"):
         monkeypatch.delenv(v, raising=False)
@@ -134,6 +165,8 @@ class TestChildEnvAndArgv:
         assert env["CLAUDE_CODE_ENTRYPOINT"] is None
         assert env["ANTHROPIC_BASE_URL"] is None
         assert env["ANTHROPIC_AUTH_TOKEN"] is None
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] is None
+        assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
         # The parent environment is untouched.
         assert "ANTHROPIC_API_KEY" not in os.environ
         assert os.environ["CLAUDE_CODE_ENTRYPOINT"] == "claude-vscode"
@@ -143,7 +176,8 @@ class TestChildEnvAndArgv:
         assert harness.run() == 0
         rec = harness.rec()
         argv = rec["argv"]
-        assert argv[:3] == ["-p", "--output-format", "json"]
+        assert argv[:4] == ["-p", "--output-format", "stream-json",
+                            "--verbose"]
         assert argv[argv.index("--model") + 1] == "claude-fable-5-1"
         assert argv[argv.index("--effort") + 1] == "high"
         assert argv[argv.index("--max-budget-usd") + 1] == "25"
@@ -164,25 +198,60 @@ class TestChildEnvAndArgv:
 
     def test_review_policy_is_read_only(self, harness):
         assert harness.run() == 0
-        argv = harness.rec()["argv"]
+        rec = harness.rec()
+        argv = rec["argv"]
+        assert "--restricted" in argv
         assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob,Bash"
         assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
         allowed = argv[argv.index("--allowedTools") + 1:
                        argv.index("--disallowedTools")]
-        denied = argv[argv.index("--disallowedTools") + 1:]
-        assert "Bash(git diff *)" in allowed and "Bash(git show *)" in allowed
-        assert not any(r.startswith("Bash(git push") for r in allowed)
+        denied = argv[argv.index("--disallowedTools") + 1:
+                      argv.index("--mcp-config")]
+        # No Bash rule at all: only the guard hook approves a Bash call.
+        assert not any(r.startswith("Bash") for r in allowed), allowed
+        assert "mcp__weaviate-kg__hybrid_search" in allowed
         for rule in ("Edit", "Write", "Bash(git push *)",
-                     "Bash(git commit *)", "Bash(rm *)"):
+                     "Bash(git commit *)", "Bash(rm *)",
+                     "mcp__weaviate-kg__store_knowledge_node"):
             assert rule in denied, rule
+        # The guard hook rides in --settings, on every tool.
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        (group,) = settings["hooks"]["PreToolUse"]
+        assert group["matcher"] == "*"
+        (hook,) = group["hooks"]
+        assert hook["type"] == "command"
+        assert "-m vco_lib.claude_api_review_guard" in hook["command"]
+        assert hook["command"].endswith(" || exit 2")
+        # Only the KG server, strictly.
+        assert "--strict-mcp-config" in argv
+        assert rec["mcp"] == {"mcpServers": {"weaviate-kg": KG_ENTRY}}
+
+    def test_review_without_a_kg_registration_says_so(
+            self, harness, monkeypatch, capsys):
+        monkeypatch.setattr(car, "_user_mcp_servers", lambda: {})
+        assert harness.run() == 0
+        argv = harness.rec()["argv"]
+        assert "--mcp-config" not in argv
+        assert "weaviate-kg MCP server is not registered" in \
+            capsys.readouterr().err
+
+    def test_the_mcp_config_file_is_removed_after_the_run(self, harness):
+        assert harness.run() == 0
+        argv = harness.rec()["argv"]
+        assert not Path(argv[argv.index("--mcp-config") + 1]).exists()
 
     def test_edit_policy_allows_edits_but_not_git_mutation(self, harness):
         assert harness.run("--policy", "edit") == 0
         argv = harness.rec()["argv"]
         assert "--tools" not in argv
         assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+        assert "--restricted" not in argv and "--settings" not in argv
+        assert "--mcp-config" not in argv
         denied = argv[argv.index("--disallowedTools") + 1:]
         assert "Edit" not in denied and "Bash(git push *)" in denied
+        allowed = argv[argv.index("--allowedTools") + 1:
+                       argv.index("--disallowedTools")]
+        assert "Bash(git diff *)" in allowed
 
     def test_the_key_is_requested_from_the_shared_slot_for_the_project(
             self, harness):
@@ -257,6 +326,15 @@ class TestRefusals:
         assert harness.run("--project", "NoSuchProjectName") == 2
         assert not harness.record.exists()
 
+    def test_a_cwd_that_is_not_a_directory_is_the_same_usage_error(
+            self, harness):
+        """R27 NIT: --cwd and --project not being directories map to ONE
+        code (2), the one the docstring lists."""
+        assert car.main(["--prompt", "x", "--cwd",
+                         str(harness.tmp / "nope")]) == car.EXIT_USAGE == 2
+        assert not harness.record.exists()
+        assert "--cwd`` or ``--project`` not a directory" in car.__doc__
+
 
 class TestSummaryAndLedger:
 
@@ -294,8 +372,9 @@ class TestSummaryAndLedger:
 
     def test_an_api_error_result_is_reported_and_exits_1(
             self, harness, capsys):
-        harness.out.write_text(json.dumps(_error_result()), encoding="utf-8")
-        assert harness.run() == car.EXIT_RUN_FAILED
+        harness.out.write_text(_stream(_error_result()), encoding="utf-8")
+        report = harness.tmp / "r.md"
+        assert harness.run("--report", str(report)) == car.EXIT_RUN_FAILED
         err = capsys.readouterr().err
         assert "ERROR: API status 400; API Error: 400 Your credit balance" \
             in err
@@ -303,11 +382,16 @@ class TestSummaryAndLedger:
         assert line["is_error"] is True and line["api_error_status"] == 400
         assert line["total_cost_usd"] == 0
         assert "credit balance" in line["error"]
+        # R27 LOW: the error text is not written as the "report".
+        assert not report.exists()
+        assert line["report"] is None
+        assert f"no report written to {report.resolve()} (the run failed)" \
+            in err
 
     def test_unparsable_output_is_a_failure(self, harness, capsys):
         harness.out.write_text("not json at all", encoding="utf-8")
         assert harness.run() == car.EXIT_RUN_FAILED
-        assert "not a JSON result" in capsys.readouterr().err
+        assert "carries no JSON result object" in capsys.readouterr().err
         assert _ledger_lines(harness)[0]["error"]
 
     def test_a_non_zero_cli_exit_is_a_failure(self, harness, monkeypatch):
@@ -319,14 +403,15 @@ class TestSummaryAndLedger:
         # A CLI that echoes the key (stderr AND the result) is scrubbed.
         d = json.loads(FIXTURE.read_text(encoding="utf-8"))
         d["result"] = "here is LEAK"
-        harness.out.write_text(json.dumps(d), encoding="utf-8")
+        harness.out.write_text(_stream(d), encoding="utf-8")
         monkeypatch.setenv("FAKE_CLAUDE_LEAK", "1")
-        monkeypatch.setenv("FAKE_CLAUDE_RC", "1")
         report = harness.tmp / "r.md"
         harness.run("--report", str(report))
+        monkeypatch.setenv("FAKE_CLAUDE_RC", "1")
         harness.run("--json")
         captured = capsys.readouterr()
         assert FAKE_KEY not in captured.out + captured.err
+        assert "here is ***" in report.read_text(encoding="utf-8")
         assert FAKE_KEY not in report.read_text(encoding="utf-8")
         assert FAKE_KEY not in harness.ledger.read_text(encoding="utf-8")
         assert harness.rec()["env"]["ANTHROPIC_API_KEY"] == FAKE_KEY
@@ -344,11 +429,68 @@ class TestSummaryAndLedger:
         assert FAKE_KEY not in harness.ledger.read_text(encoding="utf-8")
 
 
+class TestKeySource:
+    """R27 LOW (Fable FINAL2): the init event's ``apiKeySource`` proves the
+    env key served. Measured live 2026-10-20 (CLI 2.1.285): a run on the
+    key reports ``ANTHROPIC_API_KEY`` — the fixture's init event is that run's."""
+
+    def test_the_live_fixture_carries_the_expected_source(self):
+        assert INIT_EVENT["apiKeySource"] == car.EXPECTED_KEY_SOURCE
+
+    def test_the_source_is_shown_and_recorded(self, harness, capsys):
+        assert harness.run() == 0
+        assert "credential: ANTHROPIC_API_KEY" in capsys.readouterr().err
+        (line,) = _ledger_lines(harness)
+        assert line["api_key_source"] == "ANTHROPIC_API_KEY"
+        assert line["error"] is None
+
+    @pytest.mark.parametrize("source", ["/login managed key", "apiKeyHelper",
+                                        "none", None])
+    def test_another_credential_fails_the_run(self, harness, capsys, source):
+        init = dict(INIT_EVENT, apiKeySource=source)
+        if source is None:
+            del init["apiKeySource"]
+        harness.out.write_text(_stream(init=init), encoding="utf-8")
+        report = harness.tmp / "r.md"
+        assert harness.run("--report", str(report)) == car.EXIT_RUN_FAILED
+        err = capsys.readouterr().err
+        assert f"the run did not use the API key: {source}" in err
+        assert not report.exists()
+        (line,) = _ledger_lines(harness)
+        assert line["error"].startswith("the run did not use the API key")
+        # The cost summary still comes from the result event.
+        assert line["total_cost_usd"] == pytest.approx(0.003494)
+
+    def test_no_init_event_fails_the_run(self, harness, capsys):
+        result = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        harness.out.write_text(json.dumps(result) + "\n", encoding="utf-8")
+        assert harness.run() == car.EXIT_RUN_FAILED
+        assert "could not confirm which credential" in capsys.readouterr().err
+
+    def test_the_stream_fixture_is_scrubbed(self):
+        text = STREAM_FIXTURE.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            d = json.loads(line)
+            assert d["session_id"].startswith("00000000-")
+            assert d["uuid"].startswith("00000000-")
+        assert "sk-ant" not in text and "/home/" not in text
+
+
 class TestParseHelpers:
 
     def test_parse_result_tolerates_leading_noise(self):
         obj, err = car.parse_result('warning: x\n{"type": "result"}\n')
         assert err is None and obj == {"type": "result"}
+
+    def test_parse_result_takes_the_last_result_event_of_a_stream(self):
+        obj, err = car.parse_result(_stream())
+        assert err is None and obj["type"] == "result"
+        assert obj["total_cost_usd"] == pytest.approx(0.003494)
+        assert car.parse_init(_stream())["apiKeySource"] == "ANTHROPIC_API_KEY"
+
+    def test_a_stream_without_a_result_is_unparsable(self):
+        obj, err = car.parse_result(json.dumps(INIT_EVENT) + "\n")
+        assert obj is None and err
 
     def test_summarize_of_nothing_is_zeroes(self):
         s = car.summarize(None)
@@ -421,6 +563,52 @@ def test_ps1_wrapper_refuses_with_exit_3(tmp_path):
     assert proc.returncode == 3, proc.stderr
     assert "claude-api-run: ERROR - no Python environment" in proc.stderr
     assert "nothing was billed" in proc.stderr
+
+
+@pytest.mark.parametrize("native_eap", [False, True])
+@pytest.mark.parametrize("module_rc", [0, 1, 2, 3])
+def test_ps1_wrapper_exit_code_survives_stderr_output(tmp_path, module_rc,
+                                                       native_eap):
+    """R27 NIT: the module writes its cost summary to stderr on every run.
+    With ``$ErrorActionPreference = "Stop"`` still in force at the call, a
+    redirected native stderr line (Windows PowerShell 5.1) or a non-zero
+    native exit under ``$PSNativeCommandUseErrorActionPreference`` (PowerShell
+    7.3+, reproducible here) becomes a terminating error and the wrapper
+    exits 1 whatever the module returned. The wrapper must exit with the
+    module's own code."""
+    exe = shutil.which("pwsh") or shutil.which("powershell")
+    if exe is None:
+        assert not os.environ.get("CI"), (
+            "PowerShell is absent in CI — this gate cannot run and must not "
+            "be reported as passing.")
+        pytest.skip("no PowerShell interpreter on this machine")
+    if sys.platform == "win32":
+        pytest.skip("the fake interpreter is a POSIX shell script")
+    from tests.common.pwsh import PWSH_BASE_FLAGS
+
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    py = venv / "bin" / "python"
+    py.write_text(
+        '#!/bin/sh\nif [ "$1" = "-c" ]; then exit 0; fi\n'
+        'echo "claude-api-run: model x · cost 0.01" >&2\n'
+        'echo "ERROR-LIKE stderr line" >&2\n'
+        f'echo "ARGS=$*"\nexit {module_rc}\n', encoding="utf-8")
+    py.chmod(0o755)
+    scripts = stage_scripts(tmp_path / "proj" / ".claude" / "scripts",
+                            "claude-api-run.ps1")
+    env = {**_stripped_env(), "VCT_VENV": str(venv)}
+    proc = subprocess.run(
+        [exe, *PWSH_BASE_FLAGS, "-ExecutionPolicy", "Bypass", "-Command",
+         ("$PSNativeCommandUseErrorActionPreference = $true; "
+          if native_eap else "")
+         + f"& '{scripts / 'claude-api-run.ps1'}' --prompt hello 2>&1; "
+         "exit $LASTEXITCODE"],
+        capture_output=True, text=True, env=env, cwd=str(tmp_path),
+        timeout=120)
+    assert proc.returncode == module_rc, proc.stdout + proc.stderr
+    assert "ARGS=-m vco_lib.claude_api_run --project" in proc.stdout
+    assert "ERROR-LIKE stderr line" in proc.stdout + proc.stderr
 
 
 def test_the_wrapper_pair_ships():
