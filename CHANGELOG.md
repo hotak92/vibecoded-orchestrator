@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.104] - 2026-10-20
+
 ### Changed
 
 - **VCO projects are no longer compacted while idle.** Claude Code 2.1.299 started compacting a conversation of more than 200k tokens that has been idle for about 54 minutes, just before the one-hour prompt cache expires, so the user came back to a summary and could lose context that had not been written down yet. The shipped project settings now carry `"idleCompaction": false`, so every new VCO project has it, and the next bundle update adds it to existing projects and to the orchestrator root through the ordinary settings merge. The key is only added when it is missing: a value the user set themselves, true or false, is kept. Only VCO projects' `.claude/settings.json` is touched, never the user's global `~/.claude/settings.json`. Normal auto-compaction near the context limit is unchanged. To turn idle compaction back on for a project, set `"idleCompaction": true` in its `.claude/settings.local.json`. Older Claude Code versions do not know the key and ignore it, like the other keys VCO adds.
+
+- **Release mechanics:** version 0.2.103 → 0.2.104 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No new code-graph extractor-generation rung — 0.2.104 is recorded as a non-bump in `EXTRACTOR_GENERATION_NON_BUMPS` with its evidence (the extractor surface is unchanged since v0.2.103 and the golden snapshots are identical; the code-graph changes are in the resync driver and the MCP server), so no graph is re-walked for this release; `CODEGRAPH_EMBED_REVISION` is unchanged.
 
 ### Added
 
