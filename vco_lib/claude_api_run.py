@@ -45,9 +45,12 @@ instead of the Claude subscription. The run is a headless ``claude -p`` in
   tool call: Bash runs only a single plain ``git diff|log|show|status|
   blame|ls-files|rev-parse|merge-base`` with no global option, no shell
   syntax and only read-only options (no ``--output``, ``--ext-diff``,
-  ``--textconv``, ``--no-index`` …); every other tool is denied. No Bash
-  allow rule is passed, so if the hook cannot run, Bash is refused
-  (``--permission-mode dontAsk`` refuses instead of prompting). The model
+  ``--textconv``, ``--no-index`` …); every other tool is denied. The hook
+  command ends in ``|| exit 2``, which is what makes a guard that cannot run
+  fail CLOSED (measured: a non-blocking hook failure lets the CLI approve
+  commands it judges read-only even under ``dontAsk`` with no allow rule).
+  The settings travel as a FILE, never inline argv (Windows ``claude.cmd``
+  runs through cmd.exe, which would split the JSON at ``||``). The model
   has no write tool: the report file is written by this module from the
   run's final answer.
 
@@ -135,7 +138,9 @@ def _allowed_rules(policy: str) -> list[str]:
     rules = ["Read", "Grep", "Glob", *_READ_ONLY_MCP]
     if policy == "review":
         # NO Bash rule: under ``review`` a Bash call is approved only by the
-        # guard hook's allowlist, so a hook that cannot run fails closed.
+        # guard hook's allowlist. Failing CLOSED when the hook cannot run is
+        # the hook command's ``|| exit 2`` (:func:`guard_hook_command`), not
+        # this absence: the CLI auto-approves read-only-looking commands.
         return rules
     for sub in _READ_ONLY_GIT:
         rules.append(f"Bash(git {sub})")
@@ -178,6 +183,35 @@ def guard_hook_command(python: Optional[str] = None) -> str:
     return f"{quoted} -m {_guard.__name__} || exit 2"
 
 
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
+def windows_hook_shell_is_bash(env: Mapping[str, str]) -> bool:
+    """Whether Claude Code will run hooks through Git Bash on this Windows
+    machine (FINAL3 finding 4). The guard command is bash syntax (a quoted
+    path, ``|| exit 2``); under the PowerShell fallback Claude Code uses when
+    Git Bash is absent it is a parse error, i.e. a NON-blocking hook failure
+    and no guard at all — so ``review`` refuses to start instead.
+
+    Git Bash counts as present when ``CLAUDE_CODE_GIT_BASH_PATH`` names an
+    existing file, ``bash`` is on PATH, or ``git`` is on PATH with Git for
+    Windows' ``bin\\bash.exe`` beside it (UNVERIFIED on a Windows machine:
+    the detection follows Claude Code's documented setup).
+    """
+    pinned = (env.get("CLAUDE_CODE_GIT_BASH_PATH") or "").strip()
+    if pinned and Path(pinned).is_file():
+        return True
+    path = env.get("PATH")
+    if shutil.which("bash", path=path):
+        return True
+    git = shutil.which("git", path=path)
+    if git:
+        root = Path(git).resolve().parent.parent
+        return (root / "bin" / "bash.exe").is_file()
+    return False
+
+
 def review_settings(python: Optional[str] = None) -> str:
     """The ``--settings`` JSON of the ``review`` policy: the guard hook on
     every tool call (matcher ``*``)."""
@@ -217,14 +251,22 @@ def _user_mcp_servers() -> Mapping[str, Any]:
     return _read_claude_json_mcp_servers()
 
 
-def tool_flags(policy: str) -> list[str]:
-    """The CLI flags implementing *policy* (see the module docstring)."""
+def tool_flags(policy: str, settings_file: Optional[str] = None) -> list[str]:
+    """The CLI flags implementing *policy* (see the module docstring).
+
+    *settings_file* (``review``: required) is the path of the file holding
+    :func:`review_settings`. A path, never the inline JSON: on Windows an npm
+    ``claude.cmd`` runs through cmd.exe, which parses the whole command line
+    and would split the JSON at the hook command's ``||`` (FINAL3 finding 1).
+    """
     if policy not in POLICY_CHOICES:
         raise ValueError(f"unknown policy {policy!r}")
     flags: list[str] = []
     if policy == "review":
+        if not settings_file:
+            raise ValueError("the review policy needs its settings file")
         flags += ["--restricted"]
-        flags += ["--settings", review_settings()]
+        flags += ["--settings", settings_file]
         flags += ["--tools", ",".join(REVIEW_TOOLS)]
         flags += ["--permission-mode", "dontAsk"]
     else:
@@ -243,6 +285,7 @@ def build_argv(
     max_turns: Optional[int],
     policy: str,
     mcp_config: Optional[str] = None,
+    settings_file: Optional[str] = None,
 ) -> list[str]:
     """argv for the run. The prompt goes on stdin, never argv.
 
@@ -261,7 +304,7 @@ def build_argv(
     ]
     if max_turns is not None:
         argv += ["--max-turns", str(max_turns)]
-    argv += tool_flags(policy)
+    argv += tool_flags(policy, settings_file)
     if mcp_config is not None and policy == "review":
         argv += ["--mcp-config", mcp_config, "--strict-mcp-config"]
     return argv
@@ -558,6 +601,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               file=sys.stderr)
         return EXIT_USAGE
     project = str(Path(args.project).resolve()) if args.project else str(cwd)
+    if (args.policy == "review" and _on_windows()
+            and not windows_hook_shell_is_bash(os.environ)):
+        print("claude-api-run: refused — the review policy needs Git Bash on "
+              "Windows (Claude Code runs hooks through it; without it the "
+              "read-only guard cannot run). Install Git for Windows or set "
+              "CLAUDE_CODE_GIT_BASH_PATH", file=sys.stderr)
+        return EXIT_REFUSED
     child_env, refusal = prepare_env(os.environ, args.key_name, project)
     if child_env is None:
         print(f"claude-api-run: refused — {refusal}", file=sys.stderr)
@@ -579,6 +629,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   "KG / code-graph search", file=sys.stderr)
     with tempfile.TemporaryDirectory(prefix="claude-api-run-") as tmp:
         mcp_file: Optional[str] = None
+        settings_file: Optional[str] = None
+        if args.policy == "review":
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(review_settings(), encoding="utf-8")
+            settings_file = str(settings_path)
         if mcp_payload is not None:
             mcp_path = Path(tmp) / "mcp.json"
             mcp_path.write_text(json.dumps(mcp_payload), encoding="utf-8")
@@ -586,7 +641,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         argv_run = build_argv(
             claude_bin, model=args.model, effort=args.effort,
             max_budget_usd=args.max_budget_usd, max_turns=args.max_turns,
-            policy=args.policy, mcp_config=mcp_file)
+            policy=args.policy, mcp_config=mcp_file,
+            settings_file=settings_file)
         # No wall-clock timeout, deliberately: a Fable review can run for a
         # long time on a slow machine (VCO's shipped timeouts are long by
         # design), and cost — the thing a runaway would burn — is capped by

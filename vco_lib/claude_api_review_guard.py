@@ -54,10 +54,16 @@ repository's OWN git config / attributes define (a ``diff.<x>.textconv``,
 change that config, because ``-c``, ``git config`` and every write tool are
 denied. ``git status`` may refresh the index file, as it always does.
 
-The hook fails CLOSED: if it cannot run (a broken interpreter), the CLI
-treats the hook error as non-blocking and falls back to the permission
-rules, and the review policy pre-approves NO Bash rule — under
-``--permission-mode dontAsk`` the command is then refused.
+The hook fails CLOSED through its command's ``|| exit 2``
+(:func:`vco_lib.claude_api_run.guard_hook_command`): measured with CLI
+2.1.285, a hook that cannot run (a broken interpreter, an import error)
+exits non-zero but not 2, which the CLI treats as NON-blocking — it then
+approved ``git status`` on its own read-only judgment, even under
+``dontAsk`` with no Bash allow rule. Exit 2 is the blocking code.
+
+``--format=`` / ``--pretty=`` values with a ``%G`` placeholder are refused:
+``%GG`` / ``%GS`` / ``%GK`` / ``%GF`` / ``%GP`` / ``%GT`` verify signatures by
+spawning gpg or ssh-keygen (the reason ``--show-signature`` is refused).
 """
 
 from __future__ import annotations
@@ -263,6 +269,10 @@ def classify_git_command(command: str) -> Optional[str]:
             return f"a pathspec that starts with '-' ({word!r}) is not allowed"
         if sub in ("log", "show") and _NUMBER_OPTION.fullmatch(word):
             continue
+        if (word.startswith(("--format=", "--pretty="))
+                and "%G" in word):
+            return (f"{word!r} uses a %G signature placeholder, which runs "
+                    "gpg / ssh-keygen — a review runs no program")
         if not _option_allowed(word, allowed):
             return (f"option {word!r} is not on the read-only allowlist for "
                     f"`git {sub}` (options that write files, run programs or "

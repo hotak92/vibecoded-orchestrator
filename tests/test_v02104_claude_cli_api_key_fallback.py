@@ -948,6 +948,23 @@ class TestBrokenInstallIsLoud:
         assert len(run.calls) == 2  # no retry spawned
 
 
+    def test_a_broken_switch_reader_is_said_once_per_process(
+            self, sb, monkeypatch):
+        """FINAL3 NIT: a launcher_db_reader that raises must log ONE line
+        for a bulk run, not one per quota-refused node."""
+        def broken():
+            raise ImportError("launcher_db_reader broken (test)")
+
+        monkeypatch.setattr(cak, "fallback_enabled", broken)
+        lines: list[str] = []
+        monkeypatch.setattr(sb, "_log", lines.append)
+        _ScriptedRun(monkeypatch, [QUOTA_FAILURE] * 3)
+        for _ in range(3):
+            with pytest.raises(sb.BackendUnavailable):
+                sb.call_cli("node")
+        assert sum("API-key retry is unavailable" in ln for ln in lines) == 1
+
+
 # ──────────────────────────────────────────────────────────────────────
 # v0.2.104 REL: the retry carries no inherited CLAUDE_CODE_ENTRYPOINT
 # ──────────────────────────────────────────────────────────────────────
