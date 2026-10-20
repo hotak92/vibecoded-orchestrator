@@ -1412,7 +1412,12 @@ def _memo_enabled(fallback_enabled) -> bool:
 
 def _memo_key(resolve_key) -> "str | None":
     if "key" not in _API_KEY_MEMO:
-        _API_KEY_MEMO["key"] = resolve_key()
+        try:
+            _API_KEY_MEMO["key"] = resolve_key()
+        except Exception:
+            # Same rule as :func:`_memo_enabled`: said once per process.
+            _API_KEY_MEMO["key"] = None
+            raise
     return _API_KEY_MEMO["key"]
 
 
