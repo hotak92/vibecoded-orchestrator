@@ -736,9 +736,17 @@ def project_with_stand_ins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """A project that holds ITS OWN secret under VCO's name in every
     project-scoped store the chain could read: the file store's project
     leg and the project ``.env``. The hub tier is down (its slot-exclusive
-    rule is pinned by the manifest test and the hub's Rust tests)."""
+    rule is pinned by the manifest test and the hub's Rust tests).
+
+    ``HubUnreachable`` is the class ``agent_secrets`` itself imported (its
+    re-export), never a fresh ``vco_lib.project_config`` import: an earlier
+    test that purges ``vco_lib.project_config`` from ``sys.modules``
+    (``test_caller_migration_step18``) makes a fresh import a DIFFERENT
+    class that the resolver's ``except`` does not catch, which made this
+    test order-dependent."""
     from vco_lib import agent_secrets
-    from vco_lib.project_config import HubUnreachable
+
+    HubUnreachable = agent_secrets.HubUnreachable
 
     store = tmp_path / "vct-secrets"
     (store / "projects" / "proj").mkdir(parents=True)

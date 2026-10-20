@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 11 free agents, 6 skills, and 51 hooks (45 event-registered in the default `.claude/settings.json`; 4 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 10 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 11 free agents, 7 skills, and 51 hooks (45 event-registered in the default `.claude/settings.json`; 4 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 10 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -50,7 +50,7 @@ VCO's `worktree-guard` WorktreeCreate hook creates the worktree, so it also cove
 
 Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`. v0.2.101 right-sized the catalogue to **6 default skills**: the topical review/advisor skills moved into the opt-in packs, and several former skills now ship as reference docs under `.claude/specializations/`. (Agent `skills:` frontmatter was retired in the same release — specialist depth is read from the specialisation docs instead.)
 
-### Default skills (6)
+### Default skills (7)
 
 - **`context-compress`** — the `/compact` pipeline (what it saves and reinjects) plus `CONTEXT_STATE.md` inspection and maintenance. Absorbs the former `context` skill.
 - **`fix-issue`** — investigate and fix a GitHub issue or bug report: read, reproduce, root-cause, fix, add a regression test.
@@ -58,6 +58,7 @@ Skills are smaller and lighter than agents — they're injected into context as 
 - **`task-breakdown`** — break a feature or epic into estimated tasks with a dependency graph and a risk assessment.
 - **`orchestrator-installer`** — diagnose a partially-failed VCO install and advise on `install.py` flags (re-assigned from an agent).
 - **`project-bootstrapper`** — a human-led second pass over the seeded CLAUDE.md / ARCHITECTURE.md / knowledge nodes (re-assigned from an agent).
+- **`api-review`** — run one bounded headless Claude Code task (typically a final Fable review) billed to the Claude Console API key instead of the subscription, with a cost summary; drives `.claude/scripts/claude-api-run.sh` / `.ps1`.
 
 ### Pack skills
 

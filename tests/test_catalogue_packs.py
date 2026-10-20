@@ -56,9 +56,10 @@ GATEWAY_AGENTS = {
     "kimi-implementer", "kimi-reviewer",
 }
 
-# ── Plan §1.3: the 6 kept default skills. ──────────────────────────────────
+# ── Plan §1.3: the 6 kept default skills, plus api-review (v0.2.104,
+# owner 2026-10-20: a headless review on Console API credits). ────────────
 DEFAULT_SKILLS = {
-    "context-compress", "fix-issue", "orchestrator-installer",
+    "api-review", "context-compress", "fix-issue", "orchestrator-installer",
     "project-bootstrapper", "rc-native", "task-breakdown",
 }
 
@@ -215,7 +216,7 @@ class DefaultCatalogueTests(unittest.TestCase):
             sorted(MODULE_GATEWAY_AGENT_FILES),
             sorted(MODULE_GATEWAY_AGENT_FILES[:-1] + ("renamed-agent.md",)))
 
-    def test_default_skills_are_the_six_kept(self):
+    def test_default_skills_are_the_seven_kept(self):
         skills_dir = REPO_ROOT / "templates/skills"
         self.assertEqual(
             {p.name for p in skills_dir.iterdir() if p.is_dir()}, DEFAULT_SKILLS)
@@ -312,8 +313,8 @@ class DescriptionBudgetTests(unittest.TestCase):
     """
 
     def test_scan_covers_exactly_the_default_catalogue(self):
-        # Non-vacuity pin: the budget measures exactly the 27 default
-        # definitions — the 11 free agents + 10 gateway agents + 6 skills
+        # Non-vacuity pin: the budget measures exactly the 28 default
+        # definitions — the 11 free agents + 10 gateway agents + 7 skills
         # pinned above — and nothing else (packs excluded by construction).
         rel = {
             p.relative_to(REPO_ROOT / "templates").as_posix()

@@ -30,6 +30,11 @@ lazy-import this module):
   a user's own ``ANTHROPIC_AUTH_TOKEN``), or ``None``.
 * :func:`child_env_with_key` — the child env for the retry.
 * :func:`retry_env` — the four above in their one order, for both callers.
+
+The API-run tool (:mod:`vco_lib.claude_api_run`, a user-started headless
+``claude -p`` billed to the key) reuses :func:`retry_blocker`,
+:func:`resolve_key` and :func:`child_env_with_key` — this module stays the
+one home of "the env for a ``claude -p`` on the Console key".
 """
 
 from __future__ import annotations
@@ -186,8 +191,17 @@ def fallback_enabled(db_path: "Optional[Path]" = None) -> bool:
     return raw is not None and raw.strip().lower() in ("true", "1")
 
 
-def resolve_key() -> Optional[str]:
+def resolve_key(
+    name: str = SECRET_KEY_NAME, project: Optional[str] = None,
+) -> Optional[str]:
     """VCO's own ``ANTHROPIC_API_KEY_GATEWAY`` secret (shared slot), or ``None``.
+
+    *name* selects another Shared-scope secret instead (the API-run tool's
+    ``--key-name``, :mod:`vco_lib.claude_api_run`); the background jobs
+    always use the default. Whatever the name, only the Shared slot answers.
+    *project* is the REQUESTER identity the hub gates on (a registered
+    project path; ``None`` = the current working directory, which is what
+    the background jobs run in); it never widens the lookup.
 
     Resolved through the sanctioned chain (``vco_lib.agent_secrets.get``:
     hub/keychain first, then the ``~/.vct-secrets`` file store) with
@@ -207,7 +221,8 @@ def resolve_key() -> Optional[str]:
     from vco_lib.agent_secrets import get as _get_secret  # noqa: PLC0415
 
     try:
-        value = _get_secret(SECRET_KEY_NAME, shared_only=True, allow_dotenv=False)
+        value = _get_secret(name, project=project, shared_only=True,
+                            allow_dotenv=False)
     except Exception:  # noqa: BLE001 — every resolver error is a miss here
         return None
     if not value or not value.strip():
