@@ -83,6 +83,22 @@ def _drive_main_to_7b(monkeypatch, tmp_path):
     root = tmp_path / "vibecoded-orchestrator"
     root.mkdir()
     monkeypatch.setattr(install, "PROJECT_ROOT", root)
+    # The REAL main() takes the process singleton lock and sets the module
+    # globals _MAIN_ENTRY_LOCK_HELD / _MAIN_ENTRY_LOCK_HANDLE, which nothing
+    # resets in-process: a later test's _install_advisory_lock then yields
+    # None (seen as 15 order-dependent failures in a single-process suite).
+    # Stub the lock and pin both globals so monkeypatch restores them.
+    monkeypatch.setattr(install, "_install_singleton_lock_or_die",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(install, "_MAIN_ENTRY_LOCK_HELD", False)
+    monkeypatch.setattr(install, "_MAIN_ENTRY_LOCK_HANDLE", None)
+    # main() also writes launcher-DB app_state (e.g. the default code
+    # model) through vct_root_dir(); give it a per-test state dir so those
+    # rows never reach the session-shared test launcher.db that later tests
+    # resolve their code model from.
+    state = tmp_path / "vct_state"
+    state.mkdir()
+    monkeypatch.setenv("VCT_STATE_DIR", str(state))
     monkeypatch.setattr(install, "_ensure_running_under_mcp_venv", lambda: None)
     monkeypatch.setattr(install, "validate_source_repo", lambda r: None)
     monkeypatch.setattr(install, "_PENDING_EVENTS", [])
