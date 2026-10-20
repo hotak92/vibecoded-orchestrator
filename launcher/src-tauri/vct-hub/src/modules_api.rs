@@ -3532,10 +3532,11 @@ mod tests {
 
     /// v0.2.104 (R21 LOW-1): `ANTHROPIC_API_KEY_GATEWAY` — the Claude
     /// Console key VCO's background `claude -p` retry spends (the name is
-    /// historical; the model gateway does not read it) — is slot-exclusive: a per-project binding of the same name
-    /// never answers, and the shared slot does.
+    /// historical; the model gateway does not read it) — is slot-exclusive:
+    /// a per-project binding of the same name never answers, and the shared
+    /// slot does.
     #[tokio::test]
-    async fn anthropic_gateway_key_refuses_per_project_stand_in() {
+    async fn background_jobs_api_key_refuses_per_project_stand_in() {
         let _kc_lock = h1_lock();
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
         let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked

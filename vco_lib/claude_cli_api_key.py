@@ -119,13 +119,17 @@ def _is_vco_gateway_url(url: str) -> bool:
     imported (R22 LOW-A): "cannot tell" is a different answer from "not the
     gateway", and :func:`retry_blocker` says so instead of blaming the URL.
     """
+    # The call stays inside the guard: ``is_vco_gateway_base_url`` imports
+    # ``vco_lib.service_probe_http`` lazily, mid-call, and that failure is the
+    # same "cannot tell" (R25 MEDIUM) — it must not escape into the job.
     try:
         from vco_lib.vscode_settings import (  # noqa: PLC0415
             is_vco_gateway_base_url,
         )
+
+        return bool(is_vco_gateway_base_url(url))
     except ImportError as exc:
         raise GatewayCheckUnavailable(type(exc).__name__) from exc
-    return bool(is_vco_gateway_base_url(url))
 
 
 def retry_blocker(env: Mapping[str, str]) -> Optional[str]:

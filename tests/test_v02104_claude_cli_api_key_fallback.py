@@ -850,6 +850,31 @@ class TestRetryBlocker:
         child = cak.child_env_with_key(env, FAKE_KEY)
         assert child["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:11460"
 
+    def test_a_lazy_import_inside_the_gateway_rule_is_said_too(
+            self, monkeypatch):
+        """R25 MEDIUM: ``is_vco_gateway_base_url`` imports
+        ``vco_lib.service_probe_http`` mid-call; a broken install there is the
+        same "cannot tell" and must not escape ``retry_blocker`` as a raw
+        ImportError into the background job."""
+        import builtins
+
+        import vco_lib.vscode_settings  # noqa: F401 — loaded before the break
+
+        real_import = builtins.__import__
+
+        def no_probe_http(name, *args, **kwargs):
+            if name == "vco_lib.service_probe_http":
+                raise ImportError("broken (test)")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setenv("VCT_MODEL_GATEWAY_PORT", "11460")
+        monkeypatch.setattr(builtins, "__import__", no_probe_http)
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11460",
+               "ANTHROPIC_AUTH_TOKEN": "gateway-token"}
+        why = cak.retry_blocker(env)
+        assert why is not None and why.startswith(
+            "cannot tell whether ANTHROPIC_BASE_URL is the VCO gateway")
+
     def test_a_users_own_auth_token_blocks(self):
         assert cak.retry_blocker({"ANTHROPIC_AUTH_TOKEN": "t"}) is not None
 
