@@ -532,6 +532,7 @@ def reset_backend_cache() -> None:
     _BREAKER_MEM.clear()
     _CLI_ISOLATION.clear()
     _VENDOR_STATE.clear()
+    _API_KEY_MEMO.clear()
 
 
 def reset_breaker(*, persisted: bool = False) -> None:
@@ -1379,6 +1380,90 @@ def cli_available() -> bool:
     return ok
 
 
+#: v0.2.104 API-1 — the PROCESS-LOCAL memo of the Claude API-key fallback
+#: (in memory only, never on disk; cleared by :func:`reset_backend_cache`):
+#:
+#: * ``"enabled"`` — the launcher switch, read once per process;
+#: * ``"key"`` — the resolved key (``None`` = resolved, absent), read once
+#:   per process — never per node;
+#: * ``"key_first"`` — True after a quota-refused subscription call whose key
+#:   retry SERVED: every later :func:`call_cli` of this process spawns with
+#:   the key straight away (owner intent: "use the API key when the
+#:   subscription is out"). The subscription is re-probed by the NEXT process
+#:   (the next sync / hook run), which starts with an empty memo;
+#: * ``"refused"`` — True once the key was refused (auth or quota on the
+#:   key): no further key spawn in this process;
+#: * ``"import_logged"`` — the broken-install line was printed.
+_API_KEY_MEMO: dict = {}
+
+
+def _memo_enabled(fallback_enabled) -> bool:
+    if "enabled" not in _API_KEY_MEMO:
+        _API_KEY_MEMO["enabled"] = bool(fallback_enabled())
+    return _API_KEY_MEMO["enabled"]
+
+
+def _memo_key(resolve_key) -> "str | None":
+    if "key" not in _API_KEY_MEMO:
+        _API_KEY_MEMO["key"] = resolve_key()
+    return _API_KEY_MEMO["key"]
+
+
+def _quota_retry_env(base_env: dict) -> "dict | None":
+    """The child env for the ONE quota retry on the Console API key, or None.
+
+    v0.2.104 API-1: when the subscription is out of usage, the launcher
+    setting that arms the model gateway's subscription -> API-key fallback
+    (``model_gateway.api_key_fallback``) also allows this job ONE retry with
+    VCO's shared ``ANTHROPIC_API_KEY_GATEWAY`` secret, handed to the child as
+    ``ANTHROPIC_API_KEY`` in its environment only (never argv, never a file,
+    never a log line). The decision lives in
+    :func:`vco_lib.claude_cli_api_key.retry_env`; the switch and the key are
+    read through this process's memo (:data:`_API_KEY_MEMO`), so a sync of
+    many nodes reads each ONCE. A key already refused in this process means
+    no retry.
+
+    This module is stdlib-only at import (it runs from a project's
+    ``.claude/scripts/``), so ``vco_lib`` is imported lazily. Every hook and
+    launcher path that spawns it uses the orchestrator's venv, whose
+    ``pip install -e .`` puts ``vco_lib`` on ``sys.path``; an ``ImportError``
+    here is therefore a BROKEN install and is said once on stderr (the same
+    rule as :func:`_resolve_ollama_model`), never swallowed silently.
+    """
+    if _API_KEY_MEMO.get("refused"):
+        return None
+    try:
+        from vco_lib import claude_cli_api_key as _cak  # noqa: PLC0415
+    except ImportError as exc:
+        if not _API_KEY_MEMO.get("import_logged"):
+            _API_KEY_MEMO["import_logged"] = True
+            sys.stderr.write(
+                f"[summary_backends] vco_lib is not importable from this "
+                f"interpreter ({sys.executable}): {exc}. The subscription is "
+                "out of usage, but the Claude API-key retry is unavailable — "
+                "VCO scripts must run under the orchestrator's own venv (the "
+                "one install.py builds)\n")
+        return None
+    return _cak.retry_env(
+        base_env, _log,
+        enabled=lambda: _memo_enabled(_cak.fallback_enabled),
+        resolve=lambda: _memo_key(_cak.resolve_key),
+    )
+
+
+def _key_first_env(base_env: dict) -> "dict | None":
+    """The keyed child env when this process already switched to the key
+    (:data:`_API_KEY_MEMO` ``key_first``), else None."""
+    if not _API_KEY_MEMO.get("key_first") or _API_KEY_MEMO.get("refused"):
+        return None
+    key = _API_KEY_MEMO.get("key")
+    if not key:
+        return None
+    from vco_lib.claude_cli_api_key import child_env_with_key  # noqa: PLC0415
+
+    return child_env_with_key(base_env, key)
+
+
 def call_cli(prompt: str) -> str:
     """Run one headless ``claude -p`` turn. Prompt goes over STDIN.
 
@@ -1399,6 +1484,21 @@ def call_cli(prompt: str) -> str:
 
     v0.2.100 WP-13: the argv also carries :func:`cli_isolation_args` (no MCP
     server, no hook), each flag only when this CLI lists it in ``--help``.
+
+    v0.2.104 API-1: a failure the classifier reads as ``quota`` (the
+    subscription out of usage) gets ONE retry with the shared
+    ``ANTHROPIC_API_KEY_GATEWAY`` Console key when the launcher's API-key
+    fallback switch is ON — see :func:`_quota_retry_env`. When that retry
+    serves, the rest of THIS process goes straight to the key
+    (:data:`_API_KEY_MEMO`): one subscription spawn per process during an
+    outage, not one per node. A key refusal (auth, or quota on the key)
+    ends that for the process and the call falls back to the subscription;
+    a transient key failure (capacity, timeout) is raised like any CLI
+    failure and the breaker handles it. Breaker semantics are unchanged:
+    the ``cli`` tier is cleared by any served call (subscription or key)
+    and latched by the subscription's quota refusal when the key could not
+    serve. Every other failure class, the switch OFF, or no key resolvable:
+    exactly the pre-fallback behaviour.
     """
     import subprocess
 
@@ -1411,45 +1511,108 @@ def call_cli(prompt: str) -> str:
         raise RuntimeError("claude CLI not found on PATH at call time")
 
     full_prompt = SYSTEM_PROMPT + "\n\n" + prompt
-    try:
-        # --no-session-persistence: without it every one-shot summary call
-        # persists a transcript into the user's session list (943 machine-
-        # generated transcripts / 1.05 GB measured on one install). Verified
-        # on Claude CLI 2.1.258+; post-git-commit-kg-sync.{sh,ps1} already
-        # use this flag.
+    # --no-session-persistence: without it every one-shot summary call
+    # persists a transcript into the user's session list (943 machine-
+    # generated transcripts / 1.05 GB measured on one install). Verified
+    # on Claude CLI 2.1.258+; post-git-commit-kg-sync.{sh,ps1} already
+    # use this flag.
+    argv = [claude_path, "-p", "--model", "haiku", "--max-turns", "1",
+            "--no-session-persistence", *cli_isolation_args(claude_path)]
+    base_env = {**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+
+    def _attempt(env: dict) -> "tuple[str | None, str, str, str]":
+        """One spawn, classified: ``(answer, reason, signal, message)``.
+
+        ``answer`` is None on any failure; ``message`` is then the
+        ready-made :class:`BackendUnavailable` text (never the model's
+        words beyond the short stderr snippet the pre-existing messages
+        already carried).
+        """
         result = subprocess.run(
-            [claude_path, "-p", "--model", "haiku", "--max-turns", "1",
-             "--no-session-persistence", *cli_isolation_args(claude_path)],
+            argv,
             input=full_prompt,
             capture_output=True,
             text=True,
             timeout=TIMEOUT,
-            env={**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
+            env=env,
         )
+        if result.returncode != 0:
+            reason, signal = classify_backend_failure(
+                text=f"{result.stderr}\n{result.stdout}",
+            )
+            return None, reason, signal, f"claude CLI failed: {result.stderr[:200]}"
+        out = result.stdout.strip()
+        # Exit 0 but the "answer" is a usage-limit / auth notice: a tier
+        # failure wearing a success exit code. Caching it would poison the
+        # sidecar AND hide the outage.
+        reason, signal = _classify_exit_zero_text(out)
+        if reason != REASON_OTHER:
+            return None, reason, signal, (
+                "claude CLI returned a backend notice instead of an answer "
+                f"({reason})"
+            )
+        return out, REASON_OTHER, "", ""
+
+    key_env = _key_first_env(base_env)
+    if key_env is not None:
+        # This process already switched to the key (its subscription was out
+        # of usage and the key served): spend no subscription spawn.
+        try:
+            out, reason, signal, message = _attempt(key_env)
+        except subprocess.TimeoutExpired as exc:
+            raise BackendUnavailable(
+                "cli", REASON_CAPACITY, "timeout",
+                f"claude CLI timed out after {TIMEOUT}s (Claude API key)",
+            ) from exc
+        if out is not None:
+            return out
+        if reason not in (REASON_AUTH, REASON_QUOTA):
+            raise BackendUnavailable("cli", reason, signal, message)
+        _API_KEY_MEMO["refused"] = True
+        _API_KEY_MEMO["key_first"] = False
+        _log(f"  summary: the Claude API key was refused ({reason}) — back to "
+             "the subscription for the rest of this run")
+    try:
+        out, reason, signal, message = _attempt(base_env)
     except subprocess.TimeoutExpired as exc:
         raise BackendUnavailable(
             "cli", REASON_CAPACITY, "timeout",
             f"claude CLI timed out after {TIMEOUT}s",
         ) from exc
-    if result.returncode != 0:
-        reason, signal = classify_backend_failure(
-            text=f"{result.stderr}\n{result.stdout}",
-        )
-        raise BackendUnavailable(
-            "cli", reason, signal,
-            f"claude CLI failed: {result.stderr[:200]}",
-        )
-    out = result.stdout.strip()
-    # Exit 0 but the "answer" is a usage-limit / auth notice: a tier
-    # failure wearing a success exit code. Caching it would poison the
-    # sidecar AND hide the outage.
-    reason, signal = _classify_exit_zero_text(out)
-    if reason != REASON_OTHER:
-        raise BackendUnavailable(
-            "cli", reason, signal,
-            f"claude CLI returned a backend notice instead of an answer "
-            f"({reason})",
-        )
+    if out is None and reason == REASON_QUOTA:
+        # v0.2.104 API-1 — the ONE fallback retry: only a quota-classified
+        # failure triggers it, only when the launcher setting is ON, the
+        # job's env may be retried and the shared key resolves
+        # (``_quota_retry_env`` decides). The key reaches the child through
+        # its environment alone.
+        retry_env = _quota_retry_env(base_env)
+        if retry_env is not None:
+            original = (reason, signal, message)
+            _log("  summary: subscription quota exhausted — retrying with "
+                 "the Claude API key (ANTHROPIC_API_KEY_GATEWAY)")
+            try:
+                out, reason, signal, message = _attempt(retry_env)
+            except subprocess.TimeoutExpired:
+                out, reason = None, REASON_CAPACITY
+            if out is not None:
+                _API_KEY_MEMO["key_first"] = True
+                _log("  summary: the Claude API key served — the rest of this "
+                     "run uses it directly (the subscription is re-tried by "
+                     "the next run)")
+            else:
+                if reason in (REASON_AUTH, REASON_QUOTA):
+                    _API_KEY_MEMO["refused"] = True
+                    _log("  summary: the Claude API key was refused — no "
+                         "second retry; the quota outage handling proceeds")
+                else:
+                    _log("  summary: the API-key retry did not serve — no "
+                         "second retry; the quota outage handling proceeds")
+                # The breaker must still hear about the ORIGINAL quota
+                # failure: on the subscription this tier is out, and the
+                # ladder descends exactly as when no retry was attempted.
+                reason, signal, message = original
+    if out is None:
+        raise BackendUnavailable("cli", reason, signal, message)
     return out
 
 

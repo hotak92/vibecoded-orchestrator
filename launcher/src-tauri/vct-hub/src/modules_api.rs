@@ -3535,6 +3535,62 @@ mod tests {
         );
     }
 
+    /// v0.2.104 (R21 LOW-1): `ANTHROPIC_API_KEY_GATEWAY` — the Claude
+    /// Console key VCO's model gateway and background `claude -p` retry
+    /// spend — is slot-exclusive: a per-project binding of the same name
+    /// never answers, and the shared slot does.
+    #[tokio::test]
+    async fn anthropic_gateway_key_refuses_per_project_stand_in() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "sx-proj-agk", "Slot Exclusive AGK", "/tmp/sx-proj-agk");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "sx-proj-agk" },
+            "user",
+            "ANTHROPIC_API_KEY_GATEWAY",
+            "project-stand-in-value",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "sx-proj-agk", "user", "ANTHROPIC_API_KEY_GATEWAY")
+            .unwrap();
+
+        let url = format!("{}/projects/sx-proj-agk/env?key=ANTHROPIC_API_KEY_GATEWAY", base);
+        let resp = reqwest::get(&url).await.expect("hub reachable");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 404,
+            "a per-project bucket must not stand in for VCO's Claude key; body: {}",
+            body
+        );
+        assert!(
+            !body.to_string().contains("project-stand-in-value"),
+            "the stand-in value must not leak anywhere in the response"
+        );
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::Shared { project_id: "_user_shared_" },
+            "user",
+            "ANTHROPIC_API_KEY_GATEWAY",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("shared", "_user_shared_", "user", "ANTHROPIC_API_KEY_GATEWAY")
+            .unwrap();
+        let resp = reqwest::get(&url).await.expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("ANTHROPIC_API_KEY_GATEWAY").and_then(|v| v.as_str()),
+            Some("synthetic-not-a-real-secret"),
+            "the shared slot serves VCO's key, never the project's; body: {}",
+            body
+        );
+    }
+
     /// Data-driven, not global: the SAME shape for a NON-exclusive
     /// bundled key (`github_pat`, no `slot_exclusive` in the manifest) —
     /// the per-project bucket IS still served. Proves the rule keys on
@@ -3600,6 +3656,14 @@ mod tests {
         assert!(
             set.contains("openai_api_key"),
             "helper set must contain openai_api_key; got {:?}",
+            set
+        );
+        // v0.2.104 (R21 LOW-1): VCO's Claude Console key is VCO's own slot
+        // too — the model gateway and the background `claude -p` retry
+        // spend it, never a project's same-named secret.
+        assert!(
+            set.contains("ANTHROPIC_API_KEY_GATEWAY"),
+            "helper set must contain ANTHROPIC_API_KEY_GATEWAY; got {:?}",
             set
         );
         assert!(

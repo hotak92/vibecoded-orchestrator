@@ -151,6 +151,15 @@ class AnthropicApiKey:
         secret_keys: vct-secrets key names tried in order (shared scope).
         auth_header: how the key is presented to the upstream.
         docs_url: cited in user-facing copy about this route.
+        shared_only: resolve ONLY from VCO's shared slot — the key resolver
+            passes ``shared_only=True, allow_dotenv=False`` to
+            ``agent_secrets.get`` (no file-store project leg, no project
+            ``.env``) and the hub serves the name only from the shared slot
+            (``slot_exclusive`` in ``vct-module.json`` ``bundled_secrets``).
+            True for this route: the key is VCO's own, and a project's
+            secret of the same name is the project's (owner rule) — so,
+            unlike a vendor row, ``VCT_MODEL_GATEWAY_SECRET_PROJECT`` does not
+            switch it to a project's key.
     """
 
     vendor_id: str
@@ -160,6 +169,7 @@ class AnthropicApiKey:
     secret_keys: tuple[str, ...]
     auth_header: str = "x-api-key"
     docs_url: str = ""
+    shared_only: bool = True
 
 
 @dataclass(frozen=True)
@@ -391,6 +401,7 @@ ANTHROPIC_API_KEY_ROUTE = AnthropicApiKey(
     # its own slot — never a project's key (the kimi row's MOONSHOT_API_KEY
     # rule, for the same reason).
     secret_keys=("ANTHROPIC_API_KEY_GATEWAY",),
+    shared_only=True,
     auth_header="x-api-key",
     docs_url="https://platform.claude.com/docs/en/api/overview",
 )

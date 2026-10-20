@@ -63,7 +63,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 _HERE = Path(__file__).resolve().parent
 for _candidate in (
@@ -88,6 +88,7 @@ try:
     from vco_lib import kg_reviewer_guard as _guard  # noqa: E402
     from vco_lib import kg_reviewer_model as _model  # noqa: E402
     from vco_lib import kg_reviewer_prompt as _prompt  # noqa: E402
+    from vco_lib import claude_cli_api_key as _cli_api_key  # noqa: E402
 except ImportError as _exc:  # pragma: no cover — exercised by the hook tests
     print(f"kg_reviewer_backend: BROKEN INSTALL - vco_lib is not importable "
           f"({_exc}); the KG reviewer cannot run its guarded review. Repair "
@@ -582,6 +583,120 @@ def _project_root(raw: "Optional[str]") -> Path:
     return Path(top).resolve() if proc.returncode == 0 and top else Path.cwd()
 
 
+def _proc_text(maybe: "Any") -> str:
+    """A subprocess stream as text (``TimeoutExpired`` carries bytes)."""
+    if isinstance(maybe, bytes):
+        return maybe.decode("utf-8", errors="replace")
+    return maybe or ""
+
+
+class ReviewRun(NamedTuple):
+    """What :func:`run_with_quota_fallback` hands back.
+
+    ``stdout`` / ``stderr`` / ``exit_code`` are the LAST run's — the
+    transcript whose Write/Edit calls the guard must judge, and what the run
+    log records. ``record`` is the ``(stdout, stderr, exit_code)`` the
+    breaker classifies: the same run, EXCEPT after a failed API-key retry,
+    where it is the ORIGINAL subscription run, so the direct rung latches on
+    ``quota`` (5 h) and neither the subscription nor the key is spawned
+    again on the next commits inside that window.
+    """
+
+    stdout: str
+    stderr: str
+    exit_code: int
+    record: "tuple[str, str, int]"
+
+
+def run_with_quota_fallback(
+    cmd: "list[str]",
+    prompt: str,
+    env: "dict[str, str]",
+    cwd: Path,
+    timeout_s: int,
+    *,
+    direct_rung: bool,
+    log: Callable[[str], None],
+) -> ReviewRun:
+    """Run the reviewer's ``claude -p`` once, with the v0.2.104 API-1 quota
+    fallback: when the run failed and the existing classification
+    (:func:`summary_backends.classify_backend_failure` over
+    :func:`run_failure_evidence`'s text — the same machinery the breaker's
+    latch reads) says ``quota`` (the subscription out of usage), the run is
+    retried ONCE with VCO's shared ``ANTHROPIC_API_KEY_GATEWAY`` Console key
+    in the child environment (``vco_lib.claude_cli_api_key.retry_env``:
+    the launcher's API-key fallback switch ON, no cloud-provider switch or
+    foreign ``ANTHROPIC_BASE_URL`` in the job's env, the key resolves).
+
+    Only the DIRECT rung retries (``direct_rung``): a gateway rung's quota
+    refusal is already retried server-side by the gateway's own API-key
+    fallback on the very same launcher setting, and its model ids are
+    gateway-namespaced (``claude-gw/…``), which api.anthropic.com does not
+    serve. The gateway rung's forced ``ANTHROPIC_API_KEY=""`` (which keeps
+    the subscription in charge — :func:`_gateway_auth_env`) is untouched for
+    the normal attempt; only the retry's env carries the key.
+
+    A retry that does not serve — the key refused, any other failure, or a
+    ``TimeoutExpired`` (caught here, never a traceback) — is NOT retried
+    again: one log line, and :attr:`ReviewRun.record` is the ORIGINAL quota
+    run, so ``_record_outcome`` latches the direct rung on ``quota`` for the
+    quota cooldown (5 h): the next commits inside that window spawn neither
+    the subscription nor the refused key. A served retry clears the latch
+    like any success (the next commit re-probes the subscription first).
+    A ``TimeoutExpired`` of the FIRST run propagates to the caller as
+    before.
+    """
+    proc = subprocess.run(cmd, input=prompt, env=env, cwd=cwd,
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          timeout=timeout_s)
+    first = (proc.stdout or "", proc.stderr or "", proc.returncode)
+    stdout, stderr, exit_code = first
+    unchanged = ReviewRun(stdout, stderr, exit_code, first)
+    if not direct_rung or exit_code == 0:
+        return unchanged
+    served, evidence = run_failure_evidence(stdout, stderr)
+    if served:
+        return unchanged
+    reason, _signal = _sb.classify_backend_failure(text=evidence)
+    if reason != _sb.REASON_QUOTA:
+        return unchanged
+    retry_env = _cli_api_key.retry_env(env, log)
+    if retry_env is None:
+        return unchanged
+    log("run on the subscription hit its quota — retrying with the Claude "
+        "API key (ANTHROPIC_API_KEY_GATEWAY)")
+    try:
+        proc = subprocess.run(
+            cmd, input=prompt, env=retry_env, cwd=cwd,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        # Its partial transcript is kept (its completed writes are judged by
+        # the guard); the breaker records the subscription's quota refusal.
+        log(f"the API-key retry TIMED OUT after {timeout_s}s — no second "
+            "retry; the subscription's quota refusal is recorded (its "
+            "completed writes are still validated below)")
+        return ReviewRun(_proc_text(exc.stdout), _proc_text(exc.stderr), 124,
+                         first)
+    stdout, stderr, exit_code = proc.stdout or "", proc.stderr or "", proc.returncode
+    retried = (stdout, stderr, exit_code)
+    if exit_code == 0:
+        return ReviewRun(stdout, stderr, exit_code, retried)
+    served2, evidence2 = run_failure_evidence(stdout, stderr)
+    if served2:
+        return ReviewRun(stdout, stderr, exit_code, retried)
+    reason2 = _sb.classify_backend_failure(text=evidence2)[0]
+    if reason2 == _sb.REASON_AUTH:
+        log("the Claude API key was refused — no second retry; the "
+            "subscription's quota refusal is recorded")
+    else:
+        log(f"the API-key retry did not serve either (reason={reason2}) — "
+            "no second retry; the subscription's quota refusal is recorded")
+    return ReviewRun(stdout, stderr, exit_code, first)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     log = _file_logger(args.log)
     root = _project_root(args.project_root)
@@ -638,13 +753,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     snap = _guard.take_snapshot(root)
     try:
         try:
-            proc = subprocess.run(cmd, input=prompt, env=env, cwd=root,
-                                  capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace",
-                                  timeout=args.timeout_s)
-            stdout, stderr, exit_code = proc.stdout or "", proc.stderr or "", proc.returncode
-            served, evidence = run_failure_evidence(stdout, stderr)
-            _record_outcome(model, exit_code, evidence, log, served=served)
+            run = run_with_quota_fallback(
+                cmd, prompt, env, root, args.timeout_s,
+                direct_rung=not decision["base_url"], log=log)
+            stdout, stderr, exit_code = run.stdout, run.stderr, run.exit_code
+            rec_out, rec_err, rec_exit = run.record
+            served, evidence = run_failure_evidence(rec_out, rec_err)
+            _record_outcome(model, rec_exit, evidence, log, served=served)
             with open(args.log, "ab") as fh:
                 fh.write(_run_log_text(model, exit_code, stdout, started)
                          .encode("utf-8", errors="replace"))
@@ -656,12 +771,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # exit 124. The breaker reads only "timeout" plus the parsed
             # evidence, never str(exc) (its argv echo carries digits the
             # substring classifier could misread, W6-N review HIGH-1).
-            def _text(maybe: "Any") -> str:
-                if isinstance(maybe, bytes):
-                    return maybe.decode("utf-8", errors="replace")
-                return maybe or ""
-
-            stdout, err = _text(exc.stdout), _text(exc.stderr)
+            stdout, err = _proc_text(exc.stdout), _proc_text(exc.stderr)
             _served, evidence = run_failure_evidence(stdout, err)
             _record_outcome(model, 124, f"timeout\n{evidence}", log)
             exit_code = 124

@@ -35,6 +35,12 @@ overridable per project" needs no new mechanism: it needs the daemon to ask as
 a REGISTERED project, which is what :func:`_default_install_root` supplies and
 ``VCT_MODEL_GATEWAY_SECRET_PROJECT`` replaces. Nothing here reaches past those
 two stores, and the hub's auth surface is untouched by this.
+The one exception is a credential that is VCO's OWN rather than a vendor
+key a project may also hold — the Claude API-key route
+(``AnthropicApiKey.shared_only``): it resolves from the shared slot ONLY
+(``shared_only=True, allow_dotenv=False`` here, ``slot_exclusive`` on the
+hub), so no project's secret of the same name, and no project override,
+ever answers for it (owner rule: a project's secrets are the project's).
 
 The import of ``vco_lib.agent_secrets`` is deliberately deferred to first use
 rather than done at module scope, so that importing this module (for the
@@ -849,11 +855,20 @@ class VendorKeyResolver:
         # resolves. Resolved once per call so a moved cwd cannot make two
         # keys in the same request answer from two different scopes.
         scope_arg = self.effective_project
+        # A credential that is VCO's OWN (``shared_only`` — the Claude
+        # API-key route) resolves from the shared slot alone: no file-store
+        # project leg, no project ``.env``; the hub's ``slot_exclusive``
+        # declaration covers tier 1. A vendor row keeps the shared-by-default,
+        # project-overridable chain described in the module docstring.
+        shared_only = bool(getattr(vendor, "shared_only", False))
+        getter_kwargs: dict = (
+            {"shared_only": True, "allow_dotenv": False} if shared_only else {}
+        )
         failures: list[str] = []
         unavailable: list[str] = []
         for key_name in vendor.secret_keys:
             try:
-                value = getter(key_name, project=scope_arg)
+                value = getter(key_name, project=scope_arg, **getter_kwargs)
             except Exception as exc:  # noqa: BLE001 — every resolver error is a miss
                 if _is_store_unavailable(exc):
                     # v0.2.102: NOT a miss — the store could not be read right
@@ -912,9 +927,15 @@ class VendorKeyResolver:
             "Put it in the SHARED scope: the launcher's Secrets panel with "
             "scope 'shared' (OS keychain), or `vct set --shared --key "
             f"{vendor.secret_keys[0]}` (file store, ~/.vct-secrets/shared/). "
-            f"To use one project's OWN key instead, set {SCOPE_ENV}=<that "
-            "project's path> for the gateway — a project key outranks the "
-            "shared one. The gateway picks any of these up "
+            + (
+                "This key is VCO's own: only the shared slot answers for it, "
+                "never a project's secret of the same name. "
+                if shared_only else
+                f"To use one project's OWN key instead, set {SCOPE_ENV}=<that "
+                "project's path> for the gateway — a project key outranks the "
+                "shared one. "
+            )
+            + "The gateway picks any of these up "
             "within its key-cache TTL without a restart. "
             f"Resolver detail: {'; '.join(failures) if failures else 'no attempt made'}"
             f"{scope_note}"

@@ -451,7 +451,7 @@ class ApiKeyGatewayBase(GatewayTestBase):
 
     async def client_with(self, *, key: bool, fallback: bool | None) -> Any:
         """``fallback=None`` keeps the PRODUCTION setting reader."""
-        def getter(name: str, project: Any = None) -> str:
+        def getter(name: str, project: Any = None, **_scope: Any) -> str:
             if name == "ANTHROPIC_API_KEY_GATEWAY":
                 return FAKE_API_KEY if key else ""
             return FAKE_VENDOR_KEY
@@ -589,7 +589,7 @@ class ApiKeyCatalogTests(ApiKeyGatewayBase):
     async def test_a_projects_own_anthropic_key_names_are_not_used(self) -> None:
         """Only ANTHROPIC_API_KEY_GATEWAY resolves the route: a key stored
         under the generic names publishes nothing."""
-        def getter(name: str, project: Any = None) -> str:
+        def getter(name: str, project: Any = None, **_scope: Any) -> str:
             if name in ("ANTHROPIC_API_KEY", "anthropic_api_key"):
                 return FAKE_API_KEY
             return "" if name == "ANTHROPIC_API_KEY_GATEWAY" else FAKE_VENDOR_KEY
