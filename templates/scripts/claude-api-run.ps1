@@ -58,5 +58,15 @@ if (-not $VenvPython) {
 }
 
 # The project this wrapper ships in (.claude\scripts\ -> project root).
+# The module prints its cost summary on stderr on EVERY run and exits 1/2/3
+# on a failed, malformed or refused run. Under "Stop", Windows PowerShell 5.1
+# turns the first native stderr line into a terminating NativeCommandError
+# whenever stderr is redirected (a caller's `2>&1`, a host that captures it),
+# and PowerShell 7.3+ with $PSNativeCommandUseErrorActionPreference turns a
+# non-zero native exit into one - either way the wrapper would exit 1
+# instead of the module's own code. The preference goes back to "Continue"
+# for the call (the same rule as Test-VctLadderVenvHasDeps in
+# vct_venv_ladder.ps1) and the exit code is read explicitly.
+$ErrorActionPreference = "Continue"
 & $VenvPython -m vco_lib.claude_api_run --project "$ProjectRoot" @args
 exit $LASTEXITCODE

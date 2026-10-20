@@ -999,3 +999,115 @@ class TestEntrypointDropped:
             "claude-vscode")
         assert "CLAUDE_CODE_ENTRYPOINT" not in run.calls[1]["kwargs"]["env"]
         assert env["CLAUDE_CODE_ENTRYPOINT"] == "claude-vscode"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# R27 (Fable FINAL2) — a competing subscription credential never reaches
+# the keyed child, and a partially broken install is one log line, never a
+# traceback
+# ──────────────────────────────────────────────────────────────────────
+class TestOauthTokenDropped:
+    """``CLAUDE_CODE_OAUTH_TOKEN`` (``claude setup-token``) is a subscription
+    credential the CLI could use instead of the key; the keyed child is meant
+    to use the key, so the helper drops it (API-1 and the API-run tool share
+    the builder)."""
+
+    def test_the_helper_drops_it_and_leaves_the_input_alone(self):
+        base = {"PATH": "/usr/bin", "CLAUDE_CODE_OAUTH_TOKEN": "sub-token"}
+        child = cak.child_env_with_key(base, FAKE_KEY)
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in child
+        assert child["ANTHROPIC_API_KEY"] == FAKE_KEY
+        assert base["CLAUDE_CODE_OAUTH_TOKEN"] == "sub-token"
+
+    def test_the_summary_retry_env_lacks_it(self, sb, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sub-token")
+        _arm_fallback(monkeypatch, enabled=True, key=FAKE_KEY)
+        run = _ScriptedRun(monkeypatch, [QUOTA_FAILURE, SUCCESS])
+        assert sb.call_cli("node body") == SUCCESS.stdout
+        assert run.calls[0]["kwargs"]["env"].get(
+            "CLAUDE_CODE_OAUTH_TOKEN") == "sub-token"
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in run.calls[1]["kwargs"]["env"]
+
+    def test_the_reviewer_retry_env_lacks_it(self, reviewer, monkeypatch):
+        _arm_fallback(monkeypatch, enabled=True, key=FAKE_KEY)
+        run = _ScriptedRun(monkeypatch, [
+            QUOTA_FAILURE,
+            _out(0, '{"type": "result", "result": "reviewed", "num_turns": 4}', ""),
+        ])
+        env = {"PATH": "/usr/bin", "CLAUDE_CODE_OAUTH_TOKEN": "sub-token"}
+        reviewer.run_with_quota_fallback(
+            ["/fake/claude", "-p"], "p", env, Path("/tmp"), 60,
+            direct_rung=True, log=[].append)
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in run.calls[1]["kwargs"]["env"]
+
+
+def _break_import(monkeypatch: pytest.MonkeyPatch, module: str) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def broken(name, *args, **kwargs):
+        if name == module:
+            raise ImportError(f"broken {module} (test)")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken)
+
+
+class TestPartiallyBrokenInstall:
+    """vco_lib imports, but a module the helper imports lazily does not: the
+    retry is unavailable, said in ONE log line — never a traceback into the
+    job (the callers catch only RuntimeError / TimeoutExpired)."""
+
+    def test_resolve_key_is_a_miss_when_agent_secrets_is_broken(
+            self, monkeypatch):
+        _break_import(monkeypatch, "vco_lib.agent_secrets")
+        assert cak.resolve_key() is None
+
+    def test_retry_env_logs_one_line_when_the_switch_reader_is_broken(
+            self, monkeypatch):
+        _break_import(monkeypatch, "vco_lib.launcher_db_reader")
+        lines: list[str] = []
+        assert cak.retry_env({"PATH": "/usr/bin"}, lines.append) is None
+        assert len(lines) == 1
+        assert "retry is unavailable" in lines[0]
+        assert "ImportError" in lines[0]
+
+    def test_retry_env_logs_one_line_when_the_key_reader_raises(self):
+        lines: list[str] = []
+
+        def boom() -> "str | None":
+            raise ImportError("broken (test)")
+
+        assert cak.retry_env({"PATH": "/usr/bin"}, lines.append,
+                             enabled=lambda: True, resolve=boom) is None
+        assert len(lines) == 1 and "retry is unavailable" in lines[0]
+
+    def test_the_summary_job_survives_a_broken_switch_reader(
+            self, sb, monkeypatch):
+        _break_import(monkeypatch, "vco_lib.launcher_db_reader")
+        run = _ScriptedRun(monkeypatch, [QUOTA_FAILURE])
+        with pytest.raises(sb.BackendUnavailable):
+            sb.call_cli("node")
+        assert len(run.calls) == 1
+        assert any("retry is unavailable" in line for line in sb.log_lines)
+
+    def test_the_summary_job_survives_a_broken_secret_resolver(
+            self, sb, monkeypatch):
+        monkeypatch.setattr(cak, "fallback_enabled", lambda: True)
+        _break_import(monkeypatch, "vco_lib.agent_secrets")
+        run = _ScriptedRun(monkeypatch, [QUOTA_FAILURE])
+        with pytest.raises(sb.BackendUnavailable):
+            sb.call_cli("node")
+        assert len(run.calls) == 1  # no key -> no retry, no traceback
+
+    def test_the_reviewer_survives_a_broken_switch_reader(
+            self, reviewer, monkeypatch):
+        _break_import(monkeypatch, "vco_lib.launcher_db_reader")
+        run = _ScriptedRun(monkeypatch, [QUOTA_FAILURE])
+        lines: list[str] = []
+        reviewer.run_with_quota_fallback(
+            ["/fake/claude", "-p"], "p", {"PATH": "/usr/bin"}, Path("/tmp"),
+            60, direct_rung=True, log=lines.append)
+        assert len(run.calls) == 1
+        assert any("retry is unavailable" in line for line in lines)

@@ -76,6 +76,13 @@ CHILD_ENV_VAR = "ANTHROPIC_API_KEY"
 #: user-agent is left exactly as the CLI builds it.
 ENTRYPOINT_ENV_VAR = "CLAUDE_CODE_ENTRYPOINT"
 
+#: Removed from the keyed child's env, ALWAYS: a long-lived subscription
+#: token (``claude setup-token``) the CLI could authenticate with instead of
+#: the key. The keyed run is MEANT to use the key, so dropping a competing
+#: credential hides nothing; the API-run tool additionally checks the init
+#: event's ``apiKeySource`` (:func:`vco_lib.claude_api_run.check_key_source`).
+OAUTH_TOKEN_ENV_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+
 #: Gateway routing keys removed from the retry's env — ONLY when
 #: ``ANTHROPIC_BASE_URL`` names the local VCO model gateway
 #: (:func:`_is_vco_gateway_url`). A hook-spawned job inherits the panel's
@@ -188,7 +195,9 @@ def fallback_enabled(db_path: "Optional[Path]" = None) -> bool:
     """
     # Deferred: the soft reader opens SQLite, which nothing else in this
     # module needs at import time (the scripts that import this module are
-    # stdlib-oriented and import it lazily themselves).
+    # stdlib-oriented and import it lazily themselves). A failing import is
+    # a broken install: it propagates, and :func:`retry_env` — the one
+    # caller path — turns it into ONE "retry unavailable" log line.
     from vco_lib.launcher_db_reader import read_app_state_value  # noqa: PLC0415
 
     raw = read_app_state_value(APP_STATE_KEY, db_path=db_path)
@@ -222,9 +231,11 @@ def resolve_key(
     retry, today's behaviour", so this function never raises to them. The
     value is returned stripped; it is never logged anywhere.
     """
-    from vco_lib.agent_secrets import get as _get_secret  # noqa: PLC0415
-
     try:
+        # Inside the guard: a partially broken install (``agent_secrets``
+        # or one of its imports missing) is a miss, never a traceback.
+        from vco_lib.agent_secrets import get as _get_secret  # noqa: PLC0415
+
         value = _get_secret(name, project=project, shared_only=True,
                             allow_dotenv=False)
     except Exception:  # noqa: BLE001 — every resolver error is a miss here
@@ -239,7 +250,9 @@ def child_env_with_key(env: Mapping[str, str], key: str) -> "dict[str, str]":
 
     ``ANTHROPIC_API_KEY`` is set to *key*; :data:`ENTRYPOINT_ENV_VAR` is
     always removed (with an inherited ``claude-vscode`` entrypoint the CLI
-    ignores the key — see its comment); the gateway routing vars
+    ignores the key — see its comment), and so is
+    :data:`OAUTH_TOKEN_ENV_VAR` (a competing subscription credential); the
+    gateway routing vars
     (:data:`_GATEWAY_ROUTING_VARS`) are removed ONLY when
     ``ANTHROPIC_BASE_URL`` is the local VCO gateway, so the retry reaches
     Anthropic directly (see their comment). Callers check
@@ -250,6 +263,7 @@ def child_env_with_key(env: Mapping[str, str], key: str) -> "dict[str, str]":
     """
     child = dict(env)
     child.pop(ENTRYPOINT_ENV_VAR, None)
+    child.pop(OAUTH_TOKEN_ENV_VAR, None)
     base_url = (child.get("ANTHROPIC_BASE_URL") or "").strip()
     try:
         ours = bool(base_url) and _is_vco_gateway_url(base_url)
@@ -280,16 +294,31 @@ def retry_env(
     *resolve* replace the two readers (``summary_backends`` passes its
     process-local memo so a long sync reads each once); ``None`` means the
     module's own functions, looked up at call time.
+
+    Never raises: a reader that fails (a partially broken install — e.g.
+    ``launcher_db_reader`` not importable) is logged as ONE line through
+    *log* and means no retry.
     """
     is_on = enabled if enabled is not None else fallback_enabled
-    if not is_on():
+    try:
+        if not is_on():
+            return None
+    except Exception as exc:  # noqa: BLE001 — never a traceback to the job
+        log("the Claude API-key retry is unavailable: reading the launcher "
+            f"switch failed ({type(exc).__name__}) — a broken install? "
+            "Repair it with the orchestrator update")
         return None
     why = retry_blocker(base_env)
     if why is not None:
         log(f"not retrying with the Claude API key: {why}")
         return None
     get_key = resolve if resolve is not None else resolve_key
-    value = get_key()
+    try:
+        value = get_key()
+    except Exception as exc:  # noqa: BLE001 — never a traceback to the job
+        log("the Claude API-key retry is unavailable: resolving the key "
+            f"failed ({type(exc).__name__})")
+        return None
     if value is None:
         return None
     return child_env_with_key(base_env, value)
@@ -300,6 +329,7 @@ __all__ = [
     "CHILD_ENV_VAR",
     "ENTRYPOINT_ENV_VAR",
     "GatewayCheckUnavailable",
+    "OAUTH_TOKEN_ENV_VAR",
     "PROVIDER_SWITCHES",
     "SECRET_KEY_NAME",
     "child_env_with_key",

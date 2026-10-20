@@ -58,7 +58,14 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: sweep's never-follow arms) — POSIX-only primitives; the Windows ACL arm is
 #: unit-tested with a fake runner (test_windows_arm_*) and its bash legs use
 #: the sibling convention.
-NON_CONVENTION_BASELINE = 179
+#: 179 -> 181 (v0.2.104 R27, claude-api-run review guard): two POSIX-only
+#: primitives with no .ps1 sibling — the guard hook's POSIX-quoted command
+#: run through ``bash -c`` (tests/test_v02104_claude_api_review_guard.py;
+#: the Windows command shape is unit-tested by
+#: test_the_windows_hook_command_shape) and a fake ``#!/bin/sh`` venv
+#: interpreter driving the .ps1 wrapper's exit-code test
+#: (tests/test_v02104_claude_api_run.py, which IS the .ps1 leg).
+NON_CONVENTION_BASELINE = 181
 
 
 # -- which conditions skip on Windows --------------------------------------
