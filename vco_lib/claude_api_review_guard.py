@@ -207,7 +207,10 @@ def _option_allowed(word: str, allowed: "frozenset[str]") -> bool:
 
 
 _NUMBER_OPTION = re.compile(r"-[0-9]+")
-_DRIVE = re.compile(r"[A-Za-z]:/")
+#: Any Windows drive prefix, the drive-RELATIVE ``C:x`` included (R27 LOW:
+#: ``C:x`` resolves against that drive's current directory, outside the repo).
+#: Conservative cost: a one-letter ref in ``<ref>:<path>`` is refused too.
+_DRIVE = re.compile(r"[A-Za-z]:")
 
 
 def _outside_path(word: str) -> bool:

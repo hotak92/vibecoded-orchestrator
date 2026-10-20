@@ -109,6 +109,8 @@ DENIED = [
     "git log --relative=/etc",
     "git diff ~/.ssh/id_rsa f",
     "git diff C:/Windows/win.ini f",
+    "git diff C:x y",  # R27 LOW: drive-relative, no slash
+    "git show c:secret",
     "git diff ..",
     # not git / not read-only
     "git commit -m x",
