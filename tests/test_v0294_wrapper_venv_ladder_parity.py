@@ -101,11 +101,15 @@ GATED_WRAPPERS = {
     ),
     # v0.2.104: the scratch-dir wrapper needs only vco_lib (stdlib module).
     "vco-scratch": ("vco-scratch", "vco-scratch.ps1", "import vco_lib"),
+    # v0.2.104: the API-run wrapper needs only vco_lib (stdlib module).
+    "claude-api-run": (
+        "claude-api-run.sh", "claude-api-run.ps1", "import vco_lib",
+    ),
 }
 
 #: Every wrapper pair must be covered — a new one that quietly ships its own
 #: ladder is the defect this file exists to prevent.
-EXPECTED_PAIR_COUNT = 9
+EXPECTED_PAIR_COUNT = 10
 
 _BASH_DECL = re.compile(r'^LADDER_IMPORT="([^"]*)"\s*$')
 _PS1_DECL = re.compile(r'^\$LadderImport\s*=\s*"([^"]*)"\s*$')
@@ -227,6 +231,7 @@ ORIGINAL_SET_LINES = {
     "code-graph-query": None,
     "code-graph-analyze": None,
     "vco-scratch": None,
+    "claude-api-run": None,
 }
 
 
