@@ -244,6 +244,19 @@ class TestRefusals:
         assert harness.run("--max-budget-usd", "0") == 2
         assert not harness.record.exists()
 
+    @pytest.mark.parametrize("value", ["nan", "inf", "-1"])
+    def test_a_non_finite_budget_is_a_usage_error(self, harness, value):
+        """R26 NIT: ``nan`` slipped past ``<= 0``; the CLI must never get it."""
+        assert harness.run("--max-budget-usd", value) == 2
+        assert not harness.record.exists()
+
+    def test_a_project_that_is_not_a_directory_is_a_usage_error(
+            self, harness):
+        """R26 NIT: a bare name was resolved against the cwd and looked up as
+        a path that is not the project."""
+        assert harness.run("--project", "NoSuchProjectName") == 2
+        assert not harness.record.exists()
+
 
 class TestSummaryAndLedger:
 

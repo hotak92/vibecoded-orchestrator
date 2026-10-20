@@ -39,7 +39,9 @@ After the run a cost summary is printed (total $, per-model tokens incl.
 cache read/write and $, turns, duration, the API error if any) and one JSON
 line is appended to :data:`LEDGER_FILENAME` under the VCO metrics dir
 (:func:`vco_lib.paths.vct_metrics_dir`, ``$VCT_STATE_DIR``-aware). The
-ledger never carries the prompt, the result text or the key.
+ledger never carries the prompt or the key; on a FAILED run its ``error``
+field holds one short line (at most 300 characters of the CLI's error result,
+or the last 3 stderr lines when the output could not be parsed), key-scrubbed.
 
 Exit codes: 0 the run answered without error; 1 the run failed (API error,
 ``is_error``, unparsable output, non-zero CLI exit); 2 usage; 3 refused
@@ -52,6 +54,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -363,7 +366,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
-    if args.max_budget_usd <= 0:
+    if not math.isfinite(args.max_budget_usd) or args.max_budget_usd <= 0:
         print("claude-api-run: --max-budget-usd must be > 0", file=sys.stderr)
         return 2
     if args.max_turns is not None and args.max_turns <= 0:
@@ -390,6 +393,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_REFUSED
     report = Path(args.report).resolve() if args.report else None
 
+    if args.project and not Path(args.project).is_dir():
+        print(f"claude-api-run: --project {args.project} is not a directory "
+              "(pass the path of a project registered in the launcher)",
+              file=sys.stderr)
+        return 2
     project = str(Path(args.project).resolve()) if args.project else str(cwd)
     child_env, refusal = prepare_env(os.environ, args.key_name, project)
     if child_env is None:
@@ -407,6 +415,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         claude_bin, model=args.model, effort=args.effort,
         max_budget_usd=args.max_budget_usd, max_turns=args.max_turns,
         policy=args.policy)
+    # No wall-clock timeout, deliberately: a Fable review can run for a long
+    # time on a slow machine (VCO's shipped timeouts are long by design), and
+    # cost — the thing a runaway would burn — is capped by --max-budget-usd,
+    # which the CLI enforces. Ctrl-C stops the run.
     proc = subprocess.run(  # noqa: S603 — argv list, no shell
         argv_run, input=prompt, capture_output=True, text=True,
         cwd=str(cwd), env=child_env, check=False)

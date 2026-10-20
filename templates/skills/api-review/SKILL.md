@@ -71,7 +71,8 @@ apply); only the billing, the bounds and the tool policy differ.
   pre-approved for read-only git (`diff`, `log`, `show`, `status`, `blame`,
   `ls-files`, `rev-parse`, `merge-base`), VCO's KG / code-graph search tools
   are pre-approved, and everything else is refused without a prompt
-  (`--permission-mode dontAsk`). Git's mutating subcommands, `rm`, `Edit`
+  (`--permission-mode dontAsk`) — except what your own settings' allow rules
+  already permit, which still applies outside the deny list. Git's mutating subcommands, `rm`, `Edit`
   and `Write` are denied outright. The model cannot write files: the
   report is written by the tool from the model's final answer.
 - `edit`: the full tool set with `--permission-mode acceptEdits`, for a
@@ -82,7 +83,7 @@ apply); only the billing, the bounds and the tool policy differ.
 After the run the tool prints the total cost, per-model tokens (input,
 output, cache read, cache write) and cost, turns, duration, and the API
 error if there was one (e.g. `API status 400; Credit balance is too low`).
-Each run appends one JSON line — no prompt, no result text, no key — to
+Each run appends one JSON line — no prompt, no key; a failed run keeps one short error line — to
 `claude_api_runs.jsonl` in VCO's metrics directory (`~/.vct/metrics/` by
 default, `$VCT_STATE_DIR/metrics` when set). Exit codes: 0 ok, 1 the run
 failed, 2 usage, 3 refused before anything was spawned.
