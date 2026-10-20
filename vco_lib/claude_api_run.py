@@ -187,6 +187,26 @@ def _on_windows() -> bool:
     return os.name == "nt"
 
 
+def _is_wsl_launcher(path: str) -> bool:
+    """Whether *path* is Windows' WSL ``bash.exe`` (in ``System32`` or the
+    ``WindowsApps`` alias dir), which is NOT the Git Bash Claude Code runs
+    hooks through (R28 LOW)."""
+    low = str(path).replace("/", "\\").lower()
+    return "\\windows\\system32\\" in low or "\\windowsapps\\" in low
+
+
+#: Characters cmd.exe treats as syntax outside quotes; ``subprocess``'s
+#: ``list2cmdline`` quotes only arguments with spaces or tabs, so one of
+#: these in a path (a temp dir under a user name with ``&``) would split
+#: the ``claude.cmd`` command line (R28 NIT).
+_CMD_META = frozenset("&|^<>%")
+
+
+def cmd_unsafe_args(argv: Sequence[str]) -> "list[str]":
+    """The *argv* elements cmd.exe would mis-parse (see :data:`_CMD_META`)."""
+    return [a for a in argv if any(c in _CMD_META for c in a)]
+
+
 def windows_hook_shell_is_bash(env: Mapping[str, str]) -> bool:
     """Whether Claude Code will run hooks through Git Bash on this Windows
     machine (FINAL3 finding 4). The guard command is bash syntax (a quoted
@@ -203,7 +223,8 @@ def windows_hook_shell_is_bash(env: Mapping[str, str]) -> bool:
     if pinned and Path(pinned).is_file():
         return True
     path = env.get("PATH")
-    if shutil.which("bash", path=path):
+    bash = shutil.which("bash", path=path)
+    if bash and not _is_wsl_launcher(bash):
         return True
     git = shutil.which("git", path=path)
     if git:
@@ -643,6 +664,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_budget_usd=args.max_budget_usd, max_turns=args.max_turns,
             policy=args.policy, mcp_config=mcp_file,
             settings_file=settings_file)
+        if _on_windows() and claude_bin.lower().endswith((".cmd", ".bat")):
+            unsafe = cmd_unsafe_args(argv_run)
+            if unsafe:
+                print("claude-api-run: refused — an argument contains a "
+                      "character cmd.exe would treat as syntax (" +
+                      ", ".join(repr(a) for a in unsafe[:3]) + "); set TEMP "
+                      "to a path without & | ^ < > %", file=sys.stderr)
+                return EXIT_REFUSED
         # No wall-clock timeout, deliberately: a Fable review can run for a
         # long time on a slow machine (VCO's shipped timeouts are long by
         # design), and cost — the thing a runaway would burn — is capped by

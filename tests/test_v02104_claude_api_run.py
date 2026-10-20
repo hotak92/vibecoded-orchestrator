@@ -662,3 +662,17 @@ class TestWindowsHookShell:
         monkeypatch.setattr(car, "windows_hook_shell_is_bash", lambda env: False)
         assert harness.run() == car.EXIT_REFUSED
         assert not harness.record.exists()
+
+
+class TestR28WindowsResiduals:
+
+    def test_wsl_bash_is_not_git_bash(self):
+        assert car._is_wsl_launcher(r"C:\Windows\System32\bash.exe")
+        assert car._is_wsl_launcher(
+            "C:/Users/a/AppData/Local/Microsoft/WindowsApps/bash.exe")
+        assert not car._is_wsl_launcher(r"C:\Program Files\Git\bin\bash.exe")
+
+    def test_cmd_meta_in_an_argument_is_reported(self):
+        assert car.cmd_unsafe_args(["claude", "-p", "C:/t/a&b/settings.json"]) \
+            == ["C:/t/a&b/settings.json"]
+        assert car.cmd_unsafe_args(["claude", "--settings", "C:/t/x.json"]) == []
