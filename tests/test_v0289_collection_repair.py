@@ -605,3 +605,39 @@ class SharedIdentityPredicateTests(PruneBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _NoTitleWeaviateHTTP(_FakeWeaviateHTTP):
+    """A class WITHOUT a ``title`` property: real Weaviate rejects any query
+    that names it (measured live 2026-10-21 on the V46-C gate collection)."""
+
+    def __call__(self, method, url, *, body=None, timeout=30.0):
+        if method == "POST" and url.endswith("/v1/graphql") \
+                and " title " in body["query"]:
+            self.calls.append((method, url, body))
+            return (200, json.dumps({"errors": [{
+                "message": 'Cannot query field "title" on type "Proj_Development".',
+            }]}).encode())
+        return super().__call__(method, url, body=body, timeout=timeout)
+
+
+class NoTitleSchemaTests(PruneBase):
+    """v0.2.104 (live V46-C gate): the v0.2.103 title join made every prune of
+    a class without ``title`` skip as "enumeration failed"."""
+
+    def test_a_class_without_title_still_prunes(self):
+        fake = _NoTitleWeaviateHTTP({"Proj_Development": [
+            ("u-real", "docs/real.md"), ("u-gone", "docs/gone.md")]})
+        with mock.patch.object(crep, "_http_request", fake):
+            result = prune_foreign_rows(
+                self.project, "Proj_Development", weaviate_url=_URL,
+                is_shared_identity=False, dry_run=False,
+            )
+        self.assertNotIn("skipped", {k: v for k, v in result.items() if v})
+        self.assertEqual(fake.deleted_uuids, ["u-gone"])
+
+    def test_any_other_graphql_error_still_skips(self):
+        result, fake = self._run([("u-gone", "docs/gone.md")],
+                                 graphql_errors=True)
+        self.assertEqual(result.get("skipped"), "enumeration failed")
+        self.assertEqual(fake.deleted_uuids, [])
