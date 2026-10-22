@@ -34,6 +34,13 @@ import pytest
 import install
 from tests.test_v02104_install_deferral_report_wiring import _drive_main_to_7b
 
+from tests.common.env import process_state_fixture
+
+# install.main() step 7b writes the project-identity env (KG_COLLECTION & co.) into
+# os.environ for its child processes; restore the whole process state per test so the
+# conftest W-IDENTITY guard (and every later test) sees the environment untouched.
+_isolate_process_state = process_state_fixture("function")
+
 SENTINEL = "_vco_managed_keys"
 MACHINE = {
     "WEAVIATE_URL": "http://localhost:18081",
