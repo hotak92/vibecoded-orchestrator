@@ -338,6 +338,7 @@ class TestRefusals:
         assert car.main(["--prompt", "x", "--cwd",
                          str(harness.tmp / "nope")]) == car.EXIT_USAGE == 2
         assert not harness.record.exists()
+        assert car.__doc__ is not None
         assert "--cwd`` or ``--project`` not a directory" in car.__doc__
 
 
@@ -489,9 +490,10 @@ class TestParseHelpers:
 
     def test_parse_result_takes_the_last_result_event_of_a_stream(self):
         obj, err = car.parse_result(_stream())
-        assert err is None and obj["type"] == "result"
+        assert err is None and obj is not None and obj["type"] == "result"
         assert obj["total_cost_usd"] == pytest.approx(0.003494)
-        assert car.parse_init(_stream())["apiKeySource"] == "ANTHROPIC_API_KEY"
+        init = car.parse_init(_stream())
+        assert init is not None and init["apiKeySource"] == "ANTHROPIC_API_KEY"
 
     def test_a_stream_without_a_result_is_unparsable(self):
         obj, err = car.parse_result(json.dumps(INIT_EVENT) + "\n")
@@ -673,6 +675,59 @@ class TestR28WindowsResiduals:
         assert not car._is_wsl_launcher(r"C:\Program Files\Git\bin\bash.exe")
 
     def test_cmd_meta_in_an_argument_is_reported(self):
-        assert car.cmd_unsafe_args(["claude", "-p", "C:/t/a&b/settings.json"]) \
-            == ["C:/t/a&b/settings.json"]
-        assert car.cmd_unsafe_args(["claude", "--settings", "C:/t/x.json"]) == []
+        msg = car.cmd_unsafe_refusal(["claude", "-p", "C:/t/a&b/settings.json"])
+        assert msg is not None and "C:/t/a&b/settings.json" in msg
+        assert car.cmd_unsafe_refusal(
+            ["claude", "--settings", "C:/t/x.json"]) is None
+
+
+class TestFinal4CmdRefusalNamesTheRole:
+    """FINAL4 NIT 1: the refusal names WHICH argument carries the cmd.exe
+    metacharacter and the fix for THAT argument — never "set TEMP" when the
+    cause is the claude CLI's own path."""
+
+    def test_the_claude_path_is_named_and_temp_is_not_blamed(self):
+        msg = car.cmd_unsafe_refusal(
+            ["C:/Users/A&B/npm/claude.cmd", "-p", "--settings", "C:/t/s.json"])
+        assert msg is not None
+        assert "the claude CLI path 'C:/Users/A&B/npm/claude.cmd'" in msg
+        assert "install the claude CLI" in msg
+        assert "TEMP" not in msg
+
+    def test_a_temp_file_names_its_file_and_temp(self):
+        msg = car.cmd_unsafe_refusal(
+            ["claude.cmd", "--settings", "C:/T/a&b/settings.json",
+             "--mcp-config", "C:/T/a&b/mcp.json"])
+        assert msg is not None
+        assert "the review settings file 'C:/T/a&b/settings.json'" in msg
+        assert "the MCP config file 'C:/T/a&b/mcp.json'" in msg
+        assert "set TEMP" in msg
+        assert "claude CLI path" not in msg
+
+    def test_another_flag_value_names_its_flag(self):
+        msg = car.cmd_unsafe_refusal(["claude.cmd", "--model", "opus|x"])
+        assert msg is not None
+        assert "the --model value 'opus|x'" in msg
+        assert "TEMP" not in msg
+
+    def test_a_clean_argv_has_no_refusal(self):
+        assert car.cmd_unsafe_refusal(
+            ["C:/npm/claude.cmd", "-p", "--settings", "C:/t/s.json"]) is None
+
+    def test_main_names_the_claude_path_end_to_end(
+            self, harness, monkeypatch, capsys):
+        real_which = car.shutil.which
+
+        def which(name, *a, **kw):
+            if name == "claude":
+                return "C:/Users/A&B/npm/claude.cmd"
+            return real_which(name, *a, **kw)
+
+        monkeypatch.setattr(car, "_on_windows", lambda: True)
+        monkeypatch.setattr(car, "windows_hook_shell_is_bash", lambda env: True)
+        monkeypatch.setattr(car.shutil, "which", which)
+        assert harness.run() == car.EXIT_REFUSED
+        err = capsys.readouterr().err
+        assert "the claude CLI path 'C:/Users/A&B/npm/claude.cmd'" in err
+        assert "TEMP" not in err
+        assert not harness.record.exists(), "refused before anything ran"

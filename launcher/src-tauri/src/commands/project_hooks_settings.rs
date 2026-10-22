@@ -54,6 +54,11 @@ use tauri::{command, State};
 use tokio::time::timeout;
 
 use crate::db::Db;
+// Review R29 / FINAL4 LOW 3: the two readers of the writer's unit answers
+// live in the shared core so the hub's `vct-cli hooks` routes fold the same.
+use vct_launcher_core::db::project_hooks_settings::{
+    listed_unit_primary, parked_unit_registrations,
+};
 use vct_launcher_core::process::CommandExt as _;
 
 /// Ceiling for one `vco_lib.hooks_settings` call. The work is a single small
@@ -339,29 +344,6 @@ pub(crate) async fn run_vco_lib_json(
     Err(HooksCliError { code, message })
 }
 
-/// The `(matcher, command)` registrations a parked entry carries beside its
-/// own, for DISPLAY (v0.2.104, review R29): a hook registered under declared
-/// sibling matchers is parked as ONE entry whose `siblings` hold the other
-/// registrations (`vco_lib.hooks_settings.remove_hook_unit`). Read-only, like
-/// [`parked_if_rules`]: the blob goes back to the writer verbatim. An
-/// unreadable blob, or one with no `siblings`, yields nothing.
-fn parked_unit_registrations(parked_json: &str) -> Vec<(String, String)> {
-    let Ok(v) = serde_json::from_str::<JsonValue>(parked_json) else {
-        return Vec::new();
-    };
-    let Some(siblings) = v.get("siblings").and_then(JsonValue::as_array) else {
-        return Vec::new();
-    };
-    siblings
-        .iter()
-        .filter_map(|sib| {
-            let matcher = sib.get("matcher").and_then(JsonValue::as_str).unwrap_or("");
-            let command = sib.get("item").and_then(|i| i.get("command")).and_then(JsonValue::as_str)?;
-            Some((matcher.to_string(), command.to_string()))
-        })
-        .collect()
-}
-
 /// The `if` filters inside a parked entry's bytes, for DISPLAY on the row
 /// (v0.2.101).
 ///
@@ -508,13 +490,11 @@ pub async fn effective_hooks_view(
             if event.is_empty() || command.is_empty() {
                 continue;
             }
-            if let Some(primary) = entry.get("unit_of").and_then(JsonValue::as_str) {
-                if primary != matcher {
-                    let key = key_of(command);
-                    covered_keys.push((event.to_string(), matcher.to_string(), key.clone()));
-                    folded.push((event.to_string(), primary.to_string(), key, matcher.to_string()));
-                    continue;
-                }
+            if let Some(primary) = listed_unit_primary(entry) {
+                let key = key_of(command);
+                covered_keys.push((event.to_string(), matcher.to_string(), key.clone()));
+                folded.push((event.to_string(), primary.to_string(), key, matcher.to_string()));
+                continue;
             }
             let if_rule = entry
                 .get("if")
@@ -3010,22 +2990,5 @@ mod tests {
         assert_eq!(rows[0].unit_matchers, vec!["startup".to_string()]);
         enable_hook(&f.db, &f.pid, "SessionStart", RESUME, HUB).await.unwrap();
         assert_eq!(f.json(), before);
-    }
-
-    #[test]
-    fn parked_unit_registrations_reads_only_the_siblings() {
-        let blob = serde_json::json!({
-            "schema": 1, "event": "SessionStart", "matcher": "startup",
-            "item": {"command": HUB},
-            "siblings": [{"schema": 1, "event": "SessionStart", "matcher": RESUME,
-                          "item": {"command": HUB}}],
-        })
-        .to_string();
-        assert_eq!(
-            parked_unit_registrations(&blob),
-            vec![(RESUME.to_string(), HUB.to_string())]
-        );
-        assert!(parked_unit_registrations(r#"{"item": {"command": "x"}}"#).is_empty());
-        assert!(parked_unit_registrations("not json").is_empty());
     }
 }

@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
 from vco_lib import settings_merge
 from vco_lib.hook_retirements import added_sibling_matchers, unit_matchers
 from vco_lib.parked_hooks import ParkedHook, ParkedHooksState, find_parked_match
@@ -72,7 +73,7 @@ def _write(tmp_path: Path, doc: dict) -> Path:
 def _cli(*argv: str) -> dict:
     proc = subprocess.run(
         [sys.executable, "-m", "vco_lib.hooks_settings", *argv],
-        capture_output=True, text=True, timeout=60, cwd=str(REPO))
+        capture_output=True, text=True, timeout=60, cwd=str(REPO), env=child_env())
     out = json.loads(proc.stdout)
     assert out.get("ok"), out
     return out
@@ -180,7 +181,7 @@ def test_a_nested_siblings_blob_is_refused_before_anything_is_written(tmp_path: 
     proc = subprocess.run(
         [sys.executable, "-m", "vco_lib.hooks_settings", "enable", "--settings", str(path),
          "--entry-json", json.dumps(blob)],
-        capture_output=True, text=True, timeout=60, cwd=str(REPO))
+        capture_output=True, text=True, timeout=60, cwd=str(REPO), env=child_env())
     assert json.loads(proc.stdout)["code"] == "parked_entry_invalid"
     assert path.read_bytes() == before
 
@@ -267,4 +268,67 @@ def test_the_regroup_inference_needs_proof_the_hook_runs_nowhere() -> None:
         assert find_parked_match(parked, "SessionStart", matcher, command, groups,
                                  live_identities=[ident]) is None
         assert find_parked_match(parked, "SessionStart", matcher, command, groups) is None
+
+
+# ─── FINAL4 NIT 3: a stale parked primary keeps no twin out ───────────────
+
+
+def _user_with_startup_hub_only(flavour: str) -> tuple[dict, str]:
+    """The template minus the `resume|clear|compact` hub registration: the
+    user's file after they put the `startup` line back by hand while a
+    v0.2.103 park of it is still recorded."""
+    doc = _template(flavour)
+    command = _hub_command(doc)
+    groups = []
+    for g in doc["hooks"]["SessionStart"]:
+        if g.get("matcher") == RESUME:
+            g["hooks"] = [h for h in g["hooks"] if f"{HUB}." not in h["command"]]
+        if g["hooks"]:
+            groups.append(g)
+    doc["hooks"]["SessionStart"] = groups
+    return doc, command
+
+
+@pytest.mark.parametrize("flavour", sorted(TEMPLATES))
+def test_a_stale_parked_startup_row_does_not_keep_the_twin_out(flavour: str) -> None:
+    """The startup registration runs again (re-added by hand), so its parked
+    row is stale — the launcher view shows the line as running and covers
+    nothing with it — and the update delivers the resume twin. RED before the
+    fix: the sibling rule kept the twin out while the startup one ran."""
+    user, command = _user_with_startup_hub_only(flavour)
+    assert _matchers_for(user) == ["startup"]
+    parked = ParkedHooksState(readable=True, hooks=(
+        ParkedHook("SessionStart", "startup", command, True),))
+    kept: list = []
+    merged = settings_merge.smart_merge_settings(
+        user, _template(flavour), parked=parked, kept_out=kept)
+    assert _matchers_for(merged) == ["startup", RESUME]
+    assert not [k for k in kept if HUB in k.get("command", "")]
+
+
+@pytest.mark.parametrize("flavour", sorted(TEMPLATES))
+def test_a_live_parked_startup_row_still_keeps_the_twin_out(flavour: str) -> None:
+    """Leave-alone: the startup line is really gone (a real park), so the
+    twin the update would add stays out."""
+    user, command = _user_without_hub(flavour)
+    parked = ParkedHooksState(readable=True, hooks=(
+        ParkedHook("SessionStart", "startup", command, True),))
+    merged = settings_merge.smart_merge_settings(
+        user, _template(flavour), parked=parked, kept_out=[])
+    assert _matchers_for(merged) == []
+
+
+def test_the_sibling_rule_reads_what_is_present() -> None:
+    template = _template("linux")
+    command = _hub_command(template)
+    groups = template["hooks"]["SessionStart"]
+    parked = [ParkedHook("SessionStart", "startup", command, True)]
+    ident = f"{HUB}.sh"
+    present = {("SessionStart", "startup", ident)}
+    assert find_parked_match(parked, "SessionStart", RESUME, command, groups,
+                             live_registrations=present) is None
+    assert find_parked_match(parked, "SessionStart", RESUME, command, groups,
+                             live_registrations=set()) is parked[0]
+    # Unknown presence keeps the sibling rule as it was.
+    assert find_parked_match(parked, "SessionStart", RESUME, command, groups) is parked[0]
 

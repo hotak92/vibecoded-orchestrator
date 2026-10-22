@@ -28,7 +28,10 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #      then the same two slots under the ORCHESTRATOR clone (v0.2.104:
 #      $VCT_INSTALL_ROOT / $VCT_ORCHESTRATOR_ROOT, else the checkout vco_lib
 #      is imported from) — <repo_root> here is the PROJECT, which has no
-#      launcher/dist/ unless it is the orchestrator root itself
+#      launcher/dist/ unless it is the orchestrator root itself. When one of
+#      those two variables names a real clone, that clone is probed BEFORE
+#      <repo_root>, so a second clone or worktree opened as a project never
+#      starts its own hub as the machine-wide singleton
 #   3. PATH                — first `vct-hub` on PATH (install.py adds it)
 #   4. $HOME/.vct/bin/vct-hub
 # If none match the module exits 3 with a named reason; this hook turns that

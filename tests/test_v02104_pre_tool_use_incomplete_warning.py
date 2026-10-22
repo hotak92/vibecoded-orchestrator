@@ -41,6 +41,12 @@ SID = "sessPTU1"
 WARN = "[VCO safety check incomplete]"
 # A pid no live process holds (above the default Linux pid_max range).
 DEAD_PID = 4_194_999
+# The tests that signal the hook's process GROUP (os.killpg, SIGSTOP /
+# SIGCONT): none of these exists on Windows, where pwsh is installed and the
+# file's pwsh skip would not apply. Repo precedent:
+# tests/test_v0297_r8_session_lock_supervision.py (R30 NIT-1).
+posix_process_groups = pytest.mark.skipif(
+    os.name == "nt", reason="POSIX process groups (os.killpg, SIGSTOP/SIGCONT)")
 
 
 def _project(tmp_path: Path) -> Path:
@@ -180,6 +186,26 @@ def _start_bash_call(impl: str, proj: Path, **extra: str) -> subprocess.Popen:
     return p
 
 
+def _release_frozen_group(p: subprocess.Popen, *, kill: bool) -> None:
+    """Undo a SIGSTOP on ``p``'s process group (FINAL4 NIT 2 / R30 LOW-1).
+
+    SIGCONT always; on a FAILED test also SIGKILL and reap, so a failure
+    never leaves a stopped bash/pwsh group behind. A group that is already
+    gone (the sibling died before or during the test) is not an error here:
+    ``ProcessLookupError`` must not replace the test's own failure.
+    """
+    for sig in (signal.SIGCONT, signal.SIGKILL) if kill else (signal.SIGCONT,):
+        try:
+            os.killpg(p.pid, sig)
+        except ProcessLookupError:
+            break
+    if kill:
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def _wait_for_marker(proj: Path, p: subprocess.Popen, deadline_s: float = 30.0) -> Path:
     end = time.monotonic() + deadline_s
     while time.monotonic() < end:
@@ -191,6 +217,7 @@ def _wait_for_marker(proj: Path, p: subprocess.Popen, deadline_s: float = 30.0) 
     raise AssertionError("no in-progress marker appeared")
 
 
+@posix_process_groups
 @pytest.mark.parametrize("impl", _SHELLS)
 def test_a_run_killed_mid_scan_is_reported_once_by_the_next_run(tmp_path: Path, impl: str):
     proj = _project(tmp_path)
@@ -274,6 +301,7 @@ def test_carried_tools_are_all_reported(tmp_path: Path, impl: str):
     assert "2 earlier tool call(s)" in ctx and "(Write, Bash)" in ctx
 
 
+@posix_process_groups
 @pytest.mark.parametrize("impl", _SHELLS)
 def test_a_report_lost_to_a_killed_reporter_is_carried_forward(tmp_path: Path, impl: str):
     # Run B claims A's stale marker, then is killed itself: B's own marker
@@ -308,6 +336,7 @@ def test_carried_names_are_capped(tmp_path: Path, impl: str):
 # ─── never a sibling that is still running, never another key ───────────
 
 
+@posix_process_groups
 @pytest.mark.parametrize("impl", _SHELLS)
 def test_a_concurrent_sibling_is_not_reported(tmp_path: Path, impl: str):
     # The sibling is FROZEN (SIGSTOP on its process group) while `during`
@@ -320,6 +349,7 @@ def test_a_concurrent_sibling_is_not_reported(tmp_path: Path, impl: str):
     proj = _project(tmp_path)
     _stub_scanner(proj, 1.0)
     p = _start_bash_call(impl, proj, VCO_PRE_TOOL_USE_TIMEOUT_S="60")
+    failed = True
     try:
         marker = _wait_for_marker(proj, p)
         os.killpg(p.pid, signal.SIGSTOP)
@@ -328,14 +358,40 @@ def test_a_concurrent_sibling_is_not_reported(tmp_path: Path, impl: str):
         assert during.returncode == 0
         assert _context(during) == ""
         assert marker.exists(), "a running sibling's marker must be left alone"
+        failed = False
     finally:
-        os.killpg(p.pid, signal.SIGCONT)
+        _release_frozen_group(p, kill=failed)
     assert p.stdout is not None and p.stderr is not None
     out, err = p.stdout.read(), p.stderr.read()
     assert p.wait(timeout=60) == 0, err
     assert WARN.encode() not in out + err
     assert _markers(proj) == []
     assert _context(_grep(impl, proj)) == ""
+
+
+@posix_process_groups
+def test_releasing_a_group_that_already_died_does_not_raise():
+    """R30 LOW-1: the sibling died before ``finally`` ran — the release must
+    not raise ``ProcessLookupError`` over the test's real failure."""
+    p = subprocess.Popen(["sleep", "0"], start_new_session=True)
+    p.wait(timeout=30)
+    _release_frozen_group(p, kill=False)
+    _release_frozen_group(p, kill=True)
+
+
+@posix_process_groups
+def test_a_failed_test_leaves_no_stopped_group_behind():
+    """FINAL4 NIT 2: on a failure the frozen group is killed and reaped, not
+    just continued — a stopped bash/pwsh group never outlives the test."""
+    p = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        os.killpg(p.pid, signal.SIGSTOP)
+        _release_frozen_group(p, kill=True)
+        assert p.poll() == -signal.SIGKILL
+    finally:
+        if p.poll() is None:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait(timeout=30)
 
 
 @pytest.mark.parametrize("impl", _SHELLS)

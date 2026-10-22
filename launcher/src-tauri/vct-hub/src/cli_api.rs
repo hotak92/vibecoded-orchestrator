@@ -574,19 +574,44 @@ async fn deactivate_license(State(h): State<LauncherDbHandle>) -> impl IntoRespo
 
 // ─── Hooks ──────────────────────────────────────────────────────────────
 
+/// `vct-cli hooks list <project>`: one row per hook UNIT (v0.2.104 FINAL4
+/// LOW 3), as the launcher's Hooks tab shows them — a hook registered under
+/// declared sibling matchers is one row whose `unit_matchers` names the
+/// other registrations, and `disable` / `enable` on either id acts on the
+/// whole unit (`hooks_enforcement::enforce_hook_toggle`). When the project's
+/// settings.json cannot be listed, `unit_fold_partial` carries the reason and
+/// only parked units are folded.
 async fn list_hooks_for_project(
     State(h): State<LauncherDbHandle>,
     Path(id_or_slug): Path<String>,
 ) -> axum::response::Response {
-    resolve_project(&h, &id_or_slug, |project| {
-        match h.0.list_project_hooks(&project.id) {
-            Ok(rows) => {
-                let count = rows.len();
-                Json(serde_json::json!({ "hooks": rows, "count": count })).into_response()
-            }
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    let project = match h
+        .0
+        .get_project(&id_or_slug)
+        .ok()
+        .flatten()
+        .or_else(|| h.0.get_project_by_slug(&id_or_slug).ok().flatten())
+    {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "project not found" })),
+            )
+                .into_response()
         }
-    })
+    };
+    match crate::hooks_enforcement::folded_hook_rows(&h.0, &project.id).await {
+        Ok((rows, partial)) => {
+            let count = rows.len();
+            let mut body = serde_json::json!({ "hooks": rows, "count": count });
+            if let Some(reason) = partial {
+                body["unit_fold_partial"] = serde_json::Value::String(reason);
+            }
+            Json(body).into_response()
+        }
+        Err(e) => e.into_response(),
+    }
 }
 
 #[derive(Deserialize)]

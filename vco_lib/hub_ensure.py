@@ -33,13 +33,15 @@ launcher used to copy; v0.2.104 widened step 2's roots)
    ``<extra_dirs...>`` (caller-supplied anchors — the launcher passes the
    directory of its own binary, which only it knows), then
    ``<root>/launcher/dist/<arch>/`` and ``<root>/launcher/dist/`` for each
-   root of :func:`_repo_dist_roots`, in order: the caller's ``repo_root``,
-   the orchestrator clone named by the ONE install-root resolver
-   (``$VCT_INSTALL_ROOT`` / ``$VCT_ORCHESTRATOR_ROOT`` when they name a real
-   clone, else the checkout), then the checkout this module is imported
-   from — so a hook whose ``repo_root`` is a PROJECT root still finds the
-   orchestrator's copy. ``probe_repo_dist=False`` (the launcher's
-   ``--no-repo-dist``) skips every one of those roots.
+   root of :func:`_repo_dist_roots`, in order: the orchestrator clone named
+   by ``$VCT_INSTALL_ROOT`` / ``$VCT_ORCHESTRATOR_ROOT`` when one names a
+   real clone (so a second clone opened as a project never starts its own
+   hub as the singleton), the caller's ``repo_root``, the ONE install-root
+   resolver's clone, then the checkout this module is imported from — so a
+   hook whose ``repo_root`` is a PROJECT root still finds the orchestrator's
+   copy. With no such variable the caller's ``repo_root`` goes first.
+   ``probe_repo_dist=False`` (the launcher's ``--no-repo-dist``) skips
+   every one of those roots.
 3. First ``vct-hub`` on ``$PATH``.
 4. ``$HOME/.vct/bin/vct-hub`` (install.py's default install location).
 
@@ -609,10 +611,12 @@ def find_hub_binary(
     Walks the four-step chain documented at module level. Never raises and
     never spawns anything.
 
-    :param repo_root: the FIRST root whose ``launcher/dist/`` step 2 probes
-        — the hooks pass ``<hook dir>/../..`` (the project root). The
-        orchestrator clone (install-root resolver, then the checkout this
-        module is imported from) is probed after it, so a root without a
+    :param repo_root: the caller's root whose ``launcher/dist/`` step 2
+        probes — the hooks pass ``<hook dir>/../..`` (the project root). It
+        is probed FIRST unless ``$VCT_INSTALL_ROOT`` /
+        ``$VCT_ORCHESTRATOR_ROOT`` names a real clone, which then goes ahead
+        of it; the orchestrator clone (install-root resolver, then the
+        checkout this module is imported from) follows, so a root without a
         ``launcher/dist/`` no longer hides the orchestrator's copy.
     :param extra_dirs: additional install-folder anchors probed BEFORE
         every step-2 root's dist dirs. The launcher passes the directory of its
@@ -653,11 +657,22 @@ def _repo_dist_roots(
 ) -> list[Path]:
     """The roots whose ``launcher/dist/`` step 2 probes, in order.
 
-    The caller's ``repo_root`` first (an explicit anchor keeps precedence),
-    then the orchestrator clone from the ONE install-root resolver
-    (:func:`vco_lib.python_exe.resolve_install_root`: ``$VCT_INSTALL_ROOT`` /
-    ``$VCT_ORCHESTRATOR_ROOT`` when they name a clone, else the checkout this
-    module is imported from), then that checkout itself.
+    * When ``$VCT_INSTALL_ROOT`` / ``$VCT_ORCHESTRATOR_ROOT`` names a real
+      clone (:func:`vco_lib.python_exe.install_root_from_env`), THAT clone
+      comes first, then the caller's ``repo_root``, then the checkout this
+      module is imported from. VCO writes both variables into every
+      project's ``.claude/settings.json`` env from the registered
+      orchestrator root, so they state which install this machine runs. A
+      second clone or worktree opened as a project carries its own
+      committed ``launcher/dist/`` and would otherwise start ITS hub as the
+      machine-wide singleton (v0.2.104 FINAL4 LOW 1) — the install's hub
+      then short-circuits on ``--start-if-not-running`` and the launcher
+      talks to a hub of another version.
+    * With no such variable, the caller's ``repo_root`` first (an explicit
+      anchor keeps precedence: a dev clone run without a VCO env), then the
+      orchestrator clone from the ONE install-root resolver
+      (:func:`vco_lib.python_exe.resolve_install_root`, which then answers
+      the checkout), then that checkout itself.
 
     The orchestrator entries are what make the hooks work from a PROJECT:
     the ensure hooks pass ``<hook dir>/../..``, which is the project root,
@@ -665,13 +680,17 @@ def _repo_dist_roots(
     a passed ``repo_root`` REPLACED the checkout, so from any project other
     than the orchestrator root the hub and launcher binaries were never
     found (owner, 2026-10-22: after a reboot no VS Code session restarted the
-    hub). Duplicates are dropped so each root is probed once.
+    hub). The launcher leg (:func:`vco_lib.launcher_ensure.find_launcher_binary`)
+    walks this same function, so both binaries follow one order. Duplicates
+    are dropped so each root is probed once.
     """
+    orchestrators = _orchestrator_roots(environ)
+    named = [root for root, is_named in orchestrators if is_named]
+    rest = [root for root, is_named in orchestrators if not is_named]
+    caller = Path(repo_root) if repo_root is not None else None
+    ordered = [*named, caller, *rest]
     roots: list[Path] = []
-    for candidate in (
-        Path(repo_root) if repo_root is not None else None,
-        *_orchestrator_roots(environ),
-    ):
+    for candidate in ordered:
         if candidate is None:
             continue
         key = _path_key(candidate)
@@ -680,12 +699,27 @@ def _repo_dist_roots(
     return roots
 
 
-def _orchestrator_roots(environ: Mapping[str, str]) -> list[Optional[Path]]:
-    """The orchestrator clone(s) step 2 falls back to: the ONE install-root
-    resolver's answer, then the checkout this module is imported from."""
-    from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415
+def _orchestrator_roots(
+    environ: Mapping[str, str],
+) -> list[tuple[Path, bool]]:
+    """The orchestrator clone(s) step 2 probes besides the caller's root, as
+    ``(root, named)`` pairs: the clone the environment NAMES
+    (:func:`vco_lib.python_exe.install_root_from_env`, ``named=True`` — it
+    goes AHEAD of the caller's root), then the ONE install-root resolver's
+    answer and the checkout this module is imported from (``named=False`` —
+    fallbacks after it). ``None`` answers are dropped. One function for every
+    orchestrator root, so a test pins them all away in one place."""
+    from vco_lib.python_exe import (  # noqa: PLC0415
+        install_root_from_env,
+        resolve_install_root,
+    )
 
-    return [resolve_install_root(env=environ), _default_repo_root()]
+    pairs = [
+        (install_root_from_env(environ), True),
+        (resolve_install_root(env=environ), False),
+        (_default_repo_root(), False),
+    ]
+    return [(root, named) for root, named in pairs if root is not None]
 
 
 def _path_key(path: Path) -> str:
