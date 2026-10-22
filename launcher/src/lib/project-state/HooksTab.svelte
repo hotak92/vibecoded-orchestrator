@@ -16,6 +16,8 @@
     isChecked,
     ifRulesLabel,
     ifRulesTooltip,
+    matcherLabel,
+    matcherTooltip,
     isAsyncSubhookDisabled,
     leanCtxChoiceFromEnvValue,
     leanCtxEnvValueForChoice,
@@ -412,7 +414,7 @@
         {#each hooks as h (rowKey(h))}
           <tr class:ps-row-orphan={h.state === 'orphan'}>
             <td><code>{h.event}</code></td>
-            <td><code>{h.matcher || 'every'}</code></td>
+            <td title={matcherTooltip(h)}><code>{matcherLabel(h)}</code></td>
             <td class="ps-cmd">
               <code>{h.command}</code>
               {#if ifRulesLabel(h)}

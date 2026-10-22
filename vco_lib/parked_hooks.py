@@ -230,10 +230,30 @@ def find_parked_match(
         # user switched the hook off, and an upgrade that adds a matcher must
         # not switch it partly back on. Any other ambiguous drift stays
         # unmatched, as before.
-        siblings = sibling_matchers(event, matcher, vco_hook_script_identity(command))
+        ident = vco_hook_script_identity(command)
+        siblings = sibling_matchers(event, matcher, ident)
         for p in candidates:
             if p.matcher in siblings:
                 return p
+        # Review R29 (LOW): the declared siblings are ONE hook, so for the
+        # drifted-matcher inference below they count as one matcher. A row
+        # parked under a matcher the template does not use (the user
+        # regrouped the hook, then disabled it) covers every registration of
+        # that one hook — provided the hook runs on NO event in the user's
+        # file: a hook still running somewhere was switched off for one
+        # matcher only (a stale row), so the new registration is added.
+        # Without ``live_identities`` that cannot be told apart: no guess.
+        added = {
+            m for m in shipped_under
+            if any(s in shipped_under for s in sibling_matchers(event, m, ident))
+        }
+        if (
+            len(shipped_under - added) == 1
+            and ident is not None
+            and live_identities is not None
+            and ident not in set(live_identities)
+        ):
+            return candidates[0]
         return None
     # The template ships this hook under ONE matcher, so a parked row under a
     # matcher it no longer uses can only mean this registration.

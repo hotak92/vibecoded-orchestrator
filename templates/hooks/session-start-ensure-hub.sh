@@ -109,10 +109,15 @@ if command -v resolve_vco_venv_python >/dev/null 2>&1; then
 fi
 RUN_PY="${VCO_VENV_PYTHON:-${PY:-}}"
 if [ -z "$RUN_PY" ] || [ ! -x "$RUN_PY" ]; then
-    # v0.2.92 MAJOR-6: stdout, not stderr. A SessionStart hook exiting 0 has
-    # its stderr discarded — only stdout is injected as session context, so a
-    # ">&2" report here reaches nobody on the one path that runs every session.
-    echo "session-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); skipping"
+    # v0.2.92 MAJOR-6: stdout, not stderr — a SessionStart hook's stderr
+    # reaches nobody. v0.2.104 review R29: and not PLAIN stdout either. The
+    # hook is registered async, so only its JSON additionalContext is handed
+    # to the session (see "Reports" below), and _lib/emit-context.sh needs
+    # the very Python that is missing here. The envelope is therefore written
+    # by the shell itself: fixed text, nothing to escape (`\n` is the JSON
+    # escape, kept literal by the single quotes).
+    # MUST MATCH session-start-ensure-hub.ps1.
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"VCO background services (session-start-ensure-hub):\nsession-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); the hub, the model gateway and the launcher were not checked. Repair it with the launcher Update, or run python install.py --update in the orchestrator folder."}}'
     exit 0
 fi
 

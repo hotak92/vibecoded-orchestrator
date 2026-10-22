@@ -160,6 +160,23 @@ def test_the_launcher_leg_gets_the_same_fallback(
     assert launcher_ensure.find_launcher_binary(repo_root=project, env={}) == orch[stem]
 
 
+def test_the_hub_lookup_answers_the_environment_it_is_handed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """R29 NIT: ``find_hub_binary`` threads ``env`` like its siblings — the
+    install-root rung reads the mapping passed in, not ``os.environ``."""
+    _isolate(monkeypatch, tmp_path)
+    orch = _fake_orchestrator(tmp_path / "orch")
+    project = _project(tmp_path / "SomeProject")
+    _checkout_is(monkeypatch, tmp_path / "no-checkout")
+    handed = {"VCT_ORCHESTRATOR_ROOT": str(tmp_path / "orch"), "HOME": str(tmp_path / "no-home")}
+
+    assert hub_ensure.find_hub_binary(repo_root=project, env=handed) == orch["vct-hub"]
+    # Leave-alone: the real environment names no clone, so without the
+    # mapping nothing is found.
+    assert hub_ensure.find_hub_binary(repo_root=project) is None
+
+
 def test_the_callers_own_root_still_wins(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -487,3 +504,54 @@ def test_the_ps1_sibling_reports_through_the_same_envelope(tmp_path: Path) -> No
     out = json.loads(res.stdout)["hookSpecificOutput"]
     assert out["hookEventName"] == "SessionStart"
     assert "vct-hub binary not found" in out["additionalContext"]
+
+
+# ---------------------------------------------------------------------------
+# R29 LOW: the no-interpreter leg reports through the same envelope
+# ---------------------------------------------------------------------------
+
+
+def _broken_install(tmp_path: Path, ext: str) -> tuple[Path, Path, dict]:
+    """A project whose hook has NO interpreter: the `_lib/` helpers that find
+    one (find-python, resolve-vco-venv) are missing — a broken install."""
+    orch = tmp_path / "orch"
+    (orch / "vco_lib").mkdir(parents=True)
+    (orch / ".claude").mkdir(parents=True)
+    project = _project(tmp_path / "SomeProject")
+    hook = project / ".claude" / "hooks" / f"{SERVICE_HOOK}.{ext}"
+    shutil.copy2(HOOKS / f"{SERVICE_HOOK}.{ext}", hook)
+    env = _hook_env(tmp_path, project, orch)
+    for var in ("VCT_VENV", "PY", "VCO_VENV_PYTHON"):
+        env.pop(var, None)
+    return project, hook, env
+
+
+def _assert_no_python_envelope(stdout: str) -> None:
+    out = json.loads(stdout)["hookSpecificOutput"]
+    assert out["hookEventName"] == "SessionStart"
+    assert "no Python interpreter for vco_lib.hub_ensure" in out["additionalContext"]
+    assert "permissionDecision" not in out
+
+
+@needs_bash
+def test_a_hook_with_no_interpreter_reports_as_session_context(tmp_path: Path) -> None:
+    """RED before R29: the line was plain stdout, which an async hook's
+    session never receives."""
+    _project_dir, hook, env = _broken_install(tmp_path, "sh")
+    res = _run_hook(hook, env, "resume")
+    assert res.returncode == 0, res.stderr
+    _assert_no_python_envelope(res.stdout)
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
+def test_the_ps1_sibling_reports_no_interpreter_through_the_envelope(tmp_path: Path) -> None:
+    from tests.common.pwsh import PWSH_BASE_FLAGS
+
+    project, hook, env = _broken_install(tmp_path, "ps1")
+    env["PATH"] = os.pathsep.join([str(Path(shutil.which("pwsh") or "").parent), "/usr/bin", "/bin"])
+    res = subprocess.run(
+        [shutil.which("pwsh") or "pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(hook)],
+        input=json.dumps({"source": "resume"}), capture_output=True, text=True,
+        timeout=180, env=env, cwd=str(project))
+    assert res.returncode == 0, res.stderr
+    _assert_no_python_envelope(res.stdout)

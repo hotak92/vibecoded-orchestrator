@@ -641,3 +641,28 @@ class NoTitleSchemaTests(PruneBase):
                                  graphql_errors=True)
         self.assertEqual(result.get("skipped"), "enumeration failed")
         self.assertEqual(fake.deleted_uuids, [])
+
+    def test_a_title_error_beside_any_other_error_still_skips(self):
+        """R29 NIT: the retry is for the missing-``title`` answer ALONE. The
+        same error next to any other one is an enumeration failure: no retry,
+        no prune — the conservative ``all()`` gate, pinned."""
+        class _Mixed(_FakeWeaviateHTTP):
+            def __call__(self, method, url, *, body=None, timeout=30.0):
+                if method == "POST" and url.endswith("/v1/graphql"):
+                    self.calls.append((method, url, body))
+                    return (200, json.dumps({"errors": [
+                        {"message": 'Cannot query field "title" on type "Proj_Development".'},
+                        {"message": "shard Proj_Development not ready"},
+                    ]}).encode())
+                return super().__call__(method, url, body=body, timeout=timeout)
+
+        fake = _Mixed({"Proj_Development": [("u-gone", "docs/gone.md")]})
+        with mock.patch.object(crep, "_http_request", fake):
+            result = prune_foreign_rows(
+                self.project, "Proj_Development", weaviate_url=_URL,
+                is_shared_identity=False, dry_run=False,
+            )
+        self.assertEqual(result.get("skipped"), "enumeration failed")
+        self.assertEqual(fake.deleted_uuids, [])
+        graphql = [c for c in fake.calls if c[1].endswith("/v1/graphql")]
+        self.assertEqual(len(graphql), 1, "a mixed error list must not be retried")

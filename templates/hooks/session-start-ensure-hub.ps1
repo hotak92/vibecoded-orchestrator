@@ -121,8 +121,17 @@ if (Test-Path $VenvLib) {
     } catch { }
 }
 if (-not $RunPy) {
-    # v0.2.92 MAJOR-6: stdout, not stderr (see the .sh sibling).
-    Write-Output "session-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); skipping"
+    # v0.2.92 MAJOR-6: stdout, not stderr (see the .sh sibling). v0.2.104
+    # review R29: as the JSON envelope, not plain stdout -- the hook runs
+    # async and only its additionalContext reaches the session. Built here
+    # with ConvertTo-Json (no Python needed). MUST MATCH the .sh sibling.
+    $NoPy = [ordered]@{
+        hookSpecificOutput = [ordered]@{
+            hookEventName     = 'SessionStart'
+            additionalContext = "VCO background services (session-start-ensure-hub):`nsession-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); the hub, the model gateway and the launcher were not checked. Repair it with the launcher Update, or run python install.py --update in the orchestrator folder."
+        }
+    }
+    Write-Output ($NoPy | ConvertTo-Json -Compress -Depth 4)
     exit 0
 }
 

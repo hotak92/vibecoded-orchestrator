@@ -1031,6 +1031,15 @@ def migrate_group_matcher(event: str, group: Any, template_matchers: Any) -> Opt
 # a user who DISABLED the hook under the old matcher meant the new one too.
 # This table says so, and :func:`vco_lib.parked_hooks.find_parked_match`
 # reads it: a row parked under the sibling covers the added registration.
+#
+# The table is also the ONE home of "these registrations are one hook" for
+# the launcher's Hooks tab (review R29): ``vco_lib.hooks_settings`` disables
+# and restores a registration together with its declared siblings as ONE
+# parked entry, and its ``list`` verb tells the tab which row an added
+# registration folds into (``unit_of``). The Rust side reads those answers;
+# it holds no copy of this table. The added registration is a verbatim twin
+# of its sibling's inner hook (pinned by the template tests), which is what
+# lets a restore re-create a missing twin from the sibling it mirrors.
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1082,24 @@ def sibling_matchers(event: str, matcher: str, target: Optional[str]) -> Tuple[s
     matcher, target)`` registration mirrors — ``()`` when none. Never raises."""
     return tuple(row.sibling for row in MATCHER_SIBLINGS
                  if row.event == event and row.matcher == matcher and target in row.targets)
+
+
+def added_sibling_matchers(event: str, matcher: str, target: Optional[str]) -> Tuple[str, ...]:
+    """The inverse of :func:`sibling_matchers`: the matchers of the
+    registrations :data:`MATCHER_SIBLINGS` ADDED beside the ``(event,
+    matcher, target)`` one — ``()`` when none. Never raises."""
+    return tuple(row.matcher for row in MATCHER_SIBLINGS
+                 if row.event == event and row.sibling == matcher and target in row.targets)
+
+
+def unit_matchers(event: str, matcher: str, target: Optional[str]) -> Tuple[str, ...]:
+    """Every OTHER matcher whose registration of ``target`` under ``event``
+    forms one user-visible hook with the ``matcher`` one, in either
+    direction of a :data:`MATCHER_SIBLINGS` row — ``()`` when none. Never
+    raises."""
+    out = list(sibling_matchers(event, matcher, target))
+    out += [m for m in added_sibling_matchers(event, matcher, target) if m not in out]
+    return tuple(out)
 
 
 def match_prior_shipped_shape(
@@ -1867,6 +1894,8 @@ __all__ = [
     "removal_envelope_rows",
     "scrub_retired_registrations",
     "sibling_matchers",
+    "added_sibling_matchers",
+    "unit_matchers",
     "vco_hook_script_identity",
 ]
 
