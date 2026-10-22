@@ -57,6 +57,7 @@ class _FakeWeaviateHTTP:
                     {"errors": [{"message": "boom"}]}
                 ).encode())
             # Which collection was asked for?
+            assert body is not None
             query = body["query"]
             for coll, rows in self.rows_by_collection.items():
                 if f" {coll}(" in query or f"{{ {coll}(" in query:
@@ -69,6 +70,7 @@ class _FakeWeaviateHTTP:
                     ).encode())
             return (200, json.dumps({"data": {"Get": {}}}).encode())
         if method == "DELETE" and url.endswith("/v1/batch/objects"):
+            assert body is not None
             chunk = body["match"]["where"]["valueTextArray"]
             self.deleted_uuids.extend(chunk)
             return (200, json.dumps(
@@ -613,7 +615,7 @@ class _NoTitleWeaviateHTTP(_FakeWeaviateHTTP):
 
     def __call__(self, method, url, *, body=None, timeout=30.0):
         if method == "POST" and url.endswith("/v1/graphql") \
-                and " title " in body["query"]:
+                and body is not None and " title " in body["query"]:
             self.calls.append((method, url, body))
             return (200, json.dumps({"errors": [{
                 "message": 'Cannot query field "title" on type "Proj_Development".',
