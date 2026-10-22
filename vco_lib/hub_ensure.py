@@ -560,17 +560,17 @@ def find_dist_binary(
         if found is not None:
             return found
 
-    root = Path(repo_root) if repo_root is not None else _default_repo_root()
-    if probe_repo_dist and root is not None:
-        dist = root / "launcher" / "dist"
-        arch = dist_arch_dir()
-        if arch:
-            found = _first_executable_in(dist / arch, names)
+    if probe_repo_dist:
+        for root in _repo_dist_roots(repo_root, environ):
+            dist = root / "launcher" / "dist"
+            arch = dist_arch_dir()
+            if arch:
+                found = _first_executable_in(dist / arch, names)
+                if found is not None:
+                    return found
+            found = _first_executable_in(dist, names)
             if found is not None:
                 return found
-        found = _first_executable_in(dist, names)
-        if found is not None:
-            return found
 
     # 3. PATH.
     for name in names:
@@ -629,6 +629,53 @@ def find_hub_binary(
         extra_dirs=extra_dirs,
         probe_repo_dist=probe_repo_dist,
     )
+
+
+def _repo_dist_roots(
+    repo_root: Optional[Path], environ: Mapping[str, str],
+) -> list[Path]:
+    """The roots whose ``launcher/dist/`` step 2 probes, in order.
+
+    The caller's ``repo_root`` first (an explicit anchor keeps precedence),
+    then the orchestrator clone from the ONE install-root resolver
+    (:func:`vco_lib.python_exe.resolve_install_root`: ``$VCT_INSTALL_ROOT`` /
+    ``$VCT_ORCHESTRATOR_ROOT`` when they name a clone, else the checkout this
+    module is imported from), then that checkout itself.
+
+    The orchestrator entries are what make the hooks work from a PROJECT:
+    the ensure hooks pass ``<hook dir>/../..``, which is the project root,
+    and only the orchestrator root has a ``launcher/dist/``. Before v0.2.104
+    a passed ``repo_root`` REPLACED the checkout, so from any project other
+    than the orchestrator root the hub and launcher binaries were never
+    found (owner, 2026-10-22: after a reboot no VS Code session restarted the
+    hub). Duplicates are dropped so each root is probed once.
+    """
+    roots: list[Path] = []
+    for candidate in (
+        Path(repo_root) if repo_root is not None else None,
+        *_orchestrator_roots(environ),
+    ):
+        if candidate is None:
+            continue
+        key = _path_key(candidate)
+        if all(_path_key(r) != key for r in roots):
+            roots.append(candidate)
+    return roots
+
+
+def _orchestrator_roots(environ: Mapping[str, str]) -> list[Optional[Path]]:
+    """The orchestrator clone(s) step 2 falls back to: the ONE install-root
+    resolver's answer, then the checkout this module is imported from."""
+    from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415
+
+    return [resolve_install_root(env=environ), _default_repo_root()]
+
+
+def _path_key(path: Path) -> str:
+    try:
+        return os.path.normcase(str(path.resolve()))
+    except OSError:
+        return os.path.normcase(str(path))
 
 
 def _default_repo_root() -> Optional[Path]:

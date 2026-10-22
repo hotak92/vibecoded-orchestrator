@@ -125,6 +125,17 @@
             "timeout": 4
           }
         ]
+      },
+      {
+        "matcher": "resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh\"",
+            "timeout": 5,
+            "async": true
+          }
+        ]
       }
     ],
     "PreCompact": [

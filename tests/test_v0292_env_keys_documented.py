@@ -291,7 +291,6 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_COMPOSE_CMD": "container-hook plumbing (compose command handoff)",
     "VCT_FIELD": "hook-script -> embedded-python value channel (vct_project_config.sh)",
     "VCT_FORCE_RESTART_DEFERRAL": "install.py internal escape hatch (support tooling)",
-    "VCT_INSTALL_ROOT": "install-root handoff consumed by venv resolution in bundled hooks",
     "VCT_JSON_PATH": "hook-script -> embedded-python value channel",
     "VCT_KG_ACCESS_LIST": "per-project access snapshot the launcher writes into .claude/env; the launcher GUI is the user surface",
     "VCT_LAUNCHER_PID": "install.py launcher-restart guard",
