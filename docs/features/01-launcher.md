@@ -584,7 +584,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 - `GET, POST /api/v1/projects/{project_id}/skills` — list / register skills.
 - `PATCH, DELETE /api/v1/projects/{project_id}/skills/{skill_name}` — toggle / unregister.
 - `GET, POST /api/v1/projects/{project_id}/hooks` — list / register hooks.
-- `PATCH, DELETE /api/v1/projects/{project_id}/hooks/{hook_id}` — toggle / unregister.
+- `PATCH, DELETE /api/v1/projects/{project_id}/hooks/{hook_id}` — toggle / unregister. The GET lists the raw mirror rows (one per registration, shape kept stable), while a PATCH toggle acts on the whole hook UNIT: a hook registered under two SessionStart matchers (the hub ensure-hook's `startup` and `resume|clear|compact` groups) parks and restores both, whichever row id is given. `vct-cli hooks list` shows the folded one-row-per-unit view.
 - `GET, POST /api/v1/projects/{project_id}/permissions` — list / add permission entries.
 - `DELETE /api/v1/projects/{project_id}/permissions/{perm_id}` — remove a permission.
 - `GET, POST /api/v1/projects/{project_id}/secrets` — list secret refs / set a secret ref.

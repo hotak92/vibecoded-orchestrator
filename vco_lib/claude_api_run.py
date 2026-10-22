@@ -202,9 +202,9 @@ def _is_wsl_launcher(path: str) -> bool:
 _CMD_META = frozenset("&|^<>%")
 
 
-def cmd_unsafe_args(argv: Sequence[str]) -> "list[str]":
-    """The *argv* elements cmd.exe would mis-parse (see :data:`_CMD_META`)."""
-    return [a for a in argv if any(c in _CMD_META for c in a)]
+def _cmd_unsafe(arg: str) -> bool:
+    """Whether cmd.exe would mis-parse *arg* (see :data:`_CMD_META`)."""
+    return any(c in _CMD_META for c in arg)
 
 
 #: The argv flags whose value is a file this module writes under the temp
@@ -228,7 +228,7 @@ def cmd_unsafe_refusal(argv: Sequence[str]) -> Optional[str]:
     """
     problems: list[str] = []
     for i, arg in enumerate(argv):
-        if not any(c in _CMD_META for c in arg):
+        if not _cmd_unsafe(arg):
             continue
         if i == 0:
             problems.append(

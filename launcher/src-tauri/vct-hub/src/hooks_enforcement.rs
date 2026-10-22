@@ -322,7 +322,8 @@ pub(crate) async fn enforce_hook_toggle(
 pub(crate) struct HookUnitFold {
     /// Mirror row id → the id of the row its unit renders and toggles as.
     pub(crate) folded_into: std::collections::HashMap<i64, i64>,
-    /// Primary row id → the OTHER matchers its unit covers (file order).
+    /// Primary row id → the OTHER matchers its unit covers, in mirror-row
+    /// (DB) order — the order the rows were mirrored from settings.json.
     pub(crate) unit_matchers: std::collections::HashMap<i64, Vec<String>>,
     /// Set when settings.json could not be listed: only parked units were
     /// folded then (by exact command), and the reason is surfaced.

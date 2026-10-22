@@ -675,9 +675,10 @@ class TestR28WindowsResiduals:
         assert not car._is_wsl_launcher(r"C:\Program Files\Git\bin\bash.exe")
 
     def test_cmd_meta_in_an_argument_is_reported(self):
-        assert car.cmd_unsafe_args(["claude", "-p", "C:/t/a&b/settings.json"]) \
-            == ["C:/t/a&b/settings.json"]
-        assert car.cmd_unsafe_args(["claude", "--settings", "C:/t/x.json"]) == []
+        msg = car.cmd_unsafe_refusal(["claude", "-p", "C:/t/a&b/settings.json"])
+        assert msg is not None and "C:/t/a&b/settings.json" in msg
+        assert car.cmd_unsafe_refusal(
+            ["claude", "--settings", "C:/t/x.json"]) is None
 
 
 class TestFinal4CmdRefusalNamesTheRole:
