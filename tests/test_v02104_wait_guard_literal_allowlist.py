@@ -518,21 +518,54 @@ def test_device_path_reading(text, expected):
     assert _names_device_path(text) is expected
 
 
-# ─── 5. performance: linear, < 50 ms on a 200 KB command ──────────────────
+# ─── 5. performance: LINEAR on a 200 KB command ──────────────────────────
+#
+# What this guards is the complexity class, not a wall-clock budget: a
+# quadratic step (re-scanning the prefix per token, string concatenation in a
+# loop, a backtracking regex) must fail here on any machine. A fixed "< 50 ms"
+# bound did not do that reliably — it measured 23-32 ms on a dev box and 52-73
+# ms on a GitHub ubuntu runner for the SAME linear code, while a quadratic
+# step with a small constant could still slip under it on a fast machine.
+#
+# So the primary check is the SCALING RATIO: the same shape at 20 KB and at
+# 200 KB, best-of-N each. Linear code scales by ~10x (fixed per-call overhead
+# pulls it below); quadratic code scales by ~100x. The bound sits at 30x,
+# three times the linear ratio and a third of the quadratic one, so machine
+# speed cancels out of it. The absolute ceiling stays as a backstop against a
+# gross constant-factor regression (e.g. a per-character subprocess or regex
+# compile) that scales linearly but is unusable: 250 ms on 200 KB is ~3.5x the
+# slowest runner measurement and ~10x the dev-box one.
+#
+# Timings are this thread's CPU time (``time.thread_time``), not wall clock:
+# on a shared runner the scheduler preempts the 200 KB run (it spans several
+# time slices) far more often than the 2 ms 20 KB run, which skewed a
+# wall-clock ratio to ~40x under 4-way contention on one core while the
+# code's own cost still scaled by ~10x.
+
+_SMALL_CHARS = 20_000
+_LARGE_CHARS = 200_000
+_MAX_SCALING_RATIO = 30.0
+_MAX_LARGE_MS = 250.0
 
 
-def _best_ms(cmd: str) -> float:
+def _best_ms(cmd: str, rounds: int = 7) -> float:
+    import gc
+
     best = float("inf")
-    for _ in range(5):
-        start = time.perf_counter()
-        literal_text_only(cmd)
-        best = min(best, (time.perf_counter() - start) * 1000)
+    gc_was_enabled = gc.isenabled()
+    gc.disable()  # a collection landing inside one timed call is noise, not cost
+    try:
+        for _ in range(rounds):
+            start = time.thread_time()
+            literal_text_only(cmd)
+            best = min(best, (time.thread_time() - start) * 1000)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
     return best
 
 
-@pytest.mark.parametrize("shape", ["quoted", "words", "ansi", "dquoted", "reject_late",
-                                   "ansi_escape", "dquoted_var"])
-def test_200kb_command_is_linear_and_fast(shape):
+def _perf_command(shape: str, size: int) -> str:
     unit = {
         "quoted": "grep -n '$(sleep 5) aaaa' f | ",
         "words": "grep -n abc def ghi jkl f \\$ | ",
@@ -542,9 +575,23 @@ def test_200kb_command_is_linear_and_fast(shape):
         "ansi_escape": "grep $'$(sleep 5) \\x41' f | ",
         "dquoted_var": 'grep "\\$(sleep 5) $x" f | ',
     }.get(shape, "grep -n '$(sleep 5)' f | ")
-    body = unit * (200_000 // len(unit) + 1)
-    cmd = body + ("wc -l" if shape != "reject_late" else "sleep 5")
-    assert len(cmd) >= 200_000
+    body = unit * (size // len(unit) + 1)
+    return body + ("wc -l" if shape != "reject_late" else "sleep 5")
+
+
+@pytest.mark.parametrize("shape", ["quoted", "words", "ansi", "dquoted", "reject_late",
+                                   "ansi_escape", "dquoted_var"])
+def test_200kb_command_is_linear_and_fast(shape):
+    small = _perf_command(shape, _SMALL_CHARS)
+    large = _perf_command(shape, _LARGE_CHARS)
+    assert len(large) >= _LARGE_CHARS
     expected: Optional[bool] = shape not in ("reject_late", "ansi_escape", "dquoted_var")
-    assert literal_text_only(cmd) is expected
-    assert _best_ms(cmd) < 50, shape
+    assert literal_text_only(small) is expected
+    assert literal_text_only(large) is expected
+    small_ms = max(_best_ms(small), 0.05)  # floor: a sub-50-us timing is clock noise
+    large_ms = _best_ms(large)
+    ratio = large_ms / small_ms
+    assert ratio < _MAX_SCALING_RATIO, (
+        f"{shape}: 10x the input took {ratio:.1f}x the time "
+        f"({small_ms:.2f} ms -> {large_ms:.2f} ms); linear is ~10x, quadratic ~100x")
+    assert large_ms < _MAX_LARGE_MS, f"{shape}: {large_ms:.1f} ms on {len(large)} chars"

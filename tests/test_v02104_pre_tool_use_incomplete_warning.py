@@ -225,13 +225,18 @@ def test_a_run_killed_mid_scan_is_reported_once_by_the_next_run(tmp_path: Path, 
 def test_a_run_that_finished_past_the_timeout_is_reported(tmp_path: Path, impl: str):
     # The hook outlived the harness timeout (an orphan the harness stopped
     # waiting for): its answer was discarded, so its marker must survive.
+    # The REPORTING run gets a generous budget: a run that itself ends past
+    # its budget rightly withholds the report and keeps carrying it (its
+    # answer would be discarded too), and a 1 s budget is less than a pwsh
+    # cold start on a loaded CI runner — which made this test report nothing
+    # there. The late run is still the one under test.
     proj = _project(tmp_path)
     _stub_scanner(proj, 1.5)
     res = _run(impl, proj, _payload("Bash", {"command": "ls"}),
                VCO_PRE_TOOL_USE_TIMEOUT_S="1")
     assert res.returncode == 0, res.stderr
     assert len(_markers(proj)) == 1
-    nxt = _grep(impl, proj, VCO_PRE_TOOL_USE_TIMEOUT_S="1")
+    nxt = _grep(impl, proj, VCO_PRE_TOOL_USE_TIMEOUT_S="60")
     assert "(Bash)" in _context(nxt)
     assert _markers(proj) == []
 
@@ -305,14 +310,26 @@ def test_carried_names_are_capped(tmp_path: Path, impl: str):
 
 @pytest.mark.parametrize("impl", _SHELLS)
 def test_a_concurrent_sibling_is_not_reported(tmp_path: Path, impl: str):
+    # The sibling is FROZEN (SIGSTOP on its process group) while `during`
+    # looks: alive, same pid and start time — exactly what the liveness
+    # check reads. A fixed scan length could not hold it there: the hook
+    # bounds its scanner call at 2 s, and on a slow runner the 1 s scan this
+    # test used ended (clearing the sibling's own marker) before the next
+    # pwsh had even started. Both runs get a budget no start-up can exhaust,
+    # so only liveness decides: the sibling is running, leave it alone.
     proj = _project(tmp_path)
     _stub_scanner(proj, 1.0)
-    p = _start_bash_call(impl, proj)
-    marker = _wait_for_marker(proj, p)
-    during = _grep(impl, proj)
-    assert during.returncode == 0
-    assert _context(during) == ""
-    assert marker.exists(), "a running sibling's marker must be left alone"
+    p = _start_bash_call(impl, proj, VCO_PRE_TOOL_USE_TIMEOUT_S="60")
+    try:
+        marker = _wait_for_marker(proj, p)
+        os.killpg(p.pid, signal.SIGSTOP)
+        during = _grep(impl, proj, VCO_PRE_TOOL_USE_TIMEOUT_S="60")
+        assert p.poll() is None, "the sibling must still be running"
+        assert during.returncode == 0
+        assert _context(during) == ""
+        assert marker.exists(), "a running sibling's marker must be left alone"
+    finally:
+        os.killpg(p.pid, signal.SIGCONT)
     assert p.stdout is not None and p.stderr is not None
     out, err = p.stdout.read(), p.stderr.read()
     assert p.wait(timeout=60) == 0, err

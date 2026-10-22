@@ -1378,15 +1378,48 @@ def _checkout_ledger_untouched():
         return
     before = {path: _ledger_fingerprint(path) for path in _CHECKOUT_LEDGER_FILES}
     yield
-    changed = [str(p) for p in _CHECKOUT_LEDGER_FILES if _ledger_fingerprint(p) != before[p]]
+    changed = [p for p in _CHECKOUT_LEDGER_FILES if _ledger_fingerprint(p) != before[p]]
     if changed:
         raise AssertionError(
             "W-CHECKOUT-LEDGER: this test (or a process it spawned) changed "
-            + ", ".join(changed)
+            + ", ".join(str(p) for p in changed)
             + " — something resolved the checkout as its project/install root "
             "and rendered a deferral ledger / CLAUDE.md reminder into it. Give "
             "the writer a fixture root (see tests/conftest.py W-CHECKOUT-LEDGER)."
+            + _checkout_ledger_evidence(changed)
         )
+
+
+def _checkout_ledger_evidence(changed: "list[Path]") -> str:
+    """What the writer left, for the failure message: each row of the
+    changed checkout's UPDATE_DEFERRED.json (condition id, detection time,
+    title). The condition id names the emitter, and the detection time
+    dates the write. The writer may be a DETACHED child of a much earlier
+    test (the test this guard reds can be an innocent bystander), so this
+    is the only evidence a CI log carries (v0.2.104 PR #400: a pure parser
+    test was red with nothing to go on). Never raises; "" when there is
+    nothing to read."""
+    try:
+        sidecars = sorted({p.parent / ".claude" / "context" / "UPDATE_DEFERRED.json"
+                           if p.name == "CLAUDE.md" else p.with_suffix(".json")
+                           for p in changed})
+        lines = []
+        for sidecar in sidecars:
+            try:
+                payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            entries = payload.get("entries") if isinstance(payload, dict) else None
+            for entry in (entries if isinstance(entries, list) else [])[:20]:
+                if isinstance(entry, dict):
+                    lines.append(f"  - {entry.get('condition_id')!s} "
+                                 f"(detected_at {entry.get('detected_at')!s}): "
+                                 f"{str(entry.get('title', ''))[:160]}")
+        if not lines:
+            return ""
+        return "\nLedger rows now in the checkout (the condition id names the emitter):\n" + "\n".join(lines)
+    except Exception:  # noqa: BLE001 — diagnostics must never mask the guard
+        return ""
 
 
 _CONTAINED_MARK = "_vco_contained_install_log"

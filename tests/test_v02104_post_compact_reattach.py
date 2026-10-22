@@ -456,11 +456,42 @@ def test_write_is_blocked_when_vco_lib_cannot_be_imported(impl: str,
     f = _file(proj)
     t = _transcript(tmp_path, _boundary(), _attach("file", f))
     _compact(impl, proj)
+    # The premise is pinned on the interpreter the hook hands the check to
+    # (VCT_VENV is the first tier of both siblings' resolver): its
+    # compact_reattach call runs under `python -S` with PYTHONPATH pointing
+    # nowhere, so neither PYTHONPATH nor site-packages can supply vco_lib.
+    # PYTHONPATH alone did not pin it: with vco_lib pip-installed (`pip
+    # install -e .` — the CI job, any healthy install) the module imported
+    # anyway, answered `reattached` for this transcript and the hook rightly
+    # allowed. The other helpers keep the real interpreter.
+    venv, log = _unimportable_vco_lib_venv(tmp_path)
     payload = {"session_id": SID, "tool_name": "Write", "transcript_path": str(t),
                "tool_input": {"file_path": str(f), "content": "x = 9\n"}}
     res = _hook(impl, "pre-tool-use", proj, payload,
-                PYTHONPATH=str(tmp_path / "nowhere"))
+                PYTHONPATH=str(tmp_path / "nowhere"), VCT_VENV=str(venv))
     assert res.returncode == 2, (res.stdout, res.stderr)
+    assert "Build Anchor" in res.stderr
+    # the check really ran (and failed to import) — not a skipped spawn
+    assert len(_reattach_calls(log)) == 1, _reattach_calls(log)
+    assert str(f) not in (_ledger(proj).read_text(encoding="utf-8").splitlines()
+                          if _ledger(proj).exists() else [])
+
+
+def _unimportable_vco_lib_venv(tmp_path: Path) -> tuple[Path, Path]:
+    """A fake venv whose python runs the compact_reattach call with site
+    disabled (`-S`), so `import vco_lib` fails whatever is installed, and
+    every other call with the real interpreter. Returns (venv, log)."""
+    venv = tmp_path / "novcolib-venv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "python_calls.log"
+    shim = venv / "bin" / "python"
+    shim.write_text(
+        f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{log}"\n'
+        f'[ "$1 $2" = "-m vco_lib.compact_reattach" ] && '
+        f'exec "{sys.executable}" -S "$@"\n'
+        f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return venv, log
 
 
 def test_hook_on_a_large_transcript_is_fast(tmp_path: Path):
