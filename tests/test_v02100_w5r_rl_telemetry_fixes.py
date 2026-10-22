@@ -344,10 +344,16 @@ def test_hook_process_latency_with_a_hung_hub(tmp_path):
             [sys.executable, str(REPO_ROOT / "tests/common/rl_kg_search_harness.py"), str(cfg_path)],
             env=env, capture_output=True, text=True, timeout=120,
         )
+        exited_at = time.time()
         timings[label] = time.monotonic() - t0
         assert proc.returncode == 0, proc.stderr[-2000:]
         out = json.loads(res_path.read_text())
         timings[label + "_main"] = out["main_elapsed_s"]
+        # The process TAIL: from the result landing on disk (main() done) to
+        # the parent seeing the exit — interpreter shutdown, which is where a
+        # POST that is not truly detached (a joined thread, an exit-time
+        # flush, a waited-on child) or the hung secondary would surface.
+        timings[label + "_tail"] = exited_at - out["result_written_at"]
         if label == "pre_tool_use_worst":
             assert out["handed_off"] == 1, out  # primary only: the twin was over budget
         elif real_detach:
@@ -357,7 +363,11 @@ def test_hook_process_latency_with_a_hung_hub(tmp_path):
     print(f"\nHOOK-LATENCY-W5R07 {json.dumps({k: round(v, 3) for k, v in timings.items()})}")
     assert timings["inline_main"] >= 4.0, timings  # 2 POSTs x 2 s on the critical path
     assert timings["detached_main"] < 1.0, timings
-    assert timings["inline"] - timings["detached"] >= 3.5, timings
+    # The same claim end to end, minus interpreter STARTUP (cold imports, the
+    # one part of the wall clock that load inflates unevenly between runs —
+    # see the tail bound below): main() plus the exit tail.
+    assert ((timings["inline_main"] + timings["inline_tail"])
+            - (timings["detached_main"] + timings["detached_tail"])) >= 3.5, timings
     # The worst case (wedged hub AND hung secondary) costs pre-tool-use only
     # its 0.4 s embed cap over the fast detached run. The cap is wall-clock;
     # the process overhead around it is not — under a loaded machine (a full
@@ -367,7 +377,22 @@ def test_hook_process_latency_with_a_hung_hub(tmp_path):
     # (30 s) or a POST back on the critical path (2 s each) still fails it.
     slack = 0.5 + 3 * timings["detached_main"]
     assert timings["pre_tool_use_worst_main"] < 0.4 + slack, timings
-    assert timings["pre_tool_use_worst"] - timings["detached"] < 0.4 + 0.5, timings
+    # Off the critical path means off the WHOLE process too: the exit must not
+    # wait for the wedged POST or the hung (30 s) secondary. This used to be a
+    # fixed 0.9 s bound on the difference of two whole-process wall clocks,
+    # which also carries interpreter STARTUP (cold imports): on a loaded CI
+    # runner the two runs' startups alone differed by more than that (3.07 s
+    # vs 1.75 s) while the in-process times stayed within their bounds. So the
+    # bound is on the TAIL — the time after main() returned. The reference is
+    # the inline run's tail: same interpreter and imports, and its POSTs were
+    # already paid inside main(), so nothing is pending at its exit. The slack
+    # scales with that baseline but is CAPPED below one POST (2 s): a POST
+    # waited on at exit (a joined thread, an exit-time flush, a waited-on
+    # child) breaks it on either detached run, a hung secondary (~30 s) by far.
+    base_tail = timings["inline_tail"]
+    tail_slack = min(1.5, 0.5 + 2 * base_tail)
+    for label in ("detached", "pre_tool_use_worst"):
+        assert timings[label + "_tail"] - base_tail < tail_slack, (label, timings)
 
 
 # ---------------------------------------------------------------------------

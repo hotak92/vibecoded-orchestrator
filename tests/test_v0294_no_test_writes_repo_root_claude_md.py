@@ -111,6 +111,9 @@ def _seed_sentinel_root(tmp_path: Path) -> Path:
     """A throwaway project root carrying a reminder block, like a real one."""
     root = tmp_path / "sentinel_root"
     (root / ".claude" / "context").mkdir(parents=True, exist_ok=True)
+    # The project marker every installed project carries: the ledger is only
+    # reconciled into a VCO project (embedding_service._project_surface_root).
+    (root / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
     (root / "CLAUDE.md").write_text(
         _REMINDER + "\n# Sentinel project\n", encoding="utf-8"
     )
@@ -309,6 +312,9 @@ def test_real_post_edit_hook_reconciles_its_own_project_not_the_checkout(tmp_pat
     hooks = project / ".claude" / "hooks"
     hooks.mkdir(parents=True)
     (project / ".claude" / "context").mkdir(parents=True)
+    # Installed: the project marker (the ledger is only reconciled into a VCO
+    # project — embedding_service._project_surface_root).
+    (project / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
     # Installed layout: <project>/.claude/hooks/, so the hook's own
     # `$SCRIPT_DIR/../..` fallback resolves the fixture project — the branch
     # that matters, since CLAUDE_PROJECT_DIR is deliberately not set below.

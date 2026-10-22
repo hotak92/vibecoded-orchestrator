@@ -888,6 +888,15 @@ class NoCrossModelFallbackTests(unittest.TestCase):
             self.assertFalse(hasattr(es, name), name)
 
 
+def _vco_project(root: Path) -> Path:
+    """Mark ``root`` as a VCO project (``.claude/settings.json``, the marker
+    ``install-bundle`` always writes): the per-project failure surfaces are
+    written only into one (``embedding_service._project_surface_root``)."""
+    (root / ".claude").mkdir(parents=True, exist_ok=True)
+    (root / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")
+    return root
+
+
 class FailureCaptureTests(unittest.TestCase):
     def test_for_project_raises_when_no_backends(self):
         # Steer both state roots so the failure-capture JSONL goes to a
@@ -943,7 +952,7 @@ class FailureCaptureTests(unittest.TestCase):
         with _EnvIsolation():
             import tempfile
             with tempfile.TemporaryDirectory() as proj_dir:
-                proj_root = Path(proj_dir)
+                proj_root = _vco_project(Path(proj_dir))
                 with tempfile.TemporaryDirectory() as home_dir:
                     fake_home = Path(home_dir)
                     with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
@@ -1021,7 +1030,7 @@ class FailureCaptureTests(unittest.TestCase):
         with _EnvIsolation(), patch.dict(os.environ, {}, clear=False):
             import tempfile
             with tempfile.TemporaryDirectory() as proj_dir:
-                proj_root = Path(proj_dir)
+                proj_root = _vco_project(Path(proj_dir))
                 # Plant a stale failure hint file
                 md = proj_root / ".claude" / "context" / "EMBEDDING_FAILURES.md"
                 md.parent.mkdir(parents=True)
@@ -1058,7 +1067,7 @@ class FailureCaptureTests(unittest.TestCase):
         with _EnvIsolation():
             import tempfile
             with tempfile.TemporaryDirectory() as proj_dir:
-                proj_root = Path(proj_dir)
+                proj_root = _vco_project(Path(proj_dir))
                 with tempfile.TemporaryDirectory() as home_dir:
                     fake_home = Path(home_dir)
                     with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
@@ -1107,7 +1116,7 @@ class FailureCaptureTests(unittest.TestCase):
         with _EnvIsolation(), patch.dict(os.environ, {}, clear=False):
             import tempfile
             with tempfile.TemporaryDirectory() as proj_dir:
-                proj_root = Path(proj_dir)
+                proj_root = _vco_project(Path(proj_dir))
                 with tempfile.TemporaryDirectory() as home_dir:
                     fake_home = Path(home_dir)
                     with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
@@ -1155,7 +1164,7 @@ class FailureCaptureTests(unittest.TestCase):
         with _EnvIsolation():
             import tempfile
             with tempfile.TemporaryDirectory() as proj_dir:
-                proj_root = Path(proj_dir)
+                proj_root = _vco_project(Path(proj_dir))
                 with tempfile.TemporaryDirectory() as home_dir:
                     fake_home = Path(home_dir)
                     with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
@@ -1184,6 +1193,61 @@ class FailureCaptureTests(unittest.TestCase):
                         md = proj_root / ".claude" / "context" / "EMBEDDING_FAILURES.md"
                         self.assertTrue(jsonl.exists(), "JSONL must be written first")
                         self.assertTrue(md.exists(), "MD hint must be written second")
+
+
+    def test_non_project_root_gets_no_failure_surfaces(self):
+        """A root that is NOT a VCO project (no ``.claude/settings.json`` or
+        ``.claude/env`` — a bare source checkout, which spawned children reach
+        through ``VCT_ORCHESTRATOR_ROOT``) gets no ledger, no hint and no
+        reminder spliced into its tracked CLAUDE.md. The machine-level JSONL
+        still records the outage (v0.2.104 PR #400: a CI child rendered a
+        ``kg_summary_no_backend`` ledger into the checkout)."""
+        with _EnvIsolation():
+            import tempfile
+            with tempfile.TemporaryDirectory() as proj_dir, \
+                    tempfile.TemporaryDirectory() as home_dir:
+                checkout = Path(proj_dir)
+                claude_md = checkout / "CLAUDE.md"
+                claude_md.write_text("# tracked instructions\n", encoding="utf-8")
+                # A bare .claude/ (tracked assets) is NOT a project marker.
+                (checkout / ".claude" / "references").mkdir(parents=True)
+                fake_home = Path(home_dir)
+                with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                             "VCT_STATE_DIR": str(fake_home / ".vct")}):
+                    NoEmbeddingBackendError(
+                        "no backends",
+                        attempted_backends=["ollama"],
+                        error_per_backend={"ollama": "connection refused"},
+                        install_root=checkout,
+                    )
+                    jsonl = fake_home / ".vct" / "metrics" / "embedding_failures.jsonl"
+                    self.assertTrue(jsonl.exists(), "the machine-level log still records it")
+                self.assertFalse((checkout / ".claude" / "context").exists(),
+                                 "no ledger / hint / lock may be created in a non-project")
+                self.assertEqual(claude_md.read_text(encoding="utf-8"),
+                                 "# tracked instructions\n")
+
+    def test_success_on_non_project_root_creates_nothing(self):
+        """The success-path clears are gated the same way: even a no-op
+        resolve opens the ledger lock, which would create ``.claude/context``
+        in a folder that never had one."""
+        with _EnvIsolation(), patch.dict(os.environ, {}, clear=False):
+            import tempfile
+            with tempfile.TemporaryDirectory() as proj_dir:
+                checkout = Path(proj_dir)
+                ollama_m = MagicMock(spec=OllamaAdapter)
+                ollama_m.is_reachable.return_value = True
+                ollama_m.list_embedding_models.return_value = []
+                code_m = MagicMock(spec=CodeEmbedAdapter)
+                code_m.is_reachable.return_value = True
+                oa_m = MagicMock(spec=OpenAIAdapter)
+                oa_m.validate.return_value = ValidationResult(valid=True)
+                with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
+                     patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
+                     patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
+                    svc = EmbeddingService.for_project(project_root=checkout)
+                    svc.close()
+                self.assertFalse((checkout / ".claude").exists())
 
 
 # ---------------------------------------------------------------------------
