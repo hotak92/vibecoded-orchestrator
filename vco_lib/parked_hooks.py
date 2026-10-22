@@ -97,7 +97,8 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 from vco_lib.hook_relative_paths import emit_relative_hooks_deferral
 from vco_lib.hook_retirements import (
-    carry_parked_async_disables, normalize_command, vco_hook_script_identity,
+    carry_parked_async_disables, normalize_command, sibling_matchers,
+    vco_hook_script_identity,
 )
 from vco_lib.hooks_settings import normalize_matcher
 from vco_lib.jsonc_edit import load_object
@@ -222,6 +223,37 @@ def find_parked_match(
             return p
     shipped_under = _template_matchers_for(command, template_groups)
     if len(shipped_under) != 1:
+        # v0.2.104: a registration the template ADDED beside an existing one
+        # of the same script (``hook_retirements.MATCHER_SIBLINGS`` —
+        # session-start-ensure-hub's `resume|clear|compact` group mirrors its
+        # `startup` one) is covered by a row parked under that sibling: the
+        # user switched the hook off, and an upgrade that adds a matcher must
+        # not switch it partly back on. Any other ambiguous drift stays
+        # unmatched, as before.
+        ident = vco_hook_script_identity(command)
+        siblings = sibling_matchers(event, matcher, ident)
+        for p in candidates:
+            if p.matcher in siblings:
+                return p
+        # Review R29 (LOW): the declared siblings are ONE hook, so for the
+        # drifted-matcher inference below they count as one matcher. A row
+        # parked under a matcher the template does not use (the user
+        # regrouped the hook, then disabled it) covers every registration of
+        # that one hook — provided the hook runs on NO event in the user's
+        # file: a hook still running somewhere was switched off for one
+        # matcher only (a stale row), so the new registration is added.
+        # Without ``live_identities`` that cannot be told apart: no guess.
+        added = {
+            m for m in shipped_under
+            if any(s in shipped_under for s in sibling_matchers(event, m, ident))
+        }
+        if (
+            len(shipped_under - added) == 1
+            and ident is not None
+            and live_identities is not None
+            and ident not in set(live_identities)
+        ):
+            return candidates[0]
         return None
     # The template ships this hook under ONE matcher, so a parked row under a
     # matcher it no longer uses can only mean this registration.

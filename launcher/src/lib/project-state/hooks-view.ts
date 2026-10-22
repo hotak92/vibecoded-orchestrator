@@ -32,6 +32,15 @@ export interface EffectiveHook {
    * together), so per-rule checkboxes would each toggle everything anyway.
    */
   if_rules: string[];
+  /**
+   * The OTHER matchers this row also covers (v0.2.104, review R29). EMPTY
+   * for an ordinary hook. A hook VCO ships under declared sibling matchers
+   * of one event (the hub ensure: `startup` and `resume|clear|compact`) is
+   * ONE hook: one row under its primary matcher, and the toggle disables /
+   * restores every registration together. Optional so an older backend that
+   * omits it still renders.
+   */
+  unit_matchers?: string[];
 }
 
 export interface EffectiveHooksView {
@@ -182,6 +191,30 @@ export function ifRulesTooltip(hook: EffectiveHook): string {
     `This command is registered ${rules.length === 1 ? 'once' : `${rules.length} times`}, once per \`if\` filter:`,
     ...rules.map((r) => `• ${r}`),
     'The toggle applies to every rule at once; enabling restores them all exactly.',
+  ].join('\n');
+}
+
+// ── declared sibling matchers (v0.2.104, review R29) ─────────────────────
+
+/** The Matcher cell: the row's matcher, then every matcher it also covers. */
+export function matcherLabel(hook: EffectiveHook): string {
+  const own = hook.matcher || 'every';
+  const others = hook.unit_matchers ?? [];
+  return others.length === 0 ? own : [own, ...others].join(' + ');
+}
+
+/**
+ * The Matcher cell's hover text when the row covers several registrations
+ * ('' otherwise): says the toggle acts on all of them, the one fact a user
+ * needs before unticking what looks like a single registration.
+ */
+export function matcherTooltip(hook: EffectiveHook): string {
+  const others = hook.unit_matchers ?? [];
+  if (others.length === 0) return '';
+  return [
+    `This hook is registered under ${others.length + 1} matchers of ${hook.event}:`,
+    ...[hook.matcher || 'every', ...others].map((m) => `• ${m}`),
+    'It is one hook: the toggle disables or restores every registration at once.',
   ].join('\n');
 }
 

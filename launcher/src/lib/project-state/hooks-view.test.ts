@@ -26,6 +26,8 @@ import {
   isChecked,
   ifRulesLabel,
   ifRulesTooltip,
+  matcherLabel,
+  matcherTooltip,
   isAsyncSubhookDisabled,
   leanCtxChoiceFromEnvValue,
   leanCtxEnvValueForChoice,
@@ -568,6 +570,39 @@ describe('`if` groups — the row badge (v0.2.101)', () => {
     delete (legacy as Partial<EffectiveHook>).if_rules;
     expect(ifRulesLabel(legacy)).toBe('');
     expect(ifRulesTooltip(legacy)).toContain('once');
+  });
+});
+
+describe('declared sibling matchers — one hook, one row (v0.2.104 R29)', () => {
+  it('shows every matcher the row covers, and only its own otherwise', () => {
+    expect(matcherLabel(hook())).toBe('Edit(*)');
+    expect(matcherLabel(hook({ matcher: '' }))).toBe('every');
+    expect(
+      matcherLabel(hook({ event: 'SessionStart', matcher: 'startup', unit_matchers: ['resume|clear|compact'] })),
+    ).toBe('startup + resume|clear|compact');
+  });
+
+  it('says the toggle covers every registration, and stays silent otherwise', () => {
+    expect(matcherTooltip(hook())).toBe('');
+    const text = matcherTooltip(
+      hook({ event: 'SessionStart', matcher: 'startup', unit_matchers: ['resume|clear|compact'] }),
+    );
+    expect(text).toContain('2 matchers of SessionStart');
+    expect(text).toContain('• resume|clear|compact');
+    expect(text).toContain('every registration at once');
+  });
+
+  it('tolerates a backend that omits the field', () => {
+    const legacy = hook();
+    delete (legacy as Partial<EffectiveHook>).unit_matchers;
+    expect(matcherLabel(legacy)).toBe('Edit(*)');
+    expect(matcherTooltip(legacy)).toBe('');
+  });
+
+  it('is what the Matcher cell renders', () => {
+    const svelte = readFileSync(new URL('./HooksTab.svelte', import.meta.url), 'utf-8');
+    expect(svelte).toMatch(/matcherLabel\(h\)/);
+    expect(svelte).toMatch(/matcherTooltip\(h\)/);
   });
 });
 

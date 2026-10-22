@@ -57,6 +57,7 @@ class _FakeWeaviateHTTP:
                     {"errors": [{"message": "boom"}]}
                 ).encode())
             # Which collection was asked for?
+            assert body is not None
             query = body["query"]
             for coll, rows in self.rows_by_collection.items():
                 if f" {coll}(" in query or f"{{ {coll}(" in query:
@@ -69,6 +70,7 @@ class _FakeWeaviateHTTP:
                     ).encode())
             return (200, json.dumps({"data": {"Get": {}}}).encode())
         if method == "DELETE" and url.endswith("/v1/batch/objects"):
+            assert body is not None
             chunk = body["match"]["where"]["valueTextArray"]
             self.deleted_uuids.extend(chunk)
             return (200, json.dumps(
@@ -605,3 +607,64 @@ class SharedIdentityPredicateTests(PruneBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _NoTitleWeaviateHTTP(_FakeWeaviateHTTP):
+    """A class WITHOUT a ``title`` property: real Weaviate rejects any query
+    that names it (measured live 2026-10-21 on the V46-C gate collection)."""
+
+    def __call__(self, method, url, *, body=None, timeout=30.0):
+        if method == "POST" and url.endswith("/v1/graphql") \
+                and body is not None and " title " in body["query"]:
+            self.calls.append((method, url, body))
+            return (200, json.dumps({"errors": [{
+                "message": 'Cannot query field "title" on type "Proj_Development".',
+            }]}).encode())
+        return super().__call__(method, url, body=body, timeout=timeout)
+
+
+class NoTitleSchemaTests(PruneBase):
+    """v0.2.104 (live V46-C gate): the v0.2.103 title join made every prune of
+    a class without ``title`` skip as "enumeration failed"."""
+
+    def test_a_class_without_title_still_prunes(self):
+        fake = _NoTitleWeaviateHTTP({"Proj_Development": [
+            ("u-real", "docs/real.md"), ("u-gone", "docs/gone.md")]})
+        with mock.patch.object(crep, "_http_request", fake):
+            result = prune_foreign_rows(
+                self.project, "Proj_Development", weaviate_url=_URL,
+                is_shared_identity=False, dry_run=False,
+            )
+        self.assertNotIn("skipped", {k: v for k, v in result.items() if v})
+        self.assertEqual(fake.deleted_uuids, ["u-gone"])
+
+    def test_any_other_graphql_error_still_skips(self):
+        result, fake = self._run([("u-gone", "docs/gone.md")],
+                                 graphql_errors=True)
+        self.assertEqual(result.get("skipped"), "enumeration failed")
+        self.assertEqual(fake.deleted_uuids, [])
+
+    def test_a_title_error_beside_any_other_error_still_skips(self):
+        """R29 NIT: the retry is for the missing-``title`` answer ALONE. The
+        same error next to any other one is an enumeration failure: no retry,
+        no prune — the conservative ``all()`` gate, pinned."""
+        class _Mixed(_FakeWeaviateHTTP):
+            def __call__(self, method, url, *, body=None, timeout=30.0):
+                if method == "POST" and url.endswith("/v1/graphql"):
+                    self.calls.append((method, url, body))
+                    return (200, json.dumps({"errors": [
+                        {"message": 'Cannot query field "title" on type "Proj_Development".'},
+                        {"message": "shard Proj_Development not ready"},
+                    ]}).encode())
+                return super().__call__(method, url, body=body, timeout=timeout)
+
+        fake = _Mixed({"Proj_Development": [("u-gone", "docs/gone.md")]})
+        with mock.patch.object(crep, "_http_request", fake):
+            result = prune_foreign_rows(
+                self.project, "Proj_Development", weaviate_url=_URL,
+                is_shared_identity=False, dry_run=False,
+            )
+        self.assertEqual(result.get("skipped"), "enumeration failed")
+        self.assertEqual(fake.deleted_uuids, [])
+        graphql = [c for c in fake.calls if c[1].endswith("/v1/graphql")]
+        self.assertEqual(len(graphql), 1, "a mixed error list must not be retried")

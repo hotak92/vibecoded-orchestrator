@@ -125,6 +125,17 @@ def test_hub_ensure_is_the_one_home_and_exposes_the_ssot_api() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_orchestrator_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Step 2 also probes the orchestrator clone (v0.2.104) — the checkout
+    these tests run from, whose committed ``launcher/dist/`` would answer
+    every "nothing on this machine" case. Pin it away; the fallback has its
+    own tests in ``tests/test_v02104_hub_resume_ensure.py``."""
+    from vco_lib import hub_ensure as _he
+
+    monkeypatch.setattr(_he, "_orchestrator_roots", lambda _environ: [])
+
+
 @pytest.fixture()
 def spy_spawn(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, bool]]:
     """Record every ``_spawn`` call instead of executing one."""
@@ -335,7 +346,7 @@ def test_install_folder_copy_is_preferred_over_path(
     path_dir = tmp_path / "onpath"
     path_dir.mkdir()
     _write_hub(path_dir)
-    dist = tmp_path / "checkout" / "launcher" / "dist" / hub_ensure.dist_arch_dir()
+    dist = tmp_path / "checkout" / "launcher" / "dist" / (hub_ensure.dist_arch_dir() or "")
     dist.mkdir(parents=True)
     install_copy = _write_hub(dist)
 
@@ -353,7 +364,7 @@ def test_extra_dirs_are_probed_before_the_checkout_dist(
     It is the one input Python cannot derive (only the launcher process knows
     where its own binary lives), so it arrives as `--extra-dir`.
     """
-    dist = tmp_path / "checkout" / "launcher" / "dist" / hub_ensure.dist_arch_dir()
+    dist = tmp_path / "checkout" / "launcher" / "dist" / (hub_ensure.dist_arch_dir() or "")
     dist.mkdir(parents=True)
     _write_hub(dist)
     launcher_dir = tmp_path / "install-folder"
@@ -423,7 +434,7 @@ def test_launcher_anchor_asymmetry_is_explicit(tmp_path: Path, monkeypatch) -> N
     difference, not flatten it — a `cargo run` launcher that suddenly found
     the repo's dist hub would be a behaviour change smuggled in as a merge.
     """
-    dist = tmp_path / "checkout" / "launcher" / "dist" / hub_ensure.dist_arch_dir()
+    dist = tmp_path / "checkout" / "launcher" / "dist" / (hub_ensure.dist_arch_dir() or "")
     dist.mkdir(parents=True)
     _write_hub(dist)
     monkeypatch.delenv("VCT_HUB_BIN", raising=False)

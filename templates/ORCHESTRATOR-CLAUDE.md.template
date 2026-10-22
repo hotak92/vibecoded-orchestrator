@@ -379,7 +379,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 
 **SessionStart (startup)**:
 - `ensure-containers.sh` — auto-start the container ENGINE this install uses when it is down (`python -m vco_lib.container_engine_start ensure`, detached and idempotent; opt out with `VCT_CONTAINER_ENGINE_AUTOSTART=0`), then auto-start the VCO containers (Weaviate, Ollama, code-embed) if not running (background).
-- `session-start-ensure-hub.sh` — ensure `vct-hub` is running.
+- `session-start-ensure-hub.sh` — ensure `vct-hub` (plus a registered model gateway and the launcher in the tray) is running. Also registered for `resume|clear|compact`, so a chat VS Code restores after a reboot brings the hub back too; it finds the hub in the orchestrator clone's `launcher/dist/` from any project.
 - `session-start-kg-loader.sh` — display KG resource paths.
 - `context-size-check.sh` — warn (no truncation) if `CONTEXT_STATE.md` exceeds 500 lines.
 

@@ -312,6 +312,46 @@ def _stored_file_exists_for_prune(file_path_str: str, project_root: Path) -> boo
     return False
 
 
+def _get_rows_payload(
+    base: str, collection: str, *, with_title: bool,
+) -> Optional[dict]:
+    """The parsed GraphQL answer listing *collection*'s rows, or ``None`` on a
+    transport failure, a non-200 status or an unparsable body."""
+    fields = "_additional { id } file_path title" if with_title \
+        else "_additional { id } file_path"
+    gql = {
+        "query": (
+            f"{{ Get {{ {collection}(limit: {QUERY_MAX_LIMIT}) "
+            f"{{ {fields} }} }} }}"
+        ),
+    }
+    try:
+        status, body = _http_request(
+            "POST", f"{base}/v1/graphql", body=gql, timeout=30.0,
+        )
+    except Exception:  # noqa: BLE001 — transport failure ⇒ skip leg
+        return None
+    if status != 200:
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _errors_name_missing_title(payload: dict) -> bool:
+    """Whether every GraphQL error is Weaviate's "Cannot query field \"title\""
+    for a class without that property (and there is at least one)."""
+    errors = payload.get("errors") or []
+    if not errors:
+        return False
+    return all(
+        isinstance(e, dict) and 'field "title"' in str(e.get("message", ""))
+        for e in errors
+    )
+
+
 def _enumerate_rows(
     weaviate_url: str,
     collection: str,
@@ -327,23 +367,15 @@ def _enumerate_rows(
     consumed (silent-zero-fallback lesson).
     """
     base = weaviate_url.rstrip("/")
-    gql = {
-        "query": (
-            f"{{ Get {{ {collection}(limit: {QUERY_MAX_LIMIT}) "
-            f"{{ _additional {{ id }} file_path title }} }} }}"
-        ),
-    }
-    try:
-        status, body = _http_request(
-            "POST", f"{base}/v1/graphql", body=gql, timeout=30.0,
-        )
-    except Exception:  # noqa: BLE001 — transport failure ⇒ skip leg
-        return None
-    if status != 200:
-        return None
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except Exception:  # noqa: BLE001
+    payload = _get_rows_payload(base, collection, with_title=True)
+    if payload is not None and _errors_name_missing_title(payload):
+        # A collection whose schema has no ``title`` property (the title join
+        # is a v0.2.103 logging aid, not part of the prune decision): Weaviate
+        # rejects the whole query, which used to turn every prune of such a
+        # collection into "enumeration failed". Ask again without it; titles
+        # then report ``None`` exactly like an absent stored title.
+        payload = _get_rows_payload(base, collection, with_title=False)
+    if payload is None:
         return None
     if payload.get("errors"):
         # A missing class surfaces here — treat as "nothing to prune"

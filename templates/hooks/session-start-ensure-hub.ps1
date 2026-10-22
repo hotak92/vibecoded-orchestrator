@@ -27,7 +27,11 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # it implements is unchanged:
 #   1. $env:VCT_HUB_BIN    — explicit override (dev builds, custom installs)
 #   2. <repo_root>\launcher\dist\<arch>\vct-hub(.exe)  (INSTALL-FOLDER copy)
-#      then <repo_root>\launcher\dist\vct-hub(.exe)    (arch-less fallback)
+#      then <repo_root>\launcher\dist\vct-hub(.exe)    (arch-less fallback),
+#      then the same two slots under the ORCHESTRATOR clone (v0.2.104:
+#      $env:VCT_INSTALL_ROOT / $env:VCT_ORCHESTRATOR_ROOT, else the checkout
+#      vco_lib is imported from) — <repo_root> here is the PROJECT, which has
+#      no launcher\dist\ unless it is the orchestrator root itself
 #   3. PATH                — first vct-hub.exe / vct-hub on PATH
 #   4. $HOME\.vct\bin\vct-hub.exe (or .\vct-hub on non-Windows PowerShell)
 # If none match the module exits 3 with a named reason; this hook turns that
@@ -117,10 +121,29 @@ if (Test-Path $VenvLib) {
     } catch { }
 }
 if (-not $RunPy) {
-    # v0.2.92 MAJOR-6: stdout, not stderr (see the .sh sibling).
-    Write-Output "session-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); skipping"
+    # v0.2.92 MAJOR-6: stdout, not stderr (see the .sh sibling). v0.2.104
+    # review R29: as the JSON envelope, not plain stdout -- the hook runs
+    # async and only its additionalContext reaches the session. Built here
+    # with ConvertTo-Json (no Python needed). MUST MATCH the .sh sibling.
+    $NoPy = [ordered]@{
+        hookSpecificOutput = [ordered]@{
+            hookEventName     = 'SessionStart'
+            additionalContext = "VCO background services (session-start-ensure-hub):`nsession-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); the hub, the model gateway and the launcher were not checked. Repair it with the launcher Update, or run python install.py --update in the orchestrator folder."
+        }
+    }
+    Write-Output ($NoPy | ConvertTo-Json -Compress -Depth 4)
     exit 0
 }
+
+# ---------------------------------------------------------------------------
+# Reports (v0.2.104) -- parity with the .sh sibling: this hook runs ASYNC, and
+# an async hook's plain stdout is not handed to the session; only its JSON
+# additionalContext is (vendor hooks doc, "How async hooks execute"). Every
+# leg's report is collected here and emitted ONCE at the end through
+# _lib/emit-context.ps1; without that helper the lines fall back to plain
+# stdout. MUST MATCH session-start-ensure-hub.sh.
+# ---------------------------------------------------------------------------
+$Notes = [System.Collections.Generic.List[string]]::new()
 
 # The .ps1 side uses --json + ConvertFrom-Json (the .sh side evals --shell),
 # matching the established ensure-containers pair.
@@ -145,13 +168,13 @@ if (-not $HubRes) {
         $HubWhy = ((Get-Content $HubErr -Tail 3 -ErrorAction SilentlyContinue) -join " ").Trim()
         Remove-Item $HubErr -Force -ErrorAction SilentlyContinue
     }
-    Write-Output "session-start-ensure-hub: vco_lib.hub_ensure failed (rc=$HubRc): $HubWhy; skipping"
+    $Notes.Add("session-start-ensure-hub: vco_lib.hub_ensure failed (rc=$HubRc): $HubWhy; skipping")
 }
 elseif ($HubRc -ne 0) {
     # Soft-fail contract: the module exits 3 (no binary) / 4 (spawn failed)
     # LOUDLY with a named reason; the hook reports it once and still exits 0,
     # because a SessionStart hook must never block Claude Code from starting.
-    Write-Output "[vct] $($HubRes.reason)"
+    $Notes.Add("[vct] $($HubRes.reason)")
 }
 else {
     $HubWhat = if ($HubRes.binary) { $HubRes.binary } else { "pid $($HubRes.pid)" }
@@ -197,10 +220,10 @@ if (-not $GwRes) {
     if (Test-Path $GwErr) {
         $GwWhy = ((Get-Content $GwErr -Tail 3 -ErrorAction SilentlyContinue) -join " ").Trim()
     }
-    Write-Output "session-start-ensure-hub: vco_lib.gateway_ensure failed (rc=$GwRc): $GwWhy; skipping"
+    $Notes.Add("session-start-ensure-hub: vco_lib.gateway_ensure failed (rc=$GwRc): $GwWhy; skipping")
 }
 else {
-    if ($GwRc -ne 0) { Write-Output "[vct] $($GwRes.reason)" }
+    if ($GwRc -ne 0) { $Notes.Add("[vct] $($GwRes.reason)") }
     Write-Debug-Line "model-gateway $($GwRes.state): $($GwRes.reason)"
 }
 if (Test-Path $GwErr) { Remove-Item $GwErr -Force -ErrorAction SilentlyContinue }
@@ -235,12 +258,24 @@ if (-not $GuiRes) {
     if (Test-Path $GuiErr) {
         $GuiWhy = ((Get-Content $GuiErr -Tail 3 -ErrorAction SilentlyContinue) -join " ").Trim()
     }
-    Write-Output "session-start-ensure-hub: vco_lib.launcher_ensure failed (rc=$GuiRc): $GuiWhy; skipping"
+    $Notes.Add("session-start-ensure-hub: vco_lib.launcher_ensure failed (rc=$GuiRc): $GuiWhy; skipping")
 }
 else {
-    if ($GuiRc -ne 0) { Write-Output "[vct] $($GuiRes.reason)" }
+    if ($GuiRc -ne 0) { $Notes.Add("[vct] $($GuiRes.reason)") }
     Write-Debug-Line "launcher $($GuiRes.state): $($GuiRes.reason)"
 }
 if (Test-Path $GuiErr) { Remove-Item $GuiErr -Force -ErrorAction SilentlyContinue }
+
+if ($Notes.Count -gt 0) {
+    $NotesText = "VCO background services (session-start-ensure-hub):`n" + ($Notes -join "`n")
+    $EmitLib = Join-Path $ScriptDir "_lib/emit-context.ps1"
+    if (Test-Path $EmitLib) { . $EmitLib }
+    if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+        Emit-AdditionalContext -Ctx $NotesText -EventName 'SessionStart'
+    }
+    else {
+        $Notes | ForEach-Object { Write-Output $_ }
+    }
+}
 
 exit 0

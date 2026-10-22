@@ -426,6 +426,16 @@ tab says so above the table.
 | **Disabled** | VCO removed its entry from `settings.json` and parked the exact entry in `project_hooks.disabled_entry_json`. It does not run; re-enabling restores it byte-for-byte, including its `timeout` / `background` keys and its position in the group. A bundle update ("Update bundle", "Update all", `install-bundle --update`) keeps it out (v0.2.97). The parked entry lives in this machine's `launcher.db`, so the choice does not travel with a copied or cloned project: there, the next bundle update re-adds the hook. If `launcher.db` exists but cannot be read, the update re-adds no missing shipped hook and prints a warning instead. |
 | **Not in settings.json** | The launcher has a mirror row but the file does not declare the hook — someone removed it outside the launcher. It does not run, and there is nothing parked to restore, so the toggle is disabled. **Clear record** drops the stale row. |
 
+**One hook under several matchers is one row** (v0.2.104). VCO
+registers `session-start-ensure-hub` under two SessionStart matchers,
+`startup` and `resume|clear|compact`, so it also runs on resumed chats.
+The tab shows it once, with both matchers in the Matcher column
+(`startup + resume|clear|compact`). Unticking it removes both
+registrations and parks them together; ticking it puts both back. A
+row parked before v0.2.104 covers only `startup`, and ticking it adds
+the `resume|clear|compact` registration too. The list of such hooks
+lives in `vco_lib/hook_retirements.py` (`MATCHER_SIBLINGS`).
+
 If `settings.json` is missing or unparseable, the tab refuses to edit
 it, shows why, and disables its controls. It never falls back to
 showing DB rows as though they described what runs — that fallback is

@@ -1022,6 +1022,86 @@ def migrate_group_matcher(event: str, group: Any, template_matchers: Any) -> Opt
     return None
 
 
+# ── SIBLING matchers (v0.2.104) ────────────────────────────────────────────
+#
+# A shipped hook that gained a SECOND registration of the same script, under
+# a new matcher of the same event, beside the one it already had. The merge
+# delivers the new group by itself (a script the template ships under several
+# matchers is identified per (script, matcher)); what it cannot know is that
+# a user who DISABLED the hook under the old matcher meant the new one too.
+# This table says so, and :func:`vco_lib.parked_hooks.find_parked_match`
+# reads it: a row parked under the sibling covers the added registration.
+#
+# The table is also the ONE home of "these registrations are one hook" for
+# the launcher's Hooks tab (review R29): ``vco_lib.hooks_settings`` disables
+# and restores a registration together with its declared siblings as ONE
+# parked entry, and its ``list`` verb tells the tab which row an added
+# registration folds into (``unit_of``). The Rust side reads those answers;
+# it holds no copy of this table. The added registration is a verbatim twin
+# of its sibling's inner hook (pinned by the template tests), which is what
+# lets a restore re-create a missing twin from the sibling it mirrors.
+
+
+@dataclass(frozen=True)
+class MatcherSibling:
+    """One added registration that mirrors an existing one, as DATA.
+
+    Attributes:
+        event: the settings.json hook event.
+        matcher: the matcher of the ADDED group (verbatim).
+        sibling: the matcher the same script already shipped under.
+        targets: the hook-script BASENAMES (both OS flavours) concerned.
+        added_in: the release that added the group.
+        reason: why, for readers of the table.
+    """
+
+    event: str
+    matcher: str
+    sibling: str
+    targets: frozenset
+    added_in: str
+    reason: str
+
+
+MATCHER_SIBLINGS: Tuple[MatcherSibling, ...] = (
+    MatcherSibling(
+        event="SessionStart", matcher="resume|clear|compact", sibling="startup",
+        targets=frozenset(f"session-start-ensure-hub.{ext}" for ext in ("sh", "ps1")),
+        added_in="v0.2.104",
+        reason=(
+            "VS Code restores existing chats after a reboot and a restored "
+            "chat fires SessionStart with source `resume`, so a hub ensure "
+            "registered under `startup` alone never ran after a reboot "
+            "(owner 2026-10-22)"
+        )),
+)
+
+
+def sibling_matchers(event: str, matcher: str, target: Optional[str]) -> Tuple[str, ...]:
+    """The matchers a :data:`MATCHER_SIBLINGS` row says the ``(event,
+    matcher, target)`` registration mirrors — ``()`` when none. Never raises."""
+    return tuple(row.sibling for row in MATCHER_SIBLINGS
+                 if row.event == event and row.matcher == matcher and target in row.targets)
+
+
+def added_sibling_matchers(event: str, matcher: str, target: Optional[str]) -> Tuple[str, ...]:
+    """The inverse of :func:`sibling_matchers`: the matchers of the
+    registrations :data:`MATCHER_SIBLINGS` ADDED beside the ``(event,
+    matcher, target)`` one — ``()`` when none. Never raises."""
+    return tuple(row.matcher for row in MATCHER_SIBLINGS
+                 if row.event == event and row.sibling == matcher and target in row.targets)
+
+
+def unit_matchers(event: str, matcher: str, target: Optional[str]) -> Tuple[str, ...]:
+    """Every OTHER matcher whose registration of ``target`` under ``event``
+    forms one user-visible hook with the ``matcher`` one, in either
+    direction of a :data:`MATCHER_SIBLINGS` row — ``()`` when none. Never
+    raises."""
+    out = list(sibling_matchers(event, matcher, target))
+    out += [m for m in added_sibling_matchers(event, matcher, target) if m not in out]
+    return tuple(out)
+
+
 def match_prior_shipped_shape(
     event: str, matcher: str, hook: Any,
 ) -> Optional[PriorShippedShape]:
@@ -1793,7 +1873,9 @@ __all__ = [
     "KIND_COMMAND",
     "KIND_HOOK_SCRIPT",
     "MATCHER_MIGRATIONS",
+    "MATCHER_SIBLINGS",
     "MatcherMigration",
+    "MatcherSibling",
     "migration_sources",
     "PRIOR_SHIPPED_SHAPES",
     "PriorShippedShape",
@@ -1811,6 +1893,9 @@ __all__ = [
     "normalize_command",
     "removal_envelope_rows",
     "scrub_retired_registrations",
+    "sibling_matchers",
+    "added_sibling_matchers",
+    "unit_matchers",
     "vco_hook_script_identity",
 ]
 
