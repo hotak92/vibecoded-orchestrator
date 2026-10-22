@@ -240,8 +240,22 @@ pub(crate) async fn enforce_hook_toggle(
     hook_id: i64,
     enabled: bool,
 ) -> Result<(), HookEnforceError> {
-    let (event, matcher, command) = find_hook(db, project_id, hook_id)?;
+    // Validate the id against its own project first (a foreign or unknown id
+    // is refused before anything else runs).
+    find_hook(db, project_id, hook_id)?;
     let folder = project_folder(db, project_id)?;
+
+    // FINAL4 LOW 3: a hook registered under declared sibling matchers is ONE
+    // hook (review R29). A toggle on any of its mirror rows acts on the row
+    // the unit folds into — the one the writer parks the whole unit under —
+    // so `vct-cli hooks disable/enable` behaves the same on either id, as the
+    // Hooks tab does.
+    let rows = db
+        .list_project_hooks(project_id)
+        .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e))?;
+    let fold = hook_unit_fold(db, project_id, &folder, &rows).await?;
+    let target = fold.folded_into.get(&hook_id).copied().unwrap_or(hook_id);
+    let (event, matcher, command) = find_hook(db, project_id, target)?;
 
     if enabled {
         let parked = db
@@ -287,6 +301,166 @@ pub(crate) async fn enforce_hook_toggle(
             })?;
     }
     Ok(())
+}
+
+// ─── Hook units (FINAL4 LOW 3) ─────────────────────────────────────────
+//
+// The launcher's Hooks tab renders a hook VCO ships under declared sibling
+// matchers (`session-start-ensure-hub`: `startup` + `resume|clear|compact`)
+// as ONE row and toggles it as one unit (review R29). The hub's mirror rows
+// are one per registration, so `vct-cli hooks list` showed both, and after a
+// unit park through the `startup` row the `resume|clear|compact` row had no
+// parked blob: `disable` on it failed `not_found`, `enable` refused
+// `nothing_parked`. The fold below reads the SAME two writer answers the tab
+// reads — `unit_of` from `python -m vco_lib.hooks_settings list`, and the
+// `siblings` of a parked entry — through the shared readers in
+// `vct_launcher_core::db::project_hooks_settings`. The sibling table itself
+// stays in Python; nothing here knows which hooks have siblings.
+
+/// Which mirror rows fold into which, for one project.
+#[derive(Debug, Default)]
+pub(crate) struct HookUnitFold {
+    /// Mirror row id → the id of the row its unit renders and toggles as.
+    pub(crate) folded_into: std::collections::HashMap<i64, i64>,
+    /// Primary row id → the OTHER matchers its unit covers (file order).
+    pub(crate) unit_matchers: std::collections::HashMap<i64, Vec<String>>,
+    /// Set when settings.json could not be listed: only parked units were
+    /// folded then (by exact command), and the reason is surfaced.
+    pub(crate) partial: Option<String>,
+}
+
+/// Compute the unit fold of `rows` (the project's mirror rows).
+///
+/// Registrations covered by another row:
+/// * an ACTIVE registration the writer folds into a sibling present in the
+///   same file (`unit_of`);
+/// * the sibling registrations a parked unit carries — unless the parked
+///   primary is back in the file (the user put the line back by hand), the
+///   same skip the Hooks tab applies.
+///
+/// A covered row folds only into a mirror row that exists; with no row to go
+/// to it stays visible — never hidden with nowhere to toggle it.
+pub(crate) async fn hook_unit_fold(
+    db: &Db,
+    project_id: &str,
+    folder: &std::path::Path,
+    rows: &[vct_launcher_core::db::project_state::ProjectHook],
+) -> Result<HookUnitFold, HookEnforceError> {
+    use vct_launcher_core::db::project_hooks_settings::{
+        listed_unit_primary, parked_unit_registrations,
+    };
+
+    let parked = db
+        .list_parked_project_hooks(project_id)
+        .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e))?;
+    let parked_units: Vec<Vec<(String, String)>> = parked
+        .iter()
+        .map(|p| parked_unit_registrations(&p.disabled_entry_json))
+        .collect();
+
+    // Mirror and parked rows may hold an OLDER spelling of a command the file
+    // now carries; the writer computes the registration key (the one home of
+    // that rule), exactly as the Hooks tab asks it.
+    let commands: Vec<&str> = rows
+        .iter()
+        .map(|r| r.command.as_str())
+        .chain(parked.iter().map(|p| p.command.as_str()))
+        .chain(parked_units.iter().flatten().map(|(_, c)| c.as_str()))
+        .collect();
+    let keys_arg = serde_json::to_string(&commands).unwrap_or_else(|_| "[]".to_string());
+    let (listed, partial) =
+        match run_hooks_cli(folder, &["list", "--keys-for-json", &keys_arg]).await {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(format!("{}: {}", e.code, e.message))),
+        };
+    let keys = listed.as_ref().and_then(|l| l.get("keys")).and_then(JsonValue::as_object);
+    let key_of = |command: &str| -> String {
+        keys.and_then(|k| k.get(command))
+            .and_then(JsonValue::as_str)
+            .unwrap_or(command)
+            .to_string()
+    };
+
+    type RegKey = (String, String, String);
+    let mut active: Vec<RegKey> = Vec::new();
+    let mut covered: Vec<(RegKey, RegKey)> = Vec::new();
+    if let Some(arr) = listed.as_ref().and_then(|l| l.get("hooks")).and_then(JsonValue::as_array) {
+        for entry in arr {
+            let event = entry.get("event").and_then(JsonValue::as_str).unwrap_or("");
+            let matcher = entry.get("matcher").and_then(JsonValue::as_str).unwrap_or("");
+            let command = entry.get("command").and_then(JsonValue::as_str).unwrap_or("");
+            if event.is_empty() || command.is_empty() {
+                continue;
+            }
+            let key = key_of(command);
+            if let Some(primary) = listed_unit_primary(entry) {
+                covered.push((
+                    (event.to_string(), matcher.to_string(), key.clone()),
+                    (event.to_string(), primary.to_string(), key.clone()),
+                ));
+            }
+            active.push((event.to_string(), matcher.to_string(), key));
+        }
+    }
+    for (p, unit) in parked.iter().zip(&parked_units) {
+        let primary = (p.event.clone(), p.matcher.clone(), key_of(&p.command));
+        if active.contains(&primary) {
+            continue;
+        }
+        for (m, c) in unit {
+            if *m != p.matcher {
+                covered.push(((p.event.clone(), m.clone(), key_of(c)), primary.clone()));
+            }
+        }
+    }
+
+    let row_key = |r: &vct_launcher_core::db::project_state::ProjectHook| -> RegKey {
+        (r.event.clone(), r.matcher.clone(), key_of(&r.command))
+    };
+    let mut fold = HookUnitFold { partial, ..HookUnitFold::default() };
+    for row in rows {
+        let key = row_key(row);
+        let Some((_, primary)) = covered.iter().find(|(c, _)| *c == key) else {
+            continue;
+        };
+        let Some(target) = rows.iter().find(|r| r.id != row.id && row_key(r) == *primary) else {
+            continue;
+        };
+        fold.folded_into.insert(row.id, target.id);
+        let matchers = fold.unit_matchers.entry(target.id).or_default();
+        if !matchers.contains(&row.matcher) {
+            matchers.push(row.matcher.clone());
+        }
+    }
+    Ok(fold)
+}
+
+/// The project's mirror rows as `vct-cli hooks list` shows them: one row per
+/// hook UNIT (FINAL4 LOW 3), each carrying `unit_matchers` — the other
+/// matchers it covers (empty for an ordinary hook). Returns the rows and the
+/// fold's `partial` reason, if any.
+pub(crate) async fn folded_hook_rows(
+    db: &Db,
+    project_id: &str,
+) -> Result<(Vec<JsonValue>, Option<String>), HookEnforceError> {
+    let rows = db
+        .list_project_hooks(project_id)
+        .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, "db_error", e))?;
+    let folder = project_folder(db, project_id)?;
+    let fold = hook_unit_fold(db, project_id, &folder, &rows).await?;
+    let out = rows
+        .iter()
+        .filter(|r| !fold.folded_into.contains_key(&r.id))
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or(JsonValue::Null);
+            if let Some(obj) = v.as_object_mut() {
+                let unit = fold.unit_matchers.get(&r.id).cloned().unwrap_or_default();
+                obj.insert("unit_matchers".to_string(), serde_json::json!(unit));
+            }
+            v
+        })
+        .collect();
+    Ok((out, fold.partial))
 }
 
 #[cfg(test)]
@@ -671,5 +845,143 @@ mod tests {
             .expect_err("already disabled -> the writer refuses, not a silent no-op");
         assert_eq!(err.code, "not_found");
         assert_eq!(f.raw(), after_first, "the second, refused disable writes nothing further");
+    }
+
+    // ─── FINAL4 LOW 3: the hub folds a sibling unit like the Hooks tab ──
+    //
+    // `session-start-ensure-hub` ships under `startup` AND
+    // `resume|clear|compact` (vco_lib.hook_retirements.MATCHER_SIBLINGS):
+    // one hook, two mirror rows. `vct-cli hooks list` must show one row, and
+    // disable/enable on EITHER id must act on the whole unit.
+
+    const HUB: &str = r#"bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh""#;
+    const RESUME: &str = "resume|clear|compact";
+    const HUB_SETTINGS: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh\"", "async": true, "timeout": 5 },
+          { "type": "command", "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/context-size-check.sh\"", "timeout": 5 }
+        ]
+      },
+      {
+        "matcher": "resume|clear|compact",
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh\"", "async": true, "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
+"#;
+
+    /// A project whose settings.json is `HUB_SETTINGS`, with the mirror rows
+    /// a bundle scan leaves for both hub registrations.
+    fn hub_fixture() -> Fixture {
+        let f = Fixture::new();
+        std::fs::write(&f.settings, HUB_SETTINGS).unwrap();
+        for m in ["startup", RESUME] {
+            f.db.register_project_hook(
+                &f.pid, "SessionStart", m, HUB, "bundled", None, None, &serde_json::json!({}),
+            )
+            .unwrap();
+        }
+        f
+    }
+
+    fn hub_row_id(f: &Fixture, matcher: &str) -> i64 {
+        f.db.list_project_hooks(&f.pid)
+            .unwrap()
+            .into_iter()
+            .find(|h| h.command == HUB && h.matcher == matcher)
+            .expect("hub row mirrored")
+            .id
+    }
+
+    async fn listed_hub_rows(f: &Fixture) -> Vec<JsonValue> {
+        let (rows, partial) = folded_hook_rows(&f.db, &f.pid).await.unwrap();
+        assert_eq!(partial, None, "settings.json must be listable here");
+        rows.into_iter().filter(|r| r["command"] == HUB).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cli_list_shows_an_active_sibling_unit_as_one_row() {
+        let f = hub_fixture();
+        let rows = listed_hub_rows(&f).await;
+        assert_eq!(rows.len(), 1, "one hook, one row: {:?}", rows);
+        assert_eq!(rows[0]["matcher"], "startup");
+        assert_eq!(rows[0]["unit_matchers"], serde_json::json!([RESUME]));
+        // Leave-alone: an ordinary hook keeps its own row, no unit matchers.
+        let (all, _) = folded_hook_rows(&f.db, &f.pid).await.unwrap();
+        let stop: Vec<_> = all.iter().filter(|r| r["event"] == "Stop").collect();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["unit_matchers"], serde_json::json!([]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_unit_parked_through_the_primary_row_still_lists_as_one_row() {
+        let f = hub_fixture();
+        enforce_hook_toggle(&f.db, &f.pid, hub_row_id(&f, "startup"), false).await.unwrap();
+        let rows = listed_hub_rows(&f).await;
+        assert_eq!(rows.len(), 1, "the resume row has no blob but is part of the unit: {:?}", rows);
+        assert_eq!(rows[0]["matcher"], "startup");
+        assert_eq!(rows[0]["unit_matchers"], serde_json::json!([RESUME]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enable_on_the_sibling_id_restores_a_unit_parked_through_the_primary() {
+        let f = hub_fixture();
+        let before = f.json();
+        enforce_hook_toggle(&f.db, &f.pid, hub_row_id(&f, "startup"), false).await.unwrap();
+        assert!(!f.commands_under("SessionStart").iter().any(|c| c == HUB));
+
+        // Pre-fix: `nothing_parked` (the resume row holds no blob).
+        enforce_hook_toggle(&f.db, &f.pid, hub_row_id(&f, RESUME), true)
+            .await
+            .expect("enable on either id acts on the unit");
+        assert_eq!(f.json(), before, "the whole unit is back");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disable_on_the_sibling_id_parks_the_unit_under_the_primary_row() {
+        let f = hub_fixture();
+        let before = f.json();
+        enforce_hook_toggle(&f.db, &f.pid, hub_row_id(&f, RESUME), false).await.unwrap();
+        assert!(!f.commands_under("SessionStart").iter().any(|c| c == HUB), "both registrations gone");
+        assert!(
+            f.db.get_parked_project_hook_entry(&f.pid, "SessionStart", "startup", HUB)
+                .unwrap()
+                .is_some(),
+            "parked under the row the unit lists as"
+        );
+
+        // A second disable on the sibling id is the primary's own refusal.
+        let err = enforce_hook_toggle(&f.db, &f.pid, hub_row_id(&f, RESUME), false)
+            .await
+            .expect_err("already disabled");
+        assert_eq!(err.code, "not_found");
+
+        enforce_hook_toggle(&f.db, &f.pid, hub_row_id(&f, "startup"), true).await.unwrap();
+        assert_eq!(f.json(), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lone_registration_with_no_sibling_present_is_its_own_row() {
+        // Leave-alone: the user removed the startup line by hand; the resume
+        // registration is not folded into a row that runs nothing.
+        let f = hub_fixture();
+        let doc = HUB_SETTINGS.replacen(
+            r#"{ "type": "command", "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh\"", "async": true, "timeout": 5 },
+"#,
+            "",
+            1,
+        );
+        assert_ne!(doc, HUB_SETTINGS);
+        std::fs::write(&f.settings, doc).unwrap();
+        let rows = listed_hub_rows(&f).await;
+        assert_eq!(rows.len(), 2, "{:?}", rows);
+        assert!(rows.iter().all(|r| r["unit_matchers"] == serde_json::json!([])));
     }
 }

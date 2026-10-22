@@ -207,6 +207,53 @@ def cmd_unsafe_args(argv: Sequence[str]) -> "list[str]":
     return [a for a in argv if any(c in _CMD_META for c in a)]
 
 
+#: The argv flags whose value is a file this module writes under the temp
+#: directory, with how the refusal names that file.
+_TEMP_FILE_FLAGS = {
+    "--settings": "the review settings file",
+    "--mcp-config": "the MCP config file",
+}
+
+_CMD_META_SHOWN = "& | ^ < > %"
+
+
+def cmd_unsafe_refusal(argv: Sequence[str]) -> Optional[str]:
+    """The refusal text for an *argv* cmd.exe would mis-parse, or ``None``.
+
+    Each offending argument is named by its ROLE, with the fix that applies
+    to it (FINAL4 NIT 1): the claude CLI's own path (argv[0]) is fixed by
+    installing the CLI elsewhere, a temp file by setting TEMP, a flag value
+    by passing another value. Telling the user to move TEMP when the
+    metacharacter is in the claude path sends them after the wrong cause.
+    """
+    problems: list[str] = []
+    for i, arg in enumerate(argv):
+        if not any(c in _CMD_META for c in arg):
+            continue
+        if i == 0:
+            problems.append(
+                f"the claude CLI path {arg!r} — install the claude CLI under "
+                f"a folder without {_CMD_META_SHOWN}")
+            continue
+        flag = next((argv[j] for j in range(i - 1, 0, -1)
+                     if argv[j].startswith("-")), None)
+        if arg.startswith("-"):
+            problems.append(f"the flag {arg!r}")
+        elif flag in _TEMP_FILE_FLAGS:
+            problems.append(
+                f"{_TEMP_FILE_FLAGS[flag]} {arg!r}, written under the temp "
+                f"folder — set TEMP to a path without {_CMD_META_SHOWN}")
+        elif flag is not None:
+            problems.append(
+                f"the {flag} value {arg!r} — pass one without {_CMD_META_SHOWN}")
+        else:
+            problems.append(f"the argument {arg!r}")
+    if not problems:
+        return None
+    return ("an argument contains a character cmd.exe would treat as "
+            "syntax: " + "; ".join(problems))
+
+
 def windows_hook_shell_is_bash(env: Mapping[str, str]) -> bool:
     """Whether Claude Code will run hooks through Git Bash on this Windows
     machine (FINAL3 finding 4). The guard command is bash syntax (a quoted
@@ -665,12 +712,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             policy=args.policy, mcp_config=mcp_file,
             settings_file=settings_file)
         if _on_windows() and claude_bin.lower().endswith((".cmd", ".bat")):
-            unsafe = cmd_unsafe_args(argv_run)
-            if unsafe:
-                print("claude-api-run: refused — an argument contains a "
-                      "character cmd.exe would treat as syntax (" +
-                      ", ".join(repr(a) for a in unsafe[:3]) + "); set TEMP "
-                      "to a path without & | ^ < > %", file=sys.stderr)
+            refusal_cmd = cmd_unsafe_refusal(argv_run)
+            if refusal_cmd is not None:
+                print(f"claude-api-run: refused — {refusal_cmd}",
+                      file=sys.stderr)
                 return EXIT_REFUSED
         # No wall-clock timeout, deliberately: a Fable review can run for a
         # long time on a slow machine (VCO's shipped timeouts are long by

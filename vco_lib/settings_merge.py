@@ -72,6 +72,7 @@ from vco_lib.parked_hooks import (
     ParkedHooksState,
     find_parked_match,
     live_hook_identities,
+    live_hook_registrations,
 )
 
 __all__ = ["merge_hooks_block", "smart_merge_settings"]
@@ -238,6 +239,9 @@ def merge_hooks_block(
     # a disable parked under one event carries to an event the hook newly
     # ships on (find_parked_match, live_identities) — order-independent.
     live_idents = live_hook_identities(out)
+    # FINAL4 NIT 3: and which registrations it holds, so a parked row whose
+    # own line the user put back covers no sibling twin (find_parked_match).
+    live_regs = live_hook_registrations(out)
 
     def _keep_out(event: str, group: Any, command: str) -> bool:
         """True (and recorded) when adding this registration must not happen."""
@@ -250,7 +254,7 @@ def merge_hooks_block(
         else:
             hit = find_parked_match(
                 parked.hooks, event, matcher, command, template_hooks.get(event) or [],
-                live_identities=live_idents,
+                live_identities=live_idents, live_registrations=live_regs,
             )
             if hit is None:
                 return False

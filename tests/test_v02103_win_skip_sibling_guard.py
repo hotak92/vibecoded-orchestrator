@@ -65,7 +65,12 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: test_the_windows_hook_command_shape) and a fake ``#!/bin/sh`` venv
 #: interpreter driving the .ps1 wrapper's exit-code test
 #: (tests/test_v02104_claude_api_run.py, which IS the .ps1 leg).
-NON_CONVENTION_BASELINE = 181
+#: 181 -> 182 (v0.2.104 R30 NIT-1): tests/test_v02104_pre_tool_use_incomplete_warning.py's
+#: ``posix_process_groups`` marker guards the tests that signal the hook's
+#: process GROUP (os.killpg, SIGSTOP/SIGCONT) — POSIX-only primitives with no
+#: Windows equivalent and no .ps1 sibling; the hook's ps1 leg runs in the
+#: file's other tests.
+NON_CONVENTION_BASELINE = 182
 
 
 # -- which conditions skip on Windows --------------------------------------

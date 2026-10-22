@@ -601,8 +601,8 @@ Mirror of Tauri commands so the headless `vct-cli` can drive the launcher withou
 - `GET /api/v1/cli/license` — current tier + cache status.
 - `POST /api/v1/cli/license/activate` — activate a license key (writes to keychain).
 - `POST /api/v1/cli/license/deactivate` — clear license.
-- `GET /api/v1/cli/hooks/{project_id}` — list hooks for a project.
-- `PATCH /api/v1/cli/hooks/{hook_id}/enabled` — toggle hook enabled.
+- `GET /api/v1/cli/hooks/{project_id}` — list hooks for a project, one row per hook as the Hooks tab shows them: a hook registered under several matchers (the hub's session-start hook: `startup` and `resume|clear|compact`) is one row whose `unit_matchers` names the other registrations.
+- `PATCH /api/v1/cli/hooks/{hook_id}/enabled` — toggle hook enabled (edits `.claude/settings.json`); on either id of such a hook it turns the whole hook off or on.
 - `GET /api/v1/cli/telemetry` — telemetry status.
 - `POST /api/v1/cli/telemetry/consent` — set telemetry consent.
 - `GET /api/v1/cli/kg/collections` — list KG collections + per-project access for CLI consumers.

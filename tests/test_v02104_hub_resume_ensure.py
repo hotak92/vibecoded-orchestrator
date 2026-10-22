@@ -17,8 +17,10 @@ read keychain vendor keys ("503 no key found for vendor 'qwen'"). Two causes:
 
 Contract pinned here:
 
-* step 2 of the discovery chain probes the caller's root FIRST, then the
-  orchestrator clone (the ONE install-root resolver, then the checkout);
+* step 2 of the discovery chain probes the clone named by
+  ``$VCT_INSTALL_ROOT`` / ``$VCT_ORCHESTRATOR_ROOT`` FIRST when one names a
+  real clone (FINAL4 LOW 1), then the caller's root, then the orchestrator
+  clone (the ONE install-root resolver, then the checkout);
 * both settings templates register ``session-start-ensure-hub`` under a
   second SessionStart group ``resume|clear|compact`` (async, same timeout),
   so every session source ensures the hub exactly once; the context/KG hooks
@@ -177,17 +179,40 @@ def test_the_hub_lookup_answers_the_environment_it_is_handed(
     assert hub_ensure.find_hub_binary(repo_root=project) is None
 
 
-def test_the_callers_own_root_still_wins(
+def test_the_callers_own_root_still_wins_when_no_install_root_env_is_set(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """An explicit ``repo_root`` with its own dist copy keeps precedence over
-    the orchestrator fallback (the orchestrator root itself, a dev clone)."""
+    """With NO ``$VCT_INSTALL_ROOT`` / ``$VCT_ORCHESTRATOR_ROOT``, an explicit
+    ``repo_root`` with its own dist copy keeps precedence over the checkout
+    fallback (a dev clone run without a VCO env)."""
     _isolate(monkeypatch, tmp_path)
     _fake_orchestrator(tmp_path / "orch")
+    _checkout_is(monkeypatch, tmp_path / "orch")
     own = _fake_orchestrator(tmp_path / "dev-clone")
-    monkeypatch.setenv("VCT_ORCHESTRATOR_ROOT", str(tmp_path / "orch"))
 
     assert hub_ensure.find_hub_binary(repo_root=tmp_path / "dev-clone") == own["vct-hub"]
+
+
+@pytest.mark.parametrize("var", ["VCT_INSTALL_ROOT", "VCT_ORCHESTRATOR_ROOT"])
+def test_the_install_root_env_wins_over_a_second_clone_opened_as_a_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, var: str,
+) -> None:
+    """FINAL4 LOW 1. A second clone (or a work tree of the public repo)
+    opened as a project carries its own committed ``launcher/dist/``; when
+    the environment names the install, the INSTALL's hub — and launcher, the
+    same chain — is the one started as the machine-wide singleton. RED before
+    the fix: the caller's root was probed first."""
+    _isolate(monkeypatch, tmp_path)
+    stem = launcher_ensure.launcher_binary_stem()
+    install = _fake_orchestrator(tmp_path / "install", stems=("vct-hub", stem))
+    _fake_orchestrator(tmp_path / "second-clone", stems=("vct-hub", stem))
+    _checkout_is(monkeypatch, tmp_path / "second-clone")
+    monkeypatch.setenv(var, str(tmp_path / "install"))
+
+    assert hub_ensure.find_hub_binary(
+        repo_root=tmp_path / "second-clone") == install["vct-hub"]
+    assert launcher_ensure.find_launcher_binary(
+        repo_root=tmp_path / "second-clone") == install[stem]
 
 
 def test_the_launcher_process_still_never_probes_any_checkout_dist(

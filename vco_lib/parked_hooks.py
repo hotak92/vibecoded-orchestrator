@@ -111,6 +111,7 @@ __all__ = [
     "ParkedHooksState",
     "find_parked_match",
     "live_hook_identities",
+    "live_hook_registrations",
     "read_parked_hooks",
     "CONFLICT_CID",
     "conflict_still_present",
@@ -192,6 +193,7 @@ def find_parked_match(
     template_groups: Iterable[Any],
     *,
     live_identities: Optional[Iterable[str]] = None,
+    live_registrations: Optional[Iterable[tuple[str, str, str]]] = None,
 ) -> Optional[ParkedHook]:
     """The parked row that covers the template registration
     ``(event, matcher, command)``, or ``None``.
@@ -212,6 +214,18 @@ def find_parked_match(
     on some event was turned off on ONE event only, so the new event is
     added as before. Script identity only: an inline command has no identity
     and never carries. ``None`` (the default) is the event-scoped rule alone.
+
+    ``live_registrations`` (v0.2.104, FINAL4 NIT 3): the ``(event, matcher,
+    script identity)`` registrations the user's settings.json holds before
+    the merge (:func:`live_hook_registrations`). A row parked under a
+    declared SIBLING matcher covers the added registration only while the
+    row's own registration is absent from the file: a parked ``startup`` row
+    whose line the user put back by hand is stale — the hook runs again — so
+    it no longer keeps the ``resume|clear|compact`` twin out. That is the
+    rule the launcher's Hooks tab and the hub's ``vct-cli hooks`` apply to
+    the same state (a parked row whose registration is present in the file
+    covers nothing). ``None`` (the default) cannot tell, and keeps the
+    sibling rule as it was.
     """
     candidates = [
         p for p in parked if p.event == event and same_hook_command(p.command, command)
@@ -232,8 +246,9 @@ def find_parked_match(
         # unmatched, as before.
         ident = vco_hook_script_identity(command)
         siblings = sibling_matchers(event, matcher, ident)
+        present = set(live_registrations) if live_registrations is not None else set()
         for p in candidates:
-            if p.matcher in siblings:
+            if p.matcher in siblings and (p.event, p.matcher, ident) not in present:
                 return p
         # Review R29 (LOW): the declared siblings are ONE hook, so for the
         # drifted-matcher inference below they count as one matcher. A row
@@ -293,6 +308,29 @@ def live_hook_identities(hooks_block: Any) -> set[str]:
                 ident = vco_hook_script_identity(cmd) if isinstance(cmd, str) and cmd else None
                 if ident:
                     live.add(ident)
+    return live
+
+
+def live_hook_registrations(hooks_block: Any) -> set[tuple[str, str, str]]:
+    """Every ``(event, matcher, script identity)`` a settings.json ``hooks``
+    block registers — the ``live_registrations`` input of
+    :func:`find_parked_match`. The matcher is the group's
+    :func:`vco_lib.hooks_settings.normalize_matcher` value; inline commands
+    (no identity) and malformed shapes contribute nothing."""
+    live: set[tuple[str, str, str]] = set()
+    if not isinstance(hooks_block, dict):
+        return live
+    for event, groups in hooks_block.items():
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict):
+                continue
+            matcher = normalize_matcher(group)
+            inner = group.get("hooks")
+            for item in inner if isinstance(inner, list) else []:
+                cmd = item.get("command") if isinstance(item, dict) else None
+                ident = vco_hook_script_identity(cmd) if isinstance(cmd, str) and cmd else None
+                if ident:
+                    live.add((str(event), matcher, ident))
     return live
 
 
