@@ -864,6 +864,43 @@ def project_hooks_relative_paths_still_present(ctx: ProbeContext) -> Optional[bo
         return None
 
 
+def settings_local_json_still_tracked(ctx: ProbeContext) -> Optional[bool]:
+    """``settings_local_json_tracked`` — does git still track the project's
+    ``.claude/settings.local.json``? The SAME probe the env writer gates on
+    (:func:`vco_lib.settings_local_env.tracked_still`); ``None`` when git
+    cannot say."""
+    from vco_lib.settings_local_env import tracked_still
+
+    try:
+        return tracked_still(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def settings_local_layer_still_unknown(ctx: ProbeContext) -> Optional[bool]:
+    """``settings_local_layer_unknown`` — does git still give no clean answer
+    about the project's ``.claude/settings.local.json``? The SAME probe the env
+    writer gates on (:func:`vco_lib.settings_local_env.layer_unknown_still`)."""
+    from vco_lib.settings_local_env import layer_unknown_still
+
+    try:
+        return layer_unknown_still(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def settings_local_user_values_still_kept(ctx: ProbeContext) -> Optional[bool]:
+    """``settings_local_user_value_kept`` — does a machine key in
+    ``settings.local.json`` still hold a value VCO did not write? The SAME
+    rule the writer keeps them by (:func:`vco_lib.settings_local_env.user_kept_still`)."""
+    from vco_lib.settings_local_env import user_kept_still
+
+    try:
+        return user_kept_still(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def user_owned_secret_values_still_present(ctx: ProbeContext) -> Optional[bool]:
     """``user_owned_secret_value_in_tree`` — does a user-put secret-shaped key
     still carry a value? The SAME detection the emitter uses
@@ -1364,6 +1401,9 @@ PROBES: dict[str, ProbeFn] = {
     "project_hooks_relative_paths_still_present": project_hooks_relative_paths_still_present,
     "settings_write_refusal_still_applies": settings_write_refusal_still_applies,
     "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
+    "settings_local_json_still_tracked": settings_local_json_still_tracked,
+    "settings_local_layer_still_unknown": settings_local_layer_still_unknown,
+    "settings_local_user_values_still_kept": settings_local_user_values_still_kept,
     "code_embed_image_still_stale": code_embed_image_still_stale,
     "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
     "playwright_browser_still_missing": playwright_browser_still_missing,

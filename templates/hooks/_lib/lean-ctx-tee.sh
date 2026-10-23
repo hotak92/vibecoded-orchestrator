@@ -74,7 +74,7 @@ fi
 # carry credentials (SEC-RAW guards the command text, not the output), so the
 # tee dir is 0700 (also healing a pre-SF-1 0755 dir) and the .log is created
 # 0600 BEFORE any output exists — no world-readable window. Git never sees
-# the dir (bundle add/update writes /.claude/ to .git/info/exclude —
+# the dir (bundle add/update writes /.claude/state/ to .git/info/exclude —
 # vco_lib/git_exclude.py) and the code graph classifies .claude/state/ as
 # transient (vco_lib/codegraph_row_classify.py TRANSIENT_STATE_MARKER).
 chmod 700 "$RAW_DIR" 2>/dev/null || true

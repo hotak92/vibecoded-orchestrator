@@ -344,10 +344,16 @@ def test_hook_process_latency_with_a_hung_hub(tmp_path):
             [sys.executable, str(REPO_ROOT / "tests/common/rl_kg_search_harness.py"), str(cfg_path)],
             env=env, capture_output=True, text=True, timeout=120,
         )
+        exited_at = time.time()
         timings[label] = time.monotonic() - t0
         assert proc.returncode == 0, proc.stderr[-2000:]
         out = json.loads(res_path.read_text())
         timings[label + "_main"] = out["main_elapsed_s"]
+        # The process TAIL: from the result landing on disk (main() done) to
+        # the parent seeing the exit — interpreter shutdown, which is where a
+        # POST that is not truly detached (a joined thread, an exit-time
+        # flush, a waited-on child) or the hung secondary would surface.
+        timings[label + "_tail"] = exited_at - out["result_written_at"]
         if label == "pre_tool_use_worst":
             assert out["handed_off"] == 1, out  # primary only: the twin was over budget
         elif real_detach:
@@ -357,7 +363,11 @@ def test_hook_process_latency_with_a_hung_hub(tmp_path):
     print(f"\nHOOK-LATENCY-W5R07 {json.dumps({k: round(v, 3) for k, v in timings.items()})}")
     assert timings["inline_main"] >= 4.0, timings  # 2 POSTs x 2 s on the critical path
     assert timings["detached_main"] < 1.0, timings
-    assert timings["inline"] - timings["detached"] >= 3.5, timings
+    # The same claim end to end, minus interpreter STARTUP (cold imports, the
+    # one part of the wall clock that load inflates unevenly between runs —
+    # see the tail bound below): main() plus the exit tail.
+    assert ((timings["inline_main"] + timings["inline_tail"])
+            - (timings["detached_main"] + timings["detached_tail"])) >= 3.5, timings
     # The worst case (wedged hub AND hung secondary) costs pre-tool-use only
     # its 0.4 s embed cap over the fast detached run. The cap is wall-clock;
     # the process overhead around it is not — under a loaded machine (a full
@@ -367,7 +377,22 @@ def test_hook_process_latency_with_a_hung_hub(tmp_path):
     # (30 s) or a POST back on the critical path (2 s each) still fails it.
     slack = 0.5 + 3 * timings["detached_main"]
     assert timings["pre_tool_use_worst_main"] < 0.4 + slack, timings
-    assert timings["pre_tool_use_worst"] - timings["detached"] < 0.4 + 0.5, timings
+    # Off the critical path means off the WHOLE process too: the exit must not
+    # wait for the wedged POST or the hung (30 s) secondary. This used to be a
+    # fixed 0.9 s bound on the difference of two whole-process wall clocks,
+    # which also carries interpreter STARTUP (cold imports): on a loaded CI
+    # runner the two runs' startups alone differed by more than that (3.07 s
+    # vs 1.75 s) while the in-process times stayed within their bounds. So the
+    # bound is on the TAIL — the time after main() returned. The reference is
+    # the inline run's tail: same interpreter and imports, and its POSTs were
+    # already paid inside main(), so nothing is pending at its exit. The slack
+    # scales with that baseline but is CAPPED below one POST (2 s): a POST
+    # waited on at exit (a joined thread, an exit-time flush, a waited-on
+    # child) breaks it on either detached run, a hung secondary (~30 s) by far.
+    base_tail = timings["inline_tail"]
+    tail_slack = min(1.5, 0.5 + 2 * base_tail)
+    for label in ("detached", "pre_tool_use_worst"):
+        assert timings[label + "_tail"] - base_tail < tail_slack, (label, timings)
 
 
 # ---------------------------------------------------------------------------
@@ -569,12 +594,41 @@ _WRITER = (
     "import vco_lib.rl_telemetry_loss as m\n"
     "m._MAX_BYTES = 1\n"          # rotate on every append
     "m._KEEP_LINES = 10 ** 6\n"   # ...keeping everything: any lost line is a race
+    # v0.2.104: a lock wait this short times out on ANY machine under four
+    # writers, so the lock-busy path runs on every pass, not only when the
+    # host happens to be loaded (where the pre-fix unlocked append lost lines).
+    "m._LOCK_TIMEOUT_S = 0.01\n"
     "for i in range(int(sys.argv[2])):\n"
     "    m.record_loss('dual_skip', 'race', seq=sys.argv[1] + '-' + str(i))\n"
 )
 
+_READ_SEQS = (
+    "import json, sys\n"
+    "import vco_lib.rl_telemetry_loss as m\n"
+    "print(json.dumps([r['seq'] for r in m.iter_records()]))\n"
+)
 
-@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX; Windows is best-effort by design")
+_LEDGER_SEQS_AFTER_ONE_MORE = (
+    "import json, sys\n"
+    "import vco_lib.rl_telemetry_loss as m\n"
+    "m.record_loss('dual_skip', 'race', seq='final')\n"
+    "print(json.dumps([json.loads(x)['seq'] for x in m.loss_log_path().read_text().splitlines()]))\n"
+)
+
+
+def _child_json(code, state):
+    """Run ``code`` in a child Python against the state dir ``state``; its
+    stdout is JSON."""
+    proc = subprocess.run([sys.executable, "-c", code],
+                          env=child_env(VCT_STATE_DIR=str(state)), capture_output=True,
+                          text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="rotation by os.replace of a file other "
+                    "writers reopen is the POSIX shape; the lock-busy spill is pinned "
+                    "cross-platform by the deterministic test below")
 def test_rotation_does_not_drop_lines_written_by_other_processes(tmp_path):
     state = tmp_path / "vct"
     env = child_env(VCT_STATE_DIR=str(state))
@@ -587,6 +641,75 @@ def test_rotation_does_not_drop_lines_written_by_other_processes(tmp_path):
     for p in procs:
         p.wait(timeout=120)
         assert p.returncode == 0, (p.stderr.read() if p.stderr else b"")[-2000:]
-    lines = (state / "metrics" / "rl_telemetry_loss.jsonl").read_text().splitlines()
-    seqs = {json.loads(x)["seq"] for x in lines}
-    assert len(seqs) == n_proc * per, f"{n_proc * per - len(seqs)} line(s) lost to a rotation race"
+    seqs = _child_json(_READ_SEQS, state)
+    assert len(seqs) == len(set(seqs)), "a spilled line was counted twice"
+    assert len(set(seqs)) == n_proc * per, (
+        f"{n_proc * per - len(set(seqs))} line(s) lost to a rotation race")
+    # The next locked append folds every spilled line into the ledger itself.
+    ledger = _child_json(_LEDGER_SEQS_AFTER_ONE_MORE, state)
+    assert sorted(ledger) == sorted(seqs + ["final"])
+
+
+_BUSY_WRITER = (
+    "import vco_lib.rl_telemetry_loss as m\n"
+    "m._LOCK_TIMEOUT_S = 0.05\n"
+    "m.record_loss('hub_post_failed', 'refused', seq='while-busy')\n"
+)
+
+
+def test_a_writer_that_finds_the_lock_busy_never_writes_into_a_rotation(tmp_path):
+    """v0.2.104 §I: the exact interleaving that lost lines, made deterministic.
+
+    The test process holds the ledger lock and is MID-ROTATION — it has read
+    the tail and not yet replaced the file. A writer in another process times
+    out on the lock. Pre-fix that writer appended to the ledger unlocked, into
+    the inode the rotation then replaced: the line was gone. Now it spills to
+    a pending file, which readers count and the next locked append drains.
+    """
+    from vco_lib import rl_telemetry_loss as m
+    from vco_lib.atomic import atomic_write_text, exclusive_file_lock
+
+    state = tmp_path / "vct"
+    env = child_env(VCT_STATE_DIR=str(state))
+    ledger = state / "metrics" / m.LOSS_FILE_NAME
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text('{"ts_ms":1,"kind":"dual_skip","reason":"r","seq":"old"}\n')
+
+    with exclusive_file_lock(m.lock_path(ledger)):
+        tail = ledger.read_text(encoding="utf-8")          # rotation: tail read
+        proc = subprocess.run([sys.executable, "-c", _BUSY_WRITER], env=env,
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        atomic_write_text(ledger, tail, fsync=False)       # rotation: replace
+
+    assert _child_json(_READ_SEQS, state) == ["old", "while-busy"]
+    assert m.summarize(path=ledger)["by_kind"] == {
+        "dual_skip": {"r": 1}, "hub_post_failed": {"refused": 1}}
+    # Drained by the next writer that holds the lock: into the ledger, once.
+    assert _child_json(_LEDGER_SEQS_AFTER_ONE_MORE, state) == ["old", "while-busy", "final"]
+    assert not list(m.pending_dir(ledger).glob("*.jsonl"))
+    assert _child_json(_READ_SEQS, state) == ["old", "while-busy", "final"]
+
+
+def test_episode_bump_finds_its_line_when_it_was_spilled(tmp_path, monkeypatch):
+    """v0.2.104 §I: the hub-down episode's in-place ``suppressed`` bump is the
+    ledger's other rewriter. It drains spilled lines under the lock first, so
+    an episode line that was spilled (lock busy at record time) is still
+    bumped — and kept — rather than missed."""
+    from claude_mcp_servers.rl_client import hub_writer
+    from vco_lib import rl_telemetry_loss as m
+
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "vct"))
+    ledger = m.loss_log_path()
+    m._spill(ledger, json.dumps({"ts_ms": 1, "kind": "hub_post_failed",
+                                 "reason": "refused", "episode": "ep-1"},
+                                separators=(",", ":")) + "\n")
+    assert not ledger.exists()
+    hub_writer._bump_episode_ledger_line("ep-1", 7)
+    recs = [json.loads(x) for x in ledger.read_text().splitlines()]
+    (sid,) = [r.pop(m.SPILL_ID_KEY) for r in recs]  # its idempotency key survives
+    assert sid
+    assert recs == [{"ts_ms": 1, "kind": "hub_post_failed", "reason": "refused",
+                     "episode": "ep-1", "suppressed": 7}]
+    assert [{k: v for k, v in r.items() if k != m.SPILL_ID_KEY}
+            for r in m.iter_records()] == recs

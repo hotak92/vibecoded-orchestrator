@@ -33,7 +33,8 @@ from vco_lib.parked_hooks import ParkedHooksState
 from vco_lib.settings_merge import smart_merge_settings
 
 __all__ = ["REFUSAL_SURFACE", "STATUS_EDIT_REFUSED", "STATUS_UNPARSEABLE",
-           "merge_settings_template", "retry_command", "settings_template_path"]
+           "fresh_settings_from_template", "merge_settings_template", "retry_command",
+           "settings_template_path"]
 
 #: ``settings_write_refused_<surface>`` family member for this writer.
 REFUSAL_SURFACE = "bundle_claude_settings_json"
@@ -63,6 +64,30 @@ def retry_command(project_root: Path) -> str:
             f"--folder '{project_root}' --update")
 
 
+def fresh_settings_from_template(
+    template_path: Path,
+    *,
+    parked: Optional[ParkedHooksState] = None,
+    kept_out: Optional[list] = None,
+) -> dict:
+    """The settings a project gets when it has no ``settings.json`` yet: the
+    shipped template, minus the hooks the launcher has parked for it (only
+    when that answer is readable). One home for "a fresh file from the
+    template" — the bundle's create branch below and ``install.py
+    --adopt-project-replace-all`` (v0.2.104) both start from it, so a
+    whole-file rewrite can never drop a template key (``hooks``,
+    ``skillOverrides``, ``idleCompaction``, the permission denies).
+
+    Raises ``OSError`` / ``ValueError`` when the template cannot be read or
+    parsed — a missing shipped template is a broken install, never a case to
+    paper over.
+    """
+    template_data = json.loads(template_path.read_text(encoding="utf-8"))
+    return smart_merge_settings(
+        {}, template_data, kept_out=kept_out,
+        parked=parked if parked is not None and parked.readable else None)
+
+
 def merge_settings_template(
     template_path: Path,
     target_path: Path,
@@ -87,9 +112,8 @@ def merge_settings_template(
     template_data = json.loads(template_path.read_text(encoding="utf-8"))
 
     if not target_path.exists():
-        created = smart_merge_settings(
-            {}, template_data, kept_out=kept_out,
-            parked=parked if parked is not None and parked.readable else None)
+        created = fresh_settings_from_template(
+            template_path, parked=parked, kept_out=kept_out)
         if dry_run:
             return "would-create", None
         target_path.parent.mkdir(parents=True, exist_ok=True)

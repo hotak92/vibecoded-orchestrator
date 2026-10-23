@@ -19,8 +19,34 @@ The collision-safety rule is the load-bearing part and predates the move:
 entries are computed PER-RUN from the files VCO ACTUALLY created, never a
 blanket ``/.vscode/`` or ``/knowledge/`` dir-glob — those names are common in
 existing projects, and a blanket glob would silently hide the USER's own
-same-named files. Only namespaces a user cannot own (``.claude/``,
-``.vco-manifest.json``) collapse to a single glob.
+same-named files.
+
+v0.2.104 (G4): the same rule now holds INSIDE ``.claude/``. Up to v0.2.103 the
+whole tree collapsed to one ``/.claude/`` glob on the premise that a user
+cannot own anything there. That premise was false: VCO itself seeds
+``.claude/CONTEXT_STATE.md``, ``.claude/context/plans/`` and handoffs FOR the
+user, Claude Code reads a committed ``.claude/settings.json`` and
+``.claude/CLAUDE.md``, and many users version all of them — the glob made
+``git add .claude/CONTEXT_STATE.md`` fail with "paths are ignored". Now:
+
+* VCO-shipped files under ``.claude/`` (hooks, scripts, agents) are excluded
+  as their SPECIFIC paths, so a hook or agent the user writes beside them
+  stays addable; a shipped skill is excluded as its own directory.
+* Only namespaces that are genuinely VCO's alone collapse to one glob —
+  :data:`VCO_RUNTIME_EXCLUDES` (runtime state, logs, adoption backups, agent
+  worktrees, the launcher's ``.disabled/`` parking dirs, the manifest, and
+  the machine-local files VCO writes into ``.claude/context/``) plus the
+  :data:`_VCO_ONLY_SUBTREES` the bundle owns outright.
+* :data:`USER_OWNED_CLAUDE_PATHS` are NEVER excluded, whoever created them.
+* :func:`append_git_info_exclude` removes the legacy ``/.claude/`` (and the
+  never-matching root ``/.vco-manifest.json``) line from VCO's OWN blocks on
+  every write, so a project upgraded from an older release is repaired by its
+  next bundle update; a user's own lines are never touched (the two cases
+  that read both ways are stated in :func:`_block_members`). Every block now
+  ends with :data:`VCO_BLOCK_END_MARKER` (older blocks are closed on the next
+  write), a retired shipped file's line is dropped with the file, and an old
+  project-move block's lines for the user's copied knowledge nodes,
+  ``CONTEXT_STATE.md`` and ``MEMORY.md`` are removed. A CRLF file stays CRLF.
 """
 
 from __future__ import annotations
@@ -29,22 +55,29 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
 from vco_lib.atomic import atomic_write_bytes
-from vco_lib.manifest_paths import MANIFEST_BASENAME
+from vco_lib.manifest_paths import MANIFEST_BASENAME, MANIFEST_REL_POSIX
 from vco_lib.paths import to_posix_rel
 
-#: Root-anchored exclude pattern for the bundle manifest. Composed from the
-#: one home's BASENAME (v0.2.95) rather than re-spelled: git's exclude
-#: patterns are root-anchored, so this is the same FILE as
-#: ``.claude/.vco-manifest.json`` reached by a different route, and a rename
-#: that missed this line would leave the manifest visible in `git status` on
-#: every safe-added project.
-_MANIFEST_EXCLUDE_PATTERN = "/" + MANIFEST_BASENAME
+#: Exclude pattern for the bundle manifest, composed from the one home's
+#: project-relative path. A ``.git/info/exclude`` pattern containing a slash is
+#: anchored at the repository root, so the pre-v0.2.104 ``/.vco-manifest.json``
+#: matched only a ROOT-level file and never ``.claude/.vco-manifest.json``; it
+#: was hidden only by the blanket ``/.claude/`` glob this release retires.
+_MANIFEST_EXCLUDE_PATTERN = "/" + MANIFEST_REL_POSIX
 
 __all__ = [
     "SAFE_ADD_SIDECAR_SUFFIX",
-    "VCO_EXCLUSIVE_TOPLEVEL",
+    "USER_OWNED_CLAUDE_PATHS",
+    "VCO_BLOCK_MARKER",
+    "VCO_BLOCK_END_MARKER",
+    "VCO_RUNTIME_EXCLUDES",
+    "LEGACY_VCO_EXCLUDE_LINES",
+    "exclude_pattern_for",
+    "summarize_entries",
     "exclude_entries_for_created_paths",
     "safe_add_exclude_entries",
+    "retired_exclude_entries",
+    "bundle_exclude_plan",
     "append_git_info_exclude",
 ]
 
@@ -55,18 +88,119 @@ __all__ = [
 #: pattern below matches it too.
 SAFE_ADD_SIDECAR_SUFFIX = ".vco.reference"
 
-#: Top-level entries that are UNAMBIGUOUSLY VCO's (a user cannot own them) →
-#: collapse to a single dir/file glob instead of listing every created file
-#: underneath. Everything else is excluded as its SPECIFIC created path.
-#:
-#: v0.2.63 (C1 fix — "check if files are VCO's or the user's"): a blanket
-#: ``/.vscode/`` / ``/infrastructure/`` / ``/knowledge/`` would hide the user's
-#: OWN same-named directory, which is the exact opposite of what safe-add is
-#: for.
-VCO_EXCLUSIVE_TOPLEVEL: dict[str, str] = {
-    ".claude": "/.claude/",
-    MANIFEST_BASENAME: _MANIFEST_EXCLUDE_PATTERN,
-}
+#: Every block VCO appends to ``.git/info/exclude`` starts with a comment line
+#: carrying this prefix. The legacy-line migration recognises VCO's blocks by
+#: it, so it can repair what VCO wrote without touching the user's own lines.
+VCO_BLOCK_MARKER = "# VCO "
+
+#: The line that closes every block VCO writes (v0.2.104 on). Without it a
+#: block's end had to be guessed, and a line the user appended right after it
+#: (``echo '/.claude/' >> .git/info/exclude``) read as VCO's. Blocks from
+#: older releases are closed with it on the next write.
+VCO_BLOCK_END_MARKER = "# VCO end"
+
+#: Paths under ``.claude/`` that belong to the USER even when VCO seeded them.
+#: Never excluded, whatever a caller passes in. A trailing ``/`` means the
+#: directory, recursively.
+USER_OWNED_CLAUDE_PATHS: tuple[str, ...] = (
+    ".claude/CONTEXT_STATE.md",  # working memory VCO seeds for the user
+    ".claude/CLAUDE.md",  # Claude Code project instructions
+    ".claude/MEMORY.md",
+    ".claude/settings.json",  # VCO merges into it; teams commit it
+    ".claude/context/",  # plans, handoffs, reviews, per-session state
+    ".claude/rules/",
+    ".claude/commands/",
+)
+
+#: Namespaces and files that are VCO's ALONE — no user content can live there
+#: — so they are excluded as one entry each on every bundle run, created this
+#: run or not (most are written at runtime, never by the bundle copy).
+VCO_RUNTIME_EXCLUDES: tuple[str, ...] = (
+    _MANIFEST_EXCLUDE_PATTERN,  # the bundle manifest
+    "/.claude/state/",  # hook/launcher runtime state, lean-ctx tee, scratch dir
+    "/.claude/logs/",  # run logs, the auto-resolution trail
+    "/.claude/backups/",  # bundle-adoption backups
+    "/.claude/worktrees/",  # isolated-subagent worktrees
+    "/.claude/agents.disabled/",  # launcher's disable toggle parks agents here
+    "/.claude/skills.disabled/",  # ... and skills here
+    "/.claude/env",  # machine-local env file (absolute paths, hub routing)
+    # v0.2.104 L5: Claude Code's per-machine settings file, never committed by
+    # its own convention. VCO writes this machine's absolute paths, launcher
+    # ids and service ports into its `env`, so it must stay out of git even
+    # when Claude Code did not create it (Claude Code ignores it only for a
+    # file IT creates). An exclude line never un-tracks a file the user
+    # already committed.
+    "/.claude/settings.local.json",
+    "/.claude/.code_formats.json",  # code-graph format sidecar
+    # Machine-local files VCO writes into the otherwise user-owned
+    # `.claude/context/` — named one by one, never the directory.
+    "/.claude/context/UPDATE_DEFERRED.md",
+    "/.claude/context/UPDATE_DEFERRED.json",
+    "/.claude/context/.update-deferred.lock",
+    "/.claude/context/pre-compact-snapshot.md",
+    "/.claude/context/last-compact-marker",
+    "/.claude/context/launcher-restart-marker",
+    "/.claude/context/EMBEDDING_FAILURES.md",
+)
+
+#: Bundle subtrees VCO owns outright: every file is always-overwritten from the
+#: shipped copy, so one directory entry replaces a line per file.
+#: ``.claude/specializations/`` is deliberately NOT here: users add their own
+#: review-kind / topic docs beside the shipped ones, so each shipped doc is
+#: excluded by its own path like a hook or an agent.
+_VCO_ONLY_SUBTREES: tuple[str, ...] = (
+    ".claude/hooks/_lib/",
+)
+
+#: Lines VCO wrote before v0.2.104 that the migration removes from VCO's own
+#: blocks: the blanket ``.claude/`` glob, and the root-anchored manifest pattern
+#: that never matched the real manifest.
+LEGACY_VCO_EXCLUDE_LINES: frozenset[str] = frozenset(
+    {"/.claude/", "/" + MANIFEST_BASENAME}
+)
+
+
+def _is_user_owned(rel_posix: str) -> bool:
+    for owned in USER_OWNED_CLAUDE_PATHS:
+        if owned.endswith("/"):
+            if rel_posix.startswith(owned):
+                return True
+        elif rel_posix == owned:
+            return True
+    return False
+
+
+def exclude_pattern_for(rel: str) -> Optional[str]:
+    """The ``.git/info/exclude`` entry for ONE path VCO created, or ``None``.
+
+    ``None`` for a user-owned ``.claude/`` path (never hidden) and for an empty
+    path. Every pattern is root-anchored with a leading ``/`` so it matches
+    only that path, never a same-named file deeper in the tree.
+    """
+    rel_posix = to_posix_rel(rel).lstrip("/")
+    if not rel_posix:
+        return None
+    if rel_posix == MANIFEST_BASENAME or rel_posix == MANIFEST_REL_POSIX:
+        return _MANIFEST_EXCLUDE_PATTERN
+    if not rel_posix.startswith(".claude/"):
+        # A root file like CLAUDE.md, or a file inside a possibly-user-owned
+        # dir like .vscode/ or infrastructure/: this exact path only.
+        return "/" + rel_posix
+    if _is_user_owned(rel_posix):
+        return None
+    for runtime in VCO_RUNTIME_EXCLUDES:
+        bare = runtime.lstrip("/")
+        if rel_posix == bare or (bare.endswith("/") and rel_posix.startswith(bare)):
+            return runtime
+    for subtree in _VCO_ONLY_SUBTREES:
+        if rel_posix.startswith(subtree):
+            return "/" + subtree
+    parts = rel_posix.split("/")
+    if parts[1] == "skills" and len(parts) >= 4:
+        # `.claude/skills/<name>/...` — a shipped skill is a whole directory;
+        # a skill the user writes is a different directory and stays visible.
+        return "/" + "/".join(parts[:3]) + "/"
+    return "/" + rel_posix
 
 
 def exclude_entries_for_created_paths(
@@ -74,6 +208,7 @@ def exclude_entries_for_created_paths(
     folder: Path,
     *,
     include_manifest: bool = False,
+    include_vco_runtime: bool = False,
 ) -> list[str]:
     """Compute ``.git/info/exclude`` entries for the paths VCO just created.
 
@@ -87,39 +222,30 @@ def exclude_entries_for_created_paths(
             v0.2.81 separator lesson applied to a second file format).
         folder: The project folder, probed for the Rust-written
             ``.env.vco.reference`` sidecar.
-        include_manifest: Force ``/.vco-manifest.json`` in even when the
-            caller's created-list did not enumerate it.
+        include_manifest: Force the manifest entry in even when the caller's
+            created-list did not enumerate it.
+        include_vco_runtime: Add every :data:`VCO_RUNTIME_EXCLUDES` entry (a
+            bundle ran, so VCO's runtime namespaces exist or will).
 
     Returns:
-        Deduplicated, order-preserving entries. Anchored with a leading ``/``
-        so each matches ONLY that exact path, never a same-named file deeper
-        in the tree.
+        Deduplicated, order-preserving entries (see :func:`exclude_pattern_for`).
     """
     entries: list[str] = []
     seen: set[str] = set()
 
-    def _add(entry: str) -> None:
+    def _add(entry: Optional[str]) -> None:
         if entry and entry not in seen:
             seen.add(entry)
             entries.append(entry)
 
     for rel in created:
-        rel_posix = to_posix_rel(rel).lstrip("/")
-        if not rel_posix:
-            continue
-        top = rel_posix.split("/", 1)[0]
-        glob = VCO_EXCLUSIVE_TOPLEVEL.get(top)
-        if glob is not None:
-            _add(glob)
-        else:
-            # A specific VCO-created path (a root file like CLAUDE.md, or a
-            # file inside a possibly-user-owned dir like .vscode/ or
-            # infrastructure/). Anchored so it matches ONLY this exact path
-            # the user did not author.
-            _add("/" + rel_posix)
+        _add(exclude_pattern_for(rel))
 
     if include_manifest:
         _add(_MANIFEST_EXCLUDE_PATTERN)
+    if include_vco_runtime:
+        for runtime in VCO_RUNTIME_EXCLUDES:
+            _add(runtime)
 
     # The Rust launcher writes the `.env` reference sidecar before this step.
     sidecar = ".env" + SAFE_ADD_SIDECAR_SUFFIX
@@ -128,22 +254,377 @@ def exclude_entries_for_created_paths(
     return entries
 
 
+#: Bundle-envelope action buckets whose paths are VCO's shipped bytes on disk.
+#: ``noop`` (unchanged since the last run) and ``adopt`` (shipped version
+#: written over a local edit) are included, not only this run's writes: the
+#: legacy-glob migration removes ``/.claude/`` on the first update after
+#: v0.2.104, and every shipped file must get its own entry in that same run.
+#: ``skip-existing`` (a pre-existing file the bundle did NOT overwrite — the
+#: user's) and ``preserve`` (a user-modified file kept) are deliberately absent.
+_VCO_OWNED_ACTION_BUCKETS: tuple[str, ...] = (
+    "create",
+    "overwrite",
+    "always-overwrite",
+    "adopt",
+    "noop",
+)
+
+
 def safe_add_exclude_entries(result: dict, folder: Path) -> list[str]:
     """Bundle-envelope adapter over :func:`exclude_entries_for_created_paths`.
 
-    ``result`` is an ``install_project_bundle`` envelope; the created set is
-    the union of its ``create`` / ``overwrite`` / ``always-overwrite`` action
-    buckets, and ``manifest_written`` forces the manifest entry in.
+    ``result`` is an ``install_project_bundle`` envelope; the VCO-owned set is
+    the union of its :data:`_VCO_OWNED_ACTION_BUCKETS`. A bundle ran, so the
+    manifest and VCO's runtime namespaces are always included.
     """
     actions = result.get("actions", {}) or {}
     created: list[str] = []
-    for key in ("create", "overwrite", "always-overwrite"):
+    for key in _VCO_OWNED_ACTION_BUCKETS:
         created.extend(actions.get(key, []) or [])
     return exclude_entries_for_created_paths(
         created,
         folder,
-        include_manifest=bool(result.get("manifest_written")),
+        include_manifest=True,
+        include_vco_runtime=True,
     )
+
+
+#: Bundle-envelope buckets of shipped files a release STOPPED shipping:
+#: ``orphan-deleted`` (VCO deleted its unmodified copy) and ``orphan-retired``
+#: (a user-modified copy kept on disk — it is the user's file now).
+_RETIRED_ACTION_BUCKETS: tuple[str, ...] = ("orphan-deleted", "orphan-retired")
+
+
+def retired_exclude_entries(result: dict, still_listed: Iterable[str]) -> list[str]:
+    """Exclude lines to drop for shipped files this bundle run retired.
+
+    ``result`` is an ``install_project_bundle`` envelope; ``still_listed`` is
+    this run's entry set (:func:`safe_add_exclude_entries`). A retired file's
+    pattern is dropped only when no file still shipped maps to it (a shipped
+    skill's directory stays while any of its files ships). Without this a
+    retired hook's line outlived it, and a user's own file later written at
+    that path was silently hidden. :func:`append_git_info_exclude` removes
+    these only from VCO's own blocks.
+    """
+    keep = set(still_listed)
+    actions = result.get("actions", {}) or {}
+    out: list[str] = []
+    for key in _RETIRED_ACTION_BUCKETS:
+        for rel in actions.get(key, []) or []:
+            pattern = exclude_pattern_for(rel)
+            if pattern and pattern not in keep and pattern not in out:
+                out.append(pattern)
+    return out
+
+
+def bundle_exclude_plan(result: dict, folder: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(entries, retired)`` for one bundle run — the arguments of
+    :func:`append_git_info_exclude` (``paths``, ``retired``) at every bundle
+    call site, computed in one place."""
+    entries = tuple(safe_add_exclude_entries(result, folder))
+    return entries, tuple(retired_exclude_entries(result, entries))
+
+
+def summarize_entries(entries: Sequence[str], shown: int = 12) -> str:
+    """One-line human summary of exclude entries for a deferral message.
+
+    Since v0.2.104 there is one entry per shipped hook, script and agent, so
+    the first ``shown`` are named and the rest counted; the full list is one
+    ``cat .git/info/exclude`` away.
+    """
+    if not entries:
+        return "(none)"
+    text = ", ".join(entries[:shown])
+    if len(entries) > shown:
+        text += f" and {len(entries) - shown} more"
+    return text
+
+
+def _is_end_marker(stripped: str) -> bool:
+    return stripped == VCO_BLOCK_END_MARKER
+
+
+#: The legacy glob VCO wrote up to v0.2.103 (one of
+#: :data:`LEGACY_VCO_EXCLUDE_LINES`).
+_LEGACY_CLAUDE_GLOB = "/.claude/"
+
+#: The safe-add ``.env`` reference sidecar's exclude line.
+_SIDECAR_EXCLUDE_LINE = "/.env" + SAFE_ADD_SIDECAR_SUFFIX
+
+
+#: The pre-v0.2.104 root-anchored manifest line (one of
+#: :data:`LEGACY_VCO_EXCLUDE_LINES`).
+_LEGACY_MANIFEST_LINE = "/" + MANIFEST_BASENAME
+
+#: Header prefix of the blocks the project-move engine wrote (v0.2.92 on). In
+#: such a block the bundle's entries were followed by an exclude line per
+#: COPIED file; every other VCO block is a bundle (safe-add / update) block.
+_MOVE_BLOCK_HEADER = VCO_BLOCK_MARKER + "project move"
+
+#: Lines a pre-v0.2.104 project move wrote for the user's own copied material
+#: outside ``.claude/`` — the non-``.claude/`` entries of
+#: ``project_move.USER_ADJACENT_SPECS`` (``knowledge/**``, ``CONTEXT_STATE.md``,
+#: ``MEMORY.md``; parity-tested). v0.2.104 no longer hides that material at
+#: the new folder, and the migration removes these lines from old move blocks
+#: just as it removes the ``/.claude/`` glob. A prefix ends with ``/``.
+_LEGACY_MOVE_USER_LINES: tuple[str, ...] = (
+    "/knowledge/",
+    "/CONTEXT_STATE.md",
+    "/MEMORY.md",
+)
+
+
+def _is_legacy_move_user_line(stripped: str) -> bool:
+    return any(
+        stripped.startswith(p) if p.endswith("/") else stripped == p
+        for p in _LEGACY_MOVE_USER_LINES
+    )
+
+
+def _is_legacy_move_copied_line(line: str, stripped: str) -> bool:
+    """Could a pre-v0.2.104 project move have written *line* for a file it
+    COPIED outside ``.claude/`` (a ``knowledge/**`` node, ``CONTEXT_STATE.md``,
+    ``MEMORY.md``)?
+
+    That writer emitted ``"/" + <copied path>`` verbatim, one per line: no
+    escaping and no trimming, so a user's node named ``My Node.md`` became the
+    line ``/knowledge/My Node.md``. git reads such a line literally — inner
+    spaces are part of the pattern; only TRAILING spaces are dropped unless
+    escaped with a backslash — so the line did hide that node, and the migration
+    must find it. What the writer never produced: a line starting with
+    whitespace (it began with ``/``) or a directory pattern (copies are
+    files). Bundle blocks keep the stricter :func:`_is_legacy_vco_entry`: no
+    shipped path has whitespace (pinned by a test), so a whitespace line
+    there is the user's.
+    """
+    return (
+        line[:1] == "/"
+        and not stripped.endswith("/")
+        and _is_legacy_move_user_line(stripped)
+    )
+
+
+def _is_legacy_vco_entry(stripped: str) -> bool:
+    """Could a pre-v0.2.104 release have written ``stripped`` as an entry?
+
+    Those releases wrote ``"/" + <created file>`` for every path outside
+    ``.claude/`` and collapsed the whole ``.claude/`` tree to the ONE glob
+    ``/.claude/``. So an entry is root-anchored, has no whitespace, never
+    names a path under ``.claude/`` (``/.claude/<path>`` is v0.2.104's shape)
+    and is never a directory pattern other than that glob.
+    """
+    if not stripped.startswith("/") or any(c.isspace() for c in stripped):
+        return False
+    if stripped == _LEGACY_CLAUDE_GLOB:
+        return True
+    return not stripped.startswith(_LEGACY_CLAUDE_GLOB) and not stripped.endswith("/")
+
+
+def _block_members(lines: Sequence[str]) -> tuple[dict[int, str], list[int]]:
+    """Map each line VCO wrote inside one of its blocks to that block's kind.
+
+    Returns ``(members, legacy_block_ends)``: ``members`` maps a line index to
+    ``"ended"`` (a block closed by :data:`VCO_BLOCK_END_MARKER`, written whole
+    by v0.2.104 or later — every line from the header to the end marker is
+    VCO's), ``"legacy"`` (a bundle block from an older release, which has no
+    end marker), ``"legacy-move"`` (an older project-move block's bundle
+    part) or ``"legacy-move-tail"`` (an older move block's lines after its
+    bundle part: the files the move COPIED, never a shipped file's line);
+    ``legacy_block_ends`` lists, per legacy block, the index of its last
+    member line — where the end marker goes when the block is closed.
+
+    **An ended block is exact.** VCO writes it whole, header to end marker, in
+    one write; a line after the end marker is NEVER VCO's, whatever it says.
+
+    **A legacy block's end is INFERRED**, because the user's own
+    ``echo '…' >> .git/info/exclude`` lands directly after VCO's last line
+    with no blank line between them. A line belongs to a legacy block only
+    while it is one a pre-v0.2.104 release could have written there:
+
+    * a ``#`` comment, only in the header run right after the marker;
+    * an entry of the legacy shape (:func:`_is_legacy_vco_entry`): a
+      ``/.claude/<path>`` line or a directory pattern other than ``/.claude/``
+      is the user's (L3). In a MOVE block a copied-material line
+      (:func:`_is_legacy_move_copied_line`) also qualifies even with inner
+      whitespace: the old writer listed a copied ``knowledge/My Node.md``
+      verbatim (R4 L1);
+    * not a repeat of a line earlier in the same block or in an EARLIER VCO
+      block — VCO de-duplicated against them. A repeat of a line the user
+      keeps OUTSIDE VCO's blocks does not count: the user may have put it
+      above the block with an editor after VCO wrote the block, and VCO's own
+      copy must still be found (L1);
+    * the writer's ORDER: a pre-v0.2.104 bundle block listed its created
+      files (the ``/.claude/`` glob among them), then ``/.vco-manifest.json``,
+      then ``/.env.vco.reference`` LAST — each only when not already in the
+      file. So in a bundle block only the sidecar line may follow the
+      manifest line and nothing follows the sidecar line (R3 L2). A project
+      move appended a line per COPIED file after that bundle part, so a move
+      block goes on past it, as its ``legacy-move-tail``; the glob is never
+      in that tail (L2): every pre-v0.2.104 bundle run listed
+      ``.claude/hooks/_lib/`` (always overwritten) among its created files,
+      so the glob was already in the bundle part or earlier in the file.
+
+    The first line that fails ends the block; it and everything after it up
+    to the next marker are the user's.
+
+    Stated residual ambiguity: a ``/.claude/`` the user appends directly after
+    a legacy block that has no glob and does not end with the sidecar line is
+    read as VCO's and removed. A pre-v0.2.104 bundle omitted the glob only
+    when the file already held one, so the user still has that earlier line
+    unless they deleted it; the reading never leaves VCO's own glob in place,
+    which would hide ``.claude/`` with no later update able to repair it.
+
+    A second reading of the same kind (R3 L2): a root-level line the user
+    appends directly after a legacy block whose bundle part never reached the
+    manifest or sidecar line (both already in the file from an earlier
+    block) is read as VCO's, so it is pruned when it equals the pattern of a
+    shipped file a release retires in the same run, and in a move block a
+    ``/knowledge/…``, ``/CONTEXT_STATE.md`` or ``/MEMORY.md`` line is removed
+    as copied material. Both readings only ever UN-hide a path (it shows up
+    in ``git status``, and the user re-adds the line); the opposite reading
+    would leave VCO's own line hiding the user's file with nothing to repair
+    it. A BUNDLE block that has either line is exact on this point: a line
+    after it is the user's. A MOVE block is not: after its bundle part the old
+    move writer appended its copied-material lines, so a ``/knowledge/…``,
+    ``/CONTEXT_STATE.md`` or ``/MEMORY.md`` line there is still read as VCO's
+    (``legacy-move-tail``) — the same un-hide-only reading.
+    """
+    members: dict[int, str] = {}
+    legacy_ends: list[int] = []
+    vco_seen: set[str] = set()  # entries inside VCO blocks so far
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        if not stripped.startswith(VCO_BLOCK_MARKER) or _is_end_marker(stripped):
+            i += 1
+            continue
+        # A block header. Closed by an end marker before the next blank line
+        # or the next header? Then every line up to the marker is VCO's.
+        j = i + 1
+        end_at = None
+        while j < n:
+            s = lines[j].strip()
+            if _is_end_marker(s):
+                end_at = j
+                break
+            if not s or s.startswith(VCO_BLOCK_MARKER):
+                break
+            j += 1
+        if end_at is not None:
+            for k in range(i, end_at + 1):
+                members[k] = "ended"
+                s = lines[k].strip()
+                if s and not s.startswith("#"):
+                    vco_seen.add(s)
+            i = end_at + 1
+            continue
+        is_move = stripped.startswith(_MOVE_BLOCK_HEADER)
+        kind = "legacy-move" if is_move else "legacy"
+        members[i] = kind
+        last = i
+        in_header = True
+        manifest_seen = sidecar_seen = False
+        k = i + 1
+        while k < n:
+            s = lines[k].strip()
+            if not s or s.startswith(VCO_BLOCK_MARKER):
+                break
+            if s.startswith("#"):
+                if not in_header:
+                    break
+            else:
+                in_header = False
+                # No pre-v0.2.104 writer indented an entry (bundle and move
+                # alike began every line with "/"), so a leading-whitespace
+                # line is the user's even when its stripped text looks legacy.
+                if lines[k][:1].isspace():
+                    break
+                legacy_shape = _is_legacy_vco_entry(s) or (
+                    is_move and _is_legacy_move_copied_line(lines[k], s))
+                if not legacy_shape or s in vco_seen:
+                    break
+                past_bundle = manifest_seen or sidecar_seen
+                if s == _LEGACY_CLAUDE_GLOB and past_bundle:
+                    break
+                if not is_move and (sidecar_seen or (
+                        manifest_seen and s != _SIDECAR_EXCLUDE_LINE)):
+                    break
+                if is_move and past_bundle:
+                    kind = "legacy-move-tail"
+                if s == _LEGACY_MANIFEST_LINE:
+                    manifest_seen = True
+                elif s == _SIDECAR_EXCLUDE_LINE:
+                    sidecar_seen = True
+                vco_seen.add(s)
+            members[k] = kind
+            last = k
+            k += 1
+        legacy_ends.append(last)
+        i = k
+    return members, legacy_ends
+
+
+def _rewrite_vco_blocks(
+    existing: str, retired: Iterable[str] = (),
+) -> tuple[str, list[str]]:
+    """Repair VCO's own blocks; never touch a line of the user's.
+
+    * Removes :data:`LEGACY_VCO_EXCLUDE_LINES` from LEGACY blocks (v0.2.104 G4
+      migration). An ended block never carries them, so one found there was
+      put there by the user and stays.
+    * Removes, from LEGACY project-move blocks, the lines that hid the user's
+      own copied material outside ``.claude/`` (:data:`_LEGACY_MOVE_USER_LINES`)
+      — v0.2.104 no longer hides it. A path VCO still ships is listed again
+      by the same write.
+    * Removes the ``retired`` patterns — lines for shipped files a release
+      stopped shipping — from any VCO block, except a legacy move block's
+      copied-file tail (no shipped file's line is there).
+    * Closes every legacy block with :data:`VCO_BLOCK_END_MARKER`, so a line
+      the user appends afterwards is unambiguously outside it. The marker
+      takes the file's own line ending (``\r\n`` in a CRLF file).
+
+    See :func:`_block_members` for what counts as a VCO line. Returns
+    ``(new_text, removed_lines)``; ``new_text is existing`` when nothing
+    changed.
+    """
+    retired_set = set(retired)
+    eol = _line_ending(existing)
+    lines = existing.splitlines(keepends=True)
+    members, legacy_ends = _block_members(lines)
+    close_after = set(legacy_ends)
+    out: list[str] = []
+    removed: list[str] = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        kind = members.get(idx)
+        drop = kind is not None and (
+            (kind.startswith("legacy") and stripped in LEGACY_VCO_EXCLUDE_LINES)
+            or (kind.startswith("legacy-move") and _is_legacy_move_user_line(stripped))
+            or (kind != "legacy-move-tail" and stripped in retired_set)
+        )
+        if drop:
+            removed.append(stripped)
+        else:
+            if idx in close_after and not line.endswith(("\n", "\r")):
+                line += eol
+            out.append(line)
+        if idx in close_after:
+            out.append(VCO_BLOCK_END_MARKER + eol)
+    if not removed and not close_after:
+        return existing, []
+    return "".join(out), removed
+
+
+def _line_ending(text: str) -> str:
+    """The DOMINANT line ending of *text*, so what VCO adds to a CRLF exclude
+    file is CRLF too: ``\r\n`` when more lines end in CRLF than in a bare
+    LF, else ``\n`` (also when no line has an ending yet, e.g. a one-line
+    file without a final newline). Counting every line rather than reading
+    the first one keeps a file whose first line is LF but whose body is CRLF
+    (an editor that converted only what it touched) on CRLF."""
+    crlf = text.count("\r\n")
+    return "\r\n" if crlf > text.count("\n") - crlf else "\n"
 
 
 def append_git_info_exclude(
@@ -152,6 +633,7 @@ def append_git_info_exclude(
     *,
     write_bytes: Optional[Callable[[Path, bytes], object]] = None,
     block_comment: Optional[Sequence[str]] = None,
+    retired: Sequence[str] = (),
 ) -> dict:
     """Idempotently append ``paths`` to ``<folder>/.git/info/exclude``.
 
@@ -161,6 +643,14 @@ def append_git_info_exclude(
         worktree's real gitdir is deliberately out of scope: guessing wrong
         would write into an unrelated repo's exclude file.
       - Entry already present (exact-line match) -> not re-added.
+      - Legacy VCO lines (:data:`LEGACY_VCO_EXCLUDE_LINES`) inside VCO's own
+        pre-v0.2.104 blocks, and the ``retired`` patterns inside any VCO
+        block, are removed in the same write, and pre-v0.2.104 blocks are
+        closed with :data:`VCO_BLOCK_END_MARKER` (see
+        :func:`_rewrite_vco_blocks`); the user's own lines never are touched
+        (the two ambiguous legacy cases are stated in :func:`_block_members`).
+      - Every new block ends with :data:`VCO_BLOCK_END_MARKER`, so a line the
+        user appends later is never mistaken for VCO's.
       - Write failure -> ``action="write_failed:<ErrorClass>"``, no raise.
 
     Args:
@@ -180,14 +670,21 @@ def append_git_info_exclude(
             security regression.
         block_comment: Header lines written above a NEW block. Defaults to the
             safe-add wording; the move engine passes its own.
+        retired: Patterns of shipped files a release retired
+            (:func:`retired_exclude_entries`); removed from VCO's blocks only.
 
     Returns:
-        ``{"action": str, "added": [str, ...], "path": str}``. Actions:
-        ``appended`` | ``noop`` | ``not_a_git_repo`` | ``write_failed:*``.
+        ``{"action": str, "added": [str, ...], "removed": [str, ...],
+        "path": str}``. Actions: ``appended`` (new entries written, any
+        legacy/retired lines removed alongside) | ``migrated`` (only VCO's
+        existing blocks repaired: lines removed and/or old blocks closed) |
+        ``noop`` | ``not_a_git_repo`` | ``write_failed:*``.
     """
     writer = write_bytes if write_bytes is not None else _default_write_bytes
     git_dir = folder / ".git"
-    result: dict = {"action": "not_a_git_repo", "added": [], "path": ""}
+    result: dict = {
+        "action": "not_a_git_repo", "added": [], "removed": [], "path": "",
+    }
     if not git_dir.is_dir():
         return result
 
@@ -196,17 +693,29 @@ def append_git_info_exclude(
     result["path"] = str(exclude_path)
 
     try:
+        # Bytes, decoded without newline translation: a CRLF file keeps its
+        # line endings (read_text would turn every one into LF on rewrite).
         existing = (
-            exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+            exclude_path.read_bytes().decode("utf-8") if exclude_path.exists() else ""
         )
     except OSError as e:
         result["action"] = f"write_failed:{type(e).__name__}"
         return result
 
+    original = existing
+    existing, removed = _rewrite_vco_blocks(existing, retired)
+    rewritten = existing is not original
+
     # Exact-line membership check (strip trailing whitespace per line).
     present = {line.strip() for line in existing.splitlines()}
-    to_add = [p for p in paths if p not in present]
-    if not to_add:
+    # A legacy line is never (re)written: the next run would only strip it.
+    to_add = list(
+        dict.fromkeys(
+            p for p in paths
+            if p not in present and p not in LEGACY_VCO_EXCLUDE_LINES
+        )
+    )
+    if not to_add and not rewritten:
         result["action"] = "noop"
         return result
 
@@ -218,15 +727,23 @@ def append_git_info_exclude(
             "your commits.",
             "# This is .git/info/exclude (LOCAL-only) — not the tracked "
             ".gitignore.",
+            "# Your own .claude/ files (CONTEXT_STATE.md, context/, settings.json, "
+            "CLAUDE.md) are never listed here.",
         ]
     )
-    block_lines = ["", *header, *to_add]
-    block = "\n".join(block_lines) + "\n"
+    if not header or not header[0].startswith(VCO_BLOCK_MARKER):
+        # The migration finds VCO's blocks by this marker; a block without it
+        # would leave its lines unrepairable by a later release.
+        header.insert(0, VCO_BLOCK_MARKER + "exclude block (orchestrator-managed).")
+    eol = _line_ending(existing)
+    block = ""
+    if to_add:
+        block = eol.join(["", *header, *to_add, VCO_BLOCK_END_MARKER]) + eol
 
     # Ensure we don't glue onto a non-newline-terminated last line.
     prefix = existing
-    if prefix and not prefix.endswith("\n"):
-        prefix += "\n"
+    if prefix and not prefix.endswith(("\n", "\r")) and block:
+        prefix += eol
 
     try:
         info_dir.mkdir(parents=True, exist_ok=True)
@@ -235,8 +752,9 @@ def append_git_info_exclude(
         result["action"] = f"write_failed:{type(e).__name__}"
         return result
 
-    result["action"] = "appended"
+    result["action"] = "appended" if to_add else "migrated"
     result["added"] = to_add
+    result["removed"] = removed
     return result
 
 

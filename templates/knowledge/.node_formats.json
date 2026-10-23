@@ -241,11 +241,11 @@
   },
   "knowledge/concepts/kg-summary-three-tier-pipeline.md": {
     "title": "KG-Summary Generation Pipeline — Backend Ladder",
-    "description": "The KG-Summary Generation Pipeline is an automated system that creates concise summaries for every knowledge graph node and stores them in a JSON file for retrieval clients. It operates via a backend selection ladder that prioritizes local CLI tools like Claude, followed by cloud providers such as z.ai and QwenCloud, local Ollama instances, and finally OpenAI or Anthropic APIs, with specific logic to skip unavailable tiers or defer processing based on VRAM constraints. The system intelligently handles backend availability by caching smoke test results, implementing circuit breakers for failed tiers, and respecting user consent or forced environment variables to determine execution flow. This architecture ensures efficient resource usage and reliable summary generation by dynamically adapting to available models and API keys without incurring unnecessary costs or errors.",
-    "summary": "The KG-Summary Generation Pipeline automatically generates 2-3 sentence summaries for knowledge graph nodes via a tiered backend ladder that prioritizes the local `claude` CLI, followed by cloud providers (z.ai, QwenCloud), local Ollama (with dynamic VRAM deferral logic), and OpenAI, descending the ladder only when specific failure conditions like rate limits, auth errors, or quota exhaustion trigger a circuit breaker with defined cooldown periods.",
-    "generated_at": "2026-10-15T14:08:00.853990+00:00",
-    "backend": "ollama",
-    "content_hash": "79a67929061f6cb6",
+    "description": "The KG-Summary Generation Pipeline automatically generates 2–3 sentence summaries for every knowledge graph node, storing them in `.node_formats.json` for consumption by KG retrieval clients. The pipeline is triggered by a PostToolUse hook on knowledge file edits and uses a seven-tier backend selection ladder prioritizing Claude CLI, then GLM, QwenCloud, Ollama, OpenAI, and Anthropic API, with fallback to skip. Each tier has specific activation conditions—availability probes, key resolution, resource constraints—and circuit breaker logic to automatically move down the ladder when a tier fails or hits rate limits. This enables automatic, intelligent summary generation without manual backend configuration while respecting API costs, consent gates, and local resource availability.",
+    "summary": "Auto-generates 2-3 sentence summaries for every KG node, cached in `knowledge/.node_formats.json`, using a tiered backend selection ladder prioritizing local (claude CLI) then cloud options (GLM, QwenCloud, Ollama, OpenAI, Anthropic). Circuit breaker logic latches failed tiers with cooldowns—900s for rate limits, 120s for auth, 18000s for quota exhaustion, 60s for capacity after 3 consecutive strikes—to prevent retry storms and descend to the next tier.",
+    "generated_at": "2026-10-18T08:34:46.723045+00:00",
+    "backend": "cli",
+    "content_hash": "0f8fc9ae797a0a37",
     "total_chunks": 1
   },
   "knowledge/concepts/knowledge-graph.md": {
@@ -848,10 +848,11 @@
   },
   "knowledge/tools/claude-code-mcp-configuration.md": {
     "title": "Claude Code MCP Configuration Pattern",
-    "description": "The Claude Code MCP Configuration Pattern defines a secure method for isolating per-project environment variables like knowledge graph collection names within `.claude/settings.json` to prevent cross-project leakage.\nIt prioritizes hub-resolved values and project-specific settings over machine-invariant configurations or bundled defaults to ensure correct MCP subprocess behavior.\nDevelopers should use this canonical channel instead of `.vscode/settings.json` to avoid common misconfigurations where environment variables fail to propagate on Linux systems.\nThis pattern matters because it guarantees that AI agents access the correct project-specific resources while maintaining strict security boundaries across multiple projects on the same machine.",
-    "summary": "Per-project MCP environment variables (e.g., `KG_COLLECTION`, `CODE_GRAPH_PROJECT`) must be defined in `.claude/settings.json` `env` to propagate to MCP subprocesses across CLI, Desktop, and VS Code. Machine-invariant keys (e.g., `WEAVIATE_URL`) reside in `~/.claude.json` `mcpServers`, while per-project collection keys are intentionally excluded from this global file to prevent cross-project leakage. The `.vscode/settings.json` `claude-code.env` is a critical footgun on Linux as it does not reach MCP subprocesses, causing fallback to bundled defaults. Resolution precedence is: vct-hub values > `.claude/settings.json` `env` > `.claude/env` > `~/.claude.json` `mcpServers` > bundled defaults. Verification involves checking `claude mcp list` status and inspecting MCP startup logs for `resolved collections` to confirm the source and values.",
-    "generated_at": "2026-07-20T18:57:09.854138+00:00",
-    "content_hash": "72b6c858547ed637",
+    "description": "Claude Code MCP Configuration Pattern defines the correct surface for per-project MCP server environment (KG collection names, embedding profiles, service URLs) without leaking settings across projects on the same machine. Per-project env goes in the Claude Code settings `env` split across `.claude/settings.json` (portable keys like collection names, committable) and `.claude/settings.local.json` (machine-specific paths/URLs, per-machine only)—Claude Code merges them key-by-key with the local file winning, and both reach MCP subprocesses. The `.vscode/settings.json` `claude-code.env` key does NOT propagate to MCP subprocesses on Linux, making it a common misconfiguration footgun. Use the project's settings `env` to ensure MCP servers receive the right configuration for code graphs, embeddings, and knowledge graph routing.",
+    "summary": "Per-project MCP environment resolves from `.claude/settings.json` overlaid by `.claude/settings.local.json` (local wins over portable keys), following precedence: vct-hub → project settings → `.claude/env` → ~/.claude.json → bundled defaults. The `.vscode/settings.json` `claude-code.env` key does not propagate to MCP subprocesses on Linux—this is the single most common misconfiguration.",
+    "generated_at": "2026-10-18T08:35:08.289308+00:00",
+    "backend": "cli",
+    "content_hash": "ffbc2ba32c2b413a",
     "total_chunks": 1
   },
   "knowledge/tools/comfyui.md": {

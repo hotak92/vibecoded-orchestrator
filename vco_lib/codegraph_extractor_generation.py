@@ -214,6 +214,17 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "golden snapshots (tests/fixtures/codegraph_golden) are byte-identical to "
         "v0.2.102. _CHUNKER_REVISION and CODEGRAPH_EMBED_REVISION unchanged."
     ),
+    "0.2.104": (
+        "No extraction-semantics change. `git diff v0.2.103..HEAD` across the "
+        "extractor surface (analyze_code_graph.py, codegraph_{guards,"
+        "content_hash,entities,lang,calls,references,naming,imports,schema}, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py) is 0 "
+        "lines; the code-graph golden snapshots are byte-identical to v0.2.103. "
+        "The release's code-graph work is in the resync DRIVER "
+        "(codegraph_resync.py: lifetime retry cap, probe-vs-restart race, "
+        "manual-run clear) and the MCP server, neither of which changes what a "
+        "walk extracts. _CHUNKER_REVISION and CODEGRAPH_EMBED_REVISION unchanged."
+    ),
     "0.2.101": (
         "No extraction-semantics change. `git diff v0.2.100..HEAD` across the "
         "extractor surface (analyze_code_graph.py, codegraph_{guards,"

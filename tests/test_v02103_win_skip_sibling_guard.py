@@ -53,7 +53,24 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: test sends real POSIX signals and reads /proc — a POSIX-only primitive with
 #: no .ps1 sibling; its Windows leg is unit-tested with a fake runner
 #: (tests/test_v02103_uninstall_state.py::test_windows_listing_survives_*).
-NON_CONVENTION_BASELINE = 178
+#: 178 -> 179 (v0.2.104 scratch dir): tests/test_v02104_scratch_dir.py's
+#: POSIX_ONLY marker guards 0700 mode bits and unprivileged symlinks (the
+#: sweep's never-follow arms) — POSIX-only primitives; the Windows ACL arm is
+#: unit-tested with a fake runner (test_windows_arm_*) and its bash legs use
+#: the sibling convention.
+#: 179 -> 181 (v0.2.104 R27, claude-api-run review guard): two POSIX-only
+#: primitives with no .ps1 sibling — the guard hook's POSIX-quoted command
+#: run through ``bash -c`` (tests/test_v02104_claude_api_review_guard.py;
+#: the Windows command shape is unit-tested by
+#: test_the_windows_hook_command_shape) and a fake ``#!/bin/sh`` venv
+#: interpreter driving the .ps1 wrapper's exit-code test
+#: (tests/test_v02104_claude_api_run.py, which IS the .ps1 leg).
+#: 181 -> 182 (v0.2.104 R30 NIT-1): tests/test_v02104_pre_tool_use_incomplete_warning.py's
+#: ``posix_process_groups`` marker guards the tests that signal the hook's
+#: process GROUP (os.killpg, SIGSTOP/SIGCONT) — POSIX-only primitives with no
+#: Windows equivalent and no .ps1 sibling; the hook's ps1 leg runs in the
+#: file's other tests.
+NON_CONVENTION_BASELINE = 182
 
 
 # -- which conditions skip on Windows --------------------------------------

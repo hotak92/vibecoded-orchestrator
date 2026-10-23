@@ -196,6 +196,31 @@ SKIPPED = "skipped"       # precondition absent (backend down, cap reached…)
 #: the day it comes back (``test_skips_do_not_burn_the_cap``).
 BLOCKED = "blocked"
 
+#: TRAIL-ONLY row status: the condition's ledger entry was CLEARED by
+#: something other than this dispatcher (the resync driver run by hand, an
+#: update's positive-zero probe — :func:`record_episode_end`). Like
+#: :data:`BLOCKED` it is never a :class:`RetryResult` status callers receive.
+#: It exists so the attempt cap is scoped to ONE EPISODE of a condition (see
+#: :func:`retry_history`): without it a condition that came back months after
+#: it was last fixed inherited the earlier episodes' attempts and was reported
+#: as capped before VCO had retried it once (field 2026-10-16).
+RESOLVED = "resolved"
+
+#: v0.2.104 (R1 M1): names the dispatched attempt a clear happened INSIDE.
+#: The dispatcher sets it in its own environment around ``handler.run`` (so
+#: the handler, its children and their children inherit it) and records the
+#: same value on the attempt's :data:`STARTED` row; :func:`record_episode_end`
+#: copies it onto the :data:`RESOLVED` row, together with whether the
+#: dispatcher that opened the attempt is still alive. That is how
+#: :func:`retry_history` tells "the handler's own child cleared it while its
+#: parent waits for the verdict" (leave the episode open) from "the entry was
+#: cleared by hand after a driver died mid-attempt" (end it). Format:
+#: ``<dispatcher pid>-<nonce>``.
+ATTEMPT_ENV = "VCO_RETRY_ATTEMPT"
+#: The dispatcher's process start token, beside :data:`ATTEMPT_ENV`, so the
+#: liveness check survives pid reuse (``deferral_probes.process_identity_matches``).
+ATTEMPT_DRIVER_TOKEN_ENV = "VCO_RETRY_ATTEMPT_DRIVER_TOKEN"
+
 #: Consecutive blocked passes after which the generic "VCO retries this
 #: itself" stops being the most useful thing to say. Below it the condition is
 #: plausibly transient and the generic disposition is fair; at it, the reader
@@ -619,12 +644,11 @@ def _shared_collection_for(folder: Path, env: Optional[Mapping[str, str]] = None
     carried = (source.get(SEED_CTX_ENV_SHARED_KG_COLLECTION) or "").strip()
     if carried:
         return carried
-    try:
-        data = json.loads((folder / ".claude" / "settings.json").read_text(encoding="utf-8"))
-        value = (data.get("env") or {}).get("SHARED_KG_COLLECTION") or ""
-        return str(value).strip()
-    except Exception:  # noqa: BLE001 — unreadable config ⇒ nothing to target
-        return ""
+    from vco_lib.claude_settings_env import read_settings_env
+
+    # The settings layer as Claude Code merges it (settings.json, then
+    # settings.local.json — v0.2.104 L5); soft-fail ⇒ nothing to target.
+    return str(read_settings_env(folder).get("SHARED_KG_COLLECTION") or "").strip()
 
 
 def retry_kg_seed_shared(ctx: RetryContext) -> RetryResult:
@@ -901,7 +925,8 @@ def attempts_path(folder: Path) -> Path:
 
 
 def attempt_count(folder: Path, condition_id: str) -> int:
-    """How many times a handler for this condition has been STARTED here.
+    """How many times a handler for this condition has been STARTED in the
+    CURRENT episode here (:func:`retry_history` defines the episode).
 
     Counts :data:`STARTED` rows only — exactly one per dispatched handler
     invocation, written BEFORE the handler runs. Counting outcome rows instead
@@ -911,36 +936,29 @@ def attempt_count(folder: Path, condition_id: str) -> int:
 
     An unreadable/absent trail counts as zero attempts — the cap protects
     against looping, and a missing log is not evidence that the cap was
-    reached.
+    reached. ONE home with :func:`retry_history`, so the dispatcher's gate,
+    ``vco doctor`` and the disposition note can never count differently.
+    """
+    return retry_history(folder, condition_id).attempts
+
+
+def record_attempt(
+    folder: Path, result: RetryResult, extra: Optional[Mapping[str, object]] = None,
+) -> None:
+    """Append one attempt row. Best-effort — observability never gates work.
+
+    ``extra`` adds fields beside the four standard ones (the attempt id on a
+    :data:`STARTED` row, the attempt context on a :data:`RESOLVED` row); it
+    never overrides them.
     """
     path = attempts_path(folder)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return 0
-    n = 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get("condition_id") == condition_id and row.get("status") == STARTED:
-            n += 1
-    return n
-
-
-def record_attempt(folder: Path, result: RetryResult) -> None:
-    """Append one attempt row. Best-effort — observability never gates work."""
-    path = attempts_path(folder)
-    row = {
+    row: dict[str, object] = dict(extra or {})
+    row.update({
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "condition_id": result.condition_id,
         "status": result.status,
         "detail": result.detail,
-    }
+    })
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
@@ -982,8 +1000,44 @@ class RetryHistory:
         return self.attempts >= MAX_ATTEMPTS
 
 
+#: Row statuses that END an episode (see :func:`retry_history`).
+_EPISODE_END_STATUSES = frozenset({RETRIED, RESOLVED})
+#: Row statuses that close an OPEN attempt (the dispatcher's verdict row).
+_ATTEMPT_OUTCOME_STATUSES = frozenset({RETRIED, FAILED, INCONCLUSIVE, SKIPPED})
+
+
 def retry_history(folder: Path, condition_id: str) -> RetryHistory:
-    """Summarise ``condition_id``'s trail in ``folder``. Never raises.
+    """Summarise ``condition_id``'s CURRENT EPISODE in ``folder``. Never raises.
+
+    **Episodes (v0.2.104).** The trail is append-only and lives as long as the
+    project, but the cap is about one occurrence of a condition: "a retry that
+    failed three times is not transient". Counting the whole file instead
+    (pre-fix) meant a condition fixed three times over the months — each time
+    by a COMPLETED retry — came back and was reported as "ran 3 times and has
+    STOPPED" before VCO had retried it once. So every count here covers only
+    the rows AFTER the last row that ended an episode:
+
+    * :data:`RETRIED` — the dispatcher's own verdict that the handler ran AND
+      the child's paired clear removed the entry (it re-reads the ledger
+      before writing it, so this row is proof for every emitter alike);
+    * :data:`RESOLVED` — :func:`record_episode_end`: the entry was cleared by
+      something else (the resync driver run by hand, an update's
+      positive-zero probe). Ignored in exactly one case: it was written
+      INSIDE the attempt that is still open (its ``attempt`` field equals the
+      open :data:`STARTED` row's) while that attempt's dispatcher was alive —
+      the handler's own child at work, whose attempt's verdict row decides (a
+      child that clears and re-emits must not reset the cap each attempt and
+      loop forever). Every other clear ends the episode, including one that
+      lands while a :data:`STARTED` row has no verdict because its driver was
+      SIGKILLed / the machine rebooted mid-walk (R1 M1): a dangling attempt
+      must not latch the episode open forever.
+
+    Why not the ledger entry's ``detected_at`` instead: most retryable
+    emitters re-emit WITHOUT ``keep_first_detected``, so ``detected_at`` moves
+    on every re-emission — including a failed retry's own — and a cap scoped
+    to it would never engage. The trail's own episode-end rows have no such
+    hole. :data:`MAX_ATTEMPTS` therefore means "per episode": a genuinely
+    stuck current episode still stops at the cap.
 
     An absent or unreadable trail yields an all-zero history — the same
     posture :func:`attempt_count` takes, and for the same reason: a missing
@@ -998,6 +1052,8 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
     attempts = blocked = streak = 0
     streak_first = streak_last = streak_detail = ""
     last_status = ""
+    in_attempt = False
+    open_attempt = ""
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -1011,8 +1067,22 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
         status = str(row.get("status") or "")
         ts = str(row.get("ts") or "")
         last_status = status or last_status
+        if status in _EPISODE_END_STATUSES and not (
+            status == RESOLVED and in_attempt and _is_own_childs_clear(row, open_attempt)
+        ):
+            # Episode over: what follows is a NEW occurrence of the condition.
+            attempts = blocked = streak = 0
+            streak_first = streak_last = streak_detail = ""
+            in_attempt = False
+            open_attempt = ""
+            continue
         if status == STARTED:
             attempts += 1
+            in_attempt = True
+            open_attempt = str(row.get("attempt") or "")
+        elif status in _ATTEMPT_OUTCOME_STATUSES:
+            in_attempt = False
+            open_attempt = ""
         if status == BLOCKED:
             blocked += 1
             streak = streak + 1 if streak else 1
@@ -1034,6 +1104,79 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
         streak_last_detail=streak_detail,
         last_status=last_status,
     )
+
+
+def _is_own_childs_clear(row: Mapping[str, object], open_attempt: str) -> bool:
+    """Was this :data:`RESOLVED` row written by the OPEN attempt's own child?
+
+    True only when the row names that attempt AND did not record its
+    dispatcher as gone. A row with no ``attempt`` (a hand-run driver, an
+    update's clear) or one naming another attempt is an external clear.
+    """
+    attempt = str(row.get("attempt") or "")
+    if not attempt or attempt != open_attempt:
+        return False
+    return row.get("attempt_driver_alive") is not False
+
+
+def _new_attempt_id() -> str:
+    import uuid
+
+    return f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+def _attempt_driver_alive(attempt: str, token: Optional[str]) -> Optional[bool]:
+    """Is the dispatcher that opened ``attempt`` still running? Tri-state.
+
+    ``None`` = cannot tell (unparsable id, probe failure) — the caller keeps
+    the row's attempt context and :func:`_is_own_childs_clear` reads a
+    missing verdict as alive, the direction that cannot loop.
+    """
+    try:
+        pid = int(attempt.split("-", 1)[0])
+    except ValueError:
+        return None
+    if pid == os.getpid():
+        return True
+    try:
+        from vco_lib.deferral_probes import pid_is_alive, process_identity_matches
+
+        if not pid_is_alive(pid):
+            return False
+        return process_identity_matches(pid, token or None) is not False
+    except Exception:  # noqa: BLE001 — cannot tell
+        return None
+
+
+def record_episode_end(folder: Path, condition_id: str, detail: str) -> None:
+    """Mark that ``condition_id``'s entry was CLEARED outside this dispatcher.
+
+    Writes one :data:`RESOLVED` row, which closes the current episode for
+    :func:`retry_history` (and so for the cap and the disposition note). Only
+    conditions this dispatcher can retry get a row — the trail is the retry
+    record, not a general clear log. Best-effort, never raises: a missing row
+    only means the next occurrence inherits this episode's count, the
+    conservative direction.
+
+    When the clear happens inside a dispatched attempt (:data:`ATTEMPT_ENV`
+    is set — the handler's child, or anything it spawned), the row carries
+    that attempt's id and whether its dispatcher is still alive, which is
+    what lets :func:`retry_history` keep a live attempt's own clear from
+    resetting the cap while an orphaned or later clear still ends the episode.
+    """
+    try:
+        if handler_name_for(condition_id) is None:
+            return
+    except Exception:  # noqa: BLE001 — bookkeeping never fails the clear
+        return
+    extra: dict[str, object] = {}
+    attempt = (os.environ.get(ATTEMPT_ENV) or "").strip()
+    if attempt:
+        extra["attempt"] = attempt
+        alive = _attempt_driver_alive(attempt, os.environ.get(ATTEMPT_DRIVER_TOKEN_ENV))
+        if alive is not None:
+            extra["attempt_driver_alive"] = alive
+    record_attempt(folder, RetryResult(condition_id, RESOLVED, detail), extra)
 
 
 def retry_disposition_note(folder: Path, condition_id: str) -> str:
@@ -1537,11 +1680,14 @@ def _dispatch_pass(
                 continue
         # Recorded BEFORE the handler runs: a crash must still consume its
         # attempt, or the cap can never engage on a handler that always dies.
-        record_attempt(folder, RetryResult(cid, STARTED, f"handler {name}"))
+        attempt = _new_attempt_id()
+        record_attempt(
+            folder, RetryResult(cid, STARTED, f"handler {name}"), {"attempt": attempt},
+        )
         # S2 heartbeat: the staleness bound covers ONE handler's silence, so
         # a pass of several hours-long seeds never ages this driver out.
         _heartbeat_lock(folder)
-        result = handler.run(ctx)
+        result = _run_handler_in_attempt(folder, cid, handler, ctx, attempt)
         if result.status == RETRIED:
             cleared = condition_cleared(folder, cid)
             trail(
@@ -1564,6 +1710,43 @@ def _dispatch_pass(
             _record_resolution(folder, cid, result.detail)
         results.append(result)
     return results
+
+
+def _run_handler_in_attempt(
+    folder: Path, cid: str, handler: Handler, ctx: RetryContext, attempt: str,
+) -> RetryResult:
+    """Run ``handler`` with :data:`ATTEMPT_ENV` naming ``attempt``.
+
+    The env pair is what a child's clear copies onto its :data:`RESOLVED` row
+    (:func:`record_episode_end`); it is restored afterwards so nothing outside
+    the attempt inherits it. A handler that RAISES still gets a verdict row
+    (R1 M1): an exception must not leave the attempt open, or a later
+    external clear would be read as the attempt's own. The exception is then
+    re-raised — the dispatcher does not swallow a crash it cannot judge.
+    """
+    try:
+        from vco_lib.deferral_probes import process_start_token
+
+        token = process_start_token(os.getpid()) or ""
+    except Exception:  # noqa: BLE001 — no token ⇒ liveness by pid only
+        token = ""
+    keys = (ATTEMPT_ENV, ATTEMPT_DRIVER_TOKEN_ENV)
+    prev = {k: os.environ.get(k) for k in keys}
+    os.environ[ATTEMPT_ENV] = attempt
+    os.environ[ATTEMPT_DRIVER_TOKEN_ENV] = token
+    try:
+        return handler.run(ctx)
+    except BaseException as exc:
+        record_attempt(
+            folder, RetryResult(cid, FAILED, f"handler raised {type(exc).__name__}: {exc}"),
+        )
+        raise
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _log_path_for_stamp(stamp: str) -> Optional[Path]:
@@ -1828,6 +2011,7 @@ __all__ = [
     "MAX_ATTEMPTS",
     "PIDFILE_NAME",
     "PIDFILE_STALE_SECONDS",
+    "RESOLVED",
     "RETRIED",
     "SKIPPED",
     "STARTED",
@@ -1849,6 +2033,7 @@ __all__ = [
     "owed_condition_ids",
     "pidfile_path",
     "record_attempt",
+    "record_episode_end",
     "retry_disposition_note",
     "retry_history",
     "retry_code_graph_walk",

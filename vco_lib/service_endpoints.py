@@ -45,6 +45,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import shlex
 import sqlite3
 import subprocess
@@ -63,6 +64,7 @@ __all__ = [
     "RETIRED_APP_STATE_KEYS",
     "RETIRED_ENV_INPUTS",
     "RETIRED_MACHINE_ENV",
+    "ROWS_PENDING_ENV",
     "SERVICES",
     "SOURCES",
     "ApplyChangeReport",
@@ -86,7 +88,9 @@ __all__ = [
     "machine_service_urls",
     "machine_url",
     "machine_weaviate_url",
+    "mark_rows_pending",
     "plan",
+    "pin_process_env",
     "plan_shell_lines",
     "port_of_url",
     "read_row",
@@ -333,8 +337,43 @@ _SELECT = f"SELECT {', '.join(_COLUMNS)} FROM service_endpoints"
 
 _WARNED: set[str] = set()
 
+#: Set to ``"1"`` by install.py while a run that WRITES the rows (step [5b])
+#: has not reached that step on a machine with no rows yet — a first
+#: install. Every child it spawns inherits it. Until then an absent row is
+#: the expected state, not a fault, and the "run ``install.py --update``"
+#: remedy would be false (the run in progress writes them minutes later).
+ROWS_PENDING_ENV = "VCT_SERVICE_ENDPOINT_ROWS_PENDING"
+
+
+def mark_rows_pending(db_path: Optional[Path] = None) -> bool:
+    """Set :data:`ROWS_PENDING_ENV` in this process's env when launcher.db
+    holds no row yet (a first install); ``True`` when it did. A machine
+    that already has rows is left alone — a missing one there is a fault
+    worth the warning."""
+    try:
+        rows = load_rows(db_path)
+    except Exception:  # noqa: BLE001 — an unreadable registry is "no rows yet"
+        rows = {}
+    if rows:
+        return False
+    os.environ[ROWS_PENDING_ENV] = "1"
+    return True
+
+
+def pin_process_env(rows: Mapping[str, "EndpointRow"]) -> None:
+    """Pin this process's env to *rows*' transport (:func:`transport_env`) and
+    end the first-install grace (:data:`ROWS_PENDING_ENV`): the rows are
+    decided now, so a later absent row is reported again."""
+    os.environ.update(transport_env(rows))
+    os.environ.pop(ROWS_PENDING_ENV, None)
+
 
 def _warn_default_once(service: str, why: str) -> None:
+    if os.environ.get(ROWS_PENDING_ENV) == "1":
+        _LOG.debug("service_endpoints: no %s row yet (%s) — this install writes it "
+                   "at step [5b]; answering the compiled default %s until then",
+                   service, why, render_url(service, None))
+        return
     if service in _WARNED:
         return
     _WARNED.add(service)

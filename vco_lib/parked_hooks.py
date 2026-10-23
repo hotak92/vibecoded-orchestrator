@@ -97,7 +97,8 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 from vco_lib.hook_relative_paths import emit_relative_hooks_deferral
 from vco_lib.hook_retirements import (
-    carry_parked_async_disables, normalize_command, vco_hook_script_identity,
+    carry_parked_async_disables, normalize_command, sibling_matchers,
+    vco_hook_script_identity,
 )
 from vco_lib.hooks_settings import normalize_matcher
 from vco_lib.jsonc_edit import load_object
@@ -110,6 +111,7 @@ __all__ = [
     "ParkedHooksState",
     "find_parked_match",
     "live_hook_identities",
+    "live_hook_registrations",
     "read_parked_hooks",
     "CONFLICT_CID",
     "conflict_still_present",
@@ -191,6 +193,7 @@ def find_parked_match(
     template_groups: Iterable[Any],
     *,
     live_identities: Optional[Iterable[str]] = None,
+    live_registrations: Optional[Iterable[tuple[str, str, str]]] = None,
 ) -> Optional[ParkedHook]:
     """The parked row that covers the template registration
     ``(event, matcher, command)``, or ``None``.
@@ -211,6 +214,18 @@ def find_parked_match(
     on some event was turned off on ONE event only, so the new event is
     added as before. Script identity only: an inline command has no identity
     and never carries. ``None`` (the default) is the event-scoped rule alone.
+
+    ``live_registrations`` (v0.2.104, FINAL4 NIT 3): the ``(event, matcher,
+    script identity)`` registrations the user's settings.json holds before
+    the merge (:func:`live_hook_registrations`). A row parked under a
+    declared SIBLING matcher covers the added registration only while the
+    row's own registration is absent from the file: a parked ``startup`` row
+    whose line the user put back by hand is stale — the hook runs again — so
+    it no longer keeps the ``resume|clear|compact`` twin out. That is the
+    rule the launcher's Hooks tab and the hub's ``vct-cli hooks`` apply to
+    the same state (a parked row whose registration is present in the file
+    covers nothing). ``None`` (the default) cannot tell, and keeps the
+    sibling rule as it was.
     """
     candidates = [
         p for p in parked if p.event == event and same_hook_command(p.command, command)
@@ -222,6 +237,38 @@ def find_parked_match(
             return p
     shipped_under = _template_matchers_for(command, template_groups)
     if len(shipped_under) != 1:
+        # v0.2.104: a registration the template ADDED beside an existing one
+        # of the same script (``hook_retirements.MATCHER_SIBLINGS`` —
+        # session-start-ensure-hub's `resume|clear|compact` group mirrors its
+        # `startup` one) is covered by a row parked under that sibling: the
+        # user switched the hook off, and an upgrade that adds a matcher must
+        # not switch it partly back on. Any other ambiguous drift stays
+        # unmatched, as before.
+        ident = vco_hook_script_identity(command)
+        siblings = sibling_matchers(event, matcher, ident)
+        present = set(live_registrations) if live_registrations is not None else set()
+        for p in candidates:
+            if p.matcher in siblings and (p.event, p.matcher, ident) not in present:
+                return p
+        # Review R29 (LOW): the declared siblings are ONE hook, so for the
+        # drifted-matcher inference below they count as one matcher. A row
+        # parked under a matcher the template does not use (the user
+        # regrouped the hook, then disabled it) covers every registration of
+        # that one hook — provided the hook runs on NO event in the user's
+        # file: a hook still running somewhere was switched off for one
+        # matcher only (a stale row), so the new registration is added.
+        # Without ``live_identities`` that cannot be told apart: no guess.
+        added = {
+            m for m in shipped_under
+            if any(s in shipped_under for s in sibling_matchers(event, m, ident))
+        }
+        if (
+            len(shipped_under - added) == 1
+            and ident is not None
+            and live_identities is not None
+            and ident not in set(live_identities)
+        ):
+            return candidates[0]
         return None
     # The template ships this hook under ONE matcher, so a parked row under a
     # matcher it no longer uses can only mean this registration.
@@ -261,6 +308,29 @@ def live_hook_identities(hooks_block: Any) -> set[str]:
                 ident = vco_hook_script_identity(cmd) if isinstance(cmd, str) and cmd else None
                 if ident:
                     live.add(ident)
+    return live
+
+
+def live_hook_registrations(hooks_block: Any) -> set[tuple[str, str, str]]:
+    """Every ``(event, matcher, script identity)`` a settings.json ``hooks``
+    block registers — the ``live_registrations`` input of
+    :func:`find_parked_match`. The matcher is the group's
+    :func:`vco_lib.hooks_settings.normalize_matcher` value; inline commands
+    (no identity) and malformed shapes contribute nothing."""
+    live: set[tuple[str, str, str]] = set()
+    if not isinstance(hooks_block, dict):
+        return live
+    for event, groups in hooks_block.items():
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict):
+                continue
+            matcher = normalize_matcher(group)
+            inner = group.get("hooks")
+            for item in inner if isinstance(inner, list) else []:
+                cmd = item.get("command") if isinstance(item, dict) else None
+                ident = vco_hook_script_identity(cmd) if isinstance(cmd, str) and cmd else None
+                if ident:
+                    live.add((str(event), matcher, ident))
     return live
 
 

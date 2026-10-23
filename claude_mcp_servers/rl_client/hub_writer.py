@@ -237,15 +237,20 @@ def _bump_episode_ledger_line(episode_id: str, suppressed: int) -> None:
     """
     try:
         from vco_lib.atomic import atomic_write_text, exclusive_file_lock
-        from vco_lib.rl_telemetry_loss import loss_log_path
+        from vco_lib.rl_telemetry_loss import (
+            drain_pending_locked, lock_path, loss_log_path, pending_dir,
+        )
 
         path = loss_log_path()
-        if not path.exists():
+        if not path.exists() and not pending_dir(path).exists():
             return
         marker = f'"episode":"{episode_id}"'
-        with exclusive_file_lock(
-            path.with_name(path.name + ".lock"), timeout_s=_EPISODE_LOCK_TIMEOUT_S
-        ):
+        with exclusive_file_lock(lock_path(path), timeout_s=_EPISODE_LOCK_TIMEOUT_S):
+            # Fold in lines a writer spilled while the lock was busy (v0.2.104)
+            # — the episode's own first line may be one of them.
+            drain_pending_locked(path)
+            if not path.exists():
+                return
             lines = path.read_text(encoding="utf-8").splitlines()
             for i in range(len(lines) - 1, -1, -1):
                 if marker not in lines[i]:

@@ -810,6 +810,20 @@ export interface ImportableSecretKey {
   already_in_keychain: boolean;
 }
 
+/** v0.2.104 (R22 NIT-C): the secret names the hub serves ONLY from VCO's
+ *  Shared slot (`slot_exclusive` in `vct-module.json` `bundled_secrets`, read
+ *  by the launcher through the same helper the hub uses). Advisory — any
+ *  failure answers `[]` (no hint), never an error. */
+export async function listSlotExclusiveSecretNames(): Promise<string[]> {
+  if (!tauriAvailable()) return [];
+  try {
+    return await invoke<string[]>('list_slot_exclusive_secret_names', {});
+  } catch (e) {
+    console.debug('list_slot_exclusive_secret_names failed', e);
+    return [];
+  }
+}
+
 /** Enumerate importable secret keys from the canonical on-disk sources.
  *  Returns one row per (key, source) pair. The list is deterministic
  *  across calls (sorted by source-priority then filename). */

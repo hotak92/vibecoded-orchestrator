@@ -41,11 +41,17 @@ When to use:
 The `pre-compact-save.sh` hook runs before compaction and saves git status +
 recently modified files to `.claude/context/pre-compact-snapshot.md`.
 
-After compaction, `compact-context-reinject.sh` re-injects:
+After compaction, Claude Code itself re-attaches up to five recently read or
+edited files (over 5,000 tokens: path only), CLAUDE.md, auto memory and a fresh
+git status. `compact-context-reinject.sh` adds:
 - `CONTEXT_STATE.md` (current task state)
-- Recent git commits (last 10)
 - Active plan summary (first 30 lines from `.claude/context/plans/`)
-- The pre-compaction snapshot
+- The pre-compaction snapshot (recently modified files; its git-status block
+  is left to the harness's fresh one)
+
+A file the harness re-attached with its whole content stays writable (Build
+Anchor finds it in the session transcript); any other file needs a `Read`
+before a `Write`.
 
 Tips: include the file or module name in the focus (`/compact auth/jwt.py`);
 CONTEXT_STATE.md and active plans come back automatically.

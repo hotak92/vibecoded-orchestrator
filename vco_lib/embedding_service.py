@@ -483,15 +483,48 @@ def _failure_jsonl_path() -> Path:
     return claude_metrics_dir() / "embedding_failures.jsonl"
 
 
+def _project_surface_root(install_root: Path | None) -> Path | None:
+    """The folder whose per-project failure surfaces (the ``.md`` hint and the
+    ``UPDATE_DEFERRED`` ledger + ``CLAUDE.md`` reminder) this run may touch, or
+    None.
+
+    Only a VCO project/install qualifies — the marker rule of
+    :func:`vco_lib.project_root.looks_like_vco_project` (``.claude/settings.json``
+    or ``.claude/env``). The cwd rung of :func:`_detect_project_root` already
+    required it, but the explicit / ``KG_BASE_DIR`` / ``VCT_ORCHESTRATOR_ROOT``
+    rungs accept ANY existing folder — and a bare source checkout (a CI clone of
+    the orchestrator repo, which every spawned child inherits as
+    ``VCT_ORCHESTRATOR_ROOT``) then got a ledger rendered into it and a
+    "Pending VCO action" block spliced into its TRACKED ``CLAUDE.md``. A folder
+    that is not a VCO project has no launcher banner and no session that reads
+    its ledger, so the row informs nobody there; the machine-level JSONL log
+    (:func:`_write_failure_jsonl`) still records the outage. "Could not
+    confirm" ⇒ do nothing (the project_root rule: writers skip, never guess).
+    """
+    if install_root is None:
+        return None
+    from vco_lib.project_root import looks_like_vco_project  # noqa: PLC0415
+
+    if not looks_like_vco_project(install_root):
+        logger.debug(
+            "embedding failure surfaces skipped for %s: not a VCO project "
+            "(no .claude/settings.json or .claude/env)", install_root,
+        )
+        return None
+    return install_root
+
+
 def _failure_markdown_path(install_root: Path | None) -> Path | None:
     """``<install_root>/.claude/context/EMBEDDING_FAILURES.md``.
 
     Returns None if ``install_root`` is None (module-level discovery
-    failures have no project to write the hint into).
+    failures have no project to write the hint into) or is not a VCO
+    project (:func:`_project_surface_root`).
     """
-    if install_root is None:
+    root = _project_surface_root(install_root)
+    if root is None:
         return None
-    return install_root / ".claude" / "context" / "EMBEDDING_FAILURES.md"
+    return root / ".claude" / "context" / "EMBEDDING_FAILURES.md"
 
 
 def _write_failure_jsonl(exc: NoEmbeddingBackendError) -> None:
@@ -554,7 +587,8 @@ This file is auto-cleared the next time
 def _write_failure_markdown(exc: NoEmbeddingBackendError) -> None:
     """Write the Claude-readable hint file (soft-fail).
 
-    Skips when ``install_root`` is None (no project context).
+    Skips when ``install_root`` is None (no project context) or is not a VCO
+    project (:func:`_project_surface_root`).
     """
     path = _failure_markdown_path(exc.install_root)
     if path is None:
@@ -619,10 +653,12 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
     + the EMBEDDING_FAILURES.md hint) so the GUI deferral banner can pick
     up the failure without reading our private files.
 
-    Skips when ``install_root`` is None (no project to write into).
+    Skips when ``install_root`` is None or not a VCO project
+    (:func:`_project_surface_root` — no project to write into).
     Soft-fail on any error — never propagates.
     """
-    if exc.install_root is None:
+    root = _project_surface_root(exc.install_root)
+    if root is None:
         return
     try:
         # Local import: avoid circular-import risk if deferral_emit ever
@@ -662,13 +698,13 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
         kg_refs: list[str] = []
         if hint_md is not None:
             try:
-                kg_refs.append(str(hint_md.relative_to(exc.install_root)))
+                kg_refs.append(str(hint_md.relative_to(root)))
             except ValueError:
                 kg_refs.append(str(hint_md))
         kg_refs.append(str(_failure_jsonl_path()))
 
         emit(
-            exc.install_root,
+            root,
             DeferralEntry(
                 condition_id=_DEFERRAL_CONDITION_ID,
                 title="Embedding backend unreachable; KG seed deferred",
@@ -687,10 +723,24 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
 def _clear_failure_deferral(install_root: Path | None, *, code_backend_ok: bool = True) -> None:
     """Mark the ``kg_summary_no_backend`` entry resolved (paired with success).
 
-    No-op if there's no deferral file or no matching entry. Soft-fail.
+    No-op if there's no deferral file or no matching entry. A root that is
+    not a VCO project (:func:`_project_surface_root`) is resolved ONLY when its
+    ledger file already exists: even a no-op resolve opens the ledger lock,
+    creating ``.claude/context/`` in a folder that never had one, but a ledger
+    a pre-v0.2.104 run rendered there (it had no project gate) would otherwise
+    never clear (R32 NIT). Resolving it only removes this module's own rows.
+    Soft-fail.
     """
-    if install_root is None:
-        return
+    root = _project_surface_root(install_root)
+    if root is None:
+        if install_root is None:
+            return
+        from vco_lib.deferral_report import _DEFERRED_JSON_REL, _DEFERRED_REL  # noqa: PLC0415
+
+        if not ((install_root / _DEFERRED_REL).exists()
+                or (install_root / _DEFERRED_JSON_REL).exists()):
+            return
+        root = install_root
     try:
         # v0.2.83 (WP-B1): resolve through the ONE emitter home — the locked
         # read-modify-write reads the current report, tombstones + drops the
@@ -703,7 +753,7 @@ def _clear_failure_deferral(install_root: Path | None, *, code_backend_ok: bool 
             from vco_lib.embedding_pull_plan import CODE_EMBED_UNAVAILABLE_CID
 
             ids += (CODE_EMBED_UNAVAILABLE_CID,)
-        resolve_conditions(install_root, ids, log=logger)
+        resolve_conditions(root, ids, log=logger)
     except Exception as e:  # noqa: BLE001 — soft-fail; success path must not fail
         logger.debug("Failed to clear embedding failure deferral entry: %s", e)
 

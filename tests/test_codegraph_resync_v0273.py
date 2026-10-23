@@ -117,7 +117,10 @@ def test_resume_command_is_shlex_quoted(monkeypatch, tmp_path):
 
         parts = shlex.split(cmd)
         assert str(repo) in parts
-        assert parts[-2:] == ["--project", "MyProj"]
+        # v0.2.104 (G5): the printed command is the resync DRIVER.
+        i = parts.index("--project")
+        assert parts[i + 1] == "MyProj"
+        assert "--run-resync" in parts
 
 
 # ─────────────────── R-6: gate the trigger on owed work ───────────────────
@@ -473,13 +476,18 @@ def test_install_shim_resolves_ledger_on_not_owed():
     out of install.py into ``codegraph_resync.report_trigger_result`` (the
     install line ratchet answered by EXTRACTION, per its own rule), so the
     guard pins BOTH halves — the vco_lib home owns the branch (via the
-    module's ONE condition-id constant), and install.py delegates to it."""
+    module's ONE condition-id constant), and install.py delegates to it.
+    v0.2.104: the spawn + report chain moved on into
+    ``codegraph_resync.trigger_update_resync`` (install line ratchet again);
+    install.py hands it PROJECT_ROOT, and the end-to-end behaviour is pinned
+    by ``test_v0283_embed_resync_selfclear_pin``."""
     src = (REPO_ROOT / "vco_lib" / "codegraph_resync.py").read_text(encoding="utf-8")
     assert 'result.status == "not_owed"' in src
     assert 'mark_resolved(_CONDITION_ID)' in src
     assert '_CONDITION_ID = "codegraph_embed_resync_pending"' in src
+    assert "report_trigger_result(result, project_name, deferral_report" in src
     install_src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
-    assert "report_trigger_result(result, project_name, deferral_report" in install_src
+    assert "trigger_update_resync(PROJECT_ROOT," in install_src
 
 
 # ─────────── R-7: driver runs analyzer, verifies, defers one-time ───────────
@@ -550,8 +558,11 @@ def test_driver_unconverged_records_one_time_deferral(monkeypatch, tmp_path):
     entry = [e for e in rep.entries
              if e.condition_id == "codegraph_embed_resync_pending"][0]
     assert "42" in entry.detected
-    # The resume command reruns the exact analyzer argv (incl. prune flag).
-    assert "--prune-stale" in entry.command_to_apply
+    # v0.2.104 (R1 L2): the printed recovery is the resync DRIVER and never
+    # carries --prune-stale (it deletes the rows an unconverged walk left
+    # unvisited) even though this run was started with it.
+    assert "--prune-stale" not in entry.command_to_apply
+    assert "--run-resync" in entry.command_to_apply
     assert "MyProj" in entry.command_to_apply
     # --prune-stale reached the analyzer argv too.
     assert "--prune-stale" in rec.calls[0]["argv"]

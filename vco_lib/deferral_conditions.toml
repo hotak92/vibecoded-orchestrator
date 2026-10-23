@@ -341,7 +341,7 @@ owner = "vco_lib.service_reconcile"
 clear_probe = "probe:py:adopted_service_config_drift_persists"
 emit_surfaces = ["ledger"]
 dismiss_key = ["service", "drift_keys"]
-notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). True of the machine while it lasts; VCO never recreates an adopted container. The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2)."""
+notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). v0.2.104: or on an image OLDER than the one VCO's compose pins (key `image`; e.g. an Ollama too old for the summary-tier models). True of the machine while it lasts; VCO never recreates an adopted container. The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2). The probe inspects only the adopted rows' own containers, so an unrelated container vanishing mid-probe no longer leaves it undetermined."""
 
 [conditions.service_adopted_without_prompt]
 class = "informational_record"
@@ -1245,6 +1245,54 @@ nothing (review R2 F18). The refresh also clears the entry (paired) once \
 nothing remains, trailing each removed key NAME in auto-resolutions.jsonl; an \
 unanswerable check keeps it (reconciler reads None as "keep")."""
 
+[conditions.settings_local_json_tracked]
+class = "action_required"
+owner = "vco_lib.settings_local_env"
+clear_probe = "probe:py:settings_local_json_still_tracked"
+emit_surfaces = ["ledger"]
+notes = """v0.2.104 L5 (review R14B B1). Git tracks the project's \
+`.claude/settings.local.json`, the per-machine file VCO's env projection writes \
+this machine's absolute paths, launcher ids and service ports into. An exclude \
+line never un-tracks a committed file, so VCO writes NO machine value there and \
+keeps the pre-L5 layout (every key in `.claude/settings.json`) for routing. \
+Emitted by the env projection (`config_projection._write_local_settings_surface`) \
+and by `settings_local_env.move_machine_env_out_of_settings` (root install); \
+cleared by the same writer once git no longer tracks the file (paired) and by the \
+probe (None — keep — when git cannot say). Remedy: `git rm --cached \
+.claude/settings.local.json` + commit, then an env refresh."""
+
+[conditions.settings_local_layer_unknown]
+class = "environmental"
+owner = "vco_lib.settings_local_env"
+clear_probe = "probe:py:settings_local_layer_still_unknown"
+emit_surfaces = ["ledger"]
+dismiss_key = ["git_error"]
+notes = """v0.2.104 (review R18 LOW-3). Git gave no clean answer about the \
+project's `.claude/settings.local.json` — it refuses the repository (`safe.directory` \
+"detected dubious ownership": another owner, a mounted drive, WSL) or the `.git` is \
+damaged — so VCO cannot prove the per-machine file stays out of commits and writes \
+NO machine value there: the pre-L5 layout stays (every key in `.claude/settings.json`). \
+A true description of the machine while git keeps refusing; the entry names git's \
+error line and the remedy (inspect with `git status`; trust the folder with \
+`safe.directory` only if the user does). Emitted with one WARNING log line by the same \
+writers as `settings_local_json_tracked` (`settings_local_env.sync_tracked_entry`); \
+cleared by them once git answers (paired) and by the probe, which re-asks the SAME \
+`layer_state` the writer gates on. `vco verify-env-projection` lists it as a notice."""
+
+[conditions.settings_local_user_value_kept]
+class = "informational_record"
+owner = "vco_lib.settings_local_env"
+clear_probe = "probe:py:settings_local_user_values_still_kept"
+emit_surfaces = ["ledger"]
+notes = """v0.2.104 L5 (review R14B B6). A machine-local key in \
+`.claude/settings.local.json` holds a value VCO did not write (neither its \
+projection nor a value recorded in `.claude/state/settings-local-vco-values.json`, \
+VCO's `.claude/env` managed block or `settings.json`). Claude Code gives that \
+file precedence, so it is the user's override; VCO keeps it and records the \
+keys here. Nothing is pending. Cleared by the writer when no such key remains \
+(paired) and by the probe, which compares with VCO's last projection (the \
+`.claude/env` managed block)."""
+
 [conditions.user_owned_secret_value_in_tree]
 class = "action_required"
 owner = "vco_lib.user_owned_secrets"
@@ -1546,8 +1594,10 @@ auto-retryable entry is right) from `BULK_EXIT_NO_BACKEND` (3 — no backend \
 selectable at all, mapped to the sibling environmental condition \
 `kg_node_formats_backend_unavailable` instead, because a full-sync retry \
 cannot fix a missing backend and would compete with the code-graph walk). \
-A permanent model refusal is FINAL (owner ruling 2026-10-14) and exits 0 — \
-it never arms this retry. There is no whole-run wall-clock cap any more \
+A model's content refusal exits 0 and never arms this retry: the node is \
+flagged `refused` in the sidecar, kept without a summary and retried by the \
+next ordinary sync (owner ruling 2026-10-18, superseding the 2026-10-14 \
+"final" ruling). There is no whole-run wall-clock cap any more \
 (review H-3): per-LLM-call timeouts bound a hung backend and the sidecar is \
 saved incrementally after each node. `retry_action` reuses the EXISTING \
 `retry:py:kg_seed` handler rather than declaring a new one: that handler \

@@ -41,6 +41,7 @@
       "Bash(wget * | sh*)"
     ]
   },
+  "idleCompaction": false,
   "skillOverrides": {
     "loop": "user-invocable-only"
   },
@@ -122,6 +123,17 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/kg-update-nudge.sh\"",
             "timeout": 4
+          }
+        ]
+      },
+      {
+        "matcher": "resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh\"",
+            "timeout": 5,
+            "async": true
           }
         ]
       }
@@ -684,7 +696,7 @@
         ]
       },
       {
-        "matcher": "ScheduleWakeup|CronCreate|Monitor",
+        "matcher": "ScheduleWakeup|CronCreate",
         "hooks": [
           {
             "type": "command",

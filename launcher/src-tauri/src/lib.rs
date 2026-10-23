@@ -3292,6 +3292,7 @@ pub fn run() {
             // GAP-2 (2026-07-14): per-project bulk "disable shared secrets"
             // opt-out toggle (mirror of the shared-KG read gate).
             commands::secrets_cmd::get_shared_secrets_read_disabled_cmd,
+            commands::secrets_cmd::list_slot_exclusive_secret_names,
             commands::secrets_cmd::set_shared_secrets_read_disabled,
             // 0.2.x backlog #3: shared-tab key-collision shadow badge.
             commands::secrets_cmd::list_user_secret_keys_v2,

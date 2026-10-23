@@ -15,7 +15,8 @@ REM
 REM By default the uninstaller is interactive and prompts before each
 REM destructive step. It stops the model gateway, vct-hub and the VCO launcher first, then
 REM removes the WHOLE VCO state dir (%USERPROFILE%\.vct or VCT_STATE_DIR,
-REM RL training data included). It NEVER touches %USERPROFILE%\.vct-secrets and
+REM RL training data included; a junctioned state dir, or a VCT_STATE_DIR not
+REM named .vct, loses only VCO's own files). It NEVER touches %USERPROFILE%\.vct-secrets and
 REM NEVER touches user source code outside orchestrator-managed paths.
 setlocal enabledelayedexpansion
 

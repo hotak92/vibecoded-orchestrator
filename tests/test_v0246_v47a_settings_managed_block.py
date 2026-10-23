@@ -2,13 +2,15 @@
 
 Pins the behavior matrix documented in install.py::_configure_claude_settings:
 
-* File missing → write VCO defaults (including `_vco_managed_keys`).
+* File missing → write the shipped template + VCO defaults (including
+  `_vco_managed_keys`; v0.2.104 — the same result as replace-all).
 * File parses + has `_vco_managed_keys` → managed-block merge (refresh
   listed keys, preserve every other top-level key).
 * File parses + no `_vco_managed_keys` → legacy: write VCO defaults as
   `settings.json.vco-new` sibling + emit deferral, leave original alone.
 * File parse fails → emit deferral, leave file alone.
-* `adopt_project_mode == "replace-all"` → unconditionally overwrite.
+* `adopt_project_mode == "replace-all"` → unconditionally overwrite (from the
+  shipped template + VCO defaults since v0.2.104).
 * `adopt_project_mode in (None, "adopt")` → use safe matrix above.
 
 Tests intentionally use isolated tmp_path roots so the worktree's own
@@ -55,6 +57,7 @@ def embed_config() -> dict:
 def isolated_project_root(tmp_path: Path, monkeypatch):
     """Re-point install_py.PROJECT_ROOT at a fresh tmp dir for each test."""
     monkeypatch.setattr(install_py, "PROJECT_ROOT", tmp_path)
+    _ship_templates(tmp_path)
     return tmp_path
 
 
@@ -64,6 +67,16 @@ def _settings_file(root: Path) -> Path:
 
 def _vco_new_sibling(root: Path) -> Path:
     return root / ".claude" / "settings.json.vco-new"
+
+
+def _ship_templates(root: Path) -> None:
+    """Replace-all starts from the shipped settings template (v0.2.104), which
+    lives under the install root's ``templates/``."""
+    import shutil
+    repo = Path(__file__).resolve().parent.parent
+    (root / "templates").mkdir(parents=True, exist_ok=True)
+    for name in ("settings.json.linux.template", "settings.json.windows.template"):
+        shutil.copy(repo / "templates" / name, root / "templates" / name)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +377,7 @@ def test_replace_all_overwrites_managed_file(
         "env": {},
         "userExtension": "kept-on-adopt-not-on-replace-all",
     }) + "\n", encoding="utf-8")
+    _ship_templates(isolated_project_root)
 
     install_py._configure_claude_settings(
         embed_config, adopt_project_mode="replace-all",
@@ -386,6 +400,7 @@ def test_replace_all_overwrites_legacy_file_no_sidecar(
     settings_path.write_text(json.dumps({
         "permissions": {"allow": ["legacy"]},
     }) + "\n", encoding="utf-8")
+    _ship_templates(isolated_project_root)
 
     install_py._configure_claude_settings(
         embed_config, adopt_project_mode="replace-all",

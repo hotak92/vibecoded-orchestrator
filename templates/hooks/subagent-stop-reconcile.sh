@@ -520,7 +520,7 @@ if [ "${#KG_FILES[@]}" -gt 0 ]; then
         [ -n "$SESSION_ID" ] && export VCT_SESSION_ID="$SESSION_ID"
         vco_route_init "$SCRIPT_DIR" "$PROJECT_ROOT" "$PY"
         for kf in "${KG_FILES[@]}"; do
-            vco_route_touched_path "$kf" "$SESSION_ID"
+            vco_route_touched_path "$kf" "$SESSION_ID" "$AGENT_ID"
         done
         cd "$PROJECT_ROOT" 2>/dev/null || true
     else

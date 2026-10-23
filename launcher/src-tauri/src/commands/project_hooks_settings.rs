@@ -54,6 +54,11 @@ use tauri::{command, State};
 use tokio::time::timeout;
 
 use crate::db::Db;
+// Review R29 / FINAL4 LOW 3: the two readers of the writer's unit answers
+// live in the shared core so the hub's `vct-cli hooks` routes fold the same.
+use vct_launcher_core::db::project_hooks_settings::{
+    listed_unit_primary, parked_unit_registrations,
+};
 use vct_launcher_core::process::CommandExt as _;
 
 /// Ceiling for one `vco_lib.hooks_settings` call. The work is a single small
@@ -104,6 +109,16 @@ pub struct EffectiveHook {
     /// every rule here, because the toggle acts on the group as a unit:
     /// the writer parks and restores all of its entries together.
     pub if_rules: Vec<String>,
+    /// The OTHER matchers this row also covers (v0.2.104, review R29). EMPTY
+    /// for an ordinary hook. A hook VCO ships under declared sibling matchers
+    /// of one event (`session-start-ensure-hub`: `startup` and
+    /// `resume|clear|compact`) is ONE hook for the user: it renders as one
+    /// row under its primary matcher, and the toggle disables / restores
+    /// every registration together — the Python writer parks them as one
+    /// entry. The sibling table lives in `vco_lib.hook_retirements`
+    /// (`MATCHER_SIBLINGS`); this side only reads the writer's answers
+    /// (`unit_of` on `list`, `siblings` in a parked entry).
+    pub unit_matchers: Vec<String>,
 }
 
 /// What the Hooks tab renders. Carries the honesty flags alongside the rows.
@@ -407,10 +422,18 @@ pub async fn effective_hooks_view(
     // no Rust copy of it). Without this every migrated VCO hook rendered
     // twice: once active with no metadata, once as an orphan row.
     let parked_before = db.list_parked_project_hooks(project_id).unwrap_or_default();
+    // The sibling registrations folded into parked entries (review R29) are
+    // keyed too, so the mirror rows they leave behind match by spelling.
+    let parked_unit_commands: Vec<String> = parked_before
+        .iter()
+        .flat_map(|p| parked_unit_registrations(&p.disabled_entry_json))
+        .map(|(_, c)| c)
+        .collect();
     let row_commands: Vec<&str> = mirror
         .iter()
         .map(|h| h.command.as_str())
         .chain(parked_before.iter().map(|p| p.command.as_str()))
+        .chain(parked_unit_commands.iter().map(String::as_str))
         .collect();
     let keys_arg = serde_json::to_string(&row_commands).unwrap_or_else(|_| "[]".to_string());
 
@@ -452,12 +475,25 @@ pub async fn effective_hooks_view(
 
     let mut hooks: Vec<EffectiveHook> = Vec::new();
     let mut active_keys: Vec<(String, String, String)> = Vec::new();
+    // Registrations rendered INSIDE another row (review R29): an added
+    // sibling the writer folds into its primary (`unit_of`), and the sibling
+    // registrations a parked unit carries. Their mirror rows are not orphans.
+    let mut covered_keys: Vec<(String, String, String)> = Vec::new();
+    // (event, primary matcher, primary key, sibling matcher) — attached to
+    // the primary's row once every active row exists.
+    let mut folded: Vec<(String, String, String, String)> = Vec::new();
     if let Some(arr) = listed.get("hooks").and_then(JsonValue::as_array) {
         for entry in arr {
             let event = entry.get("event").and_then(JsonValue::as_str).unwrap_or("");
             let matcher = entry.get("matcher").and_then(JsonValue::as_str).unwrap_or("");
             let command = entry.get("command").and_then(JsonValue::as_str).unwrap_or("");
             if event.is_empty() || command.is_empty() {
+                continue;
+            }
+            if let Some(primary) = listed_unit_primary(entry) {
+                let key = key_of(command);
+                covered_keys.push((event.to_string(), matcher.to_string(), key.clone()));
+                folded.push((event.to_string(), primary.to_string(), key, matcher.to_string()));
                 continue;
             }
             let if_rule = entry
@@ -498,7 +534,26 @@ pub async fn effective_hooks_view(
                 timeout_ms,
                 state: HookState::Active,
                 if_rules: if_rule.into_iter().collect(),
+                unit_matchers: Vec::new(),
             });
+        }
+    }
+    for (event, primary, key, sibling) in folded {
+        let pos = active_keys
+            .iter()
+            .position(|k| k.0 == event && k.1 == primary && k.2 == key);
+        match pos {
+            Some(pos) if !hooks[pos].unit_matchers.contains(&sibling) => {
+                hooks[pos].unit_matchers.push(sibling)
+            }
+            Some(_) => {}
+            // The writer only folds into a registration present in the same
+            // file, so this is unreachable; were it reached, the sibling
+            // would simply be missing from the view — never shown wrongly.
+            None => tracing::warn!(
+                "[vct] hooks view: no `{}` row under {} to fold `{}` into",
+                primary, event, sibling
+            ),
         }
     }
 
@@ -522,6 +577,13 @@ pub async fn effective_hooks_view(
             continue;
         }
         let if_rules = parked_if_rules(&p.disabled_entry_json);
+        let mut unit_matchers: Vec<String> = Vec::new();
+        for (m, c) in parked_unit_registrations(&p.disabled_entry_json) {
+            covered_keys.push((p.event.clone(), m.clone(), key_of(&c)));
+            if m != p.matcher && !unit_matchers.contains(&m) {
+                unit_matchers.push(m);
+            }
+        }
         hooks.push(EffectiveHook {
             id: Some(p.id),
             event: p.event,
@@ -532,6 +594,7 @@ pub async fn effective_hooks_view(
             timeout_ms: p.timeout_ms,
             state: HookState::Disabled,
             if_rules,
+            unit_matchers,
         });
     }
 
@@ -547,6 +610,7 @@ pub async fn effective_hooks_view(
                 && key_of(&h.command) == key.2
         });
         if active_keys.contains(&key)
+            || covered_keys.contains(&key)
             || rendered_as_parked
             || hooks.iter().any(|h| h.id == Some(row.id))
         {
@@ -562,6 +626,7 @@ pub async fn effective_hooks_view(
             timeout_ms: row.timeout_ms,
             state: HookState::Orphan,
             if_rules: Vec::new(),
+            unit_matchers: Vec::new(),
         });
     }
 
@@ -2817,5 +2882,113 @@ mod tests {
             serde_json::json!([{"event": "Stop", "matcher": "", "command": DRAIN}]),
             "never the parked bytes"
         );
+    }
+
+    // ─── Review R29: declared sibling matchers are ONE hook ─────────────
+
+    /// The shipped hub ensure: its own `startup` registration beside another
+    /// hook, plus the `resume|clear|compact` twin v0.2.104 added
+    /// (`vco_lib.hook_retirements.MATCHER_SIBLINGS`).
+    const HUB: &str = r#"bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh""#;
+    const HUB_SETTINGS: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh\"", "async": true, "timeout": 5 },
+          { "type": "command", "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/context-size-check.sh\"", "timeout": 5 }
+        ]
+      },
+      {
+        "matcher": "resume|clear|compact",
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-ensure-hub.sh\"", "async": true, "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
+"#;
+    const RESUME: &str = "resume|clear|compact";
+
+    /// The mirror rows a bundle scan leaves for both registrations — what
+    /// would render as an orphan were a folded registration not covered.
+    fn mirror_both_hub_rows(f: &Fixture) {
+        for m in ["startup", RESUME] {
+            f.db.register_project_hook(
+                &f.pid, "SessionStart", m, HUB, "bundled", None, None, &serde_json::json!({}),
+            )
+            .unwrap();
+        }
+    }
+
+    fn hub_rows(view: &EffectiveHooksView) -> Vec<&EffectiveHook> {
+        view.hooks.iter().filter(|h| h.command == HUB).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sibling_unit_renders_as_one_row() {
+        let f = Fixture::with_settings(HUB_SETTINGS);
+        mirror_both_hub_rows(&f);
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        let rows = hub_rows(&view);
+        assert_eq!(rows.len(), 1, "one hook, one row: {:?}", rows);
+        assert_eq!(rows[0].state, HookState::Active);
+        assert_eq!(rows[0].matcher, "startup");
+        assert_eq!(rows[0].unit_matchers, vec![RESUME.to_string()]);
+        // Leave-alone: an ordinary hook covers no other matcher.
+        let other = view
+            .hooks
+            .iter()
+            .find(|h| h.command.contains("context-size-check"))
+            .unwrap();
+        assert!(other.unit_matchers.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabling_the_unit_row_parks_every_registration_and_enable_restores_them() {
+        let f = Fixture::with_settings(HUB_SETTINGS);
+        mirror_both_hub_rows(&f);
+        let before = f.json();
+
+        disable_hook(&f.db, &f.pid, "SessionStart", "startup", HUB).await.unwrap();
+        assert!(
+            !f.commands_under("SessionStart").iter().any(|c| c == HUB),
+            "the hook must run on NO session source once disabled"
+        );
+        assert!(
+            f.commands_under("SessionStart").iter().any(|c| c.contains("context-size-check")),
+            "the other hook in the startup group stays"
+        );
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        let rows = hub_rows(&view);
+        assert_eq!(rows.len(), 1, "still one row, now disabled: {:?}", rows);
+        assert_eq!(rows[0].state, HookState::Disabled);
+        assert_eq!(rows[0].unit_matchers, vec![RESUME.to_string()]);
+
+        enable_hook(&f.db, &f.pid, "SessionStart", "startup", HUB).await.unwrap();
+        assert_eq!(f.json(), before, "both registrations restored, in place");
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        assert_eq!(hub_rows(&view).len(), 1);
+        assert_eq!(hub_rows(&view)[0].state, HookState::Active);
+    }
+
+    /// The hub's `PATCH /hooks/{id}` toggles by mirror row, so the resume row
+    /// can be the one disabled: the same writer parks the whole hook under it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabling_via_the_added_registration_also_parks_the_whole_hook() {
+        let f = Fixture::with_settings(HUB_SETTINGS);
+        mirror_both_hub_rows(&f);
+        let before = f.json();
+        disable_hook(&f.db, &f.pid, "SessionStart", RESUME, HUB).await.unwrap();
+        assert!(!f.commands_under("SessionStart").iter().any(|c| c == HUB));
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        let rows = hub_rows(&view);
+        assert_eq!(rows.len(), 1, "{:?}", rows);
+        assert_eq!(rows[0].state, HookState::Disabled);
+        assert_eq!(rows[0].unit_matchers, vec!["startup".to_string()]);
+        enable_hook(&f.db, &f.pid, "SessionStart", RESUME, HUB).await.unwrap();
+        assert_eq!(f.json(), before);
     }
 }

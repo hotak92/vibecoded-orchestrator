@@ -198,3 +198,29 @@ def test_a_fixture_root_is_not_the_checkout(tmp_path: Path):
     (tmp_path / "CLAUDE.md").write_text("# fixture\n", encoding="utf-8")
     (tmp_path / ".claude" / "context" / "UPDATE_DEFERRED.md").write_text("x", encoding="utf-8")
     assert _suite.consume_state_write_attempts() == []
+
+
+def test_the_subprocess_leg_names_what_the_writer_left(tmp_path: Path):
+    """v0.2.104: a red W-CHECKOUT-LEDGER names the ledger rows it found —
+    the condition id names the emitter — because the writer can be a detached
+    child of a much earlier test and the CI log is the only evidence."""
+    ctx = tmp_path / ".claude" / "context"
+    ctx.mkdir(parents=True)
+    (ctx / "UPDATE_DEFERRED.json").write_text(
+        '{"schema_version": 1, "entries": [{"condition_id": "code_backend_down", '
+        '"detected_at": "2026-10-21T00:52:48Z", "title": "Code graph skipped"}]}\n',
+        encoding="utf-8")
+    for changed in ([tmp_path / "CLAUDE.md"], [ctx / "UPDATE_DEFERRED.md"],
+                    [ctx / "UPDATE_DEFERRED.json"]):
+        text = _suite._checkout_ledger_evidence(changed)
+        assert "code_backend_down (detected_at 2026-10-21T00:52:48Z): Code graph skipped" in text
+
+
+def test_the_evidence_never_raises_and_is_empty_without_a_sidecar(tmp_path: Path):
+    assert _suite._checkout_ledger_evidence([tmp_path / "CLAUDE.md"]) == ""
+    ctx = tmp_path / ".claude" / "context"
+    ctx.mkdir(parents=True)
+    (ctx / "UPDATE_DEFERRED.json").write_text("{not json", encoding="utf-8")
+    assert _suite._checkout_ledger_evidence([ctx / "UPDATE_DEFERRED.json"]) == ""
+    (ctx / "UPDATE_DEFERRED.json").write_text('{"entries": "nope"}', encoding="utf-8")
+    assert _suite._checkout_ledger_evidence([ctx / "UPDATE_DEFERRED.json"]) == ""

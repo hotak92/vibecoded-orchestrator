@@ -24,7 +24,14 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # it implements is unchanged:
 #   1. $VCT_HUB_BIN        — explicit override (dev builds, custom installs)
 #   2. <repo_root>/launcher/dist/<arch>/vct-hub  (INSTALL-FOLDER copy)
-#      then <repo_root>/launcher/dist/vct-hub    (arch-less fallback)
+#      then <repo_root>/launcher/dist/vct-hub    (arch-less fallback),
+#      then the same two slots under the ORCHESTRATOR clone (v0.2.104:
+#      $VCT_INSTALL_ROOT / $VCT_ORCHESTRATOR_ROOT, else the checkout vco_lib
+#      is imported from) — <repo_root> here is the PROJECT, which has no
+#      launcher/dist/ unless it is the orchestrator root itself. When one of
+#      those two variables names a real clone, that clone is probed BEFORE
+#      <repo_root>, so a second clone or worktree opened as a project never
+#      starts its own hub as the machine-wide singleton
 #   3. PATH                — first `vct-hub` on PATH (install.py adds it)
 #   4. $HOME/.vct/bin/vct-hub
 # If none match the module exits 3 with a named reason; this hook turns that
@@ -105,12 +112,39 @@ if command -v resolve_vco_venv_python >/dev/null 2>&1; then
 fi
 RUN_PY="${VCO_VENV_PYTHON:-${PY:-}}"
 if [ -z "$RUN_PY" ] || [ ! -x "$RUN_PY" ]; then
-    # v0.2.92 MAJOR-6: stdout, not stderr. A SessionStart hook exiting 0 has
-    # its stderr discarded — only stdout is injected as session context, so a
-    # ">&2" report here reaches nobody on the one path that runs every session.
-    echo "session-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); skipping"
+    # v0.2.92 MAJOR-6: stdout, not stderr — a SessionStart hook's stderr
+    # reaches nobody. v0.2.104 review R29: and not PLAIN stdout either. The
+    # hook is registered async, so only its JSON additionalContext is handed
+    # to the session (see "Reports" below), and _lib/emit-context.sh needs
+    # the very Python that is missing here. The envelope is therefore written
+    # by the shell itself: fixed text, nothing to escape (`\n` is the JSON
+    # escape, kept literal by the single quotes).
+    # MUST MATCH session-start-ensure-hub.ps1.
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"VCO background services (session-start-ensure-hub):\nsession-start-ensure-hub: no Python interpreter for vco_lib.hub_ensure (broken VCO install?); the hub, the model gateway and the launcher were not checked. Repair it with the launcher Update, or run python install.py --update in the orchestrator folder."}}'
     exit 0
 fi
+
+# ---------------------------------------------------------------------------
+# Reports (v0.2.104). This hook is registered ASYNC, and an async hook's plain
+# stdout is NOT handed to the session: Claude Code delivers only the JSON
+# `additionalContext` of an async hook, on the next turn (vendor hooks doc,
+# "How async hooks execute" — the same channel stop-codegraph-drain uses). A
+# hub that could not be found or started was therefore reported to nobody
+# (owner 2026-10-22: after a reboot the hub stayed down and a lane failed on
+# "no key found for vendor"). Every leg's report is collected here and
+# emitted ONCE at the end through _lib/emit-context.sh; without that helper
+# the lines fall back to plain stdout (the pre-v0.2.104 behaviour).
+# MUST MATCH session-start-ensure-hub.ps1.
+# ---------------------------------------------------------------------------
+__vco_notes=""
+__vco_say() {
+    if [ -n "$__vco_notes" ]; then
+        __vco_notes="$__vco_notes
+$*"
+    else
+        __vco_notes="$*"
+    fi
+}
 
 __vco_hub_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-hub-ensure.$$"
 if [ "${VCO_HOOK_DEBUG:-}" = "1" ]; then
@@ -127,7 +161,7 @@ __vco_hub_reported=0
 case "$__vco_hub_rc" in
     0|3|4) eval "$__vco_hub_out" ;;
     *)
-        echo "session-start-ensure-hub: vco_lib.hub_ensure failed (rc=$__vco_hub_rc): $(tail -n 3 "$__vco_hub_err" 2>/dev/null | tr '\n' ' ')"
+        __vco_say "session-start-ensure-hub: vco_lib.hub_ensure failed (rc=$__vco_hub_rc): $(tail -n 3 "$__vco_hub_err" 2>/dev/null | tr '\n' ' ')"
         __vco_hub_reported=1
         ;;
 esac
@@ -137,7 +171,7 @@ rm -f "$__vco_hub_err"
 # with a named reason; the hook reports it once and still exits 0, because a
 # SessionStart hook must never block Claude Code from starting.
 if [ "$__vco_hub_rc" != "0" ]; then
-    [ "$__vco_hub_reported" = "1" ] || echo "[vct] ${VCO_HUB_REASON:-vct-hub could not be started}"
+    [ "$__vco_hub_reported" = "1" ] || __vco_say "[vct] ${VCO_HUB_REASON:-vct-hub could not be started}"
 else
     debug "vct-hub $VCO_HUB_STATE: ${VCO_HUB_BINARY:-pid ${VCO_HUB_PID:-?}}"
 fi
@@ -184,11 +218,11 @@ __vco_gw_rc=$?
 case "$__vco_gw_rc" in
     0|3|4)
         eval "$__vco_gw_out"
-        [ "$__vco_gw_rc" = "0" ] || echo "[vct] ${VCO_GATEWAY_REASON:-the model gateway could not be ensured}"
+        [ "$__vco_gw_rc" = "0" ] || __vco_say "[vct] ${VCO_GATEWAY_REASON:-the model gateway could not be ensured}"
         debug "model-gateway ${VCO_GATEWAY_STATE:-?}: ${VCO_GATEWAY_REASON:-}"
         ;;
     *)
-        echo "session-start-ensure-hub: vco_lib.gateway_ensure failed (rc=$__vco_gw_rc): $(tail -n 3 "$__vco_gw_err" 2>/dev/null | tr '\n' ' ')"
+        __vco_say "session-start-ensure-hub: vco_lib.gateway_ensure failed (rc=$__vco_gw_rc): $(tail -n 3 "$__vco_gw_err" 2>/dev/null | tr '\n' ' ')"
         ;;
 esac
 rm -f "$__vco_gw_err"
@@ -229,13 +263,24 @@ __vco_gui_rc=$?
 case "$__vco_gui_rc" in
     0|3|4)
         eval "$__vco_gui_out"
-        [ "$__vco_gui_rc" = "0" ] || echo "[vct] ${VCO_LAUNCHER_REASON:-the launcher could not be started}"
+        [ "$__vco_gui_rc" = "0" ] || __vco_say "[vct] ${VCO_LAUNCHER_REASON:-the launcher could not be started}"
         debug "launcher ${VCO_LAUNCHER_STATE:-?}: ${VCO_LAUNCHER_REASON:-}"
         ;;
     *)
-        echo "session-start-ensure-hub: vco_lib.launcher_ensure failed (rc=$__vco_gui_rc): $(tail -n 3 "$__vco_gui_err" 2>/dev/null | tr '\n' ' ')"
+        __vco_say "session-start-ensure-hub: vco_lib.launcher_ensure failed (rc=$__vco_gui_rc): $(tail -n 3 "$__vco_gui_err" 2>/dev/null | tr '\n' ' ')"
         ;;
 esac
 rm -f "$__vco_gui_err"
+
+if [ -n "$__vco_notes" ]; then
+    # shellcheck source=_lib/emit-context.sh disable=SC1091
+    [ -f "$SCRIPT_DIR/_lib/emit-context.sh" ] && . "$SCRIPT_DIR/_lib/emit-context.sh"
+    if command -v emit_additional_context >/dev/null 2>&1; then
+        PY="$RUN_PY" emit_additional_context "VCO background services (session-start-ensure-hub):
+$__vco_notes" "SessionStart"
+    else
+        printf '%s\n' "$__vco_notes"
+    fi
+fi
 
 exit 0

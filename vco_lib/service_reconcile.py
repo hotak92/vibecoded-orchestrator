@@ -363,22 +363,34 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return dict(parse_env_lines(text))
 
 
+#: The endpoint keys :func:`_continuity` reads (the settings layer when it
+#: carries any of them, else ``.claude/env``).
+_CONTINUITY_URL_KEYS: tuple[str, ...] = (
+    "WEAVIATE_URL", "OLLAMA_URL", "CODE_EMBED_SERVICE_URL", "CODE_EMBED_URL",
+)
+
+
 def _continuity(orchestrator_root: Path) -> dict[str, Statement]:
     """The endpoints the root project's projected env pointed clients at."""
+    from vco_lib.claude_settings_env import read_settings_env, settings_env_sources
+
     root = Path(orchestrator_root)
-    settings = root / ".claude" / "settings.json"
-    env: dict[str, str] = {}
-    source = ""
-    try:
-        data = json.loads(settings.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("env"), dict):
-            env = {str(k): str(v) for k, v in data["env"].items()}
-            source = f"continuity:{settings}"
-    except (OSError, ValueError):
-        env = {}
-    if not env:
+    # v0.2.104 L5: the endpoint keys live in `.claude/settings.local.json`
+    # (machine-local); the merged reader sees them wherever they are, and each
+    # statement names the file its value actually came from.
+    env: dict[str, str] = {
+        str(k): str(v) for k, v in read_settings_env(root).items()
+    }
+    origins = settings_env_sources(root)
+    fallback: Optional[str] = None
+    if not any(env.get(k) for k in _CONTINUITY_URL_KEYS):
         env = _read_env_file(root / ".claude" / "env")
-        source = f"continuity:{root / '.claude' / 'env'}"
+        fallback = f"continuity:{root / '.claude' / 'env'}"
+
+    def source_of(key: str) -> str:
+        if fallback is not None:
+            return fallback
+        return f"continuity:{root / origins.get(key, '.claude/settings.json')}"
     grpc = (env.get("WEAVIATE_GRPC_PORT") or env.get("GRPC_PORT") or "").strip()
     out: dict[str, Statement] = {}
     for service, keys in (
@@ -391,7 +403,7 @@ def _continuity(orchestrator_root: Path) -> dict[str, Statement]:
             kw: dict[str, Any] = {}
             if service == "weaviate" and grpc.isdigit():
                 kw["grpc_port"] = int(grpc)
-            stmt = _stmt_from_url(service, source, value, **kw) if value else None
+            stmt = _stmt_from_url(service, source_of(key), value, **kw) if value else None
             if stmt is not None:
                 out[service] = stmt
                 break
@@ -1209,14 +1221,98 @@ def _compose_env_values(orchestrator_root: Path) -> dict[str, str]:
     return compose_reclaim_env(text)
 
 
+#: The pseudo-key :func:`config_drift` reports an older image under (beside the
+#: env keys, so it also enters the entry's ``drift_keys`` dismissal identity).
+IMAGE_DRIFT_KEY = "image"
+#: Why an older image matters, per service (rendered after the drift line).
+_IMAGE_DRIFT_WHY: Mapping[str, str] = {
+    "ollama": "the newer summary models need it",
+}
+#: Registry prefixes that name Docker Hub (a ref without one means the same).
+_DOCKER_HUB_PREFIXES: tuple[str, ...] = ("docker.io/", "index.docker.io/", "registry-1.docker.io/")
+
+
+def _image_repo_and_tag(ref: str) -> tuple[str, Optional[str]]:
+    """``(normalized repository, tag or None)`` of an image reference: the
+    digest dropped, Docker Hub's registry prefix and ``library/`` namespace
+    removed, lower-cased — so ``docker.io/ollama/ollama:0.40.5`` and
+    ``ollama/ollama:0.40.5`` are the same reference."""
+    ref = ref.strip().split("@", 1)[0]
+    slash = ref.rfind("/")
+    colon = ref.rfind(":")
+    tag: Optional[str] = None
+    if colon > slash:
+        ref, tag = ref[:colon], ref[colon + 1:] or None
+    repo = ref.lower()
+    for prefix in _DOCKER_HUB_PREFIXES:
+        if repo.startswith(prefix):
+            repo = repo[len(prefix):]
+            break
+    if repo.startswith("library/"):
+        repo = repo[len("library/"):]
+    return repo, tag
+
+
+def _tag_version(tag: Optional[str]) -> Optional[tuple[int, ...]]:
+    """The dotted numeric version a tag starts with (``0.40.5-rocm`` →
+    ``(0, 40, 5)``; a leading ``v`` is allowed), or ``None`` for a tag that
+    carries none (``latest``, ``rocm``, no tag at all)."""
+    if not tag:
+        return None
+    m = re.match(r"v?(\d+(?:\.\d+)*)(?:[-+].*)?$", tag)
+    return tuple(int(p) for p in m.group(1).split(".")) if m else None
+
+
+def image_drift(live: str, pinned: Optional[str]) -> Optional[tuple[str, str]]:
+    """``(live ref, pinned version)`` when *live* is provably OLDER than the
+    image VCO's compose pins, else ``None``.
+
+    Positive evidence only: a different repository (the user's own build or
+    mirror), a tag with no version (``latest``, a digest-only reference) or a
+    NEWER live version is never reported — a hand-over would then downgrade or
+    replace something VCO cannot judge. Only the version is compared, so the
+    hardware variant (``-rocm``) and a ``docker.io/`` prefix never read as
+    drift."""
+    if not live or not pinned:
+        return None
+    live_repo, live_tag = _image_repo_and_tag(live)
+    pin_repo, pin_tag = _image_repo_and_tag(pinned)
+    if live_repo != pin_repo:
+        return None
+    live_v, pin_v = _tag_version(live_tag), _tag_version(pin_tag)
+    if live_v is None or pin_v is None or live_v >= pin_v:
+        return None
+    return live, ".".join(str(p) for p in pin_v)
+
+
 def config_drift(service: str, container: _det.ContainerInfo,
                  orchestrator_root: Path) -> dict[str, tuple[Optional[str], str]]:
     """``key → (live, wanted)`` for every behaviour-critical key *container*
-    (an adopted one) does not carry at VCO's value."""
+    (an adopted one) does not carry at VCO's value — and, under
+    :data:`IMAGE_DRIFT_KEY`, ``(live image, pinned version)`` when it runs an
+    image older than the one VCO's compose pins (:func:`image_drift`)."""
     wanted = _compose_env_values(orchestrator_root) if service == "weaviate" else (
         dict(_OLLAMA_CANONICAL_ENV) if service == "ollama" else {})
-    return {k: (container.env.get(k), v) for k, v in sorted(wanted.items())
-            if container.env.get(k) != v}
+    drift: dict[str, tuple[Optional[str], str]] = {}
+    image = image_drift(container.image,
+                        _service_adoption.pinned_image(service, orchestrator_root))
+    if image is not None:
+        drift[IMAGE_DRIFT_KEY] = image
+    drift.update((k, (container.env.get(k), v)) for k, v in sorted(wanted.items())
+                 if container.env.get(k) != v)
+    return drift
+
+
+def describe_drift(service: str, drift: Mapping[str, tuple[Optional[str], str]]) -> str:
+    """One human line's worth of *drift* (the entry's ``Detected`` detail)."""
+    parts = []
+    for key, (live, want) in drift.items():
+        if key == IMAGE_DRIFT_KEY:
+            why = _IMAGE_DRIFT_WHY.get(service)
+            parts.append(f"image {live}, VCO pins {want}" + (f" — {why}" if why else ""))
+        else:
+            parts.append(f"{key}={live!r} (VCO sets {want!r})")
+    return ", ".join(parts)
 
 
 # ─── registry bootstrap ─────────────────────────────────────────────────
@@ -1807,10 +1903,8 @@ def _outcome_entries(result: ReconcileResult, root: Path) -> list[DeferralEntry]
         if drift:
             drift_items.append((s, c.name, drift))
     if drift_items:
-        detail = "\n".join(
-            f"  - {s} ({name}): " + ", ".join(f"{k}={live!r} (VCO sets {want!r})"
-                                              for k, (live, want) in d.items())
-            for s, name, d in drift_items)
+        detail = "\n".join(f"  - {s} ({name}): {describe_drift(s, d)}"
+                           for s, name, d in drift_items)
         handable = [(s, n) for s, n, _d in drift_items if can_hand_to_vco(s, n)]
         foreign = [(s, n) for s, n, _d in drift_items if not can_hand_to_vco(s, n)]
         remedy = ""
@@ -1820,12 +1914,13 @@ def _outcome_entries(result: ReconcileResult, root: Path) -> list[DeferralEntry]
                        + "\n".join(f"{_CLI} hand-to-vco --service {s}" for s, _n in handable) + "\n")
         if foreign:
             remedy += "".join(
-                f"# {n} ({s}) is yours: apply the settings above in its own compose, if you want them.\n"
+                f"# {n} ({s}) is yours: apply the image and settings above in its own compose, if you want them.\n"
                 for s, n in foreign)
         entries.append(DeferralEntry(
             condition_id=CID_CONFIG_DRIFT,
             title="A container VCO uses lacks some of VCO's tuning",
-            detected=f"These containers run without VCO's behaviour-critical settings:\n{detail}",
+            detected=("These containers run an older image than VCO pins, or without VCO's "
+                      f"behaviour-critical settings:\n{detail}"),
             why_deferred=("VCO never recreates a container it adopted. The service works; it "
                           "just does not carry these fixes."),
             command_to_apply=remedy + "# Or keep it as it is and dismiss this entry.",
@@ -1906,19 +2001,36 @@ def probe_ambiguous(entry: Any, *, runtime: Optional[str] = None, run: Optional[
 
 def probe_config_drift(entry: Any, *, orchestrator_root: Path, runtime: Optional[str] = None,
                        run: Optional[RunFn] = None, db_path: Optional[Path] = None) -> Optional[bool]:
+    """``adopted_service_config_drift`` — does an adopted container the entry
+    names still differ from what VCO ships (:func:`config_drift`, the SAME
+    rule the emitter uses)?
+
+    Only the adopted rows' OWN containers are listed and inspected (one
+    ``ps``, one ``inspect`` of those names). Inspecting every container on
+    the machine made the verdict hostage to unrelated ones: a single
+    container removed between the ``ps`` and the ``inspect`` (another
+    project's test run, a compose recreate) failed the whole ``inspect`` and
+    the probe answered "undetermined" — the entry was kept with no verdict.
+    An adopted container that no longer exists carries no drift (the
+    unreachable condition reports it). ``None`` only when the rows or the
+    runtime cannot be read."""
     rows = _se.load_rows(db_path)
     if not rows:
         return None
-    containers = _det.list_containers(runtime if runtime is not None else _runtime(), run=run)
-    if not containers:
+    named = set(_entry_services(entry))
+    adopted = {s: row for s, row in rows.items()
+               if row.mode == "adopted_container" and row.container_name
+               and (not named or s in named)}
+    if not adopted:
+        return False
+    containers = _det.list_containers_or_none(
+        runtime if runtime is not None else _runtime(), run=run,
+        names={row.container_name or "" for row in adopted.values()})
+    if containers is None:
         return None
-    for s, row in rows.items():
-        if row.mode != "adopted_container":
-            continue
-        c = next((x for x in containers if x.name == row.container_name), None)
-        if c is not None and config_drift(s, c, orchestrator_root):
-            return True
-    return False
+    by_name = {c.name: c for c in containers}
+    return any(config_drift(s, by_name[row.container_name], orchestrator_root)
+               for s, row in adopted.items() if row.container_name in by_name)
 
 
 def probe_confirmation_pending(entry: Any, *, db_path: Optional[Path] = None) -> Optional[bool]:

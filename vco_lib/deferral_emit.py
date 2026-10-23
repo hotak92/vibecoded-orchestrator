@@ -332,17 +332,34 @@ def resolve_conditions(
         0. Returns 0 on any I/O error (soft-fail).
     """
     try:
-        removed = 0
+        present: list[str] = []
         with locked_report(folder) as report:
             for cid in condition_ids:
                 if report.has_condition(cid):
-                    removed += 1
+                    present.append(cid)
                 report.mark_resolved(cid)
-        return removed
+        _end_retry_episodes(folder, present, log=log)
+        return len(present)
     except Exception as exc:  # noqa: BLE001 — deferral I/O is best-effort
         ids = ", ".join(condition_ids) or "(none)"
         _log(log, "warning", f"[vct] deferral resolve_conditions failed ({ids}): {exc}")
         return 0
+
+
+def _end_retry_episodes(folder: Path, condition_ids: Sequence[str], *, log: Any = None) -> None:
+    """Close the retry episode of every cleared condition the retry
+    dispatcher owns (``vco_lib.deferral_retry.record_episode_end``), so a
+    later occurrence of the same condition starts with a fresh attempt
+    budget. Runs AFTER the locked cycle (another file); best-effort."""
+    if not condition_ids:
+        return
+    try:
+        from vco_lib.deferral_retry import record_episode_end
+
+        for cid in condition_ids:
+            record_episode_end(Path(folder), cid, "ledger entry cleared")
+    except Exception as exc:  # noqa: BLE001 — bookkeeping never fails the clear
+        _log(log, "warning", f"[vct] could not close the retry episode: {exc}")
 
 
 def record_auto_resolution(

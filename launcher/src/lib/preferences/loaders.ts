@@ -51,6 +51,14 @@ export const APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL = 'code_embed_ollama_model';
 // MUST MATCH vco_lib/openai_consent.py APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT.
 export const APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT = 'openai_embeddings_consent';
 export const APP_STATE_KEY_ACTIVE_EMBEDDING = 'embedding.active_profile';
+// v0.2.104 API-1: VCO's background `claude -p` jobs (KG and code summaries,
+// the post-commit KG review) retry once with the Claude API key when the
+// subscription is out (default OFF — it bills the Console organisation). Read
+// by each job when it starts, so no restart is needed. The `model_gateway.`
+// prefix is historical: the model gateway does not read it.
+// MUST MATCH vco_lib/claude_cli_api_key.py APP_STATE_KEY
+// (parity: tests/test_v02104_claude_cli_api_key_fallback.py).
+export const APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK = 'model_gateway.api_key_fallback';
 export const APP_STATE_KEY_HARDWARE_SNAPSHOT = 'launcher.hardware_snapshot';
 
 /** Default Ollama URL. The launcher pins this to 11435 (not 11434) to avoid
@@ -259,6 +267,12 @@ export const PREF_LOADERS = {
         appStateGetBool(APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL),
         appStateGetBool(APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL),
       ]),
+  },
+  gatewayApiKeyFallback: {
+    eager: false,
+    section: 'Claude API key for background jobs',
+    /** `null` = no row = OFF (the default). */
+    load: () => appStateGetBool(APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK),
   },
   dualFlags: {
     eager: false,

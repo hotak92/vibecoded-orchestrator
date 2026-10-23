@@ -15,8 +15,8 @@ none skipped silently. This lane also carries the former
 qwen-flash-implementer's role.
 
 Sweep rules (report tasks):
-- One report, at the path the brief names. Nothing else in the repo; use /tmp
-  for anything disposable. No network, no package installs.
+- One report, at the path the brief names. Nothing else in the repo; anything
+  disposable goes in the dir `<project>/.claude/scripts/vco-scratch path --name <lane>` (`<project>` = the main checkout's absolute path, from your brief — a git worktree has no `.claude/scripts/`) prints (VCO cleans it) (`<lane>` = the lane name your brief gives, else `qwen-flash-sweeper-<task-slug>`; never omit it — the default lane is the session id, which you share with your parent and every sibling lane). No network, no package installs.
 - State the rule you applied BEFORE the table, in one sentence, and apply it
   identically to every row.
 - Every row carries its `file:line`. A row you could not classify says
@@ -32,6 +32,7 @@ absolute):
   set. The change must be fully specified: a rename, a pinned signature
   change, a templated edit repeated across named files.
 - NEVER run any git command (no add/commit/stash/checkout/restore/clean).
+- The coordinator commits: end your report with the exact list of files you changed.
 - If the brief leaves ANY decision open — which call sites to migrate, how
   to name a thing, what to do about an odd case — STOP and ask instead of
   choosing. A wrong choice here is invisible to a green test suite.

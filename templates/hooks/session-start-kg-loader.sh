@@ -73,6 +73,9 @@ cat << EOF
    Recent Work:
    - .claude/scripts/kg-search recent --days 7
 
+   Scratch (use instead of /tmp; VCO cleans it):
+   - .claude/scripts/vco-scratch path --name LANE  (subagents share the session id: always name the lane)
+
    Project Context:
    - .claude/CONTEXT_STATE.md (current task state)
    - .claude/context/plans/ (active plans - reference when needed)
@@ -103,6 +106,26 @@ PYEOF
 )
     if [ -n "$ACTIVE_JOBS" ]; then
         echo "$ACTIVE_JOBS"
+    fi
+fi
+
+# v0.2.104: TTL sweep of the sanctioned scratch dir
+# (<project>/.claude/state/scratch/; vco_lib/scratch_dir.py is the ONE home of
+# every rule: TTL knob VCO_SCRATCH_TTL_HOURS, never leaves its root, never
+# follows a symlink). It runs AFTER the listing above and DETACHED, so a slow
+# disk or a huge lane can never push this hook past its timeout and lose the
+# listing. The same run pre-creates the private lanes shell-less agents use
+# (--ensure-precreated). A lane it cannot remove is recorded and logged to
+# .claude/logs/scratch-sweep.log, and `vco doctor` names it. Needs the VCO
+# venv (vco_lib); without one it is skipped. Never on the per-tool-call path.
+# PARITY: session-start-kg-loader.ps1 detaches the same command.
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+    resolve_vco_venv_python "$SCRIPT_DIR" || true
+    if [ -n "${VCO_VENV_PYTHON:-}" ]; then
+        ( "$VCO_VENV_PYTHON" -m vco_lib.scratch_dir sweep --project "$PROJECT_DIR" \
+            --ensure-precreated </dev/null >/dev/null 2>&1 & )
     fi
 fi
 

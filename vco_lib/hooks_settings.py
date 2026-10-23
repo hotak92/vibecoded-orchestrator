@@ -1146,6 +1146,156 @@ def _remove_if_group(
     }
 
 
+# ── declared sibling registrations: one hook, one toggle (review R29) ─────
+#
+# ``vco_lib.hook_retirements.MATCHER_SIBLINGS`` declares a shipped hook that
+# is registered under two matchers of one event (session-start-ensure-hub:
+# ``startup`` and ``resume|clear|compact``). For the user that is ONE hook: the
+# Hooks tab shows it as one row, a disable removes every registration of it
+# and parks them as ONE entry (the primary's, carrying ``siblings``), and a
+# restore puts them all back. The table stays in Python; the launcher and the
+# hub reach this behaviour through the ``disable`` / ``enable`` / ``list``
+# verbs and hold no copy of it.
+
+
+def _unit_registrations(
+    doc: SettingsDoc, event: str, matcher: str, command: str,
+) -> List[Tuple[str, str]]:
+    """The ``(matcher, command)`` registrations under ``event`` that form one
+    hook with ``(event, matcher, command)`` and are present in ``doc`` — the
+    declared siblings only, never the registration itself. ``[]`` for every
+    hook the table does not name."""
+    from vco_lib.hook_retirements import (  # noqa: PLC0415 — import cycle
+        unit_matchers,
+        vco_hook_script_identity,
+    )
+
+    ident = vco_hook_script_identity(command) if isinstance(command, str) else None
+    if ident is None:
+        return []
+    out: List[Tuple[str, str]] = []
+    for other in unit_matchers(event, matcher, ident):
+        located = _locate(doc, event, other, command)
+        if located is None:
+            continue
+        g_idx, h_idx = located
+        found = doc.data["hooks"][event][g_idx]["hooks"][h_idx].get("command")
+        if isinstance(found, str) and found:
+            out.append((other, found))
+    return out
+
+
+def unit_of(doc: SettingsDoc, event: str, matcher: str, command: str) -> Optional[str]:
+    """The matcher of the row an ADDED sibling registration folds into on the
+    Hooks tab — the sibling it mirrors, when that one is present in ``doc``
+    too — else ``None`` (the registration is its own row)."""
+    from vco_lib.hook_retirements import (  # noqa: PLC0415 — import cycle
+        sibling_matchers,
+        vco_hook_script_identity,
+    )
+
+    ident = vco_hook_script_identity(command) if isinstance(command, str) else None
+    if ident is None:
+        return None
+    for primary in sibling_matchers(event, matcher, ident):
+        if _locate(doc, event, primary, command) is not None:
+            return primary
+    return None
+
+
+def remove_hook_unit(
+    doc: SettingsDoc, event: str, matcher: str, command: str
+) -> Dict[str, Any]:
+    """:func:`remove_hook`, plus every declared sibling registration present
+    in the file, parked as ONE entry: the requested registration's, with the
+    siblings' own parked entries under ``siblings`` (in removal order). A hook
+    with no declared sibling parks exactly as :func:`remove_hook` does.
+
+    Raises:
+        HooksSettingsError: ``not_found`` when the requested entry does not
+            exist (nothing is removed).
+    """
+    parked = remove_hook(doc, event, matcher, command)
+    siblings = [
+        remove_hook(doc, event, other, other_command)
+        for other, other_command in _unit_registrations(doc, event, matcher, command)
+    ]
+    if siblings:
+        parked["siblings"] = siblings
+    return parked
+
+
+def restore_hook_unit(
+    doc: SettingsDoc,
+    parked: Dict[str, Any],
+    *,
+    anchor_scripts: Optional[Iterable[str]] = None,
+) -> bool:
+    """Restore a parked entry and its ``siblings``; ``True`` when the document
+    changed.
+
+    Siblings go back FIRST, in reverse removal order, then the primary — the
+    mirror image of :func:`remove_hook_unit`, so a disable/enable round trip
+    is byte-identical. Every entry passes :func:`insert_hook` (retirement
+    refusal, idempotency), all checked before the caller writes anything.
+
+    Then the added registrations the restored hook is declared to carry
+    (``MATCHER_SIBLINGS``) that are still missing are re-created as verbatim
+    twins of the restored item, each in its own group appended to the event —
+    exactly what the bundle update would add once nothing is parked. That
+    covers a row parked before the twin shipped (or by an older build): the
+    update kept the twin out while the hook was parked, and re-enabling must
+    turn the whole hook back on, not part of it until the next update.
+    """
+    if not isinstance(parked, dict):
+        raise HooksSettingsError("parked_entry_invalid", "parked entry is not a JSON object.")
+    raw_siblings = parked.get("siblings", [])
+    if not isinstance(raw_siblings, list) or not all(
+        isinstance(sib, dict) and "siblings" not in sib for sib in raw_siblings
+    ):
+        raise HooksSettingsError(
+            "parked_entry_invalid",
+            "parked entry `siblings` must be a list of flat parked entries.",
+        )
+    primary = {k: v for k, v in parked.items() if k != "siblings"}
+    changed = False
+    for sib in reversed(raw_siblings):
+        changed = insert_hook(doc, sib, anchor_scripts=anchor_scripts) or changed
+    changed = insert_hook(doc, primary, anchor_scripts=anchor_scripts) or changed
+    changed = _restore_missing_twins(doc, primary, anchor_scripts=anchor_scripts) or changed
+    return changed
+
+
+def _restore_missing_twins(
+    doc: SettingsDoc,
+    primary: Dict[str, Any],
+    *,
+    anchor_scripts: Optional[Iterable[str]] = None,
+) -> bool:
+    """Re-create the declared added twins of a restored single-item entry
+    that the file lacks (see :func:`restore_hook_unit`)."""
+    from vco_lib.hook_retirements import (  # noqa: PLC0415 — import cycle
+        added_sibling_matchers,
+        vco_hook_script_identity,
+    )
+
+    item = primary.get("item")
+    event = primary.get("event")
+    raw_matcher = primary.get("matcher")
+    matcher = raw_matcher if isinstance(raw_matcher, str) else ""
+    if not isinstance(item, dict):
+        return False
+    command = item.get("command")
+    if not (isinstance(event, str) and isinstance(command, str) and command):
+        return False
+    changed = False
+    for twin in added_sibling_matchers(event, matcher, vco_hook_script_identity(command)):
+        entry = parked_entry_for_registration(
+            event, twin, {"matcher": twin, "hooks": []}, [item])
+        changed = insert_hook(doc, entry, anchor_scripts=anchor_scripts) or changed
+    return changed
+
+
 def parked_entry_for_registration(
     event: str, matcher: str, group: Dict[str, Any], items: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -1705,6 +1855,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     path = _settings_path(args)
     doc = load_settings(path)
     entries, skipped = list_hooks(doc)
+    for e in entries:
+        # Review R29: the row an added sibling registration folds into on
+        # the Hooks tab (None = its own row). The tab toggles the folded row
+        # as one hook through `disable` / `enable` (remove/restore_hook_unit).
+        e["unit_of"] = unit_of(doc, e["event"], e["matcher"], e["command"])
     payload: Dict[str, Any] = {
         "ok": True,
         "settings_path": str(path),
@@ -1741,7 +1896,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
 def _cmd_disable(args: argparse.Namespace) -> int:
     path = _settings_path(args)
     doc = load_settings(path)
-    parked = remove_hook(doc, args.event, args.matcher, args.command)
+    # Review R29: a hook registered under declared sibling matchers is ONE
+    # hook — every registration of it is parked in this one entry.
+    parked = remove_hook_unit(doc, args.event, args.matcher, args.command)
     write_settings(doc)
     _emit(
         {
@@ -1770,7 +1927,7 @@ def _cmd_unregister(args: argparse.Namespace) -> int:
     entry, and it NEVER deletes the hook script file."""
     path = _settings_path(args)
     doc = load_settings(path)
-    removed = remove_hook(doc, args.event, args.matcher, args.command)
+    removed = remove_hook_unit(doc, args.event, args.matcher, args.command)
     write_settings(doc)
     _emit(
         {
@@ -1795,7 +1952,7 @@ def _cmd_enable(args: argparse.Namespace) -> int:
     doc = load_settings(path)
     # Anchor a VCO-shipped hook restored from a pre-v0.2.97 park; the set
     # comes from the orchestrator clone's templates (None → anchor nothing).
-    changed = insert_hook(doc, parked, anchor_scripts=shipped_hook_scripts())
+    changed = restore_hook_unit(doc, parked, anchor_scripts=shipped_hook_scripts())
     if changed:
         write_settings(doc)
     _emit({"ok": True, "settings_path": str(path), "changed": changed})

@@ -321,8 +321,8 @@ def test_launcher_paths_cover_the_install_locations(tmp_path):
 
 
 def _run(monkeypatch, tmp_path, home, *, dry_run, events, gateway_restarts=False,
-         yes=True, tty=None, answers=None, quiet=None):
-    root = _state(home / ".vct")
+         yes=True, tty=None, answers=None, quiet=None, root_name=".vct"):
+    root = _state(home / root_name)
     monkeypatch.setenv("VCT_STATE_DIR", str(root))
     monkeypatch.delenv("VCT_LAUNCHER_DB_PATH", raising=False)
     install = importlib.import_module("install")
@@ -914,3 +914,281 @@ def test_psutil_stop_reidentifies_before_forcing(monkeypatch, ours_after_grace, 
     uq._terminate_if(4242, still_ours, lambda: None, grace=0.01)
     assert fake.killed is killed
     assert len(calls) == 2
+
+
+# ── v0.2.104: review R39 H1 / M1 / L2 / L3 (user-deferred from v0.2.103) ──
+
+
+def test_a_linked_state_dir_root_is_refused_and_its_target_untouched(home, tmp_path):
+    """R39 H1: ``~/.vct`` a symlink (a junction on Windows — ``_is_reparse``
+    covers both) to a broader dir. Walking it would delete the TARGET's
+    contents, which the plan never shows: the root is refused, the user's
+    files survive, only VCO's exact names go."""
+    target = tmp_path / "Documents"
+    target.mkdir()
+    (target / "thesis.docx").write_text("user")
+    (target / "photos").mkdir()
+    (target / "photos" / "x.jpg").write_text("user")
+    (target / "launcher.db").write_text("x")  # one VCO marker
+    root = home / ".vct"
+    root.symlink_to(target, target_is_directory=True)
+    plan = us.build_plan(root=root, home=home, env={}, launcher_db=root / "launcher.db")
+    assert plan.refused and "link or junction" in plan.refused and str(target) in plan.refused
+    assert "[refused]" in "\n".join(us.plan_lines(plan))
+    assert "by name" in us.confirm_prompt(plan)
+    us.execute(plan)
+    assert (target / "thesis.docx").read_text() == "user"
+    assert (target / "photos" / "x.jpg").read_text() == "user"
+    assert not (target / "launcher.db").exists()  # exact VCO name only
+    assert root.is_symlink()  # the link is the user's to remove
+
+
+def test_a_root_that_becomes_a_link_after_planning_is_never_walked(home, tmp_path, monkeypatch):
+    root = _state(home / ".vct")
+    plan = us.build_plan(root=root, home=home, env={}, launcher_db=root / "launcher.db")
+    assert plan.refused is None
+    real = us._is_reparse
+    monkeypatch.setattr(us, "_is_reparse", lambda p: p == root or real(p))
+    audit = us.execute(plan)
+    assert any("SKIPPED [8]" in a for a in audit), audit
+    assert (root / "hub.db").exists() and (root / "retrieval_rl_data").is_dir()
+
+
+def test_a_real_vct_dir_root_is_still_removed_whole(home):
+    root = _state(home / ".vct")
+    plan = us.build_plan(root=root, home=home, env={}, launcher_db=root / "launcher.db")
+    assert plan.refused is None and not plan.selective
+    assert us.confirm_prompt(plan).startswith("Remove the VCO state dir")
+    us.execute(plan)
+    assert not root.exists()
+
+
+def test_an_explicit_state_dir_not_named_vct_loses_only_vcos_entries(home, tmp_path):
+    """R39 M1: ``VCT_STATE_DIR=~/Documents`` holding VCO's files: VCO's own
+    top-level entries go, the user's files, the generic-named dirs and the
+    folder itself stay."""
+    root = _state(tmp_path / "Documents")
+    (root / "thesis.docx").write_text("user")
+    (root / f"hub.token.{_PROJECT_ID}").write_text("x")
+    (root / "launcher.db.bak-old").write_text("x")
+    plan = us.build_plan(root=root, home=home, env={"VCT_STATE_DIR": str(root)},
+                         launcher_db=root / "launcher.db")
+    assert plan.refused is None and plan.selective
+    text = "\n".join(us.plan_lines(plan))
+    assert "not named .vct" in text and "LEFT IN PLACE" in text and "logs" in text
+    assert "thesis.docx" not in text
+    assert "folder stays" in us.confirm_prompt(plan)
+    audit = us.execute(plan)
+    assert (root / "thesis.docx").read_text() == "user"
+    assert (root / "logs" / "model-gateway.log").exists() and (root / "state").is_dir()
+    for gone in ("launcher.db", "launcher.db-wal", "launcher.db-shm", "hub.db", "hub.pid", "hub.token",
+                 "model-gateway.token", "retrieval_rl_data", f"hub.token.{_PROJECT_ID}",
+                 "launcher.db.bak-old"):
+        assert not (root / gone).exists(), (gone, audit)
+    assert root.is_dir()
+    assert any("left in place" in a for a in audit)
+
+
+_PROJECT_ID = "3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f"
+
+#: Derived names VCO really writes (each shape's writer is named at
+#: ``uninstall_state.VCO_OWNED_DBS``) — the act arm of the exact-shape rule.
+_VCO_DERIVED = ("hub.db-wal", "hub.db-shm", "launcher.db-journal", "launcher.db.bak-pre-x",
+                "launcher.db.bak-pre-x-wal", f"hub.token.{_PROJECT_ID}",
+                "rl_project_identity_cache.json.0bxawabr.tmp",
+                "rl_project_identity_cache.json.lock", "services.toml.ab_12xyz.tmp",
+                f"hub.token.{_PROJECT_ID}.k3j9_x0q.tmp", "services.toml.migrated-v0297")
+#: Near-miss names a user may keep beside VCO's files — the leave-alone arm
+#: (v0.2.104 R2 L4: the open prefixes deleted every one of these).
+_USER_NEAR_MISS = ("hub.db-notes.txt", "model-gateway.notes", "model-gateway.howto.md",
+                   "launcher.dbx", "launcher.db.bak-", "hub.token.mine", "hub.token.0123",
+                   "services.toml.orig", "rl_project_identity_cache.json.old",
+                   "thesis.docx.abcdefgh.tmp", "services.toml.ABCDEFGH.tmp", "notes.lock")
+
+
+def test_a_selective_dir_removes_vcos_derived_names_and_keeps_near_miss_user_files(home, tmp_path):
+    root = _state(tmp_path / "Documents")
+    for name in (*_VCO_DERIVED, *_USER_NEAR_MISS):
+        (root / name).write_text("x")
+    us.execute(us.build_plan(root=root, home=home, env={"VCT_STATE_DIR": str(root)},
+                             launcher_db=root / "launcher.db"))
+    for name in _VCO_DERIVED:
+        assert not (root / name).exists(), name
+    for name in _USER_NEAR_MISS:
+        assert (root / name).read_text() == "x", name
+    assert root.is_dir()
+
+
+def test_the_migrated_services_toml_name_matches_its_writer():
+    from vco_lib import service_reconcile
+    assert us.SERVICES_TOML_MIGRATED == "services.toml" + service_reconcile.MIGRATED_SUFFIX
+
+
+def test_a_selective_dir_never_follows_a_link_named_like_vcos(home, tmp_path):
+    root = _state(tmp_path / "custom-state")
+    outside = tmp_path / "user-data"
+    outside.mkdir()
+    (outside / "precious.txt").write_text("user")
+    (root / "rl_archive").symlink_to(outside, target_is_directory=True)
+    us.execute(us.build_plan(root=root, home=home, env={"VCT_STATE_DIR": str(root)},
+                             launcher_db=root / "launcher.db"))
+    assert (outside / "precious.txt").read_text() == "user"
+    assert not (root / "rl_archive").is_symlink()
+
+
+VENV_WIN = "C:\\VCO\\.venv\\Scripts"
+CANDS_WIN = [[f"{VENV_WIN}\\vct-model-gateway.exe"], [f"{VENV_WIN}\\python.exe", "-m", "model_router"]]
+
+
+@pytest.mark.parametrize("cmdline,exe,cands,ours", [
+    # R39 L2: the script later in argv is NOT the gateway
+    (("cp", f"{VENV}/vct-model-gateway", "/tmp/"), "/usr/bin/cp", CANDS, False),
+    (("vim", f"{VENV}/vct-model-gateway"), None, CANDS, False),
+    (("/usr/bin/python3", "tool.py", f"{VENV}/vct-model-gateway"), None, CANDS, False),
+    (("notepad.exe", f"{VENV_WIN}\\vct-model-gateway.exe"), None, CANDS_WIN, False),
+    # the real shapes still match
+    ((f"{VENV}/python3.12", f"{VENV}/vct-model-gateway", "serve"), None, CANDS, True),
+    ((f"{VENV}/vct-model-gateway", "serve"), None, CANDS, True),
+    ((f"{VENV}/python", "-m", "model_router", "serve"), None, CANDS, True),
+    ((f"{VENV_WIN}\\vct-model-gateway.exe", "serve"), f"{VENV_WIN}\\vct-model-gateway.exe", CANDS_WIN, True),
+    ((f"{VENV_WIN}\\python.exe", f"{VENV_WIN}\\vct-model-gateway.exe", "serve"), None, CANDS_WIN, True),
+    ((f"{VENV_WIN}\\python.exe", "-m", "model_router", "serve"), None, CANDS_WIN, True),
+])
+def test_gateway_console_script_matches_only_at_argv0_or_after_python(cmdline, exe, cands, ours):
+    proc = uq.GatewayProc(9, cmdline, Path(exe) if exe else None)
+    assert uq.is_vco_gateway(proc, cands) is ours
+
+
+# ── step [3] on macOS: `ps -o args=` gives ONE joined line (no argv array) ──
+
+VENV_SP = "/Users/u/My Proj/vco/.venv/bin"
+DASH_BIN = "/Users/u/Proj -beta/.venv/bin"
+CANDS_SP = [[f"{VENV_SP}/vct-model-gateway"], [f"{VENV_SP}/python", "-m", "model_router"],
+            [f"{DASH_BIN}/vct-model-gateway"]]
+
+
+class _PsRes:
+    def __init__(self, out, rc=0):
+        self.stdout, self.returncode = out, rc
+
+
+def _fake_macos_ps(args_line: str, comm: str = ""):
+    def run(cmd, **_kw):
+        assert cmd[:2] == ["ps", "-ww"] and cmd[2] == "-o"
+        return _PsRes(args_line if cmd[3] == "args=" else comm)
+    return run
+
+
+@pytest.mark.parametrize("line,ours", [
+    # the gateway run from a spaced install root: script as argv[0]…
+    (f"{VENV_SP}/vct-model-gateway serve --port 11460", True),
+    # …as the first argument after a Python interpreter (its own path
+    # spaced too)…
+    (f"/usr/bin/python3 {VENV_SP}/vct-model-gateway serve", True),
+    (f"{VENV_SP}/python {VENV_SP}/vct-model-gateway serve", True),
+    # …as the pinned interpreter + `-m model_router` module form…
+    (f"{VENV_SP}/python -m model_router serve", True),
+    # interpreter options before the script are still the script position…
+    (f"/usr/bin/python3 -S {VENV_SP}/vct-model-gateway serve", True),
+    # …but the script anywhere ELSE on the line is not the gateway (R39 L2)
+    (f"cp {VENV_SP}/vct-model-gateway /tmp/gateway-copy", False),
+    (f"vim {VENV_SP}/vct-model-gateway", False),
+    (f"/usr/bin/python3 tool.py {VENV_SP}/vct-model-gateway", False),
+    # a DIFFERENT venv's interpreter for the module form is not ours
+    ("/usr/bin/python3 -m model_router serve", False),
+    # -c / -m consume the next token: the script is then an argument, not
+    # the script position
+    (f"/usr/bin/python3 -c {VENV_SP}/vct-model-gateway", False),
+    # A-N3: the install's OWN venv python whose path contains " -" is recognised
+    (f"{DASH_BIN}/python {DASH_BIN}/vct-model-gateway serve", True),
+    # …but an unknown dashed interpreter / a dashed foreign python is not
+    (f"/Users/u/Other -x/bin/python {DASH_BIN}/vct-model-gateway serve", False),
+    (f"{DASH_BIN}/python -c {DASH_BIN}/vct-model-gateway", False),
+    (f"{DASH_BIN}/python tool.py {DASH_BIN}/vct-model-gateway", False),
+    # a same-named script in another (spaced) tree
+    ("/Users/u/Other Proj/vco/.venv/bin/vct-model-gateway serve", False),
+])
+def test_macos_ps_line_matches_a_spaced_gateway_path_without_loosening(line, ours):
+    """Review FINAL4 left-open (macOS stdlib path): a gateway whose path
+    contains spaces was not recognised by the whitespace split, so the
+    uninstaller left it running. The raw-line fallback recognises it —
+    candidate-anchored, same argv0 / first-arg-after-python rule."""
+    proc = uq._stdlib_identity(42, platform="darwin", run=_fake_macos_ps(line))
+    assert proc is not None and proc.raw_line == line
+    assert uq.is_vco_gateway(proc, CANDS_SP) is ours
+
+
+def test_macos_ps_asks_for_unlimited_width():
+    """A-N2: BSD/macOS `ps` may truncate `args=`; `-ww` is passed on both calls."""
+    seen = []
+
+    def run(cmd, **_kw):
+        seen.append(cmd)
+        return _PsRes("x")
+    uq._stdlib_identity(42, platform="darwin", run=run)
+    assert seen and all(c[:2] == ["ps", "-ww"] for c in seen)
+
+
+def test_macos_ps_split_alone_breaks_on_spaces():
+    """The precondition: the naive split alone does NOT match (the tokens
+    are torn inside the path) — the raw line is what saves the match."""
+    line = f"{VENV_SP}/vct-model-gateway serve --port 11460"
+    proc = uq._stdlib_identity(42, platform="darwin", run=_fake_macos_ps(line))
+    assert proc.cmdline != (f"{VENV_SP}/vct-model-gateway", "serve", "--port", "11460")
+    assert uq.is_vco_gateway(uq.GatewayProc(proc.pid, proc.cmdline, proc.exe),
+                             CANDS_SP) is False
+
+
+def test_macos_ps_unknown_pid_is_none():
+    gone = uq._stdlib_identity(42, platform="darwin", run=_fake_macos_ps(""))
+    assert gone is None
+
+
+def test_a_current_stack_container_with_a_blank_working_dir_label_is_step_1s(tmp_path):
+    """R39 L3: some podman-compose versions leave ``working_dir`` blank; the
+    current stack's canonical container is then matched by compose project
+    and left to step [1], never listed as legacy. A blank label under another
+    project is still legacy."""
+    compose_dir = tmp_path / "vco" / "infrastructure"
+    compose_dir.mkdir(parents=True)
+    (compose_dir / "docker-compose.yml").write_text("services: {}\n")
+    canon = containers.canonical_name("ollama")
+    read, _ = _ident({canon: ("infrastructure", "", "ollama")})
+    found, left = uc.find("docker", current_compose_dir=compose_dir, identity=read)
+    assert canon not in [c.name for c in found] and not left
+    read, _ = _ident({canon: ("someother", "", "ollama")})
+    found, _ = uc.find("docker", current_compose_dir=compose_dir, identity=read)
+    assert canon in [c.name for c in found]
+
+
+@pytest.mark.parametrize("toks,script", [
+    (("/v/bin/python", "-S", "/v/bin/gw", "serve"), "/v/bin/gw"),
+    (("/v/bin/python3", "-X", "utf8", "-u", "/v/bin/gw"), "/v/bin/gw"),
+    (("/v/bin/python", "-m", "model_router"), None),
+    (("/v/bin/python", "-c", "/v/bin/gw"), None),
+    (("/usr/bin/cp", "/v/bin/gw", "/tmp"), None),
+    (("C:\\v\\Scripts\\pythonw.exe", "C:\\v\\Scripts\\gw.exe"), "C:\\v\\Scripts\\gw.exe"),
+])
+def test_python_script_arg(toks, script):
+    assert uq._python_script_arg(toks) == script
+
+
+
+def test_end_to_end_a_state_dir_not_named_vct_keeps_the_folder_and_the_users_files(
+        monkeypatch, tmp_path, home, capsys):
+    """R39 M1 + L3 through ``_run_uninstall``: the [8] question names what
+    actually goes, the user's file and the folder survive, VCO's own entries
+    go, and step [7] removes its exact-name state files inside the generic
+    ``state/`` dir that [8] leaves."""
+    prompts: list = []
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "y")
+    (home / "Documents").mkdir()
+    (home / "Documents" / "thesis.docx").write_text("user")
+    root = _run(monkeypatch, tmp_path, home, dry_run=False, events=[], yes=False, tty=True,
+                root_name="Documents")
+    assert (root / "thesis.docx").read_text() == "user" and root.is_dir()
+    assert not (root / "launcher.db").exists() and not (root / "retrieval_rl_data").exists()
+    assert not (root / "state" / "codegraph-walk-claims" / "a.lock").exists()
+    assert (root / "logs" / "model-gateway.log").exists()
+    assert any("Remove VCO's own entries from" in p and "folder stays" in p for p in prompts), prompts
+    assert not any("Remove the VCO state dir" in p for p in prompts), prompts

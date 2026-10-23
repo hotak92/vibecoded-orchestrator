@@ -1724,6 +1724,16 @@ mod tests {
         Db(Mutex::new(conn))
     }
 
+    /// R22 NIT-C: the panel hint's names come from `vct-module.json` — both
+    /// Shared-only keys VCO spends, never the per-project-capable PAT.
+    #[test]
+    fn slot_exclusive_names_come_from_the_manifest() {
+        let names = tauri::async_runtime::block_on(list_slot_exclusive_secret_names());
+        assert!(names.iter().any(|n| n == "openai_api_key"), "{names:?}");
+        assert!(names.iter().any(|n| n == "ANTHROPIC_API_KEY_GATEWAY"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "github_pat"), "{names:?}");
+    }
+
     /// R7b F2: a module setting is written through the one write path
     /// (`module_gui::write_setting`, the body of `set_module_setting`) — an invalid
     /// value for a declared setting, and a setting whose live value lives
@@ -2301,23 +2311,42 @@ mod tests {
     fn assert_refreshed_without_secret(folder: &std::path::Path, project_id: &str, key: &str, canary: &str) {
         assert_refreshed_without_secret_in(
             folder, project_id, key, canary,
-            &[".claude/settings.json", ".claude/env", ".env", ".vscode/settings.json"],
+            &[
+                ".claude/settings.json",
+                ".claude/settings.local.json",
+                ".claude/env",
+                ".env",
+                ".vscode/settings.json",
+            ],
         );
     }
 
     fn assert_refreshed_without_secret_in(
         folder: &std::path::Path, project_id: &str, key: &str, canary: &str, rels: &[&str],
     ) {
+        // v0.2.104 L5: VCT_PROJECT_ID is machine-local, so the projection
+        // writes it to `.claude/settings.local.json` (never the committable
+        // settings.json).
+        let local: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join(".claude/settings.local.json"))
+                .unwrap_or_else(|_| panic!("the re-projection did not run for {}", project_id)),
+        )
+        .unwrap();
+        assert_eq!(
+            local["env"]["VCT_PROJECT_ID"], project_id,
+            "the canonical env landed — the refresh really ran for {}: {}",
+            project_id, local["env"]
+        );
         let cs_path = folder.join(".claude/settings.json");
         let cs: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&cs_path)
                 .unwrap_or_else(|_| panic!("the re-projection did not run for {}", project_id)),
         )
         .unwrap();
-        assert_eq!(
-            cs["env"]["VCT_PROJECT_ID"], project_id,
-            "the canonical env landed — the refresh really ran for {}: {}",
-            project_id, cs["env"]
+        assert!(
+            cs["env"].get("VCT_PROJECT_ID").is_none(),
+            "a machine id must never land in the committable settings.json: {}",
+            cs["env"]
         );
         if rels.contains(&".claude/settings.json") {
             assert!(cs["env"].get(key).is_none(), "the secret KEY was projected into {}: {}", project_id, cs["env"]);
@@ -2366,7 +2395,8 @@ mod tests {
         assert_eq!(cs["env"]["USER_OWN_KEY"], "keep", "a key VCO never wrote is untouched");
     }
 
-    const NOT_SETTINGS: &[&str] = &[".claude/env", ".env", ".vscode/settings.json"];
+    const NOT_SETTINGS: &[&str] =
+        &[".claude/settings.local.json", ".claude/env", ".env", ".vscode/settings.json"];
 
 
     /// `remove_secret_v2` against the per-project user bucket: the refresh
@@ -4170,6 +4200,19 @@ pub async fn migrate_env_secrets_from_dotenv(
 pub struct SharedSecretsToggleResult {
     pub read_disabled: bool,
     pub warnings: Vec<String>,
+}
+
+/// v0.2.104 (R22 NIT-C): the secret names the hub serves ONLY from VCO's
+/// Shared slot (`slot_exclusive` in `vct-module.json` `bundled_secrets`).
+/// The Secrets panel shows "served from Shared only" when such a name is
+/// typed into a project's (or global) add form — a row the hub would
+/// otherwise skip silently. No manifest readable = no names (the hint is
+/// advisory; nothing else depends on it).
+#[command]
+pub async fn list_slot_exclusive_secret_names() -> Vec<String> {
+    vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest()
+        .map(|m| m.slot_exclusive_shared_keys())
+        .unwrap_or_default()
 }
 
 /// Read the per-project SHARED_SECRETS_READ_DISABLED gate for the launcher

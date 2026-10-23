@@ -87,3 +87,68 @@ def test_kg_base_dir_is_now_python_canonical() -> None:
         "secrets-toggle write of it does not vanish on the next Python apply."
     )
     assert "KG_BASE_DIR" in set(_extract_rust_canonical_keys())
+
+
+# ─── v0.2.104 L5: the machine-local split ───────────────────────────────
+
+_WATCHER_SRC = REPO_ROOT / "launcher" / "src-tauri" / "src" / "services" / "settings_json_watcher.rs"
+
+
+def test_machine_local_keys_are_canonical() -> None:
+    """Every machine-local key is a canonical key — the split partitions the
+    canonical set, it never adds a key the projection does not own."""
+    from vco_lib.config_projection import MACHINE_LOCAL_ENV_KEYS
+
+    stray = set(MACHINE_LOCAL_ENV_KEYS) - set(list_canonical_keys())
+    assert not stray, f"machine-local keys outside the canonical set: {sorted(stray)}"
+
+
+def test_every_rust_path_key_is_machine_local() -> None:
+    """The Rust canonical keys whose value is a machine path, id or endpoint
+    are all in the machine-local set (the Rust list is a subset of the Python
+    one; this pins the class of each shared key)."""
+    from vco_lib.config_projection import MACHINE_LOCAL_ENV_KEYS
+
+    rust = set(_extract_rust_canonical_keys())
+    expected_local = {
+        "KG_BASE_DIR", "VCT_ORCHESTRATOR_ROOT", "VCT_INFRASTRUCTURE_DIR",
+        "WEAVIATE_URL", "WEAVIATE_PORT", "OLLAMA_URL", "OLLAMA_PORT",
+        "CODE_EMBED_URL", "CODE_EMBED_PORT",
+        "VCT_KG_ACCESS_LIST", "VCT_CODE_GRAPH_ACCESS_LIST",
+    }
+    assert expected_local <= rust
+    assert expected_local <= set(MACHINE_LOCAL_ENV_KEYS)
+
+
+def test_watcher_surface_names_match_the_python_surface_table() -> None:
+    """The Rust settings watcher reads each watched file's env through
+    ``read-env`` under a surface NAME; those names and files must be the ones
+    ``config_projection._JSON_SURFACE_FILES`` serves, or a JSONC
+    settings.local.json is never hashed (fail-open reload on every write)."""
+    from vco_lib import config_projection as cp
+
+    code = "\n".join(strip_rust_comments(_WATCHER_SRC.read_text(encoding="utf-8")))
+    marker = "const WATCHED_SETTINGS_FILES: &[(&str, &str)] = &["
+    start = code.index(marker) + len(marker)
+    body = code[start:code.index("];", start)]
+    pairs = re.findall(r'\("([^"]+)",\s*"([^"]+)"\)', body)
+    assert pairs, "failed to parse WATCHED_SETTINGS_FILES"
+    for file_name, surface in pairs:
+        rel, env_key = cp._JSON_SURFACE_FILES[surface]
+        assert rel == f".claude/{file_name}" and env_key == "env", (file_name, surface)
+    assert {s for _f, s in pairs} == {
+        cp._SURFACE_CLAUDE_SETTINGS, cp._SURFACE_CLAUDE_SETTINGS_LOCAL,
+    }
+
+
+def test_unregister_strips_every_python_routing_key_not_only_the_rust_list() -> None:
+    """R14B B5: the launcher hands ``strip-routing`` its Rust list, a SUBSET
+    of the Python canonical set. The strip itself widens to the ONE table
+    (``unregister_env.routing_keys``), so every machine-local key — several of
+    which the Rust list lacks — is removed from settings.local.json."""
+    from vco_lib.config_projection import MACHINE_LOCAL_ENV_KEYS
+    from vco_lib.unregister_env import routing_keys
+
+    rust = set(_extract_rust_canonical_keys()) - {"GITHUB_TOKEN"}
+    assert set(MACHINE_LOCAL_ENV_KEYS) - rust, "precondition: the Rust list misses machine keys"
+    assert set(MACHINE_LOCAL_ENV_KEYS) | rust <= routing_keys()

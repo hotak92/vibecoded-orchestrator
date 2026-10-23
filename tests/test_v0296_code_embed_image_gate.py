@@ -531,7 +531,12 @@ def test_dispatch_stale_blocks_without_burning_the_cap(monkeypatch, tmp_path):
         )
     assert [r.status for r in results] == [dr.RETRIED]
     assert len(runner.calls) == 1
-    assert dr.attempt_count(tmp_path, CID) == 1
+    # v0.2.104 (G1): the RETRIED verdict ENDS the episode, so the per-episode
+    # count is back to 0; the trail still records exactly one STARTED row.
+    assert dr.attempt_count(tmp_path, CID) == 0
+    started = [ln for ln in dr.attempts_path(tmp_path).read_text().splitlines()
+               if '"started"' in ln]
+    assert len(started) == 1
     assert "--run-resync" in " ".join(runner.calls[0])
 
 

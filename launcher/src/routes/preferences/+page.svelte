@@ -21,6 +21,7 @@
     APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL,
     APP_STATE_KEY_OPENAI_EMBEDDINGS_CONSENT,
     APP_STATE_KEY_ACTIVE_EMBEDDING,
+    APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK,
     OLLAMA_URL,
   } from '$lib/preferences/loaders';
   import { parseSummaryTiers, type SummaryTier } from '$lib/preferences/summary_tiers';
@@ -1104,6 +1105,42 @@
       toast.error(e);
     } finally {
       rlOnlineTrainingGlobalSaving = false;
+    }
+  }
+
+  // v0.2.104 API-1: VCO's background `claude -p` jobs retry once with the
+  // Claude API key when the subscription is out. Absent row = OFF (the
+  // default): it bills the Console organisation, so it is never on by
+  // accident. Each job reads the row when it starts — no restart.
+  let gatewayApiKeyFallback = $state(false);
+  let gatewayApiKeyFallbackSaving = $state(false);
+
+  async function loadGatewayApiKeyFallback() {
+    try {
+      gatewayApiKeyFallback = (await PREF_LOADERS.gatewayApiKeyFallback.load()) === true;
+    } catch (e) {
+      console.debug('loadGatewayApiKeyFallback failed', e);
+    }
+  }
+
+  async function toggleGatewayApiKeyFallback() {
+    gatewayApiKeyFallbackSaving = true;
+    const next = !gatewayApiKeyFallback;
+    try {
+      await invoke<void>('app_state_set_bool', {
+        key: APP_STATE_KEY_GATEWAY_API_KEY_FALLBACK,
+        value: next,
+      });
+      gatewayApiKeyFallback = next;
+      toast.success(
+        next
+          ? 'Claude API key for background jobs ON — a background job refused for subscription quota retries once with the API key (billed to your Console organisation)'
+          : 'Claude API key for background jobs OFF',
+      );
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      gatewayApiKeyFallbackSaving = false;
     }
   }
 
@@ -2266,6 +2303,7 @@
     rlLocal: loadRlLocalState,
     rlUploadConsent: loadRlUploadConsent,
     rlGlobalTelemetry: loadRlGlobalTelemetryState,
+    gatewayApiKeyFallback: loadGatewayApiKeyFallback,
     dualFlags: () => { shownPanels.dualFlags = true; },
     logLevel: loadLogLevel,
     hardwareSnapshot: loadInitialHardwareSnapshot,
@@ -3190,6 +3228,36 @@
         <button class="pr-btn" onclick={() => goto('/preferences/chat-model-context')}>
           Open
         </button>
+      </div>
+    </section>
+
+    <!-- v0.2.104 API-1: VCO's background `claude -p` jobs retry once with the
+         Claude API key when the subscription is out. The key itself lives in
+         Secrets (shared scope, name ANTHROPIC_API_KEY_GATEWAY); this switch
+         only decides whether a subscription quota refusal may spend it. -->
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['gatewayApiKeyFallback'] }} aria-labelledby="pr-gateway-apikey-title">
+      <h2 class="pr-section-title" id="pr-gateway-apikey-title">Claude API key for background jobs</h2>
+      <div class="pr-rl-row">
+        <label class="pr-rl-toggle"
+               title="When ON, a VCO background claude -p job (knowledge-graph and code summaries, the post-commit KG review) refused because the Claude subscription is out of usage retries once with the Claude API key saved in Secrets → Shared as ANTHROPIC_API_KEY_GATEWAY. Billed to the Console organisation that key belongs to.">
+          <input type="checkbox" checked={gatewayApiKeyFallback}
+            disabled={gatewayApiKeyFallbackSaving}
+            onchange={() => void toggleGatewayApiKeyFallback()} />
+          <strong>Retry background jobs with the Claude API key when the subscription is out</strong>
+          <small>
+            OFF (default). ON: when the subscription is out of usage, VCO's
+            background <code>claude -p</code> jobs (knowledge-graph and code
+            summaries, the post-commit KG review) each retry their failed call
+            once with your Claude API key (Secrets → Shared,
+            <code>ANTHROPIC_API_KEY_GATEWAY</code>), passed to the job's
+            environment only; once the key serves, the rest of that run uses
+            it directly, and a key Anthropic refuses is not tried again until
+            the 5-hour quota cooldown has passed. Only the Shared slot answers
+            for this name — a project's own secret of the same name is never
+            used. The retry runs as a plain headless job, so Anthropic bills
+            it to the key; chat sessions are not affected by this switch.
+          </small>
+        </label>
       </div>
     </section>
 

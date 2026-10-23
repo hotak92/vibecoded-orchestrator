@@ -25,9 +25,10 @@ import sys
 import unittest
 from pathlib import Path
 
+from tests.common.env import IsolatedTestCase
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HELPER_DIR = PROJECT_ROOT / "claude_mcp_servers" / "scripts"
-sys.path.insert(0, str(HELPER_DIR))
 
 
 def _fresh_helper(env_overrides: dict[str, str] | None = None):
@@ -55,11 +56,24 @@ def _clear_access_env() -> None:
         os.environ.pop(k, None)
 
 
-class ParseCsvEnvTests(unittest.TestCase):
+class _IsolatedTestCase(IsolatedTestCase):
+    """Every test here mutates ``os.environ`` (the helpers read env at call
+    time) and ``sys.modules`` (fresh ``kg_access`` / ``weaviate_mcp``
+    imports). Both are process-global, so each test runs inside
+    ``tests.common.env.isolated_process_state``: without it,
+    ``PROJECT_NAME`` / ``CODE_GRAPH_PROJECT`` popped here stayed popped for
+    every later test in the same process."""
+
+    ISOLATED_MODULES = ("kg_access", "weaviate_mcp")
+    ISOLATED_SYS_PATH = (str(HELPER_DIR),)
+
+
+class ParseCsvEnvTests(_IsolatedTestCase):
     """``parse_csv_env`` must mirror the MCP-side ``_parse_csv_env`` so
     callers get identical behaviour through both paths."""
 
     def setUp(self) -> None:
+        super().setUp()
         _clear_access_env()
 
     def test_returns_empty_list_when_unset(self) -> None:
@@ -82,7 +96,7 @@ class ParseCsvEnvTests(unittest.TestCase):
         )
 
 
-class SanitizeCollectionPrefixTests(unittest.TestCase):
+class SanitizeCollectionPrefixTests(_IsolatedTestCase):
     """Canonical underscore-DROPPING PascalCase sanitization (converged onto
     the writer SSOT ``sanitize_for_weaviate_class`` in v0.2.77 7a-bis).
 
@@ -92,6 +106,7 @@ class SanitizeCollectionPrefixTests(unittest.TestCase):
     minimal in-module sanity check."""
 
     def setUp(self) -> None:
+        super().setUp()
         _clear_access_env()
 
     def test_idempotent_for_clean_input(self) -> None:
@@ -123,12 +138,13 @@ class SanitizeCollectionPrefixTests(unittest.TestCase):
         )
 
 
-class KgPeerCollectionsTests(unittest.TestCase):
+class KgPeerCollectionsTests(_IsolatedTestCase):
     """``kg_peer_collections`` parses VCT_KG_ACCESS_LIST → list of
     ``<Peer>_KnowledgeGraph`` collection names, deduped, order
     preserved."""
 
     def setUp(self) -> None:
+        super().setUp()
         _clear_access_env()
 
     def test_empty_when_unset(self) -> None:
@@ -150,11 +166,12 @@ class KgPeerCollectionsTests(unittest.TestCase):
         )
 
 
-class KgCollectionsToSearchTests(unittest.TestCase):
+class KgCollectionsToSearchTests(_IsolatedTestCase):
     """``kg_collections_to_search`` returns self → shared → peers → dev
     in that order, deduped."""
 
     def setUp(self) -> None:
+        super().setUp()
         _clear_access_env()
 
     def test_self_only_when_no_shared_no_peers(self) -> None:
@@ -281,11 +298,12 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         )
 
 
-class CodeGraphCollectionsToQueryTests(unittest.TestCase):
+class CodeGraphCollectionsToQueryTests(_IsolatedTestCase):
     """``code_graph_collections_to_query`` builds (collection_name,
     filter_value) pairs for code-graph fan-out."""
 
     def setUp(self) -> None:
+        super().setUp()
         _clear_access_env()
 
     def test_returns_bare_collections_when_no_self_project(self) -> None:
@@ -396,12 +414,13 @@ class CodeGraphCollectionsToQueryTests(unittest.TestCase):
         )
 
 
-class HelperParityWithMcpServerTests(unittest.TestCase):
+class HelperParityWithMcpServerTests(_IsolatedTestCase):
     """The CLI helper and the MCP server's in-module helpers must
     produce IDENTICAL output given the same env. Pinning this guards
     against silent drift between the two."""
 
     def setUp(self) -> None:
+        super().setUp()
         # Strip every env var that influences either helper.
         for k in (
             "VCT_KG_ACCESS_LIST",

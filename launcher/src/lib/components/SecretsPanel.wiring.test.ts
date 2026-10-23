@@ -330,3 +330,77 @@ describe('SecretsPanel suggests the dedicated VCO OpenAI key (OD-4)', () => {
     ).toBe(true);
   });
 });
+
+// ─── v0.2.104: the background jobs' Claude API key slot ───────────────────
+// VCO's background `claude -p` jobs resolve exactly `ANTHROPIC_API_KEY_GATEWAY`
+// in the SHARED scope (vco_lib/claude_cli_api_key.py SECRET_KEY_NAME); the
+// shared add form spells that name for the user.
+describe('SecretsPanel suggests the Claude API key slot (v0.2.104)', () => {
+  it('a shared-scope branch renders the ANTHROPIC_API_KEY_GATEWAY suggestion', () => {
+    const arm = ifBlocks().find(
+      (n) => n.test && subtreeHasLiteral(n.test, 'shared') && subtreeHasLiteral(n.consequent, 'ANTHROPIC_API_KEY_GATEWAY'),
+    );
+    expect(arm, "no {#if scope === 'shared'} branch suggests ANTHROPIC_API_KEY_GATEWAY").toBeTruthy();
+    const shown = renderedText(arm!.consequent);
+    expect(shown).toContain('claude api key');
+    expect(shown).toContain('background');
+    // The model gateway's API-key route is gone (owner 2026-10-20).
+    expect(shown).not.toContain('model gateway');
+    expect(shown).not.toContain('claude-gw/api');
+  });
+
+  it('clicking it fills the KEY field with the exact name', () => {
+    const assignments = NODES.filter(
+      (n) =>
+        n.type === 'AssignmentExpression' &&
+        (n.left as Record<string, unknown> | undefined)?.type === 'Identifier' &&
+        (n.left as Record<string, unknown>).name === 'newKey',
+    );
+    expect(assignments.some((n) => subtreeHasLiteral(n.right, 'ANTHROPIC_API_KEY_GATEWAY'))).toBe(true);
+  });
+});
+
+// ─── R22 NIT-C: a Shared-only name typed outside the Shared tab ────────────
+// The hub serves `slot_exclusive` names (vct-module.json) from VCO's Shared
+// slot only, so a project/global row under such a name is skipped silently.
+// The panel must say "served from Shared only" while such a name is typed.
+describe('SecretsPanel hints that slot-exclusive names are served from Shared only', () => {
+  function identifierUses(name: string): Record<string, unknown>[] {
+    return NODES.filter((n) => n.type === 'Identifier' && n.name === name);
+  }
+
+  it('loads the names from the launcher (list_slot_exclusive_secret_names)', () => {
+    const calls = NODES.filter(
+      (n) =>
+        n.type === 'CallExpression' &&
+        (n.callee as Record<string, unknown> | undefined)?.type === 'Identifier' &&
+        (n.callee as Record<string, unknown>).name === 'listSlotExclusiveSecretNames',
+    );
+    expect(calls.length).toBeGreaterThan(0);
+  });
+
+  it('derives the hint from the names, the typed key and a non-Shared scope', () => {
+    const decl = NODES.find(
+      (n) =>
+        n.type === 'VariableDeclarator' &&
+        (n.id as Record<string, unknown> | undefined)?.name === 'sharedOnlyName',
+    );
+    expect(decl, 'no sharedOnlyName derivation').toBeTruthy();
+    const init = [...walk(decl!.init)];
+    expect(init.some((n) => n.type === 'Identifier' && n.name === 'slotExclusiveNames')).toBe(true);
+    expect(init.some((n) => n.type === 'Identifier' && n.name === 'newKey')).toBe(true);
+    expect(init.some((n) => n.type === 'Identifier' && n.name === 'scope')).toBe(true);
+    expect(subtreeHasLiteral(decl!.init, 'shared')).toBe(true);
+    expect(identifierUses('slotExclusiveNames').length).toBeGreaterThan(1);
+  });
+
+  it('renders "served from Shared only" in the branch that tests the derivation', () => {
+    const arm = ifBlocks().find(
+      (n) =>
+        n.test &&
+        [...walk(n.test)].some((m) => m.type === 'Identifier' && m.name === 'sharedOnlyName'),
+    );
+    expect(arm, 'no {#if sharedOnlyName} branch').toBeTruthy();
+    expect(renderedText(arm!.consequent)).toContain('served from shared only');
+  });
+});

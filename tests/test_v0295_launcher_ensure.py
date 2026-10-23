@@ -49,6 +49,17 @@ class _Spawns(list):
         self.append((tuple(argv), cwd))
 
 
+@pytest.fixture(autouse=True)
+def _no_orchestrator_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Step 2 also probes the orchestrator clone (v0.2.104) — the checkout
+    these tests run from, whose committed ``launcher/dist/`` would answer
+    every "nothing on this machine" case. Pin it away; the fallback has its
+    own tests in ``tests/test_v02104_hub_resume_ensure.py``."""
+    from vco_lib import hub_ensure as _he
+
+    monkeypatch.setattr(_he, "_orchestrator_roots", lambda _environ: [])
+
+
 @pytest.fixture
 def spawns():
     return _Spawns()

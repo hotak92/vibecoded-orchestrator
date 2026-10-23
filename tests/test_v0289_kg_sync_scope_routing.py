@@ -40,6 +40,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from tests.common.env import isolate_process_state
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 
@@ -180,14 +182,6 @@ class _CountingServer:
         return {self.text_vector_slot: [0.9, 0.9, 0.9]}, []
 
 
-_ENV_KEYS = (
-    "KG_BASE_DIR", "KG_COLLECTION", "SHARED_KG_COLLECTION",
-    "DEVELOPMENT_COLLECTION", "DUAL_EMBEDDING_ENABLED",
-    "VCT_DISABLE_HUB_RESOLVER", "SHARED_KG_WRITE_DISABLED",
-    "SHARED_KG_OPT_OUT", "VCT_PROJECT_ID", "KG_SYNC_PROJECT_ROOT",
-)
-
-
 def _load_sync_module(project_root: Path, *, shared: str = SHARED_KG):
     os.environ["KG_BASE_DIR"] = str(project_root)
     os.environ["KG_COLLECTION"] = PROJECT_KG
@@ -240,6 +234,13 @@ def _seed_row(server: _CountingServer, collection: str, file_path: str,
 
 class ScopeRoutingTestBase(unittest.TestCase):
     def setUp(self):
+        # _load_sync_module writes the KG identity env and registers a unique
+        # module (which imports weaviate_mcp / kg_access); all of it is put
+        # back EXACTLY after the test. The old tearDown POPPED the keys, which
+        # also removed whatever the session had set before (v0.2.104).
+        isolate_process_state(
+            self.addCleanup, modules=("_sync_kg_scope_*", "weaviate_mcp", "kg_access"),
+        )
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.knowledge = self.root / "knowledge"
@@ -248,8 +249,6 @@ class ScopeRoutingTestBase(unittest.TestCase):
         self.fp = "knowledge/concepts/scoped.md"
 
     def tearDown(self):
-        for k in _ENV_KEYS:
-            os.environ.pop(k, None)
         self._tmp.cleanup()
 
     def _sync(self, mod, server):

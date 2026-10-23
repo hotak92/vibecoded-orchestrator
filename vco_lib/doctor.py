@@ -1310,6 +1310,20 @@ def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> li
             f"; {partial} dual-log twin(s) partial ({missing_nodes} node(s) "
             "had no vector for the other slot)"
         )
+    pending_files = int(summary.get("pending_files") or 0)
+    pending_oldest_ms = summary.get("pending_oldest_ms")
+    if pending_files:
+        # v0.2.104 R11 F5: spilled lines (writer found the ledger lock busy)
+        # wait in the pending dir until the next locked write drains them.
+        # Never capped (logs are always collected), so make a backlog visible.
+        age = ""
+        if isinstance(pending_oldest_ms, int):
+            age_s = max(0, int(_time.time() - pending_oldest_ms / 1000))
+            age = f", oldest {age_s} s old"
+        text += (
+            f"; {pending_files} spilled line file(s) waiting to be drained into "
+            f"the ledger{age} (counted above)"
+        )
     # The one loss no writer can record: a hook search killed by its own
     # timeout before it sent anything. Say so, so a quiet ledger is not read
     # as proof of zero loss.
@@ -1329,6 +1343,8 @@ def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> li
                 "last_ts_ms": summary.get("last_ts_ms"),
                 "partial_twins": partial,
                 "partial_missing_nodes": missing_nodes,
+                "pending_files": pending_files,
+                "pending_oldest_ms": pending_oldest_ms,
                 "not_counted": "hook search killed by its timeout before sending",
             },
         )
@@ -4739,6 +4755,13 @@ def probe_playwright_browser(folder: Path, res: DoctorResolvers, ctx: dict) -> l
     return playwright_mcp.probe_browser(folder, res, ctx)
 
 
+def probe_scratch_dir(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.scratch_dir` (v0.2.104)."""
+    from vco_lib import scratch_dir  # noqa: PLC0415
+
+    return scratch_dir.probe_scratch(folder, res, ctx)
+
+
 def _playwright_browser_entry(finding: Finding):
     from vco_lib import playwright_mcp  # noqa: PLC0415
 
@@ -4846,6 +4869,10 @@ PROBES: dict = {
     # are the user's files; nothing VCO runs can clear the finding), so the
     # boot counter must never point at it (the v0.2.92 promise reason).
     "agent_model_ids": (probe_agent_model_ids, (SCOPE_FULL,)),
+    # v0.2.104: full-only, informational — the sanctioned scratch dir's lane
+    # count, total size and oldest age. No registered condition (VCO's own
+    # SessionStart sweep cleans it; the count is reported, not graded).
+    "scratch_dir": (probe_scratch_dir, (SCOPE_FULL,)),
 }
 
 
@@ -5656,6 +5683,7 @@ __all__ = [
     "probe_agent_model_ids",
     "probe_diagnostic_files",
     "probe_disk_space",
+    "probe_scratch_dir",
     "probe_install_completeness",
     "probe_kg_binding_evidence",
     "probe_last_update_run",

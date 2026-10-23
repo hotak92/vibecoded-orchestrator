@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 11 free agents, 6 skills, and 51 hooks (45 event-registered in the default `.claude/settings.json`; 4 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 10 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 11 free agents, 7 skills, and 51 hooks (45 event-registered in the default `.claude/settings.json`; 4 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 10 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -50,7 +50,7 @@ VCO's `worktree-guard` WorktreeCreate hook creates the worktree, so it also cove
 
 Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`. v0.2.101 right-sized the catalogue to **6 default skills**: the topical review/advisor skills moved into the opt-in packs, and several former skills now ship as reference docs under `.claude/specializations/`. (Agent `skills:` frontmatter was retired in the same release — specialist depth is read from the specialisation docs instead.)
 
-### Default skills (6)
+### Default skills (7)
 
 - **`context-compress`** — the `/compact` pipeline (what it saves and reinjects) plus `CONTEXT_STATE.md` inspection and maintenance. Absorbs the former `context` skill.
 - **`fix-issue`** — investigate and fix a GitHub issue or bug report: read, reproduce, root-cause, fix, add a regression test.
@@ -58,6 +58,7 @@ Skills are smaller and lighter than agents — they're injected into context as 
 - **`task-breakdown`** — break a feature or epic into estimated tasks with a dependency graph and a risk assessment.
 - **`orchestrator-installer`** — diagnose a partially-failed VCO install and advise on `install.py` flags (re-assigned from an agent).
 - **`project-bootstrapper`** — a human-led second pass over the seeded CLAUDE.md / ARCHITECTURE.md / knowledge nodes (re-assigned from an agent).
+- **`api-review`** — run one bounded headless Claude Code task (typically a final Fable review) billed to the Claude Console API key instead of the subscription, with a cost summary; drives `.claude/scripts/claude-api-run.sh` / `.ps1`.
 
 ### Pack skills
 
@@ -99,7 +100,7 @@ Display KG resource paths at session start. Optionally launches the RL server if
 Warn if `CONTEXT_STATE.md` exceeds configured thresholds (warn: 300 lines, max: 400 lines). Prompts to run `doc-maintainer` agent to trim.
 
 ### `compact-context-reinject.sh` — SessionStart (startup + compact)
-Re-inject `CONTEXT_STATE.md`, recent git commits and the active plan at session start and after context compaction (the pre-compact snapshot section is a compaction artefact and emits only on `compact`). Before v0.2.102 only the `compact` matcher was registered; v0.2.102 W6-F briefly added `resume` and W6-K withdrew it (owner 2026-10-11: a resumed chat already has CONTEXT_STATE in context) — the bundle update scrubs the resume group from installs that received it.
+Re-inject `CONTEXT_STATE.md`, recent git commits and the active plan at session start and after context compaction (the pre-compact snapshot section is a compaction artefact and emits only on `compact`). After a compaction (v0.2.104) it does not repeat the git state Claude Code restores itself: the recent commits and the snapshot's git-status block are dropped in favour of the harness's fresh git status; `CONTEXT_STATE.md`, the session state and the plan are still re-injected in full. Before v0.2.102 only the `compact` matcher was registered; v0.2.102 W6-F briefly added `resume` and W6-K withdrew it (owner 2026-10-11: a resumed chat already has CONTEXT_STATE in context) — the bundle update scrubs the resume group from installs that received it.
 
 <details>
 <summary>Details</summary>
@@ -112,7 +113,7 @@ Uses LITM (Lost-In-The-Middle) ordering: most critical content placed at both st
 Save a snapshot of current working state before every compaction (`/compact` and auto-compact alike; matcher `*` — v0.2.102 widened it from `auto`, under which a manual `/compact` saved nothing and the re-inject later replayed a stale snapshot): git status (top 30 files), recently changed files, current open file list. Output written to `.claude/context/pre-compact-snapshot.md`.
 
 ### `post-compact.sh` — PostCompact
-Log compaction event and send desktop notification after compaction completes. Appends to `~/.claude/metrics/compactions.jsonl`. Resets the `diff-context-inject.sh` baseline.
+Log compaction event and send desktop notification after compaction completes. Appends to `compactions.jsonl` in the metrics directory. Resets the `diff-context-inject.sh` baseline and the injection dedupe state. Wipes the Build Anchor reads list and writes this session's `compacted_<session>.txt` marker; the files Claude Code itself re-attaches after the compaction stay writable anyway, because Build Anchor looks them up in the transcript on a miss (v0.2.104, see `pre-tool-use.sh` below).
 
 ### `user-prompt-submit-reminder.sh` — UserPromptSubmit (blocking)
 Inject workflow reminders (update CONTEXT_STATE.md, check KG-first policy) when session output volume suggests substantial work has occurred. The counter is the session's cumulative work units from the live transcript (incremental `claude_token_counter.py` scan, v0.2.102 — the pre-v0.2.102 hardwired `WORDS_THIS_TURN=0` meant the reminders could never fire).
@@ -139,7 +140,7 @@ Security enforcement + file backup.
 Three actions:
 1. **SSRF guard**: blocks WebFetch/fetch_page requests to private IP ranges.
 2. **Shell injection scan**: detects network-fetch-to-shell patterns (`curl | bash`, etc.).
-3. **Build Anchor Protocol**: tracks files read this session; blocks Write/Edit on files not yet read (prevents clobber). Creates a backup of existing files before Write/Edit in `.claude/state/tool_backups/`.
+3. **Build Anchor Protocol**: tracks files read this session; blocks a Write to an existing file not yet read (prevents clobber; Edit is left to Claude Code's own read-before-edit rule). After a compaction the list is wiped; on a miss (v0.2.104) a Write is still allowed — and the path recorded — when the session transcript shows Claude Code re-attached that exact file, with its whole content, after the latest compaction (`vco_lib/compact_reattach.py` reads the `file` attachment rows after the last `compact_boundary`, scanning at most the transcript's last 128 MiB; any doubt blocks). The scan gets only what is LEFT of the hook's 3-second registration timeout — a PreToolUse hook killed on timeout does not block — so the hook measures its own elapsed time (`.ps1`: from the PowerShell process start) and passes `--deadline` = 3 s − elapsed − 0.7 s (the module caps it at 1 s); under 0.2 s it blocks without starting Python. `VCO_PRE_TOOL_USE_TIMEOUT_S` must follow a changed registration timeout (`docs/CONFIGURATION.md`). It is asked only when `post-compact` has left this session's `.claude/state/compacted_<session>.txt` marker, so a session that never compacted is blocked without starting Python. Creates a backup of existing files before Write/Edit in `.claude/state/tool_backups/`.
 
 Exit 2 blocks the tool call. Exit 0 allows it. Security events logged to `.claude/logs/security_events.jsonl`.
 
@@ -323,8 +324,8 @@ Scans the user prompt for keywords declared in agents'/skills' `keywords:` front
 ### Spawn-time agent/skill suggestions — PreToolUse `Agent|Task` (v0.2.102)
 The subagent's brief gets the same keyword suggestions `agent-skill-keyword-suggest.sh` gives a user prompt: the context router's `agent` surface runs the shared matcher (`agent-skill-keyword-match.py`) over the brief and appends a `[Agent/skill suggestions for this task]` section in the SAME `updatedInput` envelope as the KG block (`agent-brief-kg-inject.sh`). Agents are suggested only when the subagent's definition can spawn one (`tools:` lists `Agent`/`Task`, or declares no list); no per-session dedupe, because the subagent has seen none of the parent's suggestions. The former `subagent-start-suggest.sh` (SubagentStart) is retired: the SubagentStart payload carries no launch prompt, so it never produced a suggestion; the next bundle update removes its registration and script.
 
-### `session-start-ensure-hub.sh` — SessionStart (startup, background)
-Ensure the `vct-hub` resolver service is running by invoking `vct-hub --start-if-not-running`. Idempotent. Soft-fails throughout — never blocks startup.
+### `session-start-ensure-hub.sh` — SessionStart (startup + resume|clear|compact, background)
+Ensure the `vct-hub` resolver service is running by invoking `vct-hub --start-if-not-running` (then the registered model gateway and the launcher, tray only). Idempotent. Soft-fails throughout — never blocks startup. Since v0.2.104 it is registered for every session source — `startup`, and a second group `resume|clear|compact` — because VS Code restores existing chats after a reboot and a restored chat fires `SessionStart` with source `resume`; and the binary is found in the orchestrator clone's `launcher/dist/` from any project. The clone named by `$VCT_INSTALL_ROOT` / `$VCT_ORCHESTRATOR_ROOT` (VCO writes both into every project's settings) is searched first, so a second clone or work tree opened as a project never starts its own hub or launcher as the machine-wide one; without those variables the project's own `launcher/dist/` comes first, then the checkout `vco_lib` runs from. The tray launcher is found through the same chain. Its reports (binary not found, start failed, no Python interpreter) are emitted as JSON `additionalContext`, the only output Claude Code hands over from an async hook. The launcher's Hooks tab shows the two registrations as one row and disables or restores them together (`vco_lib.hook_retirements.MATCHER_SIBLINGS`, read by `vco_lib.hooks_settings`); `vct-cli hooks list` folds them the same way, and `vct-cli hooks disable` / `enable` on either id acts on both.
 
 ### `check-no-fork-bomb.sh` — defense-in-depth detector
 Counts running `lean-ctx` processes and warns if the threshold is exceeded. Backstop for the historical BASH_ENV lean-ctx fork-bomb pattern (now mitigated by design in v0.2.11+).

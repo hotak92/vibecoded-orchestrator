@@ -24,11 +24,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.common.env import IsolatedTestCase
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = PROJECT_ROOT / "templates" / "scripts"
 HELPER_DIR = PROJECT_ROOT / "claude_mcp_servers" / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
-sys.path.insert(0, str(HELPER_DIR))
 
 
 def _clear_env() -> None:
@@ -117,11 +117,17 @@ class _FakeClient:
         self._closed = True
 
 
-class SearchKnowledgeAccessListTests(unittest.TestCase):
+class SearchKnowledgeAccessListTests(IsolatedTestCase):
     """``search_knowledge.search_knowledge(...)`` queries every
     collection in the access matrix."""
 
+    # Each test re-imports the CLI (and the weaviate_mcp it pulls in) under
+    # fake env; the base class restores env, these modules and sys.path after.
+    ISOLATED_MODULES = ("search_knowledge", "kg_access", "weaviate_mcp")
+    ISOLATED_SYS_PATH = (str(HELPER_DIR), str(SCRIPTS_DIR))
+
     def setUp(self) -> None:
+        super().setUp()
         _clear_env()
 
     def test_no_access_list_queries_self_only(self) -> None:

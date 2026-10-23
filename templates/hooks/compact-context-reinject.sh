@@ -101,6 +101,34 @@ if [ -z "$HOOK_SOURCE" ] || [ "$HOOK_SOURCE" = "compact" ]; then
     _IS_COMPACT_SOURCE=1
 fi
 
+# v0.2.104: after a compaction Claude Code itself re-injects a fresh git
+# status (which carries the recent commits) — vendor page
+# https://code.claude.com/docs/en/context-window, "What survives compaction".
+# Repeating it here only spends the 10 000-char hook budget twice, so when
+# the payload POSITIVELY says source=compact (an absent/unknown source keeps
+# the full pre-v0.2.104 shape — repeating is the safe direction) the Recent
+# Commits section and the snapshot's git-status block are dropped. Every
+# other section (CONTEXT_STATE, the session state, the plan) is re-injected
+# in full: whether the harness also re-attached one of those files is only
+# flushed to the transcript around this hook's own start, so it is not
+# knowable reliably here. The snapshot trimming is
+# `python -m vco_lib.compact_reattach snapshot-body`; when that is
+# unavailable the plain first 50 lines are replayed.
+# MUST MATCH compact-context-reinject.ps1.
+_IS_HARNESS_COMPACT=0
+[ "$HOOK_SOURCE" = "compact" ] && _IS_HARNESS_COMPACT=1
+_RC_PY=""
+if [ "$_IS_HARNESS_COMPACT" = "1" ] && [ -n "${PY:-}" ]; then
+    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+    [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/resolve-vco-venv.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/resolve-vco-venv.sh"
+    VCO_VENV_PYTHON=""
+    if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+        resolve_vco_venv_python "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" 2>/dev/null || true
+    fi
+    _RC_PY="${VCO_VENV_PYTHON:-$PY}"
+    [ -x "$_RC_PY" ] || _RC_PY="$PY"
+fi
+
 # The shared injection cap. A missing helper is a broken install; the hook
 # still re-injects (uncapped) rather than dropping the user's state.
 # shellcheck source=_lib/emit-context.sh disable=SC1091
@@ -237,9 +265,13 @@ if [ -n "$LATEST_PLAN" ]; then
 $(head -30 "$LATEST_PLAN")"
 fi
 
-# 3. Recent git activity -- MIDDLE position (cap: 8 commits)
-S_commits="## Recent Commits
+# 3. Recent git activity -- MIDDLE position (cap: 8 commits). Not after a
+#    compaction (v0.2.104): the harness re-injects a fresh git status with
+#    the recent commits itself.
+if [ "$_IS_HARNESS_COMPACT" != "1" ]; then
+    S_commits="## Recent Commits
 $(git -C "$PROJECT_DIR" log --oneline -8 2>/dev/null || true)"
+fi
 
 # 4. Pre-compaction snapshot -- END position (line cap: 50)
 #    Contains git status + recently changed files, saved by pre-compact-save.sh
@@ -252,8 +284,15 @@ if [ "$_IS_COMPACT_SOURCE" = "1" ] && [ -f "$SNAPSHOT" ]; then
         S_snap="## Pre-Compaction Snapshot (stale -- NOT replayed)
 Last saved: $(_vco_snapshot_saved_line "$SNAPSHOT"). This snapshot is older than the current session's compaction, so pre-compact-save.sh did not run for it (it should, on every compact since v0.2.102). Read .claude/context/pre-compact-snapshot.md only if you need it."
     else
+        # v0.2.104: minus its git-status block (the harness re-injects a
+        # fresh one); the plain first 50 lines when the module is unavailable.
+        _SNAP_BODY=""
+        if [ -n "$_RC_PY" ]; then
+            _SNAP_BODY=$("$_RC_PY" -m vco_lib.compact_reattach snapshot-body --path "$SNAPSHOT" 2>/dev/null) || _SNAP_BODY=""
+        fi
+        [ -n "$_SNAP_BODY" ] || _SNAP_BODY=$(head -50 "$SNAPSHOT")
         S_snap="## Pre-Compaction Snapshot
-$(head -50 "$SNAPSHOT")"
+$_SNAP_BODY"
     fi
 fi
 

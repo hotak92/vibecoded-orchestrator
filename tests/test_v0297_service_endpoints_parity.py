@@ -484,7 +484,10 @@ def test_standalone_env_uses_the_machine_resolver(tmp_path: Path, monkeypatch) -
     (folder / ".claude").mkdir(parents=True)
     result = _apply_standalone_env(folder, orchestrator_root=None, project_name="Standalone")
     assert result["action"] == "applied", result
-    env = json.loads((folder / ".claude" / "settings.json").read_text())["env"]
+    # v0.2.104 L5: service endpoints are machine-local → settings.local.json.
+    env = json.loads((folder / ".claude" / "settings.local.json").read_text())["env"]
+    assert "WEAVIATE_URL" not in json.loads(
+        (folder / ".claude" / "settings.json").read_text())["env"]
     assert env["WEAVIATE_URL"] == "http://weaviate.lan:8090"
     assert env["WEAVIATE_PORT"] == "8090"
     assert env["OLLAMA_URL"] == "http://localhost:11434"

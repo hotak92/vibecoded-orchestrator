@@ -1136,6 +1136,17 @@ def test_a_row_enqueued_while_the_first_pass_runs_is_still_served(seed_env, monk
     assert dr.owed_condition_ids(seed_env) == []
 
 
+def _started_rows(folder, cid: str) -> int:
+    """STARTED rows for ``cid`` in the attempt trail, across every episode."""
+    import json
+
+    from vco_lib import deferral_retry as dr
+
+    path = dr.attempts_path(folder)
+    rows = [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+    return sum(1 for r in rows if r.get("condition_id") == cid and r.get("status") == dr.STARTED)
+
+
 def test_the_settle_loop_never_re_attempts_the_same_row(seed_env, monkeypatch):
     """The bound must not eat the attempt cap: one pass per cid, per driver."""
     from vco_lib import deferral_retry as dr
@@ -1156,7 +1167,9 @@ def test_the_settle_loop_never_re_attempts_the_same_row(seed_env, monkeypatch):
     dr.dispatch(seed_env, backend_probe=lambda *a, **k: True, runner=_runner,
                 python="python", single_instance=False)
     assert len(calls) == 1, "the same row must not be dispatched twice in one driver"
-    assert dr.attempt_count(seed_env, proj) == 1, (
+    # v0.2.104: the row's retry COMPLETED, which ends its episode (the
+    # per-episode cap reads 0 again) — so count the trail's STARTED rows.
+    assert _started_rows(seed_env, proj) == 1, (
         "a second pass must not burn another attempt for a row this driver ran"
     )
 
@@ -1286,7 +1299,7 @@ def test_a_failed_row_is_not_re_attempted_when_a_new_row_arrives(seed_env, monke
     assert dr.attempt_count(seed_env, proj) == 1, (
         "the still-owed FAILED row was re-attempted in the settle pass"
     )
-    assert dr.attempt_count(seed_env, shared) == 1
+    assert _started_rows(seed_env, shared) == 1  # completed: episode over (v0.2.104)
     assert [r.status for r in results] == [dr.FAILED, dr.RETRIED], results
     assert dr.owed_condition_ids(seed_env) == [proj], "still owed: the retry"
 

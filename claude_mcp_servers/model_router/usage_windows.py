@@ -25,7 +25,11 @@ QwenCloud  none — no quota source       the gateway ledger's routed-token tota
 Kimi Code  5h, monthly, monthly code    ``Vendor.quota_url`` (``x-api-key``
                                         raw, the relayed client user-agent —
                                         the same Cloudflare edge gate as its
-                                        messages endpoint, live 2026-10-07)
+                                        messages endpoint, live 2026-10-07);
+                                        when its 5h reading is unknown or
+                                        stale, a ``~`` ESTIMATE from this
+                                        gateway's ledger against a token
+                                        budget (``ledger_estimate``)
 ========== ============================ ======================================
 
 Four rules shape everything below.
@@ -87,6 +91,10 @@ from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import aiohttp
 
+from vco_lib.atomic import atomic_write_json
+from vco_lib.env_values import env_int
+
+from .config import usage_resets_path
 from .vendors import (
     DEFAULT_ANTHROPIC_VERSION,
     OAUTH_BETA,
@@ -110,6 +118,49 @@ STALE_AFTER_S = 30 * 60
 FETCH_TIMEOUT_S = 10.0
 #: Largest quota answer read. Both real answers are under 4 KiB.
 MAX_BODY_BYTES = 256 * 1024
+#: Distinct client user-agents remembered for a user-agent-gated quota
+#: endpoint (the kimi row), most recent first when asked.
+MAX_CLIENT_USER_AGENTS = 4
+#: How long a client user-agent the quota endpoint REFUSED (HTTP 403 at the
+#: vendor's edge) is skipped before it is offered again. A library UA (the
+#: launcher's ``Python-urllib`` read of ``/usage/windows``) is refused every
+#: time; a real client's UA refused by a transient edge rule must come back.
+REFUSED_USER_AGENT_RETRY_S = 60 * 60
+
+#: The Kimi 5h FALLBACK ESTIMATE's token budget (owner 2026-10-18: "Kimi's
+#: budget is pretty much 1M tokens over a 5h window", read off the vendor's
+#: website against this gateway's own subagent traffic). ``0`` disables the
+#: estimate. Read once, when :class:`UsageWindows` is built at daemon start.
+KIMI_5H_BUDGET_ENV = "VCT_MODEL_GATEWAY_KIMI_5H_TOKEN_BUDGET"
+DEFAULT_KIMI_5H_TOKEN_BUDGET = 1_000_000
+#: Kimi's 5h windows sit on a FIXED 5-hour grid: the 2026-10-07 probe reset
+#: at 05:13:09.844464Z and the 2026-10-18 one at 06:13:09.844464Z, exactly
+#: 53 x 5 h apart — so a past reset rolls forward in 5 h steps.
+KIMI_5H_SPAN_S = 5 * 60 * 60
+#: How far back the ledger reader keeps individual rows for window estimates:
+#: one 5h window plus slack.
+RECENT_LEDGER_KEEP_S = 6 * 60 * 60
+#: The ledger's four token fields, in the order a recent row stores them.
+LEDGER_TOKEN_FIELDS: tuple[str, ...] = (
+    "input_tokens", "cache_creation_input_tokens",
+    "cache_read_input_tokens", "output_tokens",
+)
+#: Which ledger fields the Kimi 5h estimate counts. CALIBRATION (2026-10-18):
+#: the only evidence is two live readings 14 s apart in a window whose
+#: ledger held 2 then 3 kimi rows (the 2026-10-07 window predates the
+#: ledger's oldest row). ``limit_5h.used_ratio`` read 0.0135 then 0.015;
+#: the ledger held input 44,491 / output 488 / cache-read 38,656, then input
+#: 45,257 / output 962 / cache-read 82,944 (cache-creation 0 throughout).
+#: No field set fits both with one budget — input+output implies 3.3M then
+#: 3.1M per window but 0.83M for the step between; adding cache-read implies
+#: 6.2M then 8.6M — and Kimi's detail count ("1 of 100") is too coarse to
+#: help. The evidence cannot decide, so the rule is input + cache-creation
+#: + output (cache reads excluded), as the owner asked in that case. Against
+#: the 1M default it read ~4.5 % where Kimi said 1.35 %: the estimate errs
+#: HIGH, the safe side for deciding whether a lane may run.
+KIMI_5H_ESTIMATE_FIELDS: tuple[str, ...] = (
+    "input_tokens", "cache_creation_input_tokens", "output_tokens",
+)
 
 ANTHROPIC_USAGE_PATH = "/api/oauth/usage"
 
@@ -118,6 +169,9 @@ SOURCE_UNIFIED_HEADERS = "unified_headers"
 SOURCE_ZAI_QUOTA = "zai_quota"
 SOURCE_KIMI_USAGES = "kimi_usages"
 SOURCE_LEDGER = "gateway_ledger"
+#: A window percent ESTIMATED from this gateway's own ledger (the Kimi 5h
+#: fallback) — never the vendor's reading; rendered with a ``~``.
+SOURCE_LEDGER_ESTIMATE = "ledger_estimate"
 
 #: Vendor states. ``pending`` = no refresh has completed yet; ``unconfigured``
 #: = no credential to ask with; ``unknown`` = asked and got nothing usable.
@@ -441,25 +495,65 @@ _KIMI_5H_DURATION_MINUTES = 300
 _KIMI_TIME_UNIT_MINUTE = "TIME_UNIT_MINUTE"
 
 
+def _kimi_5h_from_detail(detail: Mapping[str, Any]) -> Optional[float]:
+    """The 5h percent from one ``limits[].detail`` block, else ``None``.
+
+    The block is proto3 JSON (``TIME_UNIT_MINUTE`` enum names, int64 as
+    strings), and proto3 JSON OMITS a field at its default value: an unused
+    window carries ``limit`` and ``remaining`` but no ``used`` at all. So
+    ``used`` is read when present, else derived as ``limit - remaining``
+    when BOTH of those are present (an unused window: remaining == limit,
+    0 %). With neither, nothing is known and nothing is invented.
+    """
+    cap = _number(detail.get("limit"))
+    if cap is None or cap <= 0:
+        return None
+    used = _number(detail.get("used"))
+    if used is None:
+        remaining = _number(detail.get("remaining"))
+        if remaining is None or remaining > cap:
+            return None
+        used = cap - remaining
+    return round(used * 100.0 / cap, 1)
+
+
 def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list[Window]]":
     """``(None, windows)`` from Kimi Code's usages endpoint. Always yields
     ``5h``, ``monthly`` and ``monthly_code``.
 
-    The live shape (probe 2026-10-07 with the owner's key, saved verbatim as
-    ``tests/fixtures/model_router/kimi-usages.json``): ``limits[]`` carries
-    the 5h window — ``window.duration`` 300, ``timeUnit TIME_UNIT_MINUTE``
-    — whose ``detail`` reports ``used`` / ``limit`` as STRINGS and a
-    ``resetTime``; ``usages.limit_month_total`` / ``limit_month_code``
-    carry a ``used_ratio`` FRACTION (x100 here) and a ``reset_time``. The
-    two 5h readings DISAGREED in the probe — ``usages.limit_5h.used_ratio``
-    read 0 while ``limits[0].detail`` read 9 of 100 used — so the 5h percent
-    is derived from ``limits[].detail`` and ``usages.limit_5h`` is
-    deliberately NOT read; the monthly windows have only the one reading.
-    Like every quota source this is undocumented, so each field is read
-    defensively: a missing or unparseable window is present and unknown,
-    never absent, never 0 %.
+    The live shape (probes 2026-10-07 and 2026-10-18 with the owner's key,
+    saved as ``tests/fixtures/model_router/kimi-usages.json`` and
+    ``kimi-usages-2026-10-18.json``): ``limits[]`` carries the 5h window —
+    ``window.duration`` 300, ``timeUnit TIME_UNIT_MINUTE`` — whose
+    ``detail`` reports ``limit`` / ``used`` / ``remaining`` as STRINGS and a
+    ``resetTime``; ``usages.limit_5h`` / ``limit_month_total`` /
+    ``limit_month_code`` carry a ``used_ratio`` FRACTION (x100 here) and a
+    ``reset_time``.
+
+    The 5h percent, in order of preference:
+
+    1. ``limits[].detail`` — ``used / limit``, or ``(limit - remaining) /
+       limit`` when ``used`` is absent (proto3 JSON omits a zero ``used``:
+       an unused window must read 0 %, see :func:`_kimi_5h_from_detail`).
+       Preferred because the two readings DISAGREE: 2026-10-07
+       ``limit_5h.used_ratio`` read 0 while the detail read 9 of 100 used,
+       2026-10-18 the ratio read 0.0135 against 1 of 100. The detail is
+       the count the vendor enforces.
+    2. ``usages.limit_5h.used_ratio`` — ONLY when ``limits[]`` yields no
+       readable 5h window (no matching entry, or a detail with neither
+       ``used`` nor ``remaining``), so a missing detail never leaves the
+       window unknown while the vendor did report a ratio.
+
+    The monthly windows have only the one reading. Like every quota source
+    this is undocumented, so each field is read defensively: a missing or
+    unparseable window is present and unknown, never absent, and never a
+    number nobody reported. An unknown 5h window still carries the reset
+    time the answer named, when it named one: the ledger estimate
+    (:meth:`UsageWindows._refresh_ledger`) needs the window's edges even
+    when its count is missing.
     """
     found: dict[str, Window] = {}
+    reset_hint: Optional[float] = None
     if isinstance(payload, Mapping):
         limits = payload.get("limits")
         if isinstance(limits, list):
@@ -476,22 +570,21 @@ def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list
                 detail = item.get("detail")
                 if not isinstance(detail, Mapping):
                     continue
-                used = _number(detail.get("used"))
-                cap = _number(detail.get("limit"))
-                pct = (
-                    round(used * 100.0 / cap, 1)
-                    if used is not None and cap is not None and cap > 0
-                    else None
-                )
+                pct = _kimi_5h_from_detail(detail)
+                if pct is None:
+                    reset_hint = reset_hint or _reset_epoch(detail.get("resetTime"))
+                    continue
                 found.setdefault("5h", Window(
                     "5h", "5h", pct,
                     _reset_epoch(detail.get("resetTime")),
-                    SOURCE_KIMI_USAGES, now,
-                    None if pct is not None else UNKNOWN_NOT_REPORTED,
+                    SOURCE_KIMI_USAGES, now, None,
                 ))
         usages = payload.get("usages")
         if isinstance(usages, Mapping):
             for key, window_id, label in (
+                # limit_5h is the FALLBACK for the 5h window: setdefault
+                # keeps a reading limits[] already produced (see above).
+                ("limit_5h", "5h", "5h"),
                 ("limit_month_total", "monthly", "mo"),
                 ("limit_month_code", "monthly_code", "mo-code"),
             ):
@@ -499,12 +592,20 @@ def parse_kimi_usages(payload: Any, *, now: float) -> "tuple[Optional[str], list
                 if not isinstance(block, Mapping):
                     continue
                 pct = _fraction_percent(block.get("used_ratio"))
+                if pct is None:
+                    if window_id == "5h":
+                        reset_hint = reset_hint or _reset_epoch(block.get("reset_time"))
+                    continue
                 found.setdefault(window_id, Window(
                     window_id, label, pct,
                     _reset_epoch(block.get("reset_time")),
-                    SOURCE_KIMI_USAGES, now,
-                    None if pct is not None else UNKNOWN_NOT_REPORTED,
+                    SOURCE_KIMI_USAGES, now, None,
                 ))
+    if "5h" not in found and reset_hint is not None:
+        found["5h"] = Window(
+            "5h", "5h", None, reset_hint, SOURCE_KIMI_USAGES, now,
+            UNKNOWN_NOT_REPORTED,
+        )
     windows = [
         found.get(window_id) or _unknown(window_id, label, SOURCE_KIMI_USAGES, now)
         for window_id, label in _KIMI_WINDOWS
@@ -538,6 +639,13 @@ def _kimi_quota_headers(key: str, user_agent: Optional[str]) -> Optional[dict[st
     refuses, so it is not sent at all and the vendor reads unknown with the
     reason beside it, instead of 403-ing on every refresh until the first
     chat or read relays one.
+
+    Not every relayed user-agent is one the edge accepts: ``/usage/windows``
+    is also read by the launcher's usage card through ``Python-urllib``,
+    which the edge refuses (403 "error code: 1010", live 2026-10-18, while
+    ``claude-cli/...`` and ``curl/...`` answered 200). WHICH relayed UA is
+    sent is :meth:`UsageWindows._refresh_quota_vendor`'s choice — the one
+    the edge last accepted, else the most recent one it has not refused.
     """
     if not user_agent:
         return None
@@ -591,7 +699,16 @@ class LedgerMonthCounter:
     than the month — so the total is labelled as covering only that span
     rather than presented as the whole month.
 
-    Called on an executor thread, never on the event loop.
+    The same single pass also keeps the rows of the last
+    :data:`RECENT_LEDGER_KEEP_S` individually (route, timestamp, the four
+    token fields) for :meth:`tokens_between` — the Kimi 5h estimate's
+    reading. One reader, one parse: a window that straddles the month start
+    still sees its rows, because a month change rescans the file from the
+    top and recent rows are kept whatever their month.
+
+    ``scan`` runs on an executor thread, never on the event loop; the
+    refresh is single-flight, so :meth:`tokens_between` (called after the
+    scan returned) never races it.
     """
 
     def __init__(self) -> None:
@@ -600,6 +717,9 @@ class LedgerMonthCounter:
         self._period: Optional[float] = None
         self._first_ts: Optional[float] = None
         self._totals: dict[str, list[int]] = {}
+        #: ``(ts, route, (input, cache_creation, cache_read, output))`` for
+        #: rows newer than ``now - RECENT_LEDGER_KEEP_S`` at the last scan.
+        self._recent: list[tuple[float, str, tuple[int, ...]]] = []
 
     def _reset(self, identity: Optional[tuple[int, int]], period: float) -> None:
         self._identity = identity
@@ -607,6 +727,7 @@ class LedgerMonthCounter:
         self._period = period
         self._first_ts = None
         self._totals = {}
+        self._recent = []
 
     def scan(self, path: Optional[Path], now: float) -> "tuple[float, Optional[float], dict[str, tuple[int, int]]]":
         """``(period_start, counted_since, {route: (tokens, requests)})``."""
@@ -628,14 +749,32 @@ class LedgerMonthCounter:
                 chunk = handle.read(st.st_size - self._offset)
             end = chunk.rfind(b"\n")
             if end >= 0:
-                self._consume(chunk[: end + 1], period)
+                self._consume(chunk[: end + 1], period, now - RECENT_LEDGER_KEEP_S)
                 self._offset += end + 1
+        keep_from = now - RECENT_LEDGER_KEEP_S
+        self._recent = [row for row in self._recent if row[0] >= keep_from]
         counted_since = (
             self._first_ts if self._first_ts is not None and self._first_ts > period else None
         )
         return period, counted_since, {k: (v[0], v[1]) for k, v in self._totals.items()}
 
-    def _consume(self, blob: bytes, period: float) -> None:
+    def tokens_between(
+        self, route: str, start: float, end: float, fields: "tuple[str, ...]",
+    ) -> "tuple[int, int]":
+        """``(tokens, requests)`` the ledger holds for ``route`` with
+        ``start <= ts < end``, counting only ``fields`` (names from
+        :data:`LEDGER_TOKEN_FIELDS`). Covers only what the last scan kept:
+        rows newer than :data:`RECENT_LEDGER_KEEP_S` before it."""
+        picks = [LEDGER_TOKEN_FIELDS.index(name) for name in fields]
+        tokens = requests = 0
+        for ts, row_route, counts in self._recent:
+            if row_route != route or not start <= ts < end:
+                continue
+            tokens += sum(counts[i] for i in picks)
+            requests += 1
+        return tokens, requests
+
+    def _consume(self, blob: bytes, period: float, keep_from: float) -> None:
         for raw in blob.splitlines():
             try:
                 row = json.loads(raw)
@@ -648,17 +787,19 @@ class LedgerMonthCounter:
                 continue
             if self._first_ts is None or ts < self._first_ts:
                 self._first_ts = ts
-            if ts < period:
-                continue
             route = row.get("route")
             if not isinstance(route, str):
                 continue
-            tokens = 0
-            for name in ("input_tokens", "cache_creation_input_tokens",
-                         "cache_read_input_tokens", "output_tokens"):
-                value = row.get(name)
-                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                    tokens += value
+            counts = tuple(
+                value if isinstance(value, int) and not isinstance(value, bool)
+                and value > 0 else 0
+                for value in (row.get(name) for name in LEDGER_TOKEN_FIELDS)
+            )
+            if ts >= keep_from:
+                self._recent.append((ts, route, counts))
+            if ts < period:
+                continue
+            tokens = sum(counts)
             bucket = self._totals.setdefault(route, [0, 0])
             bucket[0] += tokens
             bucket[1] += 1
@@ -716,6 +857,8 @@ class UsageWindows:
         jitter_s: float = DEFAULT_JITTER_S,
         clock: Callable[[], float] = time.time,
         rng: Callable[[], float] = random.random,
+        kimi_5h_budget: Optional[int] = None,
+        resets_path: Callable[[], Optional[Path]] = usage_resets_path,
     ) -> None:
         self._anthropic_upstream = anthropic_upstream.rstrip("/")
         self._vendors = vendors
@@ -732,8 +875,36 @@ class UsageWindows:
         self._next_due = 0.0
         self._last_refresh: Optional[float] = None
         self._last_activity: Optional[float] = None
-        self._client_user_agent: Optional[str] = None
+        #: Distinct client user-agents relayed by refresh signals, most
+        #: recent LAST, at most :data:`MAX_CLIENT_USER_AGENTS`.
+        self._client_user_agents: list[str] = []
+        #: The user-agent the quota edge last ACCEPTED (HTTP 200): asked
+        #: first, and never evicted by newer unproven ones.
+        self._accepted_user_agent: Optional[str] = None
+        #: user-agent -> when a user-agent-gated quota endpoint refused it.
+        self._refused_user_agents: dict[str, float] = {}
         self._header_windows: dict[str, Window] = {}
+        #: The ledger FALLBACK ESTIMATE per vendor id: ``{id: budget}`` for
+        #: every vendor that has one (only kimi). ``kimi_5h_budget`` is the
+        #: injected value; ``None`` reads :data:`KIMI_5H_BUDGET_ENV` (a
+        #: non-negative int; garbage keeps the default). ``0`` disables it.
+        budget = (
+            env_int(KIMI_5H_BUDGET_ENV, DEFAULT_KIMI_5H_TOKEN_BUDGET, minimum=0)
+            if kimi_5h_budget is None
+            else max(0, int(kimi_5h_budget))
+        )
+        self._estimate_budgets: dict[str, int] = (
+            {"kimi": budget} if budget > 0 and "kimi" in vendors else {}
+        )
+        #: The last 5h reset time a good vendor answer named, per vendor id.
+        #: PERSISTED (``resets_path``, owner-only): the grid is fixed, so one
+        #: reset seen before a restart still rolls forward to today's window
+        #: — and the estimate exists for the case where no fresh answer
+        #: arrives (the vendor refusing the gateway).
+        self._resets_path = resets_path
+        self._last_5h_reset: dict[str, float] = self._load_resets()
+        #: The last computed estimate per vendor id.
+        self._estimates: dict[str, _Estimate] = {}
         self._usage: dict[str, VendorUsage] = {
             ANTHROPIC_ID: VendorUsage(ANTHROPIC_ID, ANTHROPIC_LABEL, "Claude subscription"),
         }
@@ -779,17 +950,48 @@ class UsageWindows:
         return self._schedule_if_due()
 
     def _remember_client_user_agent(self, user_agent: Optional[str]) -> None:
-        """Keep the most recent client user-agent a refresh signal carried.
+        """Remember the client user-agent a refresh signal carried.
 
         A quota endpoint behind a client-identity gate (the kimi row) is
-        asked as the client whose read or traffic scheduled the refresh —
-        the same relay rule as the catalog fetch, and the honest one: the
-        gateway never invents a user-agent. Last writer wins; a signal
-        carrying none keeps what an earlier one saw. Never logged, never
-        snapshotted.
+        asked as a client whose read or traffic reached this gateway — the
+        same relay rule as the catalog fetch, and the honest one: the
+        gateway never invents a user-agent. The few most recent DISTINCT
+        ones are kept (not just the last): the readers of this snapshot are
+        not all clients the vendor's edge accepts, and a refused one must
+        not displace the one it does accept. A signal carrying none keeps
+        what earlier ones saw. Never logged, never snapshotted.
         """
-        if user_agent:
-            self._client_user_agent = user_agent
+        if not user_agent:
+            return
+        agents = self._client_user_agents
+        if user_agent in agents:
+            agents.remove(user_agent)
+        agents.append(user_agent)
+        # Evict the OLDEST unproven one, never the accepted one: four
+        # distinct readers (curl, Python-urllib, a browser, a second
+        # launcher) must not push out the client UA the edge accepts.
+        while len(agents) > MAX_CLIENT_USER_AGENTS:
+            victim = next(
+                (a for a in agents if a != self._accepted_user_agent), agents[0],
+            )
+            agents.remove(victim)
+
+    def _usable_user_agents(self, now: float) -> list[str]:
+        """Remembered client user-agents the quota edge has not refused
+        within :data:`REFUSED_USER_AGENT_RETRY_S`: the last ACCEPTED one
+        first, then the rest most recent first."""
+        usable = []
+        for agent in reversed(self._client_user_agents):
+            refused_at = self._refused_user_agents.get(agent)
+            if refused_at is not None and now - refused_at < REFUSED_USER_AGENT_RETRY_S:
+                continue
+            self._refused_user_agents.pop(agent, None)
+            usable.append(agent)
+        accepted = self._accepted_user_agent
+        if accepted in usable:
+            usable.remove(accepted)
+            usable.insert(0, accepted)
+        return usable
 
     def _schedule_if_due(self) -> bool:
         """The ONE gate both signals go through. Due means: never refreshed,
@@ -866,22 +1068,59 @@ class UsageWindows:
         headers_for, parse = _QUOTA_DIALECTS.get(
             vendor.vendor_id, _ZAI_QUOTA_DIALECT,
         )
-        headers = headers_for(key, self._client_user_agent)
-        if headers is None:
-            # The dialect declined to ask: a user-agent-gated endpoint with
-            # no client user-agent relayed yet (v0.2.102, X2). Sending the
-            # UA-less fetch would 403 at the edge on every refresh until
-            # the first chat or read relays one — and a user-agent is
-            # relayed, never invented (vendor ToS), so the honest answer
-            # until then is unknown-with-a-reason, not a refusal loop.
+        plain = headers_for(key, None)
+        if plain is not None:
+            # No user-agent gate (the Z.ai dialect): one plain fetch.
+            status, payload = await self._fetch(vendor.quota_url, plain)
+            self._apply(
+                usage, status, payload, vendor.vendor_id,
+                lambda body: parse(body, now=self._clock()),
+            )
+            return
+        # A user-agent-gated endpoint: asked as a relayed client, never an
+        # invented one (vendor ToS). With none relayed yet the fetch is NOT
+        # sent (v0.2.102, X2) — it would 403 at the edge on every refresh.
+        candidates = self._usable_user_agents(self._clock())
+        if not candidates:
             _note_problem(
                 usage,
                 f"{vendor.vendor_id} usage source not asked: no client "
                 "user-agent relayed yet, and the vendor's edge refuses "
-                "library user-agents",
+                "library user-agents"
+                if not self._client_user_agents
+                else f"{vendor.vendor_id} usage source not asked: the "
+                "vendor's edge refused (HTTP 403) every client user-agent "
+                "relayed so far; retried after "
+                f"{REFUSED_USER_AGENT_RETRY_S // 60} min or when a new one "
+                "is relayed" + _kept_reading_note(usage),
             )
             return
-        status, payload = await self._fetch(vendor.quota_url, headers)
+        # Most recent first; a 403 marks that user-agent refused and the
+        # next one is tried in the SAME refresh, so a refused reader (the
+        # launcher's Python-urllib) costs one extra request per retry
+        # interval and never the reading.
+        status: Optional[int] = None
+        payload: Any = None
+        for agent in candidates:
+            headers = headers_for(key, agent)
+            if headers is None:  # the dialect declined even with a UA
+                continue
+            status, payload = await self._fetch(vendor.quota_url, headers)
+            if status == 200:
+                self._accepted_user_agent = agent
+            if status != 403:
+                break
+            self._refused_user_agents[agent] = self._clock()
+            if self._accepted_user_agent == agent:
+                self._accepted_user_agent = None
+        if status == 403:
+            _note_problem(
+                usage,
+                f"{vendor.vendor_id} usage source answered HTTP 403 to every "
+                f"relayed client user-agent ({len(candidates)} tried) — "
+                "the vendor's edge refused them" + _kept_reading_note(usage),
+            )
+            return
         self._apply(
             usage, status, payload, vendor.vendor_id,
             lambda body: parse(body, now=self._clock()),
@@ -905,6 +1144,12 @@ class UsageWindows:
             # A previous good reading stays; _effective() ages it out.
             return
         plan, windows = parse(payload)
+        if who in self._estimate_budgets:
+            for window in windows:
+                if window.id == "5h" and window.resets_at is not None:
+                    if self._last_5h_reset.get(who) != window.resets_at:
+                        self._last_5h_reset[who] = window.resets_at
+                        self._save_resets()
         if not any(w.percent is not None for w in windows):
             _note_problem(
                 usage, f"{who} usage source answered in a shape this gateway cannot read",
@@ -926,6 +1171,7 @@ class UsageWindows:
         except (OSError, ValueError) as exc:
             logger.info("model-gateway: usage ledger month scan failed: %s", exc)
             return
+        self._refresh_estimates(now, have_ledger=path is not None)
         for vendor in self._vendors.values():
             if vendor.quota_url:
                 continue
@@ -934,6 +1180,98 @@ class UsageWindows:
             usage.tokens = TokenWindow(tokens, requests, period, since, now)
             usage.state = STATE_OK if path is not None else STATE_UNKNOWN
             usage.problem = None if path is not None else "the usage ledger has no home"
+
+    # ── the persisted 5h reset times ────────────────────────────────────
+    def _load_resets(self) -> dict[str, float]:
+        """The reset times a previous daemon saved, for vendors that still
+        have an estimate. A missing, unreadable or malformed file is an
+        empty start — never an error: the next good answer rewrites it."""
+        path = self._resets_path()
+        if path is None or not self._estimate_budgets:
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        resets = data.get("5h_resets") if isinstance(data, Mapping) else None
+        if not isinstance(resets, Mapping):
+            return {}
+        out: dict[str, float] = {}
+        for vendor_id in self._estimate_budgets:
+            epoch = _reset_epoch(resets.get(vendor_id))
+            if epoch is not None:
+                out[vendor_id] = epoch
+        return out
+
+    def _save_resets(self) -> None:
+        """Persist the reset times, owner-only (mode 0600, like the daemon's
+        token, pid and port files). Best effort: a failed write is one log
+        line and the estimate simply restarts from the next good answer."""
+        path = self._resets_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                path,
+                {"5h_resets": dict(self._last_5h_reset)},
+                mode=0o600,
+            )
+        except OSError as exc:
+            logger.info("model-gateway: could not save the 5h reset times: %s", exc)
+
+    def _refresh_estimates(self, now: float, *, have_ledger: bool) -> None:
+        """Recompute each vendor's 5h ledger estimate from the scan just made.
+
+        The window is the 5 h ending at the last reset a good answer named,
+        rolled forward in 5 h steps once that reset has passed; with no reset
+        ever seen there is no window and no estimate. ``used`` is what THIS
+        gateway routed to the vendor inside it (:data:`KIMI_5H_ESTIMATE_FIELDS`)
+        — another machine's, or the vendor's own app's, traffic is invisible
+        here, so the estimate can only read low for that reason (and reads
+        high for the calibration reason given at that constant). With no
+        ledger there is no count at all — no estimate, never a 0 %.
+        """
+        if not have_ledger:
+            self._estimates.clear()
+            return
+        for vendor_id, budget in self._estimate_budgets.items():
+            reset = self._last_5h_reset.get(vendor_id)
+            if reset is None:
+                continue
+            end = roll_window_end(reset, now, KIMI_5H_SPAN_S)
+            start = end - KIMI_5H_SPAN_S
+            tokens, requests = self._ledger.tokens_between(
+                f"vendor:{vendor_id}", start, end, KIMI_5H_ESTIMATE_FIELDS,
+            )
+            self._estimates[vendor_id] = _Estimate(
+                start, end, tokens, requests, budget, now,
+            )
+
+    def _estimate_dict(self, vendor_id: str, now: float) -> Optional[dict]:
+        """The estimated 5h window as a snapshot window, or ``None`` when
+        there is no estimate, its window has ended, or it is stale."""
+        estimate = self._estimates.get(vendor_id)
+        if estimate is None or now >= estimate.end or now - estimate.computed_at > STALE_AFTER_S:
+            return None
+        return {
+            "id": "5h",
+            "label": "5h",
+            "kind": "percent",
+            "percent": round(estimate.tokens * 100.0 / estimate.budget, 1),
+            "resets_at": _iso(estimate.end),
+            "source": SOURCE_LEDGER_ESTIMATE,
+            "fetched_at": _iso(estimate.computed_at),
+            "unknown_reason": None,
+            "estimate": {
+                "tokens": estimate.tokens,
+                "requests": estimate.requests,
+                "budget": estimate.budget,
+                "window_start": _iso(estimate.start),
+                "counted": list(KIMI_5H_ESTIMATE_FIELDS),
+                "scope": "this_gateway",
+            },
+        }
 
     # ── reading ──────────────────────────────────────────────────────────
     def snapshot(self) -> dict:
@@ -953,6 +1291,15 @@ class UsageWindows:
                 "plan": usage.plan,
                 "windows": [_window_dict(w, now) for w in windows],
             }
+            estimated = self._estimate_dict(usage.id, now)
+            if estimated is not None:
+                # FALLBACK ONLY: a live 5h reading that is known always wins.
+                rows = entry["windows"]
+                index = next((i for i, w in enumerate(rows) if w["id"] == "5h"), None)
+                if index is None:
+                    rows.insert(0, estimated)
+                elif rows[index]["percent"] is None:
+                    rows[index] = estimated
             if usage.id == ANTHROPIC_ID and usage.state != STATE_OK and any(
                 w["percent"] is not None for w in entry["windows"]
             ):
@@ -979,6 +1326,33 @@ class UsageWindows:
             "refresh_interval_s": int(self._refresh_s),
             "vendors": vendors,
         }
+
+
+@dataclass(frozen=True)
+class _Estimate:
+    """One ledger estimate of a vendor's 5h window (epoch seconds)."""
+
+    start: float
+    end: float
+    tokens: int
+    requests: int
+    budget: int
+    computed_at: float
+
+
+def roll_window_end(reset: float, now: float, span_s: float) -> float:
+    """The end of the fixed-grid window holding ``now``: ``reset`` while it
+    is still ahead, else ``reset`` moved forward in whole ``span_s`` steps to
+    the first point strictly after ``now``."""
+    if reset > now:
+        return reset
+    return reset + (math.floor((now - reset) / span_s) + 1) * span_s
+
+
+def _kept_reading_note(usage: VendorUsage) -> str:
+    """Tell the reader a failed refresh did not erase the last good reading
+    (each window keeps its own ``fetched_at``; :func:`_effective` ages it)."""
+    return "; the last good reading is kept" if usage.windows else ""
 
 
 def _note_problem(usage: VendorUsage, problem: str) -> None:
@@ -1039,16 +1413,20 @@ def _known(window: Mapping[str, Any]) -> bool:
 
 def _window_text(window: Mapping[str, Any]) -> str:
     """``5h 31%`` — the one spelling of a known window, shared by the status
-    line and the picker label so the two cannot round differently."""
-    return f"{window['label']} {window['percent']:.0f}%"
+    line and the picker label so the two cannot round differently. A ledger
+    ESTIMATE reads ``5h ~31%``: the ``~`` is the one mark that it is this
+    gateway's count against a budget, not the vendor's reading."""
+    mark = "~" if window.get("source") == SOURCE_LEDGER_ESTIMATE else ""
+    return f"{window['label']} {mark}{window['percent']:.0f}%"
 
 
 def render_line(snapshot: Mapping[str, Any]) -> str:
     """One compact line, e.g. ``Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10%``.
 
     Silent degrade: an unknown window is left out, and a vendor with nothing
-    known is left out entirely — the line never says "error" and never shows
-    a guess. The ONE renderer, so the bash and PowerShell status-line scripts
+    known is left out entirely — the line never says "error". The one number
+    that is not a vendor reading, the Kimi 5h ledger estimate, is marked
+    ``~`` (see :func:`_window_text`). The ONE renderer, so the bash and PowerShell status-line scripts
     cannot drift from each other: both print what this returns.
 
     WINDOWS only. A vendor's ledger total is collected and still rides the
@@ -1140,8 +1518,12 @@ def label_suffixes(snapshot: Mapping[str, Any]) -> dict[str, str]:
 
 __all__ = [
     "DEFAULT_JITTER_S",
+    "DEFAULT_KIMI_5H_TOKEN_BUDGET",
     "DEFAULT_REFRESH_S",
+    "KIMI_5H_BUDGET_ENV",
+    "KIMI_5H_ESTIMATE_FIELDS",
     "LedgerMonthCounter",
+    "SOURCE_LEDGER_ESTIMATE",
     "STALE_AFTER_S",
     "UsageWindows",
     "label_suffix",
@@ -1152,5 +1534,6 @@ __all__ = [
     "parse_unified_headers",
     "parse_zai_quota",
     "render_line",
+    "roll_window_end",
     "session_fetcher",
 ]

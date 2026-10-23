@@ -56,6 +56,38 @@ if ($HookStdin) {
 }
 $IsCompactSource = ($HookSource -eq "" -or $HookSource -eq "compact")
 
+# v0.2.104: after a compaction Claude Code itself re-injects a fresh git
+# status (which carries the recent commits) -- vendor page
+# https://code.claude.com/docs/en/context-window, "What survives compaction".
+# Repeating it here only spends the 10 000-char hook budget twice, so when
+# the payload POSITIVELY says source=compact (an absent/unknown source keeps
+# the full pre-v0.2.104 shape -- repeating is the safe direction) the Recent
+# Commits section and the snapshot's git-status block are dropped. Every
+# other section (CONTEXT_STATE, the session state, the plan) is re-injected
+# in full: whether the harness also re-attached one of those files is only
+# flushed to the transcript around this hook's own start, so it is not
+# knowable reliably here. The snapshot trimming is
+# `python -m vco_lib.compact_reattach snapshot-body`; when that is
+# unavailable the plain first 50 lines are replayed.
+# MUST MATCH compact-context-reinject.sh.
+$IsHarnessCompact = ($HookSource -eq "compact")
+$RcPy = ""
+if ($IsHarnessCompact) {
+    $FindPy = Join-Path $PSScriptRoot "_lib/find-python.ps1"
+    if (Test-Path -LiteralPath $FindPy) { . $FindPy }
+    if ($PY) {
+        $RcPy = $PY
+        $VenvLib = Join-Path $PSScriptRoot "_lib/resolve-vco-venv.ps1"
+        if (Test-Path -LiteralPath $VenvLib) {
+            . $VenvLib
+            try {
+                $VcoVenvPython = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+                if ($VcoVenvPython -and (Test-Path $VcoVenvPython)) { $RcPy = $VcoVenvPython }
+            } catch { }
+        }
+    }
+}
+
 # v0.2.100 WP-17: the WHOLE output goes through the shared injection cap
 # (_lib/emit-context.ps1 Limit-VcoHookContext): Claude Code shows the model
 # only a file path + a 2 000-character preview past 10 000 characters, and
@@ -172,10 +204,14 @@ if (Test-Path -LiteralPath $PlansDir) {
     }
 }
 
-# 3. Recent git activity (cap 8 commits)
-$gitLog = ""
-try { $gitLog = (@(& git -C $ProjectDir log --oneline -8 2>$null) | ForEach-Object { "$_" }) -join "`n" } catch { }
-$S_commits = "## Recent Commits`n$gitLog"
+# 3. Recent git activity (cap 8 commits). Not after a compaction
+#    (v0.2.104): the harness re-injects a fresh git status with the recent
+#    commits itself.
+if (-not $IsHarnessCompact) {
+    $gitLog = ""
+    try { $gitLog = (@(& git -C $ProjectDir log --oneline -8 2>$null) | ForEach-Object { "$_" }) -join "`n" } catch { }
+    $S_commits = "## Recent Commits`n$gitLog"
+}
 
 # 4. Pre-compaction snapshot (line cap 50); stale => one line, NOT replayed.
 #    A compaction artefact: only emitted for source=compact / unknown (W6-F).
@@ -184,7 +220,17 @@ if ($IsCompactSource -and (Test-Path -LiteralPath $Snapshot)) {
     if (Test-VcoSnapshotStale -Path $Snapshot) {
         $S_snap = "## Pre-Compaction Snapshot (stale -- NOT replayed)`nLast saved: $(Get-VcoSnapshotSavedLine -Path $Snapshot). This snapshot is older than the current session's compaction, so pre-compact-save.ps1 did not run for it (it should, on every compact since v0.2.102). Read .claude/context/pre-compact-snapshot.md only if you need it."
     } else {
-        $S_snap = "## Pre-Compaction Snapshot`n" + ((Get-Content -LiteralPath $Snapshot -TotalCount 50) -join "`n")
+        # v0.2.104: minus its git-status block (the harness re-injects a
+        # fresh one); the plain first 50 lines when the module is unavailable.
+        $SnapBody = ""
+        if ($RcPy) {
+            try {
+                $snapOut = @(& $RcPy -m vco_lib.compact_reattach snapshot-body --path $Snapshot 2>$null)
+                if ($LASTEXITCODE -eq 0) { $SnapBody = ($snapOut | ForEach-Object { "$_" }) -join "`n" }
+            } catch { }
+        }
+        if (-not $SnapBody) { $SnapBody = (Get-Content -LiteralPath $Snapshot -TotalCount 50) -join "`n" }
+        $S_snap = "## Pre-Compaction Snapshot`n" + $SnapBody
     }
 }
 

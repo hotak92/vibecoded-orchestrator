@@ -25,7 +25,8 @@ the clone (review V02103-FINAL2 M-1):
   ``logs/engine-start.log`` (bounded in place, no rotated siblings).
   Since the v0.2.103 field run these are planned here only when the
   whole-state-dir step [8] (:mod:`vco_lib.uninstall_state`) REFUSED the state
-  dir (``include_state``); otherwise that step removes them with the dir.
+  dir, or removes only VCO's own entries from a ``$VCT_STATE_DIR`` not named
+  ``.vct`` (``include_state``); otherwise that step removes them with the dir.
 
 Ownership is decided per path, never by a directory walk: an exact name VCO
 writes AND, where the name alone could be a user's, a VCO signature in the
@@ -252,7 +253,8 @@ def build_plan(
     ``include_state=False`` leaves out the files under ``vct_root``: the
     uninstall's whole-state-dir step [8] (:mod:`vco_lib.uninstall_state`)
     removes them, so they are not listed twice. They are planned here only
-    when that step refused the state dir (the exact-name fallback).
+    when that step refused the state dir (the exact-name fallback) or keeps
+    the dir and its generic-named folders (``state/``, ``logs/``).
     """
     env = os.environ if env is None else env
     plan = Plan()

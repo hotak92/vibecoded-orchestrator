@@ -78,4 +78,6 @@ def script_patterns() -> tuple[str, ...]:
         "*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*",
         # v0.2.54: extension-less bash wrappers for the workflow tooling.
         "detect-workflow-needs", "generate-workflow",
+        # v0.2.104: the scratch-dir wrapper (vco_lib.scratch_dir).
+        "vco-scratch",
     )

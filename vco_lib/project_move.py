@@ -1443,17 +1443,27 @@ def execute_pre_flip(
     write_sentinel(dst, _sentinel_payload(plan, "git-hygiene", move_id))
     if (dst / ".git").is_dir() and result.bundle and not result.bundle.get("parse_failed"):
         entries = _git_exclude.safe_add_exclude_entries(result.bundle, dst)
-        # The copied user-material is VCO-adjacent too — exclude what we put
-        # there, not only what the bundle created.
+        # Of the copied files, only the VCO-shipped ones the user modified are
+        # VCO's to hide. The user-adjacent material (knowledge nodes,
+        # CONTEXT_STATE.md, MEMORY.md, `.claude/context/`) is the user's own
+        # work, which they may version (v0.2.104 G4): hiding it would make
+        # `git add` refuse it at the new folder. VCO's runtime namespaces among
+        # the copies (`.claude/state/`, the `.disabled/` dirs) are already in
+        # `entries` through VCO_RUNTIME_EXCLUDES.
+        user_adjacent = {s.rel for s in plan.sources if s.bucket == "user-adjacent"}
+        vco_copied = [rel for rel in result.copied if rel not in user_adjacent]
         entries = list(
             dict.fromkeys(
                 entries
-                + _git_exclude.exclude_entries_for_created_paths(result.copied, dst)
+                + _git_exclude.exclude_entries_for_created_paths(vco_copied, dst)
             )
         )
         result.git_exclude = _git_exclude.append_git_info_exclude(
             dst,
             tuple(entries),
+            retired=tuple(
+                _git_exclude.retired_exclude_entries(result.bundle, entries)
+            ),
             block_comment=[
                 "# VCO project move: keep orchestrator-created files out of "
                 "your commits.",

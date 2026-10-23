@@ -92,6 +92,10 @@ class ServiceWorld:
         self.lose_models_once = False
         self.up_mount_once: Optional[dict] = None
         self.all_argv: list[list[str]] = []
+        #: the live ``.HostConfig.Devices`` (a GPU container carries some)
+        self.devices: list = []
+        #: what ``podman compose version`` prints (selects the provider)
+        self.compose_version = "Docker Compose version v2.30.0\n"
 
     # -- what compose would substitute ----------------------------------------
     def _env(self) -> dict:
@@ -115,7 +119,7 @@ class ServiceWorld:
         dest, spec = self.spec["dest"], self.spec
         if argv[1:3] == ["compose", "version"]:
             # v0.2.100: the compose PROVIDER is detected (the recovery's refine)
-            return _cp(argv, 0, "Docker Compose version v2.30.0\n")
+            return _cp(argv, 0, self.compose_version)
         if argv[-1] == "config":
             m = self._knob_mount()
             vol = ({"type": "bind", "source": m["source"], "target": dest} if m["kind"] == "bind"
@@ -165,7 +169,7 @@ class ServiceWorld:
                 "{{json .Config.Healthcheck}}": None,
                 "{{json .HostConfig.RestartPolicy}}": {"Name": "unless-stopped"},
                 "{{json .HostConfig.PortBindings}}": ports,
-                "{{json .HostConfig.Devices}}": [],
+                "{{json .HostConfig.Devices}}": self.devices,
             }
             return _cp(argv, 0, json.dumps(payloads[fmt]))
         if verb in ("stop", "rm"):
@@ -398,6 +402,120 @@ class OllamaMoveTests(_Base):
         w = self.world(mount={"kind": "bind", "source": str(empty)})
         result = self.migrate(w, _row("ollama", port=11500))
         self.assertEqual(result.status, "refused")
+        self.assertEqual((w.ups(), w.stops()), ([], []))
+
+
+INFRA_SRC = REPO_ROOT / "infrastructure"
+ROCM_DEVICES = [{"PathOnHost": "/dev/kfd", "PathInContainer": "/dev/kfd"},
+                {"PathOnHost": "/dev/dri", "PathInContainer": "/dev/dri"}]
+NVIDIA_DEVICES = [{"PathOnHost": "/dev/nvidia0", "PathInContainer": "/dev/nvidia0"},
+                  {"PathOnHost": "/dev/nvidiactl", "PathInContainer": "/dev/nvidiactl"}]
+DRI_ONLY = [{"PathOnHost": "/dev/dri", "PathInContainer": "/dev/dri"}]
+
+
+class GpuPortMoveTests(_Base):
+    """v0.2.104 R3 M1 — the GPU arm of the port move: the overlay's VENDOR
+    follows the live container's devices, then the host probe; its FILE is
+    the first shipped candidate the detected provider can parse; a container
+    naming BOTH vendors is refused before anything is stopped. Overlays are
+    the real shipped files, copied into the fake install."""
+
+    OVERLAYS = ("docker-compose.gpu.yml", "docker-compose.rocm.yml",
+                "docker-compose.amd-rocm.yml", "podman-compose.gpu.yml",
+                "podman-compose.rocm.yml", "podman-compose.amd-rocm.yml")
+
+    def setUp(self):
+        super().setUp()
+        self.models = self.tmp / "ollama-models"
+        (self.models / "blobs").mkdir(parents=True)
+        (self.models / "blobs" / "sha256-x").write_text("m", encoding="utf-8")
+        self.host_calls: list[int] = []
+
+    def world(self, devices, *, overlays=OVERLAYS, version=None) -> ServiceWorld:
+        w = ServiceWorld(self.tmp, "ollama", mount={"kind": "bind", "source": str(self.models)})
+        for name in overlays:
+            shutil.copy(INFRA_SRC / name, w.infra / name)
+        w.devices = list(devices)
+        if version is not None:
+            w.compose_version = version
+        return w
+
+    def host(self, vendor: str):
+        """The host probe stub; records each call so a test can prove it
+        was (or was not) asked."""
+        def probe() -> str:
+            self.host_calls.append(1)
+            return vendor
+        return mock.patch.object(service_adoption, "_host_gpu_vendor", side_effect=probe)
+
+    @staticmethod
+    def overlay_files(w: ServiceWorld) -> list[str]:
+        (up,) = w.ups()
+        return [Path(up[i + 1]).name for i, a in enumerate(up) if a == "-f"
+                and Path(up[i + 1]).name != "docker-compose.yml"]
+
+    def test_a_rocm_container_is_recreated_under_the_rocm_overlay(self):
+        w = self.world(ROCM_DEVICES)
+        with self.host("nvidia"):  # the container's own evidence wins over the host
+            result = self.migrate(w, _row("ollama", port=11500))
+        self.assertEqual(result.status, "migrated", result.reason)
+        self.assertEqual(self.overlay_files(w), ["docker-compose.rocm.yml"])
+        self.assertEqual(self.host_calls, [], "the host must not be asked when devices name the vendor")
+
+    def test_a_rocm_container_falls_back_to_the_legacy_rocm_file_when_only_it_ships(self):
+        w = self.world(ROCM_DEVICES, overlays=("docker-compose.gpu.yml",
+                                               "docker-compose.amd-rocm.yml"))
+        with self.host(""):
+            result = self.migrate(w, _row("ollama", port=11500))
+        self.assertEqual(result.status, "migrated", result.reason)
+        self.assertEqual(self.overlay_files(w), ["docker-compose.amd-rocm.yml"])
+
+    def test_a_rocm_container_under_podman_compose_gets_the_podman_rocm_overlay(self):
+        w = self.world(ROCM_DEVICES, version="podman-compose version 1.0.6\n")
+        with self.host(""):
+            result = self.migrate(w, _row("ollama", port=11500))
+        self.assertEqual(result.status, "migrated", result.reason)
+        self.assertEqual(self.overlay_files(w), ["podman-compose.rocm.yml"])
+
+    def test_an_nvidia_container_is_recreated_under_the_nvidia_overlay(self):
+        w = self.world(NVIDIA_DEVICES)
+        with self.host("amd"):
+            result = self.migrate(w, _row("ollama", port=11500))
+        self.assertEqual(result.status, "migrated", result.reason)
+        self.assertEqual(self.overlay_files(w), ["docker-compose.gpu.yml"])
+        self.assertEqual(self.host_calls, [])
+
+    def test_no_vendor_evidence_asks_the_host_amd_card(self):
+        w = self.world(DRI_ONLY)
+        with self.host("amd"):
+            result = self.migrate(w, _row("ollama", port=11500))
+        self.assertEqual(result.status, "migrated", result.reason)
+        self.assertEqual(self.overlay_files(w), ["docker-compose.rocm.yml"])
+        self.assertEqual(self.host_calls, [1])
+
+    def test_no_vendor_evidence_and_no_host_card_keeps_the_nvidia_answer(self):
+        w = self.world(DRI_ONLY)
+        with self.host(""):
+            result = self.migrate(w, _row("ollama", port=11500))
+        self.assertEqual(result.status, "migrated", result.reason)
+        self.assertEqual(self.overlay_files(w), ["docker-compose.gpu.yml"])
+        self.assertEqual(self.host_calls, [1])
+
+    def test_a_container_naming_both_vendors_is_refused_before_anything_stops(self):
+        w = self.world(ROCM_DEVICES + NVIDIA_DEVICES)
+        with self.host("nvidia"):
+            result = self.migrate(w, _row("ollama", port=11500))
+        self.assertEqual(result.status, "refused")
+        self.assertIn("names both GPU vendors", result.reason)
+        self.assertEqual((w.ups(), w.stops()), ([], []))
+        self.assertEqual(self.host_calls, [])
+
+    def test_a_missing_vendor_overlay_is_refused_not_swapped_for_the_other_vendor(self):
+        w = self.world(ROCM_DEVICES, overlays=("docker-compose.gpu.yml",))
+        with self.host(""):
+            result = self.migrate(w, _row("ollama", port=11500))
+        self.assertEqual(result.status, "refused")
+        self.assertIn("no GPU overlay matches", result.reason)
         self.assertEqual((w.ups(), w.stops()), ([], []))
 
 

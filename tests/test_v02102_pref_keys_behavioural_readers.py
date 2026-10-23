@@ -37,6 +37,9 @@ READERS: dict[str, str] = {
     "openai_embeddings_consent": "test_embeddings_consent_value_drives_the_gate",
     "embedding.active_profile": "test_active_profile_value_drives_the_text_model",
     "launcher.hardware_snapshot": "rust:hardware_snapshot_key_value_drives_the_read_gpu_mode",
+    # v0.2.104 API-1: background ``claude -p`` jobs' subscription -> API-key
+    # retry; the row ON makes a quota refusal retry with the key, OFF does not.
+    "model_gateway.api_key_fallback": "tests/test_v02104_claude_cli_api_key_fallback.py::TestSummaryCliFallback::test_the_launcher_row_drives_the_retry",
 }
 
 

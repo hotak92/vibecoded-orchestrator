@@ -51,9 +51,9 @@ def test_the_scan_finds_the_shipped_catalogue() -> None:
         len(list(REPO.glob("templates/packs/*/agents/*.md")))
         + len(list(REPO.glob("templates/packs/*/skills/*/SKILL.md")))
     )
-    assert default == 29, (
-        f"the default catalogue is {default} definitions, expected 29 "
-        "(11 free agents + 12 gateway agents + 6 skills)"
+    assert default == 30, (
+        f"the default catalogue is {default} definitions, expected 30 "
+        "(11 free agents + 12 gateway agents + 7 skills)"
     )
     assert pack_members >= 45, (
         f"the pack tree carries only {pack_members} members; templates/packs/ "

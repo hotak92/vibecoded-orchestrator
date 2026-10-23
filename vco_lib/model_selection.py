@@ -44,6 +44,7 @@ the ordinary owner-rule path).
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 import tomllib
@@ -250,7 +251,12 @@ def vendor_key_state_probe() -> KeyStateProbe:
     from model_router.secrets import VendorKeyResolver
     from model_router.vendors import VENDORS
 
-    resolver = VendorKeyResolver()
+    # A presence probe: a vendor whose key was never set is an ordinary
+    # ABSENT, not a fault — the resolver's per-vendor "no key" line stays at
+    # DEBUG here (a fresh install printed one per vendor). The fault worth a
+    # warning — a key that resolved before and no longer does — is reported
+    # by reachable_providers from the last-known record.
+    resolver = VendorKeyResolver(miss_log_level=logging.DEBUG)
 
     def probe(vendor_id: str) -> KeyState:
         result = resolver.resolve(VENDORS[vendor_id])
@@ -473,6 +479,16 @@ def reachable_providers(*, key_probe: Optional[KeyProbe] = None,
     if definitive:
         answer = {v: states[v] is KeyState.PRESENT for v in wanted}
         prior = load_record(record_path)
+        before = recorded_providers(prior) or {}
+        for vendor_id in wanted:
+            if before.get(vendor_id) and not answer[vendor_id]:
+                # Configured, now gone: the one miss that IS a fault. Said on
+                # the round that records the change, so once per change.
+                _warn_line(
+                    f"the key for vendor {vendor_id!r} resolved before and no longer "
+                    "does — its model rows are dropped and the gateway cannot serve "
+                    "it. Re-add it in the launcher's Secrets panel (scope 'shared')."
+                )
         if recorded_providers(prior) != answer:
             next_record = dict(prior)
             next_record.update({

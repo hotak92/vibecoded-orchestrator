@@ -124,11 +124,9 @@ class PairingRig(Rig):
         return []
 
     def ledger_rows(self) -> list:
-        p = self.ledger_path()
-        if not p.exists():
-            return []
-        return [json.loads(ln) for ln in p.read_text("utf-8").splitlines()
-                if ln.strip()]
+        from tests.common.rl_loss_ledger import loss_records
+
+        return loss_records(self.ledger_path())
 
     def bash_task_files(self) -> list:
         return sorted(self.state_dir().glob("bash_task_*.json"))

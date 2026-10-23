@@ -75,7 +75,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from vco_lib.paths import looks_like_orchestrator_root
 
@@ -237,11 +237,40 @@ def resolve_root_venv_python(root: "str | Path") -> Optional[Path]:
     return _first_existing(venv_interpreters(Path(root) / VENV_LAYOUTS[0]))
 
 
-def resolve_install_root(explicit: "str | Path | None" = None) -> Optional[Path]:
+def install_root_from_env(
+    env: "Optional[Mapping[str, str]]" = None,
+) -> Optional[Path]:
+    """The env-var rung of :func:`resolve_install_root` on its own, or ``None``.
+
+    The first of :data:`INSTALL_ROOT_ENV_VARS` that names a real clone
+    (``looks_like_orchestrator_root``). Split out in v0.2.104 (FINAL4 LOW 1)
+    because :func:`vco_lib.hub_ensure._repo_dist_roots` must tell "the
+    environment NAMES the install" (a stated fact: VCO writes both variables
+    into every project's ``.claude/settings.json`` env) apart from "this is the
+    checkout vco_lib happens to run from" (a guess) — the full ladder cannot.
+    """
+    environ = os.environ if env is None else env
+    for var in INSTALL_ROOT_ENV_VARS:
+        raw = (environ.get(var) or "").strip()
+        if raw and looks_like_orchestrator_root(raw):
+            return Path(raw)
+    return None
+
+
+def resolve_install_root(
+    explicit: "str | Path | None" = None,
+    *,
+    env: "Optional[Mapping[str, str]]" = None,
+) -> Optional[Path]:
     """The orchestrator clone this process belongs to, or ``None``.
 
     Ladder: an explicit argument, then :data:`INSTALL_ROOT_ENV_VARS` (each only
     when it really names a clone), then ``vco_lib/..``.
+
+    ``env`` (v0.2.104) is the environment the env-var rung reads; it defaults
+    to the real one. :func:`vco_lib.hub_ensure.find_dist_binary` threads the
+    environment its caller resolved, so one resolution answers one
+    environment.
 
     ``vco_lib.boot_service.default_templates_root`` (the gateway daemon's
     templates root) delegates here since v0.2.94 — one home for the question.
@@ -250,10 +279,9 @@ def resolve_install_root(explicit: "str | Path | None" = None) -> Optional[Path]
         candidate = Path(explicit)
         if candidate.is_dir():
             return candidate
-    for var in INSTALL_ROOT_ENV_VARS:
-        raw = (os.environ.get(var) or "").strip()
-        if raw and looks_like_orchestrator_root(raw):
-            return Path(raw)
+    from_env = install_root_from_env(env)
+    if from_env is not None:
+        return from_env
     fallback = Path(__file__).resolve().parent.parent
     if looks_like_orchestrator_root(fallback):
         return fallback

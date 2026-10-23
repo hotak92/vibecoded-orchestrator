@@ -8,6 +8,44 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
+# v0.2.104: this hook's clock. The harness kills it after the `timeout`
+# registered for pre-tool-use (3 s in both settings templates) and a killed
+# PreToolUse hook does NOT block -- so the Build Anchor's post-compaction
+# check below may only spend what is LEFT of that budget. Measured from the
+# PROCESS start when the OS reports it (it then includes the powershell
+# cold start, the costly part on Windows), else from this line; the larger
+# of the two counts. MUST MATCH pre-tool-use.sh's _ptu_clock_us.
+$PtuClock = [Diagnostics.Stopwatch]::StartNew()
+$PtuProcStart = $null
+try { $PtuProcStart = [Diagnostics.Process]::GetCurrentProcess().StartTime } catch { }
+function Get-PtuElapsedMs {
+    $ms = [double]$PtuClock.Elapsed.TotalMilliseconds
+    if ($PtuProcStart) {
+        try {
+            $fromProc = ([DateTime]::Now - $PtuProcStart).TotalMilliseconds
+            if ($fromProc -gt $ms) { $ms = $fromProc }
+        } catch { }
+    }
+    return [int][Math]::Ceiling($ms)
+}
+
+# Get-PtuBudgetS: the harness's kill timeout for this hook.
+# VCO_PRE_TOOL_USE_TIMEOUT_S (whole seconds) MUST MATCH the `timeout`
+# registered for pre-tool-use in .claude/settings.json. MUST MATCH
+# pre-tool-use.sh's _ptu_budget_s: digits only, read as decimal, 1..999999;
+# anything else -- empty, non-digit, 0, over-range -- reads as 3, silently
+# (TryParse: an over-range value must not throw a red error line into the
+# hook's stderr).
+function Get-PtuBudgetS {
+    $parsed = [long]0
+    if ([string]$env:VCO_PRE_TOOL_USE_TIMEOUT_S -match '^[0-9]+$' -and
+        [long]::TryParse([string]$env:VCO_PRE_TOOL_USE_TIMEOUT_S, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and
+        $parsed -ge 1 -and $parsed -le 999999) {
+        return [int]$parsed
+    }
+    return 3
+}
+
 # VCO-CENTRALIZED-KG: NOT a KG consumer (v0.2.101 wave-3). The former
 #   section-5 KG-suggestion path was retired (double emission with the
 #   pre-edit/pre-write router wrappers -- review nit-6); every remaining
@@ -144,6 +182,11 @@ if ($AgentId -and (Get-Command Get-VcoAgentKeyFromIds -ErrorAction SilentlyConti
 # at compaction).
 $SessionStateDir = Join-Path $ProjectRoot ".claude/state"
 $SessionReadsFile = Join-Path $SessionStateDir "reads_$AnchorSessionKey.txt"
+# v0.2.104: written by post-compact (same key as the reads ledger it wipes)
+# when THIS session/agent has compacted. Its absence means nothing was
+# re-attached, so a Write miss blocks without asking compact_reattach.
+# MUST MATCH post-compact.{sh,ps1} + pre-tool-use.sh.
+$SessionCompactedMarker = Join-Path $SessionStateDir "compacted_$AnchorSessionKey.txt"
 $BackupDir = Join-Path $SessionStateDir "tool_backups"
 $SecurityLog = Join-Path $ProjectRoot ".claude/logs/security_events.jsonl"
 
@@ -153,6 +196,171 @@ if (-not (Test-Path $LogsDir)) {
 }
 New-Item -ItemType Directory -Force -Path $SessionStateDir -ErrorAction SilentlyContinue | Out-Null
 New-Item -ItemType Directory -Force -Path $BackupDir -ErrorAction SilentlyContinue | Out-Null
+# Security-log timestamp (UTC, second precision) for every line this run
+# writes. MUST MATCH pre-tool-use.sh's `date -u +%Y-%m-%dT%H:%M:%SZ`.
+$ts = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
+
+function Write-SecurityLine([string]$json) {
+    try { Add-Content -Path $SecurityLog -Value $json -ErrorAction Stop } catch { }
+}
+
+# === 0. INCOMPLETE-RUN WARNING (v0.2.104) ===================================
+# A PreToolUse hook the harness kills on its `timeout` (or that crashes) does
+# NOT block: the tool call proceeds and this hook's output is discarded, so
+# the Build Anchor, SSRF guard and shell-injection scan silently did not
+# apply to that call. Owner ruling 2026-10-18: no `onFailure: "block"` --
+# tell the model instead. A killed hook cannot speak, so the NEXT run does:
+#   * every run leaves an in-progress marker
+#       ptu_inflight_<key>.<pid>.<start-epoch-ms>
+#     keyed like the Build-Anchor reads ledger (session + agent), holding
+#     only tool names (never command text -- it may carry secrets);
+#   * Exit-PtuHook removes it on every normal exit (allow AND block), unless
+#     the run ended past the harness timeout (its answer was discarded) or
+#     with an exit code the harness treats as a hook error;
+#   * a marker of the same key left by a PREVIOUS run is stale when its
+#     owner is gone (pid + start-time check, _lib/pid-live.ps1) or it is
+#     older than the timeout plus a margin -- never while a concurrent
+#     sibling run (parallel tool calls) is still working. A stale marker is
+#     claimed by an atomic delete (one reporter even under concurrency),
+#     logged to the security log, and reported through this run's answer:
+#     the additionalContext envelope on an allow, stderr on a block (the two
+#     channels Claude Code shows the model). Its tool names are copied into
+#     this run's own marker first, so a report lost to THIS run being killed
+#     is carried to the next one.
+# The start stamp is the PROCESS start when the OS reports it (the
+# powershell cold start counts against the harness timeout too).
+# "In time" (Exit-PtuHook) errs toward CLEARING: a run that completed
+# normally keeps its marker only when its elapsed time (from the process
+# start, else from the hook's first line) reaches the budget. What holds
+# exactly: a run whose own clock reads under the budget always clears its
+# marker, and a run the harness killed never gets to clear it. Grey zone, a
+# few ms wide on both sides of the budget: the harness counts from the
+# spawn, slightly before the process start, and its kill timer can also fire
+# late (event-loop latency). So a run finishing just under the budget by its
+# own clock may have been killed yet clears its marker (left unreported),
+# and a run finishing just over it may have had its answer accepted yet
+# keeps its marker (a warning for a call whose checks did apply). Outside
+# that band the marker is exact. MUST MATCH pre-tool-use.sh.
+# A marker of ANOTHER key older than a day belongs to a session or subagent
+# that never made another call (a kill on its last call): the GC below logs
+# it as `session_ended` before deleting it.
+# MUST MATCH pre-tool-use.sh's section 0.
+$PtuStaleMarginMs = 2000
+$PtuGcAgeMs = 86400000
+$PtuCarryMax = 20
+$script:PtuBudgetS = Get-PtuBudgetS
+$script:PtuMarker = ""
+$script:PtuPriorMsg = ""
+$ptuKey = [string]$AnchorSessionKey
+if (-not $ptuKey -or $ptuKey -match '[^A-Za-z0-9_-]') { $ptuKey = "default" }
+$ptuTool = ([string]$ToolName) -replace '[^A-Za-z0-9_.:-]', ''
+if ($ptuTool.Length -gt 100) { $ptuTool = $ptuTool.Substring(0, 100) }
+if (-not $ptuTool) { $ptuTool = "unknown" }
+$ptuT0 = if ($PtuProcStart) { $PtuProcStart } else { [DateTime]::Now.AddMilliseconds(-$PtuClock.Elapsed.TotalMilliseconds) }
+$ptuT0Ms = ([DateTimeOffset]$ptuT0).ToUnixTimeMilliseconds()
+# .NET calls over cmdlets throughout this section: it runs on every tool
+# call, and each cmdlet's first use costs PowerShell milliseconds.
+if ([IO.Directory]::Exists($SessionStateDir)) {
+    $m = [IO.Path]::Combine($SessionStateDir, ("ptu_inflight_{0}.{1}.{2}" -f $ptuKey, $PID, $ptuT0Ms))
+    try {
+        [IO.File]::WriteAllText($m, "$ptuTool`n")
+        $script:PtuMarker = $m
+    } catch { }
+}
+if ($script:PtuMarker) {
+    $priorTools = [System.Collections.Generic.List[string]]::new()
+    $prefix = "ptu_inflight_$ptuKey."
+    # .NET enumeration, not Get-ChildItem: this runs on every tool call. The
+    # key holds no search-pattern wildcard ([A-Za-z0-9_-]); the exact
+    # prefix is re-checked ordinally below all the same.
+    $candidates = @()
+    try { $candidates = @([IO.Directory]::GetFiles($SessionStateDir, "$prefix*")) } catch { }
+    $pidLiveLoaded = $false
+    foreach ($cPath in $candidates) {
+        if ($cPath -eq $script:PtuMarker) { continue }
+        $cName = [IO.Path]::GetFileName($cPath)
+        if (-not $cName.StartsWith($prefix, [StringComparison]::Ordinal)) { continue }
+        if ($cName.Substring($prefix.Length) -notmatch '^([0-9]+)\.([0-9]+)$') { continue }
+        $mPid = 0
+        $mMs = [long]0
+        if (-not [int]::TryParse($Matches[1], [ref]$mPid)) { continue }
+        if (-not [long]::TryParse($Matches[2], [ref]$mMs)) { continue }
+        $ageMs = $ptuT0Ms - $mMs
+        $why = ""
+        if ($ageMs -gt ($script:PtuBudgetS * 1000 + $PtuStaleMarginMs)) {
+            $why = "overdue"
+        } else {
+            # Loaded only when a same-key marker exists (rare): not on the
+            # every-tool-call path. Missing lib -> treated as live (no warn).
+            if (-not $pidLiveLoaded) {
+                $pidLiveLoaded = $true
+                $pidLiveLib = Join-Path $LibDir "pid-live.ps1"
+                if (Test-Path -LiteralPath $pidLiveLib) { . $pidLiveLib }
+            }
+            if (Get-Command Test-VcoPidLive -ErrorAction SilentlyContinue) {
+                $stamp = [DateTimeOffset]::FromUnixTimeMilliseconds($mMs).LocalDateTime
+                if (-not (Test-VcoPidLive -OwnerPid $mPid -Stamp $stamp)) { $why = "owner_gone" }
+            }
+        }
+        if (-not $why) { continue }   # a sibling still at work: leave it
+        $tools = @()
+        try {
+            foreach ($t in [IO.File]::ReadAllLines($cPath)) {
+                $t = $t -replace '[^A-Za-z0-9_.:-]', ''
+                if ($t.Length -gt 100) { $t = $t.Substring(0, 100) }
+                if ($t) { $tools += $t }
+            }
+        } catch { }
+        # The delete IS the claim: of two concurrent runs, one reports.
+        try { Remove-Item -LiteralPath $cPath -Force -ErrorAction Stop } catch { continue }
+        if ($tools.Count -eq 0) { $tools = @("unknown") }
+        foreach ($t in $tools) {
+            # Bounded: at most $PtuCarryMax names are reported and carried,
+            # so a run of killed hooks cannot grow a marker without limit.
+            if ($priorTools.Count -ge $PtuCarryMax) { break }
+            $priorTools.Add($t)
+            try { [IO.File]::AppendAllText($script:PtuMarker, "$t`n") } catch { }
+        }
+        Write-SecurityLine ("{{""timestamp"":""{0}"",""event"":""pre_tool_use_incomplete"",""tools"":""{1}"",""session_key"":""{2}"",""age_ms"":{3},""reason"":""{4}""}}" -f $ts, ($tools -join ' '), $ptuKey, $ageMs, $why)
+    }
+    if ($priorTools.Count -gt 0) {
+        $script:PtuPriorMsg = "[VCO safety check incomplete] VCO's pre-tool-use safety check did not finish for $($priorTools.Count) earlier tool call(s) in this session ($($priorTools -join ', ')): it timed out or crashed, so its checks (Build Anchor, SSRF guard, shell-injection scan) did not apply to those calls. If one of them wrote or ran something risky, review it."
+    }
+}
+
+# Exit-PtuHook <code>: every exit of this hook from here on. Removes this
+# run's marker when the run completed in time with an answer the harness
+# acts on (0 allow, 2 block), and delivers a pending stale-marker report on
+# that answer's channel -- together with any queued broken-install notice
+# in the ONE additionalContext envelope of an allow (a second envelope on
+# stdout would break the hook's JSON contract). MUST MATCH pre-tool-use.sh's
+# _ptu_exit.
+function Exit-PtuHook([int]$Code) {
+    $prior = ""
+    if ($script:PtuMarker -and ($Code -eq 0 -or $Code -eq 2)) {
+        # Not late = cleared (MUST MATCH pre-tool-use.sh's _ptu_finished_late;
+        # this clock is never coarse: Stopwatch + process start).
+        if ((Get-PtuElapsedMs) -lt ($script:PtuBudgetS * 1000)) {
+            try { [IO.File]::Delete($script:PtuMarker) } catch { }
+            $prior = $script:PtuPriorMsg
+        }
+    }
+    if ($Code -eq 0) {
+        $parts = @(@($script:VcoModelNotice, $prior) | Where-Object { $_ })
+        if ($parts.Count -gt 0) {
+            $ctx = $parts -join "`n`n"
+            if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+                Emit-AdditionalContext $ctx 'PreToolUse'
+            } else {
+                $envelope = [ordered]@{ hookSpecificOutput = [ordered]@{ hookEventName = 'PreToolUse'; additionalContext = $ctx } }
+                Write-Output ($envelope | ConvertTo-Json -Compress -Depth 4)
+            }
+        }
+    } elseif ($Code -eq 2 -and $prior) {
+        [Console]::Error.WriteLine($prior)
+    }
+    exit $Code
+}
 
 # Best-effort 14-day GC of stale per-session reads files. Sessions that
 # haven't been touched in two weeks are almost certainly abandoned;
@@ -172,6 +380,43 @@ try {
     # v0.2.70 Stream E (SF-1): same GC for the INJECTOR reads store.
     Get-ChildItem -Path $SessionStateDir -Filter 'seen_reads_*.txt' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    # v0.2.104: same GC for the post-compact markers (compacted_*.txt).
+    Get-ChildItem -Path $SessionStateDir -Filter 'compacted_*.txt' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    # v0.2.104: in-progress markers (ptu_inflight_*, section 0) of any key
+    # whose start stamp is over a day old: no later run of that session /
+    # subagent came to claim it, so it is LOGGED (reason session_ended, tools
+    # from the file) and deleted -- R13 LOW-1, a killed hook on a session's
+    # last call must still leave its audit line. Age from the file name's
+    # start stamp. MUST MATCH pre-tool-use.sh's GC loop.
+    $gcFiles = @()
+    try { $gcFiles = @([IO.Directory]::GetFiles($SessionStateDir, "ptu_inflight_*")) } catch { }
+    foreach ($g in $gcFiles) {
+        $gn = [IO.Path]::GetFileName($g)
+        if ($gn -notmatch '^ptu_inflight_([A-Za-z0-9_-]+)\.([0-9]+)\.([0-9]+)$') { continue }
+        $gKey = $Matches[1]
+        $gMs = [long]0
+        if (-not [long]::TryParse($Matches[3], [ref]$gMs)) { continue }
+        $gAge = $ptuT0Ms - $gMs
+        if ($gAge -le $PtuGcAgeMs) { continue }
+        $gTools = @()
+        try {
+            foreach ($t in [IO.File]::ReadAllLines($g)) {
+                $t = $t -replace '[^A-Za-z0-9_.:-]', ''
+                if ($t.Length -gt 100) { $t = $t.Substring(0, 100) }
+                if ($t) { $gTools += $t }
+            }
+        } catch { }
+        try { Remove-Item -LiteralPath $g -Force -ErrorAction Stop } catch { continue }   # the delete is the claim
+        $gToolText = if ($gTools.Count -gt 0) { $gTools -join ' ' } else { 'unknown' }
+        Write-SecurityLine ("{{""timestamp"":""{0}"",""event"":""pre_tool_use_incomplete"",""tools"":""{1}"",""session_key"":""{2}"",""age_ms"":{3},""reason"":""session_ended""}}" -f $ts, $gToolText, $gKey, $gAge)
+    }
+    # Backstop (MUST MATCH the .sh find): a ptu_inflight_* file untouched
+    # for two days that the loop could not parse is removed silently.
+    Get-ChildItem -Path $SessionStateDir -Filter 'ptu_inflight_*' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-2) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { }
 
@@ -212,10 +457,6 @@ function Write-VcoNoPythonNotice([string]$what) {
     $script:VcoModelNotice = $msg
 }
 
-function Write-SecurityLine([string]$json) {
-    try { Add-Content -Path $SecurityLog -Value $json -ErrorAction Stop } catch { }
-}
-
 # === 1. SSRF GUARD ===
 if ($ToolName -eq "WebFetch") {
     # The URL comes from the payload ConvertFrom-Json already decoded, NOT
@@ -237,7 +478,7 @@ if ($ToolName -eq "WebFetch") {
         [Console]::Error.WriteLine("SSRF guard: the WebFetch payload's 'url' field could not be extracted (malformed payload or a parser error), so the call cannot be checked and is blocked.")
         [Console]::Error.WriteLine("   Retry; if it persists this is a broken VCO install - re-run the orchestrator's update (``python install.py --update`` in the orchestrator root, or the launcher's Update).")
         Write-SecurityLine "{""timestamp"":""$ts"",""event"":""ssrf_blocked"",""url"":"""",""reason"":""url_extraction_failed""}"
-        exit 2
+        Exit-PtuHook 2
     }
     if ($url) {
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
@@ -282,7 +523,7 @@ if ($ToolName -eq "WebFetch") {
             }
             $urlEsc = $url -replace '\\', '\\\\' -replace '"', '\"'
             Write-SecurityLine "{""timestamp"":""$ts"",""event"":""ssrf_blocked"",""url"":""$urlEsc""}"
-            exit 2
+            Exit-PtuHook 2
         }
     }
 }
@@ -292,49 +533,141 @@ if ($ToolName -eq "WebFetch") {
 # `--shell powershell` rule set reads its syntax) ===
 if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
     $cmd = Get-Field "command"
-    $injection = ""
-    if ($cmd -match '(?i)(curl|wget)\s[^|]+\|\s*(ba)?sh\b') { $injection = "network fetch piped to shell" }
-    elseif ($cmd -match '(?i)eval\s+["\$(]*(curl|wget)') { $injection = "eval + network fetch" }
-    elseif ($cmd -match '(?i)base64\s+-d.*\|\s*(ba)?sh\b') { $injection = "base64-decoded pipe to shell" }
+    $SecurityScript = Join-Path $ProjectRoot ".claude/scripts/bash_security.py"
+
+    # v0.2.104 R6: every Python call below is time-bounded. The harness kills
+    # this hook after its 3 s registration and a killed PreToolUse hook does
+    # NOT block, so a slow scan must end as "no verdict" while there is still
+    # time to exit. Returns @{Exit; Out; Err}, or $null on timeout / any
+    # failure (= no verdict). The input is written as UTF-8 bytes, exactly.
+    # MUST MATCH pre-tool-use.sh's _ptu_bounded (1 s classifier, 2 s
+    # scanner). v0.2.104 R7 N3: ONE deadline covers start-up, the stdin write
+    # and the exit, as `timeout` does on the sh side; the write and the exit
+    # waits used to get a full budget each (a scanner that never reads a large
+    # command took 2x the bound).
+    function Invoke-PtuBoundedPython([string]$ArgTail, [string]$InputText, [int]$TimeoutMs) {
+        $proc = $null
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $left = { [int][Math]::Max(0, $TimeoutMs - $clock.ElapsedMilliseconds) }
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = [string]$PY
+            $psi.Arguments = '"' + $SecurityScript + '" ' + $ArgTail
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($InputText)
+            $writeTask = $proc.StandardInput.BaseStream.WriteAsync($bytes, 0, $bytes.Length)
+            if ($writeTask.Wait((& $left))) { $proc.StandardInput.Close() }
+            if (-not $proc.WaitForExit((& $left))) {
+                try { $proc.Kill() } catch { }
+                return $null
+            }
+            $proc.WaitForExit()
+            return @{ Exit = $proc.ExitCode; Out = $outTask.Result; Err = $errTask.Result }
+        } catch {
+            if ($proc) { try { $proc.Kill() } catch { } }
+            return $null
+        }
+    }
+
+    # The three raw-text patterns ALWAYS read the whole command (the v0.2.103
+    # guarantee) and run first. v0.2.104 R7 N2: .NET backtracks where GNU
+    # grep (pre-tool-use.sh) does not, so the spans are tempered -- the span
+    # after a fetch/decode stops at the next one that could itself reach the
+    # pipe. Same match set as the plain `[^|]+` / `.*` forms (pinned in
+    # tests/test_v02104_scanner_linear_rules.py); 40k `base64 -d f;` took 58 s
+    # here before, past the hook's 3 s, and a killed hook checks nothing.
+    function Get-PtuRawInjection([string]$Text) {
+        if ($Text -match '(?i)(curl|wget)\s(?:(?!(?:curl|wget)\s[^|])[^|])+\|\s*(ba)?sh\b') { return "network fetch piped to shell" }
+        if ($Text -match '(?i)eval\s+["\$(]*(curl|wget)') { return "eval + network fetch" }
+        if ($Text -match '(?i)base64\s+-d(?:(?!base64\s+-d).)*\|\s*(ba)?sh\b') { return "base64-decoded pipe to shell" }
+        return ""
+    }
+    $injection = Get-PtuRawInjection $cmd
+
+    # v0.2.104 E-3: the ONE exception (MUST MATCH pre-tool-use.sh). A Bash
+    # command that bash_security.py positively recognises as a pure DATA
+    # here-doc write (`cat > f <<'EOF'`, `tee f <<'EOF'`, a plain
+    # `python3 - <<'EOF'` edit script -- the strict allowlist is documented at
+    # data_heredoc_raw_text) has its BODY skipped: the patterns re-read only
+    # the opener line it hands back, and only when that line is exactly the
+    # command's first line. No interpreter, a timeout, any error or any doubt
+    # keeps the whole-text verdict. Asked only when a pattern matched.
+    if ($injection -and $ToolName -eq "Bash" -and $PY -and (Test-Path $SecurityScript)) {
+        $dataRes = Invoke-PtuBoundedPython "--data-heredoc" $cmd 1000
+        if ($dataRes -and $dataRes.Exit -eq 0) {
+            $opener = [string]$dataRes.Out
+            if ($opener -and $cmd.StartsWith($opener + "`n", [System.StringComparison]::Ordinal)) {
+                $injection = Get-PtuRawInjection $opener
+            }
+        }
+    }
 
     if ($injection) {
-        # Route the block message to STDERR (matches pre-tool-use.sh) —
+        # Route the block message to STDERR (matches pre-tool-use.sh) --
         # see the SSRF-guard branch above for why plain stdout is dropped.
         [Console]::Error.WriteLine("Shell injection guard: detected '$injection' in $ToolName command.")
         $preview = if ($cmd.Length -gt 120) { $cmd.Substring(0, 120) } else { $cmd }
         [Console]::Error.WriteLine("   Blocked command preview: $preview")
-        [Console]::Error.WriteLine("   If this is intentional, run the command manually in a terminal.")
+        [Console]::Error.WriteLine("   This check reads the whole command text. Only a plain heredoc file write (cat > file <<'EOF', tee file <<'EOF') or a plain python edit script (python3 - <<'EOF'), with a quoted delimiter and nothing else in the command, has its body exempted.")
+        [Console]::Error.WriteLine("   To write a file whose content mentions this text, use the Write tool or such a heredoc. If the command is intentional, run it manually in a terminal.")
         $previewEsc = ($preview -replace '\\', '\\\\' -replace '"', '\"')
         Write-SecurityLine "{""timestamp"":""$ts"",""event"":""shell_injection_blocked"",""pattern"":""$injection"",""cmd_preview"":""$previewEsc""}"
-        exit 2
+        Exit-PtuHook 2
     }
 
-    # Extended security scan via bash_security.py if available. It is Python,
-    # so with no interpreter it cannot run -- and says so (v0.2.100 WP-17)
-    # instead of being skipped in silence. The regex scan above already ran.
-    $SecurityScript = Join-Path $ProjectRoot ".claude/scripts/bash_security.py"
+    # Extended security scan via bash_security.py if available (bounded: a
+    # timeout is no verdict and a small command proceeds -- the raw patterns
+    # above already ran on it). It is Python, so with no interpreter it
+    # cannot run -- and says so (v0.2.100 WP-17) instead of being skipped in
+    # silence.
     if ((Test-Path $SecurityScript) -and -not $PY) {
         Write-VcoNoPythonNotice "The Bash security scanner (.claude/scripts/bash_security.py)"
     }
+    # v0.2.104 R10 F1: a command over $PtuScanSizeCeilingBytes that the
+    # scanner could not finish in time ($null = timed out / killed) is
+    # BLOCKED instead (fail-closed for that size class only): before the 2 s
+    # bound, an unbounded scan of a ~1.9-2.7 MB command still delivered its
+    # verdict inside the 3 s hook registration. A small command keeps "no
+    # verdict = proceeds". MUST MATCH pre-tool-use.sh's
+    # PTU_SCAN_SIZE_CEILING_BYTES.
+    $PtuScanSizeCeilingBytes = 1048576
     if ((Test-Path $SecurityScript) -and $PY) {
-        try {
-            $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
-            $secOut = $cmd | & $PY $SecurityScript --shell $secShell 2>&1
-            $secExit = $LASTEXITCODE
-            if ($secExit -eq 2) {
-                # Route to STDERR (matches pre-tool-use.sh's bash-security
-                # branch) — same stdout-discard rationale as the SSRF /
-                # injection guards above.
-                [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
-                [Console]::Error.WriteLine("   $secOut")
-                $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
-                $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'
-                $cmdPreview = if ($cmd.Length -gt 80) { $cmd.Substring(0,80) } else { $cmd }
-                $cmdPreviewEsc = $cmdPreview -replace '\\', '\\\\' -replace '"', '\"'
-                Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_blocked"",""detail"":""$detailEsc"",""cmd_preview"":""$cmdPreviewEsc""}"
-                exit 2
+        $secShell = if ($ToolName -eq "PowerShell") { "powershell" } else { "bash" }
+        $secRes = Invoke-PtuBoundedPython "--shell $secShell" $cmd 2000
+        if ($null -eq $secRes) {
+            $cmdBytes = [System.Text.Encoding]::UTF8.GetByteCount([string]$cmd)
+            if ($cmdBytes -gt $PtuScanSizeCeilingBytes) {
+                # MUST MATCH pre-tool-use.sh's message.
+                [Console]::Error.WriteLine("$ToolName security check: this command is $cmdBytes bytes, over the 1 MiB limit, and was too large to check in time.")
+                [Console]::Error.WriteLine("   Write large content with the Write tool, or split the command into smaller ones.")
+                Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_too_large_unchecked"",""bytes"":$cmdBytes}"
+                Exit-PtuHook 2
             }
-        } catch { }
+        }
+        if ($secRes -and $secRes.Exit -eq 2) {
+            $secOut = ("" + $secRes.Err + $secRes.Out).TrimEnd()
+            # Route to STDERR (matches pre-tool-use.sh's bash-security
+            # branch) — same stdout-discard rationale as the SSRF /
+            # injection guards above.
+            [Console]::Error.WriteLine("$ToolName security scanner blocked this command:")
+            [Console]::Error.WriteLine("   $secOut")
+            $detail = if ("$secOut".Length -gt 200) { "$secOut".Substring(0,200) } else { "$secOut" }
+            $detailEsc = $detail -replace '\\', '\\\\' -replace '"', '\"'
+            $cmdPreview = if ($cmd.Length -gt 80) { $cmd.Substring(0,80) } else { $cmd }
+            $cmdPreviewEsc = $cmdPreview -replace '\\', '\\\\' -replace '"', '\"'
+            Write-SecurityLine "{""timestamp"":""$ts"",""event"":""bash_security_blocked"",""detail"":""$detailEsc"",""cmd_preview"":""$cmdPreviewEsc""}"
+            Exit-PtuHook 2
+        }
     }
 }
 
@@ -392,7 +725,7 @@ if ($ToolName -eq "Read") {
         # same-turn Write-anchor checks and seen-store suppression see them.
         # MUST MATCH pre-tool-use.sh.
     }
-    exit 0
+    Exit-PtuHook 0
 }
 
 # === v0.2.70 Stream C Surface 4 (Grep) — RETIRED (v0.2.101 §C6) ============
@@ -423,6 +756,53 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
                         }
                     } catch { }
                 }
+                # v0.2.104: a miss right after a compaction may be a file
+                # Claude Code itself re-attached (post-compact wiped the
+                # ledger). Ask the ONE home, vco_lib/compact_reattach.py,
+                # which reads the exact set from the transcript (it also
+                # normalises Windows case and separators); only the exact
+                # answer `reattached` allows -- no interpreter, a broken
+                # vco_lib, any error or doubt keeps the block (fail closed).
+                # The allowed path is appended to the ledger below, so later
+                # Writes do not rescan. MUST MATCH pre-tool-use.sh.
+                # Asked ONLY when post-compact left this session's marker: a
+                # session that never compacted has nothing re-attached, and
+                # this hook's 3 s registration timeout must not be spent on a
+                # transcript scan -- a hook killed on timeout does not block,
+                # so it would turn this block into an allow. The module
+                # answers `no` past the deadline this hook hands it.
+                if (-not $alreadyRead -and $TranscriptPath -and (Test-Path -LiteralPath $SessionCompactedMarker -PathType Leaf)) {
+                    $raPy = ""
+                    $venvLib = Join-Path $LibDir "resolve-vco-venv.ps1"
+                    if (Test-Path -LiteralPath $venvLib) {
+                        try {
+                            . $venvLib
+                            $raVenv = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+                            if ($raVenv -and (Test-Path -LiteralPath $raVenv)) { $raPy = [string]$raVenv }
+                        } catch { }
+                    }
+                    if (-not $raPy -and $PY) { $raPy = [string]$PY }
+                    # The check gets only what is left of the registration
+                    # timeout: budget - elapsed since this hook started - a
+                    # margin for the interpreter's start and this hook's
+                    # exit. Under the floor there is no time for an answer:
+                    # skip the spawn and block. The module caps the value at
+                    # its own 1 s default. VCO_PRE_TOOL_USE_TIMEOUT_S (whole
+                    # seconds) MUST MATCH the `timeout` registered for
+                    # pre-tool-use in .claude/settings.json -- set it when you
+                    # change that registration (parsed by Get-PtuBudgetS).
+                    $ptuBudgetS = Get-PtuBudgetS
+                    $ptuLeftMs = $ptuBudgetS * 1000 - (Get-PtuElapsedMs) - 700
+                    if ($raPy -and $ptuLeftMs -ge 200) {
+                        $ptuDeadline = ([double]$ptuLeftMs / 1000).ToString("0.000", [Globalization.CultureInfo]::InvariantCulture)
+                        try {
+                            $raOut = @(& $raPy -m vco_lib.compact_reattach check "--transcript=$TranscriptPath" "--path=$filePath" "--agent-id=$AgentId" "--deadline=$ptuDeadline" 2>$null)
+                            if ($LASTEXITCODE -eq 0 -and $raOut.Count -ge 1 -and ([string]$raOut[0]).Trim() -ceq "reattached") {
+                                $alreadyRead = $true
+                            }
+                        } catch { }
+                    }
+                }
                 if (-not $alreadyRead) {
                     $bn = Split-Path $filePath -Leaf
                     # Route to STDERR (matches pre-tool-use.sh's Build Anchor
@@ -433,7 +813,7 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
                     [Console]::Error.WriteLine("    Use the Read tool on this file before overwriting it with Write.")
                     $fpEsc = $filePath -replace '\\', '\\\\' -replace '"', '\"'
                     Write-SecurityLine "{""timestamp"":""$ts"",""event"":""anchor_blocked"",""file"":""$fpEsc"",""tool"":""Write""}"
-                    exit 2
+                    Exit-PtuHook 2
                 }
             }
             # Backup existing file before modification.
@@ -473,8 +853,5 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
 
 # v0.2.100 WP-17 (kept from the retired section-5 tool gate): the Bash
 # branch's queued broken-install notice leaves in this tool call's one
-# envelope.
-if ($script:VcoModelNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
-    Emit-AdditionalContext $script:VcoModelNotice 'PreToolUse'
-}
-exit 0
+# envelope -- Exit-PtuHook emits it (with any section-0 report).
+Exit-PtuHook 0

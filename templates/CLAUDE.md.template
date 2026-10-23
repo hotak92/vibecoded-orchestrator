@@ -89,6 +89,14 @@ Four layers carry state across sessions — future-you, future agents, and the u
 
 ---
 
+## Compaction
+
+**Compaction**: critical context is preserved by the `PreCompact` / `PostCompact` hooks. Before compacting manually, update `CONTEXT_STATE.md` with the current state, modified files and open blockers. Use `/compact focus on <topic>` to guide the summary.
+
+**Idle compaction is off in this project.** VCO ships `"idleCompaction": false` in `.claude/settings.json`: Claude Code otherwise compacts a large conversation (200k+ tokens) left idle for about an hour, and you would resume into a summary that can drop context not yet written to `CONTEXT_STATE.md` or the KG. Normal auto-compact near the context limit is unaffected. A bundle update adds the key only when it is absent, so your own value always stands; to turn idle compaction back on, set `"idleCompaction": true` in `.claude/settings.local.json`.
+
+---
+
 ## Search before you answer project questions
 
 For questions about this project's state, decisions, patterns, or architecture, look it up before answering — never explain from memory what the codebase does, what patterns exist, or what was previously decided. For general coding questions, syntax, or files already in context, answer directly; searching first there costs tokens and finds nothing.
@@ -185,14 +193,16 @@ treat the window itself as unknown, because it is not.
 
 When 2+ agents edit the same working tree, either give each one an isolated git worktree (Agent-tool `isolation: "worktree"`) OR assign strictly disjoint file sets and forbid ALL git commands in their briefs (the coordinator runs git): concurrent `git checkout` / `stash` / staging operations are tree-global and clobber each other.
 
-**Isolated agents in another repo (lane reservations)**: an `isolation: "worktree"` agent normally gets a detached worktree of THIS project's repo at HEAD. When a lane's work belongs in another repo — this project itself on a chosen branch, or one of its enabled code folders (launcher: Identity tab → **Add code folder**) — reserve the worktree first, then dispatch the isolated agent:
+**Isolated agents in another repo (lane reservations)**: an `isolation: "worktree"` agent normally gets a detached worktree of THIS project's repo at the SESSION's HEAD (not main: a session tree that is behind main gives the lane an old base; a lane reservation pins `--base`). When a lane's work belongs in another repo — this project itself on a chosen branch, or one of its enabled code folders (launcher: Identity tab → **Add code folder**) — reserve the worktree first, then dispatch the isolated agent:
 
 1. `python -m vco_lib.lane_reservation reserve --project <this project> --repo <repo> --base <commit> --branch <new-branch>` — prints a reservation id (`--id` to choose one, `--existing-path` to adopt a worktree of that repo you already created on that branch; `list` / `cancel --id` manage pending ones). The repo must be the project itself or an ENABLED code folder, checked through the launcher hub — with the hub down, reservations are refused (ordinary isolation is unaffected).
 2. Put the id in the lane's brief and dispatch **one isolated agent per message**: `worktree-guard` hands the OLDEST pending reservation to the next isolated launch, creating `<repo parent>/<repo name>.vco-lanes/<branch>-<id>` with `git worktree add -b <branch> … <base>`. A reservation expires after 15 minutes unused; one that fails validation at launch aborts the launch with the reason, never falling back to a worktree of this project.
 3. The agent is told its reservation id, worktree, repo, branch and base when it starts, and stops if its brief names a different id.
 4. Review the result. When the agent finishes, a worktree with changes or commits is KEPT for you to review and merge; an unchanged one is removed together with its new branch. An adopted (`--existing-path`) worktree is never removed.
 
-The harness holds only Edit/Write to the worktree — **Bash is not confined** — so the brief must keep every Bash command (`cd`, redirects, `git`) inside the worktree path.
+The harness holds only Edit/Write to the worktree — **Bash is not confined** — so the brief must keep every Bash command (`cd`, redirects, `git`) inside the worktree path. A lane in a worktree that saves a knowledge node must pass an ABSOLUTE `file_path` inside its worktree to `store_knowledge_node` (or Write the `.md` itself): a relative path resolves against the main checkout, where the node lands untracked. A subagent cannot ask the coordinator anything mid-run (it has no SendMessage), so its brief must be complete. The pre-tool-use security hook may refuse an agent's `rm`: the lane lists the paths to delete in its report and the coordinator deletes them, instead of working around the refusal.
+
+**Scratch files go in the project's scratch dir, never `/tmp`**: put disposable files (downloads, extracted archives, test harnesses, a copy kept before an edit) in the directory `<project>/.claude/scripts/vco-scratch path --name <lane>` prints (`vco-scratch.ps1` on Windows; without `--name` the session id names it — and every subagent shares its parent's session id, so a lane ALWAYS passes `--name`) — `<project>/.claude/state/scratch/<lane>/`, private to your account (shell-less agents such as `gui-tester` get a lane VCO pre-creates, `vct-gui-report`), git-excluded and invisible to the code graph. VCO deletes a lane left untouched for 7 days at session start (a lane it cannot delete is logged to `.claude/logs/scratch-sweep.log` and named by `vco doctor`) (`VCO_SCRATCH_TTL_HOURS`, `0` = keep), so you never clean it up yourself; never `rm -rf` anything outside it, and keep scratch out of worktrees, where it breaks repo-walking tests. Name the lane in every lane brief, and give `<project>` as the main checkout's absolute path: a lane working in its own git worktree has no `.claude/scripts/` there (that folder is git-excluded and never copied into worktrees).
 
 ---
 
@@ -227,7 +237,9 @@ anything.
    `infrastructure/`, `knowledge/` — existing destination files are never
    overwritten.
 3. **Rewrite path-bearing values** in the destination: `KG_BASE_DIR` in
-   `.claude/settings.json` and `.claude/env`, AND the deferral ledger's
+   `.claude/settings.local.json` and `.claude/env` (and in
+   `.claude/settings.json` if an older VCO version wrote it there — the next
+   env refresh moves it out), AND the deferral ledger's
    apply commands (`.claude/context/UPDATE_DEFERRED.md` + `.json` embed
    absolute paths — a stale `source <old>/.claude/env` would poison a
    session). Grep the old path across the whole destination afterwards —
@@ -235,7 +247,11 @@ anything.
 4. **Git hygiene** (if the destination is a repo): add the bundle paths to
    `.git/info/exclude` (LOCAL-only, never the tracked `.gitignore`) so
    VCO-managed files can't reach a commit by accident; deliberately
-   un-exclude anything you want tracked.
+   un-exclude anything you want tracked. Exclude VCO's files one by one
+   (hooks, scripts, agents, skills) plus its runtime dirs (`.claude/state/`,
+   `logs/`, `backups/`, `worktrees/`) — never the whole `.claude/` folder,
+   which would also hide your own `CONTEXT_STATE.md`, `context/` plans and
+   handoffs, and `settings.json`.
 5. **Flip the DB row with the launcher CLOSED** (single-writer): back up
    `launcher.db`, then `UPDATE projects SET folder_path='<new>' WHERE
    id='<project-id>'`, then sweep EVERY table's path-like columns for the

@@ -70,6 +70,21 @@ pub struct OrchestratorBundledSecret {
     pub slot_exclusive: bool,
 }
 
+impl OrchestratorManifest {
+    /// The key names the hub serves ONLY from VCO's shared slot
+    /// (`scope == "shared" && slot_exclusive`). The one reading of the rule:
+    /// the hub's `/env` merge (`vct-hub` `modules_api::slot_exclusive_keys`)
+    /// and the launcher's Secrets panel hint
+    /// (`secrets_cmd::list_slot_exclusive_secret_names`) both call this.
+    pub fn slot_exclusive_shared_keys(&self) -> Vec<String> {
+        self.bundled_secrets
+            .iter()
+            .filter(|bs| bs.scope == "shared" && bs.slot_exclusive)
+            .map(|bs| bs.key.clone())
+            .collect()
+    }
+}
+
 fn default_orchestrator_secret_module_id() -> String {
     "user".to_string()
 }

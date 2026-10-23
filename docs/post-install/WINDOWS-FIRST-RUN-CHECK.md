@@ -129,7 +129,9 @@ What it does, step by step:
 - Stops the model gateway, vct-hub and the VCO launcher, then removes the
   WHOLE VCO state folder (`%USERPROFILE%\.vct`): `launcher.db`, logs,
   caches, `license.key` and the RL training data (`retrieval_rl_data\`).
-  It is skipped while any of those processes is still running.
+  It is skipped while any of those processes is still running. A state
+  folder that is a junction (or a `VCT_STATE_DIR` not named `.vct`) is not
+  removed whole: only VCO's own files in it go, the rest stays.
 - Removes orchestrator MCP registrations from `~/.claude.json` (your
   other MCP servers are preserved).
 - Removes boot autostart entries (closed in v0.2.54 Track G — this used

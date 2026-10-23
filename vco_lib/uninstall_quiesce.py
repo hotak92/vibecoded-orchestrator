@@ -40,6 +40,7 @@ Never raises; every outcome is an audit line.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -451,6 +452,11 @@ class GatewayProc:
     #: ``None`` when the OS would not say (access denied).
     cmdline: Optional[tuple[str, ...]]
     exe: Optional[Path] = None
+    #: The UNSPLIT command line, when the source could only give one (macOS
+    #: ``ps -o args=``). ``cmdline`` is then a naive whitespace split that
+    #: breaks a path containing spaces; :func:`is_vco_gateway` falls back to
+    #: candidate-anchored matching on this line for exactly that case.
+    raw_line: Optional[str] = None
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -460,14 +466,117 @@ def _same_path(a: str, b: str) -> bool:
         return False
 
 
+_PYTHON_NAME = re.compile(r"pythonw?(\d+(\.\d+)*)?(\.exe)?", re.IGNORECASE)
+
+
+def _is_python(token: str) -> bool:
+    """``token`` names a Python interpreter (``python3.12``, ``pythonw.exe`` …)."""
+    return bool(_PYTHON_NAME.fullmatch(re.split(r"[\\/]", token)[-1]))
+
+
+def _python_script_arg(toks: Sequence[str]) -> Optional[str]:
+    """The script a Python command line runs — the first argument after the
+    interpreter's own options (``python -S <script>``) — or ``None`` when
+    argv[0] is not a Python interpreter or it runs ``-m`` / ``-c`` / stdin."""
+    if not toks or not _is_python(toks[0]):
+        return None
+    i = 1
+    while i < len(toks) and toks[i].startswith("-") and toks[i] not in ("-m", "-c", "-"):
+        i += 2 if toks[i] in ("-W", "-X") else 1
+    if i >= len(toks) or toks[i] in ("-m", "-c", "-"):
+        return None
+    return toks[i]
+
+
+def _python_invocation_prefix(prefix: str, known_interps: Sequence[str] = ()) -> bool:
+    """True when *prefix* — everything on a raw command line BEFORE the
+    gateway script — is a Python interpreter followed only by its own
+    options. Mirrors :func:`_python_script_arg`'s rule without tokenising,
+    so an interpreter path containing spaces still qualifies (``_is_python``
+    judges the basename).
+
+    *known_interps* are interpreter paths the caller KNOWS (the venv python
+    of the install being uninstalled). A prefix that STARTS with one of them
+    is split exactly there, so a known interpreter path containing `` -``
+    (``/Users/u/Proj -beta/.venv/bin/python``) is still recognised; an
+    unknown interpreter keeps the first-``\\s+-\\S`` cut, so nothing else is
+    loosened."""
+    prefix = prefix.strip()
+    if not prefix:
+        return False
+    interp = optstr = ""
+    for known in known_interps:
+        if prefix == known or prefix.startswith(known + " "):
+            interp, optstr = known, prefix[len(known):]
+            break
+    else:
+        m = re.search(r"\s+-\S", prefix)
+        interp, optstr = (prefix, "") if m is None else (prefix[: m.start()],
+                                                         prefix[m.start():])
+    if not _is_python(interp):
+        return False
+    toks = optstr.split()
+    i = 0
+    while i < len(toks):
+        if toks[i] in ("-m", "-c", "-") or not toks[i].startswith("-"):
+            return False
+        if toks[i] in ("-W", "-X"):
+            if i + 1 >= len(toks):
+                return False  # a value option with no value is malformed
+            i += 2
+        else:
+            i += 1
+    return True
+
+
+def _raw_line_match(raw: str, cand: Sequence[str]) -> bool:
+    """Candidate-anchored match on an UNSPLIT command line — the macOS
+    ``ps -o args=`` arm, where a naive whitespace split breaks a gateway
+    path containing spaces (review FINAL4 "not done", v0.2.104).
+
+    The rule is exactly the token path's: for a console-script candidate the
+    script is argv[0] or the first argument after a Python interpreter and
+    its options; for a module candidate the line starts with that
+    interpreter followed by ``-m <module>``. The script anywhere else on the
+    line (``cp <script> /tmp``, an editor) still does NOT match."""
+    cand = list(cand)
+    if len(cand) == 1:
+        script = cand[0]
+        if raw == script or raw.startswith(script + " "):
+            return True  # argv[0] (== the executable on a shebang run)
+        # The install's own venv python sits beside its console script.
+        interps = [str(Path(script).parent / n) for n in ("python", "python3")]
+        for m in re.finditer(re.escape(script) + r"(?=\s|$)", raw):
+            if (m.start() > 0 and raw[m.start() - 1].isspace()
+                    and _python_invocation_prefix(raw[: m.start()], interps)):
+                return True
+        return False
+    if len(cand) == 3 and cand[1] == "-m":
+        tail = f"{cand[1]} {cand[2]}"
+        for m in re.finditer(re.escape(tail) + r"(?=\s|$)", raw):
+            if (m.start() > 0 and raw[m.start() - 1].isspace()
+                    and _same_path(raw[: m.start()].rstrip(), cand[0])):
+                return True
+    return False
+
+
 def is_vco_gateway(proc: GatewayProc, candidates: Sequence[Sequence[str]]) -> bool:
     """Does ``proc`` run one of VCO's gateway argvs?
 
-    * console-script candidate ``[script]``: the script is the executable or
-      one of the command-line tokens (a POSIX shebang runs
-      ``<venv python> <script> serve``; Windows runs ``<script>.exe serve``);
+    * console-script candidate ``[script]``: the script is the executable,
+      argv[0] (Windows runs ``<script>.exe serve``), or the first argument
+      after a Python interpreter and its options (a POSIX shebang runs
+      ``<venv python> <script> serve``; the Windows launcher's child runs
+      ``<python.exe> <script>.exe serve``). The script anywhere else on the
+      line (``cp <script> /tmp``, an editor) is NOT the gateway (review R39 L2);
     * module candidate ``[python, "-m", "model_router"]``: the command line
       starts with that interpreter followed by ``-m model_router``.
+
+    When ``proc.raw_line`` is set (macOS ``ps -o args=`` — its argv is only
+    available as one joined string) the same rule is applied
+    candidate-anchored on the raw line (:func:`_raw_line_match`), so a
+    gateway whose PATH contains spaces is still recognised; the token path
+    above stays the primary check everywhere else.
     """
     if not proc.cmdline:
         return False
@@ -475,12 +584,16 @@ def is_vco_gateway(proc: GatewayProc, candidates: Sequence[Sequence[str]]) -> bo
     for cand in candidates:
         cand = list(cand)
         if len(cand) == 1:
-            if (proc.exe is not None and _same_path(str(proc.exe), cand[0])) or any(
-                _same_path(t, cand[0]) for t in toks
-            ):
+            if (proc.exe is not None and _same_path(str(proc.exe), cand[0])) or _same_path(
+                toks[0], cand[0]
+            ) or ((script := _python_script_arg(toks)) is not None and _same_path(script, cand[0])):
                 return True
         elif len(cand) == 3 and cand[1] == "-m":
             if len(toks) >= 3 and _same_path(toks[0], cand[0]) and toks[1:3] == cand[1:]:
+                return True
+    if proc.raw_line:
+        for cand in candidates:
+            if _raw_line_match(proc.raw_line, cand):
                 return True
     return False
 
@@ -528,7 +641,7 @@ def _stdlib_identity(pid: int, *, platform: Optional[str] = None,
         line, exe = row.get("CommandLine"), row.get("ExecutablePath")
         toks = _split_windows_cmdline(line) if line else ()
         return GatewayProc(pid, toks or None, Path(exe) if exe else None)
-    if Path("/proc").is_dir():
+    if plat != "darwin" and Path("/proc").is_dir():
         if _gone(pid):
             return None
         d = Path(f"/proc/{pid}")
@@ -544,14 +657,21 @@ def _stdlib_identity(pid: int, *, platform: Optional[str] = None,
         except OSError:
             exe = None
         return GatewayProc(pid, toks or None, exe)
-    res = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
-                         text=True, errors="replace", timeout=30)
+    runner = run or subprocess.run
+    res: Any = runner(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True,
+                      text=True, errors="replace", timeout=30)
     line = res.stdout.strip()
     if res.returncode != 0 or not line:
         return None  # ps exits 1 for an unknown pid
-    comm = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True,
-                          text=True, errors="replace", timeout=30).stdout.strip()
-    return GatewayProc(pid, tuple(line.split()), Path(comm) if comm else None)
+    comm_res: Any = runner(["ps", "-ww", "-o", "comm=", "-p", str(pid)], capture_output=True,
+                           text=True, errors="replace", timeout=30)
+    comm = comm_res.stdout.strip()
+    # `ps` gives ONE joined line, not argv: the whitespace split below breaks
+    # a gateway path containing spaces, so the raw line travels alongside for
+    # `is_vco_gateway`'s candidate-anchored fallback (which keeps the same
+    # argv0 / first-arg-after-python rule — see `_raw_line_match`).
+    return GatewayProc(pid, tuple(line.split()), Path(comm) if comm else None,
+                       raw_line=line)
 
 
 def _default_gateway_reader() -> Optional[GatewayProc]:

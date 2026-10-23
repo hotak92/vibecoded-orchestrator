@@ -47,6 +47,7 @@ def test_script_patterns_include_workflow_wrappers():
     pats = script_patterns()
     assert "detect-workflow-needs" in pats
     assert "generate-workflow" in pats
+    assert "vco-scratch" in pats
     assert "*.py" in pats and "*.ps1" in pats
 
 

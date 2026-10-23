@@ -41,6 +41,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from tests.common.env import isolate_process_state
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 
@@ -229,15 +231,18 @@ class BatchTitleCollisionTest(unittest.TestCase):
     title with an archived sibling."""
 
     def setUp(self):
+        # _load_sync_module writes the KG identity env and registers a unique
+        # module; both are restored EXACTLY after the test. The old tearDown
+        # POPPED the keys, which also removed the session's own values
+        # (v0.2.104 W-IDENTITY).
+        isolate_process_state(
+            self.addCleanup,
+            modules=("_sync_kg_under_test_*", "weaviate_mcp", "kg_access"),
+        )
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
 
     def tearDown(self):
-        for k in (
-            "KG_BASE_DIR", "KG_COLLECTION", "DEVELOPMENT_COLLECTION",
-            "DUAL_EMBEDDING_ENABLED", "VCT_DISABLE_HUB_RESOLVER",
-        ):
-            os.environ.pop(k, None)
         self._tmp.cleanup()
 
     def _kg_file_paths(self, mod, server) -> list[str]:

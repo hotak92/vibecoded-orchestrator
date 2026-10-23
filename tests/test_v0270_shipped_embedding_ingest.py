@@ -44,6 +44,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from tests.common.env import isolate_process_state
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 TEMPLATES_KNOWLEDGE = REPO_ROOT / "templates" / "knowledge"
@@ -51,12 +53,15 @@ TEMPLATES_KNOWLEDGE = REPO_ROOT / "templates" / "knowledge"
 #: v0.2.89: the canonical shipped slots (see scripts/build_shipped_kg_embeddings.py).
 SHIPPED_SLOTS = ("qwen3_embed", "arctic2_embed")
 
-#: Env keys every test in this module may set — popped in tearDown.
-_ENV_KEYS = (
-    "KG_BASE_DIR", "KG_COLLECTION", "SHARED_KG_COLLECTION",
-    "DEVELOPMENT_COLLECTION", "DUAL_EMBEDDING_ENABLED",
-    "VCT_DISABLE_HUB_RESOLVER", "KG_SYNC_PROJECT_ROOT",
-)
+#: What `_load_sync_module` changes — the KG identity env and a unique module
+#: (which imports weaviate_mcp / kg_access) — is restored EXACTLY after each
+#: test by `_isolate`. The old tearDown POPPED the env keys, which also removed
+#: whatever the session had set before this file ran (v0.2.104 W-IDENTITY).
+_ISOLATED_MODULES = ("_sync_kg_ingest_*", "weaviate_mcp", "kg_access")
+
+
+def _isolate(test: unittest.TestCase) -> None:
+    isolate_process_state(test.addCleanup, modules=_ISOLATED_MODULES)
 
 
 # ─── In-memory fake Weaviate client (mirrors the batch-collision test) ────
@@ -269,6 +274,7 @@ class ShippedEmbeddingIngestTest(unittest.TestCase):
     SHIPPED_VEC = [0.11, 0.22, 0.33]  # distinct from the computed [0.9,0.9,0.9]
 
     def setUp(self):
+        _isolate(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.knowledge = self.root / "knowledge"
@@ -277,8 +283,6 @@ class ShippedEmbeddingIngestTest(unittest.TestCase):
         _write_node(self.node, "Ingest Me", "A small single-chunk node body.")
 
     def tearDown(self):
-        for k in _ENV_KEYS:
-            os.environ.pop(k, None)
         self._tmp.cleanup()
 
     def _stored_vector(self, mod, server):
@@ -446,6 +450,7 @@ class ShippedDataZeroEmbedSeedTest(unittest.TestCase):
     EXCLUDED = frozenset({"TAG_HIERARCHY.md", "VOCABULARY.md"})
 
     def setUp(self):
+        _isolate(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.knowledge = self.root / "knowledge"
@@ -464,8 +469,6 @@ class ShippedDataZeroEmbedSeedTest(unittest.TestCase):
             (self.knowledge / sidecar.name).write_bytes(sidecar.read_bytes())
 
     def tearDown(self):
-        for k in _ENV_KEYS:
-            os.environ.pop(k, None)
         self._tmp.cleanup()
 
     def test_seed_with_shipped_sidecars_performs_zero_embed_calls(self):

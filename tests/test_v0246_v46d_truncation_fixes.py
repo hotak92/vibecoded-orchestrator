@@ -29,15 +29,25 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from tests.common.env import IsolatedTestCase, process_state_fixture
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "templates" / "scripts"
 HELPER_DIR = REPO_ROOT / "claude_mcp_servers" / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-if str(HELPER_DIR) not in sys.path:
-    sys.path.insert(0, str(HELPER_DIR))
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+
+#: The scripts under test are imported from SCRIPTS_DIR / HELPER_DIR inside
+#: the tests. The whole file runs with those dirs prepended, and on exit
+#: sys.path, the env and the script modules it imported are put back — the
+#: CLI modules otherwise stayed cached (and the dirs on sys.path) for every
+#: later file.
+_isolate_file = process_state_fixture(
+    "module",
+    modules=(
+        "maintain_knowledge_graph", "search_knowledge", "detect_duplicates",
+        "process_documents", "query_code_graph", "get_node_info", "kg_access",
+    ),
+    prepend_sys_path=(REPO_ROOT, HELPER_DIR, SCRIPTS_DIR),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -647,10 +657,15 @@ class QueryCodeGraphCliTruncationTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class GetNodeInfoInboundScanTests(unittest.TestCase):
+class GetNodeInfoInboundScanTests(IsolatedTestCase):
     """Site 5: Pattern A-ish — inbound-link scan uses cursor pagination
     (with a defense-in-depth cap of 10000 per collection). We verify
-    that nodes >200 are inspected (previously capped at limit=200)."""
+    that nodes >200 are inspected (previously capped at limit=200).
+
+    Each test re-imports ``get_node_info`` under a fake ``KG_COLLECTION``;
+    the base class restores the env and those modules after it."""
+
+    ISOLATED_MODULES = ("get_node_info", "kg_access")
 
     def _fresh_get_node_info(self, env_overrides: dict[str, str]):
         for mod in ("get_node_info", "kg_access"):

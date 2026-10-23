@@ -8666,7 +8666,6 @@ def _emit_codegraph_prefix_drift_deferral(
 # that silently dropped that defense would be a security regression disguised
 # as a refactor.
 _SAFE_ADD_SIDECAR_SUFFIX = _git_exclude.SAFE_ADD_SIDECAR_SUFFIX
-_SAFE_ADD_VCO_EXCLUSIVE_TOPLEVEL = _git_exclude.VCO_EXCLUSIVE_TOPLEVEL
 
 
 def _safe_add_exclude_entries(result: dict, folder: Path) -> list:
@@ -8676,9 +8675,7 @@ def _safe_add_exclude_entries(result: dict, folder: Path) -> list:
     return _git_exclude.safe_add_exclude_entries(result, folder)
 
 
-def _append_git_info_exclude(
-    folder: Path, paths: tuple,
-) -> dict:
+def _append_git_info_exclude(folder: Path, paths: tuple, retired: tuple = ()) -> dict:
     """Idempotently append ``paths`` to ``<folder>/.git/info/exclude``.
 
     See :func:`vco_lib.git_exclude.append_git_info_exclude`. The local
@@ -8689,6 +8686,7 @@ def _append_git_info_exclude(
         folder,
         paths,
         write_bytes=lambda path, data: _write_file_atomic(path, data),
+        retired=retired,
     )
 
 
@@ -8875,15 +8873,15 @@ def _emit_safe_add_git_exclude_deferral(
     """Emit `safe_add_git_exclude_updated`: record that VCO appended its
     created paths to `.git/info/exclude` (local-only) under Safe add.
 
-    Informational — the project's Claude should know VCO files are locally
-    git-ignored so it doesn't get confused about why `git status` is clean for
-    `.claude/` etc. The tracked `.gitignore` is intentionally untouched.
+    Informational — the project's Claude should know VCO's own files are
+    locally git-ignored (never the user's: v0.2.104 G4). The tracked
+    `.gitignore` is intentionally untouched.
     """
     from vco_lib.deferral_report import DeferralEntry
     from vco_lib import deferral_emit as _de
 
     added = git_result.get("added", [])
-    added_str = ", ".join(added) if added else "(none)"
+    added_str = _git_exclude.summarize_entries(added)
     exclude_path = git_result.get("path", ".git/info/exclude")
 
     detected_msg = (
@@ -10987,7 +10985,7 @@ def install_project_bundle(
 
         try:
             git_result = _append_git_info_exclude(
-                folder, tuple(_safe_add_exclude_entries(result, folder)),
+                folder, *_git_exclude.bundle_exclude_plan(result, folder),
             )
             result["safe_add_git_exclude"] = git_result
             _log("4.bundle.safe_add_git_exclude", "ok",
@@ -11030,7 +11028,7 @@ def install_project_bundle(
     if not dry_run and not (safe_add and not update_mode):
         try:
             git_result = _append_git_info_exclude(
-                folder, tuple(_safe_add_exclude_entries(result, folder)),
+                folder, *_git_exclude.bundle_exclude_plan(result, folder),
             )
             result["g1_git_exclude"] = git_result
             _log("4.bundle.g1_git_exclude", "ok",
@@ -11894,6 +11892,7 @@ def _apply_standalone_env(
         "CODE_EMBED_URL": urls["code_embed_url"],
         "CODE_EMBED_SERVICE_URL": urls["code_embed_url"],
         "CODE_EMBED_PORT": str(urls["code_embed_port"]),
+        "KG_BASE_DIR": str(folder.resolve()),  # resolved; the DB path keeps folder_path as registered (R14B B4)
     }
 
     if orchestrator_root is not None:

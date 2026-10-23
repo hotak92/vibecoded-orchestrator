@@ -294,6 +294,53 @@ pub fn park_failure_message(parked_json: &str, db_error: &str) -> String {
     )
 }
 
+// ─── Hook units: declared sibling registrations are ONE hook (review R29) ──
+//
+// A hook VCO ships under declared sibling matchers of one event
+// (`session-start-ensure-hub`: `startup` and `resume|clear|compact`) is ONE
+// hook for the user. The sibling TABLE stays in Python
+// (`vco_lib.hook_retirements.MATCHER_SIBLINGS`); both Rust surfaces — the
+// launcher's Hooks tab and the hub's `vct-cli hooks` routes — only read the
+// writer's two answers, through these two readers, so neither carries a copy
+// of the table or of the parse (v0.2.104 FINAL4 LOW 3 moved them here from
+// the launcher crate when the hub needed them too).
+
+/// The `(matcher, command)` registrations a parked entry carries beside its
+/// own: a unit is parked as ONE entry whose `siblings` hold the other
+/// registrations (`vco_lib.hooks_settings.remove_hook_unit`). Read-only — the
+/// blob goes back to the writer verbatim. An unreadable blob, or one with no
+/// `siblings`, yields nothing.
+pub fn parked_unit_registrations(parked_json: &str) -> Vec<(String, String)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(parked_json) else {
+        return Vec::new();
+    };
+    let Some(siblings) = v.get("siblings").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    siblings
+        .iter()
+        .filter_map(|sib| {
+            let matcher = sib.get("matcher").and_then(serde_json::Value::as_str).unwrap_or("");
+            let command = sib
+                .get("item")
+                .and_then(|i| i.get("command"))
+                .and_then(serde_json::Value::as_str)?;
+            Some((matcher.to_string(), command.to_string()))
+        })
+        .collect()
+}
+
+/// The matcher of the row a `python -m vco_lib.hooks_settings list` entry
+/// folds into (its `unit_of`), or `None` when the entry is its own row —
+/// `unit_of` absent, null, or naming the entry's own matcher.
+pub fn listed_unit_primary(entry: &serde_json::Value) -> Option<&str> {
+    let matcher = entry.get("matcher").and_then(serde_json::Value::as_str).unwrap_or("");
+    entry
+        .get("unit_of")
+        .and_then(serde_json::Value::as_str)
+        .filter(|primary| *primary != matcher)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +611,37 @@ mod tests {
             msg.to_lowercase().contains("restore it by hand"),
             "the message must tell the user this is recoverable and how — got: {msg}"
         );
+    }
+
+    const HUB: &str = "bash .claude/hooks/session-start-ensure-hub.sh";
+    const RESUME: &str = "resume|clear|compact";
+
+    #[test]
+    fn parked_unit_registrations_reads_only_the_siblings() {
+        let blob = serde_json::json!({
+            "schema": 1, "event": "SessionStart", "matcher": "startup",
+            "item": {"command": HUB},
+            "siblings": [{"schema": 1, "event": "SessionStart", "matcher": RESUME,
+                          "item": {"command": HUB}}],
+        })
+        .to_string();
+        assert_eq!(
+            parked_unit_registrations(&blob),
+            vec![(RESUME.to_string(), HUB.to_string())]
+        );
+        assert!(parked_unit_registrations(r#"{"item": {"command": "x"}}"#).is_empty());
+        assert!(parked_unit_registrations("not json").is_empty());
+    }
+
+    #[test]
+    fn listed_unit_primary_names_only_another_row() {
+        let folded = serde_json::json!({"event": "SessionStart", "matcher": RESUME,
+                                        "command": HUB, "unit_of": "startup"});
+        assert_eq!(listed_unit_primary(&folded), Some("startup"));
+        let own = serde_json::json!({"matcher": "startup", "unit_of": "startup"});
+        assert_eq!(listed_unit_primary(&own), None);
+        let plain = serde_json::json!({"matcher": "startup", "unit_of": null});
+        assert_eq!(listed_unit_primary(&plain), None);
+        assert_eq!(listed_unit_primary(&serde_json::json!({"matcher": "x"})), None);
     }
 }

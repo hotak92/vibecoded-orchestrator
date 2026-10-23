@@ -805,11 +805,6 @@ class TestGitExcludeExtraction(unittest.TestCase):
     def test_project_init_delegates_to_the_shared_home(self):
         from vco_lib import git_exclude, project_init
 
-        self.assertIs(
-            project_init._SAFE_ADD_VCO_EXCLUSIVE_TOPLEVEL,
-            git_exclude.VCO_EXCLUSIVE_TOPLEVEL,
-            "project_init must re-export the shared table, not hold a copy",
-        )
         self.assertEqual(
             project_init._SAFE_ADD_SIDECAR_SUFFIX,
             git_exclude.SAFE_ADD_SIDECAR_SUFFIX,
@@ -827,14 +822,18 @@ class TestGitExcludeExtraction(unittest.TestCase):
             )
             self.assertEqual(entries, ["/infrastructure/docker-compose.yml"])
 
-    def test_vco_exclusive_namespaces_collapse_to_one_glob(self):
+    def test_claude_files_are_listed_one_by_one_never_as_one_glob(self):
+        """v0.2.104 G4: a blanket `/.claude/` hid the user's own
+        CONTEXT_STATE.md, plans and settings.json from `git add`."""
         from vco_lib import git_exclude
 
         with TemporaryDirectory() as td:
             entries = git_exclude.exclude_entries_for_created_paths(
                 [".claude/hooks/a.sh", ".claude/scripts/b", "CLAUDE.md"], Path(td)
             )
-            self.assertEqual(entries, ["/.claude/", "/CLAUDE.md"])
+            self.assertEqual(
+                entries, ["/.claude/hooks/a.sh", "/.claude/scripts/b", "/CLAUDE.md"]
+            )
 
     def test_user_ownable_directories_are_never_blanket_globbed(self):
         """A blanket `/knowledge/` would hide the USER's own same-named files,
@@ -858,16 +857,16 @@ class TestGitExcludeExtraction(unittest.TestCase):
         with TemporaryDirectory() as td:
             folder = Path(td)
             (folder / ".git" / "info").mkdir(parents=True)
-            first = git_exclude.append_git_info_exclude(folder, ("/.claude/",))
+            first = git_exclude.append_git_info_exclude(folder, ("/.claude/state/",))
             self.assertEqual(first["action"], "appended")
-            second = git_exclude.append_git_info_exclude(folder, ("/.claude/",))
+            second = git_exclude.append_git_info_exclude(folder, ("/.claude/state/",))
             self.assertEqual(second["action"], "noop")
 
     def test_non_git_folder_is_a_no_op(self):
         from vco_lib import git_exclude
 
         with TemporaryDirectory() as td:
-            res = git_exclude.append_git_info_exclude(Path(td), ("/.claude/",))
+            res = git_exclude.append_git_info_exclude(Path(td), ("/.claude/state/",))
             self.assertEqual(res["action"], "not_a_git_repo")
             self.assertEqual(res["added"], [])
 
@@ -877,7 +876,7 @@ class TestGitExcludeExtraction(unittest.TestCase):
         with TemporaryDirectory() as td:
             folder = Path(td)
             (folder / ".git").write_text("gitdir: /elsewhere/.git/worktrees/x\n")
-            res = git_exclude.append_git_info_exclude(folder, ("/.claude/",))
+            res = git_exclude.append_git_info_exclude(folder, ("/.claude/state/",))
             self.assertEqual(
                 res["action"],
                 "not_a_git_repo",

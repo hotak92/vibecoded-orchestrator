@@ -101,6 +101,10 @@ if ($SessionId -and $ProjectDir) {
 # Protocol dedup). After compaction the LLM has lost its memory of which
 # files it Read pre-compaction, so the reads list is no longer meaningful
 # — Build Anchor should re-require a fresh Read before the next Write/Edit.
+# v0.2.104: the files Claude Code itself re-attaches right after the
+# compaction are NOT re-seeded here (their set is only flushed to the
+# transcript around this moment); Build Anchor recognises them lazily, on
+# a Write miss, through vco_lib/compact_reattach.py.
 # Note: we do NOT wipe $ProjectDir/.claude/state/tool_backups/ — those
 # have a different lifecycle (tool-call rollback, not dedup), and the
 # pre-tool-use hook runs its own 24h GC there.
@@ -109,6 +113,15 @@ if ($SessionId -and $ProjectDir) {
     if (Test-Path $ReadsFile) {
         Remove-Item $ReadsFile -Force -ErrorAction SilentlyContinue
     }
+    # v0.2.104: mark that THIS session/agent compacted (same key as the
+    # ledger just wiped). pre-tool-use asks vco_lib/compact_reattach.py only
+    # when this marker exists, so a session that never compacted never pays
+    # for a transcript scan. MUST MATCH pre-tool-use.{sh,ps1} + post-compact.sh.
+    try {
+        $StateDir = Join-Path $ProjectDir ".claude/state"
+        New-Item -ItemType Directory -Force -Path $StateDir -ErrorAction SilentlyContinue | Out-Null
+        New-Item -ItemType File -Force -Path (Join-Path $StateDir "compacted_$SessionId.txt") -ErrorAction Stop | Out-Null
+    } catch { }
     # v0.2.70 Stream E (SF-1): also wipe the INJECTOR reads store
     # (seen_reads_<id>.txt) — DISTINCT from the Build-Anchor reads_<id>.txt.
     # MUST MATCH the seen_reads name in _lib/seen-store.ps1 + post-compact.sh.

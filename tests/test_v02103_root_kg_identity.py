@@ -29,6 +29,13 @@ import install
 from vco_lib import root_kg_identity as rki
 from vco_lib.deferral_report import DeferralReport
 
+from tests.common.env import process_state_fixture
+
+# install.main() step 7b writes the project-identity env (KG_COLLECTION & co.) into
+# os.environ for its child processes; restore the whole process state per test so the
+# conftest W-IDENTITY guard (and every later test) sees the environment untouched.
+_isolate_process_state = process_state_fixture("function")
+
 ROOT = Path("/x/vibecoded-orchestrator")
 DERIVED = "VibecodedOrchestrator_KnowledgeGraph"
 CONST = "VibeCodedOrchestrator_KnowledgeGraph"

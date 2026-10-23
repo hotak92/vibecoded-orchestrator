@@ -101,6 +101,7 @@ from vco_lib import compose_env as _compose_env
 from vco_lib import compose_mounts as _compose_mounts
 from vco_lib import compose_provider as _compose_provider
 from vco_lib import compose_recovery as _compose_recovery
+from vco_lib import gpu_verify as _gpu_verify
 from vco_lib.atomic import atomic_write_text
 from vco_lib.paths import vct_root_dir
 
@@ -388,6 +389,20 @@ class LiveServiceState:
     restart: str = ""
     host_ports: dict[str, str] = field(default_factory=dict)  # cont_port → host
     has_devices: bool = False
+    #: the GPU vendor the live device list positively names ("amd" for
+    #: /dev/kfd, "nvidia" for /dev/nvidia* / the CDI tag), else None —
+    #: :func:`vco_lib.gpu_verify.vendor_of_devices`.
+    gpu_vendor: Optional[str] = None
+    #: EVERY vendor the live device list names
+    #: (:func:`vco_lib.gpu_verify.vendors_of_devices`) — both for a container
+    #: carrying AMD and NVIDIA devices, which ``gpu_vendor`` reports as None.
+    #: A re-create feeds this to :func:`choose_gpu_vendor`, so such a
+    #: container is refused, never re-created under one vendor's overlay.
+    gpu_vendors: tuple[str, ...] = ()
+
+    def vendor_evidence(self) -> list[Optional[str]]:
+        """This container's vendor evidence for :func:`choose_gpu_vendor`."""
+        return list(self.gpu_vendors) or [self.gpu_vendor]
 
 
 def _inspect_json(ref: str, fmt: str, runtime: str, run: RunFn) -> Optional[Any]:
@@ -472,7 +487,52 @@ def live_service_state(ref: str, runtime: str, run: RunFn) -> Optional[LiveServi
         mounts=mounts, env=env, networks=networks,
         healthcheck=raw_hc if isinstance(raw_hc, dict) else None,
         restart=restart, host_ports=host_ports, has_devices=has_devices,
+        gpu_vendor=_gpu_verify.vendor_of_devices(raw_dev) if has_devices else None,
+        gpu_vendors=_gpu_verify.vendors_of_devices(raw_dev) if has_devices else (),
     )
+
+
+def _host_gpu_vendor() -> str:
+    """The vendor of the ONE card install selects on this host
+    (:func:`vco_lib.host_probe.selected_gpu_specs`, ``VCT_GPU_VENDOR``
+    honoured), lower-cased; ``""`` when no card or the probe fails."""
+    try:
+        from vco_lib.host_probe import selected_gpu_specs
+
+        return selected_gpu_specs()[1]
+    except Exception:  # noqa: BLE001 — a failed probe is "no evidence"
+        return ""
+
+
+def choose_gpu_vendor(evidence: Sequence[Optional[str]],
+                      host_vendor: Optional[Callable[[], str]] = None,
+                      ) -> tuple[Optional[str], str]:
+    """The GPU vendor whose overlay a re-create composes, from the
+    containers' OWN evidence first (their live devices, the owning compose
+    stanza): ``(vendor, "")``, or ``(None, reason)`` when the evidence names
+    BOTH vendors (one chain carries one overlay — refuse rather than pick).
+    With no vendor evidence at all, the host's selected card decides
+    (``amd`` → ROCm), else NVIDIA — the pre-v0.2.104 answer, unchanged on
+    NVIDIA and CPU hosts. A ROCm container is therefore re-created under
+    the ROCm overlay (its ``-rocm`` image pin and ``/dev/kfd`` devices),
+    never the NVIDIA one.
+
+    ``host_vendor`` defaults to :func:`_host_gpu_vendor`, resolved at CALL
+    time (never bound as a default argument) so a test that patches the
+    module attribute reaches the probe this function actually runs."""
+    named = {v for v in evidence if v in ("amd", "nvidia")}
+    if len(named) > 1:
+        # The evidence is flattened across containers, so the text covers
+        # both cases: one container holding both device families, or two
+        # containers naming one vendor each.
+        return None, ("the GPU evidence names both GPU vendors (AMD and "
+                      "NVIDIA devices, in one container or across the GPU "
+                      "services) — one compose chain carries one GPU "
+                      "overlay; refusing rather than picking one")
+    if named:
+        return named.pop(), ""
+    probe = host_vendor if host_vendor is not None else _host_gpu_vendor
+    return ("amd" if (probe() or "").lower() == "amd" else "nvidia"), ""
 
 
 # ===========================================================================
@@ -612,6 +672,21 @@ def _compose_entrypoints(need_gpu: bool, gpu_overlay: Optional[str],
     return files, cfg or {}
 
 
+def pinned_image(service: str, root: Path) -> Optional[str]:
+    """The image VCO's compose pins for *service* — the base file plus the
+    managed overrides, read through the SAME chain :func:`_compose_entrypoints`
+    builds for ``hand-to-vco`` (so it names the image a hand-over would run).
+    No GPU overlay: the NVIDIA overlays set no ``image:``, and a ROCm variant
+    differs from the base pin only by its ``-rocm`` suffix, which callers
+    compare away (:func:`vco_lib.service_reconcile.image_drift`). ``None``
+    when the chain cannot be read or the service names no image."""
+    infra_dir = Path(root) / "infrastructure"
+    _files, cfg = _compose_entrypoints(False, None, infra_dir,
+                                       infrastructure_env_for_substitution(infra_dir))
+    image = ((cfg.get("services") or {}).get(service) or {}).get("image")
+    return (image.strip() or None) if isinstance(image, str) else None
+
+
 # ===========================================================================
 # Reconciliation
 # ===========================================================================
@@ -630,6 +705,9 @@ class ServicePlan:
     #: for this service — the second runtime-evidence signal for including
     #: the GPU overlay (live container devices are the first).
     owning_declares_devices: bool = False
+    #: the GPU vendor the OWNING stanza declares (``/dev/kfd`` → "amd",
+    #: ``nvidia.com/gpu`` / ``driver: nvidia`` → "nvidia"), else None.
+    owning_gpu_vendor: Optional[str] = None
 
     @property
     def adoptable(self) -> bool:
@@ -1268,9 +1346,17 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
             identity = None
         plan.identity = identity
         own_reason = _containers.foreign_compose_identity(identity, own_project)
-        if own_reason is None:
+        named = container_refs is not None and service in container_refs
+        if own_reason is None and not named:
             plan.reason = "already owned by this install's compose project"
             continue
+        # A container NAMED by ``hand-to-vco`` that already carries this
+        # install's compose project is still re-created: its row says VCO
+        # only USES it (``adopted_container`` — e.g. an earlier install's
+        # "adopt" decision on VCO's own container), so no update has ever
+        # brought it to the shipped image and env. Same guarded flow; the
+        # rollback re-creates it under the same (own) project and files.
+        own_reason = own_reason or f"named by hand-to-vco under '{own_project}'"
         # Constraint #1: the owner's files must exist on disk — else there
         # is nothing to compare against and nothing to roll back to.
         owning_files = owning_config_files(identity) if identity is not None else []
@@ -1295,6 +1381,9 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
         plan.owning_declares_devices = _declares_devices(
             owning_services.get(service) or {}
         )
+        plan.owning_gpu_vendor = _gpu_verify.vendor_of_compose_service(
+            owning_services.get(service) or {}
+        )
 
     # GPU evidence: live container devices, or the OWNING files (machine
     # evidence) declaring devices for the service.  Either signal selects
@@ -1304,13 +1393,25 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
                     and (p.live.has_devices or p.owning_declares_devices)]
     # The overlay FILE follows the compose that parses it — the DETECTED
     # provider (a `podman compose` may delegate to either engine), not the
-    # bare form (v0.2.100 F-W1-13 / L1-F10).
+    # bare form (v0.2.100 F-W1-13 / L1-F10) — and the VENDOR follows the
+    # containers' own devices, then the host's card (v0.2.104 R2 M2: a ROCm
+    # Ollama is re-created under the ROCm overlay and its `-rocm` image).
+    gpu_vendor: Optional[str] = None
+    vendor_refusal = ""
+    if gpu_services:
+        gpu_vendor, vendor_refusal = choose_gpu_vendor(
+            [v for p in gpu_services
+             for v in (p.live.vendor_evidence() if p.live is not None else [None])]
+            + [p.owning_gpu_vendor for p in gpu_services])
     gpu_overlay = _compose_provider.overlay_for_provider(
         _compose_provider.detect(runtime, argv=compose_argv, run=run)
         or _compose_provider.provider_from_form(compose_form, runtime=runtime),
-        "nvidia") if gpu_services else None
+        gpu_vendor, infra_dir) if gpu_services and gpu_vendor else None
     overlay_missing = gpu_overlay is None or not (infra_dir / gpu_overlay).is_file()
-    if gpu_services and overlay_missing:
+    if gpu_services and vendor_refusal:
+        for plan in gpu_services:
+            plan.reason = vendor_refusal
+    elif gpu_services and overlay_missing:
         for plan in gpu_services:
             plan.reason = (
                 f"the running service uses GPU devices but no overlay matches "

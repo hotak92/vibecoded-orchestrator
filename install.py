@@ -215,11 +215,10 @@ _INSTALL_OWNED_CONDITION_PREFIXES = _deferral_registry.install_owned_prefixes()
 _DETACHED_CHILDREN: list = []
 
 # v0.2.46 V47-B (Gap B): symlinks under install path are never touched.
-# v0.2.46 post-adversarial L1: check_vco_new_collision guards against
-# silently clobbering .vco-new siblings that the user may have hand-
-# edited between install runs.
+# (v0.2.46 post-adversarial L1's .vco-new collision guard,
+# check_vco_new_collision, is called by the step-9 settings write, which
+# lives in vco_lib.self_install.configure_root_settings since v0.2.104.)
 from vco_lib.symlink_handler import (  # noqa: E402
-    check_vco_new_collision,
     compute_vco_new_path,
     emit_symlink_deferral,
     is_symlink_blocking,
@@ -4694,7 +4693,10 @@ def _continue_in_venv_after_deps(venv_python: Path, args: argparse.Namespace,
     ran) finished on the launching interpreter. The record carries this run's
     buffered log lines, the answers it already has and its deferral entries;
     the singleton lock is released just before the hop (the child takes it
-    again). A no-op when this run already runs in that venv or is the child."""
+    again). A no-op when this run already runs in that venv or is the child.
+    First: on a machine with no ``service_endpoints`` rows yet (a first install) the
+    rows-pending grace is set, so no step before [5b] warns "no usable row"."""
+    _service_endpoints.mark_rows_pending()
     _install_companions.continue_in_venv(venv_python, sys.argv, {
         "pending_events": list(_PENDING_EVENTS),
         "decisions": {
@@ -6272,25 +6274,9 @@ def main() -> int:
 
     _openai_key.emit_env_var_deferral(_deferral_report, embed_config.get("active_embedding"), log_event=_log_install_event)
 
-    # Step 9: Configure Claude Code settings (skip on update)
-    if mode == "install":
-        # v0.2.46 V47-A (Gap A): thread the run-scoped DeferralReport so the
-        # managed-block merge can emit `claude_settings_user_modified_preserved`
-        # and `claude_settings_unparseable` entries when it leaves the file
-        # alone.
-        _configure_claude_settings(embed_config,
-                                   adopt_project_mode=adopt_project_mode,
-                                   deferral_report=_deferral_report)
-    else:
-        print("[skip] Claude settings (preserved during update)")
-        # 0.2.11 / PR-1: pre-0.2.11 installs wired BASH_ENV in
-        # .claude/settings.json to the lean-ctx shim, which became
-        # fork-bomb-prone on lean-ctx 3.x. Idempotently strip that key +
-        # disable the shim file so an upgraded orchestrator clone
-        # doesn't carry the legacy fuse alive. Fresh installs never see
-        # this code path (`mode == "install"` above).
-        _cleanup_legacy_bash_env_shim(args)
-
+    # Step 9: Claude settings (install) / legacy cleanup (update); both route machine env
+    _root_settings_step(mode, args, embed_config, adopt_project_mode, _deferral_report)
+    if mode != "install":
         # Phase 0.B Part 2 (2026-05-25): projects the FULL canonical env for
         # the orchestrator root via vco_lib.config_projection.apply_project_env
         # (reads launcher.db; corrects per-key drift on every --update pass).
@@ -11468,7 +11454,7 @@ def _reconcile_service_endpoints(
         return None
     _SERVICE_ENDPOINTS.update(rows=dict(result.rows), pinned=result.pinned,
                               weaviate_pending=result.weaviate_pending)
-    os.environ.update(_service_endpoints.transport_env(result.rows))
+    _service_endpoints.pin_process_env(result.rows)  # also ends the rows-pending grace
     if result.migrate_code_embed and rt:
         _migrate_code_embed_with_cache(result.rows["code_embed"], rt, deferral_report)
     decisions: dict = {}
@@ -14372,54 +14358,23 @@ def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
     """v0.2.72 (P7) thin shim: trigger the revision-gated code-graph resync.
 
     All real logic lives in ``vco_lib.codegraph_resync`` (install.py is a
-    mega-file — per the modularity rule, >50-line additions go to a helper
-    module). This shim only:
-      1. resolves the orchestrator's own code-graph project name,
-      2. calls ``spawn_background_resync`` (background, non-blocking, no global
-         timeout; R-6: gated on the owed-probe — fires only when stale rows
-         exist; self-degrades when the code-embed service is down),
-      3. hands the result to ``report_trigger_result`` (v0.2.96 M-2
-         extraction, install line ratchet): the prints, the event log, the
-         deferred ``DeferralEntry`` recording and the ``not_owed`` resolve of
-         the pending ``codegraph_embed_resync_pending`` ledger entry.
-
-    Soft-fail throughout: any error here converts to a log line, never a crash —
-    the resync is a best-effort background refresh, not a gating step.
+    mega-file — per the modularity rule, new logic goes to a helper module).
+    This shim only resolves the orchestrator's own code-graph project name and
+    hands it to ``trigger_update_resync`` (v0.2.104 extraction, install line
+    ratchet): the venv-python probe, ``spawn_background_resync`` (background,
+    no global timeout; R-6 owed-probe gated; waits for a code_embed this update
+    just restarted) and ``report_trigger_result`` (prints, event log, the
+    deferred entry, the ``not_owed`` resolve of
+    ``codegraph_embed_resync_pending``). Soft-fail throughout: an error here is
+    a log line, never a crash — the resync is not a gating step.
     """
     try:
-        from vco_lib.codegraph_resync import (
-            report_trigger_result,
-            spawn_background_resync,
-        )
-        from vco_lib.python_exe import resolve_root_venv_python
+        from vco_lib.codegraph_resync import trigger_update_resync
     except Exception as exc:  # noqa: BLE001 — missing helper must not wedge update
-        _log_install_event(
-            "codegraph_resync", "warn",
-            f"codegraph_resync helper unavailable: {exc}",
-        )
+        _log_install_event("codegraph_resync", "warn", f"codegraph_resync helper unavailable: {exc}")
         return
-
-    project_name = _derive_orchestrator_project_name()
-    # Prefer the orchestrator venv python (has weaviate-client + vco_lib) so
-    # the spawned analyze can import its deps; None falls back to the helper's
-    # resolver ladder. v0.2.96 (M-2): probed via python_exe — ONE home.
-    _root_venv_py = resolve_root_venv_python(PROJECT_ROOT)
-    venv_python = str(_root_venv_py) if _root_venv_py is not None else None
-
-    try:
-        result = spawn_background_resync(
-            PROJECT_ROOT,
-            project_name,
-            python_exe=venv_python,
-        )
-    except Exception as exc:  # noqa: BLE001 — never crash the update
-        _log_install_event(
-            "codegraph_resync", "warn",
-            f"codegraph resync trigger raised: {exc}",
-        )
-        return
-
-    report_trigger_result(result, project_name, deferral_report, _log_install_event)
+    trigger_update_resync(PROJECT_ROOT, _derive_orchestrator_project_name(),
+                          deferral_report, _log_install_event)
 
 
 def _trigger_codegraph_identity_sweep(deferral_report: "DeferralReport") -> None:
@@ -20682,240 +20637,57 @@ def _merge_vco_settings_managed_block(
     return merged
 
 
+def _root_settings_step(mode: str, args: argparse.Namespace, embed_config: dict,
+                        adopt_project_mode: str | None,
+                        deferral_report: "DeferralReport | None") -> None:
+    """main() step 9: configure ``.claude/settings.json`` (install only), strip
+    the legacy BASH_ENV shim (update only), then — in BOTH modes — move this
+    machine's service URLs/ports to ``settings.local.json`` (v0.2.104 L5)."""
+    if mode == "install":
+        # v0.2.46 V47-A (Gap A): thread the run-scoped DeferralReport so the
+        # managed-block merge can emit `claude_settings_user_modified_preserved`
+        # and `claude_settings_unparseable` entries when it leaves the file
+        # alone.
+        _configure_claude_settings(embed_config,
+                                   adopt_project_mode=adopt_project_mode,
+                                   deferral_report=deferral_report,
+                                   settings_template_skipped=bool(getattr(
+                                       args, "skip_materialize_claude_dir", False)))
+    else:
+        print("[skip] Claude settings (preserved during update)")
+        # 0.2.11 / PR-1: pre-0.2.11 installs wired BASH_ENV in
+        # .claude/settings.json to the lean-ctx shim, which became
+        # fork-bomb-prone on lean-ctx 3.x. Idempotently strip that key +
+        # disable the shim file so an upgraded orchestrator clone
+        # doesn't carry the legacy fuse alive. Fresh installs never see
+        # this code path (`mode == "install"` above).
+        _cleanup_legacy_bash_env_shim(args)
+
+    # v0.2.104 L5 (R14B B2): both modes, after the settings write above.
+    _self_install.route_root_machine_env(
+        PROJECT_ROOT, lambda: _build_vco_settings_defaults(embed_config)["env"],
+        log=_log_install_event)
+
+
 def _configure_claude_settings(
     embed_config: dict,
     adopt_project_mode: str | None = None,
     deferral_report: "DeferralReport | None" = None,
+    settings_template_skipped: bool = False,
 ) -> None:
-    """Create or refresh ``.claude/settings.json`` with MCP server configuration.
-
-    v0.2.46 V47-A (Gap A) — managed-block merge. Behavior matrix:
-
-    * File missing → write VCO defaults (including ``_vco_managed_keys``).
-    * File exists + parses + has ``_vco_managed_keys`` → managed-block merge:
-      refresh listed keys from defaults, preserve every other top-level key.
-    * File exists + parses + no ``_vco_managed_keys`` (legacy / external) →
-      treat as user-owned. Land VCO defaults as ``settings.json.vco-new``
-      sibling, emit deferral entry, leave original alone.
-    * File exists + parse fails → emit deferral entry, leave file alone.
-    * ``adopt_project_mode == "replace-all"`` → unconditionally overwrite
-      with VCO defaults (advanced/explicit opt-in via
-      ``--adopt-project-replace-all``).
-    * ``adopt_project_mode in (None, "adopt")`` → use the safe matrix above.
-    * ``adopt_project_mode == "no-adopt"`` and ``"dry-run"`` are handled
-      upstream in ``main()`` before this function is reached.
-
-    * No sentinel but step 5b's bundle created the file THIS run (v0.2.103
-      F4) → VCO's own: defaults filled in, sentinel stamped, no deferral.
-
-    ``deferral_report`` is optional (deferrals skipped when not threaded).
-    V47-B (Gap B): a symlinked ``.claude/`` or ``settings.json`` is never
-    written through — content goes to a ``.vco-new`` sibling + a deferral,
-    mode-AGNOSTIC (user decision 2026-06-03).
-    """
-    settings_dir = PROJECT_ROOT / ".claude"
-
-    # V47-B (Gap B): a symlinked .claude/ → write to a .vco-new sibling dir.
-    if is_symlink_blocking(settings_dir):
-        vco_new_dir = compute_vco_new_path(settings_dir)
-        if deferral_report is not None:
-            emit_symlink_deferral(
-                deferral_report, settings_dir, vco_new_dir,
-                install_root=PROJECT_ROOT,
-            )
-        # post-adversarial L1: never clobber a prior run's .vco-new dir.
-        if check_vco_new_collision(
-            vco_new_dir,
-            install_root=PROJECT_ROOT,
-            deferral=deferral_report,
-        ):
-            print(
-                f"  Claude settings: prior {vco_new_dir.name}/ from a "
-                f"previous run exists — leaving untouched (see "
-                f"UPDATE_DEFERRED.md for reconciliation)"
-            )
-            return
-        print(
-            f"  Claude settings: .claude/ is a symlink — writing to "
-            f"{vco_new_dir.name}/ instead (see UPDATE_DEFERRED.md)"
-        )
-        settings_dir = vco_new_dir
-
-    settings_dir.mkdir(exist_ok=True)
-
-    settings_file = settings_dir / "settings.json"
-
-    # V47-B: a symlinked settings.json (dangling included) → .vco-new sibling.
-    if is_symlink_blocking(settings_file):
-        vco_new_file = compute_vco_new_path(settings_file)
-        if deferral_report is not None:
-            emit_symlink_deferral(
-                deferral_report, settings_file, vco_new_file,
-                install_root=PROJECT_ROOT,
-            )
-        # post-adversarial L1: ditto for a prior settings.json.vco-new.
-        if check_vco_new_collision(
-            vco_new_file,
-            install_root=PROJECT_ROOT,
-            deferral=deferral_report,
-        ):
-            print(
-                f"  Claude settings: prior {vco_new_file.name} from a "
-                f"previous run exists — leaving untouched (see "
-                f"UPDATE_DEFERRED.md for reconciliation)"
-            )
-            return
-        print(
-            f"  Claude settings: settings.json is a symlink — writing to "
-            f"{vco_new_file.name} instead (see UPDATE_DEFERRED.md)"
-        )
-        settings_file = vco_new_file
-
-    defaults = _build_vco_settings_defaults(embed_config)
-    rendered_defaults = json.dumps(defaults, indent=2) + "\n"
-
-    # Case 1: file missing (lexists: a diverted dangling symlink is not
-    # "missing") — write fresh VCO defaults.
-    if not os.path.lexists(os.fspath(settings_file)):
-        settings_file.write_text(rendered_defaults, encoding="utf-8")
-        return
-
-    # Case 2: --adopt-project-replace-all — overwrite outright.
-    if adopt_project_mode == "replace-all":
-        settings_file.write_text(rendered_defaults, encoding="utf-8")
-        print("  Claude settings: replaced (--adopt-project-replace-all)")
-        return
-
-    # Case 3: file exists — try to parse and decide.
-    try:
-        existing_text = settings_file.read_text(encoding="utf-8")
-        existing = json.loads(existing_text)
-    except (OSError, json.JSONDecodeError) as exc:
-        # Parse / read failed — emit deferral and leave file alone.
-        print(
-            "  Claude settings: existing file unparseable "
-            f"({type(exc).__name__}); preserved on disk"
-        )
-        if deferral_report is not None:
-            deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id="claude_settings_unparseable",
-                    title="`.claude/settings.json` unparseable; preserved on disk",
-                    detected=(
-                        f"`.claude/settings.json` exists but failed to parse as "
-                        f"JSON ({type(exc).__name__}: {exc}). VCO did not modify "
-                        "the file."
-                    ),
-                    why_deferred=(
-                        "Auto-replacing an unparseable settings file would "
-                        "discard user customizations that may still be "
-                        "recoverable. Inspect manually and either repair the "
-                        "JSON or accept VCO defaults via the command below."
-                    ),
-                    command_to_apply=(
-                        "python install.py --adopt-project-replace-all"
-                    ),
-                    severity="warning",
-                    kg_node_refs=[],
-                )
-            )
-        return
-
-    if not isinstance(existing, dict):
-        # A non-object JSON (array/string/number) cannot merge — as unparseable.
-        print(
-            "  Claude settings: existing file is not a JSON object; "
-            "preserved on disk"
-        )
-        if deferral_report is not None:
-            deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id="claude_settings_unparseable",
-                    title=(
-                        "`.claude/settings.json` is not a JSON object; "
-                        "preserved on disk"
-                    ),
-                    detected=(
-                        "`.claude/settings.json` parsed to a "
-                        f"{type(existing).__name__} (expected a JSON object). "
-                        "VCO did not modify the file."
-                    ),
-                    why_deferred=(
-                        "VCO's settings template is a JSON object; cannot "
-                        "merge with a non-object structure."
-                    ),
-                    command_to_apply=(
-                        "python install.py --adopt-project-replace-all"
-                    ),
-                    severity="warning",
-                    kg_node_refs=[],
-                )
-            )
-        return
-
-    # Case 4: file parsed and is a dict — managed-block detection.
-    if _VCO_MANAGED_KEYS_SENTINEL in existing:
-        # Managed-block-aware file → refresh listed keys, preserve rest.
-        merged = _merge_vco_settings_managed_block(existing, defaults)
-        settings_file.write_text(
-            json.dumps(merged, indent=2) + "\n", encoding="utf-8"
-        )
-        print("  Claude settings: managed keys refreshed (user keys preserved)")
-        return
-
-    # v0.2.103 F4: step 5b's bundle CREATED this file this run — VCO's own, so fill in the
-    # defaults and stamp the sentinel (vco_lib.self_install). Not a tautology: a symlinked
-    # .claude/ or settings.json diverted settings_file to a .vco-new sibling above.
-    if settings_file == PROJECT_ROOT / ".claude" / "settings.json" and \
-            _self_install.root_settings_created_this_run(PROJECT_ROOT):
-        adopted = _self_install.adopt_bundle_created_settings(
-            existing, defaults, _VCO_MANAGED_KEYS_SENTINEL)
-        settings_file.write_text(json.dumps(adopted, indent=2) + "\n", encoding="utf-8")
-        print("  Claude settings: VCO defaults added to the file install-bundle created")
-        return
-
-    # Case 5: no _vco_managed_keys, not created this run — legacy / external:
-    # VCO defaults land as a `.vco-new` sibling + a deferral.
-    vco_new_path = settings_file.with_suffix(settings_file.suffix + ".vco-new")
-    vco_new_path.write_text(rendered_defaults, encoding="utf-8")
-    print(
-        "  Claude settings: legacy file detected (no `_vco_managed_keys`); "
-        f"VCO defaults written to {vco_new_path.name}, original preserved"
+    """Create or refresh ``.claude/settings.json`` (step 9). The behaviour
+    matrix lives in :func:`vco_lib.self_install.configure_root_settings`; this
+    shim supplies install.py's ``PROJECT_ROOT``, defaults, sentinel and merge."""
+    _self_install.configure_root_settings(
+        PROJECT_ROOT,
+        lambda: _build_vco_settings_defaults(embed_config),
+        sentinel=_VCO_MANAGED_KEYS_SENTINEL,
+        managed_keys=_VCO_SETTINGS_MANAGED_KEYS,
+        merge=_merge_vco_settings_managed_block,
+        adopt_project_mode=adopt_project_mode,
+        deferral_report=deferral_report,
+        settings_template_skipped=settings_template_skipped,
     )
-    if deferral_report is not None:
-        deferral_report.add_entry(
-            DeferralEntry(
-                condition_id="claude_settings_user_modified_preserved",
-                title=(
-                    "`.claude/settings.json` preserved (no VCO-managed-block "
-                    "marker)"
-                ),
-                detected=(
-                    "`.claude/settings.json` exists but lacks the top-level "
-                    f"`{_VCO_MANAGED_KEYS_SENTINEL}` array that marks the file "
-                    "as VCO-managed. VCO treats this as user-owned and did "
-                    f"not modify it. VCO defaults landed at "
-                    f"`.claude/settings.json.vco-new`."
-                ),
-                why_deferred=(
-                    "Without the managed-keys sentinel VCO cannot tell which "
-                    "top-level keys are safe to refresh and which are user "
-                    "extensions. Manual merge keeps you in control. To accept "
-                    "VCO defaults outright run the command below; to merge "
-                    "selectively, copy the keys you want from "
-                    "`.claude/settings.json.vco-new` into your existing file, "
-                    f"then add a top-level "
-                    f'`"{_VCO_MANAGED_KEYS_SENTINEL}": '
-                    f"{list(_VCO_SETTINGS_MANAGED_KEYS)!r}` so future updates "
-                    "refresh those keys automatically."
-                ),
-                command_to_apply=(
-                    "python install.py --adopt-project-replace-all"
-                ),
-                severity="warning",
-                kg_node_refs=[],
-            )
-        )
 
 
 def _cleanup_legacy_bash_env_shim(args: argparse.Namespace) -> None:
@@ -21489,8 +21261,8 @@ def _run_uninstall(args: argparse.Namespace) -> int:
       1. Stop containers (compose down — preserves volumes); 1b. remove
          legacy VCO containers compose cannot reach (uninstall_containers.py)
       2. Remove container volumes (default: prompt; suppressed by --keep-data)
-      3. Stop vct-hub + the VCO launcher GUI BEFORE any state removal
-         (vco_lib/uninstall_quiesce.py)
+      3. Stop the VCO model gateway, vct-hub and the VCO launcher GUI BEFORE
+         any state removal (vco_lib/uninstall_quiesce.py)
       4. Remove orchestrator MCP server entries from ~/.claude.json
          (preserves user's other MCP servers)
       5. Remove boot-time autostart entries (v0.2.54 Track G):
@@ -21504,7 +21276,9 @@ def _run_uninstall(args: argparse.Namespace) -> int:
       7. Launcher binaries and shortcuts OUTSIDE the clone
          (vco_lib/uninstall_artifacts.py — exact VCO names only)
       8. The WHOLE VCO state dir (~/.vct / $VCT_STATE_DIR), RL training data
-         included (vco_lib/uninstall_state.py — refuses a dir not plainly VCO's)
+         included (vco_lib/uninstall_state.py — refuses a dir not plainly VCO's
+         or a linked one; a $VCT_STATE_DIR not named .vct loses only VCO's
+         own entries)
       NEVER touches: ~/.vct-secrets/ (user's secret material)
 
     Writes an audit log of what was removed to stdout and to
@@ -21624,7 +21398,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         print("  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
 
     _ua_plan = _uninstall_artifacts.build_plan(os_name=os_name, home=Path.home(), vct_root=st_plan.root,
-                                               include_state=st_plan.refused is not None)
+                                               include_state=st_plan.refused is not None or st_plan.selective)
     hub_bins = [*_ua_plan.hub_binaries, _try_bundled_vct_hub_binary(PROJECT_ROOT)]
     print("\n".join(_uninstall_artifacts.plan_lines(_ua_plan)))
     print("\n".join(_uninstall_state.plan_lines(st_plan, fallback_files=gateway_present)))
@@ -21777,7 +21551,7 @@ def _run_uninstall(args: argparse.Namespace) -> int:
 
     # Step 8: the whole VCO state dir (uninstall_state.py; exact names when refused).
     if (st_plan.exists or st_plan.db_files or gateway_present) and _confirm_strict(
-            f"Remove the VCO state dir {st_plan.root} (RL training data included)?"):
+            _uninstall_state.confirm_prompt(st_plan)):
         if quiesced:  # again: its boot unit may have restarted it
             audit.extend(_uninstall_quiesce.stop_gateway(
                 interactive=not non_interactive, confirm=_confirm, install_root=PROJECT_ROOT, report_idle=False))

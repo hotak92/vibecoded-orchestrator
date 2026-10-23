@@ -748,6 +748,10 @@ class TestRegistryCompleteness(unittest.TestCase):
             # attaches template_sha256 + reason on every emit (pinned by
             # tests/test_v02100_claude_md_user_section.py).
             "claude_md_user_section_review",
+            # v0.2.104 R18 LOW-3: settings_local_env._emit_unknown_entry
+            # attaches git's error line on every emit (pinned by
+            # tests/test_v02104_l5_fix_round_r14b.py).
+            "settings_local_layer_unknown",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:

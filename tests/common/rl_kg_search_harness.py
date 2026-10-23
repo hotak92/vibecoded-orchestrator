@@ -334,6 +334,10 @@ def _subprocess_main(config_path: str) -> int:
         "asked_paths": asked,
         "handed_off": state.get("handed_off", 0),
     }
+    # Wall-clock (``time.time``, comparable across processes) at the moment
+    # the result is on disk: everything after it is interpreter shutdown, so
+    # a caller can time the process TAIL apart from its startup imports.
+    out["result_written_at"] = time.time()
     Path(cfg["result_path"]).write_text(json.dumps(out))
     return 0
 

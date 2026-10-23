@@ -47,6 +47,13 @@ if str(REPO_ROOT) not in sys.path:
 
 SCRIPT_PATH = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 
+from tests.common.env import process_state_fixture  # noqa: E402
+
+#: `_load` writes the KG identity env and registers a unique module per call;
+#: both are restored after EVERY test (they used to stay set for every later
+#: file — v0.2.104 W-IDENTITY).
+_isolate = process_state_fixture("function", modules=("_skg_hb_*",))
+
 
 def _load(project_root: Path):
     """Load a FRESH sync_knowledge_graph module pinned at *project_root*.

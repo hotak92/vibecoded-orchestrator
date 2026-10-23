@@ -584,7 +584,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 - `GET, POST /api/v1/projects/{project_id}/skills` — list / register skills.
 - `PATCH, DELETE /api/v1/projects/{project_id}/skills/{skill_name}` — toggle / unregister.
 - `GET, POST /api/v1/projects/{project_id}/hooks` — list / register hooks.
-- `PATCH, DELETE /api/v1/projects/{project_id}/hooks/{hook_id}` — toggle / unregister.
+- `PATCH, DELETE /api/v1/projects/{project_id}/hooks/{hook_id}` — toggle / unregister. The GET lists the raw mirror rows (one per registration, shape kept stable), while a PATCH toggle acts on the whole hook UNIT: a hook registered under two SessionStart matchers (the hub ensure-hook's `startup` and `resume|clear|compact` groups) parks and restores both, whichever row id is given. `vct-cli hooks list` shows the folded one-row-per-unit view.
 - `GET, POST /api/v1/projects/{project_id}/permissions` — list / add permission entries.
 - `DELETE /api/v1/projects/{project_id}/permissions/{perm_id}` — remove a permission.
 - `GET, POST /api/v1/projects/{project_id}/secrets` — list secret refs / set a secret ref.
@@ -601,8 +601,8 @@ Mirror of Tauri commands so the headless `vct-cli` can drive the launcher withou
 - `GET /api/v1/cli/license` — current tier + cache status.
 - `POST /api/v1/cli/license/activate` — activate a license key (writes to keychain).
 - `POST /api/v1/cli/license/deactivate` — clear license.
-- `GET /api/v1/cli/hooks/{project_id}` — list hooks for a project.
-- `PATCH /api/v1/cli/hooks/{hook_id}/enabled` — toggle hook enabled.
+- `GET /api/v1/cli/hooks/{project_id}` — list hooks for a project, one row per hook as the Hooks tab shows them: a hook registered under several matchers (the hub's session-start hook: `startup` and `resume|clear|compact`) is one row whose `unit_matchers` names the other registrations.
+- `PATCH /api/v1/cli/hooks/{hook_id}/enabled` — toggle hook enabled (edits `.claude/settings.json`); on either id of such a hook it turns the whole hook off or on.
 - `GET /api/v1/cli/telemetry` — telemetry status.
 - `POST /api/v1/cli/telemetry/consent` — set telemetry consent.
 - `GET /api/v1/cli/kg/collections` — list KG collections + per-project access for CLI consumers.
