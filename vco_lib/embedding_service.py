@@ -723,14 +723,24 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
 def _clear_failure_deferral(install_root: Path | None, *, code_backend_ok: bool = True) -> None:
     """Mark the ``kg_summary_no_backend`` entry resolved (paired with success).
 
-    No-op if there's no deferral file or no matching entry, or when
-    ``install_root`` is not a VCO project (:func:`_project_surface_root` —
-    even a no-op resolve opens the ledger lock, creating ``.claude/context/``
-    in a folder that never had one). Soft-fail.
+    No-op if there's no deferral file or no matching entry. A root that is
+    not a VCO project (:func:`_project_surface_root`) is resolved ONLY when its
+    ledger file already exists: even a no-op resolve opens the ledger lock,
+    creating ``.claude/context/`` in a folder that never had one, but a ledger
+    a pre-v0.2.104 run rendered there (it had no project gate) would otherwise
+    never clear (R32 NIT). Resolving it only removes this module's own rows.
+    Soft-fail.
     """
     root = _project_surface_root(install_root)
     if root is None:
-        return
+        if install_root is None:
+            return
+        from vco_lib.deferral_report import _DEFERRED_JSON_REL, _DEFERRED_REL  # noqa: PLC0415
+
+        if not ((install_root / _DEFERRED_REL).exists()
+                or (install_root / _DEFERRED_JSON_REL).exists()):
+            return
+        root = install_root
     try:
         # v0.2.83 (WP-B1): resolve through the ONE emitter home — the locked
         # read-modify-write reads the current report, tombstones + drops the

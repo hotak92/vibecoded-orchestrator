@@ -1249,6 +1249,48 @@ class FailureCaptureTests(unittest.TestCase):
                     svc.close()
                 self.assertFalse((checkout / ".claude").exists())
 
+    def test_success_clears_a_pre_gate_row_in_a_non_project_root(self):
+        """A ledger a pre-v0.2.104 run rendered into a non-project folder (no
+        project gate then) is still cleared by the next success: the clear may
+        touch such a folder only when its ledger file already exists (R32 NIT)."""
+        with _EnvIsolation():
+            import tempfile
+            with tempfile.TemporaryDirectory() as proj_dir, \
+                    tempfile.TemporaryDirectory() as home_dir:
+                checkout = Path(proj_dir)
+                fake_home = Path(home_dir)
+                marker = checkout / ".claude" / "env"
+                marker.parent.mkdir(parents=True)
+                marker.write_text("", encoding="utf-8")
+                with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                                             "VCT_STATE_DIR": str(fake_home / ".vct")}):
+                    # The pre-gate write: emitted while the folder still looked
+                    # like a project, then the marker goes (a bare checkout).
+                    NoEmbeddingBackendError(
+                        "no backends", attempted_backends=["ollama"],
+                        error_per_backend={"ollama": "connection refused"},
+                        install_root=checkout,
+                    )
+                    ledger = checkout / ".claude" / "context" / "UPDATE_DEFERRED.md"
+                    self.assertIn("kg_summary_no_backend", ledger.read_text(encoding="utf-8"))
+                    marker.unlink()
+                    ollama_m = MagicMock(spec=OllamaAdapter)
+                    ollama_m.is_reachable.return_value = True
+                    ollama_m.list_embedding_models.return_value = []
+                    code_m = MagicMock(spec=CodeEmbedAdapter)
+                    code_m.is_reachable.return_value = True
+                    oa_m = MagicMock(spec=OpenAIAdapter)
+                    oa_m.validate.return_value = ValidationResult(valid=True)
+                    with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
+                         patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
+                         patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
+                        svc = EmbeddingService.for_project(project_root=checkout)
+                        svc.close()
+                    self.assertFalse(
+                        ledger.exists() and "kg_summary_no_backend"
+                        in ledger.read_text(encoding="utf-8"),
+                        "the stale row must be cleared")
+
 
 # ---------------------------------------------------------------------------
 # EmbeddingService — methods (single, batch, multi-slot, context manager)
