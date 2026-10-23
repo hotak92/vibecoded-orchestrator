@@ -44,10 +44,13 @@ before this fix and is unaffected).
 """
 from __future__ import annotations
 
+import os
 import platform
 import shutil
+import signal
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -244,10 +247,54 @@ def test_gated_command_string_is_single_line(project: Path):
     # the actual on-disk artifact that must stay single-line.
     _stub_kg_sync(project, project / "marker.log")
     _stub_access_checker(project, "write")
+    token = uuid.uuid4().hex
+    try:
+        _assert_cmd_file_single_line(project, token)
+    finally:
+        # The 999 s window keeps the lock dir for inspection, so the
+        # detached flusher would otherwise sleep on after the suite ends.
+        _reap_by_env_token(token)
+
+
+def _reap_by_env_token(token: str) -> None:
+    """SIGKILL every process whose environment carries ``token`` (the
+    detached debounce flusher and its ``sleep``). Linux reads /proc; where
+    there is none the flusher is left to its window (best-effort)."""
+    needle = f"VCO_TEST_REAP_TOKEN={token}".encode()
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return
+    # Repeat until a scan finds nobody: the flusher may fork its ``sleep``
+    # between one scan and the kill, and that child carries the token too.
+    # Only pids whose OWN environment holds the token are ever signalled —
+    # never a parent (an orphan's parent is the session's systemd --user).
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        found = False
+        for entry in proc.iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                env = (entry / "environ").read_bytes()
+            except OSError:
+                continue
+            if needle in env.split(b"\0"):
+                found = True
+                try:
+                    os.kill(int(entry.name), signal.SIGKILL)
+                except OSError:
+                    pass
+        if not found:
+            return
+        time.sleep(0.1)
+
+
+def _assert_cmd_file_single_line(project: Path, token: str) -> None:
     res = _run_hook(
         project,
         project / "knowledge" / "test.md",
-        env_extra={"VCT_PROJECT_ID": "proj-123", "KG_COLLECTION": "SomeKG"},
+        env_extra={"VCT_PROJECT_ID": "proj-123", "KG_COLLECTION": "SomeKG",
+                   "VCO_TEST_REAP_TOKEN": token},
         debounce_seconds="999",  # keep the lock file around long enough to inspect
     )
     assert res.returncode == 0, res.stderr
