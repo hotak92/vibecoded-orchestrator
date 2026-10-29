@@ -160,15 +160,33 @@ evidence_label_words = ["status", "result", "results", "outcome", "state",
 # rule (any line): kept as an escape hatch, not as a default.
 evidence_passage_min_shared_tokens = 2
 # Words that may follow a marker AFTER A COPULA and still leave it the
-# predicate ("is confirmed and shipped"). Any other following word makes the
-# marker a modifier ("was validated input", "is tested code"), which is prose.
+# predicate ("is confirmed and shipped", "is verified against the live API",
+# "was validated with real data", "is tested end-to-end"). Any other
+# following word makes the marker a modifier ("was validated input", "is
+# tested code"), which is prose. Prepositions and manner adverbs are here
+# because a passive predicate is most often followed by one — and "verified
+# against / tested end-to-end / validated with / confirmed under" are the
+# commonest inflated-claim spellings (review R1 M6, v0.2.105). The
+# attribution words (in/via/by/on/at/during) are matched by their own arm.
 evidence_predicate_followers = ["and", "but", "or", "so", "then", "now",
                                 "since", "as", "that", "which", "because",
                                 "when", "while", "too", "also", "already",
                                 "again", "once", "twice", "today", "here",
                                 "there", "correct", "correctly", "true",
                                 "false", "done", "working", "fixed", "green",
-                                "stable"]
+                                "stable",
+                                # prepositions a passive predicate takes
+                                "against", "with", "without", "under",
+                                "through", "throughout", "across", "for",
+                                "from", "after", "before", "over", "using",
+                                "per", "to", "into", "within", "upon",
+                                "inside", "outside", "end", "both",
+                                # manner adverbs
+                                "locally", "manually", "live", "empirically",
+                                "independently", "successfully", "fully",
+                                "thoroughly", "extensively", "explicitly",
+                                "directly", "automatically", "repeatedly",
+                                "experimentally", "only", "just"]
 # The largest knowledge/ symlink TARGET the snapshot copies (bytes). A larger
 # target is recorded as "too large - not restorable": a write through that
 # link is logged REVERT-IMPOSSIBLE and nothing through it is committed.

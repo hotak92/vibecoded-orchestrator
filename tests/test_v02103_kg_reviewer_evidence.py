@@ -1472,3 +1472,33 @@ def test_d25_the_passage_tie_can_be_switched_off_by_config(monkeypatch):
     monkeypatch.setitem(g, "evidence_passage_min_shared_tokens", 0)
     sources = "the deploy box was confirmed stable after the reboot\n"
     assert guard.unsourced_evidence(None, _CLAIM + "\n", sources) == []
+
+
+@pytest.mark.parametrize("line, marker", [
+    ("The cache fix is verified against the live API.", "verified"),
+    ("The path is tested end-to-end.", "tested"),
+    ("The migration was validated with real data.", "validated"),
+    ("Retry logic is confirmed under load.", "confirmed"),
+    ("The parser was proven through the fuzz corpus.", "proven"),
+    ("The fallback is verified locally.", "verified"),
+])
+def test_r1_m6_a_passive_predicate_with_a_preposition_is_still_a_claim(line, marker):
+    """Review R1 M6 (v0.2.105): the D2.5 noun-phrase rule must not let the
+    commonest inflated-claim spellings through. A copula + marker followed
+    by a preposition or a manner adverb is a passive predicate — a claim —
+    and is reverted when nothing the reviewer read carries the word."""
+    assert guard.evidence_claims(line, has_id=False) == [marker]
+    assert guard.unsourced_evidence(None, line + "\n", "") == [
+        (line, [f"marker '{marker}'"])]
+
+
+@pytest.mark.parametrize("line", [
+    "It was validated input read from the config table.",
+    "The handler is tested code from the old module.",
+    "This is verified data the importer trusts.",
+])
+def test_r1_m6_the_noun_phrase_fix_still_holds(line):
+    """LEAVE-ALONE: the D2.5 (b) fix is kept — a marker modifying a
+    following noun is prose."""
+    assert guard.evidence_claims(line, has_id=False) == []
+    assert guard.unsourced_evidence(None, line + "\n", "") == []

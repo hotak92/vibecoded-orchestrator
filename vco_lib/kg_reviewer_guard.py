@@ -1137,10 +1137,11 @@ def _predicate_at(text: str, end: int) -> bool:
     following noun ("it was validated input" is a noun phrase).
 
     "closes its clause" = the marker is followed by nothing, by punctuation,
-    or by one of ``[guard] evidence_predicate_followers`` (a conjunction, an
-    adverb, a preposition already covered by the attribution arm, or a
-    predicative adjective). Any OTHER following word makes the marker a
-    modifier, which is how ordinary prose reads."""
+    or by one of ``[guard] evidence_predicate_followers`` (a conjunction, a
+    preposition a passive predicate takes — "verified against", "validated
+    with", "confirmed under", "tested end-to-end" (review R1 M6) — a manner
+    adverb, or a predicative adjective). Any OTHER following word makes the
+    marker a modifier, which is how ordinary prose reads."""
     g = _guard()
     followers = {str(w).casefold() for w in g.get("evidence_predicate_followers") or ()}
     rest = text[end:].lstrip()
