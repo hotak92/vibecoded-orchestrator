@@ -14,10 +14,17 @@ exactly the `git diff --name-only <recorded>..HEAD` files. Covered here:
   * unchanged HEAD → NOTHING (the leave-alone case);
   * behind + recorded is an ancestor → the changed, existing code files are
     analyzed in ONE scoped batch and HEAD is recorded only after success;
-  * a non-ancestor / missing baseline → the analyzer's incremental walk, and
-    NOTHING recorded (an unprovable baseline is never advanced);
+  * a FAILED `git diff` (timeout / git error) → nothing runs, nothing is
+    recorded — failure is distinct from an empty diff (fix round M2);
+  * a non-ancestor / missing baseline → ONE full (non-incremental) walk,
+    then HEAD is recorded — the converging fallback (fix round M3: the old
+    `--incremental HEAD~1..HEAD` walk recorded nothing and re-ran forever);
+  * a project with no ENABLED code-graph binding → skipped entirely; the
+    hub's name-derived fallback prefix never authorizes a walk (M3);
   * a huge diff, or a deleted code file → the analyzer's incremental walk
     (which prunes deletions) instead of a per-turn batch;
+  * the per-root lock keys on the drain's CANONICAL root, so a symlinked
+    spelling of the checkout still serialises with a drain batch (LOW);
   * a linked-worktree session → skipped (FIX-A' territory);
   * a failed analysis → nothing recorded, so the next catch-up retries;
   * the drain hook spawns the module detached, once per interval — even when
@@ -53,10 +60,16 @@ class _Cfg:
     project_id: str = "pid-1"
     code_graph_collection_prefix: str = "Acme"
     code_graph_last_analyzed_commit: Optional[str] = None
+    code_graph_bound: bool = True
 
 
 class _Recorder:
-    """Fake git plumbing + analyzer + hub recorder."""
+    """Fake git plumbing + analyzer + hub recorder.
+
+    ``diff=None`` (the default) means the git diff FAILED — the tri-state
+    the fix round introduced (failure ≠ empty). Pass a list for a working
+    diff, ``[]`` for an empty one.
+    """
 
     def __init__(
         self,
@@ -68,19 +81,24 @@ class _Recorder:
         ok: bool = True,
         record_ok: bool = True,
         canonical: Optional[str] = None,
+        bound: bool = True,
     ):
         self.head = head
-        self.diff = diff or []
+        self.diff = diff
         self.ancestor = ancestor
         self.recorded = recorded
         self.ok = ok
         self.record_ok = record_ok
         self.canonical = canonical
+        self.bound = bound
         self.runs: list = []
         self.records: list = []
 
     def resolve(self, _root):
-        return _Cfg(code_graph_last_analyzed_commit=self.recorded)
+        return _Cfg(
+            code_graph_last_analyzed_commit=self.recorded,
+            code_graph_bound=self.bound,
+        )
 
     def git_head(self, _root):
         return self.head
@@ -89,7 +107,7 @@ class _Recorder:
         return self.ancestor
 
     def diff_paths(self, _root, _old, _new):
-        return list(self.diff)
+        return None if self.diff is None else list(self.diff)
 
     def canonical_root(self, root):
         return self.canonical if self.canonical is not None else str(Path(root).resolve())
@@ -158,6 +176,17 @@ def test_incremental_argv_never_carries_canonical_source() -> None:
     argv = chc.build_incremental_argv("/p", "Acme", A, "--index-dot-claude")
     assert argv == ["/p", "--project", "Acme", "--incremental", "--since-commit", A,
                     "--index-dot-claude"]
+    assert "--canonical-source" not in argv
+
+
+def test_full_argv_is_one_plain_walk() -> None:
+    # The converging fallback (M3): a FULL walk — no --incremental (which
+    # would bound it to HEAD~1..HEAD), no --since-commit, no scoped batch.
+    assert chc.build_full_argv("/p", "Acme", "--no-index-dot-claude") == [
+        "/p", "--project", "Acme", "--no-index-dot-claude",
+    ]
+    argv = chc.build_full_argv("/p", "Acme", "--index-dot-claude")
+    assert "--incremental" not in argv and "--only-files-from" not in argv
     assert "--canonical-source" not in argv
 
 
@@ -252,27 +281,125 @@ def test_only_non_indexable_changes_advance_the_baseline(tmp_path: Path) -> None
     assert rec.records == [("pid-1", B)]
 
 
-def test_non_ancestor_falls_back_to_the_incremental_walk_and_records_nothing(
+def test_non_ancestor_converges_via_one_full_walk_then_records(
     tmp_path: Path,
 ) -> None:
+    """M3: the old fallback ran an ``--incremental HEAD~1..HEAD`` walk and
+    recorded NOTHING, so a project with a rewritten history re-walked one
+    commit every 600 s forever while falling further behind. The converging
+    shape: ONE full walk, then HEAD is recorded — after which the next
+    catch-up is ``up_to_date``."""
     rec = _Recorder(head=B, recorded=A, ancestor=False, diff=["src/a.py"])
     out, lines, _ = _drive(tmp_path, rec, create_files=["src/a.py"])
-    assert out == "not_ancestor"
+    assert out == "recorded"
     assert len(rec.runs) == 1
     argv = rec.runs[0]["argv"]
-    assert "--incremental" in argv and "--since-commit" not in argv
+    assert "--incremental" not in argv and "--since-commit" not in argv
     assert "--only-files-from" not in argv
-    assert rec.records == []       # a baseline it cannot prove is never advanced
+    assert rec.records == [("pid-1", B)]   # the baseline is re-proven, then advanced
     assert any("NOT an ancestor" in ln for ln in lines), lines
+    assert any("full walk" in ln for ln in lines), lines
+    # Convergence: with HEAD now recorded, the next catch-up is a no-op.
+    rec.recorded = B
+    out2, _lines2, _r = _drive(tmp_path, rec)
+    assert out2 == "up_to_date"
+    assert len(rec.runs) == 1
 
 
-def test_missing_baseline_falls_back_to_the_incremental_walk(tmp_path: Path) -> None:
+def test_missing_baseline_converges_via_one_full_walk_then_records(
+    tmp_path: Path,
+) -> None:
+    """M3: same convergence for a project never analyzed (no recorded
+    commit) — a full walk once, then the baseline exists."""
     rec = _Recorder(head=B, recorded=None, diff=["src/a.py"])
     out, lines, _ = _drive(tmp_path, rec, create_files=["src/a.py"])
-    assert out == "no_recorded"
-    assert "--incremental" in rec.runs[0]["argv"]
-    assert rec.records == []
+    assert out == "recorded"
+    argv = rec.runs[0]["argv"]
+    assert "--incremental" not in argv and "--only-files-from" not in argv
+    assert rec.records == [("pid-1", B)]
     assert any("no recorded commit" in ln for ln in lines), lines
+
+
+def test_full_walk_failure_records_nothing_and_retries_next_interval(
+    tmp_path: Path,
+) -> None:
+    rec = _Recorder(head=B, recorded=None, ok=False)
+    out, lines, _ = _drive(tmp_path, rec, create_files=["src/a.py"])
+    assert out == "analyzer_failed"
+    assert rec.records == []
+    assert any("no_recorded: FAILED" in ln for ln in lines), lines
+
+
+def test_a_failed_diff_never_records_head(tmp_path: Path) -> None:
+    """M2: a FAILED ``git diff`` (timeout, git error) used to read as an
+    empty diff, so HEAD was recorded without indexing anything — the field
+    scenario made silent. Failure is distinct from empty: nothing runs,
+    nothing is recorded, and the log says why."""
+    rec = _Recorder(head=B, recorded=A, diff=None)
+    out, lines, _ = _drive(tmp_path, rec, create_files=["src/a.py"])
+    assert out == "diff_failed"
+    assert rec.runs == [] and rec.records == []
+    assert any("git diff failed" in ln for ln in lines), lines
+
+
+def test_an_empty_diff_still_records_head(tmp_path: Path) -> None:
+    """The other side of M2's branch: a diff that RAN and is empty (only
+    non-code files changed) still advances the baseline."""
+    rec = _Recorder(head=B, recorded=A, diff=[])
+    out, lines, _ = _drive(tmp_path, rec)
+    assert out == "recorded"
+    assert rec.runs == []
+    assert rec.records == [("pid-1", B)]
+
+
+def test_unbound_or_disabled_project_is_skipped(tmp_path: Path) -> None:
+    """M3: /config serves a NAME-derived fallback prefix even for a project
+    with no binding row, so a prefix alone must not authorize a walk — the
+    catch-up would create code-graph collections for an unbound project and
+    loop a walk every 600 s. ``code_graph_bound`` False (no row, or the row
+    is disabled) → nothing at all happens."""
+    rec = _Recorder(head=B, recorded=A, diff=["src/a.py"], bound=False)
+    out, lines, _ = _drive(tmp_path, rec, create_files=["src/a.py"])
+    assert out == "not_bound"
+    assert rec.runs == [] and rec.records == []
+    assert any("no enabled code-graph binding" in ln for ln in lines), lines
+    # And with no recorded commit either (never analyzed + unbound): still
+    # nothing — the full-walk fallback is behind the same gate.
+    rec2 = _Recorder(head=B, recorded=None, bound=False)
+    out2, _l2, _r2 = _drive(tmp_path, rec2)
+    assert out2 == "not_bound"
+    assert rec2.runs == [] and rec2.records == []
+
+
+def test_the_root_lock_keys_on_the_drains_canonical_root(tmp_path: Path) -> None:
+    """LOW: the drain keys its per-root lock on the git-resolved canonical
+    root; the catch-up keyed on the session's spelling of the path, so a
+    symlinked checkout let a catch-up walk and a drain batch run over the
+    same repo at once. A lock held at the CANONICAL key must read as busy
+    even when the project root was spelled through the symlink."""
+    real = tmp_path / "real-proj"
+    (real / ".claude" / "state").mkdir(parents=True)
+    (real / "src").mkdir()
+    (real / "src" / "a.py").write_text("x = 1\n")
+    link = tmp_path / "link-proj"
+    link.symlink_to(real, target_is_directory=True)
+    state = real / ".claude" / "state"
+
+    # The drain's own key: canonical (realpath) root.
+    (state / f"codegraph_drain_root_{chc.path_key(str(real))}.lock").mkdir()
+
+    rec = _Recorder(head=B, recorded=A, diff=["src/a.py"])
+    lines: list = []
+    out = chc.catchup(
+        str(link), "/x/a.py", "/x/py", state, lines.append,
+        deps=chc.Deps(resolve=rec.resolve, git_head=rec.git_head,
+                      is_ancestor=rec.is_ancestor, diff_paths=rec.diff_paths,
+                      run_analyzer=rec.run_analyzer, record=rec.record,
+                      canonical_root=rec.canonical_root),
+    )
+    assert out == "busy"
+    assert rec.runs == [] and rec.records == []
+    assert any("holds the root lock" in ln for ln in lines), lines
 
 
 def test_huge_diff_goes_to_the_background_incremental_walk(tmp_path: Path) -> None:

@@ -20,17 +20,24 @@ The catch-up closes that gap WITHOUT installing git hooks into user repos:
    ``git diff --name-only <recorded>..HEAD`` are filtered exactly the way the
    drain and the analyzer filter (code extension, no transient
    ``.claude/state`` scratch, existing files only) and analyzed in ONE scoped
-   ``--only-files-from`` run — the drain's own batched shape;
+   ``--only-files-from`` run — the drain's own batched shape. A FAILED diff
+   (timeout, git error) records nothing: failure is distinct from empty;
 4. behind by MORE than ``--max-files`` → the same efficient path the analyzer
    already has: one ``--incremental --since-commit <recorded>`` walk (which
    also prunes the entities of deleted/renamed files);
 5. the recorded commit is MISSING or is NOT an ancestor (a rewritten history)
-   → fall back to the analyzer's plain ``--incremental`` walk and record
-   nothing — a baseline that cannot be proven is never advanced;
+   → ONE full (non-incremental) analyzer walk, then record HEAD — the only
+   converging shape: an ``--incremental HEAD~1..HEAD`` walk indexed one
+   commit, recorded nothing and re-ran every interval forever;
 6. the analysis succeeded → record HEAD through the hub route
    ``POST /api/v1/projects/{id}/codegraph/analyzed`` (launcher.db keeps its
    single writer: this module never opens it). A failed run records NOTHING,
    so the next eligible catch-up retries the same diff.
+
+A project with no ENABLED code-graph binding is skipped entirely (the
+``code_graph_bound`` config field): the hub serves a name-derived fallback
+prefix even for an unbound project, and the catch-up must never create
+collections on an unbound project's behalf.
 
 The trigger lives in the Stop hook (``templates/hooks/stop-codegraph-drain.
 {sh,ps1}``), which spawns this module DETACHED at most once per
@@ -73,12 +80,17 @@ from vco_lib.paths import looks_like_orchestrator_root
 DEFAULT_MAX_DIFF_FILES = 2000
 #: Hard ceiling on one analyzer run — the same 30 min the drain/extras use.
 DEFAULT_TIMEOUT_SECONDS = 1800
+#: Wall-clock ceiling for the ONE ``git diff --name-only`` call. The module's
+#: other git calls are plumbing and keep ``git_meta``'s 5 s default, but a
+#: diff over a thousand-commit range on a slow disk or Windows can outgrow
+#: it; this module runs detached, so a generous ceiling costs no turn time.
+DIFF_TIMEOUT_SECONDS = 60
 LOG_NAME = "codegraph_head_catchup.log"
 
 #: The drain's extension gate, byte for byte
 #: (``templates/hooks/stop-codegraph-drain.sh :: CODE_RE``). MUST MATCH.
 CODE_RE = re.compile(
-    r"\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$"
+    r"\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$"
 )
 
 
@@ -93,7 +105,9 @@ CODE_RE = re.compile(
 def path_key(path: str) -> str:
     """md5 of a path — the key the drain's per-root lock uses
     (``codegraph_drain_root_<md5>.lock``), so a catch-up run serialises with a
-    drain batch over the same checkout."""
+    drain batch over the same checkout. Callers pass the CANONICAL root
+    (git-resolved realpath), which is what the drain keys on — not the
+    session's spelling of it."""
     return hashlib.md5(path.encode("utf-8")).hexdigest()  # noqa: S324 — a key, not security
 
 
@@ -120,16 +134,24 @@ def is_ancestor(root: str, ancestor: str, descendant: str) -> bool:
     return rc == 0
 
 
-def diff_paths(root: str, old: str, new: str) -> list[str]:
+def diff_paths(root: str, old: str, new: str) -> Optional[list[str]]:
     """``git diff --name-only -z <old>..<new>`` → repo-relative paths.
 
     NUL-separated (``-z``) so a path holding a space or a quote survives
-    verbatim. An empty list on any git failure — the caller then records
-    nothing rather than claiming coverage it cannot see.
+    verbatim. ``None`` on any git failure (non-zero exit, timeout, git not
+    runnable) — FAILURE is distinct from an empty diff: an empty list means
+    "nothing changed", while ``None`` means "cannot see the range", and the
+    caller must record nothing rather than advance the baseline over a diff
+    it could not read (review M2: a timed-out 1,070-commit diff used to read
+    as "no changes" and silently stamped HEAD).
     """
-    rc, out, _err = run_git(Path(root), ["diff", "--name-only", "-z", f"{old}..{new}"])
+    rc, out, _err = run_git(
+        Path(root),
+        ["diff", "--name-only", "-z", f"{old}..{new}"],
+        timeout=DIFF_TIMEOUT_SECONDS,
+    )
     if rc != 0:
-        return []
+        return None
     return [p for p in out.split("\0") if p]
 
 
@@ -221,6 +243,19 @@ def build_incremental_argv(
     return argv + [dot_flag]
 
 
+def build_full_argv(root: str, prefix: str, dot_flag: str) -> list[str]:
+    """Analyzer argv for ONE full (non-incremental) walk of ``root``.
+
+    The converging fallback for a baseline that cannot be diffed (no
+    recorded commit, or a rewritten history): re-index everything at HEAD,
+    then record HEAD — the only route that PROVES the new baseline. An
+    ``--incremental HEAD~1..HEAD`` walk here (the pre-fix shape) indexed one
+    commit's worth of files, recorded nothing and re-ran every interval
+    forever (review M3).
+    """
+    return [root, "--project", prefix, dot_flag]
+
+
 # ── Recording the new baseline (hub = the single launcher.db writer) ─────
 
 
@@ -250,7 +285,7 @@ class Deps:
     resolve: Callable[[str], object]
     git_head: Callable[[str], Optional[str]] = git_head
     is_ancestor: Callable[[str, str, str], bool] = is_ancestor
-    diff_paths: Callable[[str, str, str], list[str]] = diff_paths
+    diff_paths: Callable[[str, str, str], Optional[list[str]]] = diff_paths
     run_analyzer: Callable[..., AnalyzerResult] = run_analyzer
     record: Callable[[str, str], tuple[bool, str]] = record_analyzed_commit
     canonical_root: Callable[[str], Optional[str]] = canonical_repo_root
@@ -318,12 +353,14 @@ def _release_lock(lock: Optional[Path]) -> None:
         pass
 
 
-def _run_incremental(
+def _run_walk(
     project_root: str,
     prefix: str,
     head: str,
     since: Optional[str],
     *,
+    full: bool,
+    lock_root: str,
     analyzer: str,
     python: str,
     state_dir: Path,
@@ -332,12 +369,19 @@ def _run_incremental(
     deps: Deps,
     label: str,
 ) -> AnalyzerResult:
-    """One ``--incremental`` walk under the per-root lock AND the project's
-    single-flight walk claim (so it never twins a launcher/driver walk of the
-    same project — the 2026-10-14 field defect)."""
+    """One analyzer walk (incremental with ``since``, or full) under the
+    per-root lock AND the project's single-flight walk claim (so it never
+    twins a launcher/driver walk of the same project — the 2026-10-14 field
+    defect).
+
+    ``lock_root`` is the CANONICAL root (git-resolved realpath) the drain
+    keys its own per-root lock on, so a catch-up walk serialises with a
+    drain batch over the same checkout even when this session spelled the
+    root differently (symlink, trailing-dot form) — review LOW.
+    """
     from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
 
-    key = path_key(project_root)
+    key = path_key(lock_root)
     lock = _acquire_lock(state_dir, key)
     if lock is None:
         log(f"{label}: busy — another analyzer run holds the root lock; nothing recorded")
@@ -345,13 +389,17 @@ def _run_incremental(
     try:
         try:
             with walk_claim(prefix):
-                argv = build_incremental_argv(
-                    project_root, prefix, since, index_dot_claude_flag(project_root)
-                )
-                log(
-                    f"{label}: walk {project_root} prefix={prefix} "
-                    f"{since or 'HEAD~1'}..{head[:12]}"
-                )
+                if full:
+                    argv = build_full_argv(
+                        project_root, prefix, index_dot_claude_flag(project_root)
+                    )
+                    range_desc = f"full walk → {head[:12]}"
+                else:
+                    argv = build_incremental_argv(
+                        project_root, prefix, since, index_dot_claude_flag(project_root)
+                    )
+                    range_desc = f"{since or 'HEAD~1'}..{head[:12]}"
+                log(f"{label}: walk {project_root} prefix={prefix} {range_desc}")
                 return deps.run_analyzer(python, analyzer, argv, timeout)
         except WalkAlreadyRunning:
             log(
@@ -375,9 +423,9 @@ def catchup(
     deps: Optional[Deps] = None,
 ) -> str:
     """Bring the PRIMARY root's code graph up to HEAD. Returns the outcome
-    (one of ``up_to_date``, ``no_git_head``, ``no_config``,
-    ``worktree_session``, ``no_recorded``, ``not_ancestor``, ``busy``,
-    ``analyzer_failed``, ``record_failed``, ``recorded``). Never raises."""
+    (one of ``up_to_date``, ``no_git_head``, ``no_config``, ``not_bound``,
+    ``worktree_session``, ``diff_failed``, ``busy``, ``analyzer_failed``,
+    ``record_failed``, ``recorded``). Never raises."""
     if deps is None:
         from vco_lib import project_config
 
@@ -395,6 +443,18 @@ def catchup(
     if not project_id or not prefix:
         log(f"skip project={root}: no project id / code-graph prefix")
         return "no_config"
+    # The binding's enabled gate (review M3): /config serves a NAME-derived
+    # fallback prefix even for a project with NO binding row, so a prefix
+    # alone proves nothing. A project that is not bound (no row, or the row
+    # is disabled) must never get code-graph collections created on its
+    # behalf — and never get its (nonexistent) baseline stamped.
+    bound = bool(getattr(cfg, "code_graph_bound", False))
+    if not bound:
+        log(
+            f"skip project={root}: no enabled code-graph binding — the "
+            "catch-up never creates collections for an unbound project"
+        )
+        return "not_bound"
 
     head = deps.git_head(root)
     if not head:
@@ -410,38 +470,75 @@ def catchup(
             "checkout's own session owns this catch-up (FIX-A')"
         )
         return "worktree_session"
+    # The lock key follows the drain's canonical root (same resolution), so
+    # the catch-up and the drain serialise however the root was spelled.
+    lock_root = canonical or root
 
     if not recorded:
         log(
             f"no recorded commit for project={project_id} prefix={prefix} — "
-            "falling back to the analyzer's incremental walk; nothing recorded "
-            "(an unprovable baseline is never advanced)"
+            "running ONE full analyzer walk, then recording HEAD (the "
+            "converging fallback: an unprovable baseline is re-proven, not "
+            "advanced blind)"
         )
-        res = _run_incremental(
-            root, prefix, head, None,
+        res = _run_walk(
+            root, prefix, head, None, full=True, lock_root=lock_root,
             analyzer=analyzer, python=python, state_dir=state_dir, log=log,
             timeout=timeout, deps=deps, label="no_recorded",
         )
-        return "busy" if res.reason == "busy" else (
-            "no_recorded" if res.ok else "analyzer_failed"
+        if res.reason == "busy":
+            return "busy"
+        if not res.ok:
+            log(
+                f"no_recorded: FAILED project={project_id} full walk at "
+                f"{head[:12]}: {res.reason}; baseline unchanged"
+            )
+            return "analyzer_failed"
+        ok, why = deps.record(project_id, head)
+        log(
+            f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
+            f"via full walk (no prior baseline) at {head[:12]}: {why}",
         )
+        return "recorded" if ok else "record_failed"
 
     if not deps.is_ancestor(root, recorded, head):
         log(
             f"recorded commit {recorded[:12]} is NOT an ancestor of HEAD "
-            f"{head[:12]} (rewritten history or unknown object) — falling back "
-            "to the analyzer's incremental walk; nothing recorded"
+            f"{head[:12]} (rewritten history or unknown object) — running ONE "
+            "full analyzer walk, then recording HEAD (the converging fallback: "
+            "a baseline that cannot be diffed is re-proven, not advanced blind)"
         )
-        res = _run_incremental(
-            root, prefix, head, None,
+        res = _run_walk(
+            root, prefix, head, None, full=True, lock_root=lock_root,
             analyzer=analyzer, python=python, state_dir=state_dir, log=log,
             timeout=timeout, deps=deps, label="not_ancestor",
         )
-        return "busy" if res.reason == "busy" else (
-            "not_ancestor" if res.ok else "analyzer_failed"
+        if res.reason == "busy":
+            return "busy"
+        if not res.ok:
+            log(
+                f"not_ancestor: FAILED project={project_id} full walk at "
+                f"{head[:12]}: {res.reason}; baseline unchanged"
+            )
+            return "analyzer_failed"
+        ok, why = deps.record(project_id, head)
+        log(
+            f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
+            f"via full walk (rewritten history) at {head[:12]}: {why}",
         )
+        return "recorded" if ok else "record_failed"
 
-    files, vanished = indexable_files(root, deps.diff_paths(root, recorded, head))
+    paths = deps.diff_paths(root, recorded, head)
+    if paths is None:
+        # M2: a FAILED diff (timeout, git error) is not an empty one. Nothing
+        # is analyzed and nothing recorded — the next eligible catch-up
+        # retries the same diff instead of silently advancing the baseline.
+        log(
+            f"skip project={project_id} {recorded[:12]}..{head[:12]}: "
+            "git diff failed (timeout or git error); baseline unchanged"
+        )
+        return "diff_failed"
+    files, vanished = indexable_files(root, paths)
 
     # A code file that vanished in the range must be PRUNED, and only the
     # analyzer's ``--incremental --since-commit`` walk does that (its
@@ -457,8 +554,8 @@ def catchup(
 
     if vanished > 0 or len(files) > max_files:
         label = "deleted_files" if vanished > 0 else "huge_diff"
-        res = _run_incremental(
-            root, prefix, head, recorded,
+        res = _run_walk(
+            root, prefix, head, recorded, full=False, lock_root=lock_root,
             analyzer=analyzer, python=python, state_dir=state_dir, log=log,
             timeout=timeout, deps=deps, label=label,
         )
@@ -480,7 +577,7 @@ def catchup(
         )
         return "recorded" if ok else "record_failed"
 
-    key = path_key(root)
+    key = path_key(lock_root)
     lock = _acquire_lock(state_dir, key)
     if lock is None:
         log(f"busy: another analyzer run holds the root lock for {root}; nothing recorded")

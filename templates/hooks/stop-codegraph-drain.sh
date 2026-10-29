@@ -229,8 +229,9 @@ fi
 # `git diff --name-only <recorded>..HEAD` (existing code files only, filtered
 # like the drain's own lines); an enormous diff, or a deleted code file, goes
 # to the analyzer's incremental walk instead. A non-ancestor / missing
-# recorded commit falls back to that same incremental walk and records
-# nothing. On success it records HEAD through the hub route
+# recorded commit takes ONE full (non-incremental) walk, then records HEAD —
+# the converging fallback. A project with no ENABLED code-graph binding is
+# skipped entirely. On success it records HEAD through the hub route
 # `/projects/{id}/codegraph/analyzed` — never by opening launcher.db.
 # Runs whether or not this turn queued any file (a merge queues none), and
 # deliberately installs NO git hook into the user's repo.
@@ -381,7 +382,7 @@ _drain_key() {
     printf '%s' "$1" | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null || printf '%s' "_"
 }
 
-CODE_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+CODE_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
 
 # Per-canonical-root batch files: <hash> → tmp file of paths for that root.
 BATCH_DIR="$(mktemp -d "$STATE_DIR/cg_drain_batch.XXXXXX" 2>/dev/null || mktemp -d 2>/dev/null)"

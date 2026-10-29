@@ -603,6 +603,16 @@ struct ProjectConfigResponse {
     /// back-fills `None` for a pre-v0.2.105 hub. `schema_version` stays 1.
     #[serde(default)]
     code_graph_last_analyzed_commit: Option<String>,
+    /// v0.2.105 fix round — `true` iff a `project_codegraph_bindings` row
+    /// exists for this project AND its `enabled` flag is on. The prefix
+    /// fallback above makes `code_graph_collection_prefix` non-empty even
+    /// for an UNBOUND project, so the HEAD-diff catch-up reads THIS field
+    /// to decide whether it may run at all: `false` → skip, never create
+    /// collections for an unbound project and never walk a disabled one.
+    /// Additive; a pre-fix hub omits it and the Python parser back-fills
+    /// `false` (the catch-up stays inert until the hub binary catches up).
+    #[serde(default)]
+    code_graph_bound: bool,
 }
 
 /// One enabled extra codegraph path for the resolver response.
@@ -1333,6 +1343,10 @@ async fn project_config(
         code_graph_last_analyzed_commit: cg_binding
             .as_ref()
             .and_then(|b| b.last_analyzed_commit.clone()),
+        // v0.2.105 fix round: bound = a binding row exists AND is enabled.
+        // The catch-up refuses to run otherwise (it must not create
+        // collections for a project the launcher never bound).
+        code_graph_bound: cg_binding.as_ref().is_some_and(|b| b.enabled),
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -4187,6 +4201,59 @@ kg_tier_full = 0.8
         let one: serde_json::Value = resp.json().await.expect("json body");
         assert_eq!(one.get("code_graph_last_analyzed_commit").and_then(|v| v.as_str()),
                    Some("0123456789abcdef"));
+    }
+
+    /// v0.2.105 fix round (M3): `/config` serves `code_graph_bound` — TRUE
+    /// iff a binding row exists AND is enabled. The name-derived fallback
+    /// prefix makes `code_graph_collection_prefix` non-empty even for an
+    /// UNBOUND project, so the HEAD-diff catch-up needs a field that says
+    /// whether it may run at all (it must never create collections for an
+    /// unbound project, and never walk a disabled binding).
+    #[tokio::test]
+    async fn config_serves_the_code_graph_bound_flag() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-bound", "boundproj");
+
+        // Bound + enabled (what seed_full_project creates) → true.
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert!(body.get("code_graph_bound").is_some(),
+                "the field is always present; body={}", body);
+        assert_eq!(body["code_graph_bound"], serde_json::json!(true));
+
+        // Bound but DISABLED → false (the catch-up respects the binding's
+        // enabled flag).
+        h.0.set_project_codegraph_binding(
+            "p-bound", "Boundproj",
+            None, None, None, None,
+            false, &empty_json_obj(),
+        )
+        .unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(body["code_graph_bound"], serde_json::json!(false));
+
+        // UNBOUND (no binding row at all): false again, while the fallback
+        // prefix is still served — the exact trap this field closes (the
+        // catch-up must not mistake that prefix for permission to walk).
+        h.0.delete_project_codegraph_binding("p-bound").unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(body["code_graph_bound"], serde_json::json!(false));
+        assert!(body["code_graph_collection_prefix"].as_str().is_some_and(|p| !p.is_empty()),
+                "the fallback prefix is served even for an unbound project");
     }
 
     /// Disabled rows are filtered OUT of the resolver response. They

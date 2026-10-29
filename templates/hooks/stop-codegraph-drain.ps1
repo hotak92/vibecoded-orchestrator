@@ -158,8 +158,9 @@ if (Test-Path -LiteralPath $stateDir -PathType Container) {
 # and, when that commit is an ANCESTOR, indexes exactly
 # `git diff --name-only <recorded>..HEAD` (existing code files only); an
 # enormous diff or a deleted code file goes to the analyzer's incremental walk
-# instead, and a non-ancestor / missing baseline falls back to that walk while
-# recording nothing. On success it records HEAD through the hub route
+# instead, and a non-ancestor / missing baseline takes ONE full
+# (non-incremental) walk, then records HEAD -- the converging fallback. A
+# project with no ENABLED code-graph binding is skipped entirely. On success it records HEAD through the hub route
 # /projects/{id}/codegraph/analyzed -- never by opening launcher.db. Runs
 # whether or not the turn queued anything, and installs NO git hook.
 # Log: .claude/logs/codegraph_head_catchup.log.
@@ -282,7 +283,7 @@ if ($runtimeRc -ne 0) {
     exit 0
 }
 
-$codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+$codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
 
 function Resolve-DrainProject {
     param([string]$Root)
