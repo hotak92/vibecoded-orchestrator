@@ -1531,7 +1531,7 @@ consented cleanup the entry prints removes them (a delete is a \
 user-consented action the retry engine must never take), so the WP-H \
 dispatcher can never clear it. v0.2.105 (prune lane): the printed command \
 is the TARGETED `--prune-orphan-interactions` pass \
-(`vco_lib.codegraph_resync.prune_orphan_interactions`), which deletes ONLY \
+(`vco_lib.codegraph_source_purge.prune_orphan_interactions`), which deletes ONLY \
 the provably-dead unanchored rows the detection counted. The pre-v0.2.105 \
 remedy (`--run-resync --prune-stale`) re-walked the repo root and pruned \
 every unvisited row — deleting every ENABLED extra code folder's rows with \

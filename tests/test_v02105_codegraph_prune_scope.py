@@ -35,6 +35,7 @@ import pytest
 
 import vco_lib.codegraph_extras_refresh as xrf
 import vco_lib.codegraph_resync as cr
+import vco_lib.codegraph_source_purge as sp
 import vco_lib.codegraph_source_scope as scope_mod
 from vco_lib.codegraph_source_scope import PruneScope, prune_scope_for_walk
 
@@ -302,24 +303,36 @@ def test_prune_scope_for_walk_rules():
     assert PRIMARY not in strict.own_sources
 
 
-def test_project_has_registered_extras_soft_fails_false(monkeypatch):
-    """Hub down / unresolvable root → False (no extras known): the prune
-    keeps its previous legacy-row behaviour; never raises."""
+def test_project_has_registered_extras_leans_to_keeping(monkeypatch):
+    """v0.2.105 fix-round: anything UNKNOWN answers True (legacy unstamped
+    rows are kept by a --prune-stale walk); only a positive "no extras,
+    none removed" answers False. Never raises."""
     import vco_lib.project_config as pc
 
     monkeypatch.setattr(
         pc, "resolve", lambda root: (_ for _ in ()).throw(
             pc.ResolverError("hub down")))
-    assert scope_mod.project_has_registered_extras("/some/project") is False
+    assert scope_mod.project_has_registered_extras("/some/project") is True, (
+        "hub down is UNKNOWN: keep the legacy rows")
     assert scope_mod.project_has_registered_extras("") is False
 
-    class _Cfg:
-        code_graph_extra_paths = (SimpleNamespace(enabled=False, path="/x"),)
+    def _cfg(extras, gone):
+        return SimpleNamespace(code_graph_extra_paths=extras,
+                               code_graph_extra_paths_gone=gone)
 
-    monkeypatch.setattr(pc, "resolve", lambda root: _Cfg())
-    assert scope_mod.project_has_registered_extras("/some/project") is True, (
-        "enabled OR disabled rows count — both mean attribution is unknowable"
-    )
+    monkeypatch.setattr(pc, "resolve", lambda root: _cfg(
+        (SimpleNamespace(enabled=True, path="/x"),), ()))
+    assert scope_mod.project_has_registered_extras("/p") is True
+    monkeypatch.setattr(pc, "resolve", lambda root: _cfg((), ("/removed",)))
+    assert scope_mod.project_has_registered_extras("/p") is True, (
+        "a removed/disabled extra still makes attribution unknowable")
+    monkeypatch.setattr(pc, "resolve", lambda root: _cfg((), None))
+    assert scope_mod.project_has_registered_extras("/p") is True, (
+        "an emptied list with an unknown gone list (hub DB read failure) "
+        "is not 'no extras'")
+    monkeypatch.setattr(pc, "resolve", lambda root: _cfg((), ()))
+    assert scope_mod.project_has_registered_extras("/p") is False, (
+        "positively no extras and none removed: legacy rows are the primary's")
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +384,7 @@ def test_extra_rows_survive_the_remedy_and_a_primary_prune(
             _refs(("source_function", [{"file_path": "a.py"}]))),
     })
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "P")
-    res = cr.prune_orphan_interactions(
+    res = sp.prune_orphan_interactions(
         "P", repo_root=Path(PRIMARY), client=_client_for(inter))
     assert res["deleted"] == 1 and res["counted"] == 1, (
         "the targeted remedy deletes ONLY the provably-dead PRIMARY orphan"
@@ -456,7 +469,7 @@ def test_targeted_remedy_deletes_nothing_on_enumeration_failure(monkeypatch):
 
     bad = _Explodes(name="P_CodeInteraction")
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "P")
-    res = cr.prune_orphan_interactions(
+    res = sp.prune_orphan_interactions(
         "P", repo_root=Path(PRIMARY), client=_client_for(bad))
     assert res["counted"] is None and res["deleted"] == 0, (
         "an enumeration failure authorises nothing (deferred-delete rule)"
@@ -521,10 +534,10 @@ def test_count_rows_for_project_source_exact_scan_fallback():
          _row("m-3", "P", "path", "c.py", PRIMARY)],
         ["project", "path", "project_source"],
     )
-    assert cr.count_rows_for_project_source(
+    assert sp.count_rows_for_project_source(
         "P", EXTRA, client=_client_for(modules)) == 1
     absent = _FakeCollection("P_CodeModule", [], ["project", "path"])
-    assert cr.count_rows_for_project_source(
+    assert sp.count_rows_for_project_source(
         "P", EXTRA, client=_client_for(absent)) == 0
 
 
@@ -537,37 +550,13 @@ def test_purge_rows_for_project_source_deletes_only_that_path():
          _row("f-primary", "P", "file_path", "x.py", PRIMARY)],
         ["project", "file_path", "project_source"],
     )
-    report = cr.purge_rows_for_project_source(
+    report = sp.purge_rows_for_project_source(
         "P", EXTRA, client=_client_for(functions))
     assert functions.deleted == ["f-disabled"], (
         "the purge is scoped to the disabled path's rows only"
     )
     assert report["counts"] == {"P_CodeFunction": 1}
     assert report["failures"] == 0
-
-
-def test_stored_project_sources_and_undeterminable():
-    """ACT: the distinct non-empty stored sources; a legacy unstamped row is
-    not reported (it is the primary root's business)."""
-    modules = _FakeCollection(
-        "P_CodeModule",
-        [_row("m-1", "P", "path", "a.py", EXTRA),
-         SimpleNamespace(uuid="m-legacy",
-                         properties={"project": "P", "path": "b.py"}),
-         _row("m-3", "P", "path", "c.py", PRIMARY)],
-        ["project", "path", "project_source"],
-    )
-    got = cr.stored_project_sources("P", client=_client_for(modules))
-    assert got == {EXTRA, PRIMARY}, "non-empty sources only, distinct"
-
-    class _Explodes(_FakeCollection):
-        def iterator(self, return_properties=None):
-            raise RuntimeError("scan failed")
-
-    bad = _Explodes("P_CodeModule", [], ["project"])
-    assert cr.stored_project_sources("P", client=_client_for(bad)) is None, (
-        "undeterminable ⇒ None — the caller must not purge on unknown"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -584,10 +573,11 @@ class _Extra:
 
 
 class _Cfg:
-    def __init__(self, extras, prefix="P", project_id="pid"):
+    def __init__(self, extras, prefix="P", project_id="pid", gone=()):
         self.code_graph_extra_paths = tuple(extras)
         self.code_graph_collection_prefix = prefix
         self.project_id = project_id
+        self.code_graph_extra_paths_gone = gone
 
 
 def _extra_tree(tmp_path: Path) -> Path:
@@ -649,12 +639,12 @@ def test_build_entry_and_detect_emit(tmp_path, monkeypatch):
     emitted = []
     monkeypatch.setattr(
         "vco_lib.deferral_emit.emit",
-        lambda folder, entry, log=None: emitted.append((folder, entry)))
+        lambda folder, entry, log=None, **k: emitted.append((folder, entry)))
     monkeypatch.setattr(
         "vco_lib.project_config.resolve",
         lambda root: _Cfg([_Extra(clone.as_posix(), True)]))
     monkeypatch.setattr(
-        cr, "count_rows_for_project_source", lambda p, s: 0)
+        sp, "count_rows_for_project_source", lambda p, s: 0)
 
     missing = xrf.detect_and_emit_missing_extras("/proj")
     assert missing == [clone.as_posix()]
@@ -755,11 +745,11 @@ def test_heal_reports_failure_and_stays_owed(tmp_path):
     assert outcomes == {clone.as_posix(): "analyzer_failed"}
 
 
-def test_refresh_extras_purges_disabled_paths(tmp_path, monkeypatch):
-    """ACT (item 4): the commit-stamp refresh purges the rows of an extra
-    root that is no longer enabled-or-primary — a DISABLED row here, a
-    REMOVED row (no config row at all) in the next test — and the enabled
-    loop is untouched by the purge."""
+def test_refresh_extras_purges_positively_gone_paths(tmp_path, monkeypatch):
+    """ACT: the commit-stamp refresh purges the rows of an extra folder the
+    hub POSITIVELY reports gone (disabled, or removed with its audit entry)
+    and the enabled loop is untouched by the purge. The full matrix of the
+    purge's gate is in tests/test_v02105_prune_fix_r1.py."""
     clone = _extra_tree(tmp_path)
     purged = []
 
@@ -769,95 +759,31 @@ def test_refresh_extras_purges_disabled_paths(tmp_path, monkeypatch):
 
     logs = []
     monkeypatch.setattr(cr, "primary_sources_for", lambda p: {"/proj"})
+    cfg = _Cfg([_Extra(clone.as_posix(), True, last_indexed_commit=None)],
+               gone=("/media/disabled-clone",))
     deps = xrf.Deps(
-        resolve=lambda r: _Cfg(
-            [_Extra(clone.as_posix(), True, last_indexed_commit=None),
-             _Extra("/media/disabled-clone", False)]),
+        resolve=lambda r: cfg,
         git_head=lambda p: None,  # enabled loop: no_git_head → up-to-date
         purge=_purge,
     )
-    monkeypatch.setattr(
-        "vco_lib.codegraph_resync.stored_project_sources",
-        lambda prefix: {clone.as_posix(), "/media/disabled-clone"})
     outcomes = xrf.refresh_extras(
         "/proj", "/analyzer.py", "/py", tmp_path / "state",
         lambda m: logs.append(m), deps=deps)
     assert purged == [("P", "/media/disabled-clone")], (
-        "exactly the no-longer-walkable source is purged (the enabled clone "
-        "and the primary root are in the keep set)"
+        "exactly the positively-gone source is purged"
     )
     assert any("purge-gone" in line and "deleted=4" in line
                for line in logs), "the purge logs its count"
     assert outcomes.get(clone.as_posix()) == "no_git_head"
 
 
-def test_purge_gone_covers_a_removed_row_and_stamps(tmp_path, monkeypatch):
-    """The launcher's Remove flow DELETES the config row and relied on the
-    union prune to drop the rows — the source-scoped prune keeps them now,
-    so the sweep must purge a stored source with NO config row at all. The
-    keep-set stamp stops the sweep from re-running when nothing changed."""
-    clone = _extra_tree(tmp_path)
-    purged = []
-    sweeps = []
-
-    def _stored(prefix):
-        sweeps.append(prefix)
-        return {clone.as_posix(), "/media/removed-clone"}
-
-    monkeypatch.setattr(cr, "primary_sources_for", lambda p: {"/proj"})
-    state = tmp_path / "state"
-    out = xrf.purge_gone_extra_paths(
-        "/proj", state,
-        resolve=lambda r: _Cfg([_Extra(clone.as_posix(), True)]),
-        purge=lambda prefix, src: purged.append(src)
-        or {"counts": {"P_CodeModule": 2}, "failures": 0},
-        stored_sources=_stored, log=lambda m: None)
-    assert purged == ["/media/removed-clone"], (
-        "a source with no config row (Removed in the launcher) is purged"
-    )
-    assert sweeps, "the sweep enumerated the stored sources"
-    # Second run with the SAME keep set: the stamp short-circuits the sweep.
-    sweeps.clear()
-    purged.clear()
-    out2 = xrf.purge_gone_extra_paths(
-        "/proj", state,
-        resolve=lambda r: _Cfg([_Extra(clone.as_posix(), True)]),
-        purge=lambda prefix, src: purged.append(src)
-        or {"counts": {"P_CodeModule": 2}, "failures": 0},
-        stored_sources=_stored, log=lambda m: None)
-    assert sweeps == [] and purged == [] and out2 == {}, (
-        "an unchanged keep set must not re-sweep"
-    )
-    assert out == {"/media/removed-clone": {
-        "counts": {"P_CodeModule": 2}, "failures": 0}}
-
-
-def test_purge_gone_deletes_nothing_on_undeterminable(tmp_path, monkeypatch):
-    monkeypatch.setattr(cr, "primary_sources_for", lambda p: {"/proj"})
-    called = []
-
-    def _stored(prefix):
-        return None
-
-    out = xrf.purge_gone_extra_paths(
-        "/proj", tmp_path / "state",
-        resolve=lambda r: _Cfg([_Extra("/gone", True)]),
-        purge=lambda prefix, src: called.append(src) or {},
-        stored_sources=_stored, log=lambda m: None)
-    assert out == {} and called == []
-    # No stamp was written: the next pass retries the sweep.
-    assert not (tmp_path / "state").exists() or not list(
-        (tmp_path / "state").glob("codegraph_extra_keep_*.json"))
-
-
 def test_purge_gone_swallows_config_failure(tmp_path):
     def _raise(root):
         raise RuntimeError("hub down")
 
-    assert xrf.purge_gone_extra_paths(
+    assert sp.purge_gone_extra_paths(
         "/proj", tmp_path / "state", resolve=_raise,
         purge=lambda p, s: pytest.fail("never run"),
-        stored_sources=lambda p: pytest.fail("never enumerated"),
         log=lambda m: None) == {}
 
 

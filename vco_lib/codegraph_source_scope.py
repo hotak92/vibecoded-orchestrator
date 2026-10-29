@@ -206,9 +206,9 @@ class PruneScope:
     #: The owned source forms of every root this walk covered (the primary
     #: root, plus this run's ``--extra-path`` roots).
     own_sources: Set[str]
-    #: True when legacy unstamped rows must be preserved: the project HAS a
-    #: registered extra code folder, so an empty ``project_source`` cannot be
-    #: attributed to the primary root.
+    #: True when legacy unstamped rows must be preserved: the project has (or
+    #: had) an extra code folder, or that is unknown, so an empty
+    #: ``project_source`` cannot be attributed to the primary root.
     legacy_unowned: bool
     #: ``--as-extra-path``: the walked root IS an extra folder, so an
     #: unstamped row is most likely the primary project's and is never judged.
@@ -225,14 +225,20 @@ class PruneScope:
 
 
 def project_has_registered_extras(project_root: Any) -> bool:
-    """Does THIS project have any registered extra code folder (enabled or
-    disabled)? Resolved through the ONE config resolver (hub-first).
+    """Has THIS project any extra code folder — enabled now, or disabled /
+    removed (the hub's ``code_graph_extra_paths_gone``)? Resolved through
+    the ONE config resolver (hub-first).
 
-    Soft-fail False (hub down / unregistered project): a hub outage is
-    transient, and a ``--prune-stale`` walk only ever runs behind an explicit
-    user-consented command — the alternative (fail toward preservation on
-    every hub-less machine, which can never have extras at all) would keep
-    primary legacy rows stale forever for no reason.
+    It decides whether a ``--prune-stale`` walk may judge legacy UNSTAMPED
+    rows (no ``project_source``) as the primary root's: only when the answer
+    is a POSITIVE "no extras, none removed". Anything unknown leans toward
+    KEEPING those rows (returns True): the hub is down or the project
+    unregistered, or the hub could not read its extras (it then serves the
+    enabled list empty and the gone list as unknown — the same DB failure
+    must not make an extra folder's legacy rows look like the primary's).
+    The cost of a wrong True is stale legacy rows kept one walk longer; the
+    cost of a wrong False is an extra folder's rows deleted (the 2026-10-29
+    incident class). An empty root is no project at all (False).
     """
     root = str(project_root or "").strip()
     if not root:
@@ -241,9 +247,14 @@ def project_has_registered_extras(project_root: Any) -> bool:
         from vco_lib import project_config
 
         cfg = project_config.resolve(root)
-        return bool(getattr(cfg, "code_graph_extra_paths", ()))
-    except Exception:  # noqa: BLE001 — hub down / unregistered project
-        return False
+    except Exception:  # noqa: BLE001 — hub down / unregistered: unknown ⇒ keep
+        return True
+    if getattr(cfg, "code_graph_extra_paths", ()):
+        return True
+    gone = getattr(cfg, "code_graph_extra_paths_gone", None)
+    if gone is None:
+        return True  # the hub could not say (read failure / older hub)
+    return bool(gone)
 
 
 def prune_scope_for_walk(
@@ -263,9 +274,10 @@ def prune_scope_for_walk(
     previous unscoped semantics.
 
     The legacy-row rule: an unstamped row (no ``project_source``) is
-    preserved (``legacy_unowned``) when the project has ANY registered extra
-    folder — attribution is unknowable — and judged as the primary root's
-    when it has none.
+    preserved (``legacy_unowned``) unless the project POSITIVELY has no extra
+    folder, enabled or removed (:func:`project_has_registered_extras` —
+    attribution is unknowable otherwise, and unknown keeps), and judged as
+    the primary root's only then.
     """
     raw = str(primary_root or "").strip()
     if not raw:

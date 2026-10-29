@@ -126,7 +126,10 @@ def extra_path_is_stale(head: Optional[str], last_indexed_commit: Optional[str])
     return last != h
 
 
-# ── v0.2.105 (prune lane): lost-extras detection + heal, disabled purge ─────
+# ── v0.2.105 (prune lane): lost-extras detection + heal ────────────────────
+#
+# (The purge of REMOVED/DISABLED extra folders lives in
+# vco_lib.codegraph_source_purge; refresh_extras calls it.)
 #
 # The pre-v0.2.105 `codegraph_orphan_interactions_pending` remedy re-walked the
 # project root with `--prune-stale`, which pruned every row the walk did not
@@ -166,7 +169,7 @@ def missing_extra_paths(
 
         resolve = project_config.resolve
     if count_rows is None:
-        from vco_lib.codegraph_resync import count_rows_for_project_source
+        from vco_lib.codegraph_source_purge import count_rows_for_project_source
 
         count_rows = count_rows_for_project_source
     try:
@@ -273,7 +276,9 @@ def detect_and_emit_missing_extras(project_root: str) -> "list[str]":
     try:
         from vco_lib.deferral_emit import emit
 
-        emit(Path(project_root), entry)
+        # Re-emitted on every session start while the heal is pending: keep
+        # the first detection time (and skip an unchanged rewrite).
+        emit(Path(project_root), entry, keep_first_detected=True)
     except Exception:  # noqa: BLE001 — ledger write is best-effort
         return []
     return missing
@@ -304,7 +309,7 @@ def heal_missing_extra_paths(
     if run is None:
         run = run_analyzer
     if count_rows is None:
-        from vco_lib.codegraph_resync import count_rows_for_project_source
+        from vco_lib.codegraph_source_purge import count_rows_for_project_source
 
         count_rows = count_rows_for_project_source
     if record is None:
@@ -356,102 +361,6 @@ def heal_missing_extra_paths(
                     Path(project_root), (MISSING_EXTRAS_CONDITION_ID,))
         except Exception:  # noqa: BLE001 — the clear never gates the heal
             pass
-    return outcomes
-
-
-def purge_gone_extra_paths(
-    project_root: str,
-    state_dir: Path,
-    *,
-    resolve: Optional[Callable[[str], object]] = None,
-    purge=None,
-    stored_sources=None,
-    log: Optional[Callable[[str], None]] = None,
-) -> dict[str, dict]:
-    """v0.2.105 (prune lane): purge the rows of extra roots that can no
-    longer be walked.
-
-    A stored ``project_source`` that is neither the primary root's form nor
-    a currently-ENABLED extra path belongs to a folder the owner disabled
-    or removed — disabling/removing is the intent to take it out of the
-    graph, and since the prune is source-scoped (v0.2.105) no walk deletes
-    those rows any more (the launcher's Remove flow used to rely on the
-    union prune doing it). Called from :func:`refresh_extras`; resumable
-    (a re-run finds only rows still present), soft-fail.
-
-    Cost gate: the sweep enumerates the stored sources ONLY when the
-    keep-set changed since the last completed sweep (a stamp under
-    ``state_dir``) — the steady state is one file read. An undeterminable
-    enumeration purges nothing and leaves the stamp untouched, so the next
-    refresh retries. Returns ``{source: report}``.
-    """
-    if resolve is None:
-        from vco_lib import project_config
-
-        resolve = project_config.resolve
-    if purge is None:
-        from vco_lib.codegraph_resync import purge_rows_for_project_source
-
-        purge = purge_rows_for_project_source
-    if stored_sources is None:
-        from vco_lib.codegraph_resync import stored_project_sources
-
-        stored_sources = stored_project_sources
-    if log is None:
-        def _nolog(_msg: str) -> None:  # callers pass the RunLog
-            return None
-
-        log = _nolog
-    outcomes: dict[str, dict] = {}
-    try:
-        cfg = resolve(project_root)
-    except Exception as exc:  # noqa: BLE001 — hub down: nothing to purge by
-        log(f"purge-gone: skip project={project_root}: config unavailable ({exc})")
-        return outcomes
-    prefix = getattr(cfg, "code_graph_collection_prefix", "") or ""
-    if not prefix:
-        return outcomes
-    from vco_lib.codegraph_resync import primary_sources_for
-
-    enabled = sorted({
-        (getattr(e, "path", "") or "").strip()
-        for e in getattr(cfg, "code_graph_extra_paths", ())
-        if getattr(e, "enabled", False)
-    } - {""})
-    keep = sorted(
-        (set(primary_sources_for(Path(project_root)) or set()) | set(enabled)))
-    stamp = state_dir / f"codegraph_extra_keep_{path_key(prefix)}.json"
-    try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        if stamp.exists():
-            import json as _json
-
-            prev = _json.loads(stamp.read_text(encoding="utf-8"))
-            if isinstance(prev, dict) and prev.get("keep") == keep:
-                return outcomes  # nothing registered changed since the sweep
-    except Exception:  # noqa: BLE001 — an unreadable stamp sweeps again
-        pass
-    stored = stored_sources(prefix)
-    if stored is None:
-        log("purge-gone: stored-source enumeration undeterminable — "
-            "nothing purged this pass")
-        return outcomes
-    for src in sorted(stored - set(keep)):
-        report = purge(prefix, src)
-        outcomes[src] = report
-        total = sum(report.get("counts", {}).values())
-        log(
-            f"purge-gone: source={src} prefix={prefix} "
-            f"deleted={total} failures={report.get('failures', 0)} "
-            "(extra code folder disabled or removed by the owner)"
-        )
-    try:
-        import json as _json
-
-        stamp.write_text(
-            _json.dumps({"keep": keep}), encoding="utf-8")
-    except Exception:  # noqa: BLE001 — an unwritable stamp only re-sweeps
-        pass
     return outcomes
 
 
@@ -838,17 +747,10 @@ class Deps:
     run_analyzer: Callable[..., AnalyzerResult] = run_analyzer
     record: Callable[[str, str, str, AnalyzerResult], tuple[bool, str]] = record_indexed
     now: Callable[[], float] = time.time
-    #: v0.2.105 (prune lane): the disabled-extra purge (None → the real
-    #: ``vco_lib.codegraph_resync.purge_rows_for_project_source``, imported
-    #: lazily so this module keeps its light import surface).
+    #: v0.2.105 (prune lane): the removed/disabled-extra purge (None → the
+    #: real ``vco_lib.codegraph_source_purge.purge_rows_for_project_source``,
+    #: imported lazily so this module keeps its light import surface).
     purge: "Optional[Callable[[str, str], dict]]" = None
-
-    def resolved_purge(self) -> "Callable[[str, str], dict]":
-        if self.purge is not None:
-            return self.purge
-        from vco_lib.codegraph_resync import purge_rows_for_project_source
-
-        return purge_rows_for_project_source
 
 
 def refresh_extras(
@@ -881,12 +783,14 @@ def refresh_extras(
         log(f"skip project={project_root}: no project id / code-graph prefix")
         return outcomes
 
-    # v0.2.105 (prune lane): rows of extra roots that can no longer be
-    # walked (disabled or removed) are purged before the enabled loop.
+    # v0.2.105 (prune lane): rows of extra folders the hub POSITIVELY
+    # reports removed or disabled are purged before the enabled loop.
     try:
+        from vco_lib.codegraph_source_purge import purge_gone_extra_paths
+
         purge_gone_extra_paths(
             project_root, state_dir, resolve=deps.resolve,
-            purge=deps.resolved_purge(), log=log)
+            purge=deps.purge, log=log)
     except Exception as exc:  # noqa: BLE001 — a purge failure never blocks the refresh
         log(f"purge-gone: ERROR unexpected: {exc!r}")
 
