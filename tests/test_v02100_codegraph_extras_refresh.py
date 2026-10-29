@@ -305,7 +305,7 @@ class _FakeHub(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"recorded": true}')
 
-    def log_message(self, *a):  # silence
+    def log_message(self, format, *args):  # noqa: A002 — base API name; silence
         pass
 
 
@@ -372,6 +372,21 @@ def _wait_lines(p: Path, want: int, tries: int = 100) -> list:
     return [ln for ln in p.read_text().splitlines() if ln.strip()] if p.exists() else []
 
 
+#: v0.2.105 (#512A): the Stop hook now ALSO spawns the HEAD-diff catch-up
+#: (``-m vco_lib.codegraph_head_catchup``), so a raw line count measures two
+#: modules. Every assertion here is about the EXTRAS refresh — filter to it.
+_EXTRAS_MARKER = "-m vco_lib.codegraph_extras_refresh"
+
+
+def _extras_lines(p: Path, want: int = 1, tries: int = 100) -> list:
+    for _ in range(tries):
+        hits = [ln for ln in (_wait_lines(p, want) if p.exists() else []) if _EXTRAS_MARKER in ln]
+        if len(hits) >= want:
+            return hits
+        time.sleep(0.05)
+    return [ln for ln in (_wait_lines(p, 1) if p.exists() else []) if _EXTRAS_MARKER in ln]
+
+
 def _hook_env(root: Path, shim: Path, stub: Path, interval: str) -> dict:
     return {**os.environ, "CLAUDE_PROJECT_DIR": str(root), "VCT_PYTHON": str(shim),
             "VCT_ANALYZER_SCRIPT": str(stub),
@@ -391,9 +406,9 @@ def _hook_case(tmp_path: Path, runner: list) -> None:
     r = subprocess.run(runner, input=stdin, capture_output=True, text=True, timeout=60,
                        env=_hook_env(root, shim, stub, "600"))
     assert r.returncode == 0, r.stderr
-    lines = _wait_lines(spawn_log, 1)
+    lines = _extras_lines(spawn_log, 1)
     assert len(lines) == 1, lines
-    assert lines[0].startswith("-m vco_lib.codegraph_extras_refresh --project-root "), lines
+    assert lines[0].startswith(f"{_EXTRAS_MARKER} --project-root "), lines
     assert f"--analyzer {stub}" in lines[0] and "--state-dir " in lines[0], lines
     assert (root / ".claude" / "state" / "codegraph_extras_check.ts").is_file()
 
@@ -401,12 +416,12 @@ def _hook_case(tmp_path: Path, runner: list) -> None:
     subprocess.run(runner, input=stdin, capture_output=True, text=True, timeout=60,
                    env=_hook_env(root, shim, stub, "600"))
     time.sleep(1.0)
-    assert len(_wait_lines(spawn_log, 1)) == 1
+    assert len(_extras_lines(spawn_log, 1)) == 1
 
     # Interval 0 → the next Stop checks again.
     subprocess.run(runner, input=stdin, capture_output=True, text=True, timeout=60,
                    env=_hook_env(root, shim, stub, "0"))
-    assert len(_wait_lines(spawn_log, 2)) == 2
+    assert len(_extras_lines(spawn_log, 2)) == 2
 
 
 @pytest.mark.skipif(not (shutil.which("bash") and shutil.which("python3")), reason="bash required")

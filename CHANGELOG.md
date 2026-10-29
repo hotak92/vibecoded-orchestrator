@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Code that arrives through a merge, a pull or a commit now reaches the code graph.** Until now only files saved through the editor were indexed, so a project whose work landed through git merges could drift arbitrarily far behind: one report found its graph six days and over a thousand commits stale while nothing said so. At the end of a turn the drain hook now also compares the commit your code graph was last built at with the current commit of your checkout, and indexes exactly the code files that changed in between — no git hook is installed in your repository and nothing runs inside a merge. A very large change, or one that removed files, is handled by the analyzer's existing incremental pass, which also removes the entries of deleted files. A history that was rewritten (the recorded commit no longer exists in your branch) is not guessed at: the incremental pass runs and the recorded commit is left alone. Sessions opened in a separate git worktree skip this, since worktree edits are deliberately not indexed. Progress and every skipped reason are logged in `.claude/logs/codegraph_head_catchup.log`.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed

@@ -585,6 +585,24 @@ struct ProjectConfigResponse {
     unmanaged_containers: Vec<String>,
     #[serde(default)]
     ssrf_extra_local_ports: Vec<u16>,
+    /// v0.2.105 (#512A) — the commit the project's PRIMARY code-graph root
+    /// was last analyzed at (`project_codegraph_bindings.
+    /// last_analyzed_commit`), or `null` when the project was never analyzed
+    /// (no binding row, or a seeded binding that still carries NULL).
+    ///
+    /// Consumer: `vco_lib.codegraph_head_catchup`, spawned detached by the
+    /// Stop hook (`templates/hooks/stop-codegraph-drain.{sh,ps1}`). It
+    /// compares this with the main checkout's HEAD and indexes the
+    /// `git diff --name-only <recorded>..HEAD` files — the code that arrives
+    /// through a merge, a pull or a shell commit, which the per-edit hook
+    /// never queues (field report 2026-10-29: a graph six days / 1,070
+    /// commits behind). The new baseline is recorded through
+    /// `POST /projects/{id}/codegraph/analyzed` (advance-only).
+    ///
+    /// Additive — pre-v0.2.105 clients ignore it and the Python parser
+    /// back-fills `None` for a pre-v0.2.105 hub. `schema_version` stays 1.
+    #[serde(default)]
+    code_graph_last_analyzed_commit: Option<String>,
 }
 
 /// One enabled extra codegraph path for the resolver response.
@@ -1309,6 +1327,12 @@ async fn project_config(
         external_collections: infra.external_collections,
         unmanaged_containers: infra.unmanaged_containers,
         ssrf_extra_local_ports,
+        // v0.2.105 (#512A): the primary root's analyzed commit, read from the
+        // SAME binding row that supplied `code_graph_collection_prefix`
+        // above.
+        code_graph_last_analyzed_commit: cg_binding
+            .as_ref()
+            .and_then(|b| b.last_analyzed_commit.clone()),
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -4116,6 +4140,53 @@ kg_tier_full = 0.8
                 "last_indexed_at is a launcher concern, not a resolver-wire field"
             );
         }
+    }
+
+    /// v0.2.105 (#512A): `/config` serves the PRIMARY root's recorded
+    /// `last_analyzed_commit` so the HEAD-diff catch-up can compare it with
+    /// the checkout's HEAD without opening launcher.db.
+    #[tokio::test]
+    async fn config_serves_the_recorded_primary_analyzed_commit() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-catchup", "catchupproj");
+
+        // Never analyzed → the key is PRESENT and null (never absent: a
+        // missing key would read as "old hub" to the Python client).
+        let resp = reqwest::get(format!("{}/projects/p-catchup/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(body.get("code_graph_last_analyzed_commit").is_some(),
+                "the field is always present; body={}", body);
+        assert!(body["code_graph_last_analyzed_commit"].is_null());
+
+        // After a successful catch-up stamps a commit, it is served verbatim.
+        h.0.set_project_codegraph_binding(
+            "p-catchup", "Catchupproj",
+            Some("CodeSage-Large-v2"), Some(2048),
+            Some("0123456789abcdef"), Some(1_700_000_000_000),
+            true, &empty_json_obj(),
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-catchup/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("code_graph_last_analyzed_commit").and_then(|v| v.as_str()),
+            Some("0123456789abcdef"),
+        );
+        // The ?key= single-field filter reaches it too.
+        let resp = reqwest::get(format!(
+            "{}/projects/p-catchup/config?key=code_graph_last_analyzed_commit", base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let one: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(one.get("code_graph_last_analyzed_commit").and_then(|v| v.as_str()),
+                   Some("0123456789abcdef"));
     }
 
     /// Disabled rows are filtered OUT of the resolver response. They
