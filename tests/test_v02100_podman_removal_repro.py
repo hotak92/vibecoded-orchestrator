@@ -104,8 +104,8 @@ def _image() -> str:
 
 
 def _container_id(name: str) -> str:
-    # v0.2.105: the ONE runtime-neutral lookup (the `{{.Id}}` template field
-    # is Docker-only — podman's is `.ID`).
+    # v0.2.105: the ONE shared lookup (vco_lib.containers) — no inline
+    # template probe here.
     from vco_lib.containers import container_id
 
     return container_id(_mine(name), PODMAN) or ""

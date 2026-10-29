@@ -192,10 +192,10 @@ def capture_live_mount(service: str, runtime: str, *, run: Optional[RunFn] = Non
     dest = destination(service)
     unknown: list[str] = []
     for name in names or container_names(service):
-        # v0.2.105: the ONE runtime-neutral lookup (the `{{.Id}}` template
-        # field is Docker-only — podman's is `.ID` — so the old probe read
-        # every podman host as UNKNOWN). The tri-state verdict keeps ABSENT
-        # and UNKNOWN apart exactly as before.
+        # v0.2.105: the ONE shared lookup (vco_lib.containers). The old
+        # `{{.Id}}` probe worked on podman too; the move is for the ONE
+        # home — and the tri-state verdict, which keeps ABSENT and UNKNOWN
+        # apart exactly as before.
         _entry, verdict = _containers.inspect_container_entry(name, runtime, run=_run)
         if verdict == "exists":
             raw = _sa._inspect_json(name, "{{json .Mounts}}", runtime, _run)

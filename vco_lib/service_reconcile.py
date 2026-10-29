@@ -2408,9 +2408,9 @@ def hand_to_vco_refusal(service: str, row: Optional[_se.EndpointRow]) -> Optiona
 
 
 def _container_exists(runtime: str, name: str, run: Optional[RunFn]) -> bool:
-    # v0.2.105: the ONE runtime-neutral lookup — the `{{.Id}}` template field
-    # is Docker-only (podman's is `.ID`), so the old probe answered "does not
-    # exist" for a running container on every podman host.
+    # v0.2.105: the ONE shared lookup (vco_lib.containers.container_id) —
+    # the old `{{.Id}}` probe worked on podman too; the move is for the
+    # one home, not a bug fix.
     return _containers.container_id(name, runtime, run=run) is not None
 
 

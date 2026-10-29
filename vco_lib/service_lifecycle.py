@@ -374,9 +374,9 @@ def _find_container(row: "_se.EndpointRow", runtime: str, run: RunFn) -> Optiona
         if name and name not in names:
             names.append(name)
     for name in names:
-        # v0.2.105: the ONE runtime-neutral lookup — the `{{.Id}}` template
-        # field is Docker-only (podman's is `.ID`), so the old probe found
-        # no container on any podman host.
+        # v0.2.105: the ONE shared lookup (vco_lib.containers.container_id)
+        # — the old `{{.Id}}` probe worked on podman too; the move is for
+        # the one home, not a bug fix.
         if _containers.container_id(name, runtime, run=run) is not None:
             return name
     return None

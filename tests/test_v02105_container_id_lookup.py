@@ -3,14 +3,15 @@
 """v0.2.105 — the ONE runtime-neutral container-id lookup
 (``vco_lib.containers.inspect_container_entry`` / ``container_id``).
 
-Pre-fix, every lookup shelled ``inspect --format '{{.Id}}'`` (or
-``'{{json .Id}}'``), a Go-template field that exists only on Docker —
-podman's is ``.ID``, so podman 4.9 answers ``can't evaluate field Id``
-with exit 125 and the old probes read a RUNNING container as missing
-(field 2026-10-23: ``hand-to-vco --service ollama`` refused a running
-``vco_ollama``; ``data_identity.capture_live_mount`` read every podman
-host as UNKNOWN). The fix inspects WITHOUT a template: the JSON array
-both runtimes print carries the id under the same ``"Id"`` key.
+Pre-fix, the lookups shelled Go-template forms: plain ``{{.Id}}`` — which
+WORKS on podman 4.9 too (verified live) — and the ``{{json .Id}}`` form
+``service_adoption._plan_all`` used, which podman 4.9 refuses with exit
+125 (``can't evaluate field Id in type interface {}``) while Docker
+accepts it. That one form was the whole pre-fix bug (field 2026-10-23:
+``hand-to-vco --service ollama`` refused a running ``vco_ollama``). The
+fix inspects WITHOUT a template everywhere — the JSON array both runtimes
+print carries the id under the same ``"Id"`` key — so no template-field
+spelling can differ between the engines again.
 """
 
 import json
@@ -48,8 +49,8 @@ def test_template_free_inspect_returns_the_id(payload):
         return _cp(argv, 0, payload)
 
     assert c.container_id("vco_ollama", "podman", run=run) == CID
-    # NO Go template anywhere in the probe — the docker-only `.Id` field
-    # never rides the argv again.
+    # NO Go template anywhere in the probe — no template-field spelling
+    # can differ between the engines again.
     assert seen["argv"] == ["podman", "inspect", "--type", "container",
                             "vco_ollama"]
 
@@ -126,22 +127,42 @@ def test_cli_prints_nothing_and_exits_one_when_absent(monkeypatch):
 
 
 class _Podman49:
-    """A fake machine that behaves like podman 4.9: the template-free
-    inspect answers, but any ``--format`` probe naming the docker-only
-    ``.Id`` field fails with exit 125 (verified live: ``can't evaluate
-    field Id``)."""
+    """A fake machine that behaves like podman 4.9 (verified live on
+    4.9.3): the template-free inspect answers with the JSON array, plain
+    ``{{.Id}}`` WORKS (prints the id, exit 0), and the ``{{json .Id}}``
+    form is the ONE template podman refuses (exit 125, ``can't evaluate
+    field Id in type interface {}``)."""
 
     def run(self, argv: list, **_kw) -> Any:
         argv = [str(a) for a in argv]
         if argv[1] == "inspect" and "--format" in argv:
             fmt = argv[argv.index("--format") + 1]
-            if ".Id" in fmt:
+            if fmt == "{{json .Id}}":
                 return _cp(argv, 125, "",
-                           "Error: template: inspect:1:18: can't evaluate "
+                           "Error: template: inspect:1:18: executing "
+                           '"inspect" at <.Id>: can\'t evaluate '
                            "field Id in type interface {}")
+            if fmt == "{{.Id}}":
+                return _cp(argv, 0, CID)
         if argv[1] == "inspect":
             return _cp(argv, 0, json.dumps([{"Id": CID}]))
         return _cp(argv)
+
+
+def test_podman_49_shape_plain_template_works_json_form_fails():
+    """The corrected premise, pinned: podman 4.9 ACCEPTS plain ``{{.Id}}``
+    (exit 0, the id) and refuses only ``{{json .Id}}`` (exit 125) — the
+    pre-v0.2.105 bug was that one form (service_adoption), not every
+    ``.Id`` template. The fake above must keep modelling this shape."""
+    m = _Podman49()
+    plain = m.run(["podman", "inspect", "--type", "container",
+                   "--format", "{{.Id}}", "vco_ollama"])
+    assert plain.returncode == 0
+    assert plain.stdout.strip() == CID
+    jsoned = m.run(["podman", "inspect", "--type", "container",
+                    "--format", "{{json .Id}}", "vco_ollama"])
+    assert jsoned.returncode == 125
+    assert "can't evaluate field Id" in jsoned.stderr
 
 
 def test_hand_to_vco_container_ref_lookup_survives_podman(tmp_path,
@@ -169,8 +190,9 @@ def test_hand_to_vco_container_ref_lookup_survives_podman(tmp_path,
 
 def test_live_podman_returns_the_running_vco_ollama_id():
     """Read-only live probe against this machine's runtime: the helper must
-    resolve the RUNNING ``vco_ollama`` container's id — exactly the lookup
-    that failed with the docker-only template field."""
+    resolve the RUNNING ``vco_ollama`` container's id — the same question
+    the one podman-broken template form (``{{json .Id}}``, service_adoption)
+    used to answer with exit 125."""
     if shutil.which("podman") is None:
         pytest.skip("no podman on this machine")
     live = subprocess.run(

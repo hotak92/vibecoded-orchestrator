@@ -359,13 +359,16 @@ def inspect_container_entry(
     into ``"not_found"`` — the two are different answers).
 
     Inspects WITHOUT a Go template — ``<runtime> inspect --type container
-    <name>`` — because the ``{{.Id}}`` / ``{{json .Id}}`` field the old
-    lookups shelled is DOCKER-ONLY: the Go-template field on podman is
-    ``.ID`` (podman 4.9 answers ``can't evaluate field Id`` with exit 125),
-    while the JSON array both runtimes print carries the id under the SAME
-    key ``"Id"`` (verified live on podman 4.9; Docker's container-inspect
-    JSON uses ``"Id"`` too). Only the template FIELD spelling differs,
-    never the JSON key. Read-only; never raises.
+    <name>`` — the ONE shape both runtimes answer identically. The template
+    forms the old lookups shelled were NOT uniformly portable: plain
+    ``{{.Id}}`` works on both podman 4.9 and Docker (verified live), but the
+    ``{{json .Id}}`` form ``service_adoption._plan_all`` used is refused by
+    podman 4.9 with exit 125 (``can't evaluate field Id in type
+    interface {}``) — the pre-fix bug this helper retired — and template
+    field spellings are the one place the engines may differ. The JSON
+    array both runtimes print for a template-free inspect carries the id
+    under the SAME key ``"Id"`` on both (Docker's container-inspect JSON
+    uses ``"Id"`` too). Read-only; never raises.
 
     ``run`` is the injectable subprocess runner (tests); the default goes
     through :func:`vco_lib.tool_search_dirs.run` like every default probe
