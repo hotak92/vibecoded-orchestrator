@@ -15,6 +15,11 @@
    MCP ``hybrid_search`` calls — never through the Bash command that ran the
    CLI — so it could never be scored. The drain now also reads the query of
    the chat's own ``kg-search search <query>`` Bash / PowerShell calls.
+3. A file the drain has claimed is decided on its routing fields too; its
+   ctx is read once, when its window clears a gate (compute time), so the
+   running chat's waiting files are never read in full. The agent stamp
+   rewrites the fields and copies the ctx byte for byte
+   (``update_pending_fields``).
 """
 
 from __future__ import annotations
@@ -274,6 +279,208 @@ class TestDrainPeeksReadHeadersOnly:
         assert summary["computed"] == 0
         assert reads == []
         assert len(list((tmp_path / ".claude/state/rl_pending").glob("*.json"))) == 8
+
+
+# --------------------------------------------------------------------------
+# A claimed file's ctx is read only when it is scored (compute time)
+# --------------------------------------------------------------------------
+
+
+def _waiting_chat(root: Path, n: int, *, sid: str = "live") -> "tuple[list[Path], Path]":
+    """``n`` hook files of chat ``sid`` and a transcript whose answer, after
+    every retrieval, is far below the gate (the files keep waiting)."""
+    now = int(time.time() * 1000)
+    paths = [_stage(root, sid, f"w{i:03d}", query=f"q{i}") for i in range(n)]
+    tp = root / "t" / f"{sid}.jsonl"
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text(json.dumps(_text("a short answer", now + 60_000)) + "\n")
+    return paths, tp
+
+
+def _count_full_reads(monkeypatch) -> list:
+    reads: list = []
+    real = cp.read_pending
+    monkeypatch.setattr(cp, "read_pending", lambda p: reads.append(Path(p).name) or real(p))
+    return reads
+
+
+def _ctx_bytes(path: Path) -> bytes:
+    span = cp._ctx_value_span(path)
+    assert span is not None
+    _fields, start, end = span
+    return path.read_bytes()[start:end]
+
+
+class TestClaimedFileCtxReadAtComputeTime:
+    def test_a_waiting_claimed_file_is_never_read_in_full_across_drains(
+            self, tmp_path: Path, monkeypatch) -> None:
+        paths, tp = _waiting_chat(tmp_path, 12)
+        before = {p.name: p.read_bytes() for p in paths}
+        reads = _count_full_reads(monkeypatch)
+        for _ in range(5):
+            summary = drain.drain_session(
+                "live", str(tp), project_root=str(tmp_path),
+                compute_fn=lambda *a, **k: pytest.fail("computed below the gate"))
+            assert summary["left"] == 12 and summary["computed"] == 0
+        assert reads == []
+        # Every file is back under its own name, untouched.
+        assert {p.name: p.read_bytes() for p in paths} == before
+
+    def test_a_file_that_fires_is_read_once_and_scored_as_an_eager_read_scores_it(
+            self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "10")
+        a, b = tmp_path / "a", tmp_path / "b"
+        now = int(time.time() * 1000)
+        for root in (a, b):
+            _stage(root, "live", "fire1", query="q fire",
+                   ctx=_big_ctx() | {"session_id": ""})
+            tp = root / "live.jsonl"
+            tp.write_text(json.dumps(_text("the answer " * 400, now + 60_000)) + "\n")
+
+        def _run(root: Path) -> "tuple[list, dict]":
+            calls: list = []
+
+            def _compute(task_id, answer, ctx, write=True):
+                calls.append((task_id, answer, json.dumps(ctx, sort_keys=True)))
+                return {"cited": {}}
+
+            summary = drain.drain_session("live", str(root / "live.jsonl"),
+                                          project_root=str(root), compute_fn=_compute)
+            return calls, summary
+
+        reads = _count_full_reads(monkeypatch)
+        new_calls, new_summary = _run(a)
+        assert [n for n in reads if n.startswith("live__fire1")] == reads
+        assert len(reads) == 1 and cp.CLAIM_MARK in reads[0]
+        # The pre-fix input: the claimed file parsed whole up front.
+        monkeypatch.setattr(cp, "read_pending_header", cp.read_pending)
+        old_calls, old_summary = _run(b)
+        assert new_calls == old_calls and len(new_calls) == 1
+        assert json.loads(new_calls[0][2])["session_id"] == "live"
+        assert new_summary == old_summary and new_summary["computed"] == 1
+        assert not list((a / ".claude/state/rl_pending").iterdir())
+
+    def test_an_ended_chats_file_is_read_in_full_only_when_it_is_scored(
+            self, tmp_path: Path, monkeypatch) -> None:
+        # The finalize pass: one ended chat's file fires at the final floors
+        # (read once, scored); another ended chat's file stays below every
+        # floor and is recorded unscored from its routing fields alone.
+        monkeypatch.setenv("RL_TERMINAL_CITATION_MIN_TOKENS", "50")
+        monkeypatch.setenv("RL_SOFT_CITATION_MIN_TOKENS", "50")
+        now = int(time.time() * 1000)
+        _stage(tmp_path, "old", "f1", query="q old")
+        _stage(tmp_path, "tiny", "f2", query="q tiny")
+        tdir = tmp_path / "t"
+        tdir.mkdir()
+        (tdir / "old.jsonl").write_text(json.dumps(_text("words " * 400, now + 60_000)) + "\n")
+        (tdir / "tiny.jsonl").write_text(json.dumps(_text("hi", now + 60_000)) + "\n")
+        (tdir / "live.jsonl").write_text(json.dumps(_text("hi", now + 60_000)) + "\n")
+        for sid in ("old", "tiny"):
+            assert cp.mark_session_ended(sid, tmp_path)
+        calls: list = []
+        reads = _count_full_reads(monkeypatch)
+        summary = drain.drain_session(
+            "live", str(tdir / "live.jsonl"), project_root=str(tmp_path),
+            compute_fn=lambda task_id, answer, ctx, write=True: calls.append(
+                (task_id, isinstance(ctx, dict) and "nodes" in ctx)) or {"cited": {}})
+        assert calls == [("f1", True)]
+        assert summary["finalized"] == 1 and summary["finalized_unscored"] == 1
+        assert len(reads) == 1 and reads[0].startswith("old__f1.json" + cp.CLAIM_MARK)
+
+    def test_an_unreadable_ctx_at_compute_time_leaves_the_file(
+            self, monkeypatch) -> None:
+        # A window that fires (anchored, far above the gate) with the lazy ctx.
+        monkeypatch.setattr(aw, "match_position_for_query", lambda *a, **k: (0, 0))
+        monkeypatch.setattr(aw, "extract_answer_window", lambda *a, **k: ("answer", True))
+        msgs = [{"role": "assistant", "content": "x"}]
+        head = {"task_id": "t", "query": "q", "source": "hook", "ts_ms": 1}
+
+        def _score(payload: dict, load_ctx=None) -> "tuple[str, str]":
+            return drain._score_payload(
+                payload, msgs, [], final_window=True, session_id="s", gate=0,
+                compute_fn=lambda *a, **k: pytest.fail("computed"),
+                token_count_fn=lambda _a: 10**6, load_ctx=load_ctx)
+
+        assert _score(dict(head), lambda: None) == ("left", "unreadable_payload")
+        assert _score(dict(head), lambda: {"ctx": [1]}) == ("skipped", "bad_payload")
+        # An eager caller (a payload that carries its ctx) is unchanged.
+        assert _score(dict(head, ctx="x")) == ("skipped", "bad_payload")
+
+
+class TestStampKeepsCtxByteForByte:
+    def test_agent_drain_stamp_rewrites_the_header_and_copies_the_ctx(
+            self, tmp_path: Path, monkeypatch) -> None:
+        # An unattributed retrieval this agent's transcript holds becomes the
+        # agent's file (the stamp), while it keeps waiting below the gate.
+        now = int(time.time() * 1000)
+        p = _stage(tmp_path, "live", "st1", query="stamp me")
+        cp.update_pending_fields(p, {cp.AGENT_WINDOW_FINAL_KEY: False, "agent_id": "ag1"})
+        ctx_before = _ctx_bytes(p)
+        tp = tmp_path / "t" / "live" / "subagents" / "agent-ag1.jsonl"
+        tp.parent.mkdir(parents=True)
+        tp.write_text(json.dumps(_text("short", now + 60_000)) + "\n")
+        monkeypatch.setenv("RL_TERMINAL_CITATION_MIN_TOKENS", "100000")
+        monkeypatch.setenv("RL_SOFT_CITATION_MIN_TOKENS", "100000")
+        reads = _count_full_reads(monkeypatch)
+        drain.drain_session("live", str(tp), project_root=str(tmp_path), agent_id="ag1",
+                            compute_fn=lambda *a, **k: pytest.fail("computed"))
+        assert reads == []
+        head = _head(p)
+        assert head["agent_transcript_path"] == str(tp)
+        assert head["agent_id"] == "ag1" and cp.AGENT_WINDOW_FINAL_KEY not in head
+        assert _ctx_bytes(p) == ctx_before
+        assert list(_read(p))[-1] == "ctx"
+
+    def test_the_rewrite_is_the_writers_layout_with_the_ctx_bytes_copied(
+            self, tmp_path: Path) -> None:
+        # Multibyte text everywhere, and a ctx past the 1 MiB copy chunk whose
+        # boundary splits a 3-byte character.
+        def _staged(pad: int) -> "tuple[Path, dict, int]":
+            ctx = {"t": "a" * pad + "€" * 400_000,
+                   "é": ["ü", 1.0000000000000002, -0.0, 1e-300]}
+            path = _stage(tmp_path, "s1", "b1", query="ünï €", ctx=ctx)
+            span = cp._ctx_value_span(path)
+            assert span is not None
+            return path, ctx, span[1]
+
+        def _splits(path: Path, start: int) -> bool:
+            return 0x80 <= path.read_bytes()[start + (1 << 20)] <= 0xBF
+
+        p, ctx, start = _staged(0)
+        if not _splits(p, start):
+            p, ctx, start = _staged(1)
+        if not _splits(p, start):
+            p, ctx, start = _staged(2)
+        assert _splits(p, start)  # the copy chunk ends mid-character
+        before = _ctx_bytes(p)
+        full = _read(p)
+        cp.update_pending_fields(p, {"agent_transcript_path": "/ä/x.jsonl"},
+                                 drop=("seq", "missing"))
+        assert _ctx_bytes(p) == before
+        full.pop("seq")
+        full["agent_transcript_path"] = "/ä/x.jsonl"
+        expected = tmp_path / "expected.json"
+        cp.write_pending(expected, full)
+        assert p.read_bytes() == expected.read_bytes()
+        assert _read(p)["ctx"] == ctx
+
+    def test_a_pre_writer_file_is_rewritten_whole_and_keeps_its_ctx(
+            self, tmp_path: Path) -> None:
+        p = _stage(tmp_path, "s1", "o1")
+        _rewrite(p, agent_transcript_path="/old.jsonl", late=[1, 2])  # fields after ctx
+        assert cp._ctx_value_span(p) is None
+        ctx = _read(p)["ctx"]
+        cp.update_pending_fields(p, {"agent_transcript_path": "/new.jsonl"})
+        payload = _read(p)
+        assert payload["ctx"] == ctx and list(payload)[-1] == "ctx"
+        assert payload["agent_transcript_path"] == "/new.jsonl" and payload["late"] == [1, 2]
+
+    def test_ctx_is_never_an_update(self, tmp_path: Path) -> None:
+        p = _stage(tmp_path, "s1", "c1")
+        with pytest.raises(ValueError):
+            cp.update_pending_fields(p, {"ctx": {}})
+        with pytest.raises(ValueError):
+            cp.update_pending_fields(p, {}, drop=("ctx",))
 
 
 # --------------------------------------------------------------------------

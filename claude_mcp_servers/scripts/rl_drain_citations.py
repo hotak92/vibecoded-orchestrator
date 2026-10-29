@@ -47,6 +47,7 @@ block may not be flushed yet. We treat a below-gate window as "retry later"
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import sys
@@ -112,17 +113,26 @@ def _stamp_agent_transcript(path, payload: dict, transcript_path: str) -> None:
     """Record the agent's own transcript in its pending file, so a later
     (parent) Stop drain can retry the file against the RIGHT answer source.
     Best-effort: a failed write only means the parent drain leaves the file
-    until the session's end finds the agent transcript beside the parent's."""
+    until the session's end finds the agent transcript beside the parent's.
+
+    v0.2.105: ``payload`` may be the routing fields only (the drain reads
+    the ctx at compute time); the stamp rewrites those fields and copies the
+    file's ctx byte for byte (``update_pending_fields``)."""
     try:
         from claude_mcp_servers.rl_client.citation_pending import (
             AGENT_WINDOW_FINAL_KEY,
-            write_pending,
+            update_pending_fields,
         )
 
         payload["agent_transcript_path"] = transcript_path
         # The agent's own drain stamps it: its window is final now (R5-9).
         payload.pop(AGENT_WINDOW_FINAL_KEY, None)
-        write_pending(path, payload)
+        update_pending_fields(
+            path,
+            {"agent_id": str(payload.get("agent_id") or ""),
+             "agent_transcript_path": transcript_path},
+            drop=(AGENT_WINDOW_FINAL_KEY,),
+        )
     except Exception:  # noqa: BLE001 — telemetry must not break the drain
         pass
 
@@ -137,6 +147,7 @@ def _score_payload(
     gate: int,
     compute_fn,
     token_count_fn,
+    load_ctx=None,
 ) -> "tuple[str, str]":
     """Score ONE claimed pending payload against an already-loaded answer
     transcript — the one scoring path, shared by every drain pass and the
@@ -153,6 +164,14 @@ def _score_payload(
     never be scored; ``("left", reason)`` otherwise (a live chat's file is
     handed back; a finalized one may be recorded as unscored). Never raises
     for a ``compute_fn`` failure (that is ``("left", "compute_failed")``).
+
+    ``load_ctx`` (v0.2.105): ``payload`` is the routing fields only
+    (``read_pending_header``) and ``load_ctx()`` returns the full payload.
+    It is called only once the window clears a gate — the one moment the
+    ctx is needed — so a file that keeps waiting for its chat's answer is
+    never read in full. A full read that fails leaves the file
+    (``"unreadable_payload"``); one whose ctx is not an object is
+    ``("skipped", "bad_payload")`` exactly as an eager read would be.
     """
     from claude_mcp_servers.rl_client.answer_window import (
         extract_answer_window,
@@ -160,9 +179,9 @@ def _score_payload(
         match_position_for_query,
     )
 
-    ctx = payload.get("ctx")
     task_id = payload.get("task_id") or ""
-    if not isinstance(ctx, dict) or not task_id:
+    lazy = load_ctx is not None and "ctx" not in payload
+    if not task_id or (not lazy and not isinstance(payload.get("ctx"), dict)):
         return "skipped", "bad_payload"
 
     if not messages:
@@ -240,6 +259,16 @@ def _score_payload(
             return "left", "below_floor"
 
     # At/above a gate → compute + write (the caller finishes: one-shot).
+    # v0.2.105: the ctx is read HERE, once, and only for a window that fires.
+    if lazy:
+        full = load_ctx() if load_ctx is not None else None
+        if not isinstance(full, dict):
+            return "left", "unreadable_payload"
+        ctx = full.get("ctx")
+        if not isinstance(ctx, dict):
+            return "skipped", "bad_payload"
+    else:
+        ctx = payload["ctx"]
     # v0.2.73 RL-6/RL-9: stamp the riders onto ctx so the citation event
     # stores where/why it fired. session_id prefers the value staged in
     # the ctx (RL-9 stage-time resolution), then the pending payload —
@@ -504,6 +533,7 @@ def drain_session(
             final_window=True,
             session_id=str(payload.get("session_id") or "") or owner or session_id,
             gate=gate, compute_fn=compute_fn, token_count_fn=token_count_fn,
+            load_ctx=functools.partial(read_pending, _claimed),
         )
         return None if outcome == "computed" else reason
 
@@ -613,7 +643,10 @@ def drain_session(
         if claimed is None:
             continue  # another drain owns it right now (or just consumed it)
         try:
-            payload = read_pending(claimed)
+            # v0.2.105: the routing fields again (the claim re-checks them);
+            # the ctx is read by _score_payload only once the window fires,
+            # so the running chat's waiting files are never read in full.
+            payload = read_pending_header(claimed)
             if not isinstance(payload, dict):
                 summary["skipped"] += 1
                 continue
@@ -660,6 +693,7 @@ def drain_session(
                 final_window=final_window,
                 session_id=session_id, gate=gate,
                 compute_fn=compute_fn, token_count_fn=token_count_fn,
+                load_ctx=functools.partial(read_pending, claimed),
             )
             if outcome == "computed":
                 summary["computed"] += 1
@@ -687,7 +721,7 @@ def drain_session(
                 if claimed is None:
                     continue
                 try:
-                    payload = read_pending(claimed)
+                    payload = read_pending_header(claimed)
                     if not isinstance(payload, dict):
                         continue  # unreadable: the collector records it
                     source = _answer_source(payload)
@@ -718,7 +752,7 @@ def drain_session(
                     if claimed is None:
                         continue  # the monitor / a drain holds it: kept below
                     try:
-                        payload = read_pending(claimed)
+                        payload = read_pending_header(claimed)
                         if (not isinstance(payload, dict) or payload.get("session_id")
                                 or payload.get("agent_id")
                                 or not _holds_query(

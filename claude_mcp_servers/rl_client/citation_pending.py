@@ -321,6 +321,13 @@ def _parse_leading_fields(text: str) -> "Optional[tuple[dict, bool]]":
     """The top-level fields before ``ctx``, parsed exactly (JSON decoder,
     one value at a time). ``(fields, saw_ctx)``; ``None`` when the text ends
     before ``ctx`` (or the object) does, or is not a JSON object."""
+    scanned = _scan_leading_fields(text)
+    return None if scanned is None else (scanned[0], scanned[1])
+
+
+def _scan_leading_fields(text: str) -> "Optional[tuple[dict, bool, int]]":
+    """:func:`_parse_leading_fields` plus the index in ``text`` where the
+    ``ctx`` VALUE starts (``-1`` when there is no ``ctx``)."""
     dec = json.JSONDecoder()
     ws = re.compile(r"\s*")
     i = ws.match(text, 0).end()  # type: ignore[union-attr]
@@ -332,20 +339,20 @@ def _parse_leading_fields(text: str) -> "Optional[tuple[dict, bool]]":
         while True:
             i = ws.match(text, i).end()  # type: ignore[union-attr]
             if text[i:i + 1] == "}":
-                return out, False
+                return out, False, -1
             key, i = dec.raw_decode(text, i)
             i = ws.match(text, i).end()  # type: ignore[union-attr]
             if not isinstance(key, str) or text[i:i + 1] != ":":
                 return None
             i = ws.match(text, i + 1).end()  # type: ignore[union-attr]
             if key == _CTX_KEY:
-                return out, True
+                return out, True, i
             value, i = dec.raw_decode(text, i)
             out[key] = value
             i = ws.match(text, i).end()  # type: ignore[union-attr]
             sep = text[i:i + 1]
             if sep == "}":
-                return out, False
+                return out, False, -1
             if sep != ",":
                 return None
             i += 1
@@ -407,8 +414,10 @@ def read_pending_header(path: "str | Path") -> Optional[dict]:
     the whole file is read instead. The one shape the tail cannot tell from
     the end of ``ctx`` — an object with several keys appended after ``ctx`` —
     is one no VCO writer has ever produced. ``None`` on soft-fail
-    (unreadable / not a JSON object), as :func:`read_pending`. Never use the
-    result to score: it has no ctx."""
+    (unreadable / not a JSON object), as :func:`read_pending`. The result
+    has no ctx: a scorer reads it with :func:`read_pending` at compute time,
+    and a write-back goes through :func:`update_pending_fields`, never
+    :func:`write_pending` (which would drop the ctx)."""
     try:
         size = os.stat(path).st_size
         if size <= _HEADER_FULL_READ_MAX:
@@ -445,6 +454,88 @@ def write_pending(path: "str | Path", payload: dict) -> None:
     if _CTX_KEY in payload:
         ordered[_CTX_KEY] = payload[_CTX_KEY]
     atomic_write_json(Path(path), ordered, indent=None, fsync=False)
+
+
+def _ctx_value_span(path: Path) -> "Optional[tuple[dict, int, int]]":
+    """``(fields before ctx, start, end)``: the byte range of the ``ctx``
+    VALUE in a file :func:`write_pending` laid out (ctx last, nothing after
+    it), read from the file's two ends. ``None`` when the two ends do not
+    prove that layout (a pre-v0.2.105 file with fields after ``ctx``, a file
+    without ``ctx``, a ctx whose tail cannot be told from a trailing field)."""
+    size = os.stat(path).st_size
+    with open(path, "rb") as fh:
+        head_b = fh.read(_HEADER_EDGE_BYTES)
+        tail_at = max(0, size - _HEADER_EDGE_BYTES)
+        fh.seek(tail_at)
+        tail_b = fh.read()
+    head = head_b.decode("utf-8", errors="ignore")
+    scanned = _scan_leading_fields(head)
+    if scanned is None or not scanned[1]:
+        return None
+    fields, _saw_ctx, idx = scanned
+    lead_b = head[:idx].encode("utf-8")
+    if head_b[:len(lead_b)] != lead_b:
+        return None  # the head did not decode byte for byte: no offset to trust
+    if _parse_trailing_fields(tail_b.decode("utf-8", errors="ignore")) != {}:
+        return None  # fields after ctx (or undecidable): not the ctx-last layout
+    body = tail_b.rstrip()
+    end = tail_at + len(body) - 1  # the object's closing brace
+    start = len(lead_b)
+    if not body.endswith(b"}") or end <= start:
+        return None
+    return fields, start, end
+
+
+def update_pending_fields(
+    path: "str | Path", updates: dict, drop: "tuple[str, ...]" = (),
+) -> None:
+    """Set ``updates`` and remove ``drop`` among the routing fields of one
+    pending file WITHOUT parsing its ctx (v0.2.105: the drain's agent stamp
+    on a file it only read the header of). The ctx bytes are copied verbatim
+    into the rewritten file — never decoded, never re-serialized — so a
+    write-back can neither lose nor alter them; the layout is
+    :func:`write_pending`'s (fields first, ``ctx`` last). A file whose layout
+    the two ends do not prove (a pre-v0.2.105 file with fields after ``ctx``)
+    is read whole and written back through :func:`write_pending` instead.
+    Atomic (tmp + replace); raises ``OSError`` for an unreadable file, like
+    :func:`write_pending`."""
+    if _CTX_KEY in updates or _CTX_KEY in drop:
+        raise ValueError("update_pending_fields never touches ctx")
+    p = Path(path)
+    span = _ctx_value_span(p)
+    if span is None:
+        payload = read_pending(p)
+        if not isinstance(payload, dict):
+            raise OSError(f"unreadable pending file: {p.name}")
+        for key in drop:
+            payload.pop(key, None)
+        payload.update(updates)
+        write_pending(p, payload)
+        return
+    fields, start, end = span
+    for key in drop:
+        fields.pop(key, None)
+    fields.update(updates)
+    # Exactly the bytes write_pending would produce around the ctx value:
+    # json.dumps' default separators, ensure_ascii off, a trailing newline.
+    prefix = json.dumps(fields, ensure_ascii=False)[:-1]
+    prefix += (", " if fields else "") + json.dumps(_CTX_KEY) + ": "
+    from vco_lib.atomic import atomic_text_stream  # noqa: PLC0415
+
+    # surrogateescape round-trips every byte, even a UTF-8 sequence a chunk
+    # boundary splits. The source is closed before the replace (Windows).
+    with atomic_text_stream(p, errors="surrogateescape", fsync=False) as out:
+        out.write(prefix)
+        with open(p, "rb") as src:
+            src.seek(start)
+            remaining = end - start
+            while remaining > 0:
+                chunk = src.read(min(1 << 20, remaining))
+                if not chunk:
+                    raise OSError(f"pending file shrank while rewriting: {p.name}")
+                out.write(chunk.decode("utf-8", errors="surrogateescape"))
+                remaining -= len(chunk)
+        out.write("}\n")
 
 
 def list_pending_for_session(
