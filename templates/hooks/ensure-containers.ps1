@@ -568,7 +568,10 @@ function Clear-ZombieState {
     param([string]$Name)
     $containerId = ""
     try {
-        $containerId = (& $Runtime inspect $Name --format '{{.Id}}' 2>$null | Out-String).Trim()
+        # v0.2.105: the runtime-neutral lookup lives in vco_lib (the `{{.Id}}`
+        # Go-template field is Docker-only - podman's is `.ID`, so the old
+        # probe always came back empty here and the runc delete never ran).
+        $containerId = (& $RunPy -m vco_lib.containers container-id $Name --runtime $Runtime 2>$null | Out-String).Trim()
     } catch { }
     if (Get-Command runc -ErrorAction SilentlyContinue) {
         $runcRoot = Get-RuncRoot

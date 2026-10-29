@@ -104,7 +104,11 @@ def _image() -> str:
 
 
 def _container_id(name: str) -> str:
-    return _run([PODMAN, "inspect", "--type", "container", "--format", "{{.Id}}", _mine(name)])["stdout"].strip()
+    # v0.2.105: the ONE runtime-neutral lookup (the `{{.Id}}` template field
+    # is Docker-only — podman's is `.ID`).
+    from vco_lib.containers import container_id
+
+    return container_id(_mine(name), PODMAN) or ""
 
 
 def _events(since: float, name: str) -> list:

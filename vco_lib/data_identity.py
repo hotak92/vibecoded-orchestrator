@@ -83,11 +83,6 @@ LIVE_UNKNOWN = "unknown"
 RunFn = Callable[..., "subprocess.CompletedProcess[str]"]
 LogFn = Callable[[str], None]
 
-#: podman ("Error: no such container x") and docker ("Error: No such
-#: container: x" / "No such object: x"). Anything else from a failed inspect
-#: (daemon down, permission) is "could not look", never "absent".
-_NO_SUCH = re.compile(r"\bno such (?:container|object)\b", re.IGNORECASE)
-
 
 def destination(service: str) -> str:
     """The container-side data path of *service*."""
@@ -197,13 +192,12 @@ def capture_live_mount(service: str, runtime: str, *, run: Optional[RunFn] = Non
     dest = destination(service)
     unknown: list[str] = []
     for name in names or container_names(service):
-        try:
-            res = _run([runtime, "inspect", "--type", "container", "--format", "{{.Id}}", name],
-                       capture_output=True, text=True, timeout=15)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            unknown.append(f"{name}: {exc}")
-            continue
-        if res.returncode == 0 and (res.stdout or "").strip():
+        # v0.2.105: the ONE runtime-neutral lookup (the `{{.Id}}` template
+        # field is Docker-only — podman's is `.ID` — so the old probe read
+        # every podman host as UNKNOWN). The tri-state verdict keeps ABSENT
+        # and UNKNOWN apart exactly as before.
+        _entry, verdict = _containers.inspect_container_entry(name, runtime, run=_run)
+        if verdict == "exists":
             raw = _sa._inspect_json(name, "{{json .Mounts}}", runtime, _run)
             if not isinstance(raw, list):
                 return LiveMount(LIVE_UNKNOWN, name, None,
@@ -213,10 +207,9 @@ def capture_live_mount(service: str, runtime: str, *, run: Optional[RunFn] = Non
                 if spec is not None and spec.destination == dest:
                     return LiveMount(LIVE_PRESENT, name, _as_row_mount(spec))
             return LiveMount(LIVE_PRESENT, name, None)
-        if res.returncode == 0 or _NO_SUCH.search(res.stderr or ""):
+        if verdict == "not_found":
             continue  # no such container under this name
-        tail = (res.stderr or "").strip().splitlines()
-        unknown.append(f"{name}: {tail[-1] if tail else f'inspect exited {res.returncode}'}")
+        unknown.append(f"{name}: inspect {verdict}")
     if unknown:
         return LiveMount(LIVE_UNKNOWN, detail="; ".join(unknown))
     return LiveMount(LIVE_ABSENT)

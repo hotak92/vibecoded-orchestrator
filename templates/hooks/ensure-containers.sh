@@ -433,7 +433,11 @@ compose_up_services() {
 # ---------------------------------------------------------------------------
 clear_zombie_state() {
     local name="$1" container_id runc_root
-    container_id="$($RUNTIME inspect "$name" --format '{{.Id}}' 2>/dev/null || echo "")"
+    # v0.2.105: the runtime-neutral lookup lives in vco_lib (the `{{.Id}}`
+    # Go-template field is Docker-only — podman's is `.ID`, so the old probe
+    # always came back empty here and the `runc delete` below never ran).
+    container_id="$("$RUN_PY" -m vco_lib.containers container-id "$name" \
+        --runtime "$RUNTIME" 2>/dev/null || echo "")"
     if command -v runc >/dev/null 2>&1; then
         runc_root="$(detect_runc_root || echo "")"
         if [ -n "$runc_root" ] && [ -n "$container_id" ]; then

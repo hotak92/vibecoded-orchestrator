@@ -92,6 +92,8 @@ __all__ = [
     "vco_prefixed_container_names",
     "find_existing_container",
     "classify_container_probe",
+    "inspect_container_entry",
+    "container_id",
     "UnknownServiceError",
     "ComposeIdentity",
     "compose_project_name",
@@ -344,6 +346,72 @@ def find_existing_container(
 #: API-level misses). Case-insensitive on stderr+stdout so either
 #: runtime's phrasing matches.
 _NO_SUCH_CONTAINER_RE = re.compile(r"no such (?:container|object)", re.IGNORECASE)
+
+
+def inspect_container_entry(
+    name: str, runtime: str = "podman", *,
+    run: Optional[Callable] = None,
+) -> "tuple[Optional[dict], str]":
+    """``(first inspect JSON entry or None, verdict)`` for one container —
+    the ONE runtime-neutral container lookup (v0.2.105). Verdict is
+    :func:`classify_container_probe`'s vocabulary: ``"exists"`` /
+    ``"not_found"`` / ``"error"`` (a probe that could not run never folds
+    into ``"not_found"`` — the two are different answers).
+
+    Inspects WITHOUT a Go template — ``<runtime> inspect --type container
+    <name>`` — because the ``{{.Id}}`` / ``{{json .Id}}`` field the old
+    lookups shelled is DOCKER-ONLY: the Go-template field on podman is
+    ``.ID`` (podman 4.9 answers ``can't evaluate field Id`` with exit 125),
+    while the JSON array both runtimes print carries the id under the SAME
+    key ``"Id"`` (verified live on podman 4.9; Docker's container-inspect
+    JSON uses ``"Id"`` too). Only the template FIELD spelling differs,
+    never the JSON key. Read-only; never raises.
+
+    ``run`` is the injectable subprocess runner (tests); the default goes
+    through :func:`vco_lib.tool_search_dirs.run` like every default probe
+    here. The caller resolves the runtime (the pin rule,
+    :func:`runtime_pin` / :func:`resolve`); this helper asks exactly the
+    runtime it is given.
+    """
+    try:
+        res = (run or _tsd.run)(
+            [runtime, "inspect", "--type", "container", name],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None, "error"
+    verdict = classify_container_probe(res)
+    if verdict != "exists":
+        return None, verdict
+    if not (res.stdout or "").strip():
+        # Exit 0 with no payload: no runtime does this for a container that
+        # exists — every pre-v0.2.105 call site read it as "not found", so
+        # that reading is kept (never "error": it would turn a benign probe
+        # answer into UNKNOWN for the tri-state callers).
+        return None, "not_found"
+    try:
+        doc = json.loads(res.stdout.strip())
+    except ValueError:
+        return None, "error"
+    entry = doc[0] if isinstance(doc, list) and doc else doc
+    if not isinstance(entry, dict):
+        return None, "error"
+    return entry, "exists"
+
+
+def container_id(
+    name: str, runtime: str = "podman", *,
+    run: Optional[Callable] = None,
+) -> Optional[str]:
+    """The container's full id (``7cc5e278…``), or ``None`` when it does not
+    exist (or could not be inspected) — the thin id-only face of
+    :func:`inspect_container_entry` (v0.2.105). Callers that must keep
+    "absent" and "could not tell" apart use :func:`inspect_container_entry`
+    directly. Read-only; never raises."""
+    entry, verdict = inspect_container_entry(name, runtime, run=run)
+    if verdict != "exists" or entry is None:
+        return None
+    return str(entry.get("Id", "") or "") or None
 
 
 def classify_container_probe(
@@ -1433,6 +1501,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     r.add_argument("--no-daemon", action="store_true", help="Skip the `<runtime> info` round-trip.")
     r.add_argument("--no-compose", action="store_true", help="Skip compose detection.")
+    # v0.2.105: the runtime-neutral container-id lookup for the hooks (A of the
+    # A>B>C rule — the .sh/.ps1 siblings call this CLI instead of mirroring the
+    # docker-vs-podman `.Id`/`.ID` template spelling; see `container_id`).
+    c = sub.add_parser(
+        "container-id", help="Print the container's full id; exit 0 found / 1 not.",
+    )
+    c.add_argument("name", help="Container name or id to inspect.")
+    c.add_argument("--runtime", default="podman", help="Container runtime to ask (default podman).")
     return p
 
 
@@ -1491,6 +1567,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 line += " " + " ".join(res.compose)
             print(f"{res.state.value}: {line} ({res.reason})")
         return RESOLVE_EXIT_CODES[res.state]
+    if args.cmd == "container-id":
+        cid = container_id(args.name, args.runtime)
+        if cid is None:
+            return 1
+        print(cid)
+        return 0
     return 2
 
 
