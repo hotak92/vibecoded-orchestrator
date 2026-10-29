@@ -364,8 +364,10 @@ def _zombie_entry(bound_prefix: str, slug: str, hits: list[dict], weaviate_url: 
     )
     prefixes = sorted({h["prefix"] for h in hits})
     lines = [
-        "# For your Claude assistant: these classes duplicate this project's code",
-        "# graph under a prefix derived from its launcher name; nothing reads them.",
+        "# For your Claude assistant: these classes look like this project's code",
+        "# graph written under a prefix derived from its launcher name; no VCO",
+        "# binding owns them. An UNREGISTERED folder with the same name could still",
+        "# use them, so ask the user whether any such folder exists before dropping.",
         "# Show the user the list and counts, and run the drop ONLY when they agree.",
         "# Never drop a class whose prefix a project is bound to (the command",
         "# re-checks that itself and refuses).",
