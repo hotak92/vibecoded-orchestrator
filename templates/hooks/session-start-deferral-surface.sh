@@ -74,6 +74,24 @@ project = Path(os.environ.get("VCO_DEFERRAL_PROJECT_DIR", "."))
 json_path = project / ".claude" / "context" / "UPDATE_DEFERRED.json"
 md_path = project / ".claude" / "context" / "UPDATE_DEFERRED.md"
 
+# --- v0.2.91 WP-H: owed-work retry trigger -------------------------------
+# The containers hook (same SessionStart batch) has by now attempted to start
+# the embedding backend. If the ledger carries an `auto_retryable` condition,
+# hand it to the DETACHED driver: it re-probes the backend itself and does
+# nothing while it is still down, so this hook never waits and never guesses.
+# The rule lives in vco_lib (ONE home, shared with the .ps1 sibling).
+# v0.2.105: it runs BEFORE the ledger is read — and so also on an EMPTY
+# ledger — because it first DETECTS owed work the ledger does not hold yet
+# (an enabled extra code folder whose rows are gone); the read below then
+# shows the entry it just registered.
+owed = []
+try:
+    from vco_lib.deferral_retry import session_start_owed_check  # type: ignore
+
+    owed = session_start_owed_check(project)
+except Exception:
+    owed = []
+
 # (condition_id, title, severity, command_to_apply) tuples.
 entries = []
 # (actionable_count, informational_count) from THE partition — Path 1 only.
@@ -141,20 +159,6 @@ if not entries and md_path.exists():
 
 if not entries:
     sys.exit(0)
-
-# --- v0.2.91 WP-H: owed-work retry trigger -------------------------------
-# The containers hook (same SessionStart batch) has by now attempted to start
-# the embedding backend. If the ledger carries an `auto_retryable` condition,
-# hand it to the DETACHED driver: it re-probes the backend itself and does
-# nothing while it is still down, so this hook never waits and never guesses.
-# The rule lives in vco_lib (ONE home, shared with the .ps1 sibling).
-owed = []
-try:
-    from vco_lib.deferral_retry import session_start_owed_check  # type: ignore
-
-    owed = session_start_owed_check(project)
-except Exception:
-    owed = []
 
 # One concise line per entry — id + title + severity; NOT the full bodies.
 if split is not None:

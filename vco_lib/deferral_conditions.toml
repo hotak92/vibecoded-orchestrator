@@ -1543,19 +1543,48 @@ no source reference at all (or only dangling ones; a live target without a \
 path is UNCERTAIN, never proof). Provably dead, but no walk re-embeds them \
 and the pre-fix prune preserved every anchor-less row while any file was \
 skipped, so they survived forever while the convergence probe read "0 stale \
-rows" over them. action_required, NOT auto_retryable: only a manual \
-consented `--run-resync --prune-stale` walk removes them (that walk DELETES \
-every unvisited row — a destructive, user-consented action the retry engine \
-must never take), so the WP-H dispatcher can never clear it and would only \
-burn full walks. Clear: the `probe:py:` re-count through the SAME \
-predicate the reaping uses — a POSITIVE zero clears (the consented walk \
-reaped the rows, or there were none); an unknown count never clears. The \
-analyzer also clears the entry directly after a reaping-enabled full \
---prune-stale walk whose re-count is zero, and the resync driver resolves \
-it in its converged branch — all three route through \
+rows" over them. action_required, NOT auto_retryable: only the manual \
+consented cleanup the entry prints removes them (a delete is a \
+user-consented action the retry engine must never take), so the WP-H \
+dispatcher can never clear it. v0.2.105 (prune lane): the printed command \
+is the TARGETED `--prune-orphan-interactions` pass \
+(`vco_lib.codegraph_source_purge.prune_orphan_interactions`), which deletes ONLY \
+the provably-dead unanchored rows the detection counted. The pre-v0.2.105 \
+remedy (`--run-resync --prune-stale`) re-walked the repo root and pruned \
+every unvisited row — deleting every ENABLED extra code folder's rows with \
+the orphans (2026-10-29 incident: 33,464 rows pruned, 727 expected, nothing \
+re-added them); a printed remedy must never be a whole-collection stale \
+prune again. Clear: the `probe:py:` re-count through the SAME predicate — \
+a POSITIVE zero clears (the targeted pass deleted the rows, or there were \
+none); the targeted pass also clears the entry itself after a clean run; \
+the analyzer clears it after a reaping-enabled full --prune-stale walk, and \
+the resync driver resolves it in its converged branch — all routes through \
 `count_orphan_interaction_rows`, one counting home. Rows whose non-primary \
-`project_source` belongs to an extra code folder are never counted: the \
-consented cleanup walk covers the repo root only."""
+`project_source` belongs to an extra code folder are never counted or \
+deleted: they converge on their own root's walk."""
+
+[conditions.codegraph_extra_rows_missing]
+class = "auto_retryable"
+owner = "vco_lib.codegraph_extras_refresh"
+clear_probe = "probe:py:codegraph_extra_rows_missing"
+retry_action = "retry:py:codegraph_extras_heal"
+emit_surfaces = ["ledger"]
+notes = """v0.2.105 (prune lane): an ENABLED extra code folder has 0 rows of \
+its own `project_source` in the project's code-graph prefix although the \
+folder exists and contains indexable files. The rows were lost — most often \
+by the pre-v0.2.105 `codegraph_orphan_interactions_pending` remedy, whose \
+project-root `--prune-stale` walk pruned every unvisited row including ALL \
+enabled extras' (2026-10-29 incident; third-party users who ran the printed \
+command hit the same silent loss) — and NOTHING re-adds them: the extras \
+refresh is commit-diff based against `last_indexed_commit`, so an unchanged \
+commit never re-indexes. Detection runs at session start \
+(`detect_and_emit_missing_extras`, wired through \
+`deferral_retry.session_start_owed_check`); the heal is the handler below — \
+a FULL non-incremental re-sync of each missing path with the Sync-button \
+argv (`build_extra_sync_argv(path, prefix, False, None, root)`), idempotent \
+and attempt-capped. Tri-state probe: the missing list is empty (positive \
+all-present) → False; missing → True; undeterminable (hub/Weaviate down) → \
+None, never a clear."""
 
 [conditions.residue_cleanup_pending]
 class = "action_required"

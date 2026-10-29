@@ -585,6 +585,17 @@ struct ProjectConfigResponse {
     unmanaged_containers: Vec<String>,
     #[serde(default)]
     ssrf_extra_local_ports: Vec<u16>,
+    /// v0.2.105 — extra code folders the owner POSITIVELY took out of this
+    /// project's code graph (`Db::list_gone_codegraph_extras`: disabled rows
+    /// plus removed rows with their `codegraph_extra_path_removed` audit
+    /// entry). `None` (JSON `null`) when the DB read failed — the same
+    /// failure that empties `code_graph_extra_paths` above — so a client can
+    /// tell "nothing was removed" from "the hub could not say". The
+    /// removed-extras purge (`vco_lib.codegraph_source_purge`) deletes rows
+    /// only for a listed path and never on `null`. Additive: an older client
+    /// ignores it; an older hub omits it, which the Python parser reads as
+    /// unknown.
+    code_graph_extra_paths_gone: Option<Vec<String>>,
 }
 
 /// One enabled extra codegraph path for the resolver response.
@@ -613,6 +624,58 @@ struct CodeGraphExtraPath {
     /// clients pass this through to `code-graph-analyze --since-commit
     /// <sha>` for incremental runs.
     last_indexed_commit: Option<String>,
+}
+
+/// Step 12 of the `/config` resolver: the ENABLED extras (`code_graph_extra_paths`)
+/// and the positively-gone ones (`code_graph_extra_paths_gone`).
+///
+/// Enabled rows only in the first list — disabled rows are kept in the DB for
+/// history + label preservation but the resolver hides them so hooks / Python
+/// clients don't try to match against paths the user has paused. Service
+/// degradation (v0.2.47): a failed DB read logs and serves the list EMPTY
+/// rather than failing the resolver, since the extras are an enrichment of the
+/// core response. v0.2.105: an empty list produced that way is NOT the same
+/// as "no extras" — so the gone list is `None` whenever EITHER read failed,
+/// and the removed-extras purge, which only acts on positive knowledge, does
+/// nothing (the 2026-10-29 incident class: an emptied list must never read as
+/// "every extra was removed").
+fn extras_and_gone(db: &Db, project_id: &str) -> (Vec<CodeGraphExtraPath>, Option<Vec<String>>) {
+    let enabled = match db.list_enabled_codegraph_extras(project_id) {
+        Ok(rows) => Some(
+            rows.into_iter()
+                .map(|r| CodeGraphExtraPath {
+                    path: r.path,
+                    enabled: r.enabled,
+                    last_indexed_commit: r.last_indexed_commit,
+                })
+                .collect::<Vec<_>>(),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "[vct-hub config_api] list_enabled_codegraph_extras failed; \
+                 returning empty (gone list: unknown)",
+            );
+            None
+        }
+    };
+    let gone = match db.list_gone_codegraph_extras(project_id) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "[vct-hub config_api] list_gone_codegraph_extras failed; \
+                 serving the gone list as unknown",
+            );
+            None
+        }
+    };
+    match enabled {
+        Some(list) => (list, gone),
+        None => (Vec::new(), None),
+    }
 }
 
 // ─── Handler ─────────────────────────────────────────────────────
@@ -1220,38 +1283,10 @@ async fn project_config(
         .to_string_lossy()
         .into_owned();
 
-    // 12. Project-extra codegraph paths (v0.2.47). Read enabled rows
-    // only — disabled rows are kept in the DB for history + label
-    // preservation but the resolver hides them so hooks / Python
-    // clients don't try to match against paths the user has paused.
-    // Service degradation: if the DB read fails (unlikely — same
-    // connection that produced all 11 prior reads), log + treat the
-    // field as empty rather than failing the resolver, since the
-    // extras are an enrichment of the core response. The fail mode
-    // we want to avoid is "one bug in a v0.2.47 path breaks every
-    // resolver call".
-    let code_graph_extra_paths: Vec<CodeGraphExtraPath> =
-        match h.0.list_enabled_codegraph_extras(&project.id) {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|r| CodeGraphExtraPath {
-                    path: r.path,
-                    enabled: r.enabled,
-                    last_indexed_commit: r.last_indexed_commit,
-                })
-                .collect(),
-            Err(e) => {
-                // Soft-fail degrade: the resolver answers with no extra paths
-                // rather than failing the whole /config request.
-                tracing::warn!(
-                    project_id = %project.id,
-                    error = %e,
-                    "[vct-hub config_api] list_enabled_codegraph_extras failed; \
-                     returning empty",
-                );
-                Vec::new()
-            }
-        };
+    // 12. Project-extra codegraph paths (v0.2.47) + the positively-gone
+    // ones (v0.2.105) — see `extras_and_gone`.
+    let (code_graph_extra_paths, code_graph_extra_paths_gone) =
+        extras_and_gone(&h.0, &project.id);
 
     // v0.2.102 W5-A (M3): this project's infrastructure declarations.
     let infra = match h.0.list_infra_declarations(&project.id) {
@@ -1309,6 +1344,7 @@ async fn project_config(
         external_collections: infra.external_collections,
         unmanaged_containers: infra.unmanaged_containers,
         ssrf_extra_local_ports,
+        code_graph_extra_paths_gone,
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -4157,6 +4193,62 @@ kg_tier_full = 0.8
         // time, not via auto-deletion.
         let all = h.0.list_codegraph_extras("p-mixed").unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// v0.2.105: the positively-gone list — a disabled row and a removed row
+    /// with its audit entry; an enabled row is never in it.
+    #[tokio::test]
+    async fn config_serves_positively_gone_code_graph_extra_paths() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-gone", "myproject");
+        h.0.add_codegraph_extra("p-gone", "/opt/active", None).unwrap();
+        h.0.add_codegraph_extra("p-gone", "/opt/paused", None).unwrap();
+        h.0.set_codegraph_extra_enabled("p-gone", "/opt/paused", false).unwrap();
+        h.0.audit(
+            "codegraph_extra_path_removed",
+            Some("p-gone"),
+            None,
+            &serde_json::json!({ "path": "/opt/removed" }),
+        )
+        .unwrap();
+
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-gone/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(
+            body.get("code_graph_extra_paths_gone"),
+            Some(&serde_json::json!(["/opt/paused", "/opt/removed"])),
+            "body={}",
+            body
+        );
+    }
+
+    /// v0.2.105 (the 2026-10-29 incident class): when the extras read FAILS
+    /// the enabled list is served empty (v0.2.47 soft-fail) AND the gone list
+    /// is `null` — "unknown", never "nothing / everything removed".
+    #[tokio::test]
+    async fn config_extras_read_failure_serves_gone_as_null() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-broken", "myproject");
+        h.0.add_codegraph_extra("p-broken", "/opt/active", None).unwrap();
+        h.0.lock()
+            .execute_batch("DROP TABLE project_codegraph_extra_paths")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-broken/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200, "the resolver still answers");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(body.get("code_graph_extra_paths"), Some(&serde_json::json!([])));
+        assert!(
+            body.get("code_graph_extra_paths_gone").map(|v| v.is_null()) == Some(true),
+            "a failed read is unknown, not an empty list; body={}",
+            body
+        );
     }
 
     /// `?key=code_graph_extra_paths` returns just the new field

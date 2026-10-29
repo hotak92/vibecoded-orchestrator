@@ -618,6 +618,15 @@ class ProjectConfig:
     external_collections: tuple[str, ...] = ()
     unmanaged_containers: tuple[str, ...] = ()
     ssrf_extra_local_ports: tuple[int, ...] = ()
+    #: v0.2.105 — extra code folders the owner POSITIVELY took out of this
+    #: project's code graph: disabled launcher.db rows, plus removed rows that
+    #: left a ``codegraph_extra_path_removed`` audit entry (and were not
+    #: re-added). ``None`` means UNKNOWN — the hub could not read its DB (it
+    #: then also empties ``code_graph_extra_paths``), or it is older than the
+    #: field. The removed-extras purge
+    #: (:func:`vco_lib.codegraph_source_purge.purge_gone_extra_paths`) deletes
+    #: rows only for a path listed here, and never on ``None``.
+    code_graph_extra_paths_gone: Optional[tuple[str, ...]] = None
 
 
 #: The resolver fields that are plain lists of declared values (v0.2.102 M3).
@@ -1527,6 +1536,13 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             external_collections=_str_list(body.get("external_collections")),
             unmanaged_containers=_str_list(body.get("unmanaged_containers")),
             ssrf_extra_local_ports=_port_list(body.get("ssrf_extra_local_ports")),
+            # v0.2.105: tri-state — a list (possibly empty) only when the hub
+            # sent one; absent/null/malformed → None (unknown, never "none").
+            code_graph_extra_paths_gone=(
+                _str_list(body.get("code_graph_extra_paths_gone"))
+                if isinstance(body.get("code_graph_extra_paths_gone"), list)
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(
