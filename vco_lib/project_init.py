@@ -10843,11 +10843,14 @@ def install_project_bundle(
         # does not exist degraded in total silence (empty search results, no
         # error from any component, field-observed for three days). The probe is
         # TRI-STATE: Weaviate unreachable yields "unknown", never "absent".
-        # v0.2.105 (Hive field case): `ensure_configured_collections` wraps the
-        # probe and CREATES a positively-absent configured class with the
-        # shipped schema (empty, additive — nothing existing is touched), so
-        # add/update heals the "every KG query returns nothing" state instead
-        # of printing a manual bootstrap-collections command.
+        # v0.2.105: `ensure_configured_collections` (implementation in
+        # `vco_lib.configured_collections`) wraps the probe and CREATES a
+        # positively-absent configured class with the shipped schema (empty,
+        # additive — nothing existing is touched) for the project's OWN
+        # collections, so add/update heals the "every KG query returns
+        # nothing" state instead of printing a manual bootstrap-collections
+        # command. A distinct SHARED_KG_COLLECTION is never auto-created —
+        # its warning stands (see the implementation's docstring).
         try:
             collections_check = ensure_configured_collections(
                 folder, weaviate_url, log_event=log_event,
@@ -10855,6 +10858,19 @@ def install_project_bundle(
             result["configured_collections"] = collections_check
             for _msg in collections_check.get("warnings", []):
                 result["warnings"].append(_msg)
+            # v0.2.105 fix round: the launcher toast reads `warnings[]` off
+            # stdout, and `created` previously reached only the install log —
+            # "reports it as created" was not true to the user. Surface a
+            # one-line summary (no error/failed marker → Info classification
+            # on both toast paths, same pattern as the symlink-redirect
+            # summary above).
+            _created = collections_check.get("created") or []
+            if _created:
+                result["warnings"].append(
+                    f"{len(_created)} missing configured collection(s) "
+                    f"created empty with the shipped schema: "
+                    f"{', '.join(sorted(_created))}"
+                )
         except Exception as e:  # noqa: BLE001 — a probe never blocks an install
             err = f"{type(e).__name__}: {e}"
             _log("4.bundle.configured-collections", "error",
@@ -11729,6 +11745,14 @@ def verify_configured_collections_exist(
         # disabled" — a choice, not a missing collection.
         if isinstance(val, str) and val.strip():
             configured.append((key, val.strip()))
+    # KG_COLLECTION == SHARED_KG_COLLECTION (the orchestrator root: one class
+    # serving both roles) must not be probed twice — pre-v0.2.105-fix it
+    # landed in `absent`/`present` twice, drew two warnings and made
+    # `ensure_configured_collections` report it twice. First key wins, and
+    # the fixed key order below puts the (creatable) KG_COLLECTION first.
+    _seen: set[str] = set()
+    configured = [(k, v) for k, v in configured
+                  if not (v in _seen or _seen.add(v))]
     if not configured:
         return out
 
@@ -11781,94 +11805,23 @@ def ensure_configured_collections(
     *,
     log_event: Optional[Callable[..., None]] = None,
 ) -> dict:
-    """v0.2.105 (Hive field case): CREATE a configured-but-missing class.
+    """v0.2.105: CREATE a positively-absent configured class with the
+    shipped schema — for the project's OWN collections only.
 
-    The v0.2.92 F-12(b) probe (:func:`verify_configured_collections_exist`)
-    only WARNED that a class named in ``.claude/settings.json`` ``env`` was
-    absent from Weaviate and printed a manual ``bootstrap-collections``
-    command — but a bundle install/update is exactly the moment the missing
-    class should come into being, and an EMPTY class with the shipped
-    schema is not destructive. Until this, a project whose configured KG
-    class had never been created got "every KG query returns nothing" from
-    every session, and the update report told the user to run a command
-    instead of running it.
-
-    Strictly additive, same safety shape as ``bootstrap_collections``:
-
-    * creation runs ONLY for a name the probe answered **absent** — never
-      for ``unknown`` (Weaviate unreachable is not evidence of absence,
-      F-1's lesson) and never for a class that exists (``_create_class``
-      is itself idempotent on an existing name);
-    * the definitions POSTed are the SAME ``kg_class_definition`` /
-      ``development_class_definition`` builders bootstrap-collections uses
-      (one schema home, no second table);
-    * nothing existing is ever dropped or rewritten.
-
-    Returns verify's dict extended with ``created`` (names this call
-    created) and, for a creation that FAILED, ``create_errors`` — the
-    original per-name warning then STANDS (it names the manual
-    ``bootstrap-collections`` command, the remediation when the automatic
-    create could not complete). Never raises.
+    The implementation lives in :mod:`vco_lib.configured_collections`
+    (v0.2.105 fix round: the file-size rule — this module was already past
+    14 000 lines when the ~96-line ensure logic landed as one contiguous
+    block); this shim keeps the historical
+    ``project_init.ensure_configured_collections`` import path stable and
+    delegates to it. See that module's docstring for the full safety shape.
+    ``SHARED_KG_COLLECTION`` is NEVER auto-created (it belongs to the
+    orchestrator root; auto-creating it on any other project would hide a
+    misconfiguration behind an empty class) — its F-12(b) warning stands.
     """
-    out = verify_configured_collections_exist(
-        folder, weaviate_url, log_event=log_event,
+    from vco_lib.configured_collections import (
+        ensure_configured_collections as _ensure,
     )
-    out["created"] = []
-    out["create_errors"] = []
-    if not out.get("absent"):
-        return out
-    try:
-        from vco_lib.knowledge_residue import project_settings_env
-        env = project_settings_env(Path(folder))
-    except Exception:  # noqa: BLE001 — cannot map name→schema; warn as before
-        return out
-
-    schema_by_key = {
-        "KG_COLLECTION": kg_class_definition,
-        "SHARED_KG_COLLECTION": kg_class_definition,
-        "DEVELOPMENT_COLLECTION": development_class_definition,
-    }
-    url = (weaviate_url or (env.get("WEAVIATE_URL") or "").strip()
-           or _weaviate_url_default())
-
-    for name in list(out["absent"]):
-        key = next(
-            (k for k in schema_by_key
-             if (env.get(k) or "").strip() == name),
-            None,
-        )
-        if key is None:
-            continue  # not one of the probed keys' values; warning stands
-        try:
-            _create_class(schema_by_key[key](name), weaviate_url=url)
-        except Exception as e:  # noqa: BLE001 — never blocks the install
-            err = f"{type(e).__name__}: {e}"
-            out["create_errors"].append({"collection": name, "error": err})
-            if log_event is not None:
-                try:
-                    log_event(
-                        "4.bundle.configured-collections", "warn",
-                        f"automatic create of absent configured collection "
-                        f"{name!r} failed: {err}",
-                        data={"collection": name, "error": err[:200]},
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-            continue  # the verify warning for this name stands
-        out["created"].append(name)
-        out["absent"].remove(name)
-        out["warnings"] = [w for w in out["warnings"] if name not in w]
-        if log_event is not None:
-            try:
-                log_event(
-                    "4.bundle.configured-collections", "ok",
-                    f"created absent configured collection {name!r} with the "
-                    f"shipped schema (empty; nothing existing was touched)",
-                    data={"collection": name, "action": "create"},
-                )
-            except Exception:  # noqa: BLE001
-                pass
-    return out
+    return _ensure(folder, weaviate_url, log_event=log_event)
 
 
 def _apply_standalone_env(
