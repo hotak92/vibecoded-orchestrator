@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Automatic context injections are more selective about relevance.** A field report found off-topic knowledge-graph suggestions getting through at scores between 0.66 and 0.70. Every injection surface's relevance floor has been raised to about the midpoint between the old value and the proposed one: Edit, Write, Bash-edit and agent-brief injections now need a score of at least 0.70 (was 0.65), Read, docs-Read and prompt-time injections need 0.725 (was 0.70), and Bash-read stays at 0.75. Weak matches below the floor are simply not injected; the number of hits per injection and per turn is unchanged.
+- **The rewritten tool calls of VCO's hooks are pinned by a regression test.** The Bash-output compression hook and the agent-brief knowledge-graph hook both answer with a rewritten tool input (`updatedInput`). A new test drives both hooks (bash and PowerShell flavours) end to end and pins that the rewritten input carries no field the original did not have, that no field's type changes, and that only the one sanctioned field is rewritten (`command` / `prompt`) — the contract newer Claude Code versions validate strictly.
 
 ## [0.2.104] - 2026-10-22
 
