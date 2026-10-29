@@ -649,16 +649,21 @@ pub async fn list_legacy_codegraph_collections(
         // (v0.2.105): this wizard is an explicit user action, so its
         // classes are counted live even though they sit outside every
         // project's read scope — and each successful count refreshes the
-        // launcher.db count cache. Failures → 0 (unchanged).
-        let count = vct_launcher_core::weaviate_counts::count_and_cache(&db, &client, &base, &name)
-            .await
-            .count
-            .unwrap_or(0) as u32;
-        if count == 0 {
+        // launcher.db count cache. A FAILED live count skips the class
+        // (the pre-v0.2.105 behaviour): the wizard never shows a cached
+        // number it could not verify live, because its emptiness check
+        // (count == 0) must rest on a fresh measurement (v0.2.105 fix).
+        let count = vct_launcher_core::weaviate_counts::wizard_display_count(
+            &vct_launcher_core::weaviate_counts::count_and_cache(&db, &client, &base, &name).await,
+        )
+        .map(|n| n as u32);
+        let count = match count {
+            Some(c) if c > 0 => c,
             // Skip empty classes either way — they're noise that lingers
-            // because Weaviate doesn't auto-delete on object drain.
-            continue;
-        }
+            // because Weaviate doesn't auto-delete on object drain — and
+            // skip classes whose live count FAILED (no cached fallback).
+            _ => continue,
+        };
         let entry = LegacyCodegraphCollection {
             class: name.clone(),
             suffix: suffix.to_string(),

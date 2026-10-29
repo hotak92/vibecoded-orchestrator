@@ -79,6 +79,11 @@ impl ClassCount {
 /// names are restricted to `[A-Za-z][A-Za-z0-9_]*`, so the name needs no
 /// quoting inside the GraphQL body.
 ///
+/// A 200 response that carries a GraphQL `errors` array, or whose count
+/// pointer is missing, is an ERROR ("unknown"), never a count: caching a
+/// GraphQL error as `0` would poison the cache with a fresh-timestamped
+/// zero for a class that may hold thousands of objects (v0.2.105 fix).
+///
 /// Replaces the former per-file copies in `commands/kg.rs`,
 /// `commands/project_identity.rs` and hub `cli_api.rs` (the boot-only
 /// copy in `db/access.rs` stays, see the module doc).
@@ -108,16 +113,22 @@ pub async fn fetch_class_count(
         .json()
         .await
         .map_err(|e| format!("parse {}: {}", class, e))?;
-    Ok(v.pointer(&format!("/data/Aggregate/{}/0/meta/count", class))
+    if let Some(errors) = v.get("errors").and_then(|e| e.as_array()) {
+        if !errors.is_empty() {
+            return Err(format!("graphql {}: response carried errors", class));
+        }
+    }
+    v.pointer(&format!("/data/Aggregate/{}/0/meta/count", class))
         .and_then(|n| n.as_u64())
-        .unwrap_or(0))
+        .ok_or_else(|| format!("graphql {}: no count in response", class))
 }
 
 /// Count `class` live and cache the result. On a live-fetch failure the
-/// last cached value (if any) is served instead — a count is display-only,
-/// so a Weaviate hiccup degrades to "stale number", never to an error.
-/// Used by the legacy/orphan wizard, which must have a real number for
-/// every class it inspects (its emptiness check is `count == 0`).
+/// last cached value (if any) is served instead, marked `live: false` —
+/// a count is display-only, so a Weaviate hiccup degrades to "stale
+/// number", never to an error — and the cache is NEVER written on that
+/// arm (an unknown count must not overwrite or seed a cached number).
+/// Used by the legacy/orphan wizard through [`wizard_display_count`].
 pub async fn count_and_cache(
     db: &Db,
     client: &reqwest::Client,
@@ -146,6 +157,21 @@ pub async fn count_and_cache(
             tracing::warn!("[vct] weaviate_counts: {} (serving cached count)", e);
             ClassCount::from_cache(db.collection_count_get(class).ok().flatten())
         }
+    }
+}
+
+/// The legacy/orphan wizard's display rule (v0.2.105 fix): ONLY a count
+/// measured LIVE right now may be shown. A live fetch that failed
+/// (`live: false`, possibly carrying a stale cached number) returns
+/// `None` — the caller SKIPS the class (the pre-v0.2.105 behaviour)
+/// instead of showing a cached value, because the wizard's emptiness
+/// decision (`count == 0`) must rest on a fresh measurement, and its
+/// delete path re-verifies live anyway.
+pub fn wizard_display_count(cc: &ClassCount) -> Option<u64> {
+    if cc.live {
+        cc.count
+    } else {
+        None
     }
 }
 
@@ -199,6 +225,18 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::sync::{Arc, Mutex};
 
+    /// What the fake serves for one class.
+    #[derive(Clone, Debug)]
+    enum Answer {
+        /// A successful GraphQL count.
+        Count(u64),
+        /// Make the live fetch fail with a non-2xx status.
+        HttpError,
+        /// Serve a 200 whose body carries a GraphQL `errors` array —
+        /// "unknown" under the v0.2.105 fix, never a count of 0.
+        GraphqlError,
+    }
+
     /// A minimal fake Weaviate over raw TCP (tokio, no new deps): serves
     /// `/v1/graphql` by extracting the class name out of the Aggregate
     /// query and answering with `counts[class]`, and records every class
@@ -210,9 +248,9 @@ mod tests {
     }
 
     impl FakeWeaviate {
-        /// `counts` maps class name → the count to serve. A class that
-        /// should make the live fetch FAIL maps to `None`.
-        async fn start(counts: Arc<Mutex<Vec<(String, Option<u64>)>>>) -> Self {
+        /// `counts` maps class name → what to serve. A class absent from
+        /// the map gets a 200 with no count pointer (also "unknown").
+        async fn start(counts: Arc<Mutex<Vec<(String, Answer)>>>) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
@@ -275,15 +313,19 @@ mod tests {
                             .find(|(n, _)| *n == class)
                             .cloned();
                         let (status, payload) = match entry {
-                            // None = "make the live fetch fail" (a non-2xx;
-                            // a 200 with a GraphQL error parses to count 0,
-                            // which is a SUCCESS as far as the fetch is
-                            // concerned — the historical semantics).
-                            Some((_, None)) => (
+                            Some((_, Answer::HttpError)) => (
                                 "HTTP/1.1 500 Internal Server Error",
                                 "{\"error\":\"boom\"}".to_string(),
                             ),
-                            Some((c, Some(n))) => (
+                            Some((_, Answer::GraphqlError)) => (
+                                "HTTP/1.1 200 OK",
+                                serde_json::json!({
+                                    "data": null,
+                                    "errors": [ { "message": "boom" } ]
+                                })
+                                .to_string(),
+                            ),
+                            Some((c, Answer::Count(n))) => (
                                 "HTTP/1.1 200 OK",
                                 serde_json::json!({
                                     "data": { "Aggregate": { c: [ { "meta": { "count": n } } ] } }
@@ -329,8 +371,8 @@ mod tests {
     #[tokio::test]
     async fn in_scope_classes_are_counted_live_and_cached() {
         let counts = Arc::new(Mutex::new(vec![
-            ("Own_KnowledgeGraph".to_string(), Some(11)),
-            ("Other_KnowledgeGraph".to_string(), Some(22)),
+            ("Own_KnowledgeGraph".to_string(), Answer::Count(11)),
+            ("Other_KnowledgeGraph".to_string(), Answer::Count(22)),
         ]));
         let fake = FakeWeaviate::start(counts).await;
         let db = Db::open_in_memory().expect("in-memory db");
@@ -363,8 +405,8 @@ mod tests {
     #[tokio::test]
     async fn out_of_scope_classes_come_from_the_cache_and_are_never_queried() {
         let counts = Arc::new(Mutex::new(vec![
-            ("Own_KnowledgeGraph".to_string(), Some(11)),
-            ("Other_KnowledgeGraph".to_string(), Some(22)),
+            ("Own_KnowledgeGraph".to_string(), Answer::Count(11)),
+            ("Other_KnowledgeGraph".to_string(), Answer::Count(22)),
         ]));
         let fake = FakeWeaviate::start(counts).await;
         let db = Db::open_in_memory().expect("in-memory db");
@@ -399,7 +441,7 @@ mod tests {
     async fn never_counted_out_of_scope_class_reads_as_unknown() {
         let counts = Arc::new(Mutex::new(vec![(
             "Own_KnowledgeGraph".to_string(),
-            Some(11),
+            Answer::Count(11),
         )]));
         let fake = FakeWeaviate::start(counts).await;
         let db = Db::open_in_memory().expect("in-memory db");
@@ -424,9 +466,9 @@ mod tests {
     #[tokio::test]
     async fn refresh_counts_every_class_once() {
         let counts = Arc::new(Mutex::new(vec![
-            ("A_KnowledgeGraph".to_string(), Some(1)),
-            ("B_CodeModule".to_string(), Some(2)),
-            ("C_CodeFunction".to_string(), Some(3)),
+            ("A_KnowledgeGraph".to_string(), Answer::Count(1)),
+            ("B_CodeModule".to_string(), Answer::Count(2)),
+            ("C_CodeFunction".to_string(), Answer::Count(3)),
         ]));
         let fake = FakeWeaviate::start(counts).await;
         let db = Db::open_in_memory().expect("in-memory db");
@@ -460,7 +502,7 @@ mod tests {
     async fn live_fetch_failure_serves_the_cached_value() {
         let counts = Arc::new(Mutex::new(vec![(
             "Flaky_KnowledgeGraph".to_string(),
-            None, // make the live fetch fail
+            Answer::HttpError, // make the live fetch fail
         )]));
         let fake = FakeWeaviate::start(counts).await;
         let db = Db::open_in_memory().expect("in-memory db");
@@ -498,5 +540,99 @@ mod tests {
             fake.asked.lock().unwrap().is_empty(),
             "an empty live scope must not Aggregate-query anything"
         );
+    }
+
+    // ── 7. a GraphQL error (or a missing count) is UNKNOWN, never 0 ──
+    //
+    // Pins the v0.2.105 fix: a 200 carrying `errors`, and a 200 whose
+    // count pointer is missing, are ERRORS. The pre-fix code did
+    // `.unwrap_or(0)` on the missing pointer, so Weaviate failing to
+    // count a class was cached as a FRESH 0 — a lie with a brand-new
+    // timestamp. Nothing may be written to the cache on that arm.
+    #[tokio::test]
+    async fn graphql_error_and_missing_count_are_unknown_and_never_cached() {
+        let counts = Arc::new(Mutex::new(vec![
+            // 200 + GraphQL errors array.
+            ("Broken_KnowledgeGraph".to_string(), Answer::GraphqlError),
+            // A REAL zero: a successful measurement of an empty class —
+            // still a count, still cached (the leave-alone side).
+            ("Empty_KnowledgeGraph".to_string(), Answer::Count(0)),
+        ]));
+        let fake = FakeWeaviate::start(counts).await;
+        let db = Db::open_in_memory().expect("in-memory db");
+        // "Pointerless_KnowledgeGraph" is NOT in the fake's map → the
+        // fake serves 200 {"data":{}} → the count pointer is missing.
+        let cls = classes(&[
+            "Broken_KnowledgeGraph",
+            "Empty_KnowledgeGraph",
+            "Pointerless_KnowledgeGraph",
+        ]);
+        let live = scope(&[
+            "Broken_KnowledgeGraph",
+            "Empty_KnowledgeGraph",
+            "Pointerless_KnowledgeGraph",
+        ]);
+        let out = resolve_counts(&db, &client(), &fake.url, &cls, &live).await;
+
+        // ACT: the GraphQL error is unknown ("—"), not a cached 0.
+        assert_eq!(out[0].count, None, "a GraphQL error must read as unknown");
+        assert!(!out[0].live);
+        assert!(
+            db.collection_count_get("Broken_KnowledgeGraph")
+                .expect("get")
+                .is_none(),
+            "a GraphQL error must NEVER be written to the cache (as 0 or anything else)"
+        );
+        // ACT: the missing count pointer is unknown too, and uncached.
+        assert_eq!(out[2].count, None, "a missing count must read as unknown");
+        assert!(
+            db.collection_count_get("Pointerless_KnowledgeGraph")
+                .expect("get")
+                .is_none(),
+            "a missing count must NEVER be written to the cache"
+        );
+        // LEAVE-ALONE: a measured zero IS a count — cached and shown.
+        assert_eq!(out[1].count, Some(0));
+        assert!(out[1].live, "a real zero was measured live");
+        assert_eq!(
+            db.collection_count_get("Empty_KnowledgeGraph")
+                .expect("get")
+                .map(|c| c.count),
+            Some(0),
+            "a real zero lands in the cache"
+        );
+    }
+
+    // ── 8. the wizard rule: a failed live count never shows a cached
+    //        number — the class is skipped (pre-v0.2.105 behaviour) ────
+    #[tokio::test]
+    async fn wizard_never_shows_a_cached_count_for_a_failed_live_count() {
+        let counts = Arc::new(Mutex::new(vec![
+            ("Stale_KnowledgeGraph".to_string(), Answer::HttpError),
+            ("Fresh_KnowledgeGraph".to_string(), Answer::Count(7)),
+        ]));
+        let fake = FakeWeaviate::start(counts).await;
+        let db = Db::open_in_memory().expect("in-memory db");
+        // A previous Refresh cached 42 for the class whose live count
+        // is about to fail — exactly the stale number the wizard must
+        // NOT show.
+        db.collection_count_set("Stale_KnowledgeGraph", 42).expect("seed");
+
+        let cls = classes(&["Stale_KnowledgeGraph", "Fresh_KnowledgeGraph"]);
+        let live = scope(&["Stale_KnowledgeGraph", "Fresh_KnowledgeGraph"]);
+        let out = resolve_counts(&db, &client(), &fake.url, &cls, &live).await;
+
+        // ACT: the failed live count → skip (None), never the cached 42.
+        assert_eq!(
+            wizard_display_count(&out[0]),
+            None,
+            "the wizard skips a class whose live count failed — no cached fallback"
+        );
+        // The cached value survives in the cache untouched (the listing
+        // surfaces may still serve it, marked not-live).
+        assert_eq!(out[0].count, Some(42));
+        assert!(!out[0].live);
+        // LEAVE-ALONE: a successful live count is shown.
+        assert_eq!(wizard_display_count(&out[1]), Some(7));
     }
 }
