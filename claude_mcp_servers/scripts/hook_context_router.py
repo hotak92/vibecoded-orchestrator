@@ -604,14 +604,20 @@ def _budget_gc(project_root: str) -> None:
     per-turn budget files after 1 day, and the L4 leg-warmer's
     ``warm_leg_*`` claim files after a week — :func:`vco_lib.atomic.claim_once`
     leaves a claim on disk by design, so without this sweep one file per
-    distinct missed cache key accumulated forever (review R1 C2)."""
+    distinct missed cache key accumulated forever (review R1 C2). Also the
+    warmer's HELD citation ctxs (``rl_warm_held/``) once the query cache
+    they belong to has expired: nobody can be shown that entry any more, so
+    the retrieval was never seen (v0.2.105)."""
     if not project_root:
         return
     now = time.time()
     try:
         state = Path(project_root) / ".claude" / "state"
         for pattern, max_age in (("inject_budget_*", BUDGET_GC_AGE_S),
-                                 ("warm_leg_*", WARM_LEG_GC_AGE_S)):
+                                 ("warm_leg_*", WARM_LEG_GC_AGE_S),
+                                 (f"{_WARM_HELD_DIRNAME}/*",
+                                  float(env_int("VCO_QUERY_CACHE_TTL", 900,
+                                                minimum=1)))):
             cutoff = now - max_age
             for f in list(state.glob(pattern))[:200]:
                 try:
@@ -944,6 +950,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
     kg_text = ""
     cg_text = ""
     kg_key = ""
+    kg_served_key = ""
     cg_keys: Dict[str, str] = {}
 
     if plan.kg_profile and plan.kg_query:
@@ -952,6 +959,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         cached = cache_get(project_root, kg_key)
         if cached is not None:
             kg_text = cached
+            kg_served_key = kg_key  # v0.2.105: may carry a warmer-held ctx
             kg_key = ""  # served; nothing to put back
     policy = cg_policy(plan.cg_profile) if plan.cg_profile else None
     cg_symbol_texts: List[str] = []
@@ -1090,6 +1098,10 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
             warm_spec["cg"] = dict(warm_cg, cache_key=next(iter(cg_keys.values())))
         if warm_spec:
             _spawn_leg_warmer(project_root, warm_spec)
+    if kg_served_key:
+        # The KG producer is the only leg that stages a citation ctx; a
+        # cache entry the L4 warmer filled is a retrieval first SHOWN now.
+        _promote_warm_held(project_root, kg_served_key)
     cg_text = "".join(cg_symbol_texts)
     return kg_text, cg_text
 
@@ -1142,13 +1154,113 @@ def _spawn_leg_warmer(project_root: str, legs_spec: Dict[str, Dict]) -> None:
         pass
 
 
+#: v0.2.105: the folder where the L4 warmer HOLDS the citation ctx its
+#: producer run would have staged (one ``<cache_key>.json`` per warmed key),
+#: instead of staging it into ``rl_pending``. Nobody has seen a warmed
+#: retrieval yet; it becomes a real retrieval only when an interactive run
+#: serves that cache entry, which then stages the held ctx
+#: (:func:`_promote_warm_held`). A held file nobody served expires with the
+#: query cache (:func:`_budget_gc`).
+_WARM_HELD_DIRNAME = "rl_warm_held"
+
+
+def _warm_held_path(project_root: str, key: str) -> Optional[Path]:
+    if not project_root or not re.fullmatch(r"[0-9a-f]{8,64}", key or ""):
+        return None
+    return Path(project_root) / ".claude" / "state" / _WARM_HELD_DIRNAME / f"{key}.json"
+
+
+def _install_warm_hold_interceptor(held: List[Dict]) -> None:
+    """In the ``--warm-legs`` child ONLY: replace
+    ``citation_pending.stage_pending`` so a producer run records its staging
+    call into ``held`` and writes NOTHING to ``rl_pending``. Same interception
+    point as :func:`_install_staged_ctx_run_id_wrapper` (the producers import
+    ``stage_pending`` lazily at call time). Returns ``None`` to the producer,
+    exactly like a soft-failed stage."""
+    import claude_mcp_servers.rl_client.citation_pending as _cp
+
+    def _hold(**kwargs):
+        held.append(dict(kwargs))
+        return None
+
+    _cp.stage_pending = _hold
+
+
+def _write_warm_held(project_root: str, key: str, held: List[Dict]) -> None:
+    path = _warm_held_path(project_root, key)
+    if path is None or not held:
+        return
+    from vco_lib.atomic import atomic_write_json
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, {"held": held}, indent=None, fsync=False)
+    except (OSError, TypeError, ValueError):
+        pass  # the RL label for an unseen retrieval is lost; the cache is not
+
+
+def _promote_warm_held(project_root: str, key: str) -> None:
+    """An interactive run served cache entry ``key``: if the L4 warmer held a
+    citation ctx for it, stage it NOW — through the module attribute, so the
+    run-id wrapper stamps it and :func:`_amend_pending_citations` prunes the
+    nodes this run does not show, exactly as for a fresh retrieval. The
+    session and agent are this run's (``stage_pending`` reads
+    ``VCT_AGENT_ID`` / ``VCT_BRIEF_TOOL_USE_ID``; the session resolves as the
+    KG producer resolves it), and the stage time is the time it was shown.
+    The held file is taken by an atomic rename, so two runs serving the same
+    entry stage it once. Soft-fail everywhere."""
+    path = _warm_held_path(project_root, key)
+    if path is None:
+        return
+    taken = path.with_name(f"{path.name}.{os.getpid()}.taken")
+    try:
+        os.replace(path, taken)
+    except OSError:
+        return  # nothing held (the common case), or a sibling run took it
+    try:
+        held = json.loads(taken.read_text(encoding="utf-8")).get("held")
+    except (OSError, ValueError, AttributeError):
+        held = None
+    finally:
+        try:
+            taken.unlink()
+        except OSError:
+            pass
+    if not isinstance(held, list):
+        return
+    try:
+        import claude_mcp_servers.rl_client.citation_pending as _cp
+        from claude_mcp_servers.rl_client.telemetry_emit import resolve_session_id
+    except Exception:  # noqa: BLE001 — never break the run for RL staging
+        return
+    session = resolve_session_id("")
+    for kwargs in held:
+        if not isinstance(kwargs, dict) or not isinstance(kwargs.get("ctx"), dict):
+            continue
+        kwargs = dict(kwargs)
+        kwargs.pop("agent_id", None)
+        if session:
+            kwargs["session_id"] = session
+        kwargs["project_root"] = project_root
+        try:
+            _cp.stage_pending(**kwargs)
+        except Exception:  # noqa: BLE001
+            continue
+
+
 def _warm_legs_main() -> int:
     """The ``--warm-legs`` child: re-run the specced producer legs with NO
     deadline and write their output into the query cache. Emits nothing,
-    records no seen-store, charges no budget — the interactive run owns all
-    of those; this process only warms the cache. Empty output is never
-    cached (§9, via :func:`cache_leg_output`), so a permanently-empty query
-    keeps re-probing exactly as before."""
+    records no seen-store, charges no budget and stages NO citation ctx —
+    the interactive run owns all of those; this process only warms the
+    cache. A citation ctx the producer would have staged is HELD beside the
+    cache entry instead (:func:`_install_warm_hold_interceptor`): until an
+    interactive run shows that entry, nobody has seen the retrieval, so it
+    is not a training label (v0.2.105). Empty output is never cached (§9,
+    via :func:`cache_leg_output`), so a permanently-empty query keeps
+    re-probing exactly as before — and its held ctx is dropped."""
+    held: List[Dict] = []
+    _install_warm_hold_interceptor(held)
     try:
         spec = json.loads(sys.stdin.read() or "{}")
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1180,10 +1292,13 @@ def _warm_legs_main() -> int:
             if inspect.iscoroutine(result):
                 asyncio.run(result)
 
+        held.clear()
         out = (_hds.run_legs({str(name): _run}) or {}).get(str(name)) or ""
         out = out.strip()
         if out:
             cache_leg_output(project_root, key, out + "\n")
+            if cache_get(project_root, key) is not None:
+                _write_warm_held(project_root, key, list(held))
     return 0
 
 
@@ -1751,8 +1866,10 @@ _EMIT_LOCK = threading.Lock()
 
 
 def _emit(text: str) -> None:
-    """Write one injection payload to stdout and flush it, atomically with
-    respect to the hard-deadline watchdog (a payload is never cut short)."""
+    """Write one injection payload to stdout and flush it under the lock the
+    hard-deadline watchdog takes: no payload starts after the deadline, and
+    one already being written gets ``_EMIT_GRACE_S`` to finish. A write
+    still blocked after that (a reader that stopped reading) is cut off."""
     with _EMIT_LOCK:
         print(text)
         try:

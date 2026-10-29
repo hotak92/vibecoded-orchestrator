@@ -233,6 +233,17 @@ def stage_pending(
     process); the drain routes agent-tagged files to the agent's own
     transcript (``rl_drain_citations.drain_session``).
     """
+    # v0.2.105: a session that keeps no transcript (a headless
+    # ``--no-session-persistence`` run, marked by the process that started
+    # it) can never have this ctx scored — stage nothing. Its RL retrieval
+    # event is emitted elsewhere and is unaffected. Hard vco_lib dependency,
+    # like the imports below.
+    from vco_lib.rl_citation_env import session_keeps_no_transcript  # noqa: PLC0415
+
+    if session_keeps_no_transcript():
+        logger.debug("stage_pending: session keeps no transcript; %s not staged",
+                     task_id[:8])
+        return None
     if agent_id is None:
         agent_id = os.environ.get("VCT_AGENT_ID", "")
     try:
