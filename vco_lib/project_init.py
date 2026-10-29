@@ -5793,105 +5793,22 @@ def _emit_bash_env_cleanup_deferral(
 
 
 def _resolve_codegraph_project_name(folder: Path) -> str:
-    """The name whose Weaviate code-graph classes belong to ``folder``.
+    """The code-graph collection prefix of ``folder`` ("" when nothing can
+    answer without guessing — the caller then does nothing).
 
-    Only from a source that KNOWS, in the order the analyzer itself is invoked
-    with:
-
-    1. ``CODE_GRAPH_PROJECT`` — the explicit code-graph binding, read from the
-       ONE canonical env surface (``.claude/settings.json`` ``env``) via
-       ``knowledge_residue``; no second env parser.
-    2. ``PROJECT_NAME`` — the project's display identity, same surface.
-    3. the identity SSOT, :mod:`vco_lib.project_identity`:
-
-       * folder IS a registered ``launcher.db`` project → that project's name.
-         AUTHORITATIVE, and it is what a moved or renamed folder needs: the
-         registered name is the one whose rows exist.
-       * the DB is readable and the folder is NOT registered → the folder
-         basename, which is not a guess here but the analyzer's OWN
-         ``--project`` default, and therefore the convention the standalone
-         (never-added-to-the-launcher) project's rows were written under...
-         **unless some OTHER registered project already answers to that
-         name**, in which case return "" — that collision (``~/a/myapp``
-         registered, ``~/b/myapp`` not) is the concrete route by which this
-         function would have re-indexed one project's source into another
-         project's rows.
-       * there is NO ``launcher.db`` on this machine at all → the basename.
-         A machine with no launcher has no registry for the folder to be
-         absent FROM, so nothing is being guessed at and no other project's
-         rows can exist to collide with. This is the free-tier / CLI-only
-         install, and it must keep working.
-       * a ``launcher.db`` EXISTS but could not be read → "".
-         ``resolve_identity``'s own contract: when nothing can be POSITIVELY
-         read, the caller "MUST NOT fall back to a basename-derived identity
-         — that fallback is the whole bug this module exists to kill". An
-         unreadable registry cannot tell the standalone case from the
-         registered-elsewhere case, so there the basename IS a guess.
-         (``resolve_snapshot`` reports both as ``resolvable=False``; the
-         file's existence is what separates "there is no registry" from
-         "the registry would not answer", and only the second must refuse.)
-
-    Empty string when none of those answer, and the caller then does nothing:
-    never guess a project name and act on another project's rows.
-
-    v0.2.92 R2 — this used to end in an UNCONDITIONAL basename fallback,
-    including when the DB was unreadable, which contradicted the promise in
-    the line above. The consequence here is milder than the blockers
-    ``project_identity`` was created for (this feeds a NON-destructive
-    background re-walk, so a wrong name pollutes rather than destroys) but the
-    resolution rule must not differ per blast radius — a second rule is how
-    the first one erodes.
-
-    Not resolving is cheap: the caller logs, does NOT stamp the generation,
-    and the next bundle update re-triggers. Every launcher-managed project
-    answers at tier 1 (``config_projection`` pins ``CODE_GRAPH_PROJECT`` into
-    ``.claude/settings.json`` ``env``) or tier 3-registered.
+    Thin delegate to the ONE resolver,
+    :func:`vco_lib.codegraph_project_prefix.resolve_codegraph_prefix` (hub
+    binding prefix → settings ``CODE_GRAPH_PROJECT`` → ``launcher.db`` binding
+    row → a name only when no binding exists, with the collision and
+    unreadable-registry refusals that module documents). v0.2.105: the old
+    inline resolver returned the REGISTERED NAME ahead of the binding row, so
+    a project whose name does not sanitize to its prefix was re-indexed into a
+    zombie class set. Kept under this name as the seam the reindex trigger and
+    its tests use.
     """
-    try:
-        from vco_lib import knowledge_residue as _kres
+    from vco_lib.codegraph_project_prefix import resolve_codegraph_prefix
 
-        env = _kres.project_settings_env(Path(folder)) or {}
-    except Exception:  # noqa: BLE001 — unreadable env surface ⇒ try the DB
-        env = {}
-    for key in ("CODE_GRAPH_PROJECT", "PROJECT_NAME"):
-        val = env.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    try:
-        from vco_lib import project_identity as _pid
-
-        basename = Path(folder).name.strip()
-        snapshot = _pid.resolve_snapshot()
-        if not snapshot.resolvable:
-            # Separate "there is no registry" from "the registry would not
-            # answer" — resolve_snapshot reports both as unresolvable. Reuses
-            # the ONE discovery home (VCT_LAUNCHER_DB_PATH env → the standard
-            # path) rather than re-implementing the lookup order here.
-            from vco_lib.launcher_db_reader import _discover_db_path
-
-            return basename if _discover_db_path() is None else ""
-        registered = snapshot.identity_for_folder(Path(folder))
-        if registered is not None:
-            return (registered.name or "").strip()
-        if not basename:
-            return ""
-        # Unregistered folder: the basename is the analyzer's own --project
-        # default, EXCEPT when another registered project already answers to
-        # it — that is the collision (~/a/myapp registered, ~/b/myapp not)
-        # that would re-index this source into that project's rows. Matched
-        # on the identity module's own normalisation, so case and separator
-        # variants collide too.
-        taken = {
-            _pid.normalise_for_match(p.name or "")
-            for p in snapshot.projects
-            if (p.name or "").strip()
-        }
-        if _pid.normalise_for_match(basename) in taken:
-            return ""
-        return basename
-    except Exception:  # noqa: BLE001 — could not look is never a verdict
-        return ""
+    return resolve_codegraph_prefix(folder)
 
 
 def _trigger_extractor_generation_reindex(
@@ -10418,6 +10335,17 @@ def install_project_bundle(
     # Soft-fail + background: the helper never raises and never blocks — it
     # spawns a detached, resumable walk with no global timeout, and degrades to
     # a deferral entry when the code-embed service is down.
+    # v0.2.105: a binding prefix that differs from the sanitized slug/name —
+    # re-target a resync entry that names the slug-derived prefix, and REPORT
+    # (never drop) zombie `<slug>_Code*` classes. All logic and its soft-fail
+    # live in vco_lib.codegraph_project_prefix (this file is under a ratchet).
+    if not dry_run:
+        from vco_lib.codegraph_project_prefix import heal_slug_prefix_divergence
+
+        if heal_slug_prefix_divergence(folder, log=_log).get("emitted"):
+            result["warnings"].append(
+                "duplicate code-graph classes found under the project's launcher "
+                "name — see UPDATE_DEFERRED.md (consented cleanup)")
     if not dry_run:
         try:
             _trigger_extractor_generation_reindex(
@@ -12819,7 +12747,7 @@ def _cmd_detect_orphan_code_collections(args: argparse.Namespace) -> int:
 
 
 def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
-    """`drop-orphan-code-collections --weaviate-url <url> --confirm [--json]`
+    """`drop-orphan-code-collections --weaviate-url <url> [--prefix P ...] --confirm [--json]`
 
     CONSENTED drop of LIVE-schema orphan code classes. RE-VALIDATES against the
     CURRENT launcher bindings + CURRENT live schema at RUN TIME (re-probe-
@@ -12864,6 +12792,14 @@ def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # v0.2.105: `--prefix P` (repeatable) narrows the re-validated set to the
+    # classes of the named prefix(es) — the consented drop the
+    # `codegraph_slug_prefix_zombie_classes` entry prints. It only NARROWS:
+    # a class must still be an orphan by the run-time re-validation above.
+    _only = {p.strip().lower() for p in (getattr(args, "prefix", None) or []) if p.strip()}
+    if _only:
+        to_drop = [c for c in to_drop if (_d := _strip_known_suffix(c, _CODEGRAPH_SUFFIXES))
+                   and _d[0].lower() in _only]
     result: dict = {"dropped": [], "errors": [], "revalidated_count": len(to_drop)}
     for cls in to_drop:
         try:
@@ -14269,6 +14205,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                          help="Override Weaviate URL.")
     p_dropo.add_argument("--confirm", action="store_true",
                          help="Required — this is a destructive operation.")
+    p_dropo.add_argument("--prefix", action="append", default=None,
+                         help="Drop only the orphan classes of this code-graph "
+                              "prefix (repeatable). Narrows, never widens.")
     p_dropo.add_argument("--json", action="store_true",
                          help="Emit a single JSON object on stdout.")
     p_dropo.set_defaults(func=_cmd_drop_orphan_code_collections)

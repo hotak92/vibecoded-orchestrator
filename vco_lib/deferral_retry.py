@@ -823,11 +823,19 @@ def retry_codegraph_resync(ctx: RetryContext) -> RetryResult:
 
 
 def _project_name(folder: Path) -> Optional[str]:
-    """Project name for the analyzer, resolved by the ONE existing helper."""
-    try:
-        from vco_lib.paths import resolve_project_name
+    """The analyzer ``--project`` value: the folder's code-graph COLLECTION
+    PREFIX, from the ONE resolver (:mod:`vco_lib.codegraph_project_prefix`).
 
-        return resolve_project_name(folder)
+    v0.2.105: this used ``paths.resolve_project_name``, which returns the hub's
+    ``code_graph_project`` — the launcher SLUG. The analyzer sanitized
+    ``orchestrator-root`` to ``Orchestrator_root`` and every retry re-walked
+    the orchestrator root into a zombie class set, so the resync entry could
+    never converge. ``None`` when nothing resolves (the callers skip or let the
+    analyzer apply its own default)."""
+    try:
+        from vco_lib.codegraph_project_prefix import resolve_codegraph_prefix
+
+        return resolve_codegraph_prefix(folder) or None
     except Exception:  # noqa: BLE001 — analyzer defaults to the dir name
         return None
 

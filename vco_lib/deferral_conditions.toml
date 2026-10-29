@@ -1515,6 +1515,23 @@ all pass it, and the dispatcher BLOCKS a stale verdict BEFORE writing the \
 STARTED row — a persistently stale image therefore burns NO retry budget and \
 the retry resumes by itself once the image is rebuilt and current."""
 
+[conditions.codegraph_slug_prefix_zombie_classes]
+class = "action_required"
+owner = "vco_lib.codegraph_project_prefix"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.105. A registered project whose code-graph binding prefix \
+differs from its sanitized launcher slug/name (the orchestrator root: slug \
+`orchestrator-root`, prefix `VibeCodedOrchestrator`) was re-walked by pre-fix \
+retries into `<sanitized slug>_Code*` classes that nothing reads. Emitted by \
+`codegraph_project_prefix.heal_slug_prefix_divergence`, which every bundle \
+update runs (`project_init.install_project_bundle`, the root included): it \
+lists the live classes of the slug/name-derived prefix that NO binding owns, \
+with row counts, and prints the consented `drop-orphan-code-collections \
+--prefix <p> --confirm` (re-validated at run time). Never auto-dropped (rule 1). \
+Paired clear: the same heal resolves the cid when a READ of the live schema \
+finds none; an unreadable schema or binding keep-set leaves the entry as is."""
+
 [conditions.codegraph_orphan_interactions_pending]
 class = "action_required"
 owner = "vco_lib.codegraph_resync"

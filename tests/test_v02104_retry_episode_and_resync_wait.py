@@ -368,6 +368,7 @@ def test_install_trigger_passes_the_wait_flag_and_the_ledger_folder():
         "PROJECT_ROOT": Path("/nonexistent-root"), "DeferralReport": DeferralReport,
         "_log_install_event": lambda *a: None,
         "_derive_orchestrator_project_name": lambda: "MyProj",
+        "_root_codegraph_prefix": lambda: "MyProj",  # v0.2.105: the binding prefix
     }
     exec(compile(body, "install.py", "exec"), ns)  # noqa: S102 — the real shim body
     with mock.patch.object(cr, "spawn_background_resync", _spawn_stub), \

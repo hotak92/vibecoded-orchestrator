@@ -14347,7 +14347,7 @@ def _trigger_codegraph_maintenance(deferral_report: "DeferralReport") -> None:
     try:  # v0.2.96 (M-2): truncation-exposure detection — logic in vco_lib
         from vco_lib.code_embed_exposure import detect_and_queue
         detect_and_queue(PROJECT_ROOT, PROJECT_ROOT,
-                         _derive_orchestrator_project_name(),
+                         _root_codegraph_prefix(),
                          log_event=_log_install_event)
     except Exception as exc:  # noqa: BLE001 — never crash the update
         _log_install_event("code_embed_exposure", "warn", f"raised: {exc}")
@@ -14357,24 +14357,24 @@ def _trigger_codegraph_maintenance(deferral_report: "DeferralReport") -> None:
 def _trigger_codegraph_embed_resync(deferral_report: "DeferralReport") -> None:
     """v0.2.72 (P7) thin shim: trigger the revision-gated code-graph resync.
 
-    All real logic lives in ``vco_lib.codegraph_resync`` (install.py is a
-    mega-file — per the modularity rule, new logic goes to a helper module).
-    This shim only resolves the orchestrator's own code-graph project name and
-    hands it to ``trigger_update_resync`` (v0.2.104 extraction, install line
-    ratchet): the venv-python probe, ``spawn_background_resync`` (background,
-    no global timeout; R-6 owed-probe gated; waits for a code_embed this update
-    just restarted) and ``report_trigger_result`` (prints, event log, the
-    deferred entry, the ``not_owed`` resolve of
-    ``codegraph_embed_resync_pending``). Soft-fail throughout: an error here is
-    a log line, never a crash — the resync is not a gating step.
+    All logic lives in ``vco_lib.codegraph_resync.trigger_update_resync``
+    (venv probe, owed-gated background spawn, report + deferral). This shim
+    only resolves the root's code-graph prefix (:func:`_root_codegraph_prefix`).
+    Soft-fail: an error is a log line, never a crash.
     """
     try:
         from vco_lib.codegraph_resync import trigger_update_resync
     except Exception as exc:  # noqa: BLE001 — missing helper must not wedge update
         _log_install_event("codegraph_resync", "warn", f"codegraph_resync helper unavailable: {exc}")
         return
-    trigger_update_resync(PROJECT_ROOT, _derive_orchestrator_project_name(),
-                          deferral_report, _log_install_event)
+    trigger_update_resync(PROJECT_ROOT, _root_codegraph_prefix(), deferral_report, _log_install_event)
+
+
+def _root_codegraph_prefix() -> str:
+    """The root's code-graph prefix: its BINDING (v0.2.105, never the slug), else the install default."""
+    from vco_lib.codegraph_project_prefix import resolve_codegraph_prefix
+    return (resolve_codegraph_prefix(PROJECT_ROOT, authoritative_only=True)
+            or _derive_orchestrator_project_name())
 
 
 def _trigger_codegraph_identity_sweep(deferral_report: "DeferralReport") -> None:
@@ -14385,7 +14385,7 @@ def _trigger_codegraph_identity_sweep(deferral_report: "DeferralReport") -> None
     del deferral_report  # audit recorded inside the helper; kept for parity
     try:
         from vco_lib.codegraph_resync import identity_sweep_if_stale
-        project_name = _derive_orchestrator_project_name()
+        project_name = _root_codegraph_prefix()
         moved = identity_sweep_if_stale(PROJECT_ROOT, project_name)
     except Exception as exc:  # noqa: BLE001 — never crash the update
         _log_install_event(
