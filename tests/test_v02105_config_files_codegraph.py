@@ -248,6 +248,22 @@ def test_rule2_cooccurrence_high_distinctive_medium_generic_none() -> None:
     assert _links(idx, {"speed"}, {"speed", "c.ini"}) == {"ini:S/speed": "high"}  # basename cooc
 
 
+def test_rule2_cooccurrence_never_lifts_a_generic_or_tiny_key() -> None:
+    """L5: co-occurrence upgrades only a key past the rule-1 floor; a 1-char
+    or stoplisted key gets no link, whatever co-occurs with it."""
+    idx = _index({"c.json": '{"a": {"x": 1, "name": 2, "rpm": 3}}'})
+    assert _links(idx, {"x"}, {"x", "a"}) == {}                       # < 3 chars
+    assert _links(idx, {"name"}, {"name", "a"}) == {}                 # stoplisted
+    assert _links(idx, {"rpm"}, {"rpm", "a"}) == {"json:a/rpm": "high"}  # plain, cooc
+    assert _links(idx, {"rpm"}) == {}                                 # plain, no cooc
+
+
+def test_rule1_plain_section_name_links_medium() -> None:
+    """L5 (documented): a plain section name links medium from any file."""
+    idx = _index({"package.json": '{"dependencies": {"left-pad": "1.0.0"}}'})
+    assert _links(idx, {"dependencies"}) == {"json:dependencies": "medium"}
+
+
 def test_rule2_json_leaf_and_full_path_and_ini_dots_not_split() -> None:
     idx = _index({"cfg.json": JSON, "v.ini": INI})
     assert _links(idx, {"length_m"}) == {"json:veh_params/dims.length_m": "medium"}

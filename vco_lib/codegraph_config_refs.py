@@ -35,10 +35,13 @@ Match rules (each has an act and a leave-alone test):
 1. **Section** — a literal equal to a section name links to
    ``"<fmt>:<section>"``; ``high`` when the name is distinctive (rule 4),
    ``medium`` otherwise; a stoplisted or < 3-character name never links.
+   (So a plain section name such as ``"dependencies"`` links ``medium`` from
+   every code file that spells it; ``confidence`` marks it as the weak kind.)
 2. **Key** — a literal equal to a key (a JSON key's leaf or its full path)
    links to ``"<fmt>:<section>/<key path>"``: ``high`` when that section's
    name or its file's basename ALSO appears as a literal in the same code
-   file, ``medium`` when the key is distinctive, otherwise no link.
+   file AND the key passes the rule-1 floor (≥ 3 characters, not
+   stoplisted), ``medium`` when the key is distinctive, otherwise no link.
 3. **File** — a literal whose basename is an indexed config file's basename
    links to ``"<fmt>:file:<basename>"`` (``high``).
 4. **Distinctive** — length ≥ 5, not in :data:`GENERIC_KEYS`, and containing
@@ -88,6 +91,14 @@ GENERIC_KEYS = frozenset({
 })
 
 _CAMEL_RE = re.compile(r"[a-z][A-Z]")
+
+
+def _plain_name_ok(name: str) -> bool:
+    """The floor every NON-distinctive name must pass to link at all (a
+    section name, or a key upgraded by co-occurrence): ≥ 3 characters and not
+    in :data:`GENERIC_KEYS`. ``"x"`` or ``"name"`` never link, whatever
+    co-occurs with them."""
+    return len(name) >= 3 and name.lower() not in GENERIC_KEYS
 
 
 def is_distinctive(name: str) -> bool:
@@ -359,8 +370,9 @@ def match_literals(
         base = _basename(lit)
         for fmt, _rel in index.files.get(base, ()):            # rule 3
             add(fmt, file_endpoint(fmt, base), lit, "high")
+        plain = _plain_name_ok(lit)
         secs = index.sections.get(lit)
-        if secs and len(lit) >= 3 and lit.lower() not in GENERIC_KEYS:  # rule 1
+        if secs and plain:                                       # rule 1
             distinct = sorted({s.fmt for s in secs})
             conf = "high" if is_distinctive(lit) else "medium"
             for fmt in distinct:
@@ -379,7 +391,7 @@ def match_literals(
         for endpoint, group in sorted(by_endpoint.items()):    # rule 2
             cooc = any(d.section in file_literals or _basename(d.rel_path) in file_bases
                        for d in group)
-            if cooc:
+            if cooc and plain:
                 add(group[0].fmt, endpoint, lit, "high")
             elif is_distinctive(lit):
                 add(group[0].fmt, endpoint, lit, "medium")
