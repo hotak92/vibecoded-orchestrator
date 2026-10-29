@@ -368,14 +368,26 @@ def _int_or_none(word: str) -> Optional[int]:
         return None
 
 
+def is_signal_probe(args: Sequence[str]) -> bool:
+    """``kill -0 …`` / ``-s0`` / ``--signal=0`` / ``-s 0`` / ``-n 0`` /
+    ``-s EXIT``: a signal-0 liveness probe delivers nothing. The ONE test
+    both layers use — the static check (:mod:`vco_lib.kill_guard`) and
+    :func:`resolve_kill` here — so ``kill -0 1`` is allowed by both
+    (v0.2.105 review: the static layer refused it, the runtime allowed it)."""
+    a = list(args)
+    return bool(a) and (
+        a[0] in ("-0", "-s0", "--signal=0")
+        or (a[0] in ("-s", "-n", "--signal") and len(a) > 1
+            and a[1] in ("0", "EXIT")))
+
+
 def resolve_kill(args: Sequence[str]) -> Tuple[List[int], Optional[str]]:
     """Numeric targets of a ``kill`` call. Job specs (``%1``) are the
     shell's own children and are skipped; a non-numeric word is left for
     ``kill`` itself to reject. A signal-0 probe is not a kill: nothing is
     delivered, so it is never refused."""
     a = list(args)
-    if a and (a[0] in ("-0", "-s0", "--signal=0")
-              or (a[0] in ("-s", "-n", "--signal") and len(a) > 1 and a[1] in ("0", "EXIT"))):
+    if is_signal_probe(a):
         return [], None
     targets = kill_targets(a)
     if targets is None:
@@ -647,6 +659,6 @@ __all__ = [
     "ancestors", "check_call", "check_pids", "current_table",
     "is_protected_name", "is_signal_spec", "kill_targets", "normalize_name",
     "pgrep_args_for_pkill", "protected_reason", "read_proc_table",
-    "real_binary", "resolve_kill", "SHIM_MARKER", "resolve_killall", "resolve_stop_process",
+    "is_signal_probe", "real_binary", "resolve_kill", "SHIM_MARKER", "resolve_killall", "resolve_stop_process",
     "resolve_taskkill",
 ]

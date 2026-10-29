@@ -69,6 +69,8 @@ desktop — on GNOME/X11 that window flash crashed gnome-shell and ended the who
 (2026-09-09). Without xvfb the gate stops in seconds with the install hint;
 `VCT_BOOT_SMOKE_REAL_DISPLAY=1` is the explicit opt-in for platforms without Xvfb.
 
+When a Claude Code agent runs the release gate, `scripts/launcher-boot-smoke.sh` or `scripts/launch-claude-mcp-stack.sh`, it must use the Bash tool's `run_in_background: true`: each waits in a readiness loop far longer than the 5 s the wait guard allows a script loop in the foreground, so a foreground call is refused (see `docs/features/03-agents-skills-hooks.md`, wait guard).
+
 ---
 
 ## Continuous Integration

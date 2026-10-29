@@ -206,12 +206,12 @@ from vco_lib.bash_command_walk import (
     LOOP_OPENERS,
     SHELL_DASH_C_VERBS,
     ChainSegment,
+    command_words as _command_words,
     dash_c_subcommand,
     literal_eval_body,
     peel_wrapper_verbs,
     split_chain,
     split_chain_ops,
-    strip_case_arm,
     strip_env_assignments,
     strip_subshell_parens,
     tokenize,
@@ -228,9 +228,11 @@ from vco_lib.powershell_command import (
     PS_WAIT_VERBS,
     SHELL_TOOLS,
     command_for_bash_readers,
+    has_loop as ps_has_loop,
     statements as ps_statements,
 )
 from vco_lib.env_values import env_int
+from vco_lib.wait_guard_bounded import WAIT_BUDGET_S, bounded_loop_sleeps
 from vco_lib.wait_guard_literal import literal_text_only
 
 __all__ = [
@@ -338,23 +340,6 @@ _LITERAL_SLEEP_RE = re.compile(r"^[0-9]+(\.[0-9]+)?(?:ms|[smhd])?$")
 #: imported above); ``time`` needs no entry — the walker's wrapper peel
 #: already removed it from every emitted segment.
 _LEADING_KEYWORDS = LEADING_COMPOUND_KEYWORDS
-
-
-def _command_words(tokens: List[str]) -> List[str]:
-    """A segment's tokens from its COMMAND WORD on: leading compound
-    keywords (``do``, ``then``, ``{``, ``!``, ``coproc``), subshell parens
-    and a ``case`` head or arm pattern (``case x in a) sleep 5`` →
-    ``sleep 5``, v0.2.105 R9 gap) peeled, repeatedly, until none is
-    left."""
-    body = list(tokens)
-    while True:
-        before = body
-        while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
-            body = body[1:]
-        body = strip_subshell_parens(body)
-        body = strip_case_arm(body)
-        if body == before:
-            return body
 
 
 def _tail_follows(args: List[str]) -> bool:
@@ -1103,7 +1088,10 @@ def _script_file_pattern(word: str, depth: int, seg: ChainSegment, *,
     same classifier, in its script reading (:class:`_ScriptCtx`): a loop
     that waits, a busy-wait or condition-refresh loop, ``watch`` or
     ``tail -f`` inside the file is a poll; a single fixed pause is not.
-    Read only when a working directory is known (:data:`_SCRIPT_CTX`)."""
+    A loop whose worst-case total sleep is proved within the budget is a
+    bounded retry (:mod:`vco_lib.wait_guard_bounded`) unless the script
+    itself runs in a loop. Read only when a working directory is known
+    (:data:`_SCRIPT_CTX`)."""
     ctx = _SCRIPT_CTX.get()
     if ctx is None or ctx.nesting >= _SCRIPT_MAX_NESTING:
         return None
@@ -1114,7 +1102,8 @@ def _script_file_pattern(word: str, depth: int, seg: ChainSegment, *,
     try:
         if literal_text_only(text):
             return None
-        found = static_pattern(text, depth=depth + 1, _in_loop=seg.in_loop)
+        found = static_pattern(text, depth=depth + 1, _in_loop=seg.in_loop,
+                               _bounded_loops=not seg.in_loop)
     finally:
         _SCRIPT_CTX.reset(token)
     if found is None:
@@ -1158,7 +1147,11 @@ def ps_script_pattern(command: str, cwd: str) -> Optional[tuple]:
             found = static_pattern(command_for_bash_readers(
                 POWERSHELL_TOOL, text))
             if found is None:
-                found = loop_pattern(text)
+                # The bounded-wait budget (v0.2.105 fix round) only when
+                # nothing loops around this script's call.
+                found = loop_pattern(
+                    text, wait_budget_s=(0.0 if ps_has_loop(command)
+                                         else WAIT_BUDGET_S))
             if found is None:
                 found = ps_script_pattern(text, cwd)
         finally:
@@ -1249,7 +1242,8 @@ def _heredoc_feeds_shell(line: str) -> bool:
 
 def static_pattern(command: str, depth: int = 0, *,
                    _in_loop: bool = False,
-                   _position_override: Optional[tuple] = None) -> Optional[tuple]:
+                   _position_override: Optional[tuple] = None,
+                   _bounded_loops: bool = False) -> Optional[tuple]:
     """``(pattern_name, evidence)`` for the first polling shape in
     ``command``, else ``None``.
 
@@ -1268,7 +1262,12 @@ def static_pattern(command: str, depth: int = 0, *,
     command is positioned WITHIN the body (both opt-in walker surfaces;
     the wait guard is the consumer). ``_in_loop`` /
     ``_position_override`` are the recursion's inherited context; callers
-    pass nothing."""
+    pass nothing. ``_bounded_loops`` (v0.2.105 fix round) is set only by
+    :func:`_script_file_pattern` for a script that does not itself run in
+    a loop: a plain ``sleep`` in a counted ``for`` loop whose worst-case
+    total sleep is within :data:`~vco_lib.wait_guard_bounded.WAIT_BUDGET_S`
+    is a bounded retry, not a poll
+    (:func:`~vco_lib.wait_guard_bounded.bounded_loop_sleeps`)."""
     if not isinstance(command, str) or not command.strip():
         return None
     # A heredoc body is data — EXCEPT when its line hands it to a shell
@@ -1288,6 +1287,8 @@ def static_pattern(command: str, depth: int = 0, *,
                              _with_function_bodies=not in_script,
                              _with_assignments=True,
                              _with_shell_runs=True)
+    bounded = (bounded_loop_sleeps(segments)
+               if _bounded_loops and in_script else frozenset())
     values: Dict[str, str] = {}
     for i, seg in enumerate(segments):
         # Code held in a variable assigned a literal earlier in the same
@@ -1300,7 +1301,7 @@ def static_pattern(command: str, depth: int = 0, *,
                 return found
         if seg.depth == 0:
             _note_assignments(seg, values)
-        found = _pattern_of_segment(seg, depth)
+        found = None if i in bounded else _pattern_of_segment(seg, depth)
         if found is not None:
             return found
         busy = _busy_wait_pattern(segments, i)

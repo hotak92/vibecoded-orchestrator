@@ -149,7 +149,7 @@ LEADING_COMPOUND_KEYWORDS: frozenset[str] = frozenset(
 CONDITION_OPENERS: frozenset[str] = frozenset({"while", "until"})
 
 
-def _segment_opener(stripped: List[str]) -> Optional[str]:
+def segment_opener(stripped: List[str]) -> Optional[str]:
     """The loop opener governing a segment: its FIRST token, or an opener
     immediately after a ``{`` / ``(`` group token — the function/group
     header shape ``f() { while …`` (R6, owner ruling 2026-10-15: the loop
@@ -444,6 +444,25 @@ def _split_glued(token: str) -> List[str]:
         out.append(seps[i])
         i += 1
     return out
+
+
+def command_words(tokens: List[str]) -> List[str]:
+    """A segment's tokens from its COMMAND WORD on: leading compound
+    keywords (``do``, ``then``, ``{``, ``!``, ``coproc``), subshell parens
+    and a ``case`` head or arm pattern (``case x in a) sleep 5`` →
+    ``sleep 5``, v0.2.105 R9 gap) peeled, repeatedly, until none is
+    left. (Moved here from the wait guard in the v0.2.105 fix round: the
+    bounded-loop reading in :mod:`vco_lib.wait_guard_bounded` peels the
+    same way.)"""
+    body = list(tokens)
+    while True:
+        before = body
+        while body and os.path.basename(body[0]).lower() in LEADING_COMPOUND_KEYWORDS:
+            body = body[1:]
+        body = strip_subshell_parens(body)
+        body = strip_case_arm(body)
+        if body == before:
+            return body
 
 
 def strip_env_assignments(tokens: List[str]) -> List[str]:
@@ -787,7 +806,7 @@ def _loop_membership(segments: List[List[str]], inherited: bool) -> List[bool]:
         if not stripped:
             flags.append(inherited or loop_depth > 0 or in_condition)
             continue
-        opener = _segment_opener(stripped)
+        opener = segment_opener(stripped)
         first = os.path.basename(stripped[0]).lower()
         is_do = first == "do"
         if first == "done" and loop_depth > 0:
@@ -1156,12 +1175,14 @@ __all__ = [
     "MAX_NESTING_DEPTH",
     "SHELL_DASH_C_VERBS",
     "WRAPPER_VERBS",
+    "command_words",
     "dash_c_subcommand",
     "function_header",
     "is_env_assignment",
     "literal_eval_body",
     "parse_dash_c",
     "peel_wrapper_verbs",
+    "segment_opener",
     "split_chain",
     "split_chain_ops",
     "strip_case_arm",

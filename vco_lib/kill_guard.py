@@ -418,6 +418,8 @@ def _bash_problem(cmd: str) -> Optional[str]:
         if verb == "skill":
             return "skill selects processes by user/terminal, far too broadly"
         if verb == "kill":
+            if rt.is_signal_probe(args):
+                continue  # a signal-0 probe delivers nothing (runtime parity)
             for t in rt.kill_targets(args) or []:
                 prob = _target_problem(t)
                 if prob is not None:
