@@ -2,7 +2,7 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.105 — a HUB OUTAGE is not a missing key, and not a scope problem.
 
-Field evidence (2026-10-21/22, from the SimRacing report): vct-hub was down
+Field evidence (2026-10-21/22, from a user project's report): vct-hub was down
 for ~2 days. A ``deepseek-researcher`` lane died on "503 no key found for
 vendor 'qwen'" while the GLM lane survived on its serve-stale cached key.
 Two defects, one cause:
@@ -208,7 +208,7 @@ class HubOutageMessageTests(unittest.TestCase):
 
     def test_the_outage_is_named_first(self) -> None:
         problem = self._problem(VendorKeyResolver(getter=_hub_down))
-        self.assertTrue(problem.startswith("vendor 'acme' key: vct-hub is NOT REACHABLE"),
+        self.assertTrue(problem.startswith("vendor 'acme' key: vct-hub is NOT RUNNING"),
                         problem)
 
     def test_it_says_the_key_may_exist_and_gives_no_scope_remedy(self) -> None:
@@ -243,7 +243,7 @@ class HubOutageMessageTests(unittest.TestCase):
         result = VendorKeyResolver(getter=_definite_miss).resolve(ACME)
         self.assertFalse(result.hub_unreachable)
         problem = result.problem or ""
-        self.assertNotIn("vct-hub is NOT REACHABLE", problem)
+        self.assertNotIn("vct-hub is NOT RUNNING", problem)
         self.assertIn("Secrets panel", problem)
         self.assertIn("vct set --shared --key acme_primary_key", problem)
         self.assertIn("~/.vct-secrets/shared/", problem)
@@ -254,7 +254,7 @@ class HubOutageMessageTests(unittest.TestCase):
         with self.assertLogs("model_router.secrets", level="WARNING") as logs:
             for _ in range(4):
                 resolver.resolve(ACME)
-        lines = [line for line in logs.output if "NOT REACHABLE" in line]
+        lines = [line for line in logs.output if "NOT RUNNING" in line]
         self.assertEqual(len(lines), 1, logs.output)
 
 
@@ -267,10 +267,33 @@ class ClassificationTests(unittest.TestCase):
         self.assertIsInstance(exc, agent_secrets.SecretNotFound)
         self.assertTrue(S._is_hub_unreachable(exc))
 
-    def test_a_real_hub_unreachable_is_recognised_by_type(self) -> None:
+    def test_a_hub_not_running_is_recognised_by_type(self) -> None:
         """The ``allow_file_fallback=False`` shape: the exception IS a
-        HubUnreachable."""
-        self.assertTrue(S._is_hub_unreachable(agent_secrets.HubUnreachable("down")))
+        HubNotRunning."""
+        self.assertTrue(S._is_hub_unreachable(agent_secrets.HubNotRunning("down")))
+
+    def test_a_running_hub_that_refused_or_garbled_is_not_an_outage(self) -> None:
+        """Fix round 1: the rest of the HubUnreachable family is a hub that
+        may well be RUNNING — a 401 after a token rotation, a 200 whose body
+        is not JSON, an unknown status. None of them is "start the hub"."""
+        for message in (
+            "hub returned 401 unauthorized; launcher may have restarted",
+            "hub /env returned 200 but body is not JSON",
+            "hub returned status 418 for /env lookup",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(
+                    S._is_hub_unreachable(agent_secrets.HubUnreachable(message)),
+                )
+
+    def test_the_cause_chain_is_walked(self) -> None:
+        try:
+            try:
+                raise agent_secrets.HubNotRunning("refused")
+            except agent_secrets.HubNotRunning as inner:
+                raise agent_secrets.SecretNotFound("miss") from inner
+        except agent_secrets.SecretNotFound as exc:
+            self.assertTrue(S._is_hub_unreachable(exc))
 
     def test_an_ordinary_miss_is_not_a_hub_outage(self) -> None:
         self.assertFalse(S._is_hub_unreachable(agent_secrets.SecretNotFound("absent")))
@@ -311,7 +334,7 @@ class AgentSecretsMarksTheMissTests(unittest.TestCase):
         return caught.exception
 
     def test_a_hub_that_is_not_running_marks_the_miss(self) -> None:
-        exc = self._get_with(agent_secrets.HubUnreachable("hub is not running"))
+        exc = self._get_with(agent_secrets.HubNotRunning("hub is not running"))
         self.assertTrue(getattr(exc, "hub_unreachable", False))
 
     def test_a_hub_that_answered_not_stored_does_not(self) -> None:
@@ -319,8 +342,63 @@ class AgentSecretsMarksTheMissTests(unittest.TestCase):
         self.assertFalse(getattr(exc, "hub_unreachable", False))
 
     def test_the_miss_still_says_the_keychain_was_not_checked(self) -> None:
-        exc = self._get_with(agent_secrets.HubUnreachable("hub is not running"))
+        exc = self._get_with(agent_secrets.HubNotRunning("hub is not running"))
         self.assertIn("The launcher hub is not running", str(exc))
+
+    def test_a_running_hub_that_refused_does_not_mark_the_miss(self) -> None:
+        """Fix round 1: a 401 (rotated token) is a hub that is THERE. It must
+        not unlock the unbounded serve-stale arm, and the message must not
+        tell the user to start a hub that is running."""
+        exc = self._get_with(agent_secrets.HubUnreachable(
+            "hub returned 401 unauthorized; launcher may have restarted",
+        ))
+        self.assertFalse(getattr(exc, "hub_unreachable", False))
+        self.assertNotIn("is not running", str(exc))
+        self.assertIn("OS keychain was not checked", str(exc))
+
+
+class ResolverClassificationTests(unittest.TestCase):
+    """Fix round 1: the vco_lib resolver raises HubNotRunning ONLY for "no
+    hub to ask" — a missing/empty hub.token or a refused connection."""
+
+    def setUp(self) -> None:
+        from vco_lib import project_config as PC
+        self.PC = PC
+        self._tmp = tempfile.TemporaryDirectory(prefix="v02105-hubdisc-")
+        self.addCleanup(self._tmp.cleanup)
+        PC._test_clear_cache()
+        self.addCleanup(PC._test_clear_cache)
+        env = {k: v for k, v in os.environ.items() if k != "VCT_HUB_TOKEN"}
+        env["VCT_ROOT_DIR"] = self._tmp.name
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(PC, "vct_root_dir", lambda: Path(self._tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_missing_token_file_is_hub_not_running(self) -> None:
+        with self.assertRaises(self.PC.HubNotRunning):
+            self.PC._discover_hub()
+
+    def test_an_empty_token_file_is_hub_not_running(self) -> None:
+        (Path(self._tmp.name) / "hub.token").write_text("", encoding="utf-8")
+        with self.assertRaises(self.PC.HubNotRunning):
+            self.PC._discover_hub()
+
+    def test_a_refused_connection_is_hub_not_running(self) -> None:
+        import requests
+        refused = requests.ConnectionError(ConnectionRefusedError(111, "refused"))
+        self.assertIsInstance(
+            self.PC._transport_error(refused, "x"), self.PC.HubNotRunning,
+        )
+
+    def test_a_timeout_and_a_dropped_connection_are_not(self) -> None:
+        import requests
+        for exc in (requests.Timeout("slow"), requests.ConnectionError("reset")):
+            with self.subTest(exc=exc):
+                err = self.PC._transport_error(exc, "x")
+                self.assertNotIsInstance(err, self.PC.HubNotRunning)
 
 
 if __name__ == "__main__":  # pragma: no cover

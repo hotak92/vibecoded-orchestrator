@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already read keeps being used for as long as the service is down, instead of expiring after six hours: in a two-day
   outage (2026-10-20/22) one provider's key stopped working halfway through while another's kept working, purely
   because one had been read earlier in the session. Both now behave the same way, and a key the gateway never read still
-  has nothing to fall back on.
+  has nothing to fall back on. Only a service that is really not running counts: a running one that refused the request
+  (for example right after it restarted) or sent a garbled answer is not reported as stopped, and does not extend how
+  long an old key is used.
 
 ### Added
 

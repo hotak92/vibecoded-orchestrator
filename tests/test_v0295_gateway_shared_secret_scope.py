@@ -263,7 +263,7 @@ def test_a_full_miss_names_both_shared_write_paths(
     assert "vct set --shared --key test_api_key" in authored
     assert "~/.vct-secrets/shared/" in authored
     assert str(clone) in authored  # the scope actually consulted, named
-    assert "vct-hub is NOT REACHABLE" in authored
+    assert "vct-hub is NOT RUNNING" in authored
     assert SCOPE_ENV not in authored, (
         "a hub outage must not be answered with a secret-scope remedy"
     )

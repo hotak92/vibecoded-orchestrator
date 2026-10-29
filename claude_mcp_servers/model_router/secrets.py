@@ -95,26 +95,44 @@ def _is_store_unavailable(exc: BaseException) -> bool:
     return any(c.__name__ in _STORE_UNAVAILABLE_TYPES for c in type(exc).__mro__)
 
 
+#: The ONE resolver exception that means "there is no hub to ask"
+#: (``vco_lib.project_config.HubNotRunning``: no ``hub.token``, or a refused
+#: connection). Its parent ``HubUnreachable`` is deliberately NOT matched: that
+#: family also covers a hub that is RUNNING — a 401 after a token rotation, a
+#: 200 whose body is not JSON, an unrecognised status — and none of those may
+#: unlock the unbounded serve-stale arm or the "start the hub" message.
+_HUB_NOT_RUNNING_TYPES = frozenset({"HubNotRunning"})
+
+
 def _is_hub_unreachable(exc: BaseException) -> bool:
-    """Did this failure happen because TIER 1 could not be reached at all?
+    """Did this failure happen because there was NO HUB to ask at all?
 
     Two spellings, both real on this chain:
 
-    * the exception IS a ``HubUnreachable`` (or a subclass) — that is what
-      ``agent_secrets.get`` raises when the file-store fallback is disabled;
+    * the exception IS a ``HubNotRunning`` — what ``agent_secrets.get``
+      raises when the file-store fallback is disabled;
     * the exception is the ``SecretNotFound`` a full-chain miss raises, which
-      v0.2.105 marks with a ``hub_unreachable`` attribute — with the fallback
-      enabled (the gateway's case) a hub that is not running is reported as a
-      miss by the time it reaches here, and the TYPE alone cannot tell "the
-      key is not stored" from "nothing was asked".
+      ``agent_secrets.get`` marks with a ``hub_unreachable`` attribute (set
+      for ``HubNotRunning`` only) — with the fallback enabled (the gateway's
+      case) a hub that is not running is reported as a miss by the time it
+      reaches here, and the TYPE alone cannot tell "the key is not stored"
+      from "nothing was asked".
 
-    Matched by NAME across the MRO for the same reason as
-    :func:`_is_store_unavailable`: the resolver is imported lazily and every
-    test injects its own getter.
+    The ``__cause__`` chain is walked (bounded), so a wrapper that re-raises
+    ``from`` the resolver error is classified the same way. Matched by NAME
+    across the MRO for the same reason as :func:`_is_store_unavailable`: the
+    resolver is imported lazily and every test injects its own getter.
     """
-    if getattr(exc, "hub_unreachable", False):
-        return True
-    return any(c.__name__ == "HubUnreachable" for c in type(exc).__mro__)
+    cur: Optional[BaseException] = exc
+    for _ in range(8):
+        if cur is None:
+            return False
+        if getattr(cur, "hub_unreachable", False):
+            return True
+        if any(c.__name__ in _HUB_NOT_RUNNING_TYPES for c in type(cur).__mro__):
+            return True
+        cur = cur.__cause__
+    return False
 
 SecretGetter = Callable[..., str]
 
@@ -682,7 +700,7 @@ class VendorKeyResolver:
                         int(age),
                         self._serve_stale_max_age_s,
                         (
-                            ", not applied: vct-hub is not reachable, which "
+                            ", not applied: vct-hub is not running, which "
                             "says nothing about the key"
                             if fresh.hub_unreachable
                             else ""
@@ -885,7 +903,7 @@ class VendorKeyResolver:
             except Exception as exc:  # noqa: BLE001 — every resolver error is a miss
                 if _is_hub_unreachable(exc):
                     # v0.2.105: tier 1 was not REACHED at all — the key was
-                    # never looked for. Distinct from a busy store, and the
+                    # never consulted. Distinct from a busy store, and the
                     # distinction is what the 503 message has to carry.
                     hub_down.append(key_name)
                 if _is_store_unavailable(exc):
@@ -1022,7 +1040,7 @@ class VendorKeyResolver:
         if vendor.vendor_id not in self._hub_down_logged:
             self._hub_down_logged.add(vendor.vendor_id)
             logger.warning(
-                "model-gateway: vendor %s key: vct-hub is NOT REACHABLE, so the "
+                "model-gateway: vendor %s key: vct-hub is NOT RUNNING, so the "
                 "OS keychain was never consulted (tried %s). This is a hub "
                 "outage, not a missing key — start it (the launcher starts it "
                 "automatically, or run `vct-hub --start-if-not-running`) and "
@@ -1034,9 +1052,10 @@ class VendorKeyResolver:
         first_key = vendor.secret_keys[0]
         return KeyResult(
             problem=(
-                f"vendor {vendor.vendor_id!r} key: vct-hub is NOT REACHABLE — "
+                f"vendor {vendor.vendor_id!r} key: vct-hub is NOT RUNNING — "
                 "the hub is the only route to a key held in the OS keychain, "
-                "so the key was never looked for and MAY WELL EXIST. This is "
+                "so the keychain was never consulted and the key MAY WELL "
+                "EXIST there. This is "
                 "not a missing key and not a scope problem: start the hub "
                 "(the launcher starts it automatically, or run "
                 "`vct-hub --start-if-not-running`) and the gateway picks the "

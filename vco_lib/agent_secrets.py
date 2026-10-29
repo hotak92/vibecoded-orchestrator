@@ -81,6 +81,7 @@ from vco_lib.project_config import (  # noqa: F401 — re-exported for callers
     SECRET_READ_TIMEOUT_SECONDS,
     Forbidden,
     HubNotResponding,
+    HubNotRunning,
     HubUnreachable,
     ProjectNotFound,
     ResolverError,
@@ -107,6 +108,7 @@ __all__ = [
     "Forbidden",
     "HUB_RETRY_AFTER_CAP_SECONDS",
     "HubNotResponding",
+    "HubNotRunning",
     "HubUnreachable",
     "KeychainLocked",
     "KeychainUnavailable",
@@ -788,13 +790,25 @@ def get(
             f"`vct set --shared --key {key}`, "
             f"or add the key to the project's .env"
         )
-        if isinstance(hub_error, HubUnreachable):
+        if isinstance(hub_error, HubNotRunning):
             # v0.2.102 (W6-AB): with no hub running the OS keychain was never
             # consulted — a key stored there is invisible, not absent. Say so
             # BEFORE the add-it remedy, so the remedy stays true.
             _fix = (
                 "The launcher hub is not running, so the OS keychain was not "
                 "checked — if the key is stored there, start the launcher and "
+                "retry. Otherwise: " + _fix[len("Fix: "):]
+            )
+        elif isinstance(hub_error, HubUnreachable):
+            # v0.2.105 fix round: the rest of the HubUnreachable family (a 401
+            # after a token rotation, a 200 that is not JSON, an unknown
+            # status) comes from a hub that may well be RUNNING — "start the
+            # launcher" would be the wrong remedy. The keychain still was not
+            # read, and that is what the user needs to know.
+            _fix = (
+                "The launcher hub did not give a usable answer (see tier 1 "
+                "above), so the OS keychain was not checked — if the key is "
+                "stored there, open the launcher (it refreshes the hub) and "
                 "retry. Otherwise: " + _fix[len("Fix: "):]
             )
         miss = SecretNotFound(
@@ -804,7 +818,7 @@ def get(
             f"checked={allow_file_fallback}; shared_only={shared_only}). "
             + _fix
         )
-        if isinstance(hub_error, HubUnreachable):
+        if isinstance(hub_error, HubNotRunning):
             # v0.2.105: SecretNotFound is also what a full-chain miss raises
             # when NOBODY WAS ASKED — the hub was not running, so the OS
             # keychain (tier 1, the only route to it) was never consulted. A
@@ -812,7 +826,10 @@ def get(
             # looked at" reads this flag; the exception TYPE cannot say it
             # (the message is prose and the message is not an interface).
             # Same mechanism as the ``retry_after`` attribute on
-            # KeychainUnavailable above.
+            # KeychainUnavailable above. Set for HubNotRunning ONLY (fix
+            # round): a 401 / non-JSON 200 / unknown status is a hub that is
+            # there, and must not unlock the unbounded serve-stale arm nor the
+            # "start the hub" message.
             miss.hub_unreachable = True  # type: ignore[attr-defined]
         raise miss from hub_error
     raise hub_error
