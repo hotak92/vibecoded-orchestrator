@@ -533,6 +533,21 @@ def _describe(records: Sequence[dict], limit: int = 8) -> str:
     return "; ".join(shown)
 
 
+def _describe_groups(records: Sequence[dict], limit: int = 6) -> str:
+    """One line per duplicate-hook-group record: the event and matcher the
+    group sits under, and the commands involved."""
+    def one(r: dict) -> str:
+        matcher = r.get("matcher") or "(every event source)"
+        cmds = list(r.get("commands") or r.get("duplicate_commands") or [])
+        shown = ", ".join(str(c) for c in cmds[:3])
+        more = f" +{len(cmds) - 3} more" if len(cmds) > 3 else ""
+        return f"{r.get('event')}[{matcher}]: {shown}{more}"
+    shown_rows = [one(r) for r in records[:limit]]
+    if len(records) > limit:
+        shown_rows.append(f"... +{len(records) - limit} more")
+    return "; ".join(shown_rows)
+
+
 def report_parked_hooks(
     folder: Path,
     result: dict,
@@ -543,6 +558,7 @@ def report_parked_hooks(
     dry_run: bool,
     log: Callable[..., Any],
     log_auto: Optional[Callable[..., Any]] = None,
+    duplicate_groups: Sequence[dict] = (),
 ) -> None:
     """Put the outcome where the user sees it: the result envelope, the
     install log, and — whenever the rule ran on an answer it could not read —
@@ -583,6 +599,29 @@ def report_parked_hooks(
             f"{len(parked)} hook(s) disabled from the launcher {verb} disabled: "
             + _describe(parked),
             data={"kept_out": parked})
+    # v0.2.105: what the merge's duplicate-group fold did, and what it left
+    # alone because it was not provably VCO's (see
+    # ``vco_lib.settings_merge._fold_duplicate_shipped_groups``).
+    repaired = [r for r in duplicate_groups
+                if r.get("action") in ("folded", "redundant_all_sources_removed",
+                                       "redundant_all_sources_trimmed")]
+    kept_user = [r for r in duplicate_groups if r.get("action") == "kept_user_command"]
+    if duplicate_groups:
+        result["duplicate_hook_groups"] = [dict(r) for r in duplicate_groups]
+    if repaired:
+        log("4.bundle.settings.groups", "ok",
+            f"{len(repaired)} duplicate hook group(s) "
+            f"{'would be ' if dry_run else ''}merged into the one group they "
+            f"duplicate: " + _describe_groups(repaired),
+            data={"groups": repaired})
+    if kept_user:
+        result["warnings"].append(
+            f"settings.json: left {len(kept_user)} duplicate hook group(s) exactly "
+            f"as they are, because they hold a command VCO does not ship "
+            f"({_describe_groups(kept_user)}). VCO only folds duplicate groups made "
+            f"entirely of its own hooks. If those hooks now run twice, delete the "
+            f"duplicate group from the launcher's Hooks tab or by hand."
+        )
     if state.readable:
         return
     where = f"{state.db_path}: {state.detail}"

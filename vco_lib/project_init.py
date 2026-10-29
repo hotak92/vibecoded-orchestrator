@@ -9979,25 +9979,25 @@ def install_project_bundle(
             # removed (`vco_lib.hook_retirements`); collected at this level
             # because the audit row needs the FOLDER, not just the hooks.
             retired_removed: list = []
-            parked, kept_out = read_parked_hooks(folder), []
+            parked, kept_out, duplicate_groups = read_parked_hooks(folder), [], []
             settings_action, settings_redirect = _merge_settings_template_for_bundle(
                 settings_template, settings_target, dry_run=dry_run,
                 retired_removed=retired_removed, parked=parked, kept_out=kept_out,
-                project_root=folder,
+                duplicate_groups=duplicate_groups, project_root=folder,
             )
             result["settings_action"] = settings_action
             if settings_action.startswith("unchanged ("):  # v0.2.97: never silent
                 result["warnings"].append(f"settings.json: {settings_action} — newly "
                                           "shipped hooks NOT added; see UPDATE_DEFERRED.md")
             report_parked_hooks(folder, result, parked, kept_out, dry_run=dry_run,
-                                settings_action=settings_action, log=_log, log_auto=_log_auto)
+                                settings_action=settings_action, log=_log, log_auto=_log_auto,
+                                duplicate_groups=duplicate_groups)
             if retired_removed:
                 # Envelope on BOTH paths (dry-run reports what it WOULD
                 # remove); audit rows only after a real write.
                 result["retired_hook_registrations"] = removal_envelope_rows(retired_removed)
                 if not dry_run and settings_action == "merged":
-                    emit_removal_audit_rows(
-                        folder, retired_removed, log_auto=_log_auto, log=_log)
+                    emit_removal_audit_rows(folder, retired_removed, log_auto=_log_auto, log=_log)
             # v0.2.70 (Bug B / W-F1): when `.claude` itself is a symlink VCO
             # refused to write through, the settings.json write redirected to a
             # `.vco-new` sibling. Thread that into the SAME accumulator as the
@@ -11447,7 +11447,7 @@ def _merge_settings_template_for_bundle(
     template_path: Path, target_path: Path, *, dry_run: bool,
     retired_removed: Optional[list] = None,
     parked: Optional[ParkedHooksState] = None, kept_out: Optional[list] = None,
-    project_root: Optional[Path] = None,
+    duplicate_groups: Optional[list] = None, project_root: Optional[Path] = None,
 ) -> tuple[str, Optional[Path]]:
     """The I/O half of the settings.json merge — a shim since v0.2.97.
 
@@ -11475,7 +11475,7 @@ def _merge_settings_template_for_bundle(
     return merge_settings_template(
         template_path, target_path, dry_run=dry_run, write=_write_file_atomic,
         retired_removed=retired_removed, parked=parked, kept_out=kept_out,
-        project_root=project_root)
+        duplicate_groups=duplicate_groups, project_root=project_root)
 
 
 def _apply_canonical_env_via_config_projection(

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An update no longer leaves the same hooks registered several times.** Every bundle update could only repair or add one hook at a time, so a project that had been through several releases ended up with several groups of hooks that fire on the same moment: one real install had four `startup` groups after the 0.2.104 update, which made the container check, the container-port check, the code-embedding check, the knowledge-graph loader and the context-size check each run three extra times at every session start. An update now merges those groups back into the one group they duplicate — only when every command in them is a hook VCO ships, so nothing of yours is ever moved or deleted. A group that also holds one of your own hooks is left exactly as it is and named in the update summary, and a legacy "every session" group that only repeated what the normal start-up group already runs is removed. Running the update again changes nothing.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed
