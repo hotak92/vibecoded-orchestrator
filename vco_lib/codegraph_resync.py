@@ -99,10 +99,11 @@ DEFAULT_CODE_EMBED_PORT = 11440
 _CONDITION_ID = "codegraph_embed_resync_pending"
 
 #: v0.2.103 (R12-F4): the provable-orphan flavour's OWN condition id. Classed
-#: ``action_required`` in ``vco_lib/deferral_conditions.toml`` — only a manual
-#: consented ``--prune-stale`` walk clears it, so the WP-H retry dispatcher
-#: must never select it (the auto-retryable resync handler forwards no
-#: ``--prune-stale`` and would burn full walks that remove nothing).
+#: ``action_required`` in ``vco_lib/deferral_conditions.toml`` — only the
+#: manual consented cleanup the entry prints clears it (v0.2.105: the
+#: TARGETED ``--prune-orphan-interactions`` pass, never a ``--prune-stale``
+#: walk — that form deleted enabled extra folders' rows, the 2026-10-29
+#: incident), so the WP-H retry dispatcher must never select it.
 _ORPHAN_CONDITION_ID = "codegraph_orphan_interactions_pending"
 
 # Hygiene (v0.2.75): keep the Popen handles of deliberately-DETACHED children
@@ -2208,6 +2209,106 @@ def count_orphan_interaction_rows(
             return None
 
 
+def prune_orphan_interactions(
+    project_name: str,
+    *,
+    repo_root: Optional[Path] = None,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> dict:
+    """v0.2.105 (prune lane): delete ONLY the provably-dead unanchored
+    CodeInteraction rows — the targeted remedy behind the
+    ``codegraph_orphan_interactions_pending`` entry's printed command.
+
+    NOT a whole-collection stale prune. The pre-v0.2.105 remedy was
+    ``--run-resync --prune-stale``, whose walk covered the repo root only
+    and therefore deleted every ENABLED extra code folder's rows with it
+    (the 2026-10-29 incident: 33,464 rows pruned, 727 orphans expected).
+    This pass judges each row through the ONE predicate
+    (:func:`is_provable_codegraph_orphan`, ``repo_root`` given — a row whose
+    non-empty ``project_source`` is not a primary source is never touched)
+    and deletes NOTHING else: no visited-set semantics, no file-anchored
+    rows, no extras. Deletion is DEFERRED until the enumeration completes
+    (a mid-scan failure authorises nothing — the same rule as
+    ``codegraph_prune.prune_collection``).
+
+    Returns ``{"counted": int|None, "deleted": int, "failures": int}``;
+    ``counted`` is None when the scan was undeterminable (in which case
+    nothing was deleted). On a complete scan with zero failures the paired
+    clear runs (:func:`clear_orphan_interactions_deferral_if_zero`) so
+    running the printed command also clears its own ledger entry.
+    Never raises.
+    """
+    out = {"counted": None, "deleted": 0, "failures": 0}
+    if not project_name:
+        return out
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return out
+    with _probe_client(client, weaviate_url, grpc_port) as client:
+        if client is None:
+            return out
+        coll, status = _open_collection(
+            client, f"{prefix}_CodeInteraction", "orphan-interaction prune",
+        )
+        if status == _COLL_ABSENT:
+            out["counted"] = 0
+            return out
+        if status == _COLL_ERROR:
+            return out
+        read_props = ["file_path", "project"]
+        try:
+            if "project_source" in {
+                p.name for p in coll.config.get().properties
+            }:
+                read_props.append("project_source")
+        except Exception:  # noqa: BLE001 — probe best-effort; skip the prop
+            pass
+        candidates: list = []
+        try:
+            for obj in coll.iterator(return_properties=read_props):
+                props = getattr(obj, "properties", None) or {}
+                if is_provable_codegraph_orphan(
+                    coll, str(obj.uuid), props,
+                    project_name=project_name, repo_root=repo_root,
+                ):
+                    candidates.append(str(obj.uuid))
+        except Exception as exc:  # noqa: BLE001 — undeterminable ⇒ delete nothing
+            logger.warning(
+                "codegraph orphan-interaction prune: scan failed: %s", exc
+            )
+            return out
+        out["counted"] = len(candidates)
+        for uid in candidates:
+            try:
+                coll.data.delete_by_id(uuid=uid)
+                out["deleted"] += 1
+                logger.info(
+                    "Pruned orphan %s from %s: no file_path and no "
+                    "resolvable source reference", uid, coll.name,
+                )
+            except Exception as exc:  # noqa: BLE001 — per-row soft-fail
+                out["failures"] += 1
+                logger.warning(
+                    "Failed to prune orphan %s from %s: %s", uid, coll.name, exc,
+                )
+        if not out["failures"]:
+            # Paired clear INSIDE the probe-client scope (a built client is
+            # closed by it): a positive zero resolves the ledger entry, so
+            # the printed command clears its own condition.
+            try:
+                clear_orphan_interactions_deferral_if_zero(
+                    project_name, repo_root=repo_root, client=client,
+                )
+            except Exception as exc:  # noqa: BLE001 — clear never gates the prune
+                logger.warning(
+                    "codegraph orphan-interaction prune: clear check failed: %s",
+                    exc,
+                )
+    return out
+
+
 def _ensure_backfill_schema(client, prefix: str) -> None:
     """v0.2.103 (defect 6): ensure the backfill's target properties exist
     BEFORE the pass probes/patches them — through the ONE property-spec home.
@@ -2980,14 +3081,37 @@ def driver_resume_command(
     DELETES the rows of files a walk did not visit — exactly the rows an
     unconverged walk leaves behind. A printed command is shipped code, so a
     run that was started with ``--prune-stale`` still prints the plain
-    driver; the orphan-interactions entry prints its own ``--prune-stale``
-    form for the one condition that needs it."""
+    driver; the orphan-interactions entry prints its OWN targeted cleanup
+    line (:func:`orphan_cleanup_command`) for the one condition that needs
+    it."""
     from vco_lib.remedy_shell import command_line
 
     return command_line(driver_argv(
         python, repo_root, analyzer, project_name,
         index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
     ))
+
+
+def orphan_cleanup_command(project_name: str, repo_root: "Path | str") -> str:
+    """v0.2.105 (prune lane): the ONE line the
+    ``codegraph_orphan_interactions_pending`` entry prints as its remedy.
+
+    The pre-v0.2.105 remedy was the driver's ``--prune-stale`` form — a
+    whole-walk stale prune whose visit covered the repo root only, so it
+    deleted every ENABLED extra code folder's rows together with the
+    orphans (the 2026-10-29 incident: 33,464 rows pruned where 727 were
+    expected, and nothing re-added them). The targeted mode
+    (:func:`prune_orphan_interactions`) deletes ONLY the provably-dead
+    unanchored rows the detection counted, never a row of an extra code
+    folder, and clears its own ledger entry on a clean pass.
+    """
+    from vco_lib.remedy_shell import command_line
+
+    return command_line([
+        _python_exe.resolve_or_current(), "-m", "vco_lib.codegraph_resync",
+        "--prune-orphan-interactions", "--project", project_name,
+        "--repo-root", str(repo_root),
+    ])
 
 
 def _stale_image_resume_command(resync: str) -> str:
@@ -3060,17 +3184,24 @@ def build_unconverged_deferral(
 
     v0.2.103 (R12-F4/F5): ``orphan_interactions`` (a POSITIVE count) selects
     the ORPHAN flavour — its own condition id (:data:`_ORPHAN_CONDITION_ID`,
-    classed ``action_required`` because only a manual consented
-    ``--prune-stale`` walk clears it) and prose that is TRUE for it: the
-    command DELETES rows a full walk does not visit, it does not re-embed
-    them. ONE builder, parameterised — no second deferral builder.
+    classed ``action_required`` because only a manual consented cleanup
+    clears it) and prose that is TRUE for it: the command deletes ONLY the
+    provably dead orphan rows it names, never a row a walk could still own.
+    ONE builder, parameterised — no second deferral builder.
+
+    v0.2.105 (prune lane): the command is the TARGETED orphan cleanup
+    (:func:`orphan_cleanup_command` → :func:`prune_orphan_interactions`).
+    The pre-v0.2.105 remedy (``--run-resync --prune-stale``) re-walked the
+    repository root and pruned every unvisited row — which deleted every
+    ENABLED extra code folder's rows with the orphans; the printed command
+    must never do that again.
     """
     if DeferralEntry is None:
         return None
     if orphan_interactions:
         return DeferralEntry(
             condition_id=_ORPHAN_CONDITION_ID,
-            title="Code-graph orphan rows pending a consented prune walk",
+            title="Code-graph orphan rows pending a consented cleanup",
             detected=(
                 f"A background code-graph resync for project '{project_name}' "
                 f"converged every stale row, but {orphan_interactions} "
@@ -3079,18 +3210,16 @@ def build_unconverged_deferral(
                 "only dangling ones) — provably dead rows no walk re-embeds."
             ),
             why_deferred=(
-                "Only a FULL walk with --prune-stale removes them, and that "
-                "is a user-consented action, never automatic: the command "
-                "below re-walks the repository and DELETES every code-graph "
-                "row the walk does not visit (the ordinary prune semantics — "
-                "not only the orphans), then re-embeds what changed. The "
-                "orphan cleanup itself touches only anchor-less rows, and "
-                "removes one only when it is provably dead (no reference at "
-                "all, or only dangling ones); anything uncertain is kept. If "
-                "any enabled extra code folder is unreachable, the walk "
-                "skips orphan cleanup entirely (nothing is deleted) until "
-                "every folder is reachable. The entry clears once a re-probe "
-                "of the same count finds zero."
+                "Removing them is a user-consented action, never automatic. "
+                "The command below is a TARGETED cleanup: it deletes exactly "
+                "these provably-dead rows (no file_path, and no reference at "
+                "all or only dangling ones — verified per row before "
+                "deletion) and NOTHING else: no code-graph walk runs, no "
+                "file-anchored row is touched, and rows of extra code "
+                "folders are never judged. Anything uncertain is kept, and a "
+                "row is deleted only after the whole scan completed. On a "
+                "clean pass the command clears this entry itself; if any "
+                "deletion fails, the entry stays and lists the failure."
             ),
             command_to_apply=command_to_apply,
             severity="warning",
@@ -3281,6 +3410,209 @@ def clear_orphan_interactions_deferral_if_zero(
             "codegraph orphan cleanup: could not resolve deferral: %s", exc
         )
         return True
+
+
+def count_rows_for_project_source(
+    project_name: str,
+    source: str,
+    *,
+    bases: "tuple" = ("CodeModule",),
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> Optional[int]:
+    """v0.2.105 (prune lane): how many rows of ``project_name``'s collections
+    carry ``project_source == source`` (EXACT string, compared in Python).
+
+    The missing-extra-folder detection asks this ("an enabled extra has 0
+    rows of its own in the prefix"). Cheap filtered aggregate first
+    (``project_source`` is TEXT — an ``equal`` filter matches on the token
+    set, so a pathological sibling path could over-count, never under-count;
+    the exact per-row compare below is the fallback when the filter cannot
+    run). Returns ``None`` when undeterminable — the caller must NOT read
+    that as zero (a false "0 rows" would trigger an unnecessary re-sync; a
+    false positive merely skips one).
+    """
+    src = str(source or "").strip()
+    if not project_name or not src:
+        return 0
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+    total = 0
+    with _probe_client(client, weaviate_url, grpc_port) as client:
+        if client is None:
+            return None
+        for base in bases:
+            coll_name = f"{prefix}_{base}"
+            coll, status = _open_collection(client, coll_name, "source count")
+            if status == _COLL_ABSENT:
+                continue  # a class that does not exist holds no rows
+            if status == _COLL_ERROR:
+                return None
+            n: Optional[int] = None
+            try:
+                from weaviate.classes.query import Filter
+
+                agg = coll.aggregate.over_all(
+                    filters=Filter.by_property("project_source").equal(src),
+                    total_count=True,
+                )
+                _tc = getattr(agg, "total_count", None)
+                if _tc is not None:
+                    n = int(_tc)
+            except Exception:  # noqa: BLE001 — fall to the exact scan
+                n = None
+            if n is None:
+                # Exact per-row compare (the tokenization-safe rule — the
+                # same one every delete here follows).
+                try:
+                    n = sum(
+                        1 for obj in coll.iterator(
+                            return_properties=["project_source"])
+                        if str((getattr(obj, "properties", None) or {})
+                               .get("project_source") or "").strip() == src
+                    )
+                except Exception as exc:  # noqa: BLE001 — undeterminable
+                    logger.warning(
+                        "source count on %s failed: %s", coll_name, exc)
+                    return None
+            total += n
+        return total
+
+
+def stored_project_sources(
+    project_name: str,
+    *,
+    bases: "tuple" = ("CodeModule",),
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> "Optional[set[str]]":
+    """v0.2.105 (prune lane): the distinct NON-EMPTY ``project_source``
+    values stored in ``project_name``'s collections.
+
+    The gone-extras sweep asks this: a stored source that is neither the
+    primary root's form nor a currently-ENABLED extra path belongs to a
+    folder that can no longer be walked (disabled in the launcher, or its
+    row removed — the launcher's Remove flow deletes the row and expects the
+    next walk to drop the rows, which the source-scoped prune no longer
+    does). Reads ONLY the ``project_source`` property; ``None`` when any
+    collection cannot be enumerated — the caller must NOT purge on unknown.
+    Legacy unstamped rows (empty source) are not reported: they are the
+    primary root's business, not this sweep's.
+    """
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return None
+    sources: set = set()
+    with _probe_client(client, weaviate_url, grpc_port) as client:
+        if client is None:
+            return None
+        for base in bases:
+            coll, status = _open_collection(
+                client, f"{prefix}_{base}", "stored-sources sweep",
+            )
+            if status == _COLL_ABSENT:
+                continue
+            if status == _COLL_ERROR:
+                return None
+            try:
+                for obj in coll.iterator(return_properties=["project_source"]):
+                    src = str(
+                        (getattr(obj, "properties", None) or {})
+                        .get("project_source") or ""
+                    ).strip()
+                    if src:
+                        sources.add(src)
+            except Exception as exc:  # noqa: BLE001 — undeterminable ⇒ no purge
+                logger.warning(
+                    "stored-sources sweep on %s failed: %s",
+                    f"{prefix}_{base}", exc,
+                )
+                return None
+        return sources
+
+
+def purge_rows_for_project_source(
+    project_name: str,
+    source: str,
+    *,
+    client=None,
+    weaviate_url: Optional[str] = None,
+    grpc_port: Optional[int] = None,
+) -> dict:
+    """v0.2.105 (prune lane): delete every row with ``project_source ==
+    source`` from ``project_name``'s five code-graph collections.
+
+    The DISABLED-extra-folder purge: disabling a folder in the launcher is
+    the owner's intent to remove it, so the next extras refresh calls this
+    for the path. Scoped by the one tokenization-safe delete primitive
+    (:func:`delete_file_rows_exact` — the raw ``project_source`` is read
+    back per row and compared in Python; a Weaviate filter NEVER decides a
+    delete). Returns ``{"counts": {coll: deleted}, "failures": N}``;
+    per-collection failures are logged and skipped (soft-fail — a purge
+    failure must never fail the refresh; the next refresh re-purges).
+    """
+    report: dict = {"counts": {}, "failures": 0}
+    src = str(source or "").strip()
+    if not project_name or not src:
+        return report
+    prefix = _collection_prefix(project_name)
+    if prefix is None:
+        return report
+    with _probe_client(client, weaviate_url, grpc_port) as client:
+        if client is None:
+            return report
+        for base in _CODEGRAPH_BASES:
+            coll_name = f"{prefix}_{base}"
+            coll, status = _open_collection(client, coll_name, "source purge")
+            if status == _COLL_ABSENT:
+                continue
+            if status == _COLL_ERROR:
+                report["failures"] += 1
+                continue
+            try:
+                deleted, failures = delete_file_rows_exact(
+                    coll, _PRUNE_PATH_PROP.get(base, "file_path"),
+                    lambda _raw_path, _props: True,
+                    project_source=src,
+                    log_prefix="disabled-extra purge",
+                )
+            except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
+                logger.warning("source purge: %s failed: %s", coll_name, exc)
+                report["failures"] += 1
+                continue
+            if deleted:
+                report["counts"][coll_name] = deleted
+            report["failures"] += failures
+    return report
+
+
+def clear_orphan_deferral_after_reaping(analyzer: Any) -> None:
+    """v0.2.105 (prune lane, extracted from the analyzer's R14-B1 tail):
+    after a reaping-enabled full ``--prune-stale`` walk, re-count the
+    orphans through the SAME probe and clear the pending-orphan deferral on
+    a positive zero (:func:`clear_orphan_interactions_deferral_if_zero`).
+
+    ``analyzer`` is the :class:`~analyze_code_graph.CodeGraphAnalyzer`
+    (duck-typed, like ``codegraph_schema.ensure_analyzer_properties``):
+    reads ``project_name``, ``_analyze_repo_root_raw`` (R16-B-N1: the RAW
+    root form decides — rows are STAMPED with it; the resolved root's
+    primary set misses raw-stamped rows on a symlinked repo),
+    ``_analyze_repo_root`` (fallback) and ``client``. Never raises: a
+    failed clear check must not wedge the prune pass.
+    """
+    raw_root = str(getattr(analyzer, "_analyze_repo_root_raw", "") or "")
+    try:
+        clear_orphan_interactions_deferral_if_zero(
+            str(getattr(analyzer, "project_name", "") or ""),
+            repo_root=(Path(raw_root) if raw_root
+                       else getattr(analyzer, "_analyze_repo_root", None)),
+            client=getattr(analyzer, "client", None),
+        )
+    except Exception as exc:  # noqa: BLE001 — never wedge the prune
+        print(f"⚠️  orphan-deferral clear check failed: {exc}", file=sys.stderr)
 
 
 # ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
@@ -4401,11 +4733,9 @@ def _run_resync_and_verify_slotted(
         print(f"[resync-driver] post-walk probe raised: {exc}", flush=True)
         counts = None
 
-    # Printed (the orphan entry below): the shell-aware join, same as
-    # `driver_resume_command` (R1 L3).
-    from vco_lib.remedy_shell import command_line
-
-    resume_cmd = command_line(argv)
+    # Printed (the orphan entry below): the shell-aware TARGETED command —
+    # v0.2.105 (prune lane): never `resume_cmd + " --prune-stale"` (that
+    # form deleted enabled extra folders' rows; the 2026-10-29 incident).
     # v0.2.103 (defect 7): "0 stale rows" must not hide provable orphan
     # CodeInteraction rows — count_stale_rows classifies pathless rows
     # purgeable (no re-walk converges them), and pre-fix they also survived
@@ -4452,14 +4782,14 @@ def _run_resync_and_verify_slotted(
             print(
                 f"[resync-driver] {orphan_interactions} provable orphan "
                 "CodeInteraction row(s) remain (no file_path, no reference "
-                "at all or only dangling ones) — only a full-walk "
-                "--prune-stale run removes them (action required; never "
-                "automatic)",
+                "at all or only dangling ones) — the targeted orphan-cleanup "
+                "command recorded below removes exactly those rows (action "
+                "required; never automatic)",
                 flush=True,
             )
             _record_orphan_interactions_deferral(
                 repo_root, project_name, orphan_interactions,
-                resume_cmd + " --prune-stale",
+                orphan_cleanup_command(project_name, Path(repo_root)),
             )
         elif orphan_interactions == 0:
             _resolve_orphan_interactions_deferral(repo_root)
@@ -5322,6 +5652,10 @@ def _main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="codegraph resync helpers")
     parser.add_argument("--prune-ignored", action="store_true",
                         help="delete rows whose path is in the ignore set")
+    parser.add_argument("--prune-orphan-interactions", action="store_true",
+                        help="delete ONLY the provably-dead unanchored "
+                             "CodeInteraction rows (v0.2.105 targeted orphan "
+                             "remedy — never a whole-collection stale prune)")
     parser.add_argument("--run-resync", action="store_true",
                         help="run the analyzer + verify convergence (R-7 driver)")
     parser.add_argument("--backfill-metadata", action="store_true",
@@ -5359,6 +5693,25 @@ def _main(argv: Optional[list] = None) -> int:
                 _audits.AUDIT_IGNORED_PATHS, args.project,
                 ignore_set_key(args.index_dot_claude),
             )
+    elif args.prune_orphan_interactions:
+        configure_logging()
+        res = prune_orphan_interactions(
+            args.project,
+            repo_root=(Path(args.repo_root) if args.repo_root else None),
+        )
+        print(
+            "orphan_interactions_deleted={deleted} "
+            "failures={failures}{undetermined}".format(
+                deleted=res["deleted"], failures=res["failures"],
+                undetermined=(
+                    " (scan undeterminable — nothing was deleted)"
+                    if res["counted"] is None else ""),
+            ),
+            flush=True,
+        )
+        if res["counted"] is None or res["failures"]:
+            return 1  # nothing deleted on unknown; partial deletes stay owed
+        return 0
     elif args.run_resync:
         configure_logging()
         if not args.repo_root or not args.analyzer:

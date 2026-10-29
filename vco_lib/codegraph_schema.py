@@ -376,3 +376,17 @@ def backfill_missing_property(coll: Any, prop: str, value: str) -> Tuple[int, in
                        prop, getattr(coll, "name", "?"), exc)
         failures += 1
     return updated, failures
+
+
+def ensure_interaction_project(analyzer: Any) -> None:
+    """v0.2.102 (S16-4), extracted from the analyzer in v0.2.105 (P2f
+    ratchet): ensure ``project`` on CodeInteraction; when THIS call adds it,
+    backfill rows lacking it (resumable, soft-fail; the 7_to_8 edge too)."""
+    if "CodeInteraction.project" not in ensure_analyzer_properties(analyzer, ("project",)):
+        return
+    done, failed = backfill_missing_property(
+        analyzer.interactions_collection, "project",
+        getattr(analyzer, "project_name", "") or "")
+    print(f"   Backfilled project on {done} CodeInteraction row(s)"
+          + (f" ({failed} failed — the 7_to_8 edge finishes them on the next update)"
+             if failed else ""))

@@ -43,6 +43,7 @@ def prune_collection(
     preserve_paths: Optional[Set[Any]] = None,
     preserve_sources: Optional[Set[str]] = None,
     reap_orphans: bool = False,
+    source_scope: Optional[Any] = None,
 ) -> Tuple[int, int]:
     """Delete every object in ``collection`` whose project matches
     ``project_name`` AND whose UUID is not in ``visited_uuids``.
@@ -118,15 +119,51 @@ def prune_collection(
     only for a full, unscoped ``--prune-stale`` walk that covered every
     enabled extra folder, and only for the collection that owns the orphan
     class.
+
+    v0.2.105 (prune lane — the 2026-10-29 incident): ``source_scope`` (a
+    :class:`vco_lib.codegraph_source_scope.PruneScope`, built by
+    :func:`vco_lib.codegraph_source_scope.prune_scope_for_walk`) scopes the
+    prune to the root(s) THIS walk covered. A row whose non-empty
+    ``project_source`` is not one of the scope's ``own_sources`` (the walked
+    root's forms, plus this run's ``--extra-path`` roots) is PRESERVED and
+    counted, never judged — judging rows on a visit they were not part of is
+    exactly how a primary-only ``--prune-stale`` walk deleted 33,464 rows of
+    an enabled extra code folder (727 orphans expected). The scope's
+    ``strict`` flag is the ``--as-extra-path`` form (a legacy row with NO
+    ``project_source`` is never judged from an extra walk), and its
+    ``legacy_unowned`` flag covers the remaining legacy case on a PRIMARY
+    walk: when the project has ANY registered extra code folder (enabled or
+    disabled) an unstamped row cannot be attributed, so it is preserved (and
+    counted); with no extras registered the rows are the primary root's and
+    keep today's visited-only behaviour. The same scope gates the orphan
+    reaping: a foreign-source orphan row converges on its own root's walk,
+    not this one. ``None`` (the default) disables the scoping — direct
+    callers without a root keep the previous semantics.
     """
     pruned = 0
     failures = 0
     preserved = 0
+    # v0.2.105 (prune lane): rows kept because they belong to a source root
+    # this walk did not cover / cannot attribute — counted and reported so a
+    # "0 pruned" run still says what it spared and why.
+    foreign_preserved = 0
+    legacy_preserved = 0
     preserve_paths = preserve_paths or set()
     preserve_sources = preserve_sources or set()
     keyed = {e for e in preserve_paths if isinstance(e, tuple)}
     bare = {e for e in preserve_paths if not isinstance(e, tuple)}
     orphan_candidates: List[str] = []
+    # v0.2.105: the ONE ownership rule (lazy import — same pattern as the
+    # orphan predicate below; codegraph_source_scope imports
+    # codegraph_resync, which this module must stay importable beside).
+    _row_owned_by_walk = None
+    own_sources = getattr(source_scope, "own_sources", None)
+    _source_strict = bool(getattr(source_scope, "strict", False))
+    _legacy_unowned = bool(getattr(source_scope, "legacy_unowned", False))
+    if own_sources is not None:
+        from vco_lib.codegraph_source_scope import row_owned_by_walk
+
+        _row_owned_by_walk = row_owned_by_walk
     _is_provable_orphan = None
     if reap_orphans:
         # ONE predicate, imported lazily so the prune module stays importable
@@ -193,6 +230,19 @@ def prune_collection(
             if str(obj.uuid) in visited_uuids:
                 continue
             row_source = str(props.get("project_source") or "").strip()
+            # v0.2.105 (prune lane): judge ONLY rows this walk's root(s) own.
+            # Checked FIRST so it also gates the orphan reaping below (a
+            # foreign-source orphan converges on its own root's walk) and
+            # every later preserve branch (an unscoped preserve set can no
+            # longer mask a scope bug in either direction).
+            if _row_owned_by_walk is not None and not _row_owned_by_walk(
+                row_source, own_sources, extra_root=_source_strict,
+            ):
+                foreign_preserved += 1
+                continue
+            if _legacy_unowned and not row_source:
+                legacy_preserved += 1
+                continue
             if row_source and row_source in preserve_sources:
                 preserved += 1
                 continue
@@ -303,6 +353,20 @@ def prune_collection(
         print(
             f"🛡️  Preserved {preserved} row(s) in {collection.name} "
             f"anchored to skipped-but-present files (not stale)"
+        )
+    if foreign_preserved:
+        # v0.2.105 — the prune is scoped to the walked root; say what that
+        # spared, so a primary-only run reading "0 pruned" over a full graph
+        # is explainable from the log alone.
+        print(
+            f"🛡️  Preserved {foreign_preserved} row(s) in {collection.name} "
+            f"belonging to other source roots (not walked this run)"
+        )
+    if legacy_preserved:
+        print(
+            f"🛡️  Preserved {legacy_preserved} legacy row(s) without "
+            f"project_source in {collection.name} (project has extra code "
+            f"folders — attribution unknown)"
         )
     return pruned, failures
 

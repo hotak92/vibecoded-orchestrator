@@ -479,8 +479,9 @@ try:
         reconcile_walked_file_rows as _reconcile_walked_file_rows,
         open_walked_file_scope as _open_scope,
         commit_walked_file_scope as _commit_scope,
-        # v0.2.103 (R14-B1): post-prune deferral clear (positive zero only).
-        clear_orphan_interactions_deferral_if_zero as _clear_orphan_deferral_if_zero,
+        # v0.2.103 (R14-B1); v0.2.105: the wrapper (never raises, raw-root
+        # rule) is the seam the analyzer calls.
+        clear_orphan_deferral_after_reaping as _clear_after_reaping,
     )
     # v0.2.77 Part 5 (CG-2): ONE facade for cross-language call extraction.
     # Dependency-free to import (tree-sitter grammars are lazy-loaded inside
@@ -497,9 +498,9 @@ try:
     from vco_lib import codegraph_source_scope as _src_scope  # W6-CGD: stamp + ownership + preserve keys
     from vco_lib.codegraph_extra_overlap import classify as _extra_overlap  # W6-CGD D-4
     from vco_lib.codegraph_schema import (  # v0.2.102: one ensure loop + backfill
-        backfill_missing_property as _backfill_missing_property,
         ensure_analyzer_properties as _ensure_analyzer_properties,
         ensure_codegraph_file_path as _ensure_file_path_property_shared,
+        ensure_interaction_project,  # v0.2.105: S16-4 body extracted (P2f)
     )
     from vco_lib.codegraph_deleted_files import (  # v0.2.100: deleted-file prune
         FILE_ANCHORED_COLLECTIONS as _FILE_ANCHORED_COLLECTIONS, PruneReport as _PruneReport,
@@ -3344,15 +3345,8 @@ class CodeGraphAnalyzer:
         _ensure_analyzer_properties(self, ("n_callers",))
 
     def _ensure_interaction_project_property(self):
-        """v0.2.102 (S16-4): `project` on CodeInteraction; when THIS call adds it,
-        backfill rows lacking it (resumable, soft-fail; the 7_to_8 edge too)."""
-        if "CodeInteraction.project" not in _ensure_analyzer_properties(self, ("project",)):
-            return
-        done, failed = _backfill_missing_property(
-            self.interactions_collection, "project", getattr(self, "project_name", "") or "")
-        print(f"   Backfilled project on {done} CodeInteraction row(s)"
-              + (f" ({failed} failed — the 7_to_8 edge finishes them on the next update)"
-                 if failed else ""))
+        """v0.2.102 (S16-4) — body in vco_lib.codegraph_schema (v0.2.105)."""
+        ensure_interaction_project(self)
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
@@ -3460,6 +3454,7 @@ class CodeGraphAnalyzer:
         # v0.2.103 (R12-F2): extras DROPPED this run (unresolvable/offline/
         # unmounted) — provenance missing → the orphan reaping is disabled.
         self._dropped_extra_sources: Set[str] = set()
+        self._walked_extra_roots: Set[str] = set()  # v0.2.105: prune-scope input
         for extra in (extra_paths or []):
             try:
                 resolved = extra.resolve()
@@ -3486,6 +3481,7 @@ class CodeGraphAnalyzer:
                         scoped=not self._analyze_whole_repo, extra_root=bool(as_extra_path)))
                 continue
             canonical_extras.append(resolved)
+            self._walked_extra_roots.add(resolved.as_posix())
 
         # v0.2.75 (P1b-3): reset the delete-failure accumulator per run
         # UNCONDITIONALLY (was: only under prune_stale). Three producers now
@@ -4039,6 +4035,17 @@ class CodeGraphAnalyzer:
                 f"language={scope_lang!r} entries not visited this run"
             )
 
+        # v0.2.105 (prune lane): SOURCE-scoped prune, ONE home for the rule
+        # (vco_lib.codegraph_source_scope.prune_scope_for_walk): judge only
+        # rows of the roots this run walked — a primary-only walk must never
+        # judge an extra folder's rows (2026-10-29 incident).
+        _prune_scope = _src_scope.prune_scope_for_walk(
+            getattr(self, "_analyze_repo_root_raw", "") or "",
+            getattr(self, "_walked_extra_roots", ()) or (),
+            strict_source=bool(getattr(self, "_strict_source", False)))
+        if _prune_scope:
+            print(f"🧹 Source-scoped prune active: {_prune_scope.summary()}")
+
         # v0.2.103 (defect 7 / R12-F2 / R14-B2): orphan reaping needs a FULL,
         # unscoped walk. A REFUSED extra no longer gates the run (its rows
         # are protected per-row via preserve_sources → the ONE predicate); a
@@ -4066,6 +4073,7 @@ class CodeGraphAnalyzer:
                 preserve_paths=preserve_paths,
                 preserve_sources=getattr(self, "_refused_extra_sources", None),
                 reap_orphans=_reap_orphans if coll.name.endswith("_CodeInteraction") else False,
+                source_scope=_prune_scope,
             )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
@@ -4082,21 +4090,10 @@ class CodeGraphAnalyzer:
                 _record_prune_failures(self, coll.name, failures)
 
         # R14-B1: after a reaping-enabled full walk, re-count through the SAME
-        # probe and clear the pending-orphan deferral on a positive zero.
-        # R16-B-N1: the RAW root form — rows are STAMPED with it; the resolved
-        # root's primary set misses raw-stamped rows on a symlinked repo.
+        # probe and clear the pending-orphan deferral on a positive zero
+        # (ONE home: vco_lib.codegraph_resync.clear_orphan_deferral_after_reaping).
         if _reap_orphans and self.interactions_collection is not None:
-            _raw_root = getattr(self, "_analyze_repo_root_raw", "") or ""
-            try:
-                _clear_orphan_deferral_if_zero(
-                    self.project_name or "",
-                    repo_root=(Path(_raw_root) if _raw_root
-                               else getattr(self, "_analyze_repo_root", None)),
-                    client=getattr(self, "client", None),
-                )
-            except Exception as exc:  # noqa: BLE001 — never wedge the prune
-                print(f"⚠️  orphan-deferral clear check failed: {exc}",
-                      file=sys.stderr)
+            _clear_after_reaping(self)
 
         return total_pruned
 
@@ -4108,6 +4105,7 @@ class CodeGraphAnalyzer:
         preserve_paths: Optional[Set[Any]] = None,
         preserve_sources: Optional[Set[str]] = None,
         reap_orphans: bool = False,
+        source_scope: Optional[Any] = None,
     ) -> Tuple[int, int]:
         """Thin shim over ``vco_lib.codegraph_prune.prune_collection`` (the
         v0.2.82 extraction — full semantics, history and the 2026-07-15
@@ -4123,6 +4121,7 @@ class CodeGraphAnalyzer:
             preserve_paths=preserve_paths,
             preserve_sources=preserve_sources,
             reap_orphans=reap_orphans,
+            source_scope=source_scope,
         )
 
     def _single_file_dispatch(
