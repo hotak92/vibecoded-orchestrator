@@ -10,7 +10,12 @@
 # prints the COMPLETE updatedInput envelope (every original tool_input field
 # echoed, only `prompt` modified) and this wrapper passes it through
 # VERBATIM -- no Emit-AdditionalContext wrapping, and NEVER a
-# permissionDecision (that would auto-approve the spawn).
+# permissionDecision "allow" (that would auto-approve the spawn).
+#
+# v0.2.105 -- PRE-FLIGHT VENDOR-KEY PROBE, run FIRST: `python -m
+# vco_lib.gateway_preflight` refuses (permissionDecision "deny") a launch whose
+# agent pins a gateway model the running gateway definitely cannot serve; see
+# the .sh sibling. MUST MATCH it.
 
 # Scrub sensitive env vars before any subprocess spawning
 # (list MUST MATCH _lib/scrub-env.ps1; enforced by the scrub parity gate).
@@ -36,12 +41,27 @@ if (Test-Path $ResolveVenv) {
         $Router = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/hook_context_router.py"
     }
 }
-if (-not $Venv -or -not $Router) { exit 0 }
+if (-not $Venv) { exit 0 }
 $env:CLAUDE_PROJECT_DIR = $ProjectRoot
 
 # stdin passthrough (see read-context-inject.ps1 for the R31 rationale).
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+
+# v0.2.105 pre-flight (see the header). Its stdout is EITHER nothing OR the
+# complete deny envelope (vco_lib.gateway_preflight's contract), so any output
+# is passed through verbatim and ends the hook. Its stderr is left alone: a
+# broken install is reported there, loudly, and the launch is not refused.
+# MUST MATCH the .sh sibling.
+if ($HookStdin) {
+    $Preflight = ""
+    try { $Preflight = ($HookStdin | & $Venv -m vco_lib.gateway_preflight) -join "`n" } catch { }
+    if ($Preflight -and ($Preflight -match '\S')) {
+        Write-Output $Preflight
+        exit 0
+    }
+}
+if (-not $Router) { exit 0 }
 
 # The broken-install notice is keyed per SESSION -- extract the payload's
 # session_id the pattern way (no JSON parser needed at this stage). The

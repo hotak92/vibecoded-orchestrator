@@ -94,6 +94,46 @@ def _is_store_unavailable(exc: BaseException) -> bool:
     """Is ``exc`` one of the resolver's TRANSIENT store-unavailability errors?"""
     return any(c.__name__ in _STORE_UNAVAILABLE_TYPES for c in type(exc).__mro__)
 
+def _hub_refused(exc: BaseException) -> bool:
+    """Did tier 1 fail because the hub could not be REACHED (v0.2.105)?
+
+    The trigger test for :attr:`VendorKeyResolver._hub_reviver`. With the file
+    fallback on (the gateway's case) ``agent_secrets.get`` reports a dead hub
+    as the ``SecretNotFound`` of a full-chain miss, raised ``from`` the
+    ``HubUnreachable`` — so the cause chain is walked, not only the type. A
+    ``hub_unreachable`` attribute (set by newer resolvers) counts too. Matched
+    by class NAME, like :func:`_is_store_unavailable`. A hub that is running
+    but slow (``HubNotResponding``) also matches; the reviver's own liveness
+    check turns that into a no-op, so it is never restarted.
+    """
+    seen = 0
+    cur: Optional[BaseException] = exc
+    while cur is not None and seen < 8:
+        if getattr(cur, "hub_unreachable", False):
+            return True
+        if any(c.__name__ == "HubUnreachable" for c in type(cur).__mro__):
+            return True
+        cur = cur.__cause__
+        seen += 1
+    return False
+
+
+def default_hub_reviver() -> Optional[str]:
+    """Start vct-hub if it is DOWN — the gateway's half of "the hub must stay
+    up" (v0.2.105). Delegates to the ONE revive home,
+    :func:`vco_lib.hub_ensure.revive_if_down` (pid-file liveness check, update
+    gate, a machine-wide once-a-minute rate limit, a detached spawn). Imported
+    lazily so this module keeps importing neither ``os`` nor ``subprocess``.
+    Returns the revive state's word."""
+    from vco_lib.hub_ensure import revive_if_down
+
+    return revive_if_down(source="gateway").state.value
+
+
+#: Called (no arguments) when a key read found the hub refusing connections;
+#: returns the revive state's word, or ``None``. See :func:`default_hub_reviver`.
+HubReviver = Callable[[], Optional[str]]
+
 SecretGetter = Callable[..., str]
 
 #: Maps a project PATH (or id) to the hub's project id. Raises on every
@@ -271,8 +311,14 @@ class VendorKeyResolver:
         install_root: Optional[InstallRootResolver] = None,
         serve_stale_max_age_s: int = DEFAULT_SERVE_STALE_MAX_AGE_S,
         miss_log_level: int = logging.WARNING,
+        hub_reviver: Optional[HubReviver] = None,
     ) -> None:
         self._project = project
+        #: v0.2.105: started when a key read finds the hub refusing
+        #: connections, so vendor keys come back without a human. ``None`` (the
+        #: library default — every test and embedder) starts nothing; the
+        #: daemon passes :func:`default_hub_reviver`.
+        self._hub_reviver = hub_reviver
         #: Level of the once-per-vendor "no key" line. WARNING for the daemon
         #: (a request for that vendor fails). A PRESENCE probe passes DEBUG:
         #: asking "is this vendor's key set?" on a machine where it never
@@ -811,10 +857,14 @@ class VendorKeyResolver:
         scope_arg = self.effective_project
         failures: list[str] = []
         unavailable: list[str] = []
+        revive_asked = False
         for key_name in vendor.secret_keys:
             try:
                 value = getter(key_name, project=scope_arg)
             except Exception as exc:  # noqa: BLE001 — every resolver error is a miss
+                if not revive_asked and _hub_refused(exc):
+                    revive_asked = True
+                    self._revive_hub(vendor)
                 if _is_store_unavailable(exc):
                     # v0.2.102: NOT a miss — the store could not be read right
                     # now (hub timed out / keychain busy). The next name is still tried (it may live in
@@ -890,6 +940,37 @@ class VendorKeyResolver:
             )
         return KeyResult(problem=problem)
 
+    def _revive_hub(self, vendor: Vendor) -> None:
+        """Ask the reviver to start the hub (v0.2.105). Never raises.
+
+        Once per resolution; the reviver itself rate-limits machine-wide and
+        does nothing while the hub is alive or an update holds the gate, so a
+        burst of failing requests costs one pid-file read each. A spawn is
+        logged at WARNING — it is the one line that explains why keys come
+        back a few seconds later."""
+        reviver = self._hub_reviver
+        if reviver is None:
+            return
+        try:
+            state = reviver()
+        except Exception as exc:  # noqa: BLE001 — a revive is best-effort
+            logger.warning(
+                "model-gateway: vct-hub is not reachable and starting it failed: %s",
+                exc,
+            )
+            return
+        if state == "started":
+            logger.warning(
+                "model-gateway: vct-hub was not running (vendor %s key read); "
+                "started it — keychain keys resolve again once it is up",
+                vendor.vendor_id,
+            )
+        elif state == "failed":
+            logger.warning(
+                "model-gateway: vct-hub is not running and could not be started; "
+                "see <vct_root>/logs/hub-revive.log",
+            )
+
     def _transient_result(
         self, vendor: Vendor, unavailable: list[str], failures: list[str]
     ) -> KeyResult:
@@ -921,6 +1002,8 @@ class VendorKeyResolver:
 
 __all__ = [
     "DEFAULT_SERVE_STALE_MAX_AGE_S",
+    "HubReviver",
+    "default_hub_reviver",
     "InstallRootResolver",
     "KeyResult",
     "NEGATIVE_TTL_CAP_S",

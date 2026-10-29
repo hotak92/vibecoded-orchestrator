@@ -54,6 +54,29 @@ if (-not $SessionId) { $SessionId = "default" }
 . (Join-Path $PSScriptRoot "_lib/project-root.ps1")
 $ProjectDir = Get-VcoProjectRoot
 if (-not $ProjectDir) { exit 0 }
+
+# v0.2.105: the hub must stay up between SessionStarts (owner rule: every VCO
+# service is up while any VCO project is open). SessionStart only covers the
+# moment a chat opens or resumes; a hub that died mid-session stayed down
+# until the next one. A prompt is the cheapest moment a live chat reliably
+# produces, so it asks the ONE revive home (`vco_lib.hub_ensure revive`): a
+# pid-file read, and a detached `vct-hub --start-if-not-running` only when the
+# hub is DOWN - never during an orchestrator update, at most once a minute
+# machine-wide, logged to <vct_root>/logs/hub-revive.log. Spawned detached
+# through the ONE spawn home, so it never delays or blocks the prompt.
+# MUST MATCH user-prompt-submit-reminder.sh.
+$UpsrVenvLib = Join-Path $PSScriptRoot "_lib/resolve-vco-venv.ps1"
+$UpsrSpawnLib = Join-Path $PSScriptRoot "_lib/resolve-powershell.ps1"
+if ((Test-Path -LiteralPath $UpsrVenvLib -PathType Leaf) -and (Test-Path -LiteralPath $UpsrSpawnLib -PathType Leaf)) {
+    try {
+        . $UpsrVenvLib
+        . $UpsrSpawnLib
+        $UpsrVenvPy = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+        if ($UpsrVenvPy) {
+            Start-VcoDetachedProcess -FilePath $UpsrVenvPy -ArgumentList @('-m', 'vco_lib.hub_ensure', 'revive', '--source', 'prompt', '--quiet') | Out-Null
+        }
+    } catch { }
+}
 $ProjectName = Split-Path $ProjectDir -Leaf
 $ContextFile = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
