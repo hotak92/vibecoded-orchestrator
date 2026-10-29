@@ -242,6 +242,9 @@ try:
         run_code_retrieval_pipeline,
         resolve_retrieval_floor,
         resolve_post_rerank_floor,
+        scope_admits as _scope_admits,
+        scope_collections as _scope_collections,
+        scope_filter as _scope_filter,
     )
 except ImportError as _exc:
     _reraise_shipped_submodule_import(_exc, ".code_ranking")
@@ -5885,26 +5888,20 @@ async def search_code_graph(
     detail: str = "auto",
 ) -> str:
     """
-    Find code entities (functions, classes, modules, APIs) by describing what
+    Find code entities (functions, classes, modules, APIs, config) by what
     they do (semantic). Use BEFORE Grep to find code by purpose; for exact
     callers/deps use query_code_structure.
 
     Args: query (what the code does); scope ("all" default | "code" |
-    "interaction" for APIs/cross-service calls); limit (default 8);
-    expand_hops (0 default; 1-2 follow call/interaction edges); layer
-    (lowercase values: api, service, data, ui, utility; an unpopulated
-    filter re-runs without it);
-    project (omit for workspace default, "" for all); detail ("auto" default,
-    else "titles"/"full" — knowledge/concepts/score-driven-retrieval-tiers.md).
+    "interaction" (APIs, cross-service calls) | "config" (.ini/.json/.tweakers
+    values)); limit (default 8); expand_hops (0 default; 1-2 follow
+    call/link edges); layer (lowercase values: api, service, data, ui,
+    utility); project (omit for workspace default, "" for all);
+    detail ("auto" default, else "titles"/"full" —
+    knowledge/concepts/score-driven-retrieval-tiers.md).
 
     Returns: JSON code entities — file_path, score, tier, tier-dependent content.
     """
-    _SCOPES: dict[str, list[str]] = {
-        "all":         ["CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction"],
-        "code":        ["CodeFunction", "CodeClass", "CodeModule"],
-        "interaction": ["CodeAPI", "CodeInteraction"],
-    }
-
     # Resolve project: explicit arg > env default > no filter
     # Pass project="" to explicitly search all projects regardless of env default
     if project is not None:
@@ -5919,7 +5916,9 @@ async def search_code_graph(
     # filter). The peer list is consumed only when an effective_project is
     # set — otherwise the caller is explicitly asking for cross-tenant
     # search and we don't want to re-scope it.
-    base_names = _SCOPES.get(scope, _SCOPES["all"])
+    # v0.2.105: the scope table (+ "config", and "all" without config link
+    # rows) lives in code_ranking — one home with the ranking it feeds.
+    base_names = _scope_collections(scope)
     if effective_project:
         # v0.2.74 (BLOCKER-1): code-graph fan-out uses the underscore-PRESERVING
         # sanitizer (matches the analyzer's write class), NOT the diagrams/KG
@@ -6042,6 +6041,9 @@ async def search_code_graph(
                         active_filters.append(Filter.by_property("project").equal(project_filter))
                     if apply_layer and layer and base_name in ("CodeFunction", "CodeClass"):
                         active_filters.append(Filter.by_property("layer").equal(layer.lower()))
+                    _scope_clause = _scope_filter(scope, base_name, Filter)
+                    if _scope_clause is not None:
+                        active_filters.append(_scope_clause)
                     if active_filters:
                         combined = active_filters[0]
                         for f in active_filters[1:]:
@@ -6065,6 +6067,10 @@ async def search_code_graph(
                     )
                     for obj in _objs:
                         p = obj.properties
+                        # v0.2.105: the scope's exact rule (the clause above
+                        # is a word-tokenized narrowing read).
+                        if not _scope_admits(scope, base_name, p or {}):
+                            continue
                         distance = obj.metadata.distance if (hasattr(obj.metadata, "distance") and obj.metadata.distance is not None) else 1.0
                         # F11-iv (pre-gate audit): clamp to >= 0.0 — MUST MATCH
                         # the CLI's `max(0.0, 1.0 - distance)` normalisation
@@ -6261,6 +6267,9 @@ async def search_code_graph(
             collapse_fn=make_code_collapse_fn(),
             tier_fn=_tier_fn,
             key_fields=("file_path", "full_name"),
+            # v0.2.105: a config-scope search asked for config rows — no
+            # config penalty there; every other scope resolves the default.
+            config_penalty=0.0 if scope == "config" else None,
         )
 
         # v0.2.73 RL-2: the code path now emits retrieval telemetry (it was a
@@ -6884,6 +6893,12 @@ from vco_lib.fixture_class_guard import (  # noqa: E402 — kept beside its expl
     FixtureClassWriteRefused as _FixtureClassWriteRefused,
     guard_fixture_class_write as _guard_fixture_class_write,
 )
+# v0.2.105: `config_users` / `config_of` — the ONE implementation the CLI's
+# `structure` command calls too (shared code, not a mirror).
+from vco_lib.codegraph_config_query import (  # noqa: E402 — kept beside its explainer
+    CONFIG_QUERY_TYPES as _CONFIG_QUERY_TYPES,
+    run_config_query as _run_config_query,
+)
 
 
 # M-2 / CG-2 (v0.2.73): query types whose relationships are populated only
@@ -7016,18 +7031,18 @@ def query_code_structure(
     project: str = None
 ) -> str:
     """
-    Exact code structure from the code graph (the graph, not semantic search).
-    Use when the entity name is known; find it by description via
-    search_code_graph.
+    Exact code structure from the code graph (not semantic search). Use when
+    the name is known; otherwise search_code_graph first.
 
-    Args: query_type — "dependencies" (imports), "imports" (who imports this),
-    "callers", "methods", "extends", "interactions" (cross-service calls),
-    "path" (shortest call path, "src.func->dst.func", BFS ≤ 6),
-    "composes"/"composed_by", "type_users"; target (full_name for
-    functions/classes, path for modules, the arrow pair for "path"); project
-    (omit for workspace default, "" for all).
+    Args: query_type — "dependencies"/"imports" (what it imports / who
+    imports it), "callers", "methods", "extends", "interactions"
+    (cross-service calls), "path" ("src.func->dst.func", BFS ≤ 6),
+    "composes"/"composed_by", "type_users", "config_users" (code reading a
+    config key/section/file, with the value), "config_of" (the config values
+    a function/module reads); target (full_name, module path, arrow pair for
+    "path", config key); project (omit for workspace default, "" for all).
 
-    Returns: JSON — structural results (names, file_path, relations).
+    Returns: JSON results (names, file_path, relations).
     """
     try:
         client = get_weaviate_client()
@@ -7039,6 +7054,9 @@ def query_code_structure(
         # lookups, methods/extends/composes that read a single object's
         # field) leave it as None (never truncated).
         _truncation_meta: dict | None = None
+        # v0.2.105: extra top-level fields a branch adds (config_users'
+        # `definitions`).
+        _extra_payload: dict = {}
 
         # Resolve project: explicit arg > env default > no filter
         # Pass project="" to explicitly search all projects regardless of env default
@@ -7468,10 +7486,32 @@ def query_code_structure(
                 "limit": TYPE_USERS_LIMIT,
             }
 
+        elif query_type in _CONFIG_QUERY_TYPES:
+            # v0.2.105: config values <-> the code that reads them. ONE
+            # implementation shared with the CLI (vco_lib.codegraph_config_query);
+            # each site carries the value read back from its own root's
+            # section rows.
+            config_result = _run_config_query(
+                query_type, lambda base: client.collections.get(_proj_coll(base)),
+                target, effective_project or "",
+                filter_cls=Filter, ref_cls=QueryReference,
+            )
+            if not config_result.get("success"):
+                config_result["error"] += _code_structure_not_found_hint(
+                    query_type, target, effective_project)
+                return json.dumps(config_result, indent=2)
+            results = config_result["results"]
+            _truncation_meta = {
+                "truncated": config_result["truncated"],
+                "limit": config_result["limit"],
+            }
+            if "definitions" in config_result:
+                _extra_payload["definitions"] = config_result["definitions"]
+
         else:
             return json.dumps({
                 "success": False,
-                "error": f"Unknown query type: {query_type}. Supported: dependencies, imports, callers, methods, extends, interactions, path, composes, composed_by, type_users"
+                "error": f"Unknown query type: {query_type}. Supported: dependencies, imports, callers, methods, extends, interactions, path, composes, composed_by, type_users, config_users, config_of"
             }, indent=2)
 
         # v0.2.46 V46-D: include truncation metadata for top-N queries so
@@ -7489,6 +7529,7 @@ def query_code_structure(
         if _truncation_meta is not None:
             response_payload["truncated"] = _truncation_meta["truncated"]
             response_payload["limit"] = _truncation_meta["limit"]
+        response_payload.update(_extra_payload)
         # CG-2 (v0.2.73 → v0.2.75 P2e): a call-graph query
         # (callers/path/type_users) that returns EMPTY is ambiguous — the target
         # may genuinely have no callers, OR its language's analyzer walker

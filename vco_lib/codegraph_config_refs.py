@@ -142,9 +142,12 @@ def _basename(path: str) -> str:
     return path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
 
 
-def _lookup_names(fmt: str, key_path: str) -> List[str]:
+def key_lookup_names(fmt: str, key_path: str) -> List[str]:
     """The literals a key can be named by: its whole path, plus (JSON) its
-    leaf. INI and ``.tweakers`` keys may contain dots — never split them."""
+    leaf. INI and ``.tweakers`` keys may contain dots — never split them.
+    Shared by the linker (here) and the query side
+    (:mod:`vco_lib.codegraph_config_query`), so a name that links is a name
+    that resolves."""
     names = [key_path]
     if fmt == "json":
         leaf = key_path.rsplit(".", 1)[-1].replace("[]", "")
@@ -169,7 +172,7 @@ class ConfigIndex:
             for key in section.keys:
                 kd = KeyDef(doc.fmt, rel_path, section.name, key.path, key.line,
                             key.value, key.description, key.default)
-                for name in _lookup_names(doc.fmt, key.path):
+                for name in key_lookup_names(doc.fmt, key.path):
                     self.keys.setdefault(name, []).append(kd)
 
     @property
