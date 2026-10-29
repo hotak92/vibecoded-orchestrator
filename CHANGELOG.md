@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Automatic context injections are more selective about relevance.** A field report found off-topic knowledge-graph suggestions getting through at scores between 0.66 and 0.70. Every injection surface's relevance floor has been raised to about the midpoint between the old value and the proposed one: Edit, Write, Bash-edit and agent-brief injections now need a score of at least 0.70 (was 0.65), Read, docs-Read and prompt-time injections need 0.725 (was 0.70), and Bash-read stays at 0.75. Weak matches below the floor are simply not injected; the number of hits per injection and per turn is unchanged.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed

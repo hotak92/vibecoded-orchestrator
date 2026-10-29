@@ -7,7 +7,7 @@ RED on the base tree: `vco_lib.inject_intent` and
 `claude_mcp_servers/scripts/hook_context_router.py` are absent.
 
 Covers (PLAN-V02101 §WP-F row 2 + §2.1):
-  * floors/tiers per surface (0.75 bash-read vs 0.65 edit vs 0.70 read),
+  * floors/tiers per surface (0.75 bash-read vs 0.70 edit vs 0.725 read),
     titles-only below 0.85, three_chunks only on strong surfaces >= 0.85;
   * per-injection 2 500-char soft cap;
   * per-turn 6 000-char budget: exhaustion degrades to titles one-liners;
@@ -65,12 +65,13 @@ class TestKgFloors:
         ("profile", "floor"),
         [
             ("bash_read", 0.75),
-            ("bash_edit", 0.65),
-            ("read_code", 0.70),
-            ("read_docs", 0.70),
-            ("edit", 0.65),
-            ("write", 0.65),
-            ("agent_brief", 0.65),
+            ("bash_edit", 0.70),
+            ("read_code", 0.725),
+            ("read_docs", 0.725),
+            ("edit", 0.70),
+            ("write", 0.70),
+            ("agent_brief", 0.70),
+            ("prompt", 0.725),
         ],
     )
     def test_floor(self, profile: str, floor: float) -> None:

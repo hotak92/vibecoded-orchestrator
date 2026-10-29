@@ -844,7 +844,7 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
 # context for: two context emissions per edit, no score floor on the
 # suggestion path. The injection redesign made those wrappers (via
 # hook_context_router.py) the ONE home for edit-time KG context (PLAN-V02101
-# section 2.1 Edit/Write rows). Retiring this branch also retired the last
+# section 2.1 Edit/Write rows: floor 0.70). Retiring this branch also retired the last
 # shell caller of _lib/query-cache.ps1, deleted with it (the router keeps its
 # own Python cache under the disjoint kgi/cgi namespaces). The
 # pre_tool_use_kg_search task type stays registered in rl_kg_search's
