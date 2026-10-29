@@ -137,70 +137,18 @@ _PARENT_LOOKUP = re.compile(
     re.IGNORECASE,
 )
 
-#: Wrappers peeled before the kill verb, beyond the shared walker's
-#: WRAPPER_VERBS (which already peels sudo/env/exec/nice/time …).
-_FLAG_WRAPPERS = frozenset({"nohup", "setsid", "doas"})
-_XARGS_VALUE_OPTS = frozenset({"-I", "-i", "-n", "-L", "-l", "-P", "-d", "-E",
-                               "-e", "-a", "-s", "--max-args", "--max-lines",
-                               "--max-procs", "--delimiter", "--arg-file",
-                               "--replace", "--eof", "--max-chars"})
-_TIMEOUT_VALUE_OPTS = frozenset({"-s", "-k", "--signal", "--kill-after"})
-
-
-def _basename(tok: str) -> str:
-    return tok.replace("\\", "/").rsplit("/", 1)[-1].lower()
-
-
-def _skip_opts(toks: List[str], value_opts: frozenset) -> List[str]:
-    i = 1
-    while i < len(toks) and toks[i].startswith("-") and toks[i] != "-":
-        if toks[i] == "--":
-            i += 1
-            break
-        i += 2 if toks[i] in value_opts else 1
-    return toks[i:]
+_basename = bcw.command_basename
 
 
 def _peel_to_kill(tokens: Sequence[str]) -> Optional[Tuple[str, List[str], str]]:
     """``(verb, args, bypass)`` when the segment runs a kill verb, else None.
     ``bypass`` names a form that would dodge the runtime guard ("" if none).
-    ``via_xargs`` is folded into bypass="" — its targets come from stdin."""
-    toks = list(tokens)
-    bypass = ""
-    for _ in range(12):
-        while toks and _basename(toks[0]) in bcw.LEADING_COMPOUND_KEYWORDS:
-            toks = toks[1:]
-        toks = bcw.strip_subshell_parens(toks)
-        toks = bcw.strip_env_assignments(toks)
-        if not toks:
-            return None
-        base = _basename(toks[0])
-        if base in bcw.WRAPPER_VERBS:
-            toks = bcw.peel_wrapper_verbs(toks)
-            continue
-        if base == "xargs":
-            toks = _skip_opts(toks, _XARGS_VALUE_OPTS)
-            continue
-        if base in ("timeout", "gtimeout"):
-            toks = _skip_opts(toks, _TIMEOUT_VALUE_OPTS)
-            if toks:  # the duration
-                toks = toks[1:]
-            continue
-        if base in _FLAG_WRAPPERS:
-            toks = _skip_opts(toks, frozenset())
-            continue
-        if base in ("command", "builtin"):
-            rest = toks[1:]
-            if rest and rest[0] in ("-v", "-V"):
-                return None  # a lookup, not a call
-            while rest and rest[0] in ("-p", "--"):
-                rest = rest[1:]
-            bypass = "`%s %s`" % (base, rest[0] if rest else "")
-            toks = rest
-            continue
-        break
-    if not toks:
+    ``via_xargs`` is folded into bypass="" — its targets come from stdin.
+    The wrapper peeling is the shared :func:`bcw.peel_to_command`."""
+    peeled = bcw.peel_to_command(list(tokens))
+    if peeled is None:
         return None
+    toks, bypass = peeled
     verb = _basename(toks[0])
     if verb.endswith(".exe"):
         verb = verb[:-4]
