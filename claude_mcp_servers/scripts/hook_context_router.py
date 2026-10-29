@@ -72,6 +72,10 @@ Env seams (tests + Wave 2):
   a wrapper just before it spawns this script so the budget covers the
   wrapper's own pre-spawn work (:func:`_run_deadline_anchor`);
 * ``VCO_INJECT_LEG_TIMEOUT_S`` (default 4) — per-leg join bound;
+* ``VCO_INJECT_HARD_DEADLINE_S`` (default 7, v0.2.105) — the run's HARD
+  end-to-end deadline from the same anchor: a watchdog ends whatever is
+  still running with exit 0 and no further injection
+  (:func:`_arm_hard_deadline`);
 * ``VCO_QUERY_CACHE_TTL`` (default 900) — the router's cache window; the
   knob's OTHER reader is the pre-edit wrapper's replay cache
   (pre-edit-context-inject), aligned so the replay never outlives the

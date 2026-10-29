@@ -214,12 +214,14 @@ find "$STATE_DIR" -maxdepth 1 -type f -name "bash_intent_*.json" -mtime +1 -dele
 # targets/symbols join the payload (richer training labels). Query snippet
 # + payload travel via env, never string-interpolated into the python
 # source. Soft-fail; backgrounded so it never delays the user's command.
-# v0.2.105: the background SUBSHELL's own stdio is detached too (the
-# redirect after `)`). Without it the subshell kept the hook's stdout and
-# stderr pipes open until the emit finished (hub config resolve + event
-# post, seconds under load), and the harness waits for those pipes to
-# close: the hook counted as running, and timed out, long after this
-# wrapper had exited. MUST MATCH the .ps1 sibling (a detached process).
+# v0.2.105: the background SUBSHELL's own stdio is detached explicitly (the
+# redirect after `)`). The harness waits for the hook's stdout/stderr pipes
+# to CLOSE, so any background holder of them keeps the hook "running" for
+# the emit's whole duration (hub config resolve + event post, seconds under
+# load). Today bash execs the subshell's single command with its own
+# redirects, so nothing holds them; the explicit redirect keeps that true if
+# the subshell ever grows a second command. MUST MATCH the .ps1 sibling (a
+# detached process — it used to run the emit INLINE, inside the timeout).
 # Kept as a function at top-level indent so the child-env block matches the
 # pre-v0.2.101 shape the v0.2.94 root-handoff pin asserts.
 _emit_prebash_outcome() {

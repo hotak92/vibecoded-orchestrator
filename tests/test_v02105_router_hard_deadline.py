@@ -437,3 +437,56 @@ def test_every_router_wrapper_stamps_its_start(tmp_path: Path, wrapper: str) -> 
         assert log.is_file(), f"{argv[0]} {wrapper}: the router was never spawned"
         stamp = float(log.read_text().split()[0])
         assert t0 - 1 <= stamp <= time.time(), f"{argv[0]} {wrapper}: stamp {stamp}"
+
+
+# --- 5. the pre_bash outcome event never holds the hook --------------------------
+
+_SLOW_OUTCOME_STUB = '''\
+import json, os, time
+
+OUTCOME_EVENT_TYPES = ("bash_outcome", "edit_outcome", "pre_bash")
+
+
+def emit_outcome_event(event_type=None, task_id=None, payload=None, **kw):
+    time.sleep(float(os.environ.get("VCO_TEST_OUTCOME_DELAY", "0")))
+    with open(os.environ["VCO_TEST_OUTCOME_RECORD"], "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"event_type": event_type, "task_id": task_id}) + "\\n")
+    return True
+'''
+
+
+@pytest.mark.parametrize("shell", ["sh", "ps1"])
+def test_slow_pre_bash_outcome_does_not_hold_the_hook(tmp_path: Path, shell: str) -> None:
+    """The pre_bash outcome event (hub resolve + post: seconds under load)
+    must not keep the hook "running": the harness waits for the hook's stdout
+    and stderr to CLOSE (subprocess.run's capture does the same). RED on the
+    base for .ps1 (the emit ran inline: 9 s); the .sh case pins the detached
+    background job (green on the base too: bash execs the subshell's single
+    command with its own redirects). The event must still be emitted."""
+    if shell == "sh" and not shutil.which("bash"):
+        pytest.skip("bash required")
+    if shell == "ps1" and not shutil.which("pwsh"):
+        pytest.skip("pwsh required")
+    from tests.test_v02101_router_surfaces import Rig, _bash_payload
+
+    rig = Rig(tmp_path)
+    pkg = tmp_path / "fakepkg" / "claude_mcp_servers" / "rl_client"
+    pkg.mkdir(parents=True)
+    (pkg.parent / "__init__.py").write_text("")
+    (pkg / "__init__.py").write_text("")
+    (pkg / "outcome_emit.py").write_text(_SLOW_OUTCOME_STUB)
+    record = tmp_path / "outcome.jsonl"
+    payload = _bash_payload("grep -rn widget_loader src/", session="sess-ob", cwd=str(rig.proj))
+    payload["tool_use_id"] = f"toolu_ob_{shell}"
+    start = time.monotonic()
+    r = rig.run("pre-bash-context-inject", payload, shell=shell, env_overrides={
+        "PYTHONPATH": f"{tmp_path / 'fakepkg'}{os.pathsep}{REPO_ROOT}",
+        "VCO_TEST_OUTCOME_RECORD": str(record), "VCO_TEST_OUTCOME_DELAY": "8"})
+    elapsed = time.monotonic() - start
+    assert r.returncode == 0, r.stderr
+    assert elapsed < 6.0, f"{shell}: the hook's pipes stayed open {elapsed:.1f} s"
+    end = time.monotonic() + 20
+    while time.monotonic() < end and not record.exists():
+        time.sleep(0.2)
+    assert record.exists() and "pre_bash" in record.read_text(), (
+        f"{shell}: the detached outcome event was never emitted ({r.stderr[-400:]})")

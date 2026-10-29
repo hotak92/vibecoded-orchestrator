@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Context-injection hooks no longer time out.** On a busy project the hooks that add knowledge-graph and code-graph context before an edit, a write, a shell command and a prompt were hitting their 10 s limit on most runs (65-92 % on one project measured from the chat transcripts), so Claude Code waited 10 s and then got no context. The cause: after finding its context, the hook read every pending citation record of the project, one per search of every chat, often 1-8 MB each and thousands of files, which took far longer than the limit. It now touches only the records it wrote itself. On top of that, every injection run now has a hard deadline of 7 s from the moment the hook started (`VCO_INJECT_HARD_DEADLINE_S`): whatever it is still doing then, it stops and lets the tool call proceed without extra context, instead of making Claude Code wait out the timeout. On Windows the shell-command hook also no longer waits for its learning-signal event to be sent: that now happens in the background, as it already did on Linux and macOS.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed
