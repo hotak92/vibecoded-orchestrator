@@ -645,8 +645,15 @@ pub async fn list_legacy_codegraph_collections(
             Some(parts) => parts,
             None => continue,
         };
-        // Best-effort object count via Aggregate. Failures → 0.
-        let count = fetch_class_count(&client, &base, &name).await.unwrap_or(0);
+        // Best-effort object count via the ONE live-count home
+        // (v0.2.105): this wizard is an explicit user action, so its
+        // classes are counted live even though they sit outside every
+        // project's read scope — and each successful count refreshes the
+        // launcher.db count cache. Failures → 0 (unchanged).
+        let count = vct_launcher_core::weaviate_counts::count_and_cache(&db, &client, &base, &name)
+            .await
+            .count
+            .unwrap_or(0) as u32;
         if count == 0 {
             // Skip empty classes either way — they're noise that lingers
             // because Weaviate doesn't auto-delete on object drain.
@@ -1059,6 +1066,15 @@ pub async fn cleanup_legacy_codegraph_collections(
         }
     }
 
+    // v0.2.105 lazy-load counts: a deleted class's cached count must go
+    // with it, or the views keep showing a number for a class that no
+    // longer exists. Soft-fail — the delete already happened.
+    if !deleted.is_empty() {
+        if let Err(e) = db.collection_count_invalidate_many(&deleted) {
+            tracing::warn!("[vct] cleanup_legacy_codegraph_collections: {}", e);
+        }
+    }
+
     let _ = db.audit(
         "codegraph_legacy_cleanup",
         None,
@@ -1228,6 +1244,14 @@ pub async fn cleanup_orphan_codegraph_collections(
                     });
                 }
             }
+        }
+    }
+
+    // v0.2.105 lazy-load counts: drop the cached counts of everything the
+    // verified delete removed (mirrors the legacy cleanup above).
+    if !deleted.is_empty() {
+        if let Err(e) = db.collection_count_invalidate_many(&deleted) {
+            tracing::warn!("[vct] cleanup_orphan_codegraph_collections: {}", e);
         }
     }
 
@@ -1643,25 +1667,14 @@ fn resolve_weaviate_url(db: &Db) -> String {
     vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
-async fn fetch_class_count(
-    client: &reqwest::Client,
-    base_url: &str,
-    class: &str,
-) -> Result<u32, String> {
-    let body = serde_json::json!({
-        "query": format!("{{ Aggregate {{ {class} {{ meta {{ count }} }} }} }}", class = class)
-    });
-    let resp = client
-        .post(format!("{}/v1/graphql", base_url))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("graphql: {}", e))?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    Ok(v.pointer(&format!("/data/Aggregate/{}/0/meta/count", class))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0) as u32)
-}
+// `fetch_class_count` (the per-file live Aggregate copy) was removed in
+// v0.2.105: the one live-fetch implementation lives in
+// `vct_launcher_core::weaviate_counts`. The wizard below uses
+// `weaviate_counts::count_and_cache`, which also refreshes the launcher.db
+// count cache as a side effect — the wizard is an explicit user action, so
+// counting its classes live is allowed even for collections outside any
+// project's scope (the per-render listing surfaces are the ones that must
+// not).
 
 /// Collection name allowed alphabet, matching Weaviate's class-name rules:
 /// must start with a letter; rest is [A-Za-z0-9_]. We do NOT enforce

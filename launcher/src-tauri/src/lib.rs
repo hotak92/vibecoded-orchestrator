@@ -3336,6 +3336,7 @@ pub fn run() {
             // KG dashboard
             commands::kg::kg_list_collections,
             commands::kg::codegraph_list_projects,
+            commands::kg::refresh_collection_counts,
             // (kg_set_collection_access — the singular per-row setter — is
             //  not registered: the GUI uses kg_set_collection_access_mode
             //  exclusively, which is the higher-level mode-based API that

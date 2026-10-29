@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The launcher's collection counts no longer load every project's data into Weaviate's memory.** Weaviate keeps a collection in RAM from the first query on it (through 1.28 it never unloads), and the launcher's KG collections view, the /codegraph page and the hub's CLI listings counted EVERY collection on the machine — every project's knowledge graph and code graph included — each time they rendered. These views now count live only the collections the open project actually uses (its own, the shared one, and the ones it has been granted access to); every other collection shows the last cached count, with the moment it was taken next to it, and "—" when it was never counted. A new "Refresh counts" button on the KG collections view and the /codegraph page counts everything once and refreshes those cached numbers. A count the launcher knows is stale — after a knowledge-graph sync, a finished code-graph build, or deleting collections through the cleanup wizard — is dropped rather than shown as fresh.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed
