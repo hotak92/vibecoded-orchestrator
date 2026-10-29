@@ -60,7 +60,7 @@ def test_a_missing_container_is_none_and_positively_not_found():
         return _cp(argv, 125, "", "Error: no such container vco_ollama")
 
     assert c.container_id("vco_ollama", "podman", run=run) is None
-    _entry, verdict = c.inspect_container_entry("vco_ollama", "podman", run=run)
+    _entry, verdict, _detail = c.inspect_container_entry("vco_ollama", "podman", run=run)
     assert verdict == "not_found"
 
 
@@ -72,8 +72,11 @@ def test_a_probe_error_is_none_and_stays_error_never_not_found():
         return _cp(argv, 1, "", "Error: cannot connect to the podman socket")
 
     assert c.container_id("vco_ollama", "podman", run=run) is None
-    _entry, verdict = c.inspect_container_entry("vco_ollama", "podman", run=run)
+    _entry, verdict, detail = c.inspect_container_entry("vco_ollama", "podman", run=run)
     assert verdict == "error"
+    # v0.2.105 review LOW: the diagnostic tail (daemon down, permission
+    # denied) rides along, so UNKNOWN surfaces need not say just "error".
+    assert "cannot connect to the podman socket" in detail
 
 
 def test_exit_zero_with_an_empty_payload_reads_as_not_found():
@@ -83,7 +86,7 @@ def test_exit_zero_with_an_empty_payload_reads_as_not_found():
     def run(argv, **kw):
         return _cp(argv, 0, "", "")
 
-    _entry, verdict = c.inspect_container_entry("vco_ollama", "podman", run=run)
+    _entry, verdict, _detail = c.inspect_container_entry("vco_ollama", "podman", run=run)
     assert verdict == "not_found"
 
 
@@ -91,7 +94,7 @@ def test_unparseable_payload_is_an_error():
     def run(argv, **kw):
         return _cp(argv, 0, "not json", "")
 
-    _entry, verdict = c.inspect_container_entry("vco_ollama", "podman", run=run)
+    _entry, verdict, _detail = c.inspect_container_entry("vco_ollama", "podman", run=run)
     assert verdict == "error"
 
 

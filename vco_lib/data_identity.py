@@ -196,7 +196,8 @@ def capture_live_mount(service: str, runtime: str, *, run: Optional[RunFn] = Non
         # `{{.Id}}` probe worked on podman too; the move is for the ONE
         # home — and the tri-state verdict, which keeps ABSENT and UNKNOWN
         # apart exactly as before.
-        _entry, verdict = _containers.inspect_container_entry(name, runtime, run=_run)
+        _entry, verdict, detail = _containers.inspect_container_entry(
+            name, runtime, run=_run)
         if verdict == "exists":
             raw = _sa._inspect_json(name, "{{json .Mounts}}", runtime, _run)
             if not isinstance(raw, list):
@@ -209,7 +210,12 @@ def capture_live_mount(service: str, runtime: str, *, run: Optional[RunFn] = Non
             return LiveMount(LIVE_PRESENT, name, None)
         if verdict == "not_found":
             continue  # no such container under this name
-        unknown.append(f"{name}: inspect {verdict}")
+        # v0.2.105 (review LOW): the UNKNOWN entry keeps the probe's own
+        # diagnostic (daemon down, permission denied) — the detail
+        # inspect_container_entry extracts — instead of a bare "inspect
+        # error", exactly as the pre-refactor code recorded the stderr tail.
+        unknown.append(f"{name}: inspect {verdict}"
+                       + (f" — {detail}" if detail else ""))
     if unknown:
         return LiveMount(LIVE_UNKNOWN, detail="; ".join(unknown))
     return LiveMount(LIVE_ABSENT)

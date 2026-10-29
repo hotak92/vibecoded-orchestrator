@@ -133,3 +133,95 @@ def test_the_driver_side_probe_is_the_shared_waiting_one(monkeypatch):
     assert "code_backend_down_waiting(" in src
     assert "code_backend_down(" not in src.replace(
         "code_backend_down_waiting(", "")
+
+
+# ─── v0.2.105 fix round: the POST-WALK soft-skip convergence (the race) ──
+
+
+def test_post_walk_soft_skip_converges_on_the_refusal(monkeypatch, tmp_path,
+                                                       capsys):
+    """ACT side of the closed race (review LOW): the backend answered the
+    PRE-check but went down before the analyzer's own probe, so the analyzer
+    SOFT-SKIPPED — exit 0 with "Code-graph analysis skipped" in the shared
+    log. The driver must NOT relay that as success: the deferral is
+    recorded (driver-time text), the hub row is closed "failed" with
+    files_analyzed 0, and the code-summary rider never spawns for a walk
+    that analyzed nothing. RED-PROOF TARGET: deleting the post-walk
+    soft-skip check turns these assertions red."""
+    seen = _stub_driver_gates(monkeypatch, backend_down=False)
+    seen["summary"] = []
+    monkeypatch.setattr(cr, "spawn_code_summary_after_walk",
+                        lambda *a, **k: seen["summary"].append(a))
+    log = tmp_path / "resync.log"
+    log.write_text(
+        "⚠️  Code-graph analysis skipped: active code backend "
+        "(slot=codesage_embed) is not reachable.\n", encoding="utf-8")
+    rc = cr._run_resync_and_verify_slotted(
+        "MyProj", tmp_path, tmp_path / "analyze_code_graph.py", log_path=log)
+    assert rc == 0
+    assert len(seen["runs"]) == 1, "the analyzer DID run (and soft-skipped)"
+    assert seen["summary"] == []
+    out = capsys.readouterr().out
+    assert "SOFT-SKIPPED" in out and "stays owed" in out
+    # Exactly ONE terminal report, and it is NOT success.
+    assert len(seen["terminal"]) == 1, seen["terminal"]
+    args, kwargs = seen["terminal"][0]
+    assert args[0] == "MyProj" and args[1] == "failed"
+    assert kwargs.get("files_analyzed") == 0
+    assert "soft-skipped" in (kwargs.get("error_message") or "")
+    assert _CONDITION_ID in _persisted(tmp_path)
+
+
+def test_post_walk_no_marker_is_the_ordinary_completion(monkeypatch, tmp_path):
+    """LEAVE-ALONE side: an analyzer that RAN (no skip marker in the log)
+    keeps the ordinary completion path — its own terminal report, no
+    backend-down deferral."""
+    seen = _stub_driver_gates(monkeypatch, backend_down=False)
+    log = tmp_path / "resync.log"
+    log.write_text("Code-graph analysis: 42 files analyzed\n",
+                   encoding="utf-8")
+    rc = cr._run_resync_and_verify_slotted(
+        "MyProj", tmp_path, tmp_path / "analyze_code_graph.py", log_path=log)
+    assert rc == 0
+    assert len(seen["runs"]) == 1
+    assert len(seen["terminal"]) == 1
+    _args, kwargs = seen["terminal"][0]
+    assert kwargs.get("error_message") in (None, ""), kwargs
+    assert _CONDITION_ID not in _persisted(tmp_path)
+
+
+# ─── v0.2.105 fix round: the driver-time deferral text ───────────────────
+
+
+def test_backend_down_builder_text_is_driver_time():
+    """The DRIVER-TIME flavour must say WHEN the backend was down (the resync
+    run), never reuse the update-time wording."""
+    entry = cr.build_backend_down_deferral("MyProj", "cmd", backend=_DOWN)
+    assert entry is not None
+    assert entry.condition_id == _CONDITION_ID
+    for stale in ("--update", "pre-chunking"):
+        assert stale not in entry.detected, entry.detected
+        assert stale not in entry.why_deferred, entry.why_deferred
+    assert _DOWN.lower() in entry.detected.lower()  # capitalised first letter
+    assert "unreachable" in entry.detected
+
+
+def test_recorded_backend_down_deferral_uses_driver_time_text(
+        monkeypatch, tmp_path):
+    """End to end: the entry the DRIVER records (both arms) carries the
+    driver-time text — review LOW: the update-time wording ("was
+    unreachable during --update ... pre-chunking scheme") is false for a
+    manual or driver-time refusal. RED-PROOF TARGET: pointing
+    `_record_backend_down_deferral` back at `build_resync_deferral` turns
+    this red."""
+    _stub_driver_gates(monkeypatch, backend_down=True)
+    rc = cr._run_resync_and_verify_slotted(
+        "MyProj", tmp_path, tmp_path / "analyze_code_graph.py")
+    assert rc == 0
+    from vco_lib.deferral_report import DeferralReport
+
+    entry = next(e for e in DeferralReport.read(tmp_path).entries
+                 if e.condition_id == _CONDITION_ID)
+    for stale in ("--update", "pre-chunking"):
+        assert stale not in entry.detected, entry.detected
+        assert stale not in entry.why_deferred, entry.why_deferred

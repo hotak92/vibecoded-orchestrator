@@ -351,12 +351,19 @@ _NO_SUCH_CONTAINER_RE = re.compile(r"no such (?:container|object)", re.IGNORECAS
 def inspect_container_entry(
     name: str, runtime: str = "podman", *,
     run: Optional[Callable] = None,
-) -> "tuple[Optional[dict], str]":
-    """``(first inspect JSON entry or None, verdict)`` for one container —
-    the ONE runtime-neutral container lookup (v0.2.105). Verdict is
-    :func:`classify_container_probe`'s vocabulary: ``"exists"`` /
-    ``"not_found"`` / ``"error"`` (a probe that could not run never folds
-    into ``"not_found"`` — the two are different answers).
+) -> "tuple[Optional[dict], str, str]":
+    """``(first inspect JSON entry or None, verdict, detail)`` for one
+    container — the ONE runtime-neutral container lookup (v0.2.105).
+    Verdict is :func:`classify_container_probe`'s vocabulary:
+    ``"exists"`` / ``"not_found"`` / ``"error"`` (a probe that could not
+    run never folds into ``"not_found"`` — the two are different answers).
+
+    ``detail`` is ``""`` except on an ``"error"`` verdict, where it carries
+    the diagnostic the pre-v0.2.105 call sites used to lose: the exception
+    text (timeout / spawn failure) or the probe's stderr tail (daemon
+    down, permission denied). Callers that surface UNKNOWN to a user
+    (:func:`vco_lib.data_identity.capture_live_mount`) put it in the
+    message instead of a bare "inspect error".
 
     Inspects WITHOUT a Go template — ``<runtime> inspect --type container
     <name>`` — the ONE shape both runtimes answer identically. The template
@@ -376,30 +383,36 @@ def inspect_container_entry(
     :func:`runtime_pin` / :func:`resolve`); this helper asks exactly the
     runtime it is given.
     """
+
+    def _tail(text: str, limit: int = 160) -> str:
+        return " ".join((text or "").split())[:limit]
+
     try:
         res = (run or _tsd.run)(
             [runtime, "inspect", "--type", "container", name],
             capture_output=True, text=True, timeout=15,
         )
-    except (subprocess.TimeoutExpired, OSError):
-        return None, "error"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return None, "error", _tail(str(exc))
     verdict = classify_container_probe(res)
     if verdict != "exists":
-        return None, verdict
+        detail = (_tail(res.stderr or "") or _tail(res.stdout or "")
+                  ) if verdict == "error" else ""
+        return None, verdict, detail
     if not (res.stdout or "").strip():
         # Exit 0 with no payload: no runtime does this for a container that
         # exists — every pre-v0.2.105 call site read it as "not found", so
         # that reading is kept (never "error": it would turn a benign probe
         # answer into UNKNOWN for the tri-state callers).
-        return None, "not_found"
+        return None, "not_found", ""
     try:
         doc = json.loads(res.stdout.strip())
     except ValueError:
-        return None, "error"
+        return None, "error", _tail(f"unparseable payload: {res.stdout}")
     entry = doc[0] if isinstance(doc, list) and doc else doc
     if not isinstance(entry, dict):
-        return None, "error"
-    return entry, "exists"
+        return None, "error", _tail(f"unparseable payload: {res.stdout}")
+    return entry, "exists", ""
 
 
 def container_id(
@@ -411,7 +424,7 @@ def container_id(
     :func:`inspect_container_entry` (v0.2.105). Callers that must keep
     "absent" and "could not tell" apart use :func:`inspect_container_entry`
     directly. Read-only; never raises."""
-    entry, verdict = inspect_container_entry(name, runtime, run=run)
+    entry, verdict, _detail = inspect_container_entry(name, runtime, run=run)
     if verdict != "exists" or entry is None:
         return None
     return str(entry.get("Id", "") or "") or None
