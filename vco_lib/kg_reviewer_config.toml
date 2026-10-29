@@ -119,23 +119,29 @@ title_stopwords = ["a", "an", "the", "and", "or", "of", "for", "in", "on", "to",
 # EVIDENCE-LEVEL inflation: a line the reviewer ADDED (or extended in place —
 # only the text it added is judged) that uses one of `evidence_markers`
 # (case-insensitive, whole word; "untested" does not match "tested") AS AN
-# EVIDENCE CLAIM is reverted unless the same word occurs, as a whole word,
-# somewhere in what the reviewer read (its Read/Grep results, the commit diff
-# and stat, the commit's sha and its parent's). A marker is a claim when it is
-# written UPPERCASE ("CONFIRMED"), or is followed by one of
-# `evidence_attribution_words` ("confirmed in game", "verified via the soak
+# EVIDENCE CLAIM is reverted unless the same word is sourced by the SAME
+# PASSAGE as the claim — a line of what the reviewer read (its Read/Grep
+# results, the commit diff and stat, the commit's sha and its parent's) that
+# shares at least `evidence_passage_min_shared_tokens` content tokens with the
+# claim line (v0.2.105; before that the word only had to occur somewhere in
+# the corpus, so a marker in an unrelated passage sourced any claim). A marker
+# is a claim when it is written UPPERCASE ("CONFIRMED"), or is followed by one
+# of `evidence_attribution_words` ("confirmed in game", "verified via the soak
 # suite"), or directly follows one of `evidence_copula_words` ("is verified",
-# "has been tested"; "is not tested" is not a claim), or directly follows one
-# of `evidence_label_words` and a colon, case-insensitive ("Status:
-# confirmed", "**Result:** verified"; "Status: not confirmed" is not a
-# claim), or its line also cites a run/test id or commit hash. Prose use
+# "has been tested"; "is not tested" is not a claim) AND ends its clause
+# (v0.2.105: "it was validated input" is a noun phrase — the marker modifies
+# the next word, so it is prose; see `evidence_predicate_followers`), or
+# directly follows one of `evidence_label_words` and a colon, case-insensitive
+# ("Status: confirmed", "**Result:** verified"; "Status: not confirmed" is not
+# a claim), or its line also cites a run/test id or commit hash. Prose use
 # ("the tested path"), a heading without attribution, fenced code blocks and
 # the YAML frontmatter are not claims; a fence that never closes does not
-# exempt the lines after it (they are judged as prose). Known residue: the
-# copula arm also flags a noun phrase ("it was validated input") when the
-# word is in nothing the reviewer read — rare, and the prompt forbids these
-# words outright; an adverb or "(" between marker and attribution ("is now
-# confirmed", "confirmed (via …)") is not caught. A claim line's run/test ids and commit
+# exempt the lines after it (they are judged as prose). Known residue: an
+# adverb or "(" between marker and attribution ("is now confirmed",
+# "confirmed (via …)") is not caught, and a claim line carrying fewer than
+# `evidence_passage_min_shared_tokens` distinctive words of its own cannot be
+# tied to a passage, so the word occurring anywhere still sources it. A claim
+# line's run/test ids and commit
 # hashes must each be found verbatim in the same corpus. Id shapes (the
 # guard's `_STAMP_ID`, `_RUN_WORD_ID` and `_HEX_ID` patterns): a stamp of 8+
 # digits, optionally followed by -/_/T and 4+ digits (`20261015-221000`); the
@@ -149,6 +155,38 @@ evidence_attribution_words = ["in", "via", "by", "on", "at", "during"]
 evidence_copula_words = ["is", "are", "was", "were", "be", "been"]
 evidence_label_words = ["status", "result", "results", "outcome", "state",
                         "verdict", "evidence", "confidence"]
+# How many content tokens a claim line must share with the corpus line that
+# carries its marker word (the passage tie). 0 = the pre-v0.2.105 whole-corpus
+# rule (any line): kept as an escape hatch, not as a default.
+evidence_passage_min_shared_tokens = 2
+# Words that may follow a marker AFTER A COPULA and still leave it the
+# predicate ("is confirmed and shipped", "is verified against the live API",
+# "was validated with real data", "is tested end-to-end"). Any other
+# following word makes the marker a modifier ("was validated input", "is
+# tested code"), which is prose. Prepositions and manner adverbs are here
+# because a passive predicate is most often followed by one — and "verified
+# against / tested end-to-end / validated with / confirmed under" are the
+# commonest inflated-claim spellings (review R1 M6, v0.2.105). The
+# attribution words (in/via/by/on/at/during) are matched by their own arm.
+evidence_predicate_followers = ["and", "but", "or", "so", "then", "now",
+                                "since", "as", "that", "which", "because",
+                                "when", "while", "too", "also", "already",
+                                "again", "once", "twice", "today", "here",
+                                "there", "correct", "correctly", "true",
+                                "false", "done", "working", "fixed", "green",
+                                "stable",
+                                # prepositions a passive predicate takes
+                                "against", "with", "without", "under",
+                                "through", "throughout", "across", "for",
+                                "from", "after", "before", "over", "using",
+                                "per", "to", "into", "within", "upon",
+                                "inside", "outside", "end", "both",
+                                # manner adverbs
+                                "locally", "manually", "live", "empirically",
+                                "independently", "successfully", "fully",
+                                "thoroughly", "extensively", "explicitly",
+                                "directly", "automatically", "repeatedly",
+                                "experimentally", "only", "just"]
 # The largest knowledge/ symlink TARGET the snapshot copies (bytes). A larger
 # target is recorded as "too large - not restorable": a write through that
 # link is logged REVERT-IMPOSSIBLE and nothing through it is committed.

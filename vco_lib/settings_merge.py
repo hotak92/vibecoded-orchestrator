@@ -56,14 +56,19 @@ it cannot be read.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 from vco_lib.hook_retirements import (
+    PRIOR_SHIPPED_SHAPES,
+    hook_command_key,
     match_prior_shipped_shape,
     migrate_group_matcher,
+    normalize_command,
     migration_sources,
     scrub_retired_registrations,
     vco_hook_script_identity,
+    vco_shipped_hook_scripts,
 )
 from vco_lib.hooks_settings import normalize_matcher
 from vco_lib.parked_hooks import (
@@ -78,10 +83,28 @@ from vco_lib.parked_hooks import (
 __all__ = ["merge_hooks_block", "smart_merge_settings"]
 
 
+def _entry_cmds(entry: Any) -> list[str]:
+    """The command strings one hooks-array entry declares, in order. A
+    non-dict entry, or an inner item with no non-empty string command,
+    contributes nothing."""
+    if not isinstance(entry, dict):
+        return []
+    cmds: list[str] = []
+    for h in entry.get("hooks", []):
+        if not isinstance(h, dict):
+            continue
+        cmd = h.get("command")
+        # Keep only non-empty string commands (drops None + falsy) — this
+        # also narrows the element type to `str` for the return contract.
+        if isinstance(cmd, str) and cmd:
+            cmds.append(cmd)
+    return cmds
+
+
 def smart_merge_settings(
     user: dict, template: dict, *, retired_removed: Optional[list] = None,
     parked: Optional[ParkedHooksState] = None, kept_out: Optional[list] = None,
-    retired_allow: tuple[str, ...] = (),
+    retired_allow: tuple[str, ...] = (), duplicate_groups: Optional[list] = None,
 ) -> dict:
     """Recursive dict merge with a hooks-block special-case.
 
@@ -109,6 +132,11 @@ def smart_merge_settings(
     same authority the retired-hooks scrub carries: VCO shipped the entry,
     VCO retired what it pointed at. A user's own allow entry is untouched
     unless it is byte-identical to a retired pattern.
+
+    ``duplicate_groups`` (v0.2.105): accumulator the hooks merge appends one
+    record to per duplicate-group decision it took — folded, redundant, or
+    left alone because it holds the user's own command. Threaded through the
+    recursion for the same reason ``retired_removed`` is.
     """
     if retired_allow:
         perms = user.get("permissions")
@@ -123,6 +151,7 @@ def smart_merge_settings(
                 merged_hooks = merge_hooks_block(
                     {}, tval, retired_removed=retired_removed,
                     parked=parked, kept_out=kept_out,
+                    duplicate_groups=duplicate_groups,
                 )
                 if merged_hooks or not tval:
                     out[key] = merged_hooks
@@ -134,11 +163,13 @@ def smart_merge_settings(
             out[key] = merge_hooks_block(
                 uval, tval, retired_removed=retired_removed,
                 parked=parked, kept_out=kept_out,
+                duplicate_groups=duplicate_groups,
             )
         elif isinstance(uval, dict) and isinstance(tval, dict):
             out[key] = smart_merge_settings(
                 uval, tval, retired_removed=retired_removed,
                 parked=parked, kept_out=kept_out,
+                duplicate_groups=duplicate_groups,
             )
         # else: user wins.
     return out
@@ -148,6 +179,7 @@ def merge_hooks_block(
     user_hooks: dict, template_hooks: dict,
     *, retired_removed: Optional[list] = None,
     parked: Optional[ParkedHooksState] = None, kept_out: Optional[list] = None,
+    duplicate_groups: Optional[list] = None,
 ) -> dict:
     """Per-event hook array merge.
 
@@ -231,10 +263,28 @@ def merge_hooks_block(
     byte-for-byte — never rewritten or dropped. When in doubt, fall back to the
     pre-v0.2.70 append behavior (a wrong replace that clobbers a user hook is
     worse than a missed supersede).
+
+    v0.2.105 (duplicate groups — the fold pass, LAST): everything above works
+    per COMMAND, so it can heal a stale command but never a whole GROUP. An
+    install that received the shipped hooks across several releases therefore
+    keeps them in several groups that share one matcher — one measured file
+    carried FOUR `startup` SessionStart groups after the v0.2.104 update, so
+    the container-ensure / kg-loader / context-size pair ran three times per
+    session start. :func:`_fold_duplicate_shipped_groups` runs after the
+    append pass and folds groups that are PROVABLY VCO's: same matcher, and
+    every command's normalised spelling EQUALS one VCO ships or once shipped
+    (the current template's, a prior shipped shape's, or a retired script's)
+    — containing a shipped script is not enough. A group holding ANY other
+    command is the user's and is left byte-for-byte, reported through
+    ``duplicate_groups`` instead of changed. See that function's docstring for the fold, its ordering, and
+    the redundant all-source (``*`` / absent matcher) legacy groups.
     """
     out, scrub_removals = scrub_retired_registrations(user_hooks)
     if retired_removed is not None:
         retired_removed.extend(scrub_removals)
+    # v0.2.105: every command spelling VCO ships (or once shipped) — the
+    # eligibility set the fold pass below matches a group's commands against.
+    shipped_spellings = _shipped_spellings(template_hooks)
     # Review R9 F3: what runs in the user's file BEFORE anything is added, so
     # a disable parked under one event carries to an event the hook newly
     # ships on (find_parked_match, live_identities) — order-independent.
@@ -264,20 +314,6 @@ def merge_hooks_block(
         if kept_out is not None:
             kept_out.append(record)
         return True
-
-    def _entry_cmds(entry: dict) -> list[str]:
-        if not isinstance(entry, dict):
-            return []
-        cmds: list[str] = []
-        for h in entry.get("hooks", []):
-            if not isinstance(h, dict):
-                continue
-            cmd = h.get("command")
-            # Keep only non-empty string commands (drops None + falsy) — this
-            # also narrows the element type to `str` for the return contract.
-            if isinstance(cmd, str) and cmd:
-                cmds.append(cmd)
-        return cmds
 
     for event, t_entries in template_hooks.items():
         if event not in out:
@@ -407,8 +443,16 @@ def merge_hooks_block(
                 # the template ships AND the string actually differs (stale
                 # form). A user's own hook (ident None, or ident not in the
                 # template) is preserved verbatim.
+                # v0.2.105 (review R1 H2): a command that RUNS the hook inside
+                # something of the user's — `my-backup.sh && bash …/x.sh`, a
+                # pipe, a redirect — is the user's command. Replacing it with
+                # the template's spelling would delete their part, so it is
+                # kept verbatim and counts as the hook's registration (no
+                # second copy is appended beside it).
+                wrapped = bool(ident) and _wraps_hook_command(cmd)
                 if (
                     ident
+                    and not wrapped
                     and ident in template_cmd_for_identity
                     and cmd != template_cmd_for_identity[ident]
                 ):
@@ -419,7 +463,8 @@ def merge_hooks_block(
                     present_idents.add((u_matcher, ident))
                 else:
                     new_hooks.append(h)
-                    if ident and cmd == template_cmd_for_identity.get(ident):
+                    if ident and (wrapped and ident in template_cmd_for_identity
+                                  or cmd == template_cmd_for_identity.get(ident)):
                         # Already current — record so the append pass skips it.
                         superseded_identities.add(ident)
                         present_idents.add((u_matcher, ident))
@@ -527,7 +572,339 @@ def merge_hooks_block(
             appended["hooks"] = new_inner
             merged_entries.append(appended)
 
+        # v0.2.105: the GROUP-granularity pass, last — see the docstring.
+        merged_entries = _fold_duplicate_shipped_groups(
+            event, merged_entries, t_entries, shipped_spellings, duplicate_groups)
+
         out[event] = merged_entries
+    return out
+
+
+#: A shipped command with no trailing argument, in the anchored form
+#: :func:`hook_command_key` produces: group 1 is the launch prefix (``bash `` /
+#: ``powershell -NoProfile -ExecutionPolicy Bypass -File ``), group 2 the
+#: script extension. Read off the CURRENT template so a retired script's
+#: spelling is built with the interpreter VCO actually shipped for that
+#: extension, never a guessed one.
+_LAUNCH_PREFIX_RE = re.compile(
+    r'^(.*?)"\$\{CLAUDE_PROJECT_DIR(?::-\.)?\}/\.claude/hooks/'
+    r'[A-Za-z0-9][A-Za-z0-9._-]*\.(sh|ps1)"$')
+
+
+def _spelling_key(command: Any) -> str:
+    """The key two spellings of ONE shipped command share
+    (:func:`vco_lib.hook_retirements.hook_command_key`: whitespace collapsed,
+    the pre-v0.2.97 disable guard dropped, the relative hook path anchored).
+    ``""`` for a non-string command, which matches nothing. Anything else in
+    the command — a ``my-backup.sh &&`` before the script, an env assignment,
+    a flag after it — survives into the key, so it never equals a shipped
+    spelling."""
+    if not isinstance(command, str) or not command:
+        return ""
+    return hook_command_key(command)
+
+
+def _fields_signature(hook: Any) -> str:
+    """Exact-equality key for an inner hook's keys OTHER than ``command``
+    (``type``, ``timeout``, ``async``, ``if`` …), key order ignored."""
+    if not isinstance(hook, dict):
+        return ""
+    return json.dumps({k: v for k, v in hook.items() if k != "command"},
+                      sort_keys=True, default=str)
+
+
+def _shipped_spellings(template_hooks: dict) -> dict[str, set[str]]:
+    """Every command spelling VCO ships or once shipped, as
+    ``{spelling key: {field signatures it shipped with}}``.
+
+    Three sources, each EXACT (H2, review R1 of v0.2.105: a command that
+    merely CONTAINS a shipped script — ``my-backup.sh && bash …/x.sh`` — is
+    the user's, so eligibility is spelling equality, never script identity):
+
+    * every command of the CURRENT template, any event, with its keys;
+    * every :data:`vco_lib.hook_retirements.PRIOR_SHIPPED_SHAPES` row's
+      ``command_key``, with the keys it shipped with;
+    * every script a retirement row declares VCO's
+      (:func:`vco_lib.hook_retirements.vco_shipped_hook_scripts`), spelled
+      with the template's own launch prefix for its extension and no
+      argument. Its shipped keys are not recorded anywhere, so its signature
+      set is EMPTY: such a handler may sit in a foldable group, but its keys
+      never count as provably VCO's.
+    """
+    spell: dict[str, set[str]] = {}
+    prefixes: dict[str, set[str]] = {}
+    for entries in template_hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for h in entry.get("hooks", []):
+                key = _spelling_key(h.get("command") if isinstance(h, dict) else None)
+                if not key:
+                    continue
+                spell.setdefault(key, set()).add(_fields_signature(h))
+                launch = _LAUNCH_PREFIX_RE.match(key)
+                if launch:
+                    prefixes.setdefault(launch.group(2), set()).add(launch.group(1))
+    for row in PRIOR_SHIPPED_SHAPES:
+        spell.setdefault(row.command_key, set()).add(
+            json.dumps(dict(row.fields), sort_keys=True, default=str))
+    for name in vco_shipped_hook_scripts():
+        for prefix in prefixes.get(name.rsplit(".", 1)[-1], ()):
+            spell.setdefault(_spelling_key(f"{prefix}.claude/hooks/{name}"), set())
+    return spell
+
+
+def _entry_is_shipped(entry: Any, spell: dict[str, set[str]]) -> bool:
+    """True when EVERY inner hook of the group is a command whose spelling
+    equals one VCO ships or once shipped (:func:`_shipped_spellings`), else
+    False (the group holds something of the user's)."""
+    if not isinstance(entry, dict):
+        return False
+    inner = entry.get("hooks")
+    if not isinstance(inner, list) or not inner:
+        return False
+    return all(
+        isinstance(h, dict) and _spelling_key(h.get("command")) in spell
+        for h in inner)
+
+
+def _registration_key(hook: Any) -> Optional[tuple]:
+    """What makes two inner hooks THE SAME registration: their spelling key
+    and their ``if`` filter. An if-filtered group shares one command across
+    many rules, so the ``if`` keeps each rule distinct; a different trailing
+    argument is a different spelling key. ``None`` for a non-command item."""
+    if not isinstance(hook, dict):
+        return None
+    key = _spelling_key(hook.get("command"))
+    return (key, hook.get("if")) if key else None
+
+
+def _template_positions(template_entries: Any) -> dict:
+    """``(matcher, spelling key) -> index`` over the template's handlers for
+    ONE event, in template order — the order a fresh install runs them in."""
+    pos: dict = {}
+    n = 0
+    for entry in template_entries or []:
+        if not isinstance(entry, dict):
+            continue
+        matcher = normalize_matcher(entry)
+        for h in entry.get("hooks", []):
+            key = _spelling_key(h.get("command") if isinstance(h, dict) else None)
+            if not key:
+                continue
+            pos.setdefault((matcher, key), n)
+            n += 1
+    return pos
+
+
+def _in_template_order(handlers: list, matcher: str, pos: dict) -> list:
+    """A folded group's handlers in the template's own order for ``matcher``
+    (so an upgraded file and a fresh install have the same shape). A handler
+    the template does not ship under this matcher sorts after those it does,
+    in first-seen order."""
+    def key(item: tuple) -> tuple:
+        i, h = item
+        p = pos.get((matcher, _spelling_key(h.get("command"))))
+        return (0, p, i) if p is not None else (1, i, i)
+
+    return [h for _, h in sorted(enumerate(handlers), key=key)]
+
+
+def _survivor(handlers: list, spell: dict[str, set[str]]) -> Optional[dict]:
+    """The ONE handler a set of duplicate registrations folds into, or
+    ``None`` when folding would lose a setting of the user's.
+
+    Duplicates with identical keys: the first. Otherwise a handler whose keys
+    are not ones VCO shipped for that spelling (a user-edited ``timeout``) is
+    the user's setting: when exactly one such key set exists it survives and
+    the shipped-valued copies go; when two DIFFERENT non-shipped key sets
+    exist, no single survivor keeps both, so the caller does not fold."""
+    sigs = [_fields_signature(h) for h in handlers]
+    if len(set(sigs)) == 1:
+        return handlers[0]
+    shipped_sigs = spell.get(_spelling_key(handlers[0].get("command")), set())
+    custom = [(h, s) for h, s in zip(handlers, sigs) if s not in shipped_sigs]
+    if len({s for _, s in custom}) > 1:
+        return None
+    return custom[0][0] if custom else handlers[0]
+
+
+def _fold_duplicate_shipped_groups(
+    event: str, entries: list, template_entries: Any,
+    spell: dict[str, set[str]], records: Optional[list],
+) -> list:
+    """Fold duplicate hook groups that are provably VCO's (v0.2.105).
+
+    The merge's other passes work per COMMAND: they heal a stale command, they
+    never notice that the SAME shipped hooks sit in several groups. A project
+    that received the shipped hooks across several releases therefore keeps
+    several groups sharing one matcher — the reported case was four `startup`
+    SessionStart groups in one settings.json, so the container-ensure,
+    kg-loader and context-size hooks each ran three extra times per session
+    start. Nothing was wrong with any single registration; the group COUNT was.
+
+    "Provably VCO's" is EXACT: every command of the group, normalised
+    (:func:`_spelling_key`), equals a spelling VCO ships or once shipped
+    (:func:`_shipped_spellings`). A command that merely RUNS a shipped script
+    — ``my-backup.sh && bash …/ensure-containers.sh``, ``MY_FLAG=1 bash …`` —
+    is the user's, and its group is never folded or trimmed (owner rule: a
+    user's hook command is never deleted).
+
+    Three decisions, all conservative:
+
+    1. FOLD — groups of ONE event with the SAME matcher are merged into the
+       first of them when every one of them is provably VCO's. Duplicate
+       registrations collapse to one (:func:`_survivor`): the surviving
+       handler keeps its own bytes, a user-edited key (``timeout``) survives
+       over a shipped-valued copy, and when two copies carry DIFFERENT
+       non-shipped keys the matcher is not folded at all (``kept_user_setting``).
+       The group is ordered by the template's own order for that matcher, so
+       an upgraded file and a fresh install end up the same shape. The first
+       group's other keys (its ``matcher``) are kept.
+    2. REDUNDANT ALL-SOURCE GROUPS — a group under `*`, or under no matcher at
+       all, in an event where the CURRENT template ships neither form, is a
+       legacy "every firing source" group. When it is provably VCO's, each of
+       its handlers that another group already runs under the matcher the
+       template registers it under — with the same keys, or keys VCO shipped —
+       is removed; the group is dropped when nothing is left. A handler with
+       keys of the user's stays (``kept_user_setting``). After this, those
+       hooks run only on the matcher the template ships them under (e.g.
+       SessionStart `startup`), no longer on every resume / clear / compact.
+    3. NEVER the user's — a group holding ANY other command is left
+       byte-for-byte, and reported through ``records`` (``kept_user_command``)
+       so the update summary can say why the duplicate is still there. Every
+       decision taken is appended to ``records`` (``None`` = report nothing).
+
+    Inputs are not mutated: a folded group is a new dict, and a trimmed legacy
+    group is a new dict with a new hooks list. Nothing is returned changed when
+    no duplicate exists, so the caller's ``merged == existing`` short-circuit
+    still holds and a second run is a fixed point.
+    """
+    if not isinstance(entries, list):
+        return entries
+    # A matcher the template ships ONE group for is a matcher whose registrations
+    # belong in one group. A matcher it ships SEVERAL groups for is a deliberate
+    # split (PreToolUse ships two `Bash|PowerShell` and two `Bash` groups;
+    # PostToolUse two `Edit|Write` and two `*`) — folding those would make an
+    # upgraded file differ from the shipped shape, so they are left alone.
+    template_groups: dict[str, int] = {}
+    for t in template_entries or []:
+        if isinstance(t, dict):
+            m = normalize_matcher(t)
+            template_groups[m] = template_groups.get(m, 0) + 1
+    foldable = {m for m, n in template_groups.items() if n == 1}
+    # `*` (every occurrence) and an ABSENT matcher both select every firing
+    # source. They are legacy shapes only in an event whose template ships
+    # neither — PreCompact deliberately ships `*`, and Stop/SubagentStop ship
+    # absent-matcher groups, so those events keep them.
+    legacy_forms = {m for m in ("", "*") if m not in template_groups}
+    pos = _template_positions(template_entries)
+
+    def _record(action: str, matcher: str, **extra: Any) -> None:
+        if records is not None:
+            records.append({"action": action, "event": event,
+                            "matcher": matcher, **extra})
+
+    # ── 1. same matcher, N shipped groups -> one ───────────────────────────
+    slots: dict[str, list[int]] = {}
+    for i, entry in enumerate(entries):
+        if _entry_is_shipped(entry, spell) and normalize_matcher(entry) in foldable:
+            slots.setdefault(normalize_matcher(entry), []).append(i)
+    out: list = list(entries)
+    dropped: set[int] = set()
+    for matcher, idxs in slots.items():
+        if len(idxs) < 2:
+            continue  # untouched: the original entry object, byte for byte
+        order: list = []
+        by_key: dict = {}
+        for i in idxs:
+            for h in entries[i].get("hooks", []):
+                key = _registration_key(h)
+                if key not in by_key:
+                    by_key[key] = []
+                    order.append(key)
+                by_key[key].append(h)
+        survivors = {k: _survivor(by_key[k], spell) for k in order}
+        conflicts = [k for k in order if survivors[k] is None]
+        if conflicts:
+            _record("kept_user_setting", matcher,
+                    commands=[by_key[k][0].get("command") for k in conflicts])
+            continue
+        collapsed = sorted({h.get("command") for k in order
+                            for h in by_key[k] if h is not survivors[k]}, key=str)
+        out[idxs[0]] = {**entries[idxs[0]], "hooks": _in_template_order(
+            [survivors[k] for k in order], matcher, pos)}
+        dropped.update(idxs[1:])
+        _record("folded", matcher, groups=len(idxs), duplicate_commands=collapsed)
+    out = [e for i, e in enumerate(out) if i not in dropped]
+
+    # ── 2. legacy all-source groups that duplicate a shipped registration ──
+    present: dict = {}
+    for entry in out:
+        if isinstance(entry, dict) and normalize_matcher(entry) not in legacy_forms:
+            for h in entry.get("hooks", []):
+                reg = _registration_key(h)
+                if reg is not None:
+                    present.setdefault((normalize_matcher(entry), reg), set()).add(
+                        _fields_signature(h))
+    trimmed: list = []
+    for entry in out:
+        matcher = normalize_matcher(entry) if isinstance(entry, dict) else ""
+        if matcher not in legacy_forms or not _entry_is_shipped(entry, spell):
+            trimmed.append(entry)
+            continue
+        kept: list = []
+        removed: list = []
+        user_set: list = []
+        for h in entry.get("hooks", []):
+            reg = _registration_key(h)
+            spelled = _spelling_key(h.get("command"))
+            runs_elsewhere = [
+                (m, reg) for (m, k) in pos
+                if k == spelled and m not in legacy_forms and (m, reg) in present]
+            sig = _fields_signature(h)
+            if runs_elsewhere and (
+                    sig in spell.get(spelled, set())
+                    or any(sig in present[p] for p in runs_elsewhere)):
+                removed.append(h.get("command"))
+                continue
+            if runs_elsewhere:
+                user_set.append(h.get("command"))
+            kept.append(h)
+        if user_set:
+            _record("kept_user_setting", matcher, commands=user_set)
+        if not removed:
+            trimmed.append(entry)
+            continue
+        _record("redundant_all_sources_removed" if not kept
+                else "redundant_all_sources_trimmed", matcher, commands=removed)
+        if kept:
+            trimmed.append({**entry, "hooks": kept})
+    out = trimmed
+
+    # ── 3. duplicates that hold a command of the user's: kept, reported ────
+    per_matcher: dict[str, int] = {}
+    for entry in out:
+        if isinstance(entry, dict):
+            m = normalize_matcher(entry)
+            per_matcher[m] = per_matcher.get(m, 0) + 1
+    for entry in out:
+        if not isinstance(entry, dict) or _entry_is_shipped(entry, spell):
+            continue
+        matcher = normalize_matcher(entry)
+        # Only a matcher whose registrations belong in ONE group (see
+        # `foldable`), or a legacy all-source form, can hold a duplicate.
+        if matcher not in foldable and matcher not in legacy_forms:
+            continue
+        looks_duplicate = per_matcher.get(matcher, 0) > 1 or (
+            matcher in legacy_forms and len(out) > 1)
+        if not looks_duplicate:
+            continue
+        user_cmds = [c for c in _entry_cmds(entry) if _spelling_key(c) not in spell]
+        if user_cmds:
+            _record("kept_user_command", matcher, commands=user_cmds)
     return out
 
 
@@ -550,6 +927,43 @@ def _if_group_host(entries: list, matcher: str, new_inner: list) -> Optional[dic
                 and any(h.get("command") in cmds for h in inner):
             return entry
     return None
+
+
+def _wraps_hook_command(command: str) -> bool:
+    """True when ``command`` does more than run one hook script: it holds a
+    shell control operator outside quotes (``&&``, ``||``, ``;``, ``|``,
+    ``&``, a redirect, a newline) or a command substitution, or it starts
+    with an environment assignment (``MY_FLAG=1 bash …``).
+
+    v0.2.105 (review R1 H2). The pre-v0.2.97 disable guard VCO itself
+    prefixed (``[ -n "$VCT_DISABLE_HOOKS" ] || ``) is stripped first
+    (:func:`vco_lib.hook_retirements.normalize_command`), so that shipped
+    spelling is still a plain invocation. Conservative by construction: a
+    command this cannot read as plain is reported as wrapped, so the merge
+    keeps it verbatim instead of replacing it.
+    """
+    if "\n" in command or "\r" in command:
+        return True  # two command lines; normalize_command would join them
+    text = normalize_command(command)
+    if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", text):
+        return True
+    quote = ""
+    for i, ch in enumerate(text):
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+            continue
+        if ch == "`" or (ch == "$" and text[i + 1:i + 2] == "("):
+            return True
+        if quote == '"':
+            if ch == '"':
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch in "&|;<>":
+            return True
+    return False
 
 
 def _hook_fingerprint(hook: dict) -> str:

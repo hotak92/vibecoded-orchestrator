@@ -515,11 +515,13 @@ not configuration. Edits elsewhere are blocked and reverted.
    in, via, by, on, at or during something, or write it after a label such
    as "Status:" / "Result:" / "Outcome:", and never cite a test run, run
    id, build or commit as evidence for a fact, unless that exact word - and
-   that exact id - is in the diff, its commit stat or sha, or a Read/Grep
-   result from this run. When the source says "inferred", "untested" or
-   "unverified", the node says so too. A line that makes such a claim
-   without a source, or cites a run/commit found in nothing you read, is
-   reverted with its whole write.
+   that exact id - is in the same passage as the fact (the same line, or a
+   line about the same thing) in the diff, its commit stat or sha, or a
+   Read/Grep result from this run; the word appearing somewhere else in a
+   file you opened does not count. When the source says "inferred",
+   "untested" or "unverified", the node says so too. A line that makes such
+   a claim without a source, or cites a run/commit found in nothing you
+   read, is reverted with its whole write.
 7. Record where a node's facts came from. A node you create or extend from a
    document or other source file records the source path and the commit it
    reflects, as a line like "Source: docs/reports/cache.md @ {commit.short}".

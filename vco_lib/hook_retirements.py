@@ -1102,6 +1102,26 @@ def unit_matchers(event: str, matcher: str, target: Optional[str]) -> Tuple[str,
     return tuple(out)
 
 
+def vco_shipped_hook_scripts() -> frozenset:
+    """Every hook-script BASENAME this table knows VCO once shipped — the
+    script targets of :data:`RETIRED_REGISTRATIONS` (``KIND_HOOK_SCRIPT``
+    rows only) and of :data:`PRIOR_SHIPPED_SHAPES`.
+
+    v0.2.105. The settings merge folds duplicate hook groups that survived
+    an update, and it may only fold a group whose every command is a
+    VCO-shipped hook. The CURRENT template supplies the live half of that
+    set; this supplies the half that no longer ships — a registration the
+    scrub has not removed yet (a script retired in this very release, or a
+    group whose shape the scrub does not match) is still VCO's, never the
+    user's. Read by ``vco_lib.settings_merge`` alone; parsed from the one
+    table, so a new retirement row needs no second edit.
+    """
+    scripts = {row.target for row in RETIRED_REGISTRATIONS
+               if row.kind == KIND_HOOK_SCRIPT}
+    scripts |= {row.target for row in PRIOR_SHIPPED_SHAPES}
+    return frozenset(scripts)
+
+
 def match_prior_shipped_shape(
     event: str, matcher: str, hook: Any,
 ) -> Optional[PriorShippedShape]:
