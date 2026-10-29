@@ -865,6 +865,61 @@ def retry_code_embed_backend(ctx: RetryContext) -> RetryResult:
     return RetryResult(ctx.condition_id, RETRIED if status == DONE else SKIPPED, detail)
 
 
+def retry_codegraph_extras_heal(ctx: RetryContext) -> RetryResult:
+    """v0.2.105 (prune lane) — ``codegraph_extra_rows_missing``: re-index an
+    enabled extra code folder whose rows were lost (most often by the
+    pre-v0.2.105 orphan-cleanup command that pruned every unvisited row).
+
+    The child is
+    :func:`vco_lib.codegraph_extras_refresh.heal_missing_extra_paths` — a
+    FULL, non-incremental re-sync of each missing path with the Sync-button
+    argv, under the ONE per-project walk claim, which also performs its OWN
+    paired clear (it re-detects and resolves the entry only on a POSITIVE
+    empty list). This handler never touches the ledger: a zero-exit child
+    that could not positively restore the rows is downgraded by the
+    dispatcher's ledger re-read (:data:`INCONCLUSIVE`), exactly like every
+    other tenant. Undeterminable detection ⇒ :data:`SKIPPED`.
+    """
+    try:
+        from vco_lib.codegraph_extras_refresh import (
+            heal_missing_extra_paths, missing_extra_paths,
+        )
+        from vco_lib.codegraph_resync import _resolve_analyzer
+    except Exception as exc:  # noqa: BLE001 — broken install ⇒ skip, never crash
+        return RetryResult(
+            ctx.condition_id, SKIPPED,
+            f"codegraph_extras_refresh unavailable: {exc}",
+        )
+    analyzer = _resolve_analyzer(ctx.folder)
+    if analyzer is None:
+        return RetryResult(
+            ctx.condition_id, SKIPPED, "no analyze_code_graph.py found",
+        )
+    try:
+        outcomes = heal_missing_extra_paths(
+            str(ctx.folder), str(analyzer), ctx.interpreter())
+    except Exception as exc:  # noqa: BLE001 — a raised heal is a failed one
+        return RetryResult(
+            ctx.condition_id, FAILED, f"extras heal raised: {exc!r}")
+    if any(v in ("analyzer_failed", "record_failed", "busy")
+           for v in outcomes.values()):
+        return RetryResult(
+            ctx.condition_id, FAILED, f"extras heal outcomes: {outcomes}")
+    still = missing_extra_paths(str(ctx.folder))
+    if still is None:
+        return RetryResult(
+            ctx.condition_id, SKIPPED,
+            "post-heal detection undeterminable — left owed for a later retry",
+        )
+    if still:
+        return RetryResult(
+            ctx.condition_id, FAILED, f"still missing after heal: {still}")
+    return RetryResult(
+        ctx.condition_id, RETRIED,
+        f"extras heal complete (outcomes={outcomes})",
+    )
+
+
 @dataclass(frozen=True)
 class Handler:
     """One retry handler plus the backend ITS work needs.
@@ -912,6 +967,11 @@ HANDLERS: dict[str, Handler] = {
     ),
     "ollama_models": Handler(retry_ollama_models, TEXT_BACKEND),
     "code_embed_backend": Handler(retry_code_embed_backend, CODE_BACKEND),
+    # v0.2.105 (prune lane): re-indexing embeds through the code backend.
+    "codegraph_extras_heal": Handler(
+        retry_codegraph_extras_heal, CODE_BACKEND,
+        needs_current_code_embed_image=True,
+    ),
 }
 
 
@@ -1918,7 +1978,22 @@ def session_start_owed_check(folder: Path, *, python: str = "") -> list[str]:
       starts before the containers finish coming up simply retries next time
       rather than the hook having to guess.
     * Never raises: a SessionStart hook must not be able to break a session.
+
+    v0.2.105 (prune lane): BEFORE reading the ledger, the lost-extras
+    detection runs (``codegraph_extras_refresh.detect_and_emit_missing_
+    extras``) — an enabled extra code folder with 0 rows of its own is
+    emitted as owed work HERE, so the very same spawn can heal it. This is
+    the session-start half of the detection the update path benefits from on
+    the next session open; soft-fail, never a gate.
     """
+    try:
+        from vco_lib.codegraph_extras_refresh import (
+            detect_and_emit_missing_extras,
+        )
+
+        detect_and_emit_missing_extras(str(Path(folder)))
+    except Exception:  # noqa: BLE001 — detection must never block the check
+        pass
     try:
         owed = owed_condition_ids(Path(folder))
     except Exception:  # noqa: BLE001

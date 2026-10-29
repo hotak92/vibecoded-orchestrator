@@ -1382,6 +1382,33 @@ def codegraph_orphan_interactions_still_present(ctx: ProbeContext) -> Optional[b
     return count > 0
 
 
+def codegraph_extra_rows_missing_probe(ctx: ProbeContext) -> Optional[bool]:
+    """``codegraph_extra_rows_missing`` — does an enabled extra code folder
+    still have 0 rows of its own in the project's prefix?
+
+    v0.2.105 (prune lane): re-runs the SAME detection the emit leg used
+    (:func:`vco_lib.codegraph_extras_refresh.missing_extra_paths`) against
+    ``ctx.folder``, so the probe can never clear a row the next detection
+    would re-emit. The prefix is NOT re-parsed from the prose — the
+    detection re-resolves it from the hub config, the one home for it.
+
+    Returns:
+        True  — at least one enabled extra folder is still rowless.
+        False — positively all present (the heal re-indexed them, or the
+                folders were disabled/removed from the config).
+        None  — could not look (hub or Weaviate down): never a clear.
+    """
+    from vco_lib.codegraph_extras_refresh import missing_extra_paths
+
+    try:
+        missing = missing_extra_paths(str(ctx.folder))
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if missing is None:
+        return None
+    return bool(missing)
+
+
 PROBES: dict[str, ProbeFn] = {
     "bash_env_cleanup_still_owed": bash_env_cleanup_still_owed,
     "first_run_setup_sections_still_pending": first_run_setup_sections_still_pending,
@@ -1415,6 +1442,7 @@ PROBES: dict[str, ProbeFn] = {
     "container_runtime_data_still_under_both": container_runtime_data_still_under_both,
     "codegraph_orphan_interactions_still_present": (
         codegraph_orphan_interactions_still_present),
+    "codegraph_extra_rows_missing": codegraph_extra_rows_missing_probe,
 }
 
 
@@ -1995,5 +2023,6 @@ __all__ = [
     "retry_history_note",
     "run_probe",
     "codegraph_orphan_interactions_still_present",
+    "codegraph_extra_rows_missing_probe",
     "upstream_sidecar_paths",
 ]

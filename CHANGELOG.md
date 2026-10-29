@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stale-prune walk of the project root can no longer delete the rows of extra code folders, and the orphan-cleanup hint is targeted.** The pending-orphan entry in `UPDATE_DEFERRED.md` used to print a full resync command with `--prune-stale`; that walk visits only the project folder, so it pruned every row of every enabled extra code folder with it (on one install: 33,464 rows deleted where 727 orphan rows were expected) — and because the extra-folder refresh only re-indexes folders whose commit moved, nothing ever added the rows back. `--prune-stale` now judges only rows stamped with a root the walk actually covered (a project-root walk leaves extra folders' rows and rows of unknown origin alone, and says so in the log with a count), and the printed command is a targeted cleanup that deletes exactly the provably dead anchor-less interaction rows it reported and nothing else. If an enabled extra folder's rows are already gone, the next session start detects it and VCO re-indexes that folder automatically in the background (a `codegraph_extra_rows_missing` entry shows the progress and can be re-run by hand). Disabling or removing an extra folder now also removes its rows from the project's code graph on the next background refresh — before, they lingered and kept serving search results.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed
