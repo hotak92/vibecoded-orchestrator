@@ -505,21 +505,19 @@ def _derive_project_diagrams_name(project_root: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def named_vector_config() -> dict:
+def named_vector_config(class_name: Optional[str] = None) -> dict:
     """KG-shaped multi-slot named-vector config (v0.2.18 catalog).
 
     Sources the slot catalog from `vco_lib.weaviate_schema.KG_NAMED_VECTORS`
-    — see that module for the LOCKED slot list + rationale.
-
-    Pre-v0.2.18 this function returned a hard-coded 3-slot config
-    (`qwen3_embed`, `ollama_embed`, `openai_embed`). v0.2.18 extends to
-    5 slots — the legacy 3 are RETAINED so v0.2.17 -> v0.2.18 upgrades
-    preserve data, plus 2 new slots (`arctic2_embed`, `openai_text_embed`)
-    that the EmbeddingService (Commit 2) and GUI dropdowns (Commit 8)
-    use as additional embedding-provider targets.
+    — see that module for the LOCKED slot list + rationale. v0.2.18 grew it
+    from the hard-coded 3 slots (`qwen3_embed`, `ollama_embed`, `openai_embed`,
+    RETAINED so upgrades keep their data) to 5 (+ `arctic2_embed`,
+    `openai_text_embed`, extra embedding-provider targets).
 
     Each slot has `vectorizer: none` so we feed pre-computed embeddings
     from the MCP server. Index type stays HNSW (Weaviate default for ANN).
+    v0.2.105: with ``class_name`` each slot also carries that collection's
+    vector-index policy (the cache cap, :mod:`vco_lib.weaviate_vector_index`).
 
     The MCP server's `sync_knowledge_graph.py` writes objects with at
     least one named vector populated; the others are filled lazily as the
@@ -530,7 +528,9 @@ def named_vector_config() -> dict:
     # Late import to avoid a circular dep — weaviate_schema imports
     # project_init lazily inside `_default_collection_rebuilder`.
     from vco_lib.weaviate_schema import KG_NAMED_VECTORS
-    return {slot.name: slot.to_weaviate_config() for slot in KG_NAMED_VECTORS}
+    from vco_lib.weaviate_vector_index import create_index_config
+    index_config = create_index_config(class_name) if class_name else None
+    return {s.name: s.to_weaviate_config(index_config=index_config) for s in KG_NAMED_VECTORS}
 
 
 def code_class_definitions(
@@ -580,13 +580,13 @@ def code_class_definitions(
     """
     from vco_lib.weaviate_schema import CODE_NAMED_VECTORS, _CODE_COLLECTION_SUFFIXES
 
-    # v0.2.73 FIX-D4: thread the target index type into every slot. Default
-    # "hnsw" reproduces the pre-D4 shape byte-for-byte (so no spurious schema
-    # delta on plain migrations); "hfresh" emits the preview index config
-    # (mandatory RQ) — the copy migrate action recreates the collection fresh
-    # with this target, which is the only legal way to change the index type.
-    vc = {
-        slot.name: slot.to_weaviate_config(index_type=index_type)
+    # v0.2.73 FIX-D4: thread the target index type into every slot ("hfresh" =
+    # preview, mandatory RQ; only the copy migrate action may change it). The
+    # v0.2.105 cache cap is in vectorIndexConfig, which `_schema_delta` ignores.
+    from vco_lib.weaviate_vector_index import create_index_config
+    vc = {  # every basename is code-shaped, so one policy lookup serves all five
+        slot.name: slot.to_weaviate_config(index_type=index_type,
+                                           index_config=create_index_config("CodeFunction"))
         for slot in CODE_NAMED_VECTORS
     }
 
@@ -651,7 +651,7 @@ def kg_class_definition(name: str) -> dict:
     return {
         "class": name,
         "description": "VibeCoded Tools knowledge graph collection",
-        "vectorConfig": named_vector_config(),
+        "vectorConfig": named_vector_config(name),
         "invertedIndexConfig": {"indexNullState": True},
         "properties": [
             {"name": "title", "dataType": ["text"]},
@@ -739,7 +739,7 @@ def development_class_definition(name: str) -> dict:
     return {
         "class": name,
         "description": "VibeCoded Tools project documentation collection",
-        "vectorConfig": named_vector_config(),
+        "vectorConfig": named_vector_config(name),
         "invertedIndexConfig": {"indexNullState": True},
         "properties": [
             {"name": "title", "dataType": ["text"]},
@@ -821,7 +821,7 @@ def diagrams_class_definition(name: str) -> dict:
             "VibeCoded Tools per-project diagrams collection "
             "(Mermaid + Excalidraw)"
         ),
-        "vectorConfig": named_vector_config(),
+        "vectorConfig": named_vector_config(name),
         "invertedIndexConfig": {"indexNullState": True},
         "properties": [
             {"name": "title", "dataType": ["text"]},

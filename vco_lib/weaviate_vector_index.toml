@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# weaviate_vector_index.toml — the vector-index policy for VCO's collections
+# (v0.2.105). ONE rule table, read by:
+#   * vco_lib/weaviate_vector_index.py   (Python: class creation + the update
+#     step that brings existing collections to this policy)
+#   * launcher/src-tauri/src/commands/project_state_cmd.rs (Rust: the
+#     launcher's KG-collection create, `include_str!`-embedded — tier B of
+#     A>B>C, so the two sides parse the same values and cannot drift)
+#
+# New collections on VCO's own Weaviate get RQ-8 from the server default
+# (`DEFAULT_QUANTIZATION: "rq-8"` in infrastructure/docker-compose.yml), which
+# covers every create path at once. The update step enables it on collections
+# created before that, and on a Weaviate whose compose does not set it.
+
+format_version = 1
+
+[rq]
+# Rotational quantization, 8 bits: 4x smaller vectors in memory, no training
+# step, and full vectors are kept on disk for rescoring. Measured on this
+# project's own vectors before shipping (recall@10 against exact search,
+# 1645 text vectors / 4500 CodeSage vectors): 1.000 (text) and 0.997-0.999
+# (code), the same as uncompressed HNSW (0.9995 / 0.998).
+bits = 8
+# Candidates re-ranked with the full vector. 20 is Weaviate's own default for
+# RQ-8; it is what the recall numbers above were measured with.
+rescore_limit = 20
+# The first Weaviate with RQ. Older servers (an adopted Weaviate) are left
+# uncompressed.
+min_server_version = "1.32.0"
+
+[vector_cache_max_objects]
+# Upper bound on the vectors one HNSW index keeps in RAM. Weaviate's default
+# is 1e12 (unlimited). The cache is NOT an LRU: when it reaches this count it
+# is emptied whole and refills from disk, so a cap BELOW a collection's size
+# makes searches on it slow. The values sit above the largest collections
+# seen in the field (a 387k-row CodeFunction collection), so they bound only
+# runaway growth and never thrash a real collection.
+# With RQ-8 the cache holds the compressed vectors: 2 KiB per 2048-d CodeSage
+# vector, 1 KiB per 1024-d text vector, so the caps below are at most
+# ~1 GiB (code) and ~100 MiB (text) per index. On an uncompressed (adopted,
+# pre-1.32) Weaviate it holds float32 vectors, 4x that.
+# A collection whose cap a user has already set (anything other than
+# Weaviate's unlimited default) is left as it is.
+code = 500000
+kg = 100000

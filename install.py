@@ -10395,6 +10395,7 @@ def _converge_orchestrator_root_kg_pointer(canonical: str) -> None:
 
 from vco_lib import install_weaviate as _install_weaviate  # noqa: E402
 from vco_lib import root_kg_identity as _root_kg_identity  # noqa: E402
+from vco_lib import weaviate_vector_index as _weaviate_vector_index  # noqa: E402  (v0.2.105, stdlib-only at import)
 
 # Re-export the pure content-hash helper under its original name so tests
 # that call `install._compute_on_disk_content_hashes` keep resolving.
@@ -11218,24 +11219,14 @@ def _should_check_weaviate_reclaim_drift(
     )
 
 
-#: v0.2.74 (R2): perf/reclaim env vars whose value MUST match the compose file
-#: on the RUNNING Weaviate container. Drift on ANY of these means the container
-#: predates the current compose config and its dead LSM segments cannot compact
-#: (the 136GB-never-reclaims bug: the running container was stuck at
-#: PERSISTENCE_LSM_MAX_SEGMENT_SIZE=500MiB while compose shipped 2GiB, because a
-#: running-and-ours container is "reused" and never recreated). When any drift
-#: is detected we force a `--force-recreate` (data-safe: the named volume
-#: survives). Keys mirror the `environment:` blocks in both compose files.
-_WEAVIATE_RECLAIM_ENV_KEYS: tuple = (
-    "PERSISTENCE_LSM_MAX_SEGMENT_SIZE",
-    "TOMBSTONE_DELETION_MIN_PER_CYCLE",
-    "TOMBSTONE_DELETION_MAX_PER_CYCLE",
-    "TOMBSTONE_DELETION_CONCURRENCY",
-)
+#: v0.2.74 (R2): Weaviate env whose live value MUST match the compose file;
+#: drift means the container predates the compose config (the 136GB bug: a
+#: reused container kept LSM_MAX_SEGMENT_SIZE=500MiB), so it is force-recreated
+#: (data-safe). Keys: `vco_lib.service_adoption.WEAVIATE_RECLAIM_ENV_KEYS`.
 
 
 def _parse_compose_weaviate_reclaim_env(compose_text: str) -> dict:
-    """Extract the reclaim env values (see `_WEAVIATE_RECLAIM_ENV_KEYS`) from a
+    """Extract the reclaim env values (see `vco_lib.service_adoption.WEAVIATE_RECLAIM_ENV_KEYS`) from a
     compose file's text. Pure/regex — avoids a YAML dep on the install path.
 
     Matches `KEY: value` (with optional quotes) anywhere in the file; the
@@ -11250,7 +11241,7 @@ def _parse_compose_weaviate_reclaim_env(compose_text: str) -> dict:
 def _running_container_reclaim_env(container_cmd: str, container_ref: str) -> "Optional[dict]":
     """Inspect the RUNNING Weaviate container's reclaim env values.
 
-    Returns a dict of the `_WEAVIATE_RECLAIM_ENV_KEYS` actually set on the live
+    Returns a dict of the `WEAVIATE_RECLAIM_ENV_KEYS` actually set on the live
     container (via `<runtime> inspect`), or ``None`` when the inspect can't run /
     parse (unknown → the caller treats "can't determine" as "do NOT force a
     recreate" — conservative: never recreate on uncertainty, mirroring the
@@ -11270,7 +11261,9 @@ def _running_container_reclaim_env(container_cmd: str, container_ref: str) -> "O
             return None
     except Exception:  # noqa: BLE001 — inspect/parse failure → unknown → None
         return None
-    wanted = set(_WEAVIATE_RECLAIM_ENV_KEYS)
+    from vco_lib.service_adoption import WEAVIATE_RECLAIM_ENV_KEYS  # noqa: PLC0415
+
+    wanted = set(WEAVIATE_RECLAIM_ENV_KEYS)
     live: dict = {}
     for item in env_list:
         if not isinstance(item, str) or "=" not in item:
@@ -14169,7 +14162,7 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
          guarded, so no safety regression — strictly safer now).
       4. Still calls ``_migrate_kg_named_vector_slots`` +
          ``_emit_lowercase_codegraph_cleanup_deferrals`` after the runner —
-         unchanged.
+         unchanged. 5. v0.2.105: then ``weaviate_vector_index.run_update_step``.
 
     Soft-fail throughout: a runner exception never aborts install.py.
     """
@@ -14328,6 +14321,8 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
     # V0243-14: emit deferred cleanup suggestions for residual lowercase
     # legacy code-graph collections. Idempotent; never auto-drops.
     _emit_lowercase_codegraph_cleanup_deferrals(deferral_report)
+    _weaviate_vector_index.run_update_step(  # v0.2.105 step 7e: RQ-8 + vector-cache cap
+        deferral_report, weaviate_url=weaviate_url, log_event=_log_install_event)
 
 
 def _trigger_codegraph_maintenance(deferral_report: "DeferralReport") -> None:

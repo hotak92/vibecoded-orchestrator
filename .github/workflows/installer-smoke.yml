@@ -29,7 +29,7 @@
 #   - macOS .app notarization — release.yml handles ad-hoc codesign per X1.
 #
 # Weaviate service (weaviate-smoke job only):
-#   - semitechnologies/weaviate:1.28.4 on port 8081
+#   - semitechnologies/weaviate:1.37.18 on port 8081 (the shipped compose pin)
 #   - Used only to verify `/v1/.well-known/ready` + collection bootstrap
 #   - No embedding model configured (text2vec-none); queries work but
 #     semantic search returns random order. Fine for schema-level assertions.
@@ -305,9 +305,10 @@ jobs:
 
     services:
       weaviate:
-        # Pin to 1.28.4 — the version targeted by the v0.2.38 schema tests.
+        # Same version as infrastructure/docker-compose.yml's pin
+        # (tests/test_v02105_weaviate_pins.py keeps them equal).
         # No API key required; default-mode (no auth) matches dev installs.
-        image: semitechnologies/weaviate:1.28.4
+        image: semitechnologies/weaviate:1.37.18
         ports:
           - "8081:8080"
           - "50052:50051"
