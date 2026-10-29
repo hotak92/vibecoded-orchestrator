@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The two cheap research agents now also review code.** `deepseek-researcher` and `glm-flash-researcher` take bounded code reviews (a small diff, or a named checklist on named files) and fix-delta verifications (checking, finding by finding, whether a fix round closed what it claimed). When a brief asks for either, the agent reads a new role file, `.claude/specializations/roles/bounded-review.md`: a review checklist, the rule that every verdict quotes the code it rests on, and a fixed report shape. Large first-pass reviews still go to `glm-reviewer` or `kimi-reviewer`. The implementer agents now point bounded reviews and fix verifications at these lanes, and the model-selection guidance in `CLAUDE.md` says so. The role file is the first of a new `roles/` folder under `.claude/specializations/`: one place for extra roles any agent or skill can take on, kept outside `.claude/agents/` so Claude Code never loads it as an agent.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed

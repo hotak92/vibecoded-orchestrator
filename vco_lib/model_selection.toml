@@ -15,6 +15,11 @@
 # setup's own reviewed-lane record, ~300 rows): GLM-5.3 Debug 6 -> 5,
 # DeepSeek V4.1 Flash Review 6 -> 7, and the `*` dropped from Opus Instr,
 # Kimi K3 Review and DeepSeek Instr (own reports now exceed three).
+# v0.2.105 (owner 2026-10-16): the two research lanes also take bounded
+# code reviews and fix-delta verifications, so the DeepSeek V4.1 Flash and
+# GLM-5.3-Flash notes name the agent that carries that role (reach_via is
+# unchanged: it already names those agents, and it stays a plain
+# " / "-separated list of shipped agent names).
 # Scores are copied EXACTLY and are pinned by
 # tests/test_model_selection_grid.py — edit both together.
 #
@@ -197,7 +202,7 @@ text = "At medium, **Haiku 5.5** sits below the flash-tier vendor lanes on code.
 
 [[note]]
 models = ["deepseek-v4.1-flash"]
-text = "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s to first token) and cheapest per task: default for research, surveys, bulk and bounded implementation. Users report fragile tool calls / loops on long runs — keep tasks bounded. Accurate as a read-only verifier of bounded fix deltas."
+text = "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s to first token) and cheapest per task: default for research, surveys, bulk and bounded implementation. Users report fragile tool calls / loops on long runs — keep tasks bounded. Accurate as a read-only verifier of bounded fix deltas: `deepseek-researcher` takes fix-delta verifications and bounded code reviews."
 
 [[note]]
 models = ["glm-5.3"]
@@ -213,7 +218,7 @@ text = "**Kimi K3** — near-frontier code quality on real repos and strong long
 
 [[note]]
 models = ["glm-5.3-flash"]
-text = "**GLM-5.3-Flash** suits bulk / first-pass work behind a verifier — tests, a diff review or a stronger second pass; retries help it, more effort does not (longer runs helped it only 46% of the time, below chance). Keep it off shared-component extractions, where one un-migrated call-site leaves the suite green while defeating the change, and never give it unsupervised writes to a green test suite (it broke a passing baseline test in 6.9% of rollouts)."
+text = "**GLM-5.3-Flash** suits bulk / first-pass work behind a verifier — tests, a diff review or a stronger second pass; retries help it, more effort does not (longer runs helped it only 46% of the time, below chance). Keep it off shared-component extractions, where one un-migrated call-site leaves the suite green while defeating the change, and never give it unsupervised writes to a green test suite (it broke a passing baseline test in 6.9% of rollouts). `glm-flash-researcher` takes bounded code reviews and fix-delta verifications; a large first-pass review stays on GLM-5.3."
 
 [[note]]
 models = ["qwen3.8-max"]

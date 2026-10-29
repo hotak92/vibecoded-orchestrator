@@ -22,7 +22,7 @@ Installed by default in every project. ONE definition per agent: the dispatcher 
 
 ## Gateway agents — `agents/module-gateway/` (12 agents)
 
-Delivered ONLY when the model gateway is configured on the machine (tri-state module gate); they pin `claude-gw/*` model ids in frontmatter and are dispatched by name with no model override. The z.ai lane: `glm-implementer`, `glm-implementer-high` (effort-high sibling), `glm-reviewer`, `glm-planner`, `glm-flash-researcher`. The qwen-vendor lane: `deepseek-implementer`, `qwen-implementer`, `qwen-implementer-high` (effort high, run by QwenCloud at xhigh), `deepseek-researcher`, `qwen-flash-sweeper`. There is deliberately no dedicated reviewer or planner definition on the qwen vendor (`qwen-implementer-high` can still be dispatched for a review round). The kimi-vendor lane (Kimi K3): `kimi-implementer`, `kimi-reviewer`. Each lane is delivered only when its vendor's key resolves at bundle time; a lane whose key is missing is held back (an earlier copy is kept, never deleted).
+Delivered ONLY when the model gateway is configured on the machine (tri-state module gate); they pin `claude-gw/*` model ids in frontmatter and are dispatched by name with no model override. The z.ai lane: `glm-implementer`, `glm-implementer-high` (effort-high sibling), `glm-reviewer`, `glm-planner`, `glm-flash-researcher`. The qwen-vendor lane: `deepseek-implementer`, `qwen-implementer`, `qwen-implementer-high` (effort high, run by QwenCloud at xhigh), `deepseek-researcher`, `qwen-flash-sweeper`. There is deliberately no dedicated reviewer or planner definition on the qwen vendor (`qwen-implementer-high` can still be dispatched for a review round). Both research lanes (`deepseek-researcher`, `glm-flash-researcher`) also take bounded code reviews and fix-delta verifications, following the role file `specializations/roles/bounded-review.md`. The kimi-vendor lane (Kimi K3): `kimi-implementer`, `kimi-reviewer`. Each lane is delivered only when its vendor's key resolves at bundle time; a lane whose key is missing is held back (an earlier copy is kept, never deleted).
 
 ## Default skills — `skills/` (6 skills)
 
@@ -57,7 +57,7 @@ NOT installed by default. `packs/packs.toml` is the ONE committed table defining
 
 Pack members install to the SAME locations as default agents/skills (`.claude/agents/<name>.md`, `.claude/skills/<name>/`), so enable/disable, adoption, and update semantics are identical.
 
-## Specialisation docs — `specializations/` (17 docs)
+## Specialisation docs — `specializations/` (18 docs)
 
 Plain reference docs installed to `<project>/.claude/specializations/` — the depth that used to bloat agent prompts, now referenced by ONE line in the agent/skill body that needs it:
 
@@ -65,6 +65,9 @@ Plain reference docs installed to `<project>/.claude/specializations/` — the d
 - `review-kinds/` — code, security, test, architecture-design, docs-vs-code (read by `code-reviewer` per review kind)
 - `review-topics/` — performance, frontend-ui-a11y, database-migrations, api-design, infra-ci, data-ml
 - `languages/` — ships only when a doc exists (no empty placeholders); agents reference it conditionally
+- `roles/` — bounded-review: an extra ROLE a definition takes on beyond its base brief. The definition names the file and the trigger in one line ("when the brief asks for X, first Read `.claude/specializations/roles/<role>.md`"); one role file can serve several agents and skills. Read by `deepseek-researcher` and `glm-flash-researcher` for bounded code reviews and fix-delta verifications
+
+Why a separate folder and not a file beside the definition: Claude Code loads every `.md` under `.claude/agents/` as an agent definition, and a skill's folder is its own, so a sibling `<agent>.review.md` would load as a broken agent. `.claude/specializations/` is read by neither discovery, ships, updates and adopts like any other bundle file (kind `specializations`), and `--skip-kind specializations` covers it.
 
 ## Other paid modules (not agents)
 

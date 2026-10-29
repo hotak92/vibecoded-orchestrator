@@ -44,5 +44,7 @@ return it as your final message as well, because the coordinator reviews
 and merges the worktree branch rather than reading files in place. A task
 whose only output is a report — read-only research, a survey, a review
 with no edits — should be dispatched to glm-flash-researcher (research) or
-glm-reviewer (review) instead; they run without isolation, so their report
-files land in the main tree at the path the brief named.
+glm-reviewer (review) instead — a bounded review or a fix-delta
+verification may go to glm-flash-researcher (review); they run without
+isolation, so their report files land in the main tree at the path the
+brief named.
