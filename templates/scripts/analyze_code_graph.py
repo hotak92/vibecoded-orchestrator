@@ -6165,7 +6165,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # v0.2.21 Step 20: read the collection prefix from the running hub
     # rather than deriving it locally from --project or the CWD. When
     # this flag is set, the analyzer queries the resolver for
-    # `code_graph_project` / `code_graph_collection_prefix` so its
+    # `code_graph_collection_prefix` (never the slug alias) so its
     # output collections match exactly what consumers see via the
     # resolver. Soft-fail: if the resolver is unreachable, we fall
     # back to the existing --project / repo-dir-name logic with a
@@ -6175,8 +6175,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         '--from-resolver',
         action='store_true',
         help=(
-            'Query the vct-hub resolver for code_graph_project / '
-            'collection_prefix (uses the project at repo_path). Mutually '
+            'Query the vct-hub resolver for the code-graph collection '
+            'prefix (uses the project at repo_path). Mutually '
             'exclusive with --project. Falls back to repo-dir-name if '
             'hub unreachable.'
         ),
@@ -6357,7 +6357,7 @@ def main():
     # the analyzer writes to MUST match what consumers see via the
     # resolver, otherwise hooks query the wrong collection on every
     # Edit. Three sources of truth, in priority order:
-    #   1. --from-resolver: ask the hub for code_graph_project. The
+    #   1. --from-resolver: ask the hub for code_graph_collection_prefix. The
     #      resolver consults the project's project_codegraph_bindings
     #      row (Step 19's startup backfill seeds it) and returns the
     #      canonical prefix.

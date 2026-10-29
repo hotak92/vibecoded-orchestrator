@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A project whose launcher name differs from its code-graph prefix is no longer re-indexed into a second, unused set of collections.** The orchestrator root is registered as `orchestrator-root` but its code graph lives under `VibeCodedOrchestrator_Code*`. The automatic retry of an unfinished code-graph refresh, the summary regeneration (`summary-recheck`), and the project-move rebuild command used the launcher name instead, so they wrote (or pruned against) `Orchestrator_root_Code*` collections that no search reads; the "Code-graph resync did not fully converge" entry could therefore never clear and was retried forever. Every one of these now uses the project's bound code-graph prefix, as the launcher shows it. On the next update VCO also repairs what the old behaviour left: a pending resync entry that named the launcher name is pointed at the real prefix, and if Weaviate holds code-graph collections under the launcher name that no project uses, a new `UPDATE_DEFERRED.md` entry lists them with their row counts and the command to drop them (`python -m vco_lib.project_init drop-orphan-code-collections --prefix <name> --confirm`, which re-checks the live bindings first). Nothing is deleted without you running that command. The entry clears on the first update that finds those collections gone.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed
