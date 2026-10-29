@@ -619,6 +619,72 @@
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
             "timeout": 10,
             "if": "Bash(grep *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(bash *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(sh *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(source *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(. *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(./*)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(eval *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(coproc *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(case *)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(true)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(:)"
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(echo *)"
           }
         ]
       },

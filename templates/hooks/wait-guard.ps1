@@ -33,6 +33,16 @@
 # and lets the module's stderr lines through so the denial is visible in
 # the transcript/logs.
 #
+# Since v0.2.105 the module also: reads the script file a command runs
+# (bash/sh <file>, ./file, source/. <file>, cat <file> | bash; .ps1 on
+# PowerShell; at most 256 KiB, text only) and judges it in its script
+# reading (loops that wait, watch, tail -f -- not a single pause); judges
+# code fed to a shell on stdin / a here-string / a heredoc, case arms,
+# coproc and code held in a variable; refuses the 3rd identical no-op call
+# (true, :, echo ..., sleep 0) within 120 s; and allows a one-shot
+# CronCreate (recurring: false) in the main chat. run_in_background stays
+# exempt from every shell check.
+#
 # Kill switches, checked BEFORE any spawn: VCT_DISABLE_HOOKS (all hooks)
 # and VCO_WAIT_GUARD=off/0/false (this guard only -- a USER decision). A
 # missing venv/python is a silent no-op like every VCO hook. Never exit

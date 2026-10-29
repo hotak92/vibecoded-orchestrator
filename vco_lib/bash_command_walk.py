@@ -135,9 +135,12 @@ LOOP_OPENERS: frozenset[str] = frozenset({"while", "until", "for", "select"})
 #: 2026-10-15: ``do bash -c '…'`` recurses exactly like a bare
 #: ``bash -c '…'`` — previously the keyword hid the sub-command from every
 #: consumer). Consumers that classify a segment's verb (the wait guard)
-#: strip this same set — import it from here, one home.
+#: strip this same set — import it from here, one home. ``coproc``
+#: (v0.2.105, R9 base-equal gap) runs its command asynchronously exactly
+#: like a trailing ``&`` — the command it prefixes is judged like
+#: ``cmd &`` is: as itself.
 LEADING_COMPOUND_KEYWORDS: frozenset[str] = frozenset(
-    {"do", "then", "else", "{", "!"})
+    {"do", "then", "else", "{", "!", "coproc"})
 
 #: ``while``/``until`` are the loop openers whose CONDITION is a command
 #: (``for``/``select`` take a word list, never a command). Every segment
@@ -247,6 +250,11 @@ class ChainSegment(NamedTuple):
                    EMISSION is opt-in (:func:`walk_segments`'
                    ``_with_assignments``) so :func:`walk_command`
                    collectors keep their byte-identical contract.
+    ``piped_from`` — the raw tokens of the segment whose output feeds this
+                   one through a ``|`` (empty when the segment is not a
+                   pipe consumer, or sits in a re-positioned function
+                   body). Read by the wait guard to see the code a
+                   ``… | bash`` runs (v0.2.105); collectors ignore it.
     """
 
     tokens: List[str]
@@ -255,6 +263,7 @@ class ChainSegment(NamedTuple):
     in_loop: bool
     depth: int
     assignments: Tuple[str, ...] = ()
+    piped_from: Tuple[str, ...] = ()
 
 # A collector receives ONE peeled segment (tokens) and returns whatever
 # path-ish strings it found in it.
@@ -310,8 +319,20 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
     Empty segments (e.g. trailing `;`) are dropped to keep downstream
     iteration tight.
     """
-    segments: List[List[str]] = []
+    return [seg for _op, seg in split_chain_ops(tokens)]
+
+
+def split_chain_ops(tokens: List[str]) -> List[Tuple[Optional[str], List[str]]]:
+    """:func:`split_chain` with the separator that PRECEDES each segment
+    (``None`` for the first) — the ONE splitter; :func:`split_chain` is
+    this minus the operators. A ``|`` operator marks the segment as a pipe
+    consumer of the segment before it (v0.2.105: the wait guard reads the
+    code an ``echo '…' | bash`` feeds a shell). When empty segments are
+    dropped (``a ; ; b``) the LAST separator seen is the one reported."""
+    segments: List[Tuple[Optional[str], List[str]]] = []
     current: List[str] = []
+    op: Optional[str] = None
+    pending_op: Optional[str] = None
     arith_depth = 0
     for tok in tokens:
         if arith_depth > 0:
@@ -320,15 +341,43 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
             continue
         if tok in CHAIN_SEPARATORS:
             if current:
-                segments.append(current)
+                segments.append((op, current))
                 current = []
+            pending_op = tok
             continue
+        if not current:
+            op = pending_op if segments else None
         current.append(tok)
         if tok.startswith("((") and tok.count("(") > tok.count(")"):
             arith_depth = tok.count("(") - tok.count(")")
     if current:
-        segments.append(current)
+        segments.append((op, current))
     return segments
+
+
+#: A ``case`` arm's pattern word as the chain splitter leaves it at the
+#: head of a segment (``a)``, ``*)``, ``a|b)``, ``(a)``, ``*.py)``): no
+#: ``$``, backtick, ``=`` or inner paren, and a closing ``)``.
+_CASE_ARM_RE = re.compile(r"^\(?[^()$`=\s]+\)$")
+
+
+def strip_case_arm(tokens: List[str]) -> List[str]:
+    """Peel a ``case`` statement's head off a segment (v0.2.105, R9
+    base-equal gap): ``case WORD in PATTERN) cmd …`` → ``cmd …`` and an
+    arm's leading ``PATTERN) cmd …`` → ``cmd …``; ``esac`` alone peels to
+    nothing. Any other segment comes back unchanged. The command an arm
+    runs is then judged like any other segment."""
+    out = list(tokens)
+    if out and out[0] == "case":
+        try:
+            out = out[out.index("in", 1) + 1:]
+        except ValueError:
+            return list(tokens)
+    if out and out[0] == "esac":
+        return []
+    if out and out[0] != ")" and _CASE_ARM_RE.match(out[0]):
+        out = out[1:]
+    return out
 
 
 def _substitution_depth(text: str) -> int:
@@ -919,7 +968,8 @@ def walk_segments(command: str, depth: int = 0, *,
                   _position_override: Optional[tuple] = None,
                   _with_substitutions: bool = False,
                   _with_function_bodies: bool = False,
-                  _with_assignments: bool = False) -> List[ChainSegment]:
+                  _with_assignments: bool = False,
+                  _with_shell_runs: bool = False) -> List[ChainSegment]:
     """Parse `command` like :func:`walk_command` but hand out
     :data:`ChainSegment` records — peeled tokens PLUS the structural
     context (position within the chain level, loop membership, recursion
@@ -967,6 +1017,13 @@ def walk_segments(command: str, depth: int = 0, *,
     and its re-joined :data:`ChainSegment.assignments`, so classifiers
     read it directly. Collectors skip empty token lists, and without the
     flag such statements are not emitted at all — the pre-R16 contract.
+
+    ``_with_shell_runs`` (opt-in, v0.2.105; :func:`walk_command` callers
+    are unchanged): a shell invoked WITHOUT a ``-c`` sub-command
+    (``bash poll.sh``, ``sh -s``, ``bash <<< '…'``, ``… | bash``) is
+    EMITTED as a segment instead of being consumed silently, so the wait
+    guard can judge the script file or the stdin code it runs. Every
+    emitted segment carries :attr:`ChainSegment.piped_from` either way.
     """
     if depth > MAX_NESTING_DEPTH:
         return []
@@ -975,7 +1032,14 @@ def walk_segments(command: str, depth: int = 0, *,
     if not tokens:
         return []
 
-    segments = split_chain(tokens)
+    seg_ops = split_chain_ops(tokens)
+    segments = [seg for _op, seg in seg_ops]
+    # Pipe producers by segment identity: re-positioned function-body rows
+    # are new lists and simply carry none.
+    piped: dict = {}
+    for k in range(1, len(seg_ops)):
+        if seg_ops[k][0] == "|":
+            piped[id(seg_ops[k][1])] = tuple(seg_ops[k - 1][1])
     chain_size = len(segments)
     flags = _loop_membership(segments, _in_loop)
     rows: List[_Row] = []
@@ -1032,13 +1096,21 @@ def walk_segments(command: str, depth: int = 0, *,
                         _position_override=(pos, size),
                         _with_substitutions=_with_substitutions,
                         _with_function_bodies=_with_function_bodies,
-                        _with_assignments=_with_assignments))
-                # Consumed either way: no sub-command (`bash script.sh`)
+                        _with_assignments=_with_assignments,
+                        _with_shell_runs=_with_shell_runs))
+                elif sub_cmd is None and _with_shell_runs:
+                    # v0.2.105: a script file / stdin run is visible to the
+                    # consumer that opted in (the wait guard).
+                    out.append(ChainSegment(peeled, pos, size, in_loop, depth,
+                                            tuple(seg_assignments),
+                                            piped.get(id(segment), ())))
+                # Otherwise consumed: no sub-command (`bash script.sh`)
                 # or over budget → nothing emitted, exactly as parse_dash_c
                 # has always done.
             else:
                 out.append(ChainSegment(peeled, pos, size, in_loop, depth,
-                                        tuple(seg_assignments)))
+                                        tuple(seg_assignments),
+                                        piped.get(id(segment), ())))
                 subst_src = segment
         elif _with_assignments and seg_assignments:
             # An assignment-only statement: emitted with EMPTY tokens
@@ -1051,7 +1123,8 @@ def walk_segments(command: str, depth: int = 0, *,
                     sub_body, depth + 1, _in_loop=in_loop,
                     _with_substitutions=True,
                     _with_function_bodies=_with_function_bodies,
-                    _with_assignments=_with_assignments))
+                    _with_assignments=_with_assignments,
+                    _with_shell_runs=_with_shell_runs))
     return out
 
 
@@ -1090,6 +1163,8 @@ __all__ = [
     "parse_dash_c",
     "peel_wrapper_verbs",
     "split_chain",
+    "split_chain_ops",
+    "strip_case_arm",
     "strip_env_assignments",
     "strip_subshell_parens",
     "substitution_bodies",
