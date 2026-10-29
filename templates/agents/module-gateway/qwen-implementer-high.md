@@ -47,6 +47,7 @@ return it as your final message as well, because the coordinator reviews
 and merges the worktree branch rather than reading files in place.
 Read-only research or a survey belongs to deepseek-researcher (research),
 the qwen-vendor gateway lane; a review whose only output is a report
-belongs to glm-reviewer (review) or kimi-reviewer (review) — no
-qwen-vendor read-only review lane ships. They run without isolation, so
-their report files land in the main tree at the path the brief named.
+belongs to glm-reviewer (review) or kimi-reviewer (review); a bounded
+review or a fix-delta verification may go to deepseek-researcher (review).
+They run without isolation, so their report files land in the main tree at
+the path the brief named.
