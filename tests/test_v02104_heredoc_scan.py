@@ -379,6 +379,9 @@ _TEST_FILE_BODIES = {
     "substitution": "CMD = '$(whoami)'\n",
     "sleep-loop": "CMD = 'while true; do sleep 5; done'\n",
     "eval-fetch": f"CMD = '{EVAL_FETCH}'\n",
+    # v0.2.105: a test file that MENTIONS a parent kill (the kill guard's
+    # static layer strips heredoc bodies, so writing it must stay allowed).
+    "kill-parent": "CMD = 'kill -9 $PPID'\n",
 }
 
 
