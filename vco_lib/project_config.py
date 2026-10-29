@@ -181,6 +181,21 @@ class HubUnreachable(ResolverError):
     """
 
 
+class HubNotRunning(HubUnreachable):
+    """There is no hub to ask (v0.2.105): no ``hub.token`` (missing or empty —
+    the launcher/hub is not running) or a REFUSED connection (nothing is
+    listening on the hub port).
+
+    The narrow, positively-observed member of the :class:`HubUnreachable`
+    family. The rest of that family — a 401 (rotated token), a 200 whose body
+    is not JSON, an unreadable ``hub.token``, an unrecognised status, a busy
+    hub (:class:`HubNotResponding`) — are from a hub that is or may be
+    RUNNING, so a caller that tells the user "start the hub" must branch on
+    this class, never on its parent. A subclass so every existing
+    ``except HubUnreachable`` caller behaves exactly as before.
+    """
+
+
 class HubNotResponding(HubUnreachable):
     """The hub was reached but did not answer in time (v0.2.102, W6-AB).
 
@@ -256,11 +271,15 @@ def _is_connection_refused_walk(exc: BaseException, seen: "set[int]") -> bool:
 def _transport_error(exc: requests.RequestException, what: str) -> HubUnreachable:
     """Map a ``requests`` transport failure to the resolver taxonomy: a
     refused connection (no hub) → :class:`HubUnreachable`; a timeout or a
-    connection dropped after connect (a busy hub) → :class:`HubNotResponding`."""
+    connection dropped after connect (a busy hub) → :class:`HubNotResponding`.
+    A refused connection is the positively-observed :class:`HubNotRunning`;
+    any other transport error stays a plain :class:`HubUnreachable`."""
     if isinstance(exc, requests.Timeout):
         return HubNotResponding(f"{what}: {exc}")
-    if isinstance(exc, requests.ConnectionError) and not _is_connection_refused(exc):
-        return HubNotResponding(f"{what}: {exc}")
+    if isinstance(exc, requests.ConnectionError):
+        if not _is_connection_refused(exc):
+            return HubNotResponding(f"{what}: {exc}")
+        return HubNotRunning(f"{what}: {exc}")
     return HubUnreachable(f"{what}: {exc}")
 
 
@@ -730,7 +749,7 @@ def _discover_hub() -> tuple[int, str]:
             try:
                 token = token_file.read_text(encoding="utf-8").strip()
             except FileNotFoundError as exc:
-                raise HubUnreachable(
+                raise HubNotRunning(
                     f"hub.token missing at {token_file}; is the launcher "
                     f"running?{_POST_UPDATE_HINT}"
                 ) from exc
@@ -743,7 +762,7 @@ def _discover_hub() -> tuple[int, str]:
                     f"cannot read hub.token at {token_file}: {exc}"
                 ) from exc
             if not token:
-                raise HubUnreachable(
+                raise HubNotRunning(
                     f"hub.token at {token_file} is empty"
                 )
 
@@ -1836,6 +1855,7 @@ __all__ = [
     "Forbidden",
     "HUB_DISCOVERY_TTL_SECONDS",
     "HubNotResponding",
+    "HubNotRunning",
     "HubUnreachable",
     "ProjectConfig",
     "SECRET_READ_TIMEOUT_SECONDS",

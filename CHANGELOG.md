@@ -10,6 +10,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A project whose launcher name differs from its code-graph prefix is no longer re-indexed into a second, unused set of collections.** The orchestrator root is registered as `orchestrator-root` but its code graph lives under `VibeCodedOrchestrator_Code*`. The automatic retry of an unfinished code-graph refresh, the summary regeneration (`summary-recheck`), and the project-move rebuild command used the launcher name instead, so they wrote (or pruned against) `Orchestrator_root_Code*` collections that no search reads; the "Code-graph resync did not fully converge" entry could therefore never clear and was retried forever. Every one of these now uses the project's bound code-graph prefix, as the launcher shows it. On the next update VCO also repairs what the old behaviour left: a pending resync entry that named the launcher name is pointed at the real prefix, and if Weaviate holds code-graph collections under the launcher name that no project uses, a new `UPDATE_DEFERRED.md` entry lists them with their row counts and the command to drop them (`python -m vco_lib.project_init drop-orphan-code-collections --prefix <name> --confirm`, which re-checks the live bindings first). Nothing is deleted without you running that command. The entry clears on the first update that finds those collections gone.
+- **A chat no longer fails for a few minutes while Claude Code refreshes its own login.** Claude Code rewrites
+  `~/.claude/.credentials.json` when it refreshes, and for a second or two that file carries an empty token. The model
+  gateway was reading it at that exact moment and answering `401 claude_login_unavailable` to every request going
+  through it — three minutes of failed turns on 2026-10-28, for a login that was never actually broken. The gateway now
+  keeps the last token it read and goes on using it for up to five minutes after it last saw it (never past the token's
+  own expiry), so a rewrite is invisible. When there is no earlier token to fall back on, it says plainly that this is
+  momentary and to retry in a few seconds, instead of telling you (or a subagent, mid-task) to go and log in — which was
+  advice that could not help. A request that arrives during the rewrite waits at most two seconds for the new token
+  before giving up. A real logout is not mistaken for a rewrite: when the login is removed from the file, or the file
+  can no longer be read because of its permissions, or the token simply expired, the gateway stops using the old token
+  at once and gives the "run `claude` to log in" message straight away, with no wait. Many requests arriving together
+  while the file is being rewritten no longer make the gateway answer with an internal error.
+
+- **A gateway 503 for a vendor key now names the real cause: the background service (vct-hub) is not running.** When
+  that service is down, the gateway cannot reach the keys stored in your OS keychain, so the keychain was never checked —
+  but the message used to read like a missing or mis-filed key, and even suggested clearing
+  `VCT_MODEL_GATEWAY_SECRET_PROJECT` when that setting had nothing to do with it. It now says the service is not
+  reachable, that the key may well still exist, and that starting the service fixes it within seconds with no restart
+  and no configuration change; the secret-scope advice is gone from that message. Relatedly, a key the gateway had
+  already read keeps being used for as long as the service is down, instead of expiring after six hours: in a two-day
+  outage (2026-10-20/22) one provider's key stopped working halfway through while another's kept working, purely
+  because one had been read earlier in the session. Both now behave the same way, and a key the gateway never read still
+  has nothing to fall back on. Only a service that is really not running counts: a running one that refused the request
+  (for example right after it restarted) or sent a garbled answer is not reported as stopped, and does not extend how
+  long an old key is used.
+
+### Added
+
+- **The gateway's usage ledger records when a turn was a context compaction.** Claude Code marks those requests with an
+  `x-claude-code-compaction` header; each ledger row now carries the value (`null` on an ordinary turn), so a sudden
+  jump in a chat's context can be traced to the compaction that caused it instead of looking like a turn you never
+  typed. Nothing about routing or the request changes.
 
 ## [0.2.104] - 2026-10-22
 
