@@ -605,7 +605,8 @@ def report_parked_hooks(
     repaired = [r for r in duplicate_groups
                 if r.get("action") in ("folded", "redundant_all_sources_removed",
                                        "redundant_all_sources_trimmed")]
-    kept_user = [r for r in duplicate_groups if r.get("action") == "kept_user_command"]
+    kept_user = [r for r in duplicate_groups
+                 if r.get("action") in ("kept_user_command", "kept_user_setting")]
     if duplicate_groups:
         result["duplicate_hook_groups"] = [dict(r) for r in duplicate_groups]
     if repaired:
@@ -617,10 +618,11 @@ def report_parked_hooks(
     if kept_user:
         result["warnings"].append(
             f"settings.json: left {len(kept_user)} duplicate hook group(s) exactly "
-            f"as they are, because they hold a command VCO does not ship "
-            f"({_describe_groups(kept_user)}). VCO only folds duplicate groups made "
-            f"entirely of its own hooks. If those hooks now run twice, delete the "
-            f"duplicate group from the launcher's Hooks tab or by hand."
+            f"as they are, because they hold a command, or a hook setting such as a "
+            f"timeout, that VCO does not ship ({_describe_groups(kept_user)}). VCO "
+            f"only folds duplicate groups made entirely of its own hooks with its "
+            f"own settings. If those hooks now run twice, delete the duplicate "
+            f"group from the launcher's Hooks tab or by hand."
         )
     if state.readable:
         return
