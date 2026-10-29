@@ -330,10 +330,14 @@ def test_collect_commit_records_the_parent(repo):
 def test_run_counts_the_parent_sha_as_read(chain, monkeypatch, repo):
     """The diff says "verified"; the node cites the PARENT commit, which is in
     no diff line — only the commit identity the backend hands the guard.
-    RED when the backend leaves the parent out of the sources."""
+    RED when the backend leaves the parent out of the sources.
+
+    v0.2.105: the claim names the diff's subject ("the parity check"), the
+    passage a marker has to come from matches on."""
     parent = _git(repo, "rev-parse", "HEAD~1").strip()
     log = _run(chain, monkeypatch, repo,
-               f"x was verified against {parent} before this change.\n")
+               f"The parity check verified x against {parent} before this "
+               "change.\n")
     assert "REVERTED" not in log, log
     files = _git(repo, "show", "--name-only", "--format=", "HEAD").split()
     assert files == [CACHE], log
@@ -341,7 +345,8 @@ def test_run_counts_the_parent_sha_as_read(chain, monkeypatch, repo):
 
 def test_run_reverts_an_invented_sha(chain, monkeypatch, repo):
     log = _run(chain, monkeypatch, repo,
-               "x was verified against 0badc0de1 before this change.\n")
+               "The parity check verified x against 0badc0de1 before this "
+               "change.\n")
     assert f"REVERTED {CACHE}: raised an evidence" in log, log
     assert "id '0badc0de1'" in log
     assert (repo / CACHE).read_text() == CACHE_NODE
@@ -408,8 +413,10 @@ def test_prompt_states_both_rules(repo):
     text = prompt_mod.build_prompt(prompt_mod.collect_commit(repo), repo)
     assert "Never raise a confidence or evidence level" in text
     assert "never cite a test run, run\n   id, build or commit as evidence" in text
-    # R30 L5: the prompt names the corpus the guard actually accepts
-    assert "the diff, its commit stat or sha, or a Read/Grep\n   result" in text
+    # R30 L5: the prompt names the corpus the guard actually accepts; v0.2.105
+    # adds the passage tie the guard now enforces.
+    assert "in the same passage as the fact" in text
+    assert "its commit stat or sha, or a\n   Read/Grep result from this run" in text
     assert "look for an\n   existing node on the same subject in ANY folder" in text
 
 
@@ -1395,3 +1402,73 @@ def test_r37_absent_shared_class_is_skipped_not_failed(sync_mod, monkeypatch, ca
     assert rec["collections"][SHARED]["status"] == kg_prune_result.STATUS_SKIPPED
     assert "does not exist" in rec["collections"][SHARED]["reason"]
     assert rec["collections"][mod.COLLECTION_NAME]["status"] == kg_prune_result.STATUS_DELETED
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# v0.2.105 — the two accepted limits of the evidence check (review D2.5)
+# ═════════════════════════════════════════════════════════════════════════
+# (a) the marker word was not tied to the same PASSAGE as the claim: it only
+#     had to occur somewhere in the corpus, so a word in an unrelated
+#     paragraph sourced any claim;
+# (b) "it was validated input" — a noun phrase after a copula — was flagged
+#     as an evidence claim and reverted when the word was in nothing read.
+
+_CLAIM = "Eviction on full is CONFIRMED in game."
+
+
+def test_d25_a_marker_in_an_unrelated_passage_does_not_source_the_claim():
+    """ACT: the corpus carries the marker, about another subject entirely."""
+    sources = ("the deploy box was confirmed stable after the reboot\n"
+               "the cache keeps 100 entries\n")
+    assert guard.unsourced_evidence(None, _CLAIM + "\n", sources) == [
+        (_CLAIM, ["marker 'confirmed'"]),
+    ]
+
+
+def test_d25_a_marker_in_the_claims_own_passage_sources_it():
+    """LEAVE-ALONE: same word, same passage — the write is kept."""
+    sources = ("the deploy box was confirmed stable after the reboot\n"
+               "eviction on full confirmed in game by the soak suite\n")
+    assert guard.unsourced_evidence(None, _CLAIM + "\n", sources) == []
+
+
+def test_d25_the_passage_tie_is_on_the_claim_line_not_the_whole_node():
+    """The claim line is what has to be sourced: a marker in a passage about
+    a DIFFERENT line of the same node does not source it."""
+    post = CACHE_NODE + ("The soak suite confirmed the deploy box.\n"
+                         "Eviction on full is CONFIRMED in game.\n")
+    sources = "the soak suite confirmed the deploy box after the reboot\n"
+    missing = guard.unsourced_evidence(CACHE_NODE, post, sources)
+    assert [line for line, _why in missing] == [_CLAIM]
+
+
+def test_d25_a_noun_phrase_after_a_copula_is_not_a_claim():
+    """ACT for (b): "validated" modifies "input"; there is no evidence
+    claim here, so an unsourced word must not revert the write."""
+    assert guard.evidence_claims("it was validated input", has_id=False) == []
+    assert guard.evidence_claims("the tested implementation", has_id=False) == []
+    assert guard.unsourced_evidence(
+        None, "It was validated input read from the config table.\n", "") == []
+
+
+@pytest.mark.parametrize("line, marker", [
+    ("Eviction on full is validated.", "validated"),
+    ("Eviction on full has been tested and shipped.", "tested"),
+    ("Eviction on full is proven correct.", "proven"),
+    ("The cache is verified, not inferred.", "verified"),
+])
+def test_d25_a_predicate_after_a_copula_is_still_a_claim(line, marker):
+    """LEAVE-ALONE for (b): a real predicate — the marker ends its clause or
+    is followed by a conjunction/predicative word — is still a claim."""
+    assert marker in guard.evidence_claims(line, has_id=False)
+    assert [why for _l, missing in
+            guard.unsourced_evidence(None, line + "\n", "") for why in missing
+            ] == [f"marker '{marker}'"]
+
+
+def test_d25_the_passage_tie_can_be_switched_off_by_config(monkeypatch):
+    """The escape hatch: 0 restores the pre-v0.2.105 whole-corpus rule."""
+    g = guard._guard()
+    monkeypatch.setitem(g, "evidence_passage_min_shared_tokens", 0)
+    sources = "the deploy box was confirmed stable after the reboot\n"
+    assert guard.unsourced_evidence(None, _CLAIM + "\n", sources) == []

@@ -85,9 +85,13 @@ the reviewer.
    * a node that GAINS a line raising an evidence level — a ``[guard]
      evidence_markers`` word (CONFIRMED, VERIFIED, ...) used as a CLAIM
      (uppercase, followed by in/via/by/on/at/during, directly after
-     is/are/was/were/be/been or after a ``[guard] evidence_label_words``
-     label and colon such as "Status:", or on a line citing a run/test id
-     or commit hash) that the reviewer read nowhere, or a
+     is/are/was/were/be/been AND ending its clause (v0.2.105: "was
+     validated input" is a noun phrase, not a claim), or after a ``[guard]
+     evidence_label_words`` label and colon such as "Status:", or on a line
+     citing a run/test id or commit hash) that no SAME-PASSAGE source
+     carries — v0.2.105: the marker must occur on a corpus line sharing
+     ``[guard] evidence_passage_min_shared_tokens`` content tokens with the
+     claim line, not merely somewhere in the corpus — or a
      run/test id / commit hash it read nowhere cited on such a line
      (:func:`unsourced_evidence`; the field showed "CONFIRMED ... via test
      run <stamp>" over sources that said "inferred, untested"). Prose use
@@ -1099,7 +1103,13 @@ def evidence_claims(text: str, has_id: bool) -> List[str]:
     verified" — review R33 N2; "Status: not confirmed" is not a claim), or
     the line also cites a run/test id or commit hash (``has_id``). "The
     tested path keeps the cache warm" or a heading "## Validated
-    configuration keys" is prose, not a claim."""
+    configuration keys" is prose, not a claim.
+
+    v0.2.105 (review D2.5 b): the copula arm requires the marker to be the
+    PREDICATE — it must end its clause (:func:`_predicate_at`). "it was
+    validated input" is a noun phrase whose "validated" modifies "input",
+    not a claim about an evidence level, and it used to be reverted whenever
+    the word was in nothing the reviewer read."""
     g = _guard()
     attrib = "|".join(re.escape(w) for w in g["evidence_attribution_words"])
     copula = "|".join(re.escape(w) for w in g["evidence_copula_words"])
@@ -1114,10 +1124,73 @@ def evidence_claims(text: str, has_id: bool) -> List[str]:
             head = text[:m.start()]
             if (has_id or m.group(0).isupper()
                     or after.match(text, m.end())
-                    or before.search(head) or label.search(head)):
+                    or (before.search(head) and _predicate_at(text, m.end()))
+                    or label.search(head)):
                 out.append(marker)
                 break
     return out
+
+
+def _predicate_at(text: str, end: int) -> bool:
+    """True when a marker ending at ``end`` closes its clause — i.e. it is
+    the predicate the copula before it asserts, not an adjective modifying a
+    following noun ("it was validated input" is a noun phrase).
+
+    "closes its clause" = the marker is followed by nothing, by punctuation,
+    or by one of ``[guard] evidence_predicate_followers`` (a conjunction, an
+    adverb, a preposition already covered by the attribution arm, or a
+    predicative adjective). Any OTHER following word makes the marker a
+    modifier, which is how ordinary prose reads."""
+    g = _guard()
+    followers = {str(w).casefold() for w in g.get("evidence_predicate_followers") or ()}
+    rest = text[end:].lstrip()
+    if not rest or rest[0] in ".,;:!?)]}`*-–—":
+        return True
+    word = re.match(r"[A-Za-z]+", rest)
+    if word is None:
+        return True
+    return word.group(0).casefold() in followers
+
+
+def _marker_token_set() -> Set[str]:
+    """The ``[guard] evidence_markers`` as comparison tokens — a marker word
+    is never a claim's own subject word."""
+    return {str(m).casefold() for m in _guard()["evidence_markers"]}
+
+
+def _marker_passages(sources: str) -> List[str]:
+    """The LINES of the read corpus that carry any evidence marker: the only
+    lines a claim can be sourced from (v0.2.105, review D2.5 a). A 30-file
+    corpus is mostly lines about other subjects; searching it whole let a
+    marker found in an unrelated passage source any claim."""
+    g = _guard()
+    markers = [re.escape(str(m)) for m in g["evidence_markers"]]
+    if not markers or not sources:
+        return []
+    any_marker = re.compile("|".join(markers), re.IGNORECASE)
+    return [line for line in sources.splitlines() if any_marker.search(line)]
+
+
+def _marker_sourced(marker: str, claim_text: str, passages: List[str]) -> bool:
+    """True when ``marker`` is sourced by the SAME PASSAGE as the claim.
+
+    v0.2.105 (review D2.5 a): the marker must occur on a corpus line that
+    shares at least ``[guard] evidence_passage_min_shared_tokens`` content
+    tokens with the claim line — the passage has to be about the claim's
+    subject, not merely contain the word somewhere. A claim line with fewer
+    distinctive tokens than the minimum cannot be tied to a passage at all
+    (it has no subject of its own), so the word being present anywhere keeps
+    it sourced; ``0`` restores the pre-v0.2.105 whole-corpus rule."""
+    g = _guard()
+    min_shared = int(g["evidence_passage_min_shared_tokens"])
+    pattern = _word(marker)
+    want = subject_tokens(claim_text) - _marker_token_set()
+    if min_shared <= 0 or len(want) < min_shared:
+        return any(pattern.search(line) for line in passages)
+    for line in passages:
+        if pattern.search(line) and len(want & subject_tokens(line)) >= min_shared:
+            return True
+    return False
 
 
 def unsourced_evidence(pre: Optional[str], post: str, sources: str
@@ -1140,6 +1213,7 @@ def unsourced_evidence(pre: Optional[str], post: str, sources: str
     needles = sorted({_LINE_MARKER.sub("", ln, count=1).strip()
                       for ln in pre_set} - {""}, key=len, reverse=True)
     out: List[Tuple[str, List[str]]] = []
+    passages = _marker_passages(sources)
     for line in _judged_lines(post):
         text = line.strip()
         if not text or text in pre_set:
@@ -1153,7 +1227,7 @@ def unsourced_evidence(pre: Optional[str], post: str, sources: str
         if not hits:
             continue
         missing = [f"marker '{m}'" for m in hits
-                   if not _word(m).search(sources)]
+                   if not _marker_sourced(m, added, passages)]
         missing += [f"id '{i}'" for i in ids if not _id_sourced(i, sources)]
         if missing:
             out.append((text, missing))
