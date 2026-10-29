@@ -531,6 +531,35 @@ def test_a_file_without_config_literals_keeps_its_plain_hash(tmp_path: Path) -> 
     assert refs.link_salt("cpp", 'void f() { g.Add(P, "AimPID_P"); }', refs.ConfigIndex()) == ""
 
 
+def test_a_written_config_file_is_parsed_once(
+    analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N7: the shim's validity check and the extractor share one parse."""
+    _mini_repo(tmp_path)
+    calls: List[int] = []
+    real = cfg._PARSERS["ini"]
+
+    def _counting(text: str) -> cfg.ConfigDoc:
+        calls.append(1)
+        return real(text)
+
+    monkeypatch.setitem(cfg._PARSERS, "ini", _counting)
+    inst = _analyzer(analyzer_mod)
+    inst.analyze_repository(tmp_path, only_file=tmp_path / "params" / "vehicle.ini")
+    assert [r["path"] for r in inst.modules_collection.rows()] == ["params/vehicle.ini"]
+    assert len(calls) == 1
+
+
+def test_the_parse_memo_never_serves_another_text() -> None:
+    """N7 leave-alone: a different string (even an equal-looking one) re-parses."""
+    a = cfg._parse_memo("ini", "[A_Section]\nk = 1\n")
+    b = cfg._parse_memo("ini", "[B_Section]\nk = 1\n")
+    assert [x.name for x in a.sections] == ["A_Section"]
+    assert [x.name for x in b.sections] == ["B_Section"]
+    with pytest.raises(cfg.ConfigParseError):
+        cfg._parse_memo("ini", "this is prose\nnot a config\n")
+
+
 def test_reconcile_judges_interaction_rows(analyzer_mod: types.ModuleType, tmp_path: Path,
                                           monkeypatch: pytest.MonkeyPatch) -> None:
     """A link to a key that was removed must be deleted when its code file

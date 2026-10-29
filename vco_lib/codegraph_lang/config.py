@@ -36,7 +36,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from vco_lib.codegraph_entities import (
     CodeEntity,
@@ -445,6 +445,24 @@ def parse_config(fmt: str, text: str, *, key_limit: Optional[int] = None) -> Con
     return _cap_keys(parser(text), key_limit if key_limit is not None else max_keys())
 
 
+#: N7 (v0.2.105 fix round): the shim validates a config file (``skip_reason``)
+#: and then extracts it from the SAME ``content`` object; this one-entry memo
+#: hands the extractor the parse the validation already did. Keyed on the
+#: text's IDENTITY (the entry holds a reference, so the id cannot be reused)
+#: plus the format and key cap — a different string always re-parses.
+_LAST_PARSE: List[Any] = [None, "", 0, None]  # [text, fmt, key_limit, doc]
+
+
+def _parse_memo(fmt: str, text: str) -> ConfigDoc:
+    limit = max_keys()
+    last = _LAST_PARSE
+    if last[0] is text and last[1] == fmt and last[2] == limit:
+        return cast(ConfigDoc, last[3])
+    doc = parse_config(fmt, text, key_limit=limit)
+    _LAST_PARSE[:] = [text, fmt, limit, doc]
+    return doc
+
+
 def skip_reason(content: str, file_path: Path) -> Optional[str]:
     """Why a config file is NOT indexed, or ``None`` when it is. The analyzer's
     shim runs this INSTEAD of the minified-content gate (a one-line JSON config
@@ -456,7 +474,7 @@ def skip_reason(content: str, file_path: Path) -> Optional[str]:
     if size > max_bytes():
         return f"config file of {size} bytes is over the {max_bytes()}-byte cap"
     try:
-        parse_config(fmt, content)
+        _parse_memo(fmt, content)
     except ConfigParseError as exc:
         return f"not valid {fmt} ({exc})"
     return None
@@ -497,7 +515,7 @@ def extract_config_file(
     """Pure producer: one module row + one section row per section."""
     rel = file_path.relative_to(repo_root).as_posix()
     fmt = config_format(file_path)
-    doc = parse_config(fmt, source_text.lstrip("﻿"))
+    doc = _parse_memo(fmt, source_text)  # parse_config strips the BOM
     loc = sum(1 for line in source_text.splitlines() if line.strip())
     module = ModuleDescriptor(
         path=rel, language=fmt, loc=loc, complexity=0.0,
