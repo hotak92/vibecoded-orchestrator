@@ -6718,12 +6718,23 @@ def _caller_match_terms(target: str) -> list[str]:
 # and only callers sharing one of those roots are listed (a caller row and the
 # callee row must share `project_source`). A callee with no stamp at all
 # (pre-v0.2.47 legacy rows, or a project with no extra folders) yields no
-# root set and the list is left exactly as it was. A qualified match is listed
+# root set and the list is left exactly as it was. A CALLER row with no
+# stamp is kept too (v0.2.105 fix round M4): in a mixed graph — callee
+# re-walked and stamped, callers in untouched legacy files — an absent stamp
+# is not evidence the row came from another root, so dropping it would hide
+# real callers. A qualified match is listed
 # before a bare-name-only one so a capped list shows the real caller first;
 # bare matches are demoted, NEVER dropped — a missing `calls` edge is not
 # evidence of absence (see the CLI's callers branch).
 _CALLER_TARGET_ROWS = 8       # callee rows fetched to learn its root(s)
 _CALLER_SCOPE_SCAN_MULT = 10  # candidate over-fetch when a root scope applies
+# Path-spelling differences (a symlinked root, a `..`/`//` spelling, a
+# Windows drive-letter case) must not fork the scope, so stored stamps are
+# compared through their comparison FORMS — raw + realpath-resolved POSIX
+# (the same both-forms rule as `vco_lib.codegraph_resync.primary_sources_for`)
+# and case-folded on Windows, where two spellings of one root differ only by
+# case. Folded comparison is a module flag so tests can exercise it on any OS.
+_CASEFOLD_PROJECT_SOURCES = os.name == "nt"
 
 
 def _row_project_source(obj) -> str:
@@ -6738,9 +6749,33 @@ def _row_project_source(obj) -> str:
         return ""
 
 
+@functools.lru_cache(maxsize=1024)
+def _source_forms(src: str) -> frozenset:
+    """The comparison forms of one stored ``project_source`` stamp.
+
+    The raw POSIX spelling beside the realpath-resolved one (a symlinked or
+    ``..``/``//``-spelled root must not fork the scope — the same both-forms
+    rule as :func:`vco_lib.codegraph_resync.primary_sources_for`, which this
+    reuses), plus the case-folded spellings on Windows, where two spellings
+    of one root differ only by drive-letter / folder case. A path that no
+    longer resolves (the repo was moved) keeps at least its raw form.
+    Cached: the caller scan calls this per row.
+    """
+    from vco_lib.codegraph_resync import primary_sources_for
+
+    forms = set(primary_sources_for(Path(src)) or {src})
+    if _CASEFOLD_PROJECT_SOURCES:
+        forms |= {f.lower() for f in forms}
+    return frozenset(forms)
+
+
 def _caller_scope_roots(rows: list) -> set:
-    """The distinct NON-EMPTY source roots of the CALLEE rows (v0.2.105)."""
-    return {src for src in (_row_project_source(r) for r in (rows or [])) if src}
+    """The comparison forms of the CALLEE rows' NON-EMPTY source roots."""
+    roots: set = set()
+    for src in (_row_project_source(r) for r in (rows or [])):
+        if src:
+            roots |= _source_forms(src)
+    return roots
 
 
 def _caller_target_rows(
@@ -6810,10 +6845,15 @@ def _keep_caller_in_scope(obj, roots) -> bool:
     """Same-source-root rule for one caller row (v0.2.105 #512C).
 
     No known callee root (legacy rows) → LEAVE-ALONE: keep everything, exactly
-    the pre-v0.2.105 behaviour. Otherwise the caller's own ``project_source``
-    must be one of the callee's, compared as the EXACT stored string (a
-    property filter would be word-tokenized, and one root's path is a token
-    subset of any nested root's).
+    the pre-v0.2.105 behaviour. A caller row with an EMPTY stamp is kept too
+    (v0.2.105 fix round M4): such a row predates source stamping, and an
+    absent stamp is not evidence the row came from another root — dropping it
+    hid real callers in mixed graphs (callee re-walked and stamped, callers in
+    untouched legacy files). Otherwise the caller's ``project_source`` must
+    share a comparison form with one of the callee's roots (NOT an exact
+    string compare: a property filter would be word-tokenized, and one root's
+    path is a token subset of any nested root's — while a symlinked or
+    differently spelled root is still the SAME root).
 
     Deliberately NOT exempted: a caller linked only by a stored ``calls``
     edge. That edge is exactly what the write pass produced by resolving a
@@ -6824,12 +6864,31 @@ def _keep_caller_in_scope(obj, roots) -> bool:
     """
     if not roots:
         return True
-    return _row_project_source(obj) in roots
+    src = _row_project_source(obj)
+    if not src:
+        return True
+    return bool(_source_forms(src) & roots)
 
 
-def _caller_scan_limit(base_limit: int, roots) -> int:
-    """Candidate cap for the caller fetch: over-fetch when rows are dropped."""
-    return base_limit * (_CALLER_SCOPE_SCAN_MULT if roots else 1)
+def _caller_page_proves_mixed(objects, roots, base_limit: int) -> bool:
+    """Does the BASE-limit caller page owe the ×10 over-fetch? (fix round M5)
+
+    The over-fetch exists so a cap filled with another root's mirror rows
+    does not hide the real callers — which can only happen when the
+    collection actually holds rows from more than one root. That is proven
+    by the page itself being FULL and containing at least one out-of-scope
+    row; a single-root graph (no extra code folders) never proves it, so it
+    keeps the pre-scope fetch size and answers, exactly as before.
+    """
+    if not roots or len(objects or []) < base_limit:
+        return False
+    return any(not _keep_caller_in_scope(o, roots) for o in objects)
+
+
+def _caller_scan_limit(base_limit: int, escalate: bool) -> int:
+    """Candidate cap for the caller fetch: the ×N over-fetch only when the
+    base page proved the collection mixed (see `_caller_page_proves_mixed`)."""
+    return base_limit * (_CALLER_SCOPE_SCAN_MULT if escalate else 1)
 
 
 def _order_caller_rows(rows: list, target_full_name: str, confirmed_names=()) -> list:
@@ -7365,7 +7424,11 @@ def query_code_structure(
                 coll, target, effective_project,
                 filter_cls=Filter, base_props=("full_name",),
             ))
-            scan_limit = _caller_scan_limit(CALLERS_LIMIT, caller_roots)
+            # Fix round M5: fetch at the ANSWER cap first and over-fetch ×N
+            # only when the page itself proves the collection mixed (full
+            # page + out-of-scope rows) — a single-root graph keeps the exact
+            # pre-scope fetch size and answers.
+            scan_limit = _caller_scan_limit(CALLERS_LIMIT, False)
             # WS-4 Finding 1: call_names holds BARE leaf names; match the
             # full_name target AND its bare leaf so dotted / `::`-qualified
             # inputs (the documented form) actually resolve.
@@ -7373,26 +7436,37 @@ def query_code_structure(
                 filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
                 limit=scan_limit
             )
+            if _caller_page_proves_mixed(response.objects, caller_roots, CALLERS_LIMIT):
+                scan_limit = _caller_scan_limit(CALLERS_LIMIT, True)
+                response = coll.query.fetch_objects(
+                    filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
+                    limit=scan_limit
+                )
             # F6: `call_names` is replicated on every chunk row of a chunked
             # caller — collapse to one row per full_name (canonical chunk),
-            # then keep only same-root rows and list qualified matches first.
+            # then keep only same-root rows and list qualified matches first,
+            # and re-cap the ANSWER at CALLERS_LIMIT (fix round M5: the cap
+            # applies to the filtered list, never to the raw scan).
+            ordered_callers = _order_caller_rows(
+                [
+                    row for row in _dedup_objects_by_full_name(response.objects)
+                    if _keep_caller_in_scope(row, caller_roots)
+                ],
+                target,
+            )
             results = [
                 {
                     "full_name": obj.properties.get("full_name", ""),
                     "signature": obj.properties.get("signature", ""),
                     "file_path": obj.properties.get("file_path") or obj.properties.get("path", ""),
                 }
-                for obj in _order_caller_rows(
-                    [
-                        row for row in _dedup_objects_by_full_name(response.objects)
-                        if _keep_caller_in_scope(row, caller_roots)
-                    ],
-                    target,
-                )
+                for obj in ordered_callers[:CALLERS_LIMIT]
             ]
             _truncation_meta = {
-                "truncated": len(response.objects) >= scan_limit,
-                "limit": scan_limit,
+                "truncated": (len(ordered_callers) > CALLERS_LIMIT
+                              or len(response.objects) >= scan_limit),
+                # the TRUE answer cap — not the escalated scan width
+                "limit": CALLERS_LIMIT,
             }
 
         elif query_type == "interactions":

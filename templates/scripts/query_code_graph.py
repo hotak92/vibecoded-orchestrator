@@ -137,6 +137,7 @@ try:
         _caller_scope_roots,
         _caller_target_rows,
         _caller_scan_limit,
+        _caller_page_proves_mixed,
         _keep_caller_in_scope,
         _order_caller_rows,
         # v0.2.92 (B1): the ONE code-graph prefix rule, shared with the MCP.
@@ -1692,11 +1693,13 @@ class CodeGraphQuery:
 
                 # Pattern B (intentional top-N cap, with a truncation signal so
                 # the user knows when the list is capped — v0.2.46 V46-D).
-                # v0.2.105 (#512C): a root-scoped run over-fetches candidates
-                # (mirror rows are dropped below, and a cap filled with them
-                # must not hide the real callers).
+                # v0.2.105 (#512C + fix round M5): fetch at the ANSWER cap and
+                # over-fetch candidates only when the page itself proves the
+                # collection mixed (mirror rows are dropped below, and a cap
+                # filled with them must not hide the real callers) — a
+                # single-root graph keeps the exact pre-scope fetch size.
                 CALLERS_FETCH_LIMIT = 50
-                scan_limit = _caller_scan_limit(CALLERS_FETCH_LIMIT, target_roots)
+                scan_limit = _caller_scan_limit(CALLERS_FETCH_LIMIT, False)
                 caller_response = coll.query.fetch_objects(
                     filters=Filter.by_property("call_names").contains_any(
                         _caller_match_terms(target)
@@ -1704,6 +1707,17 @@ class CodeGraphQuery:
                     limit=scan_limit,
                     return_references=QueryReference(link_on="calls"),
                 )
+                if _caller_page_proves_mixed(
+                        caller_response.objects, target_roots,
+                        CALLERS_FETCH_LIMIT):
+                    scan_limit = _caller_scan_limit(CALLERS_FETCH_LIMIT, True)
+                    caller_response = coll.query.fetch_objects(
+                        filters=Filter.by_property("call_names").contains_any(
+                            _caller_match_terms(target)
+                        ),
+                        limit=scan_limit,
+                        return_references=QueryReference(link_on="calls"),
+                    )
 
                 # `call_names` holds BARE leaf names, so a name match alone can
                 # point at a same-named function elsewhere. A resolved `calls`
@@ -1730,8 +1744,10 @@ class CodeGraphQuery:
 
                 # `call_names` is replicated on every chunk row of a chunked
                 # caller — collapse to one row per full_name (same as the MCP),
-                # drop rows from another source root (v0.2.105 #512C), and list
-                # qualified matches first.
+                # drop rows from another source root (v0.2.105 #512C), list
+                # qualified matches first, and re-cap the ANSWER at
+                # CALLERS_FETCH_LIMIT (fix round M5: the cap applies to the
+                # filtered list, never to the raw scan width).
                 callers = _order_caller_rows(
                     [
                         row for row in _dedup_objects_by_full_name(
@@ -1739,8 +1755,9 @@ class CodeGraphQuery:
                         if _keep_caller_in_scope(row, target_roots)
                     ],
                     target, confirmed_names,
-                )
-                truncated = len(caller_response.objects) >= scan_limit
+                )[:CALLERS_FETCH_LIMIT]
+                truncated = (len(callers) >= CALLERS_FETCH_LIMIT
+                             or len(caller_response.objects) >= scan_limit)
 
                 if hook_format:
                     # WP-B2 injection block: one CODE: row per matched target
@@ -1775,14 +1792,31 @@ class CodeGraphQuery:
                     ):
                         resp = preloaded
                         if resp is None:
+                            # Fix round M5: base fetch first; the ×N
+                            # over-fetch only when the page proves the
+                            # collection mixed (full page + out-of-scope
+                            # rows), so the latency-budgeted hook path pays
+                            # it only in graphs that actually hold an extra
+                            # code folder's rows.
                             resp = coll.query.fetch_objects(
                                 filters=Filter.by_property("call_names").contains_any(
                                     terms
                                 ),
                                 limit=_caller_scan_limit(
-                                    CALLERS_FETCH_LIMIT, entity_roots),
+                                    CALLERS_FETCH_LIMIT, False),
                                 return_references=QueryReference(link_on="calls"),
                             )
+                            if _caller_page_proves_mixed(
+                                    resp.objects, entity_roots,
+                                    CALLERS_FETCH_LIMIT):
+                                resp = coll.query.fetch_objects(
+                                    filters=Filter.by_property("call_names").contains_any(
+                                        terms
+                                    ),
+                                    limit=_caller_scan_limit(
+                                        CALLERS_FETCH_LIMIT, True),
+                                    return_references=QueryReference(link_on="calls"),
+                                )
                         group_confirmed = set()
                         for obj in resp.objects:
                             for ref in read_cross_reference(obj, "calls"):

@@ -110,6 +110,9 @@ class _Query:
                 and self._coll.legacy_schema):
             raise Exception(
                 "no such prop: project_source (legacy schema variant)")
+        # fix-round M5: record the caller-scan fetches so tests can assert the
+        # over-fetch is paid ONLY when the page proves the collection mixed.
+        self._coll.fetch_log.append((filters, limit))
         hits = [r for r in self._coll.rows if _row_matches(filters, r.properties)]
         out = []
         for row in hits[:limit]:
@@ -130,6 +133,7 @@ class _Coll:
         self.rows = rows
         self.edges = edges or {}
         self.legacy_schema = legacy_schema
+        self.fetch_log = []
         self.query = _Query(self)
 
 
@@ -168,7 +172,7 @@ def _two_root_rows():
     ]
 
 
-def _mcp_callers(monkeypatch, coll, target: str) -> list:
+def _mcp_callers_payload(monkeypatch, coll, target: str) -> dict:
     srv = pytest.importorskip("claude_mcp_servers.weaviate_mcp.server")
     client = _Client(coll)
     with mock.patch.object(srv, "get_weaviate_client", return_value=client), \
@@ -177,7 +181,23 @@ def _mcp_callers(monkeypatch, coll, target: str) -> list:
         raw = srv.query_code_structure("callers", target, project="")
     payload = json.loads(raw)
     assert payload.get("success"), payload
-    return [r["full_name"] for r in payload["results"]]
+    return payload
+
+
+def _mcp_callers(monkeypatch, coll, target: str) -> list:
+    return [r["full_name"] for r in _mcp_callers_payload(
+        monkeypatch, coll, target)["results"]]
+
+
+def _caller_fetch_limits(coll) -> list:
+    """The limits of the CALLER-scan fetches (the callee identity fetch
+    filters on ``full_name``, not ``call_names``)."""
+    out = []
+    for flt, limit in coll.fetch_log:
+        props = {p for p, _op, _v in getattr(flt, "parts", [])}
+        if "call_names" in props:
+            out.append(limit)
+    return out
 
 
 def _cli_hook_row(monkeypatch, capsys, coll, target: str) -> str:
@@ -377,3 +397,166 @@ def test_a_root_with_no_candidate_keeps_the_edge(analyzer_mod) -> None:
     assert a._resolve_call_target(
         "combine", "x.y", index, "/repo/third",
     ) == "t-proj"
+
+
+# ── 5. fix round: mixed graphs keep legacy callers (M4); the over-fetch is
+# paid only by mixed graphs and the answer keeps its true cap (M5) ──────────
+
+
+def _mixed_graph_rows():
+    """A MIXED graph: the callee's file was re-walked (stamped), its caller
+    lives in an untouched legacy file (no stamp), and the mirror's caller of
+    its own same-named function is present too."""
+    return [
+        _Row("t-proj", full_name="pkg.model.Model.combine", name="combine",
+             project_source=_PROJ_ROOT, file_path="pkg/model.py",
+             start_line=10, language="python", call_names=[]),
+        # a caller in a legacy UNSTAMPED file (pre-v0.2.47 row, never re-walked)
+        _Row("c-legacy", full_name="legacy.thing.caller", name="caller",
+             file_path="legacy/thing.py", start_line=9, language="python",
+             call_names=["combine"]),
+        # the MIRROR's caller of ITS OWN same-named function — still dropped
+        _Row("c-mirror", full_name="mirror.form.Form1.convert", name="convert",
+             project_source=_MIRROR_ROOT, file_path="mirror/form.py",
+             start_line=40, language="python", call_names=["combine"]),
+    ]
+
+
+def test_mixed_graph_keeps_unstamped_legacy_callers(monkeypatch) -> None:
+    """ACT (fix M4): a stamped callee whose real caller row predates source
+    stamping must not lose it — an absent stamp is not evidence of another
+    root. Pre-fix the exact-``in``-roots check dropped the unstamped caller."""
+    names = _mcp_callers(monkeypatch, _Coll(_mixed_graph_rows()),
+                         "pkg.model.Model.combine")
+    assert "legacy.thing.caller" in names
+    # LEAVE-ALONE does not extend to STAMPED foreign rows (the original bug)
+    assert "mirror.form.Form1.convert" not in names
+
+
+def test_cli_hook_mixed_graph_keeps_unstamped_legacy_caller(
+        monkeypatch, capsys) -> None:
+    """The same rule on the INJECTION surface."""
+    row = _cli_hook_row(monkeypatch, capsys, _Coll(_mixed_graph_rows()),
+                        "pkg.model.Model.combine")
+    assert "legacy.thing.caller@legacy/thing.py:9" in row
+    assert "mirror.form.Form1.convert" not in row
+
+
+def test_path_spelling_differences_do_not_drop_the_caller(monkeypatch) -> None:
+    """ACT (fix M4): a caller stamped with a different SPELLING of the same
+    root (``/repo/./proj/`` — a ``.``/trailing-slash form) is the same root.
+    Pre-fix the exact stored-string compare dropped it."""
+    rows = [
+        _Row("t1", full_name="pkg.model.Model.combine", name="combine",
+             project_source=_PROJ_ROOT, file_path="pkg/model.py",
+             start_line=10, language="python", call_names=[]),
+        _Row("c1", full_name="pkg.model.Model.run", name="run",
+             project_source="/repo/./proj/", file_path="pkg/model.py",
+             start_line=30, language="python", call_names=["combine"]),
+        _Row("c2", full_name="mirror.form.Form1.convert", name="convert",
+             project_source=_MIRROR_ROOT, file_path="mirror/form.py",
+             start_line=40, language="python", call_names=["combine"]),
+    ]
+    assert _mcp_callers(monkeypatch, _Coll(rows),
+                        "pkg.model.Model.combine") == ["pkg.model.Model.run"]
+
+
+def test_windows_drive_letter_case_is_one_root(monkeypatch) -> None:
+    """Windows case-fold: ``C:/Projects/App`` and ``c:/projects/app`` are one
+    root; a genuinely different drive is still another codebase."""
+    srv = pytest.importorskip("claude_mcp_servers.weaviate_mcp.server")
+    monkeypatch.setattr(srv, "_CASEFOLD_PROJECT_SOURCES", True)
+    rows = [
+        _Row("wt", full_name="app.model.Model.combine", name="combine",
+             project_source="C:/Projects/App", file_path="app/model.py",
+             start_line=10, language="python", call_names=[]),
+        _Row("wc", full_name="app.model.Model.run", name="run",
+             project_source="c:/projects/app", file_path="app/model.py",
+             start_line=30, language="python", call_names=["combine"]),
+        _Row("wo", full_name="tool.form.Form1.convert", name="convert",
+             project_source="D:/Other/tool", file_path="tool/form.py",
+             start_line=40, language="python", call_names=["combine"]),
+    ]
+    assert _mcp_callers(monkeypatch, _Coll(rows),
+                        "app.model.Model.combine") == ["app.model.Model.run"]
+
+
+def _single_root_many_callers(n: int = 60) -> list:
+    rows = [
+        _Row("t1", full_name="pkg.model.Model.combine", name="combine",
+             project_source=_PROJ_ROOT, file_path="pkg/model.py",
+             start_line=10, language="python", call_names=[]),
+    ]
+    for i in range(n):
+        rows.append(_Row(
+            f"c{i}", full_name=f"pkg.callers.fn{i}", name=f"fn{i}",
+            project_source=_PROJ_ROOT, file_path="pkg/callers.py",
+            start_line=i, language="python", call_names=["combine"]))
+    return rows
+
+
+def _mixed_graph_capped_rows(mirror: int = 40, own: int = 30) -> list:
+    """A mixed graph whose base-limit caller page fills with MIRROR rows
+    before the project's own callers (the mirror rows are listed first, as
+    store order would have it)."""
+    rows = [
+        _Row("t1", full_name="pkg.model.Model.combine", name="combine",
+             project_source=_PROJ_ROOT, file_path="pkg/model.py",
+             start_line=10, language="python", call_names=[]),
+    ]
+    for i in range(mirror):
+        rows.append(_Row(
+            f"m{i}", full_name=f"mirror.form.Form1.convert{i}",
+            name=f"convert{i}", project_source=_MIRROR_ROOT,
+            file_path="mirror/form.py", start_line=i, language="python",
+            call_names=["combine"]))
+    for i in range(own):
+        rows.append(_Row(
+            f"p{i}", full_name=f"pkg.model.Model.run{i}", name=f"run{i}",
+            project_source=_PROJ_ROOT, file_path="pkg/model.py",
+            start_line=100 + i, language="python", call_names=["combine"]))
+    return rows
+
+
+def test_single_root_graph_keeps_the_base_fetch_and_answer_cap(
+        monkeypatch) -> None:
+    """M5 ACT-side: a graph with ONE root never pays the ×10 over-fetch (its
+    caller page cannot contain out-of-scope rows) and the reported limit is
+    the TRUE answer cap, not a scan width. Pre-fix the fetch was 500 rows
+    and the payload reported ``limit: 500``."""
+    coll = _Coll(_single_root_many_callers())
+    payload = _mcp_callers_payload(monkeypatch, coll,
+                                   "pkg.model.Model.combine")
+    assert _caller_fetch_limits(coll) == [50]
+    assert len(payload["results"]) == 50
+    assert payload["limit"] == 50
+    assert payload["truncated"] is True
+
+
+def test_mixed_graph_escalates_then_recaps_the_answer(monkeypatch) -> None:
+    """M5: the over-fetch IS owed when the page proves the collection mixed
+    (full page + out-of-scope rows), the ANSWER is re-capped at 50 after
+    filtering, and the payload reports the true cap."""
+    coll = _Coll(_mixed_graph_capped_rows())
+    payload = _mcp_callers_payload(monkeypatch, coll,
+                                   "pkg.model.Model.combine")
+    assert _caller_fetch_limits(coll) == [50, 500]
+    assert len(payload["results"]) == 30      # only the project's callers
+    assert payload["limit"] == 50             # the TRUE answer cap
+    assert payload["truncated"] is False
+
+
+def test_cli_hook_single_root_never_escalates(monkeypatch, capsys) -> None:
+    """The latency-budgeted injection path pays the base fetch only."""
+    coll = _Coll(_single_root_many_callers())
+    _cli_hook_row(monkeypatch, capsys, coll, "pkg.model.Model.combine")
+    assert _caller_fetch_limits(coll) == [50]
+
+
+def test_cli_hook_escalates_only_when_the_page_proves_mixed(
+        monkeypatch, capsys) -> None:
+    coll = _Coll(_mixed_graph_capped_rows())
+    row = _cli_hook_row(monkeypatch, capsys, coll,
+                        "pkg.model.Model.combine")
+    assert _caller_fetch_limits(coll) == [50, 500]
+    assert "mirror.form.Form1.convert" not in row
