@@ -26,7 +26,12 @@ Leave-alone rules (each tested both ways): only VCO-shaped classes
 ``WEAVIATE_SUFFIX_MARKERS``); only ``hnsw`` vectors; a vector that already has
 any compression (PQ / SQ / BQ / RQ, the user's or ours) keeps it; a cache cap
 someone already set keeps its value; a server older than the table's
-``min_server_version`` gets no RQ.
+``min_server_version`` (an adopted Weaviate, or VCO's own while its new image
+could not be downloaded and the old container was kept) gets NO change at all:
+the update step skips it whole and says why. Those versions mark
+``vectorConfig`` immutable (see :mod:`vco_lib.weaviate_schema`), and a PUT of a
+whole named-vector schema to them is not something VCO has verified, so the
+step does not send one — not even for the cache cap.
 """
 from __future__ import annotations
 
@@ -153,6 +158,9 @@ def plan_class_update(class_schema: Mapping[str, Any], *, rq_supported: bool) ->
     Per HNSW vector (each named vector, or the legacy class-level index):
     RQ-8 when ``rq_supported`` and the vector has no compression yet; the
     cache cap when the live value is Weaviate's unlimited default.
+    :func:`apply_policy` only calls it for a server at or above the policy's
+    ``min_server_version`` (older servers are skipped whole), so there
+    ``rq_supported`` is True; the flag keeps this function pure and total.
     """
     name = str(class_schema.get("class") or "")
     kind = collection_kind(name)
@@ -194,13 +202,16 @@ def plan_class_update(class_schema: Mapping[str, Any], *, rq_supported: bool) ->
 @dataclass
 class ApplyResult:
     """What :func:`apply_policy` did. ``unreachable`` = the server could not
-    be read at all (nothing was attempted)."""
+    be read at all (nothing was attempted). ``skipped`` = the server is older
+    than the policy's ``min_server_version``, so nothing was attempted on
+    purpose (the reason, for the summary and the install log)."""
     server_version: Optional[str] = None
     rq_supported: bool = False
     updated: list[str] = field(default_factory=list)
     conformant: list[str] = field(default_factory=list)
     failed: list[tuple[str, str]] = field(default_factory=list)
     unreachable: Optional[str] = None
+    skipped: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -230,6 +241,16 @@ def apply_policy(weaviate_url: Optional[str] = None, *,
             res.unreachable = f"GET /v1/meta answered HTTP {st}"
             return res
         res.server_version = str(json.loads(raw.decode("utf-8")).get("version") or "")
+        res.rq_supported = server_supports_rq(res.server_version)
+        if not res.rq_supported:
+            # Version gate for the WHOLE step (no shard load, no PUT): see the
+            # module docstring. A kept old VCO container already carries its
+            # own deferral (service_image_pull_failed); the update after the
+            # new image arrives does this work.
+            res.skipped = (f"Weaviate {res.server_version or '(unknown version)'} is older "
+                           f"than {'.'.join(map(str, policy().rq_min_server_version))}; "
+                           "collection index settings left unchanged")
+            return res
         st, raw = req("GET", f"{base}/v1/schema", timeout=60.0)
         if st != 200:
             res.unreachable = f"GET /v1/schema answered HTTP {st}"
@@ -238,7 +259,6 @@ def apply_policy(weaviate_url: Optional[str] = None, *,
     except Exception as exc:  # noqa: BLE001 — transport/parse → a soft failure
         res.unreachable = f"{type(exc).__name__}: {exc}"
         return res
-    res.rq_supported = server_supports_rq(res.server_version)
     for cls in classes:
         name = str((cls or {}).get("class") or "")
         if collection_kind(name) is None:
@@ -277,7 +297,8 @@ def run_update_step(deferral_report, *, weaviate_url: Optional[str] = None,
     res = apply_policy(weaviate_url, request=request)
     data = {"server_version": res.server_version, "rq_supported": res.rq_supported,
             "updated": res.updated, "conformant": len(res.conformant),
-            "failed": [n for n, _ in res.failed], "unreachable": res.unreachable}
+            "failed": [n for n, _ in res.failed], "unreachable": res.unreachable,
+            "skipped": res.skipped}
     if log_event is not None:
         try:
             log_event("7e/10", "ok" if res.ok else "warn", "weaviate vector-index policy", data=data)
@@ -286,11 +307,11 @@ def run_update_step(deferral_report, *, weaviate_url: Optional[str] = None,
     print("[7e/10] Weaviate vector index (RQ-8 compression, cache cap) ... ", end="")
     if res.unreachable is not None:
         print(f"skipped ({res.unreachable})")
+    elif res.skipped is not None:
+        print(f"skipped ({res.skipped})")
     else:
-        note = "" if res.rq_supported else (
-            f"; Weaviate {res.server_version or '?'} has no RQ, cache cap only")
         print(f"{len(res.updated)} updated, {len(res.conformant)} already set, "
-              f"{len(res.failed)} failed{note}")
+              f"{len(res.failed)} failed")
         for name, why in res.failed:
             print(f"  [vector-index] {name}: {why}")
     if res.ok:

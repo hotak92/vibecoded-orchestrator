@@ -26,8 +26,9 @@ bits = 8
 # Candidates re-ranked with the full vector. 20 is Weaviate's own default for
 # RQ-8; it is what the recall numbers above were measured with.
 rescore_limit = 20
-# The first Weaviate with RQ. Older servers (an adopted Weaviate) are left
-# uncompressed.
+# The first Weaviate with RQ, and the gate of the whole update step: on an
+# older server (an adopted Weaviate, or VCO's own kept on its old image when
+# the new one could not be pulled) the step changes nothing, cache cap included.
 min_server_version = "1.32.0"
 
 [vector_cache_max_objects]

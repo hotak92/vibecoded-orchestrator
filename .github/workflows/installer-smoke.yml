@@ -305,8 +305,8 @@ jobs:
 
     services:
       weaviate:
-        # Same version as infrastructure/docker-compose.yml's pin
-        # (tests/test_v02105_weaviate_pins.py keeps them equal).
+        # Same version as infrastructure/docker-compose.yml's pin; this test keeps them equal:
+        # tests/test_v02105_weaviate_memory_and_vector_index.py::test_every_compose_file_and_ci_pin_one_weaviate_version
         # No API key required; default-mode (no auth) matches dev installs.
         image: semitechnologies/weaviate:1.37.18
         ports:

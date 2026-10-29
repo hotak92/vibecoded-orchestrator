@@ -299,12 +299,35 @@ def test_apply_is_idempotent():
     assert not [c for c in fake.calls if c[0] == "PUT"]
 
 
-def test_apply_on_an_old_server_only_caps_the_cache():
-    fake = FakeWeaviate([_live("Foo_CodeFunction")], version="1.28.4")
+@pytest.mark.parametrize("version", ["1.28.4", "1.31.9", ""])
+def test_apply_on_an_old_server_changes_nothing_at_all(version):
+    """A pre-RQ server (an adopted Weaviate, or VCO's own kept on 1.28.4 when
+    the new image could not be pulled) gets no shard load and no PUT — not
+    even the cache cap: a whole-schema PUT to it is unverified (review L3)."""
+    fake = FakeWeaviate([_live("Foo_CodeFunction")], version=version)
     res = wvi.apply_policy("http://w:1", request=fake)
-    assert not res.rq_supported and res.updated == ["Foo_CodeFunction"]
+    assert res.ok and not res.rq_supported
+    assert res.skipped and "older than 1.32.0" in res.skipped
+    assert res.updated == [] and res.failed == []
+    assert fake.calls == [("GET", "meta")]
     slot = fake.classes["Foo_CodeFunction"]["vectorConfig"]["qwen3_embed"]["vectorIndexConfig"]
-    assert slot["rq"]["enabled"] is False and slot["vectorCacheMaxObjects"] == CAP["code"]
+    assert slot["vectorCacheMaxObjects"] == wvi.WEAVIATE_UNLIMITED_CACHE
+
+
+def test_apply_at_the_minimum_version_does_the_work():
+    fake = FakeWeaviate([_live("Foo_CodeFunction")], version="1.32.0")
+    res = wvi.apply_policy("http://w:1", request=fake)
+    assert res.rq_supported and res.skipped is None and res.updated == ["Foo_CodeFunction"]
+
+
+def test_update_step_on_an_old_server_records_why_and_defers_nothing(capsys):
+    report, events = _Report(), []
+    res = wvi.run_update_step(report, weaviate_url="http://w:1",
+                              request=FakeWeaviate([_live("Foo_CodeFunction")], version="1.28.4"),
+                              log_event=lambda *a, **k: events.append((a, k)))
+    assert res.ok and report.entries == []
+    assert events[0][0][1] == "ok" and "1.28.4" in events[0][1]["data"]["skipped"]
+    assert "skipped (Weaviate 1.28.4 is older than 1.32.0" in capsys.readouterr().out
 
 
 class _Report:
@@ -411,6 +434,21 @@ def test_every_compose_file_and_ci_pin_one_weaviate_version():
     assert len(pins) == 1, pins
     (version,) = pins
     assert version >= wvi.policy().rq_min_server_version, "RQ needs >= 1.32"
+
+
+_TEST_REF = re.compile(r"tests/[A-Za-z0-9_/]+\.py(?:::[A-Za-z0-9_]+)?")
+
+
+def test_every_test_a_workflow_comment_names_exists():
+    """A CI comment that names the test locking its pin must name a real one
+    (review L2: the Weaviate pin comment named a file that never existed)."""
+    for wf in sorted((REPO / ".github" / "workflows").glob("*.yml")):
+        for ref in _TEST_REF.findall(wf.read_text(encoding="utf-8")):
+            path, _, func = ref.partition("::")
+            assert (REPO / path).is_file(), f"{wf.name}: {ref}"
+            if func:
+                assert re.search(rf"^\s*def {func}\(", (REPO / path).read_text(encoding="utf-8"),
+                                 re.M), f"{wf.name}: {ref}"
 
 
 def _weaviate_env(path):
