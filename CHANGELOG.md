@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A chat no longer fails for a few minutes while Claude Code refreshes its own login.** Claude Code rewrites
+  `~/.claude/.credentials.json` when it refreshes, and for a second or two that file carries an empty token. The model
+  gateway was reading it at that exact moment and answering `401 claude_login_unavailable` to every request going
+  through it — three minutes of failed turns on 2026-10-28, for a login that was never actually broken. The gateway now
+  keeps the last token it read and goes on using it until that token expires, so a rewrite is invisible. When there is
+  no earlier token to fall back on, it says plainly that this is momentary and to retry in a few seconds, instead of
+  telling you (or a subagent, mid-task) to go and log in — which was advice that could not help. A request that arrives
+  during the rewrite waits at most two seconds for the new token before giving up. A machine that really has no login
+  still gets the "run `claude` to log in" message.
+
+- **A gateway 503 for a vendor key now names the real cause: the background service (vct-hub) is not running.** When
+  that service is down, the gateway cannot reach the keys stored in your OS keychain, so the key was never looked for —
+  but the message used to read like a missing or mis-filed key, and even suggested clearing
+  `VCT_MODEL_GATEWAY_SECRET_PROJECT` when that setting had nothing to do with it. It now says the service is not
+  reachable, that the key may well still exist, and that starting the service fixes it within seconds with no restart
+  and no configuration change; the secret-scope advice is gone from that message. Relatedly, a key the gateway had
+  already read keeps being used for as long as the service is down, instead of expiring after six hours: in a two-day
+  outage (2026-10-20/22) one provider's key stopped working halfway through while another's kept working, purely
+  because one had been read earlier in the session. Both now behave the same way, and a key the gateway never read still
+  has nothing to fall back on.
+
+### Added
+
+- **The gateway's usage ledger records when a turn was a context compaction.** Claude Code marks those requests with an
+  `x-claude-code-compaction` header; each ledger row now carries the value (`null` on an ordinary turn), so a sudden
+  jump in a chat's context can be traced to the compaction that caused it instead of looking like a turn you never
+  typed. Nothing about routing or the request changes.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed

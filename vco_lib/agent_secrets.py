@@ -797,13 +797,24 @@ def get(
                 "checked — if the key is stored there, start the launcher and "
                 "retry. Otherwise: " + _fix[len("Fix: "):]
             )
-        raise SecretNotFound(
+        miss = SecretNotFound(
             f"secret {key!r} not found (tier 1 hub: {hub_error}; tier 2 "
             f"file store: {tier2_desc()}; tier 3 project .env: "
             f"{tier3_desc()}; tiers 2+3 "
             f"checked={allow_file_fallback}; shared_only={shared_only}). "
             + _fix
-        ) from hub_error
+        )
+        if isinstance(hub_error, HubUnreachable):
+            # v0.2.105: SecretNotFound is also what a full-chain miss raises
+            # when NOBODY WAS ASKED — the hub was not running, so the OS
+            # keychain (tier 1, the only route to it) was never consulted. A
+            # caller that must tell "the key is not stored" from "nothing was
+            # looked at" reads this flag; the exception TYPE cannot say it
+            # (the message is prose and the message is not an interface).
+            # Same mechanism as the ``retry_after`` attribute on
+            # KeychainUnavailable above.
+            miss.hub_unreachable = True  # type: ignore[attr-defined]
+        raise miss from hub_error
     raise hub_error
 
 

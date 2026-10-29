@@ -208,6 +208,7 @@ from .usage import (
     effort_extra,
     guard_count_tokens,
     note_count_substitution,
+    read_compaction_header,
     read_identity,
 )
 from .vendors import (
@@ -1283,6 +1284,12 @@ class RequestFacts:
     #: (:func:`_carries_binary_blocks`, review batch-2 MEDIUM-1). ``False``
     #: when the body was not parsed — the ordinary text path.
     binary_body: bool = False
+    #: v0.2.105 (CL-4): the client's ``x-claude-code-compaction`` header, or
+    #: ``None`` when it sent none. Read through
+    #: :func:`model_router.usage.read_compaction_header` (one home for the
+    #: sanitising) and written to the ledger row so a compaction call can be
+    #: attributed instead of looking like a turn the user never typed.
+    compaction: Optional[str] = None
 
 
 def _route_label(decision: Route) -> str:
@@ -1380,6 +1387,7 @@ def _submit_usage(
         fallback_from=fallback_from,
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
+        compaction=facts.compaction,
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -2741,6 +2749,8 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             )
         ),
         binary_body=_carries_binary_blocks(payload),
+        # CL-4: attribution only — nothing routes or shapes on this value.
+        compaction=read_compaction_header(request.headers),
     )
 
     headers = gateway.forward_headers(request)
@@ -2762,6 +2772,15 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     clear_thinking_applied = False
     if decision.is_anthropic:
         oauth = gateway.oauth.read()
+        if oauth.token is None and oauth.retry_soon:
+            # v0.2.105: the credentials file carries no token RIGHT NOW and
+            # that is a CLI rewriting it (2026-10-28: three minutes of 401
+            # ``claude_login_unavailable`` for every first-party request).
+            # One bounded, off-loop re-read before answering — the rewrite is
+            # a millisecond-scale affair, and a request that waits 400 ms for
+            # it is a request that never failed. Bounded twice: only for a
+            # TRANSIENT verdict, never more than ``_REREAD_BUDGET_S``.
+            oauth = await gateway.oauth.aread_with_brief_wait()
         if oauth.token is None:
             log_local(401, "claude_login_unavailable")
             return _json_error(401, "authentication_error", oauth.problem or "")

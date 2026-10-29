@@ -94,6 +94,28 @@ def _is_store_unavailable(exc: BaseException) -> bool:
     """Is ``exc`` one of the resolver's TRANSIENT store-unavailability errors?"""
     return any(c.__name__ in _STORE_UNAVAILABLE_TYPES for c in type(exc).__mro__)
 
+
+def _is_hub_unreachable(exc: BaseException) -> bool:
+    """Did this failure happen because TIER 1 could not be reached at all?
+
+    Two spellings, both real on this chain:
+
+    * the exception IS a ``HubUnreachable`` (or a subclass) — that is what
+      ``agent_secrets.get`` raises when the file-store fallback is disabled;
+    * the exception is the ``SecretNotFound`` a full-chain miss raises, which
+      v0.2.105 marks with a ``hub_unreachable`` attribute — with the fallback
+      enabled (the gateway's case) a hub that is not running is reported as a
+      miss by the time it reaches here, and the TYPE alone cannot tell "the
+      key is not stored" from "nothing was asked".
+
+    Matched by NAME across the MRO for the same reason as
+    :func:`_is_store_unavailable`: the resolver is imported lazily and every
+    test injects its own getter.
+    """
+    if getattr(exc, "hub_unreachable", False):
+        return True
+    return any(c.__name__ == "HubUnreachable" for c in type(exc).__mro__)
+
 SecretGetter = Callable[..., str]
 
 #: Maps a project PATH (or id) to the hub's project id. Raises on every
@@ -131,6 +153,14 @@ class KeyResult:
     #: unavailable (hub 503 ``keychain_unavailable``), so this is NOT a "no key"
     #: answer. Cached for ``TRANSIENT_RETRY_S`` only, and never logged as a miss.
     transient: bool = False
+    #: v0.2.105: tier 1 (the hub) could not be REACHED, so the OS keychain was
+    #: never consulted. Distinct from :attr:`transient` (the hub answered, or
+    #: did not answer in time) because it needs a different message — the
+    #: misleading hint in the 2026-10-21 field report named a stale secret
+    #: scope for what was a hub outage — and because the hub being gone says
+    #: nothing about a key's validity, which is what keeps a resolved key
+    #: usable for the whole outage.
+    hub_unreachable: bool = False
 
     def __repr__(self) -> str:  # pragma: no cover - exercised via assertions
         # Never let a value reach a traceback, a pytest diff or a log record
@@ -308,6 +338,10 @@ class VendorKeyResolver:
         self._no_key_logged: set[str] = set()
         #: v0.2.102: vendors whose TRANSIENT keychain-unavailable line was logged.
         self._transient_logged: set[str] = set()
+        #: v0.2.105: vendors whose "tier 1 (the hub) is not reachable" line was
+        #: logged. Edge-triggered for the same reason as every other set here:
+        #: a 2-day hub outage must not become a log nobody can read.
+        self._hub_down_logged: set[str] = set()
         #: v0.2.102 (W6-AB): in-flight BACKGROUND refreshes, one per vendor
         #: (single flight). See :meth:`aresolve`.
         self._refreshing: dict[str, "asyncio.Task[KeyResult]"] = {}
@@ -574,6 +608,7 @@ class VendorKeyResolver:
             self._past_stale_bound.clear()
             self._no_key_logged.clear()
             self._transient_logged.clear()
+            self._hub_down_logged.clear()
         else:
             self._cache.pop(vendor_id, None)
             self._last_good.pop(vendor_id, None)
@@ -581,6 +616,7 @@ class VendorKeyResolver:
             self._past_stale_bound.discard(vendor_id)
             self._no_key_logged.discard(vendor_id)
             self._transient_logged.discard(vendor_id)
+            self._hub_down_logged.discard(vendor_id)
 
     def _serve_stale(
         self, vendor: Vendor, now: float, *, fresh: KeyResult
@@ -601,9 +637,25 @@ class VendorKeyResolver:
         (v0.2.102, W6-AB: the store could not be ASKED — hub timed out, keychain
         busy): a store that could not answer said nothing about revocation, so
         the last-known-good key keeps being served whatever its age. (A key
-        revoked at the VENDOR is refused by the vendor either way.) Both WARNs are EDGE-TRIGGERED per vendor: one
-        line entering stale service, one line leaving it. Per-request
-        warnings would rebuild the 503 storm as a WARN storm.
+        revoked at the VENDOR is refused by the vendor either way.)
+
+        v0.2.105 adds the second unbounded arm: TIER 1 UNREACHABLE
+        (``fresh.hub_unreachable``). Field evidence 2026-10-20/22 — the hub
+        was down for ~2 days while sessions ran, which is 8× the 6 h bound, so
+        a key resolved before the outage stopped being served partway through
+        it and the vendor answered 503 for a key nobody had touched. A daemon
+        that cannot reach the hub has learned nothing about the key, and the
+        6 h bound exists to expire a REVOKED key — a fact only a reachable
+        store can report. The same rule applies to EVERY vendor: in that
+        report one vendor's key kept being served and another 503'd, and the
+        difference was RESOLUTION HISTORY — the first had resolved earlier in
+        the process, the second had not. Nothing here is per-vendor, and
+        nothing should become so: a key this process never read is one it
+        cannot hold.
+
+        Both WARNs are EDGE-TRIGGERED per vendor: one line entering stale
+        service, one line leaving it. Per-request warnings would rebuild the
+        503 storm as a WARN storm.
         """
         entry = self._last_good.get(vendor.vendor_id)
         if entry is not None and entry.result.key:
@@ -613,18 +665,28 @@ class VendorKeyResolver:
             # while the TTL checks elsewhere ask "is the entry YOUNGER than
             # its TTL" and are therefore exclusive. Two questions, two
             # comparisons — not a drift to normalise away.
-            if age <= self._serve_stale_max_age_s or fresh.transient:
+            if (
+                age <= self._serve_stale_max_age_s
+                or fresh.transient
+                or fresh.hub_unreachable
+            ):
                 if vendor.vendor_id not in self._serving_stale:
                     self._serving_stale.add(vendor.vendor_id)
                     logger.warning(
                         "model-gateway: vendor %s key resolution failed; "
                         "serving the last-known-good key (resolved %ds ago, "
-                        "serve-stale bound %ds). Fresh resolution said: %s. "
+                        "serve-stale bound %ds%s). Fresh resolution said: %s. "
                         "Expected while the hub is stopped — an update stops "
                         "it by design — and self-heals on the next success.",
                         vendor.vendor_id,
                         int(age),
                         self._serve_stale_max_age_s,
+                        (
+                            ", not applied: vct-hub is not reachable, which "
+                            "says nothing about the key"
+                            if fresh.hub_unreachable
+                            else ""
+                        ),
                         fresh.problem or "no key found",
                     )
                 return KeyResult(
@@ -662,6 +724,7 @@ class VendorKeyResolver:
         self._past_stale_bound.discard(vendor_id)
         self._no_key_logged.discard(vendor_id)
         self._transient_logged.discard(vendor_id)
+        self._hub_down_logged.discard(vendor_id)
         if recovered:
             logger.info(
                 "model-gateway: vendor %s key resolves again%s",
@@ -732,11 +795,15 @@ class VendorKeyResolver:
         # waits for its first resolution. Scoped to an entry that merely
         # EXPIRED (a key) or whose last attempt was TRANSIENT: after a
         # DEFINITE miss the synchronous path below runs, so the serve-stale
-        # bound still stops serving a key the store says is gone.
+        # bound still stops serving a key the store says is gone. A hub that
+        # is NOT THERE (v0.2.105) belongs to that same "the store could not be
+        # asked" family: the key is served from the last-known-good store and
+        # the next hub attempt happens on the refresh thread.
         good = self._last_good.get(vendor.vendor_id)
         if (
             entry is not None
-            and (entry.result.key or entry.result.transient)
+            and (entry.result.key or entry.result.transient
+                 or entry.result.hub_unreachable)
             and good is not None
             and good.result.key
         ):
@@ -811,10 +878,16 @@ class VendorKeyResolver:
         scope_arg = self.effective_project
         failures: list[str] = []
         unavailable: list[str] = []
+        hub_down: list[str] = []
         for key_name in vendor.secret_keys:
             try:
                 value = getter(key_name, project=scope_arg)
             except Exception as exc:  # noqa: BLE001 — every resolver error is a miss
+                if _is_hub_unreachable(exc):
+                    # v0.2.105: tier 1 was not REACHED at all — the key was
+                    # never looked for. Distinct from a busy store, and the
+                    # distinction is what the 503 message has to carry.
+                    hub_down.append(key_name)
                 if _is_store_unavailable(exc):
                     # v0.2.102: NOT a miss — the store could not be read right
                     # now (hub timed out / keychain busy). The next name is still tried (it may live in
@@ -846,6 +919,9 @@ class VendorKeyResolver:
 
         if unavailable:
             return self._transient_result(vendor, unavailable, failures)
+
+        if hub_down:
+            return self._hub_outage_result(vendor, hub_down, failures)
 
         scope = self.describe_scope()
         # The scope is diagnosed only HERE, on the miss: a resolution that
@@ -916,6 +992,68 @@ class VendorKeyResolver:
                 f"Resolver detail: {'; '.join(failures)}"
             ),
             transient=True,
+        )
+
+    def _hub_outage_result(
+        self, vendor: Vendor, hub_down: list[str], failures: list[str]
+    ) -> KeyResult:
+        """The answer for "vct-hub could not be reached at all" (v0.2.105).
+
+        The 2026-10-21/22 field report is the spec. The hub had been down for
+        ~2 days; a subagent's request answered 503 whose text was the
+        SCAFFOLDING of the scope diagnostic — "this daemon is running out of
+        <path>, a different path from the pin … clearing
+        ``VCT_MODEL_GATEWAY_SECRET_PROJECT`` restores the default" — for a
+        cause that had nothing to do with the scope. An operator reading that
+        edits a variable; the hub stays down.
+
+        So this message names the outage FIRST, says plainly that the keychain
+        was never consulted and that the key therefore may well exist, and
+        carries NO scope remedy at all: while tier 1 is unreachable no scope
+        can help, and offering one is the misleading hint this replaces. The
+        scope is still REPORTED (as an observation, in
+        :attr:`KeyResult.problem`'s tail), never prescribed.
+
+        ``hub_unreachable`` is set so :meth:`_serve_stale` can answer with the
+        last-known-good key whatever its age, and so the caller
+        (:meth:`aresolve`) can keep serving it without waiting on a store that
+        is not there.
+        """
+        if vendor.vendor_id not in self._hub_down_logged:
+            self._hub_down_logged.add(vendor.vendor_id)
+            logger.warning(
+                "model-gateway: vendor %s key: vct-hub is NOT REACHABLE, so the "
+                "OS keychain was never consulted (tried %s). This is a hub "
+                "outage, not a missing key — start it (the launcher starts it "
+                "automatically, or run `vct-hub --start-if-not-running`) and "
+                "the gateway answers within seconds, with no restart. Said "
+                "once per vendor until the hub answers again.",
+                vendor.vendor_id,
+                ", ".join(vendor.secret_keys),
+            )
+        first_key = vendor.secret_keys[0]
+        return KeyResult(
+            problem=(
+                f"vendor {vendor.vendor_id!r} key: vct-hub is NOT REACHABLE — "
+                "the hub is the only route to a key held in the OS keychain, "
+                "so the key was never looked for and MAY WELL EXIST. This is "
+                "not a missing key and not a scope problem: start the hub "
+                "(the launcher starts it automatically, or run "
+                "`vct-hub --start-if-not-running`) and the gateway picks the "
+                "key up within seconds — no restart, no re-entry, no config "
+                "change. If it is not in any store yet, put it in the SHARED "
+                "scope: the launcher's Secrets panel with scope 'shared' (OS "
+                "keychain), or `vct set --shared --key "
+                f"{first_key}` (file store, ~/.vct-secrets/shared/ — this one "
+                "works without the hub). "
+                f"(asked for {', '.join(repr(k) for k in hub_down)}; "
+                # Reported, never prescribed: no remedy here may point at the
+                # secret scope while the scope could not be consulted.
+                f"scope in force: {self.effective_project!r} "
+                f"[{self.scope_origin()}]) "
+                f"Resolver detail: {'; '.join(failures)}"
+            ),
+            hub_unreachable=True,
         )
 
 
