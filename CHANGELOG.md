@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Function callers are no longer borrowed from another codebase.** In a project whose code graph also indexes an extra code folder, a "what calls this function" answer (the MCP `query_code_structure` tool, `code-graph-query structure callers`, and the caller lines injected before an edit or read) listed functions from the other codebase that merely had the same name — for example a model method named `combine` came back with another tool's `combine` methods. Callers are now matched inside the function's own source root: a caller is listed only when it was indexed from the same folder as the function, so an extra code folder's rows never appear under your project's function. Within that set, a caller in the same class or module — or one confirmed by the stored call edge — is listed first, so the five-line injection shows the real caller. Projects with no extra code folders, and older graphs whose rows carry no source stamp, keep exactly the answers they had before.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed

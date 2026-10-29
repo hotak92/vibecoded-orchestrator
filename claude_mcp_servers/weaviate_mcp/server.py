@@ -6702,6 +6702,148 @@ def _caller_match_terms(target: str) -> list[str]:
     return terms
 
 
+# ─── Caller scope: same source root + qualified-name preference (v0.2.105 #512C)
+# A project whose code graph ALSO holds an extra code folder's mirror rows
+# listed the mirror's functions as callers (field report: the injected context
+# for a model's `combine` named an unrelated tool's methods; the same report's
+# `combine(` search symptom is the SEARCH surface, not this one). Two causes,
+# both on the caller-list read path:
+#
+#   1. the caller list matched `call_names` BARE leaves across the WHOLE
+#      collection, while every code row carries `project_source` — the root it
+#      was walked from (the project's own folder, or one extra code folder);
+#   2. nothing preferred a caller whose qualified scope is the callee's own.
+#
+# So the callee's rows are resolved first to learn which root(s) it lives in,
+# and only callers sharing one of those roots are listed (a caller row and the
+# callee row must share `project_source`). A callee with no stamp at all
+# (pre-v0.2.47 legacy rows, or a project with no extra folders) yields no
+# root set and the list is left exactly as it was. A qualified match is listed
+# before a bare-name-only one so a capped list shows the real caller first;
+# bare matches are demoted, NEVER dropped — a missing `calls` edge is not
+# evidence of absence (see the CLI's callers branch).
+_CALLER_TARGET_ROWS = 8       # callee rows fetched to learn its root(s)
+_CALLER_SCOPE_SCAN_MULT = 10  # candidate over-fetch when a root scope applies
+
+
+def _row_project_source(obj) -> str:
+    """A code row's ``project_source`` — the root it was walked from.
+
+    ``""`` when the property is absent (a legacy row written before v0.2.47,
+    a mocked object) — such a row cannot be shown to share a root.
+    """
+    try:
+        return str((obj.properties or {}).get("project_source") or "").strip()
+    except Exception:  # noqa: BLE001 — defensive on mocked objects
+        return ""
+
+
+def _caller_scope_roots(rows: list) -> set:
+    """The distinct NON-EMPTY source roots of the CALLEE rows (v0.2.105)."""
+    return {src for src in (_row_project_source(r) for r in (rows or [])) if src}
+
+
+def _caller_target_rows(
+    coll, target, project, *, filter_cls, base_props, prop="full_name",
+    tolerant_limit=_CALLER_TARGET_ROWS,
+) -> list:
+    """The callee's identity rows, carrying ``project_source`` when present.
+
+    Requests ``project_source`` beside the caller's own properties and falls
+    back to the bare request on a collection that predates the property (an
+    unknown property in ``return_properties`` is an error on some schema
+    variants — the same defensive probe ``analyze_code_graph`` uses). The
+    fallback yields no roots, i.e. the leave-alone behaviour.
+    """
+    from vco_lib.codegraph_lookup import code_identity_rows
+
+    props = list(base_props)
+    try:
+        return code_identity_rows(
+            coll, prop, target, project, filter_cls=filter_cls,
+            tolerant_limit=tolerant_limit,
+            return_properties=props + ["project_source"],
+        )
+    except Exception:  # noqa: BLE001 — legacy schema without the property
+        return code_identity_rows(
+            coll, prop, target, project, filter_cls=filter_cls,
+            tolerant_limit=tolerant_limit, return_properties=props,
+        )
+
+
+def _caller_scope_prefix(full_name: str) -> str:
+    """The class/namespace/module path of a qualified name ("" when bare)."""
+    name = str(full_name or "")
+    for sep in ("::", "."):
+        if sep in name:
+            head, _, _leaf = name.rpartition(sep)
+            return head
+    return ""
+
+
+def _caller_match_rank(
+    caller_full_name: str, target_full_name: str, *, edge_confirmed: bool = False,
+) -> int:
+    """``0`` for a QUALIFIED match, ``1`` for a bare-name-only match.
+
+    QUALIFIED means uuid-precise (the analyzer's resolved ``calls`` edge
+    targets the callee) or same scope — the caller's class/namespace/module
+    path equals the target's, the very "prefer the caller's own module prefix"
+    rule the analyzer's short-name resolution applies. Ordering only.
+    """
+    if edge_confirmed:
+        return 0
+    want = _caller_scope_prefix(target_full_name)
+    if want and want == _caller_scope_prefix(caller_full_name):
+        return 0
+    return 1
+
+
+def _row_full_name(obj) -> str:
+    try:
+        return str((obj.properties or {}).get("full_name") or "")
+    except Exception:  # noqa: BLE001 — defensive on mocked objects
+        return ""
+
+
+def _keep_caller_in_scope(obj, roots) -> bool:
+    """Same-source-root rule for one caller row (v0.2.105 #512C).
+
+    No known callee root (legacy rows) → LEAVE-ALONE: keep everything, exactly
+    the pre-v0.2.105 behaviour. Otherwise the caller's own ``project_source``
+    must be one of the callee's, compared as the EXACT stored string (a
+    property filter would be word-tokenized, and one root's path is a token
+    subset of any nested root's).
+
+    Deliberately NOT exempted: a caller linked only by a stored ``calls``
+    edge. That edge is exactly what the write pass produced by resolving a
+    BARE short name across roots, so trusting it would re-admit the false
+    callers this rule removes (the read side ranks edge-confirmed callers
+    first instead). A callee name that exists in several roots still lists
+    each root's own callers — that pairing is correct.
+    """
+    if not roots:
+        return True
+    return _row_project_source(obj) in roots
+
+
+def _caller_scan_limit(base_limit: int, roots) -> int:
+    """Candidate cap for the caller fetch: over-fetch when rows are dropped."""
+    return base_limit * (_CALLER_SCOPE_SCAN_MULT if roots else 1)
+
+
+def _order_caller_rows(rows: list, target_full_name: str, confirmed_names=()) -> list:
+    """Stable sort of caller rows: qualified matches first (v0.2.105 #512C)."""
+    confirmed = set(confirmed_names or ())
+    return sorted(
+        rows,
+        key=lambda o: _caller_match_rank(
+            _row_full_name(o), target_full_name,
+            edge_confirmed=_row_full_name(o) in confirmed,
+        ),
+    )
+
+
 def _pick_canonical_chunk(objects: list):
     """The canonical chunk-0 row of a chunked code entity — SHARED home.
 
@@ -7216,26 +7358,41 @@ def query_code_structure(
             # v0.2.46 V46-D: emit truncation signal.
             CALLERS_LIMIT = 50
             coll = client.collections.get(_proj_coll("CodeFunction"))
+            # v0.2.105 (#512C): the callee's own rows say WHICH source root it
+            # lives in; a caller row must share it (see the helper block's
+            # docstring). Legacy rows carry no stamp → no roots → leave-alone.
+            caller_roots = _caller_scope_roots(_caller_target_rows(
+                coll, target, effective_project,
+                filter_cls=Filter, base_props=("full_name",),
+            ))
+            scan_limit = _caller_scan_limit(CALLERS_LIMIT, caller_roots)
             # WS-4 Finding 1: call_names holds BARE leaf names; match the
             # full_name target AND its bare leaf so dotted / `::`-qualified
             # inputs (the documented form) actually resolve.
             response = coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
-                limit=CALLERS_LIMIT
+                limit=scan_limit
             )
             # F6: `call_names` is replicated on every chunk row of a chunked
-            # caller — collapse to one row per full_name (canonical chunk).
+            # caller — collapse to one row per full_name (canonical chunk),
+            # then keep only same-root rows and list qualified matches first.
             results = [
                 {
                     "full_name": obj.properties.get("full_name", ""),
                     "signature": obj.properties.get("signature", ""),
                     "file_path": obj.properties.get("file_path") or obj.properties.get("path", ""),
                 }
-                for obj in _dedup_objects_by_full_name(response.objects)
+                for obj in _order_caller_rows(
+                    [
+                        row for row in _dedup_objects_by_full_name(response.objects)
+                        if _keep_caller_in_scope(row, caller_roots)
+                    ],
+                    target,
+                )
             ]
             _truncation_meta = {
-                "truncated": len(response.objects) >= CALLERS_LIMIT,
-                "limit": CALLERS_LIMIT,
+                "truncated": len(response.objects) >= scan_limit,
+                "limit": scan_limit,
             }
 
         elif query_type == "interactions":

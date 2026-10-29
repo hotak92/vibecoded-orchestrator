@@ -520,6 +520,7 @@ try:
         build_short_name_index as _build_short_name_index,
         reference_target_uuids as _reference_target_uuids,
         resolve_base_class_targets as _resolve_base_class_targets,
+        resolve_call_target as _resolve_call_target_impl,  # v0.2.105 #512C
     )
     # v0.2.102 W6-O: language-aware import → module resolution (one home).
     from vco_lib.codegraph_imports import (
@@ -5409,6 +5410,11 @@ class CodeGraphAnalyzer:
         self._xref_file_path: Dict[str, str] = {}
         self._xref_stored_calls: Dict[str, Any] = {}
         self._xref_stored_ncallers: Dict[str, Any] = {}
+        # v0.2.105 (#512C): the root each cached function row was walked from
+        # (`project_source`), so call-name resolution can prefer a candidate in
+        # the CALLER's own repo root instead of an arbitrary same-named
+        # function that an extra code folder's mirror contributed.
+        self._xref_source: Dict[str, str] = {}
         # v0.2.92: the stored `calls` BEACONS (distinct from `call_names`, the
         # text property); same single-scan sourcing as the modules loop above.
         self._xref_stored_call_refs: Dict[str, List[str]] = {}
@@ -5426,6 +5432,9 @@ class CodeGraphAnalyzer:
                     self._xref_stored_calls[_u] = _p.get("call_names")
                     self._xref_stored_ncallers[_u] = _p.get("n_callers")
                     self._xref_stored_call_refs[_u] = _reference_target_uuids(obj, "calls")
+                    self._xref_source[_u] = str(
+                        _p.get("project_source") or ""
+                    ).strip()
         except Exception as e:
             print(f"   ⚠️  Failed to load functions: {e}")
 
@@ -5436,36 +5445,20 @@ class CodeGraphAnalyzer:
         call_name: str,
         caller_full_name: str,
         func_name_to_full: Dict[str, List[str]],
+        caller_source: str = "",
     ) -> Optional[str]:
-        """Resolve a call name to the target function's UUID, or None.
+        """Seam over :func:`vco_lib.codegraph_references.resolve_call_target`
+        (the ONE home for name → target resolution; v0.2.105 #512C added the
+        caller-root preference there)."""
+        return _resolve_call_target_impl(
+            call_name, caller_full_name, self.function_cache,
+            func_name_to_full, getattr(self, "_xref_source", {}) or {},
+            caller_source,
+        )
 
-        Single home (v0.2.74 R4) for the call-name → target-UUID resolution
-        used by BOTH the changed-file body-parse path and the unchanged-file
-        stored-call_names counting path in ``create_cross_references``. Keeps
-        the two paths from drifting (my earlier inline copy would have been a
-        second implementation). Resolution order: exact full_name → unique
-        short-name → short-name preferring the caller's own module prefix.
-        """
-        # Exact full_name match first.
-        uuid_ = self.function_cache.get(call_name)
-        if uuid_ is not None:
-            return uuid_
-        # Short-name match (prefer same module).
-        candidates = func_name_to_full.get(call_name, [])
-        if len(candidates) == 1:
-            return self.function_cache.get(candidates[0])
-        if len(candidates) > 1:
-            module_prefix = (
-                caller_full_name.rsplit(".", 1)[0]
-                if "." in caller_full_name else ""
-            )
-            same_module = [
-                c for c in candidates if c.startswith(module_prefix + ".")
-            ]
-            if same_module:
-                return self.function_cache.get(same_module[0])
-            return self.function_cache.get(candidates[0])
-        return None
+    def _row_source(self, func_uuid: str) -> str:
+        """A cached row's ``project_source`` ("" when unstamped/unknown)."""
+        return (getattr(self, "_xref_source", {}) or {}).get(func_uuid, "")
 
     def create_cross_references(
         self, changed_files: Optional[Set[str]] = None,
@@ -5581,6 +5574,7 @@ class CodeGraphAnalyzer:
                         for _cn in _stored_for_count:
                             _tgt = self._resolve_call_target(
                                 _cn, full_name, func_name_to_full,
+                                self._row_source(func_uuid),
                             )
                             if _tgt is not None:
                                 inbound[_tgt] = inbound.get(_tgt, 0) + 1
@@ -5649,6 +5643,7 @@ class CodeGraphAnalyzer:
                     # unchanged-file counting path above).
                     _tgt = self._resolve_call_target(
                         call_name, full_name, func_name_to_full,
+                        self._row_source(func_uuid),
                     )
                     if _tgt is not None:
                         refs_to_add.append(_tgt)

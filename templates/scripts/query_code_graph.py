@@ -130,6 +130,15 @@ _MCP_SERVERS_PATH: Optional[Path] = (
 try:
     from weaviate_mcp.server import (
         _caller_match_terms,
+        # v0.2.105 (#512C): the caller-scope helpers — same source root rule +
+        # qualified-name preference. Shared, NOT mirrored: the MCP's `callers`
+        # branch and this CLI's run the SAME functions, so the two surfaces
+        # cannot answer the same question differently.
+        _caller_scope_roots,
+        _caller_target_rows,
+        _caller_scan_limit,
+        _keep_caller_in_scope,
+        _order_caller_rows,
         # v0.2.92 (B1): the ONE code-graph prefix rule, shared with the MCP.
         # The underscore-PRESERVING `canonical_class_prefix` the ANALYZER
         # writes `<prefix>_Code*` with, with the MCP's runtime posture for a
@@ -1648,10 +1657,13 @@ class CodeGraphQuery:
                 # v0.2.102 L5: exact-then-tolerant identity through the ONE
                 # shared home — a token-superset sibling (`foo.bar` →
                 # `foo.bar_baz`) can no longer stand in for the target.
-                response = SimpleNamespace(objects=code_identity_rows(
-                    coll, "full_name", target, "",
-                    filter_cls=Filter, tolerant_limit=TARGET_ROWS_LIMIT,
-                    return_properties=target_props,
+                # v0.2.105 (#512C): the shared wrapper also carries the
+                # callee's `project_source`, which scopes the caller list to
+                # the callee's own source root.
+                response = SimpleNamespace(objects=_caller_target_rows(
+                    coll, target, "", filter_cls=Filter,
+                    base_props=target_props,
+                    tolerant_limit=TARGET_ROWS_LIMIT,
                 ))
 
                 if not response.objects and hook_format:
@@ -1660,10 +1672,10 @@ class CodeGraphQuery:
                     # `mod::Foo::bar`), so an exact full_name miss retries on
                     # `name`. Interactive callers keep full_name-exact-only
                     # (behaviour unchanged).
-                    response = SimpleNamespace(objects=code_identity_rows(
-                        coll, "name", target, "",
-                        filter_cls=Filter, tolerant_limit=TARGET_ROWS_LIMIT,
-                        return_properties=target_props,
+                    response = SimpleNamespace(objects=_caller_target_rows(
+                        coll, target, "", filter_cls=Filter, prop="name",
+                        base_props=target_props,
+                        tolerant_limit=TARGET_ROWS_LIMIT,
                     ))
 
                 if not response.objects:
@@ -1673,15 +1685,23 @@ class CodeGraphQuery:
                     return
 
                 target_uuids = {str(obj.uuid) for obj in response.objects}
+                # v0.2.105 (#512C): the roots the callee lives in. Empty (no
+                # stamp anywhere → legacy rows / no extra folders) leaves the
+                # caller list exactly as it was.
+                target_roots = _caller_scope_roots(response.objects)
 
                 # Pattern B (intentional top-N cap, with a truncation signal so
                 # the user knows when the list is capped — v0.2.46 V46-D).
+                # v0.2.105 (#512C): a root-scoped run over-fetches candidates
+                # (mirror rows are dropped below, and a cap filled with them
+                # must not hide the real callers).
                 CALLERS_FETCH_LIMIT = 50
+                scan_limit = _caller_scan_limit(CALLERS_FETCH_LIMIT, target_roots)
                 caller_response = coll.query.fetch_objects(
                     filters=Filter.by_property("call_names").contains_any(
                         _caller_match_terms(target)
                     ),
-                    limit=CALLERS_FETCH_LIMIT,
+                    limit=scan_limit,
                     return_references=QueryReference(link_on="calls"),
                 )
 
@@ -1709,9 +1729,18 @@ class CodeGraphQuery:
                             break
 
                 # `call_names` is replicated on every chunk row of a chunked
-                # caller — collapse to one row per full_name (same as the MCP).
-                callers = _dedup_objects_by_full_name(caller_response.objects)
-                truncated = len(caller_response.objects) >= CALLERS_FETCH_LIMIT
+                # caller — collapse to one row per full_name (same as the MCP),
+                # drop rows from another source root (v0.2.105 #512C), and list
+                # qualified matches first.
+                callers = _order_caller_rows(
+                    [
+                        row for row in _dedup_objects_by_full_name(
+                            caller_response.objects)
+                        if _keep_caller_in_scope(row, target_roots)
+                    ],
+                    target, confirmed_names,
+                )
+                truncated = len(caller_response.objects) >= scan_limit
 
                 if hook_format:
                     # WP-B2 injection block: one CODE: row per matched target
@@ -1736,14 +1765,22 @@ class CodeGraphQuery:
                     # uuids. Chunked rows of one function collapse to a
                     # single entity (the canonical chunk's def line), which
                     # is what "one row per matched entity" always meant.
-                    def _hook_caller_items(terms, uuids, preloaded=None):
+                    #
+                    # v0.2.105 (#512C): each entity's caller list is also
+                    # scoped to THAT entity's source root(s), so a mirror row
+                    # from an extra code folder is never listed under it, and
+                    # qualified matches are listed first.
+                    def _hook_caller_items(
+                        terms, uuids, entity_name, entity_roots, preloaded=None,
+                    ):
                         resp = preloaded
                         if resp is None:
                             resp = coll.query.fetch_objects(
                                 filters=Filter.by_property("call_names").contains_any(
                                     terms
                                 ),
-                                limit=CALLERS_FETCH_LIMIT,
+                                limit=_caller_scan_limit(
+                                    CALLERS_FETCH_LIMIT, entity_roots),
                                 return_references=QueryReference(link_on="calls"),
                             )
                         group_confirmed = set()
@@ -1754,11 +1791,13 @@ class CodeGraphQuery:
                                         (obj.properties or {}).get("full_name") or ""
                                     )
                                     break
-                        ordered = sorted(
-                            _dedup_objects_by_full_name(resp.objects),
-                            key=lambda c: 0
-                            if ((c.properties or {}).get("full_name") in group_confirmed)
-                            else 1,
+                        ordered = _order_caller_rows(
+                            [
+                                row for row in _dedup_objects_by_full_name(
+                                    resp.objects)
+                                if _keep_caller_in_scope(row, entity_roots)
+                            ],
+                            entity_name, group_confirmed,
                         )
                         items = [
                             {
@@ -1785,12 +1824,15 @@ class CodeGraphQuery:
                     entities = []
                     for fn, fn_rows in groups.items():
                         terms = _caller_match_terms(fn)
-                        if terms == target_terms:
+                        entity_roots = _caller_scope_roots(fn_rows)
+                        if terms == target_terms and entity_roots == target_roots:
                             items = _hook_caller_items(
-                                terms, target_uuids, preloaded=caller_response)
+                                terms, target_uuids, fn, entity_roots,
+                                preloaded=caller_response)
                         else:
                             items = _hook_caller_items(
-                                terms, {str(r.uuid) for r in fn_rows})
+                                terms, {str(r.uuid) for r in fn_rows},
+                                fn, entity_roots)
                         canonical = pick_canonical_chunk(fn_rows)
                         p = (canonical.properties or {}) if canonical is not None else {}
                         entities.append({

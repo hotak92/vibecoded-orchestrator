@@ -175,7 +175,7 @@ Why: the orchestrator's PowerShell scripts under `templates/scripts/`, `template
 `ensure_schema_migration` adds the `import_names` property to `CodeModule` if created before this property was introduced. Non-destructive; skips if already present.
 
 ### `query_code_graph.py` — structural + semantic queries
-Backend for code graph queries. Subcommands: `search "<concept>"`, `similar "<full_name>"`, `structure dependencies|callers|methods|extends|interactions "<target>"`.
+Backend for code graph queries. Subcommands: `search "<concept>"`, `similar "<full_name>"`, `structure dependencies|callers|methods|extends|interactions "<target>"`. `callers` is scoped to the callee's `project_source` (an extra code folder's same-named functions are never listed as its callers) and lists qualified matches first; the MCP's `query_code_structure` runs the same shared helpers.
 
 ---
 
