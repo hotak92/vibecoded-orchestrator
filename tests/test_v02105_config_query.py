@@ -536,3 +536,14 @@ def test_identical_config_sections_in_copied_folders_show_once() -> None:
                                          retrieval_floor=0.1, post_rerank_floor=0.1,
                                          limit=5, env={}, config_penalty=0.0)
     assert [x["_p"]["file_path"] for x in out] == ["v1/p.ini", "v3/p.ini"]
+
+
+def test_the_shipped_config_penalty_is_the_measured_value():
+    """The 0.02 default was MEASURED (2026-10-29, read-only, on a real
+    C++/Python tree: 20 code-intent + 10 config-intent queries, scope "all",
+    top-5 — 0.02 was the smallest penalty that cut code-result contamination
+    without losing config recall; 0.08 dropped recall 7/10 -> 3/10). Changing
+    it needs a new measurement, not a guess — this pin makes that visible."""
+    from weaviate_mcp.code_ranking import PENALTY_CONFIG_ENTITY
+
+    assert PENALTY_CONFIG_ENTITY == 0.02
