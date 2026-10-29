@@ -862,6 +862,31 @@ def open_walked_file_scope(walked: "dict", key: "tuple") -> "Optional[dict]":
     return (walked or {}).pop(key, None)
 
 
+#: Scope key naming the collections whose rows of a file this walk must NOT
+#: judge (v0.2.105 fix round, M1). A best-effort producer whose failure looks
+#: exactly like "nothing to write" — the config links of a code file
+#: (``codegraph_config_refs.link_groups``: the config index could not be built,
+#: or linking raised) — withholds judgement instead: zero links written on
+#: FAILURE is not evidence that the file's old link rows are gone, so the
+#: reconcile leaves that file's rows in that collection alone. A later walk
+#: whose producer works judges them again. Never a collection name (``__``).
+UNJUDGED_SCOPE_KEY = "__unjudged__"
+
+
+def withhold_file_judgment(analyzer: Any, collection_name: str) -> bool:
+    """Mark ``collection_name`` unjudged in the analyzer's OPEN per-file scope.
+
+    Returns True when a scope was open (and is now marked). The mark rides the
+    scope's ``written`` map, so :func:`commit_walked_file_scope` carries it
+    with the file's UUIDs, and a second pass over the same file keeps it (the
+    union rule: withheld by either pass ⇒ not judged — conservative)."""
+    pending = getattr(analyzer, "_reconcile_pending", None)
+    if pending is None or not collection_name:
+        return False
+    pending[1].setdefault(UNJUDGED_SCOPE_KEY, set()).add(str(collection_name))
+    return True
+
+
 def commit_walked_file_scope(
     walked: "dict", key: "tuple", written: "Optional[dict]", prev: "Optional[dict]",
 ) -> None:
@@ -1024,6 +1049,8 @@ def reconcile_walked_file_rows(
                 keep_map = _paths.get(raw_path)
                 if keep_map is None:
                     return False  # file not walked by THIS pass → never touch
+                if _cn in (keep_map.get(UNJUDGED_SCOPE_KEY) or ()):
+                    return False  # a producer failed for this file → no evidence
                 row_src = str(props.get("project_source") or "").strip()
                 if _prim:
                     if not source_is_owned(row_src, primary_sources,

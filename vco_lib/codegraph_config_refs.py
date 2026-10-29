@@ -224,9 +224,27 @@ def config_index_for(ctx: Any, root: Optional[Path]) -> Optional[ConfigIndex]:
                 files = [f for f in files if ".claude" not in f.relative_to(root).parts]
             cache[key] = build_index(Path(root), files)
         except Exception as exc:  # noqa: BLE001 — linking is best-effort, never fatal
-            logger.debug("config index for %s unavailable: %s", root, exc)
+            logger.warning("config index for %s unavailable (config links of this "
+                           "walk's code files are left as they are): %s", root, exc)
             cache[key] = None
+            ctx.__dict__.setdefault("_config_index_failed", set()).add(key)
     return cache[key]
+
+
+def index_build_failed(ctx: Any, root: Optional[Path]) -> bool:
+    """Did :func:`config_index_for` TRY to build ``root``'s index and fail?
+    (``None`` from it also means "no finder" — a stub, not a failure.)"""
+    return root is not None and str(root) in (ctx.__dict__.get("_config_index_failed") or ())
+
+
+def _withhold_link_judgment(ctx: Any) -> None:
+    """M1 (v0.2.105 fix round): linking FAILED for the file being written, so
+    its zero links are no evidence its old link rows are gone — the end-of-walk
+    reconcile must not judge this file's ``CodeInteraction`` rows."""
+    from vco_lib.codegraph_resync import withhold_file_judgment
+
+    coll = getattr(ctx, "interactions_collection", None)
+    withhold_file_judgment(ctx, str(getattr(coll, "name", "") or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -383,15 +401,20 @@ def link_groups(ctx: Any, fx: Any, written: Sequence[Tuple[Any, str]]) -> List[A
     FUNCTION entity's literals link with ``source_function`` = its uuid; the
     literals of top-level code (outside every function) link with the module
     only. Empty for a config file, a stub analyzer, or a root with no config
-    files. Soft-fails to ``[]``."""
+    files. Soft-fails to ``[]``; on a FAILURE (the index could not be built,
+    or linking raised) it also withholds the end-of-walk reconcile's judgement
+    of this file's interaction rows, so a failure never deletes old links."""
     from vco_lib.codegraph_entities import InteractionGroup, KIND_FUNCTION
 
     language = _language_key(ctx)
     md = getattr(fx, "module", None)
     if md is None or language == CONFIG_DISPATCH_KEY or md.language in CONFIG_FORMATS.values():
         return []
+    root = getattr(fx, "source_root", None)
     try:
-        index = config_index_for(ctx, getattr(fx, "source_root", None))
+        index = config_index_for(ctx, root)
+        if index is None and index_build_failed(ctx, root):
+            _withhold_link_judgment(ctx)
         if index is None or index.empty:
             return []
         text = getattr(fx, "source_text", None) or ""
@@ -418,7 +441,9 @@ def link_groups(ctx: Any, fx: Any, written: Sequence[Tuple[Any, str]]) -> List[A
             groups.append(InteractionGroup(interactions=links, language=md.language))
         return groups
     except Exception as exc:  # noqa: BLE001 — a link failure never fails the file
-        logger.debug("config links for %s skipped: %s", getattr(md, "path", "?"), exc)
+        logger.warning("config links for %s skipped (its existing link rows are "
+                       "kept): %s", getattr(md, "path", "?"), exc)
+        _withhold_link_judgment(ctx)
         return []
 
 

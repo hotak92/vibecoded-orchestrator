@@ -327,6 +327,11 @@ class _Coll:
     def rows(self) -> List[Dict[str, Any]]:
         return [o.get("properties", {}) for o in self.store.values()]
 
+    def iterator(self, return_properties: Any = None) -> List[Any]:
+        """The reconcile's full-scan read (``delete_file_rows_exact``)."""
+        return [types.SimpleNamespace(uuid=u, properties=dict(o.get("properties", {})))
+                for u, o in list(self.store.items())]
+
 
 @pytest.fixture(scope="module")
 def analyzer_mod() -> types.ModuleType:
@@ -525,6 +530,110 @@ def test_reconcile_judges_interaction_rows(analyzer_mod: types.ModuleType, tmp_p
     inst = _analyzer(analyzer_mod)
     inst.analyze_repository(tmp_path)
     assert seen and "FakeProject_CodeInteraction" in seen[0]
+
+
+# The reconcile through the REAL engine (fix round M1/M2): two walks over one
+# store — what Weaviate holds between two analyzer runs.
+
+SVC_V1 = """import requests
+
+def fetch_one():
+    return fetch("http://svc-a.local/api/one")
+
+def fetch_two():
+    return fetch("http://svc-b.local/api/two")
+
+def tune():
+    return lookup("Stale_Link_Key", "Kept_Link_Key")
+"""
+# fetch_two and the "Stale_Link_Key" literal are gone; everything else stays.
+SVC_V2 = """import requests
+
+def fetch_one():
+    return fetch("http://svc-a.local/api/one")
+
+def tune():
+    return lookup("Kept_Link_Key")
+"""
+
+
+def _reconcile_repo(root: Path) -> None:
+    (root / "conf").mkdir(parents=True)
+    (root / "conf" / "tune.ini").write_text(
+        "[TuneSection]\nStale_Link_Key = 1\nKept_Link_Key = 2\n", encoding="utf-8")
+    (root / "svc.py").write_text(SVC_V1, encoding="utf-8")
+
+
+def _rewalk(mod: types.ModuleType, root: Path, prev: Any) -> Any:
+    """A fresh analyzer run over the SAME stored rows as ``prev``."""
+    inst = _analyzer(mod)
+    for attr in ("modules_collection", "classes_collection", "functions_collection",
+                 "apis_collection", "interactions_collection"):
+        setattr(inst, attr, getattr(prev, attr))
+    inst.analyze_repository(root)
+    return inst
+
+
+def _svc_endpoints(inst: Any) -> set:
+    return {r["endpoint"] for r in inst.interactions_collection.rows()
+            if r.get("file_path") == "svc.py"}
+
+
+def _first_walk(mod: types.ModuleType, root: Path) -> Any:
+    _reconcile_repo(root)
+    first = _analyzer(mod)
+    first.analyze_repository(root)
+    eps = _svc_endpoints(first)
+    assert {"ini:TuneSection/Stale_Link_Key", "ini:TuneSection/Kept_Link_Key"} <= eps
+    assert "/api/one" in eps and "/api/two" in eps
+    return first
+
+
+def test_reconcile_deletes_stale_links_and_removed_calls_and_keeps_the_rest(
+    analyzer_mod: types.ModuleType, tmp_path: Path,
+) -> None:
+    """M2: act AND leave-alone on the CodeInteraction delete side."""
+    first = _first_walk(analyzer_mod, tmp_path)
+    (tmp_path / "svc.py").write_text(SVC_V2, encoding="utf-8")
+    second = _rewalk(analyzer_mod, tmp_path, first)
+    eps = _svc_endpoints(second)
+    assert "ini:TuneSection/Stale_Link_Key" not in eps            # stale link: deleted
+    assert "/api/two" not in eps             # removed call: deleted
+    assert "ini:TuneSection/Kept_Link_Key" in eps                 # kept link: survives
+    assert "/api/one" in eps                   # re-produced http row survives
+
+
+def test_a_failed_config_index_never_deletes_link_rows(
+    analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1: the index build throws on the re-walk → zero links is no evidence;
+    the file's interaction rows are not judged (the stale one survives too)."""
+    first = _first_walk(analyzer_mod, tmp_path)
+    before = _svc_endpoints(first)
+    (tmp_path / "svc.py").write_text(SVC_V2, encoding="utf-8")
+
+    def _boom(root: Path, files: Any) -> refs.ConfigIndex:
+        raise OSError("simulated index failure")
+
+    monkeypatch.setattr(refs, "build_index", _boom)
+    second = _rewalk(analyzer_mod, tmp_path, first)
+    assert _svc_endpoints(second) == before
+
+
+def test_a_raising_link_match_never_deletes_link_rows(
+    analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1: linking raises inside link_groups → the same withholding."""
+    first = _first_walk(analyzer_mod, tmp_path)
+    before = _svc_endpoints(first)
+    (tmp_path / "svc.py").write_text(SVC_V2, encoding="utf-8")
+
+    def _boom(*a: Any, **kw: Any) -> List[Dict[str, str]]:
+        raise RuntimeError("simulated link failure")
+
+    monkeypatch.setattr(refs, "match_literals", _boom)
+    second = _rewalk(analyzer_mod, tmp_path, first)
+    assert _svc_endpoints(second) == before
 
 
 # ---------------------------------------------------------------------------
