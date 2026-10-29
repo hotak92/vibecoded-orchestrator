@@ -5,7 +5,8 @@
 # UserPromptSubmit wrapper for the prompt-time leg of the injection redesign
 # (v0.2.102 W6-F): stdin -> the ONE router (surface `prompt`) ->
 # Emit-AdditionalContext envelope. Every decision lives in the router and
-# vco_lib/inject_intent.py (the query rule is prompt_query); see the .sh
+# vco_lib/inject_intent.py (the query rule is prompt_query; the section 2.1
+# `prompt` gate is a 0.725 floor, titles-only below 0.85); see the .sh
 # sibling for the full rationale. MUST MATCH it.
 
 # Scrub sensitive env vars before any subprocess spawning

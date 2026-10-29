@@ -206,6 +206,12 @@ pub(crate) enum DriftVerdict {
     Drift { missing: usize, stale: usize, scanned: usize },
     /// Every on-disk node is present in Weaviate at the current content hash.
     Ok { scanned: usize },
+    /// No knowledge nodes on disk at all (the binding check's "ok": no
+    /// non-archived content to bind) — there is nothing to check, which is
+    /// NOT "could not check". v0.2.105: kept out of `Unavailable` so the
+    /// update report no longer warns "could NOT confirm Weaviate holds every
+    /// node" about a project that simply has no nodes.
+    NoContent { detail: String },
     /// No drift — AND the project still owes the one-time KG metadata-repair
     /// pass (v0.2.95).
     ///
@@ -242,6 +248,9 @@ pub(crate) enum KgSyncDecision {
     Spawn(KgSyncSpawnReason),
     /// Positively confirmed: nothing on disk changed AND Weaviate has it all.
     SkipConfirmed { scanned: usize },
+    /// Nothing to check: the project has no knowledge nodes on disk. Not a
+    /// warning — the store cannot be missing nodes that do not exist.
+    SkipNoContent { detail: String },
     /// Nothing on disk changed, but the store's contents could NOT be
     /// confirmed. Logged at WARN — never phrased as "every node present".
     SkipUnverified { detail: String },
@@ -316,6 +325,7 @@ pub(crate) fn decide_kg_sync_on_bundle(
             KgSyncDecision::Spawn(KgSyncSpawnReason::MetadataRepairOwed { scanned })
         }
         Some(DriftVerdict::Ok { scanned }) => KgSyncDecision::SkipConfirmed { scanned },
+        Some(DriftVerdict::NoContent { detail }) => KgSyncDecision::SkipNoContent { detail },
         Some(DriftVerdict::Unavailable { detail }) => KgSyncDecision::SkipUnverified { detail },
         None => KgSyncDecision::SkipUnverified {
             detail: "drift check was not run".to_string(),
@@ -341,6 +351,7 @@ pub(crate) fn kg_sync_decision_warning(decision: &KgSyncDecision) -> Option<Stri
         )),
         KgSyncDecision::Spawn(_)
         | KgSyncDecision::SkipConfirmed { .. }
+        | KgSyncDecision::SkipNoContent { .. }
         | KgSyncDecision::SkipInFlight { .. } => None,
     }
 }
@@ -675,6 +686,36 @@ mod v0294_gate_tests {
                 quiet
             );
         }
+    }
+
+    /// v0.2.105 (field report): a project with NO knowledge nodes on disk
+    /// ("binding: ok" — nothing to bind) is NOT an unverified skip. The
+    /// pre-fix wording read "could NOT confirm Weaviate holds every node
+    /// (no KG binding resolved (no knowledge/ nodes on disk))" — a false
+    /// alarm; there are no nodes, so there is nothing to check, and no
+    /// warning is owed. A project that HAS nodes but cannot be verified
+    /// keeps its warning (the test above).
+    #[test]
+    fn no_nodes_on_disk_skips_without_a_warning() {
+        let decision = decide_kg_sync_on_bundle(
+            false,
+            false,
+            &ok_status(),
+            Some(DriftVerdict::NoContent {
+                detail: "no knowledge/ nodes on disk".into(),
+            }),
+        );
+        assert!(matches!(
+            &decision,
+            KgSyncDecision::SkipNoContent { detail }
+                if detail == "no knowledge/ nodes on disk"
+        ));
+        assert_eq!(
+            kg_sync_decision_warning(&decision),
+            None,
+            "a project with no nodes owes no warning: {:?}",
+            decision
+        );
     }
 
     #[test]

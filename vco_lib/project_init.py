@@ -10771,13 +10771,34 @@ def install_project_bundle(
         # does not exist degraded in total silence (empty search results, no
         # error from any component, field-observed for three days). The probe is
         # TRI-STATE: Weaviate unreachable yields "unknown", never "absent".
+        # v0.2.105: `ensure_configured_collections` (implementation in
+        # `vco_lib.configured_collections`) wraps the probe and CREATES a
+        # positively-absent configured class with the shipped schema (empty,
+        # additive — nothing existing is touched) for the project's OWN
+        # collections, so add/update heals the "every KG query returns
+        # nothing" state instead of printing a manual bootstrap-collections
+        # command. A distinct SHARED_KG_COLLECTION is never auto-created —
+        # its warning stands (see the implementation's docstring).
         try:
-            collections_check = verify_configured_collections_exist(
+            collections_check = ensure_configured_collections(
                 folder, weaviate_url, log_event=log_event,
             )
             result["configured_collections"] = collections_check
             for _msg in collections_check.get("warnings", []):
                 result["warnings"].append(_msg)
+            # v0.2.105 fix round: the launcher toast reads `warnings[]` off
+            # stdout, and `created` previously reached only the install log —
+            # "reports it as created" was not true to the user. Surface a
+            # one-line summary (no error/failed marker → Info classification
+            # on both toast paths, same pattern as the symlink-redirect
+            # summary above).
+            _created = collections_check.get("created") or []
+            if _created:
+                result["warnings"].append(
+                    f"{len(_created)} missing configured collection(s) "
+                    f"created empty with the shipped schema: "
+                    f"{', '.join(sorted(_created))}"
+                )
         except Exception as e:  # noqa: BLE001 — a probe never blocks an install
             err = f"{type(e).__name__}: {e}"
             _log("4.bundle.configured-collections", "error",
@@ -11652,6 +11673,14 @@ def verify_configured_collections_exist(
         # disabled" — a choice, not a missing collection.
         if isinstance(val, str) and val.strip():
             configured.append((key, val.strip()))
+    # KG_COLLECTION == SHARED_KG_COLLECTION (the orchestrator root: one class
+    # serving both roles) must not be probed twice — pre-v0.2.105-fix it
+    # landed in `absent`/`present` twice, drew two warnings and made
+    # `ensure_configured_collections` report it twice. First key wins, and
+    # the fixed key order below puts the (creatable) KG_COLLECTION first.
+    _seen: set[str] = set()
+    configured = [(k, v) for k, v in configured
+                  if not (v in _seen or _seen.add(v))]
     if not configured:
         return out
 
@@ -11696,6 +11725,31 @@ def verify_configured_collections_exist(
         except Exception:  # noqa: BLE001 — observability is never a gate
             pass
     return out
+
+
+def ensure_configured_collections(
+    folder: Path,
+    weaviate_url: Optional[str] = None,
+    *,
+    log_event: Optional[Callable[..., None]] = None,
+) -> dict:
+    """v0.2.105: CREATE a positively-absent configured class with the
+    shipped schema — for the project's OWN collections only.
+
+    The implementation lives in :mod:`vco_lib.configured_collections`
+    (v0.2.105 fix round: the file-size rule — this module was already past
+    14 000 lines when the ~96-line ensure logic landed as one contiguous
+    block); this shim keeps the historical
+    ``project_init.ensure_configured_collections`` import path stable and
+    delegates to it. See that module's docstring for the full safety shape.
+    ``SHARED_KG_COLLECTION`` is NEVER auto-created (it belongs to the
+    orchestrator root; auto-creating it on any other project would hide a
+    misconfiguration behind an empty class) — its F-12(b) warning stands.
+    """
+    from vco_lib.configured_collections import (
+        ensure_configured_collections as _ensure,
+    )
+    return _ensure(folder, weaviate_url, log_event=log_event)
 
 
 def _apply_standalone_env(

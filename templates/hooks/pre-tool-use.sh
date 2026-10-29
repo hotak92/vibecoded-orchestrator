@@ -848,7 +848,7 @@ fi
 # context for: two context emissions per edit, and the suggestion path had
 # no score floor at all (the survey's precision complaint). The injection
 # redesign made those wrappers (via hook_context_router.py) the ONE home for
-# edit-time KG context — PLAN-V02101 §2.1 Edit/Write rows: floor 0.65,
+# edit-time KG context — PLAN-V02101 §2.1 Edit/Write rows: floor 0.70,
 # titles-only below 0.85, exact def+callers on the code-graph leg, seen-store
 # dedupe + per-turn budget. Retiring this branch also retired the last shell
 # caller of _lib/query-cache.sh, deleted with it (the router keeps its own

@@ -13,7 +13,7 @@
 # emit_additional_context envelope. EVERY decision — the query rule
 # (vco_lib.inject_intent.prompt_query: the user's prompt text,
 # whitespace-collapsed and capped; trivially short prompts, slash commands
-# and bang passthroughs skip), the §2.1 `prompt` gate (0.70 floor,
+# and bang passthroughs skip), the §2.1 `prompt` gate (0.725 floor,
 # titles-only below 0.85), the seen-store dedupe, the per-injection cap,
 # the RL `prompt_kg_search` task type — lives in the router and
 # vco_lib/inject_intent.py. MUST MATCH prompt-context-inject.ps1.

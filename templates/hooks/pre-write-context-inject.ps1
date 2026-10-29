@@ -6,7 +6,7 @@
 #
 # The ROUTER owns everything retrieval-side: KG titles keyed on module name
 # + sibling dir (the path topic -- never the file content), the write-profile
-# section 2.1 floor (0.65, titles-only below 0.85), an exact code-graph
+# section 2.1 floor (0.70, titles-only below 0.85), an exact code-graph
 # def+callers leg ONLY when the path is a REWRITE of an existing file,
 # seen-store dedupe, the per-turn budget, the query cache and the RL
 # retrieval event (pre_write_kg_search).

@@ -9,7 +9,7 @@
 # `edit_enclosing_symbols(file_path, old_string)` → an EXACT code-graph
 # def+callers leg (structure, self-file callers excluded) + a KG leg keyed
 # on module+symbol+path topic, with the §2.1 edit-profile floors
-# (0.65 / titles-only below 0.85 / three_chunks above) applied inside
+# (0.70 / titles-only below 0.85 / three_chunks above) applied inside
 # rl_kg_search --injection-profile, plus seen-store dedupe, the per-turn
 # budget and the RL retrieval event (task_type pre_edit_kg_search, passed
 # by the router as --task-type; the wrapper's VCO_RL_TASK_TYPE export is
