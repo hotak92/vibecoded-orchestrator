@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,32 @@ from vco_lib.inject_intent import (  # noqa: E402
     task_type_for,
     titles_one_liner,
 )
+
+
+# --- shipped hook headers quote the LIVE floors (v0.2.105 fix round) --------
+# The #512D floor raise left "0.65" behind in the shipped hook-header
+# comments — a stale promise about what the router enforces. This pins the
+# QUOTED number to the KG_GATES row so the comment cannot drift again.
+HOOK_HEADER_FLOORS = [
+    ("pre-edit-context-inject.sh", "edit"),
+    ("pre-write-context-inject.sh", "write"),
+    ("pre-write-context-inject.ps1", "write"),
+]
+
+
+class TestHookHeaderFloorComments:
+    @pytest.mark.parametrize(("hook", "profile"), HOOK_HEADER_FLOORS)
+    def test_header_floor_matches_the_gate_table(self, hook, profile):
+        path = REPO_ROOT / "templates" / "hooks" / hook
+        header = "\n".join(
+            path.read_text(encoding="utf-8").splitlines()[:20])
+        gate = kg_gate(profile)
+        assert gate is not None, f"no KG gate for profile {profile!r}"
+        assert f"({gate.floor:.2f}" in header, (
+            f"{hook}: header does not quote the live {profile} floor "
+            f"{gate.floor:.2f} (stale floor comment?)")
+        assert not re.search(r"\(0\.6\d", header), (
+            f"{hook}: header still quotes a pre-#512D (0.6x) floor")
 
 
 # --- §2.1 table: floors and tiers -------------------------------------------
