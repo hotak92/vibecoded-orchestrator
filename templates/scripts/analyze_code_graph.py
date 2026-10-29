@@ -462,6 +462,8 @@ try:
     # language modules directly) — except the S16-3 policy-skip prune, whose
     # skip fires there and whose end-of-walk flush is the analyzer's.
     from vco_lib import codegraph_lang as _codegraph_lang
+    from vco_lib import codegraph_config_refs as _cfg_refs  # v0.2.105: config-file links
+    from vco_lib.codegraph_lang.config import CONFIG_GLOBS, CONFIG_NAME_SKIP_SUFFIXES
     from vco_lib.codegraph_lang._shared import (
         prune_policy_skipped_files as _prune_policy_skipped_files,
     )
@@ -900,6 +902,7 @@ _LANGUAGE_DISPLAY_TO_CANONICAL: Dict[str, str] = {
     "powershell": "powershell",
     "ps1":        "powershell",
     "ps":         "powershell",
+    "tweakers": "tweakers", "ini": "ini", "json": "json",  # v0.2.105 config formats
 }
 
 
@@ -965,6 +968,7 @@ _EXT_TO_DISPATCH_NAME: Dict[str, str] = {
     ".svelte": "svelte",
     ".ps1":    "powershell",
     ".psm1":   "powershell",
+    ".tweakers": "config", ".ini": "config", ".json": "config",  # codegraph_lang.config
 }
 
 
@@ -1059,6 +1063,7 @@ _FINDER_SPECS: Dict[str, Tuple[str, Tuple[str, ...], Optional[Tuple[str, ...]]]]
     "svelte":     ("js",     ("*.svelte",),                                         None),
     "powershell": ("shell",  ("*.ps1", "*.psm1"),                                   None),
     "proto":      ("proto",  ("*.proto",),                                          None),
+    "config":     ("config", CONFIG_GLOBS,                                          CONFIG_NAME_SKIP_SUFFIXES),
 }
 
 
@@ -1089,7 +1094,7 @@ def _dispatch_name_for_file(file_path: Path) -> str:
         return ""
     if any(name.endswith(s) for s in _TS_SKIP_SUFFIXES):
         return ""
-    if name.startswith("vite.config"):
+    if name.startswith("vite.config") or name.endswith(CONFIG_NAME_SKIP_SUFFIXES):
         return ""
     return _EXT_TO_DISPATCH_NAME.get(file_path.suffix.lower(), "")
 
@@ -2402,6 +2407,7 @@ class CodeGraphAnalyzer:
             self._identity_collision_files = getattr(
                 self, "_identity_collision_files", 0) + 1
         written_by_full_name: Dict[str, str] = {}
+        written: List[Tuple[Any, str]] = []  # (entity, uuid) for the config links
         for _i, entity in enumerate(fx.entities):
             if _dup_ids[_i] is not None:
                 # Copy before mutating: producers may reuse an extras dict.
@@ -2423,6 +2429,7 @@ class CodeGraphAnalyzer:
                 if handler_uuid:
                     entity.references["handler"] = handler_uuid
             written_uuid = self.store_entity(entity)
+            written.append((entity, written_uuid))
             if entity.full_name:
                 written_by_full_name[entity.full_name] = written_uuid
             if entity.kind == KIND_CLASS and entity.full_name:
@@ -2433,7 +2440,8 @@ class CodeGraphAnalyzer:
         # Interactions last — they need the module UUID (and only exist once
         # the module/entities are in place). Mirror the imperative sites, which
         # assigned ``stats['interactions'] = ctx._store_interactions(...)``.
-        for group in fx.interactions:
+        # v0.2.105: then the config-VALUE links (codegraph_config_refs.link_groups).
+        for group in list(fx.interactions) + _cfg_refs.link_groups(self, fx, written):
             if not group.interactions:
                 continue
             stored = self._store_interactions(
@@ -3571,6 +3579,7 @@ class CodeGraphAnalyzer:
             # zero functions in code-graph queries.
             ('svelte',     self._find_svelte_files,     self._analyze_svelte_file),
             ('powershell', self._find_powershell_files, self._analyze_powershell_file),
+            ('config',     self._find_config_files,     self._analyze_config_file),
         ]
 
         # v0.2.18 (Plan C): two-phase loop so we know the grand-total file
@@ -3705,6 +3714,8 @@ class CodeGraphAnalyzer:
                             files = self._union_stale_into_changed(
                                 source_root, all_files, files, self._root_stamp(source_root, is_extra_root),
                             )
+                            files = _cfg_refs.requeue_on_config_change(  # a config edit relinks code
+                                self, source_root, lang_name, all_files, files, since_commit)
                             if not files:
                                 # Quiet skip — the typical case for clean repos
                                 # with NO stale rows (the union added nothing).
@@ -3888,6 +3899,7 @@ class CodeGraphAnalyzer:
                     (getattr(self, "modules_collection", None), "path"),
                     (getattr(self, "classes_collection", None), "file_path"),
                     (getattr(self, "functions_collection", None), "file_path"),
+                    (getattr(self, "interactions_collection", None), "file_path"),
                 ),
                 getattr(self, "_reconcile_walked", None) or {},
                 project_name=self.project_name or "",
@@ -4315,27 +4327,11 @@ class CodeGraphAnalyzer:
         return self._find_files_for('cpp', repo_path)
 
     def _find_js_files(self, repo_path: Path) -> List[Path]:
-        """Find all JavaScript files in repository.
-
-        v0.2.72 (P5): `.bundle.js` + `.chunk.js` join `.min.js` — these are
-        build-output bundles (webpack/rollup/esbuild), not source. A vendored
-        bundle (since removed) was live-confirmed injecting its functions as
-        retrieval context. `.chunk.js` covers split-chunk output that doesn't
-        live under an already-ignored codegen dir. F8: the suffix set is the
-        SHARED module-level constant (`_JS_SKIP_SUFFIXES`, via `_FINDER_SPECS`)
-        so the single-file dispatch (`_dispatch_name_for_file`) cannot drift.
-        """
+        """Find JavaScript files (build bundles skipped via `_FINDER_SPECS`, v0.2.72 P5/F8)."""
         return self._find_files_for('js', repo_path)
 
     def _find_ts_files(self, repo_path: Path) -> List[Path]:
-        """Find all TypeScript files in repository.
-
-        v0.2.72 (P5): `.bundle.ts` / `.chunk.ts` mirror the JS bundle skips.
-        Bundle output is almost always `.js`, but the mirror keeps the two
-        find-methods symmetric if a toolchain emits `.ts` bundles. F8: shared
-        module-level constant (`_TS_SKIP_SUFFIXES`, includes `.d.ts` type
-        stubs) so the single-file dispatch cannot drift.
-        """
+        """Find TypeScript files (`.d.ts` + bundles skipped via `_FINDER_SPECS`, v0.2.72 P5/F8)."""
         return self._find_files_for('ts', repo_path)
 
     def _find_go_files(self, repo_path: Path) -> List[Path]:
@@ -4363,29 +4359,24 @@ class CodeGraphAnalyzer:
         return self._find_files_for('csharp', repo_path)
 
     def _find_svelte_files(self, repo_path: Path) -> List[Path]:
-        """Find all Svelte component files in repository.
-
-        V52-O.11.B (v0.2.53 Track E): added so the launcher's 244 .svelte
-        files stop indexing as zero functions in the code graph. Shares
-        the JS/TS ignore-dir set because Svelte sits in the same npm
-        tooling ecosystem (node_modules, dist, .svelte-kit codegen).
-        """
+        """Find Svelte components (V52-O.11.B; shares the JS/TS ignore set)."""
         return self._find_files_for('svelte', repo_path)
 
     def _find_powershell_files(self, repo_path: Path) -> List[Path]:
-        """Find all PowerShell script files in repository.
-
-        V52-O.11.N (v0.2.53 Track E): added so the orchestrator's 168
-        .ps1 files (template hooks + Windows-side install scripts)
-        stop indexing as zero functions in the code graph. Reuses the
-        shell ignore-dir set since .ps1 lives in the same parts of the
-        tree as .sh (templates/hooks/, scripts/).
-        """
+        """Find PowerShell scripts (V52-O.11.N; shares the shell ignore set)."""
         return self._find_files_for('powershell', repo_path)
 
     def _find_proto_files(self, repo_path: Path) -> List[Path]:
         """Find all Protocol Buffer definition files."""
         return self._find_files_for('proto', repo_path)
+
+    def _find_config_files(self, repo_path: Path) -> List[Path]:
+        """Find .tweakers/.ini/.json config files (v0.2.105; `bin/` stays ignored)."""
+        return self._find_files_for('config', repo_path)
+
+    def _analyze_config_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
+        """vco_lib/codegraph_lang/config.py::analyze_config_file via EXTRACTORS."""
+        return _codegraph_lang.EXTRACTORS["config"](self, file_path, repo_root)
 
     def _analyze_csharp_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
         """P2f stage 2 (v0.2.76): moved verbatim to
@@ -6183,7 +6174,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--language', '-l', type=str,
                        choices=['python', 'lua', 'cpp', 'javascript', 'typescript',
-                                'go', 'rust', 'java', 'ruby', 'shell', 'csharp', 'proto'],
+                                'go', 'rust', 'java', 'ruby', 'shell', 'csharp', 'proto', 'config'],
                        default=None,
                        help='Language to analyze (default: all supported; language inferred from file extensions)')
     parser.add_argument('--incremental', '-i', action='store_true',

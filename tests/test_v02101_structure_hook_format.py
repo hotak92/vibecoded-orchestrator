@@ -263,8 +263,16 @@ class TestExtLangOneHome:
             spec.loader.exec_module(mod)
         except SystemExit:
             pytest.skip("weaviate-client unavailable — analyzer cannot load")
+        from vco_lib.codegraph_lang.config import CONFIG_DISPATCH_KEY, CONFIG_FORMATS
+
         for ext, lang in mod._EXT_TO_DISPATCH_NAME.items():
+            if ext in CONFIG_FORMATS:
+                # v0.2.105: config files are walked, but they are not CODE —
+                # the injection surfaces (EXT_TO_LANG) must not treat them so.
+                assert lang == CONFIG_DISPATCH_KEY and ext not in EXT_TO_LANG
+                continue
             assert EXT_TO_LANG.get(ext) == lang, f"ext {ext} diverges"
+        assert set(CONFIG_FORMATS) <= set(mod._EXT_TO_DISPATCH_NAME)
 
     def test_rust_prebuild_detector_matches_the_python_table(self) -> None:
         """The launcher's pre-build extension detector

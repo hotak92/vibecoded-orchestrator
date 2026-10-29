@@ -691,7 +691,13 @@ _DISPATCH_NAME_CASES = [
     ("bundle.min.js", ""),
     # Unknown extensions get empty (single-file mode is a no-op).
     ("README.md", ""),
-    ("data.json", ""),
+    # v0.2.105: config files dispatch to the config extractor; npm lockfiles
+    # and VCO's bundle manifest are not configuration.
+    ("data.json", "config"),
+    ("racecar.ini", "config"),
+    ("AI.tweakers", "config"),
+    ("package-lock.json", ""),
+    (".vco-manifest.json", ""),
 ]
 
 

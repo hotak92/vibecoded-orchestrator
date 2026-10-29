@@ -233,7 +233,7 @@ if ($runtimeRc -ne 0) {
     exit 0
 }
 
-$codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+$codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
 
 function Resolve-DrainProject {
     param([string]$Root)

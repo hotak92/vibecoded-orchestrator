@@ -333,7 +333,7 @@ _drain_key() {
     printf '%s' "$1" | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null || printf '%s' "_"
 }
 
-CODE_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+CODE_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
 
 # Per-canonical-root batch files: <hash> → tmp file of paths for that root.
 BATCH_DIR="$(mktemp -d "$STATE_DIR/cg_drain_batch.XXXXXX" 2>/dev/null || mktemp -d 2>/dev/null)"

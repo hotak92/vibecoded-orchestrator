@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Config files are now in the code graph, with their values.** `.tweakers`, `.ini` and `.json` files in a project, and in its extra code folders, are indexed beside the code. Every key's VALUE (with its default and description where the format has them) is searchable, and each key is linked to the code that names it. A search can now go from a code site to the value it reads, and from a value to every code site that uses it. Only these three extensions are indexed. Files under `bin/` stay unindexed, like all files there. A file that does not parse is skipped with one log line. npm lockfiles are skipped too. Code in an extra folder links only to that folder's own config files. When a config file adds, moves or removes a key, the code files that name it relink on the next walk; the other files are not touched. This release re-walks each existing code graph once in the background on its next bundle update. Only the new config rows and links are embedded; existing code rows are not re-embedded.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed

@@ -124,7 +124,11 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # v0.2.102 (W6-U): the failing-insert rows + stamp acceptance live in
 # `vco_lib.codegraph_extractor_generation`; two one-line seams here, paid for by
 # shorter comments — net 7022 -> 7019, re-pinned DOWNWARD.
-_ANALYZER_LINES_MAX = 7019
+# v0.2.105 (config files): the parsers, the link rules, the link-salted hash
+# and the incremental re-queue live in `vco_lib.codegraph_lang.config` and
+# `vco_lib.codegraph_config_refs`; the analyzer gained table rows + one-line
+# seams, paid for by one-line finder docstrings — net 7019 -> 7010.
+_ANALYZER_LINES_MAX = 7010
 
 
 def _measure() -> int:
