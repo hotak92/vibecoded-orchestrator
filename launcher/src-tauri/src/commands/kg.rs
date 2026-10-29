@@ -92,8 +92,13 @@ fn is_codegraph_class(name: &str) -> bool {
 /// duplicates of the same codebase. Reported 2026-04-28.
 /// v0.2.105 lazy-load counts: the classes the KG view may Aggregate-count
 /// LIVE — exactly the acting project's granted collections (`read`/`write`
-/// rows in `kg_collection_access`; its own primary row carries `write`)
-/// plus the canonical shared/root KG. Every other class is served from the
+/// rows in `kg_collection_access`; its own primary row carries `write`),
+/// the project's OWN collections from launcher.db (`own` = primary KG +
+/// its `_Development` / `_Diagrams` siblings via
+/// `Db::own_kg_access_collections` — the dev collection has no access row
+/// on installs whose access matrix was seeded before it existed, so the
+/// grants map alone under-counts the project's own classes), plus the
+/// canonical shared/root KG. Every other class is served from the
 /// count cache, because a live Aggregate lazy-loads the class into
 /// Weaviate's RAM for good (Weaviate 1.28 never unloads), and no project
 /// has a reason to pay that for a collection it cannot read. The explicit
@@ -102,12 +107,20 @@ fn is_codegraph_class(name: &str) -> bool {
 fn kg_live_count_scope(
     grants: &std::collections::HashMap<String, String>,
     canonical_shared_root: &str,
+    own: &crate::db::access::OwnKgAccessCollections,
 ) -> std::collections::HashSet<String> {
     let mut scope: std::collections::HashSet<String> = grants
         .iter()
         .filter(|(_, level)| matches!(level.as_str(), "read" | "write"))
         .map(|(name, _)| name.clone())
         .collect();
+    // The acting project's OWN collections count live regardless of the
+    // access-matrix rows: primary, dev, diagrams (all derived from the
+    // one binding-first naming rule, never from the display name alone
+    // for the root project — see `own_kg_access_collections`).
+    scope.insert(own.primary.clone());
+    scope.insert(own.dev.clone());
+    scope.insert(own.diagrams.clone());
     if !canonical_shared_root.is_empty() {
         scope.insert(canonical_shared_root.to_string());
     }
@@ -161,6 +174,25 @@ pub async fn kg_list_collections(
         .get_orchestrator_root_kg_collection()
         .unwrap_or_else(|_| String::new());
 
+    // v0.2.105 fix: the project's OWN collections (primary KG + dev +
+    // diagrams) count live even when the access matrix carries no row
+    // for them (e.g. a pre-populate install's `_Development` class) —
+    // resolved from launcher.db alone, never from Weaviate. Soft-fail:
+    // a DB error reading the project row degrades to the name-derived
+    // rule inside `own_kg_access_collections`, never to an error here.
+    let own = match db.get_project(&project_id) {
+        Ok(row) => {
+            let name = row.as_ref().map(|p| p.name.clone()).unwrap_or_default();
+            db.own_kg_access_collections(&project_id, &name, &canonical_root)
+        }
+        Err(_) => crate::db::access::OwnKgAccessCollections {
+            primary: String::new(),
+            dev: String::new(),
+            diagrams: String::new(),
+            is_root: false,
+        },
+    };
+
     let mut names = Vec::with_capacity(classes.len());
     for cls in classes {
         let name = cls
@@ -182,7 +214,7 @@ pub async fn kg_list_collections(
     // v0.2.105 lazy-load counts: live Aggregate only for own/shared/
     // granted; the rest from the launcher.db count cache ("—" when
     // never counted). One home for the policy: weaviate_counts.
-    let live_scope = kg_live_count_scope(&grants, &canonical_root);
+    let live_scope = kg_live_count_scope(&grants, &canonical_root, &own);
     let counts = vct_launcher_core::weaviate_counts::resolve_counts(
         &db,
         &client,
@@ -1416,14 +1448,31 @@ mod tests {
             .collect()
     }
 
+    fn own(primary: &str) -> crate::db::access::OwnKgAccessCollections {
+        // Derive the `_Development` / `_Diagrams` siblings exactly like
+        // `Db::own_kg_access_collections` does (suffix-swap).
+        let dev = format!("{}_Development", primary.strip_suffix("_KnowledgeGraph").unwrap_or(primary));
+        let diagrams = format!("{}_Diagrams", primary.strip_suffix("_KnowledgeGraph").unwrap_or(primary));
+        crate::db::access::OwnKgAccessCollections {
+            primary: primary.to_string(),
+            dev,
+            diagrams,
+            is_root: false,
+        }
+    }
+
     #[test]
-    fn kg_live_scope_is_granted_plus_shared_only() {
+    fn kg_live_scope_is_granted_plus_own_plus_shared_only() {
         let g = grants(&[
             ("Own_KnowledgeGraph", "write"),
             ("Granted_KnowledgeGraph", "read"),
             ("Revoked_KnowledgeGraph", "none"),
         ]);
-        let scope = super::kg_live_count_scope(&g, "VibeCodedOrchestrator_KnowledgeGraph");
+        let scope = super::kg_live_count_scope(
+            &g,
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            &own("Own_KnowledgeGraph"),
+        );
         // ACT: own (write) and granted (read) count live.
         assert!(scope.contains("Own_KnowledgeGraph"));
         assert!(scope.contains("Granted_KnowledgeGraph"));
@@ -1433,14 +1482,41 @@ mod tests {
         // they are served from the cache and never Aggregate-queried.
         assert!(!scope.contains("Revoked_KnowledgeGraph"));
         assert!(!scope.contains("Strangers_KnowledgeGraph"));
-        assert_eq!(scope.len(), 3, "scope must be exactly the three above");
+        assert_eq!(
+            scope.len(),
+            5,
+            "scope must be exactly: own kg + own dev + own diagrams + granted + shared"
+        );
+    }
+
+    // v0.2.105 fix: the project's OWN Development collection counts live
+    // even when the access matrix carries NO row for it (the state the
+    // review found: a pre-populate install's `_Development` class showed
+    // "—" or a stale cached number although it is the project's own).
+    #[test]
+    fn kg_live_scope_counts_the_projects_own_dev_and_diagrams_live() {
+        // The access matrix knows ONLY the primary KG — no dev row.
+        let g = grants(&[("Acme_KnowledgeGraph", "write")]);
+        let scope = super::kg_live_count_scope(&g, "", &own("Acme_KnowledgeGraph"));
+        // ACT: the own dev + diagrams classes are in the live scope.
+        assert!(
+            scope.contains("Acme_Development"),
+            "the project's own Development collection must count live"
+        );
+        assert!(
+            scope.contains("Acme_Diagrams"),
+            "the project's own Diagrams collection must count live"
+        );
+        // LEAVE-ALONE: another project's dev class is NOT pulled in.
+        assert!(!scope.contains("Other_Development"));
+        assert_eq!(scope.len(), 3, "primary + dev + diagrams only");
     }
 
     #[test]
-    fn kg_live_scope_without_shared_root_is_grants_only() {
+    fn kg_live_scope_without_shared_root_is_grants_plus_own() {
         let g = grants(&[("Own_KnowledgeGraph", "write")]);
-        let scope = super::kg_live_count_scope(&g, "");
-        assert_eq!(scope.len(), 1);
+        let scope = super::kg_live_count_scope(&g, "", &own("Own_KnowledgeGraph"));
+        assert_eq!(scope.len(), 3);
         assert!(scope.contains("Own_KnowledgeGraph"));
     }
 
