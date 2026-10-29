@@ -62,6 +62,18 @@ project = Path(os.environ.get("VCO_DEFERRAL_PROJECT_DIR", "."))
 json_path = project / ".claude" / "context" / "UPDATE_DEFERRED.json"
 md_path = project / ".claude" / "context" / "UPDATE_DEFERRED.md"
 
+# v0.2.91 WP-H: owed-work retry trigger. MUST MATCH the .sh sibling — and it
+# does so by CALLING the same vco_lib helper rather than mirroring its rule.
+# v0.2.105: BEFORE the ledger read (so also on an EMPTY ledger) — it first
+# detects owed work the ledger does not hold yet (lost extra-folder rows).
+owed = []
+try:
+    from vco_lib.deferral_retry import session_start_owed_check  # type: ignore
+
+    owed = session_start_owed_check(project)
+except Exception:
+    owed = []
+
 entries = []
 # (actionable_count, informational_count) from THE partition — Path 1 only.
 # Paths 2/3 are the degradation ladder (vco_lib unimportable); they keep the
@@ -114,16 +126,6 @@ if not entries and md_path.exists():
 
 if not entries:
     sys.exit(0)
-
-# v0.2.91 WP-H: owed-work retry trigger. MUST MATCH the .sh sibling — and it
-# does so by CALLING the same vco_lib helper rather than mirroring its rule.
-owed = []
-try:
-    from vco_lib.deferral_retry import session_start_owed_check  # type: ignore
-
-    owed = session_start_owed_check(project)
-except Exception:
-    owed = []
 
 if split is not None:
     lines = ["", "Pending VCO update action(s) - %d actionable, %d informational/record:"
