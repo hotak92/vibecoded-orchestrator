@@ -1006,6 +1006,113 @@ class ConfiguredCollectionExistenceProbeTests(_Case):
         _assert_project_init_argv_parses(self, cmd.group(1))
 
 
+class EnsureConfiguredCollectionsCreatesMissingTests(_Case):
+    """v0.2.105 (Hive field case): add/update CREATES a positively-absent
+    configured class with the shipped schema instead of only printing the
+    manual ``bootstrap-collections`` command. Strictly additive: "unknown"
+    (Weaviate unreachable) never creates, an existing class is never
+    touched, and a failed create keeps the original warning + command."""
+
+    def _http_mock_with_create(self, schema_classes, *, posts, post_status=200,
+                               fail=False):
+        """``_http_mock`` shape + recorded POSTs + per-class GETs."""
+
+        def _side_effect(method, url, *, body=None, timeout=30.0):
+            if fail:
+                raise urllib.error.URLError("connection refused")
+            if method == "GET" and url.endswith("/v1/schema"):
+                payload = {"classes": [{"class": c} for c in schema_classes]}
+                return (200, json.dumps(payload).encode())
+            if method == "GET" and "/v1/schema/" in url:
+                # Per-class fetch: absent (404) unless listed above.
+                return (404, b"")
+            if method == "POST" and url.endswith("/v1/schema"):
+                posts.append(body)
+                return (post_status, b"")
+            if method == "POST" and url.endswith("/v1/graphql"):
+                return (200, json.dumps({"data": {"Aggregate": {}}}).encode())
+            return (404, b"")
+
+        return _side_effect
+
+    def test_absent_configured_kg_class_is_created(self):
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION="Phantom_KnowledgeGraph")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([], posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], ["Phantom_KnowledgeGraph"])
+        self.assertEqual(report["absent"], [])
+        self.assertEqual(report["create_errors"], [])
+        self.assertEqual(report["warnings"], [],
+                         "a healed class owes no warning")
+        self.assertEqual(len(posts), 1, "exactly one class POSTed")
+        self.assertEqual(posts[0].get("class"), "Phantom_KnowledgeGraph")
+        # The shipped schema, not a bare name: the KG definition carries the
+        # named-vector slots bootstrap-collections POSTs.
+        self.assertIn("vectorConfig", json.dumps(posts[0]))
+
+    def test_absent_development_class_uses_the_development_schema(self):
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION=KG_PRIMARY,
+            DEVELOPMENT_COLLECTION="Phantom_Development")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([KG_PRIMARY],
+                                                        posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], ["Phantom_Development"])
+        self.assertEqual([p.get("class") for p in posts],
+                         ["Phantom_Development"])
+
+    def test_unreachable_weaviate_never_creates(self):
+        self.write_settings_env(KG_COLLECTION="Phantom_KnowledgeGraph")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([], posts=posts,
+                                                        fail=True)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], [])
+        self.assertEqual(report["unknown"], ["Phantom_KnowledgeGraph"])
+        self.assertEqual(posts, [], "'could not check' must not create")
+
+    def test_existing_class_is_never_posted(self):
+        self.write_settings_env(KG_COLLECTION=KG_PRIMARY)
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([KG_PRIMARY],
+                                                        posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["present"], [KG_PRIMARY])
+        self.assertEqual(report["created"], [])
+        self.assertEqual(posts, [])
+
+    def test_failed_create_keeps_the_manual_command_warning(self):
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION="Phantom_KnowledgeGraph")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create(
+                    [], posts=posts, post_status=500)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], [])
+        self.assertEqual(report["absent"], ["Phantom_KnowledgeGraph"])
+        self.assertTrue(report["create_errors"])
+        self.assertTrue(report["warnings"], "the remediation warning stands")
+        warning = report["warnings"][0]
+        self.assertIn("does NOT exist", warning)
+        cmd = re.search(r"`([^`]+)`", warning)
+        self.assertIsNotNone(cmd)
+        assert cmd is not None
+        _assert_project_init_argv_parses(self, cmd.group(1))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # F-9 — the emitted `bootstrap-collections` argv shape is pinned
 # ═══════════════════════════════════════════════════════════════════════════

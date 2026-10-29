@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The update report no longer warns that it "could NOT confirm Weaviate holds every node" about a project with no knowledge nodes.** A project whose `knowledge/` folder has no nodes answered the bundle update's drift check with "no KG binding resolved (no knowledge/ nodes on disk)", which read as a verification failure. There are no nodes, so there is nothing to check: the update now logs that plainly (info, not a warning). A project that HAS nodes but could not be verified (Weaviate unreachable) still gets the warning with the command to run.
+- **A missing knowledge-graph collection named in a project's settings is now created by the add/update itself.** A project configured to read a KG collection Weaviate does not hold got "every search returns nothing" from every session, and the update report answered with a manual `bootstrap-collections` command instead of running it. The bundle install/update now creates the missing class with the shipped schema (empty; nothing existing is ever dropped or rewritten), and reports it as created. When Weaviate cannot be reached the report says "unknown" and creates nothing, and if the automatic create fails the original warning with the exact command stays.
+
 ### Changed
 
 - **Automatic context injections are more selective about relevance.** A field report found off-topic knowledge-graph suggestions getting through at scores between 0.66 and 0.70. Every injection surface's relevance floor has been raised to about the midpoint between the old value and the proposed one: Edit, Write, Bash-edit and agent-brief injections now need a score of at least 0.70 (was 0.65), Read, docs-Read and prompt-time injections need 0.725 (was 0.70), and Bash-read stays at 0.75. Weak matches below the floor are simply not injected; the number of hits per injection and per turn is unchanged.

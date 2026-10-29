@@ -10843,8 +10843,13 @@ def install_project_bundle(
         # does not exist degraded in total silence (empty search results, no
         # error from any component, field-observed for three days). The probe is
         # TRI-STATE: Weaviate unreachable yields "unknown", never "absent".
+        # v0.2.105 (Hive field case): `ensure_configured_collections` wraps the
+        # probe and CREATES a positively-absent configured class with the
+        # shipped schema (empty, additive — nothing existing is touched), so
+        # add/update heals the "every KG query returns nothing" state instead
+        # of printing a manual bootstrap-collections command.
         try:
-            collections_check = verify_configured_collections_exist(
+            collections_check = ensure_configured_collections(
                 folder, weaviate_url, log_event=log_event,
             )
             result["configured_collections"] = collections_check
@@ -11767,6 +11772,102 @@ def verify_configured_collections_exist(
             )
         except Exception:  # noqa: BLE001 — observability is never a gate
             pass
+    return out
+
+
+def ensure_configured_collections(
+    folder: Path,
+    weaviate_url: Optional[str] = None,
+    *,
+    log_event: Optional[Callable[..., None]] = None,
+) -> dict:
+    """v0.2.105 (Hive field case): CREATE a configured-but-missing class.
+
+    The v0.2.92 F-12(b) probe (:func:`verify_configured_collections_exist`)
+    only WARNED that a class named in ``.claude/settings.json`` ``env`` was
+    absent from Weaviate and printed a manual ``bootstrap-collections``
+    command — but a bundle install/update is exactly the moment the missing
+    class should come into being, and an EMPTY class with the shipped
+    schema is not destructive. Until this, a project whose configured KG
+    class had never been created got "every KG query returns nothing" from
+    every session, and the update report told the user to run a command
+    instead of running it.
+
+    Strictly additive, same safety shape as ``bootstrap_collections``:
+
+    * creation runs ONLY for a name the probe answered **absent** — never
+      for ``unknown`` (Weaviate unreachable is not evidence of absence,
+      F-1's lesson) and never for a class that exists (``_create_class``
+      is itself idempotent on an existing name);
+    * the definitions POSTed are the SAME ``kg_class_definition`` /
+      ``development_class_definition`` builders bootstrap-collections uses
+      (one schema home, no second table);
+    * nothing existing is ever dropped or rewritten.
+
+    Returns verify's dict extended with ``created`` (names this call
+    created) and, for a creation that FAILED, ``create_errors`` — the
+    original per-name warning then STANDS (it names the manual
+    ``bootstrap-collections`` command, the remediation when the automatic
+    create could not complete). Never raises.
+    """
+    out = verify_configured_collections_exist(
+        folder, weaviate_url, log_event=log_event,
+    )
+    out["created"] = []
+    out["create_errors"] = []
+    if not out.get("absent"):
+        return out
+    try:
+        from vco_lib.knowledge_residue import project_settings_env
+        env = project_settings_env(Path(folder))
+    except Exception:  # noqa: BLE001 — cannot map name→schema; warn as before
+        return out
+
+    schema_by_key = {
+        "KG_COLLECTION": kg_class_definition,
+        "SHARED_KG_COLLECTION": kg_class_definition,
+        "DEVELOPMENT_COLLECTION": development_class_definition,
+    }
+    url = (weaviate_url or (env.get("WEAVIATE_URL") or "").strip()
+           or _weaviate_url_default())
+
+    for name in list(out["absent"]):
+        key = next(
+            (k for k in schema_by_key
+             if (env.get(k) or "").strip() == name),
+            None,
+        )
+        if key is None:
+            continue  # not one of the probed keys' values; warning stands
+        try:
+            _create_class(schema_by_key[key](name), weaviate_url=url)
+        except Exception as e:  # noqa: BLE001 — never blocks the install
+            err = f"{type(e).__name__}: {e}"
+            out["create_errors"].append({"collection": name, "error": err})
+            if log_event is not None:
+                try:
+                    log_event(
+                        "4.bundle.configured-collections", "warn",
+                        f"automatic create of absent configured collection "
+                        f"{name!r} failed: {err}",
+                        data={"collection": name, "error": err[:200]},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            continue  # the verify warning for this name stands
+        out["created"].append(name)
+        out["absent"].remove(name)
+        out["warnings"] = [w for w in out["warnings"] if name not in w]
+        if log_event is not None:
+            try:
+                log_event(
+                    "4.bundle.configured-collections", "ok",
+                    f"created absent configured collection {name!r} with the "
+                    f"shipped schema (empty; nothing existing was touched)",
+                    data={"collection": name, "action": "create"},
+                )
+            except Exception:  # noqa: BLE001
+                pass
     return out
 
 
