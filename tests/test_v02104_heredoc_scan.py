@@ -362,3 +362,34 @@ def test_hook_large_command_answered_in_time_gets_the_normal_verdict(
     assert _TOO_LARGE_MSG not in res.stderr
     if verdict == 2:
         assert "R10 stub verdict: blocked" in res.stderr
+
+
+# --- v0.2.105: the field report's case, a TEST-file heredoc write ------------
+# Field report 2026-10-16: a lane writing a test file by heredoc was refused
+# and fell back to a python edit script. The refusing guard was this hook's
+# raw net (fixed by v0.2.104 E-3 above). Test files quote the very shapes the
+# guards exist for, so pin that a quoted-delimiter test-file write carrying
+# each of them passes the REAL scanner end to end (leave-alone), while the
+# same body under an UNQUOTED delimiter — which the shell expands — is still
+# read whole (act; covered by NOT_DATA["unquoted-delimiter"] above).
+_TEST_FILE_BODIES = {
+    "net-pipe": f"CMD = '{PIPE}'\n",
+    "rm-rf": "CMD = 'rm -rf /'\n",
+    "env-grep": "CMD = 'env | grep TOKEN'\n",
+    "substitution": "CMD = '$(whoami)'\n",
+    "sleep-loop": "CMD = 'while true; do sleep 5; done'\n",
+    "eval-fetch": f"CMD = '{EVAL_FETCH}'\n",
+}
+
+
+@pytest.mark.parametrize("impl", _SHELLS)
+def test_hook_lets_test_file_heredoc_writes_through(impl: str, tmp_path: Path) -> None:
+    proj = _project(tmp_path, SCANNER.read_text(encoding="utf-8"))
+    for name, body in _TEST_FILE_BODIES.items():
+        cmd = f"cat > tests/test_guard_shapes.py <<'EOF'\ndef test_x():\n    {body}EOF"
+        res = _run(impl, proj, cmd, tmp_path)
+        assert res.returncode == 0, (name, res.stderr)
+    # Act side, same hook run: the unquoted delimiter keeps the whole-text read.
+    res = _run(impl, proj, f"cat > tests/t.py <<EOF\n{_TEST_FILE_BODIES['net-pipe']}EOF",
+               tmp_path)
+    assert res.returncode == 2 and "use the Write tool" in res.stderr, res.stderr

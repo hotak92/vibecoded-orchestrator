@@ -126,9 +126,52 @@ def test_abandoned_executor_leg_does_not_hold_the_process(tmp_path: Path) -> Non
     assert elapsed < 8.0, f"router took {elapsed:.1f} s with a 2 s budget"
 
 
+SLOW_CG_PRODUCER = """\
+import os, sys, time
+def main():
+    if "--warm-legs" in sys.argv:
+        return
+    open(os.environ["VCO_TEST_PRODUCER_MARKER"], "a").write("started")
+    time.sleep(12)  # a code-graph query against a slow backend
+    print("CODE: never | function | def x.py:1 | callers: (none) | src=x.py")
+"""
+
+
+def test_large_rewrite_code_graph_leg_is_bounded_by_the_run_deadline(
+        tmp_path: Path) -> None:
+    """v0.2.105 (field report 2026-10-16: a Write hit the 10 s timeout). The
+    v0.2.104 pins above write a NEW file, which has no code-graph leg; a
+    REWRITE of a large existing file adds that leg (its symbols are read off
+    disk). With a 12 s code-graph producer and a ~2 MB file the run must
+    still end inside the budget. Red-proof: let ``_run_legs`` ignore the
+    deadline (``leg_timeout = 30.0``) and this takes ~12 s."""
+    proj = _project(tmp_path)
+    target = proj / "pkg" / "huge.py"
+    target.write_text("".join(f"def fn_{i}(x):\n    return x + {i}\n"
+                              for i in range(60000)))
+    kg = tmp_path / "kg_fast.py"
+    kg.write_text("def main():\n    pass\n")
+    cg = tmp_path / "cg_slow.py"
+    cg.write_text(SLOW_CG_PRODUCER)
+    marker = tmp_path / "cg.ran"
+    env = _router_env(child_env(), tmp_path, proj, kg,
+                      VCO_CG_SCRIPT=str(cg), VCO_TEST_PRODUCER_MARKER=str(marker))
+    payload = json.dumps({"session_id": "sessR", "tool_name": "Write", "cwd": str(proj),
+                          "tool_input": {"file_path": str(target),
+                                         "content": target.read_text()}})
+    start = time.monotonic()
+    r = subprocess.run([sys.executable, str(ROUTER), "write"], input=payload,
+                       capture_output=True, text=True, timeout=60, env=env)
+    elapsed = time.monotonic() - start
+    assert r.returncode == 0, r.stderr
+    assert marker.exists(), f"the code-graph leg never ran: {r.stderr[-800:]}"
+    assert "CODE: never" not in r.stdout
+    assert elapsed < 6.0, f"router took {elapsed:.1f} s with a 2 s budget"
+
+
 def test_deadline_anchor_honours_the_wrapper_start(monkeypatch) -> None:
     sys.path.insert(0, str(ROUTER.parent))
-    import hook_context_router as hcr
+    import hook_context_router as hcr  # pyright: ignore[reportMissingImports]  # resolved by the sys.path.insert above
 
     now = time.monotonic()
     # A real hook run: anchored at process start, earlier still when the
