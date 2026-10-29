@@ -351,7 +351,7 @@ def test_drop_orphan_prefix_narrows_and_never_widens(monkeypatch):
     monkeypatch.setattr(project_init, "_codegraph_keep_set_normalised",
                         lambda: ({PREFIX.lower()}, True))
     monkeypatch.setattr(project_init, "_revalidated_orphan_live_classes",
-                        lambda _u: [f"{ZOMBIE}_CodeFunction", "Stale_CodeModule"])
+                        lambda _u: [f"{ZOMBIE}_CodeFunction", "Phantom_CodeModule"])
     dropped: list = []
     monkeypatch.setattr(project_init, "_delete_class",
                         lambda cls, weaviate_url=None: dropped.append(cls))
@@ -362,4 +362,4 @@ def test_drop_orphan_prefix_narrows_and_never_widens(monkeypatch):
     dropped.clear()
     args.prefix = None  # leave-alone side: no filter keeps today's behaviour
     project_init._cmd_drop_orphan_code_collections(args)
-    assert dropped == [f"{ZOMBIE}_CodeFunction", "Stale_CodeModule"]
+    assert dropped == [f"{ZOMBIE}_CodeFunction", "Phantom_CodeModule"]
