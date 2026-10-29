@@ -139,7 +139,7 @@ def test_lean_ctx_ps1_updated_input_is_the_original_tool_input(tmp_path):
 # ─── agent-brief-kg-inject: prompt extended, everything else frozen ───────
 
 
-def _agent_brief_run(hook: str, tmp_path: Path) -> dict:
+def _agent_brief_run(hook: str, tmp_path: Path) -> tuple[dict, dict]:
     from tests.test_v02101_agent_brief_inject import _env, _sandbox
 
     root, stub_out = _sandbox(tmp_path)
