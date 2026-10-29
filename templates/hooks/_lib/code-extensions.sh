@@ -28,7 +28,7 @@
 # test's mirror list, nothing else.
 
 # Extension alternation, as a bash ERE suitable for `[[ $p =~ $RE ]]`.
-VCO_CODE_EXT_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+VCO_CODE_EXT_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
 
 # vco_is_code_file <path> — exit 0 when the path names a code file.
 #
