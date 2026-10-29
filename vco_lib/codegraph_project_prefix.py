@@ -388,8 +388,8 @@ def _zombie_entry(bound_prefix: str, slug: str, hits: list[dict], weaviate_url: 
             f"This project's code graph is bound to the prefix '{bound_prefix}', "
             f"but Weaviate also holds code-graph classes under the prefix VCO "
             f"derived from its launcher name '{slug}': {listed}. Earlier VCO "
-            "versions re-walked the project into them; no search reads them and "
-            "they use memory and disk."
+            "versions re-walked the project into them. No VCO binding owns them, "
+            "and they use memory and disk."
         ),
         why_deferred=(
             "Dropping a Weaviate class is irreversible and VCO never deletes user "
