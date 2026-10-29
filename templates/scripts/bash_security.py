@@ -60,13 +60,28 @@ def _span(stop: str, cls: str = ".") -> str:
 
 
 # === 1. Destructive filesystem operations ===
+# v0.2.105 (rm guard, owner ruling 2026-10-29): this flat rule is the TEXT
+# backstop for the HARD set only — the home directory itself, /home and
+# /home/<user>, `/`, and anything at or under /etc /usr /var /boot /dev /root
+# — so prose, process substitution and over-deep `bash -c` nests that the
+# structural walk cannot reach still block. A deeper path under home is NOT
+# here: vco_lib/rm_guard.py judges it structurally (a recursive or glob
+# delete is refused once and allowed on the identical retry). `rm` must be a
+# word of its own: `confirm /home` and `git worktree add -b x-rmconfirm
+# /home/...` no longer match. MUST MATCH vco_lib.rm_guard.classify_target's
+# HARD tier (parity test: tests/test_v02105_rm_guard.py). Linear: one start
+# per `rm` word, bounded flag run, each span bounded by a single token.
+_RM_TERM = r"""(?=[\s;&|)'"`]|$)"""
+_RM_TAIL = r"(?:/(?:\.?\*)?)?" + _RM_TERM
 _rule(
     "rm_root",
-    # NB: flags-block is a single non-repeating group, NOT `(...)*`. The
-    # earlier form with `*` was flagged as ReDoS (CodeQL py/redos) because
-    # adversarial input like "rm -ff -ff -ff ..." caused exponential
-    # backtracking. Real `rm` invocations never repeat flag-blocks anyway.
-    r"rm\s+(?:-[a-zA-Z]*f[a-zA-Z]*\s+)?(/\s*$|/\*|~\s*$|~/|/home\b|/etc\b|/usr\b|/var\b|/boot\b|/dev\b)",
+    r"(?<![\w.-])rm\s+(?:-\S*\s+){0,6}[\"']?(?:"
+    r"/[.*]?" + _RM_TERM
+    + r"|/(?:etc|usr|var|boot|dev|root)\b"
+    + r"""|/(?:home|users)(?:/[^/\s;&|)'"`*?\[]+)?""" + _RM_TAIL
+    + r"""|~[^/\s;&|)'"`]*""" + _RM_TAIL
+    + r"|\$\{?HOME\}?" + _RM_TAIL
+    + r")",
     "Destructive rm targeting system/home directories",
 )
 _rule(
@@ -1337,15 +1352,75 @@ def _kill_guard_check(cmd: str, shell: str) -> tuple[bool, str]:
     return (True, "") if message is None else (False, message)
 
 
+#: An ``rm`` command word naming a home-ish path in the same simple command.
+#: Used only when vco_lib cannot be imported (a broken install), to refuse
+#: the rm deletes the rm guard would have had to judge. MUST MATCH
+#: vco_lib/rm_guard.py's _UNPARSED_HOME_RM.
+_RM_HOME_CALL = re.compile(
+    r"(?<![\w.-])rm\s(?:(?!(?<![\w.-])rm\s)[^;&|\n])*"
+    r"(?:~|\$\{?HOME|/home/|/users/)", re.IGNORECASE)
+
+
+def _rm_guard_scan(cmd: str, confirms: list) -> tuple[bool, str]:
+    """The structural rm guard (``vco_lib.rm_guard.scan``) for ONE scan
+    surface: a HARD target refuses here; CONFIRM targets are collected in
+    ``confirms`` for the one confirm-once decision :func:`check_command`
+    takes at the top level. A broken install (no vco_lib) refuses an rm on a
+    home path with the cause named."""
+    if not re.search(r"(?i)(?<![\w.-])rm\s", cmd):
+        return True, ""
+    try:
+        from vco_lib.rm_guard import HARD, hard_message, scan
+    except ImportError as exc:
+        if not _RM_HOME_CALL.search(cmd):
+            return True, ""
+        return False, (
+            "[rm_guard] Refused: the rm guard could not load (import "
+            f"vco_lib.rm_guard failed: {exc}). This is a broken VCO install: "
+            "re-run the orchestrator's install / update so the hook runs with "
+            "the VCO venv, then retry."
+        )
+    findings = scan(cmd)
+    hard = [f.target for f in findings if f.tier == HARD]
+    if hard:
+        return False, hard_message(hard)
+    confirms.extend(findings)
+    return True, ""
+
+
+def _rm_confirm_decision(cmd: str, confirms: list) -> tuple[bool, str]:
+    """ONE confirm-once decision per hook call (never per recursion level,
+    so a payload scanned twice cannot consume two confirmations)."""
+    from vco_lib.rm_guard import decide  # imported already by _rm_guard_scan
+
+    message = decide(cmd, confirms)
+    return (True, "") if message is None else (False, message)
+
+
 def check_command(cmd: str, _depth: int = 0, shell: str = "bash") -> tuple[bool, str]:
     """Check a command string for security violations.
 
     ``shell="powershell"`` (v0.2.102 W5-D) runs :func:`check_powershell`
     first, then the Bash rule set below.
 
+    v0.2.105 rm guard: a recursive or glob rm of a deeper path under the
+    home directory is refused ONCE and allowed on the identical retry —
+    the confirmation is remembered per chat session / subagent through the
+    ``VCO_GUARD_*`` environment the pre-tool-use hook sets (see
+    vco_lib/rm_guard.py). Without that environment it stays refused.
+
     Returns:
         (is_safe, reason) -- reason is empty if safe.
     """
+    confirms: list = []
+    safe, reason = _check_command(cmd, _depth, shell, confirms)
+    if not safe or not confirms:
+        return safe, reason
+    return _rm_confirm_decision(cmd, confirms)
+
+
+def _check_command(cmd: str, _depth: int, shell: str,
+                   confirms: list) -> tuple[bool, str]:
     if shell == "powershell":
         safe, reason = check_powershell(cmd)
         if not safe:
@@ -1358,6 +1433,12 @@ def check_command(cmd: str, _depth: int = 0, shell: str = "bash") -> tuple[bool,
         cmd if shell == "powershell" else _strip_heredoc_bodies(cmd), shell)
     if not safe:
         return safe, reason
+    # v0.2.105 rm guard (structural, Bash syntax only — the PowerShell tool
+    # keeps the flat backstop + its own ps_remove_root rule).
+    if shell != "powershell":
+        safe, reason = _rm_guard_scan(_strip_heredoc_bodies(cmd), confirms)
+        if not safe:
+            return safe, reason
     # v0.2.88 (FP-heredoc): build two scan surfaces from the ORIGINAL command
     # (newlines intact so here-doc boundaries survive), then normalize
     # whitespace for the flat-regex rules. The env-read rules run on the
@@ -1419,7 +1500,8 @@ def check_command(cmd: str, _depth: int = 0, shell: str = "bash") -> tuple[bool,
         for payload in shell_payloads:
             if payload == cmd:
                 continue  # defensive: never recurse on an identical string
-            safe, reason = check_command(payload, _depth + 1)
+            safe, reason = _check_command(payload, _depth + 1, "bash",
+                                          confirms)
             if not safe:
                 return False, reason
 
