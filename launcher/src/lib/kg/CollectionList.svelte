@@ -3,6 +3,7 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { KgCollectionAccess } from '$lib/types/project-state';
+  import { formatCount, formatCountAge } from '$lib/kg/count-display';
 
   let {
     projectId,
@@ -16,6 +17,11 @@
 
   let collections = $state<KgCollectionAccess[]>([]);
   let loading = $state(true);
+  // v0.2.105 lazy-load counts: counts for this project's own/shared/
+  // granted collections are fetched live; everything else shows the last
+  // cached value ("—" when never counted). "Refresh counts" live-counts
+  // every collection once and refills that cache.
+  let counting = $state(false);
 
   async function load() {
     loading = true;
@@ -28,13 +34,35 @@
     }
   }
 
+  async function refreshCounts() {
+    counting = true;
+    try {
+      await invoke<number>('refresh_collection_counts');
+      await load();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      counting = false;
+    }
+  }
+
   onMount(load);
 </script>
 
 <div class="cl-host">
   <header class="cl-header">
     <h2>KG Collections</h2>
-    <button class="cl-refresh" onclick={load}>Refresh</button>
+    <div class="cl-header-actions">
+      <button
+        class="cl-refresh"
+        onclick={refreshCounts}
+        disabled={counting}
+        title="Count every collection once and refresh the cached counts — this loads every collection on this machine into Weaviate's memory (a page load only counts this project's own, the shared, and the granted collections)"
+      >
+        {counting ? 'Counting…' : 'Refresh counts'}
+      </button>
+      <button class="cl-refresh" onclick={load}>Refresh</button>
+    </div>
   </header>
   {#if loading}
     <p class="cl-empty">Loading…</p>
@@ -49,7 +77,11 @@
             {#if col.is_shared}<span class="cl-badge cl-badge-shared">shared</span>{/if}
             <span class="cl-access cl-access-{col.access}">{col.access}</span>
           </header>
-          <p class="cl-meta">{col.node_count} nodes</p>
+          <p class="cl-meta">
+            {formatCount(col.node_count)} nodes{col.counted_at
+              ? ` · ${formatCountAge(col.counted_at)}`
+              : ''}
+          </p>
           <div class="cl-actions">
             <button onclick={() => onBrowse(col.name)} disabled={col.access === 'none'}>Browse</button>
             <button onclick={() => onAccess(col.name)}>Access…</button>
@@ -64,6 +96,8 @@
   .cl-host { padding: 16px 24px; }
   .cl-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
   .cl-header h2 { font-size: 16px; margin: 0; }
+  .cl-header-actions { display: flex; gap: 6px; }
+  .cl-header-actions .cl-refresh:disabled { opacity: 0.5; cursor: default; }
   .cl-refresh {
     background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
     color: inherit; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px;

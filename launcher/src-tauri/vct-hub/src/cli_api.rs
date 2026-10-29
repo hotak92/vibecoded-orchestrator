@@ -930,33 +930,39 @@ fn filter_codegraph_by_scope(all: Vec<String>, scope: &str) -> Vec<String> {
         .collect()
 }
 
-async fn fetch_class_count(client: &reqwest::Client, class: &str, weaviate_url: &str) -> u32 {
-    // Same shape as commands::kg::fetch_class_count. No quoting needed
-    // for class names — Weaviate class names are restricted to
-    // [A-Za-z][A-Za-z0-9_]*.
-    let body = serde_json::json!({
-        "query": format!("{{ Aggregate {{ {cls} {{ meta {{ count }} }} }} }}", cls = class)
-    });
-    let resp = client
-        .post(format!("{}/v1/graphql", weaviate_url))
-        .json(&body)
-        .send()
-        .await;
-    match resp {
-        Ok(r) => {
-            let v: serde_json::Value = r.json().await.unwrap_or(serde_json::json!({}));
-            v.pointer(&format!("/data/Aggregate/{}/0/meta/count", class))
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0) as u32
-        }
-        Err(_) => 0,
-    }
-}
+// `fetch_class_count` (the hub-side live Aggregate copy) was removed in
+// v0.2.105: the one live-fetch implementation lives in
+// `vct_launcher_core::weaviate_counts`. These two routes serve CACHED
+// counts only (empty live scope): they carry no acting project whose own
+// collections could be counted, and counting every detected class live
+// here lazy-loaded every collection on the machine into Weaviate's RAM
+// (Weaviate 1.28 loads a class on first query and never unloads it). The
+// cache is filled by the launcher's KG/codegraph views (own/shared/
+// granted classes) and by its explicit "Refresh counts" action.
 
 #[derive(Serialize)]
 struct CollectionSummary {
     name: String,
-    node_count: u32,
+    /// `None` = never counted.
+    node_count: Option<u64>,
+    /// Epoch-ms moment the count was measured (`None` with a `None` count).
+    counted_at: Option<i64>,
+}
+
+/// Cached-count summary rows for `names` — the twins' shared read path.
+/// Never touches Weaviate's GraphQL endpoint.
+fn cached_summaries(db: &Db, names: Vec<String>) -> Vec<CollectionSummary> {
+    names
+        .into_iter()
+        .map(|name| {
+            let cached = db.collection_count_get(&name).ok().flatten();
+            CollectionSummary {
+                node_count: cached.as_ref().map(|c| c.count),
+                counted_at: cached.map(|c| c.counted_at),
+                name,
+            }
+        })
+        .collect()
 }
 
 async fn kg_collections(state: State<LauncherDbHandle>) -> axum::response::Response {
@@ -975,14 +981,7 @@ async fn kg_collections(state: State<LauncherDbHandle>) -> axum::response::Respo
                 .into_response()
         }
     };
-    let mut out: Vec<CollectionSummary> = Vec::with_capacity(names.len());
-    for n in names {
-        let count = fetch_class_count(&client, &n, &wurl).await;
-        out.push(CollectionSummary {
-            name: n,
-            node_count: count,
-        });
-    }
+    let out = cached_summaries(&state.0.0, names);
     let count = out.len();
     Json(serde_json::json!({ "collections": out, "count": count })).into_response()
 }
@@ -1003,14 +1002,7 @@ async fn codegraph_collections(state: State<LauncherDbHandle>) -> axum::response
                 .into_response()
         }
     };
-    let mut out: Vec<CollectionSummary> = Vec::with_capacity(names.len());
-    for n in names {
-        let count = fetch_class_count(&client, &n, &wurl).await;
-        out.push(CollectionSummary {
-            name: n,
-            node_count: count,
-        });
-    }
+    let out = cached_summaries(&state.0.0, names);
     let count = out.len();
     Json(serde_json::json!({ "collections": out, "count": count })).into_response()
 }
@@ -1639,10 +1631,13 @@ mod cli_kg_integration_tests {
         // machine — this is the minimum sanity check.
         assert!(!cols.is_empty(), "no orchestrator KG collections detected");
 
-        // Every entry has the required shape.
+        // Every entry has the required shape. v0.2.105: node_count is
+        // CACHED on this route (Option — null when never counted), not
+        // Aggregate-queried live.
         for c in cols {
             assert!(c.get("name").and_then(|v| v.as_str()).is_some());
-            assert!(c.get("node_count").and_then(|v| v.as_u64()).is_some());
+            assert!(c.get("node_count").and_then(|v| v.as_null()).is_some()
+                || c.get("node_count").and_then(|v| v.as_u64()).is_some());
             // Names should NOT include known non-KG collections.
             let name = c.get("name").and_then(|v| v.as_str()).unwrap();
             assert!(!name.starts_with("ChatMessages"));
@@ -2048,6 +2043,86 @@ mod cli_kg_integration_tests {
             .filter_map(|c| c["name"].as_str())
             .collect();
         assert_eq!(names, vec!["GoodKG"]);
+    }
+
+    /// v0.2.105 lazy-load counts: the CLI collection twins serve CACHED
+    /// counts. Even with a reachable (fake) Weaviate, GET
+    /// /cli/kg/collections must not send a single Aggregate — counting
+    /// every detected class here lazy-loaded every collection on the
+    /// machine into Weaviate's RAM (Weaviate 1.28 loads a class on first
+    /// query and never unloads it).
+    #[tokio::test]
+    async fn kg_collections_serves_cached_counts_without_any_aggregate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let graphql_hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits = graphql_hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let kg_props = || serde_json::json!([
+            {"name": "title", "dataType": ["text"]},
+            {"name": "node_type", "dataType": ["text"]},
+            {"name": "tags", "dataType": ["text[]"]},
+            {"name": "typed_links", "dataType": ["object[]"]},
+        ]);
+        tokio::spawn(async move {
+            let app = axum::Router::new()
+                .route(
+                    "/v1/schema",
+                    axum::routing::get(move || {
+                        let p1 = kg_props();
+                        let p2 = kg_props();
+                        async move {
+                            axum::Json(serde_json::json!({
+                                "classes": [
+                                    { "class": "GoodKG", "properties": p1 },
+                                    { "class": "OtherKG", "properties": p2 },
+                                ]
+                            }))
+                        }
+                    }),
+                )
+                .route("/v1/graphql", axum::routing::post(move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        axum::Json(serde_json::json!({ "data": {} }))
+                    }
+                }));
+            let _ = axum::serve(listener, app).await;
+        });
+        let (base, h) = spawn_test_hub().await;
+        seed_weaviate_row(&h, &format!("http://{}", addr));
+        // One class counted before (cached), one never counted.
+        h.0.collection_count_set("GoodKG", 71).expect("seed cache");
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/cli/kg/collections", base))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let cols = body["collections"].as_array().expect("collections");
+        let good = cols
+            .iter()
+            .find(|c| c["name"] == "GoodKG")
+            .expect("GoodKG present");
+        assert_eq!(good["node_count"].as_u64(), Some(71), "cached value served");
+        assert!(
+            good["counted_at"].as_i64().is_some(),
+            "the cache's timestamp is carried through"
+        );
+        let other = cols
+            .iter()
+            .find(|c| c["name"] == "OtherKG")
+            .expect("OtherKG present");
+        assert!(other["node_count"].is_null(), "never counted → null");
+        assert_eq!(
+            graphql_hits.load(Ordering::Relaxed),
+            0,
+            "NO Aggregate may run on this route — cached counts only"
+        );
     }
 
     #[tokio::test]

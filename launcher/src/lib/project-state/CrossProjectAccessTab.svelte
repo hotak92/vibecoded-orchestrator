@@ -37,6 +37,7 @@
     ProjectStateSnapshot,
   } from '$lib/types/project-state';
   import type { ProjectView } from '$lib/types/launcher';
+  import { formatCount } from '$lib/kg/count-display';
   import { buildOwnAccessPayload } from './cross-project-access-payloads';
 
   let { projectId }: { projectId: string } = $props();
@@ -346,7 +347,7 @@
           {#each kgCollections as c (c.name)}
             <tr>
               <td><code>{c.name}</code></td>
-              <td class="ps-col-count">{c.node_count}</td>
+              <td class="ps-col-count">{formatCount(c.node_count)}</td>
               <td class="ps-col-tag">
                 {#if c.is_shared}
                   <span class="ps-tag ps-tag-shared" title="Cross-project shared collection — readable by every project by default.">shared</span>

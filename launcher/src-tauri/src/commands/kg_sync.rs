@@ -818,6 +818,24 @@ async fn run_sync_task(
         None,
         outcome.error_message.as_deref(),
     );
+
+    // v0.2.105 lazy-load counts: a successful sync WROTE to this
+    // project's KG/Development collections, so any cached counts for
+    // them are stale. Invalidate (the next view that needs one counts it
+    // live; this project's own view always does). Soft-fail — the sync
+    // result is already persisted and must not be disturbed.
+    if outcome.status == sync_status::SUCCESS {
+        let db = app.state::<Db>();
+        let bound: Vec<String> = db
+            .list_project_kg_bindings(&project_id)
+            .map(|rows| rows.into_iter().map(|b| b.collection_name).collect())
+            .unwrap_or_default();
+        if !bound.is_empty() {
+            if let Err(e) = db.collection_count_invalidate_many(&bound) {
+                tracing::warn!("[vct] kg_sync count-cache invalidation: {}", e);
+            }
+        }
+    }
 }
 
 /// Aggregated subprocess result. Held only inside `run_sync_task` so
