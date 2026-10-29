@@ -476,7 +476,52 @@ export const LEAN_CTX_HINT =
   '(package installs, image pulls, downloads, test/build runs); loops, pipes, git, ' +
   'unknown and credential-bearing commands run raw. Every compressed run saves its ' +
   'full raw output under .claude/state/lean-ctx-tee/ and prints a pointer to it, so ' +
-  'nothing is lost. Needs the lean-ctx binary — without one the hook does nothing.';
+  'nothing is lost. Needs the lean-ctx binary — without one the hook does nothing. ' +
+  'This setting does not affect the kill guard that runs in the same hook (see the ' +
+  'lean-ctx-rewrite row).';
+
+// ─── kill guard note (v0.2.105) ──────────────────────────────────────────
+//
+// The kill guard has no toggle of its own here — its switch,
+// VCO_KILL_GUARD=off, is the user's decision and lives in the hook
+// environment, like the wait guard's (docs/CONFIGURATION.md). What the tab
+// MUST say is which rows carry it, because parking one of those rows turns
+// a layer of the guard off: lean-ctx-rewrite hosts the runtime check (it is
+// the one hook allowed to rewrite a shell command), pre-tool-use the static
+// one. Display only — the same literal script-name check routedSubhookStem
+// makes.
+
+/** The kill-guard layer a hook row's script carries, or null. */
+export function killGuardLayer(command: string): 'runtime' | 'static' | null {
+  const has = (stem: string) =>
+    ['.sh', '.ps1'].some(
+      (ext) =>
+        command.includes(`.claude/hooks/${stem}${ext}`) ||
+        command.includes(`.claude\\hooks\\${stem}${ext}`),
+    );
+  if (has('lean-ctx-rewrite')) return 'runtime';
+  if (has('pre-tool-use')) return 'static';
+  return null;
+}
+
+/** The extra tooltip sentence for a row that carries a kill-guard layer
+ * ('' otherwise). Shown in every state: turning the row OFF is exactly when
+ * the user needs to know what else stops. */
+export function killGuardNote(hook: EffectiveHook): string {
+  const layer = killGuardLayer(hook.command);
+  if (layer === 'runtime') {
+    return ' This hook also runs the kill guard\'s runtime check: every kill/pkill/killall ' +
+      '(and Stop-Process/taskkill) first checks its target pids and refuses pid 1, the ' +
+      'shell\'s own parents and desktop processes. Turning this row off turns that check off ' +
+      '(the static check in pre-tool-use stays). The lean-ctx setting does not affect it.';
+  }
+  if (layer === 'static') {
+    return ' This hook also runs the kill guard\'s static check (refuses kills of pid 1, ' +
+      '$PPID, parent lookups and broad pkill/killall patterns). Turning this row off turns ' +
+      'that check off.';
+  }
+  return '';
+}
 
 /**
  * Map the on-disk env value to a toggle state. Both hook siblings read the

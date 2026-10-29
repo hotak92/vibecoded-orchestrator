@@ -6,6 +6,11 @@
 # for the full rationale (fork-bomb avoidance, v0.2.101 allow-list
 # inversion, lossless tee/pointer design, bypass hierarchy).
 #
+# v0.2.105: also the ONE emitter of `updatedInput` for shell tool calls, so
+# it hosts the kill guard's runtime layer as "STAGE 1" (vco_lib/kill_guard.py),
+# run FIRST and registered on matcher Bash|PowerShell; lean-ctx compression
+# (stage 2) stays Bash-only.
+#
 # CONTRACT (v0.2.101 — ALLOW-LIST INVERSION + LOSSLESS TEE)
 # ----------------------------------------------------------
 # Claude Code pipes a JSON PreToolUse payload to stdin. The hook
@@ -55,6 +60,61 @@ foreach ($k in @('SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI
 # 1. Global kill-switch (one switch for "turn off all VCT hook side-effects").
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
+# Capture the PreToolUse stdin payload ONCE (reading [Console]::In drains
+# it), FIRST: the kill-guard stage below needs it before the lean-ctx knobs
+# are consulted. MUST MATCH lean-ctx-rewrite.sh ($_lc_cmd).
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+if (-not $HookStdin) { exit 0 }
+
+# === STAGE 1: kill guard (v0.2.105) ===========================================
+# This hook is the ONE emitter of `updatedInput` for shell tool calls (two
+# PreToolUse rewriters for one call conflict), so the kill guard's runtime
+# layer lives here. For a command that runs kill/pkill/killall (Bash) or
+# Stop-Process/kill/spps/taskkill (PowerShell), vco_lib.kill_guard builds the
+# whole response (the command prefixed with guard definitions that check every
+# target pid first); such a command is never on the lean-ctx allow-list, so
+# stage 2 is skipped. Independent of the lean-ctx knobs and binary. The switch
+# VCO_KILL_GUARD=off/0/false/no is read from THIS process's environment only,
+# never from .claude/env -- the owner's decision, never the agent's. Any
+# failure emits nothing (pre-tool-use's static layer has already refused the
+# dangerous shapes). MUST MATCH lean-ctx-rewrite.sh's stage 1.
+if ($HookStdin -match '(?i)kill|stop-process|spps') {
+    $kgSwitch = if ($env:VCO_KILL_GUARD) { $env:VCO_KILL_GUARD.Trim().ToLowerInvariant() } else { "" }
+    if ($kgSwitch -notin @('off', '0', 'false', 'no')) {
+        $kgLib = Join-Path $PSScriptRoot "_lib"
+        $PY = $null
+        $kgFindPy = Join-Path $kgLib "find-python.ps1"
+        if (Test-Path -LiteralPath $kgFindPy) { . $kgFindPy }
+        $kgPy = $PY
+        $kgVenvLib = Join-Path $kgLib "resolve-vco-venv.ps1"
+        if (Test-Path -LiteralPath $kgVenvLib) {
+            . $kgVenvLib
+            try {
+                $kgVenvPy = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot
+                if ($kgVenvPy -and (Test-Path -LiteralPath $kgVenvPy)) { $kgPy = $kgVenvPy }
+            } catch { }
+        }
+        if ($kgPy) {
+            $kgRoot = ""
+            try {
+                . (Join-Path $kgLib "project-root.ps1")
+                $kgRoot = [string](Get-VcoProjectRoot)
+            } catch { $kgRoot = "" }
+            $kgOut = ""
+            try {
+                $kgOut = ($HookStdin | & $kgPy -m vco_lib.kill_guard rewrite --project-root $kgRoot) -join "`n"
+            } catch { $kgOut = "" }
+            if ($kgOut -and $kgOut.Trim()) {
+                [Console]::Out.Write($kgOut.Trim())
+                exit 0
+            }
+        }
+    }
+}
+
+# === STAGE 2: lean-ctx compression ============================================
+
 # 2. Per-project knobs. Read .claude/env if it exists; look for the
 #    VCO_LEAN_CTX_DEFAULT / VCO_LEAN_CTX_TEE_TTL_HOURS lines (KEY=VALUE
 #    syntax, optional `export ` prefix, LAST assignment wins -- what the .sh
@@ -100,12 +160,6 @@ if (Test-Path -LiteralPath $envFile) {
     }
 }
 if ($leanCtxDefault -eq "off") { exit 0 }
-
-# Capture the PreToolUse stdin payload ONCE (reading [Console]::In drains
-# it). MUST MATCH lean-ctx-rewrite.sh ($_lc_cmd).
-$HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-if (-not $HookStdin) { exit 0 }
 
 # 3. lean-ctx availability — optional dep, never break Bash for users
 #    without it. D-11 (v0.2.75): probe the same candidate list install.py
