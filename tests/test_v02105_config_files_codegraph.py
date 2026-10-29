@@ -343,7 +343,7 @@ def _analyzer(mod: types.ModuleType, gate: Optional[Dict[str, str]] = None) -> A
     setattr(mod, "embed_function", lambda sig, body, language="python": None)
     setattr(mod, "embed_class", lambda sig, body, methods=None, language="python": None)
     inst = mod.CodeGraphAnalyzer.__new__(mod.CodeGraphAnalyzer)
-    inst.project_name = "CfgProj"
+    inst.project_name = "FakeProject"
     inst.client = object()
     inst.module_cache, inst.class_cache, inst.function_cache = {}, {}, {}
     inst.module_imports, inst.visited_uuids = {}, set()
@@ -354,7 +354,7 @@ def _analyzer(mod: types.ModuleType, gate: Optional[Dict[str, str]] = None) -> A
     for attr, base in (("modules_collection", "CodeModule"), ("classes_collection", "CodeClass"),
                        ("functions_collection", "CodeFunction"), ("apis_collection", "CodeAPI"),
                        ("interactions_collection", "CodeInteraction")):
-        setattr(inst, attr, _Coll(f"CfgProj_{base}"))
+        setattr(inst, attr, _Coll(f"FakeProject_{base}"))
     if gate is not None:
         # The unchanged-file gate, against a recorded {path: file_hash} map —
         # what Weaviate's stored module rows would answer.
@@ -524,7 +524,7 @@ def test_reconcile_judges_interaction_rows(analyzer_mod: types.ModuleType, tmp_p
     monkeypatch.setattr(analyzer_mod, "_reconcile_walked_file_rows", _capture)
     inst = _analyzer(analyzer_mod)
     inst.analyze_repository(tmp_path)
-    assert seen and "CfgProj_CodeInteraction" in seen[0]
+    assert seen and "FakeProject_CodeInteraction" in seen[0]
 
 
 # ---------------------------------------------------------------------------
