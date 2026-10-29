@@ -2432,8 +2432,10 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
         # missing-slot loops.
         try:
             from vco_lib.weaviate_schema import KG_NAMED_VECTORS
+            from vco_lib.weaviate_vector_index import client_named_vector
+            # v0.2.105: each slot carries the vector-index policy (cache cap).
             named_vectors = [
-                Configure.NamedVectors.none(name=slot.name)
+                client_named_vector(slot.name, COLLECTION_NAME)
                 for slot in KG_NAMED_VECTORS
             ]
         except Exception as import_err:  # noqa: BLE001 — best-effort fallback
@@ -2552,8 +2554,10 @@ def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
         # any missing slot later when the user does run install/update.
         try:
             from vco_lib.weaviate_schema import KG_NAMED_VECTORS
+            from vco_lib.weaviate_vector_index import client_named_vector
+            # v0.2.105: each slot carries the vector-index policy (cache cap).
             named_vectors = [
-                Configure.NamedVectors.none(name=slot.name)
+                client_named_vector(slot.name, DEV_COLLECTION_NAME)
                 for slot in KG_NAMED_VECTORS
             ]
         except Exception as import_err:  # noqa: BLE001 — best-effort fallback

@@ -341,6 +341,16 @@ def compose_up_step(plan: Step5Plan, hooks: Step5Hooks) -> str:
     if project:
         cmd.extend(["-p", project])
 
+    # v0.2.105: pull each to-be-recreated service's pinned image FIRST — a
+    # recreate whose pull then fails would remove the running container and
+    # leave the service down; such a service keeps running and is ledgered.
+    from vco_lib.compose_image_prepull import drop_unpullable_recreates  # noqa: PLC0415
+    drop_unpullable_recreates(
+        plan.services_to_recreate, runtime=plan.runtime,
+        root=plan.install_root or plan.infra_dir.parent, deferral_report=plan.deferral_report,
+        rerun=_rerun_cmd(plan), run=hooks.run, timeout=compose_timeout_s(),
+        log_event=hooks.log_event)
+
     # The argv comes from the ONE builder (v0.2.97): `--no-deps` always,
     # `--build` only for a stale code_embed image, no bare `up -d` ever (I1).
     from vco_lib.service_lifecycle import compose_up_args  # noqa: PLC0415

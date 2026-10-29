@@ -58,6 +58,9 @@ def finalize_embed_config_for_host(
     # v0.2.102 W6-B2: the code_embed stack decision needs the host's GPU
     # verdict (compose_env.code_embed_container_in_stack).
     config["has_gpu"] = bool(getattr(sysinfo, "has_gpu", False))
+    # v0.2.105: the host RAM, for Weaviate's container memory limit
+    # (compose_env.compose_substitution_env -> vco_lib.weaviate_memory).
+    config["host_ram_gb"] = float(getattr(sysinfo, "ram_gb", 0.0) or 0.0)
     try:
         budget = resolve_concurrency_for_config(
             code_backend=str(config.get("code_model") or ""),

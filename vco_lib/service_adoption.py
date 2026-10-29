@@ -165,6 +165,13 @@ WEAVIATE_RECLAIM_ENV_KEYS: tuple[str, ...] = (
     "TOMBSTONE_DELETION_MIN_PER_CYCLE",
     "TOMBSTONE_DELETION_MAX_PER_CYCLE",
     "TOMBSTONE_DELETION_CONCURRENCY",
+    # v0.2.105 memory + compression knobs: a running Weaviate without them
+    # keeps the unbounded 2x heap, eager shard loading, or uncompressed new
+    # collections, so their absence is drift like the reclaim keys'.
+    "GOGC",
+    "MEMORY_READONLY_PERCENTAGE",
+    "LAZY_LOAD_SHARD_COUNT_THRESHOLD",
+    "DEFAULT_QUANTIZATION",
 )
 BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
     "OLLAMA_KEEP_ALIVE",

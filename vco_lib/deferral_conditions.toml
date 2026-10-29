@@ -179,6 +179,31 @@ emit_surfaces = ["ledger"]
 notes = """The re-probe pass also re-checks reachability every --update; the \
 SIDE-EFFECTFUL `podman start` remediation stays behind --apply-deferred."""
 
+[conditions.service_image_pull_failed]
+class = "auto_retryable"
+owner = "vco_lib.compose_image_prepull"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.105. Step 5 pulls the pinned image of every service it is \
+about to force-recreate BEFORE the recreate (`compose_image_prepull. \
+drop_unpullable_recreates`). A refused pull (registry rate limit, no network) \
+keeps that container running on its current image instead of letting compose \
+remove it with nothing to replace it. Added to the install run's report, so a \
+run whose pull succeeds does not re-emit it (owned/drop-when-absent)."""
+
+[conditions.weaviate_vector_index_update_failed]
+class = "auto_retryable"
+owner = "vco_lib.weaviate_vector_index"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.105. install.py's step 7e (`weaviate_vector_index.run_update_step`, \
+run after the schema migrations) turns RQ-8 compression on and caps the vector \
+cache of existing VCO collections. Recorded when Weaviate could not be read or \
+refused the PUT for some collection. Nothing was dropped or copied — the \
+collections keep working uncompressed. auto_retryable without a retry_action: \
+every install/update re-runs the idempotent step, and a run that succeeds does \
+not re-emit it (owned/drop-when-absent)."""
+
 [conditions.install_python_env_broken]
 class = "action_required"
 owner = "install.py"

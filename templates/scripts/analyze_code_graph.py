@@ -422,6 +422,7 @@ try:
     # v0.2.94: the ONE connect factory + URL resolver, and the guarded create.
     from vco_lib import weaviate_helpers as _wh
     from vco_lib.fixture_class_guard import guarded_collection_create
+    from vco_lib.weaviate_vector_index import client_named_vector as _client_named_vector
     # v0.2.92: extractor-generation re-index — the force-rewalk flag
     # resolution, the all-chunks-SKIP verdict, and the completion stamp all
     # live there; this file keeps only the I/O seams.
@@ -1531,17 +1532,14 @@ class CodeGraphAnalyzer:
             print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
             return False
 
-    def _vectorizer_config(self):
+    def _vectorizer_config(self, class_name: str):
         """Return appropriate vectorizer config based on named_vectors flag.
 
         v0.2.18: slot set is the active code slot (from EmbeddingService)
-        UNION the legacy/forward-compat slots so post-create switches
-        between models don't require recreating the collection.
-
-        Pre-v0.2.18 hardcoded three slots based on `_ACTIVE_CODE_VECTOR`
-        env-time resolution; that broke OpenAI-as-code and arctic-text-
-        as-code-fallback installs. The Wave-A schema helper
-        (vco_lib/weaviate_schema.py) carries the full slot map.
+        UNION the legacy/forward-compat slots, so a model switch needs no
+        collection recreate (vco_lib/weaviate_schema.py has the full slot map).
+        v0.2.105: each slot carries ``class_name``'s vector-index policy (the
+        cache cap, ``vco_lib.weaviate_vector_index``).
         """
         if not self.named_vectors:
             return Configure.Vectorizer.none()
@@ -1555,7 +1553,7 @@ class CodeGraphAnalyzer:
             "codesage_embed",      # CodeSage primary (preserved through model switches)
             "openai_code_embed",   # OpenAI text-embedding-3 reused for code
         }
-        return [Configure.NamedVectors.none(name=n) for n in sorted(slot_names)]
+        return [_client_named_vector(n, class_name) for n in sorted(slot_names)]
 
     def _inverted_index_config(self):
         """Always return an inverted index config with `index_null_state=True`.
@@ -1709,7 +1707,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_module,
                     description="Code modules/files with imports and metrics",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_module),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="path", data_type=DataType.TEXT, description="File path relative to repo root", skip_vectorization=True),
@@ -1771,7 +1769,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_class,
                     description="Classes with inheritance and methods",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_class),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="name", data_type=DataType.TEXT, description="Class name", skip_vectorization=True),
@@ -1840,7 +1838,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_function,
                     description="Functions with call graphs",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_function),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="name", data_type=DataType.TEXT, description="Function name", skip_vectorization=True),
@@ -1907,7 +1905,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_api,
                     description="API endpoints with handlers",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_api),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="endpoint", data_type=DataType.TEXT, description="API endpoint path", skip_vectorization=True),
@@ -1951,7 +1949,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_interaction,
                     description="Cross-language and cross-service communication calls",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_interaction),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="source_project", data_type=DataType.TEXT, description="Project that initiates the call", skip_vectorization=True),
