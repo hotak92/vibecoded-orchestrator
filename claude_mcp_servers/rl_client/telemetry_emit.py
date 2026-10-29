@@ -96,9 +96,16 @@ def resolve_session_id(arg_session_id: Optional[str] = None) -> str:
     that read ``session_id`` from their stdin JSON payload).
     Layer 2: ``VCT_SESSION_ID`` env (orchestrator-owned, hook-exported
     from the stdin payload — see ``pre-edit-context-inject.{sh,ps1}``).
-    Layer 3: ``CLAUDE_SESSION_ID`` env (Claude Code's own variable —
-    usually empty in MCP/hook subprocesses, kept as a last-resort
-    fallback in case future Claude Code releases start populating it).
+    Layer 3: ``CLAUDE_SESSION_ID`` env (a last-resort fallback a caller
+    may export; Claude Code itself does not set it).
+
+    Claude Code DOES export ``CLAUDE_CODE_SESSION_ID`` to the processes it
+    spawns (MCP servers, Bash commands; verified v0.2.105), and it is
+    deliberately NOT a layer here: it names the chat that spawned the
+    process — every subagent shares its parent's, and an MCP server keeps
+    the value it started with — while this value also tags the staged
+    citation file, which must name the chat that made the call
+    (``citation_pending.NO_SESSION_PREFIX``).
 
     Returns empty string if no layer yields a value. Callers downstream
     treat empty-string as "unknown session" and skip session-grouped

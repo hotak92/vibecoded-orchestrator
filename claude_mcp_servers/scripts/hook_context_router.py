@@ -1555,7 +1555,7 @@ def _amend_pending_citations(project_root: str, sid: str,
                                if staged is None else staged)]
     if not files:
         return
-    from vco_lib.atomic import atomic_write_json
+    from claude_mcp_servers.rl_client.citation_pending import write_pending
 
     for f in files:
         try:
@@ -1594,7 +1594,7 @@ def _amend_pending_citations(project_root: str, sid: str,
                 pass
             continue
         try:
-            atomic_write_json(f, payload, indent=None, fsync=False)
+            write_pending(f, payload)  # the pending writer: ctx last
         except OSError:
             pass
 
