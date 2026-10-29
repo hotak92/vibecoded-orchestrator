@@ -66,7 +66,7 @@ in any environment and its tests need no client.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "normalize_reference_targets",
@@ -75,6 +75,7 @@ __all__ = [
     "dedup_ref_targets",
     "add_missing_reference_edges",
     "build_short_name_index",
+    "resolve_call_target",
     "resolve_base_class_targets",
     "NON_PROJECT_BASE_CLASSES",
 ]
@@ -114,6 +115,59 @@ def build_short_name_index(full_names: Iterable[str]) -> Dict[str, List[str]]:
     for full_name in full_names:
         index.setdefault(full_name.rsplit(".", 1)[-1], []).append(full_name)
     return index
+
+
+def resolve_call_target(
+    call_name: str,
+    caller_full_name: str,
+    function_cache: Mapping[str, str],
+    short_name_index: Mapping[str, List[str]],
+    source_by_uuid: Mapping[str, str],
+    caller_source: str = "",
+) -> Optional[str]:
+    """The target function UUID a ``call_name`` resolves to, or ``None``.
+
+    The ONE home for the analyzer's call-name resolution (v0.2.74 R4 moved
+    the two call sites onto it; v0.2.105 moved the body here so the analyzer
+    keeps only a thin seam — its line ratchet). ``function_cache`` is
+    ``full_name -> uuid`` for the canonical rows; ``short_name_index`` is
+    :func:`build_short_name_index` over it; ``source_by_uuid`` is the
+    ``project_source`` each cached row was walked from.
+
+    Resolution order — exact ``full_name`` → unique short name → short name
+    preferring the caller's own module prefix. v0.2.105 (#512C) narrows the
+    short-name candidates to the caller's own ``project_source`` first: a
+    bare ``combine()`` must reach the function in the CALLER's tree, not a
+    same-named stranger an extra code folder's mirror contributed (which is
+    what ``candidates[0]`` used to pick, by cache order). Narrowing is
+    skipped when the caller's root is unknown (legacy rows: pre-fix
+    behaviour) and when no candidate carries it (never lose a real edge).
+    """
+    uuid_ = function_cache.get(call_name)
+    if uuid_ is not None:
+        return uuid_
+    candidates = short_name_index.get(call_name, [])
+    if caller_source and candidates:
+        same_root = [
+            c for c in candidates
+            if source_by_uuid.get(function_cache.get(c, "") or "", "") == caller_source
+        ]
+        if same_root:
+            candidates = same_root
+    if len(candidates) == 1:
+        return function_cache.get(candidates[0])
+    if len(candidates) > 1:
+        module_prefix = (
+            caller_full_name.rsplit(".", 1)[0]
+            if "." in caller_full_name else ""
+        )
+        same_module = [
+            c for c in candidates if c.startswith(module_prefix + ".")
+        ]
+        if same_module:
+            return function_cache.get(same_module[0])
+        return function_cache.get(candidates[0])
+    return None
 
 
 def resolve_base_class_targets(

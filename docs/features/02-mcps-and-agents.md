@@ -101,7 +101,7 @@ Params: `query_type`, `target`, `project`.
 Supported query types:
 - `dependencies` — what a module imports
 - `imports` — who imports a given module (reverse)
-- `callers` — what functions call a given function
+- `callers` — what functions call a given function. The list is scoped to the callee's own source root: when the project's graph also holds an extra code folder's rows, only callers that share the callee's `project_source` are listed (two spellings of the same root — a symlinked root, a different Windows drive-letter case — count as one; rows written before source stamps existed are never hidden by the rule), and a caller in the callee's own class/module (or one confirmed by its resolved `calls` edge) is listed before a bare-name-only match. The answer keeps its usual 50-row cap; the wider background scan that displacement sometimes needs is paid only when the graph really holds another root's rows.
 - `methods` — methods belonging to a class
 - `extends` — inheritance chain for a class
 - `interactions` — cross-service HTTP/gRPC calls from a module
