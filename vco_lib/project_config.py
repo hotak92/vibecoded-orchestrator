@@ -602,6 +602,25 @@ class ProjectConfig:
     #: clients. New hubs paired with old clients have the field
     #: silently ignored.
     rl_server_port: Optional[int] = None
+    #: v0.2.105 (#512A) — the commit the project's PRIMARY code-graph root
+    #: was last analyzed at, straight from
+    #: ``project_codegraph_bindings.last_analyzed_commit``. Read by the
+    #: HEAD-diff catch-up (:mod:`vco_lib.codegraph_head_catchup`) to notice
+    #: code that arrived through a merge / pull / shell commit, none of which
+    #: the Edit hook ever queues. ``None`` on a pre-v0.2.105 hub (additive,
+    #: ``schema_version`` unchanged) and for a project never analyzed.
+    code_graph_last_analyzed_commit: Optional[str] = None
+    #: v0.2.105 fix round — TRUE iff the hub's /config found an ENABLED
+    #: ``project_codegraph_bindings`` row for this project. The fallback
+    #: prefix the hub derives from the project NAME makes
+    #: ``code_graph_collection_prefix`` non-empty even for an unbound
+    #: project, so the HEAD-diff catch-up
+    #: (:mod:`vco_lib.codegraph_head_catchup`) reads THIS field to know
+    #: whether it may run at all: False → skip (never create collections
+    #: for an unbound project, never walk a disabled one). Default False —
+    #: a pre-v0.2.105 hub omits the field and the catch-up stays inert
+    #: until the hub binary catches up.
+    code_graph_bound: bool = False
     #: v0.2.97 (service endpoints SSOT): the code-embedding service URL —
     #: the machine's ``service_endpoints`` row, rendered by the hub like
     #: ``weaviate_url`` / ``ollama_url``. Additive (``schema_version`` is
@@ -1531,6 +1550,26 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             # malformed string) as ``None`` so the MCP falls through to
             # env-resolution / disabled mode.
             rl_server_port=_coerce_optional_port(body.get("rl_server_port")),
+            # v0.2.105 (#512A) additive field — pre-v0.2.105 hubs omit it;
+            # a missing / malformed / empty value reads as "no recorded
+            # commit", which the catch-up treats as the conservative
+            # incremental-walk fallback (never an advanced baseline).
+            code_graph_last_analyzed_commit=(
+                body["code_graph_last_analyzed_commit"]
+                if isinstance(body.get("code_graph_last_analyzed_commit"), str)
+                and body["code_graph_last_analyzed_commit"].strip()
+                else None
+            ),
+            # v0.2.105 fix round: TRUE iff a code-graph binding row exists
+            # AND is enabled. /config serves a name-derived fallback prefix
+            # even for an UNBOUND project, so the prefix alone cannot tell
+            # the HEAD-diff catch-up whether it may run — without this
+            # field it would create collections for an unbound project and
+            # walk it every interval. Default False (conservative: a hub
+            # that omits the field never triggers a walk).
+            code_graph_bound=bool(
+                body.get("code_graph_bound") is True
+            ),
             code_embed_url=str(body.get("code_embed_url") or ""),
             # v0.2.102 W5-A (M3) additive declaration lists.
             external_collections=_str_list(body.get("external_collections")),

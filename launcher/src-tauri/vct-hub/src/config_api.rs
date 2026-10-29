@@ -596,6 +596,34 @@ struct ProjectConfigResponse {
     /// ignores it; an older hub omits it, which the Python parser reads as
     /// unknown.
     code_graph_extra_paths_gone: Option<Vec<String>>,
+    /// v0.2.105 (#512A) — the commit the project's PRIMARY code-graph root
+    /// was last analyzed at (`project_codegraph_bindings.
+    /// last_analyzed_commit`), or `null` when the project was never analyzed
+    /// (no binding row, or a seeded binding that still carries NULL).
+    ///
+    /// Consumer: `vco_lib.codegraph_head_catchup`, spawned detached by the
+    /// Stop hook (`templates/hooks/stop-codegraph-drain.{sh,ps1}`). It
+    /// compares this with the main checkout's HEAD and indexes the
+    /// `git diff --name-only <recorded>..HEAD` files — the code that arrives
+    /// through a merge, a pull or a shell commit, which the per-edit hook
+    /// never queues (field report 2026-10-29: a graph six days / 1,070
+    /// commits behind). The new baseline is recorded through
+    /// `POST /projects/{id}/codegraph/analyzed` (advance-only).
+    ///
+    /// Additive — pre-v0.2.105 clients ignore it and the Python parser
+    /// back-fills `None` for a pre-v0.2.105 hub. `schema_version` stays 1.
+    #[serde(default)]
+    code_graph_last_analyzed_commit: Option<String>,
+    /// v0.2.105 fix round — `true` iff a `project_codegraph_bindings` row
+    /// exists for this project AND its `enabled` flag is on. The prefix
+    /// fallback above makes `code_graph_collection_prefix` non-empty even
+    /// for an UNBOUND project, so the HEAD-diff catch-up reads THIS field
+    /// to decide whether it may run at all: `false` → skip, never create
+    /// collections for an unbound project and never walk a disabled one.
+    /// Additive; a pre-fix hub omits it and the Python parser back-fills
+    /// `false` (the catch-up stays inert until the hub binary catches up).
+    #[serde(default)]
+    code_graph_bound: bool,
 }
 
 /// One enabled extra codegraph path for the resolver response.
@@ -1345,6 +1373,16 @@ async fn project_config(
         unmanaged_containers: infra.unmanaged_containers,
         ssrf_extra_local_ports,
         code_graph_extra_paths_gone,
+        // v0.2.105 (#512A): the primary root's analyzed commit, read from the
+        // SAME binding row that supplied `code_graph_collection_prefix`
+        // above.
+        code_graph_last_analyzed_commit: cg_binding
+            .as_ref()
+            .and_then(|b| b.last_analyzed_commit.clone()),
+        // v0.2.105 fix round: bound = a binding row exists AND is enabled.
+        // The catch-up refuses to run otherwise (it must not create
+        // collections for a project the launcher never bound).
+        code_graph_bound: cg_binding.as_ref().is_some_and(|b| b.enabled),
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -4152,6 +4190,106 @@ kg_tier_full = 0.8
                 "last_indexed_at is a launcher concern, not a resolver-wire field"
             );
         }
+    }
+
+    /// v0.2.105 (#512A): `/config` serves the PRIMARY root's recorded
+    /// `last_analyzed_commit` so the HEAD-diff catch-up can compare it with
+    /// the checkout's HEAD without opening launcher.db.
+    #[tokio::test]
+    async fn config_serves_the_recorded_primary_analyzed_commit() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-catchup", "catchupproj");
+
+        // Never analyzed → the key is PRESENT and null (never absent: a
+        // missing key would read as "old hub" to the Python client).
+        let resp = reqwest::get(format!("{}/projects/p-catchup/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(body.get("code_graph_last_analyzed_commit").is_some(),
+                "the field is always present; body={}", body);
+        assert!(body["code_graph_last_analyzed_commit"].is_null());
+
+        // After a successful catch-up stamps a commit, it is served verbatim.
+        h.0.set_project_codegraph_binding(
+            "p-catchup", "Catchupproj",
+            Some("CodeSage-Large-v2"), Some(2048),
+            Some("0123456789abcdef"), Some(1_700_000_000_000),
+            true, &empty_json_obj(),
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-catchup/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("code_graph_last_analyzed_commit").and_then(|v| v.as_str()),
+            Some("0123456789abcdef"),
+        );
+        // The ?key= single-field filter reaches it too.
+        let resp = reqwest::get(format!(
+            "{}/projects/p-catchup/config?key=code_graph_last_analyzed_commit", base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let one: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(one.get("code_graph_last_analyzed_commit").and_then(|v| v.as_str()),
+                   Some("0123456789abcdef"));
+    }
+
+    /// v0.2.105 fix round (M3): `/config` serves `code_graph_bound` — TRUE
+    /// iff a binding row exists AND is enabled. The name-derived fallback
+    /// prefix makes `code_graph_collection_prefix` non-empty even for an
+    /// UNBOUND project, so the HEAD-diff catch-up needs a field that says
+    /// whether it may run at all (it must never create collections for an
+    /// unbound project, and never walk a disabled binding).
+    #[tokio::test]
+    async fn config_serves_the_code_graph_bound_flag() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-bound", "boundproj");
+
+        // Bound + enabled (what seed_full_project creates) → true.
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert!(body.get("code_graph_bound").is_some(),
+                "the field is always present; body={}", body);
+        assert_eq!(body["code_graph_bound"], serde_json::json!(true));
+
+        // Bound but DISABLED → false (the catch-up respects the binding's
+        // enabled flag).
+        h.0.set_project_codegraph_binding(
+            "p-bound", "Boundproj",
+            None, None, None, None,
+            false, &empty_json_obj(),
+        )
+        .unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(body["code_graph_bound"], serde_json::json!(false));
+
+        // UNBOUND (no binding row at all): false again, while the fallback
+        // prefix is still served — the exact trap this field closes (the
+        // catch-up must not mistake that prefix for permission to walk).
+        h.0.delete_project_codegraph_binding("p-bound").unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(body["code_graph_bound"], serde_json::json!(false));
+        assert!(body["code_graph_collection_prefix"].as_str().is_some_and(|p| !p.is_empty()),
+                "the fallback prefix is served even for an unbound project");
     }
 
     /// Disabled rows are filtered OUT of the resolver response. They

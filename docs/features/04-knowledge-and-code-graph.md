@@ -179,6 +179,24 @@ Why: the orchestrator's PowerShell scripts under `templates/scripts/`, `template
 ### `query_code_graph.py` — structural + semantic queries
 Backend for code graph queries. Subcommands: `search "<concept>"`, `similar "<full_name>"`, `structure dependencies|callers|methods|extends|interactions "<target>"`.
 
+### Keeping the graph current: the end-of-turn drain and the HEAD-diff catch-up
+The code graph is kept current by two mechanisms that run from the `Stop` hook `templates/hooks/stop-codegraph-drain.{sh,ps1}` — never by git hooks inside the user's repository.
+
+**The per-turn drain (v0.2.73).** Every code file written through the Edit/Write tools (or a shell redirect the routing hooks parse) is appended to a per-session queue under `.claude/state/`; at end of turn the drain runs ONE analyzer pass per canonical root over those paths (`--only-files-from`), rate-limited to one run per 120 s and serialised per root by a lock directory. Edits in an ephemeral/unregistered git worktree are dropped (FIX-A'): a lane worktree's throwaway commits must not churn the collection.
+
+**The HEAD-diff catch-up (v0.2.105).** The drain can only index what the Edit hook saw, so code arriving through a `git merge` of a lane branch, a `git pull`, a commit made from a shell or a GUI merge was never indexed — a 2026-10-29 field report found a project's binding still pointing at a commit from six days and 1,070 commits earlier. The same Stop hook therefore also spawns `python -m vco_lib.codegraph_head_catchup`, detached and at most once per 600 s per project (`VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS`):
+
+1. it reads the project's recorded `last_analyzed_commit` and its `code_graph_bound` flag (an ENABLED `project_codegraph_bindings` row exists) from the hub's `/config`; a project that is not bound — or whose binding is disabled — is skipped entirely: the hub serves a name-derived fallback prefix even for an unbound project, and the catch-up must never create collections on an unbound project's behalf;
+2. recorded commit equal to `HEAD` → nothing happens (the leave-alone case);
+3. behind, with the recorded commit an ancestor of HEAD → the files in `git diff --name-only <recorded>..HEAD` are filtered exactly as the drain filters (`vco_lib/codegraph_head_catchup.py` keeps the drain's extension gate, drops `.claude/state` scratch, and indexes existing files only) and analyzed in ONE scoped `--only-files-from` batch. A git diff that FAILS (timeout, git error) is distinct from an empty one: nothing runs and nothing is recorded, so the next eligible catch-up retries the same range instead of silently advancing the baseline over a diff it could not read;
+4. a huge diff (more than 2,000 changed files) **or** a code file deleted in the range → the analyzer's own `--incremental --since-commit <recorded>` walk instead, which also prunes the entities of deleted and renamed files;
+5. the recorded commit is missing or is NOT an ancestor (a rewritten history, an unknown object) → ONE full (non-incremental) analyzer walk, then HEAD is recorded — the converging fallback. (The pre-fix shape ran an `--incremental HEAD~1..HEAD` walk and recorded nothing, so such a project re-walked one commit every 600 s forever while falling further behind; a baseline that cannot be diffed is re-proven, not advanced blind.);
+6. only after a successful run does it record HEAD, through the hub route `POST /api/v1/projects/{id}/codegraph/analyzed` — an advance-only stamp of `last_analyzed_commit` / `last_analyzed_at` that never touches the collection prefix, the embedding model or `config_json`, and never seeds a binding. A failed run records nothing, so the next eligible catch-up retries the same diff.
+
+The catch-up and the drain serialise on the SAME per-root lock, keyed on the repository's canonical (git-resolved) root, so a checkout reached through a symlink cannot run both at once.
+
+Sessions opened in a linked worktree skip the catch-up entirely: worktree edits are dropped from the index on purpose and a worktree HEAD would advance the binding to a commit the main checkout does not have. Every decision is one line in `.claude/logs/codegraph_head_catchup.log`, including the count of code files a diff deleted, so a graph that is not tracking HEAD is visible rather than silent. Deleting the catch-up's throttle stamp (`.claude/state/codegraph_head_catchup.ts`) forces the next Stop to check immediately.
+
 ---
 
 ## Embeddings

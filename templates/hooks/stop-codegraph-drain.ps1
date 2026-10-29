@@ -148,6 +148,56 @@ if (Test-Path -LiteralPath $stateDir -PathType Container) {
     }
 }
 
+# --- HEAD-DIFF CATCH-UP: commits, merges and pulls on the main checkout ---
+# MUST MATCH the .sh block of the same name (v0.2.105 #512A). The queue above
+# only ever holds files the EDIT hook saw; code that arrives through a
+# `git merge`, a `git pull`, a shell commit or a GUI merge is never queued. At
+# most once per VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS (default 600),
+# spawn `python -m vco_lib.codegraph_head_catchup` DETACHED: it compares the
+# binding's last_analyzed_commit (hub /config) with the main checkout's HEAD
+# and, when that commit is an ANCESTOR, indexes exactly
+# `git diff --name-only <recorded>..HEAD` (existing code files only); an
+# enormous diff or a deleted code file goes to the analyzer's incremental walk
+# instead, and a non-ancestor / missing baseline takes ONE full
+# (non-incremental) walk, then records HEAD -- the converging fallback. A
+# project with no ENABLED code-graph binding is skipped entirely. On success it records HEAD through the hub route
+# /projects/{id}/codegraph/analyzed -- never by opening launcher.db. Runs
+# whether or not the turn queued anything, and installs NO git hook.
+# Log: .claude/logs/codegraph_head_catchup.log.
+$catchupInterval = 600
+if ($env:VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS -match '^\d+$') {
+    $catchupInterval = [int]$env:VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS
+}
+if (Test-Path -LiteralPath $stateDir -PathType Container) {
+    $catchupTsFile = Join-Path $stateDir "codegraph_head_catchup.ts"
+    $catchupNow = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $catchupLast = 0
+    if (Test-Path -LiteralPath $catchupTsFile) {
+        try {
+            $rawTs = (Get-Content -LiteralPath $catchupTsFile -Raw -ErrorAction Stop).Trim()
+            if ($rawTs -match '^\d+$') { $catchupLast = [long]$rawTs }
+        } catch { }
+    }
+    # A stamp in the FUTURE is not a recent check (R20 L1; MUST MATCH the .sh
+    # sibling's clamp).
+    if ($catchupLast -gt $catchupNow) { $catchupLast = 0 }
+    if ($catchupLast -eq 0 -or (($catchupNow - $catchupLast) -ge $catchupInterval)) {
+        Set-Content -LiteralPath $catchupTsFile -Value "$catchupNow" -NoNewline -ErrorAction SilentlyContinue
+        if ((Resolve-DrainRuntime) -eq 0) {
+            $catchupLogDir = Join-Path (Join-Path $ProjectRoot ".claude") "logs"
+            try { New-Item -ItemType Directory -Path $catchupLogDir -Force -ErrorAction Stop | Out-Null } catch { }
+            $catchupLog = Join-Path $catchupLogDir "codegraph_head_catchup.log"
+            $qc = { param($v) "'" + ($v -replace "'","''") + "'" }
+            # PowerShell single quotes are LITERAL ('' escapes a quote), so
+            # paths with $ or backticks cannot re-parse here -- the .sh
+            # sibling's NB-H5 class does not exist on this surface.
+            $catchupInner = "& " + (& $qc $script:python) + " -m vco_lib.codegraph_head_catchup --project-root " + (& $qc $ProjectRoot) +
+                " --analyzer " + (& $qc $script:analyzer) + " --state-dir " + (& $qc $stateDir) + " *>> " + (& $qc $catchupLog)
+            Start-VcoDetachedPwsh -Command $catchupInner -PowerShellExe $PsExe
+        }
+    }
+}
+
 # --- EXTRA EDIT QUEUES: drain on Stop (v0.2.102 S16-7) ---
 # MUST MATCH the .sh block of the same name: route-touched-path queues a code
 # edit under an ENABLED extra path to codegraph_drain_extra_<md5>_<sid>.txt
@@ -233,7 +283,7 @@ if ($runtimeRc -ne 0) {
     exit 0
 }
 
-$codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+$codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
 
 function Resolve-DrainProject {
     param([string]$Root)

@@ -951,6 +951,42 @@ class ResolveCodeEmbedUrlTest(_ResolverTestBase):
         self.assertEqual(cfg.code_embed_url, "")
 
 
+# ─── v0.2.105 fix round: the code-graph BOUND flag ──────────────────────
+
+
+class ResolveCodeGraphBoundTest(_ResolverTestBase):
+    """``code_graph_bound`` — TRUE iff the hub found an ENABLED
+    ``project_codegraph_bindings`` row.
+
+    The hub serves a name-derived fallback prefix even for an UNBOUND
+    project, so ``code_graph_collection_prefix`` alone cannot tell the
+    HEAD-diff catch-up whether it may run; this field is that permission.
+    The back-fill for a hub that omits it is deliberately FALSE
+    (conservative): the catch-up stays inert rather than creating
+    collections for a project whose binding state is unknown.
+    """
+
+    def test_resolve_propagates_the_bound_flag(self) -> None:
+        body = {**FULL_BODY, "code_graph_bound": True}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertIs(cfg.code_graph_bound, True)
+
+    def test_resolve_back_fills_false_when_hub_omits_it(self) -> None:
+        body_old = {k: v for k, v in FULL_BODY.items() if k != "code_graph_bound"}
+        self.session.get.return_value = _make_response(200, body_old)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertIs(cfg.code_graph_bound, False)
+
+    def test_a_non_true_value_reads_as_false(self) -> None:
+        # Defensive: a malformed value never authorizes a walk.
+        for bad in (None, 1, "yes", []):
+            body = {**FULL_BODY, "code_graph_bound": bad}
+            self.session.get.return_value = _make_response(200, body)
+            cfg = resolve(FULL_BODY["project_id"])
+            self.assertIs(cfg.code_graph_bound, False)
+
+
 # ─── v0.2.40 R2: RL Reranker flag exposure ─────────────────────────────
 
 

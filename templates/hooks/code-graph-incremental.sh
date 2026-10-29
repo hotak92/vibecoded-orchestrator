@@ -187,7 +187,7 @@ if [ "$EXTRAS_MATCHED" -eq 0 ] && [ -f "$DETECT_HELPER" ]; then
 fi
 
 # Only process code files
-if [[ ! "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
+if [[ ! "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$ ]]; then
     exit 0
 fi
 
