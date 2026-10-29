@@ -18,6 +18,7 @@ import {
   CODE_FOLDER,
   CODE_FOLDER_DISAMBIG,
   disabledTitle,
+  purgedToast,
   reenabledTitle,
   removeConfirm,
   removedTitle,
@@ -158,5 +159,43 @@ describe('ExtrasDisambiguationModal uses the code-folder wording', () => {
         'CODE_FOLDER_DISAMBIG.hint',
       ]),
     );
+  });
+});
+
+// v0.2.105: the Remove / Disable toast must not claim rows were pruned when
+// the removed-extras purge kept them (no positive knowledge, or a partial
+// purge) — and the panel must route both flows through it.
+describe('purgedToast (v0.2.105)', () => {
+  it('reports the purged count on a clean purge', () => {
+    expect(purgedToast('clone', { purged_rows: 12, purge_note: null })).toBe(
+      'Re-synced; 12 entries from clone removed',
+    );
+  });
+
+  it('says the rows are KEPT when the purge was refused or partial', () => {
+    const msg = purgedToast('clone', {
+      purged_rows: 0,
+      purge_note: 'the hub could not say which code folders were removed',
+    });
+    expect(msg).toContain('kept for now');
+    expect(msg).toContain('could not say');
+    expect(msg).not.toMatch(/pruned/);
+  });
+
+  it('the panel uses it for both the Disable and the Remove toast', () => {
+    const src = readFileSync(
+      fileURLToPath(new URL('./ExtraCodegraphPathsPanel.svelte', import.meta.url)),
+      'utf8',
+    );
+    const ast = parse(src, { modern: true }) as unknown as { instance?: unknown };
+    const nodes: Node[] = [];
+    walk(ast.instance, nodes);
+    const calls = nodes.filter(
+      (n) =>
+        n.type === 'CallExpression' &&
+        (n.callee as Node | undefined)?.type === 'Identifier' &&
+        (n.callee as { name?: string }).name === 'purgedToast',
+    );
+    expect(calls.length).toBe(2);
   });
 });
