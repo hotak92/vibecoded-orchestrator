@@ -13,14 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.claude/.credentials.json` when it refreshes, and for a second or two that file carries an empty token. The model
   gateway was reading it at that exact moment and answering `401 claude_login_unavailable` to every request going
   through it — three minutes of failed turns on 2026-10-28, for a login that was never actually broken. The gateway now
-  keeps the last token it read and goes on using it until that token expires, so a rewrite is invisible. When there is
-  no earlier token to fall back on, it says plainly that this is momentary and to retry in a few seconds, instead of
-  telling you (or a subagent, mid-task) to go and log in — which was advice that could not help. A request that arrives
-  during the rewrite waits at most two seconds for the new token before giving up. A machine that really has no login
-  still gets the "run `claude` to log in" message.
+  keeps the last token it read and goes on using it for up to five minutes after it last saw it (never past the token's
+  own expiry), so a rewrite is invisible. When there is no earlier token to fall back on, it says plainly that this is
+  momentary and to retry in a few seconds, instead of telling you (or a subagent, mid-task) to go and log in — which was
+  advice that could not help. A request that arrives during the rewrite waits at most two seconds for the new token
+  before giving up. A real logout is not mistaken for a rewrite: when the login is removed from the file, or the file
+  can no longer be read because of its permissions, or the token simply expired, the gateway stops using the old token
+  at once and gives the "run `claude` to log in" message straight away, with no wait. Many requests arriving together
+  while the file is being rewritten no longer make the gateway answer with an internal error.
 
 - **A gateway 503 for a vendor key now names the real cause: the background service (vct-hub) is not running.** When
-  that service is down, the gateway cannot reach the keys stored in your OS keychain, so the key was never looked for —
+  that service is down, the gateway cannot reach the keys stored in your OS keychain, so the keychain was never checked —
   but the message used to read like a missing or mis-filed key, and even suggested clearing
   `VCT_MODEL_GATEWAY_SECRET_PROJECT` when that setting had nothing to do with it. It now says the service is not
   reachable, that the key may well still exist, and that starting the service fixes it within seconds with no restart

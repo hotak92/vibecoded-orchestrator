@@ -19,8 +19,8 @@ Freshness without blocking ``/health``
 secret resolver is wedged, so it does no subprocess, no secret resolution and
 no network call. It does need to say whether a Claude login is present, so
 :class:`OAuthReader` caches the PARSED credentials keyed on the file's
-``(mtime_ns, size)``: the steady-state ``/health`` cost is one ``stat``, and a
-CLI refresh invalidates the cache by changing both. The expiry verdict is
+``(mtime_ns, size, ctime_ns)``: the steady-state ``/health`` cost is one
+``stat``, and a CLI refresh (or a ``chmod``) invalidates the cache. The expiry verdict is
 recomputed on every call from the cached expiry, so a token that lapses while
 the file is untouched is still reported as expired.
 
@@ -35,19 +35,24 @@ file during the rewrite window.
 
 So the reader keeps a LAST-KNOWN-GOOD token (the same shape as the vendor
 key resolver's serve-stale store, and for the same reason) and serves it while
-its own expiry has not passed. That is strictly safer than the alternative:
-the token the gateway was about to forward is one the file itself carried a
-moment earlier. It also keeps the cache invalidation honest, because a parse
-that FAILS never erases a token that was parsed successfully.
+its own expiry has not passed AND it was last seen in the file within
+``_RECENT_LOGIN_MS`` (five minutes). The token the gateway forwards is one the
+file itself carried a moment earlier; a file that stays token-less past that
+bound is a login that went away, and its bearer stops being forwarded. A
+parse that FAILS never erases a token that was parsed successfully. A file
+that states a logout — valid JSON with the OAuth section removed — or that
+refuses this process (a permission error) is never read as a rewrite.
 
 Two consequences fall out of that store, and both are promises about the 401
 a user or a subagent reads:
 
-* while a last-known-good token is unexpired, there is no 401 at all;
-* when there is none, a failure that follows a token seen minutes ago (or a
-  file whose own ``expiresAt`` has not passed) is reported as TRANSIENT — a
-  CLI is rewriting the login, retry shortly — and never as "run ``claude``
-  to log in", which would send a subagent on an errand that fixes nothing.
+* while a recent last-known-good token is unexpired, there is no 401 at all;
+* when there is none, a mid-rewrite failure that follows a token seen minutes
+  ago (or a file whose own ``expiresAt`` has not passed) is reported as
+  TRANSIENT — a CLI is rewriting the login, retry shortly — and never as "run
+  ``claude`` to log in", which would send a subagent on an errand that fixes
+  nothing. A token that simply EXPIRED is not transient: it gets the login
+  message at once, with no wait.
 
 The one bounded wait (:meth:`OAuthReader.aread_with_brief_wait`) exists for
 the same reason and is deliberately NOT used by ``/health``.
@@ -62,6 +67,7 @@ import logging
 import os
 import secrets
 import stat
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -132,27 +138,79 @@ class OAuthState:
         return self.token is not None
 
 
+#: How a token-less read relates to a credentials file a CLI may be rewriting.
+#: Returned by :meth:`OAuthReader._read_file` as its third element.
+#:
+#: * ``_MID_REWRITE`` — the file is THERE and a re-parse found no usable token
+#:   in it (blank token, half-written JSON, a transient read error): the
+#:   2026-10-28 rewrite signature. A recently seen last-known-good token may
+#:   answer, and the failure is reported as transient.
+#: * ``_GAP`` — the file is GONE. A logout, or a CLI that unlinks before it
+#:   writes: no token is resurrected from a file that no longer exists, but a
+#:   login seen minutes ago still makes the bounded re-read worth one try.
+#: * ``_DEFINITE`` — the file states a fact no rewrite produces: the token
+#:   expired, the OAuth section was REMOVED (what a logout writes), or the
+#:   file's permissions refuse this process. Nothing is served and nothing is
+#:   called transient.
+_MID_REWRITE = "mid_rewrite"
+_GAP = "gap"
+_DEFINITE = "definite"
+
+
+@dataclass(frozen=True)
+class _ParsedFile:
+    """One parse of the credentials file, keyed on its ``(mtime_ns, size,
+    ctime_ns)`` — the ctime so a ``chmod`` (which changes neither of the
+    others) is re-checked rather than answered from a parse made while the
+    file was still readable.
+
+    Immutable and published with ONE attribute assignment: a reader on another
+    thread sees either the previous parse or this one, never a half-updated
+    mixture (v0.2.105 fix round — the off-loop :meth:`OAuthReader.
+    aread_with_brief_wait` made concurrent readers real, and a stamp stored
+    before its parse let one of them reach the "parsed" branch with nothing
+    parsed).
+    """
+
+    stamp: "tuple[int, int, int]"
+    #: ``(token, expires_ms)`` when the parse found a token, else ``None``.
+    parsed: "tuple[str, int] | None"
+    #: ``(state, message)`` when it did not.
+    problem: "tuple[str, str] | None"
+    #: The ``expiresAt`` the parse saw, even when it found no token. Kept
+    #: beside the problem so the "a login is being rewritten" verdict does not
+    #: evaporate on the next (unchanged-file) call — a cold start during a
+    #: rewrite has no last-known-good token to fall back on, and that is
+    #: exactly when this matters.
+    expiry_ms: int
+    #: The file is valid JSON WITHOUT an OAuth section — what a logout leaves
+    #: behind. A rewrite writes the section (with a blank token, in the
+    #: incident), so this one is never read as a rewrite.
+    section_removed: bool
+
+
 class OAuthReader:
-    """Cached reader for the Claude CLI credentials file."""
+    """Cached reader for the Claude CLI credentials file.
+
+    Thread-safe: the request path runs :meth:`read_with_brief_wait` on a worker
+    thread while every other caller uses :meth:`read` on the event loop, so
+    each :meth:`read` holds :attr:`_lock` for its whole stat-parse-decide
+    sequence. The lock is never held across the bounded wait's sleeps, and the
+    critical section is one ``stat`` plus, on a change, one small file read.
+    """
 
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._stamp: tuple[int, int] | None = None
-        self._parsed: tuple[str, int] | None = None
-        self._parse_problem: tuple[str, str] | None = None
-        #: The ``expiresAt`` the last parse saw, even when that parse found no
-        #: token. Cached beside the problem so the "a login is being
-        #: rewritten" verdict does not evaporate on the next (unchanged-file)
-        #: call — a cold start during a rewrite has no last-known-good token
-        #: to fall back on, and that is exactly when this matters.
-        self._parse_expiry_ms = 0
+        self._lock = threading.RLock()
+        self._file: _ParsedFile | None = None
         #: Success-only store: the last token this reader actually PARSED, so
         #: a rewrite that momentarily empties the file cannot erase it. Only
         #: a successful parse writes here — the same rule as the vendor key
         #: resolver's last-known-good cache, for the same reason.
         self._last_good: tuple[str, int] | None = None
-        #: When a good token was last SEEN. Drives the "was the login present
-        #: minutes ago?" half of the transient verdict.
+        #: When a good token was last SEEN. Bounds BOTH the last-known-good
+        #: service and the "was the login present minutes ago?" half of the
+        #: transient verdict to :data:`_RECENT_LOGIN_MS`.
         self._last_good_seen_ms: Optional[int] = None
         #: Edge-trigger for the "serving the last-known-good login" line: one
         #: per transition, not one per request.
@@ -165,24 +223,29 @@ class OAuthReader:
     def read(self, *, now_ms: Optional[int] = None) -> OAuthState:
         """Current OAuth state. One ``stat``; a full read only on change.
 
-        Serves the last-known-good token when a re-parse finds none and that
-        token has not expired (the 2026-10-28 rewrite window), and reports a
-        token-less read that follows a good one as TRANSIENT rather than as a
-        logout. Never waits: a caller that wants the bounded re-read asks for
+        Serves the last-known-good token when a re-parse finds none in a file
+        that is mid-rewrite, while that token is unexpired AND was seen within
+        :data:`_RECENT_LOGIN_MS`; reports a token-less read that follows a
+        good one as TRANSIENT rather than as a logout. An expired token, a
+        removed OAuth section and a permission refusal are never transient.
+        Never waits: a caller that wants the bounded re-read asks for
         :meth:`read_with_brief_wait` explicitly, and ``/health`` never does.
         """
         now = int(time.time() * 1000) if now_ms is None else now_ms
-        state, detail, rewritable = self._read_file(now)
-        if state.token is not None:
-            self._remember_good(state, now)
+        with self._lock:
+            state, detail, kind = self._read_file(now)
+            if state.token is not None:
+                self._remember_good(state, now)
+                return state
+            if kind == _MID_REWRITE:
+                last_good = self._serve_last_good(now)
+                if last_good is not None:
+                    return last_good
+            if kind != _DEFINITE and (
+                state.retry_soon or self._login_seen_recently(now)
+            ):
+                return self._transient_state(state, detail)
             return state
-        if rewritable:
-            last_good = self._serve_last_good(now)
-            if last_good is not None:
-                return last_good
-        if state.retry_soon or self._login_seen_recently(now):
-            return self._transient_state(state, detail)
-        return state
 
     def read_with_brief_wait(self, *, now_ms: Optional[int] = None) -> OAuthState:
         """:meth:`read`, plus ONE bounded re-read while a CLI is rewriting.
@@ -214,21 +277,13 @@ class OAuthReader:
         """
         return await asyncio.to_thread(self.read_with_brief_wait, now_ms=now_ms)
 
-    def _read_file(self, now: int) -> "tuple[OAuthState, str, bool]":
+    def _read_file(self, now: int) -> "tuple[OAuthState, str, str]":
         """One stat-driven read, plus the phrase describing a failure.
 
         The phrase is returned rather than re-derived from the message: the
         transient rewrite (below) must describe the SAME failure without
-        quoting the login hint.
-
-        The third element answers "may a last-known-good token answer this?".
-        True only when the file is THERE and a re-parse found no usable token
-        in it — the 2026-10-28 rewrite signature. A file that is GONE is a
-        different observation (a logout, or a
-        CLI that unlinks before it writes): the reader keeps reporting it as
-        absent rather than resurrecting a token from a file that no longer
-        exists, and the bounded re-read covers the millisecond-wide version
-        of that gap instead.
+        quoting the login hint. The third element is one of
+        :data:`_MID_REWRITE` / :data:`_GAP` / :data:`_DEFINITE` (see there).
         """
         try:
             st = os.stat(self._path)
@@ -245,66 +300,24 @@ class OAuthReader:
                     "absent",
                 ),
                 "the credentials file does not exist right now",
-                False,
+                _GAP,
             )
         except OSError as exc:
             self._invalidate()
-            return (
-                OAuthState(
-                    None,
-                    0,
-                    (
-                        f"cannot read the Claude credentials file {self._path} "
-                        f"({exc}). {_LOGIN_HINT}"
-                    ),
-                    "unreadable",
-                ),
-                f"the credentials file cannot be read right now ({exc})",
-                True,
-            )
+            return self._unreadable(exc)
 
-        stamp = (st.st_mtime_ns, st.st_size)
-        if stamp != self._stamp:
-            self._stamp = stamp
-            self._parsed = None
-            self._parse_problem = None
-            #: The file's own expiry, kept beside a parse problem: a section
-            #: that still says "this login runs until T" is evidence of a
-            #: login being REWRITTEN, not of a logout, even when the token
-            #: field is blank.
-            self._parse_expiry_ms = 0
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ctime_ns)
+        cached = self._file
+        if cached is None or cached.stamp != stamp:
             try:
-                raw = self._path.read_text(encoding="utf-8")
-                section = json.loads(raw).get(_OAUTH_SECTION) or {}
-            except (OSError, ValueError, AttributeError) as exc:
-                self._parse_problem = (
-                    "unreadable",
-                    (
-                        f"the Claude credentials file {self._path} is not "
-                        f"readable JSON ({exc}). {_LOGIN_HINT}"
-                    ),
-                )
-            else:
-                token = section.get("accessToken") or ""
-                expires = section.get("expiresAt") or 0
-                try:
-                    expires_int = int(expires)
-                except (TypeError, ValueError):
-                    expires_int = 0
-                if not isinstance(token, str) or not token:
-                    self._parse_expiry_ms = expires_int
-                    self._parse_problem = (
-                        "absent",
-                        (
-                            f"the Claude credentials file {self._path} has no "
-                            f"access token. {_LOGIN_HINT}"
-                        ),
-                    )
-                else:
-                    self._parsed = (token, expires_int)
+                cached = self._parse(stamp)
+            except PermissionError as exc:
+                self._invalidate()
+                return self._unreadable(exc)
+            self._file = cached
 
-        if self._parse_problem is not None:
-            state, message = self._parse_problem
+        if cached.problem is not None:
+            state, message = cached.problem
             detail = (
                 "the credentials file cannot be read as JSON right now"
                 if state == "unreadable"
@@ -313,20 +326,23 @@ class OAuthReader:
             return (
                 OAuthState(
                     None,
-                    self._parse_expiry_ms,
+                    cached.expiry_ms,
                     message,
                     state,
                     # A blank token beside an expiry that has NOT passed is
                     # the rewrite signature seen live on 2026-10-28.
                     retry_soon=bool(
-                        self._parse_expiry_ms and now <= self._parse_expiry_ms
+                        not cached.section_removed
+                        and cached.expiry_ms
+                        and now <= cached.expiry_ms
                     ),
                 ),
                 detail,
-                True,
+                _DEFINITE if cached.section_removed else _MID_REWRITE,
             )
-        assert self._parsed is not None  # noqa: S101 — invariant of the branch above
-        token, expires_ms = self._parsed
+        if cached.parsed is None:  # pragma: no cover — _parse sets one of the two
+            raise RuntimeError("credentials parse produced neither a token nor a problem")
+        token, expires_ms = cached.parsed
         if expires_ms and now > expires_ms:
             return (
                 OAuthState(
@@ -338,9 +354,87 @@ class OAuthReader:
                     "expired",
                 ),
                 "the login token in the credentials file has expired",
-                False,
+                _DEFINITE,
             )
-        return OAuthState(token, expires_ms, None, "present"), "", False
+        return OAuthState(token, expires_ms, None, "present"), "", _DEFINITE
+
+    def _parse(self, stamp: "tuple[int, int, int]") -> _ParsedFile:
+        """Parse the file once. Raises ``PermissionError`` (a definite
+        refusal, never a rewrite); every other read error is a problem."""
+        try:
+            raw = self._path.read_text(encoding="utf-8")
+        except PermissionError:
+            raise
+        except OSError as exc:
+            return self._problem(stamp, exc)
+        try:
+            doc = json.loads(raw)
+            section_present = isinstance(doc, dict) and _OAUTH_SECTION in doc
+            section = doc.get(_OAUTH_SECTION) or {}
+        except (ValueError, AttributeError) as exc:
+            return self._problem(stamp, exc)
+        if not isinstance(section, dict):
+            section = {}
+        token = section.get("accessToken") or ""
+        expires = section.get("expiresAt") or 0
+        try:
+            expires_int = int(expires)
+        except (TypeError, ValueError):
+            expires_int = 0
+        if not isinstance(token, str) or not token:
+            return _ParsedFile(
+                stamp=stamp,
+                parsed=None,
+                problem=(
+                    "absent",
+                    (
+                        f"the Claude credentials file {self._path} has no "
+                        f"access token. {_LOGIN_HINT}"
+                    ),
+                ),
+                expiry_ms=expires_int,
+                section_removed=not section_present,
+            )
+        return _ParsedFile(
+            stamp=stamp,
+            parsed=(token, expires_int),
+            problem=None,
+            expiry_ms=expires_int,
+            section_removed=False,
+        )
+
+    def _problem(self, stamp: "tuple[int, int, int]", exc: BaseException) -> _ParsedFile:
+        return _ParsedFile(
+            stamp=stamp,
+            parsed=None,
+            problem=(
+                "unreadable",
+                (
+                    f"the Claude credentials file {self._path} is not "
+                    f"readable JSON ({exc}). {_LOGIN_HINT}"
+                ),
+            ),
+            expiry_ms=0,
+            section_removed=False,
+        )
+
+    def _unreadable(self, exc: OSError) -> "tuple[OAuthState, str, str]":
+        """A ``stat``/read error. A PERMISSION refusal is a definite state
+        (someone changed the file's mode; no CLI rewrite does that); any other
+        OS error may be the rewrite window."""
+        return (
+            OAuthState(
+                None,
+                0,
+                (
+                    f"cannot read the Claude credentials file {self._path} "
+                    f"({exc}). {_LOGIN_HINT}"
+                ),
+                "unreadable",
+            ),
+            f"the credentials file cannot be read right now ({exc})",
+            _DEFINITE if isinstance(exc, PermissionError) else _MID_REWRITE,
+        )
 
     def _remember_good(self, state: OAuthState, now: int) -> None:
         """Record a PARSED token as the last-known-good one."""
@@ -349,15 +443,19 @@ class OAuthReader:
         self._last_good_logged = False
 
     def _serve_last_good(self, now: int) -> Optional[OAuthState]:
-        """The last parsed token, while its own expiry has not passed.
+        """The last parsed token, while it is unexpired and RECENT.
 
-        Deliberately NOT limited to "seen within the last few minutes": a
-        token the file carried is a real token until it expires, and answering
-        401 with an unexpired one is the failure this store exists to prevent.
-        An EXPIRED last-good token is never served.
+        Bounded by :data:`_RECENT_LOGIN_MS` since the token was last seen in
+        the file (v0.2.105 fix round): the store bridges a CLI's rewrite
+        window — 3 min 20 s in the 2026-10-28 incident — and nothing longer.
+        A file that stays token-less past that bound is a login that went
+        away (a logout, an account switch), and the gateway must stop
+        forwarding the old account's bearer. A cold start during a rewrite
+        has no store at all; the file's own unexpired ``expiresAt`` drives
+        the transient verdict there. An EXPIRED token is never served.
         """
         good = self._last_good
-        if good is None:
+        if good is None or not self._login_seen_recently(now):
             return None
         token, expires_ms = good
         if not token or (expires_ms and now > expires_ms):
@@ -367,8 +465,9 @@ class OAuthReader:
             logger.info(
                 "model-gateway: the Claude credentials file briefly carries no "
                 "usable token (a CLI is rewriting it); serving the "
-                "last-known-good login until it expires (expires_at_ms=%s). "
-                "No token value is logged.",
+                "last-known-good login for at most %ds after it was last seen "
+                "(expires_at_ms=%s). No token value is logged.",
+                _RECENT_LOGIN_MS // 1000,
                 expires_ms or "unset",
             )
         return OAuthState(
@@ -384,7 +483,9 @@ class OAuthReader:
 
         Never names a login command: the 2026-10-28 defect was that a
         subagent, mid-task, was told to go run ``claude`` for a file a CLI
-        was already rewriting.
+        was already rewriting. Reached only for a file that is mid-rewrite or
+        momentarily gone — never for an expired token, a removed OAuth
+        section or a permission refusal.
         """
         return OAuthState(
             None,
@@ -408,10 +509,7 @@ class OAuthReader:
         a token the login still owns because of it is what produced the
         2026-10-28 401s.
         """
-        self._stamp = None
-        self._parsed = None
-        self._parse_problem = None
-        self._parse_expiry_ms = 0
+        self._file = None
 
 
 def ensure_host_token(path: Path) -> str:

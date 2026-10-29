@@ -24,6 +24,7 @@ side:
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import time
@@ -195,6 +196,173 @@ class BoundedWaitTests(_TmpCase):
         self.assertIsNone(state.token)
         self.assertTrue(state.retry_soon)
         self.assertLess(elapsed, 2.0, "the wait must stay bounded")
+
+
+class ConcurrentReadersTests(_TmpCase):
+    """Fix round 1 (H1): the request path reads OFF the loop
+    (:meth:`OAuthReader.aread_with_brief_wait`) while ``/health`` and the
+    other routes read ON it. A reader that arrives while another is mid-parse
+    must get an answer, never an internal error (a 500 is a chat failure)."""
+
+    def test_a_read_that_interleaves_a_parse_gets_the_token(self) -> None:
+        """The reviewer's repro: a second ``read()`` runs while the first is
+        inside the file read (the point where the GIL is released)."""
+        self._write(FAKE_OAUTH)
+        reader = auth.OAuthReader(self.path)
+        original = Path.read_text
+        inner: dict[str, object] = {}
+
+        def interleaving_read_text(path_self, *args, **kwargs):
+            Path.read_text = original  # type: ignore[method-assign]
+            try:
+                inner["state"] = reader.read()
+            except BaseException as exc:  # noqa: BLE001 — the defect under test
+                inner["error"] = exc
+            return original(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", interleaving_read_text):
+            outer = reader.read()
+        self.assertNotIn("error", inner, inner.get("error"))
+        self.assertEqual(getattr(inner["state"], "token", None), FAKE_OAUTH)
+        self.assertEqual(outer.token, FAKE_OAUTH)
+
+    def test_a_reader_on_another_thread_waits_for_the_parse(self) -> None:
+        self._write(FAKE_OAUTH)
+        reader = auth.OAuthReader(self.path)
+        original = Path.read_text
+        entered = threading.Event()
+        release = threading.Event()
+        parsing_thread: dict[str, int] = {}
+
+        def slow_read_text(path_self, *args, **kwargs):
+            if threading.get_ident() == parsing_thread.get("id"):
+                entered.set()
+                release.wait(5)
+            return original(path_self, *args, **kwargs)
+
+        results: dict[str, object] = {}
+
+        def run(name: str) -> None:
+            if name == "parser":
+                parsing_thread["id"] = threading.get_ident()
+            try:
+                results[name] = reader.read()
+            except BaseException as exc:  # noqa: BLE001 — the defect under test
+                results[name] = exc
+
+        with mock.patch.object(Path, "read_text", slow_read_text):
+            parser = threading.Thread(target=run, args=("parser",))
+            parser.start()
+            self.assertTrue(entered.wait(5), "the parse never started")
+            other = threading.Thread(target=run, args=("loop",))
+            other.start()
+            other.join(0.3)
+            release.set()
+            parser.join(5)
+            other.join(5)
+        for name in ("parser", "loop"):
+            got = results.get(name)
+            self.assertIsInstance(got, auth.OAuthState, f"{name}: {got!r}")
+            self.assertEqual(getattr(got, "token", None), FAKE_OAUTH, name)
+
+
+class LastGoodIsBoundedTests(_TmpCase):
+    """Fix round 1 (H3): the last-known-good store bridges a REWRITE window,
+    never a logout. Act side: a blank token minutes after a good read is
+    still served (``LastKnownGoodTests``). Leave-alone sides below."""
+
+    def _seen_then(self, now_ms: int) -> auth.OAuthReader:
+        self._write(FAKE_OAUTH, expires_in_ms=8 * 3_600_000)
+        reader = auth.OAuthReader(self.path)
+        self.assertEqual(reader.read(now_ms=now_ms).token, FAKE_OAUTH)
+        return reader
+
+    def test_a_removed_oauth_section_is_a_logout_not_a_rewrite(self) -> None:
+        now = int(time.time() * 1000)
+        reader = self._seen_then(now)
+        self._write_raw(json.dumps({"other": 1}))  # what a logout leaves
+        state = reader.read(now_ms=now + 1_000)
+        self.assertIsNone(state.token)
+        self.assertFalse(state.from_last_good)
+        self.assertFalse(state.retry_soon)
+        self.assertIn("`claude`", state.problem or "")
+
+    def test_a_blank_token_long_after_the_last_good_read_is_not_served(self) -> None:
+        now = int(time.time() * 1000)
+        reader = self._seen_then(now)
+        self._write(None, expires_in_ms=8 * 3_600_000)
+        state = reader.read(now_ms=now + 3 * 3_600_000)
+        self.assertIsNone(state.token)
+        self.assertFalse(state.from_last_good)
+
+    def test_the_bound_is_the_recent_login_window(self) -> None:
+        now = int(time.time() * 1000)
+        reader = self._seen_then(now)
+        self._write(None, expires_in_ms=8 * 3_600_000)
+        inside = reader.read(now_ms=now + auth._RECENT_LOGIN_MS)
+        self.assertEqual(inside.token, FAKE_OAUTH)
+        outside = reader.read(now_ms=now + auth._RECENT_LOGIN_MS + 1)
+        self.assertIsNone(outside.token)
+
+    def test_half_written_json_long_after_is_not_served(self) -> None:
+        now = int(time.time() * 1000)
+        reader = self._seen_then(now)
+        self._write_raw("{not json")
+        state = reader.read(now_ms=now + 6 * 60 * 1000)
+        self.assertIsNone(state.token)
+        self.assertFalse(state.retry_soon)
+        self.assertIn("`claude`", state.problem or "")
+
+    @unittest.skipIf(
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        "needs POSIX permissions enforced on this user",
+    )
+    def test_a_permission_refusal_is_never_served_from_the_store(self) -> None:
+        now = int(time.time() * 1000)
+        reader = self._seen_then(now)
+        self.path.chmod(0)
+        self.addCleanup(self.path.chmod, 0o600)
+        state = reader.read(now_ms=now + 1_000)
+        self.assertIsNone(state.token)
+        self.assertEqual(state.state, "unreadable")
+        self.assertFalse(state.retry_soon)
+        self.assertIn("`claude`", state.problem or "")
+
+
+class ExpiredIsNotTransientTests(_TmpCase):
+    """Fix round 1 (M1): a token that lapsed on its own is not a rewrite."""
+
+    def test_an_expired_token_seen_minutes_ago_gets_the_login_message(self) -> None:
+        now = int(time.time() * 1000)
+        self._write(FAKE_OAUTH, expires_in_ms=1_000)
+        reader = auth.OAuthReader(self.path)
+        self.assertEqual(reader.read(now_ms=now).token, FAKE_OAUTH)
+        state = reader.read(now_ms=now + 60_000)
+        self.assertEqual(state.state, "expired")
+        self.assertFalse(state.retry_soon)
+        self.assertIn("`claude`", state.problem or "")
+        self.assertNotIn("TRANSIENT", state.problem or "")
+
+    def test_an_expired_token_does_not_take_the_bounded_wait(self) -> None:
+        now = int(time.time() * 1000)
+        self._write(FAKE_OAUTH, expires_in_ms=1_000)
+        reader = auth.OAuthReader(self.path)
+        reader.read(now_ms=now)
+        started = time.monotonic()
+        state = reader.read_with_brief_wait(now_ms=now + 60_000)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertEqual(state.state, "expired")
+
+    def test_a_blank_token_minutes_after_a_good_read_stays_transient(self) -> None:
+        """Leave-alone: the rewrite shape keeps its transient verdict."""
+        now = int(time.time() * 1000)
+        self._write(FAKE_OAUTH, expires_in_ms=1_000)
+        reader = auth.OAuthReader(self.path)
+        reader.read(now_ms=now)
+        self._write_raw(json.dumps({"claudeAiOauth": {"accessToken": ""}}))
+        state = reader.read(now_ms=now + 60_000)
+        self.assertTrue(state.retry_soon)
+        self.assertIn("TRANSIENT", state.problem or "")
 
 
 class GatewaySurvivesTheRewriteWindowTests(GatewayTestBase):
