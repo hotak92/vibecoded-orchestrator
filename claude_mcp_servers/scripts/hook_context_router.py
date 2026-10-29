@@ -101,6 +101,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -1313,7 +1314,7 @@ def _emit_agent_suggestions_only(payload: Dict, suggest_text: str) -> int:
     append to — the router never synthesizes one)."""
     tool_input = payload.get("tool_input") or {}
     if suggest_text.strip() and "prompt" in tool_input:
-        print(_emit_agent(tool_input, str(tool_input.get("prompt") or ""), "",
+        _emit(_emit_agent(tool_input, str(tool_input.get("prompt") or ""), "",
                           suggest_text))
     return 0
 
@@ -1340,6 +1341,16 @@ def _block_titles(text: str) -> List[str]:
 #: calls ``main()`` in-process) can never change ``citation_pending``'s
 #: behaviour for anyone else.
 _CURRENT_RUN_ID = ""
+
+#: v0.2.105: run id → the pending-citation files THIS process staged under
+#: it (recorded by the staged-ctx wrapper below). :func:`_amend_pending_citations`
+#: amends exactly these and never lists the ``rl_pending`` directory: that
+#: directory is shared by every chat of the project and holds one 1-8 MB
+#: ctx per retrieval until the Stop drain scores it — 4 800 files / 7 GB
+#: were measured on a busy project, a ~90 s read in the hook's main thread
+#: AFTER the leg deadline, which is what timed out most injection hooks.
+#: The append comes from a leg's worker thread (list.append is atomic).
+_STAGED_BY_RUN: Dict[str, List[str]] = {}
 
 
 def _install_staged_ctx_run_id_wrapper() -> None:
@@ -1377,7 +1388,10 @@ def _install_staged_ctx_run_id_wrapper() -> None:
         ctx = dict(ctx) if isinstance(ctx, dict) else {}
         ctx["router_run_id"] = rid
         kwargs["ctx"] = ctx
-        return _original(**kwargs)
+        staged = _original(**kwargs)
+        if staged:
+            _STAGED_BY_RUN.setdefault(rid, []).append(str(staged))
+        return staged
 
     _stage_with_run_id._vco_router_run_stamped = True  # type: ignore[attr-defined]
     _cp.stage_pending = _stage_with_run_id
@@ -1385,7 +1399,8 @@ def _install_staged_ctx_run_id_wrapper() -> None:
 
 def _amend_pending_citations(project_root: str, sid: str,
                              suppressed_titles: List[str],
-                             run_id: str) -> None:
+                             run_id: str,
+                             staged: Optional[List[Path]] = None) -> None:
     """Drop never-shown nodes from the pending citation ctx this run staged.
 
     W3R-10 (v0.2.102): the RL retrieval event + the citation pending file
@@ -1404,16 +1419,22 @@ def _amend_pending_citations(project_root: str, sid: str,
     AND whose payload ``session_id`` matches are touched — earlier runs'
     files, unstamped files and sibling concurrent routers' files (same
     session, their own run id) own their own ctx.
+
+    Candidates (v0.2.105): ``staged`` — default: the files this process's
+    staged-ctx wrapper recorded for ``run_id`` (:data:`_STAGED_BY_RUN`).
+    The shared ``rl_pending`` directory is never listed or scanned: the
+    cost of this step is the handful of files the run itself wrote, not
+    the size of every chat's unscored backlog. The stamp + session checks
+    above still apply to every candidate.
     """
     if not suppressed_titles or not sid or sid == "default" or not project_root:
         return
     if not run_id:
         return
     supp = set(suppressed_titles)
-    try:
-        d = Path(project_root) / ".claude" / "state" / "rl_pending"
-        files = list(d.glob("*.json"))
-    except OSError:
+    files = [Path(p) for p in (list(_STAGED_BY_RUN.get(run_id, ()))
+                               if staged is None else staged)]
+    if not files:
         return
     from vco_lib.atomic import atomic_write_json
 
@@ -1597,6 +1618,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[hook_context_router] soft-fail: {exc!r}", file=sys.stderr)
         return 0
     finally:
+        _STAGED_BY_RUN.pop(_CURRENT_RUN_ID, None)
         _CURRENT_RUN_ID = ""
 
 
@@ -1635,7 +1657,7 @@ def _emit_prompt_nudge(payload: Dict, sid: str, project_root: str,
     budget_path = budget_state_path(sid, prompt_id, project_root)
     if _budget_used(budget_path) + len(text) > turn_cap:
         text = text.split("\n", 1)[0]
-    print(text)
+    _emit(text)
     _budget_charge(budget_path, len(text) + 1)
 
 
@@ -1682,6 +1704,12 @@ def _hard_exit_if_legs_abandoned(rc: int) -> None:
     output was already written; flush it and leave without the joins."""
     if not _hds.legs_abandoned():
         return
+    _flush_and_exit(rc)
+
+
+def _flush_and_exit(rc: int) -> None:
+    """Flush every stdio stream and end the process without the interpreter's
+    exit joins (non-daemon threads, ``concurrent.futures`` workers)."""
     for stream in (sys.stdout, sys.__stdout__, sys.stderr, sys.__stderr__):
         try:
             if stream is not None:
@@ -1689,6 +1717,74 @@ def _hard_exit_if_legs_abandoned(rc: int) -> None:
         except Exception:  # noqa: BLE001 — exiting anyway
             pass
     os._exit(rc)
+
+
+# --- the HARD end-to-end deadline (v0.2.105) ---------------------------------
+# ``VCO_INJECT_BUDGET_S`` bounds only the producer legs' JOIN. Everything the
+# main thread does before and after them — the seen-store filter, the
+# citation amendment, the budget charge, the warmer spawn, interpreter exit —
+# had no bound, and one of them (the amendment's scan of the shared
+# rl_pending backlog) took ~90 s on a busy project: injection hooks hit the
+# harness's 10 s timeout on 65-92 % of their runs. The watchdog below is the
+# run's last word: at the hard deadline the process ends with exit 0 and
+# whatever it has already EMITTED (a block is emitted whole or not at all —
+# :data:`_EMIT_LOCK`), i.e. it degrades to "no injection", never to a hook the
+# harness has to kill. It is armed only for a real hook run (``__main__``),
+# never for an in-process caller and never for the detached ``--warm-legs``
+# cache warmer (no deadline by design, L4).
+
+#: Seconds from the run's anchor (:func:`_run_deadline_anchor` — the wrapper's
+#: start when it exported ``VCO_HOOK_STARTED_AT``) to the hard exit. Above the
+#: 6 s leg budget (owner ruling 2026-10-06, sized for cold producer imports on
+#: slow hardware) and 3 s under the 10 s registration of every injection
+#: surface. A larger ``VCO_INJECT_BUDGET_S`` does not move it: the hard
+#: deadline wins.
+HARD_DEADLINE_ENV = "VCO_INJECT_HARD_DEADLINE_S"
+HARD_DEADLINE_DEFAULT_S = 7.0
+#: How long the watchdog lets an emission already in progress finish.
+_EMIT_GRACE_S = 0.5
+_EMIT_LOCK = threading.Lock()
+
+
+def _emit(text: str) -> None:
+    """Write one injection payload to stdout and flush it, atomically with
+    respect to the hard-deadline watchdog (a payload is never cut short)."""
+    with _EMIT_LOCK:
+        print(text)
+        try:
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001 — a closed stdout is the reader's end
+            pass
+
+
+def _hard_deadline_s() -> float:
+    return env_float(HARD_DEADLINE_ENV, HARD_DEADLINE_DEFAULT_S, above=0)
+
+
+def _arm_hard_deadline(anchor: float) -> threading.Thread:
+    """Start the watchdog for a hook run anchored at ``anchor`` (monotonic)."""
+    fire_at = anchor + _hard_deadline_s()
+
+    def _watch() -> None:
+        remaining = fire_at - time.monotonic()
+        while remaining > 0:
+            time.sleep(remaining)
+            remaining = fire_at - time.monotonic()
+        got = _EMIT_LOCK.acquire(timeout=_EMIT_GRACE_S)
+        try:
+            print("[hook_context_router] hard deadline reached; ending the run "
+                  "without further injection", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+        # The lock is deliberately never released: no emission may start
+        # after this point. ``got`` False = an emission is stuck writing (a
+        # reader that stopped reading) — exit anyway.
+        del got
+        _flush_and_exit(0)
+
+    t = threading.Thread(target=_watch, name="vco-router-hard-deadline", daemon=True)
+    t.start()
+    return t
 
 
 def _main(argv: List[str]) -> int:
@@ -1939,19 +2035,21 @@ def _main(argv: List[str]) -> int:
         # The agent brief's own bound (≤1 500 chars) was applied inside the
         # producer (KgGate.max_chars); the budget degradation happened in the
         # per-block loop above.
-        print(_emit_agent(tool_input, prompt, final, suggest_text))
+        _emit(_emit_agent(tool_input, prompt, final, suggest_text))
         return 0
 
     # W3R-10 normal path: the filter's suppressed titles never reached the
     # transcript (budget degradation keeps every block's header, so the
     # remaining blocks' titles WERE shown).
     _amend_pending_citations(project_root, sid, suppressed, router_run_id)
-    print(final)
+    _emit(final)
     return 0
 
 
 if __name__ == "__main__":
     _DEADLINE_ANCHOR = _PROCESS_T0
+    if sys.argv[1:2] != ["--warm-legs"]:
+        _arm_hard_deadline(_run_deadline_anchor())
     _rc = main()
     _hard_exit_if_legs_abandoned(_rc)
     raise SystemExit(_rc)
