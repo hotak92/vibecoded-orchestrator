@@ -209,7 +209,7 @@
       class="cg-refresh"
       onclick={refreshCounts}
       disabled={counting}
-      title="Count every collection once and refresh the cached counts (a page load only counts this project's own and granted code graphs)"
+      title="Count every collection once and refresh the cached counts — this loads every collection on this machine into Weaviate's memory (a page load only counts this project's own and granted code graphs)"
     >
       {counting ? 'Counting…' : 'Refresh counts'}
     </button>
