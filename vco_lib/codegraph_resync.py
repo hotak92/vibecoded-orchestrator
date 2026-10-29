@@ -3037,6 +3037,34 @@ def _record_stale_image_deferral(
         )
 
 
+def _record_backend_down_deferral(
+    repo_root: Path, project_name: str, resync_cmd: str, backend: str,
+) -> None:
+    """v0.2.105: persist/refresh the service-down flavour of
+    ``codegraph_embed_resync_pending`` when the DRIVER refuses for an
+    unreachable embedding backend. Same discipline as
+    :func:`_record_stale_image_deferral` (the stale-image flavour): the owed
+    work must stay owed, so the deferral retry driver re-runs the resync once
+    the backend answers. Soft-fail throughout."""
+    try:
+        entry = build_resync_deferral(project_name, resync_cmd, backend=backend)
+        if entry is None:
+            return
+        from vco_lib.deferral_emit import emit
+
+        folder = Path(repo_root)
+        emit(folder, entry, log=logger)
+        print(
+            "[resync-driver] backend-down deferral recorded in "
+            f"{folder / '.claude' / 'context' / 'UPDATE_DEFERRED.md'}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfacing must not crash the child
+        logger.warning(
+            "resync driver: could not record backend-down deferral: %s", exc
+        )
+
+
 def build_unconverged_deferral(
     project_name: str,
     counts: Optional[dict],
@@ -4143,6 +4171,14 @@ def _run_resync_and_verify_slotted(
        verdict is judged against the install root that owns the machine's
        one service (ship-gate MAJOR-2), and a pre-v0.2.92 image is caught
        from its ``/health`` alone even when no tree carries the source.
+    0a. v0.2.105: BACKEND-REACHABILITY GATE. The analyzer soft-skips with
+       exit 0 when no embedding backend answers, which the driver used to
+       relay as terminal ``success``. When the backend the walk needs is
+       unreachable (``code_backend_down_waiting`` — after waiting out a
+       starting container) the analyzer is NOT spawned: the
+       ``codegraph_embed_resync_pending`` entry is recorded/refreshed (the
+       work stays owed), a terminal ``failed`` report closes any hub row,
+       and the driver returns 0.
     0b. v0.2.96 (M-2): EXPOSURE HEAL. When the one-time truncation-exposure
        bump is owed for THIS project (``vco_lib.code_embed_exposure`` —
        machine-level ``observed`` evidence and no ``healed`` entry for the
@@ -4217,6 +4253,58 @@ def _run_resync_and_verify_slotted(
             )
         except Exception as exc:  # noqa: BLE001 — observability, never a gate
             logger.debug("resync driver: stale-refusal report raised: %s", exc)
+        return 0
+
+    # v0.2.105: the backend-reachability gate. The analyzer soft-SKIPS with
+    # exit 0 when no embedding backend answers (field 2026-10-23, log
+    # resync-VibeCodedOrchestrator-20261023-140259: "Code-graph analysis
+    # skipped: active code backend (slot=codesage_embed) is not reachable"
+    # followed by "reported terminal 'success' to hub") — and a soft-skipped
+    # walk is indistinguishable from a successful one by exit code alone.
+    # The driver refused nothing, the hub row read 'success', and the
+    # post-walk probe could even clear `codegraph_embed_resync_pending` for
+    # work that never ran. Same defence-in-depth shape as the stale-image
+    # gate above (the spawn and the deferral dispatcher gate too, but the
+    # MANUAL `--run-resync` path and a backend that went down after the
+    # spawn converge HERE): refuse BEFORE the analyzer is asked, keep/record
+    # the deferral, and give the hub the one honest non-success terminal
+    # status its /terminal route accepts ("failed" — there is no "blocked").
+    # `code_backend_down_waiting` waits for a running-but-starting container
+    # first (the v0.2.104 tolerance), so a container still loading a model
+    # does not trip this gate.
+    down, _down_container_used = code_backend_down_waiting(project_name)
+    if down is not None:
+        print(
+            f"[resync-driver] code-embedding backend unreachable ({down}) — "
+            "NOT running the analyzer; the resync stays owed",
+            flush=True,
+        )
+        _record_backend_down_deferral(
+            repo_root, project_name, driver_resume_command(
+                _python_exe.resolve_or_current(), Path(repo_root),
+                Path(analyzer_path), project_name,
+                index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            ), backend=down,
+        )
+        # #31 discipline, same as the stale-image refusal: a hub row this
+        # driver's spawn may have registered must not be left to the
+        # pid-aliveness reconciler's false "died before completing" verdict.
+        # Soft-fail as everywhere: observability never gates the exit.
+        try:
+            _report_terminal_to_hub(
+                project_name,
+                "failed",
+                repo_root=repo_root,
+                files_analyzed=0,
+                duration_ms=0,
+                error_message=(
+                    f"code-embedding backend unreachable ({down}) — analysis "
+                    "skipped, the resync stays owed (retried once the "
+                    "backend answers)"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never a gate
+            logger.debug("resync driver: backend-down report raised: %s", exc)
         return 0
 
     # v0.2.96 (M-2, register issue 8): the exposure heal — the walk below is

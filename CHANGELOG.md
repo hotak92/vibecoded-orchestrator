@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **VCO now finds its containers on podman as well as Docker.** VCO looked a container up by asking `inspect --format '{{.Id}}'` — a template field only Docker knows (podman spells it `.ID` and answers "can't evaluate field Id"). On a podman host every such lookup failed while the container was running: "Let VCO manage it" (`service_endpoints hand-to-vco`) refused a running `vco_ollama` with "container does not exist", the service-migration and data-identity checks read the machine as having no containers (or as unreadable), and the zombie-recovery step of the session-start containers hook never cleaned the orphan runtime state because it never learned the container id. One runtime-neutral lookup in `vco_lib.containers` now inspects without a template — the JSON both engines then print carries the id under the same `"Id"` key — and every Python site and both hook siblings use it (`python -m vco_lib.containers container-id <name>` for the hooks). A container that truly does not exist is still told apart from a probe that could not run.
+- **A code-graph resync that skipped its analysis no longer reports success.** When no embedding backend answered, the analyzer exited 0 with "Code-graph analysis skipped" and the background resync driver relayed that as a successful build to the hub — the GUI showed a green build that had analyzed nothing — and its post-run check could even clear the "re-embed pending" entry for work that never ran. The driver now refuses before the analyzer is asked: a still-starting container is waited for first (as on update), and when the backend really is unreachable the hub build is closed as failed with the reason, the pending entry is kept or recorded so the automatic retry re-runs the resync once the backend is back, and nothing is spawned.
+
 ## [0.2.104] - 2026-10-22
 
 ### Changed

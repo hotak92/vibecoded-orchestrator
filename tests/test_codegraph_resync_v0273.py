@@ -527,6 +527,10 @@ def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
     _seed_pending_deferral(tmp_path)
     rec = _RunRecord(returncode=0)
     monkeypatch.setattr(cr.subprocess, "run", rec)
+    # v0.2.105: the driver\'s backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(
         cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0}
     )
@@ -543,6 +547,10 @@ def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
 def test_driver_unconverged_records_one_time_deferral(monkeypatch, tmp_path):
     rec = _RunRecord(returncode=0)
     monkeypatch.setattr(cr.subprocess, "run", rec)
+    # v0.2.105: the driver\'s backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(
         cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 42}
     )
@@ -572,6 +580,10 @@ def test_driver_unverifiable_probe_still_surfaces(monkeypatch, tmp_path):
     """DESIGN-DECISION: unverifiable convergence must SURFACE (one-time
     deferral), never soft-fail into a void."""
     monkeypatch.setattr(cr.subprocess, "run", _RunRecord(returncode=0))
+    # v0.2.105: the driver's backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
     cr.run_resync_and_verify(
         "MyProj", tmp_path, tmp_path / "analyze_code_graph.py"
