@@ -138,6 +138,7 @@ try:
         _caller_target_rows,
         _caller_scan_limit,
         _caller_page_proves_mixed,
+        _callers_answer_truncated,
         _keep_caller_in_scope,
         _order_caller_rows,
         # v0.2.92 (B1): the ONE code-graph prefix rule, shared with the MCP.
@@ -1753,16 +1754,23 @@ class CodeGraphQuery:
                 # qualified matches first, and re-cap the ANSWER at
                 # CALLERS_FETCH_LIMIT (fix round M5: the cap applies to the
                 # filtered list, never to the raw scan width).
-                callers = _order_caller_rows(
+                ordered_callers = _order_caller_rows(
                     [
                         row for row in _dedup_objects_by_full_name(
                             caller_response.objects)
                         if _keep_caller_in_scope(row, target_roots)
                     ],
                     target, confirmed_names,
-                )[:CALLERS_FETCH_LIMIT]
-                truncated = (len(callers) >= CALLERS_FETCH_LIMIT
-                             or len(caller_response.objects) >= scan_limit)
+                )
+                callers = ordered_callers[:CALLERS_FETCH_LIMIT]
+                # v0.2.105 fix round (review NIT): ONE truncation rule, both
+                # surfaces — computed on the UNSLICED in-scope list with a
+                # strict `>` against the cap (an exactly-full answer whose
+                # scan saw every row is COMPLETE; pre-fix this ran `>=` on
+                # the already-capped list and disagreed with the MCP).
+                truncated = _callers_answer_truncated(
+                    ordered_callers, len(caller_response.objects),
+                    scan_limit, CALLERS_FETCH_LIMIT)
 
                 if hook_format:
                     # WP-B2 injection block: one CODE: row per matched target

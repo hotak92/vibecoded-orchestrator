@@ -1518,8 +1518,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     r.add_argument("--no-daemon", action="store_true", help="Skip the `<runtime> info` round-trip.")
     r.add_argument("--no-compose", action="store_true", help="Skip compose detection.")
     # v0.2.105: the runtime-neutral container-id lookup for the hooks (A of the
-    # A>B>C rule — the .sh/.ps1 siblings call this CLI instead of mirroring the
-    # docker-vs-podman `.Id`/`.ID` template spelling; see `container_id`).
+    # A>B>C rule — the .sh/.ps1 siblings call this CLI rather than mirroring
+    # the probe, one home; see `inspect_container_entry`. The probe is
+    # template-FREE: both runtimes print the id under the same `"Id"` JSON
+    # key, and plain `{{.Id}}` works on both too — no engine spelling
+    # difference is being papered over here.)
     c = sub.add_parser(
         "container-id", help="Print the container's full id; exit 0 found / 1 not.",
     )

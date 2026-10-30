@@ -6900,6 +6900,22 @@ def _caller_scan_limit(base_limit: int, escalate: bool) -> int:
     return base_limit * (_CALLER_SCOPE_SCAN_MULT if escalate else 1)
 
 
+def _callers_answer_truncated(in_scope_rows, raw_object_count: int,
+                              scan_limit: int, answer_cap: int) -> bool:
+    """ONE truncation rule for BOTH caller surfaces (v0.2.105 fix round,
+    review NIT — the MCP `query_code_structure("callers")` branch and the
+    `query_code_graph` CLI used to disagree: the CLI ran ``>=`` on the
+    ALREADY-CAPPED list, so exactly-cap in-scope callers read as truncated
+    there and complete in the MCP).
+
+    The answer is truncated when the in-scope list is LONGER than the cap
+    (strictly — an exactly-full answer listed everything found, so it is
+    complete), or the raw scan filled its fetch width (there may be rows
+    the scan never saw). Computed on the UNSLICED in-scope list, both
+    surfaces, one home."""
+    return len(in_scope_rows) > answer_cap or raw_object_count >= scan_limit
+
+
 def _order_caller_rows(rows: list, target_full_name: str, confirmed_names=()) -> list:
     """Stable sort of caller rows: qualified matches first (v0.2.105 #512C)."""
     confirmed = set(confirmed_names or ())
@@ -7481,8 +7497,9 @@ def query_code_structure(
                 for obj in ordered_callers[:CALLERS_LIMIT]
             ]
             _truncation_meta = {
-                "truncated": (len(ordered_callers) > CALLERS_LIMIT
-                              or len(response.objects) >= scan_limit),
+                "truncated": _callers_answer_truncated(
+                    ordered_callers, len(response.objects), scan_limit,
+                    CALLERS_LIMIT),
                 # the TRUE answer cap — not the escalated scan width
                 "limit": CALLERS_LIMIT,
             }

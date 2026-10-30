@@ -152,20 +152,32 @@ class _Podman49:
         return _cp(argv)
 
 
-def test_podman_49_shape_plain_template_works_json_form_fails():
-    """The corrected premise, pinned: podman 4.9 ACCEPTS plain ``{{.Id}}``
-    (exit 0, the id) and refuses only ``{{json .Id}}`` (exit 125) — the
-    pre-v0.2.105 bug was that one form (service_adoption), not every
-    ``.Id`` template. The fake above must keep modelling this shape."""
+def test_the_product_lookup_resolves_the_id_on_the_podman_49_shape():
+    """v0.2.105 fix round (review NIT): this test used to assert only the
+    FAKE's own behaviour — it could never fail because of product code. It
+    now drives the PRODUCT helper (``containers.container_id`` /
+    ``inspect_container_entry``) against the podman-4.9-shaped machine, and
+    keeps the shape pins as the anti-vacuity proof: the fake still refuses
+    the one template form that broke pre-v0.2.105 (``{{json .Id}}``, exit
+    125 — the service_adoption bug), and still accepts plain ``{{.Id}}``
+    (the corrected premise). The product probe uses NEITHER — it is
+    template-free — so it resolves the id where the old json form died."""
     m = _Podman49()
-    plain = m.run(["podman", "inspect", "--type", "container",
-                   "--format", "{{.Id}}", "vco_ollama"])
-    assert plain.returncode == 0
-    assert plain.stdout.strip() == CID
+    # THE ACT, through product code:
+    assert c.container_id("vco_ollama", "podman", run=m.run) == CID
+    _entry, verdict, _detail = c.inspect_container_entry(
+        "vco_ollama", "podman", run=m.run)
+    assert verdict == "exists"
+    # Anti-vacuity: the machine really does refuse the pre-fix template
+    # form, so the product's survival above is a property of its
+    # template-free probe, not of a fake that answers everything.
     jsoned = m.run(["podman", "inspect", "--type", "container",
                     "--format", "{{json .Id}}", "vco_ollama"])
     assert jsoned.returncode == 125
     assert "can't evaluate field Id" in jsoned.stderr
+    plain = m.run(["podman", "inspect", "--type", "container",
+                   "--format", "{{.Id}}", "vco_ollama"])
+    assert plain.returncode == 0 and plain.stdout.strip() == CID
 
 
 def test_hand_to_vco_container_ref_lookup_survives_podman(tmp_path,
@@ -207,3 +219,23 @@ def test_live_podman_returns_the_running_vco_ollama_id():
     cid = c.container_id("vco_ollama", "podman")
     assert cid is not None, "the running vco_ollama resolved to no id"
     assert len(cid) == 64 and all(ch in "0123456789abcdef" for ch in cid)
+
+
+def test_the_cli_comment_carries_no_false_template_spelling_premise():
+    """v0.2.105 fix round (review LOW): the ``container-id`` parser comment
+    was the LAST place still claiming the CLI exists to avoid a
+    docker-vs-podman ``.Id``/``.ID`` template-spelling difference — the
+    false premise this fix round retired everywhere else (plain ``{{.Id}}``
+    works on BOTH runtimes; the only broken form was ``{{json .Id}}`` on
+    podman 4.9). A comment describing a guard is part of the guard: pin the
+    corrected one-home text so the stale premise cannot be re-pasted."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "vco_lib" / "containers.py"
+           ).read_text(encoding="utf-8")
+    assert "docker-vs-podman `.Id`/`.ID` template spelling" not in src, (
+        "the false '.Id vs .ID engine spelling' premise is back in "
+        "containers.py — the template-free probe exists for the ONE-home "
+        "reason, not an engine spelling difference"
+    )
+    assert "rather than mirroring" in src and "inspect_container_entry" in src

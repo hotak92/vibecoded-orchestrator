@@ -2374,6 +2374,55 @@ def _pin_localhost_default_backends():
                 os.environ[key] = value
 
 
+# ─── Embed-service cache globals (v0.2.105 fix round 2: test isolation) ────
+#
+# `_get_embedding_service` (weaviate_mcp/kg_query_core.py, rebound into
+# weaviate_mcp/server) keeps its cache and retry-window state as MODULE
+# GLOBALS on the server object: `_cached_embed_service`,
+# `_embed_service_construction_failed_at`, `_embed_service_construction_error`
+# and `_embed_record_checked_at`. A test that drives a REAL construction —
+# which under this suite's pins ALWAYS fails, no embedding backend is
+# reachable — leaves `_embed_service_construction_failed_at` at
+# `time.monotonic()`, and every test that runs inside the 10 s retry window
+# then gets `None` from the accessor instead of the rebuild it asserts.
+# Demonstrated pairwise (v0.2.105 R2, item 8):
+#   test_v0272_pregate_audit_fixes.py::test_b2_excluded_file_candidates_culled_pre_trim
+#   (drives the CLI search → a real construction failure) poisons
+#   test_v02102_code_embed_preferences_readers.py::TestFinalRoundLows::
+#   test_a_long_lived_mcp_rebuilds_its_service_when_the_record_flips
+# — order-dependent, timing-bounded, invisible when the two files run apart.
+# Reset after EVERY test, on every loaded module object that really holds
+# the name in its OWN __dict__ — vars() only, never getattr/setattr:
+# kg_query_core has a module-level __getattr__ delegating to the server,
+# and a setattr through it would CREATE a shadowing attribute on the
+# delegating module instead of resetting anything.
+_EMBED_SERVICE_CACHE_DEFAULTS: tuple = (
+    ("_cached_embed_service", None),
+    ("_embed_service_construction_failed_at", 0.0),
+    ("_embed_service_construction_error", ""),
+    ("_embed_record_checked_at", 0.0),
+)
+_EMBED_SERVICE_CACHE_MODULES: tuple = (
+    "weaviate_mcp.server",
+    "claude_mcp_servers.weaviate_mcp.server",
+    "weaviate_mcp.kg_query_core",
+    "claude_mcp_servers.weaviate_mcp.kg_query_core",
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_embed_service_cache_globals():
+    yield
+    for _key in _EMBED_SERVICE_CACHE_MODULES:
+        _mod = sys.modules.get(_key)
+        if _mod is None:
+            continue
+        _mvars = vars(_mod)
+        for _name, _default in _EMBED_SERVICE_CACHE_DEFAULTS:
+            if _name in _mvars:
+                _mvars[_name] = _default
+
+
 # ─── W-IDENTITY (v0.2.104): no test leaves the project IDENTITY env behind ───
 #
 # The v0.2.104 merge-only failure: `test_kg_access_helper_module.py` popped

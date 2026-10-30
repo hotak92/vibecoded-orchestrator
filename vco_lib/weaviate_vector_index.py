@@ -132,15 +132,24 @@ def client_named_vector(slot_name: str, class_name: str) -> Any:
     )
 
 
-def server_supports_rq(version: Optional[str]) -> bool:
-    """True when *version* (``/v1/meta``'s ``version``) is at or above the
-    table's ``min_server_version``. An unreadable version is ``False``."""
+def version_confirmed_at_least(version: Optional[str]) -> Optional[bool]:
+    """Tri-state version read (v0.2.105 fix round, W-N2): ``True``/``False``
+    when *version* (``/v1/meta``'s ``version``) parses and compares against
+    the table's ``min_server_version``; ``None`` when it cannot be read at
+    all. "Cannot confirm ≥ min" is NOT the fact "older than min", and the
+    user-facing skip text must not claim the latter without evidence."""
     from vco_lib.version_compare import VersionParseError, parse_version  # noqa: PLC0415
 
     try:
         return parse_version(str(version or "").split("-", 1)[0]) >= policy().rq_min_server_version
     except VersionParseError:
-        return False
+        return None
+
+
+def server_supports_rq(version: Optional[str]) -> bool:
+    """True when *version* (``/v1/meta``'s ``version``) is at or above the
+    table's ``min_server_version``. An unreadable version is ``False``."""
+    return version_confirmed_at_least(version) is True
 
 
 _COMPRESSIONS = ("pq", "sq", "bq", "rq")
@@ -241,15 +250,26 @@ def apply_policy(weaviate_url: Optional[str] = None, *,
             res.unreachable = f"GET /v1/meta answered HTTP {st}"
             return res
         res.server_version = str(json.loads(raw.decode("utf-8")).get("version") or "")
-        res.rq_supported = server_supports_rq(res.server_version)
+        confirmed = version_confirmed_at_least(res.server_version)
+        res.rq_supported = confirmed is True
         if not res.rq_supported:
             # Version gate for the WHOLE step (no shard load, no PUT): see the
             # module docstring. A kept old VCO container already carries its
             # own deferral (service_image_pull_failed); the update after the
             # new image arrives does this work.
-            res.skipped = (f"Weaviate {res.server_version or '(unknown version)'} is older "
-                           f"than {'.'.join(map(str, policy().rq_min_server_version))}; "
-                           "collection index settings left unchanged")
+            # W-N2 (v0.2.105 fix round): a version that PARSED and compared
+            # below the floor is "older than" — a fact. An UNPARSEABLE one
+            # (empty, garbled /v1/meta) is "not confirmed at or above": the
+            # skip behaviour is identical, but the sentence must not claim
+            # an age VCO has no evidence for.
+            _rq_min = ".".join(map(str, policy().rq_min_server_version))
+            if confirmed is False:
+                res.skipped = (f"Weaviate {res.server_version} is older than {_rq_min}; "
+                               "collection index settings left unchanged")
+            else:
+                res.skipped = (f"Weaviate {res.server_version or '(unknown version)'} is not "
+                               f"confirmed at or above {_rq_min}; "
+                               "collection index settings left unchanged")
             return res
         st, raw = req("GET", f"{base}/v1/schema", timeout=60.0)
         if st != 200:
