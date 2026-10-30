@@ -44,6 +44,7 @@ absolute):
 - Red-proof every fix: the new test FAILING before, PASSING after, both
   outputs verbatim. Restore with a `cp` copy you saved aside (md5-verified),
   never a VCS command.
+- Waiting: waiting means ENDING YOUR TURN and being woken by the completion notification (start long work with `run_in_background`), never calling a tool in a loop to check on it.
 - Report: what you changed (file:line), the red-proof, the test command and
   its output, and every point where the brief genuinely did not decide for
   you.

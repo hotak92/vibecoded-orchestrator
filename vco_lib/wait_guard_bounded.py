@@ -34,17 +34,22 @@ A loop is judged where it is DEFINED: a loop in a function body counts
 once, however often the function is called — the same reading the script
 rule already gives a function's single pause. The budget never applies
 when the script itself runs inside a loop of the calling command (the
-caller then multiplies it by an unknown count).
+caller then multiplies it by an unknown count), and it never applies to a
+loop in a function that is itself REACHED FROM A LOOP inside the script
+(``f() { for …; }; while true; do f; done``) — the enclosing loop
+multiplies the budget by an unknown count, so the loop is unbounded
+(fix round 2, WG-1).
 """
 from __future__ import annotations
 
 import os
 import re
-from typing import FrozenSet, List, Optional, Sequence
+from typing import Dict, FrozenSet, List, Optional, Sequence
 
 from vco_lib.bash_command_walk import (
     ChainSegment,
     command_words,
+    function_header,
     segment_opener,
     strip_env_assignments,
 )
@@ -138,15 +143,17 @@ def _arith_for(header: str) -> Optional[tuple]:
 
 class _Loop:
     __slots__ = ("iterations", "var", "in_body", "valid", "sleeps",
-                 "per_iteration")
+                 "per_iteration", "owner")
 
-    def __init__(self, iterations: Optional[int], var: Optional[str]):
+    def __init__(self, iterations: Optional[int], var: Optional[str],
+                 owner: Optional[str] = None):
         self.iterations = iterations
         self.var = var
         self.in_body = False
         self.valid = iterations is not None
         self.sleeps: List[int] = []
         self.per_iteration = 0.0
+        self.owner = owner
 
 
 def _opener_loop(tokens: List[str]) -> Optional[_Loop]:
@@ -178,6 +185,121 @@ def _names_var_bare(seg: ChainSegment, var: str) -> bool:
     return any(rx.search(t) for t in list(seg.tokens) + list(seg.assignments))
 
 
+def loop_iterations(tokens: Sequence[str]) -> Optional[int]:
+    """The proved iteration count of the loop these (env-stripped) tokens
+    open — a literal word list, ``$(seq …)``, a brace range or a literal
+    arithmetic ``for`` — or ``None`` when they open no loop or its count
+    is not proved. The ONE reading of a literal iteration cap."""
+    loop = _opener_loop(list(tokens))
+    return None if loop is None else loop.iterations
+
+
+def _brace_delta(tokens: Sequence[str]) -> int:
+    """Net ``{`` minus ``}`` in one segment's tokens. ``${name}`` expands a
+    variable and opens no block, so its braces are not counted."""
+    delta = 0
+    for tok in tokens:
+        i = 0
+        while i < len(tok):
+            if tok[i] == "$" and i + 1 < len(tok) and tok[i + 1] == "{":
+                i += 2
+                continue
+            if tok[i] == "{":
+                delta += 1
+            elif tok[i] == "}":
+                delta -= 1
+            i += 1
+    return delta
+
+
+def _function_bodies(segments: Sequence[ChainSegment]) -> Dict[str, tuple]:
+    """``name -> (first_index, last_index)`` of every function body this
+    flat segment stream can delimit. A brace body runs to its matching
+    ``}`` segment; a subshell body or an unterminated brace body runs to
+    the end of the stream (fail-closed: everything after it counts as
+    inside the function)."""
+    bodies: Dict[str, tuple] = {}
+    n = len(segments)
+    for i, seg in enumerate(segments):
+        if seg.depth != 0:
+            continue
+        tokens = strip_env_assignments(list(seg.tokens))
+        header = function_header(tokens) if tokens else None
+        if header is None:
+            continue
+        name, hlen = header
+        last = n - 1
+        if not tokens[hlen - 1].endswith("("):
+            depth = 0
+            j = i
+            while j < n:
+                part = tokens[hlen - 1:] if j == i else list(segments[j].tokens)
+                depth += _brace_delta(part)
+                if depth <= 0:
+                    last = j
+                    break
+                j += 1
+        bodies[name] = (i, last)
+    return bodies
+
+
+def _segment_owners(segments: Sequence[ChainSegment],
+                    bodies: Dict[str, tuple]) -> List[Optional[str]]:
+    """The function whose body each segment sits in, or ``None``. A nested
+    definition (recorded later) owns the segments inside it."""
+    owners: List[Optional[str]] = [None] * len(segments)
+    for name, (start, end) in bodies.items():
+        for k in range(start, min(end, len(segments) - 1) + 1):
+            owners[k] = name
+    return owners
+
+
+def _functions_reached_from_a_loop(
+        segments: Sequence[ChainSegment],
+        bodies: Dict[str, tuple],
+        owners: Sequence[Optional[str]]) -> FrozenSet[str]:
+    """The function names whose body runs an unknown number of times
+    because a loop reaches them: the function is called from inside a
+    loop, or from inside a function that is itself reached this way
+    (WG-1). A bounded loop in such a function is not a bounded retry."""
+    reached: set = set()
+    edges: Dict[Optional[str], set] = {}
+    for i, seg in enumerate(segments):
+        tokens = strip_env_assignments(list(seg.tokens))
+        header = function_header(tokens) if tokens else None
+        if header is not None:
+            # The definition's first BODY statement rides on its header
+            # segment (`g() { f`): scan that tail as the statement it is.
+            tokens = tokens[header[1]:]
+        words = command_words(tokens)
+        if not words:
+            continue
+        if os.path.basename(words[0]).lower() in ("while", "until"):
+            # The loop CONDITION runs once per iteration too: `while f; do
+            # …; done` reaches `f` from a loop.
+            words = command_words(words[1:])
+            if not words:
+                continue
+        name = os.path.basename(words[0])
+        if name not in bodies or i == bodies[name][0]:
+            continue  # not a call of a defined function
+        if seg.in_loop:
+            reached.add(name)
+        else:
+            edges.setdefault(owners[i], set()).add(name)
+    changed = True
+    while changed:
+        changed = False
+        for caller, callees in edges.items():
+            if caller is None or caller not in reached:
+                continue  # a top-level call runs once
+            for callee in callees:
+                if callee not in reached:
+                    reached.add(callee)
+                    changed = True
+    return frozenset(reached)
+
+
 def bounded_loop_sleeps(segments: Sequence[ChainSegment],
                         budget_s: float = WAIT_BUDGET_S) -> FrozenSet[int]:
     """Indexes (into ``segments``) of the plain ``sleep`` segments that sit
@@ -185,9 +307,14 @@ def bounded_loop_sleeps(segments: Sequence[ChainSegment],
     ``budget_s``. ``segments`` is the wait guard's own walk of ONE script
     (:func:`vco_lib.wait_guard.static_pattern`), so an index names the very
     segment the classifier would judge. Fail-closed: any loop structure
-    this reading does not track exactly yields the empty set."""
+    this reading does not track exactly yields the empty set, as does a
+    loop in a function a loop reaches (:func:`_functions_reached_from_a_loop`)."""
+    bodies = _function_bodies(segments)
+    owners = _segment_owners(segments, bodies) if bodies else [None] * len(segments)
+    reached = (_functions_reached_from_a_loop(segments, bodies, owners)
+               if bodies else frozenset())
     stack: List[_Loop] = []
-    approved: set = set()
+    closed: List[_Loop] = []
     for i, seg in enumerate(segments):
         if seg.depth != 0:
             continue  # substitution / shell-run bodies: judged as before
@@ -196,15 +323,13 @@ def bounded_loop_sleeps(segments: Sequence[ChainSegment],
         if first == "done":
             if not stack:
                 return frozenset()
-            loop = stack.pop()
-            if (loop.valid and loop.iterations is not None
-                    and loop.iterations * loop.per_iteration <= budget_s):
-                approved.update(loop.sleeps)
+            closed.append(stack.pop())
             continue
         opened = _opener_loop(tokens) if tokens else None
         if opened is not None:
             if stack and not stack[-1].in_body:
                 stack[-1].valid = False  # a loop in a loop header
+            opened.owner = owners[i]
             stack.append(opened)
             continue
         if first == "do":
@@ -231,6 +356,13 @@ def bounded_loop_sleeps(segments: Sequence[ChainSegment],
         inner.per_iteration += secs
     if stack:
         return frozenset()  # an unclosed loop
+    approved: set = set()
+    for loop in closed:
+        if loop.owner is not None and loop.owner in reached:
+            continue  # a loop the script itself multiplies: unbounded
+        if (loop.valid and loop.iterations is not None
+                and loop.iterations * loop.per_iteration <= budget_s):
+            approved.update(loop.sleeps)
     return frozenset(approved)
 
 
@@ -238,5 +370,6 @@ __all__ = [
     "WAIT_BUDGET_S",
     "bounded_loop_sleeps",
     "for_list_count",
+    "loop_iterations",
     "sleep_seconds",
 ]

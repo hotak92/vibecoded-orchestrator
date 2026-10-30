@@ -21,6 +21,7 @@ Rules that are absolute:
 - Red-proof every fix: show the new test FAILING against the pre-fix source
   (temporarily revert the source change, run, restore), then PASSING. Report
   both outputs verbatim.
+- Waiting: waiting means ENDING YOUR TURN and being woken by the completion notification (start long work with `run_in_background`), never calling a tool in a loop to check on it.
 - Minimal change. Do not refactor beyond what the brief asks. Do not
   "improve" adjacent code. Do not add abstractions the brief did not ask for.
 - If a brief item turns out to be wrong or already fixed, say so with the

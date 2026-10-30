@@ -279,7 +279,8 @@ class TestNoopWaitLoop:
         assert self._call(tmp_path, "true", 1, 1000.0) is None
 
     @pytest.mark.parametrize("command", ["true", ":", "echo waiting for build",
-                                         "true; true"])
+                                         "true; true", "exit 0", "exit",
+                                         "printf waiting"])
     def test_the_third_identical_noop_is_refused(self, tmp_path, command):
         assert self._call(tmp_path, command, 1, 1000.0) is None
         assert self._call(tmp_path, command, 2, 1030.0) is None
@@ -302,7 +303,8 @@ class TestNoopWaitLoop:
 
     @pytest.mark.parametrize("command", [
         "true && ls", "echo hi > out.txt", "echo $(date)", "echo a | cat",
-        "printf x", "make",
+        "printf x > out.txt", "printf x | cat", "exit 1", "exit 0 && make",
+        "make",
     ])
     def test_a_command_that_does_work_is_never_counted(self, tmp_path, command):
         assert wg.noop_repeat_key(command) is None

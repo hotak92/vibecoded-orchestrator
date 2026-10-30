@@ -104,12 +104,24 @@ it is defined. Code fed to a shell as TEXT — on stdin from a literal
 variable assigned a literal earlier in the same command (``c='sleep 5';
 eval "$c"`` / ``$c`` / ``bash -c "$c"``) is judged like a ``bash -c``
 body; a ``case`` arm and a ``coproc`` command are judged like any other
-segment. ``run_in_background`` stays exempt from all of it.
+segment. ``run_in_background`` stays exempt from all of it — its own rule
+is below.
+
+Background wait loops (v0.2.105 fix round 2, item 7): a background command
+never polls the model, so it is the sanctioned way to wait — but a WAIT
+LOOP inside it must be BOUNDED, because a loop whose condition never comes
+true runs until a human notices (field case 2026-10-30: an ``until`` loop
+whose command was not on PATH ran 83 minutes, its ``2>/dev/null`` hiding
+the error). Bounded = a literal ``timeout <N>`` around the whole command
+(``timeout 600 bash -c '…'``) or a literal iteration cap; a loop whose
+CONDITION throws stderr away is named in the refusal
+(:func:`_background_wait_pattern`).
 
 No-op wait loops (v0.2.105): the :data:`NOOP_REPEAT_MAX`-th IDENTICAL call
-that does nothing (``true``, ``:``, a bare ``echo …``/``Write-Host``,
-``sleep 0``) from one session/agent within :data:`NOOP_REPEAT_WINDOW_S` is
-denied — "end your turn; the completion notification wakes you".
+that does nothing (``true``, ``:``, ``exit 0``, a bare ``echo …`` /
+``printf …`` / ``Write-Host``, ``sleep 0``) from one session/agent within
+:data:`NOOP_REPEAT_WINDOW_S` is denied — "end your turn; the completion
+notification wakes you".
 
 One-shot wake-ups (owner ruling 2026-10-29, #508): a ``CronCreate`` whose
 input carries the explicit ``recurring: false`` fires once and is allowed
@@ -202,9 +214,12 @@ from typing import Any, Dict, List, Optional
 
 from vco_lib.bash_command_walk import (
     CONDITION_OPENERS,
+    FLAG_WRAPPERS,
     LEADING_COMPOUND_KEYWORDS,
     LOOP_OPENERS,
     SHELL_DASH_C_VERBS,
+    TIMEOUT_VALUE_OPTS,
+    XARGS_VALUE_OPTS,
     ChainSegment,
     command_words as _command_words,
     dash_c_subcommand,
@@ -214,6 +229,7 @@ from vco_lib.bash_command_walk import (
     split_chain_ops,
     strip_env_assignments,
     strip_subshell_parens,
+    segment_opener,
     tokenize,
     walk_segments,
 )
@@ -232,7 +248,11 @@ from vco_lib.powershell_command import (
     statements as ps_statements,
 )
 from vco_lib.env_values import env_int
-from vco_lib.wait_guard_bounded import WAIT_BUDGET_S, bounded_loop_sleeps
+from vco_lib.wait_guard_bounded import (
+    WAIT_BUDGET_S,
+    bounded_loop_sleeps,
+    loop_iterations,
+)
 from vco_lib.wait_guard_literal import literal_text_only
 
 __all__ = [
@@ -294,9 +314,10 @@ NOOP_REPEAT_MAX = 3
 NOOP_REPEAT_WINDOW_S = 120
 
 #: Verbs that do nothing a caller could be waiting on. ``echo`` /
-#: ``write-host`` count only with no output redirection, no pipe and no
-#: command substitution; ``sleep`` only as ``sleep 0``.
-_NOOP_VERBS = frozenset({"true", ":", "echo", "write-host"})
+#: ``printf`` / ``write-host`` count only with no output redirection, no
+#: pipe and no command substitution; ``sleep`` only as ``sleep 0`` and
+#: ``exit`` only with no argument or ``0`` (:func:`noop_repeat_key`).
+_NOOP_VERBS = frozenset({"true", ":", "echo", "printf", "write-host"})
 
 _KILL_SWITCH_ENV = "VCO_WAIT_GUARD"
 _OFF_VALUES = frozenset({"off", "0", "false", "no"})
@@ -383,17 +404,6 @@ def _sleep_pattern(body: List[str], seg: ChainSegment) -> Optional[tuple]:
     return None
 
 
-#: xargs flags that take a SEPARATE value token (the combined forms
-#: ``-n1`` / ``-I{}`` do not). Skipped when looking for the per-item
-#: command, so ``xargs -I sleep echo`` (replace-str "sleep") is not
-#: misread as a per-item wait.
-_XARGS_VALUE_FLAGS = frozenset({
-    "-I", "-n", "-P", "-d", "-L", "-s", "-e", "-a",
-    "--replace", "--max-args", "--max-procs", "--delimiter",
-    "--max-lines", "--eof", "--arg-file",
-})
-
-
 def _xargs_pattern(body: List[str], depth: int,
                    seg: ChainSegment) -> Optional[tuple]:
     """xargs runs its command ONCE PER INPUT ITEM — a loop (R6, owner
@@ -404,7 +414,7 @@ def _xargs_pattern(body: List[str], depth: int,
     i = 1
     while i < len(body):
         tok = body[i]
-        if tok in _XARGS_VALUE_FLAGS:
+        if tok in XARGS_VALUE_OPTS:
             i += 2
             continue
         if tok.startswith("-"):
@@ -859,6 +869,183 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
     if all(not _segment_does_real_work(s) for s in body_all):
         return ("busy-wait loop", " ".join(toks[:6])[:80])
     return _condition_refresh_poll(cond_toks, body_stmts)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# A BACKGROUND wait loop must be BOUNDED (v0.2.105 fix round 2, item 7)
+# ═══════════════════════════════════════════════════════════════════════
+
+#: Redirections that throw a command's errors away — the whole-token forms.
+_STDERR_SILENCED_RE = re.compile(r"^(?:2|&)>>?/dev/null$")
+#: …and the split form (``2> /dev/null``): the operator, then the sink.
+_STDERR_SILENCED_SPLIT = frozenset({"2>", "2>>", "&>", "&>>"})
+#: The PowerShell twin (``2>$null``, ``*>$null``).
+_PS_STDERR_SILENCED_RE = re.compile(r"(?:\*|2)>>?\s*\$null", re.IGNORECASE)
+
+
+def _silences_stderr(tokens: List[str]) -> bool:
+    """True when these tokens carry a stderr-throwing redirection
+    (``2>/dev/null``, ``&>/dev/null``, also split as ``2> /dev/null``)."""
+    for k, tok in enumerate(tokens):
+        if _STDERR_SILENCED_RE.match(tok):
+            return True
+        if (tok in _STDERR_SILENCED_SPLIT and k + 1 < len(tokens)
+                and tokens[k + 1] == "/dev/null"):
+            return True
+    return False
+
+
+def _peel_to_wrapper(tokens: List[str]) -> List[str]:
+    """Leading wrapper verbs peeled down to the command a segment runs —
+    :data:`WRAPPER_VERBS` (``sudo``/``nice``/``env``…) and the flag-only
+    :data:`FLAG_WRAPPERS` (``nohup``/``setsid``/``doas``). ``timeout`` is
+    NOT peeled: callers must see it to judge what it wraps."""
+    words = peel_wrapper_verbs(tokens)
+    while words and os.path.basename(words[0]).lower() in FLAG_WRAPPERS:
+        words = peel_wrapper_verbs(words[1:])
+    return words
+
+
+def _timeout_options_end(words: List[str]) -> int:
+    """The index of ``timeout``'s duration argument (its options, whose
+    value flags take a separate token, skipped)."""
+    i = 1
+    while i < len(words) and words[i].startswith("-") and words[i] != "-":
+        i += 2 if words[i] in TIMEOUT_VALUE_OPTS else 1
+    return i
+
+
+def _timeout_bounded(command: str, depth: int = 0) -> bool:
+    """True when ``command`` is wrapped in a LITERAL ``timeout <N>`` (or
+    ``gtimeout <N>``) — also through a ``bash -c`` / ``sh -c`` body — the
+    bounded form the refusal message shows."""
+    if depth > _MAX_TIMEOUT_SCAN_DEPTH:
+        return False
+    tokens = tokenize(command)
+    if not tokens:
+        return False
+    for segment in split_chain(tokens):
+        words = _peel_to_wrapper(strip_env_assignments(segment))
+        if not words:
+            continue
+        verb = os.path.basename(words[0]).lower()
+        if verb in ("timeout", "gtimeout"):
+            i = _timeout_options_end(words)
+            return i < len(words) and bool(_LITERAL_SLEEP_RE.match(words[i]))
+        if verb in SHELL_DASH_C_VERBS:
+            sub = dash_c_subcommand(words)
+            if sub is not None:
+                return _timeout_bounded(sub, depth + 1)
+    return False
+
+
+def _wrapped_shell_body(tokens: List[str]) -> Optional[str]:
+    """The code a wrapper hands to a shell — ``timeout 10 bash -c '…'``,
+    ``nohup sh -c '…'``. The chain walker recurses only a shell at the
+    command position, so the background reading follows the wrapper
+    itself."""
+    words = _peel_to_wrapper(strip_env_assignments(tokens))
+    if words and os.path.basename(words[0]).lower() in ("timeout", "gtimeout"):
+        i = _timeout_options_end(words)
+        words = _peel_to_wrapper(words[i + 1:]) if i < len(words) else []
+    if words and os.path.basename(words[0]).lower() in SHELL_DASH_C_VERBS:
+        return dash_c_subcommand(words)
+    return None
+
+
+def _background_loop_refusal(segments: List[ChainSegment],
+                             rec: dict) -> Optional[tuple]:
+    """``(pattern_name, evidence, stderr_silenced_in_condition)`` for a
+    background command's loop that WAITS and is not bounded, else
+    ``None``. Bounded = a proved literal iteration cap; a background
+    ``while``/``until`` has none (its bound depends on the body's control
+    flow). ``rec`` is one entry of :func:`_background_wait_pattern`'s scan."""
+    if rec["iterations"] is not None:
+        return None  # a literal iteration cap: bounded
+    waiting = None
+    for k in [rec["index"]] + rec["segments"]:
+        found = _pattern_of_segment(segments[k], 0)
+        if found is not None:
+            waiting = found
+            break
+    if waiting is None:
+        waiting = _busy_wait_pattern(segments, rec["index"])
+    if waiting is None:
+        return None  # a loop doing real work with no wait: not a wait loop
+    hidden = any(_silences_stderr(strip_env_assignments(list(segments[k].tokens)))
+                 for k in [rec["index"]] + rec["condition"])
+    return (waiting[0], waiting[1], hidden)
+
+
+def _background_wait_pattern(command: str,
+                             _depth: int = 0) -> Optional[tuple]:
+    """The background-loop rule (owner rulings 2026-10-29 / 2026-10-30):
+    a ``run_in_background`` command is the sanctioned way to wait, and a
+    background WAIT LOOP stays allowed only when it is BOUNDED — a literal
+    iteration cap, or a whole-command ``timeout <N>``
+    (:func:`_timeout_bounded`, checked by the caller). An unbounded wait
+    loop is refused: when its condition never comes true it runs until a
+    human notices (field case 2026-10-30: an ``until`` loop whose command
+    was not on PATH ran 83 minutes). The returned evidence also says
+    whether the loop's CONDITION throws stderr away — a command that
+    cannot run then looks like "not yet" forever."""
+    segments = walk_segments(command, _with_substitutions=True,
+                             _with_function_bodies=False,
+                             _with_assignments=True,
+                             _with_shell_runs=True)
+    if _depth < _MAX_TIMEOUT_SCAN_DEPTH:
+        for seg in segments:
+            body = _wrapped_shell_body(list(seg.tokens))
+            if body is not None:
+                found = _background_wait_pattern(body, _depth + 1)
+                if found is not None:
+                    return found
+    by_depth: Dict[int, List[ChainSegment]] = {}
+    for seg in segments:
+        by_depth.setdefault(seg.depth, []).append(seg)
+    for level in by_depth.values():  # `bash -c '…'` bodies are level 1
+        stack: List[dict] = []
+        for i, seg in enumerate(level):
+            tokens = strip_env_assignments(list(seg.tokens))
+            first = os.path.basename(tokens[0]).lower() if tokens else ""
+            if first == "done":
+                if stack:
+                    found = _background_loop_refusal(level, stack.pop())
+                    if found is not None:
+                        return found
+                continue
+            if stack:
+                if first == "do":
+                    stack[-1]["in_body"] = True
+                    stack[-1]["segments"].append(i)
+                elif not stack[-1]["in_body"]:
+                    stack[-1]["condition"].append(i)
+                else:
+                    stack[-1]["segments"].append(i)
+            opened = segment_opener(tokens) if tokens else None
+            if opened is not None:
+                stack.append({"index": i, "iterations": loop_iterations(tokens),
+                              "segments": [], "condition": [], "in_body": False})
+    return None
+
+
+def _background_refusal(tool: str, command: str,
+                        readable: str) -> Optional[tuple]:
+    """The one background decision for either shell: ``None`` when the
+    command may run in the background, else the pattern to refuse."""
+    if tool == POWERSHELL_TOOL:
+        # PowerShell has no `timeout`; the bounded forms it does have (a
+        # counter `for`, a `foreach` range) are what `loop_pattern`'s
+        # budget reading proves. A background loop only has to TERMINATE —
+        # it is not a foreground wait — so any PROVED literal bound is
+        # enough and the token-saving budget does not apply.
+        loop = loop_pattern(command, wait_budget_s=float("inf"))
+        if loop is None:
+            return None
+        return (loop[0], loop[1], bool(_PS_STDERR_SILENCED_RE.search(command)))
+    if _timeout_bounded(readable):
+        return None
+    return _background_wait_pattern(readable)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1387,12 +1574,12 @@ def bash_repeat_key(command: str, prefix: str = "bash") -> Optional[str]:
 
 def noop_repeat_key(command: str) -> Optional[str]:
     """The repeat key of a call that does NOTHING (v0.2.105): every
-    statement is ``true``, ``:``, ``sleep 0``, or a bare ``echo`` /
-    ``Write-Host`` (no output redirection, no pipe, no command
-    substitution — those do or feed work). ``None`` for anything else,
-    so a single real command anywhere in the line is never counted. The
-    key is the token-joined command: a DIFFERENT no-op is a different
-    key."""
+    statement is ``true``, ``:``, ``exit`` (with no argument or ``0``),
+    ``sleep 0``, or a bare ``echo`` / ``printf`` / ``Write-Host`` (no
+    output redirection, no pipe, no command substitution — those do or
+    feed work). ``None`` for anything else, so a single real command
+    anywhere in the line is never counted. The key is the token-joined
+    command: a DIFFERENT no-op is a different key."""
     if "$(" in command or "`" in command:
         return None
     tokens = tokenize(command)
@@ -1407,6 +1594,12 @@ def noop_repeat_key(command: str) -> Optional[str]:
         verb = os.path.basename(words[0]).lower()
         if verb == "sleep":
             if words[1:] != ["0"]:
+                return None
+            continue
+        if verb == "exit":
+            # `exit 0` ends the shell having done nothing; `exit 1` (or any
+            # other status) reports a result, so it is not a no-op.
+            if words[1:] not in ([], ["0"]):
                 return None
             continue
         if verb not in _NOOP_VERBS:
@@ -1484,6 +1677,43 @@ def static_deny_reason(command: str, pattern: tuple, tool: str = "Bash",
         f"BLOCKED by the VCO wait-loop guard: the {_shell_label(tool)} command "
         f"`{command}` matches the polling pattern `{name}`{read_as}." + _WHY +
         (_INSTEAD_POWERSHELL if ps else _INSTEAD_BASH) + _KNOB
+    )
+
+
+def background_wait_deny_reason(command: str, pattern: tuple,
+                                tool: str = "Bash") -> str:
+    """The refusal for an UNBOUNDED background wait loop (fix round 2,
+    item 7): names the loop, shows the bounded form, and — when the loop's
+    condition throws stderr away — says why that makes a broken command
+    look like "not yet" forever."""
+    name, evidence, stderr_silenced = pattern
+    ps = tool == POWERSHELL_TOOL
+    bounded = (
+        "wrap the whole command in a literal timeout"
+        " (e.g. `timeout 600 pwsh -File check.ps1`), or give the loop a"
+        " counter `for` with a literal bound"
+        if ps else
+        "wrap the whole command in a literal timeout"
+        " (e.g. `timeout 600 <your command>`), or give the loop a literal"
+        " iteration cap (`for i in 1 2 3 …`)")
+    reason = (
+        f"BLOCKED by the VCO wait-loop guard: this background "
+        f"{_shell_label(tool)} command starts an UNBOUNDED wait loop "
+        f"(`{name}`: {evidence}). A background loop must be BOUNDED — "
+        f"{bounded} — so it cannot run until someone notices when its "
+        f"condition never comes true."
+    )
+    if stderr_silenced:
+        reason += (
+            " Its CONDITION throws stderr away (`2>/dev/null`): a command "
+            "that cannot run then looks like \"not yet\" forever — drop the "
+            "redirection so the real error is visible."
+        )
+    return (
+        reason + _WHY +
+        " WHAT TO DO INSTEAD: bound the loop as above, start it ONCE with"
+        " run_in_background: true, and END YOUR TURN; the completion"
+        " notification wakes you." + _KNOB
     )
 
 
@@ -1753,7 +1983,14 @@ def evaluate(
         if not isinstance(command, str) or not command.strip():
             return None
         if tool_input.get("run_in_background"):
-            # The sanctioned trigger: a backgrounded command never polls.
+            # The sanctioned trigger: a backgrounded command never polls —
+            # but its WAIT LOOP must be bounded (fix round 2, item 7): an
+            # unbounded loop whose condition never comes true runs until a
+            # human notices.
+            readable_bg = command_for_bash_readers(tool, command)
+            found_bg = _background_refusal(str(tool), command, readable_bg)
+            if found_bg is not None:
+                return background_wait_deny_reason(command, found_bg, str(tool))
             return None
         # PowerShell (v0.2.102 W5-D): read through its Bash-equivalent form
         # — one detector for both shells (vco_lib.powershell_command).

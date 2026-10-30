@@ -18,6 +18,7 @@ Cite every finding as `file:line`. Where you cannot verify, write UNVERIFIED
 rather than guessing.
 
 Rules that are absolute:
+- Waiting: waiting means ENDING YOUR TURN and being woken by the completion notification (start long work with `run_in_background`), never calling a tool in a loop to check on it.
 - One report, at the path the brief names. No second file, no scratch files
   inside the repo (anything disposable goes in the dir `<project>/.claude/scripts/vco-scratch path --name <lane>` (`<project>` = the main checkout's absolute path, from your brief — a git worktree has no `.claude/scripts/`)
   prints (`<lane>` = the lane name your brief gives, else `deepseek-researcher-<task-slug>`; never omit it — the default lane is the session id, which you share with your parent and every sibling lane) - VCO cleans it; never `rm -rf` outside it).
