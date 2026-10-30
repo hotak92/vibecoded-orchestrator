@@ -42,6 +42,12 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
+# v0.2.105: the hook's start, for the router's run deadline AND its hard
+# end-to-end deadline (the harness timeout counts from HERE).
+# One home: _lib/hook-start.ps1 (MUST MATCH the .sh sibling's call).
+$HookStartLib = Join-Path $PSScriptRoot "_lib/hook-start.ps1"
+if (Test-Path $HookStartLib) { . $HookStartLib; Set-VcoHookStartedAt }
+
 # VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
 #   delegate is claude_mcp_servers/scripts/hook_context_router.py (KG +
 #   code-graph legs loaded in-process, both access-aware via the weaviate_mcp
@@ -290,7 +296,22 @@ try:
 except Exception:
     pass
 "@
-    try { & $VenvPy -c $preBashPy *> $null } catch { }
+    # v0.2.105: a DETACHED process, never an inline call. Inline, the emit
+    # (hub config resolve + event post: seconds under load) ran inside the
+    # hook's 10 s window and timed it out; the .sh sibling backgrounds it with
+    # its stdio detached (MUST MATCH). The spawn goes through the ONE guarded
+    # spawn home (_lib/resolve-powershell.ps1), whose POSIX branch also
+    # detaches the child's stdio from the hook's pipes. A missing helper is a
+    # broken install: say so, and skip the event rather than block the hook.
+    $SpawnLib = Join-Path $PSScriptRoot "_lib/resolve-powershell.ps1"
+    if (Test-Path -LiteralPath $SpawnLib) {
+        try {
+            . $SpawnLib
+            Start-VcoDetachedProcess -FilePath $VenvPy -ArgumentList @('-c', $preBashPy)
+        } catch { }
+    } else {
+        [Console]::Error.WriteLine("[VCO broken install] .claude/hooks/_lib/resolve-powershell.ps1 is missing; this command's pre_bash outcome event was not emitted (re-run the bundle update).")
+    }
 }
 
 # === Emit the router's injection text (if any) ===

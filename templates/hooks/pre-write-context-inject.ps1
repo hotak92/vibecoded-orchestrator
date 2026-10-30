@@ -23,10 +23,11 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
-# v0.2.104 E-2: the hook's start, for the router's run deadline (the harness
-# timeout counts from HERE). Invariant culture: a "1,5" radix would be
-# ignored by the router.
-$env:VCO_HOOK_STARTED_AT = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+# v0.2.105: the hook's start, for the router's run deadline AND its hard
+# end-to-end deadline (the harness timeout counts from HERE).
+# One home: _lib/hook-start.ps1 (MUST MATCH the .sh sibling's call).
+$HookStartLib = Join-Path $PSScriptRoot "_lib/hook-start.ps1"
+if (Test-Path $HookStartLib) { . $HookStartLib; Set-VcoHookStartedAt }
 
 # VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
 #   delegate is claude_mcp_servers/scripts/hook_context_router.py (KG +

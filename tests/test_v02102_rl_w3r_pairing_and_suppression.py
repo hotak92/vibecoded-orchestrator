@@ -566,7 +566,7 @@ class TestW3R10AmendPendingCitations:
         p = self._stage(proj, "sess-p", "pre_edit_p", ["Shown", "Hidden"],
                         run_id="router_1")
         router._amend_pending_citations(str(proj), "sess-p", ["Hidden"],
-                                        "router_1")
+                                        "router_1", staged=[p])
         ctx = json.loads(p.read_text())["ctx"]
         assert [n["title"] for n in ctx["nodes"]] == ["Shown"]
         assert ctx["router_suppressed_titles"] == ["Hidden"]
@@ -577,7 +577,7 @@ class TestW3R10AmendPendingCitations:
         p = self._stage(proj, "sess-f", "pre_edit_f", ["Only"],
                         run_id="router_1")
         router._amend_pending_citations(str(proj), "sess-f", ["Only"],
-                                        "router_1")
+                                        "router_1", staged=[p])
         assert not p.exists(), "no shown nodes → nothing citable → delete"
 
     def test_other_sessions_and_sibling_runs_untouched(
@@ -592,8 +592,12 @@ class TestW3R10AmendPendingCitations:
         sibling = self._stage(proj, "sess-s", "pre_edit_sib", ["Hidden"],
                               run_id="router_sibling")
         unstamped = self._stage(proj, "sess-s", "pre_edit_old", ["Hidden"])
+        # v0.2.105: the candidates are the files the run staged — here ALL
+        # three are handed in, so the stamp + session guards are what keep
+        # them untouched.
         router._amend_pending_citations(str(proj), "sess-s", ["Hidden"],
-                                        "router_1")
+                                        "router_1",
+                                        staged=[other, sibling, unstamped])
         for p, what in ((other, "other session"), (sibling, "sibling run"),
                         (unstamped, "unstamped pre-fix file")):
             assert json.loads(p.read_text())["ctx"]["nodes"], what

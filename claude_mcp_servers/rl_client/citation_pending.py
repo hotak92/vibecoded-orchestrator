@@ -50,6 +50,8 @@ __all__ = [
     "pending_dir",
     "stage_pending",
     "read_pending",
+    "read_pending_header",
+    "write_pending",
     "list_pending_for_session",
     "delete_pending",
     "collect_abandoned",
@@ -133,9 +135,15 @@ _FINISH_MAX_PASSES = 64
 # transcript is a finished agent's final answer.
 AGENT_WINDOW_FINAL_KEY = "agent_window_final"
 
-# The file-name prefix of a retrieval staged without a session id (the MCP
-# path: the server is not told which chat calls it). Such a file belongs to
-# the chat whose transcript holds its query (the drain's attribution rule).
+# The file-name prefix of a retrieval staged without a session id: the MCP
+# path and the ``kg-search`` CLI. Neither is told which chat calls it —
+# Claude Code's ``CLAUDE_CODE_SESSION_ID`` in their env names the chat that
+# SPAWNED the process (every subagent shares it, and an MCP server keeps the
+# value it started with), so tagging with it would score a subagent's
+# retrieval against its parent's answer. Such a file belongs to the chat
+# whose transcript holds its query: its ``hybrid_search`` call, or (v0.2.105)
+# its Bash / PowerShell ``kg-search search <query>`` call (the drain's
+# attribution rule, ``rl_drain_citations._query_in_transcript``).
 NO_SESSION_PREFIX = "nosession"
 
 # Filesystem-safe key sanitiser. session_id / task_id come from Claude Code +
@@ -233,6 +241,17 @@ def stage_pending(
     process); the drain routes agent-tagged files to the agent's own
     transcript (``rl_drain_citations.drain_session``).
     """
+    # v0.2.105: a session that keeps no transcript (a headless
+    # ``--no-session-persistence`` run, marked by the process that started
+    # it) can never have this ctx scored — stage nothing. Its RL retrieval
+    # event is emitted elsewhere and is unaffected. Hard vco_lib dependency,
+    # like the imports below.
+    from vco_lib.rl_citation_env import session_keeps_no_transcript  # noqa: PLC0415
+
+    if session_keeps_no_transcript():
+        logger.debug("stage_pending: session keeps no transcript; %s not staged",
+                     task_id[:8])
+        return None
     if agent_id is None:
         agent_id = os.environ.get("VCT_AGENT_ID", "")
     try:
@@ -261,12 +280,10 @@ def stage_pending(
         path = _pending_path(session_id, task_id, project_root)
         if path is None:
             return None
-        # v0.2.92: one home for tmp+os.replace. `vco_lib` is a hard
-        # dependency of every MCP process (server.py imports it at
-        # startup), so this import is loud, not a soft degrade.
-        from vco_lib.atomic import atomic_write_json  # noqa: PLC0415
-
-        atomic_write_json(path, payload, indent=None, fsync=False)
+        # v0.2.92: one home for tmp+os.replace (`vco_lib` is a hard
+        # dependency of every MCP process, so its import is loud);
+        # v0.2.105: through the pending writer, ctx last.
+        write_pending(path, payload)
         return path
     except Exception as exc:  # noqa: BLE001
         logger.debug("stage_pending: write failed for %s (%s)", task_id[:8], exc)
@@ -280,6 +297,245 @@ def read_pending(path: "str | Path") -> Optional[dict]:
             return json.load(fh)
     except Exception:  # noqa: BLE001
         return None
+
+
+# v0.2.105: how much of a pending file :func:`read_pending_header` reads at
+# each end. The routing fields are a few hundred bytes; the ctx (node
+# vectors) is 1-8 MB. A file no larger than _HEADER_FULL_READ_MAX is simply
+# parsed whole.
+_HEADER_EDGE_BYTES = 16 * 1024
+_HEADER_FULL_READ_MAX = 2 * _HEADER_EDGE_BYTES
+_CTX_KEY = "ctx"
+# A top-level key boundary as ``json.dumps`` writes it (``, "``). It never
+# occurs inside a JSON string: every ``"`` in a string is escaped.
+_KEY_BOUNDARY = re.compile(r',\s*"')
+
+
+def _header_without_ctx(payload: object) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+    return {k: v for k, v in payload.items() if k != _CTX_KEY}
+
+
+def _parse_leading_fields(text: str) -> "Optional[tuple[dict, bool]]":
+    """The top-level fields before ``ctx``, parsed exactly (JSON decoder,
+    one value at a time). ``(fields, saw_ctx)``; ``None`` when the text ends
+    before ``ctx`` (or the object) does, or is not a JSON object."""
+    scanned = _scan_leading_fields(text)
+    return None if scanned is None else (scanned[0], scanned[1])
+
+
+def _scan_leading_fields(text: str) -> "Optional[tuple[dict, bool, int]]":
+    """:func:`_parse_leading_fields` plus the index in ``text`` where the
+    ``ctx`` VALUE starts (``-1`` when there is no ``ctx``)."""
+    dec = json.JSONDecoder()
+    ws = re.compile(r"\s*")
+    i = ws.match(text, 0).end()  # type: ignore[union-attr]
+    if text[i:i + 1] != "{":
+        return None
+    i += 1
+    out: dict = {}
+    try:
+        while True:
+            i = ws.match(text, i).end()  # type: ignore[union-attr]
+            if text[i:i + 1] == "}":
+                return out, False, -1
+            key, i = dec.raw_decode(text, i)
+            i = ws.match(text, i).end()  # type: ignore[union-attr]
+            if not isinstance(key, str) or text[i:i + 1] != ":":
+                return None
+            i = ws.match(text, i + 1).end()  # type: ignore[union-attr]
+            if key == _CTX_KEY:
+                return out, True, i
+            value, i = dec.raw_decode(text, i)
+            out[key] = value
+            i = ws.match(text, i).end()  # type: ignore[union-attr]
+            sep = text[i:i + 1]
+            if sep == "}":
+                return out, False, -1
+            if sep != ",":
+                return None
+            i += 1
+    except ValueError:
+        return None
+
+
+def _parse_trailing_fields(tail: str) -> Optional[dict]:
+    """The top-level fields AFTER ``ctx``, read from the file's tail. Key
+    boundaries are tried from the right: each one inside the trailing fields
+    parses as the rest of an object, the first one inside ``ctx`` does not
+    (it would close ``ctx`` too). ``None`` when that cannot be decided from
+    this tail: no boundary inside ``ctx`` was reached, the field before the
+    trailing ones is not an object (``ctx``), or a trailing value is not a
+    scalar (every writer appends only scalars after ``ctx``)."""
+    body = tail.rstrip()
+    if not body.endswith("}"):
+        return None
+    starts = [m.start() for m in _KEY_BOUNDARY.finditer(body)]
+    found: dict = {}
+    found_at: Optional[int] = None
+    reached_ctx = False
+    for start in reversed(starts):
+        rest = "{" + body[start + 1:]
+        try:
+            obj = json.loads(rest)
+        except ValueError:
+            reached_ctx = True
+            break
+        if not isinstance(obj, dict):
+            return None
+        found, found_at = obj, start
+    if not reached_ctx:
+        return None
+    if found_at is not None and not body[:found_at].rstrip().endswith("}"):
+        return None
+    if found_at is None and not body[:-1].rstrip().endswith("}"):
+        return None  # nothing after ctx, so the object must end ``}}``
+    if any(isinstance(v, (dict, list)) for v in found.values()):
+        return None
+    return found
+
+
+def read_pending_header(path: "str | Path") -> Optional[dict]:
+    """Every top-level field of one pending file EXCEPT ``ctx`` — the
+    routing fields (``session_id``, ``agent_id``, ``query``, ``ts_ms``,
+    ``source``, ``agent_transcript_path``, ``brief_tool_use_id``, ...) a
+    drain decides on before it claims a file — read from the file's two
+    ends instead of the whole multi-megabyte ctx (v0.2.105: a drain that
+    parsed every file in full read ~6 GB per Stop on one project).
+
+    The fields are the ones :func:`read_pending` would return. The leading
+    ones are decoded value by value up to ``ctx``; :func:`write_pending`, the
+    one pending writer, puts ``ctx`` last, so for its files that is every
+    field. A file written before v0.2.105 can carry fields appended after
+    ``ctx`` (an agent-transcript stamp, a brief id — always scalars); they are
+    decoded from the tail. When the two ends do not settle the fields (no
+    ``ctx`` in the head, an undecodable tail, a non-scalar after ``ctx``),
+    the whole file is read instead. The one shape the tail cannot tell from
+    the end of ``ctx`` — an object with several keys appended after ``ctx`` —
+    is one no VCO writer has ever produced. ``None`` on soft-fail
+    (unreadable / not a JSON object), as :func:`read_pending`. The result
+    has no ctx: a scorer reads it with :func:`read_pending` at compute time,
+    and a write-back goes through :func:`update_pending_fields`, never
+    :func:`write_pending` (which would drop the ctx)."""
+    try:
+        size = os.stat(path).st_size
+        if size <= _HEADER_FULL_READ_MAX:
+            return _header_without_ctx(read_pending(path))
+        with open(path, "rb") as fh:
+            head_b = fh.read(_HEADER_EDGE_BYTES)
+            fh.seek(size - _HEADER_EDGE_BYTES)
+            tail_b = fh.read()
+    except OSError:
+        return None
+    head = head_b.decode("utf-8", errors="ignore")
+    tail = tail_b.decode("utf-8", errors="ignore")
+    lead = _parse_leading_fields(head)
+    if lead is not None and lead[1]:
+        trailing = _parse_trailing_fields(tail)
+        if trailing is not None:
+            fields = dict(lead[0])
+            for key, value in trailing.items():
+                if key != _CTX_KEY:
+                    fields[key] = value
+            return fields
+    return _header_without_ctx(read_pending(path))
+
+
+def write_pending(path: "str | Path", payload: dict) -> None:
+    """The ONE writer of a pending payload (v0.2.105): every field first,
+    ``ctx`` LAST, so a field added later (a stamp, an adopt, a new key) is
+    read by :func:`read_pending_header` from the file's head, exactly,
+    however its value is shaped. Atomic (tmp + replace); raises ``OSError``
+    like the writer it wraps."""
+    from vco_lib.atomic import atomic_write_json  # noqa: PLC0415
+
+    ordered = {k: v for k, v in payload.items() if k != _CTX_KEY}
+    if _CTX_KEY in payload:
+        ordered[_CTX_KEY] = payload[_CTX_KEY]
+    atomic_write_json(Path(path), ordered, indent=None, fsync=False)
+
+
+def _ctx_value_span(path: Path) -> "Optional[tuple[dict, int, int]]":
+    """``(fields before ctx, start, end)``: the byte range of the ``ctx``
+    VALUE in a file :func:`write_pending` laid out (ctx last, nothing after
+    it), read from the file's two ends. ``None`` when the two ends do not
+    prove that layout (a pre-v0.2.105 file with fields after ``ctx``, a file
+    without ``ctx``, a ctx whose tail cannot be told from a trailing field)."""
+    size = os.stat(path).st_size
+    with open(path, "rb") as fh:
+        head_b = fh.read(_HEADER_EDGE_BYTES)
+        tail_at = max(0, size - _HEADER_EDGE_BYTES)
+        fh.seek(tail_at)
+        tail_b = fh.read()
+    head = head_b.decode("utf-8", errors="ignore")
+    scanned = _scan_leading_fields(head)
+    if scanned is None or not scanned[1]:
+        return None
+    fields, _saw_ctx, idx = scanned
+    lead_b = head[:idx].encode("utf-8")
+    if head_b[:len(lead_b)] != lead_b:
+        return None  # the head did not decode byte for byte: no offset to trust
+    if _parse_trailing_fields(tail_b.decode("utf-8", errors="ignore")) != {}:
+        return None  # fields after ctx (or undecidable): not the ctx-last layout
+    body = tail_b.rstrip()
+    end = tail_at + len(body) - 1  # the object's closing brace
+    start = len(lead_b)
+    if not body.endswith(b"}") or end <= start:
+        return None
+    return fields, start, end
+
+
+def update_pending_fields(
+    path: "str | Path", updates: dict, drop: "tuple[str, ...]" = (),
+) -> None:
+    """Set ``updates`` and remove ``drop`` among the routing fields of one
+    pending file WITHOUT parsing its ctx (v0.2.105: the drain's agent stamp
+    on a file it only read the header of). The ctx bytes are copied verbatim
+    into the rewritten file — never decoded, never re-serialized — so a
+    write-back can neither lose nor alter them; the layout is
+    :func:`write_pending`'s (fields first, ``ctx`` last). A file whose layout
+    the two ends do not prove (a pre-v0.2.105 file with fields after ``ctx``)
+    is read whole and written back through :func:`write_pending` instead.
+    Atomic (tmp + replace); raises ``OSError`` for an unreadable file, like
+    :func:`write_pending`."""
+    if _CTX_KEY in updates or _CTX_KEY in drop:
+        raise ValueError("update_pending_fields never touches ctx")
+    p = Path(path)
+    span = _ctx_value_span(p)
+    if span is None:
+        payload = read_pending(p)
+        if not isinstance(payload, dict):
+            raise OSError(f"unreadable pending file: {p.name}")
+        for key in drop:
+            payload.pop(key, None)
+        payload.update(updates)
+        write_pending(p, payload)
+        return
+    fields, start, end = span
+    for key in drop:
+        fields.pop(key, None)
+    fields.update(updates)
+    # Exactly the bytes write_pending would produce around the ctx value:
+    # json.dumps' default separators, ensure_ascii off, a trailing newline.
+    prefix = json.dumps(fields, ensure_ascii=False)[:-1]
+    prefix += (", " if fields else "") + json.dumps(_CTX_KEY) + ": "
+    from vco_lib.atomic import atomic_text_stream  # noqa: PLC0415
+
+    # surrogateescape round-trips every byte, even a UTF-8 sequence a chunk
+    # boundary splits. The source is closed before the replace (Windows).
+    with atomic_text_stream(p, errors="surrogateescape", fsync=False) as out:
+        out.write(prefix)
+        with open(p, "rb") as src:
+            src.seek(start)
+            remaining = end - start
+            while remaining > 0:
+                chunk = src.read(min(1 << 20, remaining))
+                if not chunk:
+                    raise OSError(f"pending file shrank while rewriting: {p.name}")
+                out.write(chunk.decode("utf-8", errors="surrogateescape"))
+                remaining -= len(chunk)
+        out.write("}\n")
 
 
 def list_pending_for_session(
@@ -383,7 +639,10 @@ def collect_abandoned(
     for p in candidates:
         if live and p.name.startswith(f"{live}__"):
             continue  # the running session's own file: it has a live owner
-        before = read_pending(p)
+        # v0.2.105: decide on the routing fields only (the ctx is 1-8 MB and
+        # the decision never reads it); the full payload is read once the
+        # file is claimed, i.e. only for a file this pass will score.
+        before = read_pending_header(p)
         stage_mtime = _safe_mtime(p)
         transcript = _source_for(source_fn, before)
         if not _abandoned(p, before, transcript, now_s, idle):
@@ -885,7 +1144,7 @@ def adopt_brief_citations(
             pass
     adopted = 0
     for path in list_pending_for_session(session_id, project_root):
-        payload = read_pending(path)
+        payload = read_pending_header(path)  # v0.2.105: routing fields only
         if not isinstance(payload, dict) or payload.get("brief_tool_use_id") != tuid:
             continue
         if payload.get("agent_id"):
@@ -901,9 +1160,7 @@ def adopt_brief_citations(
                     payload["agent_transcript_path"] = agent_transcript_path
                     if not window_final:
                         payload[AGENT_WINDOW_FINAL_KEY] = False
-                from vco_lib.atomic import atomic_write_json  # noqa: PLC0415
-
-                atomic_write_json(claimed, payload, indent=None, fsync=False)
+                write_pending(claimed, payload)
                 adopted += 1
         except Exception as exc:  # noqa: BLE001 — telemetry must not break the hook
             logger.debug("adopt_brief_citations: %s (%s)", path.name, exc)

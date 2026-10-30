@@ -16,6 +16,12 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
+# v0.2.105: the hook's start, for the router's run deadline AND its hard
+# end-to-end deadline (the harness timeout counts from HERE).
+# One home: _lib/hook-start.ps1 (MUST MATCH the .sh sibling's call).
+$HookStartLib = Join-Path $PSScriptRoot "_lib/hook-start.ps1"
+if (Test-Path $HookStartLib) { . $HookStartLib; Set-VcoHookStartedAt }
+
 # v0.2.102 W6-F fix-round: per-surface kill switch (VCO_PROMPT_INJECT=off)
 # disables ONLY this prompt surface (the global VCO_INJECT_PROFILE=off,
 # checked in _lib/inject-budget.ps1 below, disables every surface). Checked

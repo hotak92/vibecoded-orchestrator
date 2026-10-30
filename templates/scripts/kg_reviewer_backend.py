@@ -89,6 +89,7 @@ try:
     from vco_lib import kg_reviewer_model as _model  # noqa: E402
     from vco_lib import kg_reviewer_prompt as _prompt  # noqa: E402
     from vco_lib import claude_cli_api_key as _cli_api_key  # noqa: E402
+    from vco_lib import rl_citation_env as _rl_env  # noqa: E402
 except ImportError as _exc:  # pragma: no cover — exercised by the hook tests
     print(f"kg_reviewer_backend: BROKEN INSTALL - vco_lib is not importable "
           f"({_exc}); the KG reviewer cannot run its guarded review. Repair "
@@ -739,6 +740,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     env = dict(os.environ)
     if decision["base_url"]:
         env.update(_gateway_auth_env(decision["base_url"]))
+    # v0.2.105: the run keeps no transcript (--no-session-persistence), so a
+    # citation its hooks / MCP servers would stage can never be scored —
+    # tell them not to stage one (their RL retrieval events still go out).
+    env[_rl_env.NO_TRANSCRIPT_ENV] = "1"
     # The prompt rides on STDIN, never argv (the Windows `claude` shim is a
     # .cmd re-parsed by the shell, the prompt embeds `git diff` output whose
     # `---` tokens would parse as options, and the command line is capped at
