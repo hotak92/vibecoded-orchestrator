@@ -561,6 +561,13 @@ if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
             $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
             $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
             $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+            # v0.2.105 rm guard: the scanner remembers a "retry to confirm"
+            # rm per chat session + subagent under .claude/state/rm-confirm/,
+            # so it gets the payload's ids and the state dir (always set, so
+            # an inherited value never leaks in). MUST MATCH pre-tool-use.sh.
+            $psi.EnvironmentVariables["VCO_GUARD_SESSION_ID"] = [string]$SessionIdFromStdin
+            $psi.EnvironmentVariables["VCO_GUARD_AGENT_ID"] = [string]$AgentId
+            $psi.EnvironmentVariables["VCO_GUARD_STATE_DIR"] = [string]$SessionStateDir
             $proc = [System.Diagnostics.Process]::Start($psi)
             $outTask = $proc.StandardOutput.ReadToEndAsync()
             $errTask = $proc.StandardError.ReadToEndAsync()

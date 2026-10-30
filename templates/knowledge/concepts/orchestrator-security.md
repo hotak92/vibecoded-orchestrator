@@ -79,6 +79,8 @@ The guard fails CLOSED: no Python, an unparseable payload, a missing helper or a
 | `pip_install_url`, `pip_install_git`, `npm_install_url` | Remote package installs from raw URLs |
 | `reverse_shell`, `crontab_write` | Persistence / remote-control |
 
+**`rm` deletes** (v0.2.105, `vco_lib/rm_guard.py`): `rm` counts only as a command word (so `confirm /home` or a branch named `x-rmconfirm` never matches). An rm of `/`, the home directory itself (`~`, `~/`, `~/*`, `$HOME`), `/home`, `/home/<user>`, or anything at or under `/etc /usr /var /boot /dev /root` is always refused. A recursive (`-r`, `-R`, `--recursive`) or glob rm of a deeper path under a home directory is refused ONCE with "Are you sure you want to delete all the contents of <path>?"; retrying the exact same command from the same chat or subagent within 10 minutes is allowed, and the confirmation is used up (a third run asks again). A plain rm of a file under home needs no confirmation. The confirmation is remembered as a hash of session, agent and command in `.claude/state/rm-confirm/` (owner-only files, no command text); when it cannot be recorded, the rm stays refused.
+
 A matched rule blocks the command (the hook exits 2) with the rule's explanation surfaced to Claude via stderr; credential-read rules add a pointer to the sanctioned secrets resolver. Blocks are logged to `.claude/logs/security_events.jsonl`. Stage 1 runs on the raw command text, so it is the stricter of the two: a here-doc or quoted string that merely mentions a fetch piped to a shell is still blocked there. Without a Python interpreter the Bash scans cannot run, and the hook says so (a broken install) instead of passing silently.
 
 ## Layer 4: Build Anchor Protocol

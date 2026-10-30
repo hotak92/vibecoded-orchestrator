@@ -525,6 +525,82 @@ def peel_wrapper_verbs(tokens: List[str]) -> List[str]:
     return out
 
 
+#: Wrappers :func:`peel_to_command` peels beyond :data:`WRAPPER_VERBS`
+#: (v0.2.105 — moved here from the kill guard so the rm guard shares them).
+FLAG_WRAPPERS: frozenset[str] = frozenset({"nohup", "setsid", "doas"})
+XARGS_VALUE_OPTS: frozenset[str] = frozenset({
+    "-I", "-i", "-n", "-L", "-l", "-P", "-d", "-E", "-e", "-a", "-s",
+    "--max-args", "--max-lines", "--max-procs", "--delimiter", "--arg-file",
+    "--replace", "--eof", "--max-chars"})
+TIMEOUT_VALUE_OPTS: frozenset[str] = frozenset({"-s", "-k", "--signal",
+                                                "--kill-after"})
+
+
+def command_basename(tok: str) -> str:
+    """Lower-cased last path component of a command word (``/bin/rm`` →
+    ``rm``; Windows separators too)."""
+    return tok.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _skip_opts(toks: List[str], value_opts: frozenset) -> List[str]:
+    i = 1
+    while i < len(toks) and toks[i].startswith("-") and toks[i] != "-":
+        if toks[i] == "--":
+            i += 1
+            break
+        i += 2 if toks[i] in value_opts else 1
+    return toks[i:]
+
+
+def peel_to_command(tokens: List[str]) -> Optional[Tuple[List[str], str]]:
+    """Peel ONE walked segment down to the command it actually runs:
+    leading compound keywords, subshell parens, env assignments,
+    :data:`WRAPPER_VERBS`, ``xargs`` (its own options), ``timeout`` (options
+    + duration), :data:`FLAG_WRAPPERS`, and ``command`` / ``builtin``.
+
+    Returns ``(tokens_from_the_command_word, via)`` — ``via`` names a
+    ``command X`` / ``builtin X`` prefix that was peeled ("" when none) —
+    or None when nothing is left or the segment is a ``command -v`` lookup.
+    One home for the kill guard and the rm guard (v0.2.105)."""
+    toks = list(tokens)
+    via = ""
+    for _ in range(12):
+        while toks and command_basename(toks[0]) in LEADING_COMPOUND_KEYWORDS:
+            toks = toks[1:]
+        toks = strip_subshell_parens(toks)
+        toks = strip_env_assignments(toks)
+        if not toks:
+            return None
+        base = command_basename(toks[0])
+        if base in WRAPPER_VERBS:
+            toks = peel_wrapper_verbs(toks)
+            continue
+        if base == "xargs":
+            toks = _skip_opts(toks, XARGS_VALUE_OPTS)
+            continue
+        if base in ("timeout", "gtimeout"):
+            toks = _skip_opts(toks, TIMEOUT_VALUE_OPTS)
+            if toks:  # the duration
+                toks = toks[1:]
+            continue
+        if base in FLAG_WRAPPERS:
+            toks = _skip_opts(toks, frozenset())
+            continue
+        if base in ("command", "builtin"):
+            rest = toks[1:]
+            if rest and rest[0] in ("-v", "-V"):
+                return None  # a lookup, not a call
+            while rest and rest[0] in ("-p", "--"):
+                rest = rest[1:]
+            via = "`%s %s`" % (base, rest[0] if rest else "")
+            toks = rest
+            continue
+        break
+    if not toks:
+        return None
+    return toks, via
+
+
 def _quoted_token_views(command: str) -> Optional[List[str]]:
     """Posix=False shadow tokenization of `command`: same whitespace
     boundaries :func:`tokenize` produces, but with quote characters
