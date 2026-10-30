@@ -128,7 +128,7 @@ class _Recorder:
         return (self.record_ok, "recorded" if self.record_ok else "hub answered 500")
 
 
-def _drive(tmp_path: Path, rec: _Recorder, **kw):
+def _drive(tmp_path: Path, rec: _Recorder, now=None, **kw):
     lines: list = []
     deps = chc.Deps(
         resolve=rec.resolve,
@@ -138,6 +138,7 @@ def _drive(tmp_path: Path, rec: _Recorder, **kw):
         run_analyzer=rec.run_analyzer,
         record=rec.record,
         canonical_root=rec.canonical_root,
+        now=now or time.time,
     )
     root = tmp_path / "proj"
     (root / ".claude" / "state").mkdir(parents=True, exist_ok=True)
@@ -703,3 +704,243 @@ def test_drain_hook_spawns_the_catchup_bash(tmp_path: Path) -> None:
 @pytest.mark.skipif(not shutil.which("pwsh") or os.name == "nt", reason="pwsh (POSIX) required")
 def test_drain_hook_spawns_the_catchup_pwsh(tmp_path: Path) -> None:
     _hook_case(tmp_path, ["pwsh", *PWSH_BASE_FLAGS, "-File", str(DRAIN_PS1)])
+
+
+# ── v0.2.105 fix round (review MEDIUM): a soft-skipped run is not success ──
+#
+# The analyzer exits 0 when no embedding backend answers, printing
+# "Code-graph analysis skipped: …" to stderr and indexing nothing. Reading
+# only `ok` recorded HEAD over a graph that was never walked (the review's
+# repro drove the REAL run_analyzer against such a stub). The check lives in
+# ONE home (vco_lib.codegraph_analyzer_outcome) so this catch-up and the
+# resync driver cannot drift — the driver had the fix, the catch-up did not.
+
+_SOFT_SKIP_STUB = (
+    "import sys\n"
+    "print('\\u26a0\\ufe0f  Code-graph analysis skipped: active code backend "
+    "(slot=codesage_embed) is not reachable.', file=sys.stderr)\n"
+    "sys.exit(0)\n"
+)
+
+_ANALYZED_STUB = (
+    "import json, sys\n"
+    "print(json.dumps({'final': True, 'files_analyzed': 3, 'modules': 3}))\n"
+    "sys.exit(0)\n"
+)
+
+
+def _real_runner_deps(rec: _Recorder) -> "chc.Deps":
+    """The recorder's git plumbing + the REAL ``run_analyzer`` (the review's
+    repro shape: the subprocess really runs and really soft-skips)."""
+    return chc.Deps(
+        resolve=rec.resolve, git_head=rec.git_head, is_ancestor=rec.is_ancestor,
+        diff_paths=rec.diff_paths, run_analyzer=chc.run_analyzer,
+        record=rec.record, canonical_root=rec.canonical_root,
+    )
+
+
+def test_a_soft_skipped_full_walk_records_nothing(tmp_path: Path) -> None:
+    """ACT: the REAL ``run_analyzer`` against an analyzer that soft-skips
+    (exit 0, nothing indexed) must fail the walk — nothing is recorded, so
+    the next eligible catch-up retries instead of diffing from a HEAD the
+    graph never reached. RED-PROOF: dropping the soft-skip check from
+    ``run_analyzer`` turns this into ``recorded``."""
+    stub = tmp_path / "stub_analyzer.py"
+    stub.write_text(_SOFT_SKIP_STUB, encoding="utf-8")
+    rec = _Recorder(head=B, recorded=None)   # no baseline → the full walk
+    root = tmp_path / "proj"
+    (root / ".claude" / "state").mkdir(parents=True, exist_ok=True)
+    logs: list = []
+    out = chc.catchup(
+        str(root), str(stub), sys.executable, root / ".claude" / "state",
+        logs.append, deps=_real_runner_deps(rec),
+    )
+    assert out == "analyzer_failed", out
+    assert rec.records == [], "a skipped walk must never advance the baseline"
+    assert any("analysis skipped" in ln for ln in logs), logs
+
+
+def test_the_same_walk_that_really_analyzed_records_head(tmp_path: Path) -> None:
+    """LEAVE-ALONE: an analyzer that ran (exit 0, a final report, no skip
+    line) still records HEAD — the check must not turn every run red."""
+    stub = tmp_path / "ok_analyzer.py"
+    stub.write_text(_ANALYZED_STUB, encoding="utf-8")
+    rec = _Recorder(head=B, recorded=None)
+    root = tmp_path / "proj"
+    (root / ".claude" / "state").mkdir(parents=True, exist_ok=True)
+    out = chc.catchup(
+        str(root), str(stub), sys.executable, root / ".claude" / "state",
+        lambda _m: None, deps=_real_runner_deps(rec),
+    )
+    assert out == "recorded", out
+    assert rec.records == [("pid-1", B)]
+
+
+def test_the_soft_skip_marker_matches_the_analyzer_literal() -> None:
+    """The one home's marker is the analyzer's own text (A>B>C rule C: a
+    mirror locked by a parity test). If the analyzer reworded its skip line
+    every consumer would silently stop noticing — this pins it."""
+    from vco_lib.codegraph_analyzer_outcome import ANALYZER_SOFT_SKIP_MARKER
+
+    src = (REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py").read_text(
+        encoding="utf-8"
+    )
+    assert src.count(ANALYZER_SOFT_SKIP_MARKER) >= 2, (
+        "the analyzer no longer prints ANALYZER_SOFT_SKIP_MARKER verbatim"
+    )
+
+
+# ── v0.2.105 fix round (review LOW): back off after repeated failures ──────
+
+
+def _failing_runs(tmp_path: Path, rec: _Recorder, clock: dict, n: int) -> list:
+    outs = []
+    for _ in range(n):
+        out, _lines, _root = _drive(tmp_path, rec, now=lambda: clock["t"])
+        outs.append(out)
+    return outs
+
+
+def test_consecutive_failures_back_off_instead_of_retrying_every_interval(
+    tmp_path: Path,
+) -> None:
+    """ACT: a full walk that keeps failing (a tree past the timeout, or a hub
+    refusing the stamp) must not restart on every Stop after the interval.
+    RED-PROOF: without the gate the fourth attempt runs the analyzer again."""
+    clock = {"t": 1_000_000.0}
+    rec = _Recorder(head=B, recorded=None, ok=False)
+    outs = _failing_runs(tmp_path, rec, clock, chc.BACKOFF_AFTER_FAILURES)
+    assert outs == ["analyzer_failed"] * chc.BACKOFF_AFTER_FAILURES
+    runs_before = len(rec.runs)
+    out, lines, _root = _drive(tmp_path, rec, now=lambda: clock["t"])
+    assert out == "backoff"
+    assert len(rec.runs) == runs_before, "no analyzer run while backing off"
+    assert any("backoff" in ln for ln in lines), lines
+    # The window elapses → one more attempt is allowed (and fails again).
+    clock["t"] += chc.BACKOFF_BASE_SECONDS + 1
+    out2, _l2, _r2 = _drive(tmp_path, rec, now=lambda: clock["t"])
+    assert out2 == "analyzer_failed"
+    assert len(rec.runs) == runs_before + 1
+
+
+def test_a_recorded_run_clears_the_backoff(tmp_path: Path) -> None:
+    """LEAVE-ALONE: a healthy project never sees the gate — one recorded run
+    drops the counter."""
+    clock = {"t": 1_000_000.0}
+    rec = _Recorder(head=B, recorded=None, ok=False)
+    _failing_runs(tmp_path, rec, clock, chc.BACKOFF_AFTER_FAILURES)
+    state = tmp_path / "proj" / ".claude" / "state"
+    assert chc.backoff_state_path(state, "pid-1").exists()
+    rec.ok = True
+    clock["t"] += chc.BACKOFF_BASE_SECONDS + 1
+    out, _lines, _root = _drive(tmp_path, rec, now=lambda: clock["t"])
+    assert out == "recorded"
+    assert not chc.backoff_state_path(state, "pid-1").exists()
+
+
+def test_an_up_to_date_tree_clears_the_backoff(tmp_path: Path) -> None:
+    """LEAVE-ALONE: when the tree already sits at the recorded baseline there
+    is nothing to converge, so a stale failure chain must not linger."""
+    clock = {"t": 1_000_000.0}
+    rec = _Recorder(head=B, recorded=None, ok=False)
+    _failing_runs(tmp_path, rec, clock, chc.BACKOFF_AFTER_FAILURES)
+    state = tmp_path / "proj" / ".claude" / "state"
+    assert chc.backoff_state_path(state, "pid-1").exists()
+    rec.recorded = B          # someone else got the graph current
+    out, _lines, _root = _drive(tmp_path, rec, now=lambda: clock["t"])
+    assert out == "up_to_date"
+    assert not chc.backoff_state_path(state, "pid-1").exists()
+
+
+def test_the_backoff_window_doubles_and_is_capped() -> None:
+    assert chc.backoff_window_seconds(0) == 0
+    assert chc.backoff_window_seconds(chc.BACKOFF_AFTER_FAILURES - 1) == 0
+    assert (
+        chc.backoff_window_seconds(chc.BACKOFF_AFTER_FAILURES)
+        == chc.BACKOFF_BASE_SECONDS
+    )
+    assert (
+        chc.backoff_window_seconds(chc.BACKOFF_AFTER_FAILURES + 1)
+        == 2 * chc.BACKOFF_BASE_SECONDS
+    )
+    assert chc.backoff_window_seconds(500) == chc.BACKOFF_MAX_SECONDS
+
+
+# ── v0.2.105 fix round (review LOW): the record route is project-scoped ────
+
+
+@pytest.fixture
+def on_disk_tokens(monkeypatch, tmp_path):
+    """Discovery WITHOUT the ``VCT_HUB_TOKEN`` pin: the on-disk tokens decide
+    (the state dir is isolated so the real ``~/.vct`` is never read)."""
+    monkeypatch.delenv("VCT_HUB_TOKEN", raising=False)
+    root = tmp_path / "vct"
+    root.mkdir()
+    monkeypatch.setenv("VCT_STATE_DIR", str(root))
+    from vco_lib import project_config
+    project_config._test_clear_cache()
+    yield root
+    project_config._test_clear_cache()
+
+
+def test_record_presents_the_project_scoped_token(fake_hub, on_disk_tokens) -> None:
+    """ACT: ``/codegraph/analyzed`` requires ``hub.token.<project_id>`` (the
+    same gate as /env and /config), so the caller must present it — the
+    global ``hub.token`` is refused there."""
+    (on_disk_tokens / "hub.token").write_text("global-tok", encoding="utf-8")
+    (on_disk_tokens / "hub.token.pid-1").write_text("scoped-tok", encoding="utf-8")
+    from vco_lib import project_config
+    project_config._test_clear_cache()
+    ok, why = chc.record_analyzed_commit("pid-1", "abc1234")
+    assert ok, why
+    path, auth, body = fake_hub.seen[0]
+    assert path == "/api/v1/projects/pid-1/codegraph/analyzed"
+    assert auth == "Bearer scoped-tok"
+    assert body == {"commit": "abc1234"}
+
+
+def test_a_refusing_hub_is_retried_once_with_the_scoped_token(
+    monkeypatch, tmp_path
+) -> None:
+    """LEAVE-ALONE (the stale-pin shape the resolvers already handle): an
+    exported ``VCT_HUB_TOKEN`` wins over the per-project file, so the POST
+    would 403 forever. ONE bounded retry with the on-disk scoped token."""
+    accepted = "scoped-tok"
+    seen: list = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 — base API name
+            n = int(self.headers.get("Content-Length", "0"))
+            auth = self.headers.get("Authorization")
+            seen.append(auth)
+            self.rfile.read(n)
+            code = 200 if auth == f"Bearer {accepted}" else 403
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"recorded": true}')
+
+        def log_message(self, format, *args):  # noqa: A002 — base API name
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.delenv("VCT_DISABLE_HUB_RESOLVER", raising=False)
+        monkeypatch.delenv("VCT_HUB_TOKEN_STRICT", raising=False)
+        monkeypatch.setenv("VCT_HUB_PORT", str(srv.server_address[1]))
+        monkeypatch.setenv("VCT_HUB_TOKEN", "stale-env-pin")
+        root = tmp_path / "vct"
+        root.mkdir()
+        (root / "hub.token").write_text("global-tok", encoding="utf-8")
+        (root / "hub.token.pid-1").write_text(accepted, encoding="utf-8")
+        monkeypatch.setenv("VCT_STATE_DIR", str(root))
+        from vco_lib import project_config
+        project_config._test_clear_cache()
+        ok, why = chc.record_analyzed_commit("pid-1", "abc1234")
+        assert ok, why
+        assert seen == ["Bearer stale-env-pin", f"Bearer {accepted}"], seen
+    finally:
+        srv.shutdown()
+        from vco_lib import project_config
+        project_config._test_clear_cache()

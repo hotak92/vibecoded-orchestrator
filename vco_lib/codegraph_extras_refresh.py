@@ -23,7 +23,10 @@ the turn. For each ENABLED extra path of the calling project it:
 3. on success records the new commit through the hub route
    ``POST /api/v1/projects/{id}/codegraph/extras/indexed`` — launcher.db keeps
    its single writer; this module never opens it. On failure (non-zero exit,
-   timeout, insert errors, a failed deleted-file prune) it logs and records
+   timeout, a SOFT SKIP — the analyzer's "Code-graph analysis skipped" line,
+   exit 0 with nothing indexed, judged in
+   :mod:`vco_lib.codegraph_analyzer_outcome`, insert errors, a failed
+   deleted-file prune) it logs and records
    NOTHING, so the path stays stale and is retried after the throttle window.
    The incremental run also removes the entities of files deleted or renamed
    away since ``last_indexed_commit`` (``vco_lib.codegraph_deleted_files``);
@@ -59,6 +62,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
+
+from vco_lib.codegraph_analyzer_outcome import (
+    says_analysis_skipped,
+    soft_skip_reason,
+)
 
 #: Default per-path throttle between re-index ATTEMPTS (seconds).
 DEFAULT_MIN_INTERVAL_SECONDS = 3600
@@ -425,10 +433,13 @@ def run_analyzer(
     python: str, analyzer: str, argv: Sequence[str], timeout: float,
 ) -> AnalyzerResult:
     """Run the analyzer bounded by ``timeout``; parse its ``{"final": true}``
-    report line. Failure = non-zero exit, timeout, spawn error, or a final
-    report with ``insert_errors`` or ``deleted_file_prune_failures`` (a partial
-    index must not be recorded as current — it would never be retried; the
-    analyzer also exits 5 for the latter under ``--since-commit``)."""
+    report line. Failure = non-zero exit, timeout, spawn error, a SOFT SKIP
+    (the "Code-graph analysis skipped" line, exit 0 — nothing was indexed and
+    the run must not be recorded as current; ONE home:
+    :mod:`vco_lib.codegraph_analyzer_outcome`), or a final report with
+    ``insert_errors`` or ``deleted_file_prune_failures`` (a partial index must
+    not be recorded as current — it would never be retried; the analyzer also
+    exits 5 for the latter under ``--since-commit``)."""
     started = time.monotonic()
     try:
         proc = subprocess.run(
@@ -445,6 +456,12 @@ def run_analyzer(
         tail = (proc.stderr or "").strip().replace("\n", " | ")[-400:]
         return AnalyzerResult(False, f"exit {proc.returncode}: {tail or 'no stderr'}",
                               duration_ms=duration_ms)
+    # v0.2.105 fix round: a SOFT SKIP exits 0 but analyzed nothing. Never let
+    # it read as success — every caller records a baseline / a last-indexed
+    # commit on ``ok``, and a recorded skip is never revisited (review MEDIUM).
+    if (says_analysis_skipped(proc.stderr)
+            or says_analysis_skipped(proc.stdout)):
+        return AnalyzerResult(False, soft_skip_reason(), duration_ms=duration_ms)
     final: dict = {}
     for line in (proc.stdout or "").splitlines():
         line = line.strip()

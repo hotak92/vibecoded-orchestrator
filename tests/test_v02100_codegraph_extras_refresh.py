@@ -290,6 +290,40 @@ def test_runner_timeout_is_a_failure(tmp_path: Path) -> None:
     assert not res.ok and "timed out" in res.reason
 
 
+def test_runner_soft_skip_is_a_failure(tmp_path: Path) -> None:
+    """v0.2.105 fix round (review MEDIUM): the analyzer SOFT-SKIPS — exit 0
+    with "Code-graph analysis skipped" on stderr — when no embedding backend
+    answers. Nothing was indexed, so the runner must report a failure; the
+    catch-up, the extras refresh, the queued drain and the heal all record a
+    baseline only on ``ok``. RED-PROOF: the pre-fix runner returned ok=True
+    for this stub and every caller recorded an unanalyzed tree."""
+    stub = tmp_path / "skipping.py"
+    stub.write_text(
+        "import sys\n"
+        "print('Code-graph analysis skipped: active code backend "
+        "(slot=codesage_embed) is not reachable.', file=sys.stderr)\n"
+        "sys.exit(0)\n"
+    )
+    res = cer.run_analyzer(sys.executable, str(stub), [], 60)
+    assert not res.ok, res
+    assert "analysis skipped" in res.reason
+    # The counts stay empty: nothing was analyzed.
+    assert (res.files_analyzed, res.entities_indexed) == (0, 0)
+
+
+def test_runner_without_the_skip_marker_still_succeeds(tmp_path: Path) -> None:
+    """LEAVE-ALONE: the same exit-0 shape WITHOUT the marker is a success."""
+    stub = tmp_path / "fine.py"
+    stub.write_text(
+        "import json, sys\n"
+        "print(json.dumps({'final': True, 'files_analyzed': 1, 'modules': 1}))\n"
+        "sys.exit(0)\n"
+    )
+    res = cer.run_analyzer(sys.executable, str(stub), [], 60)
+    assert res.ok, res
+    assert res.files_analyzed == 1
+
+
 # ── hub POST helper against a loopback fake hub ─────────────────────────────
 
 

@@ -46,12 +46,13 @@ class _Extra:
         self.last_indexed_commit = None
 
 
-def _cfg(enabled=(), gone=(), prefix="P"):
+def _cfg(enabled=(), gone=(), prefix="P", moved=()):
     return SimpleNamespace(
         code_graph_collection_prefix=prefix,
         project_id="pid",
         code_graph_extra_paths=tuple(_Extra(p) for p in enabled),
         code_graph_extra_paths_gone=None if gone is None else tuple(gone),
+        code_graph_moved_from_sources=None if moved is None else tuple(moved),
     )
 
 
@@ -271,6 +272,106 @@ def test_project_config_gone_field_is_tri_state():
                      ).code_graph_extra_paths_gone == (), "[] = none removed"
     assert _hub_body(code_graph_extra_paths_gone=["/a"]
                      ).code_graph_extra_paths_gone == ("/a",)
+
+
+def test_project_config_moved_from_field_is_tri_state():
+    """v0.2.105 fix round: the moved-from list follows the same tri-state —
+    absent/null is UNKNOWN (the purge keeps every row), ``[]`` is "this
+    project never moved"."""
+    assert _hub_body().code_graph_moved_from_sources is None, "absent = unknown"
+    assert _hub_body(code_graph_moved_from_sources=None
+                     ).code_graph_moved_from_sources is None, "null = unknown"
+    assert _hub_body(code_graph_moved_from_sources=[]
+                     ).code_graph_moved_from_sources == (), "[] = never moved"
+    assert _hub_body(code_graph_moved_from_sources=["/old"]
+                     ).code_graph_moved_from_sources == ("/old",)
+
+
+# ---------------------------------------------------------------------------
+# v0.2.105 fix round (review NIT) — the rows of a folder the project MOVED
+# away from are purged, once the current folder really holds rows
+# ---------------------------------------------------------------------------
+
+
+def _count(rows_by_source: dict, *, unknown: bool = False):
+    def _fn(prefix, src):
+        if unknown:
+            return None
+        return rows_by_source.get(src, 0)
+
+    return _fn
+
+
+def test_a_completed_move_purges_the_old_folders_rows(tmp_path):
+    """ACT: the launcher's move ledger records that the project used to live
+    at /old, so its rows are positive knowledge and get removed. RED-PROOF:
+    without the moved-from leg the sweep purges nothing."""
+    purger = _Purger()
+    out = _sweep(tmp_path, _cfg(moved=("/old",)), purger,
+                 count_rows=_count({"/proj": 12}))
+    assert purger.calls == [("P", "/old")]
+    assert set(out) == {"/old"}
+
+
+def test_a_moved_from_source_is_kept_until_the_current_root_has_rows(tmp_path):
+    """LEAVE-ALONE: a row's UUID mixes ``project_source``, so a walk of the
+    NEW root writes new rows rather than rewriting the old ones. Purging the
+    old root before that would leave the project with an empty graph — the
+    rows stay until the destination holds rows."""
+    purger = _Purger()
+    logs: list = []
+    out = _sweep(tmp_path, _cfg(moved=("/old",)), purger,
+                 count_rows=_count({}), log=logs.append)
+    assert purger.calls == [] and out == {}
+    assert any("moved-from deferred" in ln for ln in logs), logs
+    # …and an UNDETERMINABLE count is not "has rows" either.
+    out2 = _sweep(tmp_path, _cfg(moved=("/old",)), _Purger(),
+                  count_rows=_count({}, unknown=True))
+    assert out2 == {}
+
+
+def test_an_unknown_moved_from_list_purges_nothing(tmp_path):
+    """A hub that could not read its DB (or is older than the field) proves
+    nothing, exactly like the gone list — the rows stay."""
+    purger = _Purger()
+    logs: list = []
+    out = _sweep(tmp_path, _cfg(moved=None), purger,
+                 count_rows=_count({"/proj": 12}), log=logs.append)
+    assert purger.calls == [] and out == {}
+    assert any("moved-from unknown" in ln for ln in logs), logs
+    # Unknown is reported as a plain line, never as the CLI's `refused` (the
+    # gone sweep was authorized and ran).
+    assert not any(ln.startswith(sp.SKIP_PREFIX) for ln in logs), logs
+
+
+def test_a_moved_from_source_that_is_still_enabled_is_kept(tmp_path):
+    """A move back, or an old folder re-added as an extra code folder: the
+    keep set wins — its rows are live."""
+    purger = _Purger()
+    _sweep(tmp_path, _cfg(enabled=("/old",), moved=("/old",)), purger,
+           count_rows=_count({"/proj": 12}))
+    assert purger.calls == []
+
+
+def test_the_primary_root_is_never_a_moved_from_target(tmp_path, monkeypatch):
+    """A move BACK to the primary root records the root it came from; the
+    live root itself is in the keep set and is never purged."""
+    monkeypatch.setattr(cr, "primary_sources_for", lambda root: {"/proj", "/old"})
+    purger = _Purger()
+    _sweep(tmp_path, _cfg(moved=("/proj", "/old")), purger,
+           count_rows=_count({"/proj": 5}))
+    assert purger.calls == []
+
+
+def test_a_new_move_sweeps_again(tmp_path):
+    """The stamp keys on the moved list too, so a second move is not masked
+    by the first sweep's stamp."""
+    _sweep(tmp_path, _cfg(moved=("/old",)), _Purger(),
+           count_rows=_count({"/proj": 1}))
+    purger = _Purger()
+    _sweep(tmp_path, _cfg(moved=("/old", "/older")), purger,
+           count_rows=_count({"/proj": 1}))
+    assert ("P", "/older") in purger.calls
 
 
 # ---------------------------------------------------------------------------

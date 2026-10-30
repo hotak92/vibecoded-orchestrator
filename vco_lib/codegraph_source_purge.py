@@ -12,11 +12,14 @@ Everything here DELETES or counts rows by ``project_source`` — which root
 * :func:`count_rows_for_project_source` — the lost-extras detection's count.
 * :func:`purge_rows_for_project_source` / :func:`purge_gone_extra_paths` —
   remove the rows of an extra code folder the owner removed or disabled in
-  the launcher, and ONLY of such a folder: the hub must POSITIVELY report
-  it gone (``code_graph_extra_paths_gone`` — a disabled row, or a removed
-  row with its ``codegraph_extra_path_removed`` audit entry). An enabled
-  list the hub emptied on a DB error, an old hub, or a hub outage purges
-  nothing.
+  the launcher, and the rows of a folder the project itself was MOVED away
+  from, and ONLY of such a folder: the hub must POSITIVELY report it gone
+  (``code_graph_extra_paths_gone`` — a disabled row, or a removed row with
+  its ``codegraph_extra_path_removed`` audit entry — or
+  ``code_graph_moved_from_sources``, the ``src`` of a completed move in
+  ``project_moves``). An enabled list the hub emptied on a DB error, an old
+  hub, or a hub outage purges nothing; nor do a moved-from root's rows go
+  before the current folder holds rows of its own.
 
 Split out of ``vco_lib/codegraph_resync.py`` (the file-size rule); the
 shared Weaviate plumbing (client, collection open, the tokenization-safe
@@ -35,7 +38,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from vco_lib import codegraph_resync as _cr
 
@@ -304,6 +307,34 @@ def _stamp_path(state_dir: Path, prefix: str) -> Path:
     return state_dir / f"codegraph_extra_keep_{path_key(prefix)}.json"
 
 
+def _destination_has_rows(
+    prefix: str,
+    primary: Iterable[str],
+    count_rows: "Callable[[str, str], Optional[int]]",
+) -> bool:
+    """Does the project's CURRENT folder hold code-graph rows yet?
+
+    The gate in front of the moved-from purge (v0.2.105 fix round): after a
+    move the old root's rows may be the only copy until the rebuild finishes
+    (a row's UUID mixes ``project_source``, so a walk of the new root writes
+    NEW rows rather than rewriting the old ones). Deleting the old rows
+    before that would leave the project with an empty graph.
+
+    TRUE only on a POSITIVE count > 0 for one of the root's own source forms.
+    An undeterminable count (``None`` — Weaviate unreachable) is NOT "empty"
+    and NOT "has rows": the callers' rule is "when unsure, keep the rows", so
+    it counts as False here and the move's purge waits for a later sweep.
+    """
+    for src in sorted(s for s in primary if s):
+        try:
+            n = count_rows(prefix, src)
+        except Exception:  # noqa: BLE001 — a failed count proves nothing
+            continue
+        if n is not None and int(n) > 0:
+            return True
+    return False
+
+
 def purge_gone_extra_paths(
     project_root: str,
     state_dir: Path,
@@ -312,8 +343,10 @@ def purge_gone_extra_paths(
     purge: "Optional[Callable[[str, str], dict]]" = None,
     log: Optional[Callable[[str], None]] = None,
     force: bool = False,
+    count_rows: "Optional[Callable[[str, str], Optional[int]]]" = None,
 ) -> dict[str, dict]:
-    """Purge the rows of extra code folders the owner REMOVED or DISABLED.
+    """Purge the rows of extra code folders the owner REMOVED or DISABLED,
+    and of the folders this project was POSITIVELY moved away from.
 
     Positive knowledge only. A folder is purged when the hub lists it in
     ``code_graph_extra_paths_gone`` (a disabled launcher.db row, or a row
@@ -322,13 +355,24 @@ def purge_gone_extra_paths(
     else is kept — in particular when the hub could not read its DB (it then
     empties the enabled list AND reports ``gone`` as unknown), when the hub
     is down or too old to send the field, and for any stored source nobody
-    registered as removed (an old project root after a move, say). When
-    unsure, the rows stay.
+    registered as removed. When unsure, the rows stay.
 
-    Cost gate: a stamp under ``state_dir`` records the (keep, gone) sets of
-    the last COMPLETE sweep; an unchanged pair is one file read. The stamp
-    is written only when every purge reported ``failures == 0`` — a partial
-    purge leaves it untouched, so the next refresh retries. ``force``
+    v0.2.105 fix round (review NIT): the folders the project MOVED away from
+    join the same sweep. A move is recorded in launcher.db's ``project_moves``
+    ledger — the durable record that the project used to live elsewhere — and
+    the hub serves those ``src`` paths as ``code_graph_moved_from_sources``.
+    Every code-graph row is stamped with the absolute root it was walked from
+    (mixed into its UUID), so after a move the old root's rows are a second,
+    stale copy of the same files that nothing rewrites and ``--prune-stale``
+    may not judge. They are removed only once the project's CURRENT root
+    really holds rows (``count_rows`` > 0): a move must never empty a graph
+    that has not been rebuilt yet. ``None`` from the hub (unknown) purges
+    nothing, exactly like ``gone``.
+
+    Cost gate: a stamp under ``state_dir`` records the (keep, gone, moved)
+    sets of the last COMPLETE sweep; an unchanged triple is one file read. The
+    stamp is written only when every purge reported ``failures == 0`` — a
+    partial purge leaves it untouched, so the next refresh retries. ``force``
     ignores the stamp (the launcher's Remove/Disable flow: the user just
     acted). Returns ``{source: report}``; never raises.
     """
@@ -338,6 +382,8 @@ def purge_gone_extra_paths(
         resolve = project_config.resolve
     if purge is None:
         purge = purge_rows_for_project_source
+    if count_rows is None:
+        count_rows = count_rows_for_project_source
     if log is None:
         def _nolog(_msg: str) -> None:  # callers pass the RunLog
             return None
@@ -374,8 +420,41 @@ def purge_gone_extra_paths(
         return outcomes
     keep = sorted(primary | enabled)
     targets = sorted({str(g).strip() for g in gone_raw} - {""} - set(keep))
+    # v0.2.105 fix round: the folders this project POSITIVELY moved away
+    # from. Same "positive knowledge only" rule: an unknown list (a hub that
+    # cannot read its DB, or an older hub) purges nothing. The current root is
+    # in `keep`, so a move BACK to an earlier folder keeps that folder's rows.
+    moved: set[str] = set()
+    moved_raw = getattr(cfg, "code_graph_moved_from_sources", None)
+    if moved_raw is None:
+        # Plain line, NOT `SKIP_PREFIX`: the gone/extra part of the sweep is
+        # still authorized above, so this is a partial omission, not the
+        # "nothing was purged because nothing is known" refusal the CLI
+        # reports as `refused`.
+        log(
+            "purge-gone: moved-from unknown — the hub could not say which "
+            "code folders this project was moved away from (its database read "
+            "failed, or it is older than this VCO); their rows are kept"
+        )
+    else:
+        moved = {str(m).strip() for m in moved_raw} - {""} - set(keep)
+        if moved and not _destination_has_rows(prefix, primary, count_rows):
+            log(
+                "purge-gone: moved-from deferred — the current project folder "
+                f"holds no code-graph rows yet, so the rows stamped with "
+                f"{len(moved)} old folder(s) are kept until the rebuild lands "
+                "(a move must never empty a graph that has not been rebuilt)"
+            )
+            moved = set()
+    reason_for = {
+        src: ("extra code folder removed or disabled by the owner")
+        for src in targets
+    }
+    for src in moved:
+        reason_for[src] = "the project was moved away from this folder"
+    sweep = sorted(set(targets) | moved)
     stamp = _stamp_path(state_dir, prefix)
-    key = {"keep": keep, "gone": targets}
+    key = {"keep": keep, "gone": targets, "moved": sorted(moved)}
     if not force:
         try:
             if stamp.exists():
@@ -385,7 +464,7 @@ def purge_gone_extra_paths(
         except Exception:  # noqa: BLE001 — an unreadable stamp sweeps again
             pass
     complete = True
-    for src in targets:
+    for src in sweep:
         try:
             report = purge(prefix, src)
         except Exception as exc:  # noqa: BLE001 — one source never stops the rest
@@ -398,7 +477,7 @@ def purge_gone_extra_paths(
         log(
             f"purge-gone: source={src} prefix={prefix} "
             f"deleted={total} failures={failures} "
-            "(extra code folder removed or disabled by the owner)"
+            f"({reason_for.get(src, 'positive knowledge from the hub')})"
         )
     if not complete:
         log("purge-gone: partial purge — the sweep stays owed and re-runs "

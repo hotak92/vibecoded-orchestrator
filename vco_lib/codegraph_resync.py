@@ -211,6 +211,16 @@ from vco_lib.codegraph_schema import (  # noqa: E402 — grouped with the notes 
 #: Backwards-compat alias (pre-v0.2.75 module-local name).
 _path_reachable_on_disk = path_reachable_on_disk
 
+# v0.2.105 fix round: "did the analyzer actually analyze anything?" lives in
+# ONE home shared with ``vco_lib.codegraph_extras_refresh.run_analyzer`` (the
+# runner the HEAD catch-up and the extras refresh use) — the soft-skip marker,
+# the bounded log-window reader and the predicate. Aliased to the module-local
+# names the driver body uses.
+from vco_lib.codegraph_analyzer_outcome import (  # noqa: E402 — grouped with the notes above
+    log_says_analysis_skipped as _log_says_analysis_skipped,
+    read_log_window as _read_log_window,
+)
+
 
 def primary_sources_for(repo_root: "Optional[Path]") -> "Optional[set]":
     """The primary repo root's POSIX forms (raw + resolved), or ``None``.
@@ -2823,11 +2833,19 @@ def code_embed_image_verdict(
 def _resync_log_path(project_name: str) -> Optional[Path]:
     """R-5 (RT-2): per-spawn log file for the detached resync children.
 
-    ``<vct_root_dir>/logs/resync-<project>-<ts>.log``. Pre-fix the children's
-    stdout/stderr went to DEVNULL — a walk that died at 40% left NO record
-    anywhere ("soft-fail into a void"). Returns ``None`` when the path cannot
-    be prepared (caller then degrades to DEVNULL rather than blocking the
-    spawn — but logs that degradation).
+    ``<vct_root_dir>/logs/resync-<project>-<ts>-<ns>-<pid>.log``. Pre-fix the
+    children's stdout/stderr went to DEVNULL — a walk that died at 40% left NO
+    record anywhere ("soft-fail into a void"). Returns ``None`` when the path
+    cannot be prepared (caller then degrades to DEVNULL rather than blocking
+    the spawn — but logs that degradation).
+
+    v0.2.105 fix round: the name must be unique PER SPAWN. A one-second
+    timestamp plus the append-mode open let a second spawn reuse — and append
+    to — the first run's file, so the post-walk reader
+    (:func:`vco_lib.codegraph_analyzer_outcome.log_says_analysis_skipped`)
+    could find a PREVIOUS run's "analysis skipped" line and refuse a walk
+    that actually ran. The nanosecond stamp + pid make the file belong to
+    exactly one spawn.
     """
     try:
         from vco_lib.paths import vct_root_dir
@@ -2836,7 +2854,8 @@ def _resync_log_path(project_name: str) -> Optional[Path]:
         logs_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", project_name or "project")
         ts = time.strftime("%Y%m%d-%H%M%S")
-        return logs_dir / f"resync-{safe}-{ts}.log"
+        uniq = f"{time.time_ns() % 1_000_000_000:09d}-{os.getpid()}"
+        return logs_dir / f"resync-{safe}-{ts}-{uniq}.log"
     except Exception as exc:  # noqa: BLE001 — logging must not block the spawn
         logger.warning("codegraph resync: cannot prepare log path: %s", exc)
         return None
@@ -3724,37 +3743,17 @@ def _parse_analyzer_stats(text: str) -> dict:
     return stats
 
 
-def _read_log_window(log_path: "Path | str | None") -> Optional[str]:
-    """The bounded tail window of the shared per-spawn resync log (the ONE
-    reader — the analyzer inherited the log's fd and has EXITED by the time
-    this runs, so its end-of-walk lines are flushed and on disk). ``None``
-    when it could not be read (no path — e.g. the spawn degraded to
-    DEVNULL — missing file, read error). Soft-fail by contract."""
-    if not log_path:
-        return None
-    try:
-        path = Path(log_path)
-        size = path.stat().st_size
-        with open(path, "rb") as fh:
-            fh.seek(max(0, size - _TERMINAL_LOG_SCAN_MAX_BYTES))
-            return fh.read().decode("utf-8", errors="replace")
-    except Exception as exc:  # noqa: BLE001 — best-effort reads never gate
-        logger.debug("codegraph resync: log-window read skipped: %s", exc)
-        return None
+def _read_spawn_log_window(log_path: "Path | str | None") -> Optional[str]:
+    """The bounded tail window of the shared per-spawn resync log.
 
-
-#: The analyzer's soft-skip marker: with no embedding backend reachable it
-#: prints this to stderr (which the shared log captures) and still exits
-#: 0 — the one textual signal that a "successful" walk analyzed nothing.
-_ANALYZER_SOFT_SKIP_MARKER = "Code-graph analysis skipped"
-
-
-def _log_says_analysis_skipped(log_path: "Path | str | None") -> bool:
-    """v0.2.105 (fix round): did THIS run's analyzer soft-skip? Only the
-    shared per-spawn log is read (it belongs to this run alone — a fresh
-    timestamped file per spawn — so a previous run's skip cannot match)."""
-    window = _read_log_window(log_path)
-    return window is not None and _ANALYZER_SOFT_SKIP_MARKER in window
+    This module's call shape of the ONE reader
+    (:func:`vco_lib.codegraph_analyzer_outcome.read_log_window`): the analyzer
+    inherited the log's fd and has EXITED by the time this runs, so its
+    end-of-walk lines are flushed and on disk. ``None`` when it could not be
+    read (no path — e.g. the spawn degraded to DEVNULL — missing file, read
+    error). Soft-fail by contract.
+    """
+    return _read_log_window(log_path, _TERMINAL_LOG_SCAN_MAX_BYTES)
 
 
 def _collect_terminal_stats(
@@ -3769,7 +3768,7 @@ def _collect_terminal_stats(
     still goes out with the status alone.
     """
     empty = {"files_analyzed": None, "prune_failures": None, "analyzed_commit": None}
-    window = _read_log_window(log_path)
+    window = _read_spawn_log_window(log_path)
     if window is None:
         return empty, None
     tail = (
@@ -4617,7 +4616,8 @@ def _run_resync_and_verify_slotted(
     # work stays owed), the hub row is closed "failed" (never "success"),
     # the code-summary rider and the post-walk probes do not run for a walk
     # that analyzed nothing — and return 0 like every refusal here.
-    if start_error is None and rc == 0 and _log_says_analysis_skipped(log_path):
+    if (start_error is None and rc == 0
+            and _log_says_analysis_skipped(log_path, _TERMINAL_LOG_SCAN_MAX_BYTES)):
         _down_late, _ = code_backend_down_waiting(project_name)
         print(
             "[resync-driver] the analyzer SOFT-SKIPPED (embedding backend "
