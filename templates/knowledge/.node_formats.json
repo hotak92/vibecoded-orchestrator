@@ -339,11 +339,11 @@
   },
   "knowledge/concepts/orchestrator-code-graph.md": {
     "title": "Orchestrator Code Graph",
-    "description": "The Orchestrator Code Graph is a semantic index of a project's source code that extracts structural entities — modules, classes, functions, API endpoints, and cross-service interactions — embeds them with code-specialized embeddings, and stores them in Weaviate to support both purpose-based and structural queries. Analysis runs via `.claude/scripts/code-graph-analyze /path/to/repo --project \"Name\" --incremental`; Python files use full `ast` parsing while 10+ other languages use regex extraction, and `--incremental` limits re-analysis to files changed since the last run based on `git diff`. Embeddings come from the code-embedding service (CodeSage-Large-v2 on GPU, jina-embeddings-v2-base-code on CPU via Ollama), producing entity types CodeModule, CodeClass, CodeFunction, CodeAPI, and CodeInteraction with properties like `calls`, `extends`, `composes`, and `imports`. Use it instead of grep or file reads when searching for code by purpose (\"authentication middleware\") or answering structural questions such as what calls a function or what a module imports.",
-    "summary": "The Orchestrator Code Graph is a semantic source-code index that extracts structural entities (CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction) from a repository and stores their embeddings in Weaviate per-project collections for purpose-based and structural queries. It runs via `.claude/scripts/code-graph-analyze /path/to/repo --project \"Name\" --incremental`, using Python's `ast` module for full AST parsing and regex extraction for 10+ other languages, then embeds through the code-embedding service on port 11440 (CodeSage-Large-v2, 2048-dim on GPU; jina-embeddings-v2-base-code, 768-dim via Ollama on CPU fallback).",
-    "generated_at": "2026-09-23T01:42:18.606261+00:00",
-    "backend": "cli",
-    "content_hash": "47c7702b80a2382d",
+    "description": "The Orchestrator Code Graph is a semantic index that extracts structural entities from source code to enable purpose-based and structural queries via Weaviate. Its analysis pipeline detects programming languages, parses ASTs or uses regex for extraction, and embeds entities using specialized models before upserting them into project-specific collections. The system supports incremental updates by analyzing only changed files via git diffs and captures detailed properties for modules, classes, functions, and API endpoints. This capability allows developers to locate code by intent, such as finding authentication middleware, and answer structural questions like identifying function callers without manually reading files.",
+    "summary": "The Orchestrator Code Graph is a semantic index that extracts structural entities (modules, classes, functions, APIs, interactions) from source code using AST parsing for Python or regex for other languages, embeds them via CodeSage-Large-v2 or jina-embeddings-v2-base-code, and stores them in Weaviate to enable purpose-based semantic queries and structural navigation.",
+    "generated_at": "2026-10-30T05:54:15.489025+00:00",
+    "backend": "ollama",
+    "content_hash": "efd9d09723811345",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-context-management.md": {
@@ -357,11 +357,11 @@
   },
   "knowledge/concepts/orchestrator-hook-system.md": {
     "title": "Orchestrator Hook System",
-    "description": "The hook system is the orchestrator's event-driven automation layer that intercepts Claude Code lifecycle events (session start, tool use, file edits, compaction, stop) to enable security enforcement, knowledge-graph sync, and context preservation. Hooks are shell scripts registered in `.claude/settings.json` that bind to specific lifecycle events; blocking hooks can abort operations while non-blocking hooks run asynchronously, with ~20 distinct hook events available. The system follows a linear flow architecture (UserPromptSubmit → PreToolUse → PostToolUse → Stop) for normal operations and a separate compaction path (PreCompact → Compaction → PostCompact → SessionStart reinjection) for context management. This enables fully automated, secure, and stateful workflows without manual intervention, handling security scanning, credential scrubbing, context preservation across compaction, and developer experience automation (formatting, type-checking).",
-    "summary": "The orchestrator hook system intercepts ~20 Claude Code lifecycle events (session start, tool use, file edits, compaction, stop) via shell scripts registered in `.claude/settings.json` to enforce security, sync knowledge graphs, preserve context, and validate output. Blocking hooks can abort operations via non-zero exit codes; non-blocking hooks run asynchronously to automate workflow orchestration without delaying the model's execution.",
-    "generated_at": "2026-10-15T09:37:32.881193+00:00",
+    "description": "The Orchestrator Hook System is the orchestrator's automation layer: shell scripts, with some Python helpers, registered in `.claude/settings.json` to bind to Claude Code lifecycle events such as session start, tool use, file edits, compaction, and stop. Each hook can optionally filter by tool-name matcher, and blocking hooks (non-zero exit) can abort an operation while non-blocking hooks run in the background or fire-and-forget. The inventory covers security enforcement (command scanning, credential scrubbing), knowledge-graph sync to Weaviate, context preservation through PreCompact saves and SessionStart reinjection, and quality gates with developer-experience checks. It is the reference for changing how the orchestrator enforces security, syncs knowledge, or preserves context across compaction.",
+    "summary": "The orchestrator's lifecycle hooks are shell scripts (with Python helpers) registered in `.claude/settings.json` and bound to Claude Code events such as SessionStart, PreToolUse, PostToolUse, PreCompact, and Stop, where a non-zero exit from a blocking hook aborts the operation. They handle security scanning, Weaviate knowledge-graph sync, and context preservation across compaction.",
+    "generated_at": "2026-10-29T18:08:06.884260+00:00",
     "backend": "cli",
-    "content_hash": "381522ec308a08d9",
+    "content_hash": "ab2ec71d23954565",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {
@@ -375,11 +375,11 @@
   },
   "knowledge/concepts/orchestrator-mcp-servers.md": {
     "title": "Orchestrator MCP Servers",
-    "description": "The Orchestrator ships Model Context Protocol (MCP) servers to extend Claude Code with semantic search capabilities. Key components include the `weaviate-kg` server, which manages Knowledge and Code Graphs using Weaviate, and a separate `code-embedding-service` for HTTP-based code embeddings. This infrastructure is critical for advanced retrieval, enabling semantic search and code graph interaction within the Claude Code environment. Use this when deep knowledge retrieval, semantic search, or structured code-graph querying is required beyond Claude's native tools.",
-    "summary": "Orchestrator MCP servers extend Claude Code with semantic search via Python-backed processes, with `weaviate-kg` managing Knowledge Graph operations. The most important fact is that `weaviate-kg` provides hybrid search, combining BM25 keyword search and vector similarity across per-project and shared Knowledge Graphs.",
-    "generated_at": "2026-10-13T05:28:14.566244+00:00",
+    "description": "Orchestrator MCP Servers are native Python processes that extend Claude Code with semantic search capabilities by leveraging the Model Context Protocol. The primary server, `weaviate-kg`, manages Knowledge Graphs and code structures within Weaviate using hybrid search and semantic graph queries, while a separate HTTP service handles code embeddings. Although Ollama and web search tools are included in the infrastructure, they are not exposed as MCP tools because their functions are already covered by Claude's native reasoning and built-in vision features. These servers are essential for integrating external knowledge bases and code graphs into the development workflow, allowing users to enable or disable specific project-level servers via configuration files.",
+    "summary": "The Orchestrator ships Python-backed MCP servers, primarily `weaviate-kg`, which manages semantic search and Knowledge Graph operations in Weaviate by fusing BM25 and vector similarity with an optional RL reranker.",
+    "generated_at": "2026-10-30T05:54:18.603406+00:00",
     "backend": "ollama",
-    "content_hash": "3bfd17adad09d835",
+    "content_hash": "78bd4dba9b4bfefc",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-rl-retrieval.md": {
@@ -393,11 +393,11 @@
   },
   "knowledge/concepts/orchestrator-security.md": {
     "title": "Orchestrator Security Model",
-    "description": "The orchestrator enforces a 7-layer defense-in-depth security model using PreToolUse/PostToolUse hooks to automatically block credential leakage, SSRF, command injection, and destructive file overwrites. Layer 1 scrubs sensitive environment variables (API keys, tokens, passwords) before subprocess execution using canonical lists in `.claude/hooks/_lib/scrub-env.sh`, verified by parity tests. Layer 2 blocks SSRF via WebFetch URL validation using `vco_lib/ssrf_url.py`, which classifies URLs as internal (localhost, private IPs, cloud metadata) or public. Multiple layers ensure credential protection against subprocess logging exfiltration and prompt-injection attacks on internal services, with failures in one layer not compromising others.",
-    "summary": "The orchestrator's security model comprises 7 automatic layers implemented as hooks, each targeting specific threats: environment scrubbing (credential leakage to subprocesses), SSRF guards (internal service access), shell-command scanning (injection/supply chain), write-anchor protocol (file overwrite), backups (edit recovery), credential scanning (file writes), and settings-based permissions. Layer 1—environment variable scrubbing that unsets credential-shaped variables (SUPABASE_KEY, GITHUB_TOKEN, OPENAI_API_KEY, etc.) before subprocess spawns—is the foundational control, enforced by parity tests across shell and PowerShell implementations and always executed before the disable guard.",
-    "generated_at": "2026-10-13T01:03:57.665145+00:00",
-    "backend": "cli",
-    "content_hash": "71edf326d83fd132",
+    "description": "The Orchestrator Security Model enforces a defense-in-depth strategy using automated hooks to mitigate distinct threat vectors without relying on user memory. This system operates primarily through PreToolUse hooks for blocking and PostToolUse hooks for detection, ensuring that failing one security layer leaves the others active. Key implementation details include an environment variable scrubbing mechanism that unsets sensitive keys before subprocess execution and an SSRF guard that validates WebFetch URLs against internal and private address ranges. This model is critical for preventing credential leakage, server-side request forgery, and command injection attacks during automated tool usage.",
+    "summary": "The Orchestrator Security Model enforces a defense-in-depth strategy via seven layers, mostly automated hooks, that block or detect distinct threat vectors like credential leakage, SSRF, and command injection. Layer 1 specifically prevents credential exfiltration by unsetting sensitive environment variables (e.g., `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`) in every subprocess via inline scrubbing headers in shell hooks.",
+    "generated_at": "2026-10-30T05:54:22.457917+00:00",
+    "backend": "ollama",
+    "content_hash": "dce63f96641c89bc",
     "total_chunks": 1
   },
   "knowledge/concepts/parallel-agent-worktree-isolation-discipline.md": {
@@ -450,11 +450,11 @@
   },
   "knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md": {
     "title": "Project-extra codegraph paths",
-    "description": "Project-extra codegraph paths index additional filesystem folders into a project's codegraph without registering them as full launcher projects. These paths are persisted in the `project_codegraph_extra_paths` table and are accessible via the Hub resolver's configuration endpoint. Key components include GUI panels, dedicated launcher commands for management, and hooks that queue edits to specific code folder drains. This mechanism is vital for enabling comprehensive code graph analysis across related, unmanaged repositories, such as private forks needing access to sibling public-repo content.",
-    "summary": "Indexes additional filesystem folders as \"code folders\" without registering them as launcher projects, using the `project_codegraph_extra_paths` DB table. The critical invariant is that both the Launcher and Analyzer CLI must perform all indexing in a single invocation to prevent stale UUID deletion.",
-    "generated_at": "2026-10-13T05:33:06.384821+00:00",
+    "description": "Project-extra codegraph paths allow users to index additional filesystem folders into a project's codegraph collection without registering them as full launcher projects. This feature persists configuration in the `project_codegraph_extra_paths` database table and supports lane reservations to create isolated subagent worktrees within these enabled folders. Implementation involves coordinated changes across the database, Tauri launcher commands, Svelte GUI components, and specific CLI hooks that route file edits to scoped drain queues. This capability is critical for users who need to include external repository clones in search queries while preventing those directories from becoming write targets or accumulating local state.",
+    "summary": "Since v0.2.105, the `project_codegraph_extra_paths` table enables isolated subagent worktrees in enabled code folders while enforcing a critical invariant where `--prune-stale` runs must visit all source roots in a single invocation to prevent UUID deletion across passes. The system now scopes pruning to only rows whose `project_source` matches the walked root or an extra folder walked in the same run, preventing primary root resyncs from deleting unrelated extra folder rows.",
+    "generated_at": "2026-10-30T05:54:28.623235+00:00",
     "backend": "ollama",
-    "content_hash": "796c8b917fac38e9",
+    "content_hash": "b500e2e3212d5c75",
     "total_chunks": 1
   },
   "knowledge/concepts/prompt-engineering-fundamentals.md": {
