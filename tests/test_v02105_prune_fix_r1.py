@@ -34,6 +34,7 @@ import pytest
 import vco_lib.codegraph_extras_refresh as xrf
 import vco_lib.codegraph_resync as cr
 import vco_lib.codegraph_source_purge as sp
+from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -529,7 +530,7 @@ def test_ps1_hook_detects_lost_extras_on_an_empty_ledger(tmp_path):
     project = _project(tmp_path)
     venv = _wrapper_venv(tmp_path)
     res = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File",
+        ["pwsh", *PWSH_BASE_FLAGS, "-NonInteractive", "-File",
          str(HOOKS / "session-start-deferral-surface.ps1")],
         env=_env(tmp_path, project, venv), capture_output=True, text=True,
         timeout=180, cwd=str(tmp_path),
