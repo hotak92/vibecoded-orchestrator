@@ -77,12 +77,12 @@ A `warning` field appears — on success and on failure alike — when the call 
 </details>
 
 ### `search_code_graph`
-Semantic search over code entities (functions, classes, modules, APIs, cross-service interactions) by describing what they do in natural language.
+Semantic search over code entities (functions, classes, modules, APIs, cross-service interactions, and the sections of `.tweakers` / `.ini` / `.json` config files) by describing what they do in natural language.
 
 <details>
 <summary>Details</summary>
 
-Params: `query`, `scope` (`"all"` | `"code"` | `"interaction"`), `limit` (default 8), `expand_hops` (0/1/2 — follow call/interaction edges from seed nodes), `layer` (architectural layer filter: API/Service/Data/UI/Utility), `project` (override workspace default).
+Params: `query`, `scope` (`"all"` | `"code"` | `"interaction"` | `"config"` — config files, sections and their code links only; `"all"` leaves the config link rows out), `limit` (default 8), `expand_hops` (0/1/2 — follow call/interaction edges from seed nodes), `layer` (architectural layer filter: API/Service/Data/UI/Utility), `project` (override workspace default).
 
 Uses CodeSage-Large-v2 embeddings (2048-dim) via the code embedding service (port 11440 by default). Falls back to Ollama jina-v2-base-code when `CODE_EMBED_BACKEND=ollama`. Top 4 results get full details (body + signature); the rest are compact refs. `expand_hops=1` follows outgoing call edges from seeds.
 
@@ -108,6 +108,10 @@ Supported query types:
 - `path` — BFS shortest call path between two functions (`"source.func->dest.func"`, depth limit 6)
 - `composes` / `composed_by` — composition relationships
 - `type_users` — functions using a given type in annotations
+- `config_users` — the code that reads a config key, `section/key`, section, config file or endpoint (`ini:GENERAL/ggv_file`), with the VALUE (plus default and description) next to each code site
+- `config_of` — the config values a function or module reads
+
+`config_users` / `config_of` share one implementation with `code-graph-query structure` (`vco_lib/codegraph_config_query.py`), and pair each code site only with values from its own source root (the project or one extra code folder).
 
 Use `search_code_graph` first to discover entity names, then `query_code_structure` to navigate their exact relationships.
 
@@ -254,7 +258,7 @@ Windows users: `.claude/scripts/code-graph-analyze.ps1` PowerShell wrapper also 
 ### `code-graph-query` CLI
 Query the code graph from the shell.
 
-Usage: `.claude/scripts/code-graph-query search "<concept>"` / `similar "<full_name>"` / `structure dependencies|callers|methods|extends|interactions "<target>"`. Backed by `query_code_graph.py`.
+Usage: `.claude/scripts/code-graph-query search "<concept>"` / `similar "<full_name>"` / `structure dependencies|callers|methods|extends|interactions|config_users|config_of "<target>"`. Backed by `query_code_graph.py`.
 
 ### `add_temporal_metadata.py`
 Backfill `valid_from` / `created` / `updated` fields in KG node YAML frontmatter from `git log` history. `--dry-run` previews changes; `--file PATH` scopes to one file.

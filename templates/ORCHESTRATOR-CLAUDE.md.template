@@ -299,7 +299,7 @@ status: active  # active, archived, deprecated, idea
 .claude/scripts/code-graph-analyze  /path/to/repo [--project NAME] [--incremental]
 .claude/scripts/code-graph-query    search "auth middleware" [--collection TYPE] [--limit N]
 .claude/scripts/code-graph-query    similar "module.function" [--limit N]
-.claude/scripts/code-graph-query    structure dependencies|callers|methods|extends|interactions "target"
+.claude/scripts/code-graph-query    structure dependencies|callers|methods|extends|interactions|config_users|config_of "target"
 ```
 
 PowerShell variants (`*.ps1`) ship for Windows users.

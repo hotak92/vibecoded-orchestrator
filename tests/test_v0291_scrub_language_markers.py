@@ -628,15 +628,17 @@ def test_every_extractor_key_has_an_explicit_syntax_entry() -> None:
 def test_only_the_python_extractor_bypasses_the_balanced_block_helper() -> None:
     """Settles the extractor count on an explicit axis.
 
-    14 dispatch KEYS -> 13 extractor MODULES (javascript.py serves both the
-    ``javascript`` and ``typescript`` keys). Python builds bodies from the AST and
+    15 dispatch KEYS -> 14 extractor MODULES (javascript.py serves both the
+    ``javascript`` and ``typescript`` keys). The v0.2.105 ``config`` extractor
+    parses .tweakers/.ini/.json line by line and has no braces to balance.
+    Python builds bodies from the AST and
     never calls the helper, so the blast radius of #29 is the other 12 MODULES
     (= 13 non-Python KEYS). Asserted positively in both directions, so a module
     that quietly stops calling the helper fails here rather than being skipped.
     """
     modules = _extractor_modules()
-    assert len(EXTRACTORS) == 14, f"dispatch keys changed: {sorted(EXTRACTORS)}"
-    assert len(modules) == 13, f"extractor modules changed: {sorted(modules)}"
+    assert len(EXTRACTORS) == 15, f"dispatch keys changed: {sorted(EXTRACTORS)}"
+    assert len(modules) == 14, f"extractor modules changed: {sorted(modules)}"
 
     with_calls = {m for m in modules if _balanced_block_calls(_module_source(m))}
     without_calls = set(modules) - with_calls
@@ -646,6 +648,7 @@ def test_only_the_python_extractor_bypasses_the_balanced_block_helper() -> None:
         # brace counting ran their bodies to EOF in a braceless language.
         "vco_lib.codegraph_lang.ruby",
         "vco_lib.codegraph_lang.lua",
+        "vco_lib.codegraph_lang.config",
     }, (
         f"expected only python/ruby/lua to bypass "
         f"_extract_balanced_block; modules without a call: {sorted(without_calls)}"

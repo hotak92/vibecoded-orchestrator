@@ -94,7 +94,7 @@ Writes the `.md` file and syncs to Weaviate. Upsert: skips if content identical.
 ```python
 search_code_graph(
     query: str,
-    scope: str = "all",      # "all" | "code" | "interaction"
+    scope: str = "all",      # "all" | "code" | "interaction" | "config"
     limit: int = 8,
     expand_hops: int = 0,    # 0 | 1 | 2
     layer: str = None,        # API | Service | Data | UI | Utility
@@ -102,12 +102,12 @@ search_code_graph(
     detail: str = "auto",
 )
 ```
-Finds code entities by purpose using the code-embedding service. `scope="interaction"` filters to cross-service HTTP/gRPC calls; `layer` filters by architectural layer.
+Finds code entities by purpose using the code-embedding service. `scope="interaction"` filters to cross-service HTTP/gRPC calls (and config links); `scope="config"` to config files, sections and their links (`"all"` leaves the config links out); `layer` filters by architectural layer.
 
 ### query_code_structure
 ```python
 query_code_structure(
-    query_type: str,  # dependencies|imports|callers|methods|extends|interactions|path|composes|type_users
+    query_type: str,  # dependencies|imports|callers|methods|extends|interactions|path|composes|type_users|config_users|config_of
     target: str,
     project: str = None
 )

@@ -297,6 +297,11 @@ from vco_lib.codegraph_lookup import (  # noqa: E402 — the ONE code-graph iden
     confirmed_entity_rows,
     pick_canonical_chunk,
 )
+from vco_lib.codegraph_config_query import (  # noqa: E402 — config_users / config_of, shared with the MCP (v0.2.105)
+    CONFIG_QUERY_TYPES,
+    format_config_result,
+    run_config_query,
+)
 from vco_lib.weaviate_exact_match import names_same_path  # noqa: E402 — the ONE tolerant path-identity home (v0.2.102 L4)
 
 CONFIG_PATH = claude_user_dir() / "workflow" / "config" / "mcp-config.json"
@@ -2088,9 +2093,21 @@ class CodeGraphQuery:
                         f"Some interactions from '{target}' may be missing."
                     )
 
+            elif query_type in CONFIG_QUERY_TYPES:
+                # v0.2.105: config values <-> the code that reads them — the
+                # ONE implementation the MCP's query_code_structure calls too.
+                # Project "" like the branches above: the collection is
+                # already this project's.
+                result = run_config_query(
+                    query_type, lambda base: self.client.collections.get(self._coll(base)),
+                    target, "", filter_cls=Filter, ref_cls=QueryReference,
+                )
+                print(format_config_result(result))
+
             else:
                 print(f"❌ Unknown query type: {query_type}")
-                print("   Supported: dependencies, callers, methods, extends, interactions")
+                print("   Supported: dependencies, callers, methods, extends, interactions, "
+                      "config_users, config_of")
 
         except Exception as e:
             print(f"❌ Structure query error: {e}", file=sys.stderr)
@@ -2335,7 +2352,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Structural queries
     structure_parser = subparsers.add_parser('structure', help='Structural queries')
     structure_parser.add_argument('query_type', type=str,
-                                 choices=['dependencies', 'callers', 'methods', 'extends', 'interactions'],
+                                 choices=['dependencies', 'callers', 'methods', 'extends', 'interactions',
+                                          'config_users', 'config_of'],
                                  help='Query type')
     structure_parser.add_argument('target', type=str, help='Target entity')
     structure_parser.add_argument('--project', '-p', type=str,

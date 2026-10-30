@@ -124,10 +124,12 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # v0.2.102 (W6-U): the failing-insert rows + stamp acceptance live in
 # `vco_lib.codegraph_extractor_generation`; two one-line seams here, paid for by
 # shorter comments — net 7022 -> 7019, re-pinned DOWNWARD.
-# v0.2.105 (caller fix round): the caller-scope resolution moved a seam tighter
-# — measured 7014, re-pinned DOWNWARD to the measured value (the ratchet's
-# rule: shrink, and re-pin when the file is smaller than the pin).
-_ANALYZER_LINES_MAX = 7014
+# v0.2.105 (merge of the caller and config-files lanes): caller moved the
+# caller-scope resolution a seam tighter (7014) and config files moved the
+# parsers/link rules to `vco_lib.codegraph_lang.config` and
+# `vco_lib.codegraph_config_refs` (7010). Both land together at 7002,
+# re-pinned DOWNWARD to the measured value (the ratchet's rule).
+_ANALYZER_LINES_MAX = 7002
 
 
 def _measure() -> int:

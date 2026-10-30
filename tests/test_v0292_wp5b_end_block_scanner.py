@@ -418,4 +418,8 @@ def test_every_extractor_module_uses_exactly_one_block_scanner() -> None:
         }
         if not ({"_extract_balanced_block", "extract_end_keyword_block"} & names):
             braceless.add(module_name)
-    assert braceless == {"vco_lib.codegraph_lang.python"}, sorted(braceless)
+    # v0.2.105: the config extractor parses .tweakers/.ini/.json by line —
+    # it extracts no code bodies, so it has no block to scan.
+    assert braceless == {
+        "vco_lib.codegraph_lang.python", "vco_lib.codegraph_lang.config",
+    }, sorted(braceless)
