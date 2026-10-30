@@ -2444,6 +2444,13 @@ _EMBED_SERVICE_CACHE_DEFAULTS: tuple = (
     ("_embed_service_construction_failed_at", 0.0),
     ("_embed_service_construction_error", ""),
     ("_embed_record_checked_at", 0.0),
+    # Same class, different global: `server` freezes `CLAUDE_PROJECT_DIR` at
+    # import into `_MODULE_LOAD_WORKSPACE` (the workspace-drift backstop). A
+    # test that imports it first under its own tmp workspace would otherwise
+    # make every later store/search call refuse as "workspace drift" (v0.2.105
+    # final gate, shard order). "" is the backstop's "spawned without a
+    # workspace" no-op; tests of the backstop set it themselves.
+    ("_MODULE_LOAD_WORKSPACE", ""),
 )
 _EMBED_SERVICE_CACHE_MODULES: tuple = (
     "weaviate_mcp.server",
