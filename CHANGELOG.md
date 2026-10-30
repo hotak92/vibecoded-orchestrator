@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.105] - 2026-10-30
 
 ### Added
 
@@ -41,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Context-injection hooks no longer time out.** On a busy project the hooks that add knowledge-graph and code-graph context before an edit, a write, a shell command and a prompt were hitting their 10 s limit on most runs (65-92 % on one project measured from the chat transcripts), so Claude Code waited 10 s and then got no context. The cause: after finding its context, the hook read every pending citation record of the project, one per search of every chat, often 1-8 MB each and thousands of files, which took far longer than the limit. It now touches only the records it wrote itself. On top of that, every injection run now has a hard deadline of 7 s from the moment the hook started (`VCO_INJECT_HARD_DEADLINE_S`): whatever it is still doing then, it stops and lets the tool call proceed without extra context, instead of making Claude Code wait out the timeout. On Windows the shell-command hook also no longer waits for its learning-signal event to be sent: that now happens in the background, as it already did on Linux and macOS.
 
 ### Changed
+
+- **Release mechanics:** version 0.2.104 → 0.2.105 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). This release adds a code-graph extractor-generation rung (0.2.105: config files such as `.ini` / `.json` / `.tweakers` join the code graph), so existing code graphs are re-walked once after the update to pick up the new config-file rows and the links from code to config keys. Only those new rows are embedded; existing code rows are not re-embedded (`CODEGRAPH_EMBED_REVISION` is unchanged).
 
 - **The launcher's collection counts no longer load every project's data into Weaviate's memory.** Weaviate keeps a collection in RAM from the first query on it (through 1.28 it never unloads), and the launcher's KG collections view, the /codegraph page and the hub's CLI listings counted EVERY collection on the machine — every project's knowledge graph and code graph included — each time they rendered. These views now count live only the collections the open project actually uses (its own, the shared one, and the ones it has been granted access to); every other collection shows the last cached count, with the moment it was taken next to it, and "—" when it was never counted. A new "Refresh counts" button on the KG collections view and the /codegraph page counts everything once and refreshes those cached numbers. A count the launcher knows is stale — after a knowledge-graph sync, a finished code-graph build, or deleting collections through the cleanup wizard — is dropped rather than shown as fresh.
 
