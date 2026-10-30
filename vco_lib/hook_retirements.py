@@ -109,7 +109,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from vco_lib.hooks_settings import anchor_hook_command, invoked_script_tokens
+from vco_lib.hooks_settings import (
+    anchor_hook_command,
+    invoked_script_arguments,
+    invoked_script_tokens,
+)
 
 #: Matcher kinds. See the module docstring for what each one is safe for.
 KIND_HOOK_SCRIPT = "hook_script"
@@ -1202,6 +1206,27 @@ def vco_hook_script_identity(command: str) -> Optional[str]:
     return None
 
 
+def vco_hook_script_arguments(command: str) -> Optional[Tuple[str, ...]]:
+    """The tokens that FOLLOW the invoked ``.claude/hooks/<name>.{sh,ps1}``
+    script in ``command`` — its trailing ARGUMENTS — or ``None`` when the
+    command invokes no such script at an anchor position.
+
+    v0.2.105 (review R1 SB-1). A user who adds an argument to a shipped hook
+    command (``…/ensure-containers.sh --strict``) has edited it: the argument
+    is theirs, so the settings merge must keep the command verbatim rather
+    than replace it with the shipped spelling. Everything else about the
+    command (the interpreter, the path spelling, the disable guard, a
+    different number of spaces) is the SHIPPED form's business and still
+    heals — only these post-script tokens decide "the user changed it".
+
+    Same walk and same anchoring rule as :func:`vco_hook_script_identity`,
+    so the two answers always describe the same script token."""
+    for tok, args in invoked_script_arguments(command):
+        if _HOOK_TOKEN_RE.match(tok):
+            return args
+    return None
+
+
 def scrub_retired_registrations(user_hooks: dict) -> Tuple[dict, list]:
     """Drop every registration this module's table declares dead.
 
@@ -1930,6 +1955,7 @@ __all__ = [
     "sibling_matchers",
     "added_sibling_matchers",
     "unit_matchers",
+    "vco_hook_script_arguments",
     "vco_hook_script_identity",
 ]
 
