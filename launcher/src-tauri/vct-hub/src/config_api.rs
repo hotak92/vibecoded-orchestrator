@@ -596,6 +596,20 @@ struct ProjectConfigResponse {
     /// ignores it; an older hub omits it, which the Python parser reads as
     /// unknown.
     code_graph_extra_paths_gone: Option<Vec<String>>,
+    /// v0.2.105 fix round — the folders this project POSITIVELY moved AWAY
+    /// from (`Db::list_moved_from_codegraph_sources`: the `src` of every
+    /// move whose commit landed, minus the live `folder_path`).
+    ///
+    /// Every code-graph row carries `project_source` = the absolute root it
+    /// was walked from, and that root is mixed into the row's UUID, so after
+    /// a move the old root's rows are a second, stale copy of the same files
+    /// that nothing rewrites and `--prune-stale` may not judge. Consumer:
+    /// `vco_lib.codegraph_source_purge` removes them — but only once the
+    /// destination holds rows of its own, so a graph is never emptied by the
+    /// move itself. `None` (JSON `null`) when the DB read failed, exactly
+    /// like `code_graph_extra_paths_gone`: the client then purges nothing.
+    /// Additive; an older hub omits it and the Python parser reads unknown.
+    code_graph_moved_from_sources: Option<Vec<String>>,
     /// v0.2.105 (#512A) — the commit the project's PRIMARY code-graph root
     /// was last analyzed at (`project_codegraph_bindings.
     /// last_analyzed_commit`), or `null` when the project was never analyzed
@@ -1373,6 +1387,22 @@ async fn project_config(
         unmanaged_containers: infra.unmanaged_containers,
         ssrf_extra_local_ports,
         code_graph_extra_paths_gone,
+        // v0.2.105 fix round: the roots this project POSITIVELY moved away
+        // from (a `flipped`/`completed` move's `src`). Read failure → null
+        // ("unknown"), which the purge reads as "keep every row".
+        code_graph_moved_from_sources: match h.0.list_moved_from_codegraph_sources(&project.id)
+        {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project.id,
+                    error = %e,
+                    "[vct-hub config_api] list_moved_from_codegraph_sources failed; \
+                     serving the moved-from list as unknown",
+                );
+                None
+            }
+        },
         // v0.2.105 (#512A): the primary root's analyzed commit, read from the
         // SAME binding row that supplied `code_graph_collection_prefix`
         // above.
@@ -4360,6 +4390,79 @@ kg_tier_full = 0.8
             body.get("code_graph_extra_paths_gone"),
             Some(&serde_json::json!(["/opt/paused", "/opt/removed"])),
             "body={}",
+            body
+        );
+    }
+
+    /// v0.2.105 fix round (review NIT): the folders this project POSITIVELY
+    /// moved away from — the `src` of a move whose commit landed, minus the
+    /// live folder. A `running` or `failed` move proves nothing.
+    #[tokio::test]
+    async fn config_serves_moved_from_code_graph_sources() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-moved", "myproject");
+        {
+            let guard = h.0.lock();
+            for (id, src, dst, status, started) in [
+                ("m1", "/opt/old", "/opt/older", "completed", 1_i64),
+                ("m2", "/opt/older", "/opt/myproject", "flipped", 2),
+                ("m3", "/opt/never", "/opt/x", "failed", 3),
+            ] {
+                guard
+                    .execute(
+                        "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+                         VALUES (?1, 'p-moved', ?2, ?3, ?4, ?5)",
+                        rusqlite::params![id, src, dst, status, started],
+                    )
+                    .unwrap();
+            }
+        }
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-moved/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        let moved = body.get("code_graph_moved_from_sources");
+        assert_eq!(
+            moved,
+            Some(&serde_json::json!(["/opt/old", "/opt/older"])),
+            "body={}",
+            body
+        );
+
+        // A project that never moved serves an (empty) list, not null —
+        // "nothing to purge", which is a different fact from "unknown".
+        seed_full_project(&h, "p-fresh", "freshproj");
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-fresh/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(
+            body.get("code_graph_moved_from_sources"),
+            Some(&serde_json::json!([])),
+            "body={}",
+            body
+        );
+    }
+
+    /// A project row the hub does not hold: the read fails → `null`
+    /// ("unknown"), never an empty list that would read as "nothing to do".
+    #[tokio::test]
+    async fn config_moved_from_read_failure_serves_null() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-mvbroken", "myproject");
+        h.0.lock().execute_batch("DROP TABLE project_moves").unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-mvbroken/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200, "the resolver still answers");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(
+            body.get("code_graph_moved_from_sources").map(|v| v.is_null()) == Some(true),
+            "a failed read is unknown, not an empty list; body={}",
             body
         );
     }

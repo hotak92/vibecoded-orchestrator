@@ -646,6 +646,15 @@ class ProjectConfig:
     #: (:func:`vco_lib.codegraph_source_purge.purge_gone_extra_paths`) deletes
     #: rows only for a path listed here, and never on ``None``.
     code_graph_extra_paths_gone: Optional[tuple[str, ...]] = None
+    #: v0.2.105 fix round — the folders this project POSITIVELY moved AWAY
+    #: from: the ``src`` of every launcher move that completed (the
+    #: launcher's ``project_moves`` ledger — the durable record that the
+    #: project used to live elsewhere), minus the live folder. Rows stamped
+    #: with such a root are a second, stale copy of the same files after a
+    #: move (the row UUID mixes ``project_source``), and nothing rewrites
+    #: them. ``None`` means UNKNOWN (read failure, or a hub older than the
+    #: field) — the purge then keeps every row.
+    code_graph_moved_from_sources: Optional[tuple[str, ...]] = None
 
 
 #: The resolver fields that are plain lists of declared values (v0.2.102 M3).
@@ -1582,6 +1591,13 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
                 if isinstance(body.get("code_graph_extra_paths_gone"), list)
                 else None
             ),
+            # v0.2.105 fix round: same tri-state — a list (possibly empty)
+            # only when the hub sent one; absent/null → unknown (keep rows).
+            code_graph_moved_from_sources=(
+                _str_list(body.get("code_graph_moved_from_sources"))
+                if isinstance(body.get("code_graph_moved_from_sources"), list)
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(
@@ -1866,14 +1882,24 @@ def claude_session_dir_for(workspace_path: Path) -> Path:
     return Path.home() / ".claude" / "projects" / slug
 
 
-def hub_post_json(route: str, body: dict[str, Any]) -> requests.Response:
+def hub_post_json(
+    route: str, body: dict[str, Any], *, project_id: str | None = None
+) -> requests.Response:
     """POST ``body`` as JSON to ``/api/v1/<route>`` on the local hub.
 
     The write-side sibling of the resolver's GETs, so hub discovery + bearer
     handling keep ONE home in this module (v0.2.100 W5R-04 — first caller:
     :mod:`vco_lib.codegraph_extras_refresh`). Uses the global ``hub.token``
-    (non-``/env``/``/config`` routes accept it); a 401 — the stale-cache shape
-    after a hub restart — invalidates discovery and retries ONCE.
+    on every route that accepts it; a 401 — the stale-cache shape after a hub
+    restart — invalidates discovery and retries ONCE.
+
+    ``project_id`` marks a PER-PROJECT route (the same gate as ``/env`` and
+    ``/config``: ``/projects/{id}/codegraph/analyzed`` since v0.2.105): the
+    bearer is then the scoped ``hub.token.<project_id>`` — see
+    :func:`_project_token` — and a 403 gets ONE retry with the on-disk token
+    when ``$VCT_HUB_TOKEN`` is a provably-stale pin
+    (:func:`_stale_env_token_fallback`), exactly like the resolvers' GETs.
+    Without it, a session that exported a token would be refused forever.
 
     :raises HubUnreachable: the hub is down / not discoverable / the
         transport failed. Any HTTP status is returned to the caller as-is.
@@ -1886,15 +1912,32 @@ def hub_post_json(route: str, body: dict[str, Any]) -> requests.Response:
     resp: requests.Response | None = None
     for attempt in range(2):
         port, token = _discover_hub()
+        bearer = _project_token(project_id, token) if project_id else token
         try:
             resp = _http_session().post(
                 f"http://127.0.0.1:{port}/api/v1/{route}",
                 json=body,
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {bearer}"},
                 timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
             )
         except requests.RequestException as exc:
             raise HubUnreachable(f"hub POST failed: {exc}") from exc
+        if resp.status_code == 403 and project_id:
+            fallback = _stale_env_token_fallback(project_id)
+            if fallback is not None:
+                try:
+                    resp_fb = _http_session().post(
+                        f"http://127.0.0.1:{port}/api/v1/{route}",
+                        json=body,
+                        headers={"Authorization": f"Bearer {fallback}"},
+                        timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+                    )
+                except requests.RequestException:
+                    return resp  # keep the original refusal
+                if _retry_answer_is_definitive(resp_fb.status_code):
+                    _warn_stale_env_token()
+                    return resp_fb
+            return resp
         if resp.status_code != 401 or attempt == 1:
             return resp
         _invalidate_discovery_cache()

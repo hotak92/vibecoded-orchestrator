@@ -31,8 +31,19 @@ The catch-up closes that gap WITHOUT installing git hooks into user repos:
    commit, recorded nothing and re-ran every interval forever;
 6. the analysis succeeded → record HEAD through the hub route
    ``POST /api/v1/projects/{id}/codegraph/analyzed`` (launcher.db keeps its
-   single writer: this module never opens it). A failed run records NOTHING,
-   so the next eligible catch-up retries the same diff.
+   single writer: this module never opens it), presenting the PROJECT-SCOPED
+   ``hub.token.<project_id>`` that route requires. A failed run records
+   NOTHING, so the next eligible catch-up retries the same diff. A run the
+   analyzer SOFT-SKIPPED (no embedding backend → "Code-graph analysis
+   skipped", exit 0) counts as FAILED, never as success — the check lives in
+   :mod:`vco_lib.codegraph_analyzer_outcome`, one home shared with the resync
+   driver and every other ``run_analyzer`` caller.
+
+7. a walk that keeps failing (a full walk past the timeout, a hub that keeps
+   refusing the recording) does not restart on every Stop after
+   :data:`BACKOFF_AFTER_FAILURES` consecutive failures: the next attempt is
+   skipped (``backoff``) until a doubling window elapses. Any recorded outcome
+   clears the count.
 
 A project with no ENABLED code-graph binding is skipped entirely (the
 ``code_graph_bound`` config field): the hub serves a name-derived fallback
@@ -59,9 +70,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -86,6 +99,21 @@ DEFAULT_TIMEOUT_SECONDS = 1800
 #: it; this module runs detached, so a generous ceiling costs no turn time.
 DIFF_TIMEOUT_SECONDS = 60
 LOG_NAME = "codegraph_head_catchup.log"
+
+#: v0.2.105 fix round (review LOW): the Stop hook spawns this module at most
+#: once per interval (600 s), and a walk that CANNOT converge — a full walk
+#: past ``DEFAULT_TIMEOUT_SECONDS`` on a huge tree, or a recording the hub keeps
+#: refusing — used to restart on every Stop forever, each one holding the
+#: project's walk claim (a GUI build then reads "already running"). After this
+#: many CONSECUTIVE failed runs the module backs off: the next attempt is
+#: skipped (``"backoff"``) until the window elapses, which doubles per
+#: additional failure up to :data:`BACKOFF_MAX_SECONDS`. Any recorded outcome
+#: resets the count, so a healthy project never sees the gate.
+BACKOFF_AFTER_FAILURES = 3
+#: First backoff window once :data:`BACKOFF_AFTER_FAILURES` is reached.
+BACKOFF_BASE_SECONDS = 3600
+#: Ceiling of the doubling window.
+BACKOFF_MAX_SECONDS = 6 * 3600
 
 #: The drain's extension gate, byte for byte
 #: (``templates/hooks/stop-codegraph-drain.sh :: CODE_RE``). MUST MATCH.
@@ -261,12 +289,20 @@ def build_full_argv(root: str, prefix: str, dot_flag: str) -> list[str]:
 
 def record_analyzed_commit(project_id: str, commit: str) -> tuple[bool, str]:
     """POST the new baseline to the hub
-    (``/projects/{id}/codegraph/analyzed`` → advance-only stamp)."""
+    (``/projects/{id}/codegraph/analyzed`` → advance-only stamp).
+
+    That route is PROJECT-SCOPED (v0.2.105 fix round, same gate as ``/env``
+    and ``/config``): it accepts only ``hub.token.<project_id>``, so the
+    project id is passed through for the bearer — the global ``hub.token``
+    is refused there.
+    """
     from vco_lib import project_config
 
     try:
         resp = project_config.hub_post_json(
-            f"projects/{project_id}/codegraph/analyzed", {"commit": commit}
+            f"projects/{project_id}/codegraph/analyzed",
+            {"commit": commit},
+            project_id=project_id,
         )
     except project_config.ResolverError as exc:
         return False, f"hub unreachable: {exc}"
@@ -289,6 +325,8 @@ class Deps:
     run_analyzer: Callable[..., AnalyzerResult] = run_analyzer
     record: Callable[[str, str], tuple[bool, str]] = record_analyzed_commit
     canonical_root: Callable[[str], Optional[str]] = canonical_repo_root
+    #: Wall clock for the backoff window (review LOW) — a test moves it.
+    now: Callable[[], float] = time.time
 
 
 def _str_or_none(value: object) -> Optional[str]:
@@ -351,6 +389,97 @@ def _release_lock(lock: Optional[Path]) -> None:
         lock.rmdir()
     except OSError:
         pass
+
+
+# ── Backoff after consecutive failures (review LOW) ───────────────────────
+#
+# One file per project under the state dir:
+# ``{"failures": N, "retry_at": <epoch>}``. Written on every FAILED run
+# (``analyzer_failed`` / ``record_failed``), removed on a recorded one. Every
+# read/write soft-fails: an unreadable or unwritable state file must never
+# turn a catch-up into an error (a lost file merely retries at the ordinary
+# interval).
+
+
+def backoff_state_path(state_dir: Path, project_id: str) -> Path:
+    """Where this project's consecutive-failure state lives."""
+    return state_dir / f"codegraph_head_catchup_backoff_{path_key(project_id)}.json"
+
+
+def _read_backoff(path: Path) -> tuple[int, float]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0, 0.0
+    if not isinstance(raw, dict):
+        return 0, 0.0
+    try:
+        failures = int(raw.get("failures", 0) or 0)
+        retry_at = float(raw.get("retry_at", 0) or 0)
+    except (TypeError, ValueError):
+        return 0, 0.0
+    return max(0, failures), max(0.0, retry_at)
+
+
+def backoff_window_seconds(failures: int) -> int:
+    """The cooling window after ``failures`` consecutive failed runs.
+
+    ``0`` below :data:`BACKOFF_AFTER_FAILURES` (the ordinary interval still
+    applies); then :data:`BACKOFF_BASE_SECONDS`, doubling per further failure,
+    capped at :data:`BACKOFF_MAX_SECONDS`.
+    """
+    if failures < BACKOFF_AFTER_FAILURES:
+        return 0
+    doublings = failures - BACKOFF_AFTER_FAILURES
+    return min(BACKOFF_MAX_SECONDS, BACKOFF_BASE_SECONDS * (2 ** doublings))
+
+
+def _write_backoff(state_dir: Path, project_id: str, failures: int,
+                   retry_at: float) -> None:
+    path = backoff_state_path(state_dir, project_id)
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"failures": failures, "retry_at": retry_at}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # a lost counter only means "retry at the ordinary interval"
+
+
+def _clear_backoff(state_dir: Path, project_id: str) -> None:
+    try:
+        backoff_state_path(state_dir, project_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _note_failure(
+    state_dir: Path, project_id: str, log: Callable[[str], None],
+    label: str, now: float,
+) -> None:
+    """Count one failed run; once the threshold is reached, log the window
+    the next attempt must wait for (the gate reads it from the file)."""
+    path = backoff_state_path(state_dir, project_id)
+    failures, _retry_at = _read_backoff(path)
+    failures += 1
+    window = backoff_window_seconds(failures)
+    _write_backoff(state_dir, project_id, failures, now + window)
+    if window:
+        log(
+            f"backoff {label}: {failures} consecutive failed catch-up run(s) "
+            f"for project={project_id}; the next attempt is skipped for "
+            f"{window}s (capped at {BACKOFF_MAX_SECONDS}s) — the baseline is "
+            "unchanged and nothing is recorded until then"
+        )
+
+
+def _backoff_remaining(state_dir: Path, project_id: str, now: float) -> float:
+    """Seconds the next attempt must still wait (``0`` = run now)."""
+    failures, retry_at = _read_backoff(backoff_state_path(state_dir, project_id))
+    if backoff_window_seconds(failures) == 0:
+        return 0.0
+    return max(0.0, retry_at - now)
 
 
 def _run_walk(
@@ -424,8 +553,8 @@ def catchup(
 ) -> str:
     """Bring the PRIMARY root's code graph up to HEAD. Returns the outcome
     (one of ``up_to_date``, ``no_git_head``, ``no_config``, ``not_bound``,
-    ``worktree_session``, ``diff_failed``, ``busy``, ``analyzer_failed``,
-    ``record_failed``, ``recorded``). Never raises."""
+    ``worktree_session``, ``diff_failed``, ``busy``, ``backoff``,
+    ``analyzer_failed``, ``record_failed``, ``recorded``). Never raises."""
     if deps is None:
         from vco_lib import project_config
 
@@ -461,6 +590,9 @@ def catchup(
         log(f"skip project={root}: no git HEAD (not a repo, no commits, or git missing)")
         return "no_git_head"
     if recorded and recorded == head:
+        # Nothing to converge, so any earlier failure chain is over: drop the
+        # backoff state (review LOW) so the NEXT real difference starts fresh.
+        _clear_backoff(state_dir, project_id)
         return "up_to_date"
 
     canonical = deps.canonical_root(root)
@@ -473,6 +605,32 @@ def catchup(
     # The lock key follows the drain's canonical root (same resolution), so
     # the catch-up and the drain serialise however the root was spelled.
     lock_root = canonical or root
+
+    # Review LOW: the Stop hook spawns this module once per interval (600 s),
+    # and a walk that CANNOT converge (a full walk past the timeout on a huge
+    # tree, a recording the hub keeps refusing) used to restart on every Stop
+    # forever — each run holding the project's walk claim. After
+    # BACKOFF_AFTER_FAILURES consecutive failed runs, skip until the doubling
+    # window elapses. Any recorded outcome (or an up-to-date tree) clears it.
+    remaining = _backoff_remaining(state_dir, project_id, deps.now())
+    if remaining > 0:
+        log(
+            f"backoff project={project_id}: {int(remaining) + 1}s left before "
+            "the next attempt after consecutive failed catch-up run(s); the "
+            "baseline is unchanged — skipping this one"
+        )
+        return "backoff"
+
+    def _recorded() -> str:
+        _clear_backoff(state_dir, project_id)
+        return "recorded"
+
+    def _failed(outcome: str, label: str) -> str:
+        _note_failure(state_dir, project_id, log, label, deps.now())
+        return outcome
+
+    def _result(ok: bool, label: str) -> str:
+        return _recorded() if ok else _failed("record_failed", label)
 
     if not recorded:
         log(
@@ -493,13 +651,13 @@ def catchup(
                 f"no_recorded: FAILED project={project_id} full walk at "
                 f"{head[:12]}: {res.reason}; baseline unchanged"
             )
-            return "analyzer_failed"
+            return _failed("analyzer_failed", "no_recorded")
         ok, why = deps.record(project_id, head)
         log(
             f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
             f"via full walk (no prior baseline) at {head[:12]}: {why}",
         )
-        return "recorded" if ok else "record_failed"
+        return _result(ok, "no_recorded")
 
     if not deps.is_ancestor(root, recorded, head):
         log(
@@ -520,13 +678,13 @@ def catchup(
                 f"not_ancestor: FAILED project={project_id} full walk at "
                 f"{head[:12]}: {res.reason}; baseline unchanged"
             )
-            return "analyzer_failed"
+            return _failed("analyzer_failed", "not_ancestor")
         ok, why = deps.record(project_id, head)
         log(
             f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
             f"via full walk (rewritten history) at {head[:12]}: {why}",
         )
-        return "recorded" if ok else "record_failed"
+        return _result(ok, "not_ancestor")
 
     paths = deps.diff_paths(root, recorded, head)
     if paths is None:
@@ -550,7 +708,7 @@ def catchup(
             f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
             f"{recorded[:12]}..{head[:12]}: no indexable file changed: {why}"
         )
-        return "recorded" if ok else "record_failed"
+        return _result(ok, "empty_diff")
 
     if vanished > 0 or len(files) > max_files:
         label = "deleted_files" if vanished > 0 else "huge_diff"
@@ -566,7 +724,7 @@ def catchup(
                 f"{label}: FAILED project={project_id} {recorded[:12]}..{head[:12]}: "
                 f"{res.reason}; baseline unchanged"
             )
-            return "analyzer_failed"
+            return _failed("analyzer_failed", label)
         ok, why = deps.record(project_id, head)
         log(
             f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
@@ -575,7 +733,7 @@ def catchup(
             f"deleted_files={res.deleted_files} removed_entities={res.deleted_entities} "
             f"ms={res.duration_ms}: {why}",
         )
-        return "recorded" if ok else "record_failed"
+        return _result(ok, label)
 
     key = path_key(lock_root)
     lock = _acquire_lock(state_dir, key)
@@ -602,14 +760,14 @@ def catchup(
                 f"FAILED project={project_id} {recorded[:12]}..{head[:12]}: "
                 f"{res.reason}; baseline unchanged"
             )
-            return "analyzer_failed"
+            return _failed("analyzer_failed", "batch")
         ok, why = deps.record(project_id, head)
         log(
             f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
             f"{recorded[:12]}..{head[:12]}: files={res.files_analyzed} "
             f"entities={res.entities_indexed} ms={res.duration_ms}: {why}"
         )
-        return "recorded" if ok else "record_failed"
+        return _result(ok, "batch")
     finally:
         try:
             list_file.unlink(missing_ok=True)

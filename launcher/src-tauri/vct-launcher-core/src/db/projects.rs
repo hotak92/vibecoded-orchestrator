@@ -522,6 +522,74 @@ impl Db {
             .map_err(|e| format!("collect list_live_project_moves: {}", e))
     }
 
+    /// Every folder this project has POSITIVELY moved AWAY from, sorted —
+    /// the old roots whose code-graph rows nothing ever removed
+    /// (v0.2.105 fix round, review NIT).
+    ///
+    /// Only a move whose commit landed counts: `flipped` (the project lives
+    /// at the destination, reconciliation may still be owed) or `completed`
+    /// (nothing owed). A `running` row proves nothing — the project still
+    /// lives at `src` — and a `failed` row means it never moved, so both are
+    /// excluded and their rows are kept.
+    ///
+    /// Every code-graph row carries `project_source` = the absolute root it
+    /// was walked from (and that root is mixed into the row's UUID), so after
+    /// a move the old root's rows are a second, stale copy of the same files:
+    /// nothing rewrites them (a walk of the new root stamps the new root) and
+    /// `--prune-stale` may not judge them (they are not a walked source), so
+    /// they would stay forever. `vco_lib.codegraph_source_purge` deletes them
+    /// once the destination really holds rows of its own.
+    ///
+    /// The CURRENT `folder_path` is excluded here as well as by the caller's
+    /// keep set (a move back to an earlier folder is history, not a lost
+    /// root). A DB read failure is an `Err` — the hub then serves the field
+    /// as `null` ("unknown") and the purge keeps every row.
+    pub fn list_moved_from_codegraph_sources(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let (current, rows): (Option<String>, Vec<(String, String)>) = {
+            let guard = self.lock();
+            let current: Option<String> = guard
+                .query_row(
+                    "SELECT folder_path FROM projects WHERE id = ?1",
+                    params![project_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("prepare list_moved_from_codegraph_sources: {}", e))?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT src, dst FROM project_moves
+                      WHERE project_id = ?1
+                        AND status IN ('flipped','completed')
+                      ORDER BY started_at ASC",
+                )
+                .map_err(|e| format!("prepare list_moved_from_codegraph_sources: {}", e))?;
+            let it = stmt
+                .query_map(params![project_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("query list_moved_from_codegraph_sources: {}", e))?;
+            let rows = it
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect list_moved_from_codegraph_sources: {}", e))?;
+            (current, rows)
+        };
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (src, dst) in rows {
+            let src = src.trim().to_string();
+            if src.is_empty() || src == dst.trim() {
+                continue;
+            }
+            if current.as_deref().map(str::trim) == Some(src.as_str()) {
+                continue; // moved back here: this IS the live root
+            }
+            out.insert(src);
+        }
+        Ok(out.into_iter().collect())
+    }
+
     /// Claim single-flight for a move. Nothing else happens here.
     ///
     /// Called BEFORE the engine copies anything, so a second concurrent move
@@ -1097,6 +1165,74 @@ mod move_tests {
             .join(if enabled { "agents" } else { "agents.disabled" });
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{}.md", name)), "x").unwrap();
+    }
+
+    // ───── list_moved_from_codegraph_sources (v0.2.105 fix round) ─────
+
+    fn insert_move(
+        db: &Db,
+        id: &str,
+        project_id: &str,
+        src: &str,
+        dst: &str,
+        status: &str,
+        started_at: i64,
+    ) {
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, project_id, src, dst, status, started_at],
+            )
+            .expect("insert move row");
+    }
+
+    #[test]
+    fn moved_from_sources_are_the_roots_a_landed_move_left_behind() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", "/w/final");
+        insert_move(&db, "m1", "p1", "/w/a", "/w/b", "completed", 1);
+        insert_move(&db, "m2", "p1", "/w/b", "/w/final", "flipped", 2);
+        assert_eq!(
+            db.list_moved_from_codegraph_sources("p1").unwrap(),
+            vec!["/w/a".to_string(), "/w/b".to_string()],
+            "both landed moves left a root behind, sorted"
+        );
+
+        // A move that never landed proves nothing: `running` means the project
+        // still lives at src, `failed` means it never moved. A self-move is
+        // history, not a lost root.
+        seed(&db, "p2", "/w/p2");
+        insert_move(&db, "m3", "p2", "/w/x", "/w/y", "running", 3);
+        insert_move(&db, "m4", "p2", "/w/z", "/w/q", "failed", 4);
+        insert_move(&db, "m5", "p2", "/w/p2", "/w/p2", "completed", 5);
+        assert!(db.list_moved_from_codegraph_sources("p2").unwrap().is_empty());
+
+        seed(&db, "p3", "/w/a"); // moved away and BACK
+        insert_move(&db, "m6", "p3", "/w/a", "/w/b", "completed", 6);
+        insert_move(&db, "m7", "p3", "/w/b", "/w/a", "completed", 7);
+        assert_eq!(
+            db.list_moved_from_codegraph_sources("p3").unwrap(),
+            vec!["/w/b".to_string()],
+            "the live folder is never reported as moved away from"
+        );
+
+        assert!(db
+            .list_moved_from_codegraph_sources("nope")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn moved_from_read_failure_is_an_error_not_an_empty_list() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", "/w/final");
+        db.lock().execute_batch("DROP TABLE project_moves").unwrap();
+        assert!(
+            db.list_moved_from_codegraph_sources("p1").is_err(),
+            "unknown must be distinguishable from 'never moved'"
+        );
     }
 
     // ───── update_project_folder_path ─────
