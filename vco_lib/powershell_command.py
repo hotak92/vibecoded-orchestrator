@@ -1139,6 +1139,17 @@ def _ps_counter_init(prefix: List[_Tok], var: str) -> Optional[int]:
     for stmt in reversed(stmts):
         if not stmt:
             continue
+        if len(stmt) == 1 and not stmt[0].op and not stmt[0].quoted:
+            # A glued ``$n=0`` (PowerShell accepts no spaces; the tokenizer
+            # keeps it one word) — the same ungluing ``_ps_for_iterations``
+            # does (review E-6: this was the one call site that missed it).
+            m = _PS_GLUED_ASSIGN_RE.match(stmt[0].text)
+            if m is not None:
+                if m.group(2) != "=" or _ps_var(m.group(1)) is None:
+                    return None
+                if _ps_var(m.group(1)) == var and _PS_INT_RE.match(m.group(3)):
+                    return int(m.group(3))
+                continue
         if (len(stmt) != 3 or any(t.op or t.quoted for t in stmt[:2])
                 or stmt[1].text != "=" or _ps_var(stmt[0].text) is None
                 or stmt[2].op):

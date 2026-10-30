@@ -375,6 +375,66 @@ def test_a_new_move_sweeps_again(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Fix round 3 (review A-LOW-1) — the ledger's raw Windows path form vs the
+# rows' POSIX stamp
+# ---------------------------------------------------------------------------
+
+
+def test_a_windows_form_moved_source_is_purged_in_the_posix_row_form(tmp_path):
+    """ACT: the move ledger stores the RAW ``folder_path`` (``C:\\x\\proj``
+    on Windows) while code-graph rows are stamped ``source_root.as_posix()``
+    (``C:/x/proj``); the sweep compares and purges in the rows' form —
+    pre-fix the exact string match deleted nothing on Windows."""
+    purger = _Purger()
+    out = _sweep(tmp_path, _cfg(moved=("C:\\old\\proj",)), purger,
+                 count_rows=_count({"/proj": 12}))
+    assert purger.calls == [("P", "C:/old/proj")]
+    assert set(out) == {"C:/old/proj"}
+
+
+def test_a_windows_form_moved_source_readded_as_extra_is_kept(tmp_path):
+    """LEAVE-ALONE: the keep-set subtraction runs in the same one form, so
+    an extra stored in the POSIX form still shields a moved-from entry the
+    ledger spelled with backslashes (a move back, or re-added)."""
+    purger = _Purger()
+    _sweep(tmp_path, _cfg(enabled=("C:/old/proj",), moved=("C:\\old\\proj",)),
+           purger, count_rows=_count({"/proj": 12}))
+    assert purger.calls == []
+
+
+def test_the_purge_callable_matches_both_path_spellings(monkeypatch):
+    """The per-source purge hands BOTH spellings — the raw form and its
+    POSIX twin — to the exact row compare, so rows stamped either way are
+    matched (the narrowing filter narrows, the Python compare decides)."""
+    seen: list = []
+
+    def _fake_delete(coll, path_prop, match_fn, **kw):
+        seen.append(kw["project_source"])
+        return 0, 0
+
+    monkeypatch.setattr(cr, "delete_file_rows_exact", _fake_delete)
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "P")
+
+    class _Coll:
+        name = "P_X"
+
+    class _Client:
+        class collections:  # noqa: N801 — mirror the client attribute
+            @staticmethod
+            def exists(name):
+                return True
+
+            @staticmethod
+            def get(name):
+                return _Coll()
+
+    monkeypatch.setattr(cr, "_open_collection",
+                        lambda client, name, ctx: (_Coll(), "ok"))
+    sp.purge_rows_for_project_source("P", "C:\\old\\proj", client=_Client())
+    assert set(seen) == {"C:\\old\\proj", "C:/old/proj"}
+
+
+# ---------------------------------------------------------------------------
 # HIGH 2 — the session-start detection runs on an EMPTY ledger (both hooks)
 # ---------------------------------------------------------------------------
 

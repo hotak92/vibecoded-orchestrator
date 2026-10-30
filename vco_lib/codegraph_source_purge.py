@@ -66,6 +66,17 @@ def _source_filter(src: str):
         return None
 
 
+def _posix_form(src: str) -> str:
+    """The path form code-graph rows are stamped with
+    (``source_root.as_posix()`` — ``vco_lib/codegraph_resync.py``). The
+    launcher's move ledger holds the RAW ``folder_path`` string, which on
+    Windows is ``C:\\x\\proj`` while the rows say ``C:/x/proj``: an exact
+    string match between the two silently deletes nothing there (review
+    A-LOW-1). Every source spelling in this module is compared in this one
+    form."""
+    return str(src).replace("\\", "/")
+
+
 def prune_orphan_interactions(
     project_name: str,
     *,
@@ -266,6 +277,13 @@ def purge_rows_for_project_source(
     prefix = _cr._collection_prefix(project_name)
     if prefix is None:
         return report
+    # Both spellings, because the rows are POSIX-stamped while the caller's
+    # ledger string may be the raw Windows form (``_posix_form``): one of the
+    # two matches, the other deletes nothing (review A-LOW-1).
+    spellings = [src]
+    posix = _posix_form(src)
+    if posix != src:
+        spellings.append(posix)
     with _cr._probe_client(client, weaviate_url, grpc_port) as client:
         if client is None:
             return report
@@ -277,21 +295,23 @@ def purge_rows_for_project_source(
             if status == _cr._COLL_ERROR:
                 report["failures"] += 1
                 continue
-            try:
-                deleted, failures = _cr.delete_file_rows_exact(
-                    coll, _cr._PRUNE_PATH_PROP.get(base, "file_path"),
-                    lambda _raw_path, _props: True,
-                    project_source=src,
-                    log_prefix="gone-extra purge",
-                    narrow_filter=_source_filter(src),
-                )
-            except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
-                logger.warning("source purge: %s failed: %s", coll_name, exc)
-                report["failures"] += 1
-                continue
-            if deleted:
-                report["counts"][coll_name] = deleted
-            report["failures"] += failures
+            for spelling in spellings:
+                try:
+                    deleted, failures = _cr.delete_file_rows_exact(
+                        coll, _cr._PRUNE_PATH_PROP.get(base, "file_path"),
+                        lambda _raw_path, _props: True,
+                        project_source=spelling,
+                        log_prefix="gone-extra purge",
+                        narrow_filter=_source_filter(spelling),
+                    )
+                except Exception as exc:  # noqa: BLE001 — per-collection soft-fail
+                    logger.warning("source purge: %s failed: %s", coll_name, exc)
+                    report["failures"] += 1
+                    continue
+                if deleted:
+                    report["counts"][coll_name] = (
+                        report["counts"].get(coll_name, 0) + deleted)
+                report["failures"] += failures
     return report
 
 
@@ -408,7 +428,7 @@ def purge_gone_extra_paths(
         )
         return outcomes
     enabled = {
-        (getattr(e, "path", "") or "").strip()
+        _posix_form((getattr(e, "path", "") or "").strip())
         for e in getattr(cfg, "code_graph_extra_paths", ())
         if getattr(e, "enabled", False)
     } - {""}
@@ -419,7 +439,8 @@ def purge_gone_extra_paths(
             "unknown — nothing purged")
         return outcomes
     keep = sorted(primary | enabled)
-    targets = sorted({str(g).strip() for g in gone_raw} - {""} - set(keep))
+    targets = sorted({_posix_form(str(g).strip()) for g in gone_raw}
+                     - {""} - set(keep))
     # v0.2.105 fix round: the folders this project POSITIVELY moved away
     # from. Same "positive knowledge only" rule: an unknown list (a hub that
     # cannot read its DB, or an older hub) purges nothing. The current root is
@@ -437,7 +458,7 @@ def purge_gone_extra_paths(
             "failed, or it is older than this VCO); their rows are kept"
         )
     else:
-        moved = {str(m).strip() for m in moved_raw} - {""} - set(keep)
+        moved = {_posix_form(str(m).strip()) for m in moved_raw} - {""} - set(keep)
         if moved and not _destination_has_rows(prefix, primary, count_rows):
             log(
                 "purge-gone: moved-from deferred — the current project folder "
