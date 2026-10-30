@@ -23,12 +23,21 @@ Tiers, per target of every ``rm`` the command runs (chains, ``bash -c``,
 * HARD (never confirmable): ``/``, anything at or under ``/etc /usr /var
   /boot /dev /root``, ``/home`` / ``/Users``, ``/home/<user>`` (alone,
   trailing slash, ``/*``), ``~`` / ``~user`` / ``$HOME`` / ``${HOME}``
-  alone or with ``/`` or ``/*``, the real home directory, and a glob in a
-  root-level name (``/h*``).
+  alone or with ``/`` or ``/*``, the real home directory, a glob in a
+  root-level name (``/h*``), and a dot-matching wildcard component
+  (``.*``) in ANY position below a home directory (``~/.*/tmp``) — such a
+  glob expands to ``..`` and can climb out of the user's home.
 * CONFIRM: a deeper path under a home directory, deleted recursively
-  (``-r``/``-R``/``--recursive``, combined flags) or through a glob.
-* Everything else runs: a plain file rm under home, relative paths, paths
-  outside home and the system set, ``$VAR`` targets.
+  (``-r``/``-R``/``--recursive``, combined flags) or through a glob — and
+  a recursive or glob delete of a target the command leaves
+  indeterminable (``rm -rf build`` with no ``cd`` to place it, ``rm -rf
+  $D/x`` with an unassigned ``$D``): never allowed silently, never
+  hard-blocked (owner ruling, review R-2). ``$VAR`` targets the command
+  itself assigns (``D=~/proj; rm -rf $D/build``) and relative targets a
+  ``cd`` in the same command places (``cd ~/proj && rm -rf build``) are
+  judged at their real, resolved place.
+* Everything else runs: a plain file rm under home, relative paths and
+  paths outside home and the system set.
 
 The confirmation store: one file per pending confirmation under
 ``<project>/.claude/state/rm-confirm/`` (dir 0700, file 0600), named by
@@ -43,9 +52,11 @@ the clock rounded in between. Any state error refuses (fail-closed) and
 says why.
 
 Known limits: targets a program computes (``xargs rm`` fed from stdin,
-``find -delete``, ``$VAR`` paths), a ``cd ~ && rm -rf *`` relative delete,
-and rm inside a script FILE the command runs are not judged. On the
-PowerShell tool only the flat backstop and the PowerShell rule set run.
+``find -delete``) and rm inside a script FILE the command runs are not
+judged; a ``$VAR`` or relative target is judged as far as the command
+itself makes it determinable and is confirm-once otherwise (see the CONFIRM
+tier). On the PowerShell tool only the flat backstop and the PowerShell
+rule set run.
 """
 from __future__ import annotations
 
@@ -166,6 +177,14 @@ def classify_target(word: str, home: Optional[str] = None) -> Optional[str]:
             return HARD
         if len(below) == 1 and _is_wildcard_name(below[0]):
             return HARD  # ~/*, ~/.*, /home/u/*
+        for c in below:
+            # A dot-matching wildcard in ANY position (``~/.*/tmp``,
+            # ``~/.*/*``) expands to ``..`` too, so the glob can climb out
+            # of the user's home (``/home/u/../tmp`` = ``/home/tmp``, and
+            # ``~/.*/*`` reaches every user's home) — never confirmable
+            # (review R2 rmguard R-1; a plain ``*`` cannot match ``..``).
+            if _is_wildcard_name(c) and "." in c:
+                return HARD
     if homes:
         return "home_deep"
     if home_dir and home_dir.startswith(path.rstrip("/") + "/"):
@@ -195,7 +214,10 @@ def _rm_operands(args: List[str]) -> Tuple[bool, List[str]]:
     return recursive, targets
 
 
-def _segment_findings(tokens: List[str], home: Optional[str]) -> List[Finding]:
+def _segment_findings(tokens: List[str], home: Optional[str],
+                      cwd: Optional[str] = None,
+                      varmap: Optional[dict] = None,
+                      cwd_proven: bool = True) -> List[Finding]:
     peeled = bcw.peel_to_command(list(tokens))
     if peeled is None:
         return []
@@ -208,18 +230,112 @@ def _segment_findings(tokens: List[str], home: Optional[str]) -> List[Finding]:
     recursive, targets = _rm_operands(toks[1:])
     out: List[Finding] = []
     for t in targets:
-        tier = classify_target(t, home)
-        if tier == HARD:
-            out.append(Finding(HARD, t))
-        elif tier == "home_deep" and (recursive or _GLOB_CHARS.search(t)):
-            out.append(Finding(CONFIRM, t))
+        word, shown, placed, from_cwd = _resolve_word(t, home, cwd, varmap)
+        tier = classify_target(word, home)
+        if tier == HARD and from_cwd and not cwd_proven:
+            # The cwd this relative target was resolved against sits at a
+            # walk depth where the walker may have flattened two sibling
+            # ``bash -c`` bodies into one chain — the resolution is not
+            # proven beyond doubt, so it is confirm-once, never a hard
+            # block on an ordinary relative delete (owner ruling, R-2).
+            out.append(Finding(CONFIRM, shown))
+        elif tier == HARD:
+            out.append(Finding(HARD, shown))
+        elif tier == "home_deep" and (recursive
+                                      or _GLOB_CHARS.search(word)
+                                      or _GLOB_CHARS.search(t)):
+            out.append(Finding(CONFIRM, shown))
+        elif tier is None and not placed and (recursive
+                                              or _GLOB_CHARS.search(word)):
+            # A delete the guard cannot place (relative with no known cwd,
+            # or an unresolvable ``$VAR``) never slips through silently:
+            # it is confirm-once (owner ruling, review R-2). A word the
+            # guard DID place outside every protected root runs, as before.
+            out.append(Finding(CONFIRM, shown))
     return out
+
+
+#: A ``$NAME`` / ``${NAME}`` reference in a target word.
+_VAR_REF = re.compile(r"\$(\{)?([A-Za-z_]\w*)(?(1)\})")
+
+
+def _expand_vars(word: str, varmap: dict) -> Optional[str]:
+    """*word* with every ``$VAR`` the command itself assigned expanded.
+    ``None`` when a reference stays unresolvable (never guess a value)."""
+    def sub(m: "re.Match[str]") -> str:
+        return varmap.get(m.group(2), "\0")
+    expanded = _VAR_REF.sub(sub, word)
+    return None if "\0" in expanded or "$" in expanded else expanded
+
+
+def _resolve_word(t: str, home: Optional[str], cwd: Optional[str],
+                  varmap: Optional[dict]) -> Tuple[str, str, bool, bool]:
+    """``(effective word, target as shown, placed, from_cwd)`` for one rm
+    operand.
+
+    ``placed`` is True when the word is determinable: ``$VAR`` references
+    assigned earlier in the SAME command expanded, and a relative word
+    resolved against the cwd a ``cd`` in the same command established.
+    ``from_cwd`` is True only for that last case — the one resolution the
+    caller may need to distrust (see :func:`_segment_findings`). An
+    indeterminable word (unresolved ``$VAR``, or relative with no known
+    cwd) is returned AS WRITTEN with ``placed=False``, so the caller can
+    confirm-once instead of allowing silently; it is never resolved to a
+    guess and never hard-blocked.
+    """
+    word = _expand_vars(t, varmap) if (varmap and "$" in t) else t
+    if word is None:
+        return t, t, False, False
+    abs_word = _absolute(word, home)
+    if abs_word is not None:
+        return abs_word[0], abs_word[0], True, False
+    if not word.startswith("/") and word not in (".", ".."):
+        if cwd:
+            resolved = posixpath.normpath(cwd + "/" + word)
+            return resolved, resolved, True, True
+        return word, t, False, False
+    return word, t, word.startswith("/"), False
+
+
+#: ``cd``-like builtins whose argument can move the shell's cwd. A cd the
+#: command cannot resolve (``cd $D`` with unknown ``$D``, ``cd -``) marks
+#: the cwd UNKNOWN, so later relative deletes confirm instead of resolving
+#: against a directory that may no longer be right.
+_CD_UNKNOWN_ARGS = frozenset({"-", "~-", "+", "^"})
+
+
+def _cd_target(toks: List[str], home: Optional[str],
+               varmap: Optional[dict]) -> Optional[Optional[str]]:
+    """The cwd after a ``cd`` segment: an absolute path, ``None``-meaning-
+    home (``cd`` with no argument), or ``None``-meaning-unknown (the
+    sentinel :data:`_UNKNOWN` for a target that cannot be resolved)."""
+    args = [a for a in toks[1:] if not a.startswith("-")]
+    if not args:
+        return home_dir if (home_dir := _home_dir(home)) else _UNKNOWN
+    word = _expand_vars(args[0], varmap) if (varmap and "$" in args[0]) \
+        else args[0]
+    if word is None or word in _CD_UNKNOWN_ARGS:
+        return _UNKNOWN
+    resolved = _absolute(word, home)
+    if resolved is not None:
+        return resolved[0]
+    return _UNKNOWN  # a relative cd target: the cwd is real but unknowable
+
+
+_UNKNOWN = "\0unknown-cwd\0"
 
 
 def scan(cmd: str, home: Optional[str] = None) -> List[Finding]:
     """Every protected target of every rm the Bash command runs. A command
     the walk cannot parse (or too large to) that runs ``rm`` on a home-ish
-    path yields one CONFIRM finding for the whole command (conservative)."""
+    path yields one CONFIRM finding for the whole command (conservative).
+
+    A target the command makes determinable is judged at its real place:
+    ``$VAR`` references assigned earlier in the same command are expanded,
+    and a relative target is resolved against the cwd a ``cd`` in the same
+    command (or an enclosing ``bash -c`` of it) established. A target that
+    stays indeterminable never slips past silently: a recursive or glob
+    delete of it is confirm-once (owner ruling, review R-2)."""
     if not isinstance(cmd, str) or not cmd.strip():
         return []
     if len(cmd) > SCAN_MAX_CHARS or bcw.tokenize(cmd) is None:
@@ -228,10 +344,49 @@ def scan(cmd: str, home: Optional[str] = None) -> List[Finding]:
                                      "parse, which runs rm on a home path)")]
         return []
     out: List[Finding] = []
+    varmap: dict = {}
+    cwd: Optional[str] = None          # the established cwd, or _UNKNOWN
+    cwd_depth: Optional[int] = None    # the walk depth it was set at
+    cwd_pos: int = -1                  # last position seen at that depth
     for seg in bcw.walk_segments(cmd, _with_substitutions=True,
                                  _with_assignments=True):
-        if seg.tokens:
-            out.extend(_segment_findings(seg.tokens, home))
+        if cwd_depth is not None:
+            if seg.depth < cwd_depth:
+                # Left the sub-chain that cd'd: its cwd does not reach the
+                # outer level (`bash -c 'cd /etc'; rm -rf build`).
+                cwd, cwd_depth, cwd_pos = None, None, -1
+            elif seg.depth == cwd_depth and seg.position == 0 and cwd_pos > 0:
+                # A SIBLING sub-chain at the same depth restarts at
+                # position 0: it inherits the OUTER cwd, not the previous
+                # sibling's (`bash -c 'cd /etc'; bash -c 'rm -rf build'`).
+                cwd, cwd_depth, cwd_pos = None, None, -1
+            elif seg.depth == cwd_depth:
+                cwd_pos = seg.position
+        if not seg.tokens:
+            # An assignment-ONLY statement persists for the rest of the
+            # command (an env-prefix ``D=x rm …`` does not — the shell
+            # expands ``$D`` before that assignment takes effect).
+            for a in seg.assignments:
+                name, eq, value = a.partition("=")
+                if eq and name.isidentifier() and "$" not in value:
+                    varmap[name] = value
+            continue
+        peeled = bcw.peel_to_command(list(seg.tokens))
+        if peeled is not None:
+            toks, _via = peeled
+            verb = bcw.command_basename(toks[0])
+            if verb.endswith(".exe"):
+                verb = verb[:-4]
+            if verb == "cd":
+                cwd = _cd_target(toks, home, varmap)
+                if cwd == _UNKNOWN:
+                    cwd = None  # a cd the command cannot resolve: unknowable
+                cwd_depth = seg.depth
+                cwd_pos = seg.position
+                continue
+        out.extend(_segment_findings(
+            seg.tokens, home, cwd, varmap,
+            cwd_proven=(cwd_depth == 0 or seg.depth > (cwd_depth or 0))))
     return out
 
 
