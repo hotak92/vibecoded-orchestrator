@@ -248,6 +248,22 @@ def test_rule2_cooccurrence_high_distinctive_medium_generic_none() -> None:
     assert _links(idx, {"speed"}, {"speed", "c.ini"}) == {"ini:S/speed": "high"}  # basename cooc
 
 
+def test_rule2_cooccurrence_never_lifts_a_generic_or_tiny_key() -> None:
+    """L5: co-occurrence upgrades only a key past the rule-1 floor; a 1-char
+    or stoplisted key gets no link, whatever co-occurs with it."""
+    idx = _index({"c.json": '{"a": {"x": 1, "name": 2, "rpm": 3}}'})
+    assert _links(idx, {"x"}, {"x", "a"}) == {}                       # < 3 chars
+    assert _links(idx, {"name"}, {"name", "a"}) == {}                 # stoplisted
+    assert _links(idx, {"rpm"}, {"rpm", "a"}) == {"json:a/rpm": "high"}  # plain, cooc
+    assert _links(idx, {"rpm"}) == {}                                 # plain, no cooc
+
+
+def test_rule1_plain_section_name_links_medium() -> None:
+    """L5 (documented): a plain section name links medium from any file."""
+    idx = _index({"package.json": '{"dependencies": {"left-pad": "1.0.0"}}'})
+    assert _links(idx, {"dependencies"}) == {"json:dependencies": "medium"}
+
+
 def test_rule2_json_leaf_and_full_path_and_ini_dots_not_split() -> None:
     idx = _index({"cfg.json": JSON, "v.ini": INI})
     assert _links(idx, {"length_m"}) == {"json:veh_params/dims.length_m": "medium"}
@@ -326,6 +342,11 @@ class _Coll:
 
     def rows(self) -> List[Dict[str, Any]]:
         return [o.get("properties", {}) for o in self.store.values()]
+
+    def iterator(self, return_properties: Any = None) -> List[Any]:
+        """The reconcile's full-scan read (``delete_file_rows_exact``)."""
+        return [types.SimpleNamespace(uuid=u, properties=dict(o.get("properties", {})))
+                for u, o in list(self.store.items())]
 
 
 @pytest.fixture(scope="module")
@@ -510,6 +531,35 @@ def test_a_file_without_config_literals_keeps_its_plain_hash(tmp_path: Path) -> 
     assert refs.link_salt("cpp", 'void f() { g.Add(P, "AimPID_P"); }', refs.ConfigIndex()) == ""
 
 
+def test_a_written_config_file_is_parsed_once(
+    analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N7: the shim's validity check and the extractor share one parse."""
+    _mini_repo(tmp_path)
+    calls: List[int] = []
+    real = cfg._PARSERS["ini"]
+
+    def _counting(text: str) -> cfg.ConfigDoc:
+        calls.append(1)
+        return real(text)
+
+    monkeypatch.setitem(cfg._PARSERS, "ini", _counting)
+    inst = _analyzer(analyzer_mod)
+    inst.analyze_repository(tmp_path, only_file=tmp_path / "params" / "vehicle.ini")
+    assert [r["path"] for r in inst.modules_collection.rows()] == ["params/vehicle.ini"]
+    assert len(calls) == 1
+
+
+def test_the_parse_memo_never_serves_another_text() -> None:
+    """N7 leave-alone: a different string (even an equal-looking one) re-parses."""
+    a = cfg._parse_memo("ini", "[A_Section]\nk = 1\n")
+    b = cfg._parse_memo("ini", "[B_Section]\nk = 1\n")
+    assert [x.name for x in a.sections] == ["A_Section"]
+    assert [x.name for x in b.sections] == ["B_Section"]
+    with pytest.raises(cfg.ConfigParseError):
+        cfg._parse_memo("ini", "this is prose\nnot a config\n")
+
+
 def test_reconcile_judges_interaction_rows(analyzer_mod: types.ModuleType, tmp_path: Path,
                                           monkeypatch: pytest.MonkeyPatch) -> None:
     """A link to a key that was removed must be deleted when its code file
@@ -525,6 +575,110 @@ def test_reconcile_judges_interaction_rows(analyzer_mod: types.ModuleType, tmp_p
     inst = _analyzer(analyzer_mod)
     inst.analyze_repository(tmp_path)
     assert seen and "FakeProject_CodeInteraction" in seen[0]
+
+
+# The reconcile through the REAL engine (fix round M1/M2): two walks over one
+# store — what Weaviate holds between two analyzer runs.
+
+SVC_V1 = """import requests
+
+def fetch_one():
+    return fetch("http://svc-a.local/api/one")
+
+def fetch_two():
+    return fetch("http://svc-b.local/api/two")
+
+def tune():
+    return lookup("Stale_Link_Key", "Kept_Link_Key")
+"""
+# fetch_two and the "Stale_Link_Key" literal are gone; everything else stays.
+SVC_V2 = """import requests
+
+def fetch_one():
+    return fetch("http://svc-a.local/api/one")
+
+def tune():
+    return lookup("Kept_Link_Key")
+"""
+
+
+def _reconcile_repo(root: Path) -> None:
+    (root / "conf").mkdir(parents=True)
+    (root / "conf" / "tune.ini").write_text(
+        "[TuneSection]\nStale_Link_Key = 1\nKept_Link_Key = 2\n", encoding="utf-8")
+    (root / "svc.py").write_text(SVC_V1, encoding="utf-8")
+
+
+def _rewalk(mod: types.ModuleType, root: Path, prev: Any) -> Any:
+    """A fresh analyzer run over the SAME stored rows as ``prev``."""
+    inst = _analyzer(mod)
+    for attr in ("modules_collection", "classes_collection", "functions_collection",
+                 "apis_collection", "interactions_collection"):
+        setattr(inst, attr, getattr(prev, attr))
+    inst.analyze_repository(root)
+    return inst
+
+
+def _svc_endpoints(inst: Any) -> set:
+    return {r["endpoint"] for r in inst.interactions_collection.rows()
+            if r.get("file_path") == "svc.py"}
+
+
+def _first_walk(mod: types.ModuleType, root: Path) -> Any:
+    _reconcile_repo(root)
+    first = _analyzer(mod)
+    first.analyze_repository(root)
+    eps = _svc_endpoints(first)
+    assert {"ini:TuneSection/Stale_Link_Key", "ini:TuneSection/Kept_Link_Key"} <= eps
+    assert "/api/one" in eps and "/api/two" in eps
+    return first
+
+
+def test_reconcile_deletes_stale_links_and_removed_calls_and_keeps_the_rest(
+    analyzer_mod: types.ModuleType, tmp_path: Path,
+) -> None:
+    """M2: act AND leave-alone on the CodeInteraction delete side."""
+    first = _first_walk(analyzer_mod, tmp_path)
+    (tmp_path / "svc.py").write_text(SVC_V2, encoding="utf-8")
+    second = _rewalk(analyzer_mod, tmp_path, first)
+    eps = _svc_endpoints(second)
+    assert "ini:TuneSection/Stale_Link_Key" not in eps            # stale link: deleted
+    assert "/api/two" not in eps             # removed call: deleted
+    assert "ini:TuneSection/Kept_Link_Key" in eps                 # kept link: survives
+    assert "/api/one" in eps                   # re-produced http row survives
+
+
+def test_a_failed_config_index_never_deletes_link_rows(
+    analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1: the index build throws on the re-walk → zero links is no evidence;
+    the file's interaction rows are not judged (the stale one survives too)."""
+    first = _first_walk(analyzer_mod, tmp_path)
+    before = _svc_endpoints(first)
+    (tmp_path / "svc.py").write_text(SVC_V2, encoding="utf-8")
+
+    def _boom(root: Path, files: Any) -> refs.ConfigIndex:
+        raise OSError("simulated index failure")
+
+    monkeypatch.setattr(refs, "build_index", _boom)
+    second = _rewalk(analyzer_mod, tmp_path, first)
+    assert _svc_endpoints(second) == before
+
+
+def test_a_raising_link_match_never_deletes_link_rows(
+    analyzer_mod: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1: linking raises inside link_groups → the same withholding."""
+    first = _first_walk(analyzer_mod, tmp_path)
+    before = _svc_endpoints(first)
+    (tmp_path / "svc.py").write_text(SVC_V2, encoding="utf-8")
+
+    def _boom(*a: Any, **kw: Any) -> List[Dict[str, str]]:
+        raise RuntimeError("simulated link failure")
+
+    monkeypatch.setattr(refs, "match_literals", _boom)
+    second = _rewalk(analyzer_mod, tmp_path, first)
+    assert _svc_endpoints(second) == before
 
 
 # ---------------------------------------------------------------------------

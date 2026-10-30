@@ -35,10 +35,13 @@ Match rules (each has an act and a leave-alone test):
 1. **Section** — a literal equal to a section name links to
    ``"<fmt>:<section>"``; ``high`` when the name is distinctive (rule 4),
    ``medium`` otherwise; a stoplisted or < 3-character name never links.
+   (So a plain section name such as ``"dependencies"`` links ``medium`` from
+   every code file that spells it; ``confidence`` marks it as the weak kind.)
 2. **Key** — a literal equal to a key (a JSON key's leaf or its full path)
    links to ``"<fmt>:<section>/<key path>"``: ``high`` when that section's
    name or its file's basename ALSO appears as a literal in the same code
-   file, ``medium`` when the key is distinctive, otherwise no link.
+   file AND the key passes the rule-1 floor (≥ 3 characters, not
+   stoplisted), ``medium`` when the key is distinctive, otherwise no link.
 3. **File** — a literal whose basename is an indexed config file's basename
    links to ``"<fmt>:file:<basename>"`` (``high``).
 4. **Distinctive** — length ≥ 5, not in :data:`GENERIC_KEYS`, and containing
@@ -88,6 +91,14 @@ GENERIC_KEYS = frozenset({
 })
 
 _CAMEL_RE = re.compile(r"[a-z][A-Z]")
+
+
+def _plain_name_ok(name: str) -> bool:
+    """The floor every NON-distinctive name must pass to link at all (a
+    section name, or a key upgraded by co-occurrence): ≥ 3 characters and not
+    in :data:`GENERIC_KEYS`. ``"x"`` or ``"name"`` never link, whatever
+    co-occurs with them."""
+    return len(name) >= 3 and name.lower() not in GENERIC_KEYS
 
 
 def is_distinctive(name: str) -> bool:
@@ -227,9 +238,27 @@ def config_index_for(ctx: Any, root: Optional[Path]) -> Optional[ConfigIndex]:
                 files = [f for f in files if ".claude" not in f.relative_to(root).parts]
             cache[key] = build_index(Path(root), files)
         except Exception as exc:  # noqa: BLE001 — linking is best-effort, never fatal
-            logger.debug("config index for %s unavailable: %s", root, exc)
+            logger.warning("config index for %s unavailable (config links of this "
+                           "walk's code files are left as they are): %s", root, exc)
             cache[key] = None
+            ctx.__dict__.setdefault("_config_index_failed", set()).add(key)
     return cache[key]
+
+
+def index_build_failed(ctx: Any, root: Optional[Path]) -> bool:
+    """Did :func:`config_index_for` TRY to build ``root``'s index and fail?
+    (``None`` from it also means "no finder" — a stub, not a failure.)"""
+    return root is not None and str(root) in (ctx.__dict__.get("_config_index_failed") or ())
+
+
+def _withhold_link_judgment(ctx: Any) -> None:
+    """M1 (v0.2.105 fix round): linking FAILED for the file being written, so
+    its zero links are no evidence its old link rows are gone — the end-of-walk
+    reconcile must not judge this file's ``CodeInteraction`` rows."""
+    from vco_lib.codegraph_resync import withhold_file_judgment
+
+    coll = getattr(ctx, "interactions_collection", None)
+    withhold_file_judgment(ctx, str(getattr(coll, "name", "") or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +373,9 @@ def match_literals(
         base = _basename(lit)
         for fmt, _rel in index.files.get(base, ()):            # rule 3
             add(fmt, file_endpoint(fmt, base), lit, "high")
+        plain = _plain_name_ok(lit)
         secs = index.sections.get(lit)
-        if secs and len(lit) >= 3 and lit.lower() not in GENERIC_KEYS:  # rule 1
+        if secs and plain:                                       # rule 1
             distinct = sorted({s.fmt for s in secs})
             conf = "high" if is_distinctive(lit) else "medium"
             for fmt in distinct:
@@ -364,7 +394,7 @@ def match_literals(
         for endpoint, group in sorted(by_endpoint.items()):    # rule 2
             cooc = any(d.section in file_literals or _basename(d.rel_path) in file_bases
                        for d in group)
-            if cooc:
+            if cooc and plain:
                 add(group[0].fmt, endpoint, lit, "high")
             elif is_distinctive(lit):
                 add(group[0].fmt, endpoint, lit, "medium")
@@ -386,15 +416,20 @@ def link_groups(ctx: Any, fx: Any, written: Sequence[Tuple[Any, str]]) -> List[A
     FUNCTION entity's literals link with ``source_function`` = its uuid; the
     literals of top-level code (outside every function) link with the module
     only. Empty for a config file, a stub analyzer, or a root with no config
-    files. Soft-fails to ``[]``."""
+    files. Soft-fails to ``[]``; on a FAILURE (the index could not be built,
+    or linking raised) it also withholds the end-of-walk reconcile's judgement
+    of this file's interaction rows, so a failure never deletes old links."""
     from vco_lib.codegraph_entities import InteractionGroup, KIND_FUNCTION
 
     language = _language_key(ctx)
     md = getattr(fx, "module", None)
     if md is None or language == CONFIG_DISPATCH_KEY or md.language in CONFIG_FORMATS.values():
         return []
+    root = getattr(fx, "source_root", None)
     try:
-        index = config_index_for(ctx, getattr(fx, "source_root", None))
+        index = config_index_for(ctx, root)
+        if index is None and index_build_failed(ctx, root):
+            _withhold_link_judgment(ctx)
         if index is None or index.empty:
             return []
         text = getattr(fx, "source_text", None) or ""
@@ -421,7 +456,9 @@ def link_groups(ctx: Any, fx: Any, written: Sequence[Tuple[Any, str]]) -> List[A
             groups.append(InteractionGroup(interactions=links, language=md.language))
         return groups
     except Exception as exc:  # noqa: BLE001 — a link failure never fails the file
-        logger.debug("config links for %s skipped: %s", getattr(md, "path", "?"), exc)
+        logger.warning("config links for %s skipped (its existing link rows are "
+                       "kept): %s", getattr(md, "path", "?"), exc)
+        _withhold_link_judgment(ctx)
         return []
 
 
