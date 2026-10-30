@@ -215,6 +215,13 @@ class OAuthReader:
         #: Edge-trigger for the "serving the last-known-good login" line: one
         #: per transition, not one per request.
         self._last_good_logged = False
+        #: The last read found NO credentials file at all (see ``_GAP``).
+        self._file_absent = False
+        #: The bounded re-read has already been spent for THIS absence. Reset
+        #: when the file is seen again, so a second delete earns its own spin
+        #: (v0.2.105 fix round — a deleted file that never comes back is not a
+        #: rewrite, and must not stall every request for ``_RECENT_LOGIN_MS``).
+        self._absence_spun = False
 
     @property
     def path(self) -> Path:
@@ -251,13 +258,20 @@ class OAuthReader:
         """:meth:`read`, plus ONE bounded re-read while a CLI is rewriting.
 
         Called only on a request path that is about to answer 401, and only
-        when the state says the failure is transient. Bounded twice over: it
-        is entered only for a transient verdict, and it gives up after
-        :data:`_REREAD_BUDGET_S` whatever the file says. Blocking by design —
-        :meth:`aread_with_brief_wait` is the one that runs it off the loop.
+        when the state says the failure is transient. Bounded three times
+        over: it is entered only for a transient verdict, it gives up after
+        :data:`_REREAD_BUDGET_S` whatever the file says, and a file that is
+        GONE spends its one spin once per absence — every later request
+        answers at once (a delete-and-rename completes in milliseconds; a
+        deletion that stays has nothing to wait for, and the login's own
+        ``_RECENT_LOGIN_MS`` window is the wrong thing to spend per request).
+        Blocking by design — :meth:`aread_with_brief_wait` is the one that
+        runs it off the loop.
         """
         state = self.read(now_ms=now_ms)
         if state.token is not None or not state.retry_soon:
+            return state
+        if not self._consume_absent_spin():
             return state
         deadline = time.monotonic() + _REREAD_BUDGET_S
         while time.monotonic() < deadline:
@@ -289,6 +303,7 @@ class OAuthReader:
             st = os.stat(self._path)
         except FileNotFoundError:
             self._invalidate()
+            self._file_absent = True
             return (
                 OAuthState(
                     None,
@@ -306,6 +321,11 @@ class OAuthReader:
             self._invalidate()
             return self._unreadable(exc)
 
+        if self._file_absent:
+            # The file is BACK: this absence is over, and a later one earns
+            # its own bounded spin.
+            self._file_absent = False
+            self._absence_spun = False
         stamp = (st.st_mtime_ns, st.st_size, st.st_ctime_ns)
         cached = self._file
         if cached is None or cached.stamp != stamp:
@@ -500,6 +520,29 @@ class OAuthReader:
             state.state,
             retry_soon=True,
         )
+
+    def _consume_absent_spin(self) -> bool:
+        """Whether this request may spend the bounded re-read on an ABSENT
+        file: True for a file that is present (the mid-rewrite case, which
+        keeps its spin per request) and for the FIRST request of an absence;
+        False once that absence has spent its one spin.
+
+        A delete-and-rename — an editor or a CLI replacing the file — is a
+        millisecond scale event and is what the spin is for. A file that
+        stays gone is a logout or a move, not a rewrite: spending
+        :data:`_REREAD_BUDGET_S` on every request for up to
+        :data:`_RECENT_LOGIN_MS` teaches each one what the first already
+        learned. The answer does not change (no token is ever served for an
+        absent file); only the stall goes away. Reset by the next successful
+        ``stat`` (see :meth:`_read_file`).
+        """
+        with self._lock:
+            if not self._file_absent:
+                return True
+            if self._absence_spun:
+                return False
+            self._absence_spun = True
+            return True
 
     def _invalidate(self) -> None:
         """Forget the CACHED PARSE. Never the last-known-good token.

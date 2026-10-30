@@ -563,9 +563,94 @@ class TestCliQueryParser:
         ('kg-search recent "q"', False, []),
         ('echo "unterminated', False, []),
         ('my-kg-search search q', False, []),
+        # v0.2.105 fix round (V1-GLM-A MEDIUM): a NEWLINE ends a command too,
+        # so the documented two-line Bash shape — the call on line 2 — is
+        # attributed. It was whitespace to the lexer, so `at_command` stayed
+        # false and the citation was never scored.
+        ('cd /x\nkg-search search "a b"', False, ['a b']),
+        ('cd /x\r\nkg-search search "a b"', False, ['a b']),
+        ('kg-search search "a"\nkg-search list\nkg-search search "b"', False, ['a', 'b']),
+        ('kg-search search "q" |\n head -3', False, ['q']),
+        # Leave-alone: lines before/after are still parsed, not swept up.
+        ('cd /x\necho kg-search search q', False, []),
+        ('cd /x\nkg-search list\nkg-search recent "q"', False, []),
+        # A backslash-newline is a line CONTINUATION, not a separator: the
+        # call stays whole (this parsed before the newline change too).
+        ('kg-search search \\\n  "a b"', False, ['a b']),
+        # A newline INSIDE quotes is part of the query, not a separator.
+        ('kg-search search "a\nb"', False, ['a\nb']),
+        ('Set-Location C:\\p\nC:\\p\\kg-search.ps1 search "q"', True, ['q']),
     ])
     def test_parse(self, command: str, powershell: bool, expected: list) -> None:
         assert aw.cli_kg_search_queries(command, powershell=powershell) == expected
+
+
+class TestCliOptionTableIsLockedToTheParser:
+    """V1-GLM-A LOW: ``_CLI_VALUE_OPTIONS`` mirrors the ``search_knowledge.py``
+    argparse, and the mirror carried no lock. A new value-taking option would
+    be read as a flag, so its VALUE became the "query" while the real query
+    was lost — a wrong attribution key, silently. C-tier of the cross-language
+    rule (a mirror, locked by a parity test): unlocking requires a compiler,
+    not a reviewer's memory.
+
+    Derived from the shipped parser source by AST, so the test reads what the
+    CLI actually declares rather than a hand-copied table."""
+
+    SCRIPT = Path(__file__).resolve().parents[1] / "templates" / "scripts" / "search_knowledge.py"
+
+    #: argparse actions that consume no command-line value.
+    _FLAG_ACTIONS = frozenset({
+        "store_true", "store_false", "store_const", "count", "help", "version",
+    })
+
+    @classmethod
+    def _value_options(cls) -> set:
+        import ast
+
+        tree = ast.parse(cls.SCRIPT.read_text(encoding="utf-8"))
+        found: set = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr != "add_argument":
+                continue
+            keywords = {k.arg: k.value for k in node.keywords if k.arg}
+
+            def _const(expr):
+                return expr.value if isinstance(expr, ast.Constant) else None
+
+            if _const(keywords.get("action")) in cls._FLAG_ACTIONS:
+                continue
+            if _const(keywords.get("nargs")) == 0:
+                continue
+            for arg in node.args:
+                name = _const(arg)
+                if isinstance(name, str) and name.startswith("-"):
+                    found.add(name)
+        return found
+
+    def test_every_value_taking_option_of_the_live_cli_parser_is_listed(self) -> None:
+        assert self.SCRIPT.is_file(), self.SCRIPT
+        derived = self._value_options()
+        assert derived, "the parser was not found in the shipped script"
+        assert set(aw._CLI_VALUE_OPTIONS) == derived, (
+            "answer_window._CLI_VALUE_OPTIONS has drifted from "
+            f"{self.SCRIPT}: listed-but-not-value-taking "
+            f"{sorted(set(aw._CLI_VALUE_OPTIONS) - derived)}, "
+            f"value-taking-but-missing {sorted(derived - set(aw._CLI_VALUE_OPTIONS))}"
+        )
+
+    def test_a_new_value_taking_option_would_be_caught(self) -> None:
+        """The lock's act side: the derivation really does see value-taking
+        options (a rule that always returned the same set would pass the
+        parity check while locking nothing)."""
+        derived = self._value_options()
+        assert {"--limit", "--type", "--tags", "--detail", "--days",
+                "--project", "-p", "--collection", "-c"} <= derived
+        # ... and flags are NOT in it, on either side.
+        assert "--content" not in derived and "--files-only" not in derived
+        assert "--shared-only" not in derived and "--no-shared" not in derived
 
     def test_transcript_scan_takes_shell_tool_calls_only(self) -> None:
         msgs = [

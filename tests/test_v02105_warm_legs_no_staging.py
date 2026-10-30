@@ -163,6 +163,36 @@ def test_the_cache_hit_that_shows_the_entry_stages_the_held_ctx(
         hcr._STAGED_BY_RUN.pop("router_hit2", None)
 
 
+def test_a_run_with_no_session_of_its_own_promotes_nothing(
+        tmp_path: Path, monkeypatch) -> None:
+    """V1-GLM-A NIT: the held kwargs still carry the WARMER child's session
+    id (the spawner that missed the deadline, whose transcript never showed
+    this retrieval). A viewing run that cannot resolve a session of its own
+    must not stage under that one — negative-label noise — so it promotes
+    nothing, and the held file waits for a run that can attribute it."""
+    import hook_context_router as hcr  # pyright: ignore[reportMissingImports]
+
+    proj = _project(tmp_path)
+    key = hcr.cache_key("kgi", "prompt", "q", "3", "p1")
+    assert _warm(tmp_path, proj, key).returncode == 0
+    plan = hcr._Plan()
+    plan.kg_query = "q"
+    plan.kg_profile = "prompt"
+    plan.kg_limit = 3
+    hcr._install_staged_ctx_run_id_wrapper()
+    monkeypatch.setattr(hcr, "_CURRENT_RUN_ID", "router_nosession")
+    for var in ("VCT_SESSION_ID", "CLAUDE_SESSION_ID", "VCT_AGENT_ID"):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        kg_text, _cg = hcr._run_legs(plan, "", "p1", str(proj), "",
+                                     time.monotonic() + 6.0)
+    finally:
+        hcr._STAGED_BY_RUN.pop("router_nosession", None)
+    assert "KG: Stub Node" in kg_text, "the entry was served, so it was shown"
+    assert _pending(proj) == [], "staged under the warmer's session id"
+    assert _held(proj, key).is_file(), "kept for a run that can attribute it"
+
+
 def test_a_cache_hit_with_nothing_held_stages_nothing(tmp_path: Path, monkeypatch) -> None:
     import hook_context_router as hcr  # pyright: ignore[reportMissingImports]
 
