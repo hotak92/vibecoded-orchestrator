@@ -288,6 +288,98 @@ def test_a_wrapped_hook_in_the_only_group_is_kept_and_not_doubled():
     assert records == []
 
 
+@pytest.mark.parametrize("edited", [
+    f"{ENSURE} --strict",
+    "bash .claude/hooks/ensure-containers.sh --strict",
+    "bash .claude\\hooks\\ensure-containers.sh --strict --quiet",
+])
+def test_a_user_edited_argument_on_a_shipped_hook_is_kept_verbatim(edited):
+    """Review R1 SB-1: an extra argument after the script is the user's edit.
+
+    The supersede pass used to replace it with the shipped spelling, which
+    has no argument — ``--strict`` disappeared with no record and no backup.
+    Only the post-script tokens decide this, so the argument list is compared;
+    a different path spelling or extra whitespace still heals below.
+    """
+    user = copy.deepcopy(TEMPLATE)
+    startup = user["hooks"]["SessionStart"][0]["hooks"]
+    startup[[h["command"] for h in startup].index(ENSURE)] = {
+        "type": "command", "timeout": 10, "command": edited}
+    merged, records = _fold(user)
+    cmds = [h["command"] for g in merged["hooks"]["SessionStart"]
+            if g.get("matcher") == "startup" for h in g["hooks"]]
+    assert edited in cmds, "the user's argument survives byte for byte"
+    assert ENSURE not in cmds, "and no second, argument-less copy is appended"
+    assert records == []
+
+
+def test_the_command_without_the_edited_argument_still_heals():
+    """The leave-alone case: an argument difference is what keeps a command
+    verbatim — the stale relative SPELLING of the same argument-less command
+    is still rewritten to the shipped one (that is the upgrade path)."""
+    stale = "bash .claude/hooks/ensure-containers.sh"
+    user = copy.deepcopy(TEMPLATE)
+    startup = user["hooks"]["SessionStart"][0]["hooks"]
+    startup[[h["command"] for h in startup].index(ENSURE)] = {
+        "type": "command", "timeout": 10, "command": stale}
+    merged, records = _fold(user)
+    cmds = [h["command"] for g in merged["hooks"]["SessionStart"]
+            if g.get("matcher") == "startup" for h in g["hooks"]]
+    assert ENSURE in cmds
+    assert stale not in cmds
+    assert records == []
+
+
+def test_the_disable_guard_spelling_still_heals_after_the_argument_check():
+    """The pre-v0.2.97 ``VCT_DISABLE_HOOKS`` prefix is a SHIPPED spelling:
+    it carries no trailing argument, so it is still replaced by the current
+    one (dropping only the retired guard is not a user edit)."""
+    guarded = f'[ -n "$VCT_DISABLE_HOOKS" ] || {ENSURE}'
+    user = copy.deepcopy(TEMPLATE)
+    startup = user["hooks"]["SessionStart"][0]["hooks"]
+    startup[[h["command"] for h in startup].index(ENSURE)] = {
+        "type": "command", "timeout": 10, "command": guarded}
+    merged, _ = _fold(user)
+    cmds = [h["command"] for g in merged["hooks"]["SessionStart"]
+            if g.get("matcher") == "startup" for h in g["hooks"]]
+    assert ENSURE in cmds
+    assert guarded not in cmds
+
+
+#: A command that ships WITH an argument (wait-guard's mode token) — the
+#: comparison must read the ARGUMENT LIST, not "any trailing token at all".
+WAIT_PRE = 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh" pretooluse'
+TEMPLATE_WITH_ARGS = {"hooks": {"PreToolUse": [
+    {"matcher": "Bash", "hooks": [{"type": "command", "timeout": 10,
+                                   "command": WAIT_PRE}]}]}}
+
+
+def test_a_stale_spelling_of_a_command_that_ships_arguments_still_heals():
+    """Leave-alone: the same argument list in an old spelling is the shipped
+    command, so it is still rewritten (only the spelling changes)."""
+    stale = "bash .claude/hooks/wait-guard.sh pretooluse"
+    user = copy.deepcopy(TEMPLATE_WITH_ARGS)
+    user["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = stale
+    merged, records = _fold(user, TEMPLATE_WITH_ARGS)
+    assert _commands(merged["hooks"]["PreToolUse"][0]) == [WAIT_PRE]
+    assert records == []
+
+
+def test_changing_a_shipped_argument_is_the_users_edit():
+    """The act: a DIFFERENT argument is the user's command. The old supersede
+    pass replaced the whole command with the template's, i.e. it silently
+    changed the hook's mode — a deletion of the user's edit, and a behaviour
+    change to boot."""
+    edited = 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/wait-guard.sh" posttooluse'
+    user = copy.deepcopy(TEMPLATE_WITH_ARGS)
+    user["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = edited
+    merged, records = _fold(user, TEMPLATE_WITH_ARGS)
+    cmds = _commands(merged["hooks"]["PreToolUse"][0])
+    assert edited in cmds
+    assert WAIT_PRE not in cmds
+    assert records == []
+
+
 def test_a_user_edited_timeout_survives_the_fold():
     """Review R1 H2: the duplicate that carries the user's own key wins over
     the shipped-valued copy, wherever it sits."""

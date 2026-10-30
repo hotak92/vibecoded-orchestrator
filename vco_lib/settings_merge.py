@@ -67,6 +67,7 @@ from vco_lib.hook_retirements import (
     normalize_command,
     migration_sources,
     scrub_retired_registrations,
+    vco_hook_script_arguments,
     vco_hook_script_identity,
     vco_shipped_hook_scripts,
 )
@@ -450,9 +451,17 @@ def merge_hooks_block(
                 # kept verbatim and counts as the hook's registration (no
                 # second copy is appended beside it).
                 wrapped = bool(ident) and _wraps_hook_command(cmd)
+                # v0.2.105 (review R1 SB-1): an extra or changed argument
+                # AFTER the script (``…ensure-containers.sh --strict``) is the
+                # user's edit, exactly like a wrapping command above — the
+                # shipped spelling would silently drop it, so it is kept
+                # verbatim and counted as the hook's registration below.
+                edited = bool(ident) and ident in template_cmd_for_identity \
+                    and _arguments_edited(cmd, template_cmd_for_identity[ident])
                 if (
                     ident
                     and not wrapped
+                    and not edited
                     and ident in template_cmd_for_identity
                     and cmd != template_cmd_for_identity[ident]
                 ):
@@ -463,9 +472,11 @@ def merge_hooks_block(
                     present_idents.add((u_matcher, ident))
                 else:
                     new_hooks.append(h)
-                    if ident and (wrapped and ident in template_cmd_for_identity
+                    if ident and ((wrapped or edited)
+                                  and ident in template_cmd_for_identity
                                   or cmd == template_cmd_for_identity.get(ident)):
-                        # Already current — record so the append pass skips it.
+                        # Already current (or the user's own variant of it) —
+                        # record so the append pass skips it.
                         superseded_identities.add(ident)
                         present_idents.add((u_matcher, ident))
             new_entry["hooks"] = new_hooks
@@ -927,6 +938,25 @@ def _if_group_host(entries: list, matcher: str, new_inner: list) -> Optional[dic
                 and any(h.get("command") in cmds for h in inner):
             return entry
     return None
+
+
+def _arguments_edited(command: str, template_command: str) -> bool:
+    """True when ``command`` calls the same hook script as
+    ``template_command`` with a DIFFERENT trailing argument list — e.g. the
+    user's ``…/ensure-containers.sh --strict`` against the shipped
+    ``…/ensure-containers.sh``.
+
+    v0.2.105 (review R1 SB-1). Those arguments are the user's: the supersede
+    pass keeps the command verbatim instead of replacing it with the shipped
+    spelling (which has no argument, so the flag would disappear without a
+    record or a backup). Only the post-script tokens are compared — a path
+    spelling, the disable guard or extra whitespace is still the SHIPPED
+    command's business and heals as before. Conservative by construction: a
+    command whose argument list cannot be read is reported as edited, so it
+    is kept rather than rewritten."""
+    mine = vco_hook_script_arguments(command)
+    shipped = vco_hook_script_arguments(template_command)
+    return mine is None or shipped is None or mine != shipped
 
 
 def _wraps_hook_command(command: str) -> bool:

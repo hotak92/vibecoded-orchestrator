@@ -194,6 +194,15 @@ SCRIPT_FLAG_TOKENS = frozenset({"-file", "-command"})
 CMD_SEPARATOR_TOKENS = frozenset({"||", "&&", ";", "|", "&"})
 
 
+def _normalized_tokens(command: str) -> list[str]:
+    """``command`` split the way the anchor walk reads it: path separators
+    normalised, quotes stripped, whitespace-collapsed. ``[]`` for a
+    non-string / empty command."""
+    if not command or not isinstance(command, str):
+        return []
+    return command.replace("\\", "/").replace('"', " ").replace("'", " ").split()
+
+
 def invoked_script_tokens(command: str) -> Iterator[str]:
     """Yield, in order, every token of ``command`` that sits at an
     *invocation anchor* — a position where the token would be the script
@@ -217,12 +226,24 @@ def invoked_script_tokens(command: str) -> Iterator[str]:
     (bundle-merge identity, starter-script path extraction) share one
     tokenizer instead of carrying two copies that can drift.
     """
-    if not command or not isinstance(command, str):
-        return
-    norm = command.replace("\\", "/").replace('"', " ").replace("'", " ")
-    tokens = norm.split()
+    tokens = _normalized_tokens(command)
     for index in _anchor_indices(tokens):
         yield tokens[index]
+
+
+def invoked_script_arguments(
+        command: str) -> Iterator[Tuple[str, Tuple[str, ...]]]:
+    """Yield ``(token, trailing arguments)`` at every invocation anchor of
+    ``command`` — the same walk as :func:`invoked_script_tokens`, with the
+    tokens that FOLLOW the anchored one.
+
+    Used to tell a plain invocation from the same script called with extra
+    arguments (``…/ensure-containers.sh --strict``): those arguments are the
+    user's, so a caller that would rewrite the command keeps it verbatim
+    instead (``vco_lib.hook_retirements.vco_hook_script_arguments``)."""
+    tokens = _normalized_tokens(command)
+    for index in _anchor_indices(tokens):
+        yield tokens[index], tuple(tokens[index + 1:])
 
 
 def _anchor_indices(tokens: Sequence[str]) -> Iterator[int]:

@@ -223,6 +223,40 @@ def test_payload_recursion_consumes_one_confirmation(guard_env):
     assert not bs.check_command(cmd)[0]
 
 
+#: The five commands `test_old_false_positives_pass` runs, in file order.
+OLD_FALSE_POSITIVES = (
+    "git worktree add -b v0.2.105-rmconfirm /home/u/x main",
+    "echo confirm /home",
+    "printf 'perform /etc check'",
+    "./confirm /home/u",
+    "farm /usr",
+)
+
+
+def test_the_old_false_positives_then_the_payload_sequence(guard_env, tmp_path):
+    """R2 item 8: the two tests above in ONE test, in the order the review
+    named — the payload confirmation must inherit nothing from commands that
+    ran before it (the confirmation depends only on session, agent, command
+    and state dir, so a fresh `guard_env` is the whole of its context).
+
+    The stamp assertion is load-bearing: a refusal that never reached the
+    store (the broken-install fallback, an unreadable state dir) would make
+    the next line's "the second attempt is allowed" fail with a misleading
+    message. Asserting the FIRST attempt wrote its stamp says WHICH failure
+    this is."""
+    for cmd in OLD_FALSE_POSITIVES:
+        assert bs.check_command(cmd) == (True, ""), cmd
+    payload = "bash -c 'rm -rf ~/proj/build'"
+    ok, reason = bs.check_command(payload)
+    assert not ok and "[rm_confirm]" in reason, reason
+    store = tmp_path / "state" / rm_guard.STATE_SUBDIR
+    assert store.is_dir() and len(list(store.iterdir())) == 1, (
+        "the first attempt must have reached the confirm-once store — a "
+        "refusal without a stamp means the rm guard was not loaded")
+    assert bs.check_command(payload) == (True, "")
+    assert not bs.check_command(payload)[0]
+
+
 def test_different_command_is_refused(guard_env):
     assert not bs.check_command(DEEP)[0]
     assert not bs.check_command("rm -rf /home/tester/proj/other")[0]
@@ -256,6 +290,33 @@ def test_expired_confirmation_is_refused(tmp_path):
     # ... and that late attempt is itself a fresh first attempt
     assert rm_guard.confirm_once(DEEP, "s1", "", env[rm_guard.ENV_STATE_DIR],
                                  now=late + 5) == (True, "")
+
+
+def test_a_sub_millisecond_later_retry_is_the_same_confirmation(tmp_path):
+    """Review R2 item 8: the stamp is a float read back from a file, so a
+    retry can arrive with ``now`` a hair BELOW the recorded value — the write
+    used to round UP to whole milliseconds. That is the same confirmation,
+    not an expired one: before the fix the second attempt was refused and
+    recorded a fresh stamp, so the identical retry was refused instead of
+    allowed (flaky, and it read as if another test had left state behind)."""
+    d = str(tmp_path / "state")
+    t0 = 1_000_000.0006                     # "%.3f" rounded this UP
+    assert rm_guard.confirm_once(DEEP, "s1", "", d, now=t0) == (False, "")
+    assert rm_guard.confirm_once(DEEP, "s1", "", d, now=t0 + 0.0001) == (True, "")
+
+
+def test_a_stamp_a_clock_step_ahead_of_now_is_still_consumed(tmp_path):
+    """A stamp at most :data:`rm_guard.CONFIRM_FUTURE_SKEW_S` in the future
+    (a small clock step between the two calls) is the same confirmation; only
+    the TTL bounds how far BACK a stamp may sit."""
+    d = str(tmp_path / "state")
+    assert rm_guard.confirm_once(DEEP, "s1", "", d, now=1_000.0) == (False, "")
+    assert rm_guard.confirm_once(DEEP, "s1", "", d, now=999.5) == (True, "")
+    # ... and the TTL still expires: a stamp older than the TTL is refused.
+    other = str(tmp_path / "other")
+    assert rm_guard.confirm_once(DEEP, "s1", "", other, now=100.0) == (False, "")
+    expired = 100.0 + rm_guard.CONFIRM_TTL_S + 1
+    assert rm_guard.confirm_once(DEEP, "s1", "", other, now=expired) == (False, "")
 
 
 def test_within_ttl_is_allowed(tmp_path):

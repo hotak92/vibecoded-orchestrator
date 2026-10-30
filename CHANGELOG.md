@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has nothing to fall back on. Only a service that is really not running counts: a running one that refused the request
   (for example right after it restarted) or sent a garbled answer is not reported as stopped, and does not extend how
   long an old key is used.
+- **A hook command you have edited is no longer rewritten by an update.** If you added an argument to a command VCO ships
+  for its own hooks (for example `…/.claude/hooks/ensure-containers.sh --strict`), the bundle update replaced the whole
+  command with the shipped spelling and your argument disappeared, with no record and no backup. The update now compares
+  the arguments after the script: any difference keeps your command exactly as you wrote it, and the shipped copy is not
+  added beside it. A command that differs only in an old spelling of the same shipped invocation — a relative path, the
+  retired `VCT_DISABLE_HOOKS` prefix, stray whitespace — is still upgraded as before.
+- **The "run it again to confirm" retry for a recursive delete under your home now behaves the same every time.** The
+  once-only confirmation was stored with a rounded timestamp, so a retry issued immediately after the first refusal could
+  read that time as slightly in the future, treat its own confirmation as expired, and refuse again — the same command
+  sometimes went through and sometimes did not. The timestamp is now stored exactly, and a stored time up to one second
+  ahead still counts as the confirmation just made. The ten-minute window, the "allowed once and then used up" rule and
+  every refusal are unchanged.
 
 ### Added
 

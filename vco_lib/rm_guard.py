@@ -35,7 +35,12 @@ The confirmation store: one file per pending confirmation under
 the SHA-256 of session + agent + the whitespace-normalised command — the
 command text itself is never stored. The second identical attempt within
 :data:`CONFIRM_TTL_S` consumes it (allowed); a third needs a new confirm.
-Any state error refuses (fail-closed) and says why.
+The stamp is written losslessly and a stamp up to
+:data:`CONFIRM_FUTURE_SKEW_S` in the future still counts as "now", so the
+identical retry issued moments later is always the one that is allowed —
+the decision depends on session, agent, command and state dir, never on how
+the clock rounded in between. Any state error refuses (fail-closed) and
+says why.
 
 Known limits: targets a program computes (``xargs rm`` fed from stdin,
 ``find -delete``, ``$VAR`` paths), a ``cd ~ && rm -rf *`` relative delete,
@@ -58,6 +63,15 @@ CONFIRM = "confirm"
 
 #: Seconds a recorded confirmation stays usable (owner ruling: 10 min).
 CONFIRM_TTL_S = 600
+#: How far in the FUTURE a recorded stamp may sit and still count as "now".
+#: The stamp is a number read back from a text file, so it is never a guess
+#: about the size of the negative difference a rounding or a small clock step
+#: can produce — it only has to cover that, never to extend the TTL (the TTL
+#: bound below is untouched). Review R2 item 8: a millisecond-rounded stamp
+#: made a retry issued immediately afterwards read ``now - stamp < 0``, be
+#: treated as EXPIRED, and record a fresh confirmation — so the identical
+#: retry was refused instead of allowed, at random, whichever test ran first.
+CONFIRM_FUTURE_SKEW_S = 1.0
 #: The state sub-directory (under ``<project>/.claude/state``).
 STATE_SUBDIR = "rm-confirm"
 
@@ -292,7 +306,12 @@ def _record(path: str, now: float) -> None:
              | getattr(os, "O_NOFOLLOW", 0))
     fd = os.open(path, flags, 0o600)
     try:
-        os.write(fd, ("%.3f" % now).encode("ascii"))
+        # ``repr`` round-trips the float exactly. ``"%.3f"`` rounded the
+        # stamp UP by up to 0.5 ms, so a retry issued within that window read
+        # a stamp in the future and was refused as expired (review R2
+        # item 8). ``CONFIRM_FUTURE_SKEW_S`` covers what a clock step still
+        # can do.
+        os.write(fd, repr(float(now)).encode("ascii"))
     finally:
         os.close(fd)
 
@@ -320,7 +339,8 @@ def confirm_once(cmd: str, session: str, agent: str, state_dir: str,
             os.chmod(directory, 0o700)
         _sweep(directory, now)
         stamp = _read_stamp(path)
-        if stamp is not None and 0 <= now - stamp <= CONFIRM_TTL_S:
+        if (stamp is not None
+                and -CONFIRM_FUTURE_SKEW_S <= now - stamp <= CONFIRM_TTL_S):
             try:
                 os.unlink(path)
             except FileNotFoundError:
