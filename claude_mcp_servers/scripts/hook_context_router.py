@@ -1208,10 +1208,23 @@ def _promote_warm_held(project_root: str, key: str) -> None:
     ``VCT_AGENT_ID`` / ``VCT_BRIEF_TOOL_USE_ID``; the session resolves as the
     KG producer resolves it), and the stage time is the time it was shown.
     The held file is taken by an atomic rename, so two runs serving the same
-    entry stage it once. Soft-fail everywhere."""
+    entry stage it once. A run with NO session of its own does not promote at
+    all (v0.2.105 fix round): the held kwargs still carry the WARMER child's
+    session id — the spawner that missed the deadline, whose transcript never
+    showed this retrieval — and staging under it is negative-label noise. The
+    held file is left for the next run that can attribute it (and expires with
+    its cache entry otherwise). Soft-fail everywhere."""
     path = _warm_held_path(project_root, key)
     if path is None:
         return
+    try:
+        import claude_mcp_servers.rl_client.citation_pending as _cp
+        from claude_mcp_servers.rl_client.telemetry_emit import resolve_session_id
+    except Exception:  # noqa: BLE001 — never break the run for RL staging
+        return
+    session = resolve_session_id("")
+    if not session:
+        return  # no honest owner for this retrieval: promote nothing
     taken = path.with_name(f"{path.name}.{os.getpid()}.taken")
     try:
         os.replace(path, taken)
@@ -1228,19 +1241,12 @@ def _promote_warm_held(project_root: str, key: str) -> None:
             pass
     if not isinstance(held, list):
         return
-    try:
-        import claude_mcp_servers.rl_client.citation_pending as _cp
-        from claude_mcp_servers.rl_client.telemetry_emit import resolve_session_id
-    except Exception:  # noqa: BLE001 — never break the run for RL staging
-        return
-    session = resolve_session_id("")
     for kwargs in held:
         if not isinstance(kwargs, dict) or not isinstance(kwargs.get("ctx"), dict):
             continue
         kwargs = dict(kwargs)
         kwargs.pop("agent_id", None)
-        if session:
-            kwargs["session_id"] = session
+        kwargs["session_id"] = session
         kwargs["project_root"] = project_root
         try:
             _cp.stage_pending(**kwargs)

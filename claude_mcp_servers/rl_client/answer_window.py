@@ -426,12 +426,24 @@ CLI_KG_SEARCH_COMMANDS: frozenset[str] = frozenset({
 })
 # The CLI's options that take a value (``search_knowledge.py`` argparse);
 # every other ``-`` token is a flag. MUST MATCH templates/scripts/
-# search_knowledge.py's parser.
+# search_knowledge.py's parser — locked by
+# ``tests/test_v02105_rl_drain_header_reads.py::
+# TestCliOptionTableIsLockedToTheParser``, which derives this set from that
+# script's ``add_argument`` rows.
 _CLI_VALUE_OPTIONS: frozenset[str] = frozenset({
     "--limit", "--type", "--tags", "--detail", "--days",
     "--project", "-p", "--collection", "-c",
 })
-_SHELL_OPERATOR_CHARS = frozenset("();<>|&")
+#: What ends one simple command in the shell that ran it. A NEWLINE is one of
+#: them (v0.2.105 fix round): the Bash tool's own multi-line shape
+#: (``cd <project>`` newline ``.claude/scripts/kg-search search "…"``) puts the
+#: call on line 2, and PowerShell separates statements at a newline too. The
+#: lexer lists it in ``punctuation_chars`` and takes it OUT of ``whitespace``
+#: for exactly this to work (see :func:`cli_kg_search_queries`); inside quotes
+#: it stays part of the word.
+_SHELL_OPERATOR_CHARS = frozenset("();<>|&\n\r")
+_CLI_PUNCTUATION_CHARS = "();<>|&\n"
+_CLI_WHITESPACE = " \t\r"
 # Words that run the script named next (``python3 search_knowledge.py``,
 # ``bash kg-search``, PowerShell's ``& script.ps1`` / ``. script.ps1``).
 _CLI_LAUNCHERS: frozenset[str] = frozenset({
@@ -444,16 +456,28 @@ def cli_kg_search_queries(command: str, *, powershell: bool = False) -> list[str
     """The queries of every ``kg-search search <query>`` call in one shell
     command line, as the CLI's parser would read them (positional
     ``search``, then the query; options and their values skipped; a shell
-    operator ends a call). Unparseable quoting yields no query.
+    operator — ``;`` ``&&`` ``|`` or a NEWLINE — ends a call). Unparseable
+    quoting yields no query.
     ``powershell``: a PowerShell command line, whose backslash is a literal
     path separator (its escape character is the backtick), not an escape."""
     if not isinstance(command, str) or not command:
         return []
     if powershell:
         command = command.replace("\\", "/")
+    else:
+        # A backslash-newline is a LINE CONTINUATION in sh, not a separator:
+        # drop it before the newline is read as one (``kg-search search \\
+        # "q"`` wrapped over two lines is one call). PowerShell's continuation
+        # character is the backtick, and its backslash was handled above.
+        command = command.replace("\\\r\n", "").replace("\\\n", "")
     try:
-        lex = _shlex.shlex(command, posix=True, punctuation_chars=True)
+        # A newline must end a command, and shlex tests ``whitespace`` before
+        # ``punctuation_chars``: listing it in punctuation ONLY works with it
+        # removed from whitespace. Quoted text is never split either way.
+        lex = _shlex.shlex(command, posix=True,
+                           punctuation_chars=_CLI_PUNCTUATION_CHARS)
         lex.whitespace_split = True
+        lex.whitespace = _CLI_WHITESPACE
         tokens = list(lex)
     except ValueError:
         return []

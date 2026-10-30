@@ -198,6 +198,70 @@ class BoundedWaitTests(_TmpCase):
         self.assertLess(elapsed, 2.0, "the wait must stay bounded")
 
 
+class OneSpinPerAbsenceTests(_TmpCase):
+    """V1-GLM-B NIT: a credentials file DELETED within five minutes of a good
+    read was classified TRANSIENT, so EVERY request spent the full 2 s re-read
+    budget — for up to five minutes — to learn what the first one already
+    learned. One bounded spin per absence, then answer at once until the file
+    is seen again. The spin covers the real case (an editor's or a CLI's
+    delete-and-rename, which lands in milliseconds)."""
+
+    _SMALL = (mock.patch.object(auth, "_REREAD_BUDGET_S", 0.3),
+              mock.patch.object(auth, "_REREAD_INTERVAL_S", 0.1))
+
+    def test_the_first_request_spends_the_spin_and_the_next_answers_at_once(self) -> None:
+        self._write(FAKE_OAUTH)
+        reader = auth.OAuthReader(self.path)
+        self.assertEqual(reader.read().token, FAKE_OAUTH)
+        self.path.unlink()
+        with self._SMALL[0], self._SMALL[1]:
+            started = time.monotonic()
+            first = reader.read_with_brief_wait()
+            first_elapsed = time.monotonic() - started
+        self.assertIsNone(first.token, "an absent file is never served stale")
+        self.assertTrue(first.retry_soon)
+        self.assertGreaterEqual(first_elapsed, 0.25,
+                                "the first request must still cover the rename")
+        started = time.monotonic()
+        second = reader.read_with_brief_wait()  # the real 2 s budget: no spin
+        second_elapsed = time.monotonic() - started
+        self.assertIsNone(second.token, "the last-good token is never served")
+        self.assertLess(second_elapsed, 0.5, "the spent spin was repeated")
+
+    def test_the_file_coming_back_earns_the_next_absence_its_own_spin(self) -> None:
+        self._write(FAKE_OAUTH)
+        reader = auth.OAuthReader(self.path)
+        reader.read()
+        self.path.unlink()
+        with self._SMALL[0], self._SMALL[1]:
+            reader.read_with_brief_wait()  # spends this absence's spin
+        self._write(FAKE_REFRESHED)  # the rename landed
+        self.assertEqual(reader.read().token, FAKE_REFRESHED)
+        self.path.unlink()  # a SECOND absence
+        with self._SMALL[0], self._SMALL[1]:
+            started = time.monotonic()
+            state = reader.read_with_brief_wait()
+            elapsed = time.monotonic() - started
+        self.assertIsNone(state.token)
+        self.assertGreaterEqual(elapsed, 0.25,
+                                "a new absence must get its own bounded spin")
+
+    def test_a_present_but_token_less_file_keeps_its_spin_on_every_request(self) -> None:
+        """Leave-alone: the 2026-10-28 window — the file IS there, being
+        rewritten — is not an absence. The one-spin rule must not shorten it."""
+        self._write(None)
+        reader = auth.OAuthReader(self.path)
+        for attempt in ("first", "second"):
+            with self._SMALL[0], self._SMALL[1]:
+                started = time.monotonic()
+                state = reader.read_with_brief_wait()
+                elapsed = time.monotonic() - started
+            self.assertIsNone(state.token)
+            self.assertTrue(state.retry_soon)
+            self.assertGreaterEqual(elapsed, 0.25,
+                                    f"the {attempt} request of a rewrite must wait")
+
+
 class ConcurrentReadersTests(_TmpCase):
     """Fix round 1 (H1): the request path reads OFF the loop
     (:meth:`OAuthReader.aread_with_brief_wait`) while ``/health`` and the
