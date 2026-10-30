@@ -916,26 +916,32 @@ def _timeout_options_end(words: List[str]) -> int:
 
 
 def _timeout_bounded(command: str, depth: int = 0) -> bool:
-    """True when ``command`` is wrapped in a LITERAL ``timeout <N>`` (or
-    ``gtimeout <N>``) — also through a ``bash -c`` / ``sh -c`` body — the
-    bounded form the refusal message shows."""
+    """True when ``command`` is WRAPPED in a LITERAL ``timeout <N>`` (or
+    ``gtimeout <N>``) — the timeout statement is the ONLY top-level
+    statement, also through a ``bash -c`` / ``sh -c`` body that is itself
+    so wrapped. One bounded segment must NOT bless an unbounded sibling
+    (review E-1: ``timeout 5 ls; until …; do sleep 15; done`` used to
+    pass), so a command with any other top-level statement is not
+    bounded."""
     if depth > _MAX_TIMEOUT_SCAN_DEPTH:
         return False
     tokens = tokenize(command)
     if not tokens:
         return False
-    for segment in split_chain(tokens):
-        words = _peel_to_wrapper(strip_env_assignments(segment))
-        if not words:
-            continue
-        verb = os.path.basename(words[0]).lower()
-        if verb in ("timeout", "gtimeout"):
-            i = _timeout_options_end(words)
-            return i < len(words) and bool(_LITERAL_SLEEP_RE.match(words[i]))
-        if verb in SHELL_DASH_C_VERBS:
-            sub = dash_c_subcommand(words)
-            if sub is not None:
-                return _timeout_bounded(sub, depth + 1)
+    segments = split_chain(tokens)
+    if len(segments) != 1:
+        return False
+    words = _peel_to_wrapper(strip_env_assignments(segments[0]))
+    if not words:
+        return False
+    verb = os.path.basename(words[0]).lower()
+    if verb in ("timeout", "gtimeout"):
+        i = _timeout_options_end(words)
+        return i < len(words) and bool(_LITERAL_SLEEP_RE.match(words[i]))
+    if verb in SHELL_DASH_C_VERBS:
+        sub = dash_c_subcommand(words)
+        if sub is not None:
+            return _timeout_bounded(sub, depth + 1)
     return False
 
 
@@ -1032,7 +1038,13 @@ def _background_wait_pattern(command: str,
 def _background_refusal(tool: str, command: str,
                         readable: str) -> Optional[tuple]:
     """The one background decision for either shell: ``None`` when the
-    command may run in the background, else the pattern to refuse."""
+    command may run in the background, else
+    ``(pattern, evidence, stderr_silenced, already_bounded)``.
+
+    A silenced CONDITION refuses the loop even when it IS bounded (E-2:
+    the promise "a loop that hides its errors is refused" is
+    unconditional) — ``already_bounded`` then tells the message to drop
+    the bound-it advice and name only the redirection."""
     if tool == POWERSHELL_TOOL:
         # PowerShell has no `timeout`; the bounded forms it does have (a
         # counter `for`, a `foreach` range) are what `loop_pattern`'s
@@ -1042,10 +1054,20 @@ def _background_refusal(tool: str, command: str,
         loop = loop_pattern(command, wait_budget_s=float("inf"))
         if loop is None:
             return None
-        return (loop[0], loop[1], bool(_PS_STDERR_SILENCED_RE.search(command)))
-    if _timeout_bounded(readable):
+        # E-7: only the loop's own condition (the evidence names it) can
+        # decorate the refusal — a `2>$null` elsewhere in the command
+        # says nothing about this loop.
+        return (loop[0], loop[1],
+                bool(_PS_STDERR_SILENCED_RE.search(loop[1])), False)
+    found = _background_wait_pattern(readable)
+    if found is None:
         return None
-    return _background_wait_pattern(readable)
+    bounded = _timeout_bounded(readable)
+    if found[2]:
+        return (found[0], found[1], True, bounded)
+    if bounded:
+        return None
+    return (found[0], found[1], False, False)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1682,33 +1704,51 @@ def static_deny_reason(command: str, pattern: tuple, tool: str = "Bash",
 
 def background_wait_deny_reason(command: str, pattern: tuple,
                                 tool: str = "Bash") -> str:
-    """The refusal for an UNBOUNDED background wait loop (fix round 2,
-    item 7): names the loop, shows the bounded form, and — when the loop's
-    condition throws stderr away — says why that makes a broken command
-    look like "not yet" forever."""
-    name, evidence, stderr_silenced = pattern
+    """The refusal for a background wait loop that is UNBOUNDED (fix round
+    2, item 7) or hides its condition's stderr (fix round 3, E-2): names
+    the loop, shows the bounded form, and — when the loop's condition
+    throws stderr away — says why that makes a broken command look like
+    "not yet" forever."""
+    name, evidence, stderr_silenced, already_bounded = pattern
     ps = tool == POWERSHELL_TOOL
+    # E-3: the PowerShell branch never accepts a `timeout` wrapper on an
+    # inline loop, so its advice must LEAD with the form that works there
+    # (a counter `for`); a `timeout 600 pwsh -File` bounds only when the
+    # loop lives in the file.
     bounded = (
-        "wrap the whole command in a literal timeout"
-        " (e.g. `timeout 600 pwsh -File check.ps1`), or give the loop a"
-        " counter `for` with a literal bound"
+        "give the loop a counter `for` with a literal bound"
+        " (`for ($i = 0; $i -lt 5; $i++) { … }`), or move it into a file"
+        " and wrap the whole call in a literal timeout"
+        " (`timeout 600 pwsh -File check.ps1`)"
         if ps else
         "wrap the whole command in a literal timeout"
         " (e.g. `timeout 600 <your command>`), or give the loop a literal"
         " iteration cap (`for i in 1 2 3 …`)")
-    reason = (
-        f"BLOCKED by the VCO wait-loop guard: this background "
-        f"{_shell_label(tool)} command starts an UNBOUNDED wait loop "
-        f"(`{name}`: {evidence}). A background loop must be BOUNDED — "
-        f"{bounded} — so it cannot run until someone notices when its "
-        f"condition never comes true."
-    )
-    if stderr_silenced:
-        reason += (
-            " Its CONDITION throws stderr away (`2>/dev/null`): a command "
-            "that cannot run then looks like \"not yet\" forever — drop the "
-            "redirection so the real error is visible."
+    if already_bounded:
+        # E-2: the loop IS bounded; only its silenced condition refuses it.
+        reason = (
+            f"BLOCKED by the VCO wait-loop guard: this background "
+            f"{_shell_label(tool)} command's wait loop (`{name}`:"
+            f" {evidence}) throws its CONDITION's stderr away"
+            f" (`2>/dev/null`): a command that cannot run then looks like"
+            f" \"not yet\" until the timeout kills the loop, and the real"
+            f" error is never shown — drop the redirection so it is"
+            f" visible."
         )
+    else:
+        reason = (
+            f"BLOCKED by the VCO wait-loop guard: this background "
+            f"{_shell_label(tool)} command starts an UNBOUNDED wait loop "
+            f"(`{name}`: {evidence}). A background loop must be BOUNDED — "
+            f"{bounded} — so it cannot run until someone notices when its "
+            f"condition never comes true."
+        )
+        if stderr_silenced:
+            reason += (
+                " Its CONDITION throws stderr away (`2>/dev/null`): a command "
+                "that cannot run then looks like \"not yet\" forever — drop the "
+                "redirection so the real error is visible."
+            )
     return (
         reason + _WHY +
         " WHAT TO DO INSTEAD: bound the loop as above, start it ONCE with"

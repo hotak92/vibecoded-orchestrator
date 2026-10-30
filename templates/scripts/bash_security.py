@@ -62,8 +62,9 @@ def _span(stop: str, cls: str = ".") -> str:
 # === 1. Destructive filesystem operations ===
 # v0.2.105 (rm guard, owner ruling 2026-10-29): this flat rule is the TEXT
 # backstop for the HARD set only — the home directory itself, /home and
-# /home/<user>, `/`, and anything at or under /etc /usr /var /boot /dev /root
-# — so prose, process substitution and over-deep `bash -c` nests that the
+# /home/<user>, `/`, anything at or under /etc /usr /var /boot /dev /root,
+# and a dot-wildcard component (``.*``) anywhere under a home root — so
+# prose, process substitution and over-deep `bash -c` nests that the
 # structural walk cannot reach still block. A deeper path under home is NOT
 # here: vco_lib/rm_guard.py judges it structurally (a recursive or glob
 # delete is refused once and allowed on the identical retry). `rm` must be a
@@ -73,6 +74,24 @@ def _span(stop: str, cls: str = ".") -> str:
 # per `rm` word, bounded flag run, each span bounded by a single token.
 _RM_TERM = r"""(?=[\s;&|)'"`]|$)"""
 _RM_TAIL = r"(?:/(?:\.?\*)?)?" + _RM_TERM
+#: A path component, after a `/`, that is composed ONLY of glob/metachar
+#: characters AND carries a dot — the ``.*`` class that expands to ``..``
+#: and can climb out of a user's home (rm_guard HARD, review R-1). The two
+#: lookaheads stay inside the component (no `/`), so a plain-``*`` or
+#: plain-``..`` component does not match; the span itself is charset-only.
+_RM_DOTWILD = (
+    r"/(?=[^/\s;&|)\"'`]*[?*\[\]])"
+    r"(?=[^/\s;&|)\"'`]*\.)"
+    r"[*?.\[\]]+(?=[/\s;&|)\"'`]|$)"
+)
+#: Any run of ordinary components, then a dot-wildcard component, then the
+#: rest of the path — so ``~/.*/tmp``, ``~/.*/*`` and ``/home/u/.*/x`` all
+#: match. Component boundaries are `/`-anchored on both classes, so the
+#: match stays linear (one split per `/`).
+_RM_DOTWILD_PATH = (
+    r"""(?:/[^/\s;&|)'"`]+)*""" + _RM_DOTWILD
+    + r"""(?:/[^\s;&|)'"`]*)?""" + _RM_TERM
+)
 _rule(
     "rm_root",
     r"(?<![\w.-])rm\s+(?:-\S*\s+){0,6}[\"']?(?:"
@@ -81,6 +100,8 @@ _rule(
     + r"""|/(?:home|users)(?:/[^/\s;&|)'"`*?\[]+)?""" + _RM_TAIL
     + r"""|~[^/\s;&|)'"`]*""" + _RM_TAIL
     + r"|\$\{?HOME\}?" + _RM_TAIL
+    + r"""|~[^/\s;&|)'"`]*""" + _RM_DOTWILD_PATH
+    + r"""|/(?:home|users)/[^/\s;&|)'"`*?\[]+""" + _RM_DOTWILD_PATH
     + r")",
     "Destructive rm targeting system/home directories",
 )

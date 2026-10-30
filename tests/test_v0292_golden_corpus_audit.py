@@ -293,8 +293,11 @@ def test_every_stored_config_row_matches_its_own_fixture_source() -> None:
     analyzer produced, so a wrong line range or a truncated section body in
     the config extractor would be ratified as "expected" on the first regen
     and never questioned. This audit is the tool the fixture README says
-    must review snapshots; it needs NO allow-list entries for the config
-    rows (a finding here is a defect, not a known divergence)."""
+    must review snapshots. Config divergences are ruled off in
+    ``_CONFIG_ALLOWED_RULES`` (synthesized ``(root)``/chunk shapes), and
+    each rule is ratcheted by
+    ``test_no_config_allow_rule_has_gone_stale`` — a finding that matches
+    no rule is a defect, not a known divergence."""
     if not (_EXPECTED_CONFIG_DIR.is_dir() and _CONFIG_REPO_DIR.is_dir()):
         pytest.skip(
             "the expected_config/config_repo golden corpus is not in this "

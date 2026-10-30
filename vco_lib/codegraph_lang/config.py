@@ -44,6 +44,7 @@ from vco_lib.codegraph_entities import (
     KIND_CLASS,
     ModuleDescriptor,
 )
+from vco_lib.manifest_paths import MANIFEST_BASENAME
 
 #: extension -> format. The ONE home of "which files are config files".
 CONFIG_FORMATS: Dict[str, str] = {".tweakers": "tweakers", ".ini": "ini", ".json": "json"}
@@ -56,7 +57,7 @@ CONFIG_GLOBS: Tuple[str, ...] = tuple(f"*{ext}" for ext in CONFIG_FORMATS)
 #: and the single-file dispatch so the two entry points agree.
 CONFIG_NAME_SKIP_SUFFIXES: Tuple[str, ...] = (
     "package-lock.json", "npm-shrinkwrap.json", ".lock.json", ".min.json",
-    ".vco-manifest.json",
+    MANIFEST_BASENAME,
 )
 
 #: The synthetic section that holds keys outside any section.

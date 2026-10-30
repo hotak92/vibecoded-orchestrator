@@ -44,10 +44,16 @@ HARD_TARGETS = [
     "/home/tester/*", "/home/other", "/etc", "/etc/x", "/usr/lib", "/var/log/x",
     "/boot", "/dev/sda", "/root", "/root/x", "~bob", "/Users", "/Users/me",
     "/home/tester/a/../..",
+    # review R-1: a dot-matching wildcard ANYWHERE below a home root expands
+    # to `..` and can climb out of the user's home — never confirmable.
+    "~/.*/tmp", "~/.*/*", "/home/u/.*/x", "~/*/.*/y", "~/.*/tmp/deep",
 ]
 DEEP_TARGETS = [
     "/home/tester/proj", "/home/tester/a/b", "~/proj", "~/proj/x", "$HOME/proj",
     "${HOME}/a/b", "/home/other/x", "~bob/x", "/Users/me/x",
+    # leave-alone: a plain `*` (no dot) cannot match `..`, so a glob inside
+    # one deeper directory stays a confirm-tier delete under the home.
+    "~/build/*", "~/.cache/*",
 ]
 FREE_TARGETS = ["build", "./a", "/tmp/x", "/opt/thing", "$DIR/x", "$HOMEX/y",
                 "*.pyc", "../x"]
@@ -107,8 +113,8 @@ def test_real_home_outside_slash_home_is_protected():
     ("rm ~/proj/file.txt", []),                  # plain file
     ("rm -f /home/tester/a/b.txt", []),
     ("rm -- -r", []),                            # after --, a file named -r
-    ("rm -rf build ~/p/q /tmp/z", ["confirm"]),
-    ("rm -rf ./a /etc", ["hard"]),               # every operand is judged
+    ("rm -rf build ~/p/q /tmp/z", ["confirm", "confirm"]),
+    ("rm -rf ./a /etc", ["confirm", "hard"]),    # every operand is judged
     ("sudo rm -rf ~/p/q", ["confirm"]),
     ("/bin/rm -rf ~/p/q", ["confirm"]),
     ("command rm -rf ~/p/q", ["confirm"]),
@@ -121,6 +127,23 @@ def test_real_home_outside_slash_home_is_protected():
     ("echo 'rm -rf ~/p/q'", []),                 # prose, not a command
     ("git commit -m 'rm -rf ~/p/q'", []),
     ("git rm -r ~/p/q", []),                     # git's rm, not rm
+    # review R-2: relative and $VAR targets are placed when the command
+    # makes them determinable, and are confirm-once (never silent, never
+    # hard) when it does not.
+    ("cd /home/tester/proj && rm -rf build", ["confirm"]),
+    ("cd /etc && rm -rf x", ["hard"]),
+    ("cd /tmp && rm -rf build", []),             # resolved, outside home
+    ("cd /home/tester/proj && rm notes.txt", []),   # plain file, no confirm
+    ("D=/home/tester/proj; rm -rf $D/build", ["confirm"]),
+    ("D=/etc; rm -rf $D/x", ["hard"]),
+    ("D=/home/tester/p/*; rm -rf $D", ["confirm"]),
+    ("rm -rf $D/build", ["confirm"]),            # $D unknown: confirm-once
+    ("cd $D && rm -rf build", ["confirm"]),      # cwd unknowable
+    ("cd - && rm -rf build", ["confirm"]),
+    ("cd /etc && bash -c 'rm -rf x'", ["hard"]),     # bash -c inherits cwd
+    ("bash -c 'cd /etc'; bash -c 'rm -rf build'", ["confirm"]),  # sibling sub-chain does not
+    ("bash -c 'cd /etc && rm -rf x'", ["confirm"]),  # same-depth cwd: not proven
+                                                   # past a flattened boundary, capped
 ])
 def test_scan(cmd, tiers):
     assert [f.tier for f in rm_guard.scan(cmd, HOME)] == tiers, cmd
@@ -186,6 +209,7 @@ def test_check_command_is_fast_on_a_huge_rm_command(guard_env):
 @pytest.mark.parametrize("cmd", [
     "rm -rf /etc/x", "rm -rf ~", "rm -rf ~/", "rm -rf /home/user/", "rm -rf /",
     "rm -rf $HOME", "rm -rf /home/*", "rm -rf ~/*", "bash -c 'rm -rf ~'",
+    "rm -rf ~/.*/tmp", "rm -rf ~/.*/*",
 ])
 def test_hard_block_stays_blocked_on_retry(cmd, guard_env, tmp_path):
     for _ in range(3):
@@ -454,3 +478,32 @@ def test_module_reload_keeps_rules():
     # must survive a reload (it imports lazily).
     importlib.reload(bs)
     assert any(n == "rm_root" for n, _, _ in bs._RULES)
+
+
+# ── review R-2: relative and $VAR targets ──────────────────────────────
+
+
+def test_cd_placed_relative_delete_confirms_once(guard_env):
+    """ACT + LEAVE-ALONE (review R-2). A recursive relative delete a cd in
+    the command places under home is refused once, naming the RESOLVED
+    path, and allowed on the identical retry; pre-fix it ran with no
+    confirmation at all. A plain single-file rm after the same cd still
+    needs none."""
+    cmd = "cd /home/tester/proj && rm -rf build"
+    ok, reason = bs.check_command(cmd)
+    assert not ok, reason
+    assert ("delete all the contents of /home/tester/proj/build"
+            in reason), reason
+    assert bs.check_command(cmd) == (True, "")
+    # LEAVE-ALONE: no recursion, no glob — no confirmation asked.
+    assert bs.check_command("cd /home/tester/proj && rm notes.txt") == (True, "")
+
+
+def test_unresolvable_var_and_relative_recursion_confirm_once(guard_env):
+    """ACT (review R-2): a recursive delete of a target the command leaves
+    indeterminable is never allowed silently — confirm-once, both the
+    unassigned-$VAR shape and the bare relative shape."""
+    for cmd in ("rm -rf $D/build", "rm -rf build"):
+        ok, reason = bs.check_command(cmd)
+        assert not ok and "[rm_confirm]" in reason, (cmd, reason)
+        assert bs.check_command(cmd) == (True, ""), cmd

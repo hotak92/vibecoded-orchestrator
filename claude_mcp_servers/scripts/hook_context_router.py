@@ -149,6 +149,7 @@ from vco_lib.inject_intent import (  # noqa: E402
     titles_one_liner,
     turn_budget_chars,
 )
+from vco_lib.atomic import claim_by_rename  # noqa: E402
 from vco_lib.env_values import env_float, env_int  # noqa: E402
 from vco_lib.hook_agent_key import agent_state_key, sanitize_agent_id  # noqa: E402
 from vco_lib.prompt_edit_nudge import nudge_block as _prompt_nudge_block  # noqa: E402
@@ -1225,10 +1226,8 @@ def _promote_warm_held(project_root: str, key: str) -> None:
     session = resolve_session_id("")
     if not session:
         return  # no honest owner for this retrieval: promote nothing
-    taken = path.with_name(f"{path.name}.{os.getpid()}.taken")
-    try:
-        os.replace(path, taken)
-    except OSError:
+    taken = claim_by_rename(path, ".taken.")
+    if taken is None:
         return  # nothing held (the common case), or a sibling run took it
     try:
         held = json.loads(taken.read_text(encoding="utf-8")).get("held")

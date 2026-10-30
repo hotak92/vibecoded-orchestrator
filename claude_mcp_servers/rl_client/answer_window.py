@@ -440,8 +440,13 @@ _CLI_VALUE_OPTIONS: frozenset[str] = frozenset({
 #: call on line 2, and PowerShell separates statements at a newline too. The
 #: lexer lists it in ``punctuation_chars`` and takes it OUT of ``whitespace``
 #: for exactly this to work (see :func:`cli_kg_search_queries`); inside quotes
-#: it stays part of the word.
-_SHELL_OPERATOR_CHARS = frozenset("();<>|&\n\r")
+#: it stays part of the word. ``\r`` is deliberately NOT an operator: shlex
+#: tests ``whitespace`` first, so a member there is dead — and as whitespace
+#: it eats the CR of a CRLF just before the LF separator, which is the shape
+#: transcripts actually carry. A bare CR (old-Mac line ending) separates
+#: nothing; shlex treats it as a space, and no modern shell reads it as a
+#: statement separator either.
+_SHELL_OPERATOR_CHARS = frozenset("();<>|&\n")
 _CLI_PUNCTUATION_CHARS = "();<>|&\n"
 _CLI_WHITESPACE = " \t\r"
 # Words that run the script named next (``python3 search_knowledge.py``,

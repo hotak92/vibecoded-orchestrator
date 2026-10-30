@@ -212,3 +212,81 @@ def test_the_shared_table_reads_the_replace_str_form():
 
 def test_a_per_item_wait_is_still_refused(tmp_path):
     assert wg.static_pattern("xargs -n1 sleep < list.txt") is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. Fix round 3 (review E-1/E-2/E-3/E-6/E-7)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("command", [
+    # E-1: one bounded segment must not bless an unbounded sibling.
+    "timeout 5 ls; until [ -f x ]; do sleep 15; done",
+    "until [ -f x ]; do sleep 15; done; timeout 5 ls",
+    "timeout 5 true; f() { until [ -f x ]; do sleep 15; done; }; f",
+    # and a loop after the timeout-wrapped one, joined either way
+    "timeout 30 bash -c 'until [ -f x ]; do sleep 15; done'; "
+    "until [ -f y ]; do sleep 15; done",
+])
+def test_one_bounded_segment_does_not_bless_the_command(tmp_path, command):
+    reason = _eval(tmp_path, command)
+    assert reason is not None and "UNBOUNDED wait loop" in reason, command
+
+
+def test_a_timeout_wrapped_loop_with_more_after_it(tmp_path):
+    """The strict side of E-1's rule: a second top-level statement (even a
+    harmless one) means no single timeout bounds the command, so the loop
+    is refused — the message's bounded form shows how to write it."""
+    reason = _eval(
+        tmp_path, "timeout 600 bash -c 'until [ -f x ]; do sleep 15; done' "
+                  "&& echo done")
+    assert reason is not None and "UNBOUNDED wait loop" in reason
+
+
+def test_a_bounded_loop_with_a_silenced_condition_is_refused(tmp_path):
+    """E-2: the stderr rule is independent of the bound — a loop whose
+    condition throws stderr away is refused even wrapped in ``timeout``,
+    and the message names ONLY the redirection (no bound-it advice: it is
+    already bounded)."""
+    reason = _eval(
+        tmp_path,
+        "timeout 30 bash -c 'until [ -f x ] && ninja -n 2>/dev/null "
+        "| grep -q y; do sleep 15; done'")
+    assert reason is not None, "the silenced condition must refuse it"
+    assert "throws its CONDITION's stderr away" in reason
+    assert "`2>/dev/null`" in reason
+    assert "UNBOUNDED" not in reason
+
+
+def test_the_powershell_advice_leads_with_the_counter_for(tmp_path):
+    """E-3: the PowerShell branch never accepts a ``timeout`` wrapper on
+    an INLINE loop, so the advice must lead with the form that works
+    there (the counter ``for``)."""
+    reason = _eval(tmp_path, "while ($true) { Start-Sleep -Seconds 15 }",
+                   tool="PowerShell")
+    assert reason is not None
+    assert "give the loop a counter `for`" in reason
+    assert reason.index("counter `for`") < reason.index("timeout")
+
+
+def test_a_glued_powershell_counter_retry_is_bounded(tmp_path):
+    """E-6: ``$n=0`` glued (no spaces) is the same counter retry as the
+    spaced form — the ungluing ``_ps_for_iterations`` does now also covers
+    the while-loop counter init."""
+    assert _eval(
+        tmp_path,
+        "$n=0\nwhile ($n -lt 20) { Start-Sleep -Milliseconds 50; $n++ }",
+        tool="PowerShell") is None
+
+
+def test_a_silenced_command_outside_the_powershell_loop_is_not_named(tmp_path):
+    """E-7: only the loop's own condition can decorate the refusal with
+    the stderr claim — a `2>$null` elsewhere in the command says nothing
+    about the loop."""
+    reason = _eval(
+        tmp_path,
+        "Get-Content setup.log 2>$null; "
+        "while ($true) { Start-Sleep -Seconds 15 }",
+        tool="PowerShell")
+    assert reason is not None and "UNBOUNDED wait loop" in reason
+    assert "throws stderr away" not in reason

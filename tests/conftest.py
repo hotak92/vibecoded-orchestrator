@@ -2351,27 +2351,65 @@ def _pin_code_embed_url():
                 os.environ[key] = value
 
 
+class LocalhostPinLeak(AssertionError):
+    """A test left a pinned localhost-backend key changed."""
+
+
+def _localhost_pin_leak(where: str) -> "str | None":
+    """The loud message when a pinned backend key differs from its pin, or
+    None. Pure (reads os.environ only), like the identity and WEAVIATE_URL
+    guards."""
+    changed = [(key, want, os.environ.get(key))
+               for key, want in _PINNED_LOCALHOST_KEYS
+               if os.environ.get(key) != want]
+    if not changed:
+        return None
+    detail = ", ".join(f"{key}: {got!r} (pin {want!r})"
+                       for key, want, got in changed)
+    return (
+        f"{where} left a pinned localhost-backend env key changed ({detail}). "
+        "These keys route every backend client — a leaked GRPC_PORT / "
+        "WEAVIATE_GRPC_PORT pair does not fail here but as an "
+        "order-dependent refusal in a LATER test (v0.2.105 R2 item 8c: "
+        "\"Weaviate's HTTP and gRPC ports must differ\" in a test that "
+        "never touches ports). Restore them exactly (monkeypatch / "
+        "mock.patch.dict(os.environ))."
+    )
+
+
 @pytest.fixture(autouse=True)
-def _pin_localhost_default_backends():
+def _pin_localhost_default_backends(request):
     """W-TRANSPORT / W-OLLAMA / W-HUB-PORT: re-establish the pins for EVERY
     test (see the import-time block). Same reason as the Weaviate pin: a test
     that sets one of these keys itself and restores by
     ``os.environ.update(backup)`` cannot remove a key the backup lacked, so
-    one such test would un-pin everything after it."""
+    one such test would un-pin everything after it.
+
+    v0.2.105 fix round 3 (item 8c): the same fail-the-leaker-by-name
+    contract ``_pin_weaviate_url`` and the W-IDENTITY guard use. The pin
+    used to be re-established SILENTLY, so a leaked ``GRPC_PORT`` never
+    failed the test that leaked it — only a later victim, order-dependent
+    (review B-LOW-2). Monkeypatch and the test's own restores have torn
+    down by now: anything but the pin is this test's leak."""
     if _ALLOW_REAL_STATE:
         yield
         return
     prev = {k: os.environ.get(k) for k, _ in _PINNED_LOCALHOST_KEYS}
     for key, value in _PINNED_LOCALHOST_KEYS:
         os.environ[key] = value
+    leak = None
     try:
         yield
     finally:
+        if not _ALLOW_REAL_STATE:
+            leak = _localhost_pin_leak(request.node.nodeid)
         for key, value in prev.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+    if leak:
+        raise LocalhostPinLeak(leak)
 
 
 # ─── Embed-service cache globals (v0.2.105 fix round 2: test isolation) ────
@@ -2391,6 +2429,11 @@ def _pin_localhost_default_backends():
 #   test_v02102_code_embed_preferences_readers.py::TestFinalRoundLows::
 #   test_a_long_lived_mcp_rebuilds_its_service_when_the_record_flips
 # — order-dependent, timing-bounded, invisible when the two files run apart.
+# The item's OTHER order pair (a1) has its polluter in the same
+# code_embed_preferences file — its tests monkeypatch these very globals
+# (test_v02102_code_embed_preferences_readers.py:890-891) and a later test
+# in that file reads them; analyzed, same mechanism, covered by this same
+# reset (it was not reproduced as a standalone order, unlike a2).
 # Reset after EVERY test, on every loaded module object that really holds
 # the name in its OWN __dict__ — vars() only, never getattr/setattr:
 # kg_query_core has a module-level __getattr__ delegating to the server,

@@ -39,9 +39,19 @@ from tests.common.pwsh import PWSH_BASE_FLAGS
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPO_ROOT / "templates" / "hooks"
 
-needs_bash = pytest.mark.skipif(
+#: The Windows-skip convention (tests/test_v02103_win_skip_sibling_guard.py):
+#: each bash-leg skip names the .ps1-sibling test that covers it on Windows.
+#: The reason is ONE string literal — the guard's scanner reads only literals.
+needs_bash_lean_ctx = pytest.mark.skipif(
     sys.platform == "win32" or shutil.which("bash") is None,
-    reason="bash hook; .ps1 sibling driven separately below")
+    reason="bash .sh leg; Windows runs the .ps1 sibling: tests/"
+           "test_v02105_cl1_updated_input_contract.py::"
+           "test_lean_ctx_ps1_updated_input_is_the_original_tool_input")
+needs_bash_agent_brief = pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="bash .sh leg; Windows runs the .ps1 sibling: tests/"
+           "test_v02105_cl1_updated_input_contract.py::"
+           "test_agent_brief_ps1_updated_input_is_the_original_tool_input")
 needs_pwsh = pytest.mark.skipif(
     shutil.which("pwsh") is None, reason="pwsh not installed")
 
@@ -111,7 +121,7 @@ def _updated_input(stdout: str) -> dict:
 # ─── lean-ctx-rewrite: command replaced, everything else frozen ───────────
 
 
-@needs_bash
+@needs_bash_lean_ctx
 def test_lean_ctx_sh_updated_input_is_the_original_tool_input(tmp_path):
     from tests.test_v02101_lean_ctx_allowlist_tee import _run_sh_hook
 
@@ -157,7 +167,7 @@ def _agent_brief_run(hook: str, tmp_path: Path) -> tuple[dict, dict]:
     return _updated_input(proc.stdout), original
 
 
-@needs_bash
+@needs_bash_agent_brief
 def test_agent_brief_sh_updated_input_is_the_original_tool_input(tmp_path):
     updated, original = _agent_brief_run("agent-brief-kg-inject.sh", tmp_path)
     _assert_contract(updated, original, mutated_key="prompt")
