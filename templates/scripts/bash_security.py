@@ -1301,6 +1301,42 @@ def check_powershell(cmd: str) -> tuple[bool, str]:
     return True, ""
 
 
+#: Cheap prefilter: only a command naming a kill verb loads the kill guard.
+_KILL_WORD = re.compile(r"(?i)kill|stop-process|\bspps\b")
+#: A kill verb in COMMAND position (start, after an operator or `$(`, behind
+#: env assignments / sudo / xargs / timeout). Used only when vco_lib cannot
+#: be imported, to keep that broken-install refusal off `grep kill` & co.
+_KILL_VERB_CALL = re.compile(
+    r"(?i)(?:^|[;&|(`\n]|\$\()\s*(?:[A-Za-z_]\w*=\S*\s+)*"
+    r"(?:(?:sudo|xargs|timeout|nohup|env|exec|command|builtin)\b[^;&|\n]*?\s)?"
+    r"\S*\b(?:p?kill|killall5?|skill|taskkill|stop-process|spps)\b"
+)
+
+
+def _kill_guard_check(cmd: str, shell: str) -> tuple[bool, str]:
+    """Layer 1 of the kill guard (``vco_lib.kill_guard.static_check``).
+
+    A healthy install runs this scanner with the VCO venv interpreter, so
+    ``vco_lib`` imports. When it does not, that is a BROKEN install: a kill
+    command is then refused with the cause named (fail-closed for kills
+    only — every other command is unaffected)."""
+    if not _KILL_WORD.search(cmd):
+        return True, ""
+    try:
+        from vco_lib.kill_guard import static_check
+    except ImportError as exc:
+        if not _KILL_VERB_CALL.search(cmd):
+            return True, ""
+        return False, (
+            "[kill_guard] Refused: the kill guard could not load "
+            f"(import vco_lib.kill_guard failed: {exc}). This is a broken VCO "
+            "install: re-run the orchestrator's install / update so the hook "
+            "runs with the VCO venv, then retry."
+        )
+    message = static_check(cmd, shell)
+    return (True, "") if message is None else (False, message)
+
+
 def check_command(cmd: str, _depth: int = 0, shell: str = "bash") -> tuple[bool, str]:
     """Check a command string for security violations.
 
@@ -1314,6 +1350,14 @@ def check_command(cmd: str, _depth: int = 0, shell: str = "bash") -> tuple[bool,
         safe, reason = check_powershell(cmd)
         if not safe:
             return safe, reason
+    # v0.2.105 kill guard, layer 1 (static deny): kills that can take down
+    # the user's session — pid 1, the shell's parent, `pkill -f` on a broad
+    # pattern, ... The rules live in vco_lib/kill_guard.py (one home, shared
+    # with the runtime guard); a here-doc body written to a file is data.
+    safe, reason = _kill_guard_check(
+        cmd if shell == "powershell" else _strip_heredoc_bodies(cmd), shell)
+    if not safe:
+        return safe, reason
     # v0.2.88 (FP-heredoc): build two scan surfaces from the ORIGINAL command
     # (newlines intact so here-doc boundaries survive), then normalize
     # whitespace for the flat-regex rules. The env-read rules run on the

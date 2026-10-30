@@ -946,6 +946,20 @@ def _matcher_migrations() -> Tuple[MatcherMigration, ...]:
                 "so the pre-compact snapshot went stale and the reinject "
                 "hook replayed it after every manual compaction"
             )),
+        # v0.2.105: the kill guard's runtime layer rides in lean-ctx-rewrite
+        # (the ONE updatedInput emitter for shell tools — two rewriters for
+        # one call conflict), so that hook must now also see PowerShell-tool
+        # calls (Stop-Process / kill / spps / taskkill). Its lean-ctx stage
+        # still steps aside for any tool but Bash.
+        MatcherMigration(
+            event="PreToolUse", old="Bash", new="Bash|PowerShell",
+            targets=both("lean-ctx-rewrite"),
+            retired_in="v0.2.105",
+            reason=(
+                "the kill guard's runtime rewrite lives in lean-ctx-rewrite "
+                "(one updatedInput emitter per shell call) and must also see "
+                "PowerShell-tool kills; compression itself stays Bash-only"
+            )),
         # v0.2.104: Monitor left the wait-loop guard's self-wake group (it is
         # Claude Code's sanctioned streaming tool); an installed group keeps
         # the old matcher unless this row moves it.

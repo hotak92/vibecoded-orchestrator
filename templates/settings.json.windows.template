@@ -261,7 +261,7 @@
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -619,6 +619,72 @@
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
             "timeout": 10,
             "if": "Bash(grep *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(bash *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(sh *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(source *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(. *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(./*)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(eval *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(coproc *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(case *)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(true)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(:)"
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/wait-guard.ps1\" pretooluse",
+            "timeout": 10,
+            "if": "Bash(echo *)"
           }
         ]
       },

@@ -90,6 +90,32 @@ a wait inside, an unbounded loop with a no-work body, or a
 condition-refresh poll denies; a loop doing real work — or reading input
 in its condition — passes).
 
+Code a shell runs from ELSEWHERE (v0.2.105; peer field report
+2026-10-21 and the R9 base-equal gaps): the SCRIPT FILE a command runs
+(``bash poll.sh``, ``./poll.sh`` with a shell shebang, ``source``/``.``,
+``cat poll.sh | bash``, a ``timeout``/``xargs`` wrapper in front; a
+``.ps1`` on PowerShell) is read — at most :data:`SCRIPT_MAX_BYTES`, text
+only, resolved against the hook input's ``cwd`` — and judged by this same
+classifier in its SCRIPT READING: a loop that waits, a busy-wait or
+condition-refresh loop, ``watch`` and ``tail -f`` are polls, while a single
+pause is not (a script is a program) and a function body is judged where
+it is defined. Code fed to a shell as TEXT — on stdin from a literal
+``echo``/``printf``, a here-string, a heredoc — and code held in a
+variable assigned a literal earlier in the same command (``c='sleep 5';
+eval "$c"`` / ``$c`` / ``bash -c "$c"``) is judged like a ``bash -c``
+body; a ``case`` arm and a ``coproc`` command are judged like any other
+segment. ``run_in_background`` stays exempt from all of it.
+
+No-op wait loops (v0.2.105): the :data:`NOOP_REPEAT_MAX`-th IDENTICAL call
+that does nothing (``true``, ``:``, a bare ``echo …``/``Write-Host``,
+``sleep 0``) from one session/agent within :data:`NOOP_REPEAT_WINDOW_S` is
+denied — "end your turn; the completion notification wakes you".
+
+One-shot wake-ups (owner ruling 2026-10-29, #508): a ``CronCreate`` whose
+input carries the explicit ``recurring: false`` fires once and is allowed
+in the main chat; recurring (or unspecified) ones keep the /loop-or-
+/schedule rule, and subagents are refused either way.
+
 Shape (A>B>C, like the v0.2.101 injection surfaces): this module is the
 pure classifier + a small ephemeral-state helper; the ``.sh`` / ``.ps1``
 hooks (``templates/hooks/wait-guard.{sh,ps1}``) are THIN wrappers that
@@ -165,6 +191,7 @@ still accumulate.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -179,10 +206,12 @@ from vco_lib.bash_command_walk import (
     LOOP_OPENERS,
     SHELL_DASH_C_VERBS,
     ChainSegment,
+    command_words as _command_words,
     dash_c_subcommand,
     literal_eval_body,
     peel_wrapper_verbs,
     split_chain,
+    split_chain_ops,
     strip_env_assignments,
     strip_subshell_parens,
     tokenize,
@@ -199,16 +228,25 @@ from vco_lib.powershell_command import (
     PS_WAIT_VERBS,
     SHELL_TOOLS,
     command_for_bash_readers,
+    has_loop as ps_has_loop,
+    statements as ps_statements,
 )
 from vco_lib.env_values import env_int
+from vco_lib.wait_guard_bounded import WAIT_BUDGET_S, bounded_loop_sleeps
 from vco_lib.wait_guard_literal import literal_text_only
 
 __all__ = [
     "DEFAULT_REPEAT_MAX",
     "DEFAULT_REPEAT_WINDOW_S",
+    "NOOP_REPEAT_MAX",
+    "NOOP_REPEAT_WINDOW_S",
+    "SCRIPT_MAX_BYTES",
     "SELF_WAKE_TOOLS",
     "UNLOCK_COMMANDS",
     "evaluate",
+    "noop_repeat_key",
+    "ps_script_pattern",
+    "read_script_text",
     "record_expansion_event",
     "shell_static_pattern",
     "static_pattern",
@@ -246,6 +284,19 @@ _BURST_COLLAPSE_S = 1.0
 #: Slash unlocks live far longer than one repeat window — a ``/loop``
 #: session routinely runs longer than 10 minutes.
 SLASH_TTL_S = 86400
+
+#: The no-op wait detector (v0.2.105, field report 2026-10-21: a subagent
+#: issued an endless series of Bash ``true`` calls to "wait" for its own
+#: background build). The Nth IDENTICAL no-op call (``true``, ``:``, a
+#: bare ``echo …``, ``sleep 0``) from one session/agent within the window
+#: is denied: calls 1..N-1 pass.
+NOOP_REPEAT_MAX = 3
+NOOP_REPEAT_WINDOW_S = 120
+
+#: Verbs that do nothing a caller could be waiting on. ``echo`` /
+#: ``write-host`` count only with no output redirection, no pipe and no
+#: command substitution; ``sleep`` only as ``sleep 0``.
+_NOOP_VERBS = frozenset({"true", ":", "echo", "write-host"})
 
 _KILL_SWITCH_ENV = "VCO_WAIT_GUARD"
 _OFF_VALUES = frozenset({"off", "0", "false", "no"})
@@ -319,6 +370,11 @@ def _sleep_pattern(body: List[str], seg: ChainSegment) -> Optional[tuple]:
     evidence = " ".join(body[:2])
     if seg.in_loop:
         return ("sleep", evidence)
+    ctx = _SCRIPT_CTX.get()
+    if ctx is not None and ctx.in_script:
+        # Inside a script FILE (v0.2.105) only the polling shapes count:
+        # a script is a program, and a single pause in it is not a poll.
+        return None
     args = body[1:]
     if not args or not all(_LITERAL_SLEEP_RE.match(a) for a in args):
         return ("sleep", evidence)
@@ -361,7 +417,9 @@ def _xargs_pattern(body: List[str], depth: int,
             sub = dash_c_subcommand(body[i:])
             if sub is not None:
                 return static_pattern(sub, depth=depth + 1, _in_loop=True)
-            return None
+            # v0.2.105: `xargs -n1 bash poll.sh` runs the script per item.
+            return _shell_input_pattern(body[i:], depth,
+                                        seg._replace(in_loop=True))
         return None  # the per-item command is something else — not a wait
     return None
 
@@ -374,12 +432,9 @@ def _pattern_of_tokens(tokens: List[str], depth: int,
     the loop; the condition tail is scanned as a segment of its own, with
     the opener's in-loop context, so its sleep denies regardless of
     position)."""
-    body = tokens
-    while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
-        body = body[1:]
-    # Subshell/group punctuation (R6): `( sleep 5 )` / `(sleep 5)` — the
-    # subshell's verb is what the parens wrap.
-    body = strip_subshell_parens(body)
+    # Keywords, subshell/group punctuation (R6: `( sleep 5 )` — the
+    # subshell's verb is what the parens wrap) and case heads/arms.
+    body = _command_words(tokens)
     if not body:
         return None
     verb = os.path.basename(body[0]).lower()
@@ -416,7 +471,18 @@ def _pattern_of_tokens(tokens: List[str], depth: int,
         sub = dash_c_subcommand(body)
         if sub is not None:
             return static_pattern(sub, depth=depth + 1, _in_loop=seg.in_loop)
-        return None
+        # v0.2.105: a shell with no -c runs a script file or its stdin.
+        return _shell_input_pattern(body, depth, seg)
+    if verb in _SOURCE_VERBS and len(body) > 1:
+        # `source poll.sh` / `. poll.sh` (v0.2.105); `source /dev/stdin`
+        # reads the pipe like a shell does.
+        if body[1] == "/dev/stdin":
+            return _stdin_pattern(body, depth, seg)
+        return _script_file_pattern(body[1], depth, seg, direct=False)
+    if "/" in body[0] and not body[0].startswith("$"):
+        # `./poll.sh` / `scripts/poll.sh` (v0.2.105): judged only when the
+        # file is a shell script (shell shebang, or none and a .sh name).
+        return _script_file_pattern(body[0], depth, seg, direct=True)
     if verb == "eval":
         # `while eval 'sleep 1'; do …` — a literal eval body in a loop
         # condition is re-parsed like a dash-c body (v0.2.103).
@@ -483,6 +549,11 @@ def _scan_wrapped(tokens: List[str], depth: int,
                 return static_pattern(
                     sub, depth=depth + 1, _in_loop=seg.in_loop,
                     _position_override=(seg.position, seg.chain_size))
+            # v0.2.105: `timeout 600 bash poll.sh` / `nohup bash <<< …`.
+            # No finding → keep scanning the tail exactly as before.
+            found = _shell_input_pattern(tokens[i:], depth, seg)
+            if found is not None:
+                return found
         if base == "eval":
             sub = literal_eval_body(tokens[i:])
             if sub is not None:
@@ -560,10 +631,7 @@ def _segment_does_real_work(seg: ChainSegment) -> bool:
     strip and wrongly read as a no-work body, R16 A-N2) — does."""
     if seg.assignments:
         return True  # an assignment statement is work
-    body = seg.tokens
-    while body and os.path.basename(body[0]).lower() in _LEADING_KEYWORDS:
-        body = body[1:]
-    body = strip_subshell_parens(body)
+    body = _command_words(seg.tokens)
     if not body:
         return False
     first = os.path.basename(body[0]).lower()
@@ -793,9 +861,389 @@ def _busy_wait_pattern(segments: List[ChainSegment], i: int) -> Optional[tuple]:
     return _condition_refresh_poll(cond_toks, body_stmts)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Code a shell runs from elsewhere: script files, stdin, variables
+# (v0.2.105 — peer field report 2026-10-21, R9 base-equal gaps)
+# ═══════════════════════════════════════════════════════════════════════
+
+#: The largest script file the guard reads (bytes). A larger, unreadable,
+#: binary or non-shell file passes through exactly as before v0.2.105.
+SCRIPT_MAX_BYTES = 256 * 1024
+
+#: How many script files deep the guard follows (a script that runs a
+#: script that runs a script stops being followed at the third).
+_SCRIPT_MAX_NESTING = 2
+
+#: ``source FILE`` / ``. FILE`` run FILE in the current shell.
+_SOURCE_VERBS = frozenset({"source", "."})
+
+#: A shebang naming a POSIX-family shell (``#!/bin/bash``,
+#: ``#!/usr/bin/env -S bash -e``): a directly executed file is judged only
+#: then (or with no shebang and a ``.sh`` name — the kernel's fallback).
+_SHELL_SHEBANG_RE = re.compile(
+    r"^#!\s*\S*?/(?:env\s+(?:-\S+\s+)*)?(?:ba|da|z|k)?sh\b")
+
+#: Shell options that take a separate VALUE token (``bash -o pipefail
+#: x.sh``, ``bash --rcfile r x.sh``) — the value is not the script.
+_SHELL_VALUE_OPTS = frozenset({"-o", "+o", "-O", "+O", "--rcfile",
+                               "--init-file"})
+
+#: Redirection operators whose target is the NEXT token.
+_SPACED_REDIRECTS = frozenset({"<", ">", ">>", "<<<", "2>", "2>>", "&>",
+                               "&>>", "1>", "<>"})
+
+
+class _ScriptCtx:
+    """Where script files resolve and how deep the guard already is.
+    ``in_script`` switches the fixed-sleep rule to its script reading:
+    only loops, ``watch`` and ``tail -f`` count, a single pause does not."""
+
+    __slots__ = ("cwd", "nesting", "in_script")
+
+    def __init__(self, cwd: str, nesting: int = 0, in_script: bool = False):
+        self.cwd = cwd
+        self.nesting = nesting
+        self.in_script = in_script
+
+
+#: Set by :func:`shell_static_pattern` when the caller names a working
+#: directory (:func:`evaluate` always does). Unset → no file is read: the
+#: classifier stays pure for every other caller.
+_SCRIPT_CTX: "contextvars.ContextVar[Optional[_ScriptCtx]]" = (
+    contextvars.ContextVar("vco_wait_guard_script_ctx", default=None))
+
+
+def _judge_inline(text: str, depth: int, seg: ChainSegment) -> Optional[tuple]:
+    """Code handed to a shell as TEXT (stdin, a here-string, a variable) is
+    judged exactly like a ``bash -c`` body: same loop context, same
+    position when it is the outer segment's whole content."""
+    if depth >= _MAX_TIMEOUT_SCAN_DEPTH or not text.strip():
+        return None
+    return static_pattern(text, depth=depth + 1, _in_loop=seg.in_loop,
+                          _position_override=(seg.position, seg.chain_size))
+
+
+def _shell_operand(tokens: List[str]) -> tuple:
+    """``(kind, value)`` for a shell invoked WITHOUT ``-c``
+    (``tokens[0]`` is the shell): ``("herestring", text)``,
+    ``("stdin", None)`` (``bash``, ``bash -s …``, ``bash /dev/stdin``,
+    ``bash -``) or ``("file", path)``; ``(None, None)`` when the shape is
+    not one of those."""
+    i = 1
+    n = len(tokens)
+    reads_stdin_flag = False
+    while i < n:
+        t = tokens[i]
+        if t == "<<<":
+            return ("herestring", tokens[i + 1] if i + 1 < n else "")
+        if t.startswith("<<<"):
+            return ("herestring", t[3:])
+        if t in _SPACED_REDIRECTS:
+            i += 2
+            continue
+        if re.match(r"^\d*(>>?|<|&>>?)", t) or t.startswith(">") \
+                or t.startswith("<"):
+            i += 1
+            continue
+        if t == "--":
+            i += 1
+            break
+        if t in _SHELL_VALUE_OPTS:
+            i += 2
+            continue
+        if t.startswith("--"):
+            i += 1
+            continue
+        if (t.startswith("-") or t.startswith("+")) and len(t) > 1:
+            if "s" in t[1:]:
+                reads_stdin_flag = True
+            i += 1
+            continue
+        break
+    # Redirections may also follow the operand; look for a here-string.
+    for j in range(i, n):
+        if tokens[j] == "<<<":
+            return ("herestring", tokens[j + 1] if j + 1 < n else "")
+        if tokens[j].startswith("<<<"):
+            return ("herestring", tokens[j][3:])
+    if reads_stdin_flag:
+        return ("stdin", None)
+    if i >= n or tokens[i] in ("-", "/dev/stdin"):
+        return ("stdin", None)
+    return ("file", tokens[i])
+
+
+def _producer_text(producer: tuple) -> Optional[tuple]:
+    """What a pipe producer feeds the shell: ``("code", text)`` for an
+    ``echo``/``printf`` of literal words, ``("file", path)`` for
+    ``cat FILE``; ``None`` for anything else (a non-literal word — ``$``
+    or a backtick — is never guessed at)."""
+    words = _command_words(peel_wrapper_verbs(strip_env_assignments(
+        list(producer))))
+    if not words:
+        return None
+    verb = os.path.basename(words[0]).lower()
+    args = words[1:]
+    if verb == "cat" and len(args) == 2 and args[0] == "<<<":
+        return ("code", args[1])  # `cat <<EOF | bash` reaches here inlined
+    if verb == "cat" and len(args) == 1 and not args[0].startswith("-"):
+        return ("file", args[0])
+    if any("$" in a or "`" in a for a in args):
+        return None
+    if verb == "echo":
+        escapes = False
+        while args and re.fullmatch(r"-[neE]+", args[0]):
+            escapes = escapes or "e" in args[0]
+            args = args[1:]
+        text = " ".join(args)
+        return ("code", text.replace("\\n", "\n") if escapes else text)
+    if verb == "printf" and args:
+        fmt, rest = args[0], args[1:]
+        if not rest:
+            return ("code", fmt.replace("\\n", "\n"))
+        if fmt.replace("\\n", "").replace("%s", "").strip() == "":
+            return ("code", "\n".join(rest))
+    return None
+
+
+def _stdin_pattern(tokens: List[str], depth: int,
+                   seg: ChainSegment) -> Optional[tuple]:
+    """A shell (or ``source /dev/stdin``) reading CODE from a pipe."""
+    if not seg.piped_from:
+        return None
+    fed = _producer_text(seg.piped_from)
+    if fed is None:
+        return None
+    kind, value = fed
+    if kind == "code":
+        return _judge_inline(value, depth, seg)
+    return _script_file_pattern(value, depth, seg, direct=False)
+
+
+def _shell_input_pattern(tokens: List[str], depth: int,
+                         seg: ChainSegment) -> Optional[tuple]:
+    """A shell invoked without ``-c``: judge the code it actually runs —
+    a here-string (heredocs reach here as here-strings, see
+    :func:`static_pattern`), the code piped into it, or its script file."""
+    kind, value = _shell_operand(tokens)
+    if kind == "herestring":
+        return _judge_inline(value or "", depth, seg)
+    if kind == "stdin":
+        return _stdin_pattern(tokens, depth, seg)
+    if kind == "file":
+        return _script_file_pattern(value, depth, seg, direct=False)
+    return None
+
+
+def _resolve_script_path(word: str, cwd: str) -> Optional[Path]:
+    if not word or any(c in word for c in "$`*?[]{}"):
+        return None  # not a literal path: never guessed at
+    if word.startswith("~"):
+        word = os.path.expanduser(word)
+    path = Path(word)
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    if os.sep != "\\" and "\\" in word and not path.exists():
+        # A PowerShell-style `.\poll.ps1` read on a POSIX host.
+        path = Path(cwd) / word.replace("\\", "/")
+    return path
+
+
+def read_script_text(word: str, cwd: str, *, direct: bool = False,
+                     suffixes: tuple = (".sh",)) -> Optional[str]:
+    """The text of the script file ``word`` names (resolved against
+    ``cwd``), or ``None`` when it is not one the guard reads: not a
+    literal path, missing, not a regular file, larger than
+    :data:`SCRIPT_MAX_BYTES`, binary (a NUL byte), unreadable — or, for a
+    DIRECT execution (``./poll.sh``), not a shell script (no shell
+    shebang, and not a shebang-less file with one of ``suffixes``).
+    Never raises."""
+    path = _resolve_script_path(word, cwd)
+    if path is None:
+        return None
+    try:
+        st = path.stat()
+        if not path.is_file() or st.st_size > SCRIPT_MAX_BYTES:
+            return None
+        data = path.read_bytes()[:SCRIPT_MAX_BYTES + 1]
+    except (OSError, ValueError):
+        return None
+    if len(data) > SCRIPT_MAX_BYTES or b"\0" in data:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    if direct:
+        first = text.split("\n", 1)[0]
+        if first.startswith("#!"):
+            if not _SHELL_SHEBANG_RE.match(first):
+                return None
+        elif not path.name.lower().endswith(suffixes):
+            return None
+    return text
+
+
+def _script_file_pattern(word: str, depth: int, seg: ChainSegment, *,
+                         direct: bool) -> Optional[tuple]:
+    """Judge the shell script a command runs (``bash poll.sh``,
+    ``source poll.sh``, ``./poll.sh``, ``cat poll.sh | bash``) with the
+    same classifier, in its script reading (:class:`_ScriptCtx`): a loop
+    that waits, a busy-wait or condition-refresh loop, ``watch`` or
+    ``tail -f`` inside the file is a poll; a single fixed pause is not.
+    A loop whose worst-case total sleep is proved within the budget is a
+    bounded retry (:mod:`vco_lib.wait_guard_bounded`) unless the script
+    itself runs in a loop. Read only when a working directory is known
+    (:data:`_SCRIPT_CTX`)."""
+    ctx = _SCRIPT_CTX.get()
+    if ctx is None or ctx.nesting >= _SCRIPT_MAX_NESTING:
+        return None
+    text = read_script_text(word, ctx.cwd, direct=direct)
+    if text is None:
+        return None
+    token = _SCRIPT_CTX.set(_ScriptCtx(ctx.cwd, ctx.nesting + 1, True))
+    try:
+        if literal_text_only(text):
+            return None
+        found = static_pattern(text, depth=depth + 1, _in_loop=seg.in_loop,
+                               _bounded_loops=not seg.in_loop)
+    finally:
+        _SCRIPT_CTX.reset(token)
+    if found is None:
+        return None
+    name, evidence = found
+    return ("%s in script %s" % (name, word), evidence)
+
+
+def ps_script_pattern(command: str, cwd: str) -> Optional[tuple]:
+    """The PowerShell twin of the script-file rule (v0.2.105): a
+    ``.ps1`` the command runs (``.\\poll.ps1``, ``& .\\poll.ps1``,
+    ``. .\\poll.ps1``, ``pwsh -File poll.ps1``) is read and judged by the
+    PowerShell rules (its Bash reading through :func:`static_pattern`,
+    then :func:`~vco_lib.powershell_command.loop_pattern`), in the script
+    reading. A ``bash poll.sh`` from PowerShell is judged through the
+    Bash reading by :func:`shell_static_pattern`."""
+    ctx = _SCRIPT_CTX.get()
+    nesting = ctx.nesting if ctx is not None else 0
+    if nesting >= _SCRIPT_MAX_NESTING:
+        return None
+    for stmt in ps_statements(command):
+        if not stmt:
+            continue
+        word = None
+        first = stmt[0]
+        if first.lower().endswith(".ps1"):
+            word = first
+        elif os.path.basename(first).lower().removesuffix(".exe") in (
+                "pwsh", "powershell"):
+            for k in range(1, len(stmt) - 1):
+                if stmt[k].lower() in ("-file", "-f"):
+                    word = stmt[k + 1]
+                    break
+        if word is None:
+            continue
+        text = read_script_text(word, cwd, suffixes=(".ps1",))
+        if text is None:
+            continue
+        token = _SCRIPT_CTX.set(_ScriptCtx(cwd, nesting + 1, True))
+        try:
+            found = static_pattern(command_for_bash_readers(
+                POWERSHELL_TOOL, text))
+            if found is None:
+                # The bounded-wait budget (v0.2.105 fix round) only when
+                # nothing loops around this script's call.
+                found = loop_pattern(
+                    text, wait_budget_s=(0.0 if ps_has_loop(command)
+                                         else WAIT_BUDGET_S))
+            if found is None:
+                found = ps_script_pattern(text, cwd)
+        finally:
+            _SCRIPT_CTX.reset(token)
+        if found is not None:
+            name, evidence = found
+            if " in script " not in name:
+                name = "%s in script %s" % (name, word)
+            return (name, evidence)
+    return None
+
+
+#: Statements that assign shell variables from their arguments.
+_DECLARE_VERBS = frozenset({"export", "declare", "local", "readonly",
+                            "typeset"})
+_VAR_REF_RE = re.compile(r"^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$")
+
+
+def _note_assignments(seg: ChainSegment, values: Dict[str, str]) -> None:
+    """Track ``NAME=<literal>`` from an assignment-only statement or an
+    ``export``/``declare``/``local`` statement; a non-literal value
+    (``$`` or a backtick) forgets the name — it is never guessed at."""
+    words: List[str] = []
+    if not seg.tokens:
+        words = list(seg.assignments)
+    else:
+        body = _command_words(seg.tokens)
+        if body and body[0] in _DECLARE_VERBS:
+            words = [w for w in body[1:] if not w.startswith("-")]
+    for w in words:
+        m = _ASSIGN_RE.match(w)
+        if m is None:
+            continue
+        value = w[m.end():]
+        if "$" in value or "`" in value or "+=" in w[:m.end()]:
+            values.pop(m.group(1), None)
+        else:
+            values[m.group(1)] = value
+
+
+def _var_ref(word: str) -> Optional[str]:
+    m = _VAR_REF_RE.match(word)
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def _variable_code(seg: ChainSegment, values: Dict[str, str]) -> Optional[str]:
+    """The code a segment runs out of a variable assigned a literal EARLIER
+    in the same command: ``eval "$c"``, ``$c args`` as the command word,
+    ``bash -c "$c"``. ``None`` otherwise."""
+    if not values or not seg.tokens:
+        return None
+    body = _command_words(seg.tokens)
+    if not body:
+        return None
+    verb = os.path.basename(body[0]).lower()
+    name = _var_ref(body[0])
+    if name is not None and name in values:
+        return " ".join([values[name]] + body[1:])
+    if verb == "eval" and len(body) == 2:
+        ref = _var_ref(body[1])
+        if ref is not None and ref in values:
+            return values[ref]
+    if verb in SHELL_DASH_C_VERBS:
+        sub = dash_c_subcommand(body)
+        ref = _var_ref(sub) if sub is not None else None
+        if ref is not None and ref in values:
+            return values[ref]
+    return None
+
+
+def _heredoc_feeds_shell(line: str) -> bool:
+    """True when a heredoc opener LINE hands its body to a shell (or to
+    ``source``), so the body is CODE: the line's tokens hold a shell word
+    or ``source``/``.`` in command position."""
+    toks = tokenize(line) or []
+    for _op, segment in split_chain_ops(toks):
+        words = _command_words(peel_wrapper_verbs(strip_env_assignments(
+            segment)))
+        if not words:
+            continue
+        verb = os.path.basename(words[0]).lower()
+        if verb in SHELL_DASH_C_VERBS and dash_c_subcommand(words) is None:
+            return True
+        if verb in _SOURCE_VERBS and len(words) > 1 and words[1] == "/dev/stdin":
+            return True
+    return False
+
+
 def static_pattern(command: str, depth: int = 0, *,
                    _in_loop: bool = False,
-                   _position_override: Optional[tuple] = None) -> Optional[tuple]:
+                   _position_override: Optional[tuple] = None,
+                   _bounded_loops: bool = False) -> Optional[tuple]:
     """``(pattern_name, evidence)`` for the first polling shape in
     ``command``, else ``None``.
 
@@ -814,17 +1262,46 @@ def static_pattern(command: str, depth: int = 0, *,
     command is positioned WITHIN the body (both opt-in walker surfaces;
     the wait guard is the consumer). ``_in_loop`` /
     ``_position_override`` are the recursion's inherited context; callers
-    pass nothing."""
+    pass nothing. ``_bounded_loops`` (v0.2.105 fix round) is set only by
+    :func:`_script_file_pattern` for a script that does not itself run in
+    a loop: a plain ``sleep`` in a counted ``for`` loop whose worst-case
+    total sleep is within :data:`~vco_lib.wait_guard_bounded.WAIT_BUDGET_S`
+    is a bounded retry, not a poll
+    (:func:`~vco_lib.wait_guard_bounded.bounded_loop_sleeps`)."""
     if not isinstance(command, str) or not command.strip():
         return None
-    command, _heredoc_bodies = strip_heredocs(command)
+    # A heredoc body is data — EXCEPT when its line hands it to a shell
+    # (`bash <<'EOF'`, `cat <<EOF | bash`): then it is inlined as the
+    # here-string it amounts to and judged as code (v0.2.105).
+    command, _heredoc_bodies = strip_heredocs(
+        command, inline_when=_heredoc_feeds_shell)
+    ctx = _SCRIPT_CTX.get()
+    # In a script FILE a function body is judged where it is defined, not
+    # re-positioned at its calls: a retry pause in a helper that a loop
+    # calls once per item is not a poll (v0.2.105; a loop INSIDE the
+    # function still is).
+    in_script = ctx is not None and ctx.in_script
     segments = walk_segments(command, _in_loop=_in_loop,
                              _position_override=_position_override,
                              _with_substitutions=True,
-                             _with_function_bodies=True,
-                             _with_assignments=True)
+                             _with_function_bodies=not in_script,
+                             _with_assignments=True,
+                             _with_shell_runs=True)
+    bounded = (bounded_loop_sleeps(segments)
+               if _bounded_loops and in_script else frozenset())
+    values: Dict[str, str] = {}
     for i, seg in enumerate(segments):
-        found = _pattern_of_segment(seg, depth)
+        # Code held in a variable assigned a literal earlier in the same
+        # command (v0.2.105, R9): `c='sleep 5'; eval "$c"` / `$c` /
+        # `bash -c "$c"` (the recursed `$c` sits one level down).
+        code = _variable_code(seg, values)
+        if code is not None:
+            found = _judge_inline(code, depth, seg)
+            if found is not None:
+                return found
+        if seg.depth == 0:
+            _note_assignments(seg, values)
+        found = None if i in bounded else _pattern_of_segment(seg, depth)
         if found is not None:
             return found
         busy = _busy_wait_pattern(segments, i)
@@ -834,7 +1311,8 @@ def static_pattern(command: str, depth: int = 0, *,
 
 
 def shell_static_pattern(tool: str, command: str,
-                         readable: Optional[str] = None) -> Optional[tuple]:
+                         readable: Optional[str] = None, *,
+                         cwd: Optional[str] = None) -> Optional[tuple]:
     """The static (wait-shape) decision for one shell command — the ONE
     place :func:`evaluate` asks it. ``readable`` is the Bash reading
     (:func:`~vco_lib.powershell_command.command_for_bash_readers`).
@@ -845,13 +1323,28 @@ def shell_static_pattern(tool: str, command: str,
     as code, and no substitution in the line would be expanded
     (:func:`vco_lib.wait_guard_literal.literal_text_only`), a ``$(sleep 5)``
     in it is quoted search text — ``grep -n '$(sleep 5)' f`` — and no wait.
-    Every other command gets :func:`static_pattern`, the v0.2.103 reading,
-    unchanged."""
+    Every other command gets :func:`static_pattern`, the v0.2.103 reading.
+
+    ``cwd`` (v0.2.105): the directory relative script paths resolve
+    against. Given, the script FILES the command runs (``bash poll.sh``,
+    ``source poll.sh``, ``./poll.sh``, ``cat poll.sh | bash``; on
+    PowerShell ``.\\poll.ps1`` / ``pwsh -File poll.ps1``) are read — at
+    most :data:`SCRIPT_MAX_BYTES` each — and judged too; omitted, no file
+    is read."""
     if readable is None:
         readable = command_for_bash_readers(tool, command)
     if tool != POWERSHELL_TOOL and literal_text_only(command):
         return None
-    return static_pattern(readable)
+    if cwd is None:
+        return static_pattern(readable)
+    token = _SCRIPT_CTX.set(_ScriptCtx(cwd))
+    try:
+        found = static_pattern(readable)
+        if found is None and tool == POWERSHELL_TOOL:
+            found = ps_script_pattern(command, cwd)
+        return found
+    finally:
+        _SCRIPT_CTX.reset(token)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -890,6 +1383,37 @@ def bash_repeat_key(command: str, prefix: str = "bash") -> Optional[str]:
            for t in collect_candidates(command)):
         return None
     return prefix + ":" + " ".join(tokens)
+
+
+def noop_repeat_key(command: str) -> Optional[str]:
+    """The repeat key of a call that does NOTHING (v0.2.105): every
+    statement is ``true``, ``:``, ``sleep 0``, or a bare ``echo`` /
+    ``Write-Host`` (no output redirection, no pipe, no command
+    substitution — those do or feed work). ``None`` for anything else,
+    so a single real command anywhere in the line is never counted. The
+    key is the token-joined command: a DIFFERENT no-op is a different
+    key."""
+    if "$(" in command or "`" in command:
+        return None
+    tokens = tokenize(command)
+    if not tokens:
+        return None
+    for op, segment in split_chain_ops(tokens):
+        if op == "|":
+            return None
+        words = _command_words(segment)
+        if not words:
+            return None
+        verb = os.path.basename(words[0]).lower()
+        if verb == "sleep":
+            if words[1:] != ["0"]:
+                return None
+            continue
+        if verb not in _NOOP_VERBS:
+            return None
+        if any(_is_redirect_token(t) for t in _real_output_tokens(words[1:])):
+            return None
+    return "noop:" + " ".join(tokens)
 
 
 def read_repeat_key(tool_input: Dict[str, Any]) -> Optional[str]:
@@ -982,6 +1506,25 @@ def self_wake_main_reason(tool: str) -> str:
         " WHAT TO DO INSTEAD: only the user can start a loop (/loop); use a"
         " background command (run_in_background: true) and END YOUR TURN,"
         " and let the completion notification wake you." + _KNOB
+    )
+
+
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        return "%dth" % n
+    return "%d%s" % (n, {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th"))
+
+
+def noop_deny_reason(key: str, count: int, window_s: int,
+                     tool: str = "") -> str:
+    shown = key.split(":", 1)[1] if ":" in key else key
+    return (
+        f"BLOCKED by the VCO wait-loop guard: this is the {_ordinal(count)} "
+        f"identical no-op {_shell_label(tool or 'Bash')} call (`{shown}`) "
+        f"within {window_s}s — a wait loop that does nothing." + _WHY +
+        " WHAT TO DO INSTEAD: end your turn; the completion notification"
+        " wakes you (a run_in_background command or a subagent notifies you"
+        " when it finishes)." + _KNOB
     )
 
 
@@ -1087,8 +1630,26 @@ def _save_state(path: Path, state: Dict) -> None:
         _stderr("could not persist repeat-detector state (%s): allowing" % path)
 
 
+def _prune_window(env: Dict[str, str]) -> int:
+    """The window every load prunes the state with: the widest of the
+    detectors sharing the per-actor file, so loading for one detector
+    never drops another's still-live stamps (each detector counts only
+    the stamps inside its OWN window)."""
+    return max(env_int("VCO_WAIT_GUARD_REPEAT_WINDOW_S", DEFAULT_REPEAT_WINDOW_S,
+                       env=env, minimum=1), NOOP_REPEAT_WINDOW_S)
+
+
 def _state_path(payload: Dict[str, Any], state_root: Optional[Path]) -> Path:
     return _state_dir(state_root) / ("wait_%s.json" % _actor_key(payload))
+
+
+def _payload_cwd(payload: Dict[str, Any]) -> str:
+    """The directory a command runs in: the hook input's ``cwd`` (a
+    documented common input field), else this process's own."""
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        return cwd
+    return os.getcwd()
 
 
 def _stderr(line: str) -> None:
@@ -1102,11 +1663,21 @@ def _stderr(line: str) -> None:
 
 def _repeat_check(
     payload: Dict[str, Any], key: str, env: Dict[str, str],
-    state_root: Optional[Path], now: float, tool: str = "",
+    state_root: Optional[Path], now: float, tool: str = "", *,
+    window_s: Optional[int] = None, max_n: Optional[int] = None,
+    reason=None,
 ) -> Optional[str]:
-    window_s = env_int("VCO_WAIT_GUARD_REPEAT_WINDOW_S", DEFAULT_REPEAT_WINDOW_S,
+    """Count one call of ``key`` and deny the ``max_n``-th within
+    ``window_s`` (defaults: the status-check knobs). ``reason`` builds the
+    deny text from ``(key, count, window_s, tool)`` (default
+    :func:`repeat_deny_reason`)."""
+    if window_s is None:
+        window_s = env_int("VCO_WAIT_GUARD_REPEAT_WINDOW_S",
+                           DEFAULT_REPEAT_WINDOW_S, env=env, minimum=1)
+    if max_n is None:
+        max_n = env_int("VCO_WAIT_GUARD_REPEAT_MAX", DEFAULT_REPEAT_MAX,
                         env=env, minimum=1)
-    max_n = env_int("VCO_WAIT_GUARD_REPEAT_MAX", DEFAULT_REPEAT_MAX, env=env, minimum=1)
+    reason = repeat_deny_reason if reason is None else reason
     path = _state_path(payload, state_root)
     tool_use_id = payload.get("tool_use_id")
     if not isinstance(tool_use_id, str) or not tool_use_id:
@@ -1117,7 +1688,8 @@ def _repeat_check(
     # tool call: the read-modify-write runs under the shared cross-OS lock
     # so the concurrent spawns serialize instead of racing the state file.
     with portable_exclusive_lock(path.with_name(path.name + ".lock")):
-        state = _load_state(path, now, window_s, SLASH_TTL_S)
+        state = _load_state(path, now, max(window_s, _prune_window(env)),
+                            SLASH_TTL_S)
         entry = state["checks"].setdefault(key, {"stamps": [], "ids": {}})
         stamps = entry["stamps"]
         ids = entry["ids"]
@@ -1137,7 +1709,7 @@ def _repeat_check(
         _save_state(path, state)
         count = len(entry["stamps"])
     if count >= max_n:
-        return repeat_deny_reason(key, count, window_s, tool)
+        return reason(key, count, window_s, tool)
     return None
 
 
@@ -1164,10 +1736,14 @@ def evaluate(
     if tool in SELF_WAKE_TOOLS:
         if payload.get("agent_id"):
             return self_wake_subagent_reason(str(tool))
-        window_s = env_int("VCO_WAIT_GUARD_REPEAT_WINDOW_S", DEFAULT_REPEAT_WINDOW_S,
-                            env=env, minimum=1)
+        if tool == "CronCreate" and tool_input.get("recurring") is False:
+            # Owner ruling 2026-10-29 (#508): a ONE-SHOT scheduled wake-up
+            # fires once — it is not a poll. Only the explicit
+            # `recurring: false` counts; a missing or non-boolean field is
+            # the recurring default and keeps the rule below.
+            return None
         path = _state_path(payload, state_root)
-        state = _load_state(path, now, window_s, SLASH_TTL_S)
+        state = _load_state(path, now, _prune_window(env), SLASH_TTL_S)
         if state["slash"]:
             return None
         return self_wake_main_reason(str(tool))
@@ -1182,7 +1758,8 @@ def evaluate(
         # PowerShell (v0.2.102 W5-D): read through its Bash-equivalent form
         # — one detector for both shells (vco_lib.powershell_command).
         readable = command_for_bash_readers(tool, command)
-        pattern = shell_static_pattern(str(tool), command, readable)
+        pattern = shell_static_pattern(str(tool), command, readable,
+                                       cwd=_payload_cwd(payload))
         if pattern is not None:
             return static_deny_reason(command, pattern, str(tool))
         if tool == POWERSHELL_TOOL:
@@ -1191,6 +1768,12 @@ def evaluate(
             loop = loop_pattern(command)
             if loop is not None:
                 return static_deny_reason(command, loop, str(tool), translated=False)
+        noop = noop_repeat_key(readable)
+        if noop is not None:
+            return _repeat_check(payload, noop, env, state_root, now, str(tool),
+                                 window_s=NOOP_REPEAT_WINDOW_S,
+                                 max_n=NOOP_REPEAT_MAX,
+                                 reason=noop_deny_reason)
         key = bash_repeat_key(
             readable, "powershell" if tool == POWERSHELL_TOOL else "bash")
         if key is not None:
@@ -1238,10 +1821,8 @@ def record_expansion_event(
     if not isinstance(name, str) or name not in UNLOCK_COMMANDS:
         return False
     now = time.time() if now is None else now
-    window_s = env_int("VCO_WAIT_GUARD_REPEAT_WINDOW_S", DEFAULT_REPEAT_WINDOW_S,
-                        env=env, minimum=1)
     path = _state_path(payload, state_root)
-    state = _load_state(path, now, window_s, SLASH_TTL_S)
+    state = _load_state(path, now, _prune_window(env), SLASH_TTL_S)
     state["slash"][name] = now
     _save_state(path, state)
     return True

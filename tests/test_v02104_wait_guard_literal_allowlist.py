@@ -309,6 +309,15 @@ LITERAL_SET: Set[str] = {lit for lit, _live in LITERAL_PAIRS}
 
 # ─── 1. the differential ──────────────────────────────────────────────────
 
+#: The ONLY rows HEAD may deny that v0.2.103 allowed: the R9 base-equal
+#: gaps v0.2.105 closed on purpose — code a shell reads from a here-string
+#: is code (tests/test_v02105_wait_guard_scripts_noop.py pins the rest).
+V02105_CLOSED_GAPS = [
+    "bash <<< 'sleep 5'",
+    "bash <<< 'x=$(sleep 5)'",
+    "bash -s <<< 'x=$(sleep 5)'",
+]
+
 
 def test_head_never_weaker_than_v02103_outside_the_literal_set():
     rows = [cmd for _raw, cmd in _review_rows()] + _non_literal_rows() \
@@ -326,7 +335,8 @@ def test_head_never_weaker_than_v02103_outside_the_literal_set():
             stricter.append(cmd)
     assert len(rows) > 1000, len(rows)
     assert weaker == [], f"HEAD allows what v0.2.103 denies: {weaker[:10]}"
-    assert stricter == [], f"HEAD denies what v0.2.103 allows: {stricter[:10]}"
+    assert sorted(stricter) == sorted(V02105_CLOSED_GAPS), (
+        f"HEAD denies what v0.2.103 allows: {stricter[:10]}")
     assert literal_allowed > 500 and base_denied > 900, (literal_allowed, base_denied)
 
 

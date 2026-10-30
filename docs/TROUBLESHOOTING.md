@@ -1062,6 +1062,11 @@ bash .claude/scripts/rc-native.sh start        # POSIX (Linux/macOS)
 powershell -NoProfile -ExecutionPolicy Bypass -File .claude/scripts/rc-native.ps1 start   # Windows (5.1)
 ```
 
+When Claude runs these for you (the `rc-native` skill), it runs them with
+the tool's `run_in_background: true`: the scripts hold a 25-second
+readiness loop, and the wait guard refuses a script that can wait that long
+in the foreground. Typed in your own terminal they run as usual.
+
 The server is detached (survives the terminal closing; not a boot service —
 it does not survive a reboot, just start it again), prints the
 `https://claude.ai/code?environment=...` join URL, and answers sessions

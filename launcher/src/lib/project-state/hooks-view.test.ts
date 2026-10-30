@@ -24,6 +24,8 @@ import {
   dispatcherRowPresent,
   gitVisibilityNote,
   isChecked,
+  killGuardLayer,
+  killGuardNote,
   ifRulesLabel,
   ifRulesTooltip,
   matcherLabel,
@@ -714,5 +716,64 @@ describe('routed sub-hook note on a disabled row (v0.2.102 W6-HTAB)', () => {
       expect(canToggle(r, true)).toBe(true);
       expect(stateLabel(r.state)).toBe('Disabled');
     }
+  });
+});
+
+describe('kill guard note on the rows that carry it (v0.2.105)', () => {
+  const rewrite = hook({
+    event: 'PreToolUse',
+    matcher: 'Bash|PowerShell',
+    command: 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/lean-ctx-rewrite.sh"',
+  });
+  const rewritePs = hook({
+    event: 'PreToolUse',
+    matcher: 'Bash|PowerShell',
+    command: 'powershell -NoProfile -File "${CLAUDE_PROJECT_DIR}\\.claude\\hooks\\lean-ctx-rewrite.ps1"',
+  });
+  const ptu = hook({
+    event: 'PreToolUse',
+    matcher: '*',
+    command: 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-tool-use.sh" "$CLAUDE_TOOL_NAME"',
+  });
+
+  it('names the runtime layer on lean-ctx-rewrite, both OS spellings, in every state', () => {
+    expect(killGuardLayer(rewrite.command)).toBe('runtime');
+    expect(killGuardLayer(rewritePs.command)).toBe('runtime');
+    for (const state of ['active', 'disabled'] as const) {
+      const note = killGuardNote({ ...rewrite, state });
+      expect(note).toMatch(/kill guard/);
+      expect(note).toMatch(/Turning this row off turns that check off/);
+      expect(note).toMatch(/lean-ctx setting does not affect it/);
+    }
+  });
+
+  it('names the static layer on pre-tool-use', () => {
+    expect(killGuardLayer(ptu.command)).toBe('static');
+    expect(killGuardNote(ptu)).toMatch(/static check/);
+  });
+
+  it('says nothing on any other row', () => {
+    expect(killGuardNote(hook())).toBe('');
+    expect(killGuardLayer('bash .claude/hooks/pre-tool-use-extra.sh')).toBeNull();
+  });
+
+  it('the lean-ctx hint says compression off leaves the kill guard on', () => {
+    expect(LEAN_CTX_HINT).toMatch(/does not affect the kill guard/);
+  });
+
+  it('is wired into a row `title` of HooksTab.svelte (parsed, not grepped)', () => {
+    const ast = parse(
+      readFileSync(new URL('./HooksTab.svelte', import.meta.url), 'utf8'),
+      { modern: true },
+    ) as unknown;
+    const titled = [...walk(ast)].filter(
+      (n) => n.type === 'Attribute' && n.name === 'title',
+    );
+    const calls = titled.flatMap((attr) =>
+      [...walk(attr.value)].filter(
+        (n) => n.type === 'CallExpression' && isIdent(n.callee, 'killGuardNote'),
+      ),
+    );
+    expect(calls.length).toBe(1);
   });
 });

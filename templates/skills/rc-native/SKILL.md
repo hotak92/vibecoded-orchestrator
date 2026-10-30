@@ -40,6 +40,17 @@ bash .claude/scripts/rc-native.sh start          # POSIX (Linux/macOS)
 powershell -NoProfile -ExecutionPolicy Bypass -File .claude/scripts/rc-native.ps1 start   # Windows
 ```
 
+**Run every rc-native command with `run_in_background: true`** on the
+Bash / PowerShell tool call — `start`, `status`, `url`, `stop` and `logs`
+alike. The scripts contain a 25-second readiness loop (`start` waits up to
+25 s for the server to report Ready), and VCO's wait guard refuses a script
+with a loop that can wait that long in the foreground; it reads the whole
+script, so the quick commands are refused too. In the background the call
+is allowed: end your turn, and when the completion notification arrives,
+read the command's output from it (the join URL, the pid or the error). Do
+not retry a refused call another way — re-issue it with
+`run_in_background: true`.
+
 Both are **idempotent**: an already-running server just prints the pid and
 the join URL. The Windows line uses `powershell` (Windows PowerShell 5.1,
 present on every stock Windows since 2009) with `-ExecutionPolicy Bypass`
@@ -83,7 +94,8 @@ logs [name]    # tail the log (join URL redacted for safe pasting)
 ```
 
 POSIX: `bash .claude/scripts/rc-native.sh <command> [name]` ·
-Windows: `powershell -NoProfile -ExecutionPolicy Bypass -File .claude/scripts/rc-native.ps1 <command> [name]`.
+Windows: `powershell -NoProfile -ExecutionPolicy Bypass -File .claude/scripts/rc-native.ps1 <command> [name]` —
+always with `run_in_background: true` (see above).
 
 ## Prerequisites to check before `start`
 
