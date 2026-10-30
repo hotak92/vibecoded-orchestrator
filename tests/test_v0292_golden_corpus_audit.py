@@ -51,13 +51,21 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 
 _FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "codegraph_golden"
 _EXPECTED_DIR = _FIXTURE_ROOT / "expected"
 _REPO_DIR = _FIXTURE_ROOT / "repo"
+#: v0.2.105 (config-files lane): the SECOND golden corpus — a mini repo of
+#: .ini/.json/.tweakers config files plus C++/Python readers. Its rows carry
+#: section ``start_line``/``end_line`` and a 300-key section chunked into
+#: several ``class_body`` slices, exactly the shapes the fixture README calls
+#: "the snapshot WAS the defect": a byte-for-byte regen would ratify a wrong
+#: slice silently, so this corpus gets the SAME line-fidelity audit.
+_EXPECTED_CONFIG_DIR = _FIXTURE_ROOT / "expected_config"
+_CONFIG_REPO_DIR = _FIXTURE_ROOT / "config_repo"
 
 #: (collection, body field) pairs the audit covers. ``CodeModule`` carries no
 #: line range, and ``CodeAPI`` / ``CodeInteraction`` store a route rather than
@@ -102,6 +110,56 @@ _ALLOWED: Dict[Tuple[str, str, str, str], str] = {
         "codesage budget working as designed."
     ),
 }
+
+
+#: Systematic, by-design divergences of the CONFIG corpus (v0.2.105 fix
+#: round, review c1ab-N1). The config extractor SYNTHESIZES its rows — that
+#: is the feature, not a defect: a section row renders every key of the
+#: section as ``key = value`` so the VALUES are searchable, a ``(root)``
+#: pseudo-section holds the file-level keys of files whose top level is not
+#: a named section, and a section past the chunk budget is stored as several
+#: rows that each carry the section's FULL key list in ``methods`` but only
+#: their own chunk's rendered body. The source-slice properties this audit
+#: checks for CODE rows cannot hold for those synthesized shapes, so they
+#: are ruled off here — per finding CODE, scoped by a ``full_name`` suffix
+#: where the divergence is narrower than the corpus (the ``(root)`` rows,
+#: the one chunked section). Every rule is ratcheted by
+#: :func:`test_no_config_allow_rule_has_gone_stale`: a rule that stops
+#: firing must be DELETED, never left as cover.
+_CONFIG_ALLOWED_RULES: Tuple[Tuple[str, Optional[str], str], ...] = (
+    ("start_line_punctuation_only", "::(root)",
+     "the (root) pseudo-section starts at the file's opening line — a "
+     "punctuation-only start line is the synthesized whole-file span, not a "
+     "mis-slice"),
+    ("name_not_at_start_line", "::(root)",
+     "'(root)' is a synthesized name for the keys outside any named "
+     "section; it never appears literally in the source"),
+    ("end_line_eof_blank_runaway", "::(root)",
+     "the (root) pseudo-section spans to EOF by construction — file-level "
+     "keys can appear anywhere in the file"),
+    ("body_not_source_slice", None,
+     "config class bodies are SYNTHESIZED 'key = value' renderings of the "
+     "section's keys (searchable values are the whole point of the config "
+     "row), never verbatim source slices — the same CLASS of deliberate "
+     "divergence as the Lua bodies in _ALLOWED above"),
+    ("method_not_in_class_body", "::tuning_table",
+     "the 300-key section is CHUNKED into several rows that each carry the "
+     "section's FULL key list in `methods` but only their own chunk's "
+     "rendered body — the other chunks' keys are legitimately not in this "
+     "row's body (same family as the chunked-function rule in _ALLOWED)"),
+)
+
+
+def _config_rule_hit(f: Finding) -> Optional[str]:
+    """The reason *f* is an allowed CONFIG-corpus divergence, or ``None``."""
+    for code, suffix, reason in _CONFIG_ALLOWED_RULES:
+        if f.code == code and (suffix is None or f.full_name.endswith(suffix)):
+            return reason
+    return None
+
+
+def _config_unallowed(findings: List[Finding]) -> List[Finding]:
+    return [f for f in findings if _config_rule_hit(f) is None]
 
 
 def audit_corpus(expected_dir: Path, repo_dir: Path) -> List[Finding]:
@@ -222,6 +280,83 @@ def test_the_audit_actually_inspected_the_corpus() -> None:
         )
     }
     assert len(languages) >= 10, f"only {languages} — a fixture stopped parsing"
+
+
+def test_every_stored_config_row_matches_its_own_fixture_source() -> None:
+    """v0.2.105 fix round (review c1ab-N1): the config golden corpus gets
+    the SAME line-fidelity audit as the original one.
+
+    ``expected_config/CodeClass.json`` pins section ``start_line``/
+    ``end_line`` and ``class_body`` slices — including a 300-key section
+    chunked across rows — and the snapshot comparison in
+    ``test_codegraph_golden.py`` is byte-for-byte against whatever the
+    analyzer produced, so a wrong line range or a truncated section body in
+    the config extractor would be ratified as "expected" on the first regen
+    and never questioned. This audit is the tool the fixture README says
+    must review snapshots; it needs NO allow-list entries for the config
+    rows (a finding here is a defect, not a known divergence)."""
+    if not (_EXPECTED_CONFIG_DIR.is_dir() and _CONFIG_REPO_DIR.is_dir()):
+        pytest.skip(
+            "the expected_config/config_repo golden corpus is not in this "
+            "tree yet (it lands with the v0.2.105 config-files lane merge); "
+            "this audit activates the moment the corpus exists — it must "
+            "NEVER be deleted to make a run green"
+        )
+    unallowed = _config_unallowed(
+        audit_corpus(_EXPECTED_CONFIG_DIR, _CONFIG_REPO_DIR))
+    assert not unallowed, (
+        "the CONFIG golden corpus stores rows its own fixture source "
+        "contradicts:\n"
+        + "\n".join(f"  - {f}" for f in unallowed)
+        + "\n\nFix the config extractor, or — if the divergence is a "
+        "genuinely deliberate, SYSTEMATIC shape of the synthesized config "
+        "rows — add a rule to _CONFIG_ALLOWED_RULES with the reason it is "
+        "correct. Do NOT regenerate to make this pass."
+    )
+
+
+def test_the_config_audit_actually_inspected_the_config_corpus() -> None:
+    """Positive control for the audit above (the same anti-vacuity rule the
+    original corpus has): config rows were SEEN, including rows whose source
+    is a config file — not only the C++/Python readers."""
+    if not (_EXPECTED_CONFIG_DIR.is_dir() and _CONFIG_REPO_DIR.is_dir()):
+        pytest.skip("config corpus not in this tree (see the audit above)")
+    rows = [
+        (base, r)
+        for base, _ in _AUDITED
+        for r in json.loads(
+            (_EXPECTED_CONFIG_DIR / f"{base}.json").read_text(encoding="utf-8")
+        )
+    ]
+    assert len(rows) >= 10, f"only {len(rows)} config rows audited — the corpus shrank"
+    config_rows = [
+        r for _base, r in rows
+        if str(r.get("file_path", "")).endswith((".ini", ".json", ".tweakers"))
+    ]
+    assert config_rows, (
+        "no config-file rows among the audited rows — the corpus (or the "
+        "auditor's collection list) stopped covering the config extractor"
+    )
+
+
+def test_no_config_allow_rule_has_gone_stale() -> None:
+    """The _CONFIG_ALLOWED_RULES ratchet (same discipline as _ALLOWED):
+    every rule must still FIRE on the live corpus. A rule that stopped
+    matching is cover for the next loss to hide behind — DELETE it."""
+    if not (_EXPECTED_CONFIG_DIR.is_dir() and _CONFIG_REPO_DIR.is_dir()):
+        pytest.skip("config corpus not in this tree (see the audit above)")
+    findings = audit_corpus(_EXPECTED_CONFIG_DIR, _CONFIG_REPO_DIR)
+    stale = [
+        (code, suffix)
+        for code, suffix, _reason in _CONFIG_ALLOWED_RULES
+        if not any(f.code == code
+                   and (suffix is None or f.full_name.endswith(suffix))
+                   for f in findings)
+    ]
+    assert not stale, (
+        "these config allow-rules no longer describe anything — DELETE them "
+        f"rather than leaving them as cover: {stale}"
+    )
 
 
 def test_no_allow_listed_finding_has_gone_stale() -> None:

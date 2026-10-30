@@ -117,14 +117,40 @@ fn kg_live_count_scope(
     // The acting project's OWN collections count live regardless of the
     // access-matrix rows: primary, dev, diagrams (all derived from the
     // one binding-first naming rule, never from the display name alone
-    // for the root project — see `own_kg_access_collections`).
-    scope.insert(own.primary.clone());
-    scope.insert(own.dev.clone());
-    scope.insert(own.diagrams.clone());
+    // for the root project — see `own_kg_access_collections`). An EMPTY
+    // name — a degraded resolution (no project row, a DB error) — adds
+    // NOTHING: no placeholder ever lands in the live scope (v0.2.105
+    // fix round NIT).
+    for own_name in [&own.primary, &own.dev, &own.diagrams] {
+        if !own_name.is_empty() {
+            scope.insert(own_name.to_string());
+        }
+    }
     if !canonical_shared_root.is_empty() {
         scope.insert(canonical_shared_root.to_string());
     }
     scope
+}
+
+/// The Db side of the KG live-count scope (v0.2.105 fix round, counts
+/// LOW+NIT): the acting project's OWN collections, resolved binding-first
+/// by [`Db::own_kg_access_collections`]. One home, so the Db-backed test
+/// drives the SAME function the command calls.
+///
+/// `get_project` is read ONCE here, and a missing row or a DB error
+/// degrades to `OwnKgAccessCollections::default()` — no own names, so those
+/// classes are simply served from the count cache — never to the hand-built
+/// empty-string struct that used to insert `""` into the live scope.
+fn kg_own_collections(
+    db: &Db,
+    project_id: &str,
+    canonical_root: &str,
+) -> crate::db::access::OwnKgAccessCollections {
+    db.get_project(project_id)
+        .ok()
+        .flatten()
+        .map(|p| db.own_kg_access_collections(project_id, &p.name, canonical_root))
+        .unwrap_or_default()
 }
 
 #[command]
@@ -132,7 +158,18 @@ pub async fn kg_list_collections(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<Vec<KgCollectionAccess>, String> {
-    let base = weaviate_url(&db);
+    kg_list_collections_inner(&project_id, db.inner()).await
+}
+
+/// The command body without the Tauri `State` wrapper (v0.2.105 fix round,
+/// counts LOW): the Db-backed test drives the REAL command path — schema
+/// fetch, own/grants scope resolution, live+cached counts — against a fake
+/// Weaviate, so deleting the own-collections wiring turns it red.
+pub async fn kg_list_collections_inner(
+    project_id: &str,
+    db: &Db,
+) -> Result<Vec<KgCollectionAccess>, String> {
+    let base = weaviate_url(db);
     let client = weaviate_client(&base)?;
     // Weaviate exposes a schema listing at /v1/schema
     let schema_resp = client
@@ -160,7 +197,7 @@ pub async fn kg_list_collections(
         .unwrap_or_default();
 
     let grants: std::collections::HashMap<String, String> = db
-        .kg_list_access(&project_id)?
+        .kg_list_access(project_id)?
         .into_iter()
         .collect();
 
@@ -178,20 +215,10 @@ pub async fn kg_list_collections(
     // diagrams) count live even when the access matrix carries no row
     // for them (e.g. a pre-populate install's `_Development` class) —
     // resolved from launcher.db alone, never from Weaviate. Soft-fail:
-    // a DB error reading the project row degrades to the name-derived
-    // rule inside `own_kg_access_collections`, never to an error here.
-    let own = match db.get_project(&project_id) {
-        Ok(row) => {
-            let name = row.as_ref().map(|p| p.name.clone()).unwrap_or_default();
-            db.own_kg_access_collections(&project_id, &name, &canonical_root)
-        }
-        Err(_) => crate::db::access::OwnKgAccessCollections {
-            primary: String::new(),
-            dev: String::new(),
-            diagrams: String::new(),
-            is_root: false,
-        },
-    };
+    // a missing project row or a DB error degrades to NO own names (the
+    // classes are then served from the count cache), never to an error
+    // here and never to empty-string placeholders in the scope.
+    let own = kg_own_collections(db, project_id, &canonical_root);
 
     let mut names = Vec::with_capacity(classes.len());
     for cls in classes {
@@ -216,7 +243,7 @@ pub async fn kg_list_collections(
     // never counted). One home for the policy: weaviate_counts.
     let live_scope = kg_live_count_scope(&grants, &canonical_root, &own);
     let counts = vct_launcher_core::weaviate_counts::resolve_counts(
-        &db,
+        db,
         &client,
         &base,
         &names,
@@ -1518,6 +1545,227 @@ mod tests {
         let scope = super::kg_live_count_scope(&g, "", &own("Own_KnowledgeGraph"));
         assert_eq!(scope.len(), 3);
         assert!(scope.contains("Own_KnowledgeGraph"));
+    }
+
+    // ── v0.2.105 fix round (counts LOW + NIT): the Db-backed wiring ──────
+    //
+    // The pure-scope tests above hand-build `own(...)`, so nothing in them
+    // could fail if the command passed an EMPTY OwnKgAccessCollections (or
+    // deleted the own computation entirely). These tests drive the SAME
+    // `kg_own_collections` the command calls, against a real seeded Db —
+    // binding-first, no access rows — and the command body itself against a
+    // fake Weaviate.
+
+    #[test]
+    fn kg_own_collections_come_from_the_binding_not_the_access_rows() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project("p1", "Acme", "/tmp/acme", ProjectHost::Base, "acme")
+            .unwrap();
+        db.set_project_kg_binding(
+            "p1", "primary", "Acme_KnowledgeGraph", None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        // NO kg_collection_access rows at all: the matrix knows nothing
+        // about Acme_Development — the pre-populate-install state the
+        // v0.2.105 fix exists for.
+        let own = super::kg_own_collections(&db, "p1", "");
+        assert_eq!(own.primary, "Acme_KnowledgeGraph");
+        assert_eq!(own.dev, "Acme_Development");
+        assert_eq!(own.diagrams, "Acme_Diagrams");
+        let scope = super::kg_live_count_scope(
+            &std::collections::HashMap::new(), "", &own);
+        assert!(
+            scope.contains("Acme_Development"),
+            "the own dev class must reach the live scope through the Db wiring: {scope:?}"
+        );
+        assert!(scope.contains("Acme_Diagrams"), "{scope:?}");
+    }
+
+    #[test]
+    fn kg_own_collections_for_an_unknown_project_never_put_empty_strings_in_scope() {
+        // LEAVE-ALONE + the NIT: no project row → the degraded default, and
+        // the scope drops the empty names instead of inserting "" placeholders.
+        let db = Db::open_in_memory().unwrap();
+        let own = super::kg_own_collections(&db, "missing", "");
+        assert_eq!(
+            (own.primary.as_str(), own.dev.as_str(), own.diagrams.as_str()),
+            ("", "", "")
+        );
+        let scope = super::kg_live_count_scope(
+            &std::collections::HashMap::new(), "", &own);
+        assert!(
+            scope.is_empty(),
+            "a degraded own-resolution must add nothing to the live scope: {scope:?}"
+        );
+    }
+
+    /// A minimal fake Weaviate over raw TCP (the same shape as the
+    /// `vct-launcher-core::weaviate_counts` test harness): serves
+    /// `GET /v1/schema` with `classes`, answers `POST /v1/graphql`
+    /// Aggregate queries out of `counts`, and records every class it was
+    /// asked to count so the test asserts EXACTLY which classes were
+    /// Aggregate-queried (a live count lazy-loads a class into RAM — the
+    /// whole reason the scope exists).
+    struct FakeWeaviate {
+        port: u16,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeWeaviate {
+        async fn start(classes: Vec<String>, counts: Vec<(String, u64)>) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let asked_srv = asked.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = match listener.accept().await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let classes = classes.clone();
+                    let counts = counts.clone();
+                    let asked = asked_srv.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        loop {
+                            match stream.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&tmp[..n]);
+                                    if let Some(hdr_end) =
+                                        buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        let headers =
+                                            String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                                        let len = headers
+                                            .lines()
+                                            .find_map(|l| {
+                                                let (k, v) = l.split_once(':')?;
+                                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                                    v.trim().parse::<usize>().ok()
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .unwrap_or(0);
+                                        if buf.len() >= hdr_end + 4 + len {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        let request_line = text.lines().next().unwrap_or("").to_string();
+                        let payload = if request_line.contains("/v1/schema") {
+                            serde_json::json!({
+                                "classes": classes.iter()
+                                    .map(|c| serde_json::json!({"class": c}))
+                                    .collect::<Vec<_>>()
+                            })
+                            .to_string()
+                        } else {
+                            // Extract the class out of "Aggregate { <Class> {".
+                            let class = text
+                                .split("Aggregate { ")
+                                .nth(1)
+                                .and_then(|rest| rest.split(" {").next())
+                                .unwrap_or("")
+                                .to_string();
+                            asked.lock().unwrap().push(class.clone());
+                            match counts.iter().find(|(c, _)| *c == class) {
+                                Some((c, n)) => serde_json::json!({
+                                    "data": {"Aggregate": {c: [{"meta": {"count": n}}]}}
+                                })
+                                .to_string(),
+                                None => serde_json::json!({"data": {}}).to_string(),
+                            }
+                        };
+                        let http = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            payload.len(),
+                            payload
+                        );
+                        let _ = stream.write_all(http.as_bytes()).await;
+                    });
+                }
+            });
+            FakeWeaviate { port, asked }
+        }
+    }
+
+    #[tokio::test]
+    async fn kg_list_collections_counts_the_projects_own_dev_class_live() {
+        // THE COMMAND PATH (counts LOW): seeded project + primary binding,
+        // NO `_Development` access row — the dev class must be counted LIVE
+        // (Some(7)) because `kg_list_collections_inner` folds the Db-resolved
+        // own collections into the scope. Deleting the `kg_own_collections`
+        // wiring (or passing an empty struct) drops it to the never-counted
+        // cache value (None) and turns this red.
+        let fake = FakeWeaviate::start(
+            vec![
+                "Acme_KnowledgeGraph".to_string(),
+                "Acme_Development".to_string(),
+                "Strangers_KnowledgeGraph".to_string(),
+            ],
+            vec![
+                ("Acme_KnowledgeGraph".to_string(), 3),
+                ("Acme_Development".to_string(), 7),
+                ("Strangers_KnowledgeGraph".to_string(), 99),
+            ],
+        )
+        .await;
+        let db = Db::open_in_memory().unwrap();
+        db.lock()
+            .execute(
+                "INSERT INTO service_endpoints \
+                 (service, mode, scheme, host, port, grpc_port, source, updated_at) \
+                 VALUES ('weaviate','adopted_external','http','127.0.0.1',?1,?1,'install_probe',0)",
+                rusqlite::params![fake.port],
+            )
+            .unwrap();
+        db.insert_project("p1", "Acme", "/tmp/acme", ProjectHost::Base, "acme")
+            .unwrap();
+        db.set_project_kg_binding(
+            "p1", "primary", "Acme_KnowledgeGraph", None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let out = super::kg_list_collections_inner("p1", &db)
+            .await
+            .expect("command");
+        let by_name = |n: &str| {
+            out.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} not listed: {out:?}"))
+        };
+        assert_eq!(
+            by_name("Acme_Development").node_count,
+            Some(7),
+            "the project's OWN dev collection counts live through the command's own-wiring"
+        );
+        assert_eq!(by_name("Acme_KnowledgeGraph").node_count, Some(3));
+        // LEAVE-ALONE: a stranger's collection is NOT Aggregate-queried —
+        // it shows the (never-set) cache value, "—" in the GUI.
+        assert_eq!(by_name("Strangers_KnowledgeGraph").node_count, None);
+        let asked = fake.asked.lock().unwrap();
+        assert!(
+            asked.iter().any(|c| c == "Acme_Development"),
+            "the dev class was never live-queried: {asked:?}"
+        );
+        assert!(
+            !asked.iter().any(|c| c == "Strangers_KnowledgeGraph"),
+            "an out-of-scope class must never be Aggregate-queried: {asked:?}"
+        );
     }
 
     #[test]

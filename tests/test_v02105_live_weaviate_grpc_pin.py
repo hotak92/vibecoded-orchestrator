@@ -14,6 +14,7 @@ variables UNSET and record the port the client was built with.
 """
 from __future__ import annotations
 
+import os
 from unittest import mock
 
 import pytest
@@ -70,6 +71,109 @@ def test_connect_pairs_the_rest_host_with_the_resolved_grpc_port():
     kw = conn.call_args.kwargs
     assert (kw["http_host"], kw["http_port"], kw["grpc_host"]) == ("127.0.0.1", 18089, "127.0.0.1")
     assert kw["grpc_port"] == lw.DEAD_GRPC_PORT
+
+
+# ── W-N1 (v0.2.105 fix round 2): the PRODUCTION legs read GRPC_PORT only ──
+#
+# The live classes do not only build their own client through the helper —
+# they then drive production connects (vco_lib/weaviate_schema.py:504,
+# vco_lib/embedding_enrichment.py:342, vco_lib/weaviate_helpers.py:680),
+# each reading GRPC_PORT ONLY and defaulting to the live 50052. A run that
+# named just WEAVIATE_GRPC_PORT passed the old gate and sent those legs to
+# the LIVE server. The gate now promotes the named port into GRPC_PORT when
+# it opens, and refuses 50052 itself without an explicit opt-in.
+
+def _ready_200():
+    resp = mock.MagicMock(status=200)
+    resp.__enter__.return_value = resp
+    return resp
+
+
+@pytest.mark.usefixtures("no_grpc_env")
+def test_a_lone_weaviate_grpc_port_promotes_itself_into_grpc_port(monkeypatch):
+    """ACT: WEAVIATE_GRPC_PORT alone either skips or promotes itself — and
+    the gate opens, so it must promote: the production legs' own read
+    (``int(os.environ.get("GRPC_PORT", "50052"))``) must see 15005, not the
+    live default."""
+    monkeypatch.setenv("WEAVIATE_GRPC_PORT", "15005")
+    with mock.patch("urllib.request.urlopen", return_value=_ready_200()):
+        assert lw.skip_reason(_URL) is None
+    assert os.environ["GRPC_PORT"] == "15005"
+    assert int(os.environ.get("GRPC_PORT", "50052")) == 15005
+
+
+@pytest.mark.usefixtures("no_grpc_env")
+def test_promotion_never_overwrites_a_named_grpc_port(monkeypatch):
+    """LEAVE-ALONE: GRPC_PORT is the variable the operator (and the shipped
+    edges' order) put first — promotion must not touch a value it set."""
+    monkeypatch.setenv("GRPC_PORT", "15005")
+    monkeypatch.setenv("WEAVIATE_GRPC_PORT", "15006")
+    with mock.patch("urllib.request.urlopen", return_value=_ready_200()):
+        assert lw.skip_reason(_URL) is None
+    assert os.environ["GRPC_PORT"] == "15005"
+
+
+@pytest.mark.usefixtures("no_grpc_env")
+def test_a_shut_gate_promotes_nothing(monkeypatch):
+    """LEAVE-ALONE: when the server does not answer, the test skips and the
+    environment is left exactly as the operator set it."""
+    monkeypatch.setenv("WEAVIATE_GRPC_PORT", "15005")
+    with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+        assert lw.skip_reason(_URL) is not None
+    assert "GRPC_PORT" not in os.environ
+
+
+@pytest.mark.usefixtures("no_grpc_env")
+def test_connect_also_promotes_a_lone_weaviate_grpc_port(monkeypatch):
+    """A caller that builds a client WITHOUT consulting the gate first still
+    pairs the production legs with the port it named."""
+    monkeypatch.setenv("WEAVIATE_GRPC_PORT", "15005")
+    with mock.patch("weaviate.connect_to_custom") as conn:
+        lw.connect(_URL)
+    assert conn.call_args.kwargs["grpc_port"] == 15005
+    assert os.environ["GRPC_PORT"] == "15005"
+
+
+def test_an_explicit_mapping_leaves_the_real_environment_alone(monkeypatch):
+    """PURITY: every gate/client call that passes an explicit mapping (the
+    unit tests, a child-env builder) mutates nothing — promotion is a
+    real-environment side effect only."""
+    monkeypatch.delenv("GRPC_PORT", raising=False)
+    monkeypatch.setenv("WEAVIATE_GRPC_PORT", "15006")
+    with mock.patch("urllib.request.urlopen", return_value=_ready_200()):
+        assert lw.skip_reason(_URL, {"WEAVIATE_GRPC_PORT": "15005"}) is None
+    assert os.environ["WEAVIATE_GRPC_PORT"] == "15006"
+    assert "GRPC_PORT" not in os.environ
+
+
+def test_the_live_grpc_port_is_refused_without_an_explicit_opt_in():
+    """ACT: 50052 is the LIVE vco_weaviate's published gRPC port — naming it
+    skips (before any probe) unless the operator opts in deliberately."""
+    with mock.patch("urllib.request.urlopen") as probe:
+        why = lw.skip_reason(_URL, {"GRPC_PORT": "50052"})
+    assert why is not None
+    assert "50052" in why and lw.ALLOW_LIVE_GRPC_ENV in why
+    probe.assert_not_called()
+    with mock.patch("urllib.request.urlopen") as probe:
+        assert lw.skip_reason(_URL, {"WEAVIATE_GRPC_PORT": "50052"}) is not None
+    probe.assert_not_called()
+
+
+def test_the_live_grpc_port_runs_with_the_explicit_opt_in():
+    """LEAVE-ALONE: the opt-in is real — an operator who genuinely targets
+    the live server's gRPC port passes the gate (and still gets the
+    readiness probe)."""
+    env = {"GRPC_PORT": "50052", lw.ALLOW_LIVE_GRPC_ENV: "1"}
+    with mock.patch("urllib.request.urlopen", return_value=_ready_200()) as probe:
+        assert lw.skip_reason(_URL, env) is None
+    probe.assert_called_once()
+
+
+def test_the_opt_in_refusal_holds_for_a_non_truthy_value():
+    with mock.patch("urllib.request.urlopen") as probe:
+        why = lw.skip_reason(_URL, {"GRPC_PORT": "50052", lw.ALLOW_LIVE_GRPC_ENV: "0"})
+    assert why is not None and "50052" in why
+    probe.assert_not_called()
 
 
 # ── the wiring: each live class's own client code, gRPC env unset ─────────

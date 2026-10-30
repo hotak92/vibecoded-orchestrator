@@ -299,19 +299,41 @@ def test_apply_is_idempotent():
     assert not [c for c in fake.calls if c[0] == "PUT"]
 
 
-@pytest.mark.parametrize("version", ["1.28.4", "1.31.9", ""])
+@pytest.mark.parametrize("version", ["1.28.4", "1.31.9", "", "banana"])
 def test_apply_on_an_old_server_changes_nothing_at_all(version):
     """A pre-RQ server (an adopted Weaviate, or VCO's own kept on 1.28.4 when
     the new image could not be pulled) gets no shard load and no PUT — not
-    even the cache cap: a whole-schema PUT to it is unverified (review L3)."""
+    even the cache cap: a whole-schema PUT to it is unverified (review L3).
+
+    W-N2 (v0.2.105 fix round): a version that PARSED below the floor is
+    reported as the fact it is ("older than"); an unparseable one (empty,
+    garbled /v1/meta) is "not confirmed at or above" — the skip behaviour
+    is identical, but the sentence must not claim an age VCO cannot know."""
     fake = FakeWeaviate([_live("Foo_CodeFunction")], version=version)
     res = wvi.apply_policy("http://w:1", request=fake)
     assert res.ok and not res.rq_supported
-    assert res.skipped and "older than 1.32.0" in res.skipped
+    parseable = version in ("1.28.4", "1.31.9")
+    if parseable:
+        assert res.skipped and f"Weaviate {version} is older than 1.32.0" in res.skipped
+        assert "not confirmed" not in res.skipped
+    else:
+        assert res.skipped and "is not confirmed at or above 1.32.0" in res.skipped
+        assert "older than" not in res.skipped
     assert res.updated == [] and res.failed == []
     assert fake.calls == [("GET", "meta")]
     slot = fake.classes["Foo_CodeFunction"]["vectorConfig"]["qwen3_embed"]["vectorIndexConfig"]
     assert slot["vectorCacheMaxObjects"] == wvi.WEAVIATE_UNLIMITED_CACHE
+
+
+def test_version_confirmed_at_least_is_tri_state():
+    """The helper behind the wording: True/False on a parsed comparison,
+    None on anything unreadable (W-N2)."""
+    assert wvi.version_confirmed_at_least("1.37.18") is True
+    assert wvi.version_confirmed_at_least("1.28.4") is False
+    assert wvi.version_confirmed_at_least("") is None
+    assert wvi.version_confirmed_at_least("banana") is None
+    # server_supports_rq keeps its boolean contract on top of the tri-state.
+    assert wvi.server_supports_rq("banana") is False
 
 
 def test_apply_at_the_minimum_version_does_the_work():

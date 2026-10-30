@@ -11656,6 +11656,10 @@ def verify_configured_collections_exist(
     lands in ``unknown``) when Weaviate could not be reached — the caller must
     NOT report those as absent. Never raises.
     """
+    # The warning's identifying prefix lives in configured_collections (the
+    # create/retire side) — ONE home, and this file's line ratchet stays put.
+    from vco_lib.configured_collections import configured_absent_warning_prefix
+
     out: dict = {
         "probed": False, "present": [], "absent": [], "unknown": [],
         "warnings": [],
@@ -11698,7 +11702,8 @@ def verify_configured_collections_exist(
         elif state is False:
             out["absent"].append(name)
             msg = (
-                f"configured collection {name!r} ({key} in "
+                configured_absent_warning_prefix(name) +
+                f"{key} in "
                 f".claude/settings.json) does NOT exist in Weaviate at {url} — "
                 f"every query routed through it returns nothing, silently. "
                 f"Re-run `{_bootstrap_collections_cmd(proj_name, Path(folder))}` "

@@ -560,3 +560,83 @@ def test_cli_hook_escalates_only_when_the_page_proves_mixed(
                         "pkg.model.Model.combine")
     assert _caller_fetch_limits(coll) == [50, 500]
     assert "mirror.form.Form1.convert" not in row
+
+
+# ── 7. the truncation flag: ONE rule, both surfaces (v0.2.105 fix round) ──
+#
+# Pre-fix the CLI ran `len(callers) >= CALLERS_FETCH_LIMIT` on the ALREADY-
+# CAPPED list while the MCP ran `len(ordered_callers) > CALLERS_LIMIT` on
+# the unsliced one: with exactly 50 in-scope callers and a scan that was
+# not full, the CLI said "truncated" and the MCP did not. Both now compute
+# it through server._callers_answer_truncated, on the unsliced list.
+
+
+def _cli_callers_stdout(monkeypatch, capsys, coll, target: str) -> str:
+    """Drive the CLI's NON-hook callers branch and capture its stdout."""
+    qcg = pytest.importorskip("query_code_graph")
+    monkeypatch.setattr(qcg, "Filter", _Filter)
+    q = qcg.CodeGraphQuery(project=None)
+    q.client = _Client(coll)
+    q.query_structure("callers", target, hook_format=False,
+                      indexed_revision=False, source_file=None,
+                      exclude_file=None)
+    return capsys.readouterr().out
+
+
+def test_the_answer_truncation_rule_is_one_shared_helper() -> None:
+    """The rule's own truth table (act and leave-alone), and the CLI must
+    IMPORT it — one home, never a mirror."""
+    srv = pytest.importorskip("claude_mcp_servers.weaviate_mcp.server")
+    qcg = pytest.importorskip("query_code_graph")
+    assert hasattr(qcg, "_callers_answer_truncated"), (
+        "the CLI must import the shared rule from the server module"
+    )
+    f = srv._callers_answer_truncated
+    rows50 = [object()] * 50
+    # LEAVE-ALONE: exactly-cap in-scope callers with a scan that was NOT
+    # full listed everything found — complete, not truncated.
+    assert f(rows50, 55, 500, 50) is False
+    # ACT: more in-scope callers than the cap → the answer was cut.
+    assert f(rows50 + [object()], 56, 500, 50) is True
+    # ACT: the raw scan filled its width → there may be unseen rows.
+    assert f([object()] * 10, 50, 50, 50) is True
+
+
+def test_exactly_cap_in_scope_callers_read_as_complete_on_both_surfaces(
+        monkeypatch, capsys) -> None:
+    """THE NIT, reproduced: a mixed graph whose escalated scan (500) finds
+    exactly 50 in-scope callers (raw 55 < 500 — the scan was not full)
+    answered COMPLETE. Pre-fix the CLI printed the "Capped at the first 50"
+    warning anyway (>= on the capped list) while the MCP said
+    truncated=False."""
+    target = "pkg.model.Model.combine"
+    payload = _mcp_callers_payload(
+        monkeypatch, _Coll(_mixed_graph_capped_rows(mirror=5, own=50)),
+        target)
+    assert len(payload["results"]) == 50
+    assert payload["truncated"] is False, "the MCP side of the agreement"
+
+    out = _cli_callers_stdout(
+        monkeypatch, capsys,
+        _Coll(_mixed_graph_capped_rows(mirror=5, own=50)), target)
+    assert "Capped at the first" not in out, (
+        "the CLI must agree with the MCP: an exactly-full answer that saw "
+        "every row is complete — pre-fix this printed the cap warning"
+    )
+
+
+def test_over_cap_in_scope_callers_read_as_truncated_on_both_surfaces(
+        monkeypatch, capsys) -> None:
+    """LEAVE-ALONE side of the agreement: 51 in-scope callers ARE cut to
+    50 — both surfaces must say so."""
+    target = "pkg.model.Model.combine"
+    payload = _mcp_callers_payload(
+        monkeypatch, _Coll(_mixed_graph_capped_rows(mirror=5, own=51)),
+        target)
+    assert len(payload["results"]) == 50
+    assert payload["truncated"] is True
+
+    out = _cli_callers_stdout(
+        monkeypatch, capsys,
+        _Coll(_mixed_graph_capped_rows(mirror=5, own=51)), target)
+    assert "Capped at the first 50" in out

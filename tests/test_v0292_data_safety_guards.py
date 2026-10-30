@@ -1153,6 +1153,41 @@ class EnsureConfiguredCollectionsCreatesMissingTests(_Case):
         self.assertIn("Phantom_KnowledgeGraph", warning)
         self.assertIn("does NOT exist", warning)
 
+    def test_creating_a_class_never_drops_a_different_collections_warning(self):
+        """v0.2.105 fix round (review NIT): retiring the healed warning
+        matched a bare SUBSTRING — creating ``Phantom_KnowledgeGraph`` also
+        dropped the warning of a DISTINCT absent shared class whose name
+        merely contains it (``Phantom_KnowledgeGraph_Shared``), which is
+        exactly the warning this fix round says must STAND. The removal now
+        matches the one-home warning prefix
+        (``project_init.configured_absent_warning_prefix``)."""
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION="Phantom_KnowledgeGraph",
+            SHARED_KG_COLLECTION="Phantom_KnowledgeGraph_Shared")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([], posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], ["Phantom_KnowledgeGraph"])
+        self.assertEqual(report["absent"], ["Phantom_KnowledgeGraph_Shared"])
+        # the healed class's own warning is gone...
+        from vco_lib.configured_collections import (
+            configured_absent_warning_prefix,
+        )
+        healed_prefix = configured_absent_warning_prefix(
+            "Phantom_KnowledgeGraph")
+        self.assertFalse(
+            any(w.startswith(healed_prefix) for w in report["warnings"]),
+            report["warnings"])
+        # ...and the DISTINCT shared-collection warning STANDS — it was the
+        # substring drop's victim.
+        self.assertTrue(
+            any("Phantom_KnowledgeGraph_Shared" in w and "does NOT exist" in w
+                for w in report["warnings"]),
+            report["warnings"])
+        self.assertEqual(len(posts), 1, "only the OWN class is created")
+
     def test_kg_equals_shared_root_case_creates_once(self):
         """The orchestrator-root shape (KG == SHARED, one class serving both
         roles): the name is created ONCE (through the creatable

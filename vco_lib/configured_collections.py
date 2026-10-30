@@ -22,7 +22,25 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
-__all__ = ["ensure_configured_collections"]
+__all__ = ["configured_absent_warning_prefix", "ensure_configured_collections"]
+
+
+def configured_absent_warning_prefix(name: str) -> str:
+    """The identifying prefix of the F-12(b) "configured collection absent"
+    warning for *name* — ONE home for the warning's shape (v0.2.105 fix
+    round, review NIT). It lives here, beside the create side that retires
+    the warning, rather than in ``project_init`` (whose line ratchet is at
+    its measured floor).
+
+    :func:`vco_lib.project_init.verify_configured_collections_exist` builds
+    its warning starting with exactly this text, and
+    :func:`ensure_configured_collections` retires the warning of a class it
+    CREATED by matching this prefix — never by a bare ``name in w``
+    substring test, which also dropped a DIFFERENT collection's warning
+    whenever that name merely contained this one (the shared-collection
+    warning this fix round says must STAND, e.g. creating
+    ``X_KnowledgeGraph`` used to silence ``X_KnowledgeGraph_Shared``)."""
+    return f"configured collection {name!r} ("
 
 
 def ensure_configured_collections(
@@ -124,7 +142,16 @@ def ensure_configured_collections(
             continue  # the verify warning for this name stands
         out["created"].append(name)
         out["absent"].remove(name)
-        out["warnings"] = [w for w in out["warnings"] if name not in w]
+        # v0.2.105 fix round (review NIT): retire EXACTLY the warning verify
+        # built for THIS name — the one-home prefix, never a bare
+        # `name not in w` substring test, which also dropped a DIFFERENT
+        # collection's warning whenever that name merely contained this one
+        # (creating `X_KnowledgeGraph` used to silence the shared-collection
+        # warning for `X_KnowledgeGraph_Shared` — the very warning this fix
+        # round says must STAND).
+        _marker = configured_absent_warning_prefix(name)
+        out["warnings"] = [w for w in out["warnings"]
+                           if not w.startswith(_marker)]
         if log_event is not None:
             try:
                 log_event(
