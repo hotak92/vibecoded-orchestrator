@@ -210,6 +210,60 @@ def test_the_ps_budget_applies_only_inside_script_files(tmp_path, psdir):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# WG-1 — a loop a loop REACHES is unbounded (fix round 2)
+# ═══════════════════════════════════════════════════════════════════════
+
+#: A bounded loop inside a function that a loop of the same script calls:
+#: the caller multiplies the budget by an unknown count, so the loop is an
+#: unbounded poll (review WG-1).
+REACHED_FROM_A_LOOP_SH = {
+    "while_calls": ("f() {\n  for i in 1 2 3; do sleep 1; done\n}\n"
+                    "while true; do f; done\n"),
+    "until_calls": ("f() {\n  for i in 1 2 3; do sleep 1; done\n}\n"
+                    "until [ -f x ]; do f; sleep 1; done\n"),
+    "for_calls": ("f() { for i in 1 2 3; do sleep 1; done; }\n"
+                  "for k in a b; do f; done\n"),
+    "transitive": ("g() { f; }\nf() { for i in 1 2 3; do sleep 1; done; }\n"
+                   "while true; do g; done\n"),
+    "one_liner": ("f() { for i in 1 2 3; do sleep 1; done; }; "
+                  "while true; do f; done\n"),
+    "condition_call": ("f() { for i in 1 2 3; do sleep 1; done; }\n"
+                       "while f; do work; done\n"),
+    "until_condition_call": ("f() { for i in 1 2 3; do sleep 1; done; }\n"
+                             "until f; do work; done\n"),
+}
+
+#: The leave-alone side: a call that runs ONCE keeps the bounded retry, and
+#: a function nobody reaches from a loop keeps its own budget.
+NOT_REACHED_FROM_A_LOOP_SH = {
+    "called_once": "f() { for i in 1 2 3; do sleep 1; done; }\nf\n",
+    "other_loop": ("retry() { for i in 1 2 3; do sleep 1; done; }\n"
+                   "while true; do work; done\nretry\n"),
+}
+
+
+@pytest.fixture
+def reachdir(tmp_path):
+    d = tmp_path / "reach"
+    d.mkdir()
+    for name, body in {**REACHED_FROM_A_LOOP_SH,
+                       **NOT_REACHED_FROM_A_LOOP_SH}.items():
+        (d / f"{name}.sh").write_text(body, encoding="utf-8")
+    return d
+
+
+@pytest.mark.parametrize("name", sorted(REACHED_FROM_A_LOOP_SH))
+def test_a_bounded_loop_a_loop_reaches_is_refused(tmp_path, reachdir, name):
+    reason = _eval(tmp_path, "Bash", f"bash {name}.sh", reachdir)
+    assert reason is not None and "in script" in reason, name
+
+
+@pytest.mark.parametrize("name", sorted(NOT_REACHED_FROM_A_LOOP_SH))
+def test_a_bounded_loop_no_loop_reaches_is_allowed(tmp_path, reachdir, name):
+    assert _eval(tmp_path, "Bash", f"bash {name}.sh", reachdir) is None, name
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # The shipped scripts (the reviewer's verification shapes)
 # ═══════════════════════════════════════════════════════════════════════
 

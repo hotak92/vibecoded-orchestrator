@@ -1186,12 +1186,26 @@ def _ps_while_iterations(cond: List[_Tok], prefix: List[_Tok],
     return None
 
 
+_PS_GLUED_ASSIGN_RE = re.compile(r"^(\$[a-z_][a-z0-9_]*)(\+?=)(-?\d+)$")
+
+
+def _ps_unglue_assignment(words: List[str]) -> List[str]:
+    """``["$i=0"]`` -> ``["$i", "=", "0"]`` (and ``$i+=1``): PowerShell
+    accepts an assignment with no spaces, and the tokenizer keeps it one
+    word. Anything else is returned unchanged."""
+    if len(words) == 1:
+        m = _PS_GLUED_ASSIGN_RE.match(words[0])
+        if m:
+            return [m.group(1), m.group(2), m.group(3)]
+    return words
+
+
 def _ps_for_iterations(header: List[_Tok]) -> Optional[Tuple[str, int]]:
     """``(var, iterations)`` for ``for ($i = A; $i -lt B; $i++)``."""
     parts = _ps_stmts(header)
     if len(parts) != 3 or any(t.op or t.quoted for p in parts for t in p):
         return None
-    init, cond, step = ([t.text.lower() for t in p] for p in parts)
+    init, cond, step = (_ps_unglue_assignment([t.text.lower() for t in p]) for p in parts)
     if not (len(init) == 3 and init[1] == "=" and _PS_INT_RE.match(init[2])):
         return None
     var = _ps_var(init[0])
