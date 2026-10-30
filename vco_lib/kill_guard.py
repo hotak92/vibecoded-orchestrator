@@ -72,6 +72,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from vco_lib import bash_command_walk as bcw
 from vco_lib import kill_guard_runtime as rt
+from vco_lib.atomic import atomic_write_bytes
 
 KILL_SWITCH_ENV = "VCO_KILL_GUARD"
 _OFF_VALUES = frozenset({"off", "0", "false", "no"})
@@ -575,11 +576,7 @@ def ensure_shims(project_root: str, python: str) -> Optional[str]:
             except OSError:
                 current = None
             if current != text:
-                tmp = path + ".tmp%d" % os.getpid()
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write(text)
-                os.chmod(tmp, 0o700)
-                os.replace(tmp, path)
+                atomic_write_bytes(path, text.encode("utf-8"), mode=0o700)
     except OSError:
         return None
     return d

@@ -35,8 +35,28 @@ from vco_lib import hub_ensure as he
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPO_ROOT / "templates" / "hooks"
 
-needs_bash = pytest.mark.skipif(
-    sys.platform == "win32" or shutil.which("bash") is None, reason="bash hook")
+#: The Windows-skip convention (tests/test_v02103_win_skip_sibling_guard.py):
+#: each bash-leg skip names the .ps1-sibling test that covers it on Windows.
+#: The reason is ONE string literal — the guard's scanner reads only literals.
+needs_bash_prompt_revive = pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="bash .sh leg; Windows runs the .ps1 sibling: tests/"
+           "test_v02105_hub_supervision.py::test_ps1_prompt_hook_asks_the_revive_home")
+needs_bash_prompt_quiet = pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="bash .sh leg; Windows runs the .ps1 sibling: tests/"
+           "test_v02105_hub_supervision.py::"
+           "test_ps1_prompt_hook_outside_a_project_asks_nothing")
+needs_bash_agent_deny = pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="bash .sh leg; Windows runs the .ps1 sibling: tests/"
+           "test_v02105_hub_supervision.py::"
+           "test_ps1_agent_hook_passes_the_deny_through_and_skips_the_kg_leg")
+needs_bash_agent_kg = pytest.mark.skipif(
+    sys.platform == "win32" or shutil.which("bash") is None,
+    reason="bash .sh leg; Windows runs the .ps1 sibling: tests/"
+           "test_v02105_hub_supervision.py::"
+           "test_ps1_agent_hook_without_a_deny_runs_the_kg_leg")
 needs_pwsh = pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
 
 
@@ -186,7 +206,7 @@ def _wait_for(path: Path, needle: str, timeout: float = 10.0) -> str:
     return text
 
 
-@needs_bash
+@needs_bash_prompt_revive
 def test_sh_prompt_hook_asks_the_revive_home(tmp_path):
     venv, out = _fake_venv(tmp_path)
     proc = subprocess.run(
@@ -198,7 +218,7 @@ def test_sh_prompt_hook_asks_the_revive_home(tmp_path):
     assert "-m vco_lib.hub_ensure revive --source prompt --quiet" in log, log
 
 
-@needs_bash
+@needs_bash_prompt_quiet
 def test_sh_prompt_hook_outside_a_project_asks_nothing(tmp_path):
     venv, out = _fake_venv(tmp_path)
     env = _prompt_env(tmp_path, venv)
@@ -220,6 +240,19 @@ def test_ps1_prompt_hook_asks_the_revive_home(tmp_path):
     assert proc.returncode == 0, proc.stderr
     log = _wait_for(out, "vco_lib.hub_ensure revive")
     assert "-m vco_lib.hub_ensure revive --source prompt --quiet" in log, log
+
+
+@needs_pwsh
+def test_ps1_prompt_hook_outside_a_project_asks_nothing(tmp_path):
+    venv, out = _fake_venv(tmp_path)
+    env = _prompt_env(tmp_path, venv)
+    env["CLAUDE_PROJECT_DIR"] = ""
+    proc = subprocess.run(
+        ["pwsh", *PWSH_BASE_FLAGS, "-File", str(HOOKS / "user-prompt-submit-reminder.ps1")],
+        input="{}", capture_output=True, text=True, env=env, timeout=120,
+        cwd=str(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    assert "hub_ensure revive" not in _wait_for(out, "hub_ensure revive", timeout=1.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -529,7 +562,7 @@ def _hook_env(tmp_path: Path, preflight_out: str) -> tuple[dict, Path]:
 _DENY = json.dumps(gp.deny_envelope("Not launched: test"))
 
 
-@needs_bash
+@needs_bash_agent_deny
 def test_sh_agent_hook_passes_the_deny_through_and_skips_the_kg_leg(tmp_path):
     env, marker = _hook_env(tmp_path, _DENY)
     proc = subprocess.run(["bash", str(HOOKS / "agent-brief-kg-inject.sh")],
@@ -540,7 +573,7 @@ def test_sh_agent_hook_passes_the_deny_through_and_skips_the_kg_leg(tmp_path):
     assert not marker.exists(), "no KG leg for a refused launch"
 
 
-@needs_bash
+@needs_bash_agent_kg
 def test_sh_agent_hook_without_a_deny_runs_the_kg_leg(tmp_path):
     env, marker = _hook_env(tmp_path, "")
     proc = subprocess.run(["bash", str(HOOKS / "agent-brief-kg-inject.sh")],
