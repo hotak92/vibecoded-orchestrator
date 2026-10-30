@@ -68,6 +68,7 @@ import os
 import re
 import shlex
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from vco_lib import bash_command_walk as bcw
@@ -576,7 +577,8 @@ def ensure_shims(project_root: str, python: str) -> Optional[str]:
             except OSError:
                 current = None
             if current != text:
-                atomic_write_bytes(path, text.encode("utf-8"), mode=0o700)
+                atomic_write_bytes(Path(path), text.encode("utf-8"),
+                                   mode=0o700)
     except OSError:
         return None
     return d
