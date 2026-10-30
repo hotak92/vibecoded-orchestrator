@@ -215,8 +215,11 @@ def test_hand_to_vco_recreates_an_adopted_row_container_already_under_vcos_proje
     world = _own_project_world(tmp_path)
 
     def run(argv, **kw):  # hand-to-vco names the container: it is looked up by id first
-        if list(argv)[1:2] == ["inspect"] and "{{json .Id}}" in argv:
-            return subprocess.CompletedProcess(list(argv), 0, '"abc123"', "")
+        argv = list(argv)
+        # v0.2.105: the id lookup is the template-free inspect (see
+        # vco_lib.containers.container_id).
+        if argv[1:2] == ["inspect"] and "--format" not in argv:
+            return subprocess.CompletedProcess(argv, 0, json.dumps([{"Id": "abc123"}]), "")
         return world.run(argv, **kw)
 
     result, _ = world.adopt(run=run, services=("ollama",), container_refs={"ollama": "vco_ollama"},
@@ -377,8 +380,8 @@ def _gpu_own_world(tmp_path, devices, owning_files):
 
     def run(argv, **kw):
         argv = list(argv)
-        if argv[1:2] == ["inspect"] and "{{json .Id}}" in argv:
-            return subprocess.CompletedProcess(argv, 0, '"abc123"', "")
+        if argv[1:2] == ["inspect"] and "--format" not in argv:  # template-free id lookup (v0.2.105)
+            return subprocess.CompletedProcess(argv, 0, json.dumps([{"Id": "abc123"}]), "")
         if argv[1:2] == ["inspect"] and "{{json .HostConfig.Devices}}" in argv \
                 and argv[-1] == "vco_ollama":
             world.all_argv.append(argv)

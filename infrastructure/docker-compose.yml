@@ -1,6 +1,20 @@
 services:
   weaviate:
-    image: cr.weaviate.io/semitechnologies/weaviate:1.28.4
+    # v0.2.105: 1.28.4 -> 1.37.18 for RQ-8 compression (>= 1.32) and the
+    # batch memory guard; 1.37 is the newest minor the pinned Python client
+    # (weaviate-client 4.21) was released against. A 1.28.4 data folder opens
+    # in place (verified: objects, vectors and search results unchanged).
+    image: cr.weaviate.io/semitechnologies/weaviate:1.37.18
+    # v0.2.105: the container memory limit, sized from the host by install
+    # (vco_lib.weaviate_memory -> VCT_WEAVIATE_MEM_LIMIT in infrastructure/.env;
+    # an exported VCT_WEAVIATE_MEM_LIMIT wins, "0" = no limit). With a limit,
+    # LIMIT_RESOURCES below sets Go's soft limit to 80% of it, and Weaviate
+    # refuses a write batch ("not enough memory") before the kernel would kill
+    # it. If it is killed anyway, `restart: unless-stopped` brings it back
+    # (verified under rootless podman 4.9: memcg OOM kill -> restarted). The
+    # default 0 is "no limit": a compose run without install's .env behaves as
+    # before.
+    mem_limit: ${VCT_WEAVIATE_MEM_LIMIT:-0}
     # Explicit prefixed name keeps us out of the way of any bare `weaviate`
     # container the user might already be running. The compose project name
     # already prefixes generated names, but pinning it makes lifecycle CLI
@@ -36,7 +50,8 @@ services:
       # continuous flush+compaction drumbeat → ~57x write amplification (a 5GB
       # dataset rewrote ~290GB in 12h on a real install). These knobs (all
       # verified against the v1.28.4 source, safe 8-64GB, podman+docker) cut
-      # steady-state writes by roughly an order of magnitude.
+      # steady-state writes by roughly an order of magnitude. v0.2.105: every
+      # knob in this block is still read, under the same name, at v1.37.18.
       #
       # Flush a dirty memtable after 3600s (1h) instead of 60s — THE primary
       # lever. Paired with the 500MB size-trigger below, a memtable flushes on
@@ -58,7 +73,7 @@ services:
       # 500MB OR 1h, so the WAL+memtable replay backlog is capped at ~500MB
       # regardless of the 1h timer. It's a CAP not a reservation (a store only
       # holds 500MB if it accrues that much before the timer); LIMIT_RESOURCES
-      # bounds total Go heap to 80% RAM. Every write is WAL-durable on upsert —
+      # (with the mem_limit above) bounds the Go heap. Every write is WAL-durable on upsert —
       # this changes flush CADENCE, never the WAL/fsync path, so write-drop risk
       # is equal-or-lower than the default.
       PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
@@ -90,13 +105,34 @@ services:
       # the value trades a slightly later read-only trip for a slightly smaller
       # last-resort safety margin. Documented, deliberate.
       DISK_USE_READONLY_PERCENTAGE: "98"
-      # Auto-size the Go heap + CPU to the host (or to a container mem_limit if
-      # one is set): GOMEMLIMIT ~= 80% of available RAM, GOMAXPROCS = cores-1.
-      # Reduces heap-pressure-driven flushing and removes the OOM tail risk on
-      # small hosts. Self-scaling = safe to ship to unknown hardware (an 8GB
-      # box gets ~6.4GB, a 64GB box ~51GB). To pin instead: unset this and set
-      # GOMEMLIMIT=<N>MiB explicitly.
+      # Size the Go soft memory limit (GOMEMLIMIT) and GOMAXPROCS from the
+      # container's cgroup: GOMEMLIMIT = 80% of `mem_limit` above. CORRECTED in
+      # v0.2.105: WITHOUT a container limit the cgroup reports "max", Weaviate
+      # accepts it and the soft limit is effectively infinite (it logs
+      # `limit=9223372036854775807`) — it is NOT 80% of host RAM. That is why
+      # `mem_limit` is now set. LIMIT_RESOURCES overrides a hand-set
+      # GOMEMLIMIT, so size Weaviate through VCT_WEAVIATE_MEM_LIMIT instead.
       LIMIT_RESOURCES: "true"
+      # v0.2.105: collect garbage when the heap grows 50% over the live heap
+      # (Go's default 100 lets it reach twice the live heap before a GC, which
+      # is how a 13 GB live heap became 26-31 GB RSS on a 61 GB host).
+      GOGC: "50"
+      # v0.2.105: the memory read-only guard stays OFF. On Weaviate < 1.38.12
+      # it latches and loads every lazily-unloaded shard when it fires
+      # (fixed upstream in PR #12674, not in 1.37). The batch guard above is
+      # the refuse-instead-of-die path for writes.
+      MEMORY_READONLY_PERCENTAGE: "0"
+      # v0.2.105: load a collection's shards only when it is first used.
+      # Weaviate >= 1.36.6 loads single-tenant shards EAGERLY at startup
+      # unless this is 0 (0 = always lazy), which would put every project's
+      # collections in RAM again.
+      LAZY_LOAD_SHARD_COUNT_THRESHOLD: "0"
+      # v0.2.105: new collections are created with 8-bit rotational
+      # quantization (vectors 4x smaller in RAM, full vectors kept on disk
+      # for rescoring; recall@10 measured on VCO's own vectors: 0.997-1.000).
+      # Existing collections are switched by the install/update step
+      # (vco_lib.weaviate_vector_index), never re-created.
+      DEFAULT_QUANTIZATION: "rq-8"
       # --- HNSW TOMBSTONE-CLEANUP CHURN REDUCTION (v0.2.61) ---
       # SECOND disk-leak source, distinct from the memtable write-amp above.
       # The code-graph collections accumulate large tombstone counts (a

@@ -148,7 +148,12 @@ export interface AccessMode {
 
 export interface KgCollectionAccess {
   name: string;
-  node_count: number;
+  /** v0.2.105 lazy-load counts: null = never counted (render "—" via
+   * formatCount). Live only for this project's own/shared/granted
+   * collections; everything else carries the last cached value. */
+  node_count: number | null;
+  /** Epoch-ms moment node_count was measured (null with a null count). */
+  counted_at: number | null;
   access: 'read' | 'write' | 'none' | string;
   is_shared: boolean;
 }

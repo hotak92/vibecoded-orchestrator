@@ -10,6 +10,8 @@ Routes (each also served with a trailing slash — see :func:`_add_route`)::
     GET  /usage/windows             subscription usage windows per vendor,
                                     from cache (``?format=line`` = one line of
                                     text; :mod:`model_router.usage_windows`)
+    GET  /vendor-keys?model=<id>    can this model's vendor key resolve?
+                                    names only, never a value (v0.2.105)
     GET  /v1/models                 union catalog
     POST /v1/messages               proxied, streaming or not
     POST /v1/messages/count_tokens  proxied
@@ -190,7 +192,7 @@ from .routing import (
     fallback_route,
     route as route_model,
 )
-from .secrets import TRANSIENT_RETRY_S, VendorKeyResolver
+from .secrets import TRANSIENT_RETRY_S, VendorKeyResolver, default_hub_reviver
 from .source_identity import source_sha as _package_source_sha
 from .usage_windows import (
     UsageWindows,
@@ -208,6 +210,7 @@ from .usage import (
     effort_extra,
     guard_count_tokens,
     note_count_substitution,
+    read_compaction_header,
     read_identity,
 )
 from .vendors import (
@@ -592,6 +595,11 @@ class Gateway:
             # stopped the hub (by design) and nine 503s followed for a key
             # that was fine. An injected resolver keeps its own default.
             serve_stale_max_age_s=config.key_stale_max_age_s,
+            # v0.2.105: a key read that finds the hub refusing connections
+            # starts it (detached, rate-limited, never during an update), so
+            # vendor keys come back without a human. An injected resolver
+            # starts nothing.
+            hub_reviver=default_hub_reviver,
         )
         self.context = ContextTableLoader(config.context_table_file)
         self.token_permissions = token_permissions
@@ -1162,6 +1170,80 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
     return web.json_response(snapshot)
 
 
+#: Seconds ``/vendor-keys`` waits for a FIRST key resolution before it answers
+#: ``pending``. Below the Agent-launch hook's own 10 s budget; a resolution
+#: still running keeps going in the background and lands in the cache.
+VENDOR_KEY_PROBE_TIMEOUT_S = 3.0
+
+
+async def vendor_keys_handler(request: web.Request) -> web.Response:
+    """Can this gateway serve ``?model=<id>`` right now? NAMES ONLY (v0.2.105).
+
+    The pre-flight a subagent launch asks before it starts a lane on a
+    gateway model (``vco_lib.gateway_preflight``, from the Agent|Task
+    PreToolUse hook), so a lane whose vendor key cannot resolve is refused at
+    launch instead of dying on its first request ("503 no key found for
+    vendor 'qwen'", 2026-10-21). The answer::
+
+        {"model": <id>, "route": "vendor" | "anthropic" | "refused",
+         "vendor": <vendor id or null>, "state": resolved | cached | stale |
+         missing | pending, "usable": bool, "transient": bool,
+         "problem": <text built from key NAMES and store paths, or null>}
+
+    ``usable`` is true when a key is in hand (``stale`` included — that key
+    is served), false only on a DEFINITE miss; a transient failure or a
+    resolution still running reads ``usable: null`` (unknown — the caller
+    must not refuse on it). The key VALUE never appears: :class:`KeyResult`
+    is read for its state, never serialised. Host-token authorised and
+    loopback-only like ``/usage``. A miss here runs the same resolution a
+    request would — including the v0.2.105 hub revive when the hub refuses.
+    """
+    gateway: Gateway = request.app[APP_KEY]
+    started = time.monotonic()
+    if not gateway.authorised(request):
+        _log_unauthorised(gateway, request, started=started)
+        return _unauthorised()
+    model = (request.query.get("model") or "").strip()
+    decision = route_model(
+        model, gateway.vendors, gateway.anthropic,
+        known_ids=gateway.catalog.known_vendor_ids(),
+    )
+    base: dict[str, Any] = {"model": model, "vendor": None, "state": None,
+                            "usable": None, "transient": False, "problem": None}
+    if isinstance(decision, RouteError):
+        base.update(route="refused", usable=False, problem=decision.message)
+        return web.json_response(base)
+    if decision.vendor is None:
+        # First-party Claude route: no vendor key involved.
+        base.update(route="anthropic", usable=True)
+        return web.json_response(base)
+    vendor = decision.vendor
+    base.update(route="vendor", vendor=vendor.vendor_id)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.shield(gateway.keys.aresolve(vendor)),
+            timeout=VENDOR_KEY_PROBE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        base.update(
+            state="pending",
+            problem=(
+                f"the key for vendor {vendor.vendor_id!r} is still being read "
+                f"(more than {VENDOR_KEY_PROBE_TIMEOUT_S:g} s — typically a busy "
+                "OS keychain); the result lands in the gateway's cache"
+            ),
+        )
+        return web.json_response(base)
+    usable: Optional[bool] = True if result.key else (None if result.transient else False)
+    base.update(
+        state=result.state,
+        usable=usable,
+        transient=bool(result.transient),
+        problem=None if result.key else result.problem,
+    )
+    return web.json_response(base)
+
+
 async def models_handler(request: web.Request) -> web.Response:
     """The picker catalog; vendor labels carry subscription usage when known.
 
@@ -1283,6 +1365,12 @@ class RequestFacts:
     #: (:func:`_carries_binary_blocks`, review batch-2 MEDIUM-1). ``False``
     #: when the body was not parsed — the ordinary text path.
     binary_body: bool = False
+    #: v0.2.105 (CL-4): the client's ``x-claude-code-compaction`` header, or
+    #: ``None`` when it sent none. Read through
+    #: :func:`model_router.usage.read_compaction_header` (one home for the
+    #: sanitising) and written to the ledger row so a compaction call can be
+    #: attributed instead of looking like a turn the user never typed.
+    compaction: Optional[str] = None
 
 
 def _route_label(decision: Route) -> str:
@@ -1380,6 +1468,7 @@ def _submit_usage(
         fallback_from=fallback_from,
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
+        compaction=facts.compaction,
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -2741,6 +2830,8 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             )
         ),
         binary_body=_carries_binary_blocks(payload),
+        # CL-4: attribution only — nothing routes or shapes on this value.
+        compaction=read_compaction_header(request.headers),
     )
 
     headers = gateway.forward_headers(request)
@@ -2762,6 +2853,15 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     clear_thinking_applied = False
     if decision.is_anthropic:
         oauth = gateway.oauth.read()
+        if oauth.token is None and oauth.retry_soon:
+            # v0.2.105: the credentials file carries no token RIGHT NOW and
+            # that is a CLI rewriting it (2026-10-28: three minutes of 401
+            # ``claude_login_unavailable`` for every first-party request).
+            # One bounded, off-loop re-read before answering — the rewrite is
+            # a millisecond-scale affair, and a request that waits 400 ms for
+            # it is a request that never failed. Bounded twice: only for a
+            # TRANSIENT verdict, never more than ``_REREAD_BUDGET_S``.
+            oauth = await gateway.oauth.aread_with_brief_wait()
         if oauth.token is None:
             log_local(401, "claude_login_unavailable")
             return _json_error(401, "authentication_error", oauth.problem or "")
@@ -4517,7 +4617,7 @@ async def not_found_handler(request: web.Request) -> web.Response:
         404,
         "not_found_error",
         f"the model gateway has no route for {request.path!r}. It serves "
-        "/health, /usage, /usage/windows, /v1/models, /v1/messages and "
+        "/health, /usage, /usage/windows, /vendor-keys, /v1/models, /v1/messages and "
         "/v1/messages/count_tokens.",
     )
 
@@ -4555,6 +4655,7 @@ def create_app(
     )
     _add_route(app, "HEAD", "/api/hello", hello_handler, name="hello_head")
     _add_route(app, "GET", "/api/hello", hello_handler, name="hello_get")
+    _add_route(app, "GET", "/vendor-keys", vendor_keys_handler, name="vendor_keys")
     _add_route(app, "GET", "/v1/models", models_handler, name="models")
     _add_route(app, "POST", "/v1/messages", messages_handler, name="messages")
     _add_route(

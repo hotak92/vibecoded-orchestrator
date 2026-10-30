@@ -228,15 +228,24 @@ def test_no_shared_fallback_marker_keeps_the_shared_key_out(offline_hub, store):
     assert SHARED_VALUE not in (result.problem or "")
 
 
-def test_a_full_miss_names_both_shared_write_paths_and_the_override(
+def test_a_full_miss_names_both_shared_write_paths(
     offline_hub, store,
 ):
     """"No key found" is not an answer a user can act on; WHERE to put one is.
 
     Both named destinations write the SHARED scope — the launcher's Secrets
-    panel (OS keychain) and ``vct set --shared`` (file store). The per-project
-    override is named too, because a user who wants one key per project has to
-    be told which knob does that.
+    panel (OS keychain) and ``vct set --shared`` (file store). They are named
+    even on the HUB-OUTAGE arm of the message (this fixture keeps the hub
+    down), because the file store is reachable without the hub and the key may
+    simply not be stored yet.
+
+    v0.2.105 changed the other half: on that arm the SCOPE is reported, never
+    prescribed. The field report this closes (2026-10-21/22) is an operator
+    told to clear ``VCT_MODEL_GATEWAY_SECRET_PROJECT`` for a 503 whose real
+    cause was a 2-day hub outage — advice that keeps the hub down. The
+    per-project override is still offered on the ordinary miss, where the
+    scope could actually be consulted
+    (``tests/test_v02105_gateway_hub_outage.py``).
     """
     _root, clone, _acme = store
 
@@ -253,8 +262,11 @@ def test_a_full_miss_names_both_shared_write_paths_and_the_override(
     assert "Secrets panel" in authored
     assert "vct set --shared --key test_api_key" in authored
     assert "~/.vct-secrets/shared/" in authored
-    assert SCOPE_ENV in authored
     assert str(clone) in authored  # the scope actually consulted, named
+    assert "vct-hub is NOT RUNNING" in authored
+    assert SCOPE_ENV not in authored, (
+        "a hub outage must not be answered with a secret-scope remedy"
+    )
 
 
 def test_the_miss_never_carries_a_value(offline_hub, store):

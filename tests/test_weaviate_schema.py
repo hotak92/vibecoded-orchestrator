@@ -40,6 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common import live_weaviate as _live_weaviate  # noqa: E402
 from vco_lib import weaviate_schema as ws  # noqa: E402
 
 
@@ -538,16 +539,9 @@ class FormatReportsTableTests(unittest.TestCase):
 
 
 def _weaviate_reachable(url: str) -> bool:
-    """Quick HEAD-style probe — Weaviate's readyz endpoint."""
-    try:
-        req = urllib.request.Request(
-            f"{url.rstrip('/')}/v1/.well-known/ready",
-            method="GET",
-        )
-        with urllib.request.urlopen(req, timeout=2) as r:
-            return r.status == 200
-    except (urllib.error.URLError, OSError, ConnectionError):
-        return False
+    """Weaviate's ready probe, gated on a NAMED gRPC port first (never the
+    live 50052 default) — :func:`tests.common.live_weaviate.skip_reason`."""
+    return _live_weaviate.skip_reason(url) is None
 
 
 class LiveSchemaMigrationTest(unittest.TestCase):
@@ -627,16 +621,8 @@ class LiveSchemaMigrationTest(unittest.TestCase):
         """
         import uuid as _uuid
 
-        import weaviate  # type: ignore[import-untyped]
 
-        host = self.url.replace("http://", "").replace("https://", "").split(":")[0]
-        port = int(self.url.rsplit(":", 1)[-1])
-        grpc_port = int(os.environ.get("GRPC_PORT", "50052"))
-        client = weaviate.connect_to_custom(
-            http_host=host, http_port=port, http_secure=False,
-            grpc_host=host, grpc_port=grpc_port, grpc_secure=False,
-            skip_init_checks=True,
-        )
+        client = _live_weaviate.connect(self.url)
         uuids: list[str] = []
         try:
             col = client.collections.get(self.TEST_COLL)
@@ -654,16 +640,8 @@ class LiveSchemaMigrationTest(unittest.TestCase):
         return uuids
 
     def _count_objects_and_verify_qwen3(self) -> tuple[int, set[str]]:
-        import weaviate  # type: ignore[import-untyped]
 
-        host = self.url.replace("http://", "").replace("https://", "").split(":")[0]
-        port = int(self.url.rsplit(":", 1)[-1])
-        grpc_port = int(os.environ.get("GRPC_PORT", "50052"))
-        client = weaviate.connect_to_custom(
-            http_host=host, http_port=port, http_secure=False,
-            grpc_host=host, grpc_port=grpc_port, grpc_secure=False,
-            skip_init_checks=True,
-        )
+        client = _live_weaviate.connect(self.url)
         uuids = set()
         try:
             col = client.collections.get(self.TEST_COLL)

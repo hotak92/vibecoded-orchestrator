@@ -70,7 +70,17 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: process GROUP (os.killpg, SIGSTOP/SIGCONT) — POSIX-only primitives with no
 #: Windows equivalent and no .ps1 sibling; the hook's ps1 leg runs in the
 #: file's other tests.
-NON_CONVENTION_BASELINE = 182
+#: 182 -> 187 (v0.2.105 fix round 3): five POSIX-only skips the cycle's new
+#: guard suites added, none with a .ps1 sibling by nature — the kill guard's
+#: ``bash + /proc end-to-end`` arm and its pwsh parity arm (both drive the
+#: guard through POSIX /proc facts; tests/test_v02105_kill_guard.py), the
+#: code-graph catch-up drain's pwsh leg, whose fake interpreter is a
+#: ``#!/bin/sh`` shim script (tests/test_v02105_codegraph_head_catchup.py),
+#: and two ``chmod 0`` permission-refusal arms — a mode-000 file still reads
+#: on Windows, so the refusal cannot be reproduced there
+#: (tests/test_v02105_gateway_oauth_rewrite_window.py,
+#: tests/test_v02105_wait_guard_scripts_noop.py).
+NON_CONVENTION_BASELINE = 187
 
 
 # -- which conditions skip on Windows --------------------------------------

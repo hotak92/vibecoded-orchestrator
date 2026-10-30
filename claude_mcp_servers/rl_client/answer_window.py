@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json as _json
 import os as _os
+import re as _re
+import shlex as _shlex
 import threading as _threading
 from datetime import datetime as _datetime, timezone as _timezone
 from pathlib import Path  # used in string annotations (load_messages arg)
@@ -37,6 +39,8 @@ __all__ = [
     "slim_message",
     "stat_signature",
     "find_kg_positions",
+    "find_cli_kg_queries",
+    "cli_kg_search_queries",
     "extract_answer_window",
     "match_position_for_query",
     "match_position_by_timestamp",
@@ -409,6 +413,136 @@ def find_kg_positions(messages: list[dict]) -> list[tuple[int, int]]:
             ):
                 positions.append((msg_idx, blk_idx))
     return positions
+
+
+# v0.2.105: the shell tools a chat runs the ``kg-search`` CLI through, and the
+# names that CLI is invoked by (the bash / PowerShell wrappers and the script
+# itself). A CLI retrieval is staged without a session id (the Bash
+# subprocess is not told which chat or subagent runs it), so its chat is the
+# one whose transcript holds that command with that exact query.
+CLI_SHELL_TOOLS: frozenset[str] = frozenset({"Bash", "PowerShell"})
+CLI_KG_SEARCH_COMMANDS: frozenset[str] = frozenset({
+    "kg-search", "kg-search.ps1", "search_knowledge.py",
+})
+# The CLI's options that take a value (``search_knowledge.py`` argparse);
+# every other ``-`` token is a flag. MUST MATCH templates/scripts/
+# search_knowledge.py's parser — locked by
+# ``tests/test_v02105_rl_drain_header_reads.py::
+# TestCliOptionTableIsLockedToTheParser``, which derives this set from that
+# script's ``add_argument`` rows.
+_CLI_VALUE_OPTIONS: frozenset[str] = frozenset({
+    "--limit", "--type", "--tags", "--detail", "--days",
+    "--project", "-p", "--collection", "-c",
+})
+#: What ends one simple command in the shell that ran it. A NEWLINE is one of
+#: them (v0.2.105 fix round): the Bash tool's own multi-line shape
+#: (``cd <project>`` newline ``.claude/scripts/kg-search search "…"``) puts the
+#: call on line 2, and PowerShell separates statements at a newline too. The
+#: lexer lists it in ``punctuation_chars`` and takes it OUT of ``whitespace``
+#: for exactly this to work (see :func:`cli_kg_search_queries`); inside quotes
+#: it stays part of the word. ``\r`` is deliberately NOT an operator: shlex
+#: tests ``whitespace`` first, so a member there is dead — and as whitespace
+#: it eats the CR of a CRLF just before the LF separator, which is the shape
+#: transcripts actually carry. A bare CR (old-Mac line ending) separates
+#: nothing; shlex treats it as a space, and no modern shell reads it as a
+#: statement separator either.
+_SHELL_OPERATOR_CHARS = frozenset("();<>|&\n")
+_CLI_PUNCTUATION_CHARS = "();<>|&\n"
+_CLI_WHITESPACE = " \t\r"
+# Words that run the script named next (``python3 search_knowledge.py``,
+# ``bash kg-search``, PowerShell's ``& script.ps1`` / ``. script.ps1``).
+_CLI_LAUNCHERS: frozenset[str] = frozenset({
+    "bash", "sh", "pwsh", "pwsh.exe", "powershell", "powershell.exe", ".", "uv", "run",
+})
+_ENV_ASSIGNMENT = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def cli_kg_search_queries(command: str, *, powershell: bool = False) -> list[str]:
+    """The queries of every ``kg-search search <query>`` call in one shell
+    command line, as the CLI's parser would read them (positional
+    ``search``, then the query; options and their values skipped; a shell
+    operator — ``;`` ``&&`` ``|`` or a NEWLINE — ends a call). Unparseable
+    quoting yields no query.
+    ``powershell``: a PowerShell command line, whose backslash is a literal
+    path separator (its escape character is the backtick), not an escape."""
+    if not isinstance(command, str) or not command:
+        return []
+    if powershell:
+        command = command.replace("\\", "/")
+    else:
+        # A backslash-newline is a LINE CONTINUATION in sh, not a separator:
+        # drop it before the newline is read as one (``kg-search search \\
+        # "q"`` wrapped over two lines is one call). PowerShell's continuation
+        # character is the backtick, and its backslash was handled above.
+        command = command.replace("\\\r\n", "").replace("\\\n", "")
+    try:
+        # A newline must end a command, and shlex tests ``whitespace`` before
+        # ``punctuation_chars``: listing it in punctuation ONLY works with it
+        # removed from whitespace. Quoted text is never split either way.
+        lex = _shlex.shlex(command, posix=True,
+                           punctuation_chars=_CLI_PUNCTUATION_CHARS)
+        lex.whitespace_split = True
+        lex.whitespace = _CLI_WHITESPACE
+        tokens = list(lex)
+    except ValueError:
+        return []
+    out: list[str] = []
+    i = 0
+    at_command = True  # the next word is a simple command's command word
+    while i < len(tokens):
+        tok = tokens[i]
+        i += 1
+        if tok and set(tok) <= _SHELL_OPERATOR_CHARS:
+            at_command = True
+            continue
+        if not at_command:
+            continue
+        base = tok.replace("\\", "/").rsplit("/", 1)[-1]
+        if _ENV_ASSIGNMENT.match(tok) or base.startswith("python") or base in _CLI_LAUNCHERS:
+            continue  # ``VAR=x``, an interpreter: the command word follows
+        at_command = False
+        if base not in CLI_KG_SEARCH_COMMANDS:
+            continue
+        positionals: list[str] = []
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok and set(tok) <= _SHELL_OPERATOR_CHARS:
+                break
+            i += 1
+            if tok.startswith("-") and len(tok) > 1:
+                if tok in _CLI_VALUE_OPTIONS:
+                    i += 1  # its value
+                continue
+            positionals.append(tok)
+        if len(positionals) >= 2 and positionals[0] == "search":
+            out.append(positionals[1])
+    return out
+
+
+def find_cli_kg_queries(messages: list[dict]) -> frozenset[str]:
+    """The first 120 characters (the staged snippet length) of every query
+    the transcript's assistant ran through the ``kg-search`` CLI in a
+    Bash / PowerShell tool call."""
+    found: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("type") != "assistant":
+            continue
+        content = msg.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") in CLI_SHELL_TOOLS
+            ):
+                inp = block.get("input")
+                cmd = inp.get("command", "") if isinstance(inp, dict) else ""
+                for q in cli_kg_search_queries(
+                        cmd, powershell=block.get("name") == "PowerShell"):
+                    if q:
+                        found.add(q[:120])
+    return frozenset(found)
 
 
 def _chars_per_token_text() -> int:

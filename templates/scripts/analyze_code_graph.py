@@ -422,6 +422,7 @@ try:
     # v0.2.94: the ONE connect factory + URL resolver, and the guarded create.
     from vco_lib import weaviate_helpers as _wh
     from vco_lib.fixture_class_guard import guarded_collection_create
+    from vco_lib.weaviate_vector_index import client_named_vector as _client_named_vector
     # v0.2.92: extractor-generation re-index — the force-rewalk flag
     # resolution, the all-chunks-SKIP verdict, and the completion stamp all
     # live there; this file keeps only the I/O seams.
@@ -462,6 +463,8 @@ try:
     # language modules directly) — except the S16-3 policy-skip prune, whose
     # skip fires there and whose end-of-walk flush is the analyzer's.
     from vco_lib import codegraph_lang as _codegraph_lang
+    from vco_lib import codegraph_config_refs as _cfg_refs  # v0.2.105: config-file links
+    from vco_lib.codegraph_lang.config import CONFIG_GLOBS, CONFIG_NAME_SKIP_SUFFIXES
     from vco_lib.codegraph_lang._shared import (
         prune_policy_skipped_files as _prune_policy_skipped_files,
     )
@@ -479,8 +482,9 @@ try:
         reconcile_walked_file_rows as _reconcile_walked_file_rows,
         open_walked_file_scope as _open_scope,
         commit_walked_file_scope as _commit_scope,
-        # v0.2.103 (R14-B1): post-prune deferral clear (positive zero only).
-        clear_orphan_interactions_deferral_if_zero as _clear_orphan_deferral_if_zero,
+        # v0.2.103 (R14-B1); v0.2.105: the wrapper (never raises, raw-root
+        # rule) is the seam the analyzer calls.
+        clear_orphan_deferral_after_reaping as _clear_after_reaping,
     )
     # v0.2.77 Part 5 (CG-2): ONE facade for cross-language call extraction.
     # Dependency-free to import (tree-sitter grammars are lazy-loaded inside
@@ -497,9 +501,9 @@ try:
     from vco_lib import codegraph_source_scope as _src_scope  # W6-CGD: stamp + ownership + preserve keys
     from vco_lib.codegraph_extra_overlap import classify as _extra_overlap  # W6-CGD D-4
     from vco_lib.codegraph_schema import (  # v0.2.102: one ensure loop + backfill
-        backfill_missing_property as _backfill_missing_property,
         ensure_analyzer_properties as _ensure_analyzer_properties,
         ensure_codegraph_file_path as _ensure_file_path_property_shared,
+        ensure_interaction_project,  # v0.2.105: S16-4 body extracted (P2f)
     )
     from vco_lib.codegraph_deleted_files import (  # v0.2.100: deleted-file prune
         FILE_ANCHORED_COLLECTIONS as _FILE_ANCHORED_COLLECTIONS, PruneReport as _PruneReport,
@@ -520,6 +524,7 @@ try:
         build_short_name_index as _build_short_name_index,
         reference_target_uuids as _reference_target_uuids,
         resolve_base_class_targets as _resolve_base_class_targets,
+        resolve_call_target as _resolve_call_target_impl,  # v0.2.105 #512C
     )
     # v0.2.102 W6-O: language-aware import → module resolution (one home).
     from vco_lib.codegraph_imports import (
@@ -900,6 +905,7 @@ _LANGUAGE_DISPLAY_TO_CANONICAL: Dict[str, str] = {
     "powershell": "powershell",
     "ps1":        "powershell",
     "ps":         "powershell",
+    "tweakers": "tweakers", "ini": "ini", "json": "json",  # v0.2.105 config formats
 }
 
 
@@ -965,6 +971,7 @@ _EXT_TO_DISPATCH_NAME: Dict[str, str] = {
     ".svelte": "svelte",
     ".ps1":    "powershell",
     ".psm1":   "powershell",
+    ".tweakers": "config", ".ini": "config", ".json": "config",  # codegraph_lang.config
 }
 
 
@@ -1059,6 +1066,7 @@ _FINDER_SPECS: Dict[str, Tuple[str, Tuple[str, ...], Optional[Tuple[str, ...]]]]
     "svelte":     ("js",     ("*.svelte",),                                         None),
     "powershell": ("shell",  ("*.ps1", "*.psm1"),                                   None),
     "proto":      ("proto",  ("*.proto",),                                          None),
+    "config":     ("config", CONFIG_GLOBS,                                          CONFIG_NAME_SKIP_SUFFIXES),
 }
 
 
@@ -1089,7 +1097,7 @@ def _dispatch_name_for_file(file_path: Path) -> str:
         return ""
     if any(name.endswith(s) for s in _TS_SKIP_SUFFIXES):
         return ""
-    if name.startswith("vite.config"):
+    if name.startswith("vite.config") or name.endswith(CONFIG_NAME_SKIP_SUFFIXES):
         return ""
     return _EXT_TO_DISPATCH_NAME.get(file_path.suffix.lower(), "")
 
@@ -1529,17 +1537,14 @@ class CodeGraphAnalyzer:
             print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
             return False
 
-    def _vectorizer_config(self):
+    def _vectorizer_config(self, class_name: str):
         """Return appropriate vectorizer config based on named_vectors flag.
 
         v0.2.18: slot set is the active code slot (from EmbeddingService)
-        UNION the legacy/forward-compat slots so post-create switches
-        between models don't require recreating the collection.
-
-        Pre-v0.2.18 hardcoded three slots based on `_ACTIVE_CODE_VECTOR`
-        env-time resolution; that broke OpenAI-as-code and arctic-text-
-        as-code-fallback installs. The Wave-A schema helper
-        (vco_lib/weaviate_schema.py) carries the full slot map.
+        UNION the legacy/forward-compat slots, so a model switch needs no
+        collection recreate (vco_lib/weaviate_schema.py has the full slot map).
+        v0.2.105: each slot carries ``class_name``'s vector-index policy (the
+        cache cap, ``vco_lib.weaviate_vector_index``).
         """
         if not self.named_vectors:
             return Configure.Vectorizer.none()
@@ -1553,7 +1558,7 @@ class CodeGraphAnalyzer:
             "codesage_embed",      # CodeSage primary (preserved through model switches)
             "openai_code_embed",   # OpenAI text-embedding-3 reused for code
         }
-        return [Configure.NamedVectors.none(name=n) for n in sorted(slot_names)]
+        return [_client_named_vector(n, class_name) for n in sorted(slot_names)]
 
     def _inverted_index_config(self):
         """Always return an inverted index config with `index_null_state=True`.
@@ -1707,7 +1712,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_module,
                     description="Code modules/files with imports and metrics",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_module),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="path", data_type=DataType.TEXT, description="File path relative to repo root", skip_vectorization=True),
@@ -1769,7 +1774,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_class,
                     description="Classes with inheritance and methods",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_class),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="name", data_type=DataType.TEXT, description="Class name", skip_vectorization=True),
@@ -1838,7 +1843,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_function,
                     description="Functions with call graphs",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_function),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="name", data_type=DataType.TEXT, description="Function name", skip_vectorization=True),
@@ -1905,7 +1910,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_api,
                     description="API endpoints with handlers",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_api),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="endpoint", data_type=DataType.TEXT, description="API endpoint path", skip_vectorization=True),
@@ -1949,7 +1954,7 @@ class CodeGraphAnalyzer:
                 created = self._create_class_with_retry(
                     name=self.coll_interaction,
                     description="Cross-language and cross-service communication calls",
-                    vectorizer_config=self._vectorizer_config(),
+                    vectorizer_config=self._vectorizer_config(self.coll_interaction),
                     inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="source_project", data_type=DataType.TEXT, description="Project that initiates the call", skip_vectorization=True),
@@ -2402,6 +2407,7 @@ class CodeGraphAnalyzer:
             self._identity_collision_files = getattr(
                 self, "_identity_collision_files", 0) + 1
         written_by_full_name: Dict[str, str] = {}
+        written: List[Tuple[Any, str]] = []  # (entity, uuid) for the config links
         for _i, entity in enumerate(fx.entities):
             if _dup_ids[_i] is not None:
                 # Copy before mutating: producers may reuse an extras dict.
@@ -2423,6 +2429,7 @@ class CodeGraphAnalyzer:
                 if handler_uuid:
                     entity.references["handler"] = handler_uuid
             written_uuid = self.store_entity(entity)
+            written.append((entity, written_uuid))
             if entity.full_name:
                 written_by_full_name[entity.full_name] = written_uuid
             if entity.kind == KIND_CLASS and entity.full_name:
@@ -2433,7 +2440,8 @@ class CodeGraphAnalyzer:
         # Interactions last — they need the module UUID (and only exist once
         # the module/entities are in place). Mirror the imperative sites, which
         # assigned ``stats['interactions'] = ctx._store_interactions(...)``.
-        for group in fx.interactions:
+        # v0.2.105: then the config-VALUE links (codegraph_config_refs.link_groups).
+        for group in list(fx.interactions) + _cfg_refs.link_groups(self, fx, written):
             if not group.interactions:
                 continue
             stored = self._store_interactions(
@@ -3344,15 +3352,8 @@ class CodeGraphAnalyzer:
         _ensure_analyzer_properties(self, ("n_callers",))
 
     def _ensure_interaction_project_property(self):
-        """v0.2.102 (S16-4): `project` on CodeInteraction; when THIS call adds it,
-        backfill rows lacking it (resumable, soft-fail; the 7_to_8 edge too)."""
-        if "CodeInteraction.project" not in _ensure_analyzer_properties(self, ("project",)):
-            return
-        done, failed = _backfill_missing_property(
-            self.interactions_collection, "project", getattr(self, "project_name", "") or "")
-        print(f"   Backfilled project on {done} CodeInteraction row(s)"
-              + (f" ({failed} failed — the 7_to_8 edge finishes them on the next update)"
-                 if failed else ""))
+        """v0.2.102 (S16-4) — body in vco_lib.codegraph_schema (v0.2.105)."""
+        ensure_interaction_project(self)
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
@@ -3460,6 +3461,7 @@ class CodeGraphAnalyzer:
         # v0.2.103 (R12-F2): extras DROPPED this run (unresolvable/offline/
         # unmounted) — provenance missing → the orphan reaping is disabled.
         self._dropped_extra_sources: Set[str] = set()
+        self._walked_extra_roots: Set[str] = set()  # v0.2.105: prune-scope input
         for extra in (extra_paths or []):
             try:
                 resolved = extra.resolve()
@@ -3486,6 +3488,7 @@ class CodeGraphAnalyzer:
                         scoped=not self._analyze_whole_repo, extra_root=bool(as_extra_path)))
                 continue
             canonical_extras.append(resolved)
+            self._walked_extra_roots.add(resolved.as_posix())
 
         # v0.2.75 (P1b-3): reset the delete-failure accumulator per run
         # UNCONDITIONALLY (was: only under prune_stale). Three producers now
@@ -3571,6 +3574,7 @@ class CodeGraphAnalyzer:
             # zero functions in code-graph queries.
             ('svelte',     self._find_svelte_files,     self._analyze_svelte_file),
             ('powershell', self._find_powershell_files, self._analyze_powershell_file),
+            ('config',     self._find_config_files,     self._analyze_config_file),
         ]
 
         # v0.2.18 (Plan C): two-phase loop so we know the grand-total file
@@ -3705,6 +3709,8 @@ class CodeGraphAnalyzer:
                             files = self._union_stale_into_changed(
                                 source_root, all_files, files, self._root_stamp(source_root, is_extra_root),
                             )
+                            files = _cfg_refs.requeue_on_config_change(  # a config edit relinks code
+                                self, source_root, lang_name, all_files, files, since_commit)
                             if not files:
                                 # Quiet skip — the typical case for clean repos
                                 # with NO stale rows (the union added nothing).
@@ -3888,6 +3894,7 @@ class CodeGraphAnalyzer:
                     (getattr(self, "modules_collection", None), "path"),
                     (getattr(self, "classes_collection", None), "file_path"),
                     (getattr(self, "functions_collection", None), "file_path"),
+                    (getattr(self, "interactions_collection", None), "file_path"),
                 ),
                 getattr(self, "_reconcile_walked", None) or {},
                 project_name=self.project_name or "",
@@ -4039,6 +4046,17 @@ class CodeGraphAnalyzer:
                 f"language={scope_lang!r} entries not visited this run"
             )
 
+        # v0.2.105 (prune lane): SOURCE-scoped prune, ONE home for the rule
+        # (vco_lib.codegraph_source_scope.prune_scope_for_walk): judge only
+        # rows of the roots this run walked — a primary-only walk must never
+        # judge an extra folder's rows (2026-10-29 incident).
+        _prune_scope = _src_scope.prune_scope_for_walk(
+            getattr(self, "_analyze_repo_root_raw", "") or "",
+            getattr(self, "_walked_extra_roots", ()) or (),
+            strict_source=bool(getattr(self, "_strict_source", False)))
+        if _prune_scope:
+            print(f"🧹 Source-scoped prune active: {_prune_scope.summary()}")
+
         # v0.2.103 (defect 7 / R12-F2 / R14-B2): orphan reaping needs a FULL,
         # unscoped walk. A REFUSED extra no longer gates the run (its rows
         # are protected per-row via preserve_sources → the ONE predicate); a
@@ -4066,6 +4084,7 @@ class CodeGraphAnalyzer:
                 preserve_paths=preserve_paths,
                 preserve_sources=getattr(self, "_refused_extra_sources", None),
                 reap_orphans=_reap_orphans if coll.name.endswith("_CodeInteraction") else False,
+                source_scope=_prune_scope,
             )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
@@ -4082,21 +4101,10 @@ class CodeGraphAnalyzer:
                 _record_prune_failures(self, coll.name, failures)
 
         # R14-B1: after a reaping-enabled full walk, re-count through the SAME
-        # probe and clear the pending-orphan deferral on a positive zero.
-        # R16-B-N1: the RAW root form — rows are STAMPED with it; the resolved
-        # root's primary set misses raw-stamped rows on a symlinked repo.
+        # probe and clear the pending-orphan deferral on a positive zero
+        # (ONE home: vco_lib.codegraph_resync.clear_orphan_deferral_after_reaping).
         if _reap_orphans and self.interactions_collection is not None:
-            _raw_root = getattr(self, "_analyze_repo_root_raw", "") or ""
-            try:
-                _clear_orphan_deferral_if_zero(
-                    self.project_name or "",
-                    repo_root=(Path(_raw_root) if _raw_root
-                               else getattr(self, "_analyze_repo_root", None)),
-                    client=getattr(self, "client", None),
-                )
-            except Exception as exc:  # noqa: BLE001 — never wedge the prune
-                print(f"⚠️  orphan-deferral clear check failed: {exc}",
-                      file=sys.stderr)
+            _clear_after_reaping(self)
 
         return total_pruned
 
@@ -4108,6 +4116,7 @@ class CodeGraphAnalyzer:
         preserve_paths: Optional[Set[Any]] = None,
         preserve_sources: Optional[Set[str]] = None,
         reap_orphans: bool = False,
+        source_scope: Optional[Any] = None,
     ) -> Tuple[int, int]:
         """Thin shim over ``vco_lib.codegraph_prune.prune_collection`` (the
         v0.2.82 extraction — full semantics, history and the 2026-07-15
@@ -4123,6 +4132,7 @@ class CodeGraphAnalyzer:
             preserve_paths=preserve_paths,
             preserve_sources=preserve_sources,
             reap_orphans=reap_orphans,
+            source_scope=source_scope,
         )
 
     def _single_file_dispatch(
@@ -4315,27 +4325,11 @@ class CodeGraphAnalyzer:
         return self._find_files_for('cpp', repo_path)
 
     def _find_js_files(self, repo_path: Path) -> List[Path]:
-        """Find all JavaScript files in repository.
-
-        v0.2.72 (P5): `.bundle.js` + `.chunk.js` join `.min.js` — these are
-        build-output bundles (webpack/rollup/esbuild), not source. A vendored
-        bundle (since removed) was live-confirmed injecting its functions as
-        retrieval context. `.chunk.js` covers split-chunk output that doesn't
-        live under an already-ignored codegen dir. F8: the suffix set is the
-        SHARED module-level constant (`_JS_SKIP_SUFFIXES`, via `_FINDER_SPECS`)
-        so the single-file dispatch (`_dispatch_name_for_file`) cannot drift.
-        """
+        """Find JavaScript files (build bundles skipped via `_FINDER_SPECS`, v0.2.72 P5/F8)."""
         return self._find_files_for('js', repo_path)
 
     def _find_ts_files(self, repo_path: Path) -> List[Path]:
-        """Find all TypeScript files in repository.
-
-        v0.2.72 (P5): `.bundle.ts` / `.chunk.ts` mirror the JS bundle skips.
-        Bundle output is almost always `.js`, but the mirror keeps the two
-        find-methods symmetric if a toolchain emits `.ts` bundles. F8: shared
-        module-level constant (`_TS_SKIP_SUFFIXES`, includes `.d.ts` type
-        stubs) so the single-file dispatch cannot drift.
-        """
+        """Find TypeScript files (`.d.ts` + bundles skipped via `_FINDER_SPECS`, v0.2.72 P5/F8)."""
         return self._find_files_for('ts', repo_path)
 
     def _find_go_files(self, repo_path: Path) -> List[Path]:
@@ -4363,29 +4357,24 @@ class CodeGraphAnalyzer:
         return self._find_files_for('csharp', repo_path)
 
     def _find_svelte_files(self, repo_path: Path) -> List[Path]:
-        """Find all Svelte component files in repository.
-
-        V52-O.11.B (v0.2.53 Track E): added so the launcher's 244 .svelte
-        files stop indexing as zero functions in the code graph. Shares
-        the JS/TS ignore-dir set because Svelte sits in the same npm
-        tooling ecosystem (node_modules, dist, .svelte-kit codegen).
-        """
+        """Find Svelte components (V52-O.11.B; shares the JS/TS ignore set)."""
         return self._find_files_for('svelte', repo_path)
 
     def _find_powershell_files(self, repo_path: Path) -> List[Path]:
-        """Find all PowerShell script files in repository.
-
-        V52-O.11.N (v0.2.53 Track E): added so the orchestrator's 168
-        .ps1 files (template hooks + Windows-side install scripts)
-        stop indexing as zero functions in the code graph. Reuses the
-        shell ignore-dir set since .ps1 lives in the same parts of the
-        tree as .sh (templates/hooks/, scripts/).
-        """
+        """Find PowerShell scripts (V52-O.11.N; shares the shell ignore set)."""
         return self._find_files_for('powershell', repo_path)
 
     def _find_proto_files(self, repo_path: Path) -> List[Path]:
         """Find all Protocol Buffer definition files."""
         return self._find_files_for('proto', repo_path)
+
+    def _find_config_files(self, repo_path: Path) -> List[Path]:
+        """Find .tweakers/.ini/.json config files (v0.2.105; `bin/` stays ignored)."""
+        return self._find_files_for('config', repo_path)
+
+    def _analyze_config_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
+        """vco_lib/codegraph_lang/config.py::analyze_config_file via EXTRACTORS."""
+        return _codegraph_lang.EXTRACTORS["config"](self, file_path, repo_root)
 
     def _analyze_csharp_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
         """P2f stage 2 (v0.2.76): moved verbatim to
@@ -5409,6 +5398,11 @@ class CodeGraphAnalyzer:
         self._xref_file_path: Dict[str, str] = {}
         self._xref_stored_calls: Dict[str, Any] = {}
         self._xref_stored_ncallers: Dict[str, Any] = {}
+        # v0.2.105 (#512C): the root each cached function row was walked from
+        # (`project_source`), so call-name resolution can prefer a candidate in
+        # the CALLER's own repo root instead of an arbitrary same-named
+        # function that an extra code folder's mirror contributed.
+        self._xref_source: Dict[str, str] = {}
         # v0.2.92: the stored `calls` BEACONS (distinct from `call_names`, the
         # text property); same single-scan sourcing as the modules loop above.
         self._xref_stored_call_refs: Dict[str, List[str]] = {}
@@ -5426,6 +5420,9 @@ class CodeGraphAnalyzer:
                     self._xref_stored_calls[_u] = _p.get("call_names")
                     self._xref_stored_ncallers[_u] = _p.get("n_callers")
                     self._xref_stored_call_refs[_u] = _reference_target_uuids(obj, "calls")
+                    self._xref_source[_u] = str(
+                        _p.get("project_source") or ""
+                    ).strip()
         except Exception as e:
             print(f"   ⚠️  Failed to load functions: {e}")
 
@@ -5436,36 +5433,20 @@ class CodeGraphAnalyzer:
         call_name: str,
         caller_full_name: str,
         func_name_to_full: Dict[str, List[str]],
+        caller_source: str = "",
     ) -> Optional[str]:
-        """Resolve a call name to the target function's UUID, or None.
+        """Seam over :func:`vco_lib.codegraph_references.resolve_call_target`
+        (the ONE home for name → target resolution; v0.2.105 #512C added the
+        caller-root preference there)."""
+        return _resolve_call_target_impl(
+            call_name, caller_full_name, self.function_cache,
+            func_name_to_full, getattr(self, "_xref_source", {}) or {},
+            caller_source,
+        )
 
-        Single home (v0.2.74 R4) for the call-name → target-UUID resolution
-        used by BOTH the changed-file body-parse path and the unchanged-file
-        stored-call_names counting path in ``create_cross_references``. Keeps
-        the two paths from drifting (my earlier inline copy would have been a
-        second implementation). Resolution order: exact full_name → unique
-        short-name → short-name preferring the caller's own module prefix.
-        """
-        # Exact full_name match first.
-        uuid_ = self.function_cache.get(call_name)
-        if uuid_ is not None:
-            return uuid_
-        # Short-name match (prefer same module).
-        candidates = func_name_to_full.get(call_name, [])
-        if len(candidates) == 1:
-            return self.function_cache.get(candidates[0])
-        if len(candidates) > 1:
-            module_prefix = (
-                caller_full_name.rsplit(".", 1)[0]
-                if "." in caller_full_name else ""
-            )
-            same_module = [
-                c for c in candidates if c.startswith(module_prefix + ".")
-            ]
-            if same_module:
-                return self.function_cache.get(same_module[0])
-            return self.function_cache.get(candidates[0])
-        return None
+    def _row_source(self, func_uuid: str) -> str:
+        """A cached row's ``project_source`` ("" when unstamped/unknown)."""
+        return (getattr(self, "_xref_source", {}) or {}).get(func_uuid, "")
 
     def create_cross_references(
         self, changed_files: Optional[Set[str]] = None,
@@ -5581,6 +5562,7 @@ class CodeGraphAnalyzer:
                         for _cn in _stored_for_count:
                             _tgt = self._resolve_call_target(
                                 _cn, full_name, func_name_to_full,
+                                self._row_source(func_uuid),
                             )
                             if _tgt is not None:
                                 inbound[_tgt] = inbound.get(_tgt, 0) + 1
@@ -5649,6 +5631,7 @@ class CodeGraphAnalyzer:
                     # unchanged-file counting path above).
                     _tgt = self._resolve_call_target(
                         call_name, full_name, func_name_to_full,
+                        self._row_source(func_uuid),
                     )
                     if _tgt is not None:
                         refs_to_add.append(_tgt)
@@ -6165,7 +6148,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # v0.2.21 Step 20: read the collection prefix from the running hub
     # rather than deriving it locally from --project or the CWD. When
     # this flag is set, the analyzer queries the resolver for
-    # `code_graph_project` / `code_graph_collection_prefix` so its
+    # `code_graph_collection_prefix` (never the slug alias) so its
     # output collections match exactly what consumers see via the
     # resolver. Soft-fail: if the resolver is unreachable, we fall
     # back to the existing --project / repo-dir-name logic with a
@@ -6175,15 +6158,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         '--from-resolver',
         action='store_true',
         help=(
-            'Query the vct-hub resolver for code_graph_project / '
-            'collection_prefix (uses the project at repo_path). Mutually '
+            'Query the vct-hub resolver for the code-graph collection '
+            'prefix (uses the project at repo_path). Mutually '
             'exclusive with --project. Falls back to repo-dir-name if '
             'hub unreachable.'
         ),
     )
     parser.add_argument('--language', '-l', type=str,
                        choices=['python', 'lua', 'cpp', 'javascript', 'typescript',
-                                'go', 'rust', 'java', 'ruby', 'shell', 'csharp', 'proto'],
+                                'go', 'rust', 'java', 'ruby', 'shell', 'csharp', 'proto', 'config'],
                        default=None,
                        help='Language to analyze (default: all supported; language inferred from file extensions)')
     parser.add_argument('--incremental', '-i', action='store_true',
@@ -6357,7 +6340,7 @@ def main():
     # the analyzer writes to MUST match what consumers see via the
     # resolver, otherwise hooks query the wrong collection on every
     # Edit. Three sources of truth, in priority order:
-    #   1. --from-resolver: ask the hub for code_graph_project. The
+    #   1. --from-resolver: ask the hub for code_graph_collection_prefix. The
     #      resolver consults the project's project_codegraph_bindings
     #      row (Step 19's startup backfill seeds it) and returns the
     #      canonical prefix.

@@ -115,11 +115,12 @@ class Box:
         if argv[1] == "inspect":
             if self.inspect_error:
                 return _cp(argv, 125, "", self.inspect_error)
-            name, fmt = argv[-1], argv[argv.index("--format") + 1]
+            name = argv[-1]
             if not self.exists or name != "vco_ollama":
                 return _cp(argv, 125, "", f"Error: no such container {name}")
-            if fmt == "{{.Id}}":
-                return _cp(argv, 0, "abc123\n")
+            if "--format" not in argv:  # the template-free id lookup (v0.2.105)
+                return _cp(argv, 0, json.dumps([{"Id": "abc123"}]))
+            fmt = argv[argv.index("--format") + 1]
             if fmt == "{{json .Mounts}}":
                 return _cp(argv, 0, json.dumps(self.live))
         if argv[1] == "rm":
@@ -260,6 +261,10 @@ def test_an_uninspectable_container_refuses_unknown(world, error):
     g = _guard(box, infra, db, se.load_rows(db)["ollama"])
     assert g.verdict == di.REFUSE_UNKNOWN
     assert box.calls("config") == []
+    # v0.2.105 review LOW: the refusal keeps the probe's own stderr tail
+    # (daemon down, permission denied) — RED-PROOF TARGET: dropping the
+    # detail from capture_live_mount's UNKNOWN entries turns this red.
+    assert error in g.reason, g.reason
 
 
 def test_a_container_without_a_data_mount_refuses(world):
@@ -621,12 +626,13 @@ class TwoBox:
             self.env_at_up.append(self.env_file())
             return _cp(argv)
         if argv[1] == "inspect":
-            name, fmt = argv[-1], argv[argv.index("--format") + 1]
+            name = argv[-1]
             service = next((s for s, n in self.names.items() if n == name), None)
             if service is None or service not in self.live:
                 return _cp(argv, 125, "", f"Error: no such container {name}")
-            if fmt == "{{.Id}}":
-                return _cp(argv, 0, "abc123\n")
+            if "--format" not in argv:  # the template-free id lookup (v0.2.105)
+                return _cp(argv, 0, json.dumps([{"Id": "abc123"}]))
+            fmt = argv[argv.index("--format") + 1]
             if fmt == "{{json .Mounts}}":
                 return _cp(argv, 0, json.dumps(self.live[service]))
         if argv[1] == "rm":

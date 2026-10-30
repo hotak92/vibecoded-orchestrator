@@ -639,7 +639,13 @@ if [[ "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "PowerShell" ]]; then
     if [[ -f "$SECURITY_SCRIPT" ]]; then
         _SEC_SHELL="bash"
         [[ "$TOOL_NAME" == "PowerShell" ]] && _SEC_SHELL="powershell"
-        SECURITY_RESULT=$(echo "$CMD" | _ptu_bounded 2 "$PY" "$SECURITY_SCRIPT" --shell "$_SEC_SHELL" 2>&1)
+        # v0.2.105 rm guard: the scanner remembers a "retry to confirm" rm
+        # per chat session + subagent under .claude/state/rm-confirm/, so it
+        # gets the payload's ids and the state dir (always set here, so an
+        # inherited value never leaks in). MUST MATCH pre-tool-use.ps1.
+        SECURITY_RESULT=$(echo "$CMD" | VCO_GUARD_SESSION_ID="$SESSION_ID_FROM_STDIN" \
+            VCO_GUARD_AGENT_ID="$AGENT_ID" VCO_GUARD_STATE_DIR="$SESSION_STATE_DIR" \
+            _ptu_bounded 2 "$PY" "$SECURITY_SCRIPT" --shell "$_SEC_SHELL" 2>&1)
         SECURITY_EXIT=$?
         if [[ -n "${PY:-}" ]] && [[ "$SECURITY_EXIT" -eq 124 || "$SECURITY_EXIT" -eq 137 || "$SECURITY_EXIT" -eq 143 ]]; then
             _CMD_BYTES=$(printf '%s' "$CMD" | LC_ALL=C wc -c)
@@ -848,7 +854,7 @@ fi
 # context for: two context emissions per edit, and the suggestion path had
 # no score floor at all (the survey's precision complaint). The injection
 # redesign made those wrappers (via hook_context_router.py) the ONE home for
-# edit-time KG context — PLAN-V02101 §2.1 Edit/Write rows: floor 0.65,
+# edit-time KG context — PLAN-V02101 §2.1 Edit/Write rows: floor 0.70,
 # titles-only below 0.85, exact def+callers on the code-graph leg, seen-store
 # dedupe + per-turn budget. Retiring this branch also retired the last shell
 # caller of _lib/query-cache.sh, deleted with it (the router keeps its own

@@ -372,6 +372,10 @@ def test_driver_spawns_the_summary_generator_after_the_analyzer(monkeypatch, tmp
     events: list = []
     monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)
+    # v0.2.105: the driver's backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: {})
     monkeypatch.setattr(cr, "_maybe_run_exposure_heal", lambda *a, **k: False)
     monkeypatch.setattr(cr, "_report_terminal_to_hub", lambda *a, **k: None)

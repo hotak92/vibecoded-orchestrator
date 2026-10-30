@@ -954,6 +954,8 @@ test -w "${TMPDIR:-/tmp}" && echo "writable" || echo "NOT writable"
 
 **syntax-check on edit**: if you've edited a hook locally, run `bash -n .claude/hooks/<name>.sh` to syntax-check before saving. CI does this on every PR.
 
+**The session's working directory moved into a subagent's worktree.** After a "worktree KEPT" notice, one `cd` into that worktree can leave the main chat working there: Claude Code then tells the model the new primary working directory and to run all commands from it. That is Claude Code's own working-directory tracking, not a VCO hook. In the main session, a Bash `cd` that succeeds and ends inside the session's working directories carries over to the next command. No VCO hook prints that notice, sets a working directory or writes `CLAUDE_ENV_FILE`; the kept-worktree notice is plain text. To review a kept worktree without moving the session, use absolute paths or `git -C <worktree> …`. If the session has already moved, `cd` back to the project root.
+
 ## Contributor: `cargo test` flakes on shared-state tests
 
 Since v0.2.21 (Step 23), `launcher/src-tauri/.cargo/config.toml` pins `RUST_TEST_THREADS = "1"` workspace-wide. Background: a subset of tests across `auth`, `lockfile`, `boot`, `hub_status`, `hub_launcher`, `commands::installer::hub_stop_tests`, and `commands::self_update::state_roundtrip` mutate process-wide env vars (`VCT_STATE_DIR`, `HOME`, `VCT_HUB_PORT`). Even with the workspace-wide serialisation `Mutex` in `vct_launcher_core::test_env`, parallel runs can recycle PIDs under load and break "definitely-dead PID" assumptions.
@@ -1059,6 +1061,11 @@ each other on one machine. Keep the panel on the gateway, and start a
 bash .claude/scripts/rc-native.sh start        # POSIX (Linux/macOS)
 powershell -NoProfile -ExecutionPolicy Bypass -File .claude/scripts/rc-native.ps1 start   # Windows (5.1)
 ```
+
+When Claude runs these for you (the `rc-native` skill), it runs them with
+the tool's `run_in_background: true`: the scripts hold a 25-second
+readiness loop, and the wait guard refuses a script that can wait that long
+in the foreground. Typed in your own terminal they run as usual.
 
 The server is detached (survives the terminal closing; not a boot service —
 it does not survive a reboot, just start it again), prints the

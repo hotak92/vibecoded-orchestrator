@@ -72,6 +72,11 @@ pub mod diagrams;
 // time from manifest.mcp_registration.tool_allowlist; read by the hub's
 // /mcp-tool-grants route to compose per-project allowlists.
 pub mod mcp_tool_defaults;
+// Migration 050 (v0.2.105) — cached Weaviate class counts + the
+// measured-at timestamp, backing the lazy-load count policy in
+// `crate::weaviate_counts` (the launcher's KG/codegraph pages and the
+// hub's CLI twins both read it through that one module).
+pub mod count_cache;
 // Migration 024 — per-paid-module license keys (v0.2.40 L1). The raw
 // key value stays in the OS keychain; this table only holds the SOURCE-
 // of-input metadata (prefix for display, keychain coordinates, last

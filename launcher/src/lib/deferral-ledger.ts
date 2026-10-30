@@ -310,6 +310,11 @@ export const AUTO_RETRY_BACKED_CONDITIONS: ReadonlySet<string> = new Set([
   // `retry:py:code_embed_backend` resolves the row once the code backend
   // answers, so the retry claim is true.
   'code_embed_backend_unavailable',
+  // v0.2.105: an enabled extra code folder lost its rows.
+  // `retry:py:codegraph_extras_heal` (vco_lib.deferral_retry →
+  // retry_codegraph_extras_heal) re-indexes the folder once the code backend
+  // answers, so the retry claim is true.
+  'codegraph_extra_rows_missing',
   // DOCUMENTED EXCEPTION — no `retry_action` ON PURPOSE. The work is already
   // scheduled: the flip transaction inserted a `code_graph_builds` pending row
   // and the launcher's own build runner consumes it. A WP-H handler here would

@@ -15,6 +15,12 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
+# v0.2.105: the hook's start, for the router's run deadline AND its hard
+# end-to-end deadline (the harness timeout counts from HERE).
+# One home: _lib/hook-start.ps1 (MUST MATCH the .sh sibling's call).
+$HookStartLib = Join-Path $PSScriptRoot "_lib/hook-start.ps1"
+if (Test-Path $HookStartLib) { . $HookStartLib; Set-VcoHookStartedAt }
+
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Resolve-Path (Join-Path $ScriptDir "..\..")).Path }
 

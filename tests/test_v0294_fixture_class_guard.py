@@ -137,7 +137,7 @@ _UNTABLED_STEMS_SNAPSHOT = frozenset({
     "PeerOne", "PeerTwo", "Populated", "PostRename", "PreExisting",
     "Prefixexampleorchestrator", "PrefixExampleOrchestrator", "PreRename",
     "Proj", "Proj_Backend", "ProjCodeless", "Project", "ProjectA", "Q",
-    "Quuux", "R", "Real", "RealName", "Recloned", "Registered", "Renamed",
+    "Quuux", "R", "Real", "RealName", "Recloned", "Registered", "Renamed", "Root",
     "RePicked", "ResidueProj", "RlTest", "Same", "Sample",
     "schema_reingest_incomplete_P1", "Shared", "SimRaceTest_AI",
     "SimRaceTestAI", "Small", "Snapshotted", "SoftFail", "Solo",

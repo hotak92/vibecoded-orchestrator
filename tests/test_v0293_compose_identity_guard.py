@@ -222,6 +222,8 @@ class StartServicesIdentityGuardTests(unittest.TestCase):
             # argv, so only that call is recorded.
             if "compose" in cmd or "-f" in cmd:
                 recorded["cmd"] = list(cmd)
+            if list(cmd[1:3]) == ["image", "inspect"]:  # v0.2.105 pre-pull: images present
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             return subprocess.CompletedProcess(cmd, rc, "", stderr)
 
         state = code_embed_image.ImageState(code_embed_image.STALE, "summary(stale)")

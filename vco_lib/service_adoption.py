@@ -165,6 +165,13 @@ WEAVIATE_RECLAIM_ENV_KEYS: tuple[str, ...] = (
     "TOMBSTONE_DELETION_MIN_PER_CYCLE",
     "TOMBSTONE_DELETION_MAX_PER_CYCLE",
     "TOMBSTONE_DELETION_CONCURRENCY",
+    # v0.2.105 memory + compression knobs: a running Weaviate without them
+    # keeps the unbounded 2x heap, eager shard loading, or uncompressed new
+    # collections, so their absence is drift like the reclaim keys'.
+    "GOGC",
+    "MEMORY_READONLY_PERCENTAGE",
+    "LAZY_LOAD_SHARD_COUNT_THRESHOLD",
+    "DEFAULT_QUANTIZATION",
 )
 BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
     "OLLAMA_KEEP_ALIVE",
@@ -1327,7 +1334,12 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
             if not ref:
                 plan.reason = "no container named — nothing to adopt"
                 continue
-            container_id = _inspect_json(ref, "{{json .Id}}", runtime, run)
+            # v0.2.105: the ONE shared lookup. THE pre-fix bug lived here:
+            # `{{json .Id}}` is the one template form podman 4.9 refuses
+            # (exit 125, "can't evaluate field Id in type interface {}" —
+            # plain `{{.Id}}` works on podman), so the old probe refused a
+            # running container on every podman host.
+            container_id = _containers.container_id(ref, runtime, run=run)
             if not (isinstance(container_id, str) and container_id):
                 plan.reason = f"container '{ref}' does not exist (or could not be inspected)"
                 continue

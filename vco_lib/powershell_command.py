@@ -975,7 +975,352 @@ def _ps_condition_refresh_poll(cond: List[_Tok],
     return None
 
 
-def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
+# ── Bounded-total-wait reading (v0.2.105 fix round, owner ruling) ─────
+# Used ONLY for loops inside a script FILE (vco_lib.wait_guard passes the
+# budget, vco_lib.wait_guard_bounded.WAIT_BUDGET_S). A loop whose
+# iteration count is proved by a literal bound and whose every wait is a
+# literal Start-Sleep, with iterations x waits-per-iteration within the
+# budget, is a bounded retry. Whatever is not read exactly is unbounded.
+
+_PS_SLEEP_VERBS = frozenset({"start-sleep", "sleep"})
+_PS_NUM_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+_PS_INT_RE = re.compile(r"^-?[0-9]+$")
+_PS_RANGE_RE = re.compile(r"^(-?[0-9]+)\.\.(-?[0-9]+)$")
+#: Words that make a loop body unreadable for the bound: a nested loop or
+#: scriptblock-running construct, control flow that skips an increment,
+#: and the variable cmdlets that write a counter by name.
+_PS_BOUND_BREAKERS = frozenset({
+    "while", "for", "foreach", "do", "until", "function", "filter",
+    "workflow", "trap", "continue", "foreach-object", "%", "where-object",
+    "?", "switch", "set-variable", "new-variable", "clear-variable",
+    "remove-variable", "invoke-command", "icm", "start-job",
+})
+#: Blocks a counted wait/increment may sit in: they run at most once per
+#: iteration. Any other ``{`` (a scriptblock argument, a switch arm) may
+#: run any number of times — or never.
+_PS_ONCE_BLOCK_KINDS = frozenset({"try", "catch", "finally", "else", "if",
+                                  "elseif"})
+
+
+def _ps_sleep_seconds(stmt: List[_Tok]) -> Optional[float]:
+    """Seconds of a literal ``Start-Sleep N`` / ``-Seconds N`` /
+    ``-Milliseconds N`` statement (unique-prefix parameter names, ``-ms``
+    alias), else ``None``."""
+    words = [t for t in stmt if not t.op]
+    if (len(words) != len(stmt) or not words or words[0].quoted
+            or words[0].text.lower() not in _PS_SLEEP_VERBS):
+        return None
+    args = [t.text.lower() for t in words[1:]]
+    scale = 1.0
+    if len(args) == 2:
+        flag = args[0]
+        if flag == "-ms" or (len(flag) >= 2 and "-milliseconds".startswith(flag)):
+            scale = 0.001
+        elif not (len(flag) >= 2 and "-seconds".startswith(flag)):
+            return None
+        args = args[1:]
+    if len(args) != 1 or not _PS_NUM_RE.match(args[0]):
+        return None
+    return float(args[0]) * scale
+
+
+def _ps_var(text: str) -> Optional[str]:
+    """``$name`` → ``name`` (lower-cased; scope-qualified names refused)."""
+    m = re.fullmatch(r"\$([A-Za-z_]\w*)", text)
+    return m.group(1).lower() if m else None
+
+
+def _ps_is_increment(stmt: List[_Tok], var: str) -> bool:
+    """``$v++`` / ``++$v`` / ``$v += K`` / ``$v = $v + K`` (K > 0)."""
+    texts = [t.text.lower() for t in stmt]
+    if any(t.quoted for t in stmt):
+        return False
+    if texts in ([f"${var}++"], [f"++${var}"]):
+        return True
+    if (len(texts) == 3 and texts[0] == f"${var}" and texts[1] == "+="
+            and _PS_INT_RE.match(texts[2]) and int(texts[2]) > 0):
+        return True
+    return (len(texts) == 5 and texts[0] == f"${var}" and texts[1] == "="
+            and texts[2] == f"${var}" and texts[3] == "+"
+            and bool(_PS_INT_RE.match(texts[4])) and int(texts[4]) > 0)
+
+
+_PS_WRITE_FORM_RE = re.compile(r"^(?:\+\+|--)?\$(?:\w+:)?(\w+)(?:\+\+|--)?$")
+
+
+def _ps_writes_var(stmt: List[_Tok], var: str) -> bool:
+    """The statement may write ``$var`` (any assignment operator,
+    ``++``/``--`` in either position, scope-qualified, or ``[ref]``)."""
+    for k, t in enumerate(stmt):
+        if t.quoted or t.op:
+            continue
+        low = t.text.lower()
+        if "[ref]" in low and var in low:
+            return True
+        m = _PS_WRITE_FORM_RE.match(low)
+        if m is None or m.group(1) != var:
+            continue
+        if low.startswith(("++", "--")) or low.endswith(("++", "--")):
+            return True
+        nxt = stmt[k + 1] if k + 1 < len(stmt) else None
+        if nxt is not None and not nxt.op and nxt.text in _ASSIGN_OPS:
+            return True
+    return False
+
+
+def _ps_body_layout(body: List[_Tok]) -> Optional[Tuple[List[Tuple[List[_Tok], Tuple[int, ...]]], Dict[int, str]]]:
+    """``(statements, block_kinds)``: every statement of ``body`` with the
+    path of brace blocks enclosing it, and each block's kind (the word
+    before its ``{``; ``if``/``elseif`` for a ``(…) {`` behind those).
+    ``;`` inside parentheses is not a boundary. ``None`` when the braces
+    or parens do not balance."""
+    stmts: List[Tuple[List[_Tok], Tuple[int, ...]]] = []
+    kinds: Dict[int, str] = {}
+    stack: List[Tuple[int, int]] = []  # (block id, paren depth outside it)
+    cur: List[_Tok] = []
+    paren = 0
+    paren_heads: List[str] = []  # the word before each open `(`
+    last_paren_head = ""
+    for k, t in enumerate(body):
+        if t.op == "(":
+            prev = body[k - 1] if k > 0 else None
+            paren_heads.append(prev.text.lower() if prev is not None and not prev.op else "")
+            paren += 1
+            cur.append(t)
+            continue
+        if t.op == ")":
+            if paren == 0:
+                return None
+            paren -= 1
+            last_paren_head = paren_heads.pop()
+            cur.append(t)
+            continue
+        if t.op == ";" and paren > 0:
+            continue
+        if t.op in (";", "{", "}"):
+            if cur:
+                stmts.append((cur, tuple(b for b, _p in stack)))
+            if t.op == "{":
+                prev = body[k - 1] if k > 0 else None
+                if prev is None:
+                    kind = ""
+                elif prev.op == ")":
+                    kind = last_paren_head
+                elif not prev.op:
+                    kind = prev.text.lower()
+                    if kind.startswith("[") and len(cur) >= 2 \
+                            and cur[0].text.lower() == "catch":
+                        kind = "catch"  # `catch [Type] {`
+                else:
+                    kind = ""
+                bid = len(kinds) + 1
+                kinds[bid] = kind
+                stack.append((bid, paren))
+                paren = 0
+            elif t.op == "}":
+                if not stack or paren != 0:
+                    return None
+                _bid, paren = stack.pop()
+            cur = []
+            continue
+        cur.append(t)
+    if cur:
+        stmts.append((cur, tuple(b for b, _p in stack)))
+    if stack or paren:
+        return None
+    return stmts, kinds
+
+
+def _ps_counter_init(prefix: List[_Tok], var: str) -> Optional[int]:
+    """The literal integer ``$var`` is set to by the run of plain
+    ``$x = <literal>`` statements immediately before the loop, else
+    ``None``."""
+    stmts = _ps_stmts(prefix)
+    for stmt in reversed(stmts):
+        if not stmt:
+            continue
+        if len(stmt) == 1 and not stmt[0].op and not stmt[0].quoted:
+            # A glued ``$n=0`` (PowerShell accepts no spaces; the tokenizer
+            # keeps it one word) — the same ungluing ``_ps_for_iterations``
+            # does (review E-6: this was the one call site that missed it).
+            m = _PS_GLUED_ASSIGN_RE.match(stmt[0].text)
+            if m is not None:
+                if m.group(2) != "=" or _ps_var(m.group(1)) is None:
+                    return None
+                if _ps_var(m.group(1)) == var and _PS_INT_RE.match(m.group(3)):
+                    return int(m.group(3))
+                continue
+        if (len(stmt) != 3 or any(t.op or t.quoted for t in stmt[:2])
+                or stmt[1].text != "=" or _ps_var(stmt[0].text) is None
+                or stmt[2].op):
+            return None
+        value = stmt[2]
+        if not (value.quoted or _PS_INT_RE.match(value.text)
+                or value.text.lower() in ("$null", "$true", "$false")):
+            return None  # a call could write the counter by scope
+        if _ps_var(stmt[0].text) == var:
+            return int(stmt[2].text) if (
+                not stmt[2].quoted and _PS_INT_RE.match(stmt[2].text)) else None
+    return None
+
+
+def _ps_while_iterations(cond: List[_Tok], prefix: List[_Tok],
+                         body_stmts: List[List[_Tok]]) -> Optional[Tuple[str, int]]:
+    """``(counter, max iterations)`` for ``while (… -and $v -lt N -and …)``
+    whose counter starts at a literal and is only ever increased in the
+    body, else ``None``."""
+    if any(t.op or t.quoted for t in cond):
+        return None
+    words = [t.text.lower() for t in cond]
+    if any(w in ("-or", "-xor", "-not", "-bor", "-band") or w.startswith("!")
+           for w in words):
+        return None
+    terms: List[List[str]] = [[]]
+    for w in words:
+        if w == "-and":
+            terms.append([])
+        else:
+            terms[-1].append(w)
+    for term in terms:
+        if (len(term) == 3 and _ps_var(term[0]) is not None
+                and term[1] in ("-lt", "-le") and _PS_INT_RE.match(term[2])):
+            var = _ps_var(term[0])
+            assert var is not None
+            if any(_ps_writes_var(s, var) and not _ps_is_increment(s, var)
+                   for s in body_stmts):
+                return None
+            init = _ps_counter_init(prefix, var)
+            if init is None:
+                return None
+            n = int(term[2]) - init + (1 if term[1] == "-le" else 0)
+            return var, max(0, n)
+    return None
+
+
+_PS_GLUED_ASSIGN_RE = re.compile(r"^(\$[a-z_][a-z0-9_]*)(\+?=)(-?\d+)$")
+
+
+def _ps_unglue_assignment(words: List[str]) -> List[str]:
+    """``["$i=0"]`` -> ``["$i", "=", "0"]`` (and ``$i+=1``): PowerShell
+    accepts an assignment with no spaces, and the tokenizer keeps it one
+    word. Anything else is returned unchanged."""
+    if len(words) == 1:
+        m = _PS_GLUED_ASSIGN_RE.match(words[0])
+        if m:
+            return [m.group(1), m.group(2), m.group(3)]
+    return words
+
+
+def _ps_for_iterations(header: List[_Tok]) -> Optional[Tuple[str, int]]:
+    """``(var, iterations)`` for ``for ($i = A; $i -lt B; $i++)``."""
+    parts = _ps_stmts(header)
+    if len(parts) != 3 or any(t.op or t.quoted for p in parts for t in p):
+        return None
+    init, cond, step = (_ps_unglue_assignment([t.text.lower() for t in p]) for p in parts)
+    if not (len(init) == 3 and init[1] == "=" and _PS_INT_RE.match(init[2])):
+        return None
+    var = _ps_var(init[0])
+    if (var is None or len(cond) != 3 or cond[0] != f"${var}"
+            or cond[1] not in ("-lt", "-le") or not _PS_INT_RE.match(cond[2])):
+        return None
+    if step not in ([f"${var}++"], [f"++${var}"], [f"${var}", "+=", "1"]):
+        return None
+    n = int(cond[2]) - int(init[2]) + (1 if cond[1] == "-le" else 0)
+    return var, max(0, n)
+
+
+def has_loop(command: str) -> bool:
+    """True when ``command`` contains a PowerShell loop of any kind — a
+    loop keyword followed by its syntax, a ``do {`` or a per-item
+    ``| ForEach-Object`` stage. The wait guard drops the bounded-wait
+    budget for a script run from such a command: the loop around the call
+    multiplies the script's wait by an unknown count."""
+    toks = _tokenize(command) if isinstance(command, str) else []
+    for i, t in enumerate(toks):
+        if t.op or t.quoted:
+            continue
+        word = t.text.lower()
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if nxt is None:
+            continue
+        if word in ("while", "for", "foreach", "until") and nxt.op == "(":
+            return True
+        if word == "do" and nxt.op == "{":
+            return True
+        if (word in _PS_FOREACH_OBJECT and i > 0 and toks[i - 1].op == "|"):
+            return True
+    return False
+
+
+def loop_wait_bound(label: str, cond: List[_Tok], header: List[_Tok],
+                    body: List[_Tok], prefix: List[_Tok]) -> Optional[float]:
+    """Worst-case total wait, in seconds, of ONE loop :func:`loop_pattern`
+    found a wait in — or ``None`` when it cannot be proved: the wait sits
+    in the condition/header, a wait is not a literal ``Start-Sleep``, the
+    body nests a loop or runs a scriptblock per item, or the iteration
+    count has no literal bound. Bounded shapes: ``for ($i = A; $i -lt B;
+    $i++)`` whose body never writes ``$i``; ``foreach ($x in A..B)``; and
+    the counter retry ``$n = 0; while (… -and $n -lt N) { … }`` where
+    every wait shares a once-per-iteration block (``try``/``catch``/
+    ``finally``/``if``/``else``, never inside a ``try`` — an exception
+    caught in the body could skip the increment) with a plain ``$n++``,
+    and ``$n`` is never otherwise written."""
+    if _ps_loop_has_wait(cond) or _ps_loop_has_wait(header):
+        return None
+    for t in body:
+        if t.op or t.quoted:
+            continue
+        if t.text.lower() in _PS_BOUND_BREAKERS:
+            return None
+    layout = _ps_body_layout(body)
+    if layout is None:
+        return None
+    stmts, kinds = layout
+    per_iteration = 0.0
+    waits: List[Tuple[int, ...]] = []
+    for stmt, path in stmts:
+        if not _ps_loop_has_wait(stmt):
+            continue
+        secs = _ps_sleep_seconds(stmt)
+        if secs is None:
+            return None
+        if any(kinds[b] not in _PS_ONCE_BLOCK_KINDS or kinds[b] == "try"
+               for b in path):
+            return None
+        per_iteration += secs
+        waits.append(path)
+    plain = [s for s, _p in stmts]
+    if label == "for loop":
+        found = _ps_for_iterations(header)
+        if found is None or any(_ps_writes_var(s, found[0]) for s in plain):
+            return None
+        return found[1] * per_iteration
+    if label == "foreach loop":
+        words = [t for t in cond if not t.op]
+        if (len(words) != 3 or len(cond) != 3 or words[1].text.lower() != "in"
+                or words[2].quoted):
+            return None
+        m = _PS_RANGE_RE.match(words[2].text)
+        if m is None:
+            return None
+        return (abs(int(m.group(2)) - int(m.group(1))) + 1) * per_iteration
+    if label != "while loop":
+        return None
+    found = _ps_while_iterations(cond, prefix, plain)
+    if found is None:
+        return None
+    var, n = found
+    # Every wait shares a block (its own or an enclosing one, up to the
+    # body) with a top-level plain increment of the counter.
+    inc_paths = {p for s, p in stmts if _ps_is_increment(s, var)}
+    for path in waits:
+        if not any(path[:d] in inc_paths for d in range(len(path), -1, -1)):
+            return None
+    return n * per_iteration
+
+
+def loop_pattern(command: str,
+                 wait_budget_s: float = 0.0) -> Optional[Tuple[str, str]]:
     """``(pattern_name, evidence)`` for a PowerShell loop the wait guard
     denies, else ``None`` (v0.2.102 W5-D; ALIGNED with the Bash rule by
     review R10, 2026-10-15 — before, EVERY ``while``/``do`` loop was
@@ -1013,7 +1358,13 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
 
     Keywords are recognised only as unquoted words followed by their
     syntax (``(`` / ``{``), so ``Write-Output "while (x)"`` and the
-    ``ForEach-Object`` alias ``foreach { … }`` never match. Never raises."""
+    ``ForEach-Object`` alias ``foreach { … }`` never match. Never raises.
+
+    ``wait_budget_s`` (v0.2.105 fix round; the wait guard passes it only
+    for a loop inside a script FILE): a loop whose worst-case total wait
+    :func:`loop_wait_bound` proves within the budget is not denied for
+    its wait — it is still judged as a busy-wait / condition-refresh
+    poll."""
     if not isinstance(command, str) or not command.strip():
         return None
     toks = _tokenize(command)
@@ -1099,7 +1450,10 @@ def loop_pattern(command: str) -> Optional[Tuple[str, str]]:
             continue
         if (_ps_loop_has_wait(cond) or _ps_loop_has_wait(header)
                 or _ps_loop_has_wait(body)):
-            return (label, evidence)
+            bound = (loop_wait_bound(label, cond, header, body, toks[:i])
+                     if wait_budget_s > 0 else None)
+            if bound is None or bound > wait_budget_s:
+                return (label, evidence)
         cond_text = " ".join(b.text for b in cond)
         if _PS_INPUT_COND_RE.search(cond_text):
             continue  # bounded by its input: never a busy-wait

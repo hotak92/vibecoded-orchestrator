@@ -505,21 +505,19 @@ def _derive_project_diagrams_name(project_root: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def named_vector_config() -> dict:
+def named_vector_config(class_name: Optional[str] = None) -> dict:
     """KG-shaped multi-slot named-vector config (v0.2.18 catalog).
 
     Sources the slot catalog from `vco_lib.weaviate_schema.KG_NAMED_VECTORS`
-    — see that module for the LOCKED slot list + rationale.
-
-    Pre-v0.2.18 this function returned a hard-coded 3-slot config
-    (`qwen3_embed`, `ollama_embed`, `openai_embed`). v0.2.18 extends to
-    5 slots — the legacy 3 are RETAINED so v0.2.17 -> v0.2.18 upgrades
-    preserve data, plus 2 new slots (`arctic2_embed`, `openai_text_embed`)
-    that the EmbeddingService (Commit 2) and GUI dropdowns (Commit 8)
-    use as additional embedding-provider targets.
+    — see that module for the LOCKED slot list + rationale. v0.2.18 grew it
+    from the hard-coded 3 slots (`qwen3_embed`, `ollama_embed`, `openai_embed`,
+    RETAINED so upgrades keep their data) to 5 (+ `arctic2_embed`,
+    `openai_text_embed`, extra embedding-provider targets).
 
     Each slot has `vectorizer: none` so we feed pre-computed embeddings
     from the MCP server. Index type stays HNSW (Weaviate default for ANN).
+    v0.2.105: with ``class_name`` each slot also carries that collection's
+    vector-index policy (the cache cap, :mod:`vco_lib.weaviate_vector_index`).
 
     The MCP server's `sync_knowledge_graph.py` writes objects with at
     least one named vector populated; the others are filled lazily as the
@@ -530,7 +528,9 @@ def named_vector_config() -> dict:
     # Late import to avoid a circular dep — weaviate_schema imports
     # project_init lazily inside `_default_collection_rebuilder`.
     from vco_lib.weaviate_schema import KG_NAMED_VECTORS
-    return {slot.name: slot.to_weaviate_config() for slot in KG_NAMED_VECTORS}
+    from vco_lib.weaviate_vector_index import create_index_config
+    index_config = create_index_config(class_name) if class_name else None
+    return {s.name: s.to_weaviate_config(index_config=index_config) for s in KG_NAMED_VECTORS}
 
 
 def code_class_definitions(
@@ -580,13 +580,13 @@ def code_class_definitions(
     """
     from vco_lib.weaviate_schema import CODE_NAMED_VECTORS, _CODE_COLLECTION_SUFFIXES
 
-    # v0.2.73 FIX-D4: thread the target index type into every slot. Default
-    # "hnsw" reproduces the pre-D4 shape byte-for-byte (so no spurious schema
-    # delta on plain migrations); "hfresh" emits the preview index config
-    # (mandatory RQ) — the copy migrate action recreates the collection fresh
-    # with this target, which is the only legal way to change the index type.
-    vc = {
-        slot.name: slot.to_weaviate_config(index_type=index_type)
+    # v0.2.73 FIX-D4: thread the target index type into every slot ("hfresh" =
+    # preview, mandatory RQ; only the copy migrate action may change it). The
+    # v0.2.105 cache cap is in vectorIndexConfig, which `_schema_delta` ignores.
+    from vco_lib.weaviate_vector_index import create_index_config
+    vc = {  # every basename is code-shaped, so one policy lookup serves all five
+        slot.name: slot.to_weaviate_config(index_type=index_type,
+                                           index_config=create_index_config("CodeFunction"))
         for slot in CODE_NAMED_VECTORS
     }
 
@@ -651,7 +651,7 @@ def kg_class_definition(name: str) -> dict:
     return {
         "class": name,
         "description": "VibeCoded Tools knowledge graph collection",
-        "vectorConfig": named_vector_config(),
+        "vectorConfig": named_vector_config(name),
         "invertedIndexConfig": {"indexNullState": True},
         "properties": [
             {"name": "title", "dataType": ["text"]},
@@ -739,7 +739,7 @@ def development_class_definition(name: str) -> dict:
     return {
         "class": name,
         "description": "VibeCoded Tools project documentation collection",
-        "vectorConfig": named_vector_config(),
+        "vectorConfig": named_vector_config(name),
         "invertedIndexConfig": {"indexNullState": True},
         "properties": [
             {"name": "title", "dataType": ["text"]},
@@ -821,7 +821,7 @@ def diagrams_class_definition(name: str) -> dict:
             "VibeCoded Tools per-project diagrams collection "
             "(Mermaid + Excalidraw)"
         ),
-        "vectorConfig": named_vector_config(),
+        "vectorConfig": named_vector_config(name),
         "invertedIndexConfig": {"indexNullState": True},
         "properties": [
             {"name": "title", "dataType": ["text"]},
@@ -5793,105 +5793,22 @@ def _emit_bash_env_cleanup_deferral(
 
 
 def _resolve_codegraph_project_name(folder: Path) -> str:
-    """The name whose Weaviate code-graph classes belong to ``folder``.
+    """The code-graph collection prefix of ``folder`` ("" when nothing can
+    answer without guessing — the caller then does nothing).
 
-    Only from a source that KNOWS, in the order the analyzer itself is invoked
-    with:
-
-    1. ``CODE_GRAPH_PROJECT`` — the explicit code-graph binding, read from the
-       ONE canonical env surface (``.claude/settings.json`` ``env``) via
-       ``knowledge_residue``; no second env parser.
-    2. ``PROJECT_NAME`` — the project's display identity, same surface.
-    3. the identity SSOT, :mod:`vco_lib.project_identity`:
-
-       * folder IS a registered ``launcher.db`` project → that project's name.
-         AUTHORITATIVE, and it is what a moved or renamed folder needs: the
-         registered name is the one whose rows exist.
-       * the DB is readable and the folder is NOT registered → the folder
-         basename, which is not a guess here but the analyzer's OWN
-         ``--project`` default, and therefore the convention the standalone
-         (never-added-to-the-launcher) project's rows were written under...
-         **unless some OTHER registered project already answers to that
-         name**, in which case return "" — that collision (``~/a/myapp``
-         registered, ``~/b/myapp`` not) is the concrete route by which this
-         function would have re-indexed one project's source into another
-         project's rows.
-       * there is NO ``launcher.db`` on this machine at all → the basename.
-         A machine with no launcher has no registry for the folder to be
-         absent FROM, so nothing is being guessed at and no other project's
-         rows can exist to collide with. This is the free-tier / CLI-only
-         install, and it must keep working.
-       * a ``launcher.db`` EXISTS but could not be read → "".
-         ``resolve_identity``'s own contract: when nothing can be POSITIVELY
-         read, the caller "MUST NOT fall back to a basename-derived identity
-         — that fallback is the whole bug this module exists to kill". An
-         unreadable registry cannot tell the standalone case from the
-         registered-elsewhere case, so there the basename IS a guess.
-         (``resolve_snapshot`` reports both as ``resolvable=False``; the
-         file's existence is what separates "there is no registry" from
-         "the registry would not answer", and only the second must refuse.)
-
-    Empty string when none of those answer, and the caller then does nothing:
-    never guess a project name and act on another project's rows.
-
-    v0.2.92 R2 — this used to end in an UNCONDITIONAL basename fallback,
-    including when the DB was unreadable, which contradicted the promise in
-    the line above. The consequence here is milder than the blockers
-    ``project_identity`` was created for (this feeds a NON-destructive
-    background re-walk, so a wrong name pollutes rather than destroys) but the
-    resolution rule must not differ per blast radius — a second rule is how
-    the first one erodes.
-
-    Not resolving is cheap: the caller logs, does NOT stamp the generation,
-    and the next bundle update re-triggers. Every launcher-managed project
-    answers at tier 1 (``config_projection`` pins ``CODE_GRAPH_PROJECT`` into
-    ``.claude/settings.json`` ``env``) or tier 3-registered.
+    Thin delegate to the ONE resolver,
+    :func:`vco_lib.codegraph_project_prefix.resolve_codegraph_prefix` (hub
+    binding prefix → settings ``CODE_GRAPH_PROJECT`` → ``launcher.db`` binding
+    row → a name only when no binding exists, with the collision and
+    unreadable-registry refusals that module documents). v0.2.105: the old
+    inline resolver returned the REGISTERED NAME ahead of the binding row, so
+    a project whose name does not sanitize to its prefix was re-indexed into a
+    zombie class set. Kept under this name as the seam the reindex trigger and
+    its tests use.
     """
-    try:
-        from vco_lib import knowledge_residue as _kres
+    from vco_lib.codegraph_project_prefix import resolve_codegraph_prefix
 
-        env = _kres.project_settings_env(Path(folder)) or {}
-    except Exception:  # noqa: BLE001 — unreadable env surface ⇒ try the DB
-        env = {}
-    for key in ("CODE_GRAPH_PROJECT", "PROJECT_NAME"):
-        val = env.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    try:
-        from vco_lib import project_identity as _pid
-
-        basename = Path(folder).name.strip()
-        snapshot = _pid.resolve_snapshot()
-        if not snapshot.resolvable:
-            # Separate "there is no registry" from "the registry would not
-            # answer" — resolve_snapshot reports both as unresolvable. Reuses
-            # the ONE discovery home (VCT_LAUNCHER_DB_PATH env → the standard
-            # path) rather than re-implementing the lookup order here.
-            from vco_lib.launcher_db_reader import _discover_db_path
-
-            return basename if _discover_db_path() is None else ""
-        registered = snapshot.identity_for_folder(Path(folder))
-        if registered is not None:
-            return (registered.name or "").strip()
-        if not basename:
-            return ""
-        # Unregistered folder: the basename is the analyzer's own --project
-        # default, EXCEPT when another registered project already answers to
-        # it — that is the collision (~/a/myapp registered, ~/b/myapp not)
-        # that would re-index this source into that project's rows. Matched
-        # on the identity module's own normalisation, so case and separator
-        # variants collide too.
-        taken = {
-            _pid.normalise_for_match(p.name or "")
-            for p in snapshot.projects
-            if (p.name or "").strip()
-        }
-        if _pid.normalise_for_match(basename) in taken:
-            return ""
-        return basename
-    except Exception:  # noqa: BLE001 — could not look is never a verdict
-        return ""
+    return resolve_codegraph_prefix(folder)
 
 
 def _trigger_extractor_generation_reindex(
@@ -9979,25 +9896,25 @@ def install_project_bundle(
             # removed (`vco_lib.hook_retirements`); collected at this level
             # because the audit row needs the FOLDER, not just the hooks.
             retired_removed: list = []
-            parked, kept_out = read_parked_hooks(folder), []
+            parked, kept_out, duplicate_groups = read_parked_hooks(folder), [], []
             settings_action, settings_redirect = _merge_settings_template_for_bundle(
                 settings_template, settings_target, dry_run=dry_run,
                 retired_removed=retired_removed, parked=parked, kept_out=kept_out,
-                project_root=folder,
+                duplicate_groups=duplicate_groups, project_root=folder,
             )
             result["settings_action"] = settings_action
             if settings_action.startswith("unchanged ("):  # v0.2.97: never silent
                 result["warnings"].append(f"settings.json: {settings_action} — newly "
                                           "shipped hooks NOT added; see UPDATE_DEFERRED.md")
             report_parked_hooks(folder, result, parked, kept_out, dry_run=dry_run,
-                                settings_action=settings_action, log=_log, log_auto=_log_auto)
+                                settings_action=settings_action, log=_log, log_auto=_log_auto,
+                                duplicate_groups=duplicate_groups)
             if retired_removed:
                 # Envelope on BOTH paths (dry-run reports what it WOULD
                 # remove); audit rows only after a real write.
                 result["retired_hook_registrations"] = removal_envelope_rows(retired_removed)
                 if not dry_run and settings_action == "merged":
-                    emit_removal_audit_rows(
-                        folder, retired_removed, log_auto=_log_auto, log=_log)
+                    emit_removal_audit_rows(folder, retired_removed, log_auto=_log_auto, log=_log)
             # v0.2.70 (Bug B / W-F1): when `.claude` itself is a symlink VCO
             # refused to write through, the settings.json write redirected to a
             # `.vco-new` sibling. Thread that into the SAME accumulator as the
@@ -10418,6 +10335,17 @@ def install_project_bundle(
     # Soft-fail + background: the helper never raises and never blocks — it
     # spawns a detached, resumable walk with no global timeout, and degrades to
     # a deferral entry when the code-embed service is down.
+    # v0.2.105: a binding prefix that differs from the sanitized slug/name —
+    # re-target a resync entry that names the slug-derived prefix, and REPORT
+    # (never drop) zombie `<slug>_Code*` classes. All logic and its soft-fail
+    # live in vco_lib.codegraph_project_prefix (this file is under a ratchet).
+    if not dry_run:
+        from vco_lib.codegraph_project_prefix import heal_slug_prefix_divergence
+
+        if heal_slug_prefix_divergence(folder, log=_log).get("emitted"):
+            result["warnings"].append(
+                "duplicate code-graph classes found under the project's launcher "
+                "name — see UPDATE_DEFERRED.md (consented cleanup)")
     if not dry_run:
         try:
             _trigger_extractor_generation_reindex(
@@ -10843,13 +10771,34 @@ def install_project_bundle(
         # does not exist degraded in total silence (empty search results, no
         # error from any component, field-observed for three days). The probe is
         # TRI-STATE: Weaviate unreachable yields "unknown", never "absent".
+        # v0.2.105: `ensure_configured_collections` (implementation in
+        # `vco_lib.configured_collections`) wraps the probe and CREATES a
+        # positively-absent configured class with the shipped schema (empty,
+        # additive — nothing existing is touched) for the project's OWN
+        # collections, so add/update heals the "every KG query returns
+        # nothing" state instead of printing a manual bootstrap-collections
+        # command. A distinct SHARED_KG_COLLECTION is never auto-created —
+        # its warning stands (see the implementation's docstring).
         try:
-            collections_check = verify_configured_collections_exist(
+            collections_check = ensure_configured_collections(
                 folder, weaviate_url, log_event=log_event,
             )
             result["configured_collections"] = collections_check
             for _msg in collections_check.get("warnings", []):
                 result["warnings"].append(_msg)
+            # v0.2.105 fix round: the launcher toast reads `warnings[]` off
+            # stdout, and `created` previously reached only the install log —
+            # "reports it as created" was not true to the user. Surface a
+            # one-line summary (no error/failed marker → Info classification
+            # on both toast paths, same pattern as the symlink-redirect
+            # summary above).
+            _created = collections_check.get("created") or []
+            if _created:
+                result["warnings"].append(
+                    f"{len(_created)} missing configured collection(s) "
+                    f"created empty with the shipped schema: "
+                    f"{', '.join(sorted(_created))}"
+                )
         except Exception as e:  # noqa: BLE001 — a probe never blocks an install
             err = f"{type(e).__name__}: {e}"
             _log("4.bundle.configured-collections", "error",
@@ -11447,7 +11396,7 @@ def _merge_settings_template_for_bundle(
     template_path: Path, target_path: Path, *, dry_run: bool,
     retired_removed: Optional[list] = None,
     parked: Optional[ParkedHooksState] = None, kept_out: Optional[list] = None,
-    project_root: Optional[Path] = None,
+    duplicate_groups: Optional[list] = None, project_root: Optional[Path] = None,
 ) -> tuple[str, Optional[Path]]:
     """The I/O half of the settings.json merge — a shim since v0.2.97.
 
@@ -11475,7 +11424,7 @@ def _merge_settings_template_for_bundle(
     return merge_settings_template(
         template_path, target_path, dry_run=dry_run, write=_write_file_atomic,
         retired_removed=retired_removed, parked=parked, kept_out=kept_out,
-        project_root=project_root)
+        duplicate_groups=duplicate_groups, project_root=project_root)
 
 
 def _apply_canonical_env_via_config_projection(
@@ -11707,6 +11656,10 @@ def verify_configured_collections_exist(
     lands in ``unknown``) when Weaviate could not be reached — the caller must
     NOT report those as absent. Never raises.
     """
+    # The warning's identifying prefix lives in configured_collections (the
+    # create/retire side) — ONE home, and this file's line ratchet stays put.
+    from vco_lib.configured_collections import configured_absent_warning_prefix
+
     out: dict = {
         "probed": False, "present": [], "absent": [], "unknown": [],
         "warnings": [],
@@ -11724,6 +11677,14 @@ def verify_configured_collections_exist(
         # disabled" — a choice, not a missing collection.
         if isinstance(val, str) and val.strip():
             configured.append((key, val.strip()))
+    # KG_COLLECTION == SHARED_KG_COLLECTION (the orchestrator root: one class
+    # serving both roles) must not be probed twice — pre-v0.2.105-fix it
+    # landed in `absent`/`present` twice, drew two warnings and made
+    # `ensure_configured_collections` report it twice. First key wins, and
+    # the fixed key order below puts the (creatable) KG_COLLECTION first.
+    _seen: set[str] = set()
+    configured = [(k, v) for k, v in configured
+                  if not (v in _seen or _seen.add(v))]
     if not configured:
         return out
 
@@ -11741,7 +11702,8 @@ def verify_configured_collections_exist(
         elif state is False:
             out["absent"].append(name)
             msg = (
-                f"configured collection {name!r} ({key} in "
+                configured_absent_warning_prefix(name) +
+                f"{key} in "
                 f".claude/settings.json) does NOT exist in Weaviate at {url} — "
                 f"every query routed through it returns nothing, silently. "
                 f"Re-run `{_bootstrap_collections_cmd(proj_name, Path(folder))}` "
@@ -11768,6 +11730,31 @@ def verify_configured_collections_exist(
         except Exception:  # noqa: BLE001 — observability is never a gate
             pass
     return out
+
+
+def ensure_configured_collections(
+    folder: Path,
+    weaviate_url: Optional[str] = None,
+    *,
+    log_event: Optional[Callable[..., None]] = None,
+) -> dict:
+    """v0.2.105: CREATE a positively-absent configured class with the
+    shipped schema — for the project's OWN collections only.
+
+    The implementation lives in :mod:`vco_lib.configured_collections`
+    (v0.2.105 fix round: the file-size rule — this module was already past
+    14 000 lines when the ~96-line ensure logic landed as one contiguous
+    block); this shim keeps the historical
+    ``project_init.ensure_configured_collections`` import path stable and
+    delegates to it. See that module's docstring for the full safety shape.
+    ``SHARED_KG_COLLECTION`` is NEVER auto-created (it belongs to the
+    orchestrator root; auto-creating it on any other project would hide a
+    misconfiguration behind an empty class) — its F-12(b) warning stands.
+    """
+    from vco_lib.configured_collections import (
+        ensure_configured_collections as _ensure,
+    )
+    return _ensure(folder, weaviate_url, log_event=log_event)
 
 
 def _apply_standalone_env(
@@ -12819,7 +12806,7 @@ def _cmd_detect_orphan_code_collections(args: argparse.Namespace) -> int:
 
 
 def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
-    """`drop-orphan-code-collections --weaviate-url <url> --confirm [--json]`
+    """`drop-orphan-code-collections --weaviate-url <url> [--prefix P ...] --confirm [--json]`
 
     CONSENTED drop of LIVE-schema orphan code classes. RE-VALIDATES against the
     CURRENT launcher bindings + CURRENT live schema at RUN TIME (re-probe-
@@ -12864,6 +12851,14 @@ def _cmd_drop_orphan_code_collections(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # v0.2.105: `--prefix P` (repeatable) narrows the re-validated set to the
+    # classes of the named prefix(es) — the consented drop the
+    # `codegraph_slug_prefix_zombie_classes` entry prints. It only NARROWS:
+    # a class must still be an orphan by the run-time re-validation above.
+    _only = {p.strip().lower() for p in (getattr(args, "prefix", None) or []) if p.strip()}
+    if _only:
+        to_drop = [c for c in to_drop if (_d := _strip_known_suffix(c, _CODEGRAPH_SUFFIXES))
+                   and _d[0].lower() in _only]
     result: dict = {"dropped": [], "errors": [], "revalidated_count": len(to_drop)}
     for cls in to_drop:
         try:
@@ -14269,6 +14264,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                          help="Override Weaviate URL.")
     p_dropo.add_argument("--confirm", action="store_true",
                          help="Required — this is a destructive operation.")
+    p_dropo.add_argument("--prefix", action="append", default=None,
+                         help="Drop only the orphan classes of this code-graph "
+                              "prefix (repeatable). Narrows, never widens.")
     p_dropo.add_argument("--json", action="store_true",
                          help="Emit a single JSON object on stdout.")
     p_dropo.set_defaults(func=_cmd_drop_orphan_code_collections)

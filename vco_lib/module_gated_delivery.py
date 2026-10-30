@@ -467,7 +467,7 @@ def definition_vendor(path: Path) -> Optional[str]:
     ensure_importable()  # install-bundle runs under the system interpreter
     from vco_lib.vscode_settings import GATEWAY_ID_PREFIX
 
-    model = _frontmatter_model(path)
+    model = frontmatter_model(path)
     if not model or not model.startswith(GATEWAY_ID_PREFIX):
         return None
     from model_router.routing import (  # pyright: ignore[reportMissingImports]
@@ -715,8 +715,11 @@ def record_gate_outcomes(
 # ---------------------------------------------------------------------------
 
 
-def _frontmatter_model(path: Path) -> Optional[str]:
-    """The ``model:`` value of an agent definition's YAML frontmatter, or None."""
+def frontmatter_model(path: Path) -> Optional[str]:
+    """The ``model:`` value of an agent definition's YAML frontmatter, or None.
+
+    Public since v0.2.105: the pre-flight vendor-key probe
+    (:mod:`vco_lib.gateway_preflight`) reads the same line."""
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -760,7 +763,7 @@ def check_agent_model_ids(dirs: Iterable[Path]) -> list[dict[str, Any]]:
         except OSError:
             continue
         for path in files:
-            model = _frontmatter_model(path)
+            model = frontmatter_model(path)
             if not model or not model.startswith(GATEWAY_ID_PREFIX):
                 continue
             ok, reason, suggestions = validate_model_id(model)

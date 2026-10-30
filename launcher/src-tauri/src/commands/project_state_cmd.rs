@@ -1119,6 +1119,57 @@ pub async fn delete_project_kg_binding(
     .await?
 }
 
+/// The vector-index policy table (v0.2.105), embedded at compile time and
+/// parsed here; `vco_lib/weaviate_vector_index.py` parses the same file
+/// (tier B of A>B>C), so the cache cap a launcher-created KG collection gets
+/// is the one Python's class definitions and update step use. Path: 4 levels
+/// up (`commands` -> `src` -> `src-tauri` -> `launcher` -> repo root).
+const WEAVIATE_VECTOR_INDEX_TOML: &str = include_str!("../../../../vco_lib/weaviate_vector_index.toml");
+
+/// Table format this loader understands — MUST MATCH `FORMAT_VERSION` in
+/// `vco_lib/weaviate_vector_index.py`.
+const VECTOR_INDEX_TABLE_FORMAT_VERSION: i64 = 1;
+
+/// `[vector_cache_max_objects].kg` from the policy table. Panics on a
+/// malformed table: it is embedded at compile time, so a defect fails
+/// `vector_index_table_parses` in every `cargo test`, never a user.
+fn kg_vector_cache_max_objects() -> i64 {
+    let table: toml::Table = WEAVIATE_VECTOR_INDEX_TOML
+        .parse()
+        .expect("vco_lib/weaviate_vector_index.toml must parse (compile-time embedded)");
+    assert_eq!(
+        table.get("format_version").and_then(|v| v.as_integer()),
+        Some(VECTOR_INDEX_TABLE_FORMAT_VERSION),
+        "vco_lib/weaviate_vector_index.toml format_version must match this loader"
+    );
+    table
+        .get("vector_cache_max_objects")
+        .and_then(|t| t.get("kg"))
+        .and_then(|v| v.as_integer())
+        .expect("vco_lib/weaviate_vector_index.toml needs [vector_cache_max_objects].kg")
+}
+
+/// The three named-vector slots of a launcher-created KG collection, each
+/// with the policy's cache cap. RQ-8 is NOT set here: VCO's Weaviate applies
+/// it to every new collection (`DEFAULT_QUANTIZATION`), and the update step
+/// enables it on older ones — sending it from here would make this create
+/// fail on an adopted pre-1.32 Weaviate.
+fn kg_vector_config() -> JsonValue {
+    let cap = kg_vector_cache_max_objects();
+    let mut slots = serde_json::Map::new();
+    for name in ["qwen3_embed", "ollama_embed", "openai_embed"] {
+        slots.insert(
+            name.to_string(),
+            serde_json::json!({
+                "vectorizer": { "none": {} },
+                "vectorIndexType": "hnsw",
+                "vectorIndexConfig": { "vectorCacheMaxObjects": cap }
+            }),
+        );
+    }
+    JsonValue::Object(slots)
+}
+
 /// POSTs a canonical KG-collection schema to Weaviate `/v1/schema` if
 /// the collection does not yet exist. Schema mirrors the layout used
 /// across multiple orchestrator instances:
@@ -1163,20 +1214,7 @@ async fn ensure_kg_collection(weaviate_url: &str, collection_name: &str) -> Resu
     let schema = serde_json::json!({
         "class": collection_name,
         "description": format!("Knowledge graph for project (auto-created by VCT Launcher)"),
-        "vectorConfig": {
-            "qwen3_embed": {
-                "vectorizer": { "none": {} },
-                "vectorIndexType": "hnsw"
-            },
-            "ollama_embed": {
-                "vectorizer": { "none": {} },
-                "vectorIndexType": "hnsw"
-            },
-            "openai_embed": {
-                "vectorizer": { "none": {} },
-                "vectorIndexType": "hnsw"
-            }
-        },
+        "vectorConfig": kg_vector_config(),
         "properties": [
             { "name": "title",        "dataType": ["text"] },
             { "name": "content",      "dataType": ["text"] },
@@ -1381,6 +1419,30 @@ mod ensure_target_tests {
         assert_eq!(ensure_target_url(&db, None), "http://localhost:18081");
         assert_eq!(ensure_target_url(&db, Some("  ")), "http://localhost:18081");
         assert_eq!(ensure_target_url(&db, Some("http://explicit:1")), "http://explicit:1");
+    }
+}
+
+#[cfg(test)]
+mod vector_index_policy_tests {
+    use super::*;
+
+    #[test]
+    fn vector_index_table_parses() {
+        assert!(kg_vector_cache_max_objects() > 0);
+    }
+
+    #[test]
+    fn every_kg_slot_carries_the_tables_cache_cap() {
+        let table: toml::Table = WEAVIATE_VECTOR_INDEX_TOML.parse().unwrap();
+        let want = table["vector_cache_max_objects"]["kg"].as_integer().unwrap();
+        let cfg = kg_vector_config();
+        let slots = cfg.as_object().unwrap();
+        assert_eq!(slots.len(), 3);
+        for (name, slot) in slots {
+            assert_eq!(slot["vectorIndexType"], "hnsw", "{name}");
+            assert_eq!(slot["vectorIndexConfig"]["vectorCacheMaxObjects"], want, "{name}");
+            assert!(slot["vectorIndexConfig"].get("rq").is_none(), "{name}: RQ comes from the server default");
+        }
     }
 }
 

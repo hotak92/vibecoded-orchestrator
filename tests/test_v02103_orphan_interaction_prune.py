@@ -534,8 +534,8 @@ def _captured_reap_kwargs(analyzer_mod, monkeypatch, analyzer):
     monkeypatch.setattr(analyzer_mod, "_prune_collection_impl", _capture)
     # Keep the gating test hermetic: the post-prune clear check is covered by
     # its own tests below.
-    monkeypatch.setattr(analyzer_mod, "_clear_orphan_deferral_if_zero",
-                        lambda *a, **kw: None)
+    monkeypatch.setattr(analyzer_mod, "_clear_after_reaping",
+                        lambda analyzer: None)
     analyzer._prune_stale_objects()
     return captured
 
@@ -611,6 +611,10 @@ def _patch_driver_guts(monkeypatch, tmp_path, *, stale_counts, orphans):
     monkeypatch.setattr(_exposure_mod, "clear_exposure_bump",
                         lambda p: exposure_cleared.append(p) or True)
     monkeypatch.setattr(cr, "walk_uses_container", lambda p: False)
+    # v0.2.105: the driver's backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(cr, "_maybe_run_exposure_heal", lambda *a, **k: True)
     monkeypatch.setattr(cr, "_maybe_run_vectorless_audit", lambda *a, **k: None)
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)
@@ -643,7 +647,7 @@ def test_driver_discharges_then_records_orphans(monkeypatch, tmp_path, capsys):
     """R12-F4: with zero stale rows and orphans remaining, the CONVERGED
     discharge (exposure heal clear + persisted-entry clear) runs FIRST — the
     orphan condition must never block it — and the orphan entry is recorded
-    under its OWN condition id with a --prune-stale remedy."""
+    under its OWN condition id with the targeted orphan-cleanup remedy."""
     st = _patch_driver_guts(monkeypatch, tmp_path, stale_counts={}, orphans=2)
     rc = cr.run_resync_and_verify("Acme", tmp_path, tmp_path / "a.py")
     out = capsys.readouterr().out
@@ -658,9 +662,14 @@ def test_driver_discharges_then_records_orphans(monkeypatch, tmp_path, capsys):
     assert st["unconverged"] == [], "no stale rows → no unconverged entry"
     assert len(st["orphan_recorded"]) == 1
     assert st["orphan_recorded"][0]["count"] == 2
-    assert st["orphan_recorded"][0]["command"].endswith("--prune-stale")
+    # v0.2.105 (prune lane): the remedy is the TARGETED orphan cleanup —
+    # never a --prune-stale walk (that form deleted enabled extra folders'
+    # rows; the 2026-10-29 incident).
+    cmd = st["orphan_recorded"][0]["command"]
+    assert "--prune-orphan-interactions" in cmd
+    assert "--prune-stale" not in cmd
     assert st["orphan_resolved"] == []
-    assert "2 provable orphan" in out and "--prune-stale" in out
+    assert "2 provable orphan" in out and "targeted orphan-cleanup" in out
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="flock-based slots")
@@ -701,26 +710,27 @@ def test_driver_stale_path_does_not_record_orphans(monkeypatch, tmp_path, capsys
 
 
 def test_orphan_deferral_flavour_text_is_true():
-    """R12-F5 / R14-B4: the orphan flavour's prose must be TRUE and COHERENT —
-    the command DELETES rows a full walk does not visit (the ordinary prune
-    semantics), the provably-dead rule is scoped to the anchor-less rows, and
-    the unreachable-extra skip is stated plainly."""
+    """R12-F5 / R14-B4, re-scoped v0.2.105 (prune lane): the orphan flavour's
+    prose must be TRUE and COHERENT — the printed command is the TARGETED
+    orphan cleanup (it deletes exactly the provably-dead rows the detection
+    counted), never a whole-walk stale prune (the pre-v0.2.105 remedy deleted
+    every enabled extra folder's rows with the orphans), and the provably-dead
+    rule is scoped to the anchor-less rows."""
     entry = cr.build_unconverged_deferral(
-        "Acme", None, "cmd --prune-stale", orphan_interactions=2)
+        "Acme", None, "cmd --prune-orphan-interactions", orphan_interactions=2)
     assert entry is not None
     assert entry.condition_id == cr._ORPHAN_CONDITION_ID
     assert entry.condition_id != cr._CONDITION_ID
     assert "no file anchors" in entry.detected or "file anchors" in entry.detected
-    assert "DELETES" in entry.why_deferred
-    assert "ordinary prune semantics" in entry.why_deferred, (
-        "the deletion breadth must be scoped to the walk's ordinary semantics"
+    assert "TARGETED" in entry.why_deferred
+    assert "NOTHING else" in entry.why_deferred, (
+        "the deletion breadth must be scoped to the provably-dead rows only"
     )
-    # R14-B4: the provably-dead rule is scoped to the anchor-less rows, not
-    # stated as a blanket contradiction of the sentence above it.
-    assert "orphan cleanup itself touches only anchor-less rows" in entry.why_deferred
-    assert "A row is deleted only when provably dead" not in entry.why_deferred
-    # R14-B2: the unreachable-extra skip is stated, not silent.
-    assert "extra code folder is unreachable" in entry.why_deferred
+    # v0.2.105: extra code folders' rows are explicitly out of the command's
+    # reach — the sentence the 2026-10-29 incident made load-bearing.
+    assert "extra code folders are never judged" in entry.why_deferred
+    assert "code-graph walk runs" in entry.why_deferred
+    assert "--prune-stale" not in entry.why_deferred
     assert "re-embeds only" not in entry.why_deferred
     assert "never" in entry.why_deferred and "automatic" in entry.why_deferred
 
@@ -827,12 +837,15 @@ def test_analyzer_clears_the_entry_after_a_reaping_walk(analyzer_mod,
                                                         monkeypatch, tmp_path):
     """R14-B1: the analyzer-side clear — after a reaping-enabled full walk,
     the pending-orphan deferral is resolved on a positive zero (the walk
-    reaped the rows, or there were none)."""
+    reaped the rows, or there were none). v0.2.105: the seam is
+    ``_clear_after_reaping(analyzer)`` — the raw-root/never-raises rules live
+    beside the clear helper in vco_lib (covered in
+    tests/test_v02105_codegraph_prune_scope.py)."""
     calls = []
     monkeypatch.setattr(
-        analyzer_mod, "_clear_orphan_deferral_if_zero",
-        lambda project, *, repo_root=None, client=None: calls.append(
-            (project, repo_root)) or True)
+        analyzer_mod, "_clear_after_reaping",
+        lambda analyzer: calls.append(
+            (analyzer.project_name, analyzer._analyze_repo_root)) or True)
 
     analyzer = _gated_analyzer(analyzer_mod)
     analyzer._analyze_repo_root = tmp_path
@@ -851,8 +864,8 @@ def test_analyzer_does_not_clear_when_reaping_was_gated_off(
     resolved by a walk that could not have cleaned anything."""
     calls = []
     monkeypatch.setattr(
-        analyzer_mod, "_clear_orphan_deferral_if_zero",
-        lambda project, *, repo_root=None, client=None: calls.append(project))
+        analyzer_mod, "_clear_after_reaping",
+        lambda analyzer: calls.append(analyzer.project_name))
 
     analyzer = _gated_analyzer(analyzer_mod)
     analyzer._analyze_repo_root = tmp_path
@@ -904,16 +917,15 @@ def _symlinked_repo(tmp_path):
 def test_analyzer_clear_recount_uses_the_raw_root_form(
         analyzer_mod, monkeypatch, tmp_path):
     """R16-B-N1: rows are STAMPED with the raw (unresolved) root path; the
-    clear check must receive THAT form (primary_sources_for adds the resolved
-    one itself). Pre-fix the analyzer passed the resolved root, whose
-    primary-source set misses raw-stamped rows on a symlinked repo — the
-    count read zero and the deferral cleared while orphans remained."""
+    clear seam must carry the analyzer whose RAW root attribute decides (the
+    rule itself lives in vco_lib.clear_orphan_deferral_after_reaping, covered
+    in tests/test_v02105_codegraph_prune_scope.py)."""
     _real, link = _symlinked_repo(tmp_path)
     calls = []
     monkeypatch.setattr(
-        analyzer_mod, "_clear_orphan_deferral_if_zero",
-        lambda project, *, repo_root=None, client=None: calls.append(
-            repo_root) or True)
+        analyzer_mod, "_clear_after_reaping",
+        lambda analyzer: calls.append(
+            analyzer._analyze_repo_root_raw) or True)
 
     analyzer = _gated_analyzer(analyzer_mod)
     analyzer._analyze_repo_root = _real.resolve()
@@ -921,7 +933,7 @@ def test_analyzer_clear_recount_uses_the_raw_root_form(
     monkeypatch.setattr(analyzer_mod, "_prune_collection_impl",
                         lambda collection, visited_uuids, **kw: (0, 0))
     analyzer._prune_stale_objects()
-    assert calls == [Path(link.as_posix())], (
+    assert calls == [link.as_posix()], (
         "the re-count must get the RAW root — the form rows are stamped with"
     )
 
@@ -932,9 +944,9 @@ def test_analyzer_clear_falls_back_to_the_resolved_root(
     passes the resolved one (the old attribute) — never None-by-accident."""
     calls = []
     monkeypatch.setattr(
-        analyzer_mod, "_clear_orphan_deferral_if_zero",
-        lambda project, *, repo_root=None, client=None: calls.append(
-            repo_root) or True)
+        analyzer_mod, "_clear_after_reaping",
+        lambda analyzer: calls.append(
+            getattr(analyzer, "_analyze_repo_root", None)) or True)
 
     analyzer = _gated_analyzer(analyzer_mod)
     analyzer._analyze_repo_root = tmp_path.resolve()

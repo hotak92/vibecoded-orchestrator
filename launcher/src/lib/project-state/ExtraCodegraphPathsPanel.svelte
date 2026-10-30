@@ -33,6 +33,7 @@
   import {
     CODE_FOLDER,
     disabledTitle,
+    purgedToast,
     reenabledTitle,
     removeConfirm,
     removedTitle,
@@ -393,7 +394,7 @@
         successToast: (o) =>
           newEnabled
             ? `Re-enabled and indexed ${o.entities_indexed} entities`
-            : `Re-synced; entries from ${row.display_label} pruned`,
+            : purgedToast(row.display_label, o),
         onAfter: () => load(),
       });
     } catch (e) {
@@ -418,8 +419,7 @@
         body: `Removing entries originally sourced from ${row.display_label}.`,
         pillPath: row.path,
         op: () => reindexAfterExtrasChange(projectId, true),
-        successToast: () =>
-          `Re-synced; entries from ${row.display_label} pruned`,
+        successToast: (o) => purgedToast(row.display_label, o),
         onAfter: () => load(),
       });
     } catch (e) {

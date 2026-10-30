@@ -99,10 +99,11 @@ DEFAULT_CODE_EMBED_PORT = 11440
 _CONDITION_ID = "codegraph_embed_resync_pending"
 
 #: v0.2.103 (R12-F4): the provable-orphan flavour's OWN condition id. Classed
-#: ``action_required`` in ``vco_lib/deferral_conditions.toml`` — only a manual
-#: consented ``--prune-stale`` walk clears it, so the WP-H retry dispatcher
-#: must never select it (the auto-retryable resync handler forwards no
-#: ``--prune-stale`` and would burn full walks that remove nothing).
+#: ``action_required`` in ``vco_lib/deferral_conditions.toml`` — only the
+#: manual consented cleanup the entry prints clears it (v0.2.105: the
+#: TARGETED ``--prune-orphan-interactions`` pass, never a ``--prune-stale``
+#: walk — that form deleted enabled extra folders' rows, the 2026-10-29
+#: incident), so the WP-H retry dispatcher must never select it.
 _ORPHAN_CONDITION_ID = "codegraph_orphan_interactions_pending"
 
 # Hygiene (v0.2.75): keep the Popen handles of deliberately-DETACHED children
@@ -209,6 +210,16 @@ from vco_lib.codegraph_schema import (  # noqa: E402 — grouped with the notes 
 
 #: Backwards-compat alias (pre-v0.2.75 module-local name).
 _path_reachable_on_disk = path_reachable_on_disk
+
+# v0.2.105 fix round: "did the analyzer actually analyze anything?" lives in
+# ONE home shared with ``vco_lib.codegraph_extras_refresh.run_analyzer`` (the
+# runner the HEAD catch-up and the extras refresh use) — the soft-skip marker,
+# the bounded log-window reader and the predicate. Aliased to the module-local
+# names the driver body uses.
+from vco_lib.codegraph_analyzer_outcome import (  # noqa: E402 — grouped with the notes above
+    log_says_analysis_skipped as _log_says_analysis_skipped,
+    read_log_window as _read_log_window,
+)
 
 
 def primary_sources_for(repo_root: "Optional[Path]") -> "Optional[set]":
@@ -862,6 +873,31 @@ def open_walked_file_scope(walked: "dict", key: "tuple") -> "Optional[dict]":
     return (walked or {}).pop(key, None)
 
 
+#: Scope key naming the collections whose rows of a file this walk must NOT
+#: judge (v0.2.105 fix round, M1). A best-effort producer whose failure looks
+#: exactly like "nothing to write" — the config links of a code file
+#: (``codegraph_config_refs.link_groups``: the config index could not be built,
+#: or linking raised) — withholds judgement instead: zero links written on
+#: FAILURE is not evidence that the file's old link rows are gone, so the
+#: reconcile leaves that file's rows in that collection alone. A later walk
+#: whose producer works judges them again. Never a collection name (``__``).
+UNJUDGED_SCOPE_KEY = "__unjudged__"
+
+
+def withhold_file_judgment(analyzer: Any, collection_name: str) -> bool:
+    """Mark ``collection_name`` unjudged in the analyzer's OPEN per-file scope.
+
+    Returns True when a scope was open (and is now marked). The mark rides the
+    scope's ``written`` map, so :func:`commit_walked_file_scope` carries it
+    with the file's UUIDs, and a second pass over the same file keeps it (the
+    union rule: withheld by either pass ⇒ not judged — conservative)."""
+    pending = getattr(analyzer, "_reconcile_pending", None)
+    if pending is None or not collection_name:
+        return False
+    pending[1].setdefault(UNJUDGED_SCOPE_KEY, set()).add(str(collection_name))
+    return True
+
+
 def commit_walked_file_scope(
     walked: "dict", key: "tuple", written: "Optional[dict]", prev: "Optional[dict]",
 ) -> None:
@@ -1024,6 +1060,8 @@ def reconcile_walked_file_rows(
                 keep_map = _paths.get(raw_path)
                 if keep_map is None:
                     return False  # file not walked by THIS pass → never touch
+                if _cn in (keep_map.get(UNJUDGED_SCOPE_KEY) or ()):
+                    return False  # a producer failed for this file → no evidence
                 row_src = str(props.get("project_source") or "").strip()
                 if _prim:
                     if not source_is_owned(row_src, primary_sources,
@@ -2795,11 +2833,19 @@ def code_embed_image_verdict(
 def _resync_log_path(project_name: str) -> Optional[Path]:
     """R-5 (RT-2): per-spawn log file for the detached resync children.
 
-    ``<vct_root_dir>/logs/resync-<project>-<ts>.log``. Pre-fix the children's
-    stdout/stderr went to DEVNULL — a walk that died at 40% left NO record
-    anywhere ("soft-fail into a void"). Returns ``None`` when the path cannot
-    be prepared (caller then degrades to DEVNULL rather than blocking the
-    spawn — but logs that degradation).
+    ``<vct_root_dir>/logs/resync-<project>-<ts>-<ns>-<pid>.log``. Pre-fix the
+    children's stdout/stderr went to DEVNULL — a walk that died at 40% left NO
+    record anywhere ("soft-fail into a void"). Returns ``None`` when the path
+    cannot be prepared (caller then degrades to DEVNULL rather than blocking
+    the spawn — but logs that degradation).
+
+    v0.2.105 fix round: the name must be unique PER SPAWN. A one-second
+    timestamp plus the append-mode open let a second spawn reuse — and append
+    to — the first run's file, so the post-walk reader
+    (:func:`vco_lib.codegraph_analyzer_outcome.log_says_analysis_skipped`)
+    could find a PREVIOUS run's "analysis skipped" line and refuse a walk
+    that actually ran. The nanosecond stamp + pid make the file belong to
+    exactly one spawn.
     """
     try:
         from vco_lib.paths import vct_root_dir
@@ -2808,7 +2854,8 @@ def _resync_log_path(project_name: str) -> Optional[Path]:
         logs_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", project_name or "project")
         ts = time.strftime("%Y%m%d-%H%M%S")
-        return logs_dir / f"resync-{safe}-{ts}.log"
+        uniq = f"{time.time_ns() % 1_000_000_000:09d}-{os.getpid()}"
+        return logs_dir / f"resync-{safe}-{ts}-{uniq}.log"
     except Exception as exc:  # noqa: BLE001 — logging must not block the spawn
         logger.warning("codegraph resync: cannot prepare log path: %s", exc)
         return None
@@ -2862,6 +2909,54 @@ def build_resync_deferral(
             "resumable — re-running it once the service is up re-embeds only "
             "the stale rows (revision mismatch) and skips everything already "
             "current, so it is safe and cheap to defer."
+        ),
+        command_to_apply=command_to_apply,
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+
+def build_backend_down_deferral(
+    project_name: str,
+    command_to_apply: str,
+    *,
+    backend: str = "",
+) -> Optional["_DeferralEntryT"]:
+    """v0.2.105 (fix round): the DRIVER-TIME flavour of
+    ``codegraph_embed_resync_pending``.
+
+    Same condition id and ledger discipline as :func:`build_resync_deferral`
+    (deliberately NO new id: the registry row, the retry handler and every
+    clear-probe already exist for ``_CONDITION_ID``, and the ledger is
+    last-write-wins per condition id). The TEXT differs because the
+    update-time wording would be FALSE here: the resync driver refused (or
+    the analyzer soft-skipped) at driver time — a manual ``--run-resync``,
+    the deferral retry, or a backend that went down mid-spawn — so nothing
+    was "unreachable during --update" and no pre-chunking claim applies
+    (review LOW: misleading deferral text). Fields are single-line (A-3,
+    same constraint as every flavour).
+    """
+    if DeferralEntry is None:
+        return None
+    return DeferralEntry(
+        condition_id=_CONDITION_ID,
+        title="Code-graph re-embed pending (embedding backend unreachable)",
+        detected=(
+            "{backend} was unreachable when the code-graph resync ran (not "
+            "during an update), so the walk was refused or skipped and "
+            "nothing was re-embedded for project '{proj}'.".format(
+                backend=(backend[:1].upper() + backend[1:]) if backend else
+                f"The code-embedding service (:{DEFAULT_CODE_EMBED_PORT})",
+                proj=project_name,
+            )
+        ),
+        why_deferred=(
+            "A per-object re-embed needs the embedding backend that serves "
+            "this graph's model running; launching the analyze now would "
+            "fail every embed. The resync is resumable — re-running it once "
+            "the service is up re-embeds only the stale rows (revision "
+            "mismatch) and skips everything already current — and the "
+            "automatic deferral retry re-runs it once the backend answers."
         ),
         command_to_apply=command_to_apply,
         severity="warning",
@@ -2980,14 +3075,38 @@ def driver_resume_command(
     DELETES the rows of files a walk did not visit — exactly the rows an
     unconverged walk leaves behind. A printed command is shipped code, so a
     run that was started with ``--prune-stale`` still prints the plain
-    driver; the orphan-interactions entry prints its own ``--prune-stale``
-    form for the one condition that needs it."""
+    driver; the orphan-interactions entry prints its OWN targeted cleanup
+    line (:func:`orphan_cleanup_command`) for the one condition that needs
+    it."""
     from vco_lib.remedy_shell import command_line
 
     return command_line(driver_argv(
         python, repo_root, analyzer, project_name,
         index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
     ))
+
+
+def orphan_cleanup_command(project_name: str, repo_root: "Path | str") -> str:
+    """v0.2.105 (prune lane): the ONE line the
+    ``codegraph_orphan_interactions_pending`` entry prints as its remedy.
+
+    The pre-v0.2.105 remedy was the driver's ``--prune-stale`` form — a
+    whole-walk stale prune whose visit covered the repo root only, so it
+    deleted every ENABLED extra code folder's rows together with the
+    orphans (the 2026-10-29 incident: 33,464 rows pruned where 727 were
+    expected, and nothing re-added them). The targeted mode
+    (:func:`vco_lib.codegraph_source_purge.prune_orphan_interactions`)
+    deletes ONLY the provably-dead unanchored rows the detection counted,
+    never a row of an extra code folder, and clears its own ledger entry on
+    a clean pass.
+    """
+    from vco_lib.remedy_shell import command_line
+
+    return command_line([
+        _python_exe.resolve_or_current(), "-m", "vco_lib.codegraph_resync",
+        "--prune-orphan-interactions", "--project", project_name,
+        "--repo-root", str(repo_root),
+    ])
 
 
 def _stale_image_resume_command(resync: str) -> str:
@@ -3037,6 +3156,37 @@ def _record_stale_image_deferral(
         )
 
 
+def _record_backend_down_deferral(
+    repo_root: Path, project_name: str, resync_cmd: str, backend: str,
+) -> None:
+    """v0.2.105: persist/refresh the service-down flavour of
+    ``codegraph_embed_resync_pending`` when the DRIVER refuses (pre-check)
+    or converges a soft-skipped walk (post-walk check) for an unreachable
+    embedding backend. Same discipline as
+    :func:`_record_stale_image_deferral` (the stale-image flavour): the owed
+    work must stay owed, so the deferral retry driver re-runs the resync once
+    the backend answers. The DRIVER-TIME builder
+    (:func:`build_backend_down_deferral`) carries text honest about WHEN the
+    backend was down — never the update-time wording. Soft-fail throughout."""
+    try:
+        entry = build_backend_down_deferral(project_name, resync_cmd, backend=backend)
+        if entry is None:
+            return
+        from vco_lib.deferral_emit import emit
+
+        folder = Path(repo_root)
+        emit(folder, entry, log=logger)
+        print(
+            "[resync-driver] backend-down deferral recorded in "
+            f"{folder / '.claude' / 'context' / 'UPDATE_DEFERRED.md'}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfacing must not crash the child
+        logger.warning(
+            "resync driver: could not record backend-down deferral: %s", exc
+        )
+
+
 def build_unconverged_deferral(
     project_name: str,
     counts: Optional[dict],
@@ -3060,17 +3210,24 @@ def build_unconverged_deferral(
 
     v0.2.103 (R12-F4/F5): ``orphan_interactions`` (a POSITIVE count) selects
     the ORPHAN flavour — its own condition id (:data:`_ORPHAN_CONDITION_ID`,
-    classed ``action_required`` because only a manual consented
-    ``--prune-stale`` walk clears it) and prose that is TRUE for it: the
-    command DELETES rows a full walk does not visit, it does not re-embed
-    them. ONE builder, parameterised — no second deferral builder.
+    classed ``action_required`` because only a manual consented cleanup
+    clears it) and prose that is TRUE for it: the command deletes ONLY the
+    provably dead orphan rows it names, never a row a walk could still own.
+    ONE builder, parameterised — no second deferral builder.
+
+    v0.2.105 (prune lane): the command is the TARGETED orphan cleanup
+    (:func:`orphan_cleanup_command` → :func:`vco_lib.codegraph_source_purge.prune_orphan_interactions`).
+    The pre-v0.2.105 remedy (``--run-resync --prune-stale``) re-walked the
+    repository root and pruned every unvisited row — which deleted every
+    ENABLED extra code folder's rows with the orphans; the printed command
+    must never do that again.
     """
     if DeferralEntry is None:
         return None
     if orphan_interactions:
         return DeferralEntry(
             condition_id=_ORPHAN_CONDITION_ID,
-            title="Code-graph orphan rows pending a consented prune walk",
+            title="Code-graph orphan rows pending a consented cleanup",
             detected=(
                 f"A background code-graph resync for project '{project_name}' "
                 f"converged every stale row, but {orphan_interactions} "
@@ -3079,18 +3236,16 @@ def build_unconverged_deferral(
                 "only dangling ones) — provably dead rows no walk re-embeds."
             ),
             why_deferred=(
-                "Only a FULL walk with --prune-stale removes them, and that "
-                "is a user-consented action, never automatic: the command "
-                "below re-walks the repository and DELETES every code-graph "
-                "row the walk does not visit (the ordinary prune semantics — "
-                "not only the orphans), then re-embeds what changed. The "
-                "orphan cleanup itself touches only anchor-less rows, and "
-                "removes one only when it is provably dead (no reference at "
-                "all, or only dangling ones); anything uncertain is kept. If "
-                "any enabled extra code folder is unreachable, the walk "
-                "skips orphan cleanup entirely (nothing is deleted) until "
-                "every folder is reachable. The entry clears once a re-probe "
-                "of the same count finds zero."
+                "Removing them is a user-consented action, never automatic. "
+                "The command below is a TARGETED cleanup: it deletes exactly "
+                "these provably-dead rows (no file_path, and no reference at "
+                "all or only dangling ones — verified per row before "
+                "deletion) and NOTHING else: no code-graph walk runs, no "
+                "file-anchored row is touched, and rows of extra code "
+                "folders are never judged. Anything uncertain is kept, and a "
+                "row is deleted only after the whole scan completed. On a "
+                "clean pass the command clears this entry itself; if any "
+                "deletion fails, the entry stays and lists the failure."
             ),
             command_to_apply=command_to_apply,
             severity="warning",
@@ -3281,6 +3436,32 @@ def clear_orphan_interactions_deferral_if_zero(
             "codegraph orphan cleanup: could not resolve deferral: %s", exc
         )
         return True
+
+
+def clear_orphan_deferral_after_reaping(analyzer: Any) -> None:
+    """v0.2.105 (prune lane, extracted from the analyzer's R14-B1 tail):
+    after a reaping-enabled full ``--prune-stale`` walk, re-count the
+    orphans through the SAME probe and clear the pending-orphan deferral on
+    a positive zero (:func:`clear_orphan_interactions_deferral_if_zero`).
+
+    ``analyzer`` is the :class:`~analyze_code_graph.CodeGraphAnalyzer`
+    (duck-typed, like ``codegraph_schema.ensure_analyzer_properties``):
+    reads ``project_name``, ``_analyze_repo_root_raw`` (R16-B-N1: the RAW
+    root form decides — rows are STAMPED with it; the resolved root's
+    primary set misses raw-stamped rows on a symlinked repo),
+    ``_analyze_repo_root`` (fallback) and ``client``. Never raises: a
+    failed clear check must not wedge the prune pass.
+    """
+    raw_root = str(getattr(analyzer, "_analyze_repo_root_raw", "") or "")
+    try:
+        clear_orphan_interactions_deferral_if_zero(
+            str(getattr(analyzer, "project_name", "") or ""),
+            repo_root=(Path(raw_root) if raw_root
+                       else getattr(analyzer, "_analyze_repo_root", None)),
+            client=getattr(analyzer, "client", None),
+        )
+    except Exception as exc:  # noqa: BLE001 — never wedge the prune
+        print(f"⚠️  orphan-deferral clear check failed: {exc}", file=sys.stderr)
 
 
 # ─── Stale-env hub-token fallback (v0.2.91, WP-D item 4) ───────────────
@@ -3562,6 +3743,19 @@ def _parse_analyzer_stats(text: str) -> dict:
     return stats
 
 
+def _read_spawn_log_window(log_path: "Path | str | None") -> Optional[str]:
+    """The bounded tail window of the shared per-spawn resync log.
+
+    This module's call shape of the ONE reader
+    (:func:`vco_lib.codegraph_analyzer_outcome.read_log_window`): the analyzer
+    inherited the log's fd and has EXITED by the time this runs, so its
+    end-of-walk lines are flushed and on disk. ``None`` when it could not be
+    read (no path — e.g. the spawn degraded to DEVNULL — missing file, read
+    error). Soft-fail by contract.
+    """
+    return _read_log_window(log_path, _TERMINAL_LOG_SCAN_MAX_BYTES)
+
+
 def _collect_terminal_stats(
     log_path: "Path | str | None",
 ) -> "tuple[dict, Optional[str]]":
@@ -3574,22 +3768,14 @@ def _collect_terminal_stats(
     still goes out with the status alone.
     """
     empty = {"files_analyzed": None, "prune_failures": None, "analyzed_commit": None}
-    if not log_path:
+    window = _read_spawn_log_window(log_path)
+    if window is None:
         return empty, None
-    try:
-        path = Path(log_path)
-        size = path.stat().st_size
-        with open(path, "rb") as fh:
-            fh.seek(max(0, size - _TERMINAL_LOG_SCAN_MAX_BYTES))
-            window = fh.read().decode("utf-8", errors="replace")
-        tail = (
-            window.encode("utf-8")[-_TERMINAL_LOG_TAIL_MAX_BYTES:]
-            .decode("utf-8", errors="replace")
-        )
-        return _parse_analyzer_stats(window), tail
-    except Exception as exc:  # noqa: BLE001 — stats are best-effort
-        logger.debug("codegraph resync: terminal log-stat read skipped: %s", exc)
-        return empty, None
+    tail = (
+        window.encode("utf-8")[-_TERMINAL_LOG_TAIL_MAX_BYTES:]
+        .decode("utf-8", errors="replace")
+    )
+    return _parse_analyzer_stats(window), tail
 
 
 def _report_terminal_to_hub(
@@ -4143,6 +4329,19 @@ def _run_resync_and_verify_slotted(
        verdict is judged against the install root that owns the machine's
        one service (ship-gate MAJOR-2), and a pre-v0.2.92 image is caught
        from its ``/health`` alone even when no tree carries the source.
+    0a. v0.2.105: BACKEND-REACHABILITY GATE (two arms). The analyzer
+       soft-skips with exit 0 when no embedding backend answers, which the
+       driver used to relay as terminal ``success``. PRE-check: when the
+       backend the walk needs is unreachable (``code_backend_down_waiting``
+       — after waiting out a starting container) the analyzer is NOT
+       spawned: the ``codegraph_embed_resync_pending`` entry is
+       recorded/refreshed (the work stays owed), a terminal ``failed``
+       report closes any hub row, and the driver returns 0. POST-walk
+       (fix round): a backend that went down between the pre-check and the
+       analyzer's own probe is caught by the analyzer's "Code-graph
+       analysis skipped" line in this run's shared log and converges on the
+       same refusal posture — never a terminal ``success`` for a walk that
+       analyzed nothing.
     0b. v0.2.96 (M-2): EXPOSURE HEAL. When the one-time truncation-exposure
        bump is owed for THIS project (``vco_lib.code_embed_exposure`` —
        machine-level ``observed`` evidence and no ``healed`` entry for the
@@ -4217,6 +4416,61 @@ def _run_resync_and_verify_slotted(
             )
         except Exception as exc:  # noqa: BLE001 — observability, never a gate
             logger.debug("resync driver: stale-refusal report raised: %s", exc)
+        return 0
+
+    # v0.2.105: the backend-reachability gate (PRE-check). The analyzer
+    # soft-SKIPS with exit 0 when no embedding backend answers (field
+    # 2026-10-23, log resync-VibeCodedOrchestrator-20261023-140259:
+    # "Code-graph analysis skipped: active code backend (slot=codesage_embed)
+    # is not reachable" followed by "reported terminal 'success' to hub") —
+    # and a soft-skipped walk is indistinguishable from a successful one by
+    # exit code alone. The driver refused nothing, the hub row read
+    # 'success', and the post-walk probe could even clear
+    # `codegraph_embed_resync_pending` for work that never ran. Same
+    # defence-in-depth shape as the stale-image gate above (the spawn and
+    # the deferral dispatcher gate too, and the MANUAL `--run-resync` path
+    # converges HERE): refuse BEFORE the analyzer is asked, keep/record the
+    # deferral, and give the hub the one honest non-success terminal status
+    # its /terminal route accepts ("failed" — there is no "blocked"). A
+    # backend that goes down BETWEEN this pre-check and the analyzer's own
+    # probe is caught AFTER the walk by the soft-skip convergence below
+    # (v0.2.105 fix round — the review's race, now closed, not claimed).
+    # `code_backend_down_waiting` waits for a running-but-starting container
+    # first (the v0.2.104 tolerance), so a container still loading a model
+    # does not trip this gate.
+    down, _down_container_used = code_backend_down_waiting(project_name)
+    if down is not None:
+        print(
+            f"[resync-driver] code-embedding backend unreachable ({down}) — "
+            "NOT running the analyzer; the resync stays owed",
+            flush=True,
+        )
+        _record_backend_down_deferral(
+            repo_root, project_name, driver_resume_command(
+                _python_exe.resolve_or_current(), Path(repo_root),
+                Path(analyzer_path), project_name,
+                index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            ), backend=down,
+        )
+        # #31 discipline, same as the stale-image refusal: a hub row this
+        # driver's spawn may have registered must not be left to the
+        # pid-aliveness reconciler's false "died before completing" verdict.
+        # Soft-fail as everywhere: observability never gates the exit.
+        try:
+            _report_terminal_to_hub(
+                project_name,
+                "failed",
+                repo_root=repo_root,
+                files_analyzed=0,
+                duration_ms=0,
+                error_message=(
+                    f"code-embedding backend unreachable ({down}) — analysis "
+                    "skipped, the resync stays owed (retried once the "
+                    "backend answers)"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never a gate
+            logger.debug("resync driver: backend-down report raised: %s", exc)
         return 0
 
     # v0.2.96 (M-2, register issue 8): the exposure heal — the walk below is
@@ -4350,6 +4604,54 @@ def _run_resync_and_verify_slotted(
         rc = -1
     analyzer_duration_ms = int((time.monotonic() - analyzer_started) * 1000)
 
+    # v0.2.105 (fix round): the POST-WALK half of the backend-reachability
+    # gate — the race the pre-check above cannot close. A backend that went
+    # down between the pre-check and the analyzer's own probe lets the
+    # analyzer SOFT-SKIP with exit 0, which by exit code alone reads as
+    # success; the one honest signal is its "Code-graph analysis skipped"
+    # line in THIS run's shared log (stderr is captured there, and the log
+    # file is fresh per spawn, so an earlier run cannot match). Converge on
+    # the same refusal posture as the pre-check — the driver-time
+    # `codegraph_embed_resync_pending` flavour is recorded/refreshed (the
+    # work stays owed), the hub row is closed "failed" (never "success"),
+    # the code-summary rider and the post-walk probes do not run for a walk
+    # that analyzed nothing — and return 0 like every refusal here.
+    if (start_error is None and rc == 0
+            and _log_says_analysis_skipped(log_path, _TERMINAL_LOG_SCAN_MAX_BYTES)):
+        _down_late, _ = code_backend_down_waiting(project_name)
+        print(
+            "[resync-driver] the analyzer SOFT-SKIPPED (embedding backend "
+            "unreachable after the spawn"
+            + (f": {_down_late}" if _down_late else "")
+            + ") — the resync stays owed",
+            flush=True,
+        )
+        _record_backend_down_deferral(
+            repo_root, project_name, driver_resume_command(
+                _python_exe.resolve_or_current(), Path(repo_root),
+                Path(analyzer_path), project_name,
+                index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            ), backend=_down_late or "",
+        )
+        try:
+            _stats_late, _tail_late = _collect_terminal_stats(log_path)
+            _report_terminal_to_hub(
+                project_name,
+                "failed",
+                repo_root=repo_root,
+                files_analyzed=0,
+                duration_ms=analyzer_duration_ms,
+                error_message=(
+                    "analyzer soft-skipped: the code-embedding backend was "
+                    "unreachable, nothing was analyzed — the resync stays "
+                    "owed (retried once the backend answers)"
+                ),
+                log_tail=_tail_late,
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never a gate
+            logger.debug("resync driver: soft-skip report raised: %s", exc)
+        return 0
+
     # v0.2.100 WP-13: the code-summary rider starts only now, after the
     # analyzer exited — the rows it reads are the ones this walk wrote.
     if start_error is None:
@@ -4401,11 +4703,9 @@ def _run_resync_and_verify_slotted(
         print(f"[resync-driver] post-walk probe raised: {exc}", flush=True)
         counts = None
 
-    # Printed (the orphan entry below): the shell-aware join, same as
-    # `driver_resume_command` (R1 L3).
-    from vco_lib.remedy_shell import command_line
-
-    resume_cmd = command_line(argv)
+    # Printed (the orphan entry below): the shell-aware TARGETED command —
+    # v0.2.105 (prune lane): never `resume_cmd + " --prune-stale"` (that
+    # form deleted enabled extra folders' rows; the 2026-10-29 incident).
     # v0.2.103 (defect 7): "0 stale rows" must not hide provable orphan
     # CodeInteraction rows — count_stale_rows classifies pathless rows
     # purgeable (no re-walk converges them), and pre-fix they also survived
@@ -4452,14 +4752,14 @@ def _run_resync_and_verify_slotted(
             print(
                 f"[resync-driver] {orphan_interactions} provable orphan "
                 "CodeInteraction row(s) remain (no file_path, no reference "
-                "at all or only dangling ones) — only a full-walk "
-                "--prune-stale run removes them (action required; never "
-                "automatic)",
+                "at all or only dangling ones) — the targeted orphan-cleanup "
+                "command recorded below removes exactly those rows (action "
+                "required; never automatic)",
                 flush=True,
             )
             _record_orphan_interactions_deferral(
                 repo_root, project_name, orphan_interactions,
-                resume_cmd + " --prune-stale",
+                orphan_cleanup_command(project_name, Path(repo_root)),
             )
         elif orphan_interactions == 0:
             _resolve_orphan_interactions_deferral(repo_root)
@@ -5322,6 +5622,10 @@ def _main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="codegraph resync helpers")
     parser.add_argument("--prune-ignored", action="store_true",
                         help="delete rows whose path is in the ignore set")
+    parser.add_argument("--prune-orphan-interactions", action="store_true",
+                        help="delete ONLY the provably-dead unanchored "
+                             "CodeInteraction rows (v0.2.105 targeted orphan "
+                             "remedy — never a whole-collection stale prune)")
     parser.add_argument("--run-resync", action="store_true",
                         help="run the analyzer + verify convergence (R-7 driver)")
     parser.add_argument("--backfill-metadata", action="store_true",
@@ -5359,6 +5663,27 @@ def _main(argv: Optional[list] = None) -> int:
                 _audits.AUDIT_IGNORED_PATHS, args.project,
                 ignore_set_key(args.index_dot_claude),
             )
+    elif args.prune_orphan_interactions:
+        configure_logging()
+        from vco_lib.codegraph_source_purge import prune_orphan_interactions
+
+        res = prune_orphan_interactions(
+            args.project,
+            repo_root=(Path(args.repo_root) if args.repo_root else None),
+        )
+        print(
+            "orphan_interactions_deleted={deleted} "
+            "failures={failures}{undetermined}".format(
+                deleted=res["deleted"], failures=res["failures"],
+                undetermined=(
+                    " (scan undeterminable — nothing was deleted)"
+                    if res["counted"] is None else ""),
+            ),
+            flush=True,
+        )
+        if res["counted"] is None or res["failures"]:
+            return 1  # nothing deleted on unknown; partial deletes stay owed
+        return 0
     elif args.run_resync:
         configure_logging()
         if not args.repo_root or not args.analyzer:

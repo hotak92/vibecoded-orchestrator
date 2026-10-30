@@ -5451,7 +5451,10 @@ mod populate_access_for_project_tests {
 
 /// v0.2.100 W5R-05 — a project's own KG access-row names, resolved by
 /// [`Db::own_kg_access_collections`] from launcher.db (root flag + bindings).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Default` (all names empty, not root) is the DEGRADED resolution — a
+/// missing project row or a DB error — which the live-count scope skips
+/// rather than inserting empty placeholders (v0.2.105 fix round).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnKgAccessCollections {
     pub primary: String,
     pub dev: String,

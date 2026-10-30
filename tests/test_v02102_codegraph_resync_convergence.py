@@ -2061,6 +2061,10 @@ def _stub_driver_walk_gates(monkeypatch):
     from vco_lib import codegraph_resync as cr
 
     monkeypatch.setattr(cr, "walk_uses_container", lambda *_a, **_k: False)
+    # v0.2.105: the backend-reachability gate must not probe a real service
+    # from the driver tests — "reachable" keeps the tests on the walk path.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *_a, **_k: (None, False))
     monkeypatch.setattr(cr, "_maybe_run_exposure_heal", lambda *_a, **_k: False)
     monkeypatch.setattr(cr, "_maybe_run_vectorless_audit", lambda *_a, **_k: None)
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *_a, **_k: None)

@@ -416,25 +416,27 @@ def launcher_db_path() -> Path:
 
 
 def resolve_project_name(cwd: Optional[Path] = None) -> Optional[str]:
-    """Best-effort canonical project name for the current workspace.
+    """Best-effort project IDENTIFIER for telemetry stamping.
 
-    Used by per-event loggers (``ToolUsageLogger``, the RL telemetry path,
-    etc.) so JSONL rows are stamped with the same project identifier the
-    KG / code-graph use. The same resolution sequence already appears
-    inline in ``vco_lib/cli/codegraph_diagram.py::_resolve_project_name``
-    and ``templates/scripts/query_code_graph.py``; this helper deduplicates
-    it across the three KG-CLI scripts (``search_knowledge.py`` /
-    ``get_node_info.py`` / ``sync_knowledge_graph.py``) per v0.2.40 H1.
+    Used by per-event loggers (``ToolUsageLogger`` rows written by the three
+    KG-CLI scripts ``search_knowledge.py`` / ``get_node_info.py`` /
+    ``sync_knowledge_graph.py``, per v0.2.40 H1) so JSONL rows carry the same
+    project key the hub's access-matrix joins use.
+
+    **This is NOT a Weaviate collection prefix.** Tier 1 is the hub's
+    ``code_graph_project``, which is the launcher SLUG (``orchestrator-root``),
+    not the code-graph binding prefix (``VibeCodedOrchestrator``); sanitizing
+    the slug yields a class set nothing reads. Anything that names code-graph
+    classes or passes an analyzer ``--project`` must use
+    :func:`vco_lib.codegraph_project_prefix.resolve_codegraph_prefix` (v0.2.105:
+    the owed-work retries used this function for that and re-walked the
+    orchestrator root into ``Orchestrator_root_Code*``).
 
     Resolution order:
-      1. Hub-resolved ``ProjectConfig.code_graph_project`` (canonical
-         Weaviate-prefix form like ``VCODev``), via
-         ``vco_lib.project_config.resolve(cwd)``. The hub is the single
-         source of truth when the launcher is running.
-      2. ``CODE_GRAPH_PROJECT`` env var (same shape as the hub value;
-         set by ``.claude/settings.json env`` in installed projects).
-      3. ``PROJECT_NAME`` env var (display name; falls back to the same
-         value when ``CODE_GRAPH_PROJECT`` isn't set explicitly).
+      1. Hub-resolved ``ProjectConfig.code_graph_project`` (the launcher slug),
+         via ``vco_lib.project_config.resolve(cwd)``.
+      2. ``CODE_GRAPH_PROJECT`` env var.
+      3. ``PROJECT_NAME`` env var (display name).
       4. ``None`` — no project context available. Callers should treat
          this as "unknown" rather than substituting a placeholder.
 
@@ -444,7 +446,7 @@ def resolve_project_name(cwd: Optional[Path] = None) -> Optional[str]:
             the workspace and wants to avoid relying on the process CWD.
 
     Returns:
-        The resolved project name, or ``None`` when nothing is set.
+        The resolved identifier, or ``None`` when nothing is set.
         Empty-string env values are treated as unset (consistent with
         the rest of the resolver chain).
     """

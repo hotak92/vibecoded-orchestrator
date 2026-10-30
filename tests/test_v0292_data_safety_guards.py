@@ -1005,6 +1005,267 @@ class ConfiguredCollectionExistenceProbeTests(_Case):
         assert cmd is not None
         _assert_project_init_argv_parses(self, cmd.group(1))
 
+    def test_kg_equals_shared_is_probed_once(self):
+        """v0.2.105 fix round: the orchestrator-root shape (KG == SHARED,
+        one class serving both roles) — the name is probed/reported ONCE,
+        not duplicated per key (it used to land in `absent` twice and
+        draw two warnings)."""
+        self.write_settings_env(
+            KG_COLLECTION=KG_PRIMARY, SHARED_KG_COLLECTION=KG_PRIMARY)
+        with mock.patch.object(project_init, "_http_request",
+                               side_effect=_http_mock([KG_PRIMARY])):
+            report = project_init.verify_configured_collections_exist(
+                self.proj, URL)
+        self.assertEqual(report["present"], [KG_PRIMARY])
+        self.assertEqual(report["absent"], [])
+        self.assertEqual(report["warnings"], [])
+
+
+class EnsureConfiguredCollectionsCreatesMissingTests(_Case):
+    """v0.2.105: add/update CREATES a positively-absent configured class
+    with the shipped schema instead of only printing the manual
+    ``bootstrap-collections`` command — for the project's OWN collections
+    only: a distinct ``SHARED_KG_COLLECTION`` is NEVER auto-created (it
+    belongs to the orchestrator root; an empty auto-created class would
+    hide the misconfiguration and silence the F-12(b) warning for good).
+    Strictly additive: "unknown" (Weaviate unreachable) never creates, an
+    existing class is never touched, and a failed create keeps the
+    original warning + command."""
+
+    def _http_mock_with_create(self, schema_classes, *, posts, post_status=200,
+                               fail=False):
+        """``_http_mock`` shape + recorded POSTs + per-class GETs."""
+
+        def _side_effect(method, url, *, body=None, timeout=30.0):
+            if fail:
+                raise urllib.error.URLError("connection refused")
+            if method == "GET" and url.endswith("/v1/schema"):
+                payload = {"classes": [{"class": c} for c in schema_classes]}
+                return (200, json.dumps(payload).encode())
+            if method == "GET" and "/v1/schema/" in url:
+                # Per-class fetch: absent (404) unless listed above.
+                return (404, b"")
+            if method == "POST" and url.endswith("/v1/schema"):
+                posts.append(body)
+                return (post_status, b"")
+            if method == "POST" and url.endswith("/v1/graphql"):
+                return (200, json.dumps({"data": {"Aggregate": {}}}).encode())
+            return (404, b"")
+
+        return _side_effect
+
+    def test_absent_configured_kg_class_is_created(self):
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION="Phantom_KnowledgeGraph")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([], posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], ["Phantom_KnowledgeGraph"])
+        self.assertEqual(report["absent"], [])
+        self.assertEqual(report["create_errors"], [])
+        self.assertEqual(report["warnings"], [],
+                         "a healed class owes no warning")
+        self.assertEqual(len(posts), 1, "exactly one class POSTed")
+        self.assertEqual(posts[0].get("class"), "Phantom_KnowledgeGraph")
+        # The shipped schema, not a bare name: the KG definition carries the
+        # named-vector slots bootstrap-collections POSTs.
+        self.assertIn("vectorConfig", json.dumps(posts[0]))
+
+    def test_absent_development_class_uses_the_development_schema(self):
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION=KG_PRIMARY,
+            DEVELOPMENT_COLLECTION="Phantom_Development")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([KG_PRIMARY],
+                                                        posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], ["Phantom_Development"])
+        self.assertEqual([p.get("class") for p in posts],
+                         ["Phantom_Development"])
+
+    def test_unreachable_weaviate_never_creates(self):
+        self.write_settings_env(KG_COLLECTION="Phantom_KnowledgeGraph")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([], posts=posts,
+                                                        fail=True)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], [])
+        self.assertEqual(report["unknown"], ["Phantom_KnowledgeGraph"])
+        self.assertEqual(posts, [], "'could not check' must not create")
+
+    def test_existing_class_is_never_posted(self):
+        self.write_settings_env(KG_COLLECTION=KG_PRIMARY)
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([KG_PRIMARY],
+                                                        posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["present"], [KG_PRIMARY])
+        self.assertEqual(report["created"], [])
+        self.assertEqual(posts, [])
+
+    def test_failed_create_keeps_the_manual_command_warning(self):
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION="Phantom_KnowledgeGraph")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create(
+                    [], posts=posts, post_status=500)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], [])
+        self.assertEqual(report["absent"], ["Phantom_KnowledgeGraph"])
+        self.assertTrue(report["create_errors"])
+        self.assertTrue(report["warnings"], "the remediation warning stands")
+        warning = report["warnings"][0]
+        self.assertIn("does NOT exist", warning)
+        cmd = re.search(r"`([^`]+)`", warning)
+        self.assertIsNotNone(cmd)
+        assert cmd is not None
+        _assert_project_init_argv_parses(self, cmd.group(1))
+
+    def test_absent_shared_kg_collection_is_never_created(self):
+        """v0.2.105 fix round: a distinct SHARED_KG_COLLECTION belongs to
+        the orchestrator root — auto-creating it on a non-root project
+        would hide a typo/stale name behind an empty class and silence the
+        F-12(b) warning for good. The warning STANDS; nothing is POSTed."""
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION=KG_PRIMARY,
+            SHARED_KG_COLLECTION="Phantom_KnowledgeGraph")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([KG_PRIMARY],
+                                                        posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], [])
+        self.assertEqual(report["absent"], ["Phantom_KnowledgeGraph"])
+        self.assertEqual(posts, [], "the shared collection is never POSTed")
+        self.assertTrue(report["warnings"], "the F-12(b) warning stands")
+        warning = report["warnings"][0]
+        self.assertIn("Phantom_KnowledgeGraph", warning)
+        self.assertIn("does NOT exist", warning)
+
+    def test_creating_a_class_never_drops_a_different_collections_warning(self):
+        """v0.2.105 fix round (review NIT): retiring the healed warning
+        matched a bare SUBSTRING — creating ``Phantom_KnowledgeGraph`` also
+        dropped the warning of a DISTINCT absent shared class whose name
+        merely contains it (``Phantom_KnowledgeGraph_Shared``), which is
+        exactly the warning this fix round says must STAND. The removal now
+        matches the one-home warning prefix
+        (``project_init.configured_absent_warning_prefix``)."""
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION="Phantom_KnowledgeGraph",
+            SHARED_KG_COLLECTION="Phantom_KnowledgeGraph_Shared")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([], posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], ["Phantom_KnowledgeGraph"])
+        self.assertEqual(report["absent"], ["Phantom_KnowledgeGraph_Shared"])
+        # the healed class's own warning is gone...
+        from vco_lib.configured_collections import (
+            configured_absent_warning_prefix,
+        )
+        healed_prefix = configured_absent_warning_prefix(
+            "Phantom_KnowledgeGraph")
+        self.assertFalse(
+            any(w.startswith(healed_prefix) for w in report["warnings"]),
+            report["warnings"])
+        # ...and the DISTINCT shared-collection warning STANDS — it was the
+        # substring drop's victim.
+        self.assertTrue(
+            any("Phantom_KnowledgeGraph_Shared" in w and "does NOT exist" in w
+                for w in report["warnings"]),
+            report["warnings"])
+        self.assertEqual(len(posts), 1, "only the OWN class is created")
+
+    def test_kg_equals_shared_root_case_creates_once(self):
+        """The orchestrator-root shape (KG == SHARED, one class serving both
+        roles): the name is created ONCE (through the creatable
+        KG_COLLECTION key) and owes no warning — pre-fix it was reported
+        absent twice and would have been created twice."""
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION="Root_KnowledgeGraph",
+            SHARED_KG_COLLECTION="Root_KnowledgeGraph")
+        posts: list = []
+        with mock.patch.object(
+                project_init, "_http_request",
+                side_effect=self._http_mock_with_create([], posts=posts)):
+            report = project_init.ensure_configured_collections(self.proj, URL)
+        self.assertEqual(report["created"], ["Root_KnowledgeGraph"])
+        self.assertEqual(report["absent"], [])
+        self.assertEqual(report["warnings"], [],
+                         "a healed class owes no warning")
+        self.assertEqual(len(posts), 1, "created exactly once, not per key")
+
+    def test_ensure_logic_lives_in_its_own_module(self):
+        """v0.2.105 fix round (file-size rule): the ensure logic is
+        extracted to ``vco_lib.configured_collections``; the historical
+        ``project_init.ensure_configured_collections`` path is a thin
+        DELEGATING shim, so callers and tests are unaffected."""
+        from vco_lib import configured_collections
+        self.assertEqual(
+            configured_collections.ensure_configured_collections.__module__,
+            "vco_lib.configured_collections")
+        sentinel = {"sentinel": True}
+        with mock.patch.object(
+                configured_collections, "ensure_configured_collections",
+                return_value=sentinel) as impl:
+            got = project_init.ensure_configured_collections(
+                self.proj, URL)
+        impl.assert_called_once_with(self.proj, URL, log_event=None)
+        self.assertIs(got, sentinel)
+
+
+class BundleSurfacesCreatedCollectionsTests(_Case):
+    """v0.2.105 fix round: `created` must reach the update summary the
+    launcher SHOWS (the toast reads `warnings[]` off stdout) — before the
+    fix it existed only in ``result["configured_collections"]`` and the
+    install log, so "reports it as created" was not true to the user."""
+
+    def setUp(self):
+        super().setUp()
+        self.orch = self.tmp / "orch"
+        self.orch.mkdir()
+        _make_fake_orchestrator(self.orch)
+
+    def test_created_collections_appear_in_the_bundle_warnings(self):
+        self.write_settings_env(
+            PROJECT_NAME=REG_NAME, KG_COLLECTION="Phantom_KnowledgeGraph")
+        posts: list = []
+
+        def _side_effect(method, url, *, body=None, timeout=30.0):
+            if method == "GET" and url.endswith("/v1/schema"):
+                return (200, json.dumps({"classes": []}).encode())
+            if method == "POST" and url.endswith("/v1/schema"):
+                posts.append(body)
+                return (200, b"")
+            if method == "POST" and url.endswith("/v1/graphql"):
+                return (200, json.dumps({"data": {"Aggregate": {}}}).encode())
+            return (404, b"")
+
+        with self.pin(), mock.patch.object(
+                project_init, "_http_request", side_effect=_side_effect):
+            result = project_init.install_project_bundle(
+                self.proj, orchestrator_root=self.orch, update_mode=True)
+        check = result.get("configured_collections", {})
+        self.assertEqual(check.get("created"), ["Phantom_KnowledgeGraph"])
+        summary = [w for w in result.get("warnings", [])
+                   if "created empty with the shipped schema" in w]
+        self.assertEqual(len(summary), 1,
+                         "exactly one summary line for the created classes")
+        self.assertIn("Phantom_KnowledgeGraph", summary[0])
+        self.assertEqual(len(posts), 1)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # F-9 — the emitted `bootstrap-collections` argv shape is pinned

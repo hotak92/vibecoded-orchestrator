@@ -561,6 +561,13 @@ if ($ToolName -eq "Bash" -or $ToolName -eq "PowerShell") {
             $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
             $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
             $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+            # v0.2.105 rm guard: the scanner remembers a "retry to confirm"
+            # rm per chat session + subagent under .claude/state/rm-confirm/,
+            # so it gets the payload's ids and the state dir (always set, so
+            # an inherited value never leaks in). MUST MATCH pre-tool-use.sh.
+            $psi.EnvironmentVariables["VCO_GUARD_SESSION_ID"] = [string]$SessionIdFromStdin
+            $psi.EnvironmentVariables["VCO_GUARD_AGENT_ID"] = [string]$AgentId
+            $psi.EnvironmentVariables["VCO_GUARD_STATE_DIR"] = [string]$SessionStateDir
             $proc = [System.Diagnostics.Process]::Start($psi)
             $outTask = $proc.StandardOutput.ReadToEndAsync()
             $errTask = $proc.StandardError.ReadToEndAsync()
@@ -844,7 +851,7 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
 # context for: two context emissions per edit, no score floor on the
 # suggestion path. The injection redesign made those wrappers (via
 # hook_context_router.py) the ONE home for edit-time KG context (PLAN-V02101
-# section 2.1 Edit/Write rows). Retiring this branch also retired the last
+# section 2.1 Edit/Write rows: floor 0.70). Retiring this branch also retired the last
 # shell caller of _lib/query-cache.ps1, deleted with it (the router keeps its
 # own Python cache under the disjoint kgi/cgi namespaces). The
 # pre_tool_use_kg_search task type stays registered in rl_kg_search's

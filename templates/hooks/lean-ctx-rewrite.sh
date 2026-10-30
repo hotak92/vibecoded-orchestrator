@@ -3,6 +3,12 @@
 # PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Per-project lean-ctx PreToolUse hook for Bash tool calls.
 #
+# v0.2.105: this hook is also the ONE emitter of `updatedInput` for shell
+# tool calls, so it hosts a second stage that runs FIRST: the kill guard's
+# runtime layer (vco_lib/kill_guard.py; see "STAGE 1" below). It is
+# registered on matcher Bash|PowerShell for that stage; lean-ctx
+# compression (stage 2) stays Bash-only.
+#
 # CONTRACT (v0.2.101 — ALLOW-LIST INVERSION + LOSSLESS TEE)
 # ----------------------------------------------------------
 # Claude Code's PreToolUse pipes a JSON payload to this hook's stdin:
@@ -86,6 +92,53 @@ set -u
 # their own logs / debug output.
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# The PreToolUse payload is read FIRST: the kill-guard stage below needs it
+# before the lean-ctx knobs are consulted.
+_lc_cmd="$(cat 2>/dev/null || true)"
+[ -n "$_lc_cmd" ] || exit 0
+
+# === STAGE 1: kill guard (v0.2.105) ===========================================
+# This hook is the ONE emitter of `updatedInput` for shell tool calls: two
+# PreToolUse hooks rewriting one call conflict, so the kill guard's runtime
+# layer lives HERE instead of in a second rewriter. For a command that runs
+# kill/pkill/killall (Bash) or Stop-Process/kill/spps/taskkill (PowerShell),
+# vco_lib.kill_guard builds the whole response: the command prefixed with
+# guard definitions that check every target pid before it is signalled
+# (refusing pid 1, the shell's ancestors, its session leader and the
+# desktop-critical processes). Such a command is never on the lean-ctx
+# allow-list (a single simple command whose verb is allow-listed cannot run a
+# kill verb), so stage 2 has nothing to add and is skipped.
+# Independent of the lean-ctx knobs and of the lean-ctx binary. Its switch
+# VCO_KILL_GUARD=off/0/false/no is read from THIS process's environment
+# BEFORE .claude/env is sourced — the owner's decision, never the agent's
+# (the same rule as the wait guard). Any failure emits nothing (the static
+# layer in pre-tool-use has already refused the dangerous shapes).
+# MUST MATCH lean-ctx-rewrite.ps1's stage 1.
+case "$_lc_cmd" in
+    *[kK][iI][lL][lL]*|*[sS]top-[pP]rocess*|*[sS][pP][pP][sS]*)
+        case "${VCO_KILL_GUARD:-}" in
+            [oO][fF][fF]|0|[fF][aA][lL][sS][eE]|[nN][oO]) ;;
+            *)
+                _kg_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+                # shellcheck source=_lib/find-python.sh disable=SC1091
+                [ -n "$_kg_dir" ] && [ -f "$_kg_dir/_lib/find-python.sh" ] && . "$_kg_dir/_lib/find-python.sh"
+                if [ -n "${PY:-}" ]; then
+                    # shellcheck source=_lib/project-root.sh disable=SC1091
+                    . "$_kg_dir/_lib/project-root.sh"
+                    _kg_root="$(vco_project_root 2>/dev/null)" || _kg_root=""
+                    _kg_out="$(printf '%s' "$_lc_cmd" | "$PY" -m vco_lib.kill_guard rewrite --project-root "$_kg_root")" || _kg_out=""
+                    if [ -n "$_kg_out" ]; then
+                        printf '%s' "$_kg_out"
+                        exit 0
+                    fi
+                fi
+                ;;
+        esac
+        ;;
+esac
+
+# === STAGE 2: lean-ctx compression ============================================
 # Source .claude/env if present so per-project knobs (VCO_LEAN_CTX_DEFAULT,
 # VCO_LEAN_CTX_TEE_TTL_HOURS) are visible. Plain `KEY=VALUE` shell syntax;
 # hooks run with CWD=project-root. `</dev/null`: the file is user-editable
@@ -104,9 +157,6 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 case "${VCO_LEAN_CTX_DEFAULT:-on}" in
     [oO][fF][fF]) exit 0 ;;
 esac
-
-_lc_cmd="$(cat 2>/dev/null || true)"
-[ -n "$_lc_cmd" ] || exit 0
 
 # D-11 (v0.2.75): probe the same candidate list install.py uses before
 # giving up. `command -v` only checks PATH; a `cargo install lean-ctx`

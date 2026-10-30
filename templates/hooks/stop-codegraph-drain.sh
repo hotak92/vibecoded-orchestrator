@@ -216,6 +216,55 @@ if [ -d "$STATE_DIR" ]; then
     fi
 fi
 
+# ── HEAD-DIFF CATCH-UP: commits, merges and pulls on the main checkout ──────
+# v0.2.105 (#512A). The queue above only ever holds files the EDIT hook saw.
+# Code that arrives through `git merge` of a lane branch, `git pull`, a commit
+# made from a shell, or a GUI merge is never queued — a field report found a
+# project's code graph six days and 1,070 commits behind its HEAD for exactly
+# that reason. At most once per
+# VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS (default 600) per project, this
+# spawns `python -m vco_lib.codegraph_head_catchup` DETACHED: it compares the
+# binding's `last_analyzed_commit` (hub /config) with the main checkout's HEAD
+# and, when the recorded commit is an ANCESTOR, indexes exactly
+# `git diff --name-only <recorded>..HEAD` (existing code files only, filtered
+# like the drain's own lines); an enormous diff, or a deleted code file, goes
+# to the analyzer's incremental walk instead. A non-ancestor / missing
+# recorded commit takes ONE full (non-incremental) walk, then records HEAD —
+# the converging fallback. A project with no ENABLED code-graph binding is
+# skipped entirely. On success it records HEAD through the hub route
+# `/projects/{id}/codegraph/analyzed` — never by opening launcher.db.
+# Runs whether or not this turn queued any file (a merge queues none), and
+# deliberately installs NO git hook into the user's repo.
+# Log: .claude/logs/codegraph_head_catchup.log. MUST MATCH the .ps1 sibling.
+_CG_CATCHUP_INTERVAL="${VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS:-600}"
+case "$_CG_CATCHUP_INTERVAL" in
+    ''|*[!0-9]*) _CG_CATCHUP_INTERVAL=600 ;;
+esac
+if [ -d "$STATE_DIR" ]; then
+    _CG_CATCHUP_TS_FILE="$STATE_DIR/codegraph_head_catchup.ts"
+    _CG_CATCHUP_NOW="$(date +%s 2>/dev/null || echo 0)"
+    _CG_CATCHUP_LAST=0
+    if [ -f "$_CG_CATCHUP_TS_FILE" ]; then
+        _CG_CATCHUP_LAST=$(cat "$_CG_CATCHUP_TS_FILE" 2>/dev/null || echo 0)
+        case "$_CG_CATCHUP_LAST" in ''|*[!0-9]*) _CG_CATCHUP_LAST=0 ;; esac
+    fi
+    # A stamp in the FUTURE is not a recent check (R20 L1; MUST MATCH the
+    # .ps1 sibling's clamp and the two blocks above).
+    [ "$_CG_CATCHUP_LAST" -gt "$_CG_CATCHUP_NOW" ] && _CG_CATCHUP_LAST=0
+    if [ "$_CG_CATCHUP_LAST" -eq 0 ] \
+        || [ $(( _CG_CATCHUP_NOW - _CG_CATCHUP_LAST )) -ge "$_CG_CATCHUP_INTERVAL" ]; then
+        printf '%s' "$_CG_CATCHUP_NOW" > "$_CG_CATCHUP_TS_FILE" 2>/dev/null || true
+        if _drain_resolve_runtime; then
+            _CG_CATCHUP_LOG_DIR="$PROJECT_ROOT/.claude/logs"
+            mkdir -p "$_CG_CATCHUP_LOG_DIR" 2>/dev/null || true
+            _CG_CATCHUP_LOG="$_CG_CATCHUP_LOG_DIR/codegraph_head_catchup.log"
+            # Every path travels as a POSITIONAL PARAMETER (NB-H5, v0.2.102).
+            _drain_spawn_detached '"$0" -m vco_lib.codegraph_head_catchup --project-root "$1" --analyzer "$2" --state-dir "$3" >>"$4" 2>&1' \
+                "$ANALYZER_PY" "$PROJECT_ROOT" "$ANALYZER" "$STATE_DIR" "$_CG_CATCHUP_LOG"
+        fi
+    fi
+fi
+
 # ── EXTRA EDIT QUEUES: drain on Stop (v0.2.102 S16-7) ─────────────────────
 # route-touched-path.sh queues a code edit under an ENABLED extra path to
 # codegraph_drain_extra_<md5(extra)>_<session>.txt (never the primary queue —
@@ -333,7 +382,7 @@ _drain_key() {
     printf '%s' "$1" | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null || printf '%s' "_"
 }
 
-CODE_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+CODE_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
 
 # Per-canonical-root batch files: <hash> → tmp file of paths for that root.
 BATCH_DIR="$(mktemp -d "$STATE_DIR/cg_drain_batch.XXXXXX" 2>/dev/null || mktemp -d 2>/dev/null)"

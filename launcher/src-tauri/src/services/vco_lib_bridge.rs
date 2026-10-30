@@ -532,6 +532,41 @@ pub fn codegraph_extra_overlap(
     parse_ok_reply_named("code folder overlap check", &done.stdout, &done.stderr)
 }
 
+/// Wall-clock cap for one removed-extras purge (v0.2.105). Very long by
+/// design (owner rule: dev-machine speed must not set the ceiling) — a purge
+/// deletes row by row and a large folder holds tens of thousands of rows. A
+/// kill is harmless: the purge is resumable and records nothing as done
+/// until a pass completes without failures.
+pub(crate) const VCO_LIB_PURGE_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
+
+/// v0.2.105: remove the code-graph rows of the extra code folders the owner
+/// removed or disabled — `python -m vco_lib.codegraph_source_purge
+/// --project-root … --force --json` (rule A: the Python implementation, the
+/// same one the Stop-drain refresh calls). The child acts on POSITIVE
+/// knowledge only (the hub's `code_graph_extra_paths_gone`) and reports a
+/// refusal in its reply (`refused`) rather than failing. Returns the `ok:
+/// true` reply (`purged` = `{source: rows}`, `failures`, `refused`); a child
+/// that cannot run is an `Err`.
+pub fn codegraph_source_purge(
+    root: Option<&Path>,
+    project_folder: &str,
+) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.codegraph_source_purge")
+        .arg("--project-root")
+        .arg(project_folder)
+        .arg("--force")
+        .arg("--json");
+    let folder = Path::new(project_folder);
+    let done = run_vco_lib_collect(cmd, &python, root, folder, "", VCO_LIB_PURGE_TIMEOUT)?;
+    if !done.success {
+        return Err(child_failure("removed code folder purge", &done));
+    }
+    parse_ok_reply_named("removed code folder purge", &done.stdout, &done.stderr)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvTemplatePorts {
     pub weaviate: u16,

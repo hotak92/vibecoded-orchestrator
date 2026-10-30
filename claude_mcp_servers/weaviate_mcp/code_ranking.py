@@ -59,7 +59,15 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
+
+# The ONE home of "is this a config row / a config link" (v0.2.105) — the
+# config_users/config_of queries use the same predicates.
+from vco_lib.codegraph_config_query import (
+    CONFIG_LANGUAGES,
+    is_config_link,
+    is_config_row,
+)
 
 __all__ = [
     "CODE_FLOOR_BY_SLOT",
@@ -68,8 +76,14 @@ __all__ = [
     "BOOST_SAME_FILE",
     "BOOST_SHARED_TYPE",
     "PENALTY_TEST_ENTITY",
+    "PENALTY_CONFIG_ENTITY",
+    "CODE_SEARCH_SCOPES",
     "is_test_path",
     "resolve_test_penalty",
+    "resolve_config_penalty",
+    "scope_collections",
+    "scope_filter",
+    "scope_admits",
     "resolve_retrieval_floor",
     "resolve_post_rerank_floor",
     "rerank_score",
@@ -139,6 +153,94 @@ RELATIONSHIP_BOOST_CAP = 0.08  # sum of signals capped here
 #     scope for a path heuristic.
 PENALTY_TEST_ENTITY = 0.05
 _ENV_TEST_PENALTY = "VCO_CODE_GRAPH_TEST_PENALTY"
+
+# ─── Config-row penalty (v0.2.105; design item 23 §4) ────────────────────────
+#
+# ADDITIVE, like the test penalty: subtracted from a config FILE / SECTION /
+# LINK row's reranked score (``.tweakers`` / ``.ini`` / ``.json`` rows) so a
+# code-intent query is not crowded by config text. Not applied in the
+# ``config`` scope (the caller asked for config) nor when the ANCHOR is itself
+# a config row. Override: ``VCO_CODE_GRAPH_CONFIG_PENALTY`` (``0`` = off).
+# MEASURED 2026-10-29 on a real C++/Python game-AI tree (77 config sections
+# from .ini/.json files beside ~390k code rows, CodeSage floors 0.16/0.22;
+# 20 code-intent + 10 config-intent queries, scope "all", top-5):
+#   penalty   code contamination@5   config recall@5
+#   0.00      0.03                   7/10
+#   0.02      0.02                   7/10   <- shipped: smallest value with the gain
+#   0.05      0.02                   7/10
+#   0.08      0.01                   3/10   <- config intent breaks
+# (the ``config`` scope, no penalty: 9/10). Contamination is low even at 0;
+# 0.02 removes a third of it at no recall cost and keeps the widest margin
+# below the 0.08 cliff. Re-measure before changing it.
+PENALTY_CONFIG_ENTITY = 0.02
+_ENV_CONFIG_PENALTY = "VCO_CODE_GRAPH_CONFIG_PENALTY"
+
+# ─── search_code_graph scopes (v0.2.105: + "config") ─────────────────────────
+#
+# scope -> the base collections it reads. ``all`` keeps config FILE / SECTION
+# rows but EXCLUDES the config LINK rows (``interaction_type == "config"``):
+# they are edges, roughly one per use, and would crowd every result list —
+# ``interaction`` and ``config`` keep them. ``config`` reads only config rows.
+CODE_SEARCH_SCOPES: dict[str, list[str]] = {
+    "all":         ["CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction"],
+    "code":        ["CodeFunction", "CodeClass", "CodeModule"],
+    "interaction": ["CodeAPI", "CodeInteraction"],
+    "config":      ["CodeModule", "CodeClass", "CodeInteraction"],
+}
+
+
+def scope_collections(scope: str) -> list[str]:
+    """The base collections a ``search_code_graph`` scope reads (unknown → all)."""
+    return list(CODE_SEARCH_SCOPES.get(scope, CODE_SEARCH_SCOPES["all"]))
+
+
+def scope_filter(scope: str, base: str, filter_cls: Any) -> Any:
+    """The NARROWING Weaviate clause ``scope`` adds on ``base`` (``None`` = none).
+
+    Word-tokenized like every text filter, so :func:`scope_admits` confirms
+    each row in Python; this clause only keeps excluded rows from taking the
+    over-fetch slots.
+    """
+    if base == "CodeInteraction" and scope == "all":
+        return filter_cls.by_property("interaction_type").not_equal("config")
+    if scope != "config":
+        return None
+    if base == "CodeInteraction":
+        return filter_cls.by_property("interaction_type").equal("config")
+    if base in ("CodeModule", "CodeClass"):
+        clauses = [filter_cls.by_property("language").equal(lang) for lang in sorted(CONFIG_LANGUAGES)]
+        flt = clauses[0]
+        for extra in clauses[1:]:
+            flt = flt | extra
+        return flt
+    return None
+
+
+def scope_admits(scope: str, base: str, props: Mapping[str, Any]) -> bool:
+    """Does a row of ``base`` belong to ``scope``? (The exact confirmation.)"""
+    if scope == "config":
+        return is_config_link(props) if base == "CodeInteraction" else is_config_row(props)
+    if scope == "all" and base == "CodeInteraction":
+        return not is_config_link(props)
+    return True
+
+
+def _is_config_entity(props: Optional[Mapping[str, object]]) -> bool:
+    if not props:
+        return False
+    return is_config_row(props) or is_config_link(props)
+
+
+def resolve_config_penalty(env: Optional[Mapping[str, str]] = None) -> float:
+    """``VCO_CODE_GRAPH_CONFIG_PENALTY`` when set (empty / unparseable falls
+    through), else :data:`PENALTY_CONFIG_ENTITY`. ``env=None`` reads the
+    process environment, so the override reaches the MCP and the CLI alike."""
+    if env is None:
+        env = os.environ
+    override = _coerce_env_float(env, _ENV_CONFIG_PENALTY)
+    if override is not None:
+        return override
+    return PENALTY_CONFIG_ENTITY
 
 
 def is_test_path(path: str) -> bool:
@@ -367,6 +469,7 @@ def rerank_score(
     anchor_props: Optional[Mapping[str, object]],
     *,
     test_penalty: Optional[float] = None,
+    config_penalty: Optional[float] = None,
 ) -> tuple[float, dict]:
     """Compute the NET anchor-relative rerank delta for one candidate.
 
@@ -405,9 +508,25 @@ def rerank_score(
     candidate_is_test = _coerce_is_test(candidate_props)
     anchor_is_test = _coerce_is_test(anchor_props) if anchor_props else False
     penalty = test_penalty if (candidate_is_test and not anchor_is_test) else 0.0
+    # v0.2.105: the config-row penalty, same shape (anchor = escape).
+    if config_penalty is None:
+        config_penalty = resolve_config_penalty(None)
+    config_hit = bool(
+        config_penalty and _is_config_entity(candidate_props)
+        and not _is_config_entity(anchor_props)
+    )
+    if config_hit:
+        penalty += config_penalty
+
+    # The config signal is reported only when it fired (keeps the pre-v0.2.105
+    # signal shape for every non-config row).
+    config_signal = {"is_config_penalty": True} if config_hit else {}
 
     if anchor_props is None:
-        return 0.0 - penalty, {"is_test_penalty": penalty != 0.0}
+        return 0.0 - penalty, {
+            "is_test_penalty": candidate_is_test and not anchor_is_test and test_penalty != 0.0,
+            **config_signal,
+        }
 
     signals: dict[str, bool] = {}
     delta = 0.0
@@ -450,7 +569,9 @@ def rerank_score(
     # M1: subtract the test penalty AFTER the boost cap (net delta = capped
     # boost − penalty). E1 §5 measured the boost-cancels-penalty interplay at
     # 1.7% of test candidates — no need to size the penalty above the cap.
-    signals["is_test_penalty"] = penalty != 0.0
+    signals["is_test_penalty"] = (
+        candidate_is_test and not anchor_is_test and test_penalty != 0.0)
+    signals.update(config_signal)
     return delta - penalty, signals
 
 
@@ -491,6 +612,7 @@ def run_code_retrieval_pipeline(
     tier_fn: Optional[Callable[[list[dict]], list[dict]]] = None,
     key_fields: tuple[str, ...] = ("file_path", "full_name"),
     env: Optional[Mapping[str, str]] = None,
+    config_penalty: Optional[float] = None,
 ) -> list[dict]:
     """THE shared two-stage-floor + relationship-rerank pipeline.
 
@@ -517,14 +639,17 @@ def run_code_retrieval_pipeline(
     2. Compute ``rerank = semantic + rerank_score(props, anchor_props).delta``
        for each survivor and stash ``_rerank`` / ``_boost``. The delta is the
        NET of the capped relationship boost MINUS the M1 test-entity penalty
-       (a test row is nudged down before the stage-2 gate).
+       and the config-row penalty (``config_penalty``; ``None`` resolves
+       ``VCO_CODE_GRAPH_CONFIG_PENALTY`` → :data:`PENALTY_CONFIG_ENTITY`).
     3. Drop candidates whose RERANKED score < ``post_rerank_floor`` (stage-2
        gate — a near-margin LINKED result can be rescued here by its boost; an
        unlinked near-margin result is culled).
     4. Sort by ``_rerank`` descending (stable — ties keep input order).
     5. De-dup by ``key_fields`` (first-seen wins, i.e. highest reranked score
        after the sort). Keeps the pipeline robust to the multi-collection
-       fan-out returning the same entity twice.
+       fan-out returning the same entity twice. A config SECTION row keys on
+       its format + name + body instead, so byte-identical copies of a config
+       folder show once (v0.2.105).
     6. OPTIONALLY apply ``collapse_fn`` then ``tier_fn`` (both default ``None``
        = no-op). See the injection contract below.
     7. Trim to ``limit`` and return.
@@ -572,6 +697,10 @@ def run_code_retrieval_pipeline(
     """
     # M1: resolve the test penalty ONCE per pipeline call (not per candidate).
     test_penalty = resolve_test_penalty(env)
+    # v0.2.105: the config-row penalty; a caller searching the ``config``
+    # scope passes 0.0 (it asked for config).
+    if config_penalty is None:
+        config_penalty = resolve_config_penalty(env)
 
     # Step 1: stage-1 retrieval-floor gate (semantic, pre-boost).
     survivors: list[dict] = [
@@ -584,7 +713,8 @@ def run_code_retrieval_pipeline(
     for c in survivors:
         semantic = _candidate_semantic(c)
         delta, signals = rerank_score(
-            _candidate_props(c), anchor_props, test_penalty=test_penalty
+            _candidate_props(c), anchor_props, test_penalty=test_penalty,
+            config_penalty=config_penalty,
         )
         c["_rerank"] = semantic + delta
         c["_boost"] = {"delta": delta, "signals": signals}
@@ -598,6 +728,11 @@ def run_code_retrieval_pipeline(
     # Step 5: de-dup by key_fields (first-seen after sort = highest reranked).
     def _dedup_key(c: dict) -> tuple:
         props = _candidate_props(c)
+        # v0.2.105: byte-identical config SECTIONS in copies of a config
+        # folder (variant folders) are one result, not N.
+        if is_config_row(props) and props.get("class_body"):
+            return ("__config__", props.get("language") or "", props.get("name") or "",
+                    props.get("chunk_num") or 0, props.get("class_body"))
         parts = tuple((props.get(f) or "") for f in key_fields)
         # A candidate with an all-empty key is un-dedupable — key it by identity
         # so distinct empty-keyed rows are not collapsed into one.

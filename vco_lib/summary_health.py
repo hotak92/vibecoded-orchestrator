@@ -68,7 +68,7 @@ if __package__ in (None, ""):  # direct-script execution fallback
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = "vco_lib"  # type: ignore[assignment]
 
-from vco_lib import deferral_emit, launcher_db_reader, python_exe
+from vco_lib import deferral_emit, python_exe
 from vco_lib.deferral_report import DeferralEntry
 from vco_lib.node_formats_keys import canonicalize_keys, sidecar_key
 
@@ -275,24 +275,27 @@ def _resolve_script(project_root: Path, name: str) -> "Path | None":
 
 
 def _resolve_project_name(project_root: Path) -> "str | None":
-    """The registered project name for *project_root*, from launcher.db.
+    """The code-graph collection prefix for *project_root*, from an
+    AUTHORITATIVE source (:mod:`vco_lib.codegraph_project_prefix`: the hub's
+    binding prefix, the settings ``CODE_GRAPH_PROJECT`` pin, or the
+    ``launcher.db`` binding row).
 
     POSITIVE resolution only: the code-summary generator's GC prunes
     sidecar entries matching no live canonical row, and it derives those
     rows from the collection prefix this name selects — an unresolved
     name must therefore SKIP the code leg, never guess one.
+
+    v0.2.105: this returned the registered project NAME. For a project whose
+    name does not sanitize to its binding prefix (the orchestrator root,
+    ``orchestrator-root`` vs ``VibeCodedOrchestrator``) the generator pruned
+    the sidecar against a zombie collection.
     """
     try:
-        refs = launcher_db_reader.list_registered_projects() or []
-        for ref in refs:
-            try:
-                if Path(ref.folder).resolve() == project_root:
-                    return ref.name
-            except OSError:
-                continue
+        from vco_lib.codegraph_project_prefix import resolve_codegraph_prefix
+
+        return resolve_codegraph_prefix(project_root, authoritative_only=True) or None
     except Exception:  # noqa: BLE001 — resolution is best-effort
         return None
-    return None
 
 
 def _default_spawn(argv: list, *, cwd: str, env: dict) -> int:

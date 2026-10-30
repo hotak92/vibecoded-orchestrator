@@ -42,7 +42,7 @@ NOT enabled (read-only or advisory agents). By rule: an agent whose only writes 
 - `kg-maintainer` — knowledge graph read/write to isolated state
 - `web-explorer` — research that ends in one written report
 - `gui-tester` — screenshots and structured reports, no source edits
-- `deepseek-researcher`, `glm-flash-researcher` (gateway module) — report-only research lanes
+- `deepseek-researcher`, `glm-flash-researcher` (gateway module) — report-only research lanes (bounded reviews and fix-delta verifications included)
 - `glm-planner` (gateway module) — planning/report-only lane
 - `glm-reviewer`, `kimi-reviewer` (gateway module) — review/report-only lanes
 - `ai-agentic-architect` (ai-engineering pack) — multi-agent design documents, never execution

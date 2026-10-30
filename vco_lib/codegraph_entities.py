@@ -56,6 +56,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 # Entity kinds. These map to the analyzer's five collections; the analyzer's
@@ -298,3 +299,9 @@ class FileExtraction:
     interactions: List[InteractionGroup] = field(default_factory=list)
     imports: List[str] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=dict)
+    #: v0.2.105: the walked source root and the file's text, stamped by the
+    #: shared shim (``_shared.run_pure_extractor``) for the writer's config
+    #: links (:func:`vco_lib.codegraph_config_refs.link_groups`) — the root
+    #: selects that root's config index, the text gives top-level literals.
+    source_root: Optional[Path] = None
+    source_text: Optional[str] = None

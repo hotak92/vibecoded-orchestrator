@@ -1,0 +1,84 @@
+[
+  {
+    "complexity": 0.0,
+    "content_hash": "24ebf4436ef944acf0185c24a8bbda46b92d2962113f7e857d1c6975481a53d6",
+    "embed_revision": 0,
+    "file_hash": "c40b8adf409e388937c0b56cbe5c3b0572015fffd9a5121717af7e4dd321bde1",
+    "import_names": [],
+    "is_test": false,
+    "language": "json",
+    "loc": 6,
+    "module_summary": "JSON config conf/app.json: sections (root), veh_params; 6 keys: layers[].name, layers[].scale_factor, layers[].offset_m, version, mass_kg, dims.length_m",
+    "path": "conf/app.json",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 0.0,
+    "content_hash": "854cf8b34756c291fa2b89d222ad37ef5f1a2cb3276bdecdf3f272808e988ea4",
+    "embed_revision": 0,
+    "file_hash": "fd783f50a7506e9b6dfd299f1db9d39c8bc094f1fe05e273d8286f24bab45774",
+    "import_names": [],
+    "is_test": false,
+    "language": "json",
+    "loc": 305,
+    "module_summary": "JSON config conf/big_table.json: sections (root), tuning_table; 301 keys: schema, gain_stage_000_coefficient, gain_stage_001_coefficient, gain_stage_002_coefficient, gain_stage_003_coefficient, gain_stage_004_coefficient, gain_stage_005_coefficient, gain_stage_006_coefficient, gain_stage_007_coefficient, gain_stage_008_coefficient, gain_stage_009_coefficient, gain_stage_010_coefficient, gain_stage_011_coefficient, gain_stage_012_coefficient, gain_stage_013_coefficient, gain_stage_014_coefficient, gain_stage_015_coefficient, gain_stage_016_coefficient, gain_stage_017_coefficient, gain_stage_018_coefficient, gain_stage_019_coefficient, gain_stage_020_coefficient, gain_stage_021_coefficient, gain_stage_022_coefficient, gain_stage_023_coefficient, gain_stage_024_coefficient, gain_stage_025_coefficient, gain_stage_026_coefficient, gain_stage_027_coefficient, gain_stage_028_coefficient, gain_stage_029_coefficient, gain_stage_030_coefficient, gain_stage_031_coefficient, gain_stage_032_coefficient, gain_stage_033_coefficient, gain_stage_034_coefficient, gain_stage_035_coefficient, gain_stage_036_coefficient, gain_stage_037_coefficient, gain_stage_038_coefficient",
+    "path": "conf/big_table.json",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 0.0,
+    "content_hash": "0fa2c569dced2c48f8aee81b13907db0e98e0297b7157299041ceb37f6c34232",
+    "embed_revision": 0,
+    "file_hash": "ca36ed1d0b2a5d4a8e559a2cbca1b170d91291abf9f2b73315ea73d3785b3deb",
+    "import_names": [],
+    "is_test": false,
+    "language": "tweakers",
+    "loc": 10,
+    "module_summary": "TWEAKERS config data/ai/Driver.tweakers (AI Tweaks): sections (root), Passing Logic, Steering; 6 keys: orphan_item, Pass attempt Min Time To Impact, AimPID_P, consistency_change_time (in seconds), AimPID_I, steer_ratio",
+    "path": "data/ai/Driver.tweakers",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 0.0,
+    "content_hash": "e92063e2f13ed4332e83fe6b742b2490a0a7451b8f4f05d0db985d9a2cce5200",
+    "embed_revision": 0,
+    "file_hash": "1d590d79df691ba843247b45a770671b606c66b99bc2b35f106ca91eb6acd5f6",
+    "import_names": [],
+    "is_test": false,
+    "language": "ini",
+    "loc": 11,
+    "module_summary": "INI config params/vehicle.ini: sections GENERAL_OPTIONS, OPTIMIZATION_OPTIONS; 6 keys: ggv_file, veh_params, dup_key, dup_key, opt_type, bare_flag",
+    "path": "params/vehicle.ini",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "8b5dc0152a2d698618d5d7ece7af7aa2008662278e02c1788f6684f70b3ed453",
+    "embed_revision": 0,
+    "file_hash": "a2d35c5660a7b123aff8730416c9f6ea07861564ce21b96a347dab00ef6d5204",
+    "import_names": [
+      "tweak.h"
+    ],
+    "is_test": false,
+    "language": "cpp",
+    "loc": 13,
+    "module_summary": "C++ module: src/driver.cpp",
+    "path": "src/driver.cpp",
+    "project": "GoldenProj"
+  },
+  {
+    "complexity": 1.0,
+    "content_hash": "3e1955ababe59c4132b841408765f1f2621c9ea32b3bad2a0c86c5ab7f709a63",
+    "embed_revision": 0,
+    "file_hash": "c3870df23c419eec25cbf775c36c047cea8ba9fe60488a8b0b44c9a0eaf705a1",
+    "import_names": [
+      "configparser"
+    ],
+    "is_test": false,
+    "language": "python",
+    "loc": 8,
+    "module_summary": "Module: tools/load.py\nLoads the vehicle parameters.",
+    "path": "tools/load.py",
+    "project": "GoldenProj"
+  }
+]

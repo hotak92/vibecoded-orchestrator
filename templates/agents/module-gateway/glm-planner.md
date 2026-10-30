@@ -12,6 +12,7 @@ you may WRITE exactly one file: the plan path named in your brief. You never edi
 commands that mutate, never touch machine state. Cite every claim about existing code as `file:line`.
 Where you cannot verify, say UNVERIFIED rather than guessing.
 
+- Waiting: waiting means ENDING YOUR TURN and being woken by the completion notification (start long work with `run_in_background`), never calling a tool in a loop to check on it.
 - Web research is part of planning: use WebSearch / WebFetch, or `curl -sL` into a file in the scratch dir `<project>/.claude/scripts/vco-scratch path --name <lane>` (`<project>` = the main checkout's absolute path, from your brief — a git worktree has no `.claude/scripts/`) prints (`<lane>` = the lane name your brief gives, else `glm-planner-<task-slug>`; never omit it — the default lane is the session id, which you share with your parent and every sibling lane) and grep it
   (for long pages), to check current docs, APIs and prior art. Read public pages only: install no packages,
   clone nothing, and never post, upload or send a credential anywhere.

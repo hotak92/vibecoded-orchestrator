@@ -2408,12 +2408,10 @@ def hand_to_vco_refusal(service: str, row: Optional[_se.EndpointRow]) -> Optiona
 
 
 def _container_exists(runtime: str, name: str, run: Optional[RunFn]) -> bool:
-    try:
-        proc = (run or subprocess.run)([runtime, "inspect", "--type", "container", "--format",
-                                        "{{.Id}}", name], capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+    # v0.2.105: the ONE shared lookup (vco_lib.containers.container_id) —
+    # the old `{{.Id}}` probe worked on podman too; the move is for the
+    # one home, not a bug fix.
+    return _containers.container_id(name, runtime, run=run) is not None
 
 
 AdoptFn = Callable[..., Any]

@@ -678,7 +678,15 @@ def _drain_fixture(tmp_path: Path, root: Path, *, suppress_check: bool = True) -
     """State dir, shim interpreter + analyzer stub. ``suppress_check`` stamps
     a fresh commit-stamp check ts so ONLY the --queued spawn can fire; the
     NB-H5 test disables it because the commit-stamp spawn IS the surface
-    under test."""
+    under test.
+
+    v0.2.105 (#512A): the Stop hook ALSO spawns the HEAD-diff catch-up
+    (``-m vco_lib.codegraph_head_catchup``). EVERY assertion in this file is
+    about the extras surface, so the catch-up's own throttle stamp is always
+    written fresh here — unconditionally, including when ``suppress_check``
+    is False (that flag is about the EXTRAS check only). Covered by
+    ``tests/test_v02105_codegraph_head_catchup.py`` instead.
+    """
     state = root / ".claude" / "state"
     state.mkdir(parents=True, exist_ok=True)
     spawn_log = tmp_path / "spawned.log"
@@ -687,6 +695,7 @@ def _drain_fixture(tmp_path: Path, root: Path, *, suppress_check: bool = True) -
     stub = tmp_path / "analyze.py"
     stub.write_text("")
     now = str(int(time.time()))
+    (state / "codegraph_head_catchup.ts").write_text(now)
     if suppress_check:
         (state / "codegraph_extras_check.ts").write_text(now)
     return {

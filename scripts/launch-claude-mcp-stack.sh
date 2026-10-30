@@ -25,6 +25,13 @@
 #      blocked by an init-time GPU stall.
 #   6. On non-Linux or non-NVIDIA: plain compose-up.
 #
+# Usage note:
+#   Run from a Claude Code agent: use the Bash tool's run_in_background: true.
+#   This script waits in a loop (the CDI-ready wait, up to 30 s),
+#   which VCO's wait guard refuses in the foreground (a loop in a script
+#   may wait 5 s in total at most); in the background the completion
+#   notification brings the result.
+#
 # Soft-fail throughout: a CDI-wait timeout MUST NOT block the unit, just
 # degrade to CPU-only with a log warning.
 #

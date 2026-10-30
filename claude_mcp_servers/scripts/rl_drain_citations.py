@@ -47,6 +47,7 @@ block may not be flushed yet. We treat a below-gate window as "retry later"
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import sys
@@ -112,15 +113,26 @@ def _stamp_agent_transcript(path, payload: dict, transcript_path: str) -> None:
     """Record the agent's own transcript in its pending file, so a later
     (parent) Stop drain can retry the file against the RIGHT answer source.
     Best-effort: a failed write only means the parent drain leaves the file
-    until the session's end finds the agent transcript beside the parent's."""
+    until the session's end finds the agent transcript beside the parent's.
+
+    v0.2.105: ``payload`` may be the routing fields only (the drain reads
+    the ctx at compute time); the stamp rewrites those fields and copies the
+    file's ctx byte for byte (``update_pending_fields``)."""
     try:
-        from vco_lib.atomic import atomic_write_json
-        from claude_mcp_servers.rl_client.citation_pending import AGENT_WINDOW_FINAL_KEY
+        from claude_mcp_servers.rl_client.citation_pending import (
+            AGENT_WINDOW_FINAL_KEY,
+            update_pending_fields,
+        )
 
         payload["agent_transcript_path"] = transcript_path
         # The agent's own drain stamps it: its window is final now (R5-9).
         payload.pop(AGENT_WINDOW_FINAL_KEY, None)
-        atomic_write_json(path, payload, indent=None, fsync=False)
+        update_pending_fields(
+            path,
+            {"agent_id": str(payload.get("agent_id") or ""),
+             "agent_transcript_path": transcript_path},
+            drop=(AGENT_WINDOW_FINAL_KEY,),
+        )
     except Exception:  # noqa: BLE001 — telemetry must not break the drain
         pass
 
@@ -135,6 +147,7 @@ def _score_payload(
     gate: int,
     compute_fn,
     token_count_fn,
+    load_ctx=None,
 ) -> "tuple[str, str]":
     """Score ONE claimed pending payload against an already-loaded answer
     transcript — the one scoring path, shared by every drain pass and the
@@ -151,6 +164,14 @@ def _score_payload(
     never be scored; ``("left", reason)`` otherwise (a live chat's file is
     handed back; a finalized one may be recorded as unscored). Never raises
     for a ``compute_fn`` failure (that is ``("left", "compute_failed")``).
+
+    ``load_ctx`` (v0.2.105): ``payload`` is the routing fields only
+    (``read_pending_header``) and ``load_ctx()`` returns the full payload.
+    It is called only once the window clears a gate — the one moment the
+    ctx is needed — so a file that keeps waiting for its chat's answer is
+    never read in full. A full read that fails leaves the file
+    (``"unreadable_payload"``); one whose ctx is not an object is
+    ``("skipped", "bad_payload")`` exactly as an eager read would be.
     """
     from claude_mcp_servers.rl_client.answer_window import (
         extract_answer_window,
@@ -158,9 +179,9 @@ def _score_payload(
         match_position_for_query,
     )
 
-    ctx = payload.get("ctx")
     task_id = payload.get("task_id") or ""
-    if not isinstance(ctx, dict) or not task_id:
+    lazy = load_ctx is not None and "ctx" not in payload
+    if not task_id or (not lazy and not isinstance(payload.get("ctx"), dict)):
         return "skipped", "bad_payload"
 
     if not messages:
@@ -238,6 +259,16 @@ def _score_payload(
             return "left", "below_floor"
 
     # At/above a gate → compute + write (the caller finishes: one-shot).
+    # v0.2.105: the ctx is read HERE, once, and only for a window that fires.
+    if lazy:
+        full = load_ctx() if load_ctx is not None else None
+        if not isinstance(full, dict):
+            return "left", "unreadable_payload"
+        ctx = full.get("ctx")
+        if not isinstance(ctx, dict):
+            return "skipped", "bad_payload"
+    else:
+        ctx = payload["ctx"]
     # v0.2.73 RL-6/RL-9: stamp the riders onto ctx so the citation event
     # stores where/why it fired. session_id prefers the value staged in
     # the ctx (RL-9 stage-time resolution), then the pending payload —
@@ -264,15 +295,19 @@ def _score_payload(
     return "computed", fire_reason
 
 
-def _query_in_transcript(messages: list, kg_positions: list, snippet: str) -> bool:
-    """True when one of the transcript's KG tool calls carries exactly this
+def _query_in_transcript(messages: list, kg_positions: list, snippet: str,
+                         cli_queries: "frozenset[str] | None" = None) -> bool:
+    """True when one of the transcript's KG retrievals carries exactly this
     staged query (its first 120 characters, as staged). How a pending file
-    staged WITHOUT a session id (the MCP server is not told which chat calls
-    it) is attributed to its chat: the MCP path stages the literal query of
-    the chat's own ``hybrid_search`` call, so the chat whose transcript holds
-    it is the chat that produced the retrieval (v0.2.102 W6-RL2, owner ruling
-    R7-3). Exact prefix equality, not the matcher's substring rule, so a
-    short query never claims another chat's longer one."""
+    staged WITHOUT a session id is attributed to its chat (v0.2.102 W6-RL2,
+    owner ruling R7-3): the MCP path stages the literal query of the chat's
+    own ``hybrid_search`` call, the ``kg-search`` CLI (v0.2.105) the query of
+    the chat's own Bash / PowerShell ``kg-search search <query>`` call —
+    neither process is told which chat (or subagent) calls it — so the chat
+    whose transcript holds the call is the chat that produced the retrieval.
+    Exact prefix equality, not the matcher's substring rule, so a short query
+    never claims another chat's longer one. ``cli_queries``: this transcript's
+    :func:`answer_window.find_cli_kg_queries`, when the caller cached it."""
     snippet = (snippet or "")[:120]
     if not snippet.strip():
         return False
@@ -284,7 +319,11 @@ def _query_in_transcript(messages: list, kg_positions: list, snippet: str) -> bo
             continue
         if isinstance(q, str) and q and q[:120] == snippet:
             return True
-    return False
+    if cli_queries is None:
+        from claude_mcp_servers.rl_client.answer_window import find_cli_kg_queries
+
+        cli_queries = find_cli_kg_queries(messages)
+    return snippet in cli_queries
 
 
 # A finalized file (its chat ended) whose score failed for one of these
@@ -365,6 +404,7 @@ def drain_session(
     from claude_mcp_servers.rl_client.answer_window import (
         load_messages_cached,
         find_kg_positions,
+        find_cli_kg_queries,
         token_estimate,
     )
     from claude_mcp_servers.rl_client.citation_pending import (
@@ -372,6 +412,7 @@ def drain_session(
         AGENT_WINDOW_FINAL_KEY,
         list_pending_for_session,
         read_pending,
+        read_pending_header,
         delete_pending,
         claim_pending,
         release_claim,
@@ -420,6 +461,16 @@ def drain_session(
             _loaded[tp] = (msgs, find_kg_positions(msgs) if msgs else [])
         return _loaded[tp]
 
+    # v0.2.105: each loaded transcript's CLI kg-search queries, computed once
+    # on first use (keyed by the list's id: ``_loaded`` keeps it alive).
+    _cli_by_id: dict = {}
+
+    def _holds_query(messages: list, kg_positions: list, query: str) -> bool:
+        key = id(messages)
+        if key not in _cli_by_id:
+            _cli_by_id[key] = find_cli_kg_queries(messages) if messages else frozenset()
+        return _query_in_transcript(messages, kg_positions, query, _cli_by_id[key])
+
     def _answer_source(payload: dict) -> str:
         """The transcript of the chat that staged ``payload`` — the agent's
         stamped transcript, else the agent transcript beside its session's,
@@ -438,7 +489,7 @@ def drain_session(
         if file_session:
             return session_transcript_for(known, file_session)
         messages, kg_positions = _load(known)
-        return known if _query_in_transcript(
+        return known if _holds_query(
             messages, kg_positions, str(payload.get("query") or "")) else ""
 
     def _ended_owner(payload: object) -> "tuple[str, str]":
@@ -458,7 +509,7 @@ def drain_session(
             tp = session_transcript_for(known, sid)
             if tp:
                 messages, kg_positions = _load(tp)
-                if _query_in_transcript(messages, kg_positions, query):
+                if _holds_query(messages, kg_positions, query):
                     return sid, tp
         return "", ""
 
@@ -482,6 +533,7 @@ def drain_session(
             final_window=True,
             session_id=str(payload.get("session_id") or "") or owner or session_id,
             gate=gate, compute_fn=compute_fn, token_count_fn=token_count_fn,
+            load_ctx=functools.partial(read_pending, _claimed),
         )
         return None if outcome == "computed" else reason
 
@@ -523,10 +575,10 @@ def drain_session(
             return True
         messages, kg_positions = _load(tp)
         for f in files:
-            payload = read_pending(f)
+            payload = read_pending_header(f)
             if (isinstance(payload, dict) and not payload.get("session_id")
                     and not payload.get("agent_id")
-                    and _query_in_transcript(messages, kg_positions,
+                    and _holds_query(messages, kg_positions,
                                              str(payload.get("query") or ""))):
                 return True
         return False
@@ -554,7 +606,9 @@ def drain_session(
     for path in pending:
         # Pre-filter on an UNCLAIMED read, so a drain never renames a file it
         # will not touch (another session's, another agent's).
-        peek = read_pending(path)
+        # v0.2.105: the routing fields only (read_pending_header), never the
+        # multi-megabyte ctx of a file this drain may not touch.
+        peek = read_pending_header(path)
         if not isinstance(peek, dict):
             # Unreadable — leave it (the collector records it, eventually).
             summary["skipped"] += 1
@@ -589,7 +643,10 @@ def drain_session(
         if claimed is None:
             continue  # another drain owns it right now (or just consumed it)
         try:
-            payload = read_pending(claimed)
+            # v0.2.105: the routing fields again (the claim re-checks them);
+            # the ctx is read by _score_payload only once the window fires,
+            # so the running chat's waiting files are never read in full.
+            payload = read_pending_header(claimed)
             if not isinstance(payload, dict):
                 summary["skipped"] += 1
                 continue
@@ -636,6 +693,7 @@ def drain_session(
                 final_window=final_window,
                 session_id=session_id, gate=gate,
                 compute_fn=compute_fn, token_count_fn=token_count_fn,
+                load_ctx=functools.partial(read_pending, claimed),
             )
             if outcome == "computed":
                 summary["computed"] += 1
@@ -663,7 +721,7 @@ def drain_session(
                 if claimed is None:
                     continue
                 try:
-                    payload = read_pending(claimed)
+                    payload = read_pending_header(claimed)
                     if not isinstance(payload, dict):
                         continue  # unreadable: the collector records it
                     source = _answer_source(payload)
@@ -684,20 +742,20 @@ def drain_session(
             if sess_tp:
                 sess_msgs, sess_kg = _load(sess_tp)
                 for path in list_pending_for_session(NO_SESSION_PREFIX, project_root):
-                    peek = read_pending(path)
+                    peek = read_pending_header(path)
                     if (not isinstance(peek, dict) or peek.get("session_id")
                             or peek.get("agent_id")
-                            or not _query_in_transcript(
+                            or not _holds_query(
                                 sess_msgs, sess_kg, str(peek.get("query") or ""))):
                         continue  # not this ended chat's retrieval
                     claimed = claim_pending(path)
                     if claimed is None:
                         continue  # the monitor / a drain holds it: kept below
                     try:
-                        payload = read_pending(claimed)
+                        payload = read_pending_header(claimed)
                         if (not isinstance(payload, dict) or payload.get("session_id")
                                 or payload.get("agent_id")
-                                or not _query_in_transcript(
+                                or not _holds_query(
                                     sess_msgs, sess_kg, str(payload.get("query") or ""))):
                             continue  # re-staged as someone else's meanwhile
                         if _finalize_claimed(path, claimed, payload, sess_tp, sid):
