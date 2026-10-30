@@ -47,7 +47,12 @@
 //!      respected (see [`supervision_for`]). Until v0.2.97 this read
 //!      `services.toml` and healed only `Unresolved` — inert on every
 //!      machine where install.py had written `adopt` for VCO's OWN
-//!      services, AND
+//!      services. ONE narrow exception (v0.2.105): an `adopted_container`
+//!      row with `autostart` — the row the session hooks already start by
+//!      name — whose live container carries the INSTALLER's compose project
+//!      label (VCO's own stack container, recorded as adopted) is started
+//!      BY NAME, never created, never composed ([`heal_adopted_by_name`]).
+//!      A container adopted from anyone else is still never touched, AND
 //!   3. the service is NOT paused — no marker file at
 //!      `<vct_root>/state/watchdog-paused/<service>` (the SHARED marker in
 //!      `vct_launcher_core::services::watchdog_pause`, PRODUCED by the
@@ -153,7 +158,7 @@ use vct_launcher_core::services::container_ownership::{
 };
 use vct_launcher_core::services::deferral_bridge;
 use vct_launcher_core::services::service_endpoints::{
-    is_compose_managed, lifecycle_container, machine_row, CoreService,
+    adopted_autostart_container, is_compose_managed, lifecycle_container, machine_row, CoreService,
 };
 use vct_launcher_core::services::runtime::{detect_runtime_detailed, RuntimeDetection, RuntimeInfo};
 use vct_launcher_core::services::install_root;
@@ -337,6 +342,21 @@ pub struct Supervision {
     pub container: String,
     /// The row itself (its `compose_project` is the ownership reference).
     pub row: Option<ServiceEndpointRow>,
+    /// v0.2.105: an `adopted_container` row with `autostart` — the policy the
+    /// session hooks already act on (`vco_lib.service_lifecycle._policy_for`:
+    /// started BY NAME, a missing one reported, never re-created). The
+    /// watchdog heals such a service mid-session ONLY when its live container
+    /// carries the INSTALLER's compose project label, i.e. it is VCO's own
+    /// stack container recorded as adopted ([`heal_adopted_by_name`]). A
+    /// container adopted from someone else is never touched.
+    pub by_name_only: bool,
+}
+
+impl Supervision {
+    /// May the watchdog act on this service at all (either path)?
+    pub fn may_heal(&self) -> bool {
+        self.compose_managed || self.by_name_only
+    }
 }
 
 /// [`Supervision`] for `service` on this machine. `default_container` is
@@ -344,8 +364,10 @@ pub struct Supervision {
 pub fn supervision_for(db: &Db, service: &str, default_container: &str) -> Supervision {
     let svc = CoreService::from_name(service);
     let row = svc.and_then(|s| machine_row(db, s));
+    let compose_managed = is_compose_managed(row.as_ref());
     Supervision {
-        compose_managed: is_compose_managed(row.as_ref()),
+        compose_managed,
+        by_name_only: !compose_managed && adopted_autostart_container(row.as_ref()).is_some(),
         container: svc
             .and_then(|s| lifecycle_container(s, row.as_ref()))
             .unwrap_or_else(|| default_container.to_string()),
@@ -372,6 +394,12 @@ pub enum HealOutcome {
     /// A project declared this container unmanaged (v0.2.102 M3) — left
     /// alone before any runtime call: no inspect, no start, no create.
     Unmanaged(String),
+    /// v0.2.105: an ADOPTED service the watchdog may only start by name, left
+    /// alone — its container is not VCO's own stack container (labels), or it
+    /// is missing (an adopted container is reported, never re-created). No
+    /// backoff, no foreign-ledger row: adopting someone's container is a
+    /// recorded choice, not a fault.
+    NotOurs(String),
 }
 
 /// Heal ONE stopped/missing service container (AD-5):
@@ -443,6 +471,62 @@ where
     };
     match verify_running(runner, container, policy).await {
         Ok(()) => HealOutcome::Verified { action },
+        Err(e) => HealOutcome::Failed(e),
+    }
+}
+
+/// v0.2.105: heal ONE stopped service whose row ADOPTED its container
+/// (`adopted_container` + `autostart`, [`Supervision::by_name_only`]).
+///
+/// Narrower than [`heal_service`] on purpose:
+/// * ownership is judged against the INSTALLER's compose project only — the
+///   row's own `compose_project` records whoever's container was adopted, so
+///   "matches the row" would say nothing about VCO; a container labelled with
+///   any other project, or with none, is [`HealOutcome::NotOurs`];
+/// * a MISSING container is never created (the hooks' `on_missing = report`
+///   for an adopted row) — [`HealOutcome::NotOurs`];
+/// * the action is `start` / `unpause` BY NAME, then [`verify_running`].
+///
+/// Why it exists: on a machine whose reconcile recorded VCO's own Weaviate /
+/// Ollama as `adopted_container` (seen live 2026-10-29), the session hooks
+/// started them at session start but nothing restarted them mid-session.
+pub async fn heal_adopted_by_name<R: ContainerRunner>(
+    runner: &R,
+    container: &str,
+    installer_project: Option<&str>,
+    policy: VerifyPolicy,
+) -> HealOutcome {
+    let identity = read_identity(runner, container).await;
+    let verb = match &identity.state {
+        ContainerState::Running => return HealOutcome::AlreadyRunning,
+        ContainerState::Unknown(why) => return HealOutcome::Skipped(format!("state unreadable: {why}")),
+        ContainerState::Transitioning(s) => {
+            return HealOutcome::Skipped(format!("the runtime reports it '{s}' — already acting on it"))
+        }
+        ContainerState::Missing | ContainerState::StorageOnly => {
+            return HealOutcome::NotOurs(
+                "the adopted container does not exist; an adopted container is reported, never \
+                 re-created by VCO"
+                    .into(),
+            )
+        }
+        ContainerState::Paused | ContainerState::Stopped(_) => {
+            match ownership(None, &identity, installer_project) {
+                Ownership::Owned => {}
+                Ownership::Foreign { why } => {
+                    return HealOutcome::NotOurs(format!("adopted, and not VCO's own stack container: it {why}"))
+                }
+                Ownership::Unknown { why } => return HealOutcome::Skipped(format!("ownership unknown: {why}")),
+            }
+            by_name_verb(&identity.state).unwrap_or("start")
+        }
+    };
+    if let Err(e) = act_by_name(runner, verb, container).await {
+        return HealOutcome::Failed(e);
+    }
+    tracing::info!(container, verb, "[vct-hub] infra watchdog: {} issued by name (adopted row, VCO's own container)", verb);
+    match verify_running(runner, container, policy).await {
+        Ok(()) => HealOutcome::Verified { action: verb },
         Err(e) => HealOutcome::Failed(e),
     }
 }
@@ -1121,7 +1205,10 @@ pub fn apply_heal_outcome(
             }
             !was && backoff.is_given_up()
         }
-        HealOutcome::Foreign(_) | HealOutcome::Skipped(_) | HealOutcome::Unmanaged(_) => false,
+        HealOutcome::Foreign(_)
+        | HealOutcome::Skipped(_)
+        | HealOutcome::Unmanaged(_)
+        | HealOutcome::NotOurs(_) => false,
     }
 }
 
@@ -1397,7 +1484,7 @@ async fn run_one_tick(
         // which container is its (v0.2.97). An adopted service is left
         // alone BEFORE any probe — its owner's stop is respected.
         let supervision = supervision_for(&db.0, service, default_container);
-        if !supervision.compose_managed {
+        if !supervision.may_heal() {
             // No longer VCO's to supervise: a give-up about it is over.
             gave_up.remove(service);
             continue;
@@ -1462,7 +1549,7 @@ async fn run_one_tick(
         let paused = is_service_paused(service);
 
         // `running == false` here (authoritative NotRunning above).
-        if !service_eligible_for_restart(false, supervision.compose_managed, paused) {
+        if !service_eligible_for_restart(false, supervision.may_heal(), paused) {
             // Down, but deliberately paused. Leave it alone — and a give-up
             // about it is over: the user stopped it on purpose.
             gave_up.remove(service);
@@ -1500,16 +1587,21 @@ async fn run_one_tick(
             "[vct-hub] infra watchdog: service is DOWN and its row is VCO-managed; \
              attempting heal."
         );
-        let outcome = heal_service(
-            &runner,
-            supervision.row.as_ref(),
-            container,
-            installer_project.as_deref(),
-            None, // declared-unmanaged containers were skipped above
-            || create_missing(&runtime, &infra_dir, service),
-            VerifyPolicy::default(),
-        )
-        .await;
+        let outcome = if supervision.compose_managed {
+            heal_service(
+                &runner,
+                supervision.row.as_ref(),
+                container,
+                installer_project.as_deref(),
+                None, // declared-unmanaged containers were skipped above
+                || create_missing(&runtime, &infra_dir, service),
+                VerifyPolicy::default(),
+            )
+            .await
+        } else {
+            // v0.2.105: an adopted+autostart row — by name, VCO's own only.
+            heal_adopted_by_name(&runner, container, installer_project.as_deref(), VerifyPolicy::default()).await
+        };
         // Counter, give-up flag and the given-up set (P299-B3) — one pure fold.
         let crossed = apply_heal_outcome(service, container, &outcome, backoff, gave_up);
         match outcome {
@@ -1526,6 +1618,17 @@ async fn run_one_tick(
                 ticks_since_attempt.remove(service);
             }
             HealOutcome::Unmanaged(_) => {}
+            HealOutcome::NotOurs(why) => {
+                if first_time(&format!("watchdog-notours:{service}:{why}")) {
+                    tracing::info!(
+                        service,
+                        container,
+                        why = %why,
+                        "[vct-hub] infra watchdog: NOT healing an adopted service (no start, no create)."
+                    );
+                }
+                ticks_since_attempt.remove(service);
+            }
             HealOutcome::Foreign(why) => {
                 if first_time(&format!("watchdog-foreign:{service}:{why}")) {
                     tracing::warn!(
@@ -2588,5 +2691,97 @@ mod tests {
         assert!(pause_marker_path("weaviate").ends_with("watchdog-paused/weaviate"));
         watchdog_pause::remove_pause_marker("weaviate").unwrap();
         assert!(!is_service_paused("weaviate"));
+    }
+
+    // ----- v0.2.105: adopted + autostart rows, healed by name when VCO's own -----
+
+    fn adopted_row(service: &str, container: &str, project: &str, autostart: bool) -> ServiceEndpointRow {
+        use vct_launcher_core::db::service_endpoints::EndpointMode;
+        let mut r = ServiceEndpointRow::new(service, EndpointMode::AdoptedContainer, "localhost", 1);
+        r.container_name = Some(container.into());
+        r.compose_project = Some(project.into());
+        r.autostart = autostart;
+        r
+    }
+
+    /// The 2026-10-29 shape: VCO's own Ollama recorded as `adopted_container`
+    /// + autostart, its container labelled with the installer's project and
+    /// stopped → started BY NAME and verified (never composed, never rm).
+    #[tokio::test]
+    async fn an_adopted_autostart_row_of_vcos_own_container_is_started_by_name() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        r.on("start", ok(""));
+        let out = heal_adopted_by_name(&r, "vco_ollama", Some("infrastructure"), QUICK).await;
+        assert_eq!(out, HealOutcome::Verified { action: "start" });
+        assert!(!r.verbs().iter().any(|v| v == "rm" || v == "up"), "{:?}", r.verbs());
+    }
+
+    /// Leave-alone: a container adopted from SOMEONE ELSE (another compose
+    /// project — even though the row records that project) is never started.
+    #[tokio::test]
+    async fn an_adopted_container_of_another_project_is_never_started() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("their_stack"))));
+        let out = heal_adopted_by_name(&r, "their_weaviate", Some("infrastructure"), QUICK).await;
+        assert!(matches!(&out, HealOutcome::NotOurs(why) if why.contains("their_stack")), "{out:?}");
+        assert_eq!(r.verbs(), vec!["inspect"], "only the read");
+
+        // No compose label at all (a `podman run` container) → not ours either.
+        let r = FakeRunner::new("docker");
+        r.on("inspect", ok(&inspect_line("exited", "null")));
+        let out = heal_adopted_by_name(&r, "my_ollama", Some("infrastructure"), QUICK).await;
+        assert!(matches!(out, HealOutcome::NotOurs(_)), "{out:?}");
+        assert_eq!(r.verbs(), vec!["inspect"]);
+    }
+
+    /// Leave-alone: a MISSING adopted container is never created.
+    #[tokio::test]
+    async fn a_missing_adopted_container_is_never_created() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", fail("Error: no such container vco_weaviate"));
+        r.on("ps", ok("[]"));
+        let out = heal_adopted_by_name(&r, "vco_weaviate", Some("infrastructure"), QUICK).await;
+        assert!(matches!(out, HealOutcome::NotOurs(_)), "{out:?}");
+        assert!(!r.verbs().iter().any(|v| v == "start" || v == "up" || v == "create"), "{:?}", r.verbs());
+        // … and it costs no crash-loop budget.
+        let mut b = Backoff::default();
+        let mut gave_up = BTreeMap::new();
+        assert!(!apply_heal_outcome("weaviate", "vco_weaviate", &out, &mut b, &mut gave_up));
+        assert_eq!(b.consecutive_failures, 0);
+    }
+
+    /// The supervision gate: adopted + autostart → by-name supervision;
+    /// adopted WITHOUT autostart, or an adopted URL → nothing at all.
+    #[test]
+    fn only_an_adopted_autostart_row_is_supervised_by_name() {
+        use vct_launcher_core::db::service_endpoints::EndpointMode;
+        let db = Db::open_in_memory().unwrap();
+        let mut w = adopted_row("weaviate", "vco_weaviate", "infrastructure", true);
+        w.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&w).unwrap();
+        db.service_endpoint_seed_for_tests(&adopted_row("ollama", "vco_ollama", "infrastructure", false))
+            .unwrap();
+        let mut c = ServiceEndpointRow::new("code_embed", EndpointMode::VcoManaged, "localhost", 11440);
+        c.container_name = Some("vco_code_embed".into());
+        db.service_endpoint_seed_for_tests(&c).unwrap();
+
+        let weaviate = supervision_for(&db, "weaviate", "vco_weaviate");
+        assert!(!weaviate.compose_managed && weaviate.by_name_only && weaviate.may_heal());
+        assert_eq!(weaviate.container, "vco_weaviate");
+        let ollama = supervision_for(&db, "ollama", "vco_ollama");
+        assert!(!ollama.may_heal(), "an adopted row without autostart is its owner's to start");
+        let code_embed = supervision_for(&db, "code_embed", "vco_code_embed");
+        assert!(code_embed.compose_managed && !code_embed.by_name_only);
+
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::AdoptedExternal,
+            "localhost",
+            11434,
+        ))
+        .unwrap();
+        assert!(!supervision_for(&db, "ollama", "vco_ollama").may_heal(), "an adopted URL has no lifecycle");
     }
 }

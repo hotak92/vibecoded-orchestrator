@@ -79,6 +79,12 @@ CLI
     is not already running. ``--wait`` runs it in the foreground instead of
     detaching (used by the hooks' ``VCO_HOOK_DEBUG=1`` path).
 
+``python -m vco_lib.hub_ensure revive [--source S] [--json|--quiet]``
+    v0.2.105: start the hub only when it is DOWN — not during an orchestrator
+    update, at most once per :data:`REVIVE_MIN_INTERVAL_S` machine-wide. The
+    per-prompt hook and the model gateway call it (:func:`revive_if_down`).
+    Always exits 0.
+
 Exit codes follow :mod:`vco_lib.containers`' convention — ``1`` and ``2`` are
 deliberately unused, because ``1`` is what the interpreter exits with on an
 unhandled exception (an ``import vco_lib`` failure in a BROKEN install) and
@@ -101,6 +107,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -133,6 +140,10 @@ __all__ = [
     "running_hub_port",
     "is_running",
     "main",
+    "REVIVE_MIN_INTERVAL_S",
+    "ReviveState",
+    "ReviveResult",
+    "revive_if_down",
 ]
 
 #: The hub's single-instance lockfile, port file and token file, all under
@@ -837,6 +848,146 @@ def ensure_running(
 
 
 # ---------------------------------------------------------------------------
+# Mid-session revive (v0.2.105): "the hub must stay up" between SessionStarts.
+# ---------------------------------------------------------------------------
+
+#: Seconds between two revive SPAWNS, machine-wide. A dead hub is noticed by
+#: every prompt of every open chat and by every failed gateway key read; one
+#: spawn per minute is plenty (``--start-if-not-running`` is idempotent, and a
+#: hub that cannot start would otherwise be re-spawned on every keystroke of
+#: work). Only the SPAWN is rate-limited: the liveness check that precedes it
+#: is a pid-file read and runs every time.
+REVIVE_MIN_INTERVAL_S = 60
+
+#: Under ``vct_root_dir()/state`` — the stamp's mtime is the last spawn.
+REVIVE_STAMP_FILE = "hub-revive.stamp"
+
+#: Under ``vct_root_dir()/logs`` — one line per spawn (or failed spawn), so a
+#: revive that nobody watched still leaves a trace.
+REVIVE_LOG_FILE = "hub-revive.log"
+
+
+class ReviveState(str, Enum):
+    """Outcome of :func:`revive_if_down`."""
+
+    #: The lockfile names a live hub — nothing to do (the common case).
+    ALREADY_RUNNING = "already_running"
+    #: An orchestrator update holds the gate: it stopped the hub on purpose.
+    UPDATE_IN_PROGRESS = "update_in_progress"
+    #: Down, but a revive was spawned less than the interval ago.
+    RATE_LIMITED = "rate_limited"
+    #: Down, and :func:`ensure_running` was invoked (detached).
+    STARTED = "started"
+    #: Down, and :func:`ensure_running` could not start it (named reason).
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ReviveResult:
+    state: ReviveState
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"state": self.state.value, "reason": self.reason}
+
+
+def _revive_stamp() -> Path:
+    return vct_root_dir() / "state" / REVIVE_STAMP_FILE
+
+
+def _revive_log(line: str) -> None:
+    """Append one line to ``hub-revive.log``. Best-effort: never raises."""
+    import datetime as _dt
+
+    try:
+        log = vct_root_dir() / "logs" / REVIVE_LOG_FILE
+        log.parent.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(f"{ts} {line}\n")
+    except OSError:
+        pass
+
+
+def _claim_revive_slot(min_interval_s: float, now: float) -> bool:
+    """True (and the stamp touched) when no revive was spawned within
+    ``min_interval_s``. An unreadable / unwritable stamp CLAIMS the slot: a
+    broken stamp must not silence the revive forever (the spawn itself is
+    idempotent, so the worst case is an extra ``--start-if-not-running``)."""
+    stamp = _revive_stamp()
+    try:
+        last = stamp.stat().st_mtime
+    except OSError:
+        last = None
+    if last is not None and 0 <= now - last < min_interval_s:
+        return False
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        os.utime(stamp, (now, now))
+    except OSError:
+        pass
+    return True
+
+
+def revive_if_down(
+    *,
+    source: str,
+    repo_root: Optional[Path] = None,
+    min_interval_s: float = REVIVE_MIN_INTERVAL_S,
+    clock: Callable[[], float] = time.time,
+    update_in_progress: Optional[Callable[[], bool]] = None,
+    ensure: Optional[Callable[..., EnsureResult]] = None,
+) -> ReviveResult:
+    """Start the hub when it DIED mid-session — cheap, gated, rate-limited.
+
+    The SessionStart hook starts the hub when a chat opens or resumes; nothing
+    did between those moments, so a hub that died mid-session stayed down
+    until the next session (2026-10-20..22: two days, and a lane died on "no
+    key found for vendor"). The callers are the per-prompt hook
+    (``user-prompt-submit-reminder``, ``source="prompt"``) and the model
+    gateway when its key read finds the hub refusing connections
+    (``source="gateway"``) — both through this ONE function.
+
+    Order, leave-alone first:
+      1. a live hub (lockfile pid alive) → ``already_running``; nothing else
+         is read or written. A hub that is alive but slow is never touched —
+         this never kills anything.
+      2. an orchestrator update in progress (the in-JSON deadline of
+         ``<vct_root>/.update-in-progress.json``) → ``update_in_progress``:
+         the update stopped the hub on purpose to swap its binary.
+      3. a revive spawned less than ``min_interval_s`` ago → ``rate_limited``.
+      4. otherwise :func:`ensure_running` (detached) and one log line.
+
+    Never raises.
+    """
+    try:
+        if is_running():
+            return ReviveResult(ReviveState.ALREADY_RUNNING, "vct-hub is running")
+        if update_in_progress is None:
+            from vco_lib.update_gate import is_update_in_progress as update_in_progress
+        if update_in_progress():
+            return ReviveResult(
+                ReviveState.UPDATE_IN_PROGRESS,
+                "an orchestrator update is in progress; it restarts the hub itself",
+            )
+        if not _claim_revive_slot(min_interval_s, clock()):
+            return ReviveResult(
+                ReviveState.RATE_LIMITED,
+                f"a revive was started less than {int(min_interval_s)} s ago",
+            )
+        res = (ensure or ensure_running)(repo_root=repo_root)
+    except Exception as exc:  # noqa: BLE001 — a revive is best-effort by contract
+        _revive_log(f"source={source} state=failed reason=revive raised {type(exc).__name__}: {exc}")
+        return ReviveResult(ReviveState.FAILED, f"revive raised {type(exc).__name__}: {exc}")
+    if res.state in (EnsureState.STARTED, EnsureState.ALREADY_RUNNING):
+        _revive_log(f"source={source} state=started binary={res.binary or '-'}")
+        return ReviveResult(ReviveState.STARTED, res.reason)
+    _revive_log(f"source={source} state=failed reason={res.reason}")
+    return ReviveResult(ReviveState.FAILED, res.reason)
+
+
+# ---------------------------------------------------------------------------
 # CLI — the cross-language call surface (class A of the A>B>C rule).
 # ---------------------------------------------------------------------------
 
@@ -883,6 +1034,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                 help="Run the spawn in the foreground and report its exit code "
                      "(default: detach, so a slow start cannot block the caller).",
             )
+    r = sub.add_parser(
+        "revive",
+        help="Start the hub only when it is DOWN (not during an update, at most "
+             "once per minute machine-wide). Always exits 0 — the caller is a "
+             "per-prompt hook or a daemon; the outcome is printed and logged.",
+    )
+    r.add_argument("--source", default="cli", help="Who asked (logged): prompt / gateway / cli.")
+    r.add_argument("--repo-root", default=None, metavar="DIR")
+    r.add_argument("--json", action="store_true", help="Print the result as JSON.")
+    r.add_argument("--quiet", action="store_true", help="Print nothing.")
     return p
 
 
@@ -892,6 +1053,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = _build_arg_parser().parse_args(argv)
     repo_root = Path(args.repo_root) if args.repo_root else None
+    if args.cmd == "revive":
+        rv = revive_if_down(source=args.source, repo_root=repo_root)
+        if args.json:
+            print(json.dumps(rv.to_dict(), sort_keys=True))
+        elif not args.quiet:
+            print(f"{rv.state.value}: {rv.reason}")
+        return 0
     extra_dirs = [Path(d) for d in args.extra_dir]
 
     if args.cmd == "resolve":

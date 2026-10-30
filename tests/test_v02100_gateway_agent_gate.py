@@ -673,7 +673,7 @@ class ShippedDefinitionContractTests(unittest.TestCase):
         from model_router.context_table import load_seed
         seed = load_seed()
         for name in sorted(OWNER_SHIPPED_SET):
-            model = mgd._frontmatter_model(GATED_SRC / name)
+            model = mgd.frontmatter_model(GATED_SRC / name)
             with self.subTest(definition=name, model=model):
                 assert model is not None, name
                 self.assertTrue(model.startswith("claude-gw/"))

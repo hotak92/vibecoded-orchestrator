@@ -18,8 +18,19 @@
 # prints the COMPLETE updatedInput envelope (it round-trips every original
 # tool_input field and mutates only `prompt`), and this wrapper passes it
 # through VERBATIM. It must NOT be wrapped in emit_additional_context
-# (double envelope) and must NEVER add permissionDecision (that would
+# (double envelope) and must NEVER add permissionDecision "allow" (that would
 # auto-approve the spawn).
+#
+# v0.2.105 — PRE-FLIGHT VENDOR-KEY PROBE, run FIRST: when the launched agent's
+# definition pins a gateway model (`model: claude-gw/<id>`), `python -m
+# vco_lib.gateway_preflight` asks the running gateway, by NAME only, whether
+# it can serve that model (`GET /vendor-keys`). On a DEFINITE "cannot" (no key
+# for the vendor, or an id the router refuses) it prints a PreToolUse
+# envelope with permissionDecision "deny" and a reason, this wrapper passes it
+# through and stops — no KG leg for a launch that will not happen. Anything
+# uncertain (gateway down, transient keychain, not a gateway agent) prints
+# nothing and the launch proceeds as before. Kill switch:
+# VCO_GATEWAY_PREFLIGHT=0. MUST MATCH agent-brief-kg-inject.ps1.
 #
 # Constraints:
 # - Registered PreToolUse(Agent|Task), timeout 10 in settings.json.template
@@ -42,13 +53,23 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
 [ -n "$VENV" ] || exit 0
-resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/hook_context_router.py"
-ROUTER="${VCO_ORCHESTRATOR_SCRIPT:-}"
-[ -n "$ROUTER" ] || exit 0
 export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
 
 # stdin passthrough (see read-context-inject.sh for the R31 rationale).
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
+
+# v0.2.105 pre-flight (see the header). Its stdout is EITHER nothing OR the
+# complete deny envelope (vco_lib.gateway_preflight's contract), so any output
+# is passed through verbatim and ends the hook. Its stderr is left alone: a
+# broken install is reported there, loudly, and the launch is not refused.
+PREFLIGHT=$(printf '%s' "$HOOK_STDIN" | "$VENV" -m vco_lib.gateway_preflight || true)
+case "$PREFLIGHT" in
+    *[![:space:]]*) printf '%s\n' "$PREFLIGHT"; exit 0 ;;
+esac
+
+resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/hook_context_router.py"
+ROUTER="${VCO_ORCHESTRATOR_SCRIPT:-}"
+[ -n "$ROUTER" ] || exit 0
 
 # The broken-install notice is keyed per SESSION (the same sentinel shape
 # _lib/kg-sync-debounce.sh uses). The pattern-way extraction (no JSON parser
@@ -91,7 +112,8 @@ ENVELOPE=$(printf '%s' "$HOOK_STDIN" | "$VENV" "$ROUTER" agent 2>/dev/null || tr
 
 # The router's stdout IS the harness envelope (hookSpecificOutput.
 # updatedInput, or nothing). Pass it through verbatim — no additional
-# wrapping, no permissionDecision.
+# wrapping, no permissionDecision (the only decision this hook ever emits is
+# the pre-flight's "deny", above).
 case "$ENVELOPE" in
     *[![:space:]]*) printf '%s\n' "$ENVELOPE" ;;
 esac
