@@ -611,6 +611,10 @@ def _patch_driver_guts(monkeypatch, tmp_path, *, stale_counts, orphans):
     monkeypatch.setattr(_exposure_mod, "clear_exposure_bump",
                         lambda p: exposure_cleared.append(p) or True)
     monkeypatch.setattr(cr, "walk_uses_container", lambda p: False)
+    # v0.2.105: the driver's backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(cr, "_maybe_run_exposure_heal", lambda *a, **k: True)
     monkeypatch.setattr(cr, "_maybe_run_vectorless_audit", lambda *a, **k: None)
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)

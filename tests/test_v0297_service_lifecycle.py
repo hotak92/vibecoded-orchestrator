@@ -466,9 +466,9 @@ class EmbedWorld:
             ref = rest[-1]
             if ref != REF or not self.exists:
                 return _cp(argv, 125, "", "no such container")
+            if "--format" not in rest:  # the template-free id lookup (v0.2.105)
+                return _cp(argv, 0, json.dumps([{"Id": "abc123"}]))
             fmt = rest[rest.index("--format") + 1]
-            if fmt == "{{.Id}}":
-                return _cp(argv, 0, "abc123\n")
             if "com.docker.compose.project" in fmt:
                 wd = str(self.owning_dir) if self.project == OWNER else str(self.infra)
                 files = "compose.yaml" if self.project == OWNER else "docker-compose.yml"

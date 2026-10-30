@@ -2870,6 +2870,54 @@ def build_resync_deferral(
     )
 
 
+def build_backend_down_deferral(
+    project_name: str,
+    command_to_apply: str,
+    *,
+    backend: str = "",
+) -> Optional["_DeferralEntryT"]:
+    """v0.2.105 (fix round): the DRIVER-TIME flavour of
+    ``codegraph_embed_resync_pending``.
+
+    Same condition id and ledger discipline as :func:`build_resync_deferral`
+    (deliberately NO new id: the registry row, the retry handler and every
+    clear-probe already exist for ``_CONDITION_ID``, and the ledger is
+    last-write-wins per condition id). The TEXT differs because the
+    update-time wording would be FALSE here: the resync driver refused (or
+    the analyzer soft-skipped) at driver time — a manual ``--run-resync``,
+    the deferral retry, or a backend that went down mid-spawn — so nothing
+    was "unreachable during --update" and no pre-chunking claim applies
+    (review LOW: misleading deferral text). Fields are single-line (A-3,
+    same constraint as every flavour).
+    """
+    if DeferralEntry is None:
+        return None
+    return DeferralEntry(
+        condition_id=_CONDITION_ID,
+        title="Code-graph re-embed pending (embedding backend unreachable)",
+        detected=(
+            "{backend} was unreachable when the code-graph resync ran (not "
+            "during an update), so the walk was refused or skipped and "
+            "nothing was re-embedded for project '{proj}'.".format(
+                backend=(backend[:1].upper() + backend[1:]) if backend else
+                f"The code-embedding service (:{DEFAULT_CODE_EMBED_PORT})",
+                proj=project_name,
+            )
+        ),
+        why_deferred=(
+            "A per-object re-embed needs the embedding backend that serves "
+            "this graph's model running; launching the analyze now would "
+            "fail every embed. The resync is resumable — re-running it once "
+            "the service is up re-embeds only the stale rows (revision "
+            "mismatch) and skips everything already current — and the "
+            "automatic deferral retry re-runs it once the backend answers."
+        ),
+        command_to_apply=command_to_apply,
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+
 def build_stale_image_deferral(
     project_name: str,
     command_to_apply: str,
@@ -3059,6 +3107,37 @@ def _record_stale_image_deferral(
     except Exception as exc:  # noqa: BLE001 — surfacing must not crash the child
         logger.warning(
             "resync driver: could not record stale-image deferral: %s", exc
+        )
+
+
+def _record_backend_down_deferral(
+    repo_root: Path, project_name: str, resync_cmd: str, backend: str,
+) -> None:
+    """v0.2.105: persist/refresh the service-down flavour of
+    ``codegraph_embed_resync_pending`` when the DRIVER refuses (pre-check)
+    or converges a soft-skipped walk (post-walk check) for an unreachable
+    embedding backend. Same discipline as
+    :func:`_record_stale_image_deferral` (the stale-image flavour): the owed
+    work must stay owed, so the deferral retry driver re-runs the resync once
+    the backend answers. The DRIVER-TIME builder
+    (:func:`build_backend_down_deferral`) carries text honest about WHEN the
+    backend was down — never the update-time wording. Soft-fail throughout."""
+    try:
+        entry = build_backend_down_deferral(project_name, resync_cmd, backend=backend)
+        if entry is None:
+            return
+        from vco_lib.deferral_emit import emit
+
+        folder = Path(repo_root)
+        emit(folder, entry, log=logger)
+        print(
+            "[resync-driver] backend-down deferral recorded in "
+            f"{folder / '.claude' / 'context' / 'UPDATE_DEFERRED.md'}",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfacing must not crash the child
+        logger.warning(
+            "resync driver: could not record backend-down deferral: %s", exc
         )
 
 
@@ -3618,6 +3697,39 @@ def _parse_analyzer_stats(text: str) -> dict:
     return stats
 
 
+def _read_log_window(log_path: "Path | str | None") -> Optional[str]:
+    """The bounded tail window of the shared per-spawn resync log (the ONE
+    reader — the analyzer inherited the log's fd and has EXITED by the time
+    this runs, so its end-of-walk lines are flushed and on disk). ``None``
+    when it could not be read (no path — e.g. the spawn degraded to
+    DEVNULL — missing file, read error). Soft-fail by contract."""
+    if not log_path:
+        return None
+    try:
+        path = Path(log_path)
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - _TERMINAL_LOG_SCAN_MAX_BYTES))
+            return fh.read().decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001 — best-effort reads never gate
+        logger.debug("codegraph resync: log-window read skipped: %s", exc)
+        return None
+
+
+#: The analyzer's soft-skip marker: with no embedding backend reachable it
+#: prints this to stderr (which the shared log captures) and still exits
+#: 0 — the one textual signal that a "successful" walk analyzed nothing.
+_ANALYZER_SOFT_SKIP_MARKER = "Code-graph analysis skipped"
+
+
+def _log_says_analysis_skipped(log_path: "Path | str | None") -> bool:
+    """v0.2.105 (fix round): did THIS run's analyzer soft-skip? Only the
+    shared per-spawn log is read (it belongs to this run alone — a fresh
+    timestamped file per spawn — so a previous run's skip cannot match)."""
+    window = _read_log_window(log_path)
+    return window is not None and _ANALYZER_SOFT_SKIP_MARKER in window
+
+
 def _collect_terminal_stats(
     log_path: "Path | str | None",
 ) -> "tuple[dict, Optional[str]]":
@@ -3630,22 +3742,14 @@ def _collect_terminal_stats(
     still goes out with the status alone.
     """
     empty = {"files_analyzed": None, "prune_failures": None, "analyzed_commit": None}
-    if not log_path:
+    window = _read_log_window(log_path)
+    if window is None:
         return empty, None
-    try:
-        path = Path(log_path)
-        size = path.stat().st_size
-        with open(path, "rb") as fh:
-            fh.seek(max(0, size - _TERMINAL_LOG_SCAN_MAX_BYTES))
-            window = fh.read().decode("utf-8", errors="replace")
-        tail = (
-            window.encode("utf-8")[-_TERMINAL_LOG_TAIL_MAX_BYTES:]
-            .decode("utf-8", errors="replace")
-        )
-        return _parse_analyzer_stats(window), tail
-    except Exception as exc:  # noqa: BLE001 — stats are best-effort
-        logger.debug("codegraph resync: terminal log-stat read skipped: %s", exc)
-        return empty, None
+    tail = (
+        window.encode("utf-8")[-_TERMINAL_LOG_TAIL_MAX_BYTES:]
+        .decode("utf-8", errors="replace")
+    )
+    return _parse_analyzer_stats(window), tail
 
 
 def _report_terminal_to_hub(
@@ -4199,6 +4303,19 @@ def _run_resync_and_verify_slotted(
        verdict is judged against the install root that owns the machine's
        one service (ship-gate MAJOR-2), and a pre-v0.2.92 image is caught
        from its ``/health`` alone even when no tree carries the source.
+    0a. v0.2.105: BACKEND-REACHABILITY GATE (two arms). The analyzer
+       soft-skips with exit 0 when no embedding backend answers, which the
+       driver used to relay as terminal ``success``. PRE-check: when the
+       backend the walk needs is unreachable (``code_backend_down_waiting``
+       — after waiting out a starting container) the analyzer is NOT
+       spawned: the ``codegraph_embed_resync_pending`` entry is
+       recorded/refreshed (the work stays owed), a terminal ``failed``
+       report closes any hub row, and the driver returns 0. POST-walk
+       (fix round): a backend that went down between the pre-check and the
+       analyzer's own probe is caught by the analyzer's "Code-graph
+       analysis skipped" line in this run's shared log and converges on the
+       same refusal posture — never a terminal ``success`` for a walk that
+       analyzed nothing.
     0b. v0.2.96 (M-2): EXPOSURE HEAL. When the one-time truncation-exposure
        bump is owed for THIS project (``vco_lib.code_embed_exposure`` —
        machine-level ``observed`` evidence and no ``healed`` entry for the
@@ -4273,6 +4390,61 @@ def _run_resync_and_verify_slotted(
             )
         except Exception as exc:  # noqa: BLE001 — observability, never a gate
             logger.debug("resync driver: stale-refusal report raised: %s", exc)
+        return 0
+
+    # v0.2.105: the backend-reachability gate (PRE-check). The analyzer
+    # soft-SKIPS with exit 0 when no embedding backend answers (field
+    # 2026-10-23, log resync-VibeCodedOrchestrator-20261023-140259:
+    # "Code-graph analysis skipped: active code backend (slot=codesage_embed)
+    # is not reachable" followed by "reported terminal 'success' to hub") —
+    # and a soft-skipped walk is indistinguishable from a successful one by
+    # exit code alone. The driver refused nothing, the hub row read
+    # 'success', and the post-walk probe could even clear
+    # `codegraph_embed_resync_pending` for work that never ran. Same
+    # defence-in-depth shape as the stale-image gate above (the spawn and
+    # the deferral dispatcher gate too, and the MANUAL `--run-resync` path
+    # converges HERE): refuse BEFORE the analyzer is asked, keep/record the
+    # deferral, and give the hub the one honest non-success terminal status
+    # its /terminal route accepts ("failed" — there is no "blocked"). A
+    # backend that goes down BETWEEN this pre-check and the analyzer's own
+    # probe is caught AFTER the walk by the soft-skip convergence below
+    # (v0.2.105 fix round — the review's race, now closed, not claimed).
+    # `code_backend_down_waiting` waits for a running-but-starting container
+    # first (the v0.2.104 tolerance), so a container still loading a model
+    # does not trip this gate.
+    down, _down_container_used = code_backend_down_waiting(project_name)
+    if down is not None:
+        print(
+            f"[resync-driver] code-embedding backend unreachable ({down}) — "
+            "NOT running the analyzer; the resync stays owed",
+            flush=True,
+        )
+        _record_backend_down_deferral(
+            repo_root, project_name, driver_resume_command(
+                _python_exe.resolve_or_current(), Path(repo_root),
+                Path(analyzer_path), project_name,
+                index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            ), backend=down,
+        )
+        # #31 discipline, same as the stale-image refusal: a hub row this
+        # driver's spawn may have registered must not be left to the
+        # pid-aliveness reconciler's false "died before completing" verdict.
+        # Soft-fail as everywhere: observability never gates the exit.
+        try:
+            _report_terminal_to_hub(
+                project_name,
+                "failed",
+                repo_root=repo_root,
+                files_analyzed=0,
+                duration_ms=0,
+                error_message=(
+                    f"code-embedding backend unreachable ({down}) — analysis "
+                    "skipped, the resync stays owed (retried once the "
+                    "backend answers)"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never a gate
+            logger.debug("resync driver: backend-down report raised: %s", exc)
         return 0
 
     # v0.2.96 (M-2, register issue 8): the exposure heal — the walk below is
@@ -4405,6 +4577,53 @@ def _run_resync_and_verify_slotted(
         start_error = f"could not start the analyzer: {exc}"
         rc = -1
     analyzer_duration_ms = int((time.monotonic() - analyzer_started) * 1000)
+
+    # v0.2.105 (fix round): the POST-WALK half of the backend-reachability
+    # gate — the race the pre-check above cannot close. A backend that went
+    # down between the pre-check and the analyzer's own probe lets the
+    # analyzer SOFT-SKIP with exit 0, which by exit code alone reads as
+    # success; the one honest signal is its "Code-graph analysis skipped"
+    # line in THIS run's shared log (stderr is captured there, and the log
+    # file is fresh per spawn, so an earlier run cannot match). Converge on
+    # the same refusal posture as the pre-check — the driver-time
+    # `codegraph_embed_resync_pending` flavour is recorded/refreshed (the
+    # work stays owed), the hub row is closed "failed" (never "success"),
+    # the code-summary rider and the post-walk probes do not run for a walk
+    # that analyzed nothing — and return 0 like every refusal here.
+    if start_error is None and rc == 0 and _log_says_analysis_skipped(log_path):
+        _down_late, _ = code_backend_down_waiting(project_name)
+        print(
+            "[resync-driver] the analyzer SOFT-SKIPPED (embedding backend "
+            "unreachable after the spawn"
+            + (f": {_down_late}" if _down_late else "")
+            + ") — the resync stays owed",
+            flush=True,
+        )
+        _record_backend_down_deferral(
+            repo_root, project_name, driver_resume_command(
+                _python_exe.resolve_or_current(), Path(repo_root),
+                Path(analyzer_path), project_name,
+                index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            ), backend=_down_late or "",
+        )
+        try:
+            _stats_late, _tail_late = _collect_terminal_stats(log_path)
+            _report_terminal_to_hub(
+                project_name,
+                "failed",
+                repo_root=repo_root,
+                files_analyzed=0,
+                duration_ms=analyzer_duration_ms,
+                error_message=(
+                    "analyzer soft-skipped: the code-embedding backend was "
+                    "unreachable, nothing was analyzed — the resync stays "
+                    "owed (retried once the backend answers)"
+                ),
+                log_tail=_tail_late,
+            )
+        except Exception as exc:  # noqa: BLE001 — observability, never a gate
+            logger.debug("resync driver: soft-skip report raised: %s", exc)
+        return 0
 
     # v0.2.100 WP-13: the code-summary rider starts only now, after the
     # analyzer exited — the rows it reads are the ones this walk wrote.

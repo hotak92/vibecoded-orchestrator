@@ -96,6 +96,11 @@ def _quiet_driver_probes(monkeypatch, *, stale=None):
     sweep) so the tests exercise ONLY the terminal-report seam."""
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: stale)
+    # v0.2.105: the driver's backend-reachability gate must not probe a real
+    # code-embed/Ollama from these tests — "reachable" keeps them on the
+    # walk path.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
 
 
 #: The sha the fixture's stubbed git probe reports — flows through the REAL

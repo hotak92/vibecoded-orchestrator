@@ -568,7 +568,11 @@ function Clear-ZombieState {
     param([string]$Name)
     $containerId = ""
     try {
-        $containerId = (& $Runtime inspect $Name --format '{{.Id}}' 2>$null | Out-String).Trim()
+        # v0.2.105: the lookup lives in vco_lib (the ONE home, A of the
+        # A>B>C rule - no PowerShell mirror of the probe here). The old
+        # inline `{{.Id}}` probe worked on podman too; only
+        # service_adoption's `{{json .Id}}` variant was podman-broken.
+        $containerId = (& $RunPy -m vco_lib.containers container-id $Name --runtime $Runtime 2>$null | Out-String).Trim()
     } catch { }
     if (Get-Command runc -ErrorAction SilentlyContinue) {
         $runcRoot = Get-RuncRoot

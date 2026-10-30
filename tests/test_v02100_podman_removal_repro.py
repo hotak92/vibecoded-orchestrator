@@ -104,7 +104,12 @@ def _image() -> str:
 
 
 def _container_id(name: str) -> str:
-    return _run([PODMAN, "inspect", "--type", "container", "--format", "{{.Id}}", _mine(name)])["stdout"].strip()
+    # v0.2.105: the ONE shared lookup (vco_lib.containers) — no inline
+    # template probe here.
+    from vco_lib.containers import container_id
+
+    # PODMAN is str at runtime — the module skipif guarantees podman exists.
+    return container_id(_mine(name), PODMAN or "podman") or ""
 
 
 def _events(since: float, name: str) -> list:
@@ -228,7 +233,8 @@ def test_ii_stop_of_a_container_whose_rootfs_is_held_open():
         # Hold the rootfs open from inside podman's user namespace: a shell
         # whose cwd is the container's merged/ directory.
         holder = subprocess.Popen(
-            [PODMAN, "unshare", "sh", "-c", f'cd "$({PODMAN} mount {cid})" && exec sleep 120'],
+            [PODMAN or "podman", "unshare", "sh", "-c",
+             f'cd "$({PODMAN} mount {cid})" && exec sleep 120'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         clean.procs.append(holder)
         time.sleep(3)

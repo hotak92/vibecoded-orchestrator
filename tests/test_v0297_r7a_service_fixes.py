@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import builtins
 import http.server
+import json
 import threading
 from pathlib import Path
 from typing import Any
@@ -50,16 +51,20 @@ def _cids(result) -> list[str]:
 
 
 class _Formatted(FakeMachine):
-    """The fake machine, answering ``inspect --format …`` the way a real
-    runtime does: the container's id for an ``.Id`` template, exit 125 for a
-    name that does not exist (the base fake answers ``[]``)."""
+    """The fake machine, answering ``inspect`` the way a real runtime does:
+    the container's id — template-free JSON since v0.2.105, the ``--format``
+    probes otherwise — and exit 125 for a name that does not exist (the base
+    fake answers ``[]``)."""
 
     def run(self, argv, **kw):
-        if len(argv) > 1 and argv[1] == "inspect" and "--format" in argv:
+        if len(argv) > 1 and argv[1] == "inspect":
             self.argv_log.append(list(argv))
             name = argv[-1]
             if name not in self.containers:
                 return mock.Mock(returncode=125, stdout="", stderr=f"no such container {name}")
+            if "--format" not in argv:  # the template-free id lookup (v0.2.105)
+                return mock.Mock(returncode=0, stdout=json.dumps([{"Id": f"id-{name}"}]),
+                                 stderr="")
             fmt = argv[argv.index("--format") + 1]
             out = f'"id-{name}"' if "json .Id" in fmt else f"id-{name}" if ".Id" in fmt else ""
             return mock.Mock(returncode=0, stdout=out + "\n", stderr="")

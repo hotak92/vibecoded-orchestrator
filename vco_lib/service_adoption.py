@@ -1334,7 +1334,12 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
             if not ref:
                 plan.reason = "no container named — nothing to adopt"
                 continue
-            container_id = _inspect_json(ref, "{{json .Id}}", runtime, run)
+            # v0.2.105: the ONE shared lookup. THE pre-fix bug lived here:
+            # `{{json .Id}}` is the one template form podman 4.9 refuses
+            # (exit 125, "can't evaluate field Id in type interface {}" —
+            # plain `{{.Id}}` works on podman), so the old probe refused a
+            # running container on every podman host.
+            container_id = _containers.container_id(ref, runtime, run=run)
             if not (isinstance(container_id, str) and container_id):
                 plan.reason = f"container '{ref}' does not exist (or could not be inspected)"
                 continue
