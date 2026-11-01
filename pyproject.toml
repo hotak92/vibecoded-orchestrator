@@ -134,7 +134,7 @@ codegraph-ts-powershell = [
 ]
 codegraph-ts-proto = [
     "tree-sitter == 0.26.0",
-    "tree-sitter-language-pack == 1.21.3",
+    "tree-sitter-language-pack == 1.22.1",
 ]
 # Test/dev tools — mirrors requirements-dev.txt.
 test = [
