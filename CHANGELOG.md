@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The model gateway can serve a second Claude account, chosen per project.** Add a login — for example a seat on a
+  second organisation account — in Preferences → Claude accounts (VCO keeps only its name and folder; you sign in
+  yourself with the command shown there), then pick it in a project's Identity tab. Projects that pick nothing keep
+  using your current account, so nothing changes until you switch one. If the chosen account cannot be used (not
+  logged in, expired), the chat carries on with your default account and says so: a warning in the gateway log, a
+  note on the accounts page and the project page, and a one-time notice to the model naming the account it is billed
+  to and how to log back in. The gateway renews an added account's login on its own shortly before it expires,
+  without spending a model call.
 - **The gateway's usage ledger records when a turn was a context compaction.** Claude Code marks those requests with an
   `x-claude-code-compaction` header; each ledger row now carries the value (`null` on an ordinary turn), so a sudden
   jump in a chat's context can be traced to the compaction that caused it instead of looking like a turn you never
