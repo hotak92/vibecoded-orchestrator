@@ -1529,13 +1529,17 @@ class CodeGraphAnalyzer:
         nothing could redirect the analyzer and suites that spawn it minted
         `<Project>_Code*` classes on whatever instance was listening.
         """
+        # v0.2.105: ONLY the connect call is inside the try. The success line
+        # used to sit in it too, so a Windows cp1252 stdout raising on its
+        # emoji was reported as "Failed to connect to Weaviate" (and the walk
+        # ended). The failure sentence is vco_lib's one classifier.
         try:
             self.client = _wh.connect_v4(self.weaviate_url, grpc_port=self.grpc_port)
-            print(f"✅ Connected to Weaviate at {self.weaviate_url}")
-            return True
         except Exception as e:
-            print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
+            print(f"❌ {_wh.describe_connect_failure(e, self.weaviate_url)}", file=sys.stderr)
             return False
+        print(f"✅ Connected to Weaviate at {self.weaviate_url}")
+        return True
 
     def _vectorizer_config(self, class_name: str):
         """Return appropriate vectorizer config based on named_vectors flag.
@@ -5971,7 +5975,7 @@ def _migrate_from_shared(project_name: str, named_vectors: bool = False) -> int:
     try:
         client = _wh.connect_v4()  # env-resolved, like every other writer
     except Exception as e:
-        print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
+        print(f"❌ {_wh.describe_connect_failure(e)}", file=sys.stderr)
         return 1
 
     try:
@@ -6999,4 +7003,9 @@ def _deferral_op(op: str, *args: object) -> None:
 
 
 if __name__ == '__main__':
+    # v0.2.105: console-safe output on a Windows cp1252/OEM reader - the ONE
+    # home is vco_lib.console_text. Before it, the "✅ Connected" status line
+    # raised UnicodeEncodeError on a cp1252 pipe and the run died.
+    from vco_lib.console_text import harden_stdio
+    harden_stdio()
     sys.exit(main())

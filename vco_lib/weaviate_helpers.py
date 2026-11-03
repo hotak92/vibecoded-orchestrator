@@ -693,6 +693,54 @@ def connect_v4(
     )
 
 
+#: Exception class-name fragments (lowercased) of weaviate-client failures that
+#: ARE about reaching the server but whose names do not say "connect":
+#: ``WeaviateStartUpError`` (the readiness probe failed),
+#: ``WeaviateGRPCUnavailableError``, ``WeaviateTimeoutError``.
+_CONNECT_SHAPED_CLASS_FRAGMENTS: tuple[str, ...] = ("startup", "unavailable", "timeout")
+
+
+def is_connect_failure(exc: BaseException) -> bool:
+    """True when ``exc`` (raised by :func:`connect_v4`) means Weaviate could
+    not be REACHED — refused, reset, unreachable host, readiness probe failed,
+    gRPC unavailable, timed out.
+
+    v0.2.105: callers used to print "Failed to connect to Weaviate" for ANY
+    exception raised near a connect, and one of them printed its own success
+    line inside the same ``try`` — so a Windows ``'charmap' codec can't encode
+    character '✅'`` from that print was reported to the user as a connection
+    failure. The transport rule is :func:`vco_lib.retry_after.is_connection_error`
+    (one home); this adds the weaviate-client class names it cannot know.
+    ``OSError`` covers socket-level failures (``ConnectionError`` is one).
+    """
+    if isinstance(exc, (OSError, TimeoutError)):
+        return True
+    for klass in type(exc).__mro__:
+        name = klass.__name__.lower()
+        if any(fragment in name for fragment in _CONNECT_SHAPED_CLASS_FRAGMENTS):
+            return True
+    from vco_lib.retry_after import is_connection_error  # noqa: PLC0415 - keep this module a leaf
+
+    return is_connection_error(exc)
+
+
+def describe_connect_failure(exc: BaseException, weaviate_url: Optional[str] = None) -> str:
+    """The ONE user-facing sentence for an exception :func:`connect_v4` raised.
+
+    A transport failure (:func:`is_connect_failure`) reads "Failed to connect
+    to Weaviate at <url>"; anything else names its type and says it is NOT a
+    connection failure, so a client bug or a bad argument is never sent off
+    chasing a Weaviate that is up.
+    """
+    url = weaviate_url or weaviate_url_default()
+    if is_connect_failure(exc):
+        return f"Failed to connect to Weaviate at {url}: {exc}"
+    return (
+        f"Weaviate client setup failed at {url} with {type(exc).__name__}: {exc} "
+        "(this is not a connection failure - Weaviate may well be up)"
+    )
+
+
 def count_objects_v4(name: str, weaviate_url: Optional[str] = None) -> int:
     """Count objects in a collection via the v4 iterator (metadata-only, no
     vectors). Returns ``0`` on connection failure OR missing collection.

@@ -63,29 +63,9 @@ between the three entry points.
 
 import sys
 
-# v0.2.49 Bug L: reconfigure stdout/stderr to UTF-8 so emoji + non-ASCII
-# error messages don't crash on Windows cp1252 consoles. Without this,
-# `print(f"❌ ...")` raises UnicodeEncodeError on the default Windows
-# Python console (which inherits the system codepage, often cp1252 on
-# Western European installs). The launcher's `installer.rs` sets
-# PYTHONIOENCODING=utf-8 + PYTHONUTF8=1 on every Python child it
-# spawns (v0.2.27 fix), but kg-sync invokes this script directly from
-# a Windows shell without those env vars. Reconfiguring here defends
-# against the direct-CLI path. `errors='backslashreplace'` ensures we
-# never crash even if the terminal can't render a character — it'll
-# print the escape sequence instead.
-#
-# Python 3.7+ supports the `reconfigure` method on TextIOWrapper.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
-except (AttributeError, OSError):
-    # AttributeError: stdout/stderr not a TextIOWrapper (rare, e.g.
-    # captured by pytest or redirected to a non-tty). OSError: stream
-    # already detached/closed. Both are benign — fall through, and any
-    # subsequent emoji print may still crash on Windows-cp1252-direct
-    # invocations, but at least we tried.
-    pass
+# Console-safe stdout/stderr (v0.2.49 Bug L): see the `_harden_stdio()` call
+# right after the vco_lib path bootstrap below — it is the first point at
+# which the ONE home for that decision is importable.
 
 import os
 import re
@@ -137,6 +117,17 @@ else:
 if str(_VCO_LIB_PARENT) not in sys.path:
     sys.path.insert(0, str(_VCO_LIB_PARENT))
 # VCO-REWIRE-END: orchestrator-root-resolution
+
+# v0.2.49 Bug L, re-homed v0.2.105: emoji and non-ASCII messages must not
+# crash on a Windows cp1252 console or pipe. The decision lives in ONE home,
+# `vco_lib.console_text.harden_stdio` (the code-graph analyzer, the KG CLIs
+# and install.py call the same function); it runs here, before the first
+# print, now that vco_lib is importable. A real console keeps its encoding
+# (the console API renders Unicode), a reader that declared UTF-8 gets
+# UTF-8, any other pipe gets ASCII with readable stand-ins.
+from vco_lib.console_text import harden_stdio as _harden_stdio  # noqa: E402
+
+_harden_stdio()
 
 
 # ──────────────────────────────────────────────────────────────────────
