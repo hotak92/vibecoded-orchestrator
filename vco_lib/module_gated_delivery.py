@@ -959,6 +959,37 @@ def restore_parked_agents(
     return restored
 
 
+def provider_restore_pass(
+    folder: Path,
+    orchestrator_root: Path,
+    manifest: Mapping[str, Any] | None,
+    *,
+    skip_kinds: frozenset[str] = frozenset(),
+    dry_run: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+) -> tuple[Optional[GateVerdict], list[str]]:
+    """The bundle update's first provider-switch step: ``(gate verdict,
+    restored dest_rels)``.
+
+    A provider switched BACK ON gets the definitions an earlier run parked
+    restored BEFORE enumeration, so ``_file_action``'s skip-disabled guard
+    finds them at their enabled path again and the ordinary manifest logic
+    re-delivers them. Only copies THIS switch parked are restored (the
+    manifest's :data:`PARKED_AGENTS_MANIFEST_KEY`); the launcher's per-agent
+    toggle is never overridden. The verdict is computed ONCE here and handed
+    to the enumerator, which would otherwise ask the same question again.
+    ``(None, [])`` when this install ships no gateway definitions.
+    """
+    src_dir = Path(orchestrator_root) / "templates" / "agents" / GATEWAY_AGENTS_DIR
+    if not src_dir.is_dir():
+        return None, []
+    verdict = gateway_agents_gate(folder)
+    restored = restore_parked_agents(
+        folder, src_dir, manifest, verdict=verdict, skip_kinds=skip_kinds,
+        dry_run=dry_run, log=log)
+    return verdict, restored
+
+
 def _entry_for(verdict: GateVerdict, folder: Path) -> Any:
     from vco_lib.deferral_report import DeferralEntry
 
