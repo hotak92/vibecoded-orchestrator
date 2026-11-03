@@ -3291,11 +3291,21 @@ def _write_bootstrap_deferral(
 #                                       # pack, keeping members current.
 #       "<pack-name>": {"installed_at": "ISO-8601"},
 #     },
+#     "provider_parked_agents": {        # v0.2.105: gateway agent definitions
+#                                       # parked in `.claude/agents.disabled/`
+#                                       # because their model provider is
+#                                       # switched off machine-wide. The marker
+#                                       # separates "VCO parked this" from "the
+#                                       # user disabled it in the Agents tab":
+#                                       # only these are restored on re-enable.
+#       "<rel-path-from-folder>": "<vendor id>",   # e.g. ".claude/agents/kimi-reviewer.md": "kimi"
+#     },
 #   }
 #
 # Schema-version compatibility: readers default `preserved_files` to `{}` when
-# absent (v1 manifests) and `packs` to `{}` when absent (pre-v0.2.101). Both
-# are ADDITIVE keys — schema_version stays 2 (the `dismissals` precedent:
+# absent (v1 manifests) and `packs` / `provider_parked_agents` to `{}` when
+# absent (pre-v0.2.101 / pre-v0.2.105). All are ADDITIVE keys — schema_version
+# stays 2 (the `dismissals` precedent:
 # readers default when absent, no migration step). The next install run
 # upgrades the file in place by writing schema_version=2.
 # ---------------------------------------------------------------------------
@@ -3564,6 +3574,7 @@ def _enumerate_bundle_files(
     *,
     sink: "Any" = None,
     project_name: Optional[str] = None,
+    gate_verdict: "Any" = None,
 ) -> list[_BundleFileOp]:
     """Build the list of files to install. Hooks ship BOTH .sh + .ps1
     flavours on every OS (vco_lib.bundle_globs policy, v0.2.54 Track G).
@@ -3588,7 +3599,13 @@ def _enumerate_bundle_files(
       .claude/agents/<name>.md             from templates/agents/module-gateway/
                                            (ONLY when the gateway gate says
                                            DELIVER — v0.2.100 AD-7; each gated
-                                           verdict is appended to `gate_outcomes`)
+                                           verdict is appended to `gate_outcomes`).
+      v0.2.105: `gate_verdict` lets the caller hand in a verdict it already
+      computed (the bundle update needs the same answer for the provider-switch
+      restore pass); omitted, the gate is asked here as before. A definition
+      whose VENDOR the user switched off is held with
+      `SIGNAL_PROVIDER_DISABLED` and never enumerated — the orphan walk parks
+      an earlier delivery instead (see `module_gated_delivery`).
       .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
       .claude/specializations/<rel>        from templates/specializations/<rel>
                                            (recursive PLAIN copy, no substitution —
@@ -3718,8 +3735,11 @@ def _enumerate_bundle_files(
     from vco_lib import module_gated_delivery as _mgd
     gateway_agents_src = templates / "agents" / _mgd.GATEWAY_AGENTS_DIR
     if gateway_agents_src.exists():
-        verdict = _mgd.gateway_agents_gate(
-            orchestrator_root if project_root is None else project_root)
+        # v0.2.105: the caller may already hold the verdict (it needs it for
+        # the provider-switch restore pass); otherwise ask here, as before.
+        verdict = (gate_verdict if gate_verdict is not None else
+                   _mgd.gateway_agents_gate(
+                       orchestrator_root if project_root is None else project_root))
         gw_files, gw_held = _mgd.select_gateway_agents(gateway_agents_src, verdict)
         if gate_outcomes is not None:
             gate_outcomes += [(_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict), *gw_held]
@@ -9245,10 +9265,33 @@ def install_project_bundle(
          data={"recorded": sorted(_manifest_packs),
                "requested": sorted(packs), "removing": sorted(remove_packs)})
 
+    # v0.2.105: the launcher's machine-wide per-provider switch. A provider
+    # switched BACK ON restores the definitions an earlier run parked on the
+    # disabled side — BEFORE enumeration, so `_file_action`'s skip-disabled
+    # guard finds them at their enabled path again and the ordinary manifest
+    # logic re-delivers them. Only copies THIS switch parked are restored (the
+    # manifest's `provider_parked_agents` marker); the launcher's per-agent
+    # toggle is a different marker and is never overridden. The verdict is
+    # computed ONCE here and threaded into the enumerator, which would
+    # otherwise ask the same question a second time.
+    from vco_lib import module_gated_delivery as _mgd
+    _gw_src_dir = (orchestrator_root / "templates" / "agents"
+                   / _mgd.GATEWAY_AGENTS_DIR)
+    _gw_verdict = None
+    if _gw_src_dir.is_dir():
+        _gw_verdict = _mgd.gateway_agents_gate(folder)
+        _gw_restored = _mgd.restore_parked_agents(
+            folder, _gw_src_dir, manifest, verdict=_gw_verdict,
+            skip_kinds=skip_kinds, dry_run=dry_run,
+            log=lambda m: _log("4.bundle.gated", "info", m))
+        if _gw_restored:
+            result["provider_agents_restored"] = _gw_restored
+
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder,
                                   gate_outcomes=_gate_outcomes,
                                   sink=_materialize_sink,
-                                  project_name=project_name)
+                                  project_name=project_name,
+                                  gate_verdict=_gw_verdict)
     # §3.2: pack member ops join the enumeration with default-shaped dest_rels
     # (`.claude/agents|skills/...`), so kind classification, skip-disabled,
     # `--skip-kind` and the orphan machinery all apply to them unchanged.
@@ -9559,6 +9602,7 @@ def install_project_bundle(
     orphan_preserved: list[str] = []
     orphan_retired: list[str] = []  # v0.2.83 B-F5: kept-on-disk, manifest-retired
     knowledge_retired: list[str] = []
+    provider_parked: list[str] = []  # v0.2.105: parked for a switched-off provider
     prior_files: dict = manifest.get("files", {}) or {}
     # Orphans are prior_files MINUS what THIS run ENUMERATED AS OPS — never
     # minus `new_files`: user-modified preserves write their PRIOR manifest
@@ -9616,6 +9660,26 @@ def install_project_bundle(
         from vco_lib.module_gated_delivery import carries_forward
         if carries_forward(prior_entry, _gate_outcomes):
             new_files[prior_rel] = prior_entry
+            continue
+        # v0.2.105: a provider the user switched OFF in the launcher (Home →
+        # Model providers). Its delivered definitions are PARKED — moved to
+        # `.claude/agents.disabled/`, the launcher toggle's own location — so
+        # switching the provider back on restores them; never deleted. A copy
+        # the user edited (or one that cannot be moved) is LEFT IN PLACE with
+        # a warning, and its manifest entry is kept so it stays recognised.
+        # The marker that records what THIS switch parked (and nothing the
+        # user parked themselves) is the manifest's `provider_parked_agents`.
+        from vco_lib.module_gated_delivery import park_provider_agent
+        _park = park_provider_agent(
+            folder, prior_rel, prior_entry, _gate_outcomes, dry_run=dry_run,
+            log=lambda m: _log("4.bundle.gated", "info", m),
+            warn=result["warnings"].append,
+        )
+        if _park == "keep-entry":
+            new_files[prior_rel] = prior_entry
+            continue
+        if _park is not None:
+            provider_parked.append(prior_rel)
             continue
         # v0.2.81 knowledge-retirement branch (data-safety, constraint 3):
         # on a NON-root project the ~115 curated `knowledge/**` entries are
@@ -9716,6 +9780,8 @@ def install_project_bundle(
     reconcile_folder_embeddings(folder, dry_run=dry_run)
     result["actions"]["orphan-retired"] = orphan_retired
     result["actions"]["knowledge-retired"] = knowledge_retired
+    if provider_parked:
+        result["provider_agents_parked"] = provider_parked
     # v0.2.83 B-F5: one honest auto-resolution record per retired orphan (file
     # kept on disk, manifest entry dropped). Best-effort — never abort install.
     if orphan_retired and not dry_run:
@@ -10252,6 +10318,17 @@ def install_project_bundle(
             from vco_lib.deferral_dismissal import DISMISSALS_KEY as _DISM_KEY
             if isinstance(manifest.get(_DISM_KEY), dict):
                 manifest_payload[_DISM_KEY] = manifest[_DISM_KEY]
+            # v0.2.105: which disabled-side agent copies THIS machine's
+            # per-provider switch parked (`{dest_rel: vendor_id}`). Additive,
+            # readers default it; recomputed from disk each run, so a copy the
+            # user moved or deleted simply drops out.
+            from vco_lib.module_gated_delivery import (
+                PARKED_AGENTS_MANIFEST_KEY as _PARKED_KEY,
+                parked_agents_registry as _parked_registry,
+            )
+            _parked = _parked_registry(folder, _gate_outcomes)
+            if _parked:
+                manifest_payload[_PARKED_KEY] = _parked
             _write_manifest_atomic(folder, manifest_payload)
             result["manifest_written"] = True
 

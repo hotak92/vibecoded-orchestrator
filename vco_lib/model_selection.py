@@ -497,7 +497,21 @@ def reachable_providers(*, key_probe: Optional[KeyProbe] = None,
                 "recorded_at": _now_iso(),
             })
             save_record(next_record, record_path)
-    return frozenset(available)
+    # v0.2.105: the user's machine-wide per-provider switch
+    # (`vco_lib.model_providers`) subtracts here — the ONE place both the grid
+    # rows and the provider-conditional CLAUDE.md sections read, so switching a
+    # provider off hides all of them through the same refresh. The subtract
+    # happens AFTER the record write on purpose: the record answers "does this
+    # machine hold the key" (a fact), never "did the user switch it off" (a
+    # choice) — recording a choice as a missing key would raise the "your key
+    # stopped resolving, re-add it" warning on the next round.
+    try:
+        from vco_lib.model_providers import disabled_vendors
+
+        switched_off = disabled_vendors()
+    except Exception:  # noqa: BLE001 — a read never hides a provider
+        switched_off = frozenset()
+    return frozenset(available - switched_off)
 
 
 def render_grid(*, providers: Optional[FrozenSet[str]] = None,
