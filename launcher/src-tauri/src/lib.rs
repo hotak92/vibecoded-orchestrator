@@ -3606,6 +3606,8 @@ pub fn run() {
             // IdentityTab can let users pick which class is canonical.
             commands::project_identity::list_orchestrator_kg_collections,
             commands::project_identity::set_shared_kg_collection_name,
+            // v0.2.105: "primary KG is the shared collection" banner + repair.
+            commands::project_identity::get_kg_primary_shared_status,
             // PR-37 (v0.2.12 / 2026-05-16): GUI-surfaced maintenance ops.
             // Backs `McpMaintenanceSection.svelte` (MCP page) and
             // `ServicesSchemaSection.svelte` (Services page) — closes the

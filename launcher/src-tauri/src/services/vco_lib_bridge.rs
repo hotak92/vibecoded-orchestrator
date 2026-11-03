@@ -503,6 +503,51 @@ pub fn packs_status(root: &Path, project_folder: &Path) -> Result<serde_json::Va
     parse_ok_reply_named("packs status", &done.stdout, &done.stderr)
 }
 
+/// v0.2.105: is this project's PRIMARY KG binding the SHARED collection? —
+/// `python -m vco_lib.kg_primary_shared status --project-id … --json`, the ONE
+/// detection rule (rule A: the Python implementation the doctor and the
+/// registry clear probe also use; nothing is mirrored here). Returns the
+/// `ok: true` reply (`bound_to_shared`, `bound`, `expected`,
+/// `expected_is_shared`); an unreadable launcher.db or a child that cannot run
+/// is an `Err` — the Identity tab then shows no verdict rather than a guess.
+pub fn kg_primary_shared_status(root: &Path, project_id: &str) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.kg_primary_shared")
+        .arg("status")
+        .arg("--project-id")
+        .arg(project_id)
+        .arg("--json");
+    reinject_minimal_env(&mut cmd);
+    cmd.current_dir(root);
+    let done = match vct_launcher_core::process::output_bounded(
+        &mut cmd,
+        None,
+        VCO_LIB_SHORT_VERB_TIMEOUT,
+    ) {
+        Ok(done) => done,
+        Err(vct_launcher_core::process::BoundedError::Spawn(e)) => {
+            return Err(format!(
+                "kg primary status: spawn failed (python={}): {}",
+                python.display(),
+                e
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::TimedOut { after, stderr, .. }) => {
+            return Err(format!(
+                "kg primary status: timed out after {} s. stderr: {}",
+                after.as_secs(),
+                String::from_utf8_lossy(&stderr).trim()
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::Wait(e)) => {
+            return Err(format!("kg primary status: wait failed: {}", e))
+        }
+    };
+    parse_ok_reply_named("kg primary status", &done.stdout, &done.stderr)
+}
+
 /// v0.2.102 W6-CGD (D-4): classify `extra` against the project's own folder —
 /// `python -m vco_lib.codegraph_extra_overlap --extra … --project-folder … --json`,
 /// the ONE overlap rule (rule A: the Python implementation, called from here).

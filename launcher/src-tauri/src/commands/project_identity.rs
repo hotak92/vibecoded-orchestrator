@@ -1561,6 +1561,53 @@ pub async fn list_orchestrator_kg_collections(
     Ok(extract_orchestrator_shaped_classes(&schema))
 }
 
+/// v0.2.105: the Identity tab's "this project's primary KG is the SHARED
+/// collection" reading. Field-for-field the reply of
+/// `python -m vco_lib.kg_primary_shared status` (mirrored by
+/// `launcher/src/lib/project-state/kg-primary-shared.ts::KgPrimarySharedStatus`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KgPrimarySharedStatus {
+    /// The project's primary binding names the shared collection.
+    pub bound_to_shared: bool,
+    /// The bound class (empty when not bound to the shared one).
+    pub bound: String,
+    /// The name-derived class the repair re-points to.
+    pub expected: String,
+    /// The name-derived class IS the shared one — no one-click repair.
+    pub expected_is_shared: bool,
+}
+
+/// Pure: the bridge's `ok: true` reply → [`KgPrimarySharedStatus`]. A reply
+/// missing a field is an `Err` (never a silent "not bound").
+pub fn parse_kg_primary_shared_reply(reply: &serde_json::Value) -> Result<KgPrimarySharedStatus, String> {
+    serde_json::from_value(reply.clone())
+        .map_err(|e| format!("kg primary status: unexpected reply ({}): {}", e, reply))
+}
+
+/// v0.2.105: does this project use the SHARED KG collection as its primary?
+/// Detection is the Python SSOT (`vco_lib.kg_primary_shared`, also the
+/// doctor's probe and the `kg_primary_bound_to_shared` clear probe), reached
+/// through the bridge — nothing re-derives the rule here. The repair is the
+/// existing `update_project_identity` with `kg_collection = expected`.
+#[command]
+pub async fn get_kg_primary_shared_status(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<KgPrimarySharedStatus, String> {
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db.inner())
+        .ok_or_else(|| {
+            "the orchestrator clone could not be located, so the KG binding check \
+             (vco_lib.kg_primary_shared) cannot run — check the install"
+                .to_string()
+        })?;
+    tokio::task::spawn_blocking(move || {
+        let reply = crate::services::vco_lib_bridge::kg_primary_shared_status(&root, &project_id)?;
+        parse_kg_primary_shared_reply(&reply)
+    })
+    .await
+    .map_err(|e| format!("kg primary status task join failed: {}", e))?
+}
+
 /// Free-function core of `set_shared_kg_collection_name` — validation +
 /// `app_state` write + audit + machine-global env re-projection.
 /// Testable without a Tauri runtime; the `#[command]` wrapper routes it
@@ -1796,6 +1843,28 @@ fn _doc_imports() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.105: the bridge reply maps field-for-field; a reply missing a
+    /// field is an error, never a silent "not bound".
+    #[test]
+    fn kg_primary_shared_reply_parses_and_refuses_a_partial_reply() {
+        let reply = serde_json::json!({
+            "ok": true, "bound_to_shared": true,
+            "bound": "VibeCodedOrchestrator_KnowledgeGraph",
+            "expected": "MyApp_KnowledgeGraph", "expected_is_shared": false,
+        });
+        assert_eq!(
+            parse_kg_primary_shared_reply(&reply).unwrap(),
+            KgPrimarySharedStatus {
+                bound_to_shared: true,
+                bound: "VibeCodedOrchestrator_KnowledgeGraph".into(),
+                expected: "MyApp_KnowledgeGraph".into(),
+                expected_is_shared: false,
+            }
+        );
+        let partial = serde_json::json!({"ok": true, "bound_to_shared": true});
+        assert!(parse_kg_primary_shared_reply(&partial).is_err());
+    }
 
     #[test]
     fn orchestrator_root_detected_by_slug() {
