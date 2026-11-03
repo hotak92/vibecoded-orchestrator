@@ -123,14 +123,33 @@ if (Test-Path $VenvLib) {
                 '--ensure-precreated') | Out-Null
             # v0.2.105: which Claude account this project's gateway chats are
             # billed to - printed ONLY once a second account exists (the one
-            # home is vco_lib.gateway_accounts session-line).
-            # PARITY: session-start-kg-loader.sh prints the same line.
+            # home is vco_lib.gateway_accounts session-line). Bounded to 4 s
+            # (killed after) so a slow interpreter or a wedged gateway can
+            # never hold this hook past its timeout; no console window.
+            # PARITY: session-start-kg-loader.sh prints the same line, same bound.
+            $acctProc = $null
             try {
-                $acctLine = @(& $VcoVenvPython -m vco_lib.gateway_accounts session-line --folder "$ProjectDir" 2>$null)
-                if ($LASTEXITCODE -eq 0 -and $acctLine.Count -gt 0) {
-                    Write-Output (($acctLine | ForEach-Object { "$_" }) -join "`n")
+                $psi = New-Object System.Diagnostics.ProcessStartInfo
+                $psi.FileName = [string]$VcoVenvPython
+                $psi.Arguments = '-m vco_lib.gateway_accounts session-line --folder "' + $ProjectDir + '"'
+                $psi.UseShellExecute = $false
+                $psi.CreateNoWindow = $true
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+                $acctProc = [System.Diagnostics.Process]::Start($psi)
+                $acctOut = $acctProc.StandardOutput.ReadToEndAsync()
+                $null = $acctProc.StandardError.ReadToEndAsync()
+                if ($acctProc.WaitForExit(4000)) {
+                    $acctProc.WaitForExit()
+                    $text = ([string]$acctOut.Result).TrimEnd()
+                    if ($acctProc.ExitCode -eq 0 -and $text) { Write-Output $text }
+                } else {
+                    try { $acctProc.Kill() } catch { }
                 }
-            } catch { }
+            } catch {
+                if ($acctProc) { try { $acctProc.Kill() } catch { } }
+            }
         }
     } catch { }
 }

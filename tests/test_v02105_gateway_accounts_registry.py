@@ -12,7 +12,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import stat
+import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -363,10 +365,18 @@ def test_session_line_cli_prints_nothing_with_one_account(env):
     assert out.getvalue() == ""
 
 
-@pytest.mark.parametrize("sibling", ["sh", "ps1"])
+_HOOK_SIBLINGS = [
+    pytest.param("sh", marks=pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
+    pytest.param("ps1", marks=pytest.mark.skipif(
+        shutil.which("pwsh") is None, reason="pwsh not installed")),
+]
+
+
+@pytest.mark.parametrize("sibling", _HOOK_SIBLINGS)
 def test_the_session_start_hook_names_the_projects_account(env, sibling, tmp_path):
     """The line reaches the session: both hook siblings print it."""
-    import shutil
     import subprocess
     import sys as _sys
 
@@ -374,10 +384,6 @@ def test_the_session_start_hook_names_the_projects_account(env, sibling, tmp_pat
     from tests.common.pwsh import PWSH_BASE_FLAGS
 
     tmp, project, db = env
-    if sibling == "ps1" and shutil.which("pwsh") is None:
-        pytest.skip("pwsh not installed")
-    if sibling == "sh" and _sys.platform == "win32":
-        pytest.skip("bash leg")
     ga.save(ga.set_project(ga.add_account(ga.Registry(), account_id="work", label="Work seat",
                                           config_dir=str(tmp / "w")), "p-1", "work"), db)
     (project / ".claude").mkdir(exist_ok=True)

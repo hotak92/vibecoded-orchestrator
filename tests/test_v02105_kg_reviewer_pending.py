@@ -580,7 +580,8 @@ def _wait_chain_argv(repo: Path) -> str:
 
 _HOOK_SIBLINGS = [
     pytest.param("sh", marks=pytest.mark.skipif(
-        sys.platform == "win32", reason="bash .sh leg; the [ps1] param covers Windows")),
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
     pytest.param("ps1", marks=pytest.mark.skipif(
         shutil.which("pwsh") is None, reason="pwsh not installed")),
 ]
@@ -623,7 +624,8 @@ _HOOKS = REPO_ROOT / "templates" / "hooks"
 _PWSH = shutil.which("pwsh")
 _REINJECT_IMPLS = [
     pytest.param("sh", marks=pytest.mark.skipif(
-        sys.platform == "win32", reason="bash .sh leg; the [ps1] param covers Windows")),
+        sys.platform == "win32",
+        reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")),
     pytest.param("ps1", marks=pytest.mark.skipif(
         _PWSH is None, reason="pwsh not installed")),
 ]

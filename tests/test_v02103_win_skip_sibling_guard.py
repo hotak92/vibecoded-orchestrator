@@ -80,7 +80,11 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: on Windows, so the refusal cannot be reproduced there
 #: (tests/test_v02105_gateway_oauth_rewrite_window.py,
 #: tests/test_v02105_wait_guard_scripts_noop.py).
-NON_CONVENTION_BASELINE = 187
+#: 187 -> 188 (v0.2.105 fix round 5): the login keeper's timeout test kills
+#: the child's whole process GROUP (os.killpg) — a POSIX-only primitive with
+#: no .ps1 sibling (tests/test_v02105_gateway_account_refresh.py; the Windows
+#: spawn shape is unit-tested by test_windows_spawns_the_cli_without_a_console_window).
+NON_CONVENTION_BASELINE = 188
 
 
 # -- which conditions skip on Windows --------------------------------------
