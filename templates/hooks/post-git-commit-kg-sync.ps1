@@ -79,6 +79,18 @@ if ($Input -and $PY) {
 }
 if ($ToolResponseStr -match '(nothing to commit|no changes added|error:|fatal:)') { exit 0 }
 
+# v0.2.105 L-KGREV: the session that triggered this review, so the reviewer
+# can file its "N files left uncommitted" alert for THIS chat (the shipped
+# agent-alerts-deliver hook then shows it on the next prompt / tool call).
+# Absent -> no --session-id at all: the session-start / compaction re-inject
+# line is then the channel. MUST MATCH the .sh sibling.
+$SessionId = ""
+if ($Input -and $PY) {
+    try {
+        $SessionId = ($Input | & $PY -c "import sys,json; d=json.load(sys.stdin); print(d.get('session_id') or '')" 2>$null | Out-String).Trim()
+    } catch { $SessionId = "" }
+}
+
 Push-Location $ProjectRoot
 try {
     $CommitHash = (& git rev-parse --short HEAD 2>$null | Out-String).Trim()
@@ -126,8 +138,10 @@ try {
         # on every edition). No --max-turns / --model here: each is ONE knob
         # owned by the chain (VCO_KG_REVIEW_MAX_TURNS; VCO_KG_REVIEW_MODEL /
         # launcher Preferences).
+        $reviewArgs = @($ReviewerChain, 'run', '--project-root', $ProjectRoot, '--commit', $CommitHash, '--log', $logFile)
+        if ($SessionId) { $reviewArgs += @('--session-id', $SessionId) }
         $proc = Start-VcoDetachedProcess -FilePath $PY `
-            -ArgumentList @($ReviewerChain, 'run', '--project-root', $ProjectRoot, '--commit', $CommitHash, '--log', $logFile) `
+            -ArgumentList $reviewArgs `
             -RedirectStandardOutput "$logFile.out" -RedirectStandardError "$logFile.err" `
             -WorkingDirectory $ProjectRoot -PassThru
     }

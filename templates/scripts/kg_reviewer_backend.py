@@ -87,6 +87,7 @@ import summary_backends as _sb  # noqa: E402 — sibling in .claude/scripts/
 try:
     from vco_lib import kg_reviewer_guard as _guard  # noqa: E402
     from vco_lib import kg_reviewer_model as _model  # noqa: E402
+    from vco_lib import kg_reviewer_pending as _pending  # noqa: E402
     from vco_lib import kg_reviewer_prompt as _prompt  # noqa: E402
     from vco_lib import claude_cli_api_key as _cli_api_key  # noqa: E402
     from vco_lib import rl_citation_env as _rl_env  # noqa: E402
@@ -807,6 +808,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         else:
             log("commit skipped: the run's writes could not be attributed "
                 "to the reviewer")
+        # v0.2.105 L-KGREV (brief item 3): whatever the review left
+        # uncommitted is surfaced to the session once -- not once per prompt.
+        # The ledger lives in vco_lib.kg_reviewer_pending; the row rides the
+        # shipped subagent-alert channel, and the session-start / compaction
+        # re-inject shows the same count while anything remains.
+        try:
+            _pending.surface(root, args.session_id, log)
+        except Exception as exc:  # noqa: BLE001 -- never fail a review on it
+            log(f"pending-files notice not reported: {exc}")
     finally:
         snap.cleanup()
     return exit_code
@@ -850,6 +860,12 @@ def main(argv: "Optional[list[str]]" = None) -> int:
                        help=f"turn budget (default: ${MAX_TURNS_ENV}, "
                             f"else {DEFAULT_MAX_TURNS})")
     p_run.add_argument("--timeout-s", type=int, default=DEFAULT_TIMEOUT_S)
+    p_run.add_argument("--session-id", default="",
+                       help="the Claude Code session that triggered this "
+                            "review (the hook passes its payload's "
+                            "session_id); the pending-files alert is filed "
+                            "for it. Empty = no deliverable alert, the "
+                            "session-start re-inject line still shows it")
     p_rec = sub.add_parser("record", help="record a finished run's outcome")
     p_rec.add_argument("--model", required=True)
     p_rec.add_argument("--exit", type=int, required=True)
