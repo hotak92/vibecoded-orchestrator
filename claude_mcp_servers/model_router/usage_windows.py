@@ -1331,14 +1331,14 @@ class UsageWindows:
         """The JSON-ready snapshot, aged at read time. Pure read of memory."""
         now = self._clock()
         vendors = []
-        rows: list[tuple[VendorUsage, Mapping[str, Window]]] = []
+        sources: list[tuple[VendorUsage, Mapping[str, Window]]] = []
         for usage in self._usage.values():
-            rows.append((usage, self._header_windows if usage.id == ANTHROPIC_ID else {}))
+            sources.append((usage, self._header_windows if usage.id == ANTHROPIC_ID else {}))
             if usage.id == ANTHROPIC_ID:
                 # The added Claude accounts follow the user's own login.
                 for account_id, acct_usage in self._account_usage.items():
-                    rows.append((acct_usage, self._account_header_windows.get(account_id, {})))
-        for usage, header_windows in rows:
+                    sources.append((acct_usage, self._account_header_windows.get(account_id, {})))
+        for usage, header_windows in sources:
             windows = usage.windows
             is_claude = usage.id == ANTHROPIC_ID or usage.id.startswith(ACCOUNT_ID_PREFIX)
             if is_claude:
