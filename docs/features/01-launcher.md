@@ -137,6 +137,9 @@ Global settings: profile, about. Backed by `db::settings` table (key/value JSON 
 ### Per-project Settings
 `module_settings` table stores per-(project, module) non-secret settings as JSON-encoded values. Unique constraint on `(project_id, module_id, setting_key)`.
 
+### Claude accounts (v0.2.105)
+**Preferences → Claude accounts** (`routes/preferences/accounts/+page.svelte`) lists every Claude login the model gateway can serve — the original one (`primary`) and any added by configuration directory — with its login state by name and expiry only, the gateway's fallback count and last reason, and its last automatic renewal; it adds an account (showing the `CLAUDE_CONFIG_DIR=… claude auth login` command for the user to run — the launcher never runs a login), removes one (refused while a project or the default uses it) and sets the default. **Project → Identity → Claude account** (`GatewayAccountPicker.svelte`, hidden while only `primary` exists) picks the account per project and states when the project is being billed to the fallback account. Every action goes through `python -m vco_lib.gateway_accounts` (Tauri commands in `commands/gateway_accounts.rs`); the registry lives in `app_state` `model_gateway.accounts` and is exported to the gateway at every change and once at boot. Behaviour and the fallback rules: `docs/CONFIGURATION.md` → "More than one Claude account".
+
 ### Per-project KG Binding
 `project_kg_bindings` table maps a project to its primary Weaviate collection name, embedding dim, `knowledge/` dir path, and optional Weaviate URL override. Role can be `primary`, `shared`, or `archive`. (The `embedding_model` column survives in the schema with its historical values but is retired — v0.2.102 removed the per-binding KG model pick; the KG embeds with the one global embedding profile (Preferences → Embedding profile), for every project and the shared KG.)
 

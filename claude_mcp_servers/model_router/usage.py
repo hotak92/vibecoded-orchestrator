@@ -612,6 +612,18 @@ class UsageRecord:
     #: is a client-supplied token bounded by
     #: :func:`read_compaction_header`, never a body.
     compaction: Optional[str] = None
+    #: v0.2.105: the Claude account whose login served this request
+    #: (``model_router.accounts``); ``None`` on a vendor route, where no
+    #: Claude account answers. A row written before the field existed reads
+    #: as ``primary`` on a first-party route.
+    account: Optional[str] = None
+    #: ``header`` (the project chose it) or ``default``.
+    account_source: Optional[str] = None
+    #: Why the request was served by a fallback account (``None`` when it
+    #: was not): ``not_registered``, ``malformed_header``,
+    #: ``registry_unreadable``, or the login state (``absent``/``expired``/
+    #: ``unreadable``). The access line carries the same word.
+    account_fallback: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
@@ -661,6 +673,9 @@ def build_record(
     effort_requested: Optional[str] = None,
     effort_forwarded: Optional[str] = None,
     compaction: Optional[str] = None,
+    account: Optional[str] = None,
+    account_source: Optional[str] = None,
+    account_fallback: Optional[str] = None,
 ) -> UsageRecord:
     """Assemble one row. Pure — no clock unless the caller declines to pass one.
 
@@ -721,6 +736,9 @@ def build_record(
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
         compaction=compaction,
+        account=account,
+        account_source=account_source,
+        account_fallback=account_fallback,
     )
 
 

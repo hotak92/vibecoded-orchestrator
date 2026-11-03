@@ -842,6 +842,14 @@ pub(crate) fn gateway_usage_command(python: &Path, orchestrator_root: Option<&Pa
     python_module_command(python, "vco_lib.gateway_usage", orchestrator_root)
 }
 
+/// `python -m vco_lib.gateway_accounts` — the Claude account registry and the
+/// per-project account choice (`commands::gateway_accounts`). Same spawn
+/// recipe as the daemon, so the registry file it exports is the one the
+/// daemon reads.
+pub(crate) fn gateway_accounts_command(python: &Path, orchestrator_root: Option<&Path>) -> Command {
+    python_module_command(python, "vco_lib.gateway_accounts", orchestrator_root)
+}
+
 /// The writer spawn. Same `PYTHONPATH` as the daemon spawn (review R1-4):
 /// the writer imports `model_router` to resolve the gateway's port and its
 /// context table, and answers with a DEFAULT rather than an error when it

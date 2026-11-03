@@ -797,6 +797,9 @@ pub fn run() {
     // read plus tens of rows. Soft-fail end to end: every failure path inside
     // logs a line the user can act on and none of them can block boot.
     commands::chat_model_context::seed_and_export_on_boot(&db_handle);
+    // v0.2.105: re-write the gateway's copy of the Claude account registry
+    // from the launcher DB (fire-and-forget, soft-fail).
+    commands::gateway_accounts::export_on_boot();
 
     // v0.2.21 Step 19: launcher-startup project-row backfill. Sweep
     // every registered project and ensure the v0.2.21 resolver
@@ -3199,6 +3202,12 @@ pub fn run() {
             commands::codegraph_parsers::codegraph_parsers_decline,
             commands::codegraph_parsers::codegraph_parsers_install,
             commands::gateway_usage::model_gateway_usage_windows,
+            commands::gateway_accounts::gateway_accounts_list,
+            commands::gateway_accounts::gateway_accounts_add,
+            commands::gateway_accounts::gateway_accounts_remove,
+            commands::gateway_accounts::gateway_accounts_set_default,
+            commands::gateway_accounts::project_gateway_account_set,
+            commands::gateway_accounts::project_gateway_account_status,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.

@@ -707,7 +707,7 @@ class HealthTests(GatewayTestBase):
         "vendor_keys_stale",
         "secret_scope",
         "model_echo_mismatches",
-        "token_file_permissions", "host_token_file", "usage_ledger",
+        "token_file_permissions", "host_token_file", "usage_ledger", "accounts",
     }
 
     async def test_health_needs_no_token(self) -> None:

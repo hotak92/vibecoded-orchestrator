@@ -133,7 +133,7 @@ import ipaddress
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
 from typing import (
     Any,
@@ -149,7 +149,16 @@ import aiohttp
 from aiohttp import web
 
 from . import __version__
-from .auth import OAuthReader, host_token_stamp, token_matches
+from vco_lib.gateway_accounts import PRIMARY_ID as PRIMARY_ACCOUNT_ID
+
+from .accounts import (
+    AccountChoice,
+    AccountService,
+    append_notice,
+    conversation_key,
+    notice_eligible,
+)
+from .auth import OAuthReader, OAuthState, host_token_stamp, token_matches
 from .catalog import (
     USER_AGENT_HEADER,
     CatalogEntry,
@@ -274,6 +283,10 @@ _HOP_BY_HOP_REQUEST = frozenset(
         "x-api-key",
         "accept-encoding",
         "content-encoding",
+        # v0.2.105: the gateway's own account selector (``x-vco-account``,
+        # :mod:`model_router.accounts`). It chooses a login HERE and means
+        # nothing to any upstream, first-party or vendor.
+        "x-vco-account",
     }
 )
 
@@ -582,6 +595,13 @@ class Gateway:
         self.vendors = vendors
         self.anthropic = anthropic
         self.oauth = oauth_reader or OAuthReader(config.credentials_file)
+        #: v0.2.105: the Claude accounts (``primary`` is :attr:`oauth`, the
+        #: login this gateway has always used). With no registry file every
+        #: request is served by ``primary`` exactly as before.
+        self.accounts = AccountService(self.oauth, config.accounts_file)
+        #: The background login keeper (:mod:`model_router.account_refresh`),
+        #: attached by the DAEMON only — ``create_app`` starts nothing.
+        self.account_refresher: Optional[Any] = None
         self.keys = key_resolver or VendorKeyResolver(
             project=config.secret_project,
             ttl_s=config.key_ttl_s,
@@ -1024,7 +1044,16 @@ async def health_handler(request: web.Request) -> web.Response:
     the newest one, ``null`` before the first. Two in-memory counters and a
     path string that is resolved once and remembered: no file is opened, no
     directory is created and nothing is probed, which is what lets a liveness
-    probe carry it).
+    probe carry it),
+    ``accounts`` (v0.2.105, :mod:`model_router.accounts`: ``default``,
+    ``selector_header``, ``registry`` — ``path``/``source``
+    (``file``/``absent``)/``error`` — and one row per Claude account: ``id``,
+    ``label``, ``config_dir``, ``is_default``, ``oauth_state``,
+    ``oauth_expires_in_s``, ``usable``, ``fallbacks`` / ``last_fallback_at`` /
+    ``last_fallback_reason`` (how often a request asking for it was served by
+    another account, and why), ``refresh`` (the login keeper's last attempt,
+    ``null`` when none). One ``stat`` per account and cached parses — no
+    subprocess. The top-level ``oauth_*`` fields stay the ``primary`` login's).
     """
     gateway: Gateway = request.app[APP_KEY]
     oauth = gateway.oauth.read()
@@ -1081,6 +1110,10 @@ async def health_handler(request: web.Request) -> web.Response:
             # Cached counters and a resolved path — no directory is created
             # and no file is opened, so /health's "never blocks" holds.
             "usage_ledger": gateway.usage.health(),
+            "accounts": gateway.accounts.health(
+                gateway.account_refresher.status()
+                if gateway.account_refresher is not None else None
+            ),
         }
     )
 
@@ -1371,6 +1404,55 @@ class RequestFacts:
     #: sanitising) and written to the ledger row so a compaction call can be
     #: attributed instead of looking like a turn the user never typed.
     compaction: Optional[str] = None
+    #: v0.2.105: which Claude login served this first-party request, and
+    #: whether it was a fallback (:mod:`model_router.accounts`). ``None`` on
+    #: a vendor route, where no Claude account answers.
+    account: Optional[AccountChoice] = None
+
+
+async def _read_login(reader: OAuthReader) -> OAuthState:
+    """One login read, with the bounded wait for a CLI mid-rewrite (the
+    2026-10-28 incident; see :mod:`model_router.auth`)."""
+    oauth = reader.read()
+    if oauth.token is None and oauth.retry_soon:
+        oauth = await reader.aread_with_brief_wait()
+    return oauth
+
+
+async def _choose_account(
+    gateway: "Gateway", headers: Mapping[str, str],
+) -> "tuple[AccountChoice, OAuthState, int]":
+    """The account that serves a first-party request, its login, and the
+    fallback episode (``0`` when there is no fallback).
+
+    Never refuses (owner ruling 2026-11-03): an account that cannot be used
+    is replaced by the fallback account and the fallback is recorded LOUDLY
+    (:meth:`AccountService.note_fallback`). Only when the fallback's own login
+    is unusable does the caller answer 401 — exactly today's behaviour for
+    the single-account install.
+    """
+    accounts = gateway.accounts
+    requested, source, early = accounts.requested(headers)
+    if early is None:
+        reader = accounts.reader(requested)
+        assert reader is not None  # noqa: S101 — `requested` resolved it
+        oauth = await _read_login(reader)
+        if oauth.token is not None:
+            accounts.note_usable(requested)
+            return AccountChoice(requested, source, requested), oauth, 0
+        if requested == PRIMARY_ACCOUNT_ID:
+            # The last resort itself: nothing to fall back to.
+            return AccountChoice(requested, source, requested), oauth, 0
+        reason = oauth.state
+    else:
+        reason = early
+    served = accounts.fallback_for(requested)
+    reader = accounts.reader(served)
+    assert reader is not None  # noqa: S101 — the fallback always resolves
+    oauth = await _read_login(reader)
+    choice = AccountChoice(requested, source, served, reason)
+    episode = accounts.note_fallback(choice)
+    return choice, oauth, episode
 
 
 def _route_label(decision: Route) -> str:
@@ -1469,6 +1551,11 @@ def _submit_usage(
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
         compaction=facts.compaction,
+        account=facts.account.served if facts.account is not None else None,
+        account_source=facts.account.source if facts.account is not None else None,
+        account_fallback=(
+            facts.account.fallback_reason if facts.account is not None else None
+        ),
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -2574,6 +2661,33 @@ def _ladder_escalation(
     return escalate
 
 
+def _inject_fallback_notice(
+    gateway: "Gateway",
+    choice: AccountChoice,
+    episode: int,
+    session: Optional[str],
+    client_payload: Mapping[str, Any],
+    forward_payload: dict,
+) -> Optional[dict]:
+    """``forward_payload`` with the fallback notice appended, or ``None``
+    when this request must not carry it (not eligible, or the conversation
+    was already told). The conversation is recognised on the CLIENT's own
+    body (``client_payload``) so a gateway-side repair cannot change it."""
+    if not notice_eligible(forward_payload):
+        return None
+    conv = conversation_key(session, client_payload)
+    if conv is None:
+        return None
+    key = (choice.requested, episode, conv)
+    if not gateway.accounts.notices.claim(key):
+        return None
+    try:
+        return append_notice(forward_payload, gateway.accounts.notice_for(choice))
+    except Exception:
+        gateway.accounts.notices.release(key)
+        raise
+
+
 async def messages_handler(request: web.Request) -> web.StreamResponse:
     """Proxy ``/v1/messages`` and ``/v1/messages/count_tokens``.
 
@@ -2851,19 +2965,18 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     effort_translated = False
     text_only_images_omitted = 0
     clear_thinking_applied = False
+    account_note = ""
     if decision.is_anthropic:
-        oauth = gateway.oauth.read()
-        if oauth.token is None and oauth.retry_soon:
-            # v0.2.105: the credentials file carries no token RIGHT NOW and
-            # that is a CLI rewriting it (2026-10-28: three minutes of 401
-            # ``claude_login_unavailable`` for every first-party request).
-            # One bounded, off-loop re-read before answering — the rewrite is
-            # a millisecond-scale affair, and a request that waits 400 ms for
-            # it is a request that never failed. Bounded twice: only for a
-            # TRANSIENT verdict, never more than ``_REREAD_BUDGET_S``.
-            oauth = await gateway.oauth.aread_with_brief_wait()
+        # v0.2.105: WHICH login serves this request (``x-vco-account``, else
+        # the default account), with the loud fallback when it cannot be
+        # used. The bounded re-read for a CLI mid-rewrite (2026-10-28: three
+        # minutes of 401 ``claude_login_unavailable``) happens inside, per
+        # account — see `_read_login`.
+        choice, oauth, episode = await _choose_account(gateway, request.headers)
+        facts = _dc_replace(facts, account=choice)
+        account_note = choice.access_fields()
         if oauth.token is None:
-            log_local(401, "claude_login_unavailable")
+            log_local(401, f"claude_login_unavailable {account_note}")
             return _json_error(401, "authentication_error", oauth.problem or "")
         headers["Authorization"] = f"Bearer {oauth.token}"
         beta = headers.get("anthropic-beta", "")
@@ -2903,6 +3016,27 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                         repair.summary(),
                         ", ".join(str(i) for i in repair.touched_indexes) or "-",
                     )
+
+        # v0.2.105 (owner ruling 2026-11-03): tell the MODEL about a
+        # fallback — once per conversation, appended LAST so the cached
+        # prompt prefix is untouched. See `model_router.accounts`.
+        if (
+            choice.fell_back
+            and forward_payload is not None
+            and payload is not None
+            and not is_count_tokens
+        ):
+            injected = _guarded(
+                _inject_fallback_notice,
+                gateway, choice, episode, facts.session, payload, forward_payload,
+                what="account fallback notice",
+            )
+            if injected is _ABANDON:
+                rewrite_failed = True
+            elif injected is not None:
+                forward_payload = injected
+                mutated = True
+                account_note = f"{account_note} note=account_notice_injected"
     else:
         vendor = decision.vendor
         assert vendor is not None  # noqa: S101 — guaranteed by Route
@@ -3048,6 +3182,8 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
 
     body: "bytes | AsyncIterator[bytes]"
     note = "note=rewrite_failed" if rewrite_failed else ""
+    if account_note:
+        note = f"{note} {account_note}".strip()
     # Per-transform notes (items a/f). Each says a request-shaping fired,
     # with the count where one is meaningful, and none of them logs a body
     # byte. Assembled here so they ride EVERY access line this request writes.
@@ -3142,6 +3278,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
 
 def _reread_oauth_headers(
     gateway: "Gateway", headers: dict[str, str],
+    account: "Optional[AccountChoice]" = None,
 ) -> "Optional[dict[str, str]]":
     """Headers carrying a NEWER Claude login, or ``None`` if nothing changed.
 
@@ -3157,7 +3294,12 @@ def _reread_oauth_headers(
     without owning any part of the refresh protocol. ``None`` means the file
     still holds the token we just used, so a retry would only repeat the 401.
     """
-    fresh = gateway.oauth.read()
+    # v0.2.105: the SAME account's file — a 401 on one login is never
+    # answered with another login's token.
+    reader = (
+        gateway.accounts.reader(account.served) if account is not None else None
+    ) or gateway.oauth
+    fresh = reader.read()
     if not fresh.token:
         return None
     presented = headers.get("Authorization", "")
@@ -3394,7 +3536,9 @@ async def _proxy(
                 # sent twice — that request carries the 401 to the client,
                 # which is what native does when its own retry is impossible.
                 # `allow_oauth_retry=False` below is what bounds this at one.
-                refreshed = _reread_oauth_headers(gateway, headers)
+                refreshed = _reread_oauth_headers(
+                    gateway, headers, facts.account if facts is not None else None,
+                )
                 if refreshed is not None:
                     return await _proxy(
                         request,

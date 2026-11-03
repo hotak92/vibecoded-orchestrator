@@ -131,6 +131,9 @@ pub mod codegraph_parsers;
 // are the gateway's (`GET /usage/windows`), read through
 // `python -m vco_lib.gateway_usage` so the host token never enters Rust.
 pub mod gateway_usage;
+// v0.2.105: Claude accounts served by the model gateway (registry, default,
+// per-project choice), through `python -m vco_lib.gateway_accounts`.
+pub mod gateway_accounts;
 // v0.2.33 Agent A (L0): public-catalog endpoint client. Fetches paid-module
 // catalog metadata from the launcher-controlled Supabase edge function with
 // retry-with-backoff + 15min app_state-backed cache + schema_version

@@ -407,6 +407,12 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # (test_canonical_env_key_parity_v0273.py) passes. Value = folder path;
     # always emitted (never None).
     "KG_BASE_DIR",
+    # v0.2.105: the model-gateway account selector
+    # (``x-vco-account: <id>``, :mod:`vco_lib.gateway_accounts`). Python-only
+    # (the subset parity test allows that direction); machine-local, because
+    # the account is this user's choice on this machine. Conditionally
+    # emitted — omitted for "use the default account".
+    "ANTHROPIC_CUSTOM_HEADERS",
 )
 
 
@@ -464,6 +470,9 @@ MACHINE_LOCAL_ENV_KEYS: frozenset[str] = frozenset({
     "VCT_CODE_GRAPH_ACCESS_LIST",
     "VCT_EXTERNAL_COLLECTIONS",
     "VCT_UNMANAGED_CONTAINERS",
+    # v0.2.105: which of THIS user's Claude logins the gateway serves the
+    # project with — a per-user, per-machine choice, never committed.
+    "ANTHROPIC_CUSTOM_HEADERS",
     # machine service endpoints
     "WEAVIATE_URL",
     "WEAVIATE_PORT",
@@ -2136,6 +2145,15 @@ def project_env_from_db(
         # (vco_lib/service_endpoints.py, mirrored by the hub): row → compiled
         # default, no other leg.
         endpoint_rows = _service_endpoints.read_rows(conn)
+        # v0.2.105: the Claude account this project selects through the model
+        # gateway (Project -> Identity -> Claude account). The registry and
+        # its rule live in ONE home, vco_lib.gateway_accounts; ``None`` (no
+        # explicit choice) omits the key, so a selector VCO wrote earlier is
+        # removed and the gateway's default account applies.
+        from vco_lib import gateway_accounts as _gateway_accounts
+        gateway_account_header = _gateway_accounts.project_header_value(
+            _gateway_accounts.registry_from_conn(conn), project_id,
+        )
     finally:
         try:
             conn.close()
@@ -2332,6 +2350,8 @@ def project_env_from_db(
         # Same value; the legacy alias kept until the wrappers fully
         # migrate to VCT_ORCHESTRATOR_ROOT.
         _set("VCT_INSTALL_ROOT", str(orchestrator_root))
+
+    _set("ANTHROPIC_CUSTOM_HEADERS", gateway_account_header)
 
     if kg_access:
         _set("VCT_KG_ACCESS_LIST", ",".join(kg_access))
