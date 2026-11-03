@@ -239,8 +239,9 @@
       </span>
       <strong class="dl-title">{e.title}</strong>
       <code class="dl-cid">{e.condition_id}</code>
-      <!-- v0.2.105 (L-SMALL): the whole entry — title, condition id, body and
-           the exact remedy command — so it can be pasted elsewhere. -->
+      <!-- v0.2.105: the whole entry as the row shows it (severity,
+           disposition, detected, body, retries, the exact remedy command,
+           context refs) — so it can be pasted elsewhere. -->
       <CopyButton
         text={entryCopyText(e, view)}
         label="Copy this pending action"

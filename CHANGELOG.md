@@ -61,8 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Context-injection hooks no longer time out.** On a busy project the hooks that add knowledge-graph and code-graph context before an edit, a write, a shell command and a prompt were hitting their 10 s limit on most runs (65-92 % on one project measured from the chat transcripts), so Claude Code waited 10 s and then got no context. The cause: after finding its context, the hook read every pending citation record of the project, one per search of every chat, often 1-8 MB each and thousands of files, which took far longer than the limit. It now touches only the records it wrote itself. On top of that, every injection run now has a hard deadline of 7 s from the moment the hook started (`VCO_INJECT_HARD_DEADLINE_S`): whatever it is still doing then, it stops and lets the tool call proceed without extra context, instead of making Claude Code wait out the timeout. On Windows the shell-command hook also no longer waits for its learning-signal event to be sent: that now happens in the background, as it already did on Linux and macOS.
 
 - **A pending action in the launcher can be copied with one click.** Every entry in a project's pending-actions panel
-  (project Settings) and in Preferences → Updates now has a Copy button beside Dismiss. It copies the whole entry —
-  title, condition id, scope, what was detected, why it was deferred and the exact remedy command, kept verbatim — so
+  (project Settings) and in Preferences → Updates now has a Copy button beside Dismiss. It copies the whole entry as
+  the row shows it — title, condition id, scope, severity, disposition and what it means, when it was detected, what
+  was detected, why it was deferred, the retry history, the exact remedy command (kept verbatim) and the context
+  notes — so
   it can be pasted into a bug report or a chat without retyping the command. It is the same button and the same
   clipboard routine as the notification bell's Copy, and the text it copies is built by one tested helper.
 
@@ -90,13 +92,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The hub's container watchdog now restarts VCO's own Weaviate and Ollama even when they are recorded as "adopted".** On a machine where the service reconcile had recorded VCO's own containers as adopted (`adopted_container` with autostart), the session hooks started them when a chat opened, but the hub's watchdog skipped them entirely, so a Weaviate or Ollama that stopped mid-session stayed down until the next session start. The watchdog now starts such a container by name when its compose labels prove it belongs to VCO's own stack. It never creates, re-composes or removes it, and a container adopted from another project or started by hand is still left alone.
 - **The hub comes back on its own when it dies mid-session.** The hub was started when a chat opened or resumed, by the launcher, by install, and by the opt-in login autostart (which already restarts a crashed hub). Between those moments a hub that died stayed down, in one case for two days, and every vendor key kept in the OS keychain became unreachable. Now each prompt checks the hub's lockfile in the background and starts the hub only when it is down. The model gateway does the same when a key read finds the hub refusing connections, so vendor keys come back without anyone acting. Both use one rule (`python -m vco_lib.hub_ensure revive`): the hub is never restarted during an orchestrator update, at most one start is attempted per minute across the machine, and each start is logged to `~/.vct/logs/hub-revive.log`.
 
-- **Implementer agents may commit their own work on their own worktree branch.** Owner ruling 2026-11-03: the
+- **Implementer agents may commit their own work in their own worktree.** Owner ruling 2026-11-03: the
   shipped implementer definitions (`glm-implementer`, `glm-implementer-high`, `qwen-implementer`,
   `qwen-implementer-high`, `deepseek-implementer`, `kimi-implementer`, `qwen-flash-sweeper`) used to forbid every git
-  command; they now allow `git add` and `git commit` on their own branch only, with the commit message ending in a
-  `Co-Authored-By:` line naming the model that wrote it. Everything else stays forbidden — no push, stash, checkout,
-  restore, reset or clean, and never another worktree. The worktree isolation guide and the shipped CLAUDE templates
-  say the same, and the coordinator still reviews and merges the branch.
+  command; they now allow `git add` and `git commit` on the worktree's current HEAD only — the detached HEAD the
+  harness creates, or a lane reservation's branch; a lane never creates or switches a branch — with the commit message
+  ending in a `Co-Authored-By:` line naming the model that wrote it, plus read-only `git status` / `git diff` /
+  `git log`. Everything else stays forbidden — no push, stash, checkout, switch, restore, reset or clean, and never
+  another worktree. The lane reports its commit shas; the coordinator names a branch for them, reviews and merges. The
+  worktree isolation guide and the shipped CLAUDE templates say the same.
 
 ### Fixed
 
