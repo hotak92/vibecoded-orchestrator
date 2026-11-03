@@ -198,9 +198,9 @@ if ($VcoRt.state -ne "resolved") {
     # ONE home, `python -m vco_lib.container_engine_start ensure`:
     # idempotent (an engine that answers is a no-op), starts ONLY the
     # runtime this install uses (a refused pin is started, never swapped),
-    # soft-fail, honours VCT_CONTAINER_ENGINE_AUTOSTART=0. Start-Process
-    # returns immediately (never blocks the hook); -WindowStyle applies on
-    # Windows only, so it is dropped on other OSes. Only when a runtime
+    # soft-fail, honours VCT_CONTAINER_ENGINE_AUTOSTART=0. The detached
+    # spawn (_lib/resolve-powershell.ps1, windowless on Windows) returns
+    # immediately and never blocks the hook. Only when a runtime
     # binary exists ($VcoRt.installed) - with nothing installed there is
     # nothing to start.
     if ($VcoRt.installed) {
@@ -271,7 +271,17 @@ if ($VcoRt.state -ne "resolved") {
                 }
             }
         } catch { $EngineSpawned = $false }
+        if (-not $EngineSpawned -and (Get-Command Start-VcoDetachedProcess -ErrorAction SilentlyContinue)) {
+            # v0.2.105: the direct fallback goes through the ONE windowless
+            # spawn home too (a Start-Process child gets a console window that
+            # -WindowStyle Hidden only asks to hide). It reports its own
+            # failure on stderr and never throws.
+            Start-VcoDetachedProcess -FilePath $RunPy -ArgumentList @('-m', 'vco_lib.container_engine_start', 'ensure')
+            $EngineSpawned = $true
+        }
         if (-not $EngineSpawned) {
+            # Last resort, only when _lib/resolve-powershell.ps1 itself could
+            # not be loaded (a damaged hooks folder): plain Start-Process.
             try {
                 $startArgs = @{ FilePath = $RunPy
                                 ArgumentList = @('-m', 'vco_lib.container_engine_start', 'ensure')
