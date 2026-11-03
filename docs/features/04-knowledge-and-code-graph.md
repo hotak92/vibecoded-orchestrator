@@ -109,6 +109,8 @@ Stores chunks from files dropped in `documents/`. Created on demand by `process_
 ### Per-project KG routing via `KG_COLLECTION` env var
 Each project sets `KG_COLLECTION` in `.claude/settings.json` `env` — the canonical per-project MCP env channel. Opening a different project workspace redirects all KG reads/writes to that project's collection without code changes. The launcher does not write `.vscode/settings.json` `claude-code.env` for this: empirical sentinel testing on Linux showed that block does not propagate to MCP subprocesses.
 
+**A project's own collection is never the shared one (v0.2.105).** Only the orchestrator root uses one class for both roles. The update-time cross-prefix adoption (`vco_lib.kg_binding_heal`) never adopts, as a project's PRIMARY, the shared class or a class another project binds, and the launcher's binding writers (Identity tab KG field, KG tab picker, re-detect from disk) refuse it through `python -m vco_lib.kg_primary_shared status --candidate`. Projects an older update already bound that way are listed by the doctor as `kg_primary_bound_to_shared` and get a banner with "Repair primary KG binding" on their Identity tab (re-points the binding to the name-derived class; nothing is moved or deleted).
+
 ---
 
 ## Weaviate Collections: Code Graph
