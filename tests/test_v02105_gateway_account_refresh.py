@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import stat
 import sys
 import tempfile
 import textwrap
@@ -227,22 +226,26 @@ _DOUBLE = textwrap.dedent('''\
 ''')
 
 
-@unittest.skipIf(os.name == "nt", "the double is a POSIX executable script")
+async def _python_runner(argv, env, cwd, timeout):
+    """The real runner, with the double run by this interpreter (portable:
+    no shebang, no exec bit, the same on every OS)."""
+    return await ar.default_runner([sys.executable, *argv], env, cwd, timeout)
+
+
 class TestDoubleTests(_Base):
     """Which command rewrites the credentials file, against a double that
     behaves like the shipped CLI read on 2026-11-03."""
 
     def make_double(self) -> str:
-        path = self.root / "claude"
-        path.write_text(f"#!{sys.executable}\n{_DOUBLE}")
-        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        path = self.root / "claude_double.py"
+        path.write_text(_DOUBLE)
         return str(path)
 
     async def test_the_keepers_command_renews_through_a_real_child(self) -> None:
         write_login(self.work_dir, TOKEN, 60)
         before = (self.work_dir / ".credentials.json").stat().st_mtime_ns
-        keeper = self.keeper(runner=ar.default_runner, claude_bin=self.make_double(),
-                             base_env={"PATH": os.environ.get("PATH", "")})
+        keeper = self.keeper(runner=_python_runner, claude_bin=self.make_double(),
+                             base_env=dict(os.environ))
         done = await keeper.tick()
         self.assertEqual([a.outcome for a in done], [ar.OUTCOME_RENEWED])
         self.assertNotEqual((self.work_dir / ".credentials.json").stat().st_mtime_ns, before)
@@ -251,19 +254,18 @@ class TestDoubleTests(_Base):
         write_login(self.work_dir, TOKEN, 60)
         double = self.make_double()
         before = (self.work_dir / ".credentials.json").read_bytes()
-        code = await ar.default_runner(
-            [double, "auth", "status"], {"CLAUDE_CONFIG_DIR": str(self.work_dir)},
+        code = await _python_runner(
+            [double, "auth", "status"], {**os.environ, "CLAUDE_CONFIG_DIR": str(self.work_dir)},
             self.root, 30,
         )
         self.assertEqual(code, 0)
         self.assertEqual((self.work_dir / ".credentials.json").read_bytes(), before)
 
     async def test_the_default_runner_kills_a_hung_child(self) -> None:
-        hang = self.root / "hang"
-        hang.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
-        hang.chmod(hang.stat().st_mode | stat.S_IXUSR)
+        hang = self.root / "hang.py"
+        hang.write_text("import time\ntime.sleep(30)\n")
         started = time.monotonic()
-        code = await ar.default_runner([str(hang)], {}, self.root, 0.5)
+        code = await _python_runner([str(hang)], dict(os.environ), self.root, 0.5)
         self.assertIsNone(code)
         self.assertLess(time.monotonic() - started, 10)
 
