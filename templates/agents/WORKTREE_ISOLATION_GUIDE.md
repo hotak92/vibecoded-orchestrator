@@ -130,6 +130,17 @@ repository with no commits fails with `Failed to resolve base branch "HEAD"`, an
 with `not in a git repository and no WorktreeCreate hooks are configured`. If you disable `worktree-guard`
 from the launcher, those projects lose their isolated agents until the repository has a commit.
 
+## Committing inside the worktree
+
+An implementer lane runs isolated, so the owner's 2026-11-03 ruling lets it commit its own work:
+`glm-implementer`, `glm-implementer-high`, `qwen-implementer`, `qwen-implementer-high`,
+`deepseek-implementer`, `kimi-implementer` and `qwen-flash-sweeper` MAY run `git add` and `git commit` **on their
+own worktree branch only**, with the message ending in a `Co-Authored-By:` line naming the model that wrote it.
+Nothing else: never `push`, `stash`, `checkout`, `restore`, `reset` or `clean`, and never touch another worktree.
+The coordinator reviews the branch and merges it.
+
+Read-only lanes (researchers, reviewers, planners) still never run git: they write one report file and return.
+
 ## Merging worktree changes
 
 After an agent with worktree isolation completes, if it made changes, its worktree is kept (path in the
@@ -140,8 +151,9 @@ HEAD, so give the agent's commits a branch before merging:
 git -C <worktree> status
 git -C <worktree> diff HEAD
 
-# Keep it: commit in the worktree if needed, name the result, merge
-git -C <worktree> switch -c agent-work      # or: git -C <worktree> commit ... first
+# Keep it: the lane may already have committed on its own branch; otherwise
+# commit in the worktree, name the result, merge
+git -C <worktree> switch -c agent-work      # skip when the lane's branch exists already
 git merge agent-work
 
 # Clean up (after merging, or to discard)
