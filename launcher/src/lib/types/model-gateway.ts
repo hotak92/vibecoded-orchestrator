@@ -51,6 +51,12 @@ export interface GatewayHealth {
   usage_ledger?: GatewayUsageLedger | null;
   /** `owner_only` | `broader` | `unknown` for the gateway's token file. */
   token_file_permissions: string;
+  /** v0.2.105: the Claude accounts block (`/health` `accounts`): the
+   *  default account and one row per account. */
+  accounts?: {
+    default?: string;
+    accounts?: import('$lib/api/gateway_accounts').GatewayAccountView[];
+  } | null;
 }
 
 /** `/health`'s `secret_scope` block. */

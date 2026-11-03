@@ -28,6 +28,8 @@ export interface LoginCommands {
 /** The running gateway's view of one account (`/health` `accounts`). */
 export interface GatewayAccountView {
   id: string;
+  label?: string;
+  is_default?: boolean;
   usable: boolean;
   oauth_state: string;
   oauth_expires_in_s: number | null;
@@ -221,6 +223,27 @@ export function saveOutcome(answer: MutationAnswer): { text: string; tone: 'ok' 
     return { text: `Claude account saved, but not in force yet: ${driftText(answer.status)}`, tone: 'warn' };
   }
   return { text: 'Claude account saved — the next request of a running chat uses it.', tone: 'ok' };
+}
+
+/**
+ * One Services-card line per Claude account the running gateway serves
+ * (`/health` `accounts`): its login, and how often it fell back. `[]` while
+ * only the user's own login exists — the card's "Claude login" row already
+ * says everything then.
+ */
+export function gatewayAccountLines(
+  accounts: GatewayAccountView[] | null | undefined,
+): { id: string; text: string; tone: Tone }[] {
+  if (!accounts || accounts.length < 2) return [];
+  return accounts.map((a) => {
+    const login = loginVerdict({ login: null, gateway: a });
+    const name = a.label ? `${a.label} (${a.id})` : a.id;
+    const fell = a.fallbacks
+      ? ` — fell back ${a.fallbacks}×${a.last_fallback_reason ? ` (${a.last_fallback_reason})` : ''}`
+      : '';
+    const def = a.is_default ? ' · default' : '';
+    return { id: a.id, text: `${name}${def}: ${login.text}${fell}`, tone: a.fallbacks ? 'warn' : login.tone };
+  });
 }
 
 /** The picker is shown once a second account exists. */

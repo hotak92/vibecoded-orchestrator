@@ -121,6 +121,16 @@ if (Test-Path $VenvLib) {
             Start-VcoDetachedProcess -FilePath $VcoVenvPython -ArgumentList @(
                 '-m', 'vco_lib.scratch_dir', 'sweep', '--project', "$ProjectDir",
                 '--ensure-precreated') | Out-Null
+            # v0.2.105: which Claude account this project's gateway chats are
+            # billed to - printed ONLY once a second account exists (the one
+            # home is vco_lib.gateway_accounts session-line).
+            # PARITY: session-start-kg-loader.sh prints the same line.
+            try {
+                $acctLine = @(& $VcoVenvPython -m vco_lib.gateway_accounts session-line --folder "$ProjectDir" 2>$null)
+                if ($LASTEXITCODE -eq 0 -and $acctLine.Count -gt 0) {
+                    Write-Output (($acctLine | ForEach-Object { "$_" }) -join "`n")
+                }
+            } catch { }
         }
     } catch { }
 }

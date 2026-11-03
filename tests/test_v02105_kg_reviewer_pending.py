@@ -641,7 +641,9 @@ def _stub_venv(tmp_path: Path) -> Path:
 def _reinject_argv(impl: str) -> "list[str]":
     if impl == "sh":
         return ["bash", str(_HOOKS / "compact-context-reinject.sh")]
-    return [str(_PWSH), "-NoProfile", "-NonInteractive", "-File",
+    from tests.common.pwsh import PWSH_BASE_FLAGS
+
+    return [str(_PWSH), *PWSH_BASE_FLAGS, "-NonInteractive", "-File",
             str(_HOOKS / "compact-context-reinject.ps1")]
 
 

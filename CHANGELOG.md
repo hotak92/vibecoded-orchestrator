@@ -28,7 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   using your current account, so nothing changes until you switch one. The choice is written only into the project's
   private `.claude/settings.local.json` — never into a file you commit — and an `ANTHROPIC_CUSTOM_HEADERS` of your own
   is never changed or removed; when that file is committed to git, or holds headers of your own, the Identity tab says
-  what to do instead of claiming the choice is in force. If the chosen account cannot be used (not
+  what to do instead of claiming the choice is in force. Each added account's own 5-hour and weekly usage appears on
+  the Home usage card and in the gateway status line (`Claude/<id> 5h …`), read with that account's own login; the
+  Services page's gateway card lists every account with its login state and fallback count; and once a second account
+  exists, every session start says which account the project's gateway chats are billed to. If the chosen account cannot be used (not
   logged in, expired), the chat carries on with your default account and says so: a warning in the gateway log, a
   note on the accounts page and the project page, and a one-time notice to the model naming the account it is billed
   to and how to log back in. The gateway renews an added account's login on its own shortly before it expires,

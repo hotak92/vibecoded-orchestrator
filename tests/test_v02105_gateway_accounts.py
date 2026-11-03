@@ -161,6 +161,23 @@ class SelectionTests(AccountsTestBase):
         rows = await self.ledger_rows()
         self.assertIsNone(rows[-1]["account"], "a vendor route is served by no Claude account")
 
+    async def test_usage_windows_are_read_and_filed_per_account(self) -> None:
+        """L-ACCT: every added account's usage is fetched with its OWN login,
+        and the rate-limit headers of an answer are filed under the account
+        that served it."""
+        from unittest import mock
+
+        self.write_registry()
+        gw = self.client.app[APP_KEY]
+        label, extras = gw._usage_accounts()  # noqa: SLF001
+        self.assertEqual(label, gw.accounts.registry().label_of("primary"))
+        self.assertEqual([(a, t) for a, _l, t in extras],
+                         [("work", WORK_TOKEN), ("team", TEAM_TOKEN)])
+        with mock.patch.object(gw.usage_windows, "observe_anthropic_headers") as tap:
+            await self.send(conversation("hi"), account="work")
+            await self.send(conversation("hi"))
+        self.assertEqual([c.args[1] for c in tap.call_args_list], ["work", "primary"])
+
     async def test_the_default_account_follows_the_registry_without_restart(self) -> None:
         self.write_registry(default="work")
         await self.send(conversation("hi"))

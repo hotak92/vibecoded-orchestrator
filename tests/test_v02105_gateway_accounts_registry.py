@@ -333,3 +333,67 @@ def test_a_failed_projection_still_reports_the_save(env, monkeypatch):
     assert out["projection_error"].startswith("SettingsWriteRefused")
     assert ga.load(db).projects["p-1"] == "work"
     assert out["status"]["drift"] is True
+
+
+# ── L-ACCT: the session-start line ────────────────────────────────────────
+
+
+def test_session_line_only_once_a_second_account_exists(env):
+    tmp, project, db = env
+    assert ga.session_line(ga.Registry(), "p-1", project) == ""
+    reg = ga.add_account(ga.Registry(), account_id="work", label="Work seat",
+                         config_dir=str(tmp / "w"))
+    line = ga.session_line(reg, "p-1", project, {"primary": {"usable": True}})
+    assert line.startswith("## Claude account\n")
+    assert "billed to \"" in line and "(primary, the default account)" in line
+    assert ga.session_line(reg, None, project) == "", "an unregistered folder says nothing"
+    reg = ga.set_project(reg, "p-1", "work")
+    on = ga.session_line(reg, "p-1", project, {"work": {"usable": True}})
+    assert "\"Work seat\" (work, this project's choice)" in on
+    assert "does not carry that choice yet" in on  # nothing projected in this unit test
+    off = ga.session_line(reg, "p-1", project, {"work": {"usable": False}})
+    assert "which cannot be used right now" in off and "(primary)" in off
+
+
+def test_session_line_cli_prints_nothing_with_one_account(env):
+    _tmp, project, db = env
+    out = io.StringIO()
+    with redirect_stdout(out):
+        assert ga.main(["--db", str(db), "session-line", "--folder", str(project)]) == 0
+    assert out.getvalue() == ""
+
+
+@pytest.mark.parametrize("sibling", ["sh", "ps1"])
+def test_the_session_start_hook_names_the_projects_account(env, sibling, tmp_path):
+    """The line reaches the session: both hook siblings print it."""
+    import shutil
+    import subprocess
+    import sys as _sys
+
+    from tests.common.child_env import child_env
+    from tests.common.pwsh import PWSH_BASE_FLAGS
+
+    tmp, project, db = env
+    if sibling == "ps1" and shutil.which("pwsh") is None:
+        pytest.skip("pwsh not installed")
+    if sibling == "sh" and _sys.platform == "win32":
+        pytest.skip("bash leg")
+    ga.save(ga.set_project(ga.add_account(ga.Registry(), account_id="work", label="Work seat",
+                                          config_dir=str(tmp / "w")), "p-1", "work"), db)
+    (project / ".claude").mkdir(exist_ok=True)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    os.symlink(_sys.executable, venv / "bin" / "python3")
+    hooks = Path(__file__).resolve().parent.parent / "templates" / "hooks"
+    argv = (["bash", str(hooks / "session-start-kg-loader.sh")] if sibling == "sh" else
+            [shutil.which("pwsh"), *PWSH_BASE_FLAGS, "-NonInteractive", "-File",
+             str(hooks / "session-start-kg-loader.ps1")])
+    env_ = child_env(CLAUDE_PROJECT_DIR=str(project), VCT_VENV=str(venv),
+                     VCT_LAUNCHER_DB_PATH=str(db), VCT_STATE_DIR=str(tmp / "vct"),
+                     STDERR_CAP_DISABLE="1", RL_SERVER_LAUNCHER=str(tmp / "none"))
+    env_.pop("VCT_DISABLE_HOOKS", None)
+    proc = subprocess.run(argv, cwd=project, env=env_, input="{}", capture_output=True,
+                          text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert "## Claude account" in proc.stdout, proc.stdout + proc.stderr
+    assert "\"Work seat\" (work" in proc.stdout or "cannot be used right now" in proc.stdout

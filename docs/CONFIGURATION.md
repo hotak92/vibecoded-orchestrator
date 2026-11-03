@@ -854,6 +854,12 @@ example your personal plan and a seat on a second organisation account — and e
   workspace is trusted). The prompt cache does not carry across accounts. It applies only to chats that go through the
   gateway (`multimodel` mode, or a CLI pointed at it); in `remote-control` mode the panel uses its native login. The
   gateway never forwards the `x-vco-account` header to any upstream.
+- *Seeing each account.* Each added account's 5h and weekly usage is read with that account's own login and shows as
+  its own row (`Claude/<id>`) on the Home usage card and in the gateway status line; the rate-limit headers of an
+  answer are filed under the account that served it, so one account's numbers never appear as another's. The
+  Services page's gateway card lists every account (login state, expiry, fallbacks) once there are two, and a
+  session start prints `## Claude account` naming the account the project's gateway chats are billed to
+  (`python -m vco_lib.gateway_accounts session-line --folder <project>`; nothing with a single account).
 - *An account that cannot be used never stops a chat.* Unknown id, malformed header, unreadable registry, not logged
   in, expired, or renewal failed: the request is served — and billed — by the default account when that is a
   different, usable one, else by `primary`. It is loud: a WARNING in `~/.vct/logs/model-gateway.log` (repeated every

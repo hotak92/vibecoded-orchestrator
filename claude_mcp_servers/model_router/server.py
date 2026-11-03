@@ -688,7 +688,20 @@ class Gateway:
             vendor_key=self._catalog_vendor_key,
             fetch=session_fetcher(lambda: self.session),
             ledger_path=lambda: self.usage.path,
+            accounts=self._usage_accounts,
         )
+
+    def _usage_accounts(self) -> "tuple[str, list[tuple[str, str, Optional[str]]]]":
+        """The user's own login's label and every ADDED Claude account with its
+        current bearer, for the per-account usage rows (v0.2.105). Runs off
+        the event loop (a macOS Keychain read may be a subprocess)."""
+        reg = self.accounts.registry()
+        extras: list[tuple[str, str, Optional[str]]] = []
+        for acct in reg.accounts:
+            reader = self.accounts.reader(acct.id, reg)
+            extras.append((acct.id, reg.label_of(acct.id),
+                           reader.read().token if reader is not None else None))
+        return reg.label_of(PRIMARY_ACCOUNT_ID), extras
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -3764,6 +3777,9 @@ async def _proxy(
                 _guarded(
                     gateway.usage_windows.observe_anthropic_headers,
                     upstream.headers,
+                    # Filed under the account that SERVED it (v0.2.105).
+                    facts.account.served
+                    if facts is not None and facts.account is not None else None,
                     what="usage-window header capture",
                 )
             content_type = upstream.headers.get("Content-Type", "application/json")

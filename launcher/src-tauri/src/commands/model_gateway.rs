@@ -605,6 +605,13 @@ pub struct GatewayHealth {
     /// `owner_only` / `broader` / `unknown` for the gateway's token file.
     #[serde(default)]
     pub token_file_permissions: String,
+    /// v0.2.105: the Claude accounts block — `default` plus `accounts`, one
+    /// row per account the gateway serves (`id`, `label`, `oauth_state`,
+    /// `oauth_expires_in_s`, `usable`, fallback counts, the keeper's last
+    /// `refresh`) — names, states and expiries only. Passed through verbatim for the Services card's per-account
+    /// lines; without this field serde dropped it on the way to the GUI.
+    #[serde(default)]
+    pub accounts: Option<serde_json::Value>,
 }
 
 // ─── Login registration: the THIRD state ──────────────────────────────────
@@ -2333,6 +2340,24 @@ mod tests {
         assert_eq!(parsed.catalog_source.get("zai").map(String::as_str), Some("static"));
         assert_eq!(parsed.token_file_permissions, "owner_only");
         assert_eq!(parsed.oauth_state, "absent");
+    }
+
+    #[test]
+    fn health_payload_carries_the_per_account_rows() {
+        // v0.2.105: the Services card's per-account lines read these; a
+        // struct without the field dropped them on the way to the GUI.
+        let json = r#"{"ok": true, "accounts": {"default": "primary", "accounts": [
+            {"id": "primary", "label": "Personal", "usable": true, "oauth_state": "present"},
+            {"id": "work", "label": "Work", "usable": false, "oauth_state": "expired", "fallbacks": 2}
+        ]}}"#;
+        let parsed: GatewayHealth = serde_json::from_str(json).unwrap();
+        let block = parsed.accounts.expect("accounts carried through");
+        assert_eq!(block["accounts"][1]["id"], "work");
+        assert_eq!(block["accounts"][1]["fallbacks"], 2);
+        let out =
+            serde_json::to_value(GatewayHealth { accounts: Some(block), ..Default::default() })
+                .unwrap();
+        assert_eq!(out["accounts"]["accounts"][0]["label"], "Personal");
     }
 
     #[test]

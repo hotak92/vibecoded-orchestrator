@@ -18,6 +18,7 @@ import { invoke } from '$lib/tauri';
 import {
   addAccount,
   formatDuration,
+  gatewayAccountLines,
   listAccounts,
   loginVerdict,
   pickerVisible,
@@ -144,6 +145,23 @@ describe('verdicts', () => {
     expect(projFail.text).toContain('Claude account saved');
     expect(projFail.text).not.toContain('not saved');
     expect(saveOutcome({ ok: false, error: 'nope' })).toEqual({ text: 'nope', tone: 'bad' });
+  });
+
+  it('lists one Services line per gateway account, only once there are two', () => {
+    const primary = {
+      id: 'primary', label: 'Personal', is_default: true, usable: true, oauth_state: 'present',
+      oauth_expires_in_s: 30000, fallbacks: 0, last_fallback_at: null, last_fallback_reason: null,
+      refresh: null,
+    };
+    expect(gatewayAccountLines([primary])).toEqual([]);
+    expect(gatewayAccountLines(null)).toEqual([]);
+    const work = { ...primary, id: 'work', label: 'Work seat', is_default: false, usable: false,
+      oauth_state: 'expired', fallbacks: 3, last_fallback_reason: 'expired' };
+    const lines = gatewayAccountLines([primary, work]);
+    expect(lines.map((l) => l.id)).toEqual(['primary', 'work']);
+    expect(lines[0].text).toBe('Personal (primary) · default: logged in — expires in 8 h 20 min');
+    expect(lines[1].text).toBe('Work seat (work): login expired — fell back 3× (expired)');
+    expect(lines[1].tone).toBe('warn');
   });
 
   it('shows the picker only once a second account exists', () => {

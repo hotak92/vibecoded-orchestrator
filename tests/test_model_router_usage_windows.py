@@ -120,7 +120,7 @@ SECRET_KEY = "zai-SYNTHETIC-usage-windows-key.abc123"
 
 
 def _by_id(windows) -> dict:
-    return {w.id: w for w in windows}
+    return {(w["id"] if isinstance(w, dict) else w.id): w for w in windows}
 
 
 class AnthropicParsingTests(unittest.TestCase):
@@ -387,6 +387,62 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             for window in vendor["windows"]:
                 self.assertIn("fetched_at", window)
                 self.assertIn("source", window)
+
+    async def test_each_added_claude_account_gets_its_own_row(self) -> None:
+        """v0.2.105 (L-ACCT): per-account 5h/weekly windows, each read with
+        that account's own login, rendered on the status line and in the
+        snapshot the launcher card shows; a logged-out account says so and
+        never borrows another account's numbers."""
+        work_payload = json.loads(json.dumps(ANTHROPIC_PAYLOAD))
+        work_payload["five_hour"]["utilization"] = 12.0
+        work_payload["limits"][0]["percent"] = 12
+        seen: list[str] = []
+
+        async def fetch(url, headers):
+            seen.append(headers.get("Authorization", ""))
+            if url.startswith("https://anthropic.example"):
+                if headers["Authorization"] == "Bearer work-token-synthetic":
+                    return 200, work_payload
+                return 200, ANTHROPIC_PAYLOAD
+            return 200, ZAI_PAYLOAD_2026
+
+        accounts = ("Personal", [("work", "Work seat", "work-token-synthetic"),
+                                 ("team", "Team seat", None)])
+        service = self.make(fetch=fetch, accounts=lambda: accounts)
+        self.clock[0] = datetime(2026, 9, 23, 3, tzinfo=timezone.utc).timestamp()
+        await service.refresh()
+        snap = service.snapshot()
+        vendors = {v["id"]: v for v in snap["vendors"]}
+        self.assertEqual([v["id"] for v in snap["vendors"]][:3],
+                         ["anthropic", "anthropic:work", "anthropic:team"])
+        self.assertEqual(vendors["anthropic"]["name"], "Claude subscription — Personal")
+        self.assertEqual(vendors["anthropic:work"]["name"], "Claude subscription — Work seat")
+        self.assertEqual(_by_id(vendors["anthropic:work"]["windows"])["5h"]["percent"], 12.0)
+        self.assertEqual(_by_id(vendors["anthropic"]["windows"])["5h"]["percent"], 31.0)
+        self.assertEqual(vendors["anthropic:team"]["state"], uw.STATE_UNCONFIGURED)
+        self.assertEqual(vendors["anthropic:team"]["windows"], [])
+        self.assertIn("Claude/work 5h 12%", render_line(snap))
+        self.assertIn("Bearer work-token-synthetic", seen)
+        self.assertNotIn("work-token-synthetic", json.dumps(snap))
+
+    async def test_relayed_headers_are_filed_under_the_serving_account(self) -> None:
+        accounts = ("Personal", [("work", "Work seat", None)])
+        service = self.make(accounts=lambda: accounts)
+        await service.refresh()
+        reset = int(self.clock[0]) + 3600
+        service.observe_anthropic_headers({
+            "anthropic-ratelimit-unified-5h-utilization": "0.5",
+            "anthropic-ratelimit-unified-5h-reset": str(reset)}, "work")
+        vendors = {v["id"]: v for v in service.snapshot()["vendors"]}
+        self.assertEqual(_by_id(vendors["anthropic:work"]["windows"])["5h"]["percent"], 50.0)
+        self.assertNotEqual(_by_id(vendors["anthropic"]["windows"])["5h"]["percent"], 50.0)
+
+    async def test_no_added_account_no_extra_rows(self) -> None:
+        service = self.make(accounts=lambda: ("Personal", []))
+        await service.refresh()
+        snap = service.snapshot()
+        self.assertFalse([v for v in snap["vendors"] if v["id"].startswith("anthropic:")])
+        self.assertEqual(snap["vendors"][0]["name"], "Claude subscription")
 
     async def test_request_headers_carry_the_credentials_correctly(self) -> None:
         await self.make().refresh()

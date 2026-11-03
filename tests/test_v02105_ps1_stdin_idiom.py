@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.pwsh import PWSH_BASE_FLAGS
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
 _PWSH = shutil.which("pwsh")
@@ -51,7 +53,7 @@ def test_the_variable_name_decides_whether_the_payload_arrives(
         f"try {{ ${name} = [Console]::In.ReadToEnd() }} catch {{ }}\n"
         f'"len=" + ([string]${name}).Length\n', encoding="utf-8")
     proc = subprocess.run(
-        [str(_PWSH), "-NoProfile", "-NonInteractive", "-File", str(script)],
+        [str(_PWSH), *PWSH_BASE_FLAGS, "-NonInteractive", "-File", str(script)],
         input='{"session_id":"s1"}', capture_output=True, text=True,
         timeout=60)
     assert proc.returncode == 0, proc.stderr

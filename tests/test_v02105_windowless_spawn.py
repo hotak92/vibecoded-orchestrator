@@ -460,5 +460,5 @@ def test_the_shape_check_rejects_the_flashing_spelling():
     ok = 'powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.ps1"'
     assert _WIN_SHAPE.match(ok)
     assert _WIN_SHAPE.match(ok + " pretooluse")
-    assert not _WIN_SHAPE.match(ok.replace("-NoProfile", "-NoProfile -WindowStyle Hidden"))
+    assert not _WIN_SHAPE.match(ok.replace(" -ExecutionPolicy", " -WindowStyle Hidden -ExecutionPolicy"))
     assert not _WIN_SHAPE.match('cmd /c start "" ' + ok)

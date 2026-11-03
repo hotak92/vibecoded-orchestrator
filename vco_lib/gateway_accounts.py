@@ -595,6 +595,30 @@ def _emit(obj: Mapping[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj, indent=2) + "\n")
 
 
+def session_line(reg: Registry, project_id: Optional[str], folder: Optional[Path],
+                 gateway_accounts: Optional[Mapping[str, Any]] = None) -> str:
+    """The session-start line naming the Claude account a project's gateway
+    chats are billed to — ``""`` while only the user's own login exists
+    (nothing to choose, nothing to say) or for a folder the launcher does not
+    know. Names and states only."""
+    if not reg.accounts or not project_id:
+        return ""
+    st = project_status(reg, project_id, folder, gateway_accounts)
+    chosen = "this project's choice" if st["source"] == "project" else "the default account"
+    line = (f"## Claude account\nChats of this project that go through the model "
+            f"gateway are billed to \"{reg.label_of(st['effective'])}\" "
+            f"({st['effective']}, {chosen}).")
+    if st["falling_back"]:
+        line = (f"## Claude account\nThis project selects \"{reg.label_of(st['selected'])}\" "
+                f"({st['selected']}), which cannot be used right now: its gateway chats "
+                f"are served by, and billed to, \"{reg.label_of(st['effective'])}\" "
+                f"({st['effective']}) until it is logged in again.")
+    if st["drift"]:
+        line += (" The project's .claude/settings.local.json does not carry that "
+                 "choice yet - see the project's Identity tab in the launcher.")
+    return line
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m vco_lib.gateway_accounts",
                                 description="Claude accounts served by the model gateway")
@@ -617,6 +641,9 @@ def _build_parser() -> argparse.ArgumentParser:
     grp.add_argument("--default", action="store_true")
     ps = sub.add_parser("project-status")
     ps.add_argument("--project-id", required=True)
+    sl = sub.add_parser("session-line", help="the session-start line naming the "
+                        "project's Claude account (prints nothing with one account)")
+    sl.add_argument("--folder", required=True, type=Path)
     sub.add_parser("export", help="(re)write the gateway contract file")
     return p
 
@@ -631,6 +658,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         if args.cmd == "export":
             _emit({"ok": True, "path": str(export(reg))})
+            return 0
+        if args.cmd == "session-line":
+            if not reg.accounts:
+                return 0  # one login: no line, and no gateway or DB lookup
+            from vco_lib.module_gated_delivery import resolve_project_id_for_folder
+            folder = Path(args.folder)
+            pid = resolve_project_id_for_folder(folder, db_path=db)
+            gw = _gateway_view()
+            gw_accounts = ({a.get("id"): a for a in gw.get("accounts") or []}
+                           if gw.get("ok") else None)
+            text = session_line(reg, pid, folder, gw_accounts)
+            if text:
+                print(text)
             return 0
         if args.cmd == "project-status":
             gw = _gateway_view()
