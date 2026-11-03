@@ -594,6 +594,34 @@ def _probe_secret_scope_at_startup(app) -> None:
     app.on_cleanup.append(_cleanup)
 
 
+def _start_account_refresh_at_startup(app) -> None:
+    """Attach and start the login keeper for the extra Claude accounts
+    (:mod:`model_router.account_refresh`). DAEMON only, like the scope probe:
+    ``create_app`` starts nothing, so a test or an embedder never spawns a
+    ``claude`` process."""
+    from vco_lib.paths import vct_root_dir
+
+    from .account_refresh import AccountRefresher
+    from .server import APP_KEY
+
+    async def _start(_app) -> None:
+        gateway = _app[APP_KEY]
+        refresher = AccountRefresher(
+            gateway.accounts,
+            work_dir=vct_root_dir() / "model-gateway" / "login-keeper",
+        )
+        gateway.account_refresher = refresher
+        refresher.start()
+
+    async def _cleanup(_app) -> None:
+        refresher = _app[APP_KEY].account_refresher
+        if refresher is not None:
+            await refresher.stop()
+
+    app.on_startup.append(_start)
+    app.on_cleanup.append(_cleanup)
+
+
 def _serve(port_override: Optional[int]) -> int:
     from aiohttp import web
 
@@ -758,6 +786,7 @@ def _serve(port_override: Optional[int]) -> int:
             token_file_stamp=host_token_stamp(token_path()),
         )
         _probe_secret_scope_at_startup(app)
+        _start_account_refresh_at_startup(app)
         # AFTER the bind, never before: a port file naming a port we did not
         # get is what sends every reader at somebody else's service.
         _write_owner_only(port_path(), f"{port}\n", strict=False)
