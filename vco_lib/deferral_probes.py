@@ -1164,6 +1164,19 @@ def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
     return None
 
 
+def kg_primary_still_bound_to_shared(ctx: ProbeContext) -> Optional[bool]:
+    """``kg_primary_bound_to_shared`` — does a non-root project still use the
+    shared KG collection as its primary? The SAME reading the doctor probe
+    emits from (:func:`vco_lib.kg_primary_shared.still_bound`): True while one
+    does, False once none does, None when launcher.db cannot be read."""
+    from vco_lib import kg_primary_shared
+
+    try:
+        return kg_primary_shared.still_bound()
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def playwright_browser_still_missing(ctx: ProbeContext) -> Optional[bool]:
     """``playwright_browser_missing`` — is the pinned Playwright MCP's browser
     revision still absent?
@@ -1434,6 +1447,7 @@ PROBES: dict[str, ProbeFn] = {
     "code_embed_image_still_stale": code_embed_image_still_stale,
     "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
     "playwright_browser_still_missing": playwright_browser_still_missing,
+    "kg_primary_still_bound_to_shared": kg_primary_still_bound_to_shared,
     "service_endpoint_still_unreachable": service_endpoint_still_unreachable,
     "service_endpoint_still_ambiguous": service_endpoint_still_ambiguous,
     "adopted_service_config_drift_persists": adopted_service_config_drift_persists,
