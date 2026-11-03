@@ -73,8 +73,13 @@
     } catch {
       result = null;
     }
-    note = toggleNote(row, enabled, result);
     await refresh();
+    // A failed CALL (not a refused write) may still have stored the row:
+    // the note reports what the re-read status says, never "nothing changed".
+    const now = problem
+      ? null
+      : (payload?.providers.find((p) => p.vendor_id === row.vendor_id)?.enabled ?? null);
+    note = toggleNote(row, enabled, result, now);
     busy = null;
   }
 </script>

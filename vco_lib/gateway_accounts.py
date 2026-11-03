@@ -42,7 +42,6 @@ import re
 import shlex
 import sqlite3
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -289,19 +288,11 @@ def export(reg: Registry, path: Optional[Path] = None) -> Path:
     target = path or accounts_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(render_registry(reg, with_projects=False), indent=2) + "\n"
-    fd, tmp = tempfile.mkstemp(prefix=".accounts.", dir=str(target.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        if os.name != "nt":
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, target)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    # One home for tmp+rename (vco_lib.atomic): the tempfile is created 0600,
+    # so the file is never briefly world-readable; the mode is a no-op on NT.
+    from vco_lib.atomic import atomic_write_text
+
+    atomic_write_text(target, payload, mode=0o600)
     return target
 
 

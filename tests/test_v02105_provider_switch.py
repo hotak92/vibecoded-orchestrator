@@ -241,7 +241,25 @@ class CliTests(_Base):
             ["set", "--vendor", "kimi", "--disabled", "--json"])
         self.assertEqual(code, 1)
         self.assertIn("NOT stored", err)
+        self.assertIn("no launcher.db at", err)
         self.assertFalse(json.loads(out)["stored"])
+
+    def test_a_failed_write_to_an_existing_db_names_the_write_not_the_file(self) -> None:
+        self.db()
+        with mock.patch("vco_lib.launcher_db_writer.write_app_state_key",
+                        side_effect=OSError("disk full")):
+            code, _out, err = self.run_cli(
+                ["set", "--vendor", "kimi", "--disabled", "--json"])
+        self.assertEqual(code, 1)
+        self.assertNotIn("no launcher.db", err)
+        self.assertIn("failed or did not read back", err)
+
+    def test_a_stored_shell_set_names_the_guidance_refresh(self) -> None:
+        self.db()
+        code, out, _err = self.run_cli(["set", "--vendor", "kimi", "--disabled"])
+        self.assertEqual(code, 0)
+        self.assertIn("python -m vco_lib.model_guidance refresh", out)
+        self.assertIn("--trigger providers", out)
 
     def test_an_unknown_vendor_exits_two(self) -> None:
         self.db()
@@ -414,18 +432,68 @@ class DeliveryTests(_Bundle):
                           ".claude/agents/kimi-reviewer.md": "kimi"})
 
     def test_a_user_toggled_agent_is_never_restored_by_a_provider_switch(self) -> None:
-        """The launcher's per-agent toggle leaves no manifest marker — a
-        provider re-enable must not undo that choice."""
+        """User parks kimi-reviewer with the Agents tab → the provider is
+        switched OFF → update → switched back ON → update: the user's choice
+        stands. Only the copy the switch itself moved comes back."""
         with _patch_signal(True):
             self.install()
         self.parked().mkdir(parents=True, exist_ok=True)
         shutil.move(str(self.agents() / "kimi-reviewer.md"),
                     str(self.parked() / "kimi-reviewer.md"))
-        self.db(folder=self.proj)
+        self.db(disabled=["kimi"], folder=self.proj)
+        with _patch_signal(True):
+            self.install(update=True)
+        # The switch moved only kimi-implementer; the user's copy is not ours.
+        self.assertEqual(self.manifest()["provider_parked_agents"],
+                         {".claude/agents/kimi-implementer.md": "kimi"})
+        self.db(folder=self.proj)  # the provider is back on
         with _patch_signal(True):
             self.install(update=True)
         self.assertFalse((self.agents() / "kimi-reviewer.md").exists())
         self.assertTrue((self.parked() / "kimi-reviewer.md").is_file())
+        # The definition the switch parked IS restored.
+        self.assertTrue((self.agents() / "kimi-implementer.md").is_file())
+        self.assertFalse((self.parked() / "kimi-implementer.md").exists())
+
+    def _park_kimi(self) -> None:
+        with _patch_signal(True):
+            self.install()
+        self.db(disabled=["kimi"], folder=self.proj)
+        with _patch_signal(True):
+            self.install(update=True)
+        self.assertEqual(len(self.manifest()["provider_parked_agents"]), 2)
+
+    def test_the_marker_survives_a_re_enable_run_that_skips_agents(self) -> None:
+        self._park_kimi()
+        self.db(folder=self.proj)
+        with _patch_signal(True):
+            project_init.install_project_bundle(
+                self.proj, orchestrator_root=self.orch, update_mode=True,
+                skip_kinds=frozenset({"agents"}))
+        self.assertEqual(self.manifest()["provider_parked_agents"],
+                         {".claude/agents/kimi-implementer.md": "kimi",
+                          ".claude/agents/kimi-reviewer.md": "kimi"})
+        # ...so the next ordinary run still restores them.
+        with _patch_signal(True):
+            self.install(update=True)
+        self.assertIn("kimi-reviewer.md", self.delivered())
+        self.assertNotIn("provider_parked_agents", self.manifest())
+
+    def test_the_marker_survives_a_run_whose_gate_answers_unknown(self) -> None:
+        self._park_kimi()
+        with _patch_signal(None):  # "could not ask"
+            self.install(update=True)
+        self.assertEqual(self.manifest()["provider_parked_agents"],
+                         {".claude/agents/kimi-implementer.md": "kimi",
+                          ".claude/agents/kimi-reviewer.md": "kimi"})
+
+    def test_a_marker_whose_parked_copy_is_gone_is_dropped(self) -> None:
+        self._park_kimi()
+        (self.parked() / "kimi-reviewer.md").unlink()
+        with _patch_signal(True):
+            self.install(update=True)
+        self.assertEqual(self.manifest()["provider_parked_agents"],
+                         {".claude/agents/kimi-implementer.md": "kimi"})
 
     def test_dry_run_moves_nothing_and_promises_the_park(self) -> None:
         with _patch_signal(True):

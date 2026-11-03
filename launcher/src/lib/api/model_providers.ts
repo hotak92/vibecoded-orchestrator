@@ -114,14 +114,32 @@ export function secretNamesLabel(row: ModelProviderRow): string {
   return row.secret_key_names.join(' or ');
 }
 
-/** What to tell the user after a toggle, in one sentence. */
+/**
+ * What to tell the user after a toggle, in one sentence.
+ *
+ * Three outcomes are kept apart: the helper answered `stored: false` (the
+ * database refused the write — nothing changed); the call itself FAILED
+ * (`result === null`: no Python, a timeout, unparseable output — the row may
+ * or may not have been written, so the caller re-reads the status and passes
+ * what it now says as `nowEnabled`); and a stored change.
+ */
 export function toggleNote(
   row: ModelProviderRow,
   enabled: boolean,
   result: ModelProviderSetResult | null,
+  nowEnabled: boolean | null = null,
 ): string {
-  if (!result || result.stored !== true) {
-    return `Could not save the change for ${row.display}: the launcher database is not writable. Nothing was changed.`;
+  if (result === null) {
+    if (nowEnabled === enabled) {
+      return `The launcher could not confirm the change for ${row.display}, but the saved setting now reads ${enabled ? 'on' : 'off'}.`;
+    }
+    if (nowEnabled === null) {
+      return `Could not ask the launcher to change ${row.display}, and its saved state could not be read back. Check the card again in a moment.`;
+    }
+    return `Could not ask the launcher to change ${row.display}: the saved setting is still ${nowEnabled ? 'on' : 'off'}.`;
+  }
+  if (result.stored !== true) {
+    return `Could not save the change for ${row.display}: the launcher database could not be written. Nothing was changed.`;
   }
   return enabled
     ? `${row.display} is on again: its agent definitions come back on the next update and its rows return to the model guidance.`

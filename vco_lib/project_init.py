@@ -9278,6 +9278,7 @@ def install_project_bundle(
     _gw_src_dir = (orchestrator_root / "templates" / "agents"
                    / _mgd.GATEWAY_AGENTS_DIR)
     _gw_verdict = None
+    _gw_restored: list[str] = []
     if _gw_src_dir.is_dir():
         _gw_verdict = _mgd.gateway_agents_gate(folder)
         _gw_restored = _mgd.restore_parked_agents(
@@ -9603,6 +9604,7 @@ def install_project_bundle(
     orphan_retired: list[str] = []  # v0.2.83 B-F5: kept-on-disk, manifest-retired
     knowledge_retired: list[str] = []
     provider_parked: list[str] = []  # v0.2.105: parked for a switched-off provider
+    provider_moved: list[str] = []  # ...of which THIS run moved (registry input)
     prior_files: dict = manifest.get("files", {}) or {}
     # Orphans are prior_files MINUS what THIS run ENUMERATED AS OPS — never
     # minus `new_files`: user-modified preserves write their PRIOR manifest
@@ -9680,6 +9682,8 @@ def install_project_bundle(
             continue
         if _park is not None:
             provider_parked.append(prior_rel)
+            if _park == "parked":  # an actual move — the registry's input
+                provider_moved.append(prior_rel)
             continue
         # v0.2.81 knowledge-retirement branch (data-safety, constraint 3):
         # on a NON-root project the ~115 curated `knowledge/**` entries are
@@ -10319,14 +10323,14 @@ def install_project_bundle(
             if isinstance(manifest.get(_DISM_KEY), dict):
                 manifest_payload[_DISM_KEY] = manifest[_DISM_KEY]
             # v0.2.105: which disabled-side agent copies THIS machine's
-            # per-provider switch parked (`{dest_rel: vendor_id}`). Additive,
-            # readers default it; recomputed from disk each run, so a copy the
-            # user moved or deleted simply drops out.
-            from vco_lib.module_gated_delivery import (
-                PARKED_AGENTS_MANIFEST_KEY as _PARKED_KEY,
-                parked_agents_registry as _parked_registry,
-            )
-            _parked = _parked_registry(folder, _gate_outcomes)
+            # per-provider switch moved (`{dest_rel: vendor_id}`) — the prior
+            # map carried forward, plus this run's moves, minus this run's
+            # restores (never a scan of agents.disabled/: the user's own
+            # parked copies live there too).
+            _PARKED_KEY = _mgd.PARKED_AGENTS_MANIFEST_KEY
+            _parked = _mgd.parked_agents_registry(
+                folder, manifest.get(_PARKED_KEY), provider_moved,
+                _gate_outcomes, restored=_gw_restored)
             if _parked:
                 manifest_payload[_PARKED_KEY] = _parked
             _write_manifest_atomic(folder, manifest_payload)

@@ -139,7 +139,17 @@ describe('the sentence after a toggle', () => {
     expect(note).toContain('Could not save');
     expect(note).toContain('Nothing was changed');
     expect(note).not.toContain(PROVIDER_OFF_NOTICE);
-    const failed = toggleNote(row(), false, null);
-    expect(failed).toContain('Could not save');
+  });
+
+  it('a failed call never claims nothing changed, and reports the re-read state', () => {
+    const stuck = toggleNote(row(), false, null, true);
+    expect(stuck).toContain('Could not ask');
+    expect(stuck).toContain('still on');
+    expect(stuck).not.toContain('Nothing was changed');
+    const landed = toggleNote(row(), false, null, false);
+    expect(landed).toContain('now reads off');
+    expect(landed).not.toContain('Nothing was changed');
+    const unknown = toggleNote(row(), false, null, null);
+    expect(unknown).toContain('could not be read back');
   });
 });
