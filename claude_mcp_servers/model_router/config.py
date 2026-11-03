@@ -117,6 +117,7 @@ from pathlib import Path
 from typing import Optional
 
 from vco_lib.env_values import env_int
+from vco_lib.gateway_accounts import accounts_path
 from vco_lib.intfile import read_int_line
 from vco_lib.paths import claude_user_dir, vct_root_dir
 
@@ -570,6 +571,10 @@ class GatewayConfig:
     token: str = ""
     credentials_file: Path = field(default_factory=credentials_path)
     context_table_file: Path = field(default_factory=export_path)
+    #: v0.2.105: the Claude account registry the launcher exports
+    #: (``vco_lib.gateway_accounts.accounts_path`` — one home for the path and
+    #: the format). Absent is the normal single-account state.
+    accounts_file: Path = field(default_factory=accounts_path)
     seed_context_table: Path | None = None
     static_catalog_file: Path | None = None
     catalog_ttl_s: int = DEFAULT_CATALOG_TTL_S
@@ -629,6 +634,7 @@ class GatewayConfig:
             token=token,
             credentials_file=credentials_path(),
             context_table_file=export_path(),
+            accounts_file=accounts_path(),
             # Positive ints; 0, negatives and garbage keep the default.
             catalog_ttl_s=env_int(
                 "VCT_MODEL_GATEWAY_CATALOG_TTL", DEFAULT_CATALOG_TTL_S, minimum=1,
@@ -689,6 +695,7 @@ __all__ = [
     "LAST_PORT_BASENAME",
     "GatewayConfig",
     "HostNotLoopbackError",
+    "accounts_path",
     "context_guard_margin",
     "credentials_path",
     "explicit_port",
