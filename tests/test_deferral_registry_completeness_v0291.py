@@ -761,6 +761,9 @@ class TestRegistryCompleteness(unittest.TestCase):
             # attaches git's error line on every emit (pinned by
             # tests/test_v02104_l5_fix_round_r14b.py).
             "settings_local_layer_unknown",
+            # v0.2.105: vco_lib.kg_primary_shared.doctor_entry attaches the
+            # affected project set (pinned by tests/test_v02105_kg_primary_shared.py).
+            "kg_primary_bound_to_shared",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:

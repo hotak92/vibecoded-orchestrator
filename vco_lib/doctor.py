@@ -248,6 +248,10 @@ CID_COMPOSE_OVERRIDE_PAIR_DIVERGED = "compose_override_pair_diverged"
 #: (stdlib-only at import time, so importing it here costs nothing).
 from vco_lib.playwright_mcp import CID_BROWSER_MISSING as CID_PLAYWRIGHT_BROWSER_MISSING  # noqa: E402
 
+#: v0.2.105: a non-root project's PRIMARY KG binding names the SHARED class.
+#: Probe, entry and the cid live in :mod:`vco_lib.kg_primary_shared`.
+from vco_lib.kg_primary_shared import CID_PRIMARY_BOUND_TO_SHARED as CID_KG_PRIMARY_SHARED  # noqa: E402
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -258,6 +262,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_INSTALL_MARKER_UNBACKED, CID_FORMER_LAUNCHER_CLI,
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
+    CID_KG_PRIMARY_SHARED,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -269,6 +274,7 @@ DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (
     CID_DISK_SPACE_LOW, CID_KG_BINDING_EVIDENCE_MISMATCH,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
+    CID_KG_PRIMARY_SHARED,
 )
 
 #: Env override for the free-space floor, in GiB (float). Default
@@ -460,6 +466,23 @@ class DoctorResolvers:
     #: Injected so the browser probe is driven from a described cache, no
     #: npx cache and no browser registry on disk.
     playwright_browser_state: Optional[Callable[[], Any]] = None
+    #: () -> list of :class:`vco_lib.kg_primary_shared.PrimaryBoundToShared`,
+    #: or None when launcher.db cannot be read (v0.2.105). Injected so the
+    #: probe is driven from described bindings, no launcher.db.
+    kg_primary_shared: Optional[Callable[[], Optional[list]]] = None
+
+    def resolve_kg_primary_shared(self) -> Optional[list]:
+        """Non-root projects whose primary KG binding is the shared class —
+        :func:`vco_lib.kg_primary_shared.find`, the ONE reader (shared with
+        the registry clear probe). ``None`` = could not look."""
+        if self.kg_primary_shared is not None:
+            return self.kg_primary_shared()
+        from vco_lib import kg_primary_shared  # noqa: PLC0415
+
+        try:
+            return kg_primary_shared.find()
+        except Exception:  # noqa: BLE001 — could not look is not a verdict
+            return None
 
     def resolve_playwright_browser_state(self):
         """Is the pinned Playwright MCP's browser installed? —
@@ -4768,6 +4791,19 @@ def _playwright_browser_entry(finding: Finding):
     return playwright_mcp.doctor_entry(finding)
 
 
+def probe_kg_primary_shared(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.kg_primary_shared` (v0.2.105)."""
+    from vco_lib import kg_primary_shared  # noqa: PLC0415
+
+    return kg_primary_shared.probe(folder, res, ctx)
+
+
+def _kg_primary_shared_entry(finding: Finding):
+    from vco_lib import kg_primary_shared  # noqa: PLC0415
+
+    return kg_primary_shared.doctor_entry(finding)
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4813,6 +4849,10 @@ PROBES: dict = {
     # by the same reading (self-resolving + the registry probe
     # `kg_binding_evidence_still_mismatched`).
     "kg_binding_evidence": (probe_kg_binding_evidence, (SCOPE_FULL,)),
+    # v0.2.105: full-only — one read-only launcher.db open. Doctor-owned,
+    # self-resolving `kg_primary_bound_to_shared` (a binding changes only
+    # through the launcher or an install/update, which is when this runs).
+    "kg_primary_shared": (probe_kg_primary_shared, (SCOPE_FULL,)),
     # v0.2.102 W4-C L2: full-only — per registered project, one Weaviate
     # reachability probe + one hash query per populated collection (network
     # reads; same cost reasoning as kg_binding_evidence). REPORTED-not-owned:
@@ -5358,6 +5398,7 @@ _ENTRY_BUILDERS: dict = {
     CID_FORMER_LAUNCHER_CLI: _former_launcher_cli_entry,
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED: _compose_override_pair_entry,
     CID_PLAYWRIGHT_BROWSER_MISSING: _playwright_browser_entry,
+    CID_KG_PRIMARY_SHARED: _kg_primary_shared_entry,
 }
 
 
@@ -5686,6 +5727,7 @@ __all__ = [
     "probe_scratch_dir",
     "probe_install_completeness",
     "probe_kg_binding_evidence",
+    "probe_kg_primary_shared",
     "probe_last_update_run",
     "probe_source_currency",
     "probe_stale_vct_deploy",

@@ -492,6 +492,10 @@ def find_connections(title: str):
         client.close()
 
 if __name__ == "__main__":
+    # v0.2.105: console-safe output on a Windows cp1252/OEM reader - the ONE
+    # home is vco_lib.console_text.
+    from vco_lib.console_text import harden_stdio
+    harden_stdio()
     if len(sys.argv) < 3:
         print("Usage:")
         print("  get_node_info.py info <title>")

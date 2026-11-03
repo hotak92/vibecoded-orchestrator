@@ -33,6 +33,7 @@
   import SharedKgPicker from '$lib/components/SharedKgPicker.svelte';
   import ExtraCodegraphPathsPanel from '$lib/project-state/ExtraCodegraphPathsPanel.svelte';
   import InfraDeclarationsPanel from '$lib/project-state/InfraDeclarationsPanel.svelte';
+  import KgPrimarySharedPanel from '$lib/project-state/KgPrimarySharedPanel.svelte';
   import type {
     ProjectIdentity,
     UpdateProjectIdentityRequest,
@@ -309,6 +310,13 @@
     }
   }
 
+  /** v0.2.105: the shared-KG banner repaired the binding — show the result. */
+  function applyRepair(res: UpdateProjectIdentityResult) {
+    identity = res.identity;
+    loadedKg = res.identity.kg_collection;
+    editKg = loadedKg;
+  }
+
   async function discard() {
     if (!identity) return;
     editKg = loadedKg;
@@ -508,6 +516,12 @@
         {/if}
       </div>
     </div>
+
+    <!-- v0.2.105: a non-root project bound to the SHARED KG as its primary
+         (ledger condition kg_primary_bound_to_shared) — banner + repair. -->
+    {#if !identity.is_orchestrator_root}
+      <KgPrimarySharedPanel {projectId} onRepaired={applyRepair} />
+    {/if}
 
     <!-- PR-5 (v0.2.11): Shared KG section — readonly informational card. -->
     <div class="ps-section ps-section-shared-kg">

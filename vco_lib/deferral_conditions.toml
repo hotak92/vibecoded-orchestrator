@@ -900,6 +900,28 @@ run, so installing Node makes the entry disappear by itself. The launcher's \
 registration badge renders the same fact (gui_badge) via \
 `python -m vco_lib.npx_resolver --json`."""
 
+[conditions.kg_primary_bound_to_shared]
+class = "action_required"
+owner = "vco_lib.doctor (probe + entry in vco_lib.kg_primary_shared)"
+clear_probe = "probe:py:kg_primary_still_bound_to_shared"
+emit_surfaces = ["ledger", "gui_banner"]
+dismiss_key = ["projects"]
+notes = """v0.2.105 (Windows field: 19 of 20 projects). A registered NON-root \
+project's primary KG binding names the SHARED KG collection (the app_state \
+pointer, or a class the orchestrator root binds; the root itself uses one \
+class for both roles and is never flagged). Cause, fixed at its source: the \
+update-time cross-prefix adoption in `kg_binding_heal` re-pointed a binding \
+whose class did not exist yet (a project that never synced) to the ONE \
+populated *_KnowledgeGraph class, which on such a machine was the shared one; \
+it no longer adopts the shared class or another project's class as a primary, \
+and the launcher's binding writers refuse it. DETECTION: \
+`vco_lib.kg_primary_shared.find` (one read-only launcher.db open), run by the \
+doctor's full scope and by this clear probe. REPAIR: the launcher's Identity \
+tab shows the problem and offers "Repair primary KG binding", which re-points \
+the binding to the name-derived class through `update_project_identity` and \
+re-projects the env; nothing is moved or deleted. Self-resolving: the doctor's \
+clean reading carries the cid."""
+
 [conditions.playwright_browser_missing]
 class = "action_required"
 owner = "vco_lib.doctor + install.py (playwright pre-cache)"

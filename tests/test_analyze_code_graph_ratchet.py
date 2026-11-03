@@ -129,7 +129,11 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # parsers/link rules to `vco_lib.codegraph_lang.config` and
 # `vco_lib.codegraph_config_refs` (7010). Both land together at 7002,
 # re-pinned DOWNWARD to the measured value (the ratchet's rule).
-_ANALYZER_LINES_MAX = 7002
+# v0.2.105 (silent zero-module walk): the source-exclusion family moved to
+# `vco_lib.codegraph_source_filter` and the empty-walk verdict + incremental
+# gate to `vco_lib.codegraph_walk_diagnosis` (thin seams here) — net
+# 7002 -> 6995, re-pinned DOWNWARD.
+_ANALYZER_LINES_MAX = 6995
 
 
 def _measure() -> int:

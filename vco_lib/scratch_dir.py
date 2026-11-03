@@ -660,4 +660,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via the wrappers
+    # v0.2.105: console-safe output on a Windows cp1252/OEM reader - the ONE
+    # home is vco_lib.console_text.
+    from vco_lib.console_text import harden_stdio
+    harden_stdio()
     sys.exit(main())

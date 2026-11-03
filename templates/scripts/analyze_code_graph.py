@@ -511,6 +511,15 @@ try:
         filter_changed_files as _filter_changed_files_impl,
     )
     from vco_lib.codegraph_rust_modules import single_file_scope as _single_file_scope
+    # v0.2.105: the source-exclusion decision (walk + single-file) lives in ONE
+    # vco_lib home; the walk now judges only the path BELOW its root.
+    from vco_lib.codegraph_source_filter import (  # noqa: F401 — two re-exports (tests)
+        classify_finder_files as _classify_finder_files_impl,
+        is_under_transient_state as _is_under_transient_state,
+        keep_source_file as _keep_source_file,
+        path_is_excluded as _path_is_excluded,
+    )
+    from vco_lib import codegraph_walk_diagnosis as _walk_diag  # v0.2.105: empty-walk verdict
     # v0.2.91 dogfood fix: the orchestrator-root heuristic behind the
     # `--index-dot-claude` default has TWO callers now (here and the deferral
     # retry driver), so it lives in vco_lib rather than as a mirrored copy.
@@ -728,77 +737,6 @@ def _ignore_dirs_for(language: str, index_dot_claude: bool = False) -> frozenset
         dirs = dirs | frozenset({'.claude'})
     return dirs
 
-
-def _is_under_transient_state(parts: tuple) -> bool:
-    """True if a path lives under ``.claude/state/`` (transient scratch).
-
-    v0.2.73 (READ-amp origin fix). ``.claude/state/`` holds ``tool_backups/``
-    snapshot copies + per-session scratch — NEVER first-party source. It must
-    be skipped by BOTH the directory walk and the single-file path.
-
-    WHY this is its own predicate and NOT a `_COMMON_IGNORE_DIRS` entry:
-    ``ignore_dirs`` is a flat directory-NAME set tested with
-    ``any(d in f.parts for ...)``. Adding a bare ``'state'`` there would wrongly
-    skip a legitimate top-level ``state/`` package in a user project. The skip
-    must be anchored to the two-segment ``.claude`` → ``state`` sequence, which a
-    name-set can't express — hence a path-aware check shared by every walker.
-
-    Origin this fixes (live-measured 2026-07-04): on the orchestrator clone
-    ``index_dot_claude=True`` makes the walk descend into ``.claude/`` and reach
-    ``.claude/state/tool_backups/``. Because ``state`` was in no ignore set,
-    ~16k backup-snapshot ``.py`` copies (43% of the CodeFunction collection)
-    were indexed as real functions — each backup a flattened copy of a source
-    (often a ``.wt/`` worktree) file, so it ALSO defeated the ``.wt`` exclusion.
-    The old single-file guard at ``_analyze_single_file`` asserted "the directory
-    walk doesn't reach state/ in practice" — FALSE on the orchestrator clone.
-
-    Args:
-        parts: ``Path.parts`` of the candidate file (or its ``.resolve()``).
-
-    Returns:
-        True when some ``.claude`` segment is immediately followed by ``state``.
-    """
-    for i in range(len(parts) - 1):
-        if parts[i] == ".claude" and parts[i + 1] == "state":
-            return True
-    return False
-
-
-def _path_is_excluded(parts: tuple, ignore_dirs: frozenset) -> bool:
-    """The ONE source-exclusion decision, shared by the directory walk AND the
-    single-file / drain path (mirror-don't-fork — v0.2.73).
-
-    A path is excluded when it sits under any ignored directory OR under
-    ``.claude/state/`` (transient scratch — see
-    :func:`_is_under_transient_state`). Both call sites must give an IDENTICAL
-    verdict so a per-edit ``--only-file`` (drain) can't index something the
-    whole-tree walk would have skipped, or vice-versa.
-
-    Args:
-        parts: the path segments to test. Callers pass either the FULL
-            ``path.parts`` (directory walk — the repo root is not itself a
-            skip-dir) or the REPO-RELATIVE parts (single-file path — so a repo
-            that itself lives under a dir literally named e.g. ``build`` isn't
-            mis-skipped). The ``.claude/state`` two-segment check works on either.
-        ignore_dirs: the directory-NAME set to reject (already merged with any
-            language extras + unconditional additions like ``.wt``/``vendor`` by
-            the caller).
-    """
-    if any(d in parts for d in ignore_dirs):
-        return True
-    if _is_under_transient_state(parts):
-        return True
-    return False
-
-
-def _keep_source_file(path: "Path", ignore_dirs: frozenset) -> bool:
-    """Walker-facing convenience: keep ``path`` iff it is not excluded.
-
-    Thin wrapper over :func:`_path_is_excluded` so the 14 ``_find_*_files``
-    walkers read cleanly (``if _keep_source_file(f, ignore_dirs)``). Uses the
-    FULL path parts (the walk root is a real ancestor, never a skip-dir itself).
-    """
-    return not _path_is_excluded(path.parts, ignore_dirs)
 
 
 def _looks_like_orchestrator_root(repo_path: Path) -> bool:
@@ -1068,6 +1006,10 @@ _FINDER_SPECS: Dict[str, Tuple[str, Tuple[str, ...], Optional[Tuple[str, ...]]]]
     "proto":      ("proto",  ("*.proto",),                                          None),
     "config":     ("config", CONFIG_GLOBS,                                          CONFIG_NAME_SKIP_SUFFIXES),
 }
+
+#: `_FINDER_SPECS` key → its `lang_dispatch` name where the two differ (the
+#: `--language` filter speaks dispatch names; v0.2.105 empty-walk census).
+_DISPATCH_OF_SPEC: Dict[str, str] = {"js": "javascript", "ts": "typescript"}
 
 
 def _dispatch_name_for_file(file_path: Path) -> str:
@@ -1529,13 +1471,17 @@ class CodeGraphAnalyzer:
         nothing could redirect the analyzer and suites that spawn it minted
         `<Project>_Code*` classes on whatever instance was listening.
         """
+        # v0.2.105: ONLY the connect call is inside the try. The success line
+        # used to sit in it too, so a Windows cp1252 stdout raising on its
+        # emoji was reported as "Failed to connect to Weaviate" (and the walk
+        # ended). The failure sentence is vco_lib's one classifier.
         try:
             self.client = _wh.connect_v4(self.weaviate_url, grpc_port=self.grpc_port)
-            print(f"✅ Connected to Weaviate at {self.weaviate_url}")
-            return True
         except Exception as e:
-            print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
+            print(f"❌ {_wh.describe_connect_failure(e, self.weaviate_url)}", file=sys.stderr)
             return False
+        print(f"✅ Connected to Weaviate at {self.weaviate_url}")
+        return True
 
     def _vectorizer_config(self, class_name: str):
         """Return appropriate vectorizer config based on named_vectors flag.
@@ -3551,6 +3497,9 @@ class CodeGraphAnalyzer:
             'prune_failures': 0,
             # v0.2.92: entities embedded UN-CHUNKED (chunk plan uncomputable).
             'chunk_plan_failures': 0,
+            # v0.2.105: files the --incremental gate dropped as unchanged
+            # (roots that already had indexed rows only).
+            'incremental_unchanged_files': 0,
         }
 
         # Language dispatch: auto-detect from extensions, or filter by --language
@@ -3682,13 +3631,20 @@ class CodeGraphAnalyzer:
                     )
                     if incremental:  # rows of files deleted/renamed since the lower bound
                         self._prune_git_deleted(source_root, since_commit)
+                    # v0.2.105 (silent zero-module walk): the "nothing changed"
+                    # gate is only meaningful for a root that HAS been indexed.
+                    # On a never-built root it dropped every file and the walk
+                    # ended with zero modules and exit 0 — the deferral retry
+                    # and the launcher's Re-analyze both run --incremental.
+                    root_gated = incremental and self._root_incremental_gate(
+                        source_root, is_extra_root)
                     for lang_name, find_fn, analyze_fn in lang_dispatch:
                         if lang and lang != lang_name:
                             continue
                         files = find_fn(source_root)
                         if not files:
                             continue
-                        if incremental:
+                        if root_gated:
                             all_files = files
                             # v0.2.82 (review blocker 1): record the PRE-filter
                             # discovery — `--incremental` drops unchanged files
@@ -3711,6 +3667,7 @@ class CodeGraphAnalyzer:
                             )
                             files = _cfg_refs.requeue_on_config_change(  # a config edit relinks code
                                 self, source_root, lang_name, all_files, files, since_commit)
+                            stats['incremental_unchanged_files'] += len(all_files) - len(files)
                             if not files:
                                 # Quiet skip — the typical case for clean repos
                                 # with NO stale rows (the union added nothing).
@@ -3724,6 +3681,18 @@ class CodeGraphAnalyzer:
                         per_lang_files.append(
                             (lang_name, analyze_fn, list(files), source_root)
                         )
+                # v0.2.105: a whole-tree walk that dispatched NOTHING says why
+                # (main() prints the verdict; vco_lib.codegraph_walk_diagnosis
+                # decides it). Census per root under that root's own `.claude`
+                # gate — the same view the finders above had.
+                if not per_lang_files:
+                    censuses = []
+                    for source_root in source_roots:
+                        self.index_dot_claude = (
+                            False if source_root != repo_path else _primary_index_dot_claude
+                        )
+                        censuses.append(self._walk_census(source_root, lang))
+                    stats['walk_censuses'] = censuses
             finally:
                 # Restore the primary's resolved value for any downstream reader,
                 # even if a finder raised mid-loop.
@@ -4297,20 +4266,24 @@ class CodeGraphAnalyzer:
         the method surface (direct calls, monkeypatch, ``lang_dispatch`` tuple
         construction in tests + ``analyze_repository``) is unchanged.
         """
+        return sorted(f for f, why in self._classify_finder_files(spec_key, repo_path)
+                      if why is None)
+
+    def _classify_finder_files(self, spec_key: str, repo_path: Path):
+        """(file, exclusion rule or None) for ``spec_key`` — the ONE per-file
+        decision (vco_lib.codegraph_source_filter) behind the finders and the
+        v0.2.105 empty-walk census, under the current `.claude` gate."""
         ignore_lang, extensions, name_skip_suffixes = _FINDER_SPECS[spec_key]
-        ignore_dirs = _ignore_dirs_for(ignore_lang, self.index_dot_claude)
-        files: List[Path] = []
-        for ext in extensions:
-            for f in repo_path.rglob(ext):
-                if not _keep_source_file(f, ignore_dirs):
-                    continue
-                if name_skip_suffixes is not None:
-                    if any(f.name.endswith(s) for s in name_skip_suffixes):
-                        continue
-                    if f.name.startswith('vite.config'):
-                        continue
-                files.append(f)
-        return sorted(files)
+        return _classify_finder_files_impl(repo_path, extensions, name_skip_suffixes,
+                                           _ignore_dirs_for(ignore_lang, self.index_dot_claude))
+
+    def _walk_census(self, repo_path: Path, language: Optional[str] = None):
+        """v0.2.105: what a whole-tree walk of ``repo_path`` sees (read-only),
+        run only when a walk dispatched nothing — to say WHY."""
+        return _walk_diag.census_from_pairs(repo_path.as_posix(), [
+            pair for key in _FINDER_SPECS
+            if not language or _DISPATCH_OF_SPEC.get(key, key) == language
+            for pair in self._classify_finder_files(key, repo_path)])
 
     def _find_python_files(self, repo_path: Path) -> List[Path]:
         """Find all Python files in repository."""
@@ -4424,6 +4397,13 @@ class CodeGraphAnalyzer:
                 f"rows re-queued under {source_root} (rev-0 heal)"
             )
         return result
+
+    def _root_incremental_gate(self, source_root: Path, is_extra: bool) -> bool:
+        """v0.2.105: apply ``--incremental``'s changed-files gate to this root?
+        Only once it HAS indexed rows (rule: vco_lib.codegraph_walk_diagnosis)."""
+        return _walk_diag.root_incremental_gate(
+            getattr(self, "modules_collection", None), source_root,
+            extra_stamp=self._root_stamp(source_root, True) if is_extra else None)
 
     def _root_stamp(self, root: Path, is_extra: bool) -> str:  # one rule: codegraph_source_scope
         cs, scoped = getattr(self, "_stamp_scope", (None, False))
@@ -5971,7 +5951,7 @@ def _migrate_from_shared(project_name: str, named_vectors: bool = False) -> int:
     try:
         client = _wh.connect_v4()  # env-resolved, like every other writer
     except Exception as e:
-        print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
+        print(f"❌ {_wh.describe_connect_failure(e)}", file=sys.stderr)
         return 1
 
     try:
@@ -6904,6 +6884,14 @@ def main():
         #   insert count survives. If a future reader wants a non-zero partial
         #   code, add it here AND teach the reader to preserve files_analyzed for
         #   that code first (mirror-don't-fork the contract).
+        # v0.2.105: a whole-tree walk that dispatched no file says WHY (stderr)
+        # and exits 3 when source files exist but nothing was indexed.
+        _empty_rc = _walk_diag.report_empty_walk(
+            stats, incremental=bool(args.incremental), since_commit=args.since_commit,
+            language=args.language, extensions_hint=" ".join(sorted(
+                {e for k, (_l, xs, _s) in _FINDER_SPECS.items() if k != "config" for e in xs})))
+        if _empty_rc:
+            return _empty_rc
         files_total = stats['files_analyzed'] + stats['files_skipped']
         if stats['files_analyzed'] == 0 and files_total > 0:
             print(
@@ -6999,4 +6987,9 @@ def _deferral_op(op: str, *args: object) -> None:
 
 
 if __name__ == '__main__':
+    # v0.2.105: console-safe output on a Windows cp1252/OEM reader - the ONE
+    # home is vco_lib.console_text. Before it, the "✅ Connected" status line
+    # raised UnicodeEncodeError on a cp1252 pipe and the run died.
+    from vco_lib.console_text import harden_stdio
+    harden_stdio()
     sys.exit(main())

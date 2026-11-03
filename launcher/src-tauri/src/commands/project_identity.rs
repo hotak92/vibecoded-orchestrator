@@ -218,9 +218,44 @@ pub async fn update_project_identity(
     crate::commands::blocking::run_with_db_on_blocking_pool(
         app,
         "update_project_identity",
-        move |db| update_project_identity_with_db(db, &project_id, &req),
+        move |db| update_project_identity_checked(db, &project_id, req, false),
     )
     .await?
+}
+
+/// v0.2.105: [`update_project_identity_with_db`] behind the shared-KG
+/// primary check ([`check_shared_primary`]). A user's explicit edit naming
+/// the shared collection is REFUSED; a re-detect from disk (`drop_refused`)
+/// keeps the rest of its update and drops only the KG part, with a warning —
+/// a settings file that an older update projected the shared name into must
+/// not re-apply the defect.
+pub fn update_project_identity_checked(
+    db: &Db,
+    project_id: &str,
+    mut req: UpdateProjectIdentityReq,
+    drop_refused: bool,
+) -> Result<UpdateProjectIdentityResult, String> {
+    let mut notes: Vec<String> = Vec::new();
+    let proposed = req
+        .kg_collection
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(kg) = proposed {
+        match check_shared_primary(db, project_id, &kg) {
+            SharedPrimaryCheck::Allowed => {}
+            SharedPrimaryCheck::Unchecked(w) => notes.push(w),
+            SharedPrimaryCheck::Refused(msg) if drop_refused => {
+                req.kg_collection = None;
+                notes.push(format!("KG collection from disk not applied: {}", msg));
+            }
+            SharedPrimaryCheck::Refused(msg) => return Err(msg),
+        }
+    }
+    let mut res = update_project_identity_with_db(db, project_id, &req)?;
+    res.warnings.extend(notes);
+    Ok(res)
 }
 
 /// Inner helper. The Tauri command above is a thin wrapper; this is the
@@ -429,7 +464,7 @@ pub async fn redetect_project_identity(
     let res = crate::commands::blocking::run_with_db_on_blocking_pool(
         app,
         "redetect_project_identity",
-        move |db| update_project_identity_with_db(db, &pid, &identity_req),
+        move |db| update_project_identity_checked(db, &pid, identity_req, true),
     )
     .await
     .and_then(|r| r);
@@ -1561,6 +1596,108 @@ pub async fn list_orchestrator_kg_collections(
     Ok(extract_orchestrator_shaped_classes(&schema))
 }
 
+/// v0.2.105: the Identity tab's "this project's primary KG is the SHARED
+/// collection" reading. Field-for-field the reply of
+/// `python -m vco_lib.kg_primary_shared status` (mirrored by
+/// `launcher/src/lib/project-state/kg-primary-shared.ts::KgPrimarySharedStatus`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KgPrimarySharedStatus {
+    /// The project's primary binding names the shared collection.
+    pub bound_to_shared: bool,
+    /// The bound class (empty when not bound to the shared one).
+    pub bound: String,
+    /// The name-derived class the repair re-points to.
+    pub expected: String,
+    /// The name-derived class IS the shared one — no one-click repair.
+    pub expected_is_shared: bool,
+}
+
+/// Pure: the bridge's `ok: true` reply → [`KgPrimarySharedStatus`]. A reply
+/// missing a field is an `Err` (never a silent "not bound").
+pub fn parse_kg_primary_shared_reply(reply: &serde_json::Value) -> Result<KgPrimarySharedStatus, String> {
+    serde_json::from_value(reply.clone())
+        .map_err(|e| format!("kg primary status: unexpected reply ({}): {}", e, reply))
+}
+
+/// v0.2.105: does this project use the SHARED KG collection as its primary?
+/// Detection is the Python SSOT (`vco_lib.kg_primary_shared`, also the
+/// doctor's probe and the `kg_primary_bound_to_shared` clear probe), reached
+/// through the bridge — nothing re-derives the rule here. The repair is the
+/// existing `update_project_identity` with `kg_collection = expected`.
+#[command]
+pub async fn get_kg_primary_shared_status(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<KgPrimarySharedStatus, String> {
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db.inner())
+        .ok_or_else(|| {
+            "the orchestrator clone could not be located, so the KG binding check \
+             (vco_lib.kg_primary_shared) cannot run — check the install"
+                .to_string()
+        })?;
+    tokio::task::spawn_blocking(move || {
+        let reply =
+            crate::services::vco_lib_bridge::kg_primary_shared_status(&root, &project_id, None)?;
+        parse_kg_primary_shared_reply(&reply)
+    })
+    .await
+    .map_err(|e| format!("kg primary status task join failed: {}", e))?
+}
+
+/// The writers' verdict for one proposed PRIMARY class name.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SharedPrimaryCheck {
+    /// The name is not the shared collection for this project: write it.
+    Allowed,
+    /// The name IS the shared collection for this (non-root) project: refuse.
+    Refused(String),
+    /// The check could not run (no clone, a broken Python): write it and say
+    /// so — a check that cannot look never blocks a user's own edit.
+    Unchecked(String),
+}
+
+/// Pure: the bridge's `--candidate` reply (or its error) → the verdict.
+pub fn shared_primary_verdict(
+    candidate: &str,
+    reply: Result<serde_json::Value, String>,
+) -> SharedPrimaryCheck {
+    match reply {
+        Ok(v) => match v.get("candidate_is_shared").and_then(serde_json::Value::as_bool) {
+            Some(true) => SharedPrimaryCheck::Refused(format!(
+                "'{}' is the SHARED KG collection every project reads; a project's own \
+                 primary KG must be a collection of its own (only the orchestrator root \
+                 uses the shared one for both roles)",
+                candidate
+            )),
+            Some(false) => SharedPrimaryCheck::Allowed,
+            None => SharedPrimaryCheck::Unchecked(format!(
+                "shared-KG check gave no verdict for '{}': {}",
+                candidate, v
+            )),
+        },
+        Err(e) => SharedPrimaryCheck::Unchecked(format!(
+            "shared-KG check could not run for '{}': {}",
+            candidate, e
+        )),
+    }
+}
+
+/// v0.2.105: may `candidate` become `project_id`'s PRIMARY KG binding? The
+/// Identity tab's KG field, the KG tab's picker and re-detect-from-disk ask
+/// this before writing, so no launcher path can bind a project to the shared
+/// collection (the rule is the Python SSOT, `vco_lib.kg_primary_shared`).
+pub fn check_shared_primary(db: &Db, project_id: &str, candidate: &str) -> SharedPrimaryCheck {
+    let Some(root) = crate::services::vco_lib_bridge::resolve_orchestrator_root(db) else {
+        return SharedPrimaryCheck::Unchecked(
+            "shared-KG check skipped: the orchestrator clone could not be located".into(),
+        );
+    };
+    shared_primary_verdict(
+        candidate,
+        crate::services::vco_lib_bridge::kg_primary_shared_status(&root, project_id, Some(candidate)),
+    )
+}
+
 /// Free-function core of `set_shared_kg_collection_name` — validation +
 /// `app_state` write + audit + machine-global env re-projection.
 /// Testable without a Tauri runtime; the `#[command]` wrapper routes it
@@ -1796,6 +1933,49 @@ fn _doc_imports() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.105: the bridge reply maps field-for-field; a reply missing a
+    /// field is an error, never a silent "not bound".
+    #[test]
+    fn kg_primary_shared_reply_parses_and_refuses_a_partial_reply() {
+        let reply = serde_json::json!({
+            "ok": true, "bound_to_shared": true,
+            "bound": "VibeCodedOrchestrator_KnowledgeGraph",
+            "expected": "MyApp_KnowledgeGraph", "expected_is_shared": false,
+        });
+        assert_eq!(
+            parse_kg_primary_shared_reply(&reply).unwrap(),
+            KgPrimarySharedStatus {
+                bound_to_shared: true,
+                bound: "VibeCodedOrchestrator_KnowledgeGraph".into(),
+                expected: "MyApp_KnowledgeGraph".into(),
+                expected_is_shared: false,
+            }
+        );
+        let partial = serde_json::json!({"ok": true, "bound_to_shared": true});
+        assert!(parse_kg_primary_shared_reply(&partial).is_err());
+    }
+
+    /// v0.2.105: the writers' pre-write check — refuse the shared class,
+    /// allow any other, and never block when the check could not look.
+    #[test]
+    fn shared_primary_verdict_refuses_allows_and_never_blocks_on_unknown() {
+        let shared = serde_json::json!({"ok": true, "candidate_is_shared": true});
+        let own = serde_json::json!({"ok": true, "candidate_is_shared": false});
+        assert!(matches!(
+            shared_primary_verdict("VibeCodedOrchestrator_KnowledgeGraph", Ok(shared)),
+            SharedPrimaryCheck::Refused(m) if m.contains("SHARED KG collection")
+        ));
+        assert_eq!(shared_primary_verdict("MyApp_KnowledgeGraph", Ok(own)), SharedPrimaryCheck::Allowed);
+        assert!(matches!(
+            shared_primary_verdict("X", Err("launcher.db could not be read".into())),
+            SharedPrimaryCheck::Unchecked(_)
+        ));
+        assert!(matches!(
+            shared_primary_verdict("X", Ok(serde_json::json!({"ok": true}))),
+            SharedPrimaryCheck::Unchecked(_)
+        ));
+    }
 
     #[test]
     fn orchestrator_root_detected_by_slug() {

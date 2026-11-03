@@ -385,6 +385,28 @@ def _prefix_adopt_kg_bindings_pass(
                 classes_by_suffix[suffix].append(cls)
                 break
 
+    # v0.2.105 (Windows field: 19 of 20 projects bound to the shared KG): a
+    # PRIMARY row is never adopted onto a class that is the SHARED collection
+    # or that ANOTHER project binds (any role). A project that has not synced
+    # yet has no class of its own; on a machine where the only populated
+    # `*_KnowledgeGraph` class is the shared one, that class was the "exactly
+    # one candidate" and every unsynced project adopted it. Those classes are
+    # somebody else's data, so they are not adoption candidates at all.
+    bound_by: dict[str, set] = {}
+    shared_lower: set = set()
+    for _pid, _role, _name, _cfg in rows:
+        if _name:
+            bound_by.setdefault(str(_name).lower(), set()).add(_pid)
+            if _role == "shared":
+                shared_lower.add(str(_name).lower())
+    _pointer = _read_app_state(cur, _APP_STATE_ORCH_ROOT_KG)
+    if _pointer:
+        shared_lower.add(_pointer.lower())
+
+    def _foreign_for_primary(proj_id: str, cand: str) -> bool:
+        low = cand.lower()
+        return low in shared_lower or bool(bound_by.get(low, set()) - {proj_id})
+
     # Cache row-counts so we don't re-probe Weaviate twice for the same
     # class when multiple binding rows map to the same suffix.
     count_cache: dict[str, Optional[int]] = {}
@@ -438,6 +460,8 @@ def _prefix_adopt_kg_bindings_pass(
                 # "VCO will not write there" and "VCO will not BIND there"
                 # must not be able to drift apart.
                 continue
+            if role == "primary" and _foreign_for_primary(proj_id, cand):
+                continue  # v0.2.105: the shared class / another project's class
             cnt = _count(cand)
             if cnt is None:
                 # Weaviate transient error or malformed response — skip

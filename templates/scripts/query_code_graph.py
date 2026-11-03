@@ -572,7 +572,9 @@ class CodeGraphQuery:
             )
             return True
         except Exception as e:
-            print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
+            # v0.2.105: one classifier — only a transport failure reads as
+            # "Failed to connect" (vco_lib.weaviate_helpers).
+            print(f"❌ {_wh.describe_connect_failure(e, WEAVIATE_URL)}", file=sys.stderr)
             return False
 
     def _resolve_anchor_props(self, anchor: str) -> Optional[dict]:
@@ -2478,4 +2480,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # v0.2.105: console-safe output on a Windows cp1252/OEM reader - the ONE
+    # home is vco_lib.console_text.
+    from vco_lib.console_text import harden_stdio
+    harden_stdio()
     sys.exit(main())
