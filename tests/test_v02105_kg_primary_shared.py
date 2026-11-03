@@ -221,6 +221,17 @@ def test_status_cli_names_the_repair_target_for_a_bound_project(tmp_path):
     assert rc == 0 and reply["bound_to_shared"] is False  # the root is never flagged
 
 
+def test_candidate_check_refuses_the_shared_class_for_a_project_but_not_the_root(tmp_path):
+    """The launcher's binding writers ask this before writing a primary."""
+    db = _db(tmp_path, ROOT, {"project_id": "a", "name": "My App",
+                              "kg_primary": "MyApp_KnowledgeGraph", "kg_shared": SHARED})
+    assert kps.candidate_is_shared("a", SHARED.lower(), db) is True
+    assert kps.candidate_is_shared("a", "MyApp_KnowledgeGraph", db) is False
+    assert kps.candidate_is_shared("root", SHARED, db) is False
+    rc, reply = _cli(["status", "--project-id", "a", "--candidate", SHARED, "--db", str(db), "--json"])
+    assert rc == 0 and reply == {"ok": True, "candidate": SHARED, "candidate_is_shared": True}
+
+
 def test_status_cli_reports_an_unreadable_db_as_not_ok(tmp_path):
     bogus = tmp_path / "launcher.db"
     bogus.write_bytes(b"not a database" * 20)

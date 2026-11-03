@@ -100,10 +100,24 @@ def shared_collection_names(conn: sqlite3.Connection) -> set:
     return names or {DEFAULT_SHARED_KG_COLLECTION.lower()}
 
 
+def _roles_of(conn: sqlite3.Connection, project_id: str) -> dict:
+    return {str(r[0]): str(r[1] or "").strip() for r in conn.execute(
+        "SELECT role, collection_name FROM project_kg_bindings WHERE project_id = ?",
+        (project_id,)).fetchall()}
+
+
+def names_shared_for(name: str, shared: set, roles: dict) -> bool:
+    """THE rule: ``name`` is the shared collection for a project whose
+    bindings are ``roles`` — one of the machine's shared names, or the
+    project's OWN shared row. (Callers exclude the root first.)"""
+    low = (name or "").strip().lower()
+    return bool(low) and (low in shared or low == roles.get("shared", "").lower())
+
+
 def find_in_conn(conn: sqlite3.Connection) -> list:
     """Every non-root project whose primary binding names the shared class
-    (the machine-wide shared names, or the project's OWN shared row).
-    Raises ``sqlite3.Error`` when the tables cannot be read."""
+    (:func:`names_shared_for`). Raises ``sqlite3.Error`` when the tables
+    cannot be read."""
     from vco_lib.project_identity import expected_kg_primary_class
 
     shared = shared_collection_names(conn)
@@ -112,12 +126,9 @@ def find_in_conn(conn: sqlite3.Connection) -> list:
     for pid, name, slug, host, folder in projects:
         if _is_root(str(host or ""), str(slug or "")):
             continue
-        roles = {str(r[0]): str(r[1] or "").strip() for r in conn.execute(
-            "SELECT role, collection_name FROM project_kg_bindings WHERE project_id = ?",
-            (pid,)).fetchall()}
+        roles = _roles_of(conn, pid)
         primary = roles.get("primary", "")
-        own_shared = roles.get("shared", "").lower()
-        if primary and (primary.lower() in shared or primary.lower() == own_shared):
+        if names_shared_for(primary, shared, roles):
             out.append(PrimaryBoundToShared(
                 project_id=str(pid), project_name=str(name or ""), folder=str(folder or ""),
                 bound=primary, expected=expected_kg_primary_class(str(name or "")),
@@ -233,12 +244,49 @@ def still_bound(db_path: Optional[Path] = None) -> Optional[bool]:
     return bool(findings)
 
 
-def project_status(project_id: str, db_path: Optional[Path] = None) -> dict:
-    """The launcher Identity tab's reading for ONE project (the reply of
+def candidate_is_shared(project_id: str, candidate: str,
+                        db_path: Optional[Path] = None) -> Optional[bool]:
+    """Would binding ``candidate`` as ``project_id``'s PRIMARY make it use the
+    shared collection? The launcher's binding writers ask this before they
+    write (the Identity tab's KG field, the KG tab's picker, re-detect from
+    disk). Always False for the orchestrator root; None when launcher.db
+    cannot be read."""
+    try:
+        from vco_lib.launcher_db_reader import _open_db_readonly
+
+        conn = _open_db_readonly(db_path)
+    except Exception:  # noqa: BLE001 — cannot look
+        return None
+    if conn is None:
+        return None
+    try:
+        conn.row_factory = None
+        row = conn.execute("SELECT slug, host FROM projects WHERE id = ?",
+                           (project_id,)).fetchone()
+        if row is not None and _is_root(str(row[1] or ""), str(row[0] or "")):
+            return False
+        return names_shared_for(candidate, shared_collection_names(conn),
+                                _roles_of(conn, project_id))
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def project_status(project_id: str, db_path: Optional[Path] = None,
+                   candidate: Optional[str] = None) -> dict:
+    """The launcher's reading for ONE project (the reply of
     ``python -m vco_lib.kg_primary_shared status``): ``bound_to_shared`` plus
-    the bound and name-derived classes when it is. ``ok: false`` when
-    launcher.db cannot be read — the tab then shows nothing rather than a
-    guess."""
+    the bound and name-derived classes when it is. With ``candidate`` the
+    reply also carries ``candidate_is_shared`` (the writers' pre-write
+    check). ``ok: false`` when launcher.db cannot be read — the caller then
+    shows / decides nothing rather than guessing."""
+    if candidate is not None:
+        verdict = candidate_is_shared(project_id, candidate, db_path)
+        if verdict is None:
+            return {"ok": False, "error": "launcher_db_unreadable",
+                    "message": "launcher.db could not be read"}
+        return {"ok": True, "candidate": candidate, "candidate_is_shared": verdict}
     findings = find(db_path)
     if findings is None:
         return {"ok": False, "error": "launcher_db_unreadable",
@@ -263,17 +311,20 @@ def main(argv: Optional[list] = None) -> int:
     st = sub.add_parser("status", help="is this project's primary KG the shared one?")
     st.add_argument("--project-id", required=True)
     st.add_argument("--db", type=Path, default=None, help="launcher.db (default: discovered)")
+    st.add_argument("--candidate", default=None,
+                    help="judge this class name as the project's primary instead")
     st.add_argument("--json", action="store_true", help="JSON reply (the only output form)")
     args = parser.parse_args(argv)
-    reply = project_status(args.project_id, args.db)
+    reply = project_status(args.project_id, args.db, args.candidate)
     print(json.dumps(reply))
     return 0 if reply.get("ok") else 1
 
 
 __all__ = [
     "CID_PRIMARY_BOUND_TO_SHARED", "DEFAULT_SHARED_KG_COLLECTION", "GUI_ACTION",
-    "PrimaryBoundToShared", "doctor_entry", "find", "find_in_conn", "main", "probe",
-    "project_status", "remedy", "shared_collection_names", "still_bound",
+    "PrimaryBoundToShared", "candidate_is_shared", "doctor_entry", "find", "find_in_conn",
+    "main", "names_shared_for", "probe", "project_status", "remedy",
+    "shared_collection_names", "still_bound",
 ]
 
 

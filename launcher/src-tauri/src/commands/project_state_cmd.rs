@@ -867,7 +867,20 @@ pub async fn set_project_kg_binding(
     let row = crate::commands::blocking::run_with_db_on_blocking_pool(
         app,
         "set_project_kg_binding",
-        move |db| set_project_kg_binding_row_with_db(db, &project_id_for_task, &req),
+        move |db| {
+            // v0.2.105: a non-root project's PRIMARY never names the shared
+            // KG collection (one rule: vco_lib.kg_primary_shared). A check
+            // that cannot run does not block the user's pick.
+            if req.role == "primary" {
+                use crate::commands::project_identity::{check_shared_primary, SharedPrimaryCheck};
+                match check_shared_primary(db, &project_id_for_task, req.collection_name.trim()) {
+                    SharedPrimaryCheck::Refused(msg) => return Err(msg),
+                    SharedPrimaryCheck::Unchecked(w) => tracing::warn!("[vct] {}", w),
+                    SharedPrimaryCheck::Allowed => {}
+                }
+            }
+            set_project_kg_binding_row_with_db(db, &project_id_for_task, &req)
+        },
     )
     .await??;
 

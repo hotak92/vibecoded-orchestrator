@@ -510,7 +510,13 @@ pub fn packs_status(root: &Path, project_folder: &Path) -> Result<serde_json::Va
 /// `ok: true` reply (`bound_to_shared`, `bound`, `expected`,
 /// `expected_is_shared`); an unreadable launcher.db or a child that cannot run
 /// is an `Err` — the Identity tab then shows no verdict rather than a guess.
-pub fn kg_primary_shared_status(root: &Path, project_id: &str) -> Result<serde_json::Value, String> {
+/// With `candidate` the reply is instead `candidate_is_shared` for that class
+/// name (the binding writers' pre-write check).
+pub fn kg_primary_shared_status(
+    root: &Path,
+    project_id: &str,
+    candidate: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let python = vco_lib_python()?;
     let mut cmd = Command::new(&python).silent();
     cmd.arg("-m")
@@ -519,6 +525,9 @@ pub fn kg_primary_shared_status(root: &Path, project_id: &str) -> Result<serde_j
         .arg("--project-id")
         .arg(project_id)
         .arg("--json");
+    if let Some(name) = candidate {
+        cmd.arg("--candidate").arg(name);
+    }
     reinject_minimal_env(&mut cmd);
     cmd.current_dir(root);
     let done = match vct_launcher_core::process::output_bounded(

@@ -218,9 +218,44 @@ pub async fn update_project_identity(
     crate::commands::blocking::run_with_db_on_blocking_pool(
         app,
         "update_project_identity",
-        move |db| update_project_identity_with_db(db, &project_id, &req),
+        move |db| update_project_identity_checked(db, &project_id, req, false),
     )
     .await?
+}
+
+/// v0.2.105: [`update_project_identity_with_db`] behind the shared-KG
+/// primary check ([`check_shared_primary`]). A user's explicit edit naming
+/// the shared collection is REFUSED; a re-detect from disk (`drop_refused`)
+/// keeps the rest of its update and drops only the KG part, with a warning —
+/// a settings file that an older update projected the shared name into must
+/// not re-apply the defect.
+pub fn update_project_identity_checked(
+    db: &Db,
+    project_id: &str,
+    mut req: UpdateProjectIdentityReq,
+    drop_refused: bool,
+) -> Result<UpdateProjectIdentityResult, String> {
+    let mut notes: Vec<String> = Vec::new();
+    let proposed = req
+        .kg_collection
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(kg) = proposed {
+        match check_shared_primary(db, project_id, &kg) {
+            SharedPrimaryCheck::Allowed => {}
+            SharedPrimaryCheck::Unchecked(w) => notes.push(w),
+            SharedPrimaryCheck::Refused(msg) if drop_refused => {
+                req.kg_collection = None;
+                notes.push(format!("KG collection from disk not applied: {}", msg));
+            }
+            SharedPrimaryCheck::Refused(msg) => return Err(msg),
+        }
+    }
+    let mut res = update_project_identity_with_db(db, project_id, &req)?;
+    res.warnings.extend(notes);
+    Ok(res)
 }
 
 /// Inner helper. The Tauri command above is a thin wrapper; this is the
@@ -429,7 +464,7 @@ pub async fn redetect_project_identity(
     let res = crate::commands::blocking::run_with_db_on_blocking_pool(
         app,
         "redetect_project_identity",
-        move |db| update_project_identity_with_db(db, &pid, &identity_req),
+        move |db| update_project_identity_checked(db, &pid, identity_req, true),
     )
     .await
     .and_then(|r| r);
@@ -1601,11 +1636,66 @@ pub async fn get_kg_primary_shared_status(
                 .to_string()
         })?;
     tokio::task::spawn_blocking(move || {
-        let reply = crate::services::vco_lib_bridge::kg_primary_shared_status(&root, &project_id)?;
+        let reply =
+            crate::services::vco_lib_bridge::kg_primary_shared_status(&root, &project_id, None)?;
         parse_kg_primary_shared_reply(&reply)
     })
     .await
     .map_err(|e| format!("kg primary status task join failed: {}", e))?
+}
+
+/// The writers' verdict for one proposed PRIMARY class name.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SharedPrimaryCheck {
+    /// The name is not the shared collection for this project: write it.
+    Allowed,
+    /// The name IS the shared collection for this (non-root) project: refuse.
+    Refused(String),
+    /// The check could not run (no clone, a broken Python): write it and say
+    /// so — a check that cannot look never blocks a user's own edit.
+    Unchecked(String),
+}
+
+/// Pure: the bridge's `--candidate` reply (or its error) → the verdict.
+pub fn shared_primary_verdict(
+    candidate: &str,
+    reply: Result<serde_json::Value, String>,
+) -> SharedPrimaryCheck {
+    match reply {
+        Ok(v) => match v.get("candidate_is_shared").and_then(serde_json::Value::as_bool) {
+            Some(true) => SharedPrimaryCheck::Refused(format!(
+                "'{}' is the SHARED KG collection every project reads; a project's own \
+                 primary KG must be a collection of its own (only the orchestrator root \
+                 uses the shared one for both roles)",
+                candidate
+            )),
+            Some(false) => SharedPrimaryCheck::Allowed,
+            None => SharedPrimaryCheck::Unchecked(format!(
+                "shared-KG check gave no verdict for '{}': {}",
+                candidate, v
+            )),
+        },
+        Err(e) => SharedPrimaryCheck::Unchecked(format!(
+            "shared-KG check could not run for '{}': {}",
+            candidate, e
+        )),
+    }
+}
+
+/// v0.2.105: may `candidate` become `project_id`'s PRIMARY KG binding? The
+/// Identity tab's KG field, the KG tab's picker and re-detect-from-disk ask
+/// this before writing, so no launcher path can bind a project to the shared
+/// collection (the rule is the Python SSOT, `vco_lib.kg_primary_shared`).
+pub fn check_shared_primary(db: &Db, project_id: &str, candidate: &str) -> SharedPrimaryCheck {
+    let Some(root) = crate::services::vco_lib_bridge::resolve_orchestrator_root(db) else {
+        return SharedPrimaryCheck::Unchecked(
+            "shared-KG check skipped: the orchestrator clone could not be located".into(),
+        );
+    };
+    shared_primary_verdict(
+        candidate,
+        crate::services::vco_lib_bridge::kg_primary_shared_status(&root, project_id, Some(candidate)),
+    )
 }
 
 /// Free-function core of `set_shared_kg_collection_name` — validation +
@@ -1864,6 +1954,27 @@ mod tests {
         );
         let partial = serde_json::json!({"ok": true, "bound_to_shared": true});
         assert!(parse_kg_primary_shared_reply(&partial).is_err());
+    }
+
+    /// v0.2.105: the writers' pre-write check — refuse the shared class,
+    /// allow any other, and never block when the check could not look.
+    #[test]
+    fn shared_primary_verdict_refuses_allows_and_never_blocks_on_unknown() {
+        let shared = serde_json::json!({"ok": true, "candidate_is_shared": true});
+        let own = serde_json::json!({"ok": true, "candidate_is_shared": false});
+        assert!(matches!(
+            shared_primary_verdict("VibeCodedOrchestrator_KnowledgeGraph", Ok(shared)),
+            SharedPrimaryCheck::Refused(m) if m.contains("SHARED KG collection")
+        ));
+        assert_eq!(shared_primary_verdict("MyApp_KnowledgeGraph", Ok(own)), SharedPrimaryCheck::Allowed);
+        assert!(matches!(
+            shared_primary_verdict("X", Err("launcher.db could not be read".into())),
+            SharedPrimaryCheck::Unchecked(_)
+        ));
+        assert!(matches!(
+            shared_primary_verdict("X", Ok(serde_json::json!({"ok": true}))),
+            SharedPrimaryCheck::Unchecked(_)
+        ));
     }
 
     #[test]
