@@ -3229,6 +3229,22 @@
           Open
         </button>
       </div>
+      <!-- v0.2.105: more than one of the user's Claude logins through the
+           gateway; each project picks one (Project → Identity). -->
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Claude accounts</strong>
+          <span class="pr-onboarding-hint">
+            Let the model gateway serve more than one of your Claude logins — for example your
+            personal plan and a seat on a second organisation account — and choose one per
+            project. You sign in yourself; VCO keeps only each account's name and folder, and
+            renews an added account's login before it expires.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => goto('/preferences/accounts')}>
+          Open
+        </button>
+      </div>
     </section>
 
     <!-- v0.2.104 API-1: VCO's background `claude -p` jobs retry once with the

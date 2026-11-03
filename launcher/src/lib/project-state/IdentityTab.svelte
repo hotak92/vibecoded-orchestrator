@@ -33,6 +33,7 @@
   import SharedKgPicker from '$lib/components/SharedKgPicker.svelte';
   import ExtraCodegraphPathsPanel from '$lib/project-state/ExtraCodegraphPathsPanel.svelte';
   import InfraDeclarationsPanel from '$lib/project-state/InfraDeclarationsPanel.svelte';
+  import GatewayAccountPicker from '$lib/components/GatewayAccountPicker.svelte';
   import type {
     ProjectIdentity,
     UpdateProjectIdentityRequest,
@@ -641,6 +642,10 @@
          collections, unmanaged containers, local ports) — VCO leaves it
          alone. Self-contained: loads and saves its own data. -->
     <InfraDeclarationsPanel {projectId} />
+
+    <!-- v0.2.105: which Claude login the model gateway serves this project
+         with. Self-contained; hidden while only the primary login exists. -->
+    <GatewayAccountPicker {projectId} />
   {/if}
 </section>
 
