@@ -586,11 +586,12 @@ def _spawn(argv: Sequence[str], cwd: Optional[Path]) -> None:
     """Start the launcher detached, so the hook never waits on a GUI.
 
     Same detach discipline as :func:`vco_lib.hub_ensure._spawn`: a new session
-    on POSIX, ``DETACHED_PROCESS | CREATE_NO_WINDOW`` on Windows so no console
-    flashes. stdio goes to ``DEVNULL`` — a GUI writing into the hook's pipe
+    on POSIX, ``CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`` on Windows
+    (:mod:`vco_lib.windowless_spawn`) so no console flashes. stdio goes to ``DEVNULL`` — a GUI writing into the hook's pipe
     would keep the SessionStart hook's stdout open after the hook returns.
     """
-    from vco_lib.install_companions import detached_child_env, detached_popen_kwargs
+    from vco_lib.install_companions import detached_child_env
+    from vco_lib.windowless_spawn import detached_popen_kwargs
 
     subprocess.Popen(  # noqa: S603 — argv[0] is a resolved absolute path
         list(argv),

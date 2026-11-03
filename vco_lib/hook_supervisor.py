@@ -16,8 +16,9 @@ Two pieces, used together by the container session hooks
   forwarded by anything; that is why the session hooks never leave the
   supervisor where a hook runner's timeout could reach it — see below.
 * :func:`relay_detached` — start a command DETACHED (a new session on POSIX,
-  ``DETACHED_PROCESS`` on Windows: ``install_companions.detached_popen_kwargs``,
-  the same discipline the hub and launcher spawns use), with its output in a
+  its own windowless console on Windows:
+  ``vco_lib.windowless_spawn.detached_popen_kwargs``, the same discipline the
+  hub and launcher spawns use), with its output in a
   log file, and relay that output to the caller's stdout for at most
   *budget_s*. If the work outlives the budget, the relay says so, names the
   log, and returns — the hook finishes inside its registered timeout while the
@@ -212,7 +213,8 @@ def relay_detached(
     """Start *argv* detached and relay its output for up to *budget_s*
     (see the module docstring). Returns the child's exit code when it ended
     inside the budget, else 0 (a session hook never fails the session)."""
-    from vco_lib.install_companions import detached_child_env, detached_popen_kwargs  # noqa: PLC0415
+    from vco_lib.install_companions import detached_child_env  # noqa: PLC0415
+    from vco_lib.windowless_spawn import detached_popen_kwargs  # noqa: PLC0415
 
     out = out or _write_stdout
     env = detached_child_env()

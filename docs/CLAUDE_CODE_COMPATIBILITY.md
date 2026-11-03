@@ -131,6 +131,24 @@ the `:-.` fallback additionally covers its absence. The shipped `.ps1`
 hooks themselves read `$env:CLAUDE_PROJECT_DIR` (falling back to the
 project cwd) when they need the project root at runtime.
 
+**Windows console windows (v0.2.105).** Claude Code starts every hook
+command, in every form (shell form through Git Bash or PowerShell, exec
+form, `shell: "powershell"`), with `windowsHide` and, on Windows, without
+`detached`. That is libuv's `CREATE_NO_WINDOW`, so the registered
+`powershell.exe` gets a console that has no window, and every plain child it
+runs shares that console. The registration shape therefore stays as it is.
+`-WindowStyle Hidden` must never be added to it: PowerShell applies that
+flag only after it has started inside a console the OS already created, so
+under a spawner that does not hide the console the window still flashes.
+Windows only show up when a hook's background work gets a **new** console,
+which happens in two cases: `Start-Process` (a new console that is only
+*asked* to stay hidden) and a `DETACHED_PROCESS` child (no console at all,
+so each console program it starts, a venv `python.exe` included, opens a
+visible one). VCO's background spawns therefore go through one place,
+`vco_lib/windowless_spawn.py` (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`,
+never `DETACHED_PROCESS`), and the PowerShell hooks reach it through
+`Start-VcoDetachedProcess` in `.claude/hooks/_lib/resolve-powershell.ps1`.
+
 Every spelling of one registration — the pre-v0.2.97 relative form, the
 exact-placeholder form, and the `:-.` fallback form — is treated as the
 same hook by the bundle update and the launcher's Hooks tab (registration

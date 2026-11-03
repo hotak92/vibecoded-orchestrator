@@ -243,7 +243,7 @@ def _serialize(items: Sequence[DeferredEmit]) -> str:
 def _spawn_child(payload: str) -> None:
     """Write ``payload`` to a private temp file and start the detached sender.
     Raises on any failure (the caller then sends inline)."""
-    from vco_lib.install_companions import detached_popen_kwargs
+    from vco_lib.windowless_spawn import detached_popen_kwargs
 
     fd, path = tempfile.mkstemp(prefix="vco-rl-emit-", suffix=".json")
     try:
