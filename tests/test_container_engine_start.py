@@ -271,7 +271,7 @@ class TryStartDockerDaemonTests(unittest.TestCase):
         """R19 F3 / R21 L2: on Windows the ``cmd`` console child is spawned
         with ``CREATE_NO_WINDOW`` (0x08000000) so a windowless parent (the
         Rust spawn) never flashes a console. Red-proofed by mutation:
-        removing ``**_windows_no_window_kwargs()`` from the Popen call
+        removing ``**no_window_popen_kwargs()`` from the Popen call
         makes this fail."""
         with tempfile.TemporaryDirectory() as td:
             env, exe = self._windows_env(Path(td))
@@ -281,18 +281,17 @@ class TryStartDockerDaemonTests(unittest.TestCase):
                 seen.append(kw)
                 return mock.Mock()
 
-            # `os.name` is what `_windows_no_window_kwargs` branches on —
+            # `os.name` is what `no_window_popen_kwargs` branches on —
             # but a global patch makes every `Path()` INSIDE the starter
             # a WindowsPath, which cannot instantiate on POSIX. So drive
-            # the REAL helper with os.name="nt" for exactly its call (it
-            # builds no Path) and let the call site pass its kwargs on.
-            real_kwargs = ces._windows_no_window_kwargs
+            # the REAL helper as Windows (its `os_name` seam) for exactly
+            # its call and let the call site pass its kwargs on.
+            real_kwargs = ces.no_window_popen_kwargs
 
             def _nt_kwargs():
-                with mock.patch("os.name", "nt"):
-                    return real_kwargs()
+                return real_kwargs(os_name="nt")
 
-            with mock.patch.object(ces, "_windows_no_window_kwargs", side_effect=_nt_kwargs):
+            with mock.patch.object(ces, "no_window_popen_kwargs", side_effect=_nt_kwargs):
                 ok, _ = ces.try_start_docker_daemon(
                     system="Windows", env=env,
                     which=lambda n: f"/bin/{n}" if n == "docker" else None,
@@ -300,7 +299,7 @@ class TryStartDockerDaemonTests(unittest.TestCase):
                     wait_s=0.0)
             self.assertTrue(ok)
             self.assertEqual(len(seen), 1)
-            self.assertEqual(seen[0].get("creationflags"), ces.CREATE_NO_WINDOW)
+            self.assertEqual(seen[0].get("creationflags"), 0x0800_0000)  # CREATE_NO_WINDOW
 
     def test_darwin_opens_docker_app(self):
         runs: list = []

@@ -974,9 +974,9 @@ def _notify_degradation(tier: str, reason: str) -> None:
         return
     try:
         import subprocess as _sub
-        kwargs = {}
-        if os.name == "posix":
-            kwargs["start_new_session"] = True
+
+        from vco_lib.windowless_spawn import detached_popen_kwargs
+        kwargs = detached_popen_kwargs()
         proc = _sub.Popen(
             argv,
             stdin=_sub.DEVNULL,

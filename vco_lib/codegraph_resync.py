@@ -4152,6 +4152,7 @@ def spawn_code_summary_after_walk(
     out_handle = None
     try:
         from vco_lib.install_companions import detached_child_env
+        from vco_lib.windowless_spawn import detached_popen_kwargs
 
         if log_path is not None:
             try:
@@ -4165,9 +4166,8 @@ def spawn_code_summary_after_walk(
             "stderr": child_out,
             "stdin": subprocess.DEVNULL,
             "env": detached_child_env(),
+            **detached_popen_kwargs(),
         }
-        if os.name == "posix":
-            popen_kwargs["start_new_session"] = True
         print(f"[resync-driver] code-summary rider: {' '.join(summary_argv)}",
               flush=True)
         proc = subprocess.Popen(summary_argv, **popen_kwargs)  # noqa: S603 — argv is ours
@@ -5373,8 +5373,8 @@ def spawn_background_resync(
     # inherit the fd; the parent closes its handle right after spawning so
     # nothing keeps the parent's pipes open. Log-file preparation failure
     # degrades to DEVNULL (spawn must never block on logging).
-    # start_new_session detaches the process group (POSIX); on Windows the
-    # default is fine (no controlling terminal to inherit).
+    # detached_popen_kwargs: a new session on POSIX, its own windowless console
+    # + process group on Windows (vco_lib.windowless_spawn).
     log_path = _resync_log_path(project_name)
     log_handle = None
     if log_path is not None:
@@ -5398,6 +5398,7 @@ def spawn_background_resync(
             log_handle = None
     child_out = log_handle if log_handle is not None else subprocess.DEVNULL
     from vco_lib.install_companions import detached_child_env
+    from vco_lib.windowless_spawn import detached_popen_kwargs
 
     popen_kwargs = {
         "cwd": str(repo_root),
@@ -5405,9 +5406,8 @@ def spawn_background_resync(
         "stderr": child_out,
         "stdin": subprocess.DEVNULL,
         "env": detached_child_env(),  # outlives the caller: no relaunch record
+        **detached_popen_kwargs(),
     }
-    if os.name == "posix":
-        popen_kwargs["start_new_session"] = True
 
     # v0.2.91 (#31): tell the driver WHERE its own stdout lands so it can read
     # the analyzer's end-of-walk summary lines back out of the shared log for

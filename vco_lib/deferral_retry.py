@@ -1952,8 +1952,9 @@ def spawn_detached(
     }
     if extra_env:
         kwargs["env"] = {**kwargs["env"], **{k: str(v) for k, v in extra_env.items()}}
-    if os.name == "posix":
-        kwargs["start_new_session"] = True
+    from vco_lib.windowless_spawn import detached_popen_kwargs
+
+    kwargs.update(detached_popen_kwargs())
     try:
         _DETACHED_CHILDREN.append(
             subprocess.Popen(argv, **kwargs)  # noqa: S603 — argv is ours

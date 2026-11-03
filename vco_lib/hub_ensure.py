@@ -761,7 +761,8 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
     short-circuits when already running and returns within ~100 ms, so the
     cost of the spawn is bounded either way.
     """
-    from vco_lib.install_companions import detached_child_env, detached_popen_kwargs
+    from vco_lib.install_companions import detached_child_env
+    from vco_lib.windowless_spawn import detached_popen_kwargs
 
     argv = [str(binary), "--start-if-not-running"]
     env = detached_child_env()  # the hub outlives us: no relaunch record

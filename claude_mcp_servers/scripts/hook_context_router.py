@@ -1122,7 +1122,8 @@ def _spawn_leg_warmer(project_root: str, legs_spec: Dict[str, Dict]) -> None:
     job spec (producer script, pinned argv, cache key) rides STDIN as JSON —
     the query text never travels through argv (R31). Detach shape: a new
     session on POSIX (the ``setsid`` discipline of stop-codegraph-drain's
-    ``_drain_spawn_detached``), plain DEVNULL'd handles elsewhere. A per-key
+    ``_drain_spawn_detached``), its own windowless console + process group on
+    Windows (:func:`vco_lib.windowless_spawn.detached_popen_kwargs`). A per-key
     ``O_CREAT|O_EXCL`` claim (:func:`vco_lib.atomic.claim_once`) stops a
     slow backend from stacking one warmer per interactive call. Soft-fail:
     any spawn problem drops the warming, never the hook."""
@@ -1141,9 +1142,9 @@ def _spawn_leg_warmer(project_root: str, legs_spec: Dict[str, Dict]) -> None:
     if not claimed:
         return
     spec = {"project_root": project_root, "legs": claimed}
-    popen_kwargs: Dict[str, object] = {}
-    if os.name == "posix":
-        popen_kwargs["start_new_session"] = True
+    from vco_lib.windowless_spawn import detached_popen_kwargs
+
+    popen_kwargs: Dict[str, object] = detached_popen_kwargs()
     try:
         proc = subprocess.Popen(
             [sys.executable, str(_HERE / "hook_context_router.py"), "--warm-legs"],
