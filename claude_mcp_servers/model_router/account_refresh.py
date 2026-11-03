@@ -240,6 +240,12 @@ class AccountRefresher:
         """One pass over every registered account. Never raises."""
         done: list[RefreshAttempt] = []
         async with self._lock:
+            # Keeps every login's cached state current — on macOS the Keychain
+            # answer /health shows (it never runs `security` itself).
+            try:
+                self._service.primary_reader.read()
+            except Exception:  # noqa: BLE001 — a warm-up never stops a tick
+                pass
             reg = self._service.registry()
             for acct in reg.accounts:
                 try:
@@ -273,7 +279,7 @@ class AccountRefresher:
             except OSError as exc:
                 attempt = RefreshAttempt(now, OUTCOME_SPAWN_FAILED, str(exc), None)
             else:
-                after_state = reader.read()
+                after_state = reader.read(fresh=True)  # the Keychain too
                 after = after_state.expires_at_ms
                 expires_in = int(after / 1000 - self._clock()) if after else None
                 if after and after > (before or 0):

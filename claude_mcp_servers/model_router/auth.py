@@ -56,6 +56,19 @@ a user or a subagent reads:
 
 The one bounded wait (:meth:`OAuthReader.aread_with_brief_wait`) exists for
 the same reason and is deliberately NOT used by ``/health``.
+
+macOS: the login Keychain (v0.2.105)
+------------------------------------
+On a Mac Claude Code keeps the login in the login Keychain and writes the file
+only when it cannot. When the file yields no usable token, the reader asks the
+Keychain item Claude Code wrote for the same config dir
+(:mod:`model_router.macos_keychain` — naming, account and the ``security``
+call). That answer is cached for :data:`model_router.macos_keychain.CACHE_S`;
+``/health`` passes ``cached_only=True`` and never runs ``security`` (the login
+keeper's tick keeps the cache warm), and the keeper asks ``fresh=True`` after
+a renewal. A missing item or a locked Keychain is "no login here" — the
+gateway's loud fallback — and the value is never logged. Off macOS this path
+is never taken.
 """
 
 from __future__ import annotations
@@ -73,6 +86,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from . import macos_keychain as _kc
 from .fileperms import PermissionHardeningError, restrict_to_owner
 
 logger = logging.getLogger(__name__)
@@ -199,8 +213,24 @@ class OAuthReader:
     critical section is one ``stat`` plus, on a change, one small file read.
     """
 
-    def __init__(self, path: Path) -> None:
+    #: ``keychain_config_dir`` default: derive it from ``path``'s folder (an
+    #: added account, whose login was made with ``CLAUDE_CONFIG_DIR=<folder>``).
+    DERIVE = object()
+
+    def __init__(self, path: Path, *, keychain_config_dir: "object" = DERIVE,
+                 platform: Optional[str] = None) -> None:
+        """``keychain_config_dir`` is the ``CLAUDE_CONFIG_DIR`` the login was
+        made with (``None`` = not set: the user's own ``claude``), which names
+        the macOS Keychain item; ``platform`` overrides ``sys.platform``
+        (tests). The Keychain is consulted on macOS only."""
         self._path = path
+        self._keychain = _kc.is_macos(platform)
+        self._kc_dir: Optional[str] = (
+            str(Path(path).parent) if keychain_config_dir is OAuthReader.DERIVE
+            else (str(keychain_config_dir) if keychain_config_dir else None))
+        #: ``(monotonic time, answer)`` of the last Keychain read.
+        self._kc_cache: "tuple[float, _kc.KeychainLogin] | None" = None
+        self._kc_logged: Optional[str] = None
         self._lock = threading.RLock()
         self._file: _ParsedFile | None = None
         #: Success-only store: the last token this reader actually PARSED, so
@@ -227,8 +257,63 @@ class OAuthReader:
     def path(self) -> Path:
         return self._path
 
-    def read(self, *, now_ms: Optional[int] = None) -> OAuthState:
-        """Current OAuth state. One ``stat``; a full read only on change.
+    def read(self, *, now_ms: Optional[int] = None, cached_only: bool = False,
+             fresh: bool = False) -> OAuthState:
+        """Current OAuth state: the file (:meth:`_read_from_file`), then — on
+        macOS, when the file yields no usable token — the login Keychain.
+        ``cached_only`` never runs ``security`` (``/health``); ``fresh``
+        ignores the Keychain cache (after a renewal)."""
+        now = int(time.time() * 1000) if now_ms is None else now_ms
+        with self._lock:
+            state = self._read_from_file(now)
+            if state.token is not None or not self._keychain:
+                return state
+            login = self._keychain_login(cached_only=cached_only, fresh=fresh)
+            return self._keychain_state(login, state, now)
+
+    def _keychain_login(self, *, cached_only: bool, fresh: bool
+                        ) -> "_kc.KeychainLogin | None":
+        cached = self._kc_cache
+        if cached is not None and (cached_only or (
+                not fresh and time.monotonic() - cached[0] < _kc.CACHE_S)):
+            return cached[1]
+        if cached_only:
+            return None
+        login = _kc.read_login(self._kc_dir)
+        self._kc_cache = (time.monotonic(), login)
+        if login.status != self._kc_logged:
+            self._kc_logged = login.status
+            log = logger.info if login.status == _kc.FOUND else logger.warning
+            log("model-gateway: macOS Keychain item %r for the Claude login: %s%s "
+                "(expires_at_ms=%s). No token value is logged.",
+                login.service, login.status,
+                f" — {login.detail}" if login.detail else "",
+                login.expires_at_ms or "unset")
+        return login
+
+    def _keychain_state(self, login: "_kc.KeychainLogin | None",
+                        file_state: OAuthState, now: int) -> OAuthState:
+        """The state the Keychain answer gives, else the file's."""
+        if login is None or login.status in (_kc.NOT_FOUND, _kc.UNAVAILABLE):
+            return file_state
+        if login.status == _kc.LOCKED:
+            return OAuthState(
+                None, 0,
+                (f"the macOS login Keychain refused to hand over the Claude "
+                 f"login (item {login.service!r}: {login.detail}). Unlock the "
+                 f"Keychain (log in to the Mac session), then retry."),
+                "unreadable",
+            )
+        if login.expires_at_ms and now > login.expires_at_ms:
+            return OAuthState(
+                None, login.expires_at_ms,
+                "your Claude login token (macOS Keychain) has expired. " + _LOGIN_HINT,
+                "expired",
+            )
+        return OAuthState(login.token, login.expires_at_ms, None, "present")
+
+    def _read_from_file(self, now: int) -> OAuthState:
+        """The credentials FILE's verdict. One ``stat``; a full read only on change.
 
         Serves the last-known-good token when a re-parse finds none in a file
         that is mid-rewrite, while that token is unexpired AND was seen within
@@ -238,7 +323,6 @@ class OAuthReader:
         Never waits: a caller that wants the bounded re-read asks for
         :meth:`read_with_brief_wait` explicitly, and ``/health`` never does.
         """
-        now = int(time.time() * 1000) if now_ms is None else now_ms
         with self._lock:
             state, detail, kind = self._read_file(now)
             if state.token is not None:

@@ -132,6 +132,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
@@ -594,7 +595,11 @@ class Gateway:
         self.config = config
         self.vendors = vendors
         self.anthropic = anthropic
-        self.oauth = oauth_reader or OAuthReader(config.credentials_file)
+        # The user's own login: on macOS its Keychain item is named after the
+        # CLAUDE_CONFIG_DIR the user's `claude` runs with (none, normally).
+        self.oauth = oauth_reader or OAuthReader(
+            config.credentials_file,
+            keychain_config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or None)
         #: v0.2.105: the Claude accounts (``primary`` is :attr:`oauth`, the
         #: login this gateway has always used). With no registry file every
         #: request is served by ``primary`` exactly as before.
@@ -1056,7 +1061,9 @@ async def health_handler(request: web.Request) -> web.Response:
     subprocess. The top-level ``oauth_*`` fields stay the ``primary`` login's).
     """
     gateway: Gateway = request.app[APP_KEY]
-    oauth = gateway.oauth.read()
+    # cached_only: /health never runs a subprocess (the macOS Keychain answer
+    # is the one the request path / login keeper cached).
+    oauth = gateway.oauth.read(cached_only=True)
     table = gateway.context.current()
     return web.json_response(
         {
@@ -3328,7 +3335,7 @@ def _reread_oauth_headers(
     reader = (
         gateway.accounts.reader(account.served) if account is not None else None
     ) or gateway.oauth
-    fresh = reader.read()
+    fresh = reader.read(fresh=True)
     if not fresh.token:
         return None
     presented = headers.get("Authorization", "")

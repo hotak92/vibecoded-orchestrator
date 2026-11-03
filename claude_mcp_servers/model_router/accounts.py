@@ -419,7 +419,9 @@ class AccountService:
         rows = []
         for acct_id in reg.ids():
             reader = self.reader(acct_id, reg)
-            state: Optional[OAuthState] = reader.read() if reader is not None else None
+            # cached_only: /health runs no subprocess (macOS Keychain).
+            state: Optional[OAuthState] = (
+                reader.read(cached_only=True) if reader is not None else None)
             acct = reg.get(acct_id)
             stats = self._stats.get(acct_id) or _AccountStats()
             expires_in = (

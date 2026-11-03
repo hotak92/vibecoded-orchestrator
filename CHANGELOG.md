@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   note on the accounts page and the project page, and a one-time notice to the model naming the account it is billed
   to and how to log back in. The gateway renews an added account's login on its own shortly before it expires,
   without spending a model call.
+- **On a Mac the model gateway now finds your Claude login in the Keychain.** Claude Code on macOS keeps the login in
+  the login Keychain rather than in `~/.claude/.credentials.json`, so the gateway saw no login there — for your own
+  account and for any added one. When the file holds no usable login, the gateway now reads the Keychain item Claude
+  Code wrote for that account (one per configuration folder) through the system `security` tool; the token stays in
+  memory and is never logged, a locked Keychain or a missing item is treated as "not logged in" (the loud fallback,
+  never a failed chat), and the login keeper sees a renewal written to the Keychain. Linux and Windows are unchanged.
 - **The gateway's usage ledger records when a turn was a context compaction.** Claude Code marks those requests with an
   `x-claude-code-compaction` header; each ledger row now carries the value (`null` on an ordinary turn), so a sudden
   jump in a chat's context can be traced to the compaction that caused it instead of looking like a turn you never
