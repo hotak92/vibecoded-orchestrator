@@ -17,6 +17,9 @@
   import { toast } from '$lib/stores/toast';
   import { invoke } from '$lib/tauri';
   import { duplicateScanSummary, type DuplicateScanResult } from '$lib/project-state/kg-duplicates';
+  // v0.2.105: the Copy button is the shared one (`$lib/components/CopyButton`),
+  // so the clipboard routine lives in one place.
+  import CopyButton from './CopyButton.svelte';
 
   // The Tauri commands a bell action may run — the literal union keeps the
   // invoke-name census (invoke-names.test.ts DYNAMIC_INVOKES) honest. The
@@ -40,15 +43,6 @@
       });
     } catch {
       return '';
-    }
-  }
-
-  async function copy(message: string) {
-    try {
-      await navigator.clipboard.writeText(message);
-      toast.success('Copied to clipboard');
-    } catch {
-      toast.error('Copy failed');
     }
   }
 
@@ -138,17 +132,7 @@
                 {/if}
               </div>
               <div class="bell-item-actions">
-                <button
-                  class="bell-icon-btn"
-                  onclick={() => copy(n.message)}
-                  aria-label="Copy error message"
-                  title="Copy"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                  </svg>
-                </button>
+                <CopyButton text={n.message} label="Copy error message" />
                 <button
                   class="bell-icon-btn bell-icon-trash"
                   onclick={() => notifications.dismiss(n.id)}

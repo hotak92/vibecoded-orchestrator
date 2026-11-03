@@ -22,6 +22,7 @@ import {
   dispositionExplanation,
   dispositionLabel,
   emptyStateMessage,
+  entryCopyText,
   findEntry,
   groupEntries,
   mountConfigError,
@@ -575,5 +576,70 @@ describe('AUTO_RETRY_BACKED_CONDITIONS is pinned to the deferral registry', () =
       expect(byCid.get(cid)?.retryAction).toBeNull();
       expect(AUTO_RETRY_BACKED_CONDITIONS.has(cid)).toBe(false);
     }
+  });
+});
+
+describe("entryCopyText — what a row's Copy button puts on the clipboard", () => {
+  it('carries the title, the condition id, the body and the remedy command', () => {
+    const e = entry({
+      condition_id: 'weaviate_unreachable_at_update',
+      title: 'Weaviate was unreachable',
+      detected: 'Connection refused on 8081.',
+      why_deferred: 'The service was down at update time.',
+      command_to_apply: '# start it, then\npython -m vco_lib.doctor',
+    });
+    expect(entryCopyText(e, view())).toBe(
+      'Weaviate was unreachable\n' +
+        'Condition: weaviate_unreachable_at_update\n' +
+        'Scope: My Project\n' +
+        '\n' +
+        'Connection refused on 8081.\n' +
+        'The service was down at update time.\n' +
+        '\n' +
+        'Remedy:\n' +
+        '# start it, then\npython -m vco_lib.doctor',
+    );
+  });
+
+  it('keeps the command verbatim — comment lines and blank lines survive', () => {
+    const cmd = '# step one\n\npython -m vco_lib.project_init foo \\\n  --confirm';
+    const text = entryCopyText(
+      entry({ condition_id: 'c', command_to_apply: cmd }),
+      view(),
+    );
+    expect(text.endsWith(`Remedy:\n${cmd}`)).toBe(true);
+  });
+
+  it('names the ORCHESTRATOR ROOT for the root ledger, never a project name', () => {
+    const text = entryCopyText(
+      entry({ condition_id: 'c' }),
+      view({ scope: 'orchestrator_root', scope_label: 'root folder' }),
+    );
+    expect(text).toContain(`Scope: ${ROOT_SCOPE_LABEL}`);
+    expect(text).not.toContain('Scope: root folder');
+  });
+
+  it('omits the scope line when no view is given (leave-alone)', () => {
+    const text = entryCopyText(entry({ condition_id: 'c' }));
+    expect(text).not.toContain('Scope:');
+    expect(text.startsWith('T c\nCondition: c')).toBe(true);
+  });
+
+  it('omits the remedy block when there is no command to run', () => {
+    const text = entryCopyText(
+      entry({ condition_id: 'c', command_to_apply: '' }),
+      view(),
+    );
+    expect(text).not.toContain('Remedy:');
+    expect(text.endsWith('W')).toBe(true);
+  });
+
+  it('omits blank body parts instead of copying empty lines twice', () => {
+    const text = entryCopyText(
+      entry({ condition_id: 'c', detected: '', why_deferred: 'only why' }),
+      view(),
+    );
+    expect(text).toContain('\n\nonly why');
+    expect(text).not.toContain('\n\n\n');
   });
 });

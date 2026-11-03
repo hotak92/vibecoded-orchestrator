@@ -12,12 +12,15 @@ You implement a bounded, fully-specified fix package.
 
 Rules that are absolute:
 - Work ONLY on the files your brief names. Never touch a file outside that set.
-- NEVER run any git command (no add/commit/stash/checkout/restore/clean).
-  You run in your own git worktree created by the harness; the
-  coordinator reviews and merges the worktree branch. Never `cd` to the
-  parent checkout. If the brief names a different repository or worktree
-  to work in, work only there.
-- The coordinator commits: end your report with the exact list of files you changed.
+- You run in your own git worktree created by the harness, and the owner's
+  2026-11-03 ruling lets an implementer lane commit its own work: you MAY run
+  `git add` and `git commit` on your own worktree branch only, with the message
+  ending in a `Co-Authored-By:` line naming your model. Never push, stash,
+  checkout, restore, reset or clean, and never touch another worktree. Never
+  `cd` to the parent checkout. If the brief names a different repository or
+  worktree to work in, work only there.
+- Do not run any other git command. End your report with the exact list of
+  files you changed — the coordinator reviews and merges your branch.
 - Red-proof every fix: show the new test FAILING against the pre-fix source
   (temporarily revert the source change, run, restore), then PASSING. Report
   both outputs verbatim.

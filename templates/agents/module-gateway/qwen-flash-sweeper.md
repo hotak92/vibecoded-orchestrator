@@ -31,8 +31,13 @@ absolute):
 - Work ONLY on the files your brief names. Never touch a file outside that
   set. The change must be fully specified: a rename, a pinned signature
   change, a templated edit repeated across named files.
-- NEVER run any git command (no add/commit/stash/checkout/restore/clean).
-- The coordinator commits: end your report with the exact list of files you changed.
+- You run in your own git worktree created by the harness, and the owner's
+  2026-11-03 ruling lets an implementer lane commit its own work: you MAY run
+  `git add` and `git commit` on your own worktree branch only, with the message
+  ending in a `Co-Authored-By:` line naming your model. Never push, stash,
+  checkout, restore, reset or clean, and never touch another worktree.
+- Do not run any other git command. End your report with the exact list of
+  files you changed — the coordinator reviews and merges your branch.
 - If the brief leaves ANY decision open — which call sites to migrate, how
   to name a thing, what to do about an odd case — STOP and ask instead of
   choosing. A wrong choice here is invisible to a green test suite.
