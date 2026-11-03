@@ -28,6 +28,8 @@ export interface LoginCommands {
 /** The running gateway's view of one account (`/health` `accounts`). */
 export interface GatewayAccountView {
   id: string;
+  label?: string;
+  is_default?: boolean;
   usable: boolean;
   oauth_state: string;
   oauth_expires_in_s: number | null;
@@ -70,7 +72,12 @@ export interface ProjectAccountStatus {
   falling_back: boolean;
   file_says: string | null;
   drift: boolean;
-  label: string;
+  /** Why the file does not carry the choice (`null` without drift). Only
+   *  `not_applied` is fixed by Re-apply. */
+  drift_cause: 'not_applied' | 'local_tracked' | 'local_unknown' | 'user_value' | null;
+  /** The header line that selects the assigned account (`x-vco-account: <id>`). */
+  selector_line: string | null;
+  label?: string;
   error?: string;
 }
 
@@ -78,6 +85,10 @@ export interface MutationAnswer {
   ok: boolean;
   error?: string;
   exported?: string;
+  /** set-project: the choice was saved, but re-writing the project's env failed. */
+  projection_error?: string;
+  /** set-project: the project's status re-read after the save. */
+  status?: ProjectAccountStatus;
 }
 
 export const listAccounts = () => invoke<AccountsListing>('gateway_accounts_list');
@@ -159,14 +170,80 @@ export function projectVerdict(status: ProjectAccountStatus): { text: string; to
     };
   }
   if (status.drift) {
+    return { text: driftText(status), tone: 'warn' };
+  }
+  return { text: `Requests are served by "${status.effective}".`, tone: 'ok' };
+}
+
+/** What to say about a choice that is not in force — a remedy that helps. */
+export function driftText(status: Pick<ProjectAccountStatus, 'drift_cause' | 'selector_line'>): string {
+  const line = status.selector_line;
+  switch (status.drift_cause) {
+    case 'local_tracked':
+      return (
+        "This project's .claude/settings.local.json is committed to git, so VCO does not write the " +
+        'account choice into it (it would be shared with everyone who clones the project). Untrack it ' +
+        'with `git rm --cached .claude/settings.local.json`, then press Re-apply.'
+      );
+    case 'local_unknown':
+      return (
+        "Git could not say whether this project's .claude/settings.local.json is committed, so VCO " +
+        'does not write the account choice into it. The project\'s pending actions name git\'s error; ' +
+        'fix it, then press Re-apply.'
+      );
+    case 'user_value':
+      return (
+        "This project's .claude/settings.local.json carries your own ANTHROPIC_CUSTOM_HEADERS, which " +
+        'VCO never overwrites. Add the line ' +
+        (line ? `\`${line}\`` : 'that selects the account') +
+        ' to it (one header per line) to use this account.'
+      );
+    default:
+      return "The project's .claude/settings.local.json does not carry this choice yet. Press Re-apply.";
+  }
+}
+
+/** Is the Re-apply button worth showing? Only when re-running the projection
+ *  can bring the choice into force (a tracked/unknown layer needs the user
+ *  first; their own header is never overwritten). */
+export function reapplyHelps(status: Pick<ProjectAccountStatus, 'drift' | 'drift_cause'> | null): boolean {
+  return !!status && status.drift && status.drift_cause !== 'user_value';
+}
+
+/** The toast after a save: success only when the choice is now in force. */
+export function saveOutcome(answer: MutationAnswer): { text: string; tone: 'ok' | 'warn' | 'bad' } {
+  if (!answer.ok) return { text: answer.error ?? 'The account choice was not saved.', tone: 'bad' };
+  if (answer.projection_error) {
     return {
-      text:
-        "The project's .claude/settings.local.json does not carry this choice yet " +
-        '(or carries your own ANTHROPIC_CUSTOM_HEADERS). Press Re-apply.',
+      text: `Claude account saved, but the project's settings could not be updated: ${answer.projection_error}`,
       tone: 'warn',
     };
   }
-  return { text: `Requests are served by "${status.effective}".`, tone: 'ok' };
+  if (answer.status?.drift) {
+    return { text: `Claude account saved, but not in force yet: ${driftText(answer.status)}`, tone: 'warn' };
+  }
+  return { text: 'Claude account saved — the next request of a running chat uses it.', tone: 'ok' };
+}
+
+/**
+ * One Services-card line per Claude account the running gateway serves
+ * (`/health` `accounts`): its login, and how often it fell back. `[]` while
+ * only the user's own login exists — the card's "Claude login" row already
+ * says everything then.
+ */
+export function gatewayAccountLines(
+  accounts: GatewayAccountView[] | null | undefined,
+): { id: string; text: string; tone: Tone }[] {
+  if (!accounts || accounts.length < 2) return [];
+  return accounts.map((a) => {
+    const login = loginVerdict({ login: null, gateway: a });
+    const name = a.label ? `${a.label} (${a.id})` : a.id;
+    const fell = a.fallbacks
+      ? ` — fell back ${a.fallbacks}×${a.last_fallback_reason ? ` (${a.last_fallback_reason})` : ''}`
+      : '';
+    const def = a.is_default ? ' · default' : '';
+    return { id: a.id, text: `${name}${def}: ${login.text}${fell}`, tone: a.fallbacks ? 'warn' : login.tone };
+  });
 }
 
 /** The picker is shown once a second account exists. */

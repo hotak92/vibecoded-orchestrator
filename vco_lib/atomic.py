@@ -1204,3 +1204,19 @@ def release_rename_claim(claimed: Path, path: Path, *, newer_wins: bool = True) 
         return True
     except OSError:
         return False
+
+
+def move_file(src: Path, dst: Path) -> None:
+    """Move ``src`` to ``dst`` with one atomic rename (same filesystem).
+
+    The one home for a plain file MOVE (as opposed to a tmp+rename write):
+    the bundle engine parks and restores agent definitions between
+    ``.claude/agents/`` and ``.claude/agents.disabled/`` with it. The parent
+    of ``dst`` is created. Like ``os.replace`` it overwrites an existing
+    ``dst`` — callers that must never overwrite check first. Raises
+    ``OSError`` on failure; nothing is left half-moved (a rename either
+    happened or did not).
+    """
+    src, dst = Path(src), Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dst)

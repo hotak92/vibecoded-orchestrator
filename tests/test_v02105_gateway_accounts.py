@@ -161,6 +161,23 @@ class SelectionTests(AccountsTestBase):
         rows = await self.ledger_rows()
         self.assertIsNone(rows[-1]["account"], "a vendor route is served by no Claude account")
 
+    async def test_usage_windows_are_read_and_filed_per_account(self) -> None:
+        """L-ACCT: every added account's usage is fetched with its OWN login,
+        and the rate-limit headers of an answer are filed under the account
+        that served it."""
+        from unittest import mock
+
+        self.write_registry()
+        gw = self.client.app[APP_KEY]
+        label, extras = gw._usage_accounts()  # noqa: SLF001
+        self.assertEqual(label, gw.accounts.registry().label_of("primary"))
+        self.assertEqual([(a, t) for a, _l, t in extras],
+                         [("work", WORK_TOKEN), ("team", TEAM_TOKEN)])
+        with mock.patch.object(gw.usage_windows, "observe_anthropic_headers") as tap:
+            await self.send(conversation("hi"), account="work")
+            await self.send(conversation("hi"))
+        self.assertEqual([c.args[1] for c in tap.call_args_list], ["work", "primary"])
+
     async def test_the_default_account_follows_the_registry_without_restart(self) -> None:
         self.write_registry(default="work")
         await self.send(conversation("hi"))
@@ -271,6 +288,26 @@ class NoticeTests(AccountsTestBase):
         # Another session with the same first text: its own conversation.
         await self.send(conversation("first", "second"), account="work", session="sess-2")
         self.assertEqual(len(self.notice_blocks(self.last_body())), 1)
+
+    async def test_a_turn_the_upstream_refused_does_not_use_up_the_notice(self) -> None:
+        """A5: the notice is consumed only by a turn the model ANSWERED. A
+        refused turn (here a 400) never reached it, so the client's retry of
+        the same turn carries the notice again; once a turn succeeds, the
+        conversation is told and later turns carry nothing."""
+        self.anthropic_up.messages_status = 400
+        self.anthropic_up.messages_body = {"type": "error", "error": {
+            "type": "invalid_request_error", "message": "nope"}}
+        status = await self.send(conversation("first", "second"), account="work")
+        self.assertEqual(status, 400)
+        self.assertEqual(len(self.notice_blocks(self.last_body())), 1)
+        self.anthropic_up.messages_status = 200
+        self.anthropic_up.messages_body = {"id": "msg_1", "type": "message", "model": "stub",
+                                           "content": [], "usage": {"input_tokens": 1,
+                                                                    "output_tokens": 1}}
+        await self.send(conversation("first", "second"), account="work")
+        self.assertEqual(len(self.notice_blocks(self.last_body())), 1, "the retry is told")
+        await self.send(conversation("first", "second", "third"), account="work")
+        self.assertEqual(self.notice_blocks(self.last_body()), [], "told once it was answered")
 
     async def test_ineligible_requests_leave_the_notice_pending(self) -> None:
         await self.send(conversation("first", tools=False), account="work")

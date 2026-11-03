@@ -79,7 +79,7 @@ APP_STATE_KEY = "model_providers.disabled"
 
 
 class ProviderError(ValueError):
-    """A request names something the vendor table does not known."""
+    """A request names something the vendor table does not know."""
 
 
 def _launcher_db_path() -> Path:
@@ -157,10 +157,9 @@ def enabled_vendors(*, db_path: Optional[Path] = None) -> FrozenSet[str]:
     """The registry's vendor ids minus the ones switched off.
 
     A vendor id the current registry no longer knows is NOT returned (it has
-    no rows to render and no definitions to deliver); an unimportable gateway
-    answers ``None``'s sibling — the empty set — because no vendor can be
-    named. Callers that must tell "nothing enabled" from "cannot ask" use
-    :func:`provider_vendor_ids` (which raises) plus :func:`disabled_vendors`.
+    no rows to render and no definitions to deliver). An unimportable gateway
+    RAISES ``ImportError`` (from :func:`provider_vendor_ids`) — "cannot ask"
+    is never answered as "nothing enabled".
     """
     off = disabled_vendors(db_path=db_path)
     return frozenset(v for v in provider_vendor_ids() if v not in off)
@@ -387,14 +386,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not stored:
         # A user choice that could not be stored is a FAILURE, never a silent
         # no-op: the GUI switch must not read back as applied.
-        print("[vco] model-providers: the launcher database could not be "
-              f"written (no launcher.db at {db_path or _launcher_db_path()}); "
-              "the provider setting was NOT stored", file=sys.stderr)
+        target = Path(db_path) if db_path else _launcher_db_path()
+        cause = (f"no launcher.db at {target}" if not target.is_file()
+                 else f"the write to {target} failed or did not read back")
+        print(f"[vco] model-providers: the launcher database could not be "
+              f"written ({cause}); the provider setting was NOT stored",
+              file=sys.stderr)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
         print(f"{args.vendor}: {'enabled' if args.enabled else 'disabled'}"
               + ("" if stored else " (NOT stored)"))
+        if stored:
+            # The launcher's toggle refreshes the CLAUDE.md guidance itself;
+            # from a shell that is one more command.
+            print("to refresh the model guidance in every project's CLAUDE.md "
+                  "now, run: python -m vco_lib.model_guidance refresh "
+                  "--orchestrator-root <install root> --trigger providers")
     return 0 if stored else 1
 
 

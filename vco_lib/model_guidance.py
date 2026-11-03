@@ -156,7 +156,7 @@ def refresh_guidance(
         db_path: launcher.db override (tests); ``None`` = the machine's.
         state_path: provider-record override (tests).
         state_probe / sleeper: probe injection (tests).
-        trigger: who asked (``startup`` / ``secrets`` / ``manual``) —
+        trigger: who asked (``startup`` / ``secrets`` / ``providers`` / ``manual``) —
             recorded in ``last_refresh`` for the GUI.
         log: the notice sink (default: one stderr line per event).
 
@@ -330,7 +330,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("--db-path", default=None,
                        help="launcher.db override")
         p.add_argument("--trigger", default="manual",
-                       help="who asked (startup / secrets / manual)")
+                       help="who asked (startup / secrets / providers / manual)")
     args = parser.parse_args(argv)
     root = Path(args.orchestrator_root).resolve() if args.orchestrator_root \
         else Path.cwd()

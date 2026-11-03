@@ -84,6 +84,7 @@
   // shows `offerNote`'s one-liner when the fresh verdict is not stale.
   import { gatewayFreshness } from '$lib/stores/gateway-freshness';
   import { offerNote } from '$lib/gateway-freshness';
+  import { gatewayAccountLines } from '$lib/api/gateway_accounts';
   import { projects } from '$lib/stores/projects';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
@@ -923,6 +924,14 @@
             >
           {/if}
         </dd>
+        {#if gatewayAccountLines(gw.health.accounts?.accounts).length > 0}
+          <dt>Claude accounts</dt>
+          <dd>
+            {#each gatewayAccountLines(gw.health.accounts?.accounts) as line (line.id)}
+              <div class="gw-account gw-account-{line.tone}">{line.text}</div>
+            {/each}
+          </dd>
+        {/if}
         {#if gw.health.secret_scope}
           <dt>vendor key scope</dt>
           <dd>
@@ -1374,6 +1383,12 @@
     padding: 1rem 1.1rem 1.2rem;
     border: 1px solid var(--border, #333);
     border-radius: 6px;
+  }
+  .gw-account-warn {
+    color: #f5b942;
+  }
+  .gw-account-bad {
+    color: var(--color-pink, #ff4fa0);
   }
   .gw-head {
     display: flex;

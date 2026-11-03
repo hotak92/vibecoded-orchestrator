@@ -62,8 +62,8 @@ $LogDir = Join-Path $ProjectRoot ".claude/logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $logFile = Join-Path $LogDir "kg-commit-review.log"
 
-$Input = ""
-try { $Input = [Console]::In.ReadToEnd() } catch { }
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 
 # Check if the commit actually succeeded - look for failure markers in the
 # tool_response embedded in the JSON payload. We use a substring scan rather
@@ -72,9 +72,9 @@ $LibDir = Join-Path $PSScriptRoot "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 $ToolResponseStr = ""
-if ($Input -and $PY) {
+if ($HookStdin -and $PY) {
     try {
-        $ToolResponseStr = ($Input | & $PY -c "import sys,json; d=json.load(sys.stdin); v=d.get('tool_response',''); print(v if isinstance(v,str) else json.dumps(v))" 2>$null | Out-String).Trim()
+        $ToolResponseStr = ($HookStdin | & $PY -c "import sys,json; d=json.load(sys.stdin); v=d.get('tool_response',''); print(v if isinstance(v,str) else json.dumps(v))" 2>$null | Out-String).Trim()
     } catch { }
 }
 if ($ToolResponseStr -match '(nothing to commit|no changes added|error:|fatal:)') { exit 0 }
@@ -85,9 +85,9 @@ if ($ToolResponseStr -match '(nothing to commit|no changes added|error:|fatal:)'
 # Absent -> no --session-id at all: the session-start / compaction re-inject
 # line is then the channel. MUST MATCH the .sh sibling.
 $SessionId = ""
-if ($Input -and $PY) {
+if ($HookStdin -and $PY) {
     try {
-        $SessionId = ($Input | & $PY -c "import sys,json; d=json.load(sys.stdin); print(d.get('session_id') or '')" 2>$null | Out-String).Trim()
+        $SessionId = ($HookStdin | & $PY -c "import sys,json; d=json.load(sys.stdin); print(d.get('session_id') or '')" 2>$null | Out-String).Trim()
     } catch { $SessionId = "" }
 }
 

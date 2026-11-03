@@ -195,9 +195,15 @@ def test_the_helper_runs_isolated_and_stdlib_only(tmp_path):
              "import sys, pathlib; pathlib.Path(sys.argv[1]).write_text('|'.join(sys.argv[2:]))",
              str(marker), "a b", "", 'q"uote']
     spec = {"argv": child, "cwd": str(tmp_path)}
+    # `-I` is what makes this run isolated: it ignores PYTHON* variables
+    # (child_env's PYTHONPATH pin included), the user site and the script's
+    # own folder, exactly as the PowerShell hooks run it. child_env() keeps
+    # the suite's convention for every other variable.
+    from tests.common.child_env import child_env
+
     res = subprocess.run([sys.executable, "-I", str(HELPER), "detach", "--spec-b64", _b64(spec)],
                          capture_output=True, text=True, timeout=60, cwd=str(tmp_path),
-                         env={"PATH": os.environ.get("PATH", "")})
+                         env=child_env())
     assert res.returncode == 0, res.stderr
     assert re.fullmatch(r"\d+\n", res.stdout)
     deadline = time.monotonic() + 30
@@ -454,5 +460,5 @@ def test_the_shape_check_rejects_the_flashing_spelling():
     ok = 'powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.ps1"'
     assert _WIN_SHAPE.match(ok)
     assert _WIN_SHAPE.match(ok + " pretooluse")
-    assert not _WIN_SHAPE.match(ok.replace("-NoProfile", "-NoProfile -WindowStyle Hidden"))
+    assert not _WIN_SHAPE.match(ok.replace(" -ExecutionPolicy", " -WindowStyle Hidden -ExecutionPolicy"))
     assert not _WIN_SHAPE.match('cmd /c start "" ' + ok)

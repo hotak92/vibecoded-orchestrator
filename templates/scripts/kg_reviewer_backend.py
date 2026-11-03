@@ -758,6 +758,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     cmd = build_claude_cmd(model, resolve_max_turns(args.max_turns),
                            executable=claude_exe)
     snap = _guard.take_snapshot(root)
+    # The run's wall-clock budget ends here; the commit's git-op retry waits
+    # only for what is left of it (brief: "within the existing budget").
+    budget_end = time.monotonic() + float(args.timeout_s)
     try:
         try:
             run = run_with_quota_fallback(
@@ -804,7 +807,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             _guard.commit_reviewer_changes(
                 snap, result.kept, reviewer_bytes=result.reviewer_bytes,
                 short=commit.short, subject=commit.subject, model=model,
-                attributed=True, log=log)
+                attributed=True, log=log, retry_deadline=budget_end)
         else:
             log("commit skipped: the run's writes could not be attributed "
                 "to the reviewer")

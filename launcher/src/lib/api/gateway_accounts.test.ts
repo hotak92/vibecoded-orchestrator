@@ -18,12 +18,15 @@ import { invoke } from '$lib/tauri';
 import {
   addAccount,
   formatDuration,
+  gatewayAccountLines,
   listAccounts,
   loginVerdict,
   pickerVisible,
   projectAccountStatus,
   projectVerdict,
+  reapplyHelps,
   removeAccount,
+  saveOutcome,
   setDefaultAccount,
   setProjectAccount,
   suggestedConfigDir,
@@ -95,12 +98,70 @@ describe('verdicts', () => {
     const base: ProjectAccountStatus = {
       ok: true, project_id: 'p1', assigned: 'work', selected: 'work', source: 'project',
       effective: 'work', falling_back: false, file_says: 'work', drift: false, label: 'Work',
+      drift_cause: null, selector_line: 'x-vco-account: work',
     };
     expect(projectVerdict(base).tone).toBe('ok');
     const fb = projectVerdict({ ...base, effective: 'primary', falling_back: true });
     expect(fb.tone).toBe('bad');
     expect(fb.text).toContain('billed to, "primary"');
-    expect(projectVerdict({ ...base, drift: true, file_says: null }).text).toContain('Re-apply');
+    expect(
+      projectVerdict({ ...base, drift: true, file_says: null, drift_cause: 'not_applied' }).text,
+    ).toContain('Re-apply');
+  });
+
+  it('names a remedy that helps for each drift cause (A3)', () => {
+    const base: ProjectAccountStatus = {
+      ok: true, project_id: 'p1', assigned: 'work', selected: 'work', source: 'project',
+      effective: 'work', falling_back: false, file_says: null, drift: true,
+      drift_cause: 'user_value', selector_line: 'x-vco-account: work',
+    };
+    const own = projectVerdict(base).text;
+    expect(own).toContain('your own ANTHROPIC_CUSTOM_HEADERS');
+    expect(own).toContain('`x-vco-account: work`');
+    expect(own).not.toContain('Re-apply');
+    expect(reapplyHelps(base)).toBe(false);
+    const tracked = { ...base, drift_cause: 'local_tracked' as const };
+    expect(projectVerdict(tracked).text).toContain('git rm --cached .claude/settings.local.json');
+    expect(reapplyHelps(tracked)).toBe(true);
+    expect(projectVerdict({ ...base, drift_cause: 'local_unknown' }).text).toContain('Git could not say');
+    expect(reapplyHelps({ ...base, drift: false, drift_cause: null })).toBe(false);
+  });
+
+  it('toasts success only when the saved choice is in force (A3/A10)', () => {
+    const status: ProjectAccountStatus = {
+      ok: true, project_id: 'p1', assigned: 'work', selected: 'work', source: 'project',
+      effective: 'work', falling_back: false, file_says: 'work', drift: false,
+      drift_cause: null, selector_line: 'x-vco-account: work',
+    };
+    expect(saveOutcome({ ok: true, status }).tone).toBe('ok');
+    const notInForce = saveOutcome({
+      ok: true,
+      status: { ...status, drift: true, file_says: null, drift_cause: 'user_value' },
+    });
+    expect(notInForce.tone).toBe('warn');
+    expect(notInForce.text).toContain('saved, but not in force yet');
+    const projFail = saveOutcome({ ok: true, projection_error: 'SettingsWriteRefused: x' });
+    expect(projFail.tone).toBe('warn');
+    expect(projFail.text).toContain('Claude account saved');
+    expect(projFail.text).not.toContain('not saved');
+    expect(saveOutcome({ ok: false, error: 'nope' })).toEqual({ text: 'nope', tone: 'bad' });
+  });
+
+  it('lists one Services line per gateway account, only once there are two', () => {
+    const primary = {
+      id: 'primary', label: 'Personal', is_default: true, usable: true, oauth_state: 'present',
+      oauth_expires_in_s: 30000, fallbacks: 0, last_fallback_at: null, last_fallback_reason: null,
+      refresh: null,
+    };
+    expect(gatewayAccountLines([primary])).toEqual([]);
+    expect(gatewayAccountLines(null)).toEqual([]);
+    const work = { ...primary, id: 'work', label: 'Work seat', is_default: false, usable: false,
+      oauth_state: 'expired', fallbacks: 3, last_fallback_reason: 'expired' };
+    const lines = gatewayAccountLines([primary, work]);
+    expect(lines.map((l) => l.id)).toEqual(['primary', 'work']);
+    expect(lines[0].text).toBe('Personal (primary) · default: logged in — expires in 8 h 20 min');
+    expect(lines[1].text).toBe('Work seat (work): login expired — fell back 3× (expired)');
+    expect(lines[1].tone).toBe('warn');
   });
 
   it('shows the picker only once a second account exists', () => {

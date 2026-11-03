@@ -135,11 +135,18 @@ from the launcher, those projects lose their isolated agents until the repositor
 An implementer lane runs isolated, so the owner's 2026-11-03 ruling lets it commit its own work:
 `glm-implementer`, `glm-implementer-high`, `qwen-implementer`, `qwen-implementer-high`,
 `deepseek-implementer`, `kimi-implementer` and `qwen-flash-sweeper` MAY run `git add` and `git commit` **on their
-own worktree branch only**, with the message ending in a `Co-Authored-By:` line naming the model that wrote it.
-Nothing else: never `push`, `stash`, `checkout`, `restore`, `reset` or `clean`, and never touch another worktree.
-The coordinator reviews the branch and merges it.
+worktree's current HEAD only**, with the message ending in a `Co-Authored-By:` line naming the model that wrote it.
+A harness worktree starts on a **detached HEAD** (`worktree-guard` creates it that way), so the lane commits right
+there and never creates or switches a branch; a lane-reservation worktree already sits on its branch, and the lane
+commits on that. Why detached and not a lane-made branch: the lane's git allowance stays two commands (no branch
+names chosen by parallel lanes, no `switch`/`checkout` in a lane's hands), and the commits stay reachable — a
+worktree with commits is KEPT, and its HEAD names them — until the coordinator names the branch at merge time (below).
+Read-only `git status` / `git diff` / `git log` are fine; nothing else: never `push`, `stash`, `checkout`, `switch`,
+`restore`, `reset` or `clean`, and never touch another worktree. The lane reports its commit shas; the coordinator
+reviews them and merges.
 
-Read-only lanes (researchers, reviewers, planners) still never run git: they write one report file and return.
+Read-only lanes (researchers, reviewers, planners) never run a git command that mutates (read-only `git log` /
+`git diff` / `git show` are fine): they write one report file and return.
 
 ## Merging worktree changes
 
@@ -151,8 +158,8 @@ HEAD, so give the agent's commits a branch before merging:
 git -C <worktree> status
 git -C <worktree> diff HEAD
 
-# Keep it: the lane may already have committed on its own branch; otherwise
-# commit in the worktree, name the result, merge
+# Keep it: the lane committed on the worktree's detached HEAD (or on its
+# reservation branch); name the result, merge
 git -C <worktree> switch -c agent-work      # skip when the lane's branch exists already
 git merge agent-work
 

@@ -14,13 +14,17 @@ Rules that are absolute:
 - Work ONLY on the files your brief names. Never touch a file outside that set.
 - You run in your own git worktree created by the harness, and the owner's
   2026-11-03 ruling lets an implementer lane commit its own work: you MAY run
-  `git add` and `git commit` on your own worktree branch only, with the message
-  ending in a `Co-Authored-By:` line naming your model. Never push, stash,
-  checkout, restore, reset or clean, and never touch another worktree. Never
+  `git add` and `git commit` on your worktree's current HEAD only — its own
+  branch when the worktree came with one (a lane reservation), otherwise the
+  detached HEAD the harness created. Never create or switch a branch: the
+  coordinator names the branch when it merges. End the message with a
+  `Co-Authored-By:` line naming your model. Never push, stash, checkout,
+  switch, restore, reset or clean, and never touch another worktree. Never
   `cd` to the parent checkout. If the brief names a different repository or
   worktree to work in, work only there.
-- Do not run any other git command. End your report with the exact list of
-  files you changed — the coordinator reviews and merges your branch.
+- Read-only `git status`, `git diff` and `git log` are fine; do not run any
+  other git command. End your report with the exact list of files you changed
+  and your commit shas — the coordinator reviews and merges them.
 - Red-proof every fix: show the new test FAILING against the pre-fix source,
   then PASSING. Restore the pre-fix source with a `cp` copy aside, never with
   a VCS command. Report both outputs verbatim.
@@ -61,7 +65,7 @@ Worktree lane: you carry `isolation: worktree`, so EVERYTHING you write —
 the edits AND your report — lands inside your own worktree, never in the
 main checkout. Never write your report to a path outside the worktree;
 return it as your final message as well, because the coordinator reviews
-and merges the worktree branch rather than reading files in place. A
+and merges the worktree's commits rather than reading files in place. A
 review belongs to kimi-reviewer (review); read-only research or a survey
 belongs to deepseek-researcher (research) or glm-flash-researcher
 (research) — no kimi-vendor researcher ships. They run without isolation,

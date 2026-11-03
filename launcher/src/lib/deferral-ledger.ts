@@ -460,9 +460,11 @@ export function findEntry(
 }
 
 /**
- * The full text a row's Copy button puts on the clipboard: the title, the
- * condition id, the body (what was detected + why it was deferred) and the
- * remedy command — the same four things the row renders.
+ * The full text a row's Copy button puts on the clipboard — everything the
+ * row renders: the title, the condition id, the severity and the disposition
+ * (with its explanation), when it was detected, the body (what was detected +
+ * why it was deferred), the retry summary and each recorded attempt, the
+ * remedy command and the KG context refs.
  *
  * The scope is named when a view is passed, because a copied entry travels
  * outside the panel it came from and decision #6's rider requires that a
@@ -485,12 +487,25 @@ export function entryCopyText(
       }`,
     );
   }
+  if (entry.severity) lines.push(`Severity: ${entry.severity}`);
+  lines.push(`Disposition: ${dispositionLabel(entry.disposition)} — ${dispositionExplanation(entry)}`);
+  if (entry.detected_at) lines.push(`Detected: ${entry.detected_at}`);
   const body = [entry.detected, entry.why_deferred].filter(
     (part) => part && part.trim().length > 0,
   );
   if (body.length > 0) lines.push('', ...body);
+  const retry = retryLine(entry.retries);
+  if (retry) {
+    lines.push('', retry);
+    for (const a of entry.retries?.outcomes ?? []) {
+      lines.push(`  ${a.status} ${a.ts}${a.detail ? ` ${a.detail}` : ''}`);
+    }
+  }
   if (entry.command_to_apply) {
     lines.push('', 'Remedy:', entry.command_to_apply);
+  }
+  if (entry.kg_node_refs.length > 0) {
+    lines.push('', `Context: ${entry.kg_node_refs.join(', ')}`);
   }
   return lines.join('\n');
 }

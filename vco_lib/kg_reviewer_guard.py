@@ -1555,12 +1555,13 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
 _IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD",
                 "rebase-merge", "rebase-apply", "BISECT_LOG")
 
-#: How long a commit that found a git operation in progress waits for that
+#: The LONGEST a commit that found a git operation in progress waits for that
 #: operation to END before it gives up and ledgers the files (v0.2.105
-#: L-KGREV, brief item 4). A merge / rebase / index lock normally lasts
-#: seconds; the review itself has already spent the run's wall-clock budget,
-#: so this wait is short and bounded and the failure mode is the pre-v0.2.105
-#: one (files left uncommitted) plus the ledger line that names them.
+#: L-KGREV, brief item 4). The wait is also capped at what is left of the
+#: run's own wall-clock budget (``retry_deadline``), so the retry never runs
+#: past it: a review that used its whole budget gets no retry at all, and
+#: the failure mode is the pre-v0.2.105 one (files left uncommitted) plus the
+#: ledger line that names them.
 GIT_OP_RETRY_S = 20.0
 GIT_OP_POLL_S = 0.5
 
@@ -1656,12 +1657,21 @@ def commit_block_reason(snap: Snapshot, paths: List[str],
     return None
 
 
+def _retry_window(retry_deadline: Optional[float]) -> float:
+    """Seconds the git-op retry may wait: :data:`GIT_OP_RETRY_S`, capped at
+    what is left of the run's budget (``0`` when it is spent)."""
+    if retry_deadline is None:
+        return GIT_OP_RETRY_S
+    return max(0.0, min(GIT_OP_RETRY_S, retry_deadline - time.monotonic()))
+
+
 def _after_git_op(snap: Snapshot, paths: List[str], attributed: bool,
-                  own: "Set[str]") -> Optional[str]:
-    """Wait (bounded) for an in-flight git operation to end, then judge the
-    commit once more. Returns the block reason that still applies, or
-    ``None`` when the operation ended and the commit may proceed."""
-    deadline = time.monotonic() + GIT_OP_RETRY_S
+                  own: "Set[str]", window_s: float) -> Optional[str]:
+    """Wait (bounded by ``window_s``) for an in-flight git operation to end,
+    then judge the commit once more. Returns the block reason that still
+    applies, or ``None`` when the operation ended and the commit may
+    proceed."""
+    deadline = time.monotonic() + window_s
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1672,10 +1682,20 @@ def _after_git_op(snap: Snapshot, paths: List[str], attributed: bool,
             return block
 
 
+def _foldable(snap: Snapshot, paths: List[str], own: "Set[str]") -> List[str]:
+    """The paths whose current bytes are the reviewer's ALONE: clean when
+    this run started, or dirty only with a verified leftover of its own. A
+    path the user had changes on is ledgered too (so it is still named) but
+    never as foldable -- a later run must not commit the user's edit."""
+    return [p for p in paths if p not in snap.dirty_before or p in own]
+
+
 def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
                             reviewer_bytes: Dict[str, bytes],
                             short: str, subject: str, model: str,
-                            attributed: bool, log: Log) -> Optional[str]:
+                            attributed: bool, log: Log,
+                            retry_deadline: Optional[float] = None
+                            ) -> Optional[str]:
     """Commit exactly ``kept`` -- each path only while it still holds the
     reviewer's bytes (``reviewer_bytes``) -- plus the reviewer's OWN
     leftovers from earlier skipped runs; return the new sha, or ``None``.
@@ -1704,12 +1724,17 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
             proofs[p] = _sha(cur)
     # The reviewer's own leftovers from an earlier skipped run: the ledger
     # holds the sha of the bytes it wrote, so their CURRENT bytes prove it.
-    # The FULL ledgered set (not only the byte-identical subset) also exempts
-    # those paths from the "the user already had uncommitted changes" block:
-    # they are dirty because an earlier reviewer run left them dirty, which
-    # is the cascade this fixes.
+    # Only a FOLDABLE entry whose bytes at the START of this run still hash
+    # to the ledger is exempt from the "the user already had uncommitted
+    # changes" block (that dirt was the reviewer's own -- the cascade this
+    # fixes). A ledgered path the user edited since, or one ledgered while
+    # the user had changes on it, is NOT exempt: committing it would commit
+    # the user's edit under the reviewer's name. Entries whose file now
+    # equals HEAD (committed or reverted by anybody) are dropped first.
     try:
-        own: Set[str] = set(_pending.pending_paths(root))
+        _pending.prune_settled(root, root, lambda rel: _head_bytes(root, rel))
+        own: Set[str] = _pending.verified_own(
+            root, lambda rel: snap.pre_bytes(rel)[1])
         leftovers = _pending.own_leftovers(root, root)
     except Exception:  # noqa: BLE001 -- the fold is a convenience, never a stop
         own, leftovers = set(), {}
@@ -1734,16 +1759,18 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         log("reviewer wrote nothing to commit - no commit")
         return None
     block = commit_block_reason(snap, paths, attributed, own_leftover=own)
-    if block and is_git_op_block(block):
+    window = _retry_window(retry_deadline)
+    if block and is_git_op_block(block) and window > 0:
         log(f"commit deferred: {block}; retrying once it ends "
-            f"(up to {GIT_OP_RETRY_S:.0f}s)")
-        block = _after_git_op(snap, paths, attributed, own)
+            f"(up to {window:.0f}s, within the run's budget)")
+        block = _after_git_op(snap, paths, attributed, own, window)
     if block:
         log(f"commit skipped: {block}; reviewer files left uncommitted: "
             + ", ".join(paths))
         _pending.record_skips(root, root, {p: proofs[p] for p in paths
                                            if p in proofs},
-                              reason=block, short=short)
+                              reason=block, short=short,
+                              foldable=_foldable(snap, paths, own))
         return None
     ignored = [p for p in paths
                if _git(root, "check-ignore", "-q", "--", p).returncode == 0]
@@ -1766,7 +1793,8 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
             _pending.record_skips(root, root,
                                   {p: proofs[p] for p in paths if p in proofs},
                                   reason=f"git add failed: {detail}",
-                                  short=short)
+                                  short=short,
+                                  foldable=_foldable(snap, paths, own))
             return None
     message = (f"{commit_subject(short, subject)}\n\n"
                f"KG nodes written by the post-commit KG reviewer ({model}) "
@@ -1785,7 +1813,8 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         _pending.record_skips(root, root,
                               {p: proofs[p] for p in paths if p in proofs},
                               reason=f"commit failed: {detail}",
-                              short=short)
+                              short=short,
+                              foldable=_foldable(snap, paths, own))
         return None
     _pending.clear_paths(root, paths)
     sha = _git(root, "rev-parse", "HEAD").stdout.decode().strip()

@@ -833,14 +833,33 @@ example your personal plan and a seat on a second organisation account — and e
   `$env:CLAUDE_CONFIG_DIR='C:\Users\you\.claude-work'; claude auth login`); check it with
   `CLAUDE_CONFIG_DIR=~/.claude-work claude auth status`. The page shows the exact command per account. Your original
   login is the account `primary` (it cannot be removed).
+- *macOS: logins in the Keychain.* On a Mac Claude Code keeps the login in the login Keychain and writes
+  `<config dir>/.credentials.json` only when it cannot. When that file holds no usable login, the gateway reads the
+  Keychain item Claude Code wrote — service `Claude Code-credentials` for your own login (no `CLAUDE_CONFIG_DIR`), and
+  `Claude Code-credentials-<first 8 hex of sha256(config dir)>` for an added account, account name `$USER` — with
+  `/usr/bin/security find-generic-password … -w` (no shell). The value stays in the gateway's memory and is never
+  logged; the log names the item, whether it was found and its expiry. A missing item or a locked Keychain counts as
+  "not logged in" (the loud fallback), never a failed chat; `/health` shows the last answer (cached for 30 s, kept
+  current by the login keeper) and never runs `security` itself. Off macOS the Keychain is never asked.
 - *Choosing per project.* Project → Identity → **Claude account** ("Use the default", or an account). The env
   projection writes the choice as `ANTHROPIC_CUSTOM_HEADERS="x-vco-account: <id>"` into the project's
   `.claude/settings.local.json` (machine-local, never the committable `settings.json`); "Use the default" removes it,
-  and an `ANTHROPIC_CUSTOM_HEADERS` value of your own is kept. Claude Code re-reads the file, so the next request of a
+  and an `ANTHROPIC_CUSTOM_HEADERS` value of your own is kept — in `settings.local.json`, `settings.json` and
+  `.vscode/settings.json` alike (VCO never writes or removes the key in the two committable files). When your
+  `settings.local.json` is committed to git (or git cannot say), VCO writes the choice nowhere — a per-machine account
+  must not land in a shared file — and the Identity tab says so with the remedy (`git rm --cached
+  .claude/settings.local.json`); with a header value of your own there, it shows the `x-vco-account: <id>` line to add
+  to it. Claude Code re-reads the file, so the next request of a
   running chat already uses the new account (needs Claude Code 2.1.227 or later; project settings apply once the
   workspace is trusted). The prompt cache does not carry across accounts. It applies only to chats that go through the
   gateway (`multimodel` mode, or a CLI pointed at it); in `remote-control` mode the panel uses its native login. The
   gateway never forwards the `x-vco-account` header to any upstream.
+- *Seeing each account.* Each added account's 5h and weekly usage is read with that account's own login and shows as
+  its own row (`Claude/<id>`) on the Home usage card and in the gateway status line; the rate-limit headers of an
+  answer are filed under the account that served it, so one account's numbers never appear as another's. The
+  Services page's gateway card lists every account (login state, expiry, fallbacks) once there are two, and a
+  session start prints `## Claude account` naming the account the project's gateway chats are billed to
+  (`python -m vco_lib.gateway_accounts session-line --folder <project>`; nothing with a single account).
 - *An account that cannot be used never stops a chat.* Unknown id, malformed header, unreadable registry, not logged
   in, expired, or renewal failed: the request is served — and billed — by the default account when that is a
   different, usable one, else by `primary`. It is loud: a WARNING in `~/.vct/logs/model-gateway.log` (repeated every
@@ -852,13 +871,20 @@ example your personal plan and a seat on a second organisation account — and e
   byte the prompt cache keys on is unchanged and the client never stores it. The gateway recognises a conversation by
   the `x-claude-code-session-id` header plus a digest of the request's first message (a session's subagents and side
   calls share the session id but not the first message); a compaction or a new fallback episode tells it once more.
+  A turn the upstream refuses (or that fails) does not count as told — the client's retry carries the notice again.
+  The memory of who was told lives in the gateway process (the last 4096 conversations), so a gateway restart may
+  tell a running conversation once more.
   Only a primary login that is itself unusable still answers 401, as before.
 - *Keeping an added login alive.* Claude Code refreshes a login only in a session it runs, and only in the last five
   minutes before expiry; `claude auth status` does not refresh. So, four minutes before an added account's login
   expires (or once it has), the gateway runs `claude -p --safe-mode --no-session-persistence --max-turns 1 ok` with
   that account's `CLAUDE_CONFIG_DIR` and `ANTHROPIC_BASE_URL` pointed at a loopback port it holds bound but not
   listening: Claude Code renews its own credentials file, then its model request is refused on the spot — no model
-  call, and VCO never sees the token. Success is judged on the file (a later expiry). One attempt per account per 10
+  call, and VCO never sees the token. That is the design, read from Claude Code 2.1.312's own bundle and exercised in
+  VCO's tests against a stand-in CLI; it has not yet been run against a live second login, which is why success is
+  judged on the file (a later expiry) and never assumed: if a Claude Code release stops refreshing this way, the
+  keeper logs `not_renewed` and the account takes the loud fallback once its login lapses. On Windows the `claude`
+  child runs without a console window; on a timeout the child and everything it started are stopped. One attempt per account per 10
   minutes, doubling up to an hour after failures, 90 s hard timeout, logged; a failure leads to the loud fallback once
   the login lapses. The `primary` login is never touched. `VCT_MODEL_GATEWAY_CLAUDE_BIN` names the `claude`
   executable when it is not on the daemon's `PATH`.
@@ -871,7 +897,7 @@ example your personal plan and a seat on a second organisation account — and e
 |---|---|---|
 | `VCT_MODEL_GATEWAY_PORT` | `11436` | TCP port. Falls back to the port file `<vct-state-dir>/model-gateway.port` (written by the running daemon, same convention as `hub.port`), then to the default. A non-numeric or out-of-range value falls through the same chain rather than being used literally. |
 | `VCT_MODEL_GATEWAY_HOST` | `127.0.0.1` | Bind address. REFUSED at startup unless it resolves to a loopback address: the gateway proxies under your Claude login and is authorised by a local file token, so binding a routable interface is an error, not a configuration. |
-| `VCT_MODEL_GATEWAY_CREDENTIALS` | `~/.claude/.credentials.json` | Path to the Claude CLI's OAuth credentials file (honours `VCT_CLAUDE_DIR`, see next section). Harness-owned: the gateway only ever reads it, never writes or copies it. Since v0.2.105 the reader keeps the last token it PARSED and serves it while that token's own `expiresAt` has not passed and it was last seen in the file within the last five minutes, because a Claude CLI rewrites the file with an EMPTY `accessToken` for a second or two (live 2026-10-28: three minutes of 401s for every first-party request). A read that finds no token in a file being rewritten (blank token, half-written JSON) is reported as TRANSIENT — retry shortly — when a token was here minutes ago or the file's own expiry has not passed. A logout is never read as a rewrite: a file whose `claudeAiOauth` section was removed, a file this user may no longer read (permissions), and a token that simply expired all stop the old token at once and get the "run `claude`" message with no wait. On that transient verdict the request path spends one bounded, off-loop re-read (≤2 s) before answering 401 — once per absence when the file has been DELETED: the first request after it disappears still covers a delete-and-rename, every later one is answered at once until the file is seen again, and the last-good token is never served for an absent file; `/health` never waits and reports the machine state (`present`/`absent`/`expired`/`unreadable`) as before. |
+| `VCT_MODEL_GATEWAY_CREDENTIALS` | `~/.claude/.credentials.json` | Path to the Claude CLI's OAuth credentials file (honours `VCT_CLAUDE_DIR`, see next section). On macOS, when the file holds no usable login, the login Keychain item `Claude Code-credentials` (suffixed per `CLAUDE_CONFIG_DIR`, as Claude Code names it) is read instead — see "macOS: logins in the Keychain" above. Harness-owned: the gateway only ever reads it, never writes or copies it. Since v0.2.105 the reader keeps the last token it PARSED and serves it while that token's own `expiresAt` has not passed and it was last seen in the file within the last five minutes, because a Claude CLI rewrites the file with an EMPTY `accessToken` for a second or two (live 2026-10-28: three minutes of 401s for every first-party request). A read that finds no token in a file being rewritten (blank token, half-written JSON) is reported as TRANSIENT — retry shortly — when a token was here minutes ago or the file's own expiry has not passed. A logout is never read as a rewrite: a file whose `claudeAiOauth` section was removed, a file this user may no longer read (permissions), and a token that simply expired all stop the old token at once and get the "run `claude`" message with no wait. On that transient verdict the request path spends one bounded, off-loop re-read (≤2 s) before answering 401 — once per absence when the file has been DELETED: the first request after it disappears still covers a delete-and-rename, every later one is answered at once until the file is seen again, and the last-good token is never served for an absent file; `/health` never waits and reports the machine state (`present`/`absent`/`expired`/`unreadable`) as before. |
 | `VCT_MODEL_GATEWAY_ACCOUNTS` | `<vct-state-dir>/model-gateway/accounts.json` | The Claude account registry the gateway reads (ids, labels, configuration directories — no credential), written by `python -m vco_lib.gateway_accounts` from the launcher DB. Absent = one account, `primary`, exactly as before. See "More than one Claude account" above. |
 | `VCT_MODEL_GATEWAY_CLAUDE_BIN` | the `claude` on `PATH`, else `~/.local/bin/claude` | The executable the gateway runs to renew an added account's login before it expires. |
 | `VCT_MODEL_GATEWAY_CONTEXT_TABLE` | `<vct-state-dir>/model-gateway/chat_model_context.json` | Where the daemon looks for an exported chat-model context table (schema: `model_router.context_table`). Written by the launcher — on boot and on every GUI edit of the table (`launcher/src-tauri/src/commands/chat_model_context.rs`: `seed_and_export_on_boot`, `upsert_and_export`, `export_now`). Absent only before the launcher's first run; the daemon then reads the shipped seed (`claude_mcp_servers/model_router/chat_model_context.seed.json`), and the export wins per ROW over it. **On boot the launcher CONVERGES the table with that seed, row by row** (`converge_chat_model_context_seed` → `converge_rows`, the same per-row rule the reseed button applies): an absent row is inserted, a row with `user_edited = 0` whose values differ from the shipped ones is refreshed, a row that already matches is written not at all (so `updated_at` keeps meaning "when this row last changed"), a row with `user_edited = 1` — a human wrote it — is left byte-identical, and an id carrying a delete tombstone is skipped even when absent, because an automatic path must never undo a human's delete. `user_edited` is the marker that makes the first three cases safe to distinguish: it is 0 exactly when no human hand has written the row since it was seeded. So a shipped figure that changes — a model whose real window turns out to be larger than the row claimed — reaches every existing install on the next launcher boot, with no user action. The one thing boot may NOT do is clear a tombstone; that stays the model-gateway pane's **"Reseed from shipped defaults"** (`chat_model_context_reseed` → `reseed_chat_model_context`), which re-applies the shipped table, refreshes every row the user has not edited, preserves the ones they have byte-for-byte, restores a shipped row the user deleted, and leaves models they added themselves alone. |

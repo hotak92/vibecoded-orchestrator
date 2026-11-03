@@ -521,11 +521,17 @@ class DeliveryAuditTests(unittest.TestCase):
 
         v0.2.104 (G4) — LOWERED 14_653 -> 14_652: the exclude-entry summary
         for the safe-add deferral lives in ``git_exclude.summarize_entries``.
+
+        v0.2.105 (fix round 5) — LOWERED 14_652 -> 14_380: the per-provider
+        switch's restore pass lives in
+        ``module_gated_delivery.provider_restore_pass``, and the Weaviate class
+        builders (``named_vector_config``, ``kg/development/diagrams/code``
+        class definitions) moved to ``vco_lib.collection_schemas`` (re-exported).
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 14_652,
+            n, 14_380,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

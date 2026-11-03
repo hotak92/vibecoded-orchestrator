@@ -109,7 +109,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sqlite3
 import sys
 from dataclasses import dataclass, field
@@ -816,8 +815,9 @@ def park_provider_agent(
                   f"(provider {vendor_id!r} is switched off)")
         return "parked"
     try:
-        parked_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(enabled_path, parked_path)
+        from vco_lib.atomic import move_file
+
+        move_file(enabled_path, parked_path)
     except OSError as exc:
         _say(warn, f"{prior_rel}: could not be parked ({type(exc).__name__}: "
                    f"{exc}) — left in place")
@@ -828,19 +828,55 @@ def park_provider_agent(
 
 
 def parked_agents_registry(
-    folder: Path, outcomes: Iterable[GateOutcome],
+    folder: Path,
+    prior: Any,
+    parked_now: Iterable[str],
+    outcomes: Iterable[GateOutcome],
+    *,
+    restored: Iterable[str] = (),
 ) -> dict[str, str]:
-    """``{dest_rel: vendor_id}`` for every disabled-provider definition whose
-    parked copy is on disk right now — what the manifest records this run."""
+    """``{dest_rel: vendor_id}`` — what the manifest records this run.
+
+    The registry is the record of what THIS switch moved, never a scan of the
+    disabled side: a copy the user parked with the Agents tab lives in the
+    same folder and must never be mistaken for one of ours (re-enabling the
+    provider would otherwise restore the user's own choice away).
+
+    * ``prior`` — the previous manifest's map. Carried forward VERBATIM: a run
+      that does not re-observe the vendor as switched off (gate SKIP/UNKNOWN,
+      ``--skip-kind agents``, a restore skipped because both copies exist or
+      the move failed) must not forget what an earlier run parked.
+    * ``restored`` — dest_rels moved back this run: dropped.
+    * an entry whose parked copy is no longer on disk (the user deleted or
+      moved it): dropped — there is nothing left to restore.
+    * ``parked_now`` — the dest_rels :func:`park_provider_agent` answered
+      ``"parked"`` for in THIS run (an actual move, not ``"already-parked"``):
+      added with the vendor this run's outcomes name.
+    """
     from vco_lib.bundle_kinds import disabled_counterpart
 
+    def _norm(rel: str) -> str:
+        return str(rel).replace("\\", "/")
+
     registry: dict[str, str] = {}
-    for name, vendor_id in _provider_disabled_vendors(outcomes).items():
-        dest_rel = f".claude/agents/{name}"
+    if isinstance(prior, Mapping):
+        for dest_rel, vendor_id in prior.items():
+            if isinstance(dest_rel, str) and isinstance(vendor_id, str):
+                registry[_norm(dest_rel)] = vendor_id
+    for dest_rel in restored:
+        registry.pop(_norm(dest_rel), None)
+    vendors = _provider_disabled_vendors(outcomes)
+    for dest_rel in parked_now:
+        name = _agent_definition_name(dest_rel)
+        vendor_id = vendors.get(name) if name else None
+        if vendor_id:
+            registry[_norm(dest_rel)] = vendor_id
+    out: dict[str, str] = {}
+    for dest_rel, vendor_id in registry.items():
         dis_rel = disabled_counterpart(dest_rel)
         if dis_rel and (Path(folder) / dis_rel).is_file():
-            registry[dest_rel] = vendor_id
-    return dict(sorted(registry.items()))
+            out[dest_rel] = vendor_id
+    return dict(sorted(out.items()))
 
 
 def restore_parked_agents(
@@ -908,8 +944,9 @@ def restore_parked_agents(
                     f"(provider {vendor_id!r} is switched back on)")
             continue
         try:
-            enabled_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(parked_path, enabled_path)
+            from vco_lib.atomic import move_file
+
+            move_file(parked_path, enabled_path)
         except OSError as exc:
             if log is not None:
                 log(f"{dest_rel}: could not be restored from {dis_rel} "
@@ -920,6 +957,37 @@ def restore_parked_agents(
             log(f"{dest_rel}: restored from {dis_rel} (provider {vendor_id!r} "
                 "is switched back on)")
     return restored
+
+
+def provider_restore_pass(
+    folder: Path,
+    orchestrator_root: Path,
+    manifest: Mapping[str, Any] | None,
+    *,
+    skip_kinds: frozenset[str] = frozenset(),
+    dry_run: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+) -> tuple[Optional[GateVerdict], list[str]]:
+    """The bundle update's first provider-switch step: ``(gate verdict,
+    restored dest_rels)``.
+
+    A provider switched BACK ON gets the definitions an earlier run parked
+    restored BEFORE enumeration, so ``_file_action``'s skip-disabled guard
+    finds them at their enabled path again and the ordinary manifest logic
+    re-delivers them. Only copies THIS switch parked are restored (the
+    manifest's :data:`PARKED_AGENTS_MANIFEST_KEY`); the launcher's per-agent
+    toggle is never overridden. The verdict is computed ONCE here and handed
+    to the enumerator, which would otherwise ask the same question again.
+    ``(None, [])`` when this install ships no gateway definitions.
+    """
+    src_dir = Path(orchestrator_root) / "templates" / "agents" / GATEWAY_AGENTS_DIR
+    if not src_dir.is_dir():
+        return None, []
+    verdict = gateway_agents_gate(folder)
+    restored = restore_parked_agents(
+        folder, src_dir, manifest, verdict=verdict, skip_kinds=skip_kinds,
+        dry_run=dry_run, log=log)
+    return verdict, restored
 
 
 def _entry_for(verdict: GateVerdict, folder: Path) -> Any:
@@ -1230,6 +1298,7 @@ def vendor_keys_payload(
         (v for v in vendor_of.values() if v is not None),
         vendor_probe=vendor_probe,
     )
+    off = _default_disabled_vendors()  # one launcher-DB read, not one per vendor
     return {
         vendor_id: {
             "resolves": ok,
@@ -1237,7 +1306,7 @@ def vendor_keys_payload(
             # v0.2.105: the user's machine-wide switch, beside the key answer.
             # A disabled provider still reports its key state (so the Home
             # card can say "switched off, key present") but delivers nothing.
-            "enabled": vendor_id not in _default_disabled_vendors(),
+            "enabled": vendor_id not in off,
             "definitions": sorted(f.stem for f, v in vendor_of.items()
                                   if v == vendor_id),
         }

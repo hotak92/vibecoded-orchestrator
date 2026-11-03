@@ -29,7 +29,11 @@ fallback account (the default when that is a different, usable account, else
    which the launcher shows per account and per project;
 3. the MODEL is told: one short notice is appended at the END of the last user
    turn of the first eligible request of each conversation served by a
-   fallback, and never again in that conversation (:class:`NoticeLedger`).
+   fallback, and not again in that conversation for as long as this gateway
+   process remembers it (:class:`NoticeLedger` — in memory, the last
+   :data:`NOTICE_MEMORY` conversations; a gateway restart may tell a running
+   conversation once more). A turn the upstream did not answer does not count
+   (the server releases the claim, so the retry is told).
 
 How "first request of a conversation" is recognised
 ---------------------------------------------------
@@ -283,7 +287,8 @@ def notice_text(*, requested: str, requested_label: str, served: str,
         f"'{requested}' ({requested_label}), but {why}. This conversation is "
         f"therefore being served by, and billed to, the account '{served}' "
         f"({served_label}). {fix} Mention this to the user once, briefly; "
-        f"you will not see this notice again in this conversation."
+        f"this notice is not repeated in this conversation unless the gateway "
+        f"restarts."
     )
 
 
@@ -414,7 +419,9 @@ class AccountService:
         rows = []
         for acct_id in reg.ids():
             reader = self.reader(acct_id, reg)
-            state: Optional[OAuthState] = reader.read() if reader is not None else None
+            # cached_only: /health runs no subprocess (macOS Keychain).
+            state: Optional[OAuthState] = (
+                reader.read(cached_only=True) if reader is not None else None)
             acct = reg.get(acct_id)
             stats = self._stats.get(acct_id) or _AccountStats()
             expires_in = (

@@ -377,5 +377,7 @@ fi
 [ -n "$S_plan" ] && _rb_emit "$S_plan" "$RB_plan" "rest is on disk: Read .claude/context/plans/$(basename "$LATEST_PLAN")"
 [ -n "$S_commits" ] && _rb_emit "$S_commits" "$RB_commits" "run 'git log --oneline -20' for more"
 [ -n "$S_snap" ] && _rb_emit "$S_snap" "$RB_snapshot" "rest is on disk: Read .claude/context/pre-compact-snapshot.md"
-[ -n "$S_kgsync" ] && _rb_emit "$S_kgsync" "" "run 'python -m vco_lib.kg_reviewer_pending paths --project-root .' for the full list"
+# The pointer names the interpreter that just answered (a bare `python` in a
+# user project is rarely the VCO venv, and a printed command is shipped code).
+[ -n "$S_kgsync" ] && _rb_emit "$S_kgsync" "" "run \"$_KGP_PY\" -m vco_lib.kg_reviewer_pending paths --project-root \"$PROJECT_DIR\" for the full list"
 } | _reinject_cap

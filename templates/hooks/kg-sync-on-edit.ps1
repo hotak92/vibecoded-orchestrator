@@ -35,19 +35,19 @@ if (Test-Path $ScrubLib) {
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 # Read the untrusted JSON payload from stdin.
-$Input = ""
+$HookStdin = ""
 try {
-    $Input = [Console]::In.ReadToEnd()
+    $HookStdin = [Console]::In.ReadToEnd()
 } catch {
     exit 0
 }
-if (-not $Input) { exit 0 }
+if (-not $HookStdin) { exit 0 }
 
 # Extract the edited file path from the payload. Parse in PowerShell (robust
 # to path metacharacters — never interpolated into a command string).
 $FilePath = $null
 try {
-    $payload = $Input | ConvertFrom-Json
+    $payload = $HookStdin | ConvertFrom-Json
     $ti = $payload.tool_input
     if ($ti) {
         foreach ($k in 'file_path','path','filePath') {

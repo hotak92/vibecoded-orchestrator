@@ -45,11 +45,13 @@ delivering that vendor's definitions, moves an already-delivered UNMODIFIED copy
 `.claude/agents.disabled/` (the launcher toggle's own location — parked, never deleted) and records it in the
 manifest's additive `provider_parked_agents` map; a copy you edited is left in place with a warning line and
 stays recognised; and the provider's rows leave the rendered model guidance (the grid and the
-provider-conditional `CLAUDE.md` sections), refreshed at once on the toggle. Switching it back on restores the
+provider-conditional `CLAUDE.md` sections), refreshed at once on the launcher toggle. Switching it back on restores the
 copies named in that manifest map and re-delivers them on the next update — copies parked by the per-project
 Agents toggle carry no such marker and are never restored. The gateway itself keeps serving every vendor id it
 is asked for: this is a delivery/guidance choice, not a routing block. Check the state from a shell with
-`python -m vco_lib.model_providers status` (and change it with `set --vendor <id> --disabled`).
+`python -m vco_lib.model_providers status` (and change it with `set --vendor <id> --disabled`). The shell `set`
+does not refresh the guidance by itself (the launcher toggle does): follow it with
+`python -m vco_lib.model_guidance refresh --orchestrator-root <install root> --trigger providers`, as `set` prints.
 
 ### Opt-in packs (`templates/packs/`)
 

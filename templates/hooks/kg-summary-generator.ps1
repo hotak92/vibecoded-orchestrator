@@ -45,8 +45,8 @@ if (-not (Test-Path $generator)) { exit 0 }
 # 2026-05-08 — that env var is NOT populated by Claude Code, so it
 # always evaluated to empty and the fallback path silently skipped to
 # the MCP branch. Verified via stdin-capture diagnostic.
-$Input = ""
-try { $Input = [Console]::In.ReadToEnd() } catch { }
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 
 $FilePath = ""
 # Single Python extractor handles both Edit/Write (tool_input.file_path)
@@ -93,7 +93,7 @@ except Exception:
     print('')
 '@
     try {
-        $FilePath = ($Input | & $PY -c $code 2>$null | Out-String).Trim()
+        $FilePath = ($HookStdin | & $PY -c $code 2>$null | Out-String).Trim()
     } catch { }
 }
 

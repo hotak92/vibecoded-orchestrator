@@ -592,6 +592,9 @@ describe("entryCopyText — what a row's Copy button puts on the clipboard", () 
       'Weaviate was unreachable\n' +
         'Condition: weaviate_unreachable_at_update\n' +
         'Scope: My Project\n' +
+        'Severity: warning\n' +
+        `Disposition: ${dispositionLabel('action_required')} — ${dispositionExplanation(e)}\n` +
+        'Detected: 2026-08-27T00:00:00Z\n' +
         '\n' +
         'Connection refused on 8081.\n' +
         'The service was down at update time.\n' +
@@ -632,6 +635,28 @@ describe("entryCopyText — what a row's Copy button puts on the clipboard", () 
     );
     expect(text).not.toContain('Remedy:');
     expect(text.endsWith('W')).toBe(true);
+  });
+
+  it('carries everything else the row renders: retries, attempts, context refs', () => {
+    const e = entry({
+      condition_id: 'kg_seed_skipped',
+      disposition: 'auto_retryable',
+      retries: retries({
+        attempts: 2,
+        failed: 2,
+        outcomes: [
+          { ts: '2026-08-27T01:00:00Z', status: 'failed', detail: 'weaviate down' },
+          { ts: '2026-08-27T02:00:00Z', status: 'failed', detail: 'still down' },
+        ],
+      }),
+      kg_node_refs: ['knowledge/concepts/a.md', 'knowledge/concepts/b.md'],
+    });
+    const text = entryCopyText(e, view());
+    expect(text).toContain(retryLine(e.retries) as string);
+    expect(text).toContain('  failed 2026-08-27T01:00:00Z weaviate down');
+    expect(text).toContain('  failed 2026-08-27T02:00:00Z still down');
+    expect(text).toContain(dispositionLabel('auto_retryable'));
+    expect(text.endsWith('Context: knowledge/concepts/a.md, knowledge/concepts/b.md')).toBe(true);
   });
 
   it('omits blank body parts instead of copying empty lines twice', () => {

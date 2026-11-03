@@ -153,6 +153,30 @@ describe('ModelProvidersCard.svelte', () => {
     expect(switchFor('kimi').checked).toBe(true);
   });
 
+  it('a save call that throws after the row landed reports the re-read state', async () => {
+    let stored = true;
+    await mountCard({
+      load: async () =>
+        payload({
+          providers: payload().providers.map((p) =>
+            p.vendor_id === 'kimi' ? { ...p, enabled: stored } : p,
+          ),
+        }),
+      save: async () => {
+        stored = false; // the helper wrote the row, then its output was lost
+        throw new Error('unparseable output');
+      },
+    });
+    const input = switchFor('kimi');
+    input.checked = false;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+    const note = document.querySelector('[data-testid="providers-note"]');
+    expect(note?.textContent).toContain('now reads off');
+    expect(note?.textContent).not.toContain('Nothing was changed');
+    expect(switchFor('kimi').checked).toBe(false);
+  });
+
   it('renders nothing when no gateway provider can be named', async () => {
     await mountCard({
       load: async () => payload({ gateway_available: false, providers: [] }),

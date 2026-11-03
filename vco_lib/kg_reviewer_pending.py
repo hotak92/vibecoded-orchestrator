@@ -25,14 +25,21 @@ This module is the ONE home for the state that breaks that cycle:
   (:mod:`vco_lib.agent_alerts`, ``agent-alerts-deliver``) under the pseudo
   agent id :data:`ALERT_AGENT_ID`; the deliver hook already surfaces those
   to the main chat on the next prompt or tool call of the session. One row
-  per NEW skip (:func:`surface` compares :data:`ALERT_SIG_KEY`), never one
-  per prompt.
+  per NEW skip (:func:`surface` compares the pending set against the
+  ``path:sha`` pairs already alerted, :data:`ALERT_SIG_KEY`), never one per
+  prompt -- and a set that only SHRANK (a partial fold) raises nothing.
 * **the line** — :func:`status_line`, what the session-start / compaction
   re-inject shows while anything is still pending.
 
 Every entry carries the sha it was recorded with so the fold is a byte
 proof, never a guess: a file whose bytes differ from the ledger is the
-user's, and stays out of the commit exactly as before.
+user's, and stays out of the commit exactly as before. An entry also carries
+``foldable``: True only when the reviewer's bytes are the WHOLE change (the
+file was clean when that run started, or dirty only with a byte-verified
+leftover of the reviewer's own). A file skipped because the USER had
+uncommitted changes on it is ledgered ``foldable: false`` -- still named to
+the session, never committed by a later review (its bytes mix the user's
+edit with the reviewer's).
 """
 from __future__ import annotations
 
@@ -59,8 +66,9 @@ ALERT_KIND = "kg_reviewer_uncommitted"
 LEDGER_VERSION = 1
 #: Bound on the paths named in one alert line / status line.
 MAX_PATHS_IN_LINE = 8
-#: Bound on the sha256 of the whole pending set kept as the "already
-#: alerted" signature.
+#: The ``path:sha`` pairs the last alert covered (a sorted list). A new
+#: alert is filed only for a pair NOT in it -- a newly skipped file or new
+#: reviewer bytes -- never for a set that merely shrank.
 ALERT_SIG_KEY = "alert_sig"
 
 Log = Callable[[str], None]
@@ -92,7 +100,7 @@ def _now_stamp() -> str:
 
 
 def _empty() -> Dict[str, object]:
-    return {"v": LEDGER_VERSION, "paths": {}, ALERT_SIG_KEY: ""}
+    return {"v": LEDGER_VERSION, "paths": {}, ALERT_SIG_KEY: []}
 
 
 def load(project_root: "str | Path") -> Dict[str, object]:
@@ -111,8 +119,10 @@ def load(project_root: "str | Path") -> Dict[str, object]:
         for rel, entry in paths.items():
             if isinstance(rel, str) and isinstance(entry, dict):
                 out["paths"][rel] = entry  # type: ignore[index]
-    if isinstance(data.get(ALERT_SIG_KEY), str):
-        out[ALERT_SIG_KEY] = data[ALERT_SIG_KEY]  # type: ignore[index]
+    alerted = data.get(ALERT_SIG_KEY)
+    if isinstance(alerted, list):
+        out[ALERT_SIG_KEY] = sorted(  # type: ignore[index]
+            a for a in alerted if isinstance(a, str))
     return out
 
 
@@ -145,9 +155,14 @@ def pending_paths(project_root: "str | Path") -> List[str]:
 
 def record_skips(project_root: "str | Path", root: Path,
                  proofs: Mapping[str, str], *, reason: str, short: str,
+                 foldable: Iterable[str] = (),
                  now: Optional[str] = None) -> List[str]:
     """Ledger every path in ``proofs`` whose CURRENT bytes still hash to the
     reviewer-proven sha.
+
+    ``foldable`` names the paths whose bytes are the reviewer's ALONE (see
+    the module docstring); every other recorded path is ``foldable: false``
+    and :func:`own_leftovers` never hands it back.
 
     ``proofs`` is ``rel -> sha256`` of the bytes the run PROVED the reviewer
     wrote. A path whose bytes no longer hash to that value was changed by
@@ -161,6 +176,7 @@ def record_skips(project_root: "str | Path", root: Path,
     now = now or _now_stamp()
     data = load(project_root)
     entries: Dict[str, dict] = dict(data.get("paths") or {})  # type: ignore[arg-type]
+    fold_ok = set(foldable)
     touched: List[str] = []
     for rel, proven in sorted(proofs.items()):
         try:
@@ -175,6 +191,7 @@ def record_skips(project_root: "str | Path", root: Path,
             "last_skip": now,
             "reason": reason,
             "commit": short,
+            "foldable": rel in fold_ok,
         })
         entry.setdefault("first_seen", now)
         entries[rel] = entry
@@ -190,10 +207,61 @@ def record_skips(project_root: "str | Path", root: Path,
 # ── reading it back ────────────────────────────────────────────────────────
 
 
+def _matches(entry: Mapping[str, object], raw: Optional[bytes]) -> bool:
+    recorded = str(entry.get("sha256") or "")
+    return bool(recorded) and raw is not None and (
+        _sha(raw) == recorded or _lf_sha(raw) == recorded)
+
+
+def verified_own(project_root: "str | Path",
+                 pre_bytes: Callable[[str], Optional[bytes]]) -> "set[str]":
+    """The FOLDABLE ledgered paths whose bytes at the START of this run (the
+    caller's ``pre_bytes``) hash to the recorded sha: their dirty state at
+    that start was the reviewer's own leftover and nothing else, so it is
+    not "the user's uncommitted changes". A path the user edited after the
+    skip, or one recorded ``foldable: false``, is NOT in the set -- the
+    user-changes block applies to it exactly as before."""
+    entries: Dict[str, dict] = dict(load(project_root).get("paths") or {})  # type: ignore[arg-type]
+    out: "set[str]" = set()
+    for rel, entry in entries.items():
+        if entry.get("foldable") is not True:
+            continue
+        try:
+            raw = pre_bytes(rel)
+        except Exception:  # noqa: BLE001 -- unprovable = not ours
+            continue
+        if _matches(entry, raw):
+            out.add(rel)
+    return out
+
+
+def prune_settled(project_root: "str | Path", root: Path,
+                  head_bytes: Callable[[str], "tuple[bool, Optional[bytes]]"]
+                  ) -> List[str]:
+    """Drop every entry whose working-tree bytes equal the current commit's
+    (``head_bytes(rel)`` -> ``(known, bytes)``), whatever its recorded sha:
+    the file was committed (by anybody) or reverted, so nothing is pending
+    on it any more. Covers the entries :func:`own_leftovers` never returns
+    (user-edited, ``foldable: false``), which would otherwise be named at
+    every session start forever. Returns the dropped paths; never raises."""
+    entries: Dict[str, dict] = dict(load(project_root).get("paths") or {})  # type: ignore[arg-type]
+    settled: List[str] = []
+    for rel in sorted(entries):
+        try:
+            raw = (Path(root) / rel).read_bytes()
+            known, head = head_bytes(rel)
+        except Exception:  # noqa: BLE001 -- a vanished file is own_leftovers' job
+            continue
+        if known and head is not None and (
+                raw.replace(b"\r\n", b"\n") == head.replace(b"\r\n", b"\n")):
+            settled.append(rel)
+    return clear_paths(project_root, settled) if settled else []
+
+
 def own_leftovers(project_root: "str | Path",
                   root: Path) -> Dict[str, bytes]:
-    """``rel -> current bytes`` for every ledger entry the reviewer still
-    owns (its current bytes hash to the recorded sha).
+    """``rel -> current bytes`` for every FOLDABLE ledger entry the reviewer
+    still owns (its current bytes hash to the recorded sha).
 
     An entry whose file vanished is dropped from the ledger here -- there is
     nothing left to fold or to warn about. An entry whose bytes changed is
@@ -210,8 +278,9 @@ def own_leftovers(project_root: "str | Path",
         except OSError:
             gone.append(rel)
             continue
-        recorded = str(entry.get("sha256") or "")
-        if recorded and (_sha(raw) == recorded or _lf_sha(raw) == recorded):
+        if entry.get("foldable") is not True:
+            continue  # the user's edit is part of these bytes: never folded
+        if _matches(entry, raw):
             out[rel] = raw
     if gone:
         for rel in gone:
@@ -239,21 +308,23 @@ def clear_paths(project_root: "str | Path", rels: Iterable[str]) -> List[str]:
         entries.pop(rel, None)
     data = dict(data)
     data["paths"] = entries
-    if not entries:
-        data[ALERT_SIG_KEY] = ""
+    gone = set(removed)
+    data[ALERT_SIG_KEY] = [a for a in _alerted(data)
+                           if a.rsplit(":", 1)[0] not in gone]
     _save(project_root, data)
     return removed
 
 
-def signature(entries: Mapping[str, dict]) -> str:
-    """A stable signature of the pending set (path + recorded sha). An
-    unchanged signature means 'the same files, unchanged since the last
-    alert' -- :func:`surface` then adds nothing."""
-    if not entries:
-        return ""
-    body = "\n".join(f"{rel}:{str(e.get('sha256') or '')}"
-                     for rel, e in sorted(entries.items()))
-    return _sha(body.encode("utf-8"))
+def signature(entries: Mapping[str, dict]) -> List[str]:
+    """The pending set as sorted ``path:sha`` pairs. :func:`surface` alerts
+    only when this holds a pair the last alert did not cover."""
+    return sorted(f"{rel}:{str(e.get('sha256') or '')}"
+                  for rel, e in entries.items())
+
+
+def _alerted(data: Mapping[str, object]) -> List[str]:
+    raw = data.get(ALERT_SIG_KEY)
+    return [a for a in raw if isinstance(a, str)] if isinstance(raw, list) else []
 
 
 # ── what the session is told ───────────────────────────────────────────────
@@ -275,10 +346,19 @@ def status_line(project_root: "str | Path") -> str:
         return ""
     rels = sorted(entries)
     since = min(str(e.get("first_seen") or "") for e in entries.values()) or "?"
+    full = ""
+    if len(rels) > MAX_PATHS_IN_LINE:
+        # The line names only the first few; the command for the rest names
+        # THIS interpreter (the VCO venv the hook resolved -- a bare `python`
+        # in a user project rarely has vco_lib) and the absolute root.
+        import sys
+
+        full = (f" Full list: \"{sys.executable}\" -m vco_lib.kg_reviewer_pending"
+                f" paths --project-root \"{Path(project_root).resolve()}\"")
     return (f"## KG reviewer: {len(rels)} file(s) left uncommitted since "
             f"{since}\n{_name_paths(rels)} - review them and commit the ones "
             f"you want (`git add` + `git commit`); a later review folds in "
-            f"the unchanged ones by itself.")
+            f"the unchanged ones by itself.{full}")
 
 
 def alert_message(project_root: "str | Path") -> str:
@@ -301,7 +381,8 @@ def surface(project_root: "str | Path", session_id: str,
 
     The row goes through the shipped alert channel, so the next main-chat
     prompt or tool call of ``session_id`` carries it as context -- and a row
-    is consumed by its delivery, so the SAME set never alerts twice
+    is consumed by its delivery, so the SAME set never alerts twice, and a
+    set that only shrank (some files folded) raises nothing either
     (:data:`ALERT_SIG_KEY`). A skip with no session id cannot be delivered
     (`agent_alerts` files it under ``nosession__``, which no session sweep
     matches): the re-inject line (:func:`status_line`) is then the channel,
@@ -312,7 +393,7 @@ def surface(project_root: "str | Path", session_id: str,
     if not message:
         return False
     sig = signature(entries)
-    if sig and sig == str(data.get(ALERT_SIG_KEY) or ""):
+    if not set(sig) - set(_alerted(data)):
         return False
     filed = False
     if session_id:

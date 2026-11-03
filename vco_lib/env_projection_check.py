@@ -125,13 +125,16 @@ def _surface_expectation(
         if surface == _cp._SURFACE_CLAUDE_SETTINGS_LOCAL:
             return [], {}
         if surface == _cp._SURFACE_CLAUDE_SETTINGS:
-            compared = _cp.list_canonical_keys()
+            # A local-only key is projected nowhere on this layout (and a
+            # value of the user's own in settings.json is theirs): not compared.
+            compared = _cp.list_canonical_keys() - _cp.LOCAL_ONLY_ENV_KEYS
             keys = [k for k in canonical_env if k in compared] + sorted(
                 k for k in compared if k not in canonical_env)
-            return keys, dict(canonical_env)
+            return keys, {k: v for k, v in canonical_env.items() if k in compared}
     carried = _cp.surface_keys(surface)
     expected = {k: v for k, v in canonical_env.items() if k in carried}
-    compared = carried if surface == _cp._SURFACE_CLAUDE_SETTINGS_LOCAL else _cp.list_canonical_keys()
+    compared = (carried if surface == _cp._SURFACE_CLAUDE_SETTINGS_LOCAL
+                else _cp.list_canonical_keys() - _cp.LOCAL_ONLY_ENV_KEYS)
     keys = [k for k in canonical_env if k in compared] + sorted(
         k for k in compared if k not in canonical_env
     )
