@@ -324,7 +324,9 @@ $Parts += Emit-RbSection $S_commits (Get-RbBudget 'commits') "run 'git log --one
 $Parts += Emit-RbSection $S_snap (Get-RbBudget 'snapshot') "rest is on disk: Read .claude/context/pre-compact-snapshot.md"
 # v0.2.105 L-KGREV: emitted past the fixed budgets (one bounded line) --
 # same order as the .sh sibling.
-$Parts += Emit-RbSection $S_kgsync 0 "run 'python -m vco_lib.kg_reviewer_pending paths --project-root .' for the full list"
+# The pointer names the interpreter that just answered (a bare `python` in a
+# user project is rarely the VCO venv, and a printed command is shipped code).
+$Parts += Emit-RbSection $S_kgsync 0 "run & '$KgpPy' -m vco_lib.kg_reviewer_pending paths --project-root '$ProjectDir' for the full list"
 
 # v0.2.102 W6-D review F4: strip the trailing newlines, cap, then write the
 # text + exactly ONE newline -- byte-for-byte what the .sh sibling's

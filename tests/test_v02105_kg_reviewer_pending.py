@@ -115,9 +115,35 @@ def _commit(repo: Path, snap, kept: List[str],
     return sha, lines
 
 
+REVIEWER_V1 = NODE + "\nreviewer line\n"
+
+
+def _skip_own_write(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drive run #1: CACHE is CLEAN when the review starts, the reviewer
+    rewrites it, and the commit is skipped by a git operation that never
+    ends. The reviewer's bytes are the whole change: ledgered FOLDABLE."""
+    monkeypatch.setattr(guard, "GIT_OP_RETRY_S", 0.2)
+    monkeypatch.setattr(guard, "GIT_OP_POLL_S", 0.05)
+    lock = repo / ".git" / "MERGE_HEAD"
+    lock.write_text("0" * 40)
+    try:
+        snap = guard.take_snapshot(repo)
+        try:
+            (repo / CACHE).write_text(REVIEWER_V1)
+            sha, lines = _commit(repo, snap, [CACHE])
+        finally:
+            snap.cleanup()
+    finally:
+        lock.unlink()
+    assert sha is None
+    assert any("a git operation is in progress" in ln for ln in lines), lines
+    assert pending.load(repo)["paths"][CACHE]["foldable"] is True
+
+
 def _skip_on_a_dirty_file(repo: Path) -> None:
-    """Drive run #1: the file is already dirty when the review starts, so the
-    commit is skipped and the reviewer's bytes are ledgered."""
+    """Drive run #1: the file is already dirty WITH THE USER'S EDIT when the
+    review starts, so the commit is skipped; the path is ledgered (named to
+    the session) but NOT foldable -- its bytes mix the user's edit in."""
     (repo / CACHE).write_text(NODE + "\nuser scratch line\n")
     snap = guard.take_snapshot(repo)
     try:
@@ -179,9 +205,10 @@ def test_head_moved_and_overlapping_is_skipped_ledgered_and_surfaced(repo):
 # ═════════════════════════════════════════════════════════════════════════
 
 
-def test_leftover_with_ledgered_bytes_is_folded_into_the_next_commit(repo):
+def test_leftover_with_ledgered_bytes_is_folded_into_the_next_commit(
+        repo, monkeypatch):
     """RED before v0.2.105: the cascade -- every later review skipped too."""
-    _skip_on_a_dirty_file(repo)
+    _skip_own_write(repo, monkeypatch)
     assert pending.pending_paths(repo) == [CACHE]
     # Run #2 rewrites nothing of its own: the leftover must still be
     # committed, on its own, by the reviewer.
@@ -192,17 +219,55 @@ def test_leftover_with_ledgered_bytes_is_folded_into_the_next_commit(repo):
         snap.cleanup()
     assert sha, lines
     assert _git(repo, "show", "--name-only", "--format=", sha).split() == [CACHE]
-    assert "user scratch line" in _git(repo, "show", f"{sha}:{CACHE}")
+    assert "reviewer line" in _git(repo, "show", f"{sha}:{CACHE}")
     assert pending.pending_paths(repo) == []
 
 
-def test_a_second_review_that_touches_its_own_leftover_still_commits(repo):
+def test_a_skip_over_the_users_own_dirt_is_never_folded(repo):
+    """K-1: the file the review skipped because the USER had uncommitted
+    changes on it holds the user's edit plus the reviewer's. A later review
+    must never commit it (the user's line would be committed under the
+    reviewer's name) -- it stays ledgered and named, and nothing commits."""
+    _skip_on_a_dirty_file(repo)
+    assert pending.load(repo)["paths"][CACHE]["foldable"] is False
+    assert pending.own_leftovers(repo, repo) == {}
+    before = _git(repo, "rev-parse", "HEAD").strip()
+    snap = guard.take_snapshot(repo)
+    try:
+        sha, lines = _commit(repo, snap, [])
+    finally:
+        snap.cleanup()
+    assert sha is None, lines
+    assert _git(repo, "rev-parse", "HEAD").strip() == before
+    assert "user scratch line" not in _git(repo, "show", f"HEAD:{CACHE}")
+    assert pending.pending_paths(repo) == [CACHE]
+    assert CACHE in pending.status_line(repo)
+
+
+def test_a_review_that_rewrites_a_user_dirty_skip_is_still_blocked(repo):
+    """K-1 through the cascade door: run #2 edits the file run #1 skipped
+    over the user's dirt -- the user's line must still never be committed."""
+    _skip_on_a_dirty_file(repo)
+    snap = guard.take_snapshot(repo)
+    try:
+        (repo / CACHE).write_text(
+            (repo / CACHE).read_text() + "second reviewer line\n")
+        sha, lines = _commit(repo, snap, [CACHE])
+    finally:
+        snap.cleanup()
+    assert sha is None
+    assert any("already had uncommitted changes" in ln for ln in lines), lines
+    assert "user scratch line" not in _git(repo, "show", f"HEAD:{CACHE}")
+
+
+def test_a_second_review_that_touches_its_own_leftover_still_commits(
+        repo, monkeypatch):
     """The cascade itself: run #2 edits the file run #1 left dirty. The
     ledger says the dirty state is the reviewer's, so the "user already had
     uncommitted changes" block must not fire again."""
-    _skip_on_a_dirty_file(repo)
+    _skip_own_write(repo, monkeypatch)
     assert pending.pending_paths(repo) == [CACHE]
-    v2 = NODE + "\nuser scratch line\nreviewer line\nanother reviewer line\n"
+    v2 = REVIEWER_V1 + "another reviewer line\n"
     snap = guard.take_snapshot(repo)  # CACHE is dirty again at this start
     try:
         (repo / CACHE).write_text(v2)
@@ -214,9 +279,9 @@ def test_a_second_review_that_touches_its_own_leftover_still_commits(repo):
     assert pending.pending_paths(repo) == []
 
 
-def test_a_user_edited_leftover_is_never_committed(repo):
+def test_a_user_edited_leftover_is_never_committed(repo, monkeypatch):
     """The fold is a byte proof: the user's own edit stays out."""
-    _skip_on_a_dirty_file(repo)
+    _skip_own_write(repo, monkeypatch)
     (repo / CACHE).write_text(
         (repo / CACHE).read_text() + "the user kept editing\n")
     before = _git(repo, "rev-parse", "HEAD").strip()
@@ -233,13 +298,118 @@ def test_a_user_edited_leftover_is_never_committed(repo):
     assert pending.own_leftovers(repo, repo) == {}
 
 
+def test_a_ledgered_file_the_user_edited_is_not_exempt_when_rewritten(
+        repo, monkeypatch):
+    """K-2: ledgered -> the user edits it -> this run's reviewer edits it
+    again. Its dirt at the start is the USER's now, so the user-changes
+    block applies and nothing is committed."""
+    _skip_own_write(repo, monkeypatch)
+    (repo / CACHE).write_text(REVIEWER_V1 + "the user's own line\n")
+    before = _git(repo, "rev-parse", "HEAD").strip()
+    snap = guard.take_snapshot(repo)
+    try:
+        (repo / CACHE).write_text(
+            REVIEWER_V1 + "the user's own line\nreviewer again\n")
+        sha, lines = _commit(repo, snap, [CACHE])
+    finally:
+        snap.cleanup()
+    assert sha is None, lines
+    assert any("already had uncommitted changes" in ln for ln in lines), lines
+    assert _git(repo, "rev-parse", "HEAD").strip() == before
+
+
+def test_an_entry_the_user_committed_is_cleared(repo, monkeypatch):
+    """K-3: the user edits the leftover and commits it themselves -- the next
+    run drops the entry, and the re-inject line goes quiet."""
+    _skip_own_write(repo, monkeypatch)
+    (repo / CACHE).write_text(REVIEWER_V1 + "the user's own line\n")
+    _git(repo, "commit", "-q", "-am", "user commits it")
+    assert pending.pending_paths(repo) == [CACHE]
+    snap = guard.take_snapshot(repo)
+    try:
+        sha, _lines = _commit(repo, snap, [])
+    finally:
+        snap.cleanup()
+    assert sha is None
+    assert pending.pending_paths(repo) == []
+    assert pending.status_line(repo) == ""
+
+
+def test_a_shrinking_pending_set_raises_no_new_alert(repo, monkeypatch):
+    """K-4: two files pending and alerted; one is committed -> no new row."""
+    monkeypatch.setattr(guard, "GIT_OP_RETRY_S", 0.2)
+    monkeypatch.setattr(guard, "GIT_OP_POLL_S", 0.05)
+    lock = repo / ".git" / "MERGE_HEAD"
+    lock.write_text("0" * 40)
+    try:
+        snap = guard.take_snapshot(repo)
+        try:
+            (repo / CACHE).write_text(REVIEWER_V1)
+            (repo / NEW).write_text(NEW_NODE)
+            sha, _lines = _commit(repo, snap, [CACHE, NEW])
+        finally:
+            snap.cleanup()
+    finally:
+        lock.unlink()
+    assert sha is None
+    assert pending.surface(repo, "sess-k4", log=lambda _l: None) is True
+    assert len(agent_alerts.collect(str(repo), "sess-k4")) == 1
+    _git(repo, "add", NEW)
+    _git(repo, "commit", "-q", "-m", "user commits one of them")
+    pending.prune_settled(repo, repo, lambda rel: guard._head_bytes(repo, rel))
+    assert pending.pending_paths(repo) == [CACHE]
+    assert pending.surface(repo, "sess-k4", log=lambda _l: None) is False
+    assert agent_alerts.collect(str(repo), "sess-k4") == []
+    # A NEW skip (new reviewer bytes) still alerts.
+    entries = pending.load(repo)["paths"]
+    assert pending.record_skips(
+        repo, repo, {CACHE: entries[CACHE]["sha256"]}, reason="r",
+        short="s", foldable=[CACHE]) == [CACHE]
+    (repo / CACHE).write_text(REVIEWER_V1 + "more\n")
+    import hashlib
+    pending.record_skips(
+        repo, repo,
+        {CACHE: hashlib.sha256((repo / CACHE).read_bytes()).hexdigest()},
+        reason="r", short="s", foldable=[CACHE])
+    assert pending.surface(repo, "sess-k4", log=lambda _l: None) is True
+
+
+def test_the_git_op_retry_never_runs_past_the_runs_budget(repo, monkeypatch):
+    """K-7: a review that spent its whole budget gets no git-op wait."""
+    monkeypatch.setattr(guard, "GIT_OP_RETRY_S", 30.0)
+    lock = repo / ".git" / "MERGE_HEAD"
+    lock.write_text("0" * 40)
+    lines: List[str] = []
+    try:
+        snap = guard.take_snapshot(repo)
+        try:
+            (repo / NEW).write_text(NEW_NODE)
+            t0 = time.monotonic()
+            sha = guard.commit_reviewer_changes(
+                snap, [NEW], reviewer_bytes={NEW: NEW_NODE.encode()},
+                short="abc1234", subject="s", model="sonnet",
+                attributed=True, log=lines.append,
+                retry_deadline=time.monotonic() - 1)
+            elapsed = time.monotonic() - t0
+        finally:
+            snap.cleanup()
+    finally:
+        lock.unlink()
+    assert sha is None
+    assert elapsed < 5, elapsed
+    assert not any("commit deferred" in ln for ln in lines), lines
+    assert guard._retry_window(time.monotonic() + 3) <= 3
+    assert guard._retry_window(None) == 30.0
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # 3. Every skip is surfaced
 # ═════════════════════════════════════════════════════════════════════════
 
 
-def test_alert_is_emitted_once_and_cleared_when_the_files_are_committed(repo):
-    _skip_on_a_dirty_file(repo)
+def test_alert_is_emitted_once_and_cleared_when_the_files_are_committed(
+        repo, monkeypatch):
+    _skip_own_write(repo, monkeypatch)
     first = pending.surface(repo, "sess-1", log=lambda _l: None)
     assert first is True
     rows = agent_alerts.collect(str(repo), "sess-1")
@@ -277,6 +447,29 @@ def test_the_reinject_status_line_names_the_pending_files(repo):
     line = pending.status_line(repo)
     assert line.startswith("## KG reviewer: 1 file(s) left uncommitted since ")
     assert CACHE in line
+    assert "Full list" not in line  # every path is already named
+
+
+def test_a_long_status_line_names_a_full_list_command_that_works(repo):
+    """K-6: the command printed for the rest of the list must run as printed
+    -- the resolved interpreter, never a bare `python` -- and list them all."""
+    import shlex
+    rels = [f"knowledge/concepts/n{i}.md" for i in range(pending.MAX_PATHS_IN_LINE + 3)]
+    for rel in rels:
+        (repo / rel).write_text(f"node {rel}\n")
+    pending.record_skips(
+        repo, repo,
+        {rel: pending._sha((repo / rel).read_bytes()) for rel in rels},
+        reason="r", short="s", foldable=rels)
+    line = pending.status_line(repo)
+    assert "(+3 more)" in line
+    cmd = line.split("Full list: ", 1)[1]
+    assert cmd.startswith(f'"{sys.executable}" -m vco_lib.kg_reviewer_pending paths')
+    proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True,
+                          env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+                          timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == sorted(rels)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -385,13 +578,23 @@ def _wait_chain_argv(repo: Path) -> str:
     return marker.read_text(encoding="utf-8")
 
 
-@pytest.mark.skipif(sys.platform == "win32",
-                    reason="bash .sh leg; Windows exercises the .ps1 sibling")
-def test_the_hook_hands_the_session_id_to_the_reviewer(tmp_path):
+_HOOK_SIBLINGS = [
+    pytest.param("sh", marks=pytest.mark.skipif(
+        sys.platform == "win32", reason="bash .sh leg; the [ps1] param covers Windows")),
+    pytest.param("ps1", marks=pytest.mark.skipif(
+        shutil.which("pwsh") is None, reason="pwsh not installed")),
+]
+
+
+@pytest.mark.parametrize("sibling", _HOOK_SIBLINGS)
+def test_the_hook_hands_the_session_id_to_the_reviewer(tmp_path, sibling):
     """RED before v0.2.105: the reviewer never learned the session, so its
-    "N files left uncommitted" alert had nobody it could be filed for."""
+    "N files left uncommitted" alert had nobody it could be filed for. The
+    .ps1 leg was RED a second way: it stored stdin in ``$Input`` -- the
+    automatic pipeline variable -- so pwsh fed the payload to that
+    enumerator and the hook read an empty payload (no session id)."""
     repo, env = _stub_chain_repo(tmp_path)
-    _read_payload(repo, env, "sh", {
+    _read_payload(repo, env, sibling, {
         "tool_name": "Bash", "tool_input": {"command": "git commit -m x"},
         "tool_response": "[main abc123] committed",
         "session_id": "sess-abc-123"})
@@ -399,31 +602,17 @@ def test_the_hook_hands_the_session_id_to_the_reviewer(tmp_path):
     assert "--session-id sess-abc-123" in argv, argv
 
 
-@pytest.mark.skipif(sys.platform == "win32",
-                    reason="bash .sh leg; Windows exercises the .ps1 sibling")
-def test_the_hook_passes_no_session_id_when_the_payload_has_none(tmp_path):
+@pytest.mark.parametrize("sibling", _HOOK_SIBLINGS)
+def test_the_hook_passes_no_session_id_when_the_payload_has_none(
+        tmp_path, sibling):
     """No empty argv entry either: the Windows command-line join would turn
     ``--session-id ''`` into a broken spawn."""
     repo, env = _stub_chain_repo(tmp_path)
-    _read_payload(repo, env, "sh", {
+    _read_payload(repo, env, sibling, {
         "tool_name": "Bash", "tool_input": {"command": "git commit -m x"},
         "tool_response": "[main abc123] committed"})
     argv = _wait_chain_argv(repo)
     assert "--session-id" not in argv, argv
-
-
-def test_the_ps1_sibling_carries_the_same_session_wiring():
-    """POSIX pwsh never hands a redirected stdin to ``[Console]::In``
-    (measured: the payload reads back empty however it is fed, while the
-    same idiom in the shipped .ps1 hooks is the Windows path), so the .ps1
-    leg cannot be driven from this suite. Its two pieces are pinned instead,
-    and the .sh leg above proves the wiring end to end."""
-    ps1 = (REPO_ROOT / "templates" / "hooks"
-           / "post-git-commit-kg-sync.ps1").read_text(encoding="utf-8")
-    assert "'--session-id'" in ps1 and "if ($SessionId)" in ps1
-    sh = (REPO_ROOT / "templates" / "hooks"
-          / "post-git-commit-kg-sync.sh").read_text(encoding="utf-8")
-    assert "--session-id" in sh
 
 
 # ═════════════════════════════════════════════════════════════════════════
