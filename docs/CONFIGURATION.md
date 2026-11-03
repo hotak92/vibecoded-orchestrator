@@ -836,7 +836,12 @@ example your personal plan and a seat on a second organisation account — and e
 - *Choosing per project.* Project → Identity → **Claude account** ("Use the default", or an account). The env
   projection writes the choice as `ANTHROPIC_CUSTOM_HEADERS="x-vco-account: <id>"` into the project's
   `.claude/settings.local.json` (machine-local, never the committable `settings.json`); "Use the default" removes it,
-  and an `ANTHROPIC_CUSTOM_HEADERS` value of your own is kept. Claude Code re-reads the file, so the next request of a
+  and an `ANTHROPIC_CUSTOM_HEADERS` value of your own is kept — in `settings.local.json`, `settings.json` and
+  `.vscode/settings.json` alike (VCO never writes or removes the key in the two committable files). When your
+  `settings.local.json` is committed to git (or git cannot say), VCO writes the choice nowhere — a per-machine account
+  must not land in a shared file — and the Identity tab says so with the remedy (`git rm --cached
+  .claude/settings.local.json`); with a header value of your own there, it shows the `x-vco-account: <id>` line to add
+  to it. Claude Code re-reads the file, so the next request of a
   running chat already uses the new account (needs Claude Code 2.1.227 or later; project settings apply once the
   workspace is trusted). The prompt cache does not carry across accounts. It applies only to chats that go through the
   gateway (`multimodel` mode, or a CLI pointed at it); in `remote-control` mode the panel uses its native login. The
@@ -852,13 +857,20 @@ example your personal plan and a seat on a second organisation account — and e
   byte the prompt cache keys on is unchanged and the client never stores it. The gateway recognises a conversation by
   the `x-claude-code-session-id` header plus a digest of the request's first message (a session's subagents and side
   calls share the session id but not the first message); a compaction or a new fallback episode tells it once more.
+  A turn the upstream refuses (or that fails) does not count as told — the client's retry carries the notice again.
+  The memory of who was told lives in the gateway process (the last 4096 conversations), so a gateway restart may
+  tell a running conversation once more.
   Only a primary login that is itself unusable still answers 401, as before.
 - *Keeping an added login alive.* Claude Code refreshes a login only in a session it runs, and only in the last five
   minutes before expiry; `claude auth status` does not refresh. So, four minutes before an added account's login
   expires (or once it has), the gateway runs `claude -p --safe-mode --no-session-persistence --max-turns 1 ok` with
   that account's `CLAUDE_CONFIG_DIR` and `ANTHROPIC_BASE_URL` pointed at a loopback port it holds bound but not
   listening: Claude Code renews its own credentials file, then its model request is refused on the spot — no model
-  call, and VCO never sees the token. Success is judged on the file (a later expiry). One attempt per account per 10
+  call, and VCO never sees the token. That is the design, read from Claude Code 2.1.312's own bundle and exercised in
+  VCO's tests against a stand-in CLI; it has not yet been run against a live second login, which is why success is
+  judged on the file (a later expiry) and never assumed: if a Claude Code release stops refreshing this way, the
+  keeper logs `not_renewed` and the account takes the loud fallback once its login lapses. On Windows the `claude`
+  child runs without a console window; on a timeout the child and everything it started are stopped. One attempt per account per 10
   minutes, doubling up to an hour after failures, 90 s hard timeout, logged; a failure leads to the loud fallback once
   the login lapses. The `primary` login is never touched. `VCT_MODEL_GATEWAY_CLAUDE_BIN` names the `claude`
   executable when it is not on the daemon's `PATH`.

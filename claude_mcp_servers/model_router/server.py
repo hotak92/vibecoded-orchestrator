@@ -2668,11 +2668,14 @@ def _inject_fallback_notice(
     session: Optional[str],
     client_payload: Mapping[str, Any],
     forward_payload: dict,
-) -> Optional[dict]:
-    """``forward_payload`` with the fallback notice appended, or ``None``
-    when this request must not carry it (not eligible, or the conversation
-    was already told). The conversation is recognised on the CLIENT's own
-    body (``client_payload``) so a gateway-side repair cannot change it."""
+) -> Optional[tuple]:
+    """``(forward_payload with the fallback notice appended, claim key)``, or
+    ``None`` when this request must not carry it (not eligible, or the
+    conversation was already told). The conversation is recognised on the
+    CLIENT's own body (``client_payload``) so a gateway-side repair cannot
+    change it. The claim is held only until the upstream answers: the caller
+    releases it (:func:`_settle_notice_claim`) when the injected turn did not
+    reach the model, so the client's retry carries the notice again."""
     if not notice_eligible(forward_payload):
         return None
     conv = conversation_key(session, client_payload)
@@ -2682,10 +2685,27 @@ def _inject_fallback_notice(
     if not gateway.accounts.notices.claim(key):
         return None
     try:
-        return append_notice(forward_payload, gateway.accounts.notice_for(choice))
+        return append_notice(forward_payload, gateway.accounts.notice_for(choice)), key
     except Exception:
         gateway.accounts.notices.release(key)
         raise
+
+
+def _settle_notice_claim(gateway: "Gateway", key: Optional[tuple],
+                         status: Optional[int]) -> None:
+    """Keep the "already told" claim only when the injected turn was
+    ANSWERED (2xx). A refused / failed / aborted turn (``status`` non-2xx or
+    ``None``) never reached the model, so the conversation was not told:
+    release the claim and let the client's retry of the same turn carry the
+    notice (review A5)."""
+    if key is None:
+        return
+    if status is not None and 200 <= status < 300:
+        return
+    try:
+        gateway.accounts.notices.release(key)
+    except Exception:  # noqa: BLE001 — a ledger hiccup never fails the chat
+        logger.debug("model-gateway: notice claim release failed", exc_info=True)
 
 
 async def messages_handler(request: web.Request) -> web.StreamResponse:
@@ -2966,6 +2986,9 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     text_only_images_omitted = 0
     clear_thinking_applied = False
     account_note = ""
+    #: The "conversation already told" claim taken when the fallback notice
+    #: is injected; settled after the upstream answers (A5).
+    notice_key: Optional[tuple] = None
     if decision.is_anthropic:
         # v0.2.105: WHICH login serves this request (``x-vco-account``, else
         # the default account), with the loud fallback when it cannot be
@@ -3034,7 +3057,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             if injected is _ABANDON:
                 rewrite_failed = True
             elif injected is not None:
-                forward_payload = injected
+                forward_payload, notice_key = injected
                 mutated = True
                 account_note = f"{account_note} note=account_notice_injected"
     else:
@@ -3257,23 +3280,29 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         images=images_field,
         facts=facts,
     )
-    return await _proxy(
-        request,
-        gateway,
-        decision,
-        url,
-        headers,
-        body,
-        requested_model=str(requested_model),
-        stream_requested=stream_requested,
-        started=started,
-        note=note,
-        images=images_field,
-        facts=facts,
-        ladder_escalate=ladder_hook,
-        effort_requested=effort_requested,
-        effort_forwarded=effort_forwarded,
-    )
+    try:
+        response = await _proxy(
+            request,
+            gateway,
+            decision,
+            url,
+            headers,
+            body,
+            requested_model=str(requested_model),
+            stream_requested=stream_requested,
+            started=started,
+            note=note,
+            images=images_field,
+            facts=facts,
+            ladder_escalate=ladder_hook,
+            effort_requested=effort_requested,
+            effort_forwarded=effort_forwarded,
+        )
+    except BaseException:
+        _settle_notice_claim(gateway, notice_key, None)
+        raise
+    _settle_notice_claim(gateway, notice_key, getattr(response, "status", None))
+    return response
 
 
 def _reread_oauth_headers(

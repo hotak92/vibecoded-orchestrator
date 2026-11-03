@@ -44,6 +44,7 @@ __all__ = [
     "detached_log_dir",
     "relay_detached",
     "run_supervised",
+    "signal_group",
 ]
 
 #: Seconds a forwarded signal (or the ceiling's SIGTERM) gets before SIGKILL
@@ -56,9 +57,12 @@ _FORWARDED = ("SIGTERM", "SIGINT", "SIGHUP")
 PopenFn = Callable[..., "subprocess.Popen[bytes]"]
 
 
-def _signal_group(proc: "subprocess.Popen[Any]", sig: int) -> None:
+def signal_group(proc: Any, sig: int) -> None:
     """*sig* to the child's whole process group (POSIX), or to the child
-    (Windows: no process groups to signal; ``terminate``/``kill``)."""
+    (Windows: no process groups to signal; ``terminate``/``kill``). The child
+    must have been started in its own session (``start_new_session``), so
+    its pid is its group id. Works for a ``subprocess.Popen`` and an
+    ``asyncio`` subprocess alike (only ``pid``/``kill``/``terminate``)."""
     try:
         if os.name == "nt":
             if sig == getattr(signal, "SIGKILL", None):
@@ -94,7 +98,7 @@ def run_supervised(
 
     def _forward(signum: int, _frame: Any) -> None:
         received.append(signum)
-        _signal_group(proc, signum)
+        signal_group(proc, signum)
 
     previous: dict[int, Any] = {}
     for name in _FORWARDED:
@@ -123,10 +127,10 @@ def run_supervised(
                     kill_at = now + grace_s
                 elif max_run_s is not None and now - start >= max_run_s:
                     stopped_by = int(signal.SIGTERM)
-                    _signal_group(proc, stopped_by)
+                    signal_group(proc, stopped_by)
                     kill_at = now + grace_s
             elif now >= kill_at:
-                _signal_group(proc, int(getattr(signal, "SIGKILL", signal.SIGTERM)))
+                signal_group(proc, int(getattr(signal, "SIGKILL", signal.SIGTERM)))
                 rc = proc.wait()
                 break
         # A child that exited on its own is NOT followed by a group kill: what

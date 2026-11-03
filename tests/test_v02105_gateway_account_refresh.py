@@ -15,6 +15,7 @@ NOT on ``auth status``. The live check is in the owner's steps.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -268,6 +269,109 @@ class TestDoubleTests(_Base):
         code = await _python_runner([str(hang)], dict(os.environ), self.root, 0.5)
         self.assertIsNone(code)
         self.assertLess(time.monotonic() - started, 10)
+
+    @unittest.skipIf(os.name == "nt", "process groups are POSIX")
+    async def test_a_timeout_kills_what_the_child_started_too(self) -> None:
+        """A9: a `claude` that spawned helpers must not leave them behind."""
+        pid_file = self.root / "grandchild.pid"
+        hang = self.root / "hang_with_child.py"
+        hang.write_text(textwrap.dedent(f"""
+            import subprocess, sys, time
+            p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            open({str(pid_file)!r}, "w").write(str(p.pid))
+            time.sleep(60)
+        """))
+        code = await _python_runner([str(hang)], dict(os.environ), self.root, 1.5)
+        self.assertIsNone(code)
+        grandchild = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild, 0)
+                with open(f"/proc/{grandchild}/stat") as fh:
+                    if fh.read().split(") ", 1)[1].startswith("Z"):
+                        alive = False
+                        break
+            except (ProcessLookupError, FileNotFoundError):
+                alive = False
+                break
+            time.sleep(0.1)
+        if alive:  # never leave it running, whatever the verdict
+            os.kill(grandchild, 9)
+        self.assertFalse(alive, "the child's own child survived the timeout")
+
+
+class SpawnShapeTests(unittest.IsolatedAsyncioTestCase):
+    def test_windows_spawns_the_cli_without_a_console_window(self) -> None:
+        """A4: the gateway has no console; a console child would flash one."""
+        from vco_lib import windowless_spawn as ws
+
+        kw = ar.spawn_kwargs(os_name="nt")
+        self.assertTrue(kw["creationflags"] & ws.CREATE_NO_WINDOW)
+        self.assertFalse(kw["creationflags"] & ws.DETACHED_PROCESS)
+        self.assertEqual(ar.spawn_kwargs(os_name="posix"), {"start_new_session": True})
+
+    async def test_the_default_runner_uses_the_windowless_shape(self) -> None:
+        from unittest import mock
+
+        seen: dict = {}
+
+        async def fake_exec(*argv, **kw):
+            seen.update(kw)
+            raise OSError("stop here")
+
+        with mock.patch.object(ar, "spawn_kwargs", lambda: {"creationflags": 0x08000000}), \
+                mock.patch("asyncio.create_subprocess_exec", fake_exec):
+            with self.assertRaises(OSError):
+                await ar.default_runner(["x"], {}, Path("."), 1)
+        self.assertEqual(seen.get("creationflags"), 0x08000000)
+
+    async def test_the_keeper_loop_survives_an_unexpected_raise(self) -> None:
+        """A8: one bad pass is logged; the keeper keeps running."""
+        keeper = ar.AccountRefresher.__new__(ar.AccountRefresher)
+        calls = []
+
+        async def tick():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return []
+
+        keeper.tick = tick  # type: ignore[method-assign]
+        with self.assertLogs(ar.logger, level="WARNING") as logs:
+            task = asyncio.create_task(keeper.run_forever(interval_s=0.01))
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if len(calls) >= 3:
+                    break
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertIn("boom", "\n".join(logs.output))
+
+
+class ClaudeBinTests(unittest.TestCase):
+    def test_an_override_that_is_not_a_file_finds_nothing(self) -> None:
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {ar.CLAUDE_BIN_ENV: "/nonexistent/claude"}):
+            self.assertIsNone(ar.resolve_claude_bin())
+
+    def test_the_native_install_location_is_found_without_path(self) -> None:
+        """A launcher-started gateway often lacks ~/.local/bin on PATH."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory(prefix="claude-bin-") as tmp:
+            exe = Path(tmp) / ".local" / "bin" / ("claude.exe" if os.name == "nt" else "claude")
+            exe.parent.mkdir(parents=True)
+            exe.write_text("")
+            env = {"VCT_USER_HOME_OVERRIDE": tmp, "PATH": "",
+                   "VCT_CLAUDE_DIR": str(Path(tmp) / "nope")}
+            with mock.patch.dict(os.environ, env):
+                os.environ.pop(ar.CLAUDE_BIN_ENV, None)
+                self.assertEqual(ar.resolve_claude_bin(), str(exe))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -272,6 +272,26 @@ class NoticeTests(AccountsTestBase):
         await self.send(conversation("first", "second"), account="work", session="sess-2")
         self.assertEqual(len(self.notice_blocks(self.last_body())), 1)
 
+    async def test_a_turn_the_upstream_refused_does_not_use_up_the_notice(self) -> None:
+        """A5: the notice is consumed only by a turn the model ANSWERED. A
+        refused turn (here a 400) never reached it, so the client's retry of
+        the same turn carries the notice again; once a turn succeeds, the
+        conversation is told and later turns carry nothing."""
+        self.anthropic_up.messages_status = 400
+        self.anthropic_up.messages_body = {"type": "error", "error": {
+            "type": "invalid_request_error", "message": "nope"}}
+        status = await self.send(conversation("first", "second"), account="work")
+        self.assertEqual(status, 400)
+        self.assertEqual(len(self.notice_blocks(self.last_body())), 1)
+        self.anthropic_up.messages_status = 200
+        self.anthropic_up.messages_body = {"id": "msg_1", "type": "message", "model": "stub",
+                                           "content": [], "usage": {"input_tokens": 1,
+                                                                    "output_tokens": 1}}
+        await self.send(conversation("first", "second"), account="work")
+        self.assertEqual(len(self.notice_blocks(self.last_body())), 1, "the retry is told")
+        await self.send(conversation("first", "second", "third"), account="work")
+        self.assertEqual(self.notice_blocks(self.last_body()), [], "told once it was answered")
+
     async def test_ineligible_requests_leave_the_notice_pending(self) -> None:
         await self.send(conversation("first", tools=False), account="work")
         self.assertEqual(self.notice_blocks(self.last_body()), [], "no tools: a side call")

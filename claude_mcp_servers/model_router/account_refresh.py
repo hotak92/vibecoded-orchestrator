@@ -13,6 +13,13 @@ reads, passes or stores the token value.
 
 Which invocation, and why it spends no model call
 -------------------------------------------------
+STATUS: the design below is read from Claude Code 2.1.312's shipped bundle
+and exercised against a stand-in CLI in the tests; it has NOT been run
+against a live second login yet (feasibility probe P4 needs one). That is why
+success is judged on the file, never assumed — a release that stops
+refreshing this way shows up as ``not_renewed`` WARNINGs and the loud
+fallback, never as a silent "renewed".
+
 * ``claude auth status`` does NOT refresh: in Claude Code 2.1.312 its handler
   reports ``loggedIn`` from token PRESENCE and makes no refresh call (read in
   the shipped bundle, 2026-11-03). It cannot keep a login alive.
@@ -45,7 +52,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
+import signal
 import socket
 import time
 from dataclasses import dataclass, asdict
@@ -110,17 +117,13 @@ Runner = Callable[[Sequence[str], Mapping[str, str], Path, float], Awaitable[Opt
 
 
 def resolve_claude_bin() -> Optional[str]:
+    """``$VCT_MODEL_GATEWAY_CLAUDE_BIN`` when set (a file, else ``None``),
+    else the one resolver for a detached process (:mod:`vco_lib.claude_cli`:
+    PATH, then Claude Code's own install locations)."""
+    from vco_lib.claude_cli import resolve_claude_cli
+
     custom = (os.environ.get(CLAUDE_BIN_ENV) or "").strip()
-    if custom:
-        return custom if os.path.isfile(custom) else None
-    found = shutil.which("claude")
-    if found:
-        return found
-    for candidate in (Path.home() / ".local" / "bin" / "claude",
-                      Path.home() / ".claude" / "local" / "claude"):
-        if candidate.is_file():
-            return str(candidate)
-    return None
+    return resolve_claude_cli(override=custom or None)
 
 
 def refresh_command(claude_bin: str) -> list[str]:
@@ -140,21 +143,41 @@ def refresh_env(base: Mapping[str, str], config_dir: str, dead_port: int) -> dic
     return env
 
 
+def spawn_kwargs(*, os_name: Optional[str] = None) -> dict:
+    """How the child is started: its own session on POSIX (so a timeout can
+    kill everything it started), and on Windows a console with NO window —
+    the gateway is a console-less daemon, so a plain console child would get
+    a visible window every time the keeper runs (the one windowless home,
+    :mod:`vco_lib.windowless_spawn`)."""
+    from vco_lib.windowless_spawn import detached_popen_kwargs
+
+    return detached_popen_kwargs(os_name=os_name)
+
+
+def kill_child_tree(proc) -> None:
+    """Kill the child AND whatever it started: its whole process group on
+    POSIX (it leads its own session), the child itself on Windows."""
+    from vco_lib.hook_supervisor import signal_group
+
+    signal_group(proc, int(getattr(signal, "SIGKILL", signal.SIGTERM)))
+
+
 async def default_runner(argv: Sequence[str], env: Mapping[str, str], cwd: Path,
                          timeout_s: float) -> Optional[int]:
-    """Spawn, wait with a hard timeout, kill our own child on timeout. The
-    child's output is discarded: it is never needed and never logged."""
+    """Spawn, wait with a hard timeout, kill our own child (and its process
+    group) on timeout. The child's output is discarded: it is never needed
+    and never logged."""
     proc = await asyncio.create_subprocess_exec(
         *argv, env=dict(env), cwd=str(cwd),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
-        start_new_session=(os.name != "nt"),
+        **spawn_kwargs(),
     )
     try:
         return await asyncio.wait_for(proc.wait(), timeout_s)
     except asyncio.TimeoutError:
-        proc.kill()
+        kill_child_tree(proc)
         await proc.wait()
         return None
 
@@ -290,8 +313,16 @@ class AccountRefresher:
         }
 
     async def run_forever(self, interval_s: float = TICK_S) -> None:
+        """Tick forever. An unexpected raise is logged and the loop goes on:
+        a keeper that died silently would let every extra login lapse."""
         while True:
-            await self.tick()
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — logged, the loop survives
+                logger.warning("model-gateway: login keeper pass failed (%s: %s); "
+                               "retrying in %.0fs", type(exc).__name__, exc, interval_s)
             await asyncio.sleep(interval_s)
 
     def start(self) -> None:

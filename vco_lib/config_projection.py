@@ -2824,6 +2824,9 @@ def apply_project_env(
     # NAME — a token the user typed included. It is removed only on value
     # evidence, with the user secrets below.
     canonical_keys = list_canonical_keys() - _LEGACY_SECRET_ENV_KEYS
+    # v0.2.105 review A1/A2: never written to nor removed from a committable
+    # surface (see LOCAL_ONLY_ENV_KEYS).
+    committable_keys = canonical_keys - LOCAL_ONLY_ENV_KEYS
 
     # v0.2.84 D2 (P2): snapshot the on-disk KG_COLLECTION /
     # DEVELOPMENT_COLLECTION values BEFORE writing so we can emit a repoint
@@ -2897,7 +2900,7 @@ def apply_project_env(
         keys = _write_json_surface(
             project_root, _SURFACE_CLAUDE_SETTINGS, refusals, project_id,
             lambda: _write_json_env_block(
-                path, settings_env, canonical_keys, env_key="env",
+                path, settings_env, committable_keys, env_key="env",
                 user_secret_pairs=us_pairs,
                 user_secret_strip_keys=us_strip_keys,
             ),
@@ -2924,7 +2927,7 @@ def apply_project_env(
         keys = _write_json_surface(
             project_root, _SURFACE_VSCODE_SETTINGS, refusals, project_id,
             lambda: _write_json_env_block(
-                vscode_path, vscode_env, canonical_keys, env_key="claude-code.env",
+                vscode_path, vscode_env, committable_keys, env_key="claude-code.env",
                 user_secret_pairs=us_pairs,
                 user_secret_strip_keys=vscode_strip_keys,
             ),
@@ -2982,6 +2985,18 @@ def apply_project_env(
 #: :func:`apply_project_env`): only with the same value evidence as the rest.
 _LEGACY_SECRET_ENV_KEYS: frozenset[str] = frozenset({"GITHUB_TOKEN"})
 _STORED_SLOT_FOR_ENV_KEY: dict[str, str] = {"GITHUB_TOKEN": "github_pat"}
+
+#: Canonical keys VCO projects ONLY into the private ``settings.local.json``
+#: and therefore never writes to, nor removes from, a COMMITTABLE JSON surface
+#: (``.claude/settings.json``, ``.vscode/settings.json``). A value there is the
+#: user's own (``ANTHROPIC_CUSTOM_HEADERS`` is a legitimate Claude Code key) —
+#: deleting it by name on every apply was the ``GITHUB_TOKEN`` defect again
+#: (v0.2.105 review A1). When the local layer is not usable (git tracks it or
+#: cannot say), the key is not projected anywhere and the project status says
+#: why (:func:`vco_lib.gateway_accounts.project_status`), rather than putting a
+#: per-machine account selector into a file teams commit (review A2). Read by
+#: the writer here and by :mod:`vco_lib.env_projection_check`.
+LOCAL_ONLY_ENV_KEYS: frozenset[str] = frozenset({"ANTHROPIC_CUSTOM_HEADERS"})
 
 # A condition id, not a secret: the constant's name avoids "secret" because
 # CodeQL's clear-text-storage query taints identifiers by name, and this id is

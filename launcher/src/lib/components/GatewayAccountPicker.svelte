@@ -13,6 +13,8 @@
     pickerVisible,
     projectAccountStatus,
     projectVerdict,
+    reapplyHelps,
+    saveOutcome,
     setProjectAccount,
     type AccountsListing,
     type ProjectAccountStatus,
@@ -47,11 +49,10 @@
     busy = true;
     try {
       const answer = await setProjectAccount(projectId, next === '' ? null : next);
-      if (!answer.ok) {
-        toast.error(answer.error ?? 'The account choice was not saved.');
-      } else {
-        toast.success('Claude account saved — the next request of a running chat uses it.');
-      }
+      const outcome = saveOutcome(answer);
+      if (outcome.tone === 'ok') toast.success(outcome.text);
+      else if (outcome.tone === 'warn') toast.info(outcome.text);
+      else toast.error(outcome.text);
       await loadAccountChoice();
     } catch (e) {
       toast.error(String(e));
@@ -88,7 +89,7 @@
     {#if verdict}
       <p class="acct-verdict acct-{verdict.tone}">{verdict.text}</p>
     {/if}
-    {#if status?.drift}
+    {#if reapplyHelps(status)}
       <button class="ps-btn-secondary" disabled={busy} onclick={() => applyAccountChoice(choice)}>
         Re-apply
       </button>

@@ -433,6 +433,34 @@ def _settings_local_header(folder: Path) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
+#: Why a project's ``settings.local.json`` does not carry its account choice
+#: (``project_status`` ``drift_cause``). Only ``not_applied`` is fixed by
+#: re-running the projection; the others need the user, and the GUI says how.
+DRIFT_NOT_APPLIED = "not_applied"
+DRIFT_LOCAL_TRACKED = "local_tracked"
+DRIFT_LOCAL_UNKNOWN = "local_unknown"
+DRIFT_USER_VALUE = "user_value"
+
+
+def _drift_cause(folder: Path, raw: Optional[str]) -> str:
+    """Why the selector is not in force (``drift`` is True). Never reads out
+    a header VALUE: a user's own headers may carry anything."""
+    from vco_lib import settings_local_env as sle
+    try:
+        state = sle.layer_state(folder)
+    except Exception:  # noqa: BLE001 — unprovable layer = not usable
+        state = sle.UNKNOWN
+    if state == sle.TRACKED:
+        return DRIFT_LOCAL_TRACKED
+    if state != sle.USABLE:
+        return DRIFT_LOCAL_UNKNOWN
+    if raw and read_selector(raw) is None:
+        # A value VCO writes is a pure selector; anything else is the user's
+        # own, which the projection keeps (settings_local_user_value_kept).
+        return DRIFT_USER_VALUE
+    return DRIFT_NOT_APPLIED
+
+
 def project_status(reg: Registry, project_id: str, folder: Optional[Path],
                    gateway_accounts: Optional[Mapping[str, Any]] = None) -> dict:
     """Which account a project's requests are billed to, and why.
@@ -440,12 +468,16 @@ def project_status(reg: Registry, project_id: str, folder: Optional[Path],
     ``effective`` is the account the gateway will actually use: the
     assigned one when its login is usable, else the fallback (the default,
     else ``primary``) — the same rule the gateway applies, stated so the GUI
-    can show it before any request is sent.
+    can show it before any request is sent. ``drift_cause`` (``None`` when
+    there is no drift) says why the file does not carry the choice, so the
+    GUI offers only a remedy that helps (``DRIFT_*``).
     """
     assigned = reg.projects.get(project_id)
     selected = assigned or reg.default
-    file_says = read_selector(_settings_local_header(folder)) if folder else None
+    raw = _settings_local_header(folder) if folder else None
+    file_says = read_selector(raw)
     drift = folder is not None and file_says != assigned
+    cause = _drift_cause(folder, raw) if (drift and folder is not None) else None
     usable = _account_usable(reg, selected, gateway_accounts)
     effective = selected if usable else fallback_target(reg, selected, gateway_accounts)
     return {
@@ -457,6 +489,8 @@ def project_status(reg: Registry, project_id: str, folder: Optional[Path],
         "falling_back": effective != selected,
         "file_says": file_says,
         "drift": drift,
+        "drift_cause": cause,
+        "selector_line": header_value(assigned) if assigned else None,
     }
 
 
@@ -624,7 +658,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         exported = export(new)
         out: dict[str, Any] = {"ok": True, "exported": str(exported)}
         if args.cmd == "set-project":
-            out["projection"] = _reproject(args.project_id, db)
+            # The choice is SAVED and exported at this point; a projection
+            # that fails (a settings file VCO may not edit) must not read
+            # back as "not saved" (review A10). It is reported beside ok.
+            try:
+                out["projection"] = _reproject(args.project_id, db)
+            except Exception as exc:  # noqa: BLE001 — reported, never a traceback
+                out["projection_error"] = f"{type(exc).__name__}: {exc}"
+            folder = _project_folder(args.project_id, db)
+            out["status"] = project_status(new, args.project_id, folder)
         _emit(out)
         return 0
     except AccountsError as exc:

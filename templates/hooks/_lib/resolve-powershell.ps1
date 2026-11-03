@@ -165,10 +165,6 @@ function Start-VcoDetachedProcess {
         [string]$RedirectStandardInput,
         [switch]$PassThru
     )
-    $spawn = @{
-        FilePath    = $FilePath
-        ErrorAction = 'SilentlyContinue'
-    }
     # QUIRK 2 diversion first: identical redirect targets are rejected by
     # Start-Process on every edition (Windows branch below) and would leave
     # two fd offsets interleaving on one file (POSIX branch below) - divert
