@@ -125,9 +125,26 @@ the reviewer.
    leaves that path uncommitted, logged). The commit is SKIPPED (files left
    in place, one log line) when a merge / rebase / cherry-pick / revert /
    bisect is in progress, ``index.lock`` exists, HEAD moved since the run
-   started, a target path already had user changes before the run, or the
-   run's writes could not be attributed. A run that wrote nothing commits
-   nothing.
+   started AND that move touched one of the reviewer's own paths, a target
+   path already had user changes before the run, or the run's writes could
+   not be attributed. A run that wrote nothing commits nothing.
+
+   v0.2.105 L-KGREV — a skip is never silent again, and never cascades:
+
+   * a HEAD that moved is only a reason to skip when ``start..HEAD`` touched
+     one of the reviewer's files (:func:`head_changed_paths`); otherwise the
+     nodes land as a clean commit on top;
+   * a git operation in progress is retried once, for up to
+     :data:`GIT_OP_RETRY_S` seconds, before the skip stands;
+   * every path this call leaves uncommitted is recorded in
+     :mod:`vco_lib.kg_reviewer_pending` together with the sha256 of the bytes
+     the run PROVED the reviewer wrote, and every path it commits is dropped
+     from it. The next run folds a ledgered path whose current bytes still
+     hash to that sha into its own commit — the reviewer's own leftover, not
+     a user change — while a ledgered path whose bytes differ is the user's
+     and is never committed. The ledger is what
+     :func:`vco_lib.kg_reviewer_pending.surface` turns into one alert for the
+     session.
 
    The user's git hooks are NOT bypassed (no ``--no-verify``): a hook that
    rejects the commit leaves the files uncommitted and the reason in the
@@ -160,6 +177,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 import yaml
 
 from vco_lib import kg_prune_result
+from vco_lib import kg_reviewer_pending as _pending
 from vco_lib.kg_reviewer_model import config
 from vco_lib.knowledge_residue import content_signature_of_file_bytes
 
@@ -181,6 +199,9 @@ __all__ = [
     "removed_lines",
     "validate",
     "commit_reviewer_changes",
+    "commit_block_reason",
+    "head_changed_paths",
+    "is_git_op_block",
     "is_reviewer_commit_subject",
     "commit_subject",
 ]
@@ -1534,6 +1555,15 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
 _IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD",
                 "rebase-merge", "rebase-apply", "BISECT_LOG")
 
+#: How long a commit that found a git operation in progress waits for that
+#: operation to END before it gives up and ledgers the files (v0.2.105
+#: L-KGREV, brief item 4). A merge / rebase / index lock normally lasts
+#: seconds; the review itself has already spent the run's wall-clock budget,
+#: so this wait is short and bounded and the failure mode is the pre-v0.2.105
+#: one (files left uncommitted) plus the ledger line that names them.
+GIT_OP_RETRY_S = 20.0
+GIT_OP_POLL_S = 0.5
+
 
 def _git_path(root: Path, name: str) -> Path:
     out = _git(root, "rev-parse", "--git-path", name).stdout.decode().strip()
@@ -1541,9 +1571,64 @@ def _git_path(root: Path, name: str) -> Path:
     return p if p.is_absolute() else root / p
 
 
+def _head_bytes(root: Path, rel: str) -> "Tuple[bool, Optional[bytes]]":
+    """``(known, bytes)`` of ``rel`` in the CURRENT commit (``None`` = not in
+    it / no commit). The "is this path still a change?" test for a LEDGERED
+    leftover, whose snapshot-time bytes ARE its current bytes."""
+    proc = _git(root, "cat-file", "blob", f"HEAD:./{rel}")
+    if proc.returncode != 0:
+        return False, None
+    return True, proc.stdout
+
+
+def head_changed_paths(snap: Snapshot, end: str) -> "Optional[Set[str]]":
+    """The PROJECT-relative paths ``snap.start_head..end`` changed, or
+    ``None`` when that cannot be determined (no start commit, a git failure).
+
+    Used by :func:`commit_block_reason` to decide whether a moved HEAD
+    actually touched the reviewer's files (v0.2.105 L-KGREV, brief item 1):
+    a commit that merged / rebased / landed while the review ran is not a
+    reason to strand the nodes when none of them is in the diff. Paths
+    outside the project are named ``<repo>/<path>`` so they can never equal
+    a project-relative reviewer path."""
+    start = snap.start_head
+    if not start or not end:
+        return None
+    proc = _git(snap.root, "diff", "--name-only", "-z", f"{start}..{end}")
+    if proc.returncode != 0:
+        return None
+    prefix = repo_prefix(snap.root)
+    out: Set[str] = set()
+    for top_rel in proc.stdout.decode("utf-8", errors="surrogateescape").split("\0"):
+        if not top_rel:
+            continue
+        rel = project_rel(top_rel, prefix)
+        out.add(rel if rel is not None else f"<repo>/{top_rel}")
+    return out
+
+
+def is_git_op_block(reason: str) -> bool:
+    """True for the two block reasons that name an IN-FLIGHT git operation
+    (the ones :func:`commit_reviewer_changes` retries once, brief item 4)."""
+    return (reason.startswith("a git operation is in progress")
+            or reason.startswith("index.lock exists"))
+
+
 def commit_block_reason(snap: Snapshot, paths: List[str],
-                        attributed: bool) -> Optional[str]:
-    """Why the reviewer must NOT commit now (``None`` = safe to commit)."""
+                        attributed: bool,
+                        own_leftover: "Optional[Set[str]]" = None
+                        ) -> Optional[str]:
+    """Why the reviewer must NOT commit now (``None`` = safe to commit).
+
+    ``own_leftover`` (v0.2.105 L-KGREV) names the paths the ledger proves the
+    reviewer itself wrote in an earlier skipped run: they are dirty in this
+    run's snapshot too, but they are not the user's changes, so they do not
+    block the commit.
+
+    A HEAD that moved does not block by itself any more: the commit goes
+    through when none of ``paths`` appears in ``start_head..HEAD``, so the
+    reviewer's nodes land as a clean commit on top. When the moved HEAD DID
+    touch one of them the skip stands, exactly as before."""
     root = snap.root
     if not attributed:
         return "the run's writes could not be attributed to the reviewer"
@@ -1555,21 +1640,56 @@ def commit_block_reason(snap: Snapshot, paths: List[str],
     head = _git(root, "rev-parse", "--verify", "--quiet", "HEAD")
     now = head.stdout.decode().strip() if head.returncode == 0 else None
     if now != snap.start_head:
-        return f"HEAD moved since the review started ({snap.start_head} -> {now})"
-    user_touched = sorted(p for p in paths if p in snap.dirty_before)
+        moved = f"HEAD moved since the review started ({snap.start_head} -> {now})"
+        changed = head_changed_paths(snap, now) if now else None
+        if changed is None:
+            return moved
+        overlap = sorted(set(paths) & changed)
+        if overlap:
+            return moved + (" and it changed " + ", ".join(overlap))
+    own = own_leftover or set()
+    user_touched = sorted(p for p in paths
+                          if p in snap.dirty_before and p not in own)
     if user_touched:
         return ("the user already had uncommitted changes on "
                 + ", ".join(user_touched))
     return None
 
 
+def _after_git_op(snap: Snapshot, paths: List[str], attributed: bool,
+                  own: "Set[str]") -> Optional[str]:
+    """Wait (bounded) for an in-flight git operation to end, then judge the
+    commit once more. Returns the block reason that still applies, or
+    ``None`` when the operation ended and the commit may proceed."""
+    deadline = time.monotonic() + GIT_OP_RETRY_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return commit_block_reason(snap, paths, attributed, own_leftover=own)
+        time.sleep(min(GIT_OP_POLL_S, remaining))
+        block = commit_block_reason(snap, paths, attributed, own_leftover=own)
+        if block is None or not is_git_op_block(block):
+            return block
+
+
 def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
                             reviewer_bytes: Dict[str, bytes],
                             short: str, subject: str, model: str,
                             attributed: bool, log: Log) -> Optional[str]:
-    """Commit exactly ``kept`` — each path only while it still holds the
-    reviewer's bytes (``reviewer_bytes``); return the new sha, or ``None``."""
+    """Commit exactly ``kept`` -- each path only while it still holds the
+    reviewer's bytes (``reviewer_bytes``) -- plus the reviewer's OWN
+    leftovers from earlier skipped runs; return the new sha, or ``None``.
+
+    v0.2.105 L-KGREV: a path the ledger
+    (:mod:`vco_lib.kg_reviewer_pending`) proves the reviewer wrote in an
+    earlier run and that still holds exactly those bytes is folded into this
+    commit, so the field cascade ("once a file was left dirty every later
+    review touching it skipped too") ends by itself. A ledgered path whose
+    bytes changed is the user's: it is never committed here. Every path this
+    call leaves uncommitted is recorded in the ledger with the sha the run
+    proved, and the committed ones are dropped from it."""
     root = snap.root
+    proofs: Dict[str, str] = {}
     paths: List[str] = []
     for p in sorted(set(kept)):
         cur = _read_bytes(root / p)
@@ -1580,13 +1700,50 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
                 f"(someone else's edit) - left uncommitted")
             continue
         paths.append(p)
+        if cur is not None:
+            proofs[p] = _sha(cur)
+    # The reviewer's own leftovers from an earlier skipped run: the ledger
+    # holds the sha of the bytes it wrote, so their CURRENT bytes prove it.
+    # The FULL ledgered set (not only the byte-identical subset) also exempts
+    # those paths from the "the user already had uncommitted changes" block:
+    # they are dirty because an earlier reviewer run left them dirty, which
+    # is the cascade this fixes.
+    try:
+        own: Set[str] = set(_pending.pending_paths(root))
+        leftovers = _pending.own_leftovers(root, root)
+    except Exception:  # noqa: BLE001 -- the fold is a convenience, never a stop
+        own, leftovers = set(), {}
+    for p in sorted(leftovers):
+        if p in paths:
+            continue
+        cur = _read_bytes(root / p)
+        if cur is None:
+            continue
+        # A leftover EQUALS its own snapshot: what says "nothing to do" here
+        # is whether the working tree still differs from HEAD, not whether it
+        # differs from the run's start (it is the same dirty file).
+        known, head_bytes = _head_bytes(root, p)
+        if known and _same(cur, head_bytes):
+            # Committed (or reverted) by someone since: nothing to fold and
+            # nothing left to warn about.
+            _pending.clear_paths(root, [p])
+            continue
+        paths.append(p)
+        proofs[p] = _sha(cur)
     if not paths:
         log("reviewer wrote nothing to commit - no commit")
         return None
-    block = commit_block_reason(snap, paths, attributed)
+    block = commit_block_reason(snap, paths, attributed, own_leftover=own)
+    if block and is_git_op_block(block):
+        log(f"commit deferred: {block}; retrying once it ends "
+            f"(up to {GIT_OP_RETRY_S:.0f}s)")
+        block = _after_git_op(snap, paths, attributed, own)
     if block:
         log(f"commit skipped: {block}; reviewer files left uncommitted: "
             + ", ".join(paths))
+        _pending.record_skips(root, root, {p: proofs[p] for p in paths
+                                           if p in proofs},
+                              reason=block, short=short)
         return None
     ignored = [p for p in paths
                if _git(root, "check-ignore", "-q", "--", p).returncode == 0]
@@ -1594,6 +1751,9 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         log("not committed (git-ignored, not version-controlled here): "
             + ", ".join(ignored))
     paths = [p for p in paths if p not in ignored]
+    # A git-ignored path can never be committed, so it must never keep
+    # alerting either.
+    _pending.clear_paths(root, ignored)
     if not paths:
         return None
     new = [p for p in paths
@@ -1601,8 +1761,12 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
     if new:
         added = _git(root, "add", "--", *new)
         if added.returncode != 0:
-            log(f"commit skipped: git add failed: "
-                f"{added.stderr.decode(errors='replace').strip()}")
+            detail = added.stderr.decode(errors="replace").strip()
+            log(f"commit skipped: git add failed: {detail}")
+            _pending.record_skips(root, root,
+                                  {p: proofs[p] for p in paths if p in proofs},
+                                  reason=f"git add failed: {detail}",
+                                  short=short)
             return None
     message = (f"{commit_subject(short, subject)}\n\n"
                f"KG nodes written by the post-commit KG reviewer ({model}) "
@@ -1618,7 +1782,12 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         if new:  # undo only OUR index additions; the worktree is untouched
             _git(root, "rm", "--cached", "-q", "--", *new)
         log(f"commit failed (files left uncommitted): {detail}")
+        _pending.record_skips(root, root,
+                              {p: proofs[p] for p in paths if p in proofs},
+                              reason=f"commit failed: {detail}",
+                              short=short)
         return None
+    _pending.clear_paths(root, paths)
     sha = _git(root, "rev-parse", "HEAD").stdout.decode().strip()
     prefix = repo_prefix(root)
     files = set()
