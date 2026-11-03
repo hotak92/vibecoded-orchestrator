@@ -30,6 +30,9 @@ use crate::db::Db;
 pub(crate) const REFRESH_TRIGGER_STARTUP: &str = "startup";
 /// `refresh --trigger` value for a Secrets-panel key change.
 pub(crate) const REFRESH_TRIGGER_SECRETS: &str = "secrets";
+/// `refresh --trigger` value for the Home page's per-provider switch
+/// (v0.2.105): switching a provider off hides its rows from the model grid.
+pub(crate) const REFRESH_TRIGGER_PROVIDERS: &str = "providers";
 
 /// The status read budgets the same ceiling as the other vco_lib status
 /// transports (`embedding_catalog`).

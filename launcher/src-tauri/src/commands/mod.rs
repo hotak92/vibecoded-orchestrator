@@ -113,6 +113,11 @@ pub mod model_gateway;
 // itself is Python (`python -m vco_lib.model_guidance`); this module only
 // fires it and transports its payload.
 pub mod model_guidance;
+// v0.2.105: the machine-wide per-provider switch behind the Home page's
+// "Model providers" card. The setting, its reader and its writer are
+// `vco_lib.model_providers` (rung A); this module spawns it and passes the
+// payload through.
+pub mod model_providers;
 // v0.2.97: after an update, "is the running gateway still on the previous
 // release's code?" and the Continue that restarts it. Never automatic — a
 // restart ends every agent session routed through the gateway. The verdict

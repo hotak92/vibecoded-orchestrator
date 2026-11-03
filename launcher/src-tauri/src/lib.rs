@@ -3188,6 +3188,11 @@ pub fn run() {
             commands::model_gateway::model_gateway_mode_set,
             commands::model_gateway::model_gateway_agents_gate,
             commands::model_gateway::model_gateway_routing_guidance,
+            // v0.2.105: the machine-wide per-provider switch (Home →
+            // Model providers). Python owns the row; these two only
+            // transport it and fire the guidance refresh after a write.
+            commands::model_providers::model_providers_status,
+            commands::model_providers::model_providers_set,
             commands::gateway_freshness::model_gateway_freshness,
             commands::gateway_freshness::model_gateway_restart_stale,
             commands::codegraph_parsers::codegraph_parser_offers,
