@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Turn a model provider off once, and it stays off.** The Home page has a new "Model providers" card: every
+  provider your model gateway knows (z.ai/GLM, QwenCloud, Kimi, …), with whether its key is found on this machine and
+  an on/off switch. Switching one off is remembered for the whole machine, so a subscription you no longer pay for
+  stops coming back: on the next update, each project moves that provider's agent definitions to
+  `.claude/agents.disabled/` and nothing is delivered there again, and the provider's rows disappear from the model
+  guidance VCO writes into every project's `CLAUDE.md`. Nothing is deleted: a definition you edited yourself is left
+  where it is (with a note in the update report), and switching the provider back on restores the parked definitions
+  and brings its agents and rows back. The gateway itself keeps answering any model id it is asked for — this is a
+  delivery and guidance choice, not a routing block — and a provider that was never configured on this machine is
+  unaffected. Agents you disabled yourself, per project, stay disabled: only what this switch parked is restored.
+
 - **The gateway's usage ledger records when a turn was a context compaction.** Claude Code marks those requests with an
   `x-claude-code-compaction` header; each ledger row now carries the value (`null` on an ordinary turn), so a sudden
   jump in a chat's context can be traced to the compaction that caused it instead of looking like a turn you never

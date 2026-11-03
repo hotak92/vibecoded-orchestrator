@@ -794,7 +794,11 @@ pub(crate) fn orchestrator_pythonpath(root: &Path) -> std::ffi::OsString {
 /// comment previously claimed the opposite). That is the intended
 /// resolution: the launcher spawns the source it was built from, and it also
 /// keeps a not-yet-`pip install -e`d clone working instead of degrading.
-fn python_module_command(python: &Path, module: &str, orchestrator_root: Option<&Path>) -> Command {
+pub(crate) fn python_module_command(
+    python: &Path,
+    module: &str,
+    orchestrator_root: Option<&Path>,
+) -> Command {
     let mut cmd = Command::new(python).silent();
     cmd.arg("-m").arg(module);
     crate::services::vco_lib_bridge::reinject_minimal_env(&mut cmd);

@@ -30,7 +30,26 @@ Default agents install to a project's `.claude/agents/` on the bundle install (d
 
 ### Gateway agents (machine-gated)
 
-The ten machine-gated definitions are described in the paragraph above (`templates/agents/module-gateway/`).
+The twelve machine-gated definitions are described in the paragraph above (`templates/agents/module-gateway/`).
+
+**Turning a provider off (v0.2.105).** The Home page's **Model providers** card lists every provider the model
+gateway knows (`model_router.vendors.VENDORS` — a new vendor is a registry row, never a code change) with its key
+state (`key detected` / `no key` / `key store unavailable`, plus the declared key NAMES — never a value) and an
+on/off switch. The choice is machine-wide and stored in one `launcher.db` `app_state` row,
+`model_providers.disabled` (a JSON array of the OFF vendor ids); its only reader and writer is
+`vco_lib.model_providers`, and the launcher's `model_providers_status` / `model_providers_set` commands shell that
+helper rather than re-implementing the encoding (rung A of the cross-language ladder). No row means every
+provider is on, and an unreadable or corrupt row reads the same way — switching a provider off is a subtraction,
+so a failed read must never take one away. Switching off has three effects: the next bundle update stops
+delivering that vendor's definitions, moves an already-delivered UNMODIFIED copy to
+`.claude/agents.disabled/` (the launcher toggle's own location — parked, never deleted) and records it in the
+manifest's additive `provider_parked_agents` map; a copy you edited is left in place with a warning line and
+stays recognised; and the provider's rows leave the rendered model guidance (the grid and the
+provider-conditional `CLAUDE.md` sections), refreshed at once on the toggle. Switching it back on restores the
+copies named in that manifest map and re-delivers them on the next update — copies parked by the per-project
+Agents toggle carry no such marker and are never restored. The gateway itself keeps serving every vendor id it
+is asked for: this is a delivery/guidance choice, not a routing block. Check the state from a shell with
+`python -m vco_lib.model_providers status` (and change it with `set --vendor <id> --disabled`).
 
 ### Opt-in packs (`templates/packs/`)
 
