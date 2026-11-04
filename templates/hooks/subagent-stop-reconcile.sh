@@ -311,6 +311,26 @@ fi
 # alert itself, since a detached job's stderr reaches nobody.
 # shellcheck source=_lib/agent-alerts.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/agent-alerts.sh" ] && . "$SCRIPT_DIR/_lib/agent-alerts.sh"
+# v0.2.105: name what the parent merges. A harness-style lane worktree sits on
+# a DETACHED HEAD (worktree-guard: `git worktree add --detach`), so
+# `git log base..<branch>` finds nothing and the commit has to be merged by
+# SHA; a lane reservation's worktree is on its own branch. Must match the
+# .ps1 sibling's Get-ReconcileHeadDescription. Never fails.
+_reconcile_head_desc() {
+    local ref sha
+    ref="$(git -C "$1" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+    if [ -n "$ref" ]; then
+        printf 'branch %s' "$ref"
+        return 0
+    fi
+    sha="$(git -C "$1" rev-parse --short=12 HEAD 2>/dev/null || true)"
+    if [ -n "$sha" ]; then
+        printf 'detached HEAD %s - merge it by that SHA or name a branch first' "$sha"
+        return 0
+    fi
+    printf 'HEAD unreadable'
+}
+
 _reconcile_parent_alert() {
     [ -n "$AGENT_ID" ] || return 0
     if command -v vco_agent_alert_append >/dev/null 2>&1 && \
@@ -408,12 +428,13 @@ with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
             # race.
             KEPT_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null || true)"
             if [ -z "$KEPT_REC" ] || wtrec_kept_alert_once "$KEPT_REC" "$SESSION_ID" "$REAP_PATH"; then
-                printf 'subagent-stop-reconcile: worktree of agent %s KEPT at %s (%s) - if the agent is still running background work it will resume; review, merge or remove it after its final report\n' \
-                    "$AGENT_ID" "$REAP_PATH" "$REAP_REASON" >&2
+                KEPT_HEAD="$(_reconcile_head_desc "$REAP_PATH")"
+                printf 'subagent-stop-reconcile: worktree of agent %s KEPT at %s (%s; %s) - if the agent is still running background work it will resume; review, merge or remove it after its final report\n' \
+                    "$AGENT_ID" "$REAP_PATH" "$REAP_REASON" "$KEPT_HEAD" >&2
                 # census F8: SubagentStop stderr on exit 0 reaches no model —
                 # file it for the PARENT, which must review/merge/remove it.
                 _reconcile_parent_alert worktree_kept \
-                    "worktree KEPT at $REAP_PATH ($REAP_REASON) - if the agent is still running background work it will resume; review its changes, then merge or remove it after its final report" \
+                    "worktree KEPT at $REAP_PATH ($REAP_REASON; $KEPT_HEAD) - if the agent is still running background work it will resume; review its changes, then merge or remove it after its final report" \
                     "$REAP_PATH"
             fi
         fi

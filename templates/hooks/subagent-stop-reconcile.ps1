@@ -229,6 +229,19 @@ if (Test-Path -LiteralPath $SessionIdLib) { . $SessionIdLib }
 # the alert. Must match the .sh.
 $AgentAlertsLib = Join-Path $ScriptDir "_lib/agent-alerts.ps1"
 if (Test-Path -LiteralPath $AgentAlertsLib) { . $AgentAlertsLib }
+# v0.2.105: name what the parent merges - a harness-style lane worktree sits on
+# a DETACHED HEAD (merge by SHA), a lane reservation's on its own branch.
+# Must match the .sh sibling's _reconcile_head_desc. Never throws.
+function Get-ReconcileHeadDescription([string]$Path) {
+    $ref = ""
+    try { $ref = [string](& git -C $Path symbolic-ref -q --short HEAD 2>$null | Select-Object -First 1) } catch { $ref = "" }
+    if ($ref) { return "branch $($ref.Trim())" }
+    $sha = ""
+    try { $sha = [string](& git -C $Path rev-parse --short=12 HEAD 2>$null | Select-Object -First 1) } catch { $sha = "" }
+    if ($sha) { return "detached HEAD $($sha.Trim()) - merge it by that SHA or name a branch first" }
+    return "HEAD unreadable"
+}
+
 function Add-ReconcileParentAlert([string]$Kind, [string]$Message, [string]$File = "") {
     if (-not $AgentId) { return }
     if ((Get-Command Add-VcoAgentAlert -ErrorAction SilentlyContinue) -and
@@ -317,9 +330,10 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
             # covers the rewritten-record case and the detached-job race.
             $keptRec = Find-WtrecRecord $ProjectRoot $AgentId
             if (-not $keptRec -or (Test-WtrecKeptAlertOnce $keptRec $SessionId ([string]$reap.Path))) {
-                [Console]::Error.WriteLine("subagent-stop-reconcile: worktree of agent $AgentId KEPT at $($reap.Path) ($($reap.Reason)) - if the agent is still running background work it will resume; review, merge or remove it after its final report")
+                $keptHead = Get-ReconcileHeadDescription ([string]$reap.Path)
+                [Console]::Error.WriteLine("subagent-stop-reconcile: worktree of agent $AgentId KEPT at $($reap.Path) ($($reap.Reason); $keptHead) - if the agent is still running background work it will resume; review, merge or remove it after its final report")
                 # census F8: file it for the PARENT, which must review/merge/remove it.
-                Add-ReconcileParentAlert "worktree_kept" "worktree KEPT at $($reap.Path) ($($reap.Reason)) - if the agent is still running background work it will resume; review its changes, then merge or remove it after its final report" ([string]$reap.Path)
+                Add-ReconcileParentAlert "worktree_kept" "worktree KEPT at $($reap.Path) ($($reap.Reason); $keptHead) - if the agent is still running background work it will resume; review its changes, then merge or remove it after its final report" ([string]$reap.Path)
             }
         }
     }

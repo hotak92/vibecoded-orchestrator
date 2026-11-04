@@ -337,3 +337,50 @@ def test_a_crashed_marker_temp_file_is_pruned(flavour: str, tmp_path: Path):
     assert not stale_bak.exists(), "a stale marker backup must not accumulate"
     assert fresh.exists(), "a fresh marker tmp may still be mid-write"
     assert record.exists(), "records keep their own idle window"
+
+
+# ── SimRacing 2026-11-04: the KEPT notice names what to merge ───────────────
+def _wt_git(wt: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(wt), *args], capture_output=True,
+                          text=True, check=True, timeout=60).stdout.strip()
+
+
+def _commit_in(wt: Path) -> None:
+    (wt / "new.py").write_text("X = 1\n", encoding="utf-8")
+    _wt_git(wt, "add", "new.py")
+    _wt_git(wt, "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+            "commit", "-q", "-m", "lane work")
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_kept_notice_names_the_sha_of_a_detached_worktree(
+        flavour: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A harness-style lane worktree is on a DETACHED HEAD, so
+    ``git log base..<branch>`` finds nothing: the notice must carry the SHA
+    to merge by, on stderr and in the alert filed for the parent."""
+    monkeypatch.setenv("VCT_VENV", sys.executable)
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "abc777")
+    _commit_in(wt)
+    sha = _wt_git(wt, "rev-parse", "--short=12", "HEAD")
+
+    proc = _stop(flavour, "abc777", repo)
+    assert proc.returncode == 0, proc.stderr
+    assert f"detached HEAD {sha} - merge it by that SHA" in proc.stderr
+    rows = _alerts(repo)
+    assert [r["kind"] for r in rows] == ["worktree_kept"]
+    assert f"detached HEAD {sha}" in rows[0]["message"]
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_kept_notice_names_the_branch_when_the_worktree_has_one(
+        flavour: str, tmp_path: Path):
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "abc888")
+    _wt_git(wt, "switch", "-q", "-c", "lane-x")
+    _commit_in(wt)
+
+    proc = _stop(flavour, "abc888", repo)
+    assert proc.returncode == 0, proc.stderr
+    assert "branch lane-x" in proc.stderr
+    assert "detached HEAD" not in proc.stderr
