@@ -38,9 +38,10 @@ a short window, one reviewer pass should cover them"):
   commit leaves it only when a pass that covered it SUCCEEDED (:func:`ack`)
   — a crash or a failed pass leaves it queued (M2) — or by a LOGGED drop:
   a reviewer commit (never reviewed), a sha git can no longer read, a
-  commit whose passes failed :data:`MAX_ATTEMPTS` times, or the oldest
-  entries past :data:`MAX_QUEUE`. Every read-modify-write runs under its
-  own short kernel lock.
+  commit whose passes failed :data:`MAX_ATTEMPTS` times, the oldest
+  entries past :data:`MAX_QUEUE`, or a pass skipped because no reviewer
+  rung was available (each covered commit gets its own line). Every
+  read-modify-write runs under its own short kernel lock.
 
 The run-side loop that uses this state lives in
 ``templates/scripts/kg_reviewer_backend.py`` (``_cmd_run``).
@@ -125,6 +126,29 @@ def _ops_path(project_root: "str | Path") -> Path:
 
 def _queue_lock_path(project_root: "str | Path") -> Path:
     return Path(project_root) / ".claude" / "state" / QUEUE_LOCK_NAME
+
+
+def _sweep_heartbeat_temps(project_root: "str | Path", log: Log) -> None:
+    """Delete ``<lock>.hb.<pid>.<token8>`` heartbeat temp files left by a
+    run that crashed between the temp write and its ``os.replace`` (review
+    V02105-DS). Every LIVE writer creates and replaces its temp under the
+    ops kernel lock, so anything present while the caller holds that same
+    lock is a dead run's leftover. Called from :func:`acquire` and
+    :meth:`ReviewLock.release`. Never raises."""
+    state = Path(project_root) / ".claude" / "state"
+    try:
+        temps = sorted(state.glob(f"{LOCK_REL.name}.hb.*"))
+    except OSError:
+        return
+    for tmp in temps:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            log(f"heartbeat temp file {tmp} could not be removed ({exc})")
+            continue
+        log(f"removed a leftover heartbeat temp file {tmp.name}")
 
 
 def _read_payload(path: Path) -> "Tuple[Optional[bytes], Optional[dict]]":
@@ -247,6 +271,7 @@ class ReviewLock:
         try:
             with exclusive_file_lock(_ops_path(self.root),
                                      timeout_s=OPS_TIMEOUT_S):
+                _sweep_heartbeat_temps(self.root, self.log)
                 if self.ours():
                     self.path.unlink()
         except FileNotFoundError:
@@ -295,6 +320,7 @@ def acquire(project_root: "str | Path", *, stale_s: float = DEFAULT_STALE_S,
         return AcquireResult(ERROR, detail=f"{path.parent}: {exc}")
     try:
         with exclusive_file_lock(_ops_path(root), timeout_s=OPS_TIMEOUT_S):
+            _sweep_heartbeat_temps(root, log)
             raw, data = _read_payload(path)
             if raw is not None:
                 gone, why = _holder_gone(data, raw, path, stale_s,
