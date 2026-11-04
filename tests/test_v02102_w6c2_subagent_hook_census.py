@@ -1437,7 +1437,11 @@ def test_reconcile_runs_detached(tmp_path: Path, flavour: str) -> None:
     assert not files_log.exists(), "the job's work must not be done in the foreground"
     audit = project / ".claude" / "logs" / "subagent-reconciliation.jsonl"
     assert audit.exists(), "the audit row is written in the foreground"
-    assert _wait_for(files_log.exists, 120), "the detached job never finished"
+    # The job opens the log in append mode before it writes the row: wait for
+    # a COMPLETE line, not for the file (CI race 2026-11-04: exists() but empty).
+    assert _wait_for(lambda: files_log.exists()
+                     and files_log.read_text().endswith("\n"), 120), \
+        "the detached job never finished"
     row = json.loads(files_log.read_text().splitlines()[-1])
     assert row["attribution"] == "agent_worktree"
     assert _wait_for(lambda: (project / ".claude" / "state" /
