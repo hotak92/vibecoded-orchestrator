@@ -63,7 +63,21 @@ the reviewer.
      marked in place, e.g. "Original <date>: <line> (superseded by ...)" or
      "~~<line>~~"). Compared after CRLF->LF and trailing-whitespace strip;
      an original line survives verbatim or as a contiguous substring of a
-     new line (:func:`removed_lines`); the log names the lost lines;
+     new line (:func:`removed_lines`); the log names the lost lines.
+     ONE exception (v0.2.105 L-KGREV2, owner request 2026-11-04: a node
+     refined commit after commit collected a CHAIN of "## Status after
+     <sha>" sections, each superseding the last, and readers land on the
+     stale ones first): a write may remove lines from a REPLACEABLE
+     section — a ``## Status after <sha>`` (or rule-11 ``## Proposed
+     change``) section whose EVERY non-blank line ``git blame`` attributes
+     to a reviewer ``kg-sync:`` commit (:func:`blame_reviewer_lines`,
+     :func:`reviewer_sections`; one batch blame per file, bounded) — and
+     only when the new body carries a ``Superseded: <section key> -> ...``
+     trail line naming that section (:func:`trail_keys`). Every other
+     removed or reworded line — the owner's, a mixed section's, an
+     uncommitted line's, or a blame failure's — still reverts the whole
+     write: provenance is PROVEN, never assumed (:data:`UNKNOWN` bytes
+     and uncommitted changes keep the append-only rule);
    * a NEW node without frontmatter carrying every
      ``[guard] new_node_required_keys`` key (title, type, tags, created,
      updated, status), or whose title duplicates an existing node's
@@ -197,6 +211,13 @@ __all__ = [
     "same_subject_node",
     "new_node_violation",
     "removed_lines",
+    "ReplaceableSection",
+    "STATUS_HEADING_PREFIX",
+    "TRAIL_PREFIX",
+    "blame_reviewer_lines",
+    "reviewer_sections",
+    "replaceable_sections_for",
+    "trail_keys",
     "validate",
     "commit_reviewer_changes",
     "commit_block_reason",
@@ -753,8 +774,10 @@ def _body_lines(body: str) -> List[str]:
     return [line.rstrip() for line in body.replace("\r\n", "\n").split("\n")]
 
 
-def removed_lines(body_pre: str, body_post: str) -> List[str]:
-    """The non-blank ORIGINAL body lines that do not survive in the new body.
+def _missing_with_index(body_pre: str, body_post: str) -> List[Tuple[int, str]]:
+    """The non-blank ORIGINAL body lines that do not survive in the new body,
+    as ``(body line index, line)`` — the one matcher behind
+    :func:`removed_lines` and the replaceable-section exception.
 
     Owner rule (2026-10-15): stored information must survive — an existing
     node's text is append-and-annotate only. An original line survives when
@@ -766,9 +789,9 @@ def removed_lines(body_pre: str, body_post: str) -> List[str]:
     original line that was dropped is caught too. Reordering original lines
     counts as removing them: a reorder is a rewrite."""
     new = _body_lines(body_post)
-    missing: List[str] = []
+    missing: List[Tuple[int, str]] = []
     j = 0
-    for line in _body_lines(body_pre):
+    for i, line in enumerate(_body_lines(body_pre)):
         # The needle is the line's TEXT: a leading Markdown list/quote marker
         # is not text, so "- X" annotated as "- Original <date>: X ..." or
         # "- ~~X~~" survives (the marker stays, the annotation goes after it).
@@ -781,12 +804,192 @@ def removed_lines(body_pre: str, body_post: str) -> List[str]:
         if k < len(new):
             j = k + 1
         else:
-            missing.append(line.strip())  # named as the user wrote it
+            missing.append((i, line.strip()))  # named as the user wrote it
     return missing
 
 
-def edit_violation(pre: str, post: str) -> Optional[str]:
-    """Why an edit of an EXISTING node breaks a rule (``None`` = allowed)."""
+def removed_lines(body_pre: str, body_post: str) -> List[str]:
+    """The non-blank ORIGINAL body lines that do not survive in the new body
+    (:func:`_missing_with_index`, without the indices)."""
+    return [line for _idx, line in _missing_with_index(body_pre, body_post)]
+
+
+# ── reviewer-owned Status sections (v0.2.105 L-KGREV2) ────────────────────
+#
+# The reviewer appends one "## Status after <sha>" section per commit it
+# reviews (prompt rule 8); a decision refined several times in a row collects
+# a CHAIN of them, each superseding the last, and readers and search hits
+# land on the stale statements first. The fix (owner request 2026-11-04): a
+# later reviewer pass may FOLD its own earlier sections into one
+# "## Current state (consolidated <date>)" section. Provenance, not trust:
+# a line is REVIEWER-OWNED only when `git blame` attributes it to a commit
+# whose subject starts with the reviewer's `kg-sync:` prefix — and a section
+# is replaceable only when EVERY non-blank line of it (its heading included)
+# is reviewer-owned. Anything else stays append-only exactly as before.
+
+#: The heading prefix of a reviewer Status section (prompt rule 8). ONE
+#: home: the prompt builder renders its Status headings from this.
+STATUS_HEADING_PREFIX = "## Status after "
+#: The one-line-per-step trail a consolidation write must carry, naming each
+#: section it folds: ``Superseded: <old key> → <new key> (<date>)`` (an
+#: ASCII ``->`` arrow is accepted too).
+TRAIL_PREFIX = "Superseded:"
+
+_STATUS_HEADING_RE = re.compile(
+    r"^## Status after ([0-9A-Za-z][0-9A-Za-z.-]{2,39})\s*$")
+_TRAIL_LINE_RE = re.compile(
+    r"^\s*Superseded:\s*([0-9A-Za-z][\w.-]*)\s*(?:→|->)", re.MULTILINE)
+#: One ``git blame --porcelain`` header: ``<40-hex sha> <orig> <final>
+#: [<num>]`` (every file line gets one; the commit's metadata block follows
+#: the header only the FIRST time a sha appears).
+_BLAME_HEADER_RE = re.compile(r"^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$")
+_BLAME_SUMMARY_RE = re.compile(r"^summary (.*)$")
+
+
+def trail_keys(body_post: str) -> Set[str]:
+    """The section keys the new body's ``Superseded:`` trail lines name (the
+    old side of each step). A removed line from a replaceable section is
+    justified only by its section's key appearing here."""
+    return {m.group(1) for m in _TRAIL_LINE_RE.finditer(body_post)}
+
+
+@dataclass(frozen=True)
+class ReplaceableSection:
+    """A reviewer Status / Proposed-change section whose every non-blank line
+    is blame-proven reviewer work — the only text a later reviewer write may
+    remove (and only under a trail line naming :attr:`key`)."""
+
+    #: body line index of the section heading (0-based).
+    start: int
+    #: exclusive body line index of the section's end.
+    end: int
+    #: what a ``Superseded:`` trail line must name to fold it: the sha a
+    #: ``## Status after <sha>`` heading carries (or a Proposed-change
+    #: section's date).
+    key: str
+    #: the heading line, as the prompt lists it.
+    heading: str
+
+
+def blame_reviewer_lines(root: Path, rel: str, data: bytes,
+                         rev: Optional[str]) -> Optional[Set[int]]:
+    """The WHOLE-FILE line indices (0-based, CRLF read as LF) that
+    ``git blame`` attributes to the reviewer's own ``kg-sync:`` commits, in
+    the file as ``rev`` has it; ``None`` when blame cannot answer (no rev,
+    a git failure, the path unknown to that rev) — the caller then keeps the
+    append-only rule.
+
+    ONE batch blame per file (bounded cost). The blame describes the
+    COMMITTED file, while ``data`` is the bytes the run started from; when
+    the two differ (uncommitted changes) the sets are aligned INDEX BY INDEX
+    and only indices whose text still matches keep their provenance — an
+    inserted or deleted line shifts everything after it to "not owned",
+    which is the conservative direction (an owner line is never mistaken
+    for the reviewer's; uncommitted reviewer lines are provably nobody's
+    here and stay append-only)."""
+    if not rev:
+        return None
+    proc = _git(root, "blame", "--porcelain", rev, "--", f"./{rel}",
+                timeout=60)
+    if proc.returncode != 0:
+        return None
+    try:
+        text = proc.stdout.decode("utf-8", errors="replace")
+    except UnicodeDecodeError:  # pragma: no cover — surrogate-free decode
+        return None
+    reviewer: Dict[str, bool] = {}
+    owned: Set[int] = set()
+    blamed_lines: List[str] = []
+    cur_sha = ""
+    cur_owned = False
+    for line in text.split("\n"):
+        if line.startswith("\t"):
+            blamed_lines.append(line[1:].rstrip())
+            if cur_owned:
+                owned.add(len(blamed_lines) - 1)
+            continue
+        m = _BLAME_HEADER_RE.match(line)
+        if m:
+            cur_sha = m.group(1)
+            cur_owned = reviewer.get(cur_sha, False)
+            continue
+        m = _BLAME_SUMMARY_RE.match(line)
+        if m and cur_sha and cur_sha not in reviewer:
+            reviewer[cur_sha] = is_reviewer_commit_subject(m.group(1))
+            cur_owned = reviewer[cur_sha]
+    # Align with the bytes the run actually started from.
+    cur_lines = _body_lines(data.decode("utf-8", errors="replace"))
+    if len(cur_lines) == len(blamed_lines) and all(
+            a.rstrip() == b for a, b in zip(cur_lines, blamed_lines)):
+        return owned
+    return {i for i in owned
+            if i < len(cur_lines) and i < len(blamed_lines)
+            and cur_lines[i].rstrip() == blamed_lines[i]}
+
+
+def reviewer_sections(text: str, owned_file_lines: Set[int]
+                      ) -> List[ReplaceableSection]:
+    """The reviewer sections of a node whose EVERY non-blank line is in
+    ``owned_file_lines`` (whole-file line indices, as
+    :func:`blame_reviewer_lines` returns them).
+
+    A reviewer section is a ``## Status after <sha>`` heading (its key is
+    the sha) or a rule-11 ``## Proposed change (kg-reviewer, <date>)``
+    heading (its key is the date), extending to the next Markdown heading
+    or the end of the body. Sections with a hole in their provenance (one
+    owner or uncommitted line) are simply absent from the list — they stay
+    append-only."""
+    fm_raw, body = _split_frontmatter(text.replace("\r\n", "\n"))
+    lines = _body_lines(body)
+    offset = len(_body_lines(text)) - len(lines)
+    owned = {i - offset for i in owned_file_lines if i >= offset}
+    proposed = _guard()["proposed_change_heading"]
+    out: List[ReplaceableSection] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        m = _STATUS_HEADING_RE.match(stripped)
+        if m is None and not stripped.startswith(proposed):
+            i += 1
+            continue
+        key = (m.group(1) if m is not None
+               else stripped[len(proposed):].rstrip(") \t").strip())
+        j = i + 1
+        while j < len(lines) and not lines[j].lstrip().startswith("#"):
+            j += 1
+        nonblank = [k for k in range(i, j) if lines[k].strip()]
+        if nonblank and all(k in owned for k in nonblank):
+            out.append(ReplaceableSection(i, j, key, stripped))
+        i = j
+    return out
+
+
+def replaceable_sections_for(root: Path, rel: str, data: bytes,
+                             rev: Optional[str]
+                             ) -> Optional[List[ReplaceableSection]]:
+    """The sections of the node ``rel`` holds in ``data`` that a reviewer
+    write may fold (blame-proven reviewer sections); ``None`` when
+    provenance cannot be established — append-only then, exactly as before."""
+    owned = blame_reviewer_lines(root, rel, data, rev)
+    if owned is None:
+        return None
+    return reviewer_sections(
+        data.decode("utf-8", errors="replace").replace("\r\n", "\n"), owned)
+
+
+def edit_violation(pre: str, post: str,
+                   replaceable: Optional[List[ReplaceableSection]] = None
+                   ) -> Optional[str]:
+    """Why an edit of an EXISTING node breaks a rule (``None`` = allowed).
+
+    ``replaceable`` (v0.2.105 L-KGREV2) names this node's blame-proven
+    reviewer sections (:func:`replaceable_sections_for`); a removed line
+    inside one of them is allowed only when the new body's ``Superseded:``
+    trail names that section (:func:`trail_keys`) — the write's declaration
+    that the section's statements are superseded. A removed line anywhere
+    else, or from a section the trail does not name, reverts the write
+    exactly as before. ``None`` (no provenance) keeps the pre-v0.2.105
+    append-only rule."""
     g = _guard()
     mutable = set(g["frontmatter_mutable_keys"])
     fm_pre_raw, body_pre = _split_frontmatter(pre)
@@ -814,7 +1017,14 @@ def edit_violation(pre: str, post: str) -> Optional[str]:
                         f"{', '.join(changed)})")
     locked = lock_reason(fm_pre, body_pre)
     if locked is None:
-        removed = removed_lines(body_pre, body_post)
+        missing = _missing_with_index(body_pre, body_post)
+        removed: List[str] = []
+        if missing:
+            sections = replaceable or []
+            keys = trail_keys(body_post) if sections else set()
+            removed = [line for idx, line in missing
+                       if not any(s.start <= idx < s.end and s.key in keys
+                                  for s in sections)]
         if removed:
             shown = "; ".join(repr(_clip(line)) for line in removed[:3])
             more = f" (+{len(removed) - 3} more)" if len(removed) > 3 else ""
@@ -1488,6 +1698,17 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
                                             nodes=nodes, bodies=bodies)
             else:
                 reason = edit_violation(pre_text, post_text)
+                if reason is not None and pre is not None:
+                    # v0.2.105 L-KGREV2: the removals may sit in a
+                    # blame-proven reviewer section. Provenance is computed
+                    # only now (one batch blame per candidate file, bounded)
+                    # and re-judged with it; a blame failure keeps the
+                    # append-only verdict above.
+                    replaceable = replaceable_sections_for(
+                        root, rel, pre, snap.start_head)
+                    if replaceable:
+                        reason = edit_violation(pre_text, post_text,
+                                                replaceable=replaceable)
             if reason is None:
                 bad = unsourced_flags(pre_text, post_text, sources)
                 if bad:

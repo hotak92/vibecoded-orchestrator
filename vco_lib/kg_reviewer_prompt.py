@@ -53,7 +53,12 @@ hybrid_search, and nothing recorded which revision a node reflected):
   node's source changed in this commit, a "``## Status after
   <short-sha>``" block is APPENDED (append-and-annotate — superseded lines
   kept and marked in place, never deleted or reworded; locked nodes take
-  their Proposed-change section instead). Reconciled with the
+  their Proposed-change section instead), EXCEPT where the backend lists a
+  node's earlier reviewer Status sections as foldable (v0.2.105 L-KGREV2,
+  :func:`foldable_sections`): those blame-proven sections may be folded
+  into one "``## Current state (consolidated <date>)``" section with a
+  ``Superseded:`` trail, still-valid facts carried over (the guard
+  enforces the trail mechanically). Reconciled with the
   no-status-tracking-nodes rule: a Status-after block annotates an EXISTING
   node with one concrete change — it is not a status-tracking node.
 
@@ -71,11 +76,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from vco_lib.kg_reviewer_guard import _parse_fm, _split_frontmatter, lock_reason, walk_no_follow
+from vco_lib.kg_reviewer_guard import (
+    STATUS_HEADING_PREFIX,
+    ReplaceableSection,
+    _parse_fm,
+    _split_frontmatter,
+    lock_reason,
+    replaceable_sections_for,
+    walk_no_follow,
+)
 from vco_lib.kg_reviewer_model import config
 
 __all__ = ["CommitInfo", "collect_commit", "changed_paths",
-           "PathCiters", "CitingScan", "citing_nodes", "build_prompt"]
+           "PathCiters", "CitingScan", "citing_nodes", "build_prompt",
+           "foldable_sections"]
 
 
 @dataclass(frozen=True)
@@ -382,6 +396,38 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
 _LINE_SEPS = "\x85\u2028\u2029"
 
 
+def foldable_sections(project_root: Path, entries: "Tuple[PathCiters, ...]",
+                      rev: str) -> "Dict[str, List[ReplaceableSection]]":
+    """The blame-proven reviewer sections of every node the citing scan
+    SHOWED \u2014 what the prompt lists as foldable (v0.2.105 L-KGREV2).
+
+    ONE batch blame per shown node (bounded: the citing list itself is
+    capped), through the guard's ONE provenance home
+    (:func:`vco_lib.kg_reviewer_guard.replaceable_sections_for`). A node
+    with no replaceable section, one whose blame cannot answer, a symlink,
+    an unreadable file \u2014 all simply stay absent, which leaves the node to
+    the append branch: provenance is computed by the backend, never decided
+    by the model."""
+    out: "Dict[str, List[ReplaceableSection]]" = {}
+    for entry in entries:
+        for rel in entry.nodes:
+            path = project_root / rel
+            try:
+                if path.is_symlink():
+                    continue
+                data = path.read_bytes()
+            except OSError:
+                continue
+            try:
+                sections = replaceable_sections_for(project_root, rel,
+                                                    data, rev)
+            except Exception:  # noqa: BLE001 \u2014 a foldable listing is advice
+                continue
+            if sections:
+                out[rel] = sections
+    return out
+
+
 def _inline(path: str) -> str:
     """A path rendered so it cannot inject prompt structure: control
     characters and line/paragraph separators - newlines, U+0085, U+2028,
@@ -392,9 +438,14 @@ def _inline(path: str) -> str:
 
 
 def build_prompt(commit: CommitInfo, project_root: Path,
-                 today: Optional[str] = None) -> str:
+                 today: Optional[str] = None,
+                 also: "Tuple[CommitInfo, ...]" = ()) -> str:
     """The reviewer prompt for ``commit``. ``today`` (``YYYY-MM-DD``) is the
-    date the locked-node "Proposed change" heading must carry."""
+    date the locked-node "Proposed change" heading must carry.
+
+    ``also`` (v0.2.105 L-KGREV2) names further unreviewed commits coalesced
+    into this pass by the debounce queue: each is listed with its stat, and
+    the prompt tells the reviewer this one pass covers them too."""
     import datetime as _dt
 
     guard = config()["guard"]
@@ -460,6 +511,43 @@ def build_prompt(commit: CommitInfo, project_root: Path,
             "The deterministic text scan found no knowledge/ node citing a "
             "path this commit changed (hybrid_search in step 2 is still the "
             "way to find nodes by TOPIC).")
+    # The blame-proven reviewer sections of every SHOWN citing node: what
+    # rule 8's fold branch may touch. Computed by the backend — the model
+    # never decides provenance (v0.2.105 L-KGREV2).
+    foldable = (foldable_sections(project_root, scan.entries, commit.sha)
+                if scan.entries else {})
+    if foldable:
+        fold_lines = "\n".join(
+            f"- `{_inline(rel)}`:\n" + "\n".join(
+                f"  - `{_inline(s.heading)}` (body lines {s.start + 1}-{s.end})"
+                for s in sections)
+            for rel, sections in sorted(foldable.items()))
+        fold_block = (
+            "For the nodes below, the backend PROVED (git blame) that these "
+            f"`{STATUS_HEADING_PREFIX}<sha>` sections were written entirely "
+            "by earlier reviewer runs (`kg-sync:` commits). When this "
+            "commit supersedes what one of them says, you may fold exactly "
+            "these sections per rule 8 - nothing else is foldable, in "
+            "these nodes or in any other:\n"
+            f"{fold_lines}")
+    else:
+        fold_block = (
+            "No foldable reviewer sections: none of the scanned nodes "
+            "carries a blame-proven reviewer section. Rule 8's append "
+            "branch applies everywhere.")
+    if also:
+        also_lines = "\n\n".join(
+            f"#### `{c.short}` - {_inline(c.subject)}\n{c.stat}"
+            for c in also)
+        also_block = (
+            f"\n### Also covered by this pass\n"
+            f"{len(also)} further unreviewed commit(s) were coalesced into "
+            f"this pass (they landed while an earlier review was still "
+            f"running). This ONE pass reviews them all: consider what each "
+            f"changed - the stats below name their files, Read them when a "
+            f"node you edit cites them.\n\n{also_lines}\n")
+    else:
+        also_block = ""
     return f"""You are the post-commit knowledge-graph (KG) reviewer for this project.
 Your ONLY job: keep the KG nodes under {knowledge}/ accurate for what this commit
 changed. You never edit anything outside {knowledge}/ - not docs/, not code,
@@ -474,9 +562,12 @@ not configuration. Edits elsewhere are blocked and reverted.
 {diff_note}
 
 {commit.diff}
-
+{also_block}
 ## Nodes that cite files this commit changed
 {citing_block}
+
+## Reviewer Status sections this pass may fold
+{fold_block}
 
 ## Procedure - research FIRST, then write
 1. Decide whether this commit needs any KG change at all. Skip trivial,
@@ -534,13 +625,33 @@ not configuration. Edits elsewhere are blocked and reverted.
    Proposed change section of rule 11.
 8. A node listed under "Nodes that cite files this commit changed" may state
    something this commit superseded. Read the changed file it cites and,
-   when the commit changed what the node states, APPEND one section at the
-   end of the node:
+   when the commit changed what the node states:
+   - When that node has sections listed under "Reviewer Status sections
+     this pass may fold" and this commit supersedes what those sections
+     say, CONSOLIDATE them: replace exactly the listed sections with ONE
+     new section at that place in the node,
+   ## Current state (consolidated {today})
+     stating the CURRENT state of the topic. Old facts not superseded are
+     KEPT - carry every still-valid statement from the folded sections over
+     into the new section (group them, e.g. by Built / Decided /
+     Investigated / Open), drop ONLY the statements a newer commit
+     supersedes, leave everything above the folded sections (the node's
+     original body) untouched, and end the section with the trail - one
+     line per superseded section, keeping any trail lines already there:
+     Superseded: <old short-sha> → {commit.short} ({today})
+     The validator REVERTS the whole write unless every fact line removed
+     from a folded section either survives in the new section or has its
+     section's sha on a `Superseded:` trail line like the one above.
+   - Otherwise APPEND one section at the end of the node:
    ## Status after {commit.short}
    stating what changed and which of the node's statements it supersedes;
    mark superseded lines IN PLACE per rule 10 - never delete or reword
-   them. A LOCKED node (rule 11) takes only the Proposed change section of
-   rule 11 instead.
+   them.
+   You may fold ONLY the sections listed under "Reviewer Status sections
+   this pass may fold" - the backend proved with git blame that those are
+   the reviewer's own; every other line of every node (including sections
+   that merely look like reviewer ones) is append-only. A LOCKED node
+   (rule 11) takes only the Proposed change section of rule 11 instead.
 9. Never create or update "blocker", "in-progress", "TODO", "investigation"
    or other status-tracking NODES from a commit diff - a single commit is a
    partial view. (A "Status after" block appended to an EXISTING node by
