@@ -311,7 +311,10 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
             # scoped to the PARENT session (docs: hooks#subagentstop-input).
             # Tell the parent ONCE per worktree path per session
             # (_lib/worktree-records.ps1 :: Test-WtrecKeptAlertOnce), worded so
-            # the reader knows the agent may still be running.
+            # the reader knows the agent may still be running. In the ordinary
+            # sequence the second stop of one launch is already suppressed by
+            # Invoke-WtrecReap's PRE-EXISTING already_handled gate; the marker
+            # covers the rewritten-record case and the detached-job race.
             $keptRec = Find-WtrecRecord $ProjectRoot $AgentId
             if (-not $keptRec -or (Test-WtrecKeptAlertOnce $keptRec $SessionId ([string]$reap.Path))) {
                 [Console]::Error.WriteLine("subagent-stop-reconcile: worktree of agent $AgentId KEPT at $($reap.Path) ($($reap.Reason)) - if the agent is still running background work it will resume; review, merge or remove it after its final report")

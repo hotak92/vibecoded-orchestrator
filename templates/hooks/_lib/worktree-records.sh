@@ -212,17 +212,28 @@ except Exception:
 # interim stop from a final one — SubagentStop input is session_id,
 # transcript_path, cwd, permission_mode, hook_event_name, stop_hook_active,
 # agent_id, agent_type, agent_transcript_path, last_assistant_message,
-# background_tasks and session_crons (https://code.claude.com/docs/en/hooks
-# #subagentstop-input), and those last two arrays are scoped to the PARENT
-# session, not the subagent — so a first-stop notice was read as "the agent
-# finished". The answer is one honest notice per worktree path per session,
-# worded so a reader knows the agent may still be running (the call site
-# owns that wording). The marker rides the agent's own record, so
-# wtrec_prune's idle window retires it with the record; a record rewritten
-# for a NEW path (a fresh launch) alerts again.
+# effort, background_tasks and session_crons
+# (https://code.claude.com/docs/en/hooks#subagentstop-input), and
+# background_tasks / session_crons are scoped to the PARENT session, not the
+# subagent (effort does not separate the two either) — so a first-stop notice
+# was read as "the agent finished". The answer is one honest notice per
+# worktree path per session, worded so a reader knows the agent may still be
+# running (the call site owns that wording).
 #
-# Best-effort and FAIL-OPEN: no python, an unreadable record or a failed
-# write means "emit" — a real kept worktree is never reported silently.
+# WHICH GATE DECIDES: in the ordinary sequence the SECOND stop of one launch
+# is already suppressed by the PRE-EXISTING `already_handled` gate in
+# wtrec_reap (the first stop's reap flips `status` off `created`) before this
+# function is ever called. This marker is the belt to that suspender: it
+# covers the rewritten-record case (a record re-made re-reapable that still
+# carries kept_alert_*) and the detached-job race (stop 2's job reaps before
+# stop 1's job has written its status). Both directions fail OPEN — a
+# missing or unreadable marker emits. The marker rides the agent's own
+# record, so wtrec_prune's idle window retires it with the record; a record
+# rewritten for a NEW path (a fresh launch) alerts again.
+#
+# Best-effort and FAIL-OPEN: no python, an unreadable record, a valid-JSON
+# non-object record or a failed write means "emit" — a real kept worktree is
+# never reported silently and a corrupt record is never rewritten.
 # MUST MATCH Test-WtrecKeptAlertOnce in the .ps1.
 wtrec_kept_alert_once() {
     local rec="$1" sid="${2:-}" path="$3"
@@ -268,7 +279,11 @@ print("emit")
 # guard DID isolate. So:
 #   * notices (one-shot, consumed at SubagentStart) go after 30 days;
 #   * records of ANY status go only once IDLE (mtime — wtrec_find bumps it on
-#     every lookup) longer than max(30, cleanupPeriodDays) + 30 days.
+#     every lookup) longer than max(30, cleanupPeriodDays) + 30 days. A
+#     `wt-*.json.tmp` (or the .ps1 sibling's `.json.bak`) left by a crash
+#     between wtrec_kept_alert_once's tmp write and its rename ages out on
+#     that same window (nothing reads it — every lookup is by exact name — so
+#     this is only hygiene).
 #     `cleanupPeriodDays` is Claude Code's transcript retention (default 30):
 #     a subagent can be resumed while its transcript exists, and the extra 30
 #     days is margin. It is the ONLY key read, from
@@ -312,7 +327,12 @@ for p in (os.path.join(cfg, "settings.json"),
 cut = time.time() - (days + 30.0) * 86400.0
 d = e["WTREC_DIR"]
 for n in os.listdir(d):
-    if not (n.startswith("wt-") and n.endswith(".json")):
+    # `.json.tmp` is marker-write crash residue; `.json.bak` belongs to the .ps1
+    # sibling (File.Replace needs a backup path), pruned here too so the two
+    # prune rules stay identical.
+    if not (n.startswith("wt-") and (n.endswith(".json")
+                                      or n.endswith(".json.tmp")
+                                      or n.endswith(".json.bak"))):
         continue
     p = os.path.join(d, n)
     try:
