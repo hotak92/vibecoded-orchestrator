@@ -291,6 +291,9 @@ def acquire(project_root: "str | Path", *, stale_s: float = DEFAULT_STALE_S,
                         pid=os.getpid() if pid is None else pid, log=log)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:  # FileExistsError too: a FILE where the dir goes
+        return AcquireResult(ERROR, detail=f"{path.parent}: {exc}")
+    try:
         with exclusive_file_lock(_ops_path(root), timeout_s=OPS_TIMEOUT_S):
             raw, data = _read_payload(path)
             if raw is not None:
@@ -314,7 +317,12 @@ def acquire(project_root: "str | Path", *, stale_s: float = DEFAULT_STALE_S,
                     claimed.unlink()
                 except OSError:
                     pass
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                             0o600)
+            except FileExistsError:
+                return AcquireResult(BUSY, detail="another run created the "
+                                                  "lock first")
             try:
                 os.write(fd, holder.payload(time.time()))
             finally:
@@ -322,8 +330,6 @@ def acquire(project_root: "str | Path", *, stale_s: float = DEFAULT_STALE_S,
             if not holder.ours():
                 return AcquireResult(BUSY, detail="the lock is not ours after "
                                                   "creating it")
-    except FileExistsError:
-        return AcquireResult(BUSY, detail="another run created the lock first")
     except LockTimeout as exc:
         return AcquireResult(ERROR, detail=f"lock ops timed out: {exc}")
     except OSError as exc:
