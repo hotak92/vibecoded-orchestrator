@@ -118,6 +118,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The model gateway can no longer hang forever on a stalled network lookup.** During a brief DNS outage
+  (2026-11-04), the gateway answered 502s the clients retried — but one retry was accepted and never answered: no log
+  line, no timeout, its connection open for hours, the chat hung until VS Code was restarted. The request's timeout
+  covered only the TCP connect, not DNS resolution or the wait for the upstream's response headers, and a total bound
+  is deliberately absent there (a healthy completion may stream for many minutes). Every phase BEFORE the response
+  headers is now bounded: pool acquisition, DNS and connect as one bound, plus a time-to-response-headers bound —
+  while the streaming body after the headers keeps only its idle bound and is never cut. A transient pre-header
+  failure (DNS failure or stall, connect refused or timed out) is retried inside the gateway with bounded backoff for
+  up to 75 s, so a brief outage is invisible to the chat; only then does the retryable 502 go out, now with a short
+  `retry-after`. Nothing is ever retried once response bytes have started streaming to you. One WARNING per outage
+  (not per attempt) and one INFO on recovery land in the gateway log, and `/health` now reports how many upstream
+  requests are waiting for their response headers and how old the oldest is — by name and age, no URLs — so a stuck
+  request is visible while it is stuck instead of only in a post-mortem. Two new env knobs, documented in
+  `docs/CONFIGURATION.md`: `VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S` (default 600) and
+  `VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S` (default 75, `0` answers the first failure).
+
 - **The launcher's build and test toolchain is clear of four high-severity advisories.** The launcher's development
   dependencies are patched: vite 6.4.5 (from 6.4.4), devalue 5.9.4, source-map-js 1.2.2 and undici 7.30.1. All four
   advisories were in the build/test toolchain, not in anything the launcher ships at runtime, so no launcher

@@ -172,7 +172,6 @@ from .catalog import (
 from .config import (
     PICKER_USAGE_ON,
     SERVICE_NAME,
-    UPSTREAM_CONNECT_TIMEOUT_S,
     GatewayConfig,
     context_guard_margin,
 )
@@ -452,6 +451,24 @@ def _ladder_verdict(
 #: on the most ordinary flake there is.
 RETRYABLE_HEADERS = {"x-should-retry": "true"}
 
+#: What a gateway-side 502 for a PRE-HEADER network failure carries, on top
+#: of :data:`RETRYABLE_HEADERS`. The gateway has already spent its bounded
+#: retry window inside itself (see :func:`_acquire_upstream`) when it writes
+#: one of these, so a client that retries immediately would just hit the
+#: same outage; a short ``retry-after`` paces the one it is going to do
+#: anyway. Clients that ignore it are no worse off than before.
+UPSTREAM_RETRY_AFTER_S = 5
+RETRYABLE_502_HEADERS = {
+    **RETRYABLE_HEADERS,
+    "Retry-After": str(UPSTREAM_RETRY_AFTER_S),
+}
+
+#: First backoff between in-gateway retries of a transient pre-header
+#: failure, doubling per attempt up to the cap. Sub-second start so a
+#: one-failure blip costs the chat well under a second.
+_UPSTREAM_RETRY_BACKOFF_S = 0.5
+_UPSTREAM_RETRY_BACKOFF_CAP_S = 5.0
+
 #: WP-6 review MAJOR-1/MINOR-1 caps. Auth strikes: one 401 is a blip,
 #: three consecutive is a dead key (rotated/revoked) that must not keep
 #: serving from the last-good store. Echo-log cap: ``forwarded`` is
@@ -577,6 +594,52 @@ async def loopback_only_middleware(
     )
 
 
+class _UpstreamFlight:
+    """Upstream requests currently waiting to reach response headers.
+
+    The 2026-11-04 03:08 incident's signature was a request the gateway had
+    ACCEPTED and then never mentioned again: no access line, no timeout, a
+    TCP connection ESTABLISHED for hours. A counter plus the age of the
+    oldest wait is what makes that state visible from ``/health`` while it
+    is happening, instead of from a log afterwards.
+
+    Tracks the ACQUISITION phase (pool + DNS + connect + response headers,
+    including the bounded in-gateway retry window) — the phase that hung.
+    A request already STREAMING a body has a real signal of its own (the
+    idle bound, and an aborted connection when it breaks), so it is not
+    counted here. Single-threaded by construction (one event loop); plain
+    dict bookkeeping needs no lock.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._next_id = 0
+        self._waiting: dict[int, "tuple[float, str]"] = {}
+
+    def enter(self, label: str) -> int:
+        self._next_id += 1
+        self._waiting[self._next_id] = (self._clock(), label)
+        return self._next_id
+
+    def exit(self, token: int) -> None:
+        self._waiting.pop(token, None)
+
+    def report(self) -> "dict[str, object]":
+        """Names and ages only — never a URL, key or header value."""
+        now = self._clock()
+        oldest: "tuple[float, str] | None" = None
+        for started, label in self._waiting.values():
+            if oldest is None or started < oldest[0]:
+                oldest = (started, label)
+        return {
+            "count": len(self._waiting),
+            "oldest_age_s": (
+                None if oldest is None else round(now - oldest[0], 3)
+            ),
+            "oldest_label": None if oldest is None else oldest[1],
+        }
+
+
 class Gateway:
     """Everything the handlers need, built once at startup."""
 
@@ -634,6 +697,14 @@ class Gateway:
         #: observation, exactly like ``token_permissions``.
         self._token_file_stamp: Optional[Mapping[str, object]] = token_file_stamp
         self._session: Optional[aiohttp.ClientSession] = None
+        #: v0.2.105 (2026-11-04 incident): upstream acquisitions waiting for
+        #: response headers, reported by ``/health`` as
+        #: ``upstream_in_flight``. See :class:`_UpstreamFlight`.
+        self.upstream_flight = _UpstreamFlight()
+        #: Route labels (family ids) with an UNRECOVERED transient network
+        #: outage — gates the per-EPISODE (not per-attempt) WARNING and the
+        #: one INFO on recovery. See :func:`_note_transient_failure`.
+        self._upstream_outages: "set[str]" = set()
         #: Per-vendor rewritten-id -> vendor-id maps. Per PROCESS and bounded:
         #: the client echoes an id back one turn later, so the map only has to
         #: outlive a request, and an unbounded one would grow with uptime.
@@ -706,6 +777,20 @@ class Gateway:
     # ── lifecycle ────────────────────────────────────────────────────────
     async def start(self) -> None:
         if self._session is None or self._session.closed:
+            # Resolver choice (2026-11-04 incident review): the DEFAULT
+            # ThreadedResolver stays. getaddrinfo runs on the loop's default
+            # executor, so a stalled lookup pins one worker thread until the
+            # OS resolver's own timeout reclaims it (glibc: 5 s x 2 attempts
+            # by default — the ~10 s the incident's failures took). Cancelling
+            # the await (which the bounded `connect` timeout in
+            # `_acquire_upstream` now does) abandons the future, not the
+            # thread, but threads are bounded by in-flight requests and the
+            # executor's own size, so the queue can degrade during an outage
+            # without hanging a request or growing without bound. Switching
+            # to AsyncResolver would need the aiodns dependency (c-ares) this
+            # repo does not ship; an unbounded private pool would trade a
+            # bounded wait for unbounded threads. Neither is justified while
+            # every request is bounded by `connect` + the headers timeout.
             self._session = aiohttp.ClientSession()
 
     def request_started(self) -> None:
@@ -757,6 +842,10 @@ class Gateway:
             async with self.session.get(
                 url,
                 headers=dict(headers),
+                # A `total` bound covers every phase — DNS and pool
+                # included — which is the right bound for a catalog fetch:
+                # unlike a relayed completion (see `_acquire_upstream`) no
+                # part of this call is allowed to run long.
                 timeout=aiohttp.ClientTimeout(total=self.config.catalog_timeout_s),
             ) as resp:
                 if resp.status != 200:
@@ -1071,7 +1160,16 @@ async def health_handler(request: web.Request) -> web.Response:
     ``last_fallback_reason`` (how often a request asking for it was served by
     another account, and why), ``refresh`` (the login keeper's last attempt,
     ``null`` when none). One ``stat`` per account and cached parses — no
-    subprocess. The top-level ``oauth_*`` fields stay the ``primary`` login's).
+    subprocess. The top-level ``oauth_*`` fields stay the ``primary`` login's),
+    ``upstream_in_flight`` (v0.2.105, 2026-11-04 incident: upstream requests
+    currently waiting to reach RESPONSE HEADERS — ``count``, ``oldest_age_s``
+    and ``oldest_label``, the last two ``null`` when nothing is waiting. A
+    healthy daemon shows ``count: 0``; a request stuck in DNS or connect
+    shows up here by NAME and AGE while it is stuck, which is what the
+    incident lacked — its hung request was visible only as a TCP connection
+    ESTABLISHED for hours. Covers the acquisition phase (the one that hung;
+    a streaming body has the idle bound as its own signal) and reads pure
+    in-memory counters, so the liveness promise holds).
     """
     gateway: Gateway = request.app[APP_KEY]
     # cached_only: /health never runs a subprocess (the macOS Keychain answer
@@ -1134,6 +1232,9 @@ async def health_handler(request: web.Request) -> web.Response:
                 gateway.account_refresher.status()
                 if gateway.account_refresher is not None else None
             ),
+            # Pure in-memory counters — see :class:`_UpstreamFlight`. Names
+            # and ages only, never a URL: /health is unauthenticated.
+            "upstream_in_flight": gateway.upstream_flight.report(),
         }
     )
 
@@ -3359,6 +3460,148 @@ def _reread_oauth_headers(
     return updated
 
 
+def _note_transient_failure(gateway: Gateway, label: str, exc: BaseException) -> None:
+    """One WARNING per outage EPISODE, not per attempt.
+
+    An episode opens with the first transient failure of a route and closes
+    with :func:`_note_upstream_recovery`; attempts in between log at DEBUG so
+    a 60 s outage retried every few seconds is one alarming line, not
+    twenty. The label is a family id — a NAME, never a URL or a header
+    value.
+    """
+    if label in gateway._upstream_outages:
+        logger.debug(
+            "model-gateway: upstream %s still unreachable (%s), retrying",
+            label, type(exc).__name__,
+        )
+        return
+    gateway._upstream_outages.add(label)
+    logger.warning(
+        "model-gateway: upstream %s transient network failure (%s); "
+        "retrying inside the gateway",
+        label, type(exc).__name__,
+    )
+
+
+def _note_upstream_recovery(gateway: Gateway, label: str) -> None:
+    """The one INFO that closes an episode :func:`_note_transient_failure`
+    opened. Called on every successful acquisition; it only speaks when
+    there was an episode."""
+    if label in gateway._upstream_outages:
+        gateway._upstream_outages.discard(label)
+        logger.info("model-gateway: upstream %s reachable again", label)
+
+
+async def _acquire_upstream(
+    gateway: Gateway,
+    url: str,
+    body: "bytes | bytearray | AsyncIterator[bytes]",
+    headers: "Mapping[str, str]",
+    *,
+    label: str,
+) -> aiohttp.ClientResponse:
+    """Open ONE upstream request and wait for its response headers.
+
+    Every phase before the headers is bounded (2026-11-04 03:08 incident:
+    a DNS resolution that stalled instead of failing was accepted and never
+    answered — ``sock_connect`` covers only the TCP handshake, DNS and the
+    connection pool were bounded only by ``connect``, which was unset, and
+    ``total`` was deliberately ``None``):
+
+    * pool + DNS + TCP connect — aiohttp's ``connect`` (set here) plus the
+      headers wait below;
+    * the wait for the response headers themselves — the ``wait_for``
+      around the acquisition.
+
+    What is deliberately NOT bounded is the streaming body after the
+    headers: a healthy completion may run for many minutes, and the idle
+    bound (``sock_read``) stays the only body bound.
+
+    A transient failure BEFORE any byte reached the client — which this
+    whole function is: the client response is not even prepared yet — is
+    retried with bounded backoff for ``upstream_retry_window_s`` seconds so
+    a brief outage is invisible to the chat, and only then raises for the
+    caller to answer the retryable 502. A body that is not re-sendable
+    bytes (the over-buffer streaming path) cannot be sent twice, so such a
+    request fails on the first attempt.
+
+    Returns the response with headers received; the CALLER owns it (``async
+    with``). Raises ``RuntimeError`` (session not started — a programming
+    error), ``asyncio.TimeoutError`` (the headers bound), or an
+    ``aiohttp.ClientError`` (transport, after retries).
+    """
+    config = gateway.config
+    resendable = isinstance(body, (bytes, bytearray))
+    deadline = (
+        time.monotonic() + config.upstream_retry_window_s
+        if resendable and config.upstream_retry_window_s > 0
+        else None
+    )
+    token = gateway.upstream_flight.enter(label)
+    attempt = 0
+    try:
+        while True:
+            attempt += 1
+            try:
+                ctx = gateway.session.post(
+                    url,
+                    data=body,
+                    headers=dict(headers),
+                    # NO total budget, on purpose: a completion runs as long
+                    # as it runs, and a total one cut a healthy 601 s stream
+                    # on 2026-09-09. What is bounded is every phase before
+                    # the body: REACHING the upstream (`connect`, which
+                    # unlike `sock_connect` also covers DNS resolution and
+                    # connection-pool acquisition — the 2026-11-04 hang was
+                    # exactly a phase only `connect` bounds) and going quiet
+                    # (`sock_read`). The headers wait itself is bounded by
+                    # the `wait_for` around this context manager.
+                    timeout=aiohttp.ClientTimeout(
+                        total=None,
+                        connect=config.upstream_connect_timeout_s,
+                        sock_connect=config.upstream_connect_timeout_s,
+                        sock_read=config.upstream_idle_timeout_s,
+                    ),
+                )
+                response = await asyncio.wait_for(
+                    ctx.__aenter__(), timeout=config.upstream_headers_timeout_s,
+                )
+            except RuntimeError:
+                # `gateway.session` raised before start() — a programming
+                # error, not a network condition; the caller's own branch
+                # answers it.
+                raise
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError) as exc:
+                # Pre-header transient failures only: connection errors
+                # (DNS failure/stall, refused, reset), the connect timeout
+                # (a ServerTimeoutError is both a ClientConnectionError and
+                # an asyncio.TimeoutError) and the headers bound. Nothing
+                # has reached the client — the client response is not even
+                # prepared — so retrying is always safe here.
+                now = time.monotonic()
+                _note_transient_failure(gateway, label, exc)
+                if deadline is None or now >= deadline:
+                    if attempt > 1:
+                        logger.warning(
+                            "model-gateway: upstream %s unreachable after %d "
+                            "attempt(s) (%.0fs retry window); answering 502",
+                            label, attempt, config.upstream_retry_window_s,
+                        )
+                    raise
+                backoff = min(
+                    _UPSTREAM_RETRY_BACKOFF_CAP_S,
+                    _UPSTREAM_RETRY_BACKOFF_S * 2 ** (attempt - 1),
+                    max(0.0, deadline - now),
+                )
+                if backoff > 0:
+                    await asyncio.sleep(backoff)
+                continue
+            _note_upstream_recovery(gateway, label)
+            return response
+    finally:
+        gateway.upstream_flight.exit(token)
+
+
 async def _proxy(
     request: web.Request,
     gateway: Gateway,
@@ -3551,27 +3794,50 @@ async def _proxy(
                 )
 
     try:
-        upstream_ctx = gateway.session.post(
-            url,
-            data=body,
-            headers=headers,
-            # NO total budget, on purpose: a completion runs as long as it
-            # runs, and a total one cut a healthy 601 s stream on 2026-09-09.
-            # What is bounded is CONNECTING and going quiet — the two
-            # conditions that actually mean the upstream is not coming back.
-            timeout=aiohttp.ClientTimeout(
-                total=None,
-                sock_connect=UPSTREAM_CONNECT_TIMEOUT_S,
-                sock_read=gateway.config.upstream_idle_timeout_s,
-            ),
+        upstream = await _acquire_upstream(
+            gateway, url, body, headers, label=decision.family_id,
         )
     except RuntimeError as exc:  # session not started — a programming error
         logger.error("model-gateway: %s", exc)
         access(502, stream=stream_requested)
         return _json_error(502, "api_error", str(exc), headers=RETRYABLE_HEADERS)
+    except asyncio.TimeoutError:
+        # The headers bound (2026-11-04): the upstream was reached but never
+        # committed to a status within `upstream_headers_timeout_s` — after
+        # the in-gateway retry window. Not a word about "going quiet": the
+        # idle bound owns that vocabulary, and this failure is earlier.
+        logger.warning(
+            "model-gateway: %s -> %s sent no response headers within %ss",
+            _log_safe(decision.forward_model), decision.family_id,
+            gateway.config.upstream_headers_timeout_s,
+        )
+        access(502, stream=stream_requested, extra="note=upstream_timeout")
+        return _json_error(
+            502,
+            "api_error",
+            f"upstream {decision.upstream} sent no response headers within "
+            f"{gateway.config.upstream_headers_timeout_s}s",
+            headers=RETRYABLE_502_HEADERS,
+        )
+    except aiohttp.ClientError as exc:
+        # Unreachable after the in-gateway retry window
+        # (:func:`_acquire_upstream`) — DNS, connect refused, reset, or the
+        # connect bound. The client retries on this 502; the `retry-after`
+        # paces it because the window has already been spent.
+        logger.warning(
+            "model-gateway: %s -> %s unreachable: %s",
+            _log_safe(decision.forward_model), decision.family_id, _log_safe(exc),
+        )
+        access(502, stream=stream_requested, extra="note=upstream_unreachable")
+        return _json_error(
+            502,
+            "api_error",
+            f"upstream {decision.upstream} unreachable: {exc}",
+            headers=RETRYABLE_502_HEADERS,
+        )
 
     try:
-        async with upstream_ctx as upstream:
+        async with upstream:
             if (
                 allow_oauth_retry
                 and decision.is_anthropic
