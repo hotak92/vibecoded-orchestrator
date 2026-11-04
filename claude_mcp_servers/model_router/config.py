@@ -747,11 +747,13 @@ class GatewayConfig:
         """The response-headers bound in force: the explicit value, else the
         idle bound plus :data:`UPSTREAM_UPLOAD_ALLOWANCE_S`.
 
-        Derived rather than a fixed constant so the bound can never be
-        SHORTER than the idle bound it backs up — a non-streaming completion
+        Derived rather than a fixed constant so the DEFAULT bound is never
+        shorter than the idle bound it backs up — a non-streaming completion
         waits for its headers as long as the whole answer takes, and before
         v0.2.105 only the idle bound (counted from the end of the upload)
-        limited that wait.
+        limited that wait. An explicit value is used as given (it may be
+        shorter), and an upload longer than
+        :data:`UPSTREAM_UPLOAD_ALLOWANCE_S` eats into the default's margin.
         """
         if self.upstream_headers_timeout_s is not None:
             return self.upstream_headers_timeout_s

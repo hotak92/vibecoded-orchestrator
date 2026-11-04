@@ -683,8 +683,8 @@ class _UpstreamOutages:
         self._episodes[label] = [now, False]
         logger.warning(
             "model-gateway: upstream %s unreachable (%s, nothing was sent "
-            "upstream); retrying inside the gateway while the retry window "
-            "lasts",
+            "upstream); the gateway retries it only while the request's retry "
+            "window has time left",
             label, type(exc).__name__,
         )
 
@@ -3552,6 +3552,29 @@ def _is_pre_send_failure(exc: BaseException) -> bool:
     )
 
 
+
+def _classify_upstream_error(exc: BaseException) -> "tuple[str, str, dict]":
+    """``(reason, access note, response headers)`` for an upstream failure
+    that reached the client (after any in-gateway retry).
+
+    * ``ClientConnectorError`` — unreachable (DNS, refused, no route, TLS):
+      never connected, so after the in-gateway retry window where one
+      applies (:func:`_acquire_upstream`); ``retry-after`` paces the client's
+      retry because the window is spent.
+    * ``ClientPayloadError`` — the GATEWAY's own streamed request body (the
+      over-buffer path) failed while being sent: not the upstream's fault,
+      and the client's retry decides.
+    * anything else — disconnected or reset after the connection existed:
+      the upstream may have the request, so the gateway did NOT re-send it.
+    """
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return "unreachable", "upstream_unreachable", RETRYABLE_502_HEADERS
+    if isinstance(exc, aiohttp.ClientPayloadError):
+        return ("failed while the gateway was sending the request body",
+                "request_body_failed", RETRYABLE_HEADERS)
+    return ("dropped the connection before answering", "upstream_dropped",
+            RETRYABLE_HEADERS)
+
 async def _acquire_upstream(
     gateway: Gateway,
     url: str,
@@ -3650,8 +3673,9 @@ async def _acquire_upstream(
             except (aiohttp.ClientError, OSError) as exc:
                 if not _is_pre_send_failure(exc):
                     # The upstream may already have this request: never
-                    # re-send it. (`UpstreamHeadersTimeout` is not caught
-                    # here at all, for the same reason.)
+                    # re-send it. (`UpstreamHeadersTimeout` — a TimeoutError,
+                    # hence an OSError — lands here too and is re-raised by
+                    # this check, for the same reason.)
                     raise
                 now = time.monotonic()
                 gateway.upstream_outages.failure(label, exc)
@@ -3931,22 +3955,7 @@ async def _proxy(
             headers=RETRYABLE_HEADERS,
         )
     except (aiohttp.ClientError, OSError) as exc:
-        if isinstance(exc, aiohttp.ClientConnectorError):
-            # Unreachable — DNS, refused, no route, TLS — never connected,
-            # so after the in-gateway retry window where one applies
-            # (:func:`_acquire_upstream`). The `retry-after` paces the
-            # client's retry because the window is spent.
-            reason, note, retry_headers = (
-                "unreachable", "upstream_unreachable", RETRYABLE_502_HEADERS,
-            )
-        else:
-            # Disconnected or reset after the connection existed — the
-            # upstream may have the request, so the gateway did NOT re-send
-            # it; the client's own retry decides, at once.
-            reason, note, retry_headers = (
-                "dropped the connection before answering",
-                "upstream_dropped", RETRYABLE_HEADERS,
-            )
+        reason, note, retry_headers = _classify_upstream_error(exc)
         logger.warning(
             "model-gateway: %s -> %s %s: %s",
             _log_safe(decision.forward_model), decision.family_id, reason,

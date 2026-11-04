@@ -586,3 +586,26 @@ class OutageEpisodeWiringTests(NetboundTestBase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class UpstreamErrorClassificationTests(unittest.TestCase):
+    """v0.2.105 F7 verify NIT-4: a failure of the gateway's OWN streamed
+    request body is not blamed on the upstream."""
+
+    def test_each_failure_class_gets_its_own_reason_and_note(self) -> None:
+        import aiohttp
+        from model_router import server
+
+        conn_key = mock.Mock()
+        unreachable = aiohttp.ClientConnectorError(conn_key, OSError("dns"))
+        reason, note, _ = server._classify_upstream_error(unreachable)
+        self.assertEqual((reason, note), ("unreachable", "upstream_unreachable"))
+
+        reason, note, _ = server._classify_upstream_error(
+            aiohttp.ClientPayloadError("body"))
+        self.assertEqual(note, "request_body_failed")
+        self.assertIn("gateway", reason)
+
+        reason, note, _ = server._classify_upstream_error(
+            aiohttp.ServerDisconnectedError())
+        self.assertEqual(note, "upstream_dropped")
