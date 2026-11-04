@@ -299,14 +299,23 @@ def export(reg: Registry, path: Optional[Path] = None) -> Path:
 # ── login state: names and expiry only ───────────────────────────────────
 
 
-def login_state(config_dir: Path, *, now_ms: Optional[int] = None) -> dict:
+def login_state(config_dir: Path, *, now_ms: Optional[int] = None,
+                primary: bool = False) -> dict:
     """``{"state", "expires_at_ms", "expires_in_s", "problem"}`` for one
     config dir, read through the gateway's own credentials reader (one
-    parser). Never returns any part of a token."""
+    parser). Never returns any part of a token.
+
+    ``primary``: the user's own login, made WITHOUT ``CLAUDE_CONFIG_DIR`` —
+    on macOS its Keychain item is the un-suffixed one, exactly as the gateway
+    builds its primary reader (``model_router/server.py``); an added account's
+    item is named after its config dir (the reader's default)."""
     from vco_lib.gateway_package import ensure_importable
     ensure_importable()
     from model_router.auth import OAuthReader  # pyright: ignore[reportMissingImports]
-    state = OAuthReader(Path(config_dir) / ".credentials.json").read(now_ms=now_ms)
+    path = Path(config_dir) / ".credentials.json"
+    reader = (OAuthReader(path, keychain_config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or None)
+              if primary else OAuthReader(path))
+    state = reader.read(now_ms=now_ms)
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     expires_in = (
         int((state.expires_at_ms - now) / 1000) if state.expires_at_ms else None
@@ -558,7 +567,8 @@ def describe(reg: Registry, *, with_gateway: bool = True) -> dict:
             "is_default": acct_id == reg.default,
             "is_primary": acct_id == PRIMARY_ID,
             "projects": sorted(p for p, a in reg.projects.items() if a == acct_id),
-            "login": login_state(Path(config_dir)) if config_dir else None,
+            "login": (login_state(Path(config_dir), primary=acct_id == PRIMARY_ID)
+                      if config_dir else None),
             "login_commands": login_commands(config_dir) if config_dir else None,
             "gateway": gw_accounts.get(acct_id),
         }
