@@ -1,8 +1,8 @@
 {
   "binary_name": "vct-launcher",
-  "built_at": "2026-10-23T06:59:14Z",
+  "built_at": "2026-11-04T11:20:30Z",
   "os": "macos-arm64",
-  "size_bytes": 26811040,
-  "source_sha": "c93bcafac115c539b5d9429a097fd3d945e4744d",
-  "version": "0.2.104"
+  "size_bytes": 27140256,
+  "source_sha": "82c0dbb3e42dad8d332527f21c6f9e27502a306f",
+  "version": "0.2.105"
 }

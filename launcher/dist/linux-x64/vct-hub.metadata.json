@@ -1,11 +1,11 @@
 {
-  "source_sha": "c93bcafac115c539b5d9429a097fd3d945e4744d",
-  "source_short_sha": "c93bcaf",
-  "source_hash": "cc6fe5b8233f12e234cfe9d78e25afef32062d0f",
-  "built_at": "2026-10-23T06:44:47Z",
-  "launcher_version": "0.2.104",
+  "source_sha": "82c0dbb3e42dad8d332527f21c6f9e27502a306f",
+  "source_short_sha": "82c0dbb",
+  "source_hash": "05ca3edcd2146e703a6c3038cce7260a8b145ebd",
+  "built_at": "2026-11-04T11:04:22Z",
+  "launcher_version": "0.2.105",
   "host_target": "linux-x64",
   "binary_name": "vct-hub",
-  "binary_size_bytes": 11498040,
+  "binary_size_bytes": 11813232,
   "tier": "stable"
 }
