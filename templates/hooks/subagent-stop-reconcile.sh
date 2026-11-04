@@ -401,7 +401,11 @@ with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
             # PARENT session (https://code.claude.com/docs/en/hooks
             # #subagentstop-input). So tell the parent ONCE per worktree path
             # per session (_lib/worktree-records.sh :: wtrec_kept_alert_once),
-            # and say plainly that the agent may still be running.
+            # and say plainly that the agent may still be running. In the
+            # ordinary sequence the second stop of one launch is already
+            # suppressed by wtrec_reap's PRE-EXISTING `already_handled` gate;
+            # the marker covers the rewritten-record case and the detached-job
+            # race.
             KEPT_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null || true)"
             if [ -z "$KEPT_REC" ] || wtrec_kept_alert_once "$KEPT_REC" "$SESSION_ID" "$REAP_PATH"; then
                 printf 'subagent-stop-reconcile: worktree of agent %s KEPT at %s (%s) - if the agent is still running background work it will resume; review, merge or remove it after its final report\n' \
