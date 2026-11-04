@@ -1066,34 +1066,36 @@ def reviewer_originated_sections(base: Optional[str], new: str,
 
 def _fold_removals(pre_lines: List[str], body_post: str,
                    sections: List[ReplaceableSection]) -> List[str]:
-    """The lines of proven ``sections`` a write dropped WITHOUT carrying or
-    naming them (review V02105-KGREV2 H3 — the owner's "old ones not
-    superseded need to be kept", enforced per FACT):
+    """The lines of proven ``sections`` a write dropped (review
+    V02105-KGREV2 H3 — the owner's "old ones not superseded need to be
+    kept", enforced per FACT, not per section):
 
-    * a fact line survives when its text (marker aside, whitespace
-      collapsed) is still a substring of a line of the new body — carried
-      into the consolidated section, regrouped as the write likes;
-    * a dropped fact is justified only by a trail line NEW in this write
-      that names its section (``Superseded: <key> → …``) and quotes it
-      (``… (<date>): <fact text>``);
-    * a dropped section HEADING is justified by any new trail line naming
-      the section's key (the step line)."""
+    * every non-blank line of a folded section must still be in the new
+      body: its text (list/quote marker aside, whitespace collapsed) a
+      substring of a new line — carried into the consolidated section
+      (regrouped, prefixed "Built:" etc. as the write likes), or QUOTED on
+      the trail line that names it superseded (``Superseded: <key> → <new>
+      (<date>): <the statement>``). A statement can be dropped from the
+      prose only by being named superseded; it can never just vanish;
+    * the one exception is the section's HEADING, which a fold replaces:
+      it needs a trail line NEW in this write naming the section's key
+      (the step line ``Superseded: <key> → <new> (<date>)``).
+
+    Reordering is allowed here (a fold regroups facts); the owner's lines
+    outside the proven sections are still matched in order by
+    :func:`_missing_with_index`."""
     post_lines = _body_lines(body_post)
     post_collapsed = [_collapse(line) for line in post_lines]
     pre_set = set(pre_lines)
-    trails = [t for line in post_lines if line not in pre_set
-              for t in [parse_trail(line)] if t is not None]
+    named = {t.old for line in post_lines if line not in pre_set
+             for t in [parse_trail(line)] if t is not None}
     out: List[str] = []
     for s in sections:
-        named = any(t.old == s.key for t in trails)
-        facts = [t.fact for t in trails if t.old == s.key and t.fact]
         for i in range(s.start, min(s.end, len(pre_lines))):
             n = _needle(pre_lines[i])
             if not n or any(n in p for p in post_collapsed):
                 continue
-            if i == s.start and named:
-                continue
-            if i != s.start and any(n in f for f in facts):
+            if i == s.start and s.key in named:
                 continue
             out.append(pre_lines[i].strip())
     return out

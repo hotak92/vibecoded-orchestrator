@@ -717,9 +717,10 @@ not configuration. Edits elsewhere are blocked and reverted.
      and one line per statement you DROP because this commit supersedes
      it, quoting that statement in full:
      Superseded: <key> → {commit.short} ({today}): <the dropped statement>
-     The validator REVERTS the whole write when any line of a folded
-     section neither appears in the new text nor is quoted on such a
-     trail line of its own section.
+     The validator REVERTS the whole write when any statement of a folded
+     section is missing from the new text (neither carried over verbatim
+     nor quoted on such a trail line), or a folded section has no step
+     line naming its key.
    - Otherwise APPEND one section at the end of the node:
    ## Status after {commit.short}
    stating what changed and which of the node's statements it supersedes;
