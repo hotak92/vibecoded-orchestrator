@@ -202,6 +202,65 @@ except Exception:
 ' 2>/dev/null || true
 }
 
+# wtrec_kept_alert_once RECORD_FILE SESSION_ID WORKTREE_PATH — 0 when the
+# PARENT should be told "worktree KEPT" now, 1 when it was already told about
+# THIS path in THIS session.
+#
+# WHY (v0.2.105): a subagent that starts its own background work (a test
+# suite, a build) stops and resumes several times, and every interim stop
+# fires SubagentStop. The harness payload carries no field that tells an
+# interim stop from a final one — SubagentStop input is session_id,
+# transcript_path, cwd, permission_mode, hook_event_name, stop_hook_active,
+# agent_id, agent_type, agent_transcript_path, last_assistant_message,
+# background_tasks and session_crons (https://code.claude.com/docs/en/hooks
+# #subagentstop-input), and those last two arrays are scoped to the PARENT
+# session, not the subagent — so a first-stop notice was read as "the agent
+# finished". The answer is one honest notice per worktree path per session,
+# worded so a reader knows the agent may still be running (the call site
+# owns that wording). The marker rides the agent's own record, so
+# wtrec_prune's idle window retires it with the record; a record rewritten
+# for a NEW path (a fresh launch) alerts again.
+#
+# Best-effort and FAIL-OPEN: no python, an unreadable record or a failed
+# write means "emit" — a real kept worktree is never reported silently.
+# MUST MATCH Test-WtrecKeptAlertOnce in the .ps1.
+wtrec_kept_alert_once() {
+    local rec="$1" sid="${2:-}" path="$3"
+    [ -n "$rec" ] && [ -f "$rec" ] || return 0
+    [ -n "$path" ] || return 0
+    [ -n "${PY:-}" ] || return 0
+    WTREC_FILE="$rec" WTREC_SID="$sid" WTREC_PATH="$path" "$PY" -c '
+import json, os, sys
+p = os.environ["WTREC_FILE"]
+sid = os.environ.get("WTREC_SID", "")
+path = os.environ.get("WTREC_PATH", "")
+try:
+    with open(p, encoding="utf-8") as fh:
+        rec = json.load(fh)
+except Exception:
+    print("emit")
+    sys.exit(0)
+if not isinstance(rec, dict):
+    print("emit")
+    sys.exit(0)
+if rec.get("kept_alert_path") == path and str(rec.get("kept_alert_session", "")) == sid:
+    print("seen")
+    sys.exit(0)
+rec["kept_alert_path"] = path
+rec["kept_alert_session"] = sid
+try:
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh)
+    os.replace(tmp, p)
+except OSError:
+    print("emit")
+    sys.exit(0)
+print("emit")
+' 2>/dev/null | grep -qx seen && return 1
+    return 0
+}
+
 # wtrec_prune PROJECT_ROOT — keep the directory bounded without breaking a
 # resume. A record outlives its worktree on purpose: a resumed subagent's
 # SubagentStart must still find it (isolation-check), or the skipped-isolation

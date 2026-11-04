@@ -369,7 +369,10 @@ fi
 # worktree is logged with its path and reason to
 # .claude/logs/worktree-guard.jsonl and named on stderr. Runs before the
 # snapshot reconciler's early exits so it never depends on them; never
-# blocks (SubagentStop context would keep the subagent running).
+# blocks (SubagentStop context would keep the subagent running). A kept
+# worktree's notice is sent to the parent ONCE per path per session (v0.2.105:
+# an interim stop, with the agent waiting on its own background work, is not
+# distinguishable in the payload from a final one), and it says so.
 if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     # shellcheck source=_lib/worktree-records.sh disable=SC1091
     . "$SCRIPT_DIR/_lib/worktree-records.sh"
@@ -391,13 +394,24 @@ with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
     fh.write(json.dumps(row) + "\n")
 ' 2>/dev/null || true
         if [ "$REAP_DECISION" = "kept" ]; then
-            printf 'subagent-stop-reconcile: worktree of agent %s KEPT at %s (%s) - review, merge or remove it\n' \
-                "$AGENT_ID" "$REAP_PATH" "$REAP_REASON" >&2
-            # census F8: SubagentStop stderr on exit 0 reaches no model —
-            # file it for the PARENT, which must review/merge/remove it.
-            _reconcile_parent_alert worktree_kept \
-                "worktree KEPT at $REAP_PATH ($REAP_REASON): review its changes, then merge or remove it" \
-                "$REAP_PATH"
+            # v0.2.105: an interim SubagentStop (the agent is waiting on its
+            # own background work and will resume) is indistinguishable from a
+            # final one in the payload — SubagentStop carries no interim/final
+            # field, and background_tasks / session_crons are scoped to the
+            # PARENT session (https://code.claude.com/docs/en/hooks
+            # #subagentstop-input). So tell the parent ONCE per worktree path
+            # per session (_lib/worktree-records.sh :: wtrec_kept_alert_once),
+            # and say plainly that the agent may still be running.
+            KEPT_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null || true)"
+            if [ -z "$KEPT_REC" ] || wtrec_kept_alert_once "$KEPT_REC" "$SESSION_ID" "$REAP_PATH"; then
+                printf 'subagent-stop-reconcile: worktree of agent %s KEPT at %s (%s) - if the agent is still running background work it will resume; review, merge or remove it after its final report\n' \
+                    "$AGENT_ID" "$REAP_PATH" "$REAP_REASON" >&2
+                # census F8: SubagentStop stderr on exit 0 reaches no model —
+                # file it for the PARENT, which must review/merge/remove it.
+                _reconcile_parent_alert worktree_kept \
+                    "worktree KEPT at $REAP_PATH ($REAP_REASON) - if the agent is still running background work it will resume; review its changes, then merge or remove it after its final report" \
+                    "$REAP_PATH"
+            fi
         fi
     fi
 fi
