@@ -831,6 +831,11 @@ def session_fetcher(
             async with session().get(
                 url,
                 headers=dict(headers),
+                # `total` bounds every phase — DNS and pool included; a
+                # side call must never hang a request path (contrast the
+                # relayed-completion policy in model_router.server's
+                # `_acquire_upstream`, where only the pre-header phases are
+                # bounded and the body is left to the idle bound).
                 timeout=aiohttp.ClientTimeout(total=timeout_s),
                 allow_redirects=False,
             ) as resp:

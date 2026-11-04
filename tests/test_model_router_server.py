@@ -246,6 +246,11 @@ class GatewayTestBase(unittest.IsolatedAsyncioTestCase):
             static_retry_ttl_s=1,
             upstream_idle_timeout_s=10,
             catalog_timeout_s=5,
+            # Fail fast on a dead stub upstream (v0.2.105: the gateway now
+            # retries pre-header network failures inside itself for
+            # `upstream_retry_window_s` seconds by default — 75 s would make
+            # every unreachable-upstream test wait it out).
+            upstream_retry_window_s=0,
         )
         self.client = await self.make_client()
 
@@ -708,6 +713,7 @@ class HealthTests(GatewayTestBase):
         "secret_scope",
         "model_echo_mismatches",
         "token_file_permissions", "host_token_file", "usage_ledger", "accounts",
+        "upstream_in_flight",
     }
 
     async def test_health_needs_no_token(self) -> None:
