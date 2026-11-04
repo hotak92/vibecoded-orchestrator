@@ -138,6 +138,31 @@ function Set-WtrecStatus([string]$file, [string]$status, [string]$reason) {
     } catch { }
 }
 
+# Test-WtrecKeptAlertOnce FILE SESSION PATH -- $true when the PARENT should be
+# told "worktree KEPT" now, $false when it was already told about THIS path in
+# THIS session. Must match wtrec_kept_alert_once in the .sh sibling (see the
+# WHY there): SubagentStop carries no field that separates an interim stop
+# (the subagent is waiting on its own background work) from a final one, so
+# the notice is emitted once per worktree path per session, and the call site
+# words it so the reader knows the agent may still be running. The marker
+# rides the agent's own record, so Remove-WtrecStale retires it with the
+# record. FAIL-OPEN: an unreadable record or a failed write means "emit".
+function Test-WtrecKeptAlertOnce([string]$file, [string]$sessionId, [string]$path) {
+    if (-not $file -or -not $path) { return $true }
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $true }
+    $rec = Read-WtrecRecord $file
+    if (-not $rec) { return $true }
+    try {
+        if ([string]$rec.kept_alert_path -eq $path -and [string]$rec.kept_alert_session -eq $sessionId) { return $false }
+        $h = [ordered]@{}
+        foreach ($p in $rec.PSObject.Properties) { $h[$p.Name] = $p.Value }
+        $h["kept_alert_path"] = $path
+        $h["kept_alert_session"] = $sessionId
+        Set-VcoUtf8Content -Path $file -Value ($h | ConvertTo-Json -Compress)
+    } catch { return $true }
+    return $true
+}
+
 # Get-WtrecCleanupDays: the largest valid `cleanupPeriodDays` (Claude Code's
 # transcript retention) from the user settings
 # ($env:CLAUDE_CONFIG_DIR, else ~/.claude) and the project's settings.json +
