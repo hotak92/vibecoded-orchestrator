@@ -60,10 +60,12 @@ from typing import Callable, List, Optional, Tuple
 
 from vco_lib.atomic import (
     LockTimeout,
+    atomic_write_bytes,
     atomic_write_json,
     claim_by_rename,
     claim_owner_gone,
     exclusive_file_lock,
+    release_rename_claim,
 )
 
 __all__ = ["lock_path", "queue_path", "ReviewLock", "AcquireResult",
@@ -130,7 +132,7 @@ def _queue_lock_path(project_root: "str | Path") -> Path:
 
 def _sweep_heartbeat_temps(project_root: "str | Path", log: Log) -> None:
     """Delete ``<lock>.hb.<pid>.<token8>`` heartbeat temp files left by a
-    run that crashed between the temp write and its ``os.replace`` (review
+    run that crashed between the temp write and its rename (review
     V02105-DS). Every LIVE writer creates and replaces its temp under the
     ops kernel lock, so anything present while the caller holds that same
     lock is a dead run's leftover. Called from :func:`acquire` and
@@ -237,10 +239,13 @@ class ReviewLock:
                                  f"by this run - no further pass starts here")
                     self.lost = True
                     return False
-                tmp = self.path.with_name(
-                    f"{self.path.name}.hb.{self.pid}.{self.token[:8]}")
-                tmp.write_bytes(self.payload(time.time()))
-                os.replace(tmp, self.path)
+                # The temp file keeps the ``<lock>.hb.<pid>.<token8>`` prefix
+                # so a crash leftover is still swept by
+                # :func:`_sweep_heartbeat_temps`.
+                atomic_write_bytes(
+                    self.path, self.payload(time.time()), fsync=False,
+                    tmp_prefix=(f"{self.path.name}.hb.{self.pid}."
+                                f"{self.token[:8]}."))
             return True
         except (OSError, LockTimeout) as exc:
             self.log(f"review lock heartbeat failed ({exc}) - retried at the "
@@ -334,8 +339,9 @@ def acquire(project_root: "str | Path", *, stale_s: float = DEFAULT_STALE_S,
                 again = claimed.read_bytes()
                 if again != raw:
                     # Not the file that was judged: put it back untouched.
-                    if not path.exists():
-                        os.replace(claimed, path)
+                    # A lock that appeared meanwhile is newer and wins; the
+                    # claim is then dropped.
+                    release_rename_claim(claimed, path, newer_wins=True)
                     return AcquireResult(BUSY, detail="the lock changed "
                                                       "while it was judged")
                 log(f"review lock {path} is stale ({why}) - taking it over")
