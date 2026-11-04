@@ -222,6 +222,7 @@ def test_the_heartbeat_keeps_a_live_lock_fresh_and_notices_a_takeover(repo):
     lock = res.lock
     first = json.loads(q.lock_path(repo).read_text())["heartbeat"]
     lock.start_heartbeat(interval_s=0.05)
+    beat = first
     deadline = time.time() + 5
     while time.time() < deadline:
         beat = json.loads(q.lock_path(repo).read_text())["heartbeat"]

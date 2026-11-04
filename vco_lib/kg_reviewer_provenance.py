@@ -45,7 +45,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 __all__ = ["LEDGER_REL", "MAX_ENTRIES", "ledger_path", "section_digest",
            "load", "entries_for", "record"]
@@ -152,7 +152,7 @@ def _save(project_root: "str | Path", paths: Mapping[str, List[dict]]
 
 
 def record(project_root: "str | Path", commit: str,
-           sections: Mapping[str, List[Mapping[str, str]]],
+           sections: Mapping[str, Sequence[Mapping[str, str]]],
            log: Optional[Log] = None, *, now: Optional[str] = None) -> bool:
     """Record what one reviewer commit left in each node it committed.
 

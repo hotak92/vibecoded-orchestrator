@@ -169,8 +169,8 @@ def _judge(repo: Path, new_text: str, foldable=None
     """Snapshot, land the reviewer's write, validate; (result, log, file)."""
     snap = guard.take_snapshot(repo)
     try:
-        writes = {guard.path_key(repo / REL, repo.resolve()):
-                  [("write", new_text)]}
+        writes: "dict[Path, list[guard.WriteOp]]" = {
+            guard.path_key(repo / REL, repo.resolve()): [("write", new_text)]}
         (repo / REL).write_text(new_text)
         lines: List[str] = []
         res = guard.validate(snap, writes, lines.append, sources="",
