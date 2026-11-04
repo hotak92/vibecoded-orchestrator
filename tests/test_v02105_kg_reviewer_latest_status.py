@@ -29,6 +29,7 @@ The lock / queue half lives in ``test_v02105_kg_reviewer_queue.py``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -108,10 +109,10 @@ def _git_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(k, v)
 
 
-def _init(r: Path, node: bytes) -> None:
-    (r / "knowledge" / "concepts").mkdir(parents=True)
-    (r / "docs").mkdir(parents=True)
-    (r / REL).write_bytes(node)
+def _init(r: Path, node: bytes, rel: str = REL) -> None:
+    (r / rel).parent.mkdir(parents=True, exist_ok=True)
+    (r / "docs").mkdir(parents=True, exist_ok=True)
+    (r / rel).write_bytes(node)
     (r / "docs" / "deploy.md").write_text("v1\n")
     (r / "src.py").write_text("x = 1\n")
     _git(r, "init", "-q")
@@ -123,21 +124,25 @@ def _init(r: Path, node: bytes) -> None:
 
 
 def _reviewer_commit(repo: Path, text: str, short: str,
-                     subject: str = "feat: change") -> str:
+                     subject: str = "feat: change",
+                     rel: str = REL,
+                     lines_out: "List[str] | None" = None) -> str:
     """The reviewer's REAL write path: snapshot, the write, the guard, the
     isolated kg-sync commit (which records provenance)."""
     lines: List[str] = []
     snap = guard.take_snapshot(repo)
     try:
-        key = guard.path_key(repo / REL, repo.resolve())
-        (repo / REL).write_bytes(text.encode("utf-8"))
+        key = guard.path_key(repo / rel, repo.resolve())
+        (repo / rel).write_bytes(text.encode("utf-8"))
         res = guard.validate(snap, {key: [("write", text)]}, lines.append,
                              sources="")
-        assert res.kept == [REL], (res.reverted, lines)
+        assert res.kept == [rel], (res.reverted, lines)
         sha = guard.commit_reviewer_changes(
             snap, res.kept, reviewer_bytes=res.reviewer_bytes, short=short,
             subject=subject, model="test", attributed=True, log=lines.append)
         assert sha, lines
+        if lines_out is not None:
+            lines_out.extend(lines)
         return sha
     finally:
         snap.cleanup()
@@ -180,8 +185,8 @@ def _judge(repo: Path, new_text: str, foldable=None
         snap.cleanup()
 
 
-def _headings(repo: Path) -> List[str]:
-    return [e["heading"] for e in prov.entries_for(repo, REL)]
+def _headings(repo: Path, rel: str = REL) -> List[str]:
+    return [e["heading"] for e in prov.entries_for(repo, rel)]
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -217,6 +222,96 @@ def test_an_owner_line_enclosed_under_a_new_reviewer_heading_is_not_recorded(
         "The owner's own note survives every review.\n")
     _reviewer_commit(r, enclosing, "3333333")
     assert _headings(r) == []
+
+
+def test_an_owner_created_uncommitted_node_is_never_ledgered(
+        tmp_path, monkeypatch):
+    """N2: the owner writes a node to disk and nothing commits it (the KG
+    sync writes nodes immediately). Whenever that exact path IS committed
+    later, its sections must not be ledgered: with no committed base they
+    are the owner's. Proven at the ledger boundary — the reviewer's own
+    commit path refuses an untracked owner file outright
+    (``commit_block_reason``: "the user already had uncommitted changes")."""
+    _git_env(monkeypatch)
+    r = tmp_path / "proj"
+    _init(r, OWNER_NODE.encode())
+    rel = "knowledge/concepts/owner-new.md"
+    (r / rel).write_text(OWNER_NODE + SECTION_1)
+    _git(r, "add", "--", rel)
+    _git(r, "commit", "-q", "-m", "docs: the owner writes a node")
+    sha = _git(r, "rev-parse", "HEAD").strip()
+    lines: List[str] = []
+    assert guard.record_provenance(r, sha, [rel], lines.append) is True
+    assert prov.entries_for(r, rel) == []
+    assert any("untracked before this run" in ln for ln in lines), lines
+    # ...and nothing is foldable: dropping the section reverts.
+    folded = (OWNER_NODE
+              + "\n## Current state (consolidated 2026-11-04)\n\n"
+              "- Built: The blue pipeline was replaced by the green pipeline.\n"
+              "\nSuperseded: 1111111 -> 3333333 (2026-11-04)\n")
+    snap = guard.take_snapshot(r)
+    try:
+        key = guard.path_key(r / rel, r.resolve())
+        (r / rel).write_text(folded)
+        res = guard.validate(snap, {key: [("write", folded)]}, lambda _l: None,
+                             sources="")
+    finally:
+        snap.cleanup()
+    assert res.kept == [] and "300 s" in res.reverted[0][1]
+
+
+def test_an_earlier_runs_leftover_node_is_not_ledgered_whole(
+        tmp_path, monkeypatch):
+    """The reachable form of N2: the reviewer wrote a brand-new node in an
+    earlier run whose commit was skipped (so the path is a verified
+    leftover it may commit now). It still has no committed base and the
+    reviewer did not create it in THIS run, so committing it ledgers
+    nothing."""
+    from vco_lib import kg_reviewer_pending as pending
+
+    _git_env(monkeypatch)
+    r = tmp_path / "proj"
+    _init(r, OWNER_NODE.encode())
+    rel = "knowledge/concepts/leftover.md"
+    first = OWNER_NODE + SECTION_1
+    (r / rel).write_text(first)
+    pending.record_skips(r, r, {rel: hashlib.sha256(first.encode()).hexdigest()},
+                         reason="test: the earlier commit was skipped",
+                         short="0000000", foldable=[rel])
+    lines: List[str] = []
+    _reviewer_commit(r, first + SECTION_2, "2222222", rel=rel,
+                     lines_out=lines)
+    assert _headings(r, rel) == []
+    assert any("untracked before this run" in ln for ln in lines), lines
+
+
+NEW_NODE = """---
+title: Fresh node
+type: concept
+tags: [x]
+created: 2026-01-01T00:00:00Z
+updated: 2026-01-01T00:00:00Z
+status: active
+---
+
+# Fresh node
+
+## Status after 1111111
+
+A reviewer-created node.
+"""
+
+
+def test_a_node_the_reviewer_created_in_this_run_is_ledgered(
+        tmp_path, monkeypatch):
+    """The other side of N2: a node the reviewer itself created in this run
+    (absent when the run started) is its own work and IS ledgered."""
+    _git_env(monkeypatch)
+    r = tmp_path / "proj"
+    _init(r, OWNER_NODE.encode())
+    rel = "knowledge/concepts/fresh.md"
+    _reviewer_commit(r, NEW_NODE, "1111111", rel=rel)
+    assert _headings(r, rel) == ["## Status after 1111111"]
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -425,6 +520,54 @@ def test_line_endings_are_normalized_for_hashing_only(repo):
     proven = guard.proven_sections(repo, REL, crlf, "HEAD")
     assert len(proven) == 2
     assert b"\r\n" not in (repo / REL).read_bytes()
+
+
+SHORT_OWNER = """---
+title: Cache policy
+type: concept
+tags: [cache]
+status: active
+updated: 2026-01-01T00:00:00Z
+---
+
+# Cache policy
+
+Eviction interval is documented in the ops runbook above.
+use 5m.
+"""
+
+
+def test_a_short_owner_line_absorbed_out_of_order_keeps_the_section_append_only(
+        tmp_path, monkeypatch):
+    """N6: ``use 5m.`` (7 chars) is short enough that the contains arm used
+    to ignore it, and it stays in place in the owner body — so the in-order
+    matcher spends itself there and never reaches the reviewer's sentence
+    that ABSORBS the same owner line. The section must still be foreign."""
+    _git_env(monkeypatch)
+    r = tmp_path / "proj"
+    rel = "knowledge/concepts/cache.md"
+    _init(r, SHORT_OWNER.encode(), rel=rel)
+    absorbed = (SHORT_OWNER
+                + "\n## Status after 1111111\n\n"
+                "The eviction job runs hourly.\n"
+                "use 5m. remains the default for the eviction job.\n")
+    _reviewer_commit(r, absorbed, "1111111", rel=rel)
+    assert _headings(r, rel) == []
+
+
+def test_a_short_owner_line_inside_a_longer_word_is_not_foreign(
+        tmp_path, monkeypatch):
+    """The other side of N6: the short line only counts as a whole token
+    run, so ``use 5m.`` inside ``Reuse 5m.`` does not taint the section."""
+    _git_env(monkeypatch)
+    r = tmp_path / "proj"
+    rel = "knowledge/concepts/cache2.md"
+    _init(r, SHORT_OWNER.encode(), rel=rel)
+    reuse = (SHORT_OWNER
+             + "\n## Status after 1111111\n\n"
+             "Reuse 5m. of retention is the new default.\n")
+    _reviewer_commit(r, reuse, "1111111", rel=rel)
+    assert _headings(r, rel) == ["## Status after 1111111"]
 
 
 # ═════════════════════════════════════════════════════════════════════════

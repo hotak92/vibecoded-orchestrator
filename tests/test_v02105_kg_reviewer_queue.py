@@ -499,3 +499,62 @@ def test_busy_with_an_unwritable_queue_reviews_unlocked(
     assert "could not queue" in (tmp_path / "r.log").read_text()
     assert held.lock is not None
     held.lock.release()
+
+
+def test_a_skip_mode_pass_logs_every_commit_it_acknowledges(
+        chain, repo, tmp_path, monkeypatch):
+    """N3: no reviewer rung can run, so the pass exits 0 and the caller
+    ACKS its commits. Each one gets its own log line — the queue must never
+    swallow a commit silently."""
+    c1, c2 = _commit(repo, 1), _commit(repo, 2)
+    q.enqueue(repo, c1)
+    monkeypatch.setattr(
+        chain, "select_reviewer_backend",
+        lambda log=None, model=None: {"mode": "skip", "model": "",
+                                      "base_url": None, "reason": "no rung"})
+    assert _run(chain, repo, tmp_path, c2[:12]) == 0
+    assert chain.prompts == []
+    assert _queued(repo) == []
+    log = (tmp_path / "r.log").read_text()
+    for c in (c1, c2):
+        short = _git(repo, "rev-parse", "--short", c).strip()
+        assert f"{short} not reviewed: no reviewer rung available" in log
+
+
+def test_a_queued_copy_of_the_runs_own_commit_is_acked_on_lock_loss(
+        chain, repo, tmp_path, monkeypatch):
+    """N4: a retried hook had queued the run's own commit, and the lock is
+    lost mid-run — the loop breaks before _next_batch's done-ack. The own
+    commit must still leave the queue, so no successor reviews it again."""
+    c1 = _commit(repo, 1)
+    q.enqueue(repo, c1)          # a retried hook queued this very commit
+    real = q.acquire
+
+    def acquire(root, **kw):
+        res = real(root, **kw)
+        if res.lock is not None:
+            res.lock.lost = True     # taken over by a successor mid-run
+        return res
+
+    monkeypatch.setattr(q, "acquire", acquire)
+    assert _run(chain, repo, tmp_path, c1[:12]) == 0
+    assert len(chain.prompts) == 1, "reviewed once, never twice"
+    assert _queued(repo) == []
+    assert chain.spawned == []
+
+
+def test_a_crashed_heartbeat_temp_file_is_swept_at_acquire_and_release(repo):
+    """A crash between the heartbeat temp write and its ``os.replace``
+    leaves ``<lock>.hb.<pid>.<token8>`` in the state dir. Both acquire and
+    release sweep it (each holds the ops lock every live writer uses)."""
+    state = repo / ".claude" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    stale = state / "kg_reviewer.lock.hb.999999.deadbeef"
+    stale.write_text("{}", encoding="utf-8")
+    res = q.acquire(repo)
+    assert res.lock is not None
+    assert not stale.exists(), "the crash leftover is swept on acquire"
+    later = state / "kg_reviewer.lock.hb.999998.cafebabe"
+    later.write_text("{}", encoding="utf-8")
+    res.lock.release()
+    assert not later.exists(), "and again on release"

@@ -735,6 +735,13 @@ def _review_pass(args: argparse.Namespace, log: Callable[[str], None],
     model = decision["model"]
     started = time.time()
     if decision["mode"] == "skip":
+        # No rung can run (review V02105-DS N3): the caller treats exit 0 as
+        # "covered" and ACKS this pass's commits, so each one leaves a
+        # per-commit line - the queue must not swallow them silently.
+        for c in (commit,) + also_commits:
+            log(f"{c.short} not reviewed: no reviewer rung available - "
+                f"acknowledged (a later run does not sit in the queue "
+                f"waiting for it)")
         return 0
     # The citing scan and the proven foldable sections are computed ONCE
     # (at this moment's HEAD) and handed to BOTH the prompt and the guard,
@@ -994,8 +1001,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
             reviewed.add(own)
         else:
             # The backend just failed; the queue waits for the next run
-            # rather than being run against a failing backend now (a
-            # successor's own commit is itself queued: one failure counted).
+            # rather than being run against a failing backend now. The own
+            # commit is normally not queued at all, so record_failure counts
+            # nothing for it; a queued copy keeps its failed-pass count.
             failed = True
             _queue.record_failure(root, [own], log)
         for _ in range(MAX_PASSES_PER_RUN - 1):
@@ -1020,6 +1028,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 failed = True
                 break
     finally:
+        if own in reviewed:
+            # A retried hook can have queued the run's OWN commit earlier.
+            # The loop breaks on `lock.lost` before `_next_batch` (whose
+            # done-ack would remove it), so ack it here: otherwise the
+            # successor reviews the same commit a second time (review
+            # V02105-DS N4). Not queued = a no-op (ack is a filter).
+            _queue.ack(root, [own], log)
         lock.release()
     # Commits still queued after this process's pass budget (or a failed
     # pass): one detached successor takes them; they STAY in the queue, so

@@ -864,9 +864,35 @@ _TRAIL_LINE_RE = re.compile(
 _SECTION_END_RE = re.compile(r"^ {0,3}#{1,2}(?:\s|$)")
 #: A foreign (non-reviewer) line at least this long marks every new line
 #: that CONTAINS it as foreign too (an annotated or quoted owner line);
-#: shorter ones only by equality (a "---" rule must not taint every line).
+#: shorter ones are matched as WHOLE TOKEN RUNS (:func:`_word_bounded`) or
+#: by equality (a "---" rule must not taint every line on a bare substring).
 _FOREIGN_CONTAINS_MIN = 12
+#: A shorter foreign line is matched only when it appears as a whole token
+#: run of a new line, so an owner line the reviewer absorbed and REORDERED
+#: (the in-order matcher then never reaches it) is still caught, while the
+#: same characters inside a longer word ("Reuse 5m." for "Use 5m.") are
+#: not. Lines below this length stay equality-only: they are too generic
+#: ("OK", "1.") to mark prose on a boundary match.
+_FOREIGN_SHORT_MIN = 4
 _WS_RE = re.compile(r"\s+")
+
+
+def _word_bounded(needle: str, line: str) -> bool:
+    """``needle`` occurs in ``line`` as a whole token run — bounded on both
+    sides by a non-word character or a line end."""
+    start = line.find(needle)
+    while start != -1:
+        end = start + len(needle)
+
+        def _boundary(i: int) -> bool:
+            ch = line[i]
+            return not (ch.isalnum() or ch == "_")
+
+        if (start == 0 or _boundary(start - 1)) and (
+                end == len(line) or _boundary(end)):
+            return True
+        start = line.find(needle, start + 1)
+    return False
 
 
 @dataclass(frozen=True)
@@ -1031,8 +1057,12 @@ def reviewer_originated_sections(base: Optional[str], new: str,
     maps that base line to, every new line equal to one, and every new line
     containing one of at least :data:`_FOREIGN_CONTAINS_MIN` characters (an
     owner line the reviewer annotated, quoted or enclosed under a new
-    heading). A section holding even one foreign line is not recorded, so a
-    reviewer edit can never launder the owner's text into foldable text."""
+    heading) — or carrying a shorter one as a WHOLE TOKEN RUN, so an owner
+    line absorbed into a longer line and reordered out of the in-order
+    matcher's reach is still caught (:data:`_FOREIGN_SHORT_MIN`; below it
+    only equality applies). A section holding even one foreign line is not
+    recorded, so a reviewer edit can never launder the owner's text into
+    foldable text."""
     new_body = _split_frontmatter(new.replace("\r\n", "\n"))[1]
     post = _body_lines(new_body)
     foreign: Set[int] = set()
@@ -1055,9 +1085,14 @@ def reviewer_originated_sections(base: Optional[str], new: str,
                 j = k + 1
         exact = set(needles)
         long_needles = [n for n in exact if len(n) >= _FOREIGN_CONTAINS_MIN]
+        short_needles = [n for n in exact
+                         if _FOREIGN_SHORT_MIN <= len(n) < _FOREIGN_CONTAINS_MIN]
         for k, line in enumerate(post):
             n = _needle(line)
-            if n and (n in exact or any(f in collapsed[k] for f in long_needles)):
+            if n and (n in exact
+                      or any(f in collapsed[k] for f in long_needles)
+                      or any(_word_bounded(f, collapsed[k])
+                             for f in short_needles)):
                 foreign.add(k)
     return [s for s in reviewer_sections(new)
             if not any(k in foreign for k in range(s.start, s.end)
@@ -2196,12 +2231,14 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         log(f"WARNING: commit {sha[:12]} also contains {', '.join(extra)} "
             f"(added by a git hook?) - review it")
     log(f"committed {sha[:12]}: {', '.join(paths)}")
-    record_provenance(root, sha, paths, log)
+    created = {p for p in paths
+               if snap.pre_bytes(p) == (True, None)}
+    record_provenance(root, sha, paths, log, created=created)
     return sha
 
 
-def record_provenance(root: Path, sha: str, paths: List[str], log: Log
-                      ) -> bool:
+def record_provenance(root: Path, sha: str, paths: List[str], log: Log,
+                      created: "Optional[Set[str]]" = None) -> bool:
     """Ledger the reviewer sections commit ``sha`` (the reviewer's own,
     just made) holds in each of ``paths`` (v0.2.105, review V02105-KGREV2
     H1/H2/M1): every section :func:`reviewer_originated_sections` proves the
@@ -2210,10 +2247,18 @@ def record_provenance(root: Path, sha: str, paths: List[str], log: Log
     section it left untouched (that one keeps its ORIGINAL commit) — with
     its digest, in :mod:`vco_lib.kg_reviewer_provenance`. Read from the
     COMMITTED blobs, so what is ledgered is exactly what is in history.
-    ``False`` (logged) when it could not be recorded: those sections then
-    stay append-only. Never raises."""
+
+    ``created`` names the paths the reviewer CREATED in this run (absent
+    when the run started). A node whose parent commit has no blob for its
+    path is only ledgered when it is one of those: an owner-created node
+    that was never committed (the project's KG sync writes it to disk at
+    once; ``/knowledge/`` is gitignored in some trees) has no base to
+    compare against, so its sections are the OWNER's and are never recorded
+    (review V02105-DS N2). ``False`` (logged) when it could not be
+    recorded: those sections then stay append-only. Never raises."""
     from vco_lib import kg_reviewer_provenance as _prov
 
+    created = created or set()
     parent_proc = _git(root, "rev-parse", "--verify", "--quiet", f"{sha}^")
     parent = (parent_proc.stdout.decode().strip()
               if parent_proc.returncode == 0 else None)
@@ -2230,6 +2275,11 @@ def record_provenance(root: Path, sha: str, paths: List[str], log: Log
                 prev = _git(root, "cat-file", "blob", f"{parent}:./{p}")
                 if prev.returncode == 0:
                     base_bytes = prev.stdout
+            if base_bytes is None and p not in created:
+                log(f"provenance NOT recorded for {p} in {sha[:12]}: it was "
+                    f"untracked before this run and the reviewer did not "
+                    f"create it, so its sections stay append-only")
+                continue
             base_proven = proven_sections(root, p, base_bytes, parent, log)
             kept_commit: Dict[str, str] = {}
             for e in _prov.entries_for(root, p, log):
