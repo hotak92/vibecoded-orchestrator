@@ -176,17 +176,27 @@ def test_a_takeover_rechecks_what_it_claimed(repo, monkeypatch):
 
 
 def test_concurrent_takeovers_admit_exactly_one(repo, monkeypatch):
-    """H5: eight contenders all see the same stale lock; the judging step is
-    slowed to widen the window. Exactly one acquires."""
+    """H5: eight contenders race for the same stale lock. Judging is slowed
+    (so every contender could judge the SAME stale bytes) and each claim is
+    staggered (contender i claims i*30 ms later — after an earlier one has
+    already created its fresh lock). Exactly one acquires: the others either
+    wait on the ops lock and then see a live lock, or re-read what they
+    claimed and put it back."""
     _write_lock(repo, {"pid": _dead_pid(), "token": "stale",
                        "heartbeat": time.time()})
     real_gone = q._holder_gone
+    real_claim = q.claim_by_rename
 
     def slow_gone(*a, **k):
         time.sleep(0.05)
         return real_gone(*a, **k)
 
+    def staggered_claim(path, mark):
+        time.sleep(0.03 * int(threading.current_thread().name.split("-")[-1]))
+        return real_claim(path, mark)
+
     monkeypatch.setattr(q, "_holder_gone", slow_gone)
+    monkeypatch.setattr(q, "claim_by_rename", staggered_claim)
     barrier = threading.Barrier(8)
     results: List[str] = []
 
@@ -194,7 +204,8 @@ def test_concurrent_takeovers_admit_exactly_one(repo, monkeypatch):
         barrier.wait()
         results.append(q.acquire(repo).status)
 
-    threads = [threading.Thread(target=contend) for _ in range(8)]
+    threads = [threading.Thread(target=contend, name=f"contender-{i}")
+               for i in range(8)]
     for t in threads:
         t.start()
     for t in threads:
