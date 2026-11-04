@@ -11,12 +11,15 @@ script owns everything else (one home): the commit capture and prompt
 run (:mod:`vco_lib.kg_reviewer_guard`: snapshot, post-run validator, isolated
 ``kg-sync:`` commit).
 
-v0.2.105 L-KGREV2 — at most ONE review runs per project at a time: a run
-that finds another in flight queues its commit
-(:mod:`vco_lib.kg_reviewer_queue`) and exits, and the holder drains the
-queue when its pass ends, one pass covering every queued commit (each is
-named in its prompt). Bounded per process
-(:data:`MAX_PASSES_PER_RUN`), and no commit is ever dropped.
+v0.2.105 — at most ONE review runs per project at a time: a run that finds
+another in flight queues its commit (:mod:`vco_lib.kg_reviewer_queue`) and
+exits, and the holder covers the queue when its pass ends — one pass per up
+to ``[prompt] coalesced_max`` queued commits, each given with its stat and
+diff, the citing-node scan run over all of their changed files. A queued
+commit leaves the queue only once a pass covering it succeeded, or by a
+LOGGED drop (a reviewer commit, an unreadable sha, repeated failures, the
+queue bound). Bounded per process (:data:`MAX_PASSES_PER_RUN`, then one
+detached successor).
 
 Model chain (owner rulings 2026-10-11, revised 2026-10-15):
 
@@ -710,11 +713,13 @@ def run_with_quota_fallback(
 
 def _review_pass(args: argparse.Namespace, log: Callable[[str], None],
                  root: Path, rev: str,
-                 also: "tuple[str, ...]" = ()) -> int:
+                 also: "tuple[Any, ...]" = ()) -> int:
     """One guarded review of ONE commit (the pre-v0.2.105 ``_cmd_run``
-    body). ``also`` names further unreviewed commits coalesced into this
-    pass (v0.2.105 L-KGREV2): they are listed in the prompt, so one pass
-    covers them. Returns the run's exit code."""
+    body). ``also`` (v0.2.105) is the further unreviewed commits
+    (:class:`vco_lib.kg_reviewer_prompt.CommitInfo`) coalesced into this
+    pass: each is given with its stat and diff, the citing scan covers
+    their changed paths, and their diffs count as read for the guard's
+    evidence rule. Returns the run's exit code."""
     try:
         commit = _prompt.collect_commit(root, rev)
     except Exception as exc:  # noqa: BLE001 — nothing to review, said so
@@ -725,20 +730,22 @@ def _review_pass(args: argparse.Namespace, log: Callable[[str], None],
         log(f"{commit.short} is a reviewer commit ({commit.subject!r}) - "
             f"not reviewed")
         return 0
-    also_commits = []
-    for sha in also:
-        if sha == commit.sha:
-            continue  # the pass's own commit
-        try:
-            also_commits.append(_prompt.collect_commit(root, sha))
-        except Exception as exc:  # noqa: BLE001 — named, never fatal
-            log(f"coalesced commit {sha} cannot be read: {exc}")
+    also_commits = tuple(c for c in also if c.sha != commit.sha)
     decision = select_reviewer_backend(log=log)
     model = decision["model"]
     started = time.time()
     if decision["mode"] == "skip":
         return 0
-    prompt = _prompt.build_prompt(commit, root, also=tuple(also_commits))
+    # The citing scan and the proven foldable sections are computed ONCE
+    # (at this moment's HEAD) and handed to BOTH the prompt and the guard,
+    # so the reviewer is never told one list while the guard judges by
+    # another (review V02105-KGREV2 M4).
+    scan = _prompt.citing_nodes(root, commit.sha,
+                                also=tuple(c.sha for c in also_commits))
+    foldable = (_prompt.foldable_sections(root, scan.entries, "HEAD")
+                if scan.entries else {})
+    prompt = _prompt.build_prompt(commit, root, also=also_commits,
+                                  scan=scan, foldable=foldable)
     if decision["mode"] == "openai":
         try:
             answer = _sb.call_openai(
@@ -819,10 +826,13 @@ def _review_pass(args: argparse.Namespace, log: Callable[[str], None],
         # sourced too) and the commit's own sha and its parent's (a node may
         # cite the commit it reflects).
         sources = "\n".join((_guard.transcript_sources(stdout), commit.stat,
-                             commit.diff, commit.sha, commit.parent))
+                             commit.diff, commit.sha, commit.parent,
+                             *(part for c in also_commits
+                               for part in (c.stat, c.diff, c.sha,
+                                            c.parent))))
         result = _guard.validate(snap, writes, log,
                                  resync=_guard.resync_with(root, log),
-                                 sources=sources)
+                                 sources=sources, foldable=foldable)
         if writes is not None:
             _guard.commit_reviewer_changes(
                 snap, result.kept, reviewer_bytes=result.reviewer_bytes,
@@ -846,9 +856,9 @@ def _review_pass(args: argparse.Namespace, log: Callable[[str], None],
 
 
 #: The most passes ONE backend process runs: its own commit plus coalesced
-#: follow-ups (v0.2.105 L-KGREV2). Anything still queued after that is
-#: handed to a detached successor process, so no commit waits on a single
-#: process's lifetime and no process runs forever.
+#: follow-ups (v0.2.105). Anything still queued after that is handed to a
+#: detached successor process, so no commit waits on a single process's
+#: lifetime and no process runs forever.
 MAX_PASSES_PER_RUN = 4
 
 
@@ -868,65 +878,162 @@ def _spawn_successor(args: argparse.Namespace, log: Callable[[str], None],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as exc:  # noqa: BLE001 — the queue keeps the commit
-        log(f"could not spawn a successor review for {sha}: {exc} - it "
+        log(f"could not spawn a successor review for {sha[:12]}: {exc} - it "
             f"stays queued for the next commit's run")
         return False
     return True
 
 
+def _resolve_sha(root: Path, rev: str) -> str:
+    """``rev`` as a full commit sha (``rev`` itself when git cannot)."""
+    try:
+        return _prompt._git(root, "rev-parse", "--verify",
+                            f"{rev}^{{commit}}").strip() or rev
+    except Exception:  # noqa: BLE001 — the caller logs what it cannot read
+        return rev
+
+
+def _is_reviewer_sha(root: Path, sha: str) -> "Optional[bool]":
+    """True for a ``kg-sync:`` commit, False for any other, ``None`` when
+    the commit cannot be read."""
+    try:
+        subject = _prompt._git(root, "log", "-1", "--format=%s", sha).strip()
+    except Exception:  # noqa: BLE001
+        return None
+    return _guard.is_reviewer_commit_subject(subject)
+
+
+def _next_batch(root: Path, log: Callable[[str], None],
+                reviewed: "set[str]") -> "Optional[list[Any]]":
+    """The next coalesced batch, oldest first, at most ``[prompt]
+    coalesced_max`` readable, non-reviewer commits (review V02105-KGREV2
+    M2 / L2 / L3): queued commits this process already reviewed
+    successfully are acknowledged, reviewer commits and shas git cannot
+    read are dropped (each logged), and everything past the batch STAYS
+    queued. ``None`` when the queue cannot be read (logged); ``[]`` when
+    nothing is left."""
+    items = _queue.peek(root, log)
+    if items is None:
+        return None
+    done = [i.sha for i in items if i.sha in reviewed]
+    if done:
+        _queue.ack(root, done, log)
+    batch: "list[Any]" = []
+    cap = _prompt.coalesced_max()
+    for item in items:
+        if item.sha in reviewed:
+            continue
+        if len(batch) >= cap:
+            break
+        kind = _is_reviewer_sha(root, item.sha)
+        if kind is None:
+            _queue.ack(root, [item.sha], log,
+                       why="git cannot read this commit any more (rewritten "
+                           "or garbage-collected) - it cannot be reviewed")
+            continue
+        if kind:
+            _queue.ack(root, [item.sha], log,
+                       why="a reviewer (kg-sync:) commit is never reviewed")
+            continue
+        try:
+            batch.append(_prompt.collect_commit(root, item.sha))
+        except Exception as exc:  # noqa: BLE001 — dropped, said so
+            _queue.ack(root, [item.sha], log,
+                       why=f"its commit cannot be read ({exc})")
+    return batch
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """Run the review for this commit, coalescing the burst around it.
 
-    v0.2.105 L-KGREV2 (owner suggestion): several commits of one session
-    used to spawn several concurrent multi-minute reviews of the same tree
-    (each appending its own superseded ``## Status after`` section). Now at
-    most ONE review runs per project: a run that finds the lock held
-    :func:`enqueue <vco_lib.kg_reviewer_queue.enqueue>`s its commit and
-    exits, and the holder drains the queue when its pass ends — one pass
-    covers every queued commit (each is named in its prompt). Bounded
-    (:data:`MAX_PASSES_PER_RUN` passes per process, then a detached
-    successor); no commit is ever dropped: it either got a pass of its own
-    or is named in one."""
+    v0.2.105 (owner suggestion): several commits of one session used to
+    spawn several concurrent multi-minute reviews of the same tree (each
+    appending its own superseded ``## Status after`` section). Now at most
+    ONE review runs per project (:mod:`vco_lib.kg_reviewer_queue`):
+
+    * the lock is BUSY — this commit joins the queue and the run exits
+      (a reviewer commit is not queued; a queue that cannot be written is
+      reported loudly and this commit is reviewed unlocked, never lost);
+    * the lock cannot be used at all (ERROR) — reported loudly (log,
+      stderr, the session's alert channel) and this commit is reviewed
+      unlocked, the pre-v0.2.105 behaviour;
+    * ACQUIRED — the holder heartbeats the lock, reviews its commit, then
+      covers the queue in passes of up to ``[prompt] coalesced_max``
+      commits (the newest of a batch reviewed, the older ones given with
+      their diffs). A batch leaves the queue only when its pass SUCCEEDED;
+      a failed pass counts a failure and stops this process's loop.
+      Bounded (:data:`MAX_PASSES_PER_RUN` passes, then one detached
+      successor for what is still queued)."""
     log = _file_logger(args.log)
     root = _project_root(args.project_root)
-    if not _queue.acquire(root, log=log):
-        sha = args.commit or "HEAD"
-        try:
-            sha = _prompt._git(root, "rev-parse", "--verify",
-                               f"{sha}^{{commit}}").strip() or sha
-        except Exception:  # noqa: BLE001 — enqueue what the hook named
-            pass
-        _queue.enqueue(root, sha, log=log)
-        log(f"another KG review is already running for this project - "
-            f"{sha[:12]} joins its queue; that review covers it when its "
-            f"current pass ends")
+    own = _resolve_sha(root, args.commit or "HEAD")
+    if _is_reviewer_sha(root, own):
+        log(f"{own[:12]} is a reviewer commit - not reviewed")
         return 0
+    res = _queue.acquire(root, log=log)
+    if res.status == _queue.BUSY:
+        if _queue.enqueue(root, own, log=log):
+            log(f"another KG review is already running for this project "
+                f"({res.detail}) - {own[:12]} joins its queue; a later pass "
+                f"of that review covers it")
+            return 0
+        _queue.report_error(root, getattr(args, "session_id", ""),
+                            f"could not queue {own[:12]}", log)
+        return _review_pass(args, log, root, own)
+    if res.status == _queue.ERROR or res.lock is None:
+        _queue.report_error(root, getattr(args, "session_id", ""),
+                            res.detail, log)
+        return _review_pass(args, log, root, own)
+    lock = res.lock
+    lock.start_heartbeat()
+    reviewed: "set[str]" = set()
+    failed = False
     try:
-        exit_code = _review_pass(args, log, root, args.commit or "HEAD")
+        exit_code = _review_pass(args, log, root, own)
+        if exit_code == 0:
+            reviewed.add(own)
+        else:
+            # The backend just failed; the queue waits for the next run
+            # rather than being run against a failing backend now (a
+            # successor's own commit is itself queued: one failure counted).
+            failed = True
+            _queue.record_failure(root, [own], log)
         for _ in range(MAX_PASSES_PER_RUN - 1):
-            queued = _queue.drain(root)
-            if not queued:
+            if lock.lost or failed:
                 break
-            newest = queued[-1]
-            log(f"coalescing {len(queued)} commit(s) that arrived while "
-                f"this review ran - one further pass covers them, newest "
-                f"{newest[:12]}")
-            exit_code = _review_pass(args, log, root, newest,
-                                     also=tuple(queued[:-1]))
+            batch = _next_batch(root, log, reviewed)
+            if not batch:
+                break
+            newest = batch[-1]
+            log(f"coalescing {len(batch)} queued commit(s) into one pass - "
+                f"newest {newest.short}")
+            exit_code = _review_pass(args, log, root, newest.sha,
+                                     also=tuple(batch[:-1]))
+            shas = [c.sha for c in batch]
+            if exit_code == 0:
+                reviewed.update(shas)
+                _queue.ack(root, shas, log)
+            else:
+                log(f"the coalesced pass exited {exit_code} - its "
+                    f"{len(shas)} commit(s) stay queued for a later run")
+                _queue.record_failure(root, shas, log)
+                failed = True
+                break
     finally:
-        _queue.release(root)
-    # Commits that arrived during the very last pass this process could
-    # run: hand them to a successor rather than dropping them. Re-queued
-    # first, so a successor that loses the lock race re-joins the queue
-    # instead of disappearing.
-    rest = _queue.drain(root)
-    if rest:
-        newest = rest[-1]
-        for sha in rest[:-1]:
-            _queue.enqueue(root, sha, log=log)
-        if _spawn_successor(args, log, root, newest):
-            log(f"pass budget reached with {len(rest)} commit(s) still "
-                f"queued - spawned a successor review for {newest[:12]}")
+        lock.release()
+    # Commits still queued after this process's pass budget (or a failed
+    # pass): one detached successor takes them; they STAY in the queue, so
+    # a successor that loses the lock race (or never starts) loses nothing.
+    rest = _queue.peek(root, log) or []
+    rest = [i for i in rest if i.sha not in reviewed]
+    if rest and (failed or lock.lost):
+        log(f"{len(rest)} commit(s) stay queued for the next commit's "
+            f"review run")
+    elif rest:
+        newest_sha = rest[-1].sha
+        if _spawn_successor(args, log, root, newest_sha):
+            log(f"{len(rest)} commit(s) still queued - spawned a successor "
+                f"review starting at {newest_sha[:12]}")
     return exit_code
 
 

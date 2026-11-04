@@ -54,11 +54,12 @@ hybrid_search, and nothing recorded which revision a node reflected):
   <short-sha>``" block is APPENDED (append-and-annotate — superseded lines
   kept and marked in place, never deleted or reworded; locked nodes take
   their Proposed-change section instead), EXCEPT where the backend lists a
-  node's earlier reviewer Status sections as foldable (v0.2.105 L-KGREV2,
-  :func:`foldable_sections`): those blame-proven sections may be folded
-  into one "``## Current state (consolidated <date>)``" section with a
-  ``Superseded:`` trail, still-valid facts carried over (the guard
-  enforces the trail mechanically). Reconciled with the
+  node's earlier reviewer sections as foldable (v0.2.105,
+  :func:`foldable_sections`): those PROVEN sections (the provenance ledger
+  the reviewer's own commits record) may be folded into one
+  "``## Current state (consolidated <date>)``" section, every still-valid
+  fact carried over and every dropped one named on a ``Superseded:`` trail
+  line (the guard enforces both per fact). Reconciled with the
   no-status-tracking-nodes rule: a Status-after block annotates an EXISTING
   node with one concrete change — it is not a status-tracking node.
 
@@ -77,19 +78,20 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from vco_lib.kg_reviewer_guard import (
+    CURRENT_STATE_HEADING_PREFIX,
     STATUS_HEADING_PREFIX,
     ReplaceableSection,
     _parse_fm,
     _split_frontmatter,
     lock_reason,
-    replaceable_sections_for,
+    proven_sections,
     walk_no_follow,
 )
 from vco_lib.kg_reviewer_model import config
 
 __all__ = ["CommitInfo", "collect_commit", "changed_paths",
            "PathCiters", "CitingScan", "citing_nodes", "build_prompt",
-           "foldable_sections"]
+           "foldable_sections", "coalesced_max"]
 
 
 @dataclass(frozen=True)
@@ -282,7 +284,8 @@ def _citer_pattern(needles: "List[str]") -> "re.Pattern[str]":
                       rf"(?![\w/\\-])(?!\.[\w/\\-])")
 
 
-def citing_nodes(project_root: Path, sha: str) -> CitingScan:
+def citing_nodes(project_root: Path, sha: str,
+                 also: "Tuple[str, ...]" = ()) -> CitingScan:
     """The ``knowledge/**/*.md`` nodes whose text CITES a path ``sha``
     changed, GROUPED per changed path (:class:`CitingScan`).
 
@@ -309,7 +312,13 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
     files over ``[prompt] citing_nodes_max_bytes`` are skipped. A shallow
     clone whose commit has no parent object cannot know its changed paths
     (every tracked file would count as changed): ``unknown=True``,
-    nothing scanned."""
+    nothing scanned.
+
+    ``also`` (v0.2.105, review V02105-KGREV2 M5) names the further commits a
+    coalesced pass covers: their changed paths join ``sha``'s (``sha``'s
+    first, then each one's in order, de-duplicated), so a node citing a file
+    only an older coalesced commit changed is surfaced too. A coalesced
+    commit whose changed paths cannot be determined adds none."""
     cfg = config()["prompt"]
     cap = int(cfg["citing_nodes_max"])
     max_bytes = int(cfg["citing_nodes_max_bytes"])
@@ -319,8 +328,21 @@ def citing_nodes(project_root: Path, sha: str) -> CitingScan:
     if not has_parent and _is_shallow(project_root):
         return CitingScan(entries=(), unknown=True)
     prefix = _show_prefix(project_root)
+    rels: List[str] = list(changed_paths(project_root, sha,
+                                         has_parent=has_parent))
+    for other in also:
+        try:
+            other_parent = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", f"{other}~1"],
+                cwd=project_root, capture_output=True).returncode == 0
+            if not other_parent and _is_shallow(project_root):
+                continue
+            more = changed_paths(project_root, other, has_parent=other_parent)
+        except (RuntimeError, OSError):
+            continue
+        rels += [r for r in more if r not in rels]
     patterns = []
-    for rel in changed_paths(project_root, sha, has_parent=has_parent):
+    for rel in dict.fromkeys(rels):
         needles = _citer_needles(rel, project_root, prefix)
         patterns.append((rel, needles, _citer_pattern(needles)))
     if not patterns:
@@ -398,19 +420,23 @@ _LINE_SEPS = "\x85\u2028\u2029"
 
 def foldable_sections(project_root: Path, entries: "Tuple[PathCiters, ...]",
                       rev: str) -> "Dict[str, List[ReplaceableSection]]":
-    """The blame-proven reviewer sections of every node the citing scan
-    SHOWED \u2014 what the prompt lists as foldable (v0.2.105 L-KGREV2).
+    """The PROVEN reviewer sections of every node the citing scan SHOWED —
+    what the prompt lists as foldable (v0.2.105).
 
-    ONE batch blame per shown node (bounded: the citing list itself is
-    capped), through the guard's ONE provenance home
-    (:func:`vco_lib.kg_reviewer_guard.replaceable_sections_for`). A node
-    with no replaceable section, one whose blame cannot answer, a symlink,
-    an unreadable file \u2014 all simply stay absent, which leaves the node to
-    the append branch: provenance is computed by the backend, never decided
-    by the model."""
+    Proven through the guard's ONE provenance home
+    (:func:`vco_lib.kg_reviewer_guard.proven_sections`: the provenance
+    ledger, at ``rev``). The backend computes this ONCE per pass and hands
+    the same dict to the guard (``validate(foldable=...)``), so what the
+    reviewer is told and what the guard allows cannot diverge (review
+    V02105-KGREV2 M4). A node with no proven section, a symlink, an
+    unreadable file — all simply stay absent, which leaves the node to the
+    append branch: provenance is computed by the backend, never decided by
+    the model."""
     out: "Dict[str, List[ReplaceableSection]]" = {}
     for entry in entries:
         for rel in entry.nodes:
+            if rel in out:
+                continue
             path = project_root / rel
             try:
                 if path.is_symlink():
@@ -419,9 +445,8 @@ def foldable_sections(project_root: Path, entries: "Tuple[PathCiters, ...]",
             except OSError:
                 continue
             try:
-                sections = replaceable_sections_for(project_root, rel,
-                                                    data, rev)
-            except Exception:  # noqa: BLE001 \u2014 a foldable listing is advice
+                sections = proven_sections(project_root, rel, data, rev)
+            except Exception:  # noqa: BLE001 — a foldable listing is advice
                 continue
             if sections:
                 out[rel] = sections
@@ -437,15 +462,67 @@ def _inline(path: str) -> str:
                     else c for c in path).replace("`", "'").strip())
 
 
+def coalesced_max() -> int:
+    """How many coalesced commits ONE pass covers at most (``[prompt]
+    coalesced_max``); the rest stay queued for the next pass."""
+    return max(1, int(config()["prompt"]["coalesced_max"]))
+
+
+def _also_block(also: "Tuple[CommitInfo, ...]") -> str:
+    """The "Also covered by this pass" section: each coalesced commit with
+    its stat AND its diff (review V02105-KGREV2 M5), the diffs sharing ONE
+    budget of ``[prompt] diff_max_chars`` (each is already capped at
+    ``diff_max_lines`` itself), and at most :func:`coalesced_max` commits
+    listed in full — any further ones named by short sha only (L2)."""
+    if not also:
+        return ""
+    cap = coalesced_max()
+    budget = int(config()["prompt"]["diff_max_chars"])
+    parts: List[str] = []
+    for c in also[:cap]:
+        diff = c.diff
+        note = (" (diff truncated - Read the changed files)"
+                if c.diff_truncated else "")
+        if len(diff) > budget:
+            diff = diff[:max(0, budget)].rsplit("\n", 1)[0] if budget > 0 else ""
+            note = (" (diff cut to this prompt's budget for coalesced "
+                    "commits - Read the changed files)")
+        budget -= len(diff)
+        body = f"{diff}\n" if diff else ""
+        parts.append(f"#### `{c.short}` - {_inline(c.subject)}\n{c.stat}\n\n"
+                     f"Diff{note}:\n{body}")
+    rest = also[cap:]
+    more = ""
+    if rest:
+        more = (f"\n(+{len(rest)} further coalesced commit(s) not shown: "
+                + ", ".join(f"`{c.short}`" for c in rest)
+                + " - they are reviewed by a later pass)\n")
+    return (f"\n### Also covered by this pass\n"
+            f"{len(also)} further unreviewed commit(s) were coalesced into "
+            f"this pass (they landed while an earlier review was still "
+            f"running). This ONE pass reviews them all: consider what each "
+            f"changed - their stats and diffs follow, and the citing-node "
+            f"scan below covers the files every one of them changed.\n\n"
+            + "\n".join(parts) + more)
+
+
 def build_prompt(commit: CommitInfo, project_root: Path,
                  today: Optional[str] = None,
-                 also: "Tuple[CommitInfo, ...]" = ()) -> str:
+                 also: "Tuple[CommitInfo, ...]" = (),
+                 scan: Optional[CitingScan] = None,
+                 foldable: "Optional[Dict[str, List[ReplaceableSection]]]" = None
+                 ) -> str:
     """The reviewer prompt for ``commit``. ``today`` (``YYYY-MM-DD``) is the
     date the locked-node "Proposed change" heading must carry.
 
-    ``also`` (v0.2.105 L-KGREV2) names further unreviewed commits coalesced
-    into this pass by the debounce queue: each is listed with its stat, and
-    the prompt tells the reviewer this one pass covers them too."""
+    ``also`` (v0.2.105) names further unreviewed commits coalesced into
+    this pass by the debounce queue: each is listed with its stat and diff,
+    and the citing-node scan covers their changed paths too.
+
+    ``scan`` / ``foldable`` let the backend pass the citing scan and the
+    proven-section list it computed ONCE for the pass (it hands the same
+    ``foldable`` to the guard); ``None`` computes them here (``foldable``
+    at the current HEAD)."""
     import datetime as _dt
 
     guard = config()["guard"]
@@ -469,7 +546,10 @@ def build_prompt(commit: CommitInfo, project_root: Path,
                       f"path `{prefix}x` is the file `x` here.")
     locked_tags = ", ".join(guard["locked_tags"])
     locked_statuses = ", ".join(guard["locked_statuses"])
-    scan = citing_nodes(project_root, commit.sha)
+    if scan is None:
+        scan = (citing_nodes(project_root, commit.sha,
+                             also=tuple(c.sha for c in also))
+                if also else citing_nodes(project_root, commit.sha))
     if scan.unknown:
         citing_block = (
             "The commit's changed-file list could NOT be determined (this "
@@ -511,43 +591,35 @@ def build_prompt(commit: CommitInfo, project_root: Path,
             "The deterministic text scan found no knowledge/ node citing a "
             "path this commit changed (hybrid_search in step 2 is still the "
             "way to find nodes by TOPIC).")
-    # The blame-proven reviewer sections of every SHOWN citing node: what
-    # rule 8's fold branch may touch. Computed by the backend — the model
-    # never decides provenance (v0.2.105 L-KGREV2).
-    foldable = (foldable_sections(project_root, scan.entries, commit.sha)
-                if scan.entries else {})
+    # The PROVEN reviewer sections of every SHOWN citing node: what rule
+    # 8's fold branch may touch. Computed by the backend from the provenance
+    # ledger — the model never decides provenance (v0.2.105).
+    if foldable is None:
+        foldable = (foldable_sections(project_root, scan.entries, "HEAD")
+                    if scan.entries else {})
     if foldable:
         fold_lines = "\n".join(
             f"- `{_inline(rel)}`:\n" + "\n".join(
-                f"  - `{_inline(s.heading)}` (body lines {s.start + 1}-{s.end})"
+                f"  - `{_inline(s.heading)}` (key `{_inline(s.key)}`, body "
+                f"lines {s.start + 1}-{s.end})"
                 for s in sections)
             for rel, sections in sorted(foldable.items()))
         fold_block = (
-            "For the nodes below, the backend PROVED (git blame) that these "
-            f"`{STATUS_HEADING_PREFIX}<sha>` sections were written entirely "
-            "by earlier reviewer runs (`kg-sync:` commits). When this "
-            "commit supersedes what one of them says, you may fold exactly "
-            "these sections per rule 8 - nothing else is foldable, in "
-            "these nodes or in any other:\n"
+            "For the nodes below, the backend PROVED from its provenance "
+            "ledger that these sections are exactly what earlier reviewer "
+            "commits wrote (`" + STATUS_HEADING_PREFIX + "<sha>` and "
+            "`" + CURRENT_STATE_HEADING_PREFIX + "<date>)` sections, "
+            "byte-for-byte unchanged since). When this commit supersedes "
+            "what one of them says, you may fold exactly these sections per "
+            "rule 8 - nothing else is foldable, in these nodes or in any "
+            "other:\n"
             f"{fold_lines}")
     else:
         fold_block = (
             "No foldable reviewer sections: none of the scanned nodes "
-            "carries a blame-proven reviewer section. Rule 8's append "
-            "branch applies everywhere.")
-    if also:
-        also_lines = "\n\n".join(
-            f"#### `{c.short}` - {_inline(c.subject)}\n{c.stat}"
-            for c in also)
-        also_block = (
-            f"\n### Also covered by this pass\n"
-            f"{len(also)} further unreviewed commit(s) were coalesced into "
-            f"this pass (they landed while an earlier review was still "
-            f"running). This ONE pass reviews them all: consider what each "
-            f"changed - the stats below name their files, Read them when a "
-            f"node you edit cites them.\n\n{also_lines}\n")
-    else:
-        also_block = ""
+            "carries a proven reviewer section. Rule 8's append branch "
+            "applies everywhere.")
+    also_block = _also_block(also)
     return f"""You are the post-commit knowledge-graph (KG) reviewer for this project.
 Your ONLY job: keep the KG nodes under {knowledge}/ accurate for what this commit
 changed. You never edit anything outside {knowledge}/ - not docs/, not code,
@@ -629,28 +701,36 @@ not configuration. Edits elsewhere are blocked and reverted.
    - When that node has sections listed under "Reviewer Status sections
      this pass may fold" and this commit supersedes what those sections
      say, CONSOLIDATE them: replace exactly the listed sections with ONE
-     new section at that place in the node,
+     section at that place in the node,
    ## Current state (consolidated {today})
-     stating the CURRENT state of the topic. Old facts not superseded are
-     KEPT - carry every still-valid statement from the folded sections over
-     into the new section (group them, e.g. by Built / Decided /
-     Investigated / Open), drop ONLY the statements a newer commit
-     supersedes, leave everything above the folded sections (the node's
-     original body) untouched, and end the section with the trail - one
-     line per superseded section, keeping any trail lines already there:
-     Superseded: <old short-sha> → {commit.short} ({today})
-     The validator REVERTS the whole write unless every fact line removed
-     from a folded section either survives in the new section or has its
-     section's sha on a `Superseded:` trail line like the one above.
+     stating the CURRENT state of the topic. If one of the listed sections
+     already IS a "Current state (consolidated ...)" section, UPDATE that
+     one (new date in its heading) instead of adding a second. Old facts
+     not superseded are KEPT: copy every still-valid line of the folded
+     sections over VERBATIM (you may add a list marker or a group prefix
+     such as "Built:" / "Decided:" / "Investigated:" / "Open:" before it,
+     never reword it), keep every trail line already there, and leave
+     everything outside the folded sections (the node's original body)
+     untouched. End the section with the trail: one step line per folded
+     section, using the key the list above gives,
+     Superseded: <key> → {commit.short} ({today})
+     and one line per statement you DROP because this commit supersedes
+     it, quoting that statement in full:
+     Superseded: <key> → {commit.short} ({today}): <the dropped statement>
+     The validator REVERTS the whole write when any statement of a folded
+     section is missing from the new text (neither carried over verbatim
+     nor quoted on such a trail line), or a folded section has no step
+     line naming its key.
    - Otherwise APPEND one section at the end of the node:
    ## Status after {commit.short}
    stating what changed and which of the node's statements it supersedes;
    mark superseded lines IN PLACE per rule 10 - never delete or reword
    them.
    You may fold ONLY the sections listed under "Reviewer Status sections
-   this pass may fold" - the backend proved with git blame that those are
-   the reviewer's own; every other line of every node (including sections
-   that merely look like reviewer ones) is append-only. A LOCKED node
+   this pass may fold" - the backend proved from its ledger that those are
+   the reviewer's own, unchanged; every other line of every node
+   (including sections that merely look like reviewer ones) is
+   append-only. A LOCKED node
    (rule 11) takes only the Proposed change section of rule 11 instead.
 9. Never create or update "blocker", "in-progress", "TODO", "investigation"
    or other status-tracking NODES from a commit diff - a single commit is a

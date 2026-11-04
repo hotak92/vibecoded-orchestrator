@@ -64,20 +64,20 @@ the reviewer.
      "~~<line>~~"). Compared after CRLF->LF and trailing-whitespace strip;
      an original line survives verbatim or as a contiguous substring of a
      new line (:func:`removed_lines`); the log names the lost lines.
-     ONE exception (v0.2.105 L-KGREV2, owner request 2026-11-04: a node
-     refined commit after commit collected a CHAIN of "## Status after
-     <sha>" sections, each superseding the last, and readers land on the
-     stale ones first): a write may remove lines from a REPLACEABLE
-     section — a ``## Status after <sha>`` (or rule-11 ``## Proposed
-     change``) section whose EVERY non-blank line ``git blame`` attributes
-     to a reviewer ``kg-sync:`` commit (:func:`blame_reviewer_lines`,
-     :func:`reviewer_sections`; one batch blame per file, bounded) — and
-     only when the new body carries a ``Superseded: <section key> -> ...``
-     trail line naming that section (:func:`trail_keys`). Every other
-     removed or reworded line — the owner's, a mixed section's, an
-     uncommitted line's, or a blame failure's — still reverts the whole
-     write: provenance is PROVEN, never assumed (:data:`UNKNOWN` bytes
-     and uncommitted changes keep the append-only rule);
+     ONE exception (v0.2.105, owner request 2026-11-04: a node refined
+     commit after commit collected a CHAIN of "## Status after <sha>"
+     sections, each superseding the last, and readers land on the stale
+     ones first): a write may FOLD a PROVEN reviewer section — one whose
+     current normalized bytes hash-match the provenance ledger the
+     reviewer's own commits record (:func:`proven_sections`,
+     :func:`record_provenance`, :mod:`vco_lib.kg_reviewer_provenance`) —
+     and only per fact: every line of it must survive in the new body or
+     be named by a new ``Superseded: <key> → <new> (<date>): <fact>`` trail
+     line (:func:`_fold_removals`). Every other removed or reworded line —
+     the owner's, an unproven section's, an uncommitted line's — still
+     reverts the whole write: provenance is RECORDED, never inferred from
+     a commit subject or ``git blame`` (:data:`UNKNOWN` bytes and
+     uncommitted changes keep the append-only rule);
    * a NEW node without frontmatter carrying every
      ``[guard] new_node_required_keys`` key (title, type, tags, created,
      updated, status), or whose title duplicates an existing node's
@@ -212,11 +212,15 @@ __all__ = [
     "new_node_violation",
     "removed_lines",
     "ReplaceableSection",
+    "TrailEntry",
     "STATUS_HEADING_PREFIX",
+    "CURRENT_STATE_HEADING_PREFIX",
     "TRAIL_PREFIX",
-    "blame_reviewer_lines",
+    "parse_trail",
     "reviewer_sections",
-    "replaceable_sections_for",
+    "proven_sections",
+    "reviewer_originated_sections",
+    "record_provenance",
     "trail_keys",
     "validate",
     "commit_reviewer_changes",
@@ -814,167 +818,287 @@ def removed_lines(body_pre: str, body_post: str) -> List[str]:
     return [line for _idx, line in _missing_with_index(body_pre, body_post)]
 
 
-# ── reviewer-owned Status sections (v0.2.105 L-KGREV2) ────────────────────
+# ── reviewer-owned sections (v0.2.105) ───────────────────────────────────
 #
 # The reviewer appends one "## Status after <sha>" section per commit it
 # reviews (prompt rule 8); a decision refined several times in a row collects
 # a CHAIN of them, each superseding the last, and readers and search hits
 # land on the stale statements first. The fix (owner request 2026-11-04): a
 # later reviewer pass may FOLD its own earlier sections into one
-# "## Current state (consolidated <date>)" section. Provenance, not trust:
-# a line is REVIEWER-OWNED only when `git blame` attributes it to a commit
-# whose subject starts with the reviewer's `kg-sync:` prefix — and a section
-# is replaceable only when EVERY non-blank line of it (its heading included)
-# is reviewer-owned. Anything else stays append-only exactly as before.
+# "## Current state (consolidated <date>)" section, carrying every
+# still-true fact over and naming every dropped one as superseded.
+#
+# Provenance is a LEDGER, never an inference (review V02105-KGREV2 H1/H2):
+# when the reviewer's own commit is made, :func:`commit_reviewer_changes`
+# records each section the reviewer ORIGINATED in it
+# (:func:`reviewer_originated_sections`) — the sha256 of the section's
+# normalized bytes plus the commit — in :mod:`vco_lib.kg_reviewer_provenance`.
+# A section is foldable only while its CURRENT bytes hash-match an entry of
+# the same node whose commit is still an ancestor of the reviewed revision
+# (:func:`proven_sections`). An amended or rebased reviewer commit, a user
+# commit titled "kg-sync: ...", a line the owner added inside the section, a
+# CRLF->LF rewrite of an owner section, an owner line the reviewer annotated:
+# none of them yields a matching entry, so none of them is foldable.
 
 #: The heading prefix of a reviewer Status section (prompt rule 8). ONE
 #: home: the prompt builder renders its Status headings from this.
 STATUS_HEADING_PREFIX = "## Status after "
-#: The one-line-per-step trail a consolidation write must carry, naming each
-#: section it folds: ``Superseded: <old key> → <new key> (<date>)`` (an
-#: ASCII ``->`` arrow is accepted too).
+#: The heading prefix of the consolidated section a fold writes (rule 8).
+CURRENT_STATE_HEADING_PREFIX = "## Current state (consolidated "
+#: The trail a fold carries, one line per step and one per dropped fact:
+#: ``Superseded: <old key> → <new key> (<date>)`` names a folded section;
+#: ``Superseded: <old key> → <new key> (<date>): <fact text>`` names one
+#: dropped statement of that section (an ASCII ``->`` arrow is accepted).
 TRAIL_PREFIX = "Superseded:"
 
 _STATUS_HEADING_RE = re.compile(
-    r"^## Status after ([0-9A-Za-z][0-9A-Za-z.-]{2,39})\s*$")
+    r"^## Status after ([0-9A-Za-z][0-9A-Za-z.-]{2,39})$")
+_CURRENT_HEADING_RE = re.compile(
+    r"^## Current state \(consolidated (\d{4}-\d{2}-\d{2})\)$")
 _TRAIL_LINE_RE = re.compile(
-    r"^\s*Superseded:\s*([0-9A-Za-z][\w.-]*)\s*(?:→|->)", re.MULTILINE)
-#: One ``git blame --porcelain`` header: ``<40-hex sha> <orig> <final>
-#: [<num>]`` (every file line gets one; the commit's metadata block follows
-#: the header only the FIRST time a sha appears).
-_BLAME_HEADER_RE = re.compile(r"^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$")
-_BLAME_SUMMARY_RE = re.compile(r"^summary (.*)$")
-
-
-def trail_keys(body_post: str) -> Set[str]:
-    """The section keys the new body's ``Superseded:`` trail lines name (the
-    old side of each step). A removed line from a replaceable section is
-    justified only by its section's key appearing here."""
-    return {m.group(1) for m in _TRAIL_LINE_RE.finditer(body_post)}
+    r"^(?:[-*+]\s+)?Superseded:\s*(?P<old>[0-9A-Za-z][\w.-]*)\s*(?:→|->)\s*"
+    r"(?P<new>[0-9A-Za-z][\w.-]*)(?:\s*\((?P<date>[^)]*)\))?"
+    r"(?:\s*:\s*(?P<fact>.*\S))?$")
+#: A section ends at the next level-1/2 ATX heading (outside a code fence),
+#: so a "### Built" sub-heading belongs to the section it groups.
+_SECTION_END_RE = re.compile(r"^ {0,3}#{1,2}(?:\s|$)")
+#: A foreign (non-reviewer) line at least this long marks every new line
+#: that CONTAINS it as foreign too (an annotated or quoted owner line);
+#: shorter ones only by equality (a "---" rule must not taint every line).
+_FOREIGN_CONTAINS_MIN = 12
+_WS_RE = re.compile(r"\s+")
 
 
 @dataclass(frozen=True)
 class ReplaceableSection:
-    """A reviewer Status / Proposed-change section whose every non-blank line
-    is blame-proven reviewer work — the only text a later reviewer write may
-    remove (and only under a trail line naming :attr:`key`)."""
+    """A reviewer section of a node: a ``## Status after <sha>``, a rule-11
+    ``## Proposed change (kg-reviewer, <date>)`` or a ``## Current state
+    (consolidated <date>)`` heading and its lines up to the next level-1/2
+    heading. Foldable only when :func:`proven_sections` returns it."""
 
     #: body line index of the section heading (0-based).
     start: int
     #: exclusive body line index of the section's end.
     end: int
-    #: what a ``Superseded:`` trail line must name to fold it: the sha a
-    #: ``## Status after <sha>`` heading carries (or a Proposed-change
-    #: section's date).
+    #: what a ``Superseded:`` trail line names to fold it: the sha of a
+    #: Status heading, the date of a Proposed-change heading, the NEW key of
+    #: the last trail line of a Current-state section (its heading date
+    #: when it carries none).
     key: str
     #: the heading line, as the prompt lists it.
     heading: str
+    #: ``status`` / ``proposed`` / ``current``.
+    kind: str = "status"
+    #: :func:`vco_lib.kg_reviewer_provenance.section_digest` of its lines.
+    digest: str = ""
 
 
-def blame_reviewer_lines(root: Path, rel: str, data: bytes,
-                         rev: Optional[str]) -> Optional[Set[int]]:
-    """The WHOLE-FILE line indices (0-based, CRLF read as LF) that
-    ``git blame`` attributes to the reviewer's own ``kg-sync:`` commits, in
-    the file as ``rev`` has it; ``None`` when blame cannot answer (no rev,
-    a git failure, the path unknown to that rev) — the caller then keeps the
-    append-only rule.
+@dataclass(frozen=True)
+class TrailEntry:
+    """One parsed ``Superseded:`` line."""
 
-    ONE batch blame per file (bounded cost). The blame describes the
-    COMMITTED file, while ``data`` is the bytes the run started from; when
-    the two differ (uncommitted changes) the sets are aligned INDEX BY INDEX
-    and only indices whose text still matches keep their provenance — an
-    inserted or deleted line shifts everything after it to "not owned",
-    which is the conservative direction (an owner line is never mistaken
-    for the reviewer's; uncommitted reviewer lines are provably nobody's
-    here and stay append-only)."""
-    if not rev:
+    old: str
+    new: str
+    date: str
+    #: the dropped fact it names, whitespace-collapsed ("" = a step line).
+    fact: str
+
+
+def _collapse(text: str) -> str:
+    return _WS_RE.sub(" ", text).strip()
+
+
+def _needle(line: str) -> str:
+    """A line's TEXT for matching: list/quote marker dropped, whitespace
+    collapsed (the same marker rule as :func:`_missing_with_index`)."""
+    return _collapse(_LINE_MARKER.sub("", line.strip(), count=1))
+
+
+def parse_trail(line: str) -> Optional[TrailEntry]:
+    """The trail entry a body line carries, or ``None``."""
+    m = _TRAIL_LINE_RE.match(line.strip())
+    if m is None:
         return None
-    proc = _git(root, "blame", "--porcelain", rev, "--", f"./{rel}",
-                timeout=60)
-    if proc.returncode != 0:
-        return None
-    try:
-        text = proc.stdout.decode("utf-8", errors="replace")
-    except UnicodeDecodeError:  # pragma: no cover — surrogate-free decode
-        return None
-    reviewer: Dict[str, bool] = {}
-    owned: Set[int] = set()
-    blamed_lines: List[str] = []
-    cur_sha = ""
-    cur_owned = False
-    for line in text.split("\n"):
-        if line.startswith("\t"):
-            blamed_lines.append(line[1:].rstrip())
-            if cur_owned:
-                owned.add(len(blamed_lines) - 1)
-            continue
-        m = _BLAME_HEADER_RE.match(line)
-        if m:
-            cur_sha = m.group(1)
-            cur_owned = reviewer.get(cur_sha, False)
-            continue
-        m = _BLAME_SUMMARY_RE.match(line)
-        if m and cur_sha and cur_sha not in reviewer:
-            reviewer[cur_sha] = is_reviewer_commit_subject(m.group(1))
-            cur_owned = reviewer[cur_sha]
-    # Align with the bytes the run actually started from.
-    cur_lines = _body_lines(data.decode("utf-8", errors="replace"))
-    if len(cur_lines) == len(blamed_lines) and all(
-            a.rstrip() == b for a, b in zip(cur_lines, blamed_lines)):
-        return owned
-    return {i for i in owned
-            if i < len(cur_lines) and i < len(blamed_lines)
-            and cur_lines[i].rstrip() == blamed_lines[i]}
+    return TrailEntry(m.group("old"), m.group("new"), m.group("date") or "",
+                      _collapse(m.group("fact") or ""))
 
 
-def reviewer_sections(text: str, owned_file_lines: Set[int]
-                      ) -> List[ReplaceableSection]:
-    """The reviewer sections of a node whose EVERY non-blank line is in
-    ``owned_file_lines`` (whole-file line indices, as
-    :func:`blame_reviewer_lines` returns them).
+def trail_keys(body_post: str) -> Set[str]:
+    """The section keys the body's ``Superseded:`` trail lines name (the old
+    side of each step)."""
+    return {t.old for line in _body_lines(body_post)
+            for t in [parse_trail(line)] if t is not None}
 
-    A reviewer section is a ``## Status after <sha>`` heading (its key is
-    the sha) or a rule-11 ``## Proposed change (kg-reviewer, <date>)``
-    heading (its key is the date), extending to the next Markdown heading
-    or the end of the body. Sections with a hole in their provenance (one
-    owner or uncommitted line) are simply absent from the list — they stay
-    append-only."""
-    fm_raw, body = _split_frontmatter(text.replace("\r\n", "\n"))
-    lines = _body_lines(body)
-    offset = len(_body_lines(text)) - len(lines)
-    owned = {i - offset for i in owned_file_lines if i >= offset}
+
+def reviewer_sections(text: str) -> List[ReplaceableSection]:
+    """Every reviewer-shaped section of a node (``text`` CRLF-tolerant),
+    with body line indices (the body below the frontmatter, as
+    :func:`edit_violation` indexes it). Shape only — :func:`proven_sections`
+    decides which are the reviewer's."""
+    from vco_lib.kg_reviewer_provenance import section_digest
+
+    _fm, body = _split_frontmatter(text.replace("\r\n", "\n"))
+    raw = body.split("\n")
+    lines = [line.rstrip() for line in raw]
     proposed = _guard()["proposed_change_heading"]
+    fence = [False] * len(lines)
+    inside = False
+    for i, line in enumerate(lines):
+        if _FENCE.match(line):
+            fence[i] = True
+            inside = not inside
+        elif inside:
+            fence[i] = True
     out: List[ReplaceableSection] = []
     i = 0
     while i < len(lines):
         stripped = lines[i].strip()
-        m = _STATUS_HEADING_RE.match(stripped)
-        if m is None and not stripped.startswith(proposed):
+        if fence[i]:
             i += 1
             continue
-        key = (m.group(1) if m is not None
-               else stripped[len(proposed):].rstrip(") \t").strip())
+        m_status = _STATUS_HEADING_RE.match(stripped)
+        m_current = _CURRENT_HEADING_RE.match(stripped)
+        if m_status is None and m_current is None \
+                and not stripped.startswith(proposed):
+            i += 1
+            continue
         j = i + 1
-        while j < len(lines) and not lines[j].lstrip().startswith("#"):
+        while j < len(lines) and (fence[j] or not _SECTION_END_RE.match(lines[j])):
             j += 1
-        nonblank = [k for k in range(i, j) if lines[k].strip()]
-        if nonblank and all(k in owned for k in nonblank):
-            out.append(ReplaceableSection(i, j, key, stripped))
+        if m_status is not None:
+            kind, key = "status", m_status.group(1)
+        elif m_current is not None:
+            kind, key = "current", m_current.group(1)
+            for k in range(i + 1, j):
+                t = parse_trail(lines[k])
+                if t is not None:
+                    key = t.new
+        else:
+            kind = "proposed"
+            key = stripped[len(proposed):].rstrip(") \t").strip()
+        out.append(ReplaceableSection(i, j, key, stripped, kind,
+                                      section_digest(raw[i:j])))
         i = j
     return out
 
 
-def replaceable_sections_for(root: Path, rel: str, data: bytes,
-                             rev: Optional[str]
-                             ) -> Optional[List[ReplaceableSection]]:
-    """The sections of the node ``rel`` holds in ``data`` that a reviewer
-    write may fold (blame-proven reviewer sections); ``None`` when
-    provenance cannot be established — append-only then, exactly as before."""
-    owned = blame_reviewer_lines(root, rel, data, rev)
-    if owned is None:
-        return None
-    return reviewer_sections(
-        data.decode("utf-8", errors="replace").replace("\r\n", "\n"), owned)
+def _is_ancestor(root: Path, commit: str, rev: str,
+                 cache: Dict[str, bool]) -> bool:
+    if commit not in cache:
+        try:
+            cache[commit] = _git(root, "merge-base", "--is-ancestor", commit,
+                                 rev, timeout=60).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            cache[commit] = False
+    return cache[commit]
+
+
+def proven_sections(root: Path, rel: str, data: Optional[bytes],
+                    rev: Optional[str], log: Optional[Log] = None
+                    ) -> List[ReplaceableSection]:
+    """The sections of node ``rel`` (bytes ``data``) a reviewer write may
+    fold: those whose CURRENT normalized bytes hash-match a provenance
+    ledger entry of this node (:mod:`vco_lib.kg_reviewer_provenance`) whose
+    commit is an ancestor of ``rev``. Anything unproven — no ledger entry,
+    an edited section, a rewritten commit, no ``rev`` — is absent, so it
+    keeps the append-only rule. Never raises."""
+    if not rev or data is None:
+        return []
+    from vco_lib import kg_reviewer_provenance as _prov
+
+    entries = _prov.entries_for(root, rel, log)
+    if not entries:
+        return []
+    commits: Dict[str, List[str]] = {}
+    for e in entries:
+        commits.setdefault(str(e["digest"]), []).append(str(e["commit"]))
+    cache: Dict[str, bool] = {}
+    return [s for s in reviewer_sections(_lf_text(data))
+            if any(_is_ancestor(root, c, rev, cache)
+                   for c in commits.get(s.digest, ()))]
+
+
+def reviewer_originated_sections(base: Optional[str], new: str,
+                                 base_proven: List[ReplaceableSection]
+                                 ) -> List[ReplaceableSection]:
+    """The reviewer sections of ``new`` (a node the reviewer is committing
+    over ``base``, its bytes in the parent commit; ``None`` = a new node)
+    whose EVERY non-blank line the reviewer originated — what
+    :func:`commit_reviewer_changes` records in the provenance ledger.
+
+    A line is FOREIGN when it carries a ``base`` line that was not inside a
+    proven reviewer section: the position the guard's own in-order matcher
+    maps that base line to, every new line equal to one, and every new line
+    containing one of at least :data:`_FOREIGN_CONTAINS_MIN` characters (an
+    owner line the reviewer annotated, quoted or enclosed under a new
+    heading). A section holding even one foreign line is not recorded, so a
+    reviewer edit can never launder the owner's text into foldable text."""
+    new_body = _split_frontmatter(new.replace("\r\n", "\n"))[1]
+    post = _body_lines(new_body)
+    foreign: Set[int] = set()
+    if base is not None:
+        base_body = _split_frontmatter(base.replace("\r\n", "\n"))[1]
+        pre = _body_lines(base_body)
+        inside: Set[int] = set()
+        for s in base_proven:
+            inside.update(range(s.start, s.end))
+        needles = [n for i, line in enumerate(pre) if i not in inside
+                   for n in [_needle(line)] if n]
+        collapsed = [_collapse(line) for line in post]
+        j = 0
+        for n in needles:
+            k = j
+            while k < len(collapsed) and n not in collapsed[k]:
+                k += 1
+            if k < len(collapsed):
+                foreign.add(k)
+                j = k + 1
+        exact = set(needles)
+        long_needles = [n for n in exact if len(n) >= _FOREIGN_CONTAINS_MIN]
+        for k, line in enumerate(post):
+            n = _needle(line)
+            if n and (n in exact or any(f in collapsed[k] for f in long_needles)):
+                foreign.add(k)
+    return [s for s in reviewer_sections(new)
+            if not any(k in foreign for k in range(s.start, s.end)
+                       if post[k].strip())]
+
+
+def _fold_removals(pre_lines: List[str], body_post: str,
+                   sections: List[ReplaceableSection]) -> List[str]:
+    """The lines of proven ``sections`` a write dropped (review
+    V02105-KGREV2 H3 — the owner's "old ones not superseded need to be
+    kept", enforced per FACT, not per section):
+
+    * every non-blank line of a folded section must still be in the new
+      body: its text (list/quote marker aside, whitespace collapsed) a
+      substring of a new line — carried into the consolidated section
+      (regrouped, prefixed "Built:" etc. as the write likes), or QUOTED on
+      the trail line that names it superseded (``Superseded: <key> → <new>
+      (<date>): <the statement>``). A statement can be dropped from the
+      prose only by being named superseded; it can never just vanish;
+    * the one exception is the section's HEADING, which a fold replaces:
+      it needs a trail line NEW in this write naming the section's key
+      (the step line ``Superseded: <key> → <new> (<date>)``).
+
+    Reordering is allowed here (a fold regroups facts); the owner's lines
+    outside the proven sections are still matched in order by
+    :func:`_missing_with_index`."""
+    post_lines = _body_lines(body_post)
+    post_collapsed = [_collapse(line) for line in post_lines]
+    pre_set = set(pre_lines)
+    named = {t.old for line in post_lines if line not in pre_set
+             for t in [parse_trail(line)] if t is not None}
+    out: List[str] = []
+    for s in sections:
+        for i in range(s.start, min(s.end, len(pre_lines))):
+            n = _needle(pre_lines[i])
+            if not n or any(n in p for p in post_collapsed):
+                continue
+            if i == s.start and s.key in named:
+                continue
+            out.append(pre_lines[i].strip())
+    return out
 
 
 def edit_violation(pre: str, post: str,
@@ -982,14 +1106,15 @@ def edit_violation(pre: str, post: str,
                    ) -> Optional[str]:
     """Why an edit of an EXISTING node breaks a rule (``None`` = allowed).
 
-    ``replaceable`` (v0.2.105 L-KGREV2) names this node's blame-proven
-    reviewer sections (:func:`replaceable_sections_for`); a removed line
-    inside one of them is allowed only when the new body's ``Superseded:``
-    trail names that section (:func:`trail_keys`) — the write's declaration
-    that the section's statements are superseded. A removed line anywhere
-    else, or from a section the trail does not name, reverts the write
-    exactly as before. ``None`` (no provenance) keeps the pre-v0.2.105
-    append-only rule."""
+    ``replaceable`` (v0.2.105) names this node's PROVEN reviewer sections
+    (:func:`proven_sections`, the provenance ledger). Their lines are judged
+    per fact by :func:`_fold_removals` — each must survive in the new body
+    or be named by a new ``Superseded:`` trail line of its section — and
+    every OTHER original line by the plain in-order append-and-annotate
+    matcher, with the proven sections' lines left out of that matching (a
+    fold moves their facts; the owner's lines around them must still
+    survive in order). ``None`` / empty keeps the pre-v0.2.105 append-only
+    rule for the whole body."""
     g = _guard()
     mutable = set(g["frontmatter_mutable_keys"])
     fm_pre_raw, body_pre = _split_frontmatter(pre)
@@ -1017,14 +1142,19 @@ def edit_violation(pre: str, post: str,
                         f"{', '.join(changed)})")
     locked = lock_reason(fm_pre, body_pre)
     if locked is None:
-        missing = _missing_with_index(body_pre, body_post)
-        removed: List[str] = []
-        if missing:
-            sections = replaceable or []
-            keys = trail_keys(body_post) if sections else set()
-            removed = [line for idx, line in missing
-                       if not any(s.start <= idx < s.end and s.key in keys
-                                  for s in sections)]
+        sections = replaceable or []
+        if sections:
+            pre_lines = _body_lines(body_pre)
+            inside: Set[int] = set()
+            for s in sections:
+                inside.update(range(s.start, s.end))
+            masked = "\n".join("" if i in inside else line
+                               for i, line in enumerate(pre_lines))
+            removed = [line for _idx, line
+                       in _missing_with_index(masked, body_post)]
+            removed += _fold_removals(pre_lines, body_post, sections)
+        else:
+            removed = removed_lines(body_pre, body_post)
         if removed:
             shown = "; ".join(repr(_clip(line)) for line in removed[:3])
             more = f" (+{len(removed) - 3} more)" if len(removed) > 3 else ""
@@ -1619,14 +1749,24 @@ Resync = Callable[[List[str], Dict[str, str]], None]
 
 def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
              log: Log, resync: Optional[Resync] = None,
-             *, sources: str) -> ValidationResult:
+             *, sources: str,
+             foldable: "Optional[Dict[str, List[ReplaceableSection]]]" = None
+             ) -> ValidationResult:
     """Revert every rule-breaking change the reviewer PROVABLY made; return
     what survives. ``writes`` is :func:`attributed_writes`; ``None``
     (unattributable run) judges, reverts and keeps NOTHING. ``sources`` is
     what the reviewer read (:func:`transcript_sources` plus the commit diff,
     stat, sha and parent sha it was given): a backticked ``--flag``, an
     evidence-level word or a cited run/commit id a node gains must appear
-    there."""
+    there.
+
+    ``foldable`` (v0.2.105) is the section list the PROMPT showed the
+    reviewer (:func:`vco_lib.kg_reviewer_prompt.foldable_sections`, the same
+    ledger at the prompt's revision): when given, a fold is judged only
+    against the sections that are BOTH listed there and still proven now
+    (:func:`proven_sections` at the snapshot's HEAD) — the guard never
+    allows more than the reviewer was told, and never anything unproven.
+    ``None`` (a caller without a prompt) judges against the proven set."""
     res = ValidationResult()
     if writes is None:
         res.unattributed = True
@@ -1699,13 +1839,16 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
             else:
                 reason = edit_violation(pre_text, post_text)
                 if reason is not None and pre is not None:
-                    # v0.2.105 L-KGREV2: the removals may sit in a
-                    # blame-proven reviewer section. Provenance is computed
-                    # only now (one batch blame per candidate file, bounded)
-                    # and re-judged with it; a blame failure keeps the
-                    # append-only verdict above.
-                    replaceable = replaceable_sections_for(
-                        root, rel, pre, snap.start_head)
+                    # v0.2.105: the removals may sit in a PROVEN reviewer
+                    # section (provenance ledger, computed only now that a
+                    # write removed lines) and are re-judged per fact with
+                    # it; nothing proven keeps the append-only verdict above.
+                    replaceable = proven_sections(root, rel, pre,
+                                                  snap.start_head, log)
+                    if foldable is not None:
+                        listed = {s.digest for s in foldable.get(rel, ())}
+                        replaceable = [s for s in replaceable
+                                       if s.digest in listed]
                     if replaceable:
                         reason = edit_violation(pre_text, post_text,
                                                 replaceable=replaceable)
@@ -2053,7 +2196,59 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         log(f"WARNING: commit {sha[:12]} also contains {', '.join(extra)} "
             f"(added by a git hook?) - review it")
     log(f"committed {sha[:12]}: {', '.join(paths)}")
+    record_provenance(root, sha, paths, log)
     return sha
+
+
+def record_provenance(root: Path, sha: str, paths: List[str], log: Log
+                      ) -> bool:
+    """Ledger the reviewer sections commit ``sha`` (the reviewer's own,
+    just made) holds in each of ``paths`` (v0.2.105, review V02105-KGREV2
+    H1/H2/M1): every section :func:`reviewer_originated_sections` proves the
+    reviewer wrote against the node's bytes in the parent commit — a new
+    Status section, a consolidated Current-state section, an earlier proven
+    section it left untouched (that one keeps its ORIGINAL commit) — with
+    its digest, in :mod:`vco_lib.kg_reviewer_provenance`. Read from the
+    COMMITTED blobs, so what is ledgered is exactly what is in history.
+    ``False`` (logged) when it could not be recorded: those sections then
+    stay append-only. Never raises."""
+    from vco_lib import kg_reviewer_provenance as _prov
+
+    parent_proc = _git(root, "rev-parse", "--verify", "--quiet", f"{sha}^")
+    parent = (parent_proc.stdout.decode().strip()
+              if parent_proc.returncode == 0 else None)
+    out: Dict[str, List[Dict[str, str]]] = {}
+    try:
+        for p in paths:
+            if not p.endswith(".md") or not p.startswith(KNOWLEDGE_DIR + "/"):
+                continue
+            blob = _git(root, "cat-file", "blob", f"{sha}:./{p}")
+            if blob.returncode != 0:
+                continue
+            base_bytes: Optional[bytes] = None
+            if parent:
+                prev = _git(root, "cat-file", "blob", f"{parent}:./{p}")
+                if prev.returncode == 0:
+                    base_bytes = prev.stdout
+            base_proven = proven_sections(root, p, base_bytes, parent, log)
+            kept_commit: Dict[str, str] = {}
+            for e in _prov.entries_for(root, p, log):
+                if any(s.digest == e["digest"] for s in base_proven):
+                    kept_commit.setdefault(str(e["digest"]), str(e["commit"]))
+            secs = reviewer_originated_sections(
+                _lf_text(base_bytes) if base_bytes is not None else None,
+                _lf_text(blob.stdout), base_proven)
+            out[p] = [{"digest": s.digest, "heading": s.heading,
+                       "key": s.key, "kind": s.kind,
+                       "keep_commit": kept_commit.get(s.digest, "")}
+                      for s in secs]
+    except Exception as exc:  # noqa: BLE001 — logged, the safe direction
+        log(f"provenance NOT recorded for {sha[:12]} ({exc}): its reviewer "
+            f"sections stay append-only (never foldable)")
+        return False
+    if not out:
+        return True
+    return _prov.record(root, sha, out, log)
 
 
 def resync_with(project_root: Path, log: Log,
