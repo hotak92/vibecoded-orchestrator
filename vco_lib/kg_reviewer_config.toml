@@ -65,6 +65,11 @@ diff_max_lines = 1200
 diff_max_chars = 120000
 citing_nodes_max = 20
 citing_nodes_max_bytes = 2097152
+# v0.2.105: commits that land while a review runs are queued and one later
+# pass covers several of them. `coalesced_max` caps how many ONE pass covers
+# (each listed with its stat and its diff; the coalesced diffs share one
+# `diff_max_chars` budget); the rest stay queued for the next pass.
+coalesced_max = 8
 
 [guard]
 # Subject prefix of the reviewer's own commits. The hook's reviewer never
