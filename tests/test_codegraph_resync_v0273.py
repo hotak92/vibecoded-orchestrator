@@ -95,6 +95,37 @@ def test_log_filename_sanitizes_project_name(monkeypatch, tmp_path):
     assert "/" not in p.name and ":" not in p.name
 
 
+def test_two_spawns_never_share_a_log_file(monkeypatch, tmp_path):
+    """v0.2.105 fix round (review NIT): the name was second-resolution and
+    the file opens in APPEND mode, so two spawns in the same second shared a
+    log — and the post-walk soft-skip reader could then find the FIRST run's
+    "analysis skipped" line and refuse a walk that actually ran. Every spawn
+    now gets its own file. RED-PROOF: the one-second stamp made these two
+    names equal."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "vct-state"))
+    paths = [cr._resync_log_path("MyProj") for _ in range(50)]
+    assert all(p is not None for p in paths)
+    names = {str(p.name) for p in paths if p is not None}
+    assert len(names) == 50, "each spawn must get its own log file"
+
+
+def test_the_post_walk_reader_sees_only_this_runs_log(monkeypatch, tmp_path):
+    """The reader's contract, driven through the real helpers: a marker in
+    ANOTHER run's file is irrelevant — the caller passes its own spawn's
+    path."""
+    from vco_lib.codegraph_analyzer_outcome import log_says_analysis_skipped
+
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "vct-state"))
+    first = cr._resync_log_path("MyProj")
+    second = cr._resync_log_path("MyProj")
+    assert first is not None and second is not None
+    first.write_text(
+        "⚠️  Code-graph analysis skipped: no backend\n", encoding="utf-8")
+    second.write_text("Code-graph analysis: 42 files analyzed\n", encoding="utf-8")
+    assert log_says_analysis_skipped(first, 256 * 1024) is True
+    assert log_says_analysis_skipped(second, 256 * 1024) is False
+
+
 # ─────────────────── R-5 rider (A-1): quoted resume command ─────────────────
 
 
@@ -527,6 +558,10 @@ def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
     _seed_pending_deferral(tmp_path)
     rec = _RunRecord(returncode=0)
     monkeypatch.setattr(cr.subprocess, "run", rec)
+    # v0.2.105: the driver\'s backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(
         cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 0}
     )
@@ -543,6 +578,10 @@ def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
 def test_driver_unconverged_records_one_time_deferral(monkeypatch, tmp_path):
     rec = _RunRecord(returncode=0)
     monkeypatch.setattr(cr.subprocess, "run", rec)
+    # v0.2.105: the driver\'s backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(
         cr, "count_stale_rows", lambda *a, **k: {"P_CodeFunction": 42}
     )
@@ -572,6 +611,10 @@ def test_driver_unverifiable_probe_still_surfaces(monkeypatch, tmp_path):
     """DESIGN-DECISION: unverifiable convergence must SURFACE (one-time
     deferral), never soft-fail into a void."""
     monkeypatch.setattr(cr.subprocess, "run", _RunRecord(returncode=0))
+    # v0.2.105: the driver's backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: None)
     cr.run_resync_and_verify(
         "MyProj", tmp_path, tmp_path / "analyze_code_graph.py"

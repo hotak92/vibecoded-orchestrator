@@ -112,6 +112,9 @@ SPECIALIZATION_DOCS = {
     "review-topics/performance.md", "review-topics/frontend-ui-a11y.md",
     "review-topics/database-migrations.md", "review-topics/api-design.md",
     "review-topics/infra-ci.md", "review-topics/data-ml.md",
+    # v0.2.105 (owner 2026-10-16): the first ROLE specialisation — the
+    # research lanes' bounded-review / fix-delta-verification role.
+    "roles/bounded-review.md",
 }
 
 

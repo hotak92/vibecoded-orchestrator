@@ -148,9 +148,9 @@ class ServiceWorld:
             ref = argv[-1]
             if ref != spec["container"] or not self.exists:
                 return _cp(argv, 125, "", "no such container")
-            fmt = argv[argv.index("--format") + 1]
-            if fmt == "{{.Id}}":
-                return _cp(argv, 0, "abc123\n")
+            fmt = argv[argv.index("--format") + 1] if "--format" in argv else None
+            if fmt is None:  # the template-free id lookup (v0.2.105)
+                return _cp(argv, 0, json.dumps([{"Id": "abc123"}]))
             if "com.docker.compose.project" in fmt:
                 wd = str(self.owning_dir) if self.project == OWNER else str(self.infra)
                 return _cp(argv, 0, f"{self.project}\t{wd}\tdocker-compose.yml\n")

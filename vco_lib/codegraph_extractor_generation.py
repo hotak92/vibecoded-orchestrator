@@ -174,7 +174,22 @@ logger = logging.getLogger(__name__)
 #:          so this rung's forced re-walk also writes the project rows an
 #:          identical, earlier-indexed extra-code-folder copy had shadowed
 #:          (those files embed once under the project; nothing is deleted).
-EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = ("0.2.92", "0.2.93", "0.2.94", "0.2.102")
+#: 0.2.105 — config files (``.tweakers`` / ``.ini`` / ``.json``) join the
+#:          graph (``vco_lib.codegraph_lang.config``: one module row per file,
+#:          one section row per section holding every key's value), and every
+#:          CODE file gains config links (``vco_lib.codegraph_config_refs``):
+#:          one ``CodeInteraction`` (``interaction_type == "config"``) per
+#:          (entity, key/section/file) its string literals name. The links
+#:          change what is extracted from UNCHANGED code files, so the rung's
+#:          forced re-walk is what delivers them; the per-entity hash gate
+#:          embeds only the NEW rows (config rows + link rows) — no re-embed of
+#:          existing code rows. A linked code file's module ``file_hash`` is
+#:          salted with its link set (``link_salt``), so later key edits
+#:          re-walk exactly the files whose links changed, without another
+#:          rung. ``CODEGRAPH_EMBED_REVISION`` is NOT bumped.
+EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = (
+    "0.2.92", "0.2.93", "0.2.94", "0.2.102", "0.2.105",
+)
 
 #: Releases DELIBERATELY not added to the ladder, each with the evidence that
 #: decided it. A release must appear in EXACTLY ONE of these two structures —
@@ -355,6 +370,10 @@ EXTRACTOR_GENERATION_RUNG_REASONS: dict[str, str] = {
         "languages — new symbols, corrected line ranges and bodies, Rust "
         "test-gated modules, PowerShell and Protobuf support, "
         "language-aware imports"
+    ),
+    "0.2.105": (
+        "indexed .tweakers, .ini and .json config files (keys with their "
+        "values) and linked them to the code that reads them"
     ),
 }
 

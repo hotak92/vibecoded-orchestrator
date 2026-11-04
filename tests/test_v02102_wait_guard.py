@@ -683,6 +683,19 @@ WAIT_GUARD_BASH_RULES = [
     "Bash(ls *)",
     "Bash(wc *)",
     "Bash(grep *)",
+    # v0.2.105: script files and stdin code a shell runs, code in a
+    # variable, case/coproc wrappers, and the no-op wait detector.
+    "Bash(bash *)",
+    "Bash(sh *)",
+    "Bash(source *)",
+    "Bash(. *)",
+    "Bash(./*)",
+    "Bash(eval *)",
+    "Bash(coproc *)",
+    "Bash(case *)",
+    "Bash(true)",
+    "Bash(:)",
+    "Bash(echo *)",
 ]
 
 

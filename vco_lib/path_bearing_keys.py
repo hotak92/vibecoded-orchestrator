@@ -305,6 +305,15 @@ PATH_BEARING_DB_COLUMNS: tuple[ColumnPolicy, ...] = (
     *_plain(
         "codegraph_access", "grantor_project_id", "grantee_project_id", "access_level"
     ),
+    # ── collection_count_cache ───────────────────────────────────────────
+    ColumnPolicy(
+        "collection_count_cache",
+        "collection",
+        POLICY_NOT_PATH_BEARING,
+        "A Weaviate class name keyed to its cached object count (v0.2.105). "
+        "Class names never carry a folder path, so a project move leaves the "
+        "row valid.",
+    ),
     # ── deprecation_events ───────────────────────────────────────────────
     *_plain("deprecation_events", "project_id", "module_id", "eol_date", "migration_url"),
     ColumnPolicy(

@@ -218,10 +218,12 @@ def _collection_snapshot(coll: _FakeCollection) -> List[Dict[str, Any]]:
     return rows
 
 
-def _run_analyzer(analyzer_mod: types.ModuleType) -> Dict[str, _FakeCollection]:
+def _run_analyzer(
+    analyzer_mod: types.ModuleType, repo: Path = _FIXTURE_REPO,
+) -> Dict[str, _FakeCollection]:
     _stub_embeddings(analyzer_mod)
     analyzer = _wire_analyzer(analyzer_mod)
-    analyzer.analyze_repository(_FIXTURE_REPO)
+    analyzer.analyze_repository(repo)
     return {
         "CodeModule": analyzer.modules_collection,
         "CodeClass": analyzer.classes_collection,
@@ -269,9 +271,41 @@ def test_golden_snapshots_match(analyzer_mod: types.ModuleType, defs_backend: st
     the committed per-collection snapshots of the active definitions backend.
     On CODEGRAPH_GOLDEN_REGEN=1 the snapshots are (re)written and the run is
     marked skipped (regen is not a pass — a human must review the diff)."""
-    expected_dir = _BACKEND_DIRS[defs_backend]
-    colls = _run_analyzer(analyzer_mod)
+    _assert_snapshots(_run_analyzer(analyzer_mod), _BACKEND_DIRS[defs_backend], defs_backend)
 
+
+#: v0.2.105 (design §7): a second corpus with config files (``.tweakers`` /
+#: ``.ini`` / ``.json``, one 300-key section that the CodeClass write chunks)
+#: plus C++ and Python code that names their keys — pins the config module and
+#: section rows byte-for-byte AND the config-link ``CodeInteraction`` rows. The
+#: first corpus has no config file, so its snapshots are unchanged by design.
+_CONFIG_REPO = _FIXTURE_ROOT / "config_repo"
+_CONFIG_BACKEND_DIRS = {
+    "regex": _FIXTURE_ROOT / "expected_config",
+    "treesitter": _FIXTURE_ROOT / "expected_config_treesitter",
+}
+
+
+def test_golden_config_snapshots_match(analyzer_mod: types.ModuleType, defs_backend: str) -> None:
+    colls = _run_analyzer(analyzer_mod, _CONFIG_REPO)
+    _assert_snapshots(colls, _CONFIG_BACKEND_DIRS[defs_backend], defs_backend)
+    # The corpus must actually exercise what it pins (a regen of an empty
+    # walk would otherwise "pass"): config rows, a chunked section, links.
+    langs = {r["language"] for r in _collection_snapshot(colls["CodeModule"])}
+    assert {"tweakers", "ini", "json", "cpp", "python"} <= langs
+    assert not any(r["path"].startswith("bin/")
+                   for r in _collection_snapshot(colls["CodeModule"]))
+    sections = _collection_snapshot(colls["CodeClass"])
+    assert any(r.get("file_path") == "conf/big_table.json" and int(r.get("chunk_num") or 0) > 0
+               for r in sections), "the 300-key section must be chunked"
+    links = [r for r in _collection_snapshot(colls["CodeInteraction"])
+             if r.get("interaction_type") == "config"]
+    assert {r["file_path"] for r in links} == {"src/driver.cpp", "tools/load.py"}
+
+
+def _assert_snapshots(
+    colls: Dict[str, _FakeCollection], expected_dir: Path, defs_backend: str,
+) -> None:
     if _REGEN:
         expected_dir.mkdir(parents=True, exist_ok=True)
         for base in _COLLECTION_BASES:

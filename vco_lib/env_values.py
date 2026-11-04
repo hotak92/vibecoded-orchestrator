@@ -30,6 +30,11 @@ one more bound: ``above`` — a STRICT lower bound (``value > above``, else
 ``minimum=0`` would accept ``0.0``). Comparisons are the plain ``<`` / ``>``
 the replaced readers used, so their handling of ``nan`` / ``inf`` is kept
 exactly (``nan`` passes ``minimum``/``maximum`` and fails ``above``).
+A caller for which a non-finite value is never meaningful (a timeout or a
+retry window: ``inf`` there is an unbounded wait) passes ``finite=True``,
+and ``inf`` / ``-inf`` / ``nan`` then yield ``default`` like any other
+out-of-range value (v0.2.105). The default stays ``False`` so the documented
+copies below keep matching byte for byte.
 
 Stdlib-only, so it imports wherever ``vco_lib`` does. Code that cannot
 import ``vco_lib`` keeps a documented copy that names this module and is
@@ -55,6 +60,7 @@ grammar differs and routing it would change what it accepts:
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Mapping, Optional, overload
 
@@ -138,6 +144,7 @@ def env_float(
     maximum: Optional[float] = None,
     above: Optional[float] = None,
     clamp: bool = False,
+    finite: bool = False,
 ) -> float: ...
 
 
@@ -151,6 +158,7 @@ def env_float(
     maximum: Optional[float] = None,
     above: Optional[float] = None,
     clamp: bool = False,
+    finite: bool = False,
 ) -> Optional[float]: ...
 
 
@@ -163,6 +171,7 @@ def env_float(
     maximum: Optional[float] = None,
     above: Optional[float] = None,
     clamp: bool = False,
+    finite: bool = False,
 ) -> Optional[float]:
     """Read ``name`` from ``env`` (default: ``os.environ``) as a float.
 
@@ -170,7 +179,8 @@ def env_float(
     ``default``; ``minimum`` / ``maximum`` are inclusive and yield
     ``default`` (or, with ``clamp=True``, the bound crossed). ``above`` is a
     strict lower bound that always yields ``default`` (never clamped: there
-    is no "just above" value to clamp to).
+    is no "just above" value to clamp to). ``finite=True`` turns ``inf`` /
+    ``-inf`` / ``nan`` into ``default`` before any bound is checked.
     """
     text = _raw_text(name, env)
     if text is None:
@@ -178,6 +188,8 @@ def env_float(
     try:
         value = float(text)
     except ValueError:
+        return default
+    if finite and not math.isfinite(value):
         return default
     if above is not None and not value > above:
         return default

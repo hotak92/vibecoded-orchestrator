@@ -135,6 +135,10 @@ def run_pure_extractor(
     extract: Callable[[str, Path, Path, "ExtractorHelpers"], Any],
     empty_stats: Dict[str, int],
     file_hash_fn: Optional[Callable[[str, Path, Path], str]] = None,
+    *,
+    skip_check: Optional[Callable[[str, Path], Optional[str]]] = None,
+    skip_stat: str = "",
+    config_links: bool = True,
 ) -> Dict[str, int]:
     """The shared thin-shim body for a pure ``extract_<lang>_file`` producer.
 
@@ -167,20 +171,32 @@ def run_pure_extractor(
     (Rust: a test-gated ``mod x;`` elsewhere — v0.2.102 W6-G). Since W6-L the
     gate's hash (salted for a regex-fallback file) is written onto the module
     row HERE, so the gate and the stored value cannot disagree.
+
+    ``skip_check(content, file_path)`` (v0.2.105, config files) REPLACES the
+    minified gate: it returns the reason the file is out of the graph, or
+    ``None``. A skip takes the same S16-3 prune path, and ``skip_stat`` names
+    the stats counter it bumps. With ``config_links`` (every code language;
+    the config extractor passes False) the hash is also salted with
+    its config links (:func:`vco_lib.codegraph_config_refs.link_salt`), so an
+    unchanged file whose links changed (a key added to or removed from a
+    config file) re-walks and relinks — and one with no config link keeps its
+    plain hash.
     """
     content = file_path.read_text(encoding="utf-8", errors="ignore")
-    if _is_minified_content(content):
+    reason = (skip_check(content, file_path) if skip_check is not None
+              else "looks minified/generated" if _is_minified_content(content) else None)
+    if reason:
         try:
             _rel_min = file_path.relative_to(repo_root).as_posix()
         except Exception:  # noqa: BLE001
             _rel_min = ""
-        print(f"⏭️  Skipping {_rel_min or file_path} (looks minified/generated)")
+        print(f"⏭️  Skipping {_rel_min or file_path} ({reason})")
         # S16-3: a relative path is the only anchor the stored rows carry; an
         # unresolvable one prunes nothing (never guess a path to delete).
         _note = getattr(ctx, "_note_policy_skipped_file", None)
         if _rel_min and callable(_note):
             _note(_rel_min)
-        return dict(empty_stats)
+        return dict(empty_stats, **({skip_stat: 1} if skip_stat else {}))
 
     file_hash = (file_hash_fn(content, file_path, repo_root) if file_hash_fn is not None
                  else hashlib.sha256(content.encode()).hexdigest())
@@ -192,6 +208,12 @@ def run_pure_extractor(
     salt = regex_fallback_hash_salt(file_path)
     if salt:
         file_hash = hashlib.sha256((file_hash + salt).encode()).hexdigest()
+    if config_links:
+        from vco_lib.codegraph_config_refs import link_salt_for
+
+        link_salt = link_salt_for(ctx, repo_root, content)
+        if link_salt:
+            file_hash = hashlib.sha256((file_hash + link_salt).encode()).hexdigest()
     relative_path = file_path.relative_to(repo_root).as_posix()
     if ctx._get_existing_module(relative_path, file_hash):
         print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -200,6 +222,7 @@ def run_pure_extractor(
     fx = extract(content, file_path, repo_root, ExtractorHelpers(ctx))
     if fx.module is not None:
         fx.module.file_hash = file_hash
+    fx.source_root, fx.source_text = repo_root, content
     return ctx.write_file_extraction(fx)
 
 
@@ -1166,6 +1189,9 @@ _LANG_SYNTAX: Dict[str, _LangSyntax] = {
         single_quote_string=True,
     ),
     # ── other ──────────────────────────────────────────────────────────────
+    # Config files (.tweakers/.ini/.json) are parsed by codegraph_lang.config
+    # and never brace-scanned; the row exists for the registry-parity test.
+    "config": _LangSyntax(),
     "lua": _LangSyntax(
         line_comments=("--",),
         multiline=(_ML_LUA_LONG_COMMENT, _ML_LUA_LONG_STRING),

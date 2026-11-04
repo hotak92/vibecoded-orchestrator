@@ -109,7 +109,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from vco_lib.hooks_settings import anchor_hook_command, invoked_script_tokens
+from vco_lib.hooks_settings import (
+    anchor_hook_command,
+    invoked_script_arguments,
+    invoked_script_tokens,
+)
 
 #: Matcher kinds. See the module docstring for what each one is safe for.
 KIND_HOOK_SCRIPT = "hook_script"
@@ -946,6 +950,20 @@ def _matcher_migrations() -> Tuple[MatcherMigration, ...]:
                 "so the pre-compact snapshot went stale and the reinject "
                 "hook replayed it after every manual compaction"
             )),
+        # v0.2.105: the kill guard's runtime layer rides in lean-ctx-rewrite
+        # (the ONE updatedInput emitter for shell tools — two rewriters for
+        # one call conflict), so that hook must now also see PowerShell-tool
+        # calls (Stop-Process / kill / spps / taskkill). Its lean-ctx stage
+        # still steps aside for any tool but Bash.
+        MatcherMigration(
+            event="PreToolUse", old="Bash", new="Bash|PowerShell",
+            targets=both("lean-ctx-rewrite"),
+            retired_in="v0.2.105",
+            reason=(
+                "the kill guard's runtime rewrite lives in lean-ctx-rewrite "
+                "(one updatedInput emitter per shell call) and must also see "
+                "PowerShell-tool kills; compression itself stays Bash-only"
+            )),
         # v0.2.104: Monitor left the wait-loop guard's self-wake group (it is
         # Claude Code's sanctioned streaming tool); an installed group keeps
         # the old matcher unless this row moves it.
@@ -1102,6 +1120,26 @@ def unit_matchers(event: str, matcher: str, target: Optional[str]) -> Tuple[str,
     return tuple(out)
 
 
+def vco_shipped_hook_scripts() -> frozenset:
+    """Every hook-script BASENAME this table knows VCO once shipped — the
+    script targets of :data:`RETIRED_REGISTRATIONS` (``KIND_HOOK_SCRIPT``
+    rows only) and of :data:`PRIOR_SHIPPED_SHAPES`.
+
+    v0.2.105. The settings merge folds duplicate hook groups that survived
+    an update, and it may only fold a group whose every command is a
+    VCO-shipped hook. The CURRENT template supplies the live half of that
+    set; this supplies the half that no longer ships — a registration the
+    scrub has not removed yet (a script retired in this very release, or a
+    group whose shape the scrub does not match) is still VCO's, never the
+    user's. Read by ``vco_lib.settings_merge`` alone; parsed from the one
+    table, so a new retirement row needs no second edit.
+    """
+    scripts = {row.target for row in RETIRED_REGISTRATIONS
+               if row.kind == KIND_HOOK_SCRIPT}
+    scripts |= {row.target for row in PRIOR_SHIPPED_SHAPES}
+    return frozenset(scripts)
+
+
 def match_prior_shipped_shape(
     event: str, matcher: str, hook: Any,
 ) -> Optional[PriorShippedShape]:
@@ -1165,6 +1203,27 @@ def vco_hook_script_identity(command: str) -> Optional[str]:
         m = _HOOK_TOKEN_RE.match(tok)
         if m:
             return m.group(1)
+    return None
+
+
+def vco_hook_script_arguments(command: str) -> Optional[Tuple[str, ...]]:
+    """The tokens that FOLLOW the invoked ``.claude/hooks/<name>.{sh,ps1}``
+    script in ``command`` — its trailing ARGUMENTS — or ``None`` when the
+    command invokes no such script at an anchor position.
+
+    v0.2.105 (review R1 SB-1). A user who adds an argument to a shipped hook
+    command (``…/ensure-containers.sh --strict``) has edited it: the argument
+    is theirs, so the settings merge must keep the command verbatim rather
+    than replace it with the shipped spelling. Everything else about the
+    command (the interpreter, the path spelling, the disable guard, a
+    different number of spaces) is the SHIPPED form's business and still
+    heals — only these post-script tokens decide "the user changed it".
+
+    Same walk and same anchoring rule as :func:`vco_hook_script_identity`,
+    so the two answers always describe the same script token."""
+    for tok, args in invoked_script_arguments(command):
+        if _HOOK_TOKEN_RE.match(tok):
+            return args
     return None
 
 
@@ -1896,6 +1955,7 @@ __all__ = [
     "sibling_matchers",
     "added_sibling_matchers",
     "unit_matchers",
+    "vco_hook_script_arguments",
     "vco_hook_script_identity",
 ]
 

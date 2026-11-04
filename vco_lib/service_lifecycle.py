@@ -374,12 +374,10 @@ def _find_container(row: "_se.EndpointRow", runtime: str, run: RunFn) -> Optiona
         if name and name not in names:
             names.append(name)
     for name in names:
-        try:
-            res = run([runtime, "inspect", "--type", "container", "--format", "{{.Id}}", name],
-                      capture_output=True, text=True, timeout=15)
-        except (subprocess.TimeoutExpired, OSError):
-            continue
-        if res.returncode == 0 and (res.stdout or "").strip():
+        # v0.2.105: the ONE shared lookup (vco_lib.containers.container_id)
+        # — the old `{{.Id}}` probe worked on podman too; the move is for
+        # the one home, not a bug fix.
+        if _containers.container_id(name, runtime, run=run) is not None:
             return name
     return None
 

@@ -76,10 +76,12 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import os
 import re
 import signal
 import subprocess  # noqa: S404 — the child argv is the caller's own analyzer
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence, Tuple
 
@@ -146,6 +148,41 @@ def walk_claim_lock_path(project_name: str) -> Path:
     )
 
 
+def walk_claim_holder_path(project_name: str) -> Path:
+    """Sidecar naming WHO holds the claim (v0.2.105): ``pid=<n> since=<utc>``.
+
+    A separate file because the Windows lock is a byte-range lock on the
+    claim file itself, which other processes cannot read while it is held.
+    Written by the holder right after it takes the claim; a stale sidecar is
+    harmless (it is only read while the claim is HELD, i.e. right after a
+    refusal, and the next holder overwrites it).
+    """
+    return walk_claim_lock_path(project_name).with_suffix(".holder")
+
+
+def _record_holder(project_name: str) -> None:
+    try:
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        walk_claim_holder_path(project_name).write_text(
+            f"pid={os.getpid()} since={stamp}\n", encoding="utf-8")
+    except OSError:
+        pass  # a missing sidecar only shortens the refusal message
+
+
+def describe_holder(project_name: str) -> str:
+    """``"pid 1234 since 2026-11-03T10:00:00Z"`` from the holder sidecar, or
+    ``""`` when it cannot be read."""
+    try:
+        text = walk_claim_holder_path(project_name).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    fields = dict(part.split("=", 1) for part in text.split() if "=" in part)
+    pid, since = fields.get("pid", ""), fields.get("since", "")
+    if not pid.isdigit():
+        return ""
+    return f"pid {pid}" + (f" since {since}" if since else "")
+
+
 @contextlib.contextmanager
 def _held_walk_claim(project_name: str) -> Iterator[Tuple[Path, Optional[int]]]:
     """:func:`walk_claim`, also yielding the lock's descriptor when it is a
@@ -155,6 +192,7 @@ def _held_walk_claim(project_name: str) -> Iterator[Tuple[Path, Optional[int]]]:
     lock_path = walk_claim_lock_path(project_name)
     try:
         with exclusive_file_lock(lock_path, timeout_s=0) as fd:
+            _record_holder(project_name)
             yield lock_path, fd
     except LockTimeout as exc:
         raise WalkAlreadyRunning(
@@ -454,10 +492,13 @@ def project_from_argv(args: Sequence[str]) -> Optional[str]:
 def already_running_message(project_name: str) -> str:
     """The ONE refusal sentence (log + stderr + the launcher's toast text
     derives from the same fact: exit code :data:`WALK_ALREADY_RUNNING_RC`)."""
+    holder = describe_holder(project_name)
     return (
         f"[codegraph-walk] {project_name}: another code-graph walk is already "
         f"running for this project — not starting a twin "
-        f"(claim: {walk_claim_lock_path(project_name)})"
+        f"(claim: {walk_claim_lock_path(project_name)}"
+        + (f", held by {holder}" if holder else "")
+        + ")"
     )
 
 

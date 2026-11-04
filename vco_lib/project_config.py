@@ -181,6 +181,21 @@ class HubUnreachable(ResolverError):
     """
 
 
+class HubNotRunning(HubUnreachable):
+    """There is no hub to ask (v0.2.105): no ``hub.token`` (missing or empty —
+    the launcher/hub is not running) or a REFUSED connection (nothing is
+    listening on the hub port).
+
+    The narrow, positively-observed member of the :class:`HubUnreachable`
+    family. The rest of that family — a 401 (rotated token), a 200 whose body
+    is not JSON, an unreadable ``hub.token``, an unrecognised status, a busy
+    hub (:class:`HubNotResponding`) — are from a hub that is or may be
+    RUNNING, so a caller that tells the user "start the hub" must branch on
+    this class, never on its parent. A subclass so every existing
+    ``except HubUnreachable`` caller behaves exactly as before.
+    """
+
+
 class HubNotResponding(HubUnreachable):
     """The hub was reached but did not answer in time (v0.2.102, W6-AB).
 
@@ -256,11 +271,15 @@ def _is_connection_refused_walk(exc: BaseException, seen: "set[int]") -> bool:
 def _transport_error(exc: requests.RequestException, what: str) -> HubUnreachable:
     """Map a ``requests`` transport failure to the resolver taxonomy: a
     refused connection (no hub) → :class:`HubUnreachable`; a timeout or a
-    connection dropped after connect (a busy hub) → :class:`HubNotResponding`."""
+    connection dropped after connect (a busy hub) → :class:`HubNotResponding`.
+    A refused connection is the positively-observed :class:`HubNotRunning`;
+    any other transport error stays a plain :class:`HubUnreachable`."""
     if isinstance(exc, requests.Timeout):
         return HubNotResponding(f"{what}: {exc}")
-    if isinstance(exc, requests.ConnectionError) and not _is_connection_refused(exc):
-        return HubNotResponding(f"{what}: {exc}")
+    if isinstance(exc, requests.ConnectionError):
+        if not _is_connection_refused(exc):
+            return HubNotResponding(f"{what}: {exc}")
+        return HubNotRunning(f"{what}: {exc}")
     return HubUnreachable(f"{what}: {exc}")
 
 
@@ -583,6 +602,25 @@ class ProjectConfig:
     #: clients. New hubs paired with old clients have the field
     #: silently ignored.
     rl_server_port: Optional[int] = None
+    #: v0.2.105 (#512A) — the commit the project's PRIMARY code-graph root
+    #: was last analyzed at, straight from
+    #: ``project_codegraph_bindings.last_analyzed_commit``. Read by the
+    #: HEAD-diff catch-up (:mod:`vco_lib.codegraph_head_catchup`) to notice
+    #: code that arrived through a merge / pull / shell commit, none of which
+    #: the Edit hook ever queues. ``None`` on a pre-v0.2.105 hub (additive,
+    #: ``schema_version`` unchanged) and for a project never analyzed.
+    code_graph_last_analyzed_commit: Optional[str] = None
+    #: v0.2.105 fix round — TRUE iff the hub's /config found an ENABLED
+    #: ``project_codegraph_bindings`` row for this project. The fallback
+    #: prefix the hub derives from the project NAME makes
+    #: ``code_graph_collection_prefix`` non-empty even for an unbound
+    #: project, so the HEAD-diff catch-up
+    #: (:mod:`vco_lib.codegraph_head_catchup`) reads THIS field to know
+    #: whether it may run at all: False → skip (never create collections
+    #: for an unbound project, never walk a disabled one). Default False —
+    #: a pre-v0.2.105 hub omits the field and the catch-up stays inert
+    #: until the hub binary catches up.
+    code_graph_bound: bool = False
     #: v0.2.97 (service endpoints SSOT): the code-embedding service URL —
     #: the machine's ``service_endpoints`` row, rendered by the hub like
     #: ``weaviate_url`` / ``ollama_url``. Additive (``schema_version`` is
@@ -599,6 +637,24 @@ class ProjectConfig:
     external_collections: tuple[str, ...] = ()
     unmanaged_containers: tuple[str, ...] = ()
     ssrf_extra_local_ports: tuple[int, ...] = ()
+    #: v0.2.105 — extra code folders the owner POSITIVELY took out of this
+    #: project's code graph: disabled launcher.db rows, plus removed rows that
+    #: left a ``codegraph_extra_path_removed`` audit entry (and were not
+    #: re-added). ``None`` means UNKNOWN — the hub could not read its DB (it
+    #: then also empties ``code_graph_extra_paths``), or it is older than the
+    #: field. The removed-extras purge
+    #: (:func:`vco_lib.codegraph_source_purge.purge_gone_extra_paths`) deletes
+    #: rows only for a path listed here, and never on ``None``.
+    code_graph_extra_paths_gone: Optional[tuple[str, ...]] = None
+    #: v0.2.105 fix round — the folders this project POSITIVELY moved AWAY
+    #: from: the ``src`` of every launcher move that completed (the
+    #: launcher's ``project_moves`` ledger — the durable record that the
+    #: project used to live elsewhere), minus the live folder. Rows stamped
+    #: with such a root are a second, stale copy of the same files after a
+    #: move (the row UUID mixes ``project_source``), and nothing rewrites
+    #: them. ``None`` means UNKNOWN (read failure, or a hub older than the
+    #: field) — the purge then keeps every row.
+    code_graph_moved_from_sources: Optional[tuple[str, ...]] = None
 
 
 #: The resolver fields that are plain lists of declared values (v0.2.102 M3).
@@ -730,7 +786,7 @@ def _discover_hub() -> tuple[int, str]:
             try:
                 token = token_file.read_text(encoding="utf-8").strip()
             except FileNotFoundError as exc:
-                raise HubUnreachable(
+                raise HubNotRunning(
                     f"hub.token missing at {token_file}; is the launcher "
                     f"running?{_POST_UPDATE_HINT}"
                 ) from exc
@@ -743,7 +799,7 @@ def _discover_hub() -> tuple[int, str]:
                     f"cannot read hub.token at {token_file}: {exc}"
                 ) from exc
             if not token:
-                raise HubUnreachable(
+                raise HubNotRunning(
                     f"hub.token at {token_file} is empty"
                 )
 
@@ -1503,11 +1559,45 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             # malformed string) as ``None`` so the MCP falls through to
             # env-resolution / disabled mode.
             rl_server_port=_coerce_optional_port(body.get("rl_server_port")),
+            # v0.2.105 (#512A) additive field — pre-v0.2.105 hubs omit it;
+            # a missing / malformed / empty value reads as "no recorded
+            # commit", which the catch-up treats as the conservative
+            # incremental-walk fallback (never an advanced baseline).
+            code_graph_last_analyzed_commit=(
+                body["code_graph_last_analyzed_commit"]
+                if isinstance(body.get("code_graph_last_analyzed_commit"), str)
+                and body["code_graph_last_analyzed_commit"].strip()
+                else None
+            ),
+            # v0.2.105 fix round: TRUE iff a code-graph binding row exists
+            # AND is enabled. /config serves a name-derived fallback prefix
+            # even for an UNBOUND project, so the prefix alone cannot tell
+            # the HEAD-diff catch-up whether it may run — without this
+            # field it would create collections for an unbound project and
+            # walk it every interval. Default False (conservative: a hub
+            # that omits the field never triggers a walk).
+            code_graph_bound=bool(
+                body.get("code_graph_bound") is True
+            ),
             code_embed_url=str(body.get("code_embed_url") or ""),
             # v0.2.102 W5-A (M3) additive declaration lists.
             external_collections=_str_list(body.get("external_collections")),
             unmanaged_containers=_str_list(body.get("unmanaged_containers")),
             ssrf_extra_local_ports=_port_list(body.get("ssrf_extra_local_ports")),
+            # v0.2.105: tri-state — a list (possibly empty) only when the hub
+            # sent one; absent/null/malformed → None (unknown, never "none").
+            code_graph_extra_paths_gone=(
+                _str_list(body.get("code_graph_extra_paths_gone"))
+                if isinstance(body.get("code_graph_extra_paths_gone"), list)
+                else None
+            ),
+            # v0.2.105 fix round: same tri-state — a list (possibly empty)
+            # only when the hub sent one; absent/null → unknown (keep rows).
+            code_graph_moved_from_sources=(
+                _str_list(body.get("code_graph_moved_from_sources"))
+                if isinstance(body.get("code_graph_moved_from_sources"), list)
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(
@@ -1792,14 +1882,24 @@ def claude_session_dir_for(workspace_path: Path) -> Path:
     return Path.home() / ".claude" / "projects" / slug
 
 
-def hub_post_json(route: str, body: dict[str, Any]) -> requests.Response:
+def hub_post_json(
+    route: str, body: dict[str, Any], *, project_id: str | None = None
+) -> requests.Response:
     """POST ``body`` as JSON to ``/api/v1/<route>`` on the local hub.
 
     The write-side sibling of the resolver's GETs, so hub discovery + bearer
     handling keep ONE home in this module (v0.2.100 W5R-04 — first caller:
     :mod:`vco_lib.codegraph_extras_refresh`). Uses the global ``hub.token``
-    (non-``/env``/``/config`` routes accept it); a 401 — the stale-cache shape
-    after a hub restart — invalidates discovery and retries ONCE.
+    on every route that accepts it; a 401 — the stale-cache shape after a hub
+    restart — invalidates discovery and retries ONCE.
+
+    ``project_id`` marks a PER-PROJECT route (the same gate as ``/env`` and
+    ``/config``: ``/projects/{id}/codegraph/analyzed`` since v0.2.105): the
+    bearer is then the scoped ``hub.token.<project_id>`` — see
+    :func:`_project_token` — and a 403 gets ONE retry with the on-disk token
+    when ``$VCT_HUB_TOKEN`` is a provably-stale pin
+    (:func:`_stale_env_token_fallback`), exactly like the resolvers' GETs.
+    Without it, a session that exported a token would be refused forever.
 
     :raises HubUnreachable: the hub is down / not discoverable / the
         transport failed. Any HTTP status is returned to the caller as-is.
@@ -1812,15 +1912,32 @@ def hub_post_json(route: str, body: dict[str, Any]) -> requests.Response:
     resp: requests.Response | None = None
     for attempt in range(2):
         port, token = _discover_hub()
+        bearer = _project_token(project_id, token) if project_id else token
         try:
             resp = _http_session().post(
                 f"http://127.0.0.1:{port}/api/v1/{route}",
                 json=body,
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {bearer}"},
                 timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
             )
         except requests.RequestException as exc:
             raise HubUnreachable(f"hub POST failed: {exc}") from exc
+        if resp.status_code == 403 and project_id:
+            fallback = _stale_env_token_fallback(project_id)
+            if fallback is not None:
+                try:
+                    resp_fb = _http_session().post(
+                        f"http://127.0.0.1:{port}/api/v1/{route}",
+                        json=body,
+                        headers={"Authorization": f"Bearer {fallback}"},
+                        timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+                    )
+                except requests.RequestException:
+                    return resp  # keep the original refusal
+                if _retry_answer_is_definitive(resp_fb.status_code):
+                    _warn_stale_env_token()
+                    return resp_fb
+            return resp
         if resp.status_code != 401 or attempt == 1:
             return resp
         _invalidate_discovery_cache()
@@ -1836,6 +1953,7 @@ __all__ = [
     "Forbidden",
     "HUB_DISCOVERY_TTL_SECONDS",
     "HubNotResponding",
+    "HubNotRunning",
     "HubUnreachable",
     "ProjectConfig",
     "SECRET_READ_TIMEOUT_SECONDS",

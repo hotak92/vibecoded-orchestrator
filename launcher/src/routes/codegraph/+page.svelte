@@ -21,20 +21,28 @@
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
   import NoProjectBanner from '$lib/components/NoProjectBanner.svelte';
+  import { formatCount, formatCountAge, sumCounts } from '$lib/kg/count-display';
 
   interface CodegraphProjectSummary {
     project_name: string;
     prefix: string;
-    module_count: number;
-    class_count: number;
-    function_count: number;
-    api_count: number;
-    interaction_count: number;
+    /** v0.2.105 lazy-load counts: null = never counted (render "—"). */
+    module_count: number | null;
+    class_count: number | null;
+    function_count: number | null;
+    api_count: number | null;
+    interaction_count: number | null;
+    /** Epoch-ms moment the newest count was measured. */
+    counted_at: number | null;
     access: 'read' | 'write' | 'none';
   }
 
   let summaries = $state<CodegraphProjectSummary[]>([]);
   let loading = $state(true);
+  // v0.2.105 lazy-load counts: "Refresh counts" live-counts every
+  // collection once (a page load only counts the acting project's own
+  // codegraph and the ones it can read).
+  let counting = $state(false);
   const acting = $derived($selectedProject);
 
   async function load() {
@@ -66,14 +74,26 @@
     if (acting) void load();
   });
 
-  function totalEntities(s: CodegraphProjectSummary): number {
-    return (
-      s.module_count +
-      s.class_count +
-      s.function_count +
-      s.api_count +
-      s.interaction_count
-    );
+  function totalEntities(s: CodegraphProjectSummary): number | null {
+    return sumCounts([
+      s.module_count,
+      s.class_count,
+      s.function_count,
+      s.api_count,
+      s.interaction_count,
+    ]);
+  }
+
+  async function refreshCounts() {
+    counting = true;
+    try {
+      await invoke<number>('refresh_collection_counts');
+      await load();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      counting = false;
+    }
   }
 
   // Assign-access modal state. Mirrors the KG dashboard's flow:
@@ -185,6 +205,14 @@
   <header class="cg-header">
     <button class="cg-back" onclick={() => goto('/')}>← Back</button>
     <h1>Code Graph</h1>
+    <button
+      class="cg-refresh"
+      onclick={refreshCounts}
+      disabled={counting}
+      title="Count every collection once and refresh the cached counts — this loads every collection on this machine into Weaviate's memory (a page load only counts this project's own and granted code graphs)"
+    >
+      {counting ? 'Counting…' : 'Refresh counts'}
+    </button>
     <button class="cg-refresh" onclick={load} disabled={loading}>
       {loading ? 'Loading…' : 'Refresh'}
     </button>
@@ -210,17 +238,21 @@
           </header>
           <p class="cg-card-prefix"><code>{s.prefix}_*</code></p>
           <div class="cg-card-stats">
-            <span class="cg-stat" style="--c:#3aa3ff"><strong>{s.module_count}</strong> modules</span>
-            <span class="cg-stat" style="--c:#9b59b6"><strong>{s.class_count}</strong> classes</span>
-            <span class="cg-stat" style="--c:#1abc9c"><strong>{s.function_count}</strong> functions</span>
-            {#if s.api_count > 0}
-              <span class="cg-stat" style="--c:#ff9b3d"><strong>{s.api_count}</strong> APIs</span>
+            <span class="cg-stat" style="--c:#3aa3ff"><strong>{formatCount(s.module_count)}</strong> modules</span>
+            <span class="cg-stat" style="--c:#9b59b6"><strong>{formatCount(s.class_count)}</strong> classes</span>
+            <span class="cg-stat" style="--c:#1abc9c"><strong>{formatCount(s.function_count)}</strong> functions</span>
+            {#if (s.api_count ?? 0) > 0}
+              <span class="cg-stat" style="--c:#ff9b3d"><strong>{formatCount(s.api_count)}</strong> APIs</span>
             {/if}
-            {#if s.interaction_count > 0}
-              <span class="cg-stat" style="--c:#ff6f9e"><strong>{s.interaction_count}</strong> interactions</span>
+            {#if (s.interaction_count ?? 0) > 0}
+              <span class="cg-stat" style="--c:#ff6f9e"><strong>{formatCount(s.interaction_count)}</strong> interactions</span>
             {/if}
           </div>
-          <p class="cg-card-total">{totalEntities(s)} entities total</p>
+          <p class="cg-card-total">
+            {formatCount(totalEntities(s))} entities total{s.counted_at
+              ? ` · ${formatCountAge(s.counted_at)}`
+              : ''}
+          </p>
           <div class="cg-card-actions">
             <button class="cg-btn" onclick={() => openAssign(s)}>
               Assign access…

@@ -22,6 +22,8 @@ The two helpers:
   caller's environment): ``CODE_EMBED_BACKEND``, (NVIDIA-only)
   ``CODE_EMBED_DOCKERFILE``, and (v0.2.77 F2) the host-derived
   ``CODE_EMBED_MAX_CONCURRENT`` cap.
+  v0.2.105 adds ``VCT_WEAVIATE_MEM_LIMIT`` (Weaviate's container memory
+  limit, :mod:`vco_lib.weaviate_memory`).
 - :func:`write_infrastructure_env` — persist those keys to
   ``<infra_dir>/.env`` with managed-line replacement so user lines
   survive re-runs.
@@ -218,6 +220,16 @@ def compose_substitution_env(embed_config: dict, *,
     cap = embed_config.get("code_embed_max_concurrent")
     if cap is not None and "CODE_EMBED_MAX_CONCURRENT" not in os.environ:
         env["CODE_EMBED_MAX_CONCURRENT"] = str(int(cap))
+    # v0.2.105: Weaviate's container memory limit, sized from the host RAM
+    # install probed (``host_ram_gb``, stamped by
+    # install_embed_concurrency.finalize_embed_config_for_host). Same
+    # honour-explicit-config rule as the cap above; an unknown RAM writes
+    # nothing (an earlier run's line is then kept).
+    from vco_lib import weaviate_memory  # noqa: PLC0415
+
+    mem_limit = weaviate_memory.env_value(embed_config.get("host_ram_gb"))
+    if mem_limit is not None:
+        env[weaviate_memory.ENV_KEY] = mem_limit
     return env
 
 

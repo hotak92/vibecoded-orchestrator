@@ -1170,15 +1170,35 @@ def test_commit_skipped_while_git_is_busy(repo, make_block, needle):
 
 
 def test_commit_skipped_when_head_moved(repo):
+    """A moved HEAD skips only when it touched one of the reviewer's files.
+
+    v0.2.105 L-KGREV: the pre-v0.2.105 rule skipped on ANY moved HEAD, which
+    stranded 235 of 839 logged runs (a coordinator commits often). A clean
+    commit on top is safe when the intervening commits never touched the
+    reviewer's paths; when they did, the skip stands."""
     snap = guard.take_snapshot(repo)
     try:
+        # Disjoint: the intervening commit touches src.py only.
         (repo / "src.py").write_text("x = 3\n")
         _git(repo, "commit", "-q", "-am", "user commit meanwhile")
         (repo / "knowledge/concepts/new-topic.md").write_text("x\n")
-        sha, lines = _commit(repo, snap, ["knowledge/concepts/new-topic.md"])
+        sha, _lines = _commit(repo, snap, ["knowledge/concepts/new-topic.md"])
     finally:
         snap.cleanup()
-    assert sha is None and any("HEAD moved" in ln for ln in lines)
+    assert sha
+    # Overlapping: the intervening commit rewrites the very node.
+    node = repo / "knowledge/concepts/cache-layer.md"
+    snap = guard.take_snapshot(repo)
+    try:
+        node.write_text(PLAIN_NODE.replace("100", "150"))
+        _git(repo, "commit", "-q", "-am", "user commit meanwhile")
+        reviewer = PLAIN_NODE.replace("100", "250")
+        node.write_text(reviewer)
+        sha, lines = _commit(repo, snap, ["knowledge/concepts/cache-layer.md"])
+    finally:
+        snap.cleanup()
+    assert sha is None and any("HEAD moved" in ln for ln in lines), lines
+    assert "250" in node.read_text()  # the files are left in place
 
 
 def test_commit_skipped_when_target_had_user_changes(repo):

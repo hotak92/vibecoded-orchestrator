@@ -36,6 +36,9 @@
 
   import { onMount } from 'svelte';
   import { toast } from '$lib/stores/toast';
+  // v0.2.105 (L-SMALL): the shared Copy button (one clipboard routine with the
+  // notification bell). It copies the entry's full text — see `entryCopyText`.
+  import CopyButton from './CopyButton.svelte';
   import {
     deferrals,
     dismissDeferral,
@@ -49,6 +52,7 @@
     dispositionExplanation,
     dispositionLabel,
     emptyStateMessage,
+    entryCopyText,
     groupEntries,
     mountConfigError,
     panelTitle,
@@ -235,6 +239,14 @@
       </span>
       <strong class="dl-title">{e.title}</strong>
       <code class="dl-cid">{e.condition_id}</code>
+      <!-- v0.2.105: the whole entry as the row shows it (severity,
+           disposition, detected, body, retries, the exact remedy command,
+           context refs) — so it can be pasted elsewhere. -->
+      <CopyButton
+        text={entryCopyText(e, view)}
+        label="Copy this pending action"
+        title="Copy the entry and its remedy command"
+      />
       <button
         class="dl-btn dl-btn-dismiss"
         onclick={() => dismiss(e)}

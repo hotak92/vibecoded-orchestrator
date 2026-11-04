@@ -56,6 +56,16 @@ pub fn router() -> Router<LauncherDbHandle> {
             "/projects/{project_id}/codegraph/extras/indexed",
             post(record_codegraph_extra_indexed),
         )
+        // v0.2.105 (#512A): advance the PRIMARY code-graph baseline after the
+        // HEAD-diff catch-up indexed a merge / pull / shell commit. Same
+        // single-writer discipline as the extras route above (the detached
+        // module never opens launcher.db) and the SAME narrow writer the
+        // detached-walk terminal report uses (`advance_codegraph_binding_
+        // analyzed`) — collection prefix, model, dim and config are untouched.
+        .route(
+            "/projects/{project_id}/codegraph/analyzed",
+            post(record_codegraph_analyzed),
+        )
         // v0.2.49 access-matrix Phase 8 (Stream W4) — WRITE-path gate.
         // Hooks + MCP server consult this endpoint before allowing a
         // write into a Weaviate collection. Returns the project's
@@ -673,6 +683,76 @@ async fn record_codegraph_extra_indexed(
     }
 }
 
+// ─── PRIMARY code-graph baseline: record an automatic HEAD-diff catch-up ──
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordCodegraphAnalyzedBody {
+    /// The repo HEAD the catch-up run indexed (full or abbreviated SHA).
+    commit: String,
+}
+
+/// `POST /api/v1/projects/{project_id}/codegraph/analyzed` (v0.2.105 #512A)
+///
+/// Advances the project's PRIMARY code-graph baseline
+/// (`project_codegraph_bindings.last_analyzed_commit` / `last_analyzed_at`)
+/// after `vco_lib.codegraph_head_catchup` indexed the files a merge, a pull or
+/// a shell commit added — none of which the per-edit hook ever queues.
+///
+/// The writer is `Db::advance_codegraph_binding_analyzed`, the SAME
+/// advance-only function the detached-walk terminal report uses: the
+/// collection prefix, embedding model/dim and `config_json` are never touched,
+/// and a project with no binding row is left alone (seeding stays the
+/// launcher/build path's job).
+///
+/// Responses: 200 `{ "recorded": true, "last_analyzed_commit": <sha> }`;
+/// 400 the commit is not a git object id; 404 unknown project, or no codegraph
+/// binding to advance; 500 a DB error.
+async fn record_codegraph_analyzed(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<RecordCodegraphAnalyzedBody>,
+) -> impl IntoResponse {
+    let commit = body.commit.trim();
+    if !is_commit_id(commit) {
+        return err400(format!("'commit' is not a git object id: {:?}", body.commit));
+    }
+    match h.0.get_project(&project_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("project not found: {}", project_id)
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => return err500(e),
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match h.0
+        .advance_codegraph_binding_analyzed(&project_id, Some(commit), now_ms)
+    {
+        Ok(true) => Json(serde_json::json!({
+            "recorded": true,
+            "last_analyzed_commit": commit,
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!(
+                    "no codegraph binding for project {}; nothing to advance",
+                    project_id
+                )
+            })),
+        )
+            .into_response(),
+        Err(e) => err500(e),
+    }
+}
+
 // ─── Access matrix (v0.2.49 Phase 8, Stream W4) ───────────────────────────
 
 /// v0.2.49 access-matrix Phase 8 / Stream W4 — WRITE-path gate
@@ -980,6 +1060,66 @@ mod tests {
             let row = h.0.get_codegraph_extra("p1", p).unwrap().unwrap();
             assert!(row.last_indexed_commit.is_none(), "{p}");
         }
+    }
+
+    // ── v0.2.105 #512A: record the PRIMARY code-graph baseline ──────────
+
+    fn seed_cg_binding(db: &Db, pid: &str) {
+        db.set_project_codegraph_binding(
+            pid,
+            "Acme",
+            Some("codesage-large-v2"),
+            Some(2048),
+            Some("aaaaaaaaaaaa"),
+            Some(1_700_000_000_000),
+            true,
+            &serde_json::json!({"keep": "me"}),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_codegraph_analyzed_advances_only_the_baseline() {
+        let (base, h) = spawn_project_state_hub().await;
+        seed_project(&h.0, "p1", "Acme", "/tmp/acme");
+        seed_cg_binding(&h.0, "p1");
+        let resp = reqwest::Client::new()
+            .post(format!("{}/projects/p1/codegraph/analyzed", base))
+            .json(&serde_json::json!({"commit": "bbbbbbbbbbbb"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let after = h.0.get_project_codegraph_binding("p1").unwrap().unwrap();
+        assert_eq!(after.last_analyzed_commit.as_deref(), Some("bbbbbbbbbbbb"));
+        // Advance-only: the rest of the row is byte-identical.
+        assert_eq!(after.collection_prefix, "Acme");
+        assert_eq!(after.embedding_model.as_deref(), Some("codesage-large-v2"));
+        assert_eq!(after.embedding_dim, Some(2048));
+        assert_eq!(after.config, serde_json::json!({"keep": "me"}));
+        assert!(after.enabled);
+    }
+
+    #[tokio::test]
+    async fn record_codegraph_analyzed_refuses_bad_input_and_missing_rows() {
+        let (base, h) = spawn_project_state_hub().await;
+        seed_project(&h.0, "p1", "Acme", "/tmp/acme");
+        let c = reqwest::Client::new();
+        let post = |pid: &str, commit: &str| {
+            c.post(format!("{}/projects/{}/codegraph/analyzed", base, pid))
+                .json(&serde_json::json!({"commit": commit}))
+                .send()
+        };
+        // Unknown project.
+        assert_eq!(post("nope", "abcdef1").await.unwrap().status(), 404);
+        // Known project, no binding row: leave alone, never seed.
+        assert_eq!(post("p1", "abcdef1").await.unwrap().status(), 404);
+        assert!(h.0.get_project_codegraph_binding("p1").unwrap().is_none());
+        // Malformed commit id.
+        seed_cg_binding(&h.0, "p1");
+        assert_eq!(post("p1", "not-a-sha; rm").await.unwrap().status(), 400);
+        let after = h.0.get_project_codegraph_binding("p1").unwrap().unwrap();
+        assert_eq!(after.last_analyzed_commit.as_deref(), Some("aaaaaaaaaaaa"));
     }
 
     /// serde contract: an omitted `is_set` deserializes to `None`

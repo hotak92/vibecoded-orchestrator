@@ -632,6 +632,47 @@ async fn report_codegraph_build_terminal(
                 resolved_id, e
             ),
         }
+        // v0.2.105 lazy-load counts: a finished build WROTE to this
+        // project's five codegraph classes, so their cached counts are
+        // stale. Invalidate them (a class without a cache entry reads as
+        // "needs recount", never as a fresh number). Soft-fail — the
+        // build row is already finalized.
+        let prefix = match h.0.get_project_codegraph_binding(&resolved_id) {
+            Ok(Some(b)) => Some(b.collection_prefix),
+            // No binding row: fall back to the name-derived canonical,
+            // mirroring what an unbound analyzer run would write to.
+            Ok(None) => h
+                .0
+                .get_project(&resolved_id)
+                .ok()
+                .flatten()
+                .and_then(|p| vct_launcher_core::project_naming::canonical_class_prefix(&p.name).ok()),
+            Err(e) => {
+                tracing::warn!(
+                    "[vct-hub] warning: could not resolve codegraph prefix for {}: {}",
+                    resolved_id, e
+                );
+                None
+            }
+        };
+        if let Some(prefix) = prefix {
+            let classes: Vec<String> = [
+                "CodeModule",
+                "CodeClass",
+                "CodeFunction",
+                "CodeAPI",
+                "CodeInteraction",
+            ]
+            .iter()
+            .map(|s| format!("{}_{}", prefix, s))
+            .collect();
+            if let Err(e) = h.0.collection_count_invalidate_many(&classes) {
+                tracing::warn!(
+                    "[vct-hub] warning: could not invalidate cached counts for {}: {}",
+                    prefix, e
+                );
+            }
+        }
     }
     let mut body = serde_json::json!({
         "finalized": finalized,

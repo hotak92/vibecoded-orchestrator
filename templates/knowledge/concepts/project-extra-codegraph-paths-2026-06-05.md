@@ -10,7 +10,7 @@ tags:
   - hub-resolver
   - low-level-implementation
 created: 2026-06-05T00:00:00Z
-updated: 2026-10-13T00:00:00Z
+updated: 2026-10-30T00:00:00Z
 status: active
 ---
 
@@ -44,7 +44,7 @@ Four surfaces co-evolve:
 | DB | `project_codegraph_extra_paths` (migration 026) | Persists `(project_id, path, label, added_at, last_indexed_at, last_indexed_commit, enabled)` per row, PK `(project_id, path)`, CASCADE on project delete |
 | Launcher (Tauri) | `commands::project_codegraph_extras` | 6 commands: list / add / remove / set_enabled / sync / reindex. Per-project mutex serialises add→reindex sequences. Disambiguation response when path is an existing launcher project |
 | Hub resolver | `code_graph_extra_paths: Vec<{path, enabled, last_indexed_commit}>` on `/api/v1/projects/{id}/config` | Additive field; older clients ignore. Only enabled rows projected |
-| GUI (Svelte) | `ExtraCodegraphPathsPanel.svelte` + `ExtrasDisambiguationModal` + `ExtrasSyncProgressModal` | Per-row sync/disable/remove. Auto-sync on add. Re-sync with `--prune-stale` on remove/disable. Hide-to-pill on long syncs |
+| GUI (Svelte) | `ExtraCodegraphPathsPanel.svelte` + `ExtrasDisambiguationModal` + `ExtrasSyncProgressModal` | Per-row sync/disable/remove. Auto-sync on add. Remove/disable purges that folder's rows (see below). Hide-to-pill on long syncs |
 | Hooks | `post-file-edit` → `_lib/route-touched-path.sh` (+ `.ps1`) queues; `stop-codegraph-drain.sh` (+ `.ps1`) drains | A code edit under an enabled code folder goes to that folder's own drain queue (never the primary queue); the Stop hook drains it as a scoped run into the CURRENT project's prefix, and periodically re-indexes folders whose HEAD moved. `code-graph-incremental.sh` keeps the first-match ordering below but ships unregistered |
 | Analyzer CLI | `--extra-path <DIR>` (repeatable) + `--since-commit <SHA>` | Walks all source roots in ONE pass; `visited_uuids` is the UNION across primary repo + all extras. Schema adds `project_source` property to all 5 code collections |
 
@@ -53,6 +53,13 @@ Four surfaces co-evolve:
 **`--prune-stale` runs MUST visit every file currently meant to be in the
 project's codegraph in ONE invocation.** Multi-pass with `--prune-stale`
 would cause each pass to delete the OTHER passes' UUIDs.
+
+Since v0.2.105 the prune is also SCOPED to what the run walked
+(`vco_lib.codegraph_source_scope.prune_scope_for_walk`): it judges only rows
+whose `project_source` is the walked root or an extra walked in the same run.
+Rows of an extra folder the run did not walk are left alone, so a resync of
+the primary root can no longer delete the extras' rows. An unstamped legacy
+row is kept unless the project positively has no extra folder.
 
 Locked in at TWO layers:
 
@@ -129,9 +136,15 @@ Backwards-compatible by construction.
   the project's KG. Codegraph only.
 - Treating code folders as read-only: since v0.2.102 lane reservations may
   create isolated subagent worktrees in an enabled code folder.
-- Auto-drop of Weaviate entries on row delete: handled by the analyzer's
-  `--prune-stale` pass in the re-analyze that fires after removal, NOT by
-  destroying the collection.
+- Auto-drop of Weaviate entries on row delete: NOT done by `--prune-stale`
+  (since v0.2.105 it is scoped to the walked roots and never touches another
+  folder's rows), and never by destroying the collection. A removed or
+  disabled folder's rows are deleted by `vco_lib.codegraph_source_purge`, only
+  for a path the hub POSITIVELY reports as gone (`code_graph_extra_paths_gone`:
+  a disabled row, or a removed row with its audit entry). An unknown answer
+  (hub down, DB read failed) keeps the rows. The launcher's Remove/Disable
+  flow runs that purge for the path at once; a session-start sweep catches up
+  otherwise.
 
 ## Audit-log events
 

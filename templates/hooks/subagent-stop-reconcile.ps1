@@ -229,6 +229,19 @@ if (Test-Path -LiteralPath $SessionIdLib) { . $SessionIdLib }
 # the alert. Must match the .sh.
 $AgentAlertsLib = Join-Path $ScriptDir "_lib/agent-alerts.ps1"
 if (Test-Path -LiteralPath $AgentAlertsLib) { . $AgentAlertsLib }
+# v0.2.105: name what the parent merges - a harness-style lane worktree sits on
+# a DETACHED HEAD (merge by SHA), a lane reservation's on its own branch.
+# Must match the .sh sibling's _reconcile_head_desc. Never throws.
+function Get-ReconcileHeadDescription([string]$Path) {
+    $ref = ""
+    try { $ref = [string](& git -C $Path symbolic-ref -q --short HEAD 2>$null | Select-Object -First 1) } catch { $ref = "" }
+    if ($ref) { return "branch $($ref.Trim())" }
+    $sha = ""
+    try { $sha = [string](& git -C $Path rev-parse --short=12 HEAD 2>$null | Select-Object -First 1) } catch { $sha = "" }
+    if ($sha) { return "detached HEAD $($sha.Trim()) - merge it by that SHA or name a branch first" }
+    return "HEAD unreadable"
+}
+
 function Add-ReconcileParentAlert([string]$Kind, [string]$Message, [string]$File = "") {
     if (-not $AgentId) { return }
     if ((Get-Command Add-VcoAgentAlert -ErrorAction SilentlyContinue) -and
@@ -283,6 +296,9 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
 # a hook-created worktree nor runs WorktreeRemove when a subagent finishes).
 # Conditions live in _lib/worktree-records.ps1 :: Invoke-WtrecReap. A kept
 # worktree is logged with path + reason and named on stderr. Never blocks.
+# A kept worktree's notice reaches the parent ONCE per path per session
+# (v0.2.105: an interim stop, the agent waiting on its own background work,
+# is indistinguishable in the payload from a final one) and says so.
 $WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
 if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
     . $WtrecHelper
@@ -301,9 +317,24 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
             Add-Content -Path (Join-Path $LogDir "worktree-guard.jsonl") -Value ($row | ConvertTo-Json -Compress) -ErrorAction Stop
         } catch { }
         if ($reap.Decision -eq "kept") {
-            [Console]::Error.WriteLine("subagent-stop-reconcile: worktree of agent $AgentId KEPT at $($reap.Path) ($($reap.Reason)) - review, merge or remove it")
-            # census F8: file it for the PARENT, which must review/merge/remove it.
-            Add-ReconcileParentAlert "worktree_kept" "worktree KEPT at $($reap.Path) ($($reap.Reason)): review its changes, then merge or remove it" ([string]$reap.Path)
+            # v0.2.105 - must match the .sh sibling: an interim SubagentStop
+            # (the agent is waiting on its own background work and will resume)
+            # is indistinguishable from a final one in the payload - no
+            # interim/final field, and background_tasks / session_crons are
+            # scoped to the PARENT session (docs: hooks#subagentstop-input).
+            # Tell the parent ONCE per worktree path per session
+            # (_lib/worktree-records.ps1 :: Test-WtrecKeptAlertOnce), worded so
+            # the reader knows the agent may still be running. In the ordinary
+            # sequence the second stop of one launch is already suppressed by
+            # Invoke-WtrecReap's PRE-EXISTING already_handled gate; the marker
+            # covers the rewritten-record case and the detached-job race.
+            $keptRec = Find-WtrecRecord $ProjectRoot $AgentId
+            if (-not $keptRec -or (Test-WtrecKeptAlertOnce $keptRec $SessionId ([string]$reap.Path))) {
+                $keptHead = Get-ReconcileHeadDescription ([string]$reap.Path)
+                [Console]::Error.WriteLine("subagent-stop-reconcile: worktree of agent $AgentId KEPT at $($reap.Path) ($($reap.Reason); $keptHead) - if the agent is still running background work it will resume; review, merge or remove it after its final report")
+                # census F8: file it for the PARENT, which must review/merge/remove it.
+                Add-ReconcileParentAlert "worktree_kept" "worktree KEPT at $($reap.Path) ($($reap.Reason); $keptHead) - if the agent is still running background work it will resume; review its changes, then merge or remove it after its final report" ([string]$reap.Path)
+            }
         }
     }
 }

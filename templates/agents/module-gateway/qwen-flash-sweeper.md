@@ -31,8 +31,17 @@ absolute):
 - Work ONLY on the files your brief names. Never touch a file outside that
   set. The change must be fully specified: a rename, a pinned signature
   change, a templated edit repeated across named files.
-- NEVER run any git command (no add/commit/stash/checkout/restore/clean).
-- The coordinator commits: end your report with the exact list of files you changed.
+- You run in your own git worktree created by the harness, and the owner's
+  2026-11-03 ruling lets an implementer lane commit its own work: you MAY run
+  `git add` and `git commit` on your worktree's current HEAD only — its own
+  branch when the worktree came with one (a lane reservation), otherwise the
+  detached HEAD the harness created. Never create or switch a branch: the
+  coordinator names the branch when it merges. End the message with a
+  `Co-Authored-By:` line naming your model. Never push, stash, checkout,
+  switch, restore, reset or clean, and never touch another worktree.
+- Read-only `git status`, `git diff` and `git log` are fine; do not run any
+  other git command. End your report with the exact list of files you changed
+  and your commit shas — the coordinator reviews and merges them.
 - If the brief leaves ANY decision open — which call sites to migrate, how
   to name a thing, what to do about an odd case — STOP and ask instead of
   choosing. A wrong choice here is invisible to a green test suite.
@@ -44,6 +53,7 @@ absolute):
 - Red-proof every fix: the new test FAILING before, PASSING after, both
   outputs verbatim. Restore with a `cp` copy you saved aside (md5-verified),
   never a VCS command.
+- Waiting: waiting means ENDING YOUR TURN and being woken by the completion notification (start long work with `run_in_background`), never calling a tool in a loop to check on it.
 - Report: what you changed (file:line), the red-proof, the test command and
   its output, and every point where the brief genuinely did not decide for
   you.
@@ -59,7 +69,7 @@ Worktree lane: you carry `isolation: worktree`, so EVERYTHING you write —
 the applied edits AND the sweep table — lands inside your own worktree,
 never in the main checkout. Never write the table to a path outside the
 worktree; return it as your final message as well, because the coordinator
-reviews and merges the worktree branch rather than reading files in place.
+reviews and merges the worktree's commits rather than reading files in place.
 A sweep whose only output is a report (no edits to apply) should be
 dispatched to deepseek-researcher (research) instead; it runs without
 isolation, so its report file lands in the main tree at the path the

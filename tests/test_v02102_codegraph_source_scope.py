@@ -207,10 +207,17 @@ def test_d1_identical_file_gets_rows_in_both_roots_and_survives_folder_removal(
 
     c = _analyzer(amod)
     _rewire(c, b)
-    c.analyze_repository(proj, prune_stale=True)  # Remove → reindex without the folder
-    assert _module_sources(c, "pkg/same.py") == [proj.as_posix()], (
-        "removing the folder deletes its rows and keeps the project's")
-    assert _fn_sources(c, "pkg/same.py") == [proj.as_posix()]
+    c.analyze_repository(proj, prune_stale=True)  # reindex without the folder argv
+    # v0.2.105 (prune lane): a primary-only --prune-stale walk judges ONLY
+    # the primary root's rows — the extra folder's rows SURVIVE it (they used
+    # to be deleted here, which is how the pre-v0.2.105 orphan remedy wiped
+    # every enabled extra folder; a folder's rows are removed by disabling
+    # it, whose purge lives in vco_lib.codegraph_extras_refresh).
+    assert _module_sources(c, "pkg/same.py") == sorted(
+        [proj.as_posix(), extra.as_posix()]), (
+        "a primary-only prune must never judge the extra folder's rows")
+    assert _fn_sources(c, "pkg/same.py") == sorted(
+        [proj.as_posix(), extra.as_posix()])
 
 
 def test_d1_unchanged_file_same_root_still_skipped_zero_writes(amod, no_embed, tmp_path):

@@ -242,6 +242,9 @@ try:
         run_code_retrieval_pipeline,
         resolve_retrieval_floor,
         resolve_post_rerank_floor,
+        scope_admits as _scope_admits,
+        scope_collections as _scope_collections,
+        scope_filter as _scope_filter,
     )
 except ImportError as _exc:
     _reraise_shipped_submodule_import(_exc, ".code_ranking")
@@ -5885,26 +5888,20 @@ async def search_code_graph(
     detail: str = "auto",
 ) -> str:
     """
-    Find code entities (functions, classes, modules, APIs) by describing what
+    Find code entities (functions, classes, modules, APIs, config) by what
     they do (semantic). Use BEFORE Grep to find code by purpose; for exact
     callers/deps use query_code_structure.
 
     Args: query (what the code does); scope ("all" default | "code" |
-    "interaction" for APIs/cross-service calls); limit (default 8);
-    expand_hops (0 default; 1-2 follow call/interaction edges); layer
-    (lowercase values: api, service, data, ui, utility; an unpopulated
-    filter re-runs without it);
-    project (omit for workspace default, "" for all); detail ("auto" default,
-    else "titles"/"full" — knowledge/concepts/score-driven-retrieval-tiers.md).
+    "interaction" (APIs, cross-service calls) | "config" (.ini/.json/.tweakers
+    values)); limit (default 8); expand_hops (0 default; 1-2 follow
+    call/link edges); layer (lowercase values: api, service, data, ui,
+    utility); project (omit for workspace default, "" for all);
+    detail ("auto" default, else "titles"/"full" —
+    knowledge/concepts/score-driven-retrieval-tiers.md).
 
     Returns: JSON code entities — file_path, score, tier, tier-dependent content.
     """
-    _SCOPES: dict[str, list[str]] = {
-        "all":         ["CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction"],
-        "code":        ["CodeFunction", "CodeClass", "CodeModule"],
-        "interaction": ["CodeAPI", "CodeInteraction"],
-    }
-
     # Resolve project: explicit arg > env default > no filter
     # Pass project="" to explicitly search all projects regardless of env default
     if project is not None:
@@ -5919,7 +5916,9 @@ async def search_code_graph(
     # filter). The peer list is consumed only when an effective_project is
     # set — otherwise the caller is explicitly asking for cross-tenant
     # search and we don't want to re-scope it.
-    base_names = _SCOPES.get(scope, _SCOPES["all"])
+    # v0.2.105: the scope table (+ "config", and "all" without config link
+    # rows) lives in code_ranking — one home with the ranking it feeds.
+    base_names = _scope_collections(scope)
     if effective_project:
         # v0.2.74 (BLOCKER-1): code-graph fan-out uses the underscore-PRESERVING
         # sanitizer (matches the analyzer's write class), NOT the diagrams/KG
@@ -6042,6 +6041,9 @@ async def search_code_graph(
                         active_filters.append(Filter.by_property("project").equal(project_filter))
                     if apply_layer and layer and base_name in ("CodeFunction", "CodeClass"):
                         active_filters.append(Filter.by_property("layer").equal(layer.lower()))
+                    _scope_clause = _scope_filter(scope, base_name, Filter)
+                    if _scope_clause is not None:
+                        active_filters.append(_scope_clause)
                     if active_filters:
                         combined = active_filters[0]
                         for f in active_filters[1:]:
@@ -6065,6 +6067,10 @@ async def search_code_graph(
                     )
                     for obj in _objs:
                         p = obj.properties
+                        # v0.2.105: the scope's exact rule (the clause above
+                        # is a word-tokenized narrowing read).
+                        if not _scope_admits(scope, base_name, p or {}):
+                            continue
                         distance = obj.metadata.distance if (hasattr(obj.metadata, "distance") and obj.metadata.distance is not None) else 1.0
                         # F11-iv (pre-gate audit): clamp to >= 0.0 — MUST MATCH
                         # the CLI's `max(0.0, 1.0 - distance)` normalisation
@@ -6261,6 +6267,9 @@ async def search_code_graph(
             collapse_fn=make_code_collapse_fn(),
             tier_fn=_tier_fn,
             key_fields=("file_path", "full_name"),
+            # v0.2.105: a config-scope search asked for config rows — no
+            # config penalty there; every other scope resolves the default.
+            config_penalty=0.0 if scope == "config" else None,
         )
 
         # v0.2.73 RL-2: the code path now emits retrieval telemetry (it was a
@@ -6702,6 +6711,223 @@ def _caller_match_terms(target: str) -> list[str]:
     return terms
 
 
+# ─── Caller scope: same source root + qualified-name preference (v0.2.105 #512C)
+# A project whose code graph ALSO holds an extra code folder's mirror rows
+# listed the mirror's functions as callers (field report: the injected context
+# for a model's `combine` named an unrelated tool's methods; the same report's
+# `combine(` search symptom is the SEARCH surface, not this one). Two causes,
+# both on the caller-list read path:
+#
+#   1. the caller list matched `call_names` BARE leaves across the WHOLE
+#      collection, while every code row carries `project_source` — the root it
+#      was walked from (the project's own folder, or one extra code folder);
+#   2. nothing preferred a caller whose qualified scope is the callee's own.
+#
+# So the callee's rows are resolved first to learn which root(s) it lives in,
+# and only callers sharing one of those roots are listed (a caller row and the
+# callee row must share `project_source`). A callee with no stamp at all
+# (pre-v0.2.47 legacy rows, or a project with no extra folders) yields no
+# root set and the list is left exactly as it was. A CALLER row with no
+# stamp is kept too (v0.2.105 fix round M4): in a mixed graph — callee
+# re-walked and stamped, callers in untouched legacy files — an absent stamp
+# is not evidence the row came from another root, so dropping it would hide
+# real callers. A qualified match is listed
+# before a bare-name-only one so a capped list shows the real caller first;
+# bare matches are demoted, NEVER dropped — a missing `calls` edge is not
+# evidence of absence (see the CLI's callers branch).
+_CALLER_TARGET_ROWS = 8       # callee rows fetched to learn its root(s)
+_CALLER_SCOPE_SCAN_MULT = 10  # candidate over-fetch when a root scope applies
+# Path-spelling differences (a symlinked root, a `..`/`//` spelling, a
+# Windows drive-letter case) must not fork the scope, so stored stamps are
+# compared through their comparison FORMS — raw + realpath-resolved POSIX
+# (the same both-forms rule as `vco_lib.codegraph_resync.primary_sources_for`)
+# and case-folded on Windows, where two spellings of one root differ only by
+# case. Folded comparison is a module flag so tests can exercise it on any OS.
+_CASEFOLD_PROJECT_SOURCES = os.name == "nt"
+
+
+def _row_project_source(obj) -> str:
+    """A code row's ``project_source`` — the root it was walked from.
+
+    ``""`` when the property is absent (a legacy row written before v0.2.47,
+    a mocked object) — such a row cannot be shown to share a root.
+    """
+    try:
+        return str((obj.properties or {}).get("project_source") or "").strip()
+    except Exception:  # noqa: BLE001 — defensive on mocked objects
+        return ""
+
+
+@functools.lru_cache(maxsize=1024)
+def _source_forms(src: str) -> frozenset:
+    """The comparison forms of one stored ``project_source`` stamp.
+
+    The raw POSIX spelling beside the realpath-resolved one (a symlinked or
+    ``..``/``//``-spelled root must not fork the scope — the same both-forms
+    rule as :func:`vco_lib.codegraph_resync.primary_sources_for`, which this
+    reuses), plus the case-folded spellings on Windows, where two spellings
+    of one root differ only by drive-letter / folder case. A path that no
+    longer resolves (the repo was moved) keeps at least its raw form.
+    Cached: the caller scan calls this per row.
+    """
+    from vco_lib.codegraph_resync import primary_sources_for
+
+    forms = set(primary_sources_for(Path(src)) or {src})
+    if _CASEFOLD_PROJECT_SOURCES:
+        forms |= {f.lower() for f in forms}
+    return frozenset(forms)
+
+
+def _caller_scope_roots(rows: list) -> set:
+    """The comparison forms of the CALLEE rows' NON-EMPTY source roots."""
+    roots: set = set()
+    for src in (_row_project_source(r) for r in (rows or [])):
+        if src:
+            roots |= _source_forms(src)
+    return roots
+
+
+def _caller_target_rows(
+    coll, target, project, *, filter_cls, base_props, prop="full_name",
+    tolerant_limit=_CALLER_TARGET_ROWS,
+) -> list:
+    """The callee's identity rows, carrying ``project_source`` when present.
+
+    Requests ``project_source`` beside the caller's own properties and falls
+    back to the bare request on a collection that predates the property (an
+    unknown property in ``return_properties`` is an error on some schema
+    variants — the same defensive probe ``analyze_code_graph`` uses). The
+    fallback yields no roots, i.e. the leave-alone behaviour.
+    """
+    from vco_lib.codegraph_lookup import code_identity_rows
+
+    props = list(base_props)
+    try:
+        return code_identity_rows(
+            coll, prop, target, project, filter_cls=filter_cls,
+            tolerant_limit=tolerant_limit,
+            return_properties=props + ["project_source"],
+        )
+    except Exception:  # noqa: BLE001 — legacy schema without the property
+        return code_identity_rows(
+            coll, prop, target, project, filter_cls=filter_cls,
+            tolerant_limit=tolerant_limit, return_properties=props,
+        )
+
+
+def _caller_scope_prefix(full_name: str) -> str:
+    """The class/namespace/module path of a qualified name ("" when bare)."""
+    name = str(full_name or "")
+    for sep in ("::", "."):
+        if sep in name:
+            head, _, _leaf = name.rpartition(sep)
+            return head
+    return ""
+
+
+def _caller_match_rank(
+    caller_full_name: str, target_full_name: str, *, edge_confirmed: bool = False,
+) -> int:
+    """``0`` for a QUALIFIED match, ``1`` for a bare-name-only match.
+
+    QUALIFIED means uuid-precise (the analyzer's resolved ``calls`` edge
+    targets the callee) or same scope — the caller's class/namespace/module
+    path equals the target's, the very "prefer the caller's own module prefix"
+    rule the analyzer's short-name resolution applies. Ordering only.
+    """
+    if edge_confirmed:
+        return 0
+    want = _caller_scope_prefix(target_full_name)
+    if want and want == _caller_scope_prefix(caller_full_name):
+        return 0
+    return 1
+
+
+def _row_full_name(obj) -> str:
+    try:
+        return str((obj.properties or {}).get("full_name") or "")
+    except Exception:  # noqa: BLE001 — defensive on mocked objects
+        return ""
+
+
+def _keep_caller_in_scope(obj, roots) -> bool:
+    """Same-source-root rule for one caller row (v0.2.105 #512C).
+
+    No known callee root (legacy rows) → LEAVE-ALONE: keep everything, exactly
+    the pre-v0.2.105 behaviour. A caller row with an EMPTY stamp is kept too
+    (v0.2.105 fix round M4): such a row predates source stamping, and an
+    absent stamp is not evidence the row came from another root — dropping it
+    hid real callers in mixed graphs (callee re-walked and stamped, callers in
+    untouched legacy files). Otherwise the caller's ``project_source`` must
+    share a comparison form with one of the callee's roots (NOT an exact
+    string compare: a property filter would be word-tokenized, and one root's
+    path is a token subset of any nested root's — while a symlinked or
+    differently spelled root is still the SAME root).
+
+    Deliberately NOT exempted: a caller linked only by a stored ``calls``
+    edge. That edge is exactly what the write pass produced by resolving a
+    BARE short name across roots, so trusting it would re-admit the false
+    callers this rule removes (the read side ranks edge-confirmed callers
+    first instead). A callee name that exists in several roots still lists
+    each root's own callers — that pairing is correct.
+    """
+    if not roots:
+        return True
+    src = _row_project_source(obj)
+    if not src:
+        return True
+    return bool(_source_forms(src) & roots)
+
+
+def _caller_page_proves_mixed(objects, roots, base_limit: int) -> bool:
+    """Does the BASE-limit caller page owe the ×10 over-fetch? (fix round M5)
+
+    The over-fetch exists so a cap filled with another root's mirror rows
+    does not hide the real callers — which can only happen when the
+    collection actually holds rows from more than one root. That is proven
+    by the page itself being FULL and containing at least one out-of-scope
+    row; a single-root graph (no extra code folders) never proves it, so it
+    keeps the pre-scope fetch size and answers, exactly as before.
+    """
+    if not roots or len(objects or []) < base_limit:
+        return False
+    return any(not _keep_caller_in_scope(o, roots) for o in objects)
+
+
+def _caller_scan_limit(base_limit: int, escalate: bool) -> int:
+    """Candidate cap for the caller fetch: the ×N over-fetch only when the
+    base page proved the collection mixed (see `_caller_page_proves_mixed`)."""
+    return base_limit * (_CALLER_SCOPE_SCAN_MULT if escalate else 1)
+
+
+def _callers_answer_truncated(in_scope_rows, raw_object_count: int,
+                              scan_limit: int, answer_cap: int) -> bool:
+    """ONE truncation rule for BOTH caller surfaces (v0.2.105 fix round,
+    review NIT — the MCP `query_code_structure("callers")` branch and the
+    `query_code_graph` CLI used to disagree: the CLI ran ``>=`` on the
+    ALREADY-CAPPED list, so exactly-cap in-scope callers read as truncated
+    there and complete in the MCP).
+
+    The answer is truncated when the in-scope list is LONGER than the cap
+    (strictly — an exactly-full answer listed everything found, so it is
+    complete), or the raw scan filled its fetch width (there may be rows
+    the scan never saw). Computed on the UNSLICED in-scope list, both
+    surfaces, one home."""
+    return len(in_scope_rows) > answer_cap or raw_object_count >= scan_limit
+
+
+def _order_caller_rows(rows: list, target_full_name: str, confirmed_names=()) -> list:
+    """Stable sort of caller rows: qualified matches first (v0.2.105 #512C)."""
+    confirmed = set(confirmed_names or ())
+    return sorted(
+        rows,
+        key=lambda o: _caller_match_rank(
+            _row_full_name(o), target_full_name,
+            edge_confirmed=_row_full_name(o) in confirmed,
+        ),
+    )
+
+
 def _pick_canonical_chunk(objects: list):
     """The canonical chunk-0 row of a chunked code entity — SHARED home.
 
@@ -6884,6 +7110,12 @@ from vco_lib.fixture_class_guard import (  # noqa: E402 — kept beside its expl
     FixtureClassWriteRefused as _FixtureClassWriteRefused,
     guard_fixture_class_write as _guard_fixture_class_write,
 )
+# v0.2.105: `config_users` / `config_of` — the ONE implementation the CLI's
+# `structure` command calls too (shared code, not a mirror).
+from vco_lib.codegraph_config_query import (  # noqa: E402 — kept beside its explainer
+    CONFIG_QUERY_TYPES as _CONFIG_QUERY_TYPES,
+    run_config_query as _run_config_query,
+)
 
 
 # M-2 / CG-2 (v0.2.73): query types whose relationships are populated only
@@ -7016,18 +7248,18 @@ def query_code_structure(
     project: str = None
 ) -> str:
     """
-    Exact code structure from the code graph (the graph, not semantic search).
-    Use when the entity name is known; find it by description via
-    search_code_graph.
+    Exact code structure from the code graph (not semantic search). Use when
+    the name is known; otherwise search_code_graph first.
 
-    Args: query_type — "dependencies" (imports), "imports" (who imports this),
-    "callers", "methods", "extends", "interactions" (cross-service calls),
-    "path" (shortest call path, "src.func->dst.func", BFS ≤ 6),
-    "composes"/"composed_by", "type_users"; target (full_name for
-    functions/classes, path for modules, the arrow pair for "path"); project
-    (omit for workspace default, "" for all).
+    Args: query_type — "dependencies"/"imports" (what it imports / who
+    imports it), "callers", "methods", "extends", "interactions"
+    (cross-service calls), "path" ("src.func->dst.func", BFS ≤ 6),
+    "composes"/"composed_by", "type_users", "config_users" (code reading a
+    config key/section/file, with the value), "config_of" (the config values
+    a function/module reads); target (full_name, module path, arrow pair for
+    "path", config key); project (omit for workspace default, "" for all).
 
-    Returns: JSON — structural results (names, file_path, relations).
+    Returns: JSON results (names, file_path, relations).
     """
     try:
         client = get_weaviate_client()
@@ -7039,6 +7271,9 @@ def query_code_structure(
         # lookups, methods/extends/composes that read a single object's
         # field) leave it as None (never truncated).
         _truncation_meta: dict | None = None
+        # v0.2.105: extra top-level fields a branch adds (config_users'
+        # `definitions`).
+        _extra_payload: dict = {}
 
         # Resolve project: explicit arg > env default > no filter
         # Pass project="" to explicitly search all projects regardless of env default
@@ -7216,25 +7451,56 @@ def query_code_structure(
             # v0.2.46 V46-D: emit truncation signal.
             CALLERS_LIMIT = 50
             coll = client.collections.get(_proj_coll("CodeFunction"))
+            # v0.2.105 (#512C): the callee's own rows say WHICH source root it
+            # lives in; a caller row must share it (see the helper block's
+            # docstring). Legacy rows carry no stamp → no roots → leave-alone.
+            caller_roots = _caller_scope_roots(_caller_target_rows(
+                coll, target, effective_project,
+                filter_cls=Filter, base_props=("full_name",),
+            ))
+            # Fix round M5: fetch at the ANSWER cap first and over-fetch ×N
+            # only when the page itself proves the collection mixed (full
+            # page + out-of-scope rows) — a single-root graph keeps the exact
+            # pre-scope fetch size and answers.
+            scan_limit = _caller_scan_limit(CALLERS_LIMIT, False)
             # WS-4 Finding 1: call_names holds BARE leaf names; match the
             # full_name target AND its bare leaf so dotted / `::`-qualified
             # inputs (the documented form) actually resolve.
             response = coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
-                limit=CALLERS_LIMIT
+                limit=scan_limit
             )
+            if _caller_page_proves_mixed(response.objects, caller_roots, CALLERS_LIMIT):
+                scan_limit = _caller_scan_limit(CALLERS_LIMIT, True)
+                response = coll.query.fetch_objects(
+                    filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
+                    limit=scan_limit
+                )
             # F6: `call_names` is replicated on every chunk row of a chunked
-            # caller — collapse to one row per full_name (canonical chunk).
+            # caller — collapse to one row per full_name (canonical chunk),
+            # then keep only same-root rows and list qualified matches first,
+            # and re-cap the ANSWER at CALLERS_LIMIT (fix round M5: the cap
+            # applies to the filtered list, never to the raw scan).
+            ordered_callers = _order_caller_rows(
+                [
+                    row for row in _dedup_objects_by_full_name(response.objects)
+                    if _keep_caller_in_scope(row, caller_roots)
+                ],
+                target,
+            )
             results = [
                 {
                     "full_name": obj.properties.get("full_name", ""),
                     "signature": obj.properties.get("signature", ""),
                     "file_path": obj.properties.get("file_path") or obj.properties.get("path", ""),
                 }
-                for obj in _dedup_objects_by_full_name(response.objects)
+                for obj in ordered_callers[:CALLERS_LIMIT]
             ]
             _truncation_meta = {
-                "truncated": len(response.objects) >= CALLERS_LIMIT,
+                "truncated": _callers_answer_truncated(
+                    ordered_callers, len(response.objects), scan_limit,
+                    CALLERS_LIMIT),
+                # the TRUE answer cap — not the escalated scan width
                 "limit": CALLERS_LIMIT,
             }
 
@@ -7468,10 +7734,32 @@ def query_code_structure(
                 "limit": TYPE_USERS_LIMIT,
             }
 
+        elif query_type in _CONFIG_QUERY_TYPES:
+            # v0.2.105: config values <-> the code that reads them. ONE
+            # implementation shared with the CLI (vco_lib.codegraph_config_query);
+            # each site carries the value read back from its own root's
+            # section rows.
+            config_result = _run_config_query(
+                query_type, lambda base: client.collections.get(_proj_coll(base)),
+                target, effective_project or "",
+                filter_cls=Filter, ref_cls=QueryReference,
+            )
+            if not config_result.get("success"):
+                config_result["error"] += _code_structure_not_found_hint(
+                    query_type, target, effective_project)
+                return json.dumps(config_result, indent=2)
+            results = config_result["results"]
+            _truncation_meta = {
+                "truncated": config_result["truncated"],
+                "limit": config_result["limit"],
+            }
+            if "definitions" in config_result:
+                _extra_payload["definitions"] = config_result["definitions"]
+
         else:
             return json.dumps({
                 "success": False,
-                "error": f"Unknown query type: {query_type}. Supported: dependencies, imports, callers, methods, extends, interactions, path, composes, composed_by, type_users"
+                "error": f"Unknown query type: {query_type}. Supported: dependencies, imports, callers, methods, extends, interactions, path, composes, composed_by, type_users, config_users, config_of"
             }, indent=2)
 
         # v0.2.46 V46-D: include truncation metadata for top-N queries so
@@ -7489,6 +7777,7 @@ def query_code_structure(
         if _truncation_meta is not None:
             response_payload["truncated"] = _truncation_meta["truncated"]
             response_payload["limit"] = _truncation_meta["limit"]
+        response_payload.update(_extra_payload)
         # CG-2 (v0.2.73 → v0.2.75 P2e): a call-graph query
         # (callers/path/type_users) that returns EMPTY is ambiguous — the target
         # may genuinely have no callers, OR its language's analyzer walker

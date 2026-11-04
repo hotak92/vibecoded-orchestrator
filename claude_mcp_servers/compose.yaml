@@ -25,7 +25,13 @@ services:
   # Anonymous access enabled for local-only use; lock down before
   # exposing on any non-loopback interface.
   weaviate:
-    image: cr.weaviate.io/semitechnologies/weaviate:1.28.4
+    # v0.2.105: same pin as the canonical infrastructure/docker-compose.yml
+    # (see its notes for why 1.37.18 and the verified in-place upgrade).
+    image: cr.weaviate.io/semitechnologies/weaviate:1.37.18
+    # v0.2.105: container memory limit (see infrastructure/docker-compose.yml).
+    # This legacy file's project folder has no install-written .env, so it is
+    # unlimited unless VCT_WEAVIATE_MEM_LIMIT is exported (e.g. 12288m).
+    mem_limit: ${VCT_WEAVIATE_MEM_LIMIT:-0}
     # Prefixed name avoids collision with bare `weaviate` containers a user
     # may already be running. The `name: vibecoded` project label above also
     # auto-prefixes, but the explicit form makes the lifecycle (start / stop /
@@ -61,12 +67,18 @@ services:
       # BLOCKED compaction from collapsing ~42k dead CodeFunction versions, so
       # they were re-written every cycle; 2GiB lets them converge once. Keep
       # 2GiB conservative so a ~2x merge spike stays under free-disk headroom /
-      # DISK_USE_READONLY_PERCENTAGE). Auto-size Go heap/CPU to host to cut
-      # heap-driven flushing without OOM risk.
+      # DISK_USE_READONLY_PERCENTAGE). LIMIT_RESOURCES sizes the Go soft
+      # memory limit to 80% of `mem_limit` (with no limit it is unbounded).
       PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 3600
       PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
       PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 2GiB
       LIMIT_RESOURCES: "true"
+      # v0.2.105 memory + compression knobs — mirror of the canonical
+      # infrastructure/docker-compose.yml (full rationale there).
+      GOGC: "50"
+      MEMORY_READONLY_PERCENTAGE: "0"
+      LAZY_LOAD_SHARD_COUNT_THRESHOLD: "0"
+      DEFAULT_QUANTIZATION: "rq-8"
       # --- HNSW TOMBSTONE-CLEANUP CHURN REDUCTION (v0.2.61) ---
       # Mirror of the tuning in infrastructure/docker-compose.yml (canonical);
       # this legacy compose path wires into the same shared volume so it must

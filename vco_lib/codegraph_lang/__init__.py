@@ -57,6 +57,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from vco_lib.codegraph_lang.config import analyze_config_file
 from vco_lib.codegraph_lang.cpp import analyze_cpp_file
 from vco_lib.codegraph_lang.csharp import analyze_csharp_file
 from vco_lib.codegraph_lang.go import analyze_go_file
@@ -89,4 +90,6 @@ EXTRACTORS: Dict[str, Callable[[Any, Path, Path], Dict[str, int]]] = {
     "shell": analyze_shell_file,
     "proto": analyze_proto_file,
     "svelte": analyze_svelte_file,
+    # v0.2.105: .tweakers / .ini / .json — one key, the format is per row.
+    "config": analyze_config_file,
 }

@@ -22,6 +22,7 @@ import http.server
 import importlib
 import importlib.util
 import json
+import os
 import subprocess as _subprocess
 import sys
 import threading
@@ -356,3 +357,40 @@ def test_gateway_auth_env_reads_the_token_file_not_argv(
     assert env["ANTHROPIC_AUTH_TOKEN"] == "s3cret-token"
     assert env["ANTHROPIC_API_KEY"] == ""
     assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
+
+def test_run_marks_the_reviewer_session_as_keeping_no_transcript(
+        chain, monkeypatch, tmp_path):
+    """v0.2.105: the reviewer's ``claude -p --no-session-persistence`` child
+    writes no transcript, so no citation its hooks / MCP servers stage can
+    ever be scored. The spawn env carries the marker ``stage_pending``
+    honours (vco_lib.rl_citation_env)."""
+    from vco_lib.rl_citation_env import NO_TRANSCRIPT_ENV
+
+    _Rig(chain, monkeypatch)  # haiku rung available
+    monkeypatch.delenv(NO_TRANSCRIPT_ENV, raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    real_run = _subprocess.run
+    for args in (["init", "-q"], ["-c", "user.name=t", "-c",
+                                  "user.email=t@e.invalid", "commit", "-q",
+                                  "--allow-empty", "-m", "c"]):
+        real_run(["git", *args], cwd=repo, check=True, capture_output=True)
+    seen: dict = {}
+
+    def _capture(cmd, *a, **kw):
+        if cmd and cmd[0] == "claude":
+            seen["env"] = dict(kw.get("env") or {})
+            seen["argv"] = list(cmd)
+            raise _subprocess.TimeoutExpired(cmd=["claude"], timeout=900)
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(chain, "subprocess", types.SimpleNamespace(
+        run=_capture, TimeoutExpired=_subprocess.TimeoutExpired))
+    monkeypatch.setattr(chain, "resolve_claude_executable", lambda: "claude")
+    rc = chain.main(["run", "--project-root", str(repo),
+                     "--log", str(tmp_path / "review.log")])
+    assert rc == 124, rc
+    assert "--no-session-persistence" in seen["argv"]
+    assert seen["env"].get(NO_TRANSCRIPT_ENV) == "1"
+    assert NO_TRANSCRIPT_ENV not in os.environ, "only the child's env is marked"

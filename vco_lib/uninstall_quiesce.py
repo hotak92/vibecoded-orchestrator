@@ -144,8 +144,10 @@ def _cim_json(query: str, *, run: Optional[Callable[..., object]] = None) -> Any
 
     cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + query]
+    from vco_lib.windowless_spawn import no_window_popen_kwargs
+
     res = (run or subprocess.run)(cmd, capture_output=True, timeout=60,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                  **no_window_popen_kwargs())
     rc = getattr(res, "returncode", 0)
     if rc:
         raise OSError(f"PowerShell process query exited {rc}")
@@ -271,8 +273,10 @@ def _signal_stdlib(pid: int, *, force: bool) -> bool:
 
     if sys.platform == "win32":
         argv = ["taskkill", "/PID", str(pid)] + (["/F"] if force else [])
+        from vco_lib.windowless_spawn import no_window_popen_kwargs
+
         res = subprocess.run(argv, capture_output=True, timeout=30,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                             **no_window_popen_kwargs())
         return res.returncode == 0
     try:
         os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)

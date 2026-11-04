@@ -1,0 +1,11 @@
+AI Tweaks
+Prefix groups with ====== items with > and descriptions with //
+
+>orphan_item:7
+======Passing Logic
+>Pass attempt Min Time To Impact:default[3.000000]          //minimum time to impact before a pass
+>AimPID_P:1.000000                                        //description missing.
+>consistency_change_time (in seconds):default[0.5]
+======Steering
+>AimPID_I:default[0.25]
+>steer_ratio:14.5                                         //rack ratio

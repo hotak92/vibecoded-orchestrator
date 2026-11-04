@@ -126,6 +126,22 @@ if command -v resolve_vco_venv_python >/dev/null 2>&1; then
     if [ -n "${VCO_VENV_PYTHON:-}" ]; then
         ( "$VCO_VENV_PYTHON" -m vco_lib.scratch_dir sweep --project "$PROJECT_DIR" \
             --ensure-precreated </dev/null >/dev/null 2>&1 & )
+        # v0.2.105: which Claude account this project's gateway chats are
+        # billed to — printed ONLY once a second account exists (the one home
+        # is vco_lib.gateway_accounts session-line; names and states only).
+        # Bounded to 4 s (a watchdog kills it) so a slow interpreter or a
+        # wedged gateway can never hold this hook past its timeout.
+        # PARITY: session-start-kg-loader.ps1 prints the same line, same bound.
+        _acct_line="$(
+            "$VCO_VENV_PYTHON" -m vco_lib.gateway_accounts session-line \
+                --folder "$PROJECT_DIR" </dev/null 2>/dev/null &
+            _acct_pid=$!
+            ( sleep 4; kill "$_acct_pid" 2>/dev/null ) >/dev/null 2>&1 &
+            _acct_dog=$!
+            wait "$_acct_pid" 2>/dev/null
+            kill "$_acct_dog" 2>/dev/null
+        )" || _acct_line=""
+        [ -n "$_acct_line" ] && printf '%s\n' "$_acct_line"
     fi
 fi
 

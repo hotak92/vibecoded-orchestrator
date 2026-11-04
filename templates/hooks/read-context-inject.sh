@@ -39,6 +39,12 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
+# v0.2.105: the hook's start, for the router's run deadline AND its hard
+# end-to-end deadline (the harness timeout counts from HERE).
+# One home: _lib/hook-start.sh (MUST MATCH the .ps1 sibling's call).
+# shellcheck source=_lib/hook-start.sh disable=SC1091
+[ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/hook-start.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/hook-start.sh" && vco_mark_hook_start
+
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ]; then
     . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"

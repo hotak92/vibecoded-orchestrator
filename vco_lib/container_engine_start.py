@@ -62,6 +62,7 @@ from vco_lib import tool_search_dirs as _tsd
 from vco_lib.atomic import exclusive_file_lock
 from vco_lib.install_companions import detached_child_env
 from vco_lib.paths import vct_root_dir
+from vco_lib.windowless_spawn import no_window_popen_kwargs
 
 __all__ = ["VCT_CONTAINER_ENGINE_AUTOSTART", "APP_STATE_ENGINE_AUTOSTART",
            "DEFAULT_ENGINE_AUTOSTART", "autostart_enabled", "pref_enabled",
@@ -110,17 +111,9 @@ def _default_log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-#: Win32 ``CREATE_NO_WINDOW`` — the child gets a hidden console (which ITS
-#: children then inherit) instead of a fresh visible one. Review R19 F3.
-CREATE_NO_WINDOW = 0x0800_0000
-
-
-def _windows_no_window_kwargs() -> dict:
-    """``{}`` on POSIX; ``{"creationflags": CREATE_NO_WINDOW}`` on Windows —
-    the kwargs shape every console child this module spawns directly wants."""
-    if os.name == "nt":
-        return {"creationflags": CREATE_NO_WINDOW}
-    return {}
+# Review R19 F3: a console child this module spawns directly gets
+# ``CREATE_NO_WINDOW`` — a hidden console (which ITS children then inherit)
+# instead of a fresh visible one. One home: vco_lib.windowless_spawn.
 
 
 def autostart_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
@@ -269,7 +262,7 @@ def try_start_docker_daemon(
                     ["cmd", "/c", "start", "", str(exe)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     env=detached_child_env(),
-                    **_windows_no_window_kwargs(),
+                    **no_window_popen_kwargs(),
                 )
             )
         except OSError as e:

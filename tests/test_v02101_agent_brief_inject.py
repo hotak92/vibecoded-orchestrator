@@ -17,7 +17,7 @@ The KG producer is stubbed through the router's ``VCO_ROUTER_KG_SCRIPT``
 seam; the stub RECORDS the argv it was pinned to, so the test also pins
 the WP-D contract: the query is the TASK section and the leg carries
 ``--injection-profile agent_brief`` + ``--task-type agent_brief_kg_search``
-(the bound itself — ≤1 500 chars, floor 0.65 — is enforced inside the
+(the bound itself — ≤1 500 chars, floor 0.70 — is enforced inside the
 producer via the profile and pinned by test_v02101_inject_gates.py).
 """
 from __future__ import annotations

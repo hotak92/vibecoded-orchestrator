@@ -309,6 +309,15 @@ LITERAL_SET: Set[str] = {lit for lit, _live in LITERAL_PAIRS}
 
 # ─── 1. the differential ──────────────────────────────────────────────────
 
+#: The ONLY rows HEAD may deny that v0.2.103 allowed: the R9 base-equal
+#: gaps v0.2.105 closed on purpose — code a shell reads from a here-string
+#: is code (tests/test_v02105_wait_guard_scripts_noop.py pins the rest).
+V02105_CLOSED_GAPS = [
+    "bash <<< 'sleep 5'",
+    "bash <<< 'x=$(sleep 5)'",
+    "bash -s <<< 'x=$(sleep 5)'",
+]
+
 
 def test_head_never_weaker_than_v02103_outside_the_literal_set():
     rows = [cmd for _raw, cmd in _review_rows()] + _non_literal_rows() \
@@ -326,7 +335,8 @@ def test_head_never_weaker_than_v02103_outside_the_literal_set():
             stricter.append(cmd)
     assert len(rows) > 1000, len(rows)
     assert weaker == [], f"HEAD allows what v0.2.103 denies: {weaker[:10]}"
-    assert stricter == [], f"HEAD denies what v0.2.103 allows: {stricter[:10]}"
+    assert sorted(stricter) == sorted(V02105_CLOSED_GAPS), (
+        f"HEAD denies what v0.2.103 allows: {stricter[:10]}")
     assert literal_allowed > 500 and base_denied > 900, (literal_allowed, base_denied)
 
 
@@ -410,11 +420,17 @@ def test_literal_rows_run_no_wait_in_real_bash(bash_dir):
 
 def test_dup_redirect_target_is_expanded_twice_by_real_bash(bash_dir):
     # Why `>&word` / `<&word` must name an fd: bash re-expands a non-fd
-    # word, so the single-quoted text RUNS (bash 5.2, fuzz-found).
+    # word, so the single-quoted text RUNS (bash 5.2, fuzz-found). The guard
+    # must deny it on EVERY bash — users still run 5.2. The live
+    # reproduction is required only where bash still has the quirk: newer
+    # bash (the ubuntu-26.04 CI image, 2026-11-04) no longer re-expands.
     cmd = "echo x >&'$(sleep 5)'"
-    _run(_marked(cmd, "DUP"), bash_dir)
-    assert (bash_dir / "DUP").exists()
     assert literal_text_only(cmd) is False and head_denies(cmd)
+    _run(_marked(cmd, "DUP"), bash_dir)
+    ver = subprocess.run(["bash", "-c", 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'],
+                         capture_output=True, text=True, check=True).stdout.split()
+    if (int(ver[0]), int(ver[1])) <= (5, 2):
+        assert (bash_dir / "DUP").exists()
     assert literal_text_only("grep -n '$(sleep 5)' f 2>&1 >&2 <&0 1>&-") is True
 
 

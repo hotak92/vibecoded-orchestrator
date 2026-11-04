@@ -87,8 +87,9 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import shlex
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from vco_lib.bash_command_walk import tokenize, walk_command
 from vco_lib.powershell_command import (
@@ -242,8 +243,18 @@ _SECRETISH_RE = re.compile(
 # --- Heredoc stripping ---------------------------------------------------
 
 
-def strip_heredocs(command: str) -> Tuple[str, List[str]]:
+def strip_heredocs(
+    command: str,
+    inline_when: Optional[Callable[[str], bool]] = None,
+) -> Tuple[str, List[str]]:
     """Remove heredoc BODIES from *command*, returning ``(command, bodies)``.
+
+    ``inline_when`` (v0.2.105, the wait guard): a predicate on an opener
+    LINE (heredoc operators already removed). When it holds, that line's
+    heredocs are rewritten as here-strings carrying their bodies
+    (``bash <<'X'`` + body → ``bash <<< '<body>'``) instead of being
+    dropped, so a consumer that knows the line feeds a SHELL can read the
+    body as the code it is. Bodies are still returned in ``bodies``.
 
     Why this must happen before tokenising: the body of
     ``cat > f <<EOF`` is raw text. A body line like ``see foo > bar``
@@ -273,14 +284,21 @@ def strip_heredocs(command: str) -> Tuple[str, List[str]]:
             out.append(line)
             continue
         kept = _HEREDOC_RE.sub(" ", line)
-        out.append(kept)
+        line_bodies: List[str] = []
         for delim, dash in openers:
             end = _find_heredoc_terminator(lines, i, delim, dash)
             if end is None:
                 # Unterminated: not a heredoc after all (quoted text).
                 continue
-            bodies.append("\n".join(lines[i:end]))
+            body = "\n".join(lines[i:end])
+            bodies.append(body)
+            line_bodies.append(body)
             i = end + 1
+        if line_bodies and inline_when is not None and inline_when(kept):
+            feed = iter(line_bodies)
+            kept = _HEREDOC_RE.sub(
+                lambda _m: " <<< " + shlex.quote(next(feed, "")) + " ", line)
+        out.append(kept)
     return "\n".join(out), bodies
 
 

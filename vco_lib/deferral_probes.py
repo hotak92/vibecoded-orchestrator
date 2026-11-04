@@ -1164,6 +1164,19 @@ def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
     return None
 
 
+def kg_primary_still_bound_to_shared(ctx: ProbeContext) -> Optional[bool]:
+    """``kg_primary_bound_to_shared`` — does a non-root project still use the
+    shared KG collection as its primary? The SAME reading the doctor probe
+    emits from (:func:`vco_lib.kg_primary_shared.still_bound`): True while one
+    does, False once none does, None when launcher.db cannot be read."""
+    from vco_lib import kg_primary_shared
+
+    try:
+        return kg_primary_shared.still_bound()
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def playwright_browser_still_missing(ctx: ProbeContext) -> Optional[bool]:
     """``playwright_browser_missing`` — is the pinned Playwright MCP's browser
     revision still absent?
@@ -1382,6 +1395,33 @@ def codegraph_orphan_interactions_still_present(ctx: ProbeContext) -> Optional[b
     return count > 0
 
 
+def codegraph_extra_rows_missing_probe(ctx: ProbeContext) -> Optional[bool]:
+    """``codegraph_extra_rows_missing`` — does an enabled extra code folder
+    still have 0 rows of its own in the project's prefix?
+
+    v0.2.105 (prune lane): re-runs the SAME detection the emit leg used
+    (:func:`vco_lib.codegraph_extras_refresh.missing_extra_paths`) against
+    ``ctx.folder``, so the probe can never clear a row the next detection
+    would re-emit. The prefix is NOT re-parsed from the prose — the
+    detection re-resolves it from the hub config, the one home for it.
+
+    Returns:
+        True  — at least one enabled extra folder is still rowless.
+        False — positively all present (the heal re-indexed them, or the
+                folders were disabled/removed from the config).
+        None  — could not look (hub or Weaviate down): never a clear.
+    """
+    from vco_lib.codegraph_extras_refresh import missing_extra_paths
+
+    try:
+        missing = missing_extra_paths(str(ctx.folder))
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if missing is None:
+        return None
+    return bool(missing)
+
+
 PROBES: dict[str, ProbeFn] = {
     "bash_env_cleanup_still_owed": bash_env_cleanup_still_owed,
     "first_run_setup_sections_still_pending": first_run_setup_sections_still_pending,
@@ -1407,6 +1447,7 @@ PROBES: dict[str, ProbeFn] = {
     "code_embed_image_still_stale": code_embed_image_still_stale,
     "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
     "playwright_browser_still_missing": playwright_browser_still_missing,
+    "kg_primary_still_bound_to_shared": kg_primary_still_bound_to_shared,
     "service_endpoint_still_unreachable": service_endpoint_still_unreachable,
     "service_endpoint_still_ambiguous": service_endpoint_still_ambiguous,
     "adopted_service_config_drift_persists": adopted_service_config_drift_persists,
@@ -1415,6 +1456,7 @@ PROBES: dict[str, ProbeFn] = {
     "container_runtime_data_still_under_both": container_runtime_data_still_under_both,
     "codegraph_orphan_interactions_still_present": (
         codegraph_orphan_interactions_still_present),
+    "codegraph_extra_rows_missing": codegraph_extra_rows_missing_probe,
 }
 
 
@@ -1995,5 +2037,6 @@ __all__ = [
     "retry_history_note",
     "run_probe",
     "codegraph_orphan_interactions_still_present",
+    "codegraph_extra_rows_missing_probe",
     "upstream_sidecar_paths",
 ]

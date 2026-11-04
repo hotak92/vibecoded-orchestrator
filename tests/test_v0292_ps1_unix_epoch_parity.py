@@ -133,22 +133,80 @@ def test_the_shipped_expression_yields_true_unix_seconds(hook, variable, tmp_pat
     )
 
 
+def _pwsh_version(exe: str, tmp_path: Path) -> str:
+    """The interpreter's own version string (``$PSVersionTable``), or ""."""
+    script = tmp_path / "version.ps1"
+    script.write_text("Write-Output $PSVersionTable.PSVersion.ToString()\n",
+                      encoding="utf-8")
+    out = subprocess.run(
+        [exe, *PWSH_BASE_FLAGS, "-File", str(script)],
+        capture_output=True, text=True, timeout=60,
+    )
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _known_to_drift(version: str) -> bool:
+    """Is the mixed-Kind epoch idiom KNOWN to drift on this interpreter?
+
+    Windows PowerShell 5.1 (major < 6) is the version family where the drift
+    was observed in the field (v0.2.92 R2 — the reason this file exists):
+    there ``Get-Date "1970-01-01Z"`` keeps a UTC Kind while ``Get-Date`` is
+    Local, and .NET subtracts raw ticks ignoring Kind, so the stamp shifts
+    by the UTC offset. pwsh 7.4.6 was MEASURED (2026-10-30, CET host) to
+    parse the same literal as Local kind — the two Kinds agree and the idiom
+    no longer drifts. For any other version the measurement in the test
+    below decides; an unparseable version string is treated as unknown.
+    """
+    major = version.split(".", 1)[0]
+    return major.isdigit() and int(major) < 6
+
+
 def test_the_broken_idioms_really_are_broken_on_this_host(tmp_path):
     """The premise, measured — otherwise the test above proves nothing here.
 
-    On a UTC machine every idiom agrees and the gate above is vacuous. Skip
-    loudly there rather than reporting a pass that measured nothing.
+    Three honest outcomes (v0.2.105 fix round 2 — pre-fix this asserted the
+    drift unconditionally and failed on pwsh 7.4.6, which no longer drifts):
+
+    * the idiom DRIFTS on this interpreter → the gate above has teeth (pass);
+    * NO drift on a version known to drift (Windows PowerShell 5.1) → fail:
+      either this probe broke or the known-drift table is wrong, and the
+      gate above must not be trusted until that is understood;
+    * NO drift on any other version → skip loudly naming the version: this
+      interpreter parses ``Get-Date "1970-01-01Z"`` as Local kind, so the
+      mixed-Kind idiom is simply not broken here and the gate above cannot
+      distinguish it. Nothing shipped depends on the premise — the hooks
+      use ``[DateTimeOffset]::UtcNow``, which is correct on every version.
+
+    On a UTC machine every idiom agrees and nothing is observable — skip
+    loudly there too rather than reporting a pass that measured nothing.
     """
     exe = _pwsh()
     if abs(time.timezone) < 1800 and abs(time.altzone) < 1800:
         pytest.skip("this host is at UTC — the offset bug is not observable")
+    version = _pwsh_version(exe, tmp_path)
+    named = version or "(unknown version)"
     ours = int(time.time())
     broken = _eval_ps(
         exe,
         '[int][double]::Parse(((Get-Date) - (Get-Date "1970-01-01Z")).TotalSeconds)',
         tmp_path,
     )
-    assert abs(broken - ours) > TOLERANCE_S, (
-        "the mixed-Kind idiom agreed with unix epoch on this host, so the "
-        "gate above cannot distinguish it from the correct one"
+    if abs(broken - ours) > TOLERANCE_S:
+        return  # the premise is confirmed on this interpreter — the gate has teeth
+    if _known_to_drift(version):
+        pytest.fail(
+            f"PowerShell {named} is KNOWN to drift on the mixed-Kind epoch idiom, "
+            f"but this run measured {broken - ours}s (within {TOLERANCE_S}s of unix "
+            "epoch) — either this premise probe is broken or the known-drift table "
+            "in _known_to_drift is wrong. The shipped-expression gate above proves "
+            "nothing on this host until that is understood."
+        )
+    pytest.skip(
+        f"PowerShell {named} parses Get-Date \"1970-01-01Z\" as Local kind — the "
+        "mixed-Kind epoch idiom measures NO drift on this version (pwsh 7.4.6 "
+        "confirmed 2026-10-30), so the gate above cannot distinguish it from the "
+        "correct one HERE. This is a property of the interpreter, not a defect: "
+        "the shipped hooks use [DateTimeOffset]::UtcNow, which is correct on "
+        "every version, and this gate keeps its teeth on any host whose "
+        "PowerShell does drift (e.g. Windows PowerShell 5.1)."
     )

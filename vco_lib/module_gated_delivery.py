@@ -69,6 +69,38 @@ v0.2.102: inside a DELIVER, each definition also passes a per-VENDOR leg —
 it ships only when its vendor's key resolves (:func:`select_gateway_agents`;
 a miss holds it back and carries an earlier copy forward, never deletes).
 
+v0.2.105 — the user's OWN per-provider switch, which outranks the key leg
+--------------------------------------------------------------------------
+A key resolving answers "can this machine reach the vendor", not "does the
+user still want it" (the lapsed-subscription field case). The machine-wide
+setting lives in ``launcher.db`` ``app_state`` and its ONE reader is
+:mod:`vco_lib.model_providers`. Inside a DELIVER, a definition whose vendor
+the user switched OFF is held with ``SIGNAL_PROVIDER_DISABLED`` — the same
+"not shipped this run" shape as a key miss, so the ordinary orphan walk would
+delete a delivered copy. It must not: this module owns what happens instead.
+
+=====================================================================  =====
+state of the installed copy of a disabled provider's definition         effect
+=====================================================================  =====
+absent from ``.claude/agents/``                                         nothing to do
+present, UNMODIFIED (manifest hash match)                              MOVED to
+                                                                        ``.claude/agents.disabled/``
+                                                                        — the launcher's own
+                                                                        disable location, so a
+                                                                        re-enable restores it;
+                                                                        never deleted
+present, user-modified / unreadable / a parked copy already exists      LEFT IN PLACE, one
+                                                                        warning line, manifest
+                                                                        entry kept
+=====================================================================  =====
+
+The parked copies are recorded in the bundle manifest's additive
+``provider_parked_agents`` map (``{dest_rel: vendor_id}``) — the marker that
+tells a re-enable which disabled-side files are THIS switch's doing, so the
+launcher's per-project per-agent toggle is never overridden. Re-enabling a
+provider restores the copies named there and lets the ordinary enumeration
+re-deliver (and refresh) the definitions.
+
 The CLAUDE.md routing section (``{{#if_module_active model_gateway}}``) stays
 opt-in on the row alone: advice text is a per-project choice, the agent
 definitions follow the machine.
@@ -318,6 +350,10 @@ SIGNAL_LAUNCHER_DB = "launcher_db"
 #: The per-VENDOR leg (v0.2.102, :func:`select_gateway_agents`): one
 #: definition held back because its vendor's key did not resolve.
 SIGNAL_VENDOR_KEY = "vendor_key"
+#: The USER'S per-provider switch (v0.2.105): the vendor is switched off
+#: machine-wide, so its definitions are not delivered and a previously
+#: delivered copy is parked (see :func:`park_provider_agent`).
+SIGNAL_PROVIDER_DISABLED = "provider_disabled"
 
 
 @dataclass(frozen=True)
@@ -330,6 +366,10 @@ class GateVerdict:
     #: The machine signal's ``configured`` when it was consulted (``None``
     #: when it was not, or could not answer).
     machine_configured: Optional[bool] = None
+    #: The gateway vendor id this verdict is about, for a per-definition
+    #: verdict (v0.2.105: the provider switch's parking pass needs it to name
+    #: the provider in its report). ``None`` on a bucket verdict.
+    vendor: Optional[str] = None
 
     @property
     def delivers(self) -> bool:
@@ -341,6 +381,7 @@ class GateVerdict:
             "signal": self.signal,
             "reason": self.reason,
             "machine_configured": self.machine_configured,
+            "vendor": self.vendor,
         }
 
 
@@ -467,7 +508,7 @@ def definition_vendor(path: Path) -> Optional[str]:
     ensure_importable()  # install-bundle runs under the system interpreter
     from vco_lib.vscode_settings import GATEWAY_ID_PREFIX
 
-    model = _frontmatter_model(path)
+    model = frontmatter_model(path)
     if not model or not model.startswith(GATEWAY_ID_PREFIX):
         return None
     from model_router.routing import (  # pyright: ignore[reportMissingImports]
@@ -516,6 +557,7 @@ def select_gateway_agents(
     verdict: GateVerdict,
     *,
     vendor_probe: Optional[VendorProbe] = None,
+    disabled_vendors: Optional[Iterable[str]] = None,
 ) -> tuple[list[Path], list[GateOutcome]]:
     """The gated definitions to deliver, and the held ones' carry-forward
     outcomes (see the table above).
@@ -526,6 +568,15 @@ def select_gateway_agents(
     SIGNAL_VENDOR_KEY)`` outcome, so :func:`carries_forward` keeps an earlier
     delivery of exactly that file and :func:`record_gate_outcomes` logs it
     without a deferral.
+
+    v0.2.105: a vendor the USER switched off (``disabled_vendors``, default
+    :func:`vco_lib.model_providers.disabled_vendors`) is held FIRST, with
+    ``SIGNAL_PROVIDER_DISABLED``, and its key is never probed — the user's own
+    choice outranks the key leg, and the parked-copy handling for it lives in
+    :func:`park_provider_agent`. That verdict is deliberately NOT UNKNOWN, so
+    :func:`carries_forward` does not keep the delivered copy: the orphan walk
+    must reach it to park it. A read of the setting that fails answers
+    "nothing disabled" (see the model_providers soft-fail rule).
     """
     if not verdict.delivers:
         return [], []
@@ -535,19 +586,52 @@ def select_gateway_agents(
     except ImportError as exc:
         reason = f"model gateway not importable ({type(exc).__name__})"
         return [], [_held(f, "?", reason) for f in files]
+    if disabled_vendors is None:
+        disabled = _default_disabled_vendors()
+    else:
+        disabled = frozenset(disabled_vendors)
     reach = vendor_reachability(
-        (v for v in vendor_of.values() if v is not None),
+        (v for v in vendor_of.values() if v is not None and v not in disabled),
         vendor_probe=vendor_probe,
     )
     deliver: list[Path] = []
     held: list[GateOutcome] = []
     for f in files:
         vendor_id = vendor_of[f]
-        if vendor_id is None or reach[vendor_id][0]:
+        if vendor_id is not None and vendor_id in disabled:
+            held.append(_provider_disabled(f, vendor_id))
+        elif vendor_id is None or reach[vendor_id][0]:
             deliver.append(f)
         else:
             held.append(_held(f, vendor_id, reach[vendor_id][1]))
     return deliver, held
+
+
+def _default_disabled_vendors() -> frozenset[str]:
+    """The machine's off-list, or the empty set when it cannot be read.
+
+    Unreadable answers "nothing disabled" on purpose: switching a provider off
+    is a subtraction (agents parked, rows hidden), so a failed read must never
+    invent one — see :mod:`vco_lib.model_providers`.
+    """
+    try:
+        from vco_lib.model_providers import disabled_vendors
+
+        return frozenset(disabled_vendors())
+    except Exception:  # noqa: BLE001 — a read never disables a provider
+        return frozenset()
+
+
+def _provider_disabled(path: Path, vendor_id: str) -> GateOutcome:
+    return (
+        f"{GATEWAY_AGENTS_SOURCE_PREFIX}{path.name}",
+        GateVerdict(
+            GateState.SKIP, SIGNAL_PROVIDER_DISABLED,
+            f"{path.stem} not delivered: the {vendor_id!r} provider is "
+            "switched off in the launcher (Home → Model providers)",
+            vendor=vendor_id,
+        ),
+    )
 
 
 def _held(path: Path, vendor_id: str, reason: str) -> GateOutcome:
@@ -597,6 +681,313 @@ def carries_forward(
         verdict.state is GateState.UNKNOWN and source.startswith(prefix)
         for prefix, verdict in outcomes
     )
+
+
+# ---------------------------------------------------------------------------
+# The per-provider switch's bundle-engine half (v0.2.105)
+# ---------------------------------------------------------------------------
+#
+# The additive manifest key recording WHICH disabled-side copies this switch
+# parked (`{dest_rel: vendor_id}`). It is the marker that distinguishes "VCO
+# parked this because the provider was switched off" from "the user disabled
+# this agent in the launcher's Agents tab" — only the former is restored when
+# the provider is switched back on, so a per-agent choice is never overridden.
+# Readers default it (an older manifest simply has none).
+PARKED_AGENTS_MANIFEST_KEY = "provider_parked_agents"
+
+
+def _agent_definition_name(dest_rel: str) -> Optional[str]:
+    """``<name>.md`` for a ``.claude/agents/<name>.md`` manifest key, else None.
+
+    Separator-normalised (Windows manifest keys carry ``\\``); nested paths and
+    skills are not agent definitions and answer ``None``.
+    """
+    from pathlib import PurePosixPath
+
+    parts = PurePosixPath(
+        str(dest_rel or "").replace("\\", "/")).parts
+    if (len(parts) != 3 or parts[0] != ".claude" or parts[1] != "agents"
+            or not parts[2].endswith(".md")):
+        return None
+    return parts[2]
+
+
+def _provider_disabled_vendors(
+    outcomes: Iterable[GateOutcome],
+) -> dict[str, str]:
+    """``{definition file name: vendor_id}`` for the held disabled-provider
+    outcomes of this run (``SIGNAL_PROVIDER_DISABLED`` only)."""
+    out: dict[str, str] = {}
+    for prefix, verdict in outcomes:
+        if verdict.signal != SIGNAL_PROVIDER_DISABLED or not verdict.vendor:
+            continue
+        name = str(prefix).replace("\\", "/").rsplit("/", 1)[-1]
+        if name:
+            out[name] = verdict.vendor
+    return out
+
+
+def park_provider_agent(
+    folder: Path,
+    prior_rel: str,
+    prior_entry: Mapping[str, Any] | None,
+    outcomes: Iterable[GateOutcome],
+    *,
+    dry_run: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+    warn: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """Park ONE previously delivered definition of a switched-off provider.
+
+    Called from the bundle engine's orphan walk (that is where a file VCO no
+    longer ships this run surfaces). Returns ``None`` when ``prior_rel`` is not
+    a definition of a provider this run held with
+    ``SIGNAL_PROVIDER_DISABLED`` — the caller then continues its ordinary
+    orphan handling. Otherwise:
+
+    * ``"parked"`` — an UNMODIFIED copy (manifest hash match) was moved to its
+      ``.claude/agents.disabled/`` counterpart, the launcher's own disable
+      location. Never deleted; the manifest entry is dropped (the copy is not
+      at the enabled path any more).
+    * ``"already-parked"`` — nothing on the enabled side (the copy is already
+      parked, or was never delivered). The manifest entry is dropped.
+    * ``"keep-entry"`` — the copy is the user's (edited, unreadable, a symlink)
+      or a parked copy already exists: LEFT IN PLACE with one warning line,
+      and the caller must keep the manifest entry so a later run still
+      recognises the file.
+
+    ``dry_run`` decides and reports exactly as a real run would, and moves
+    nothing.
+    """
+    name = _agent_definition_name(prior_rel)
+    if name is None:
+        return None
+    vendor_id = _provider_disabled_vendors(outcomes).get(name)
+    if vendor_id is None:
+        return None
+    from vco_lib.bundle_kinds import disabled_counterpart
+
+    dis_rel = disabled_counterpart(prior_rel)
+    if dis_rel is None:
+        return None
+    enabled_path = Path(folder) / prior_rel
+    parked_path = Path(folder) / dis_rel
+
+    def _say(fn: Optional[Callable[[str], None]], message: str) -> None:
+        if fn is not None:
+            try:
+                fn(message)
+            except Exception:  # noqa: BLE001 — reporting never aborts a run
+                pass
+
+    if enabled_path.is_symlink():
+        _say(warn, f"{prior_rel}: a symlink — left in place (the {vendor_id!r} "
+                   "provider is switched off; VCO does not follow or move links)")
+        return "keep-entry"
+    if not enabled_path.is_file():
+        if parked_path.is_file():
+            _say(log, f"{prior_rel}: already parked in {dis_rel} "
+                      f"(provider {vendor_id!r} is switched off)")
+        else:
+            _say(log, f"{prior_rel}: not on disk any more; its manifest entry "
+                      f"is retired (provider {vendor_id!r} is switched off)")
+        return "already-parked"
+    prior_hash = str((prior_entry or {}).get("sha256", "") or "")
+    try:
+        from vco_lib.hashing import sha256_file
+
+        modified = not prior_hash or sha256_file(enabled_path) != prior_hash
+    except OSError:
+        modified = True
+    if modified:
+        _say(warn, f"{prior_rel}: edited since it was delivered, so it was "
+                   f"left in place; the {vendor_id!r} provider is switched "
+                   "off — use the project's Agents tab to park it if you no "
+                   "longer want it")
+        return "keep-entry"
+    if parked_path.exists():
+        _say(warn, f"{prior_rel}: left in place — a copy already exists at "
+                   f"{dis_rel}, and nothing is overwritten. Remove one of the "
+                   "two by hand (the Agents tab moves files between them)")
+        return "keep-entry"
+    if dry_run:
+        _say(log, f"{prior_rel}: would be parked in {dis_rel} "
+                  f"(provider {vendor_id!r} is switched off)")
+        return "parked"
+    try:
+        from vco_lib.atomic import move_file
+
+        move_file(enabled_path, parked_path)
+    except OSError as exc:
+        _say(warn, f"{prior_rel}: could not be parked ({type(exc).__name__}: "
+                   f"{exc}) — left in place")
+        return "keep-entry"
+    _say(log, f"{prior_rel}: parked in {dis_rel} (provider {vendor_id!r} is "
+              "switched off; switching it back on restores this definition)")
+    return "parked"
+
+
+def parked_agents_registry(
+    folder: Path,
+    prior: Any,
+    parked_now: Iterable[str],
+    outcomes: Iterable[GateOutcome],
+    *,
+    restored: Iterable[str] = (),
+) -> dict[str, str]:
+    """``{dest_rel: vendor_id}`` — what the manifest records this run.
+
+    The registry is the record of what THIS switch moved, never a scan of the
+    disabled side: a copy the user parked with the Agents tab lives in the
+    same folder and must never be mistaken for one of ours (re-enabling the
+    provider would otherwise restore the user's own choice away).
+
+    * ``prior`` — the previous manifest's map. Carried forward VERBATIM: a run
+      that does not re-observe the vendor as switched off (gate SKIP/UNKNOWN,
+      ``--skip-kind agents``, a restore skipped because both copies exist or
+      the move failed) must not forget what an earlier run parked.
+    * ``restored`` — dest_rels moved back this run: dropped.
+    * an entry whose parked copy is no longer on disk (the user deleted or
+      moved it): dropped — there is nothing left to restore.
+    * ``parked_now`` — the dest_rels :func:`park_provider_agent` answered
+      ``"parked"`` for in THIS run (an actual move, not ``"already-parked"``):
+      added with the vendor this run's outcomes name.
+    """
+    from vco_lib.bundle_kinds import disabled_counterpart
+
+    def _norm(rel: str) -> str:
+        return str(rel).replace("\\", "/")
+
+    registry: dict[str, str] = {}
+    if isinstance(prior, Mapping):
+        for dest_rel, vendor_id in prior.items():
+            if isinstance(dest_rel, str) and isinstance(vendor_id, str):
+                registry[_norm(dest_rel)] = vendor_id
+    for dest_rel in restored:
+        registry.pop(_norm(dest_rel), None)
+    vendors = _provider_disabled_vendors(outcomes)
+    for dest_rel in parked_now:
+        name = _agent_definition_name(dest_rel)
+        vendor_id = vendors.get(name) if name else None
+        if vendor_id:
+            registry[_norm(dest_rel)] = vendor_id
+    out: dict[str, str] = {}
+    for dest_rel, vendor_id in registry.items():
+        dis_rel = disabled_counterpart(dest_rel)
+        if dis_rel and (Path(folder) / dis_rel).is_file():
+            out[dest_rel] = vendor_id
+    return dict(sorted(out.items()))
+
+
+def restore_parked_agents(
+    folder: Path,
+    src_dir: Path,
+    manifest: Mapping[str, Any] | None,
+    *,
+    verdict: Optional[GateVerdict] = None,
+    skip_kinds: frozenset[str] = frozenset(),
+    dry_run: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+) -> list[str]:
+    """Bring back the definitions THIS switch parked, for providers now on.
+
+    Reads the manifest's :data:`PARKED_AGENTS_MANIFEST_KEY`, and for every
+    entry whose vendor is no longer switched off moves the disabled-side copy
+    back to ``.claude/agents/<name>.md`` — the inverse of
+    :func:`park_provider_agent`, and the step that lets the ordinary
+    enumeration re-deliver and refresh the definition (without it the
+    ``skip-disabled`` guard would leave the definition parked forever).
+
+    What is deliberately NOT restored:
+    * a vendor that is still switched off (its copies stay parked);
+    * a definition this release no longer ships (the parked copy is the user's
+      to keep; nothing deletes it);
+    * an entry whose enabled-side copy also exists (nothing is overwritten);
+    * a project whose module gate is not DELIVER, or a run that skips the
+      ``agents`` kind (that is an explicit "do not touch agents").
+
+    Returns the restored dest_rels (also reported one line each). ``dry_run``
+    reports without moving.
+    """
+    prior = (manifest or {}).get(PARKED_AGENTS_MANIFEST_KEY)
+    if not isinstance(prior, dict) or not prior:
+        return []
+    if "agents" in skip_kinds:
+        return []
+    if verdict is not None and not verdict.delivers:
+        return []
+    from vco_lib.bundle_kinds import disabled_counterpart
+
+    off = _default_disabled_vendors()
+    restored: list[str] = []
+    for dest_rel, vendor_id in sorted(prior.items()):
+        if not isinstance(dest_rel, str) or not isinstance(vendor_id, str):
+            continue
+        if vendor_id in off:
+            continue
+        name = _agent_definition_name(dest_rel)
+        if name is None or not (Path(src_dir) / name).is_file():
+            continue  # no longer shipped: the parked copy is left alone
+        dis_rel = disabled_counterpart(dest_rel)
+        if dis_rel is None:
+            continue
+        enabled_path = Path(folder) / dest_rel
+        parked_path = Path(folder) / dis_rel
+        if enabled_path.exists():
+            continue  # both copies exist: never overwrite either
+        if parked_path.is_symlink() or not parked_path.is_file():
+            continue
+        if dry_run:
+            restored.append(dest_rel)
+            if log is not None:
+                log(f"{dest_rel}: would be restored from {dis_rel} "
+                    f"(provider {vendor_id!r} is switched back on)")
+            continue
+        try:
+            from vco_lib.atomic import move_file
+
+            move_file(parked_path, enabled_path)
+        except OSError as exc:
+            if log is not None:
+                log(f"{dest_rel}: could not be restored from {dis_rel} "
+                    f"({type(exc).__name__}: {exc}) — left parked")
+            continue
+        restored.append(dest_rel)
+        if log is not None:
+            log(f"{dest_rel}: restored from {dis_rel} (provider {vendor_id!r} "
+                "is switched back on)")
+    return restored
+
+
+def provider_restore_pass(
+    folder: Path,
+    orchestrator_root: Path,
+    manifest: Mapping[str, Any] | None,
+    *,
+    skip_kinds: frozenset[str] = frozenset(),
+    dry_run: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+) -> tuple[Optional[GateVerdict], list[str]]:
+    """The bundle update's first provider-switch step: ``(gate verdict,
+    restored dest_rels)``.
+
+    A provider switched BACK ON gets the definitions an earlier run parked
+    restored BEFORE enumeration, so ``_file_action``'s skip-disabled guard
+    finds them at their enabled path again and the ordinary manifest logic
+    re-delivers them. Only copies THIS switch parked are restored (the
+    manifest's :data:`PARKED_AGENTS_MANIFEST_KEY`); the launcher's per-agent
+    toggle is never overridden. The verdict is computed ONCE here and handed
+    to the enumerator, which would otherwise ask the same question again.
+    ``(None, [])`` when this install ships no gateway definitions.
+    """
+    src_dir = Path(orchestrator_root) / "templates" / "agents" / GATEWAY_AGENTS_DIR
+    if not src_dir.is_dir():
+        return None, []
+    verdict = gateway_agents_gate(folder)
+    restored = restore_parked_agents(
+        folder, src_dir, manifest, verdict=verdict, skip_kinds=skip_kinds,
+        dry_run=dry_run, log=log)
+    return verdict, restored
 
 
 def _entry_for(verdict: GateVerdict, folder: Path) -> Any:
@@ -664,6 +1055,14 @@ def record_gate_outcomes(
     emit: list[Any] = []
     log_lines: list[str] = []
     for prefix, verdict in outcomes:
+        if verdict.signal == SIGNAL_PROVIDER_DISABLED:
+            # v0.2.105: the user's own switch — a log line only. It is a
+            # CHOICE, not a fault, so nothing is deferred; the parking pass
+            # (:func:`park_provider_agent`) is what acts on it.
+            log_lines.append(
+                f"gated definition {prefix}: NOT DELIVERED — {verdict.reason}; "
+                "a previously delivered copy is parked, not deleted")
+            continue
         if verdict.signal == SIGNAL_VENDOR_KEY:
             # The per-vendor leg: a log line only — a user without that
             # vendor's key has nothing to fix (see select_gateway_agents).
@@ -715,8 +1114,11 @@ def record_gate_outcomes(
 # ---------------------------------------------------------------------------
 
 
-def _frontmatter_model(path: Path) -> Optional[str]:
-    """The ``model:`` value of an agent definition's YAML frontmatter, or None."""
+def frontmatter_model(path: Path) -> Optional[str]:
+    """The ``model:`` value of an agent definition's YAML frontmatter, or None.
+
+    Public since v0.2.105: the pre-flight vendor-key probe
+    (:mod:`vco_lib.gateway_preflight`) reads the same line."""
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -760,7 +1162,7 @@ def check_agent_model_ids(dirs: Iterable[Path]) -> list[dict[str, Any]]:
         except OSError:
             continue
         for path in files:
-            model = _frontmatter_model(path)
+            model = frontmatter_model(path)
             if not model or not model.startswith(GATEWAY_ID_PREFIX):
                 continue
             ok, reason, suggestions = validate_model_id(model)
@@ -896,10 +1298,15 @@ def vendor_keys_payload(
         (v for v in vendor_of.values() if v is not None),
         vendor_probe=vendor_probe,
     )
+    off = _default_disabled_vendors()  # one launcher-DB read, not one per vendor
     return {
         vendor_id: {
             "resolves": ok,
             "reason": reason,
+            # v0.2.105: the user's machine-wide switch, beside the key answer.
+            # A disabled provider still reports its key state (so the Home
+            # card can say "switched off, key present") but delivers nothing.
+            "enabled": vendor_id not in off,
             "definitions": sorted(f.stem for f, v in vendor_of.items()
                                   if v == vendor_id),
         }

@@ -1,125 +1,47 @@
-"""v0.2.49 Bug L regression test: sync_knowledge_graph.py reconfigures
-stdout to UTF-8 + backslashreplace at startup, so emoji prints don't
-crash on Windows cp1252 consoles."""
+"""v0.2.49 Bug L regression test: sync_knowledge_graph.py must not crash on a
+Windows cp1252 console or pipe when it prints emoji.
+
+v0.2.105: the script no longer carries its own ``reconfigure`` block; it
+calls the ONE home, :func:`vco_lib.console_text.harden_stdio`, at import
+time (right after its vco_lib path bootstrap). This test imports the real
+script in a child whose stdout is a STRICT cp1252 pipe, with Windows
+simulated at that one home, and prints the emoji that used to crash.
+"""
 from __future__ import annotations
 
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 from tests.common.child_env import child_env
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 
-def _project_root() -> Path:
-    here = Path(__file__).resolve().parent
-    # tests/ is a sibling of the repo root
-    return here.parent
-
-
-def _extract_reconfigure_block(script: Path) -> str:
-    """Extract just the top-of-file reconfigure block from the script.
-
-    The block is bracketed by sentinel comments containing 'Bug L'
-    (start marker) and ends at the next blank line followed by
-    `import os`. Falls back to "first 50 lines" if markers shift —
-    that still avoids the heavyweight weaviate/vco_lib imports
-    further down the file which would fail in a venv-less subprocess.
-    """
-    text = script.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    # The reconfigure block lives between `import sys` and the next
-    # plain `import os` (which begins the post-reconfigure imports).
-    out: list[str] = []
-    saw_sys = False
-    for line in lines:
-        if not saw_sys:
-            if line.strip() == "import sys":
-                saw_sys = True
-                out.append(line)
-            continue
-        if line.strip() == "import os":
-            break  # stop BEFORE the heavy imports
-        out.append(line)
-    return "\n".join(out)
-
-
-def test_sync_knowledge_graph_reconfigures_stdout_for_utf8():
-    """At import time, sys.stdout.reconfigure should be called with
-    encoding='utf-8', errors='backslashreplace'. Verify by spawning a
-    subprocess that execs just the reconfigure block + checks the
-    encoding."""
-    script = _project_root() / "templates" / "scripts" / "sync_knowledge_graph.py"
-    assert script.exists(), f"missing source-of-truth script: {script}"
-
-    head = _extract_reconfigure_block(script)
-    # Sanity-check the extraction caught the reconfigure call.
-    assert "reconfigure" in head, (
-        f"extraction logic broken — no 'reconfigure' in head:\n{head}"
-    )
-
-    harness = (
-        "import sys\n"
-        + head
-        + "\nprint(sys.stdout.encoding)\nprint(sys.stdout.errors)\n"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", harness],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env=child_env(),
-    )
-    assert result.returncode == 0, f"subprocess failed: {result.stderr}"
-    out_lines = result.stdout.strip().split("\n")
-    # Last two lines should be the encoding + errors values.
-    encoding, errors = out_lines[-2], out_lines[-1]
-    assert encoding.lower() == "utf-8", (
-        f"expected stdout encoding='utf-8' post-reconfigure, got {encoding!r}; "
-        f"full output:\n{result.stdout}"
-    )
-    assert errors == "backslashreplace", (
-        f"expected stdout errors='backslashreplace', got {errors!r}"
-    )
+_CHILD = textwrap.dedent(r"""
+    import importlib.util, io, sys
+    import vco_lib.console_text as _ct
+    _orig = _ct.harden_stdio
+    _ct.harden_stdio = lambda *a, **k: _orig(*a, **{**k, "platform": "win32"})
+    out = io.BytesIO()
+    sys.stdout = io.TextIOWrapper(out, encoding="cp1252", errors="strict", write_through=True)
+    spec = importlib.util.spec_from_file_location("kg_sync_bug_l", sys.argv[1])
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # module top hardens the streams
+    print("emoji-test ❌ ✅ \U0001f4ca")
+    sys.stdout.flush()
+    sys.__stdout__.buffer.write(out.getvalue())
+""")
 
 
 def test_emoji_print_does_not_crash_when_stdout_is_cp1252():
-    """Simulate the Windows direct-CLI invocation by monkey-patching
-    sys.stdout to a cp1252-encoding wrapper BEFORE importing the
-    script-top, then asserting the reconfigure runs + a subsequent
-    emoji print survives.
-
-    This is the actual failure mode a contributor reported: stdout was cp1252,
-    the script crashed with UnicodeEncodeError on `print(f"❌ ...")`.
-    """
-    script = _project_root() / "templates" / "scripts" / "sync_knowledge_graph.py"
-    head = _extract_reconfigure_block(script)
-    assert "reconfigure" in head, (
-        f"extraction logic broken — no 'reconfigure' in head:\n{head}"
+    env = child_env(WEAVIATE_URL="http://127.0.0.1:9")
+    env.pop("PYTHONIOENCODING", None)
+    env.pop("PYTHONUTF8", None)
+    res = subprocess.run(
+        [sys.executable, "-X", "utf8=0", "-c", _CHILD, str(SCRIPT)],
+        capture_output=True, timeout=120, env=env, cwd=str(REPO_ROOT),
     )
-    harness = (
-        "import sys, io\n"
-        # Wrap stdout in a cp1252 TextIOWrapper — what Windows
-        # console looks like by default.
-        "raw = sys.stdout.buffer\n"
-        "sys.stdout = io.TextIOWrapper(raw, encoding='cp1252', errors='strict', line_buffering=True)\n"
-        # Now exec the script's top — reconfigure should override our
-        # cp1252 wrapper. If it doesn't, the print below crashes.
-        + head
-        + "\nprint('emoji-test ❌ ✅ \U0001f4ca')\n"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", harness],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env=child_env(),
-    )
-    assert result.returncode == 0, (
-        f"subprocess crashed (expected reconfigure to neutralize cp1252):\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-    # Either the emoji rendered as UTF-8 or as backslash-escapes — both
-    # are acceptable; what's NOT acceptable is a UnicodeEncodeError.
-    assert "emoji-test" in result.stdout, (
-        f"expected the test marker in output, got:\n{result.stdout}"
-    )
+    assert res.returncode == 0, res.stderr.decode("utf-8", "replace")[-2000:]
+    assert res.stdout.strip() == b"emoji-test [x] [ok] ?", res.stdout

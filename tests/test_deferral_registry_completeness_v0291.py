@@ -321,6 +321,15 @@ _V02103_OWNED_ADDITIONS = frozenset({
     "root_kg_pick_wrong_embedding",
 })
 
+# v0.2.105: install step 7e (vco_lib.weaviate_vector_index.run_update_step)
+# adds this row to the install run's REPORT (family A proper, like
+# kg_seed_failed), so the run whose step succeeds simply does not re-emit it.
+_V02105_OWNED_ADDITIONS = frozenset({
+    "weaviate_vector_index_update_failed",
+    # step 5's image pre-pull (vco_lib.compose_image_prepull), same shape.
+    "service_image_pull_failed",
+})
+
 
 # v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12, WP-04): fifteen ids registered in
 # wave 1 AHEAD of most of their emitters, every one `owned-drop-when-absent`
@@ -752,6 +761,9 @@ class TestRegistryCompleteness(unittest.TestCase):
             # attaches git's error line on every emit (pinned by
             # tests/test_v02104_l5_fix_round_r14b.py).
             "settings_local_layer_unknown",
+            # v0.2.105: vco_lib.kg_primary_shared.doctor_entry attaches the
+            # affected project set (pinned by tests/test_v02105_kg_primary_shared.py).
+            "kg_primary_bound_to_shared",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:
@@ -793,7 +805,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             | _V0298_OWNED_ADDITIONS
             | _V02100_OWNED_ADDITIONS
             | _V02101_OWNED_ADDITIONS
-            | _V02103_OWNED_ADDITIONS,
+            | _V02103_OWNED_ADDITIONS
+            | _V02105_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

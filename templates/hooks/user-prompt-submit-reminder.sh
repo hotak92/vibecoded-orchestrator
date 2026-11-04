@@ -57,6 +57,28 @@ fi
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/project-root.sh"
 PROJECT_DIR="$(vco_project_root)" || PROJECT_DIR=""
 [ -n "$PROJECT_DIR" ] || exit 0
+
+# v0.2.105: the hub must stay up between SessionStarts (owner rule: every VCO
+# service is up while any VCO project is open). SessionStart only covers the
+# moment a chat opens or resumes; a hub that died mid-session stayed down
+# until the next one. A prompt is the cheapest moment a live chat reliably
+# produces, so it asks the ONE revive home (`vco_lib.hub_ensure revive`): a
+# pid-file read, and a detached `vct-hub --start-if-not-running` only when the
+# hub is DOWN — never during an orchestrator update, at most once a minute
+# machine-wide, logged to <vct_root>/logs/hub-revive.log. Run in the
+# background with every stream on /dev/null, so it never delays or blocks the
+# prompt. MUST MATCH user-prompt-submit-reminder.ps1.
+_UPSR_LIB="$(dirname "${BASH_SOURCE[0]}")/_lib/resolve-vco-venv.sh"
+if [ -f "$_UPSR_LIB" ]; then
+    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+    . "$_UPSR_LIB"
+    VCO_VENV_PYTHON=""
+    resolve_vco_venv_python "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || true
+    if [ -n "${VCO_VENV_PYTHON:-}" ]; then
+        ( "$VCO_VENV_PYTHON" -m vco_lib.hub_ensure revive --source prompt --quiet \
+            </dev/null >/dev/null 2>&1 & ) || true
+    fi
+fi
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 CONTEXT_FILE="$PROJECT_DIR/.claude/CONTEXT_STATE.md"
 SESSION_LOG="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-session-${PROJECT_NAME}-${SESSION_ID}"

@@ -63,7 +63,21 @@ the reviewer.
      marked in place, e.g. "Original <date>: <line> (superseded by ...)" or
      "~~<line>~~"). Compared after CRLF->LF and trailing-whitespace strip;
      an original line survives verbatim or as a contiguous substring of a
-     new line (:func:`removed_lines`); the log names the lost lines;
+     new line (:func:`removed_lines`); the log names the lost lines.
+     ONE exception (v0.2.105, owner request 2026-11-04: a node refined
+     commit after commit collected a CHAIN of "## Status after <sha>"
+     sections, each superseding the last, and readers land on the stale
+     ones first): a write may FOLD a PROVEN reviewer section — one whose
+     current normalized bytes hash-match the provenance ledger the
+     reviewer's own commits record (:func:`proven_sections`,
+     :func:`record_provenance`, :mod:`vco_lib.kg_reviewer_provenance`) —
+     and only per fact: every line of it must survive in the new body or
+     be named by a new ``Superseded: <key> → <new> (<date>): <fact>`` trail
+     line (:func:`_fold_removals`). Every other removed or reworded line —
+     the owner's, an unproven section's, an uncommitted line's — still
+     reverts the whole write: provenance is RECORDED, never inferred from
+     a commit subject or ``git blame`` (:data:`UNKNOWN` bytes and
+     uncommitted changes keep the append-only rule);
    * a NEW node without frontmatter carrying every
      ``[guard] new_node_required_keys`` key (title, type, tags, created,
      updated, status), or whose title duplicates an existing node's
@@ -85,9 +99,13 @@ the reviewer.
    * a node that GAINS a line raising an evidence level — a ``[guard]
      evidence_markers`` word (CONFIRMED, VERIFIED, ...) used as a CLAIM
      (uppercase, followed by in/via/by/on/at/during, directly after
-     is/are/was/were/be/been or after a ``[guard] evidence_label_words``
-     label and colon such as "Status:", or on a line citing a run/test id
-     or commit hash) that the reviewer read nowhere, or a
+     is/are/was/were/be/been AND ending its clause (v0.2.105: "was
+     validated input" is a noun phrase, not a claim), or after a ``[guard]
+     evidence_label_words`` label and colon such as "Status:", or on a line
+     citing a run/test id or commit hash) that no SAME-PASSAGE source
+     carries — v0.2.105: the marker must occur on a corpus line sharing
+     ``[guard] evidence_passage_min_shared_tokens`` content tokens with the
+     claim line, not merely somewhere in the corpus — or a
      run/test id / commit hash it read nowhere cited on such a line
      (:func:`unsourced_evidence`; the field showed "CONFIRMED ... via test
      run <stamp>" over sources that said "inferred, untested"). Prose use
@@ -121,9 +139,26 @@ the reviewer.
    leaves that path uncommitted, logged). The commit is SKIPPED (files left
    in place, one log line) when a merge / rebase / cherry-pick / revert /
    bisect is in progress, ``index.lock`` exists, HEAD moved since the run
-   started, a target path already had user changes before the run, or the
-   run's writes could not be attributed. A run that wrote nothing commits
-   nothing.
+   started AND that move touched one of the reviewer's own paths, a target
+   path already had user changes before the run, or the run's writes could
+   not be attributed. A run that wrote nothing commits nothing.
+
+   v0.2.105 L-KGREV — a skip is never silent again, and never cascades:
+
+   * a HEAD that moved is only a reason to skip when ``start..HEAD`` touched
+     one of the reviewer's files (:func:`head_changed_paths`); otherwise the
+     nodes land as a clean commit on top;
+   * a git operation in progress is retried once, for up to
+     :data:`GIT_OP_RETRY_S` seconds, before the skip stands;
+   * every path this call leaves uncommitted is recorded in
+     :mod:`vco_lib.kg_reviewer_pending` together with the sha256 of the bytes
+     the run PROVED the reviewer wrote, and every path it commits is dropped
+     from it. The next run folds a ledgered path whose current bytes still
+     hash to that sha into its own commit — the reviewer's own leftover, not
+     a user change — while a ledgered path whose bytes differ is the user's
+     and is never committed. The ledger is what
+     :func:`vco_lib.kg_reviewer_pending.surface` turns into one alert for the
+     session.
 
    The user's git hooks are NOT bypassed (no ``--no-verify``): a hook that
    rejects the commit leaves the files uncommitted and the reason in the
@@ -156,6 +191,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 import yaml
 
 from vco_lib import kg_prune_result
+from vco_lib import kg_reviewer_pending as _pending
 from vco_lib.kg_reviewer_model import config
 from vco_lib.knowledge_residue import content_signature_of_file_bytes
 
@@ -175,8 +211,22 @@ __all__ = [
     "same_subject_node",
     "new_node_violation",
     "removed_lines",
+    "ReplaceableSection",
+    "TrailEntry",
+    "STATUS_HEADING_PREFIX",
+    "CURRENT_STATE_HEADING_PREFIX",
+    "TRAIL_PREFIX",
+    "parse_trail",
+    "reviewer_sections",
+    "proven_sections",
+    "reviewer_originated_sections",
+    "record_provenance",
+    "trail_keys",
     "validate",
     "commit_reviewer_changes",
+    "commit_block_reason",
+    "head_changed_paths",
+    "is_git_op_block",
     "is_reviewer_commit_subject",
     "commit_subject",
 ]
@@ -728,8 +778,10 @@ def _body_lines(body: str) -> List[str]:
     return [line.rstrip() for line in body.replace("\r\n", "\n").split("\n")]
 
 
-def removed_lines(body_pre: str, body_post: str) -> List[str]:
-    """The non-blank ORIGINAL body lines that do not survive in the new body.
+def _missing_with_index(body_pre: str, body_post: str) -> List[Tuple[int, str]]:
+    """The non-blank ORIGINAL body lines that do not survive in the new body,
+    as ``(body line index, line)`` — the one matcher behind
+    :func:`removed_lines` and the replaceable-section exception.
 
     Owner rule (2026-10-15): stored information must survive — an existing
     node's text is append-and-annotate only. An original line survives when
@@ -741,9 +793,9 @@ def removed_lines(body_pre: str, body_post: str) -> List[str]:
     original line that was dropped is caught too. Reordering original lines
     counts as removing them: a reorder is a rewrite."""
     new = _body_lines(body_post)
-    missing: List[str] = []
+    missing: List[Tuple[int, str]] = []
     j = 0
-    for line in _body_lines(body_pre):
+    for i, line in enumerate(_body_lines(body_pre)):
         # The needle is the line's TEXT: a leading Markdown list/quote marker
         # is not text, so "- X" annotated as "- Original <date>: X ..." or
         # "- ~~X~~" survives (the marker stays, the annotation goes after it).
@@ -756,12 +808,348 @@ def removed_lines(body_pre: str, body_post: str) -> List[str]:
         if k < len(new):
             j = k + 1
         else:
-            missing.append(line.strip())  # named as the user wrote it
+            missing.append((i, line.strip()))  # named as the user wrote it
     return missing
 
 
-def edit_violation(pre: str, post: str) -> Optional[str]:
-    """Why an edit of an EXISTING node breaks a rule (``None`` = allowed)."""
+def removed_lines(body_pre: str, body_post: str) -> List[str]:
+    """The non-blank ORIGINAL body lines that do not survive in the new body
+    (:func:`_missing_with_index`, without the indices)."""
+    return [line for _idx, line in _missing_with_index(body_pre, body_post)]
+
+
+# ── reviewer-owned sections (v0.2.105) ───────────────────────────────────
+#
+# The reviewer appends one "## Status after <sha>" section per commit it
+# reviews (prompt rule 8); a decision refined several times in a row collects
+# a CHAIN of them, each superseding the last, and readers and search hits
+# land on the stale statements first. The fix (owner request 2026-11-04): a
+# later reviewer pass may FOLD its own earlier sections into one
+# "## Current state (consolidated <date>)" section, carrying every
+# still-true fact over and naming every dropped one as superseded.
+#
+# Provenance is a LEDGER, never an inference (review V02105-KGREV2 H1/H2):
+# when the reviewer's own commit is made, :func:`commit_reviewer_changes`
+# records each section the reviewer ORIGINATED in it
+# (:func:`reviewer_originated_sections`) — the sha256 of the section's
+# normalized bytes plus the commit — in :mod:`vco_lib.kg_reviewer_provenance`.
+# A section is foldable only while its CURRENT bytes hash-match an entry of
+# the same node whose commit is still an ancestor of the reviewed revision
+# (:func:`proven_sections`). An amended or rebased reviewer commit, a user
+# commit titled "kg-sync: ...", a line the owner added inside the section, a
+# CRLF->LF rewrite of an owner section, an owner line the reviewer annotated:
+# none of them yields a matching entry, so none of them is foldable.
+
+#: The heading prefix of a reviewer Status section (prompt rule 8). ONE
+#: home: the prompt builder renders its Status headings from this.
+STATUS_HEADING_PREFIX = "## Status after "
+#: The heading prefix of the consolidated section a fold writes (rule 8).
+CURRENT_STATE_HEADING_PREFIX = "## Current state (consolidated "
+#: The trail a fold carries, one line per step and one per dropped fact:
+#: ``Superseded: <old key> → <new key> (<date>)`` names a folded section;
+#: ``Superseded: <old key> → <new key> (<date>): <fact text>`` names one
+#: dropped statement of that section (an ASCII ``->`` arrow is accepted).
+TRAIL_PREFIX = "Superseded:"
+
+_STATUS_HEADING_RE = re.compile(
+    r"^## Status after ([0-9A-Za-z][0-9A-Za-z.-]{2,39})$")
+_CURRENT_HEADING_RE = re.compile(
+    r"^## Current state \(consolidated (\d{4}-\d{2}-\d{2})\)$")
+_TRAIL_LINE_RE = re.compile(
+    r"^(?:[-*+]\s+)?Superseded:\s*(?P<old>[0-9A-Za-z][\w.-]*)\s*(?:→|->)\s*"
+    r"(?P<new>[0-9A-Za-z][\w.-]*)(?:\s*\((?P<date>[^)]*)\))?"
+    r"(?:\s*:\s*(?P<fact>.*\S))?$")
+#: A section ends at the next level-1/2 ATX heading (outside a code fence),
+#: so a "### Built" sub-heading belongs to the section it groups.
+_SECTION_END_RE = re.compile(r"^ {0,3}#{1,2}(?:\s|$)")
+#: A foreign (non-reviewer) line at least this long marks every new line
+#: that CONTAINS it as foreign too (an annotated or quoted owner line);
+#: shorter ones are matched as WHOLE TOKEN RUNS (:func:`_word_bounded`) or
+#: by equality (a "---" rule must not taint every line on a bare substring).
+_FOREIGN_CONTAINS_MIN = 12
+#: A shorter foreign line is matched only when it appears as a whole token
+#: run of a new line, so an owner line the reviewer absorbed and REORDERED
+#: (the in-order matcher then never reaches it) is still caught, while the
+#: same characters inside a longer word ("Reuse 5m." for "Use 5m.") are
+#: not. Lines below this length stay equality-only: they are too generic
+#: ("OK", "1.") to mark prose on a boundary match.
+_FOREIGN_SHORT_MIN = 4
+_WS_RE = re.compile(r"\s+")
+
+
+def _word_bounded(needle: str, line: str) -> bool:
+    """``needle`` occurs in ``line`` as a whole token run — bounded on both
+    sides by a non-word character or a line end."""
+    start = line.find(needle)
+    while start != -1:
+        end = start + len(needle)
+
+        def _boundary(i: int) -> bool:
+            ch = line[i]
+            return not (ch.isalnum() or ch == "_")
+
+        if (start == 0 or _boundary(start - 1)) and (
+                end == len(line) or _boundary(end)):
+            return True
+        start = line.find(needle, start + 1)
+    return False
+
+
+@dataclass(frozen=True)
+class ReplaceableSection:
+    """A reviewer section of a node: a ``## Status after <sha>``, a rule-11
+    ``## Proposed change (kg-reviewer, <date>)`` or a ``## Current state
+    (consolidated <date>)`` heading and its lines up to the next level-1/2
+    heading. Foldable only when :func:`proven_sections` returns it."""
+
+    #: body line index of the section heading (0-based).
+    start: int
+    #: exclusive body line index of the section's end.
+    end: int
+    #: what a ``Superseded:`` trail line names to fold it: the sha of a
+    #: Status heading, the date of a Proposed-change heading, the NEW key of
+    #: the last trail line of a Current-state section (its heading date
+    #: when it carries none).
+    key: str
+    #: the heading line, as the prompt lists it.
+    heading: str
+    #: ``status`` / ``proposed`` / ``current``.
+    kind: str = "status"
+    #: :func:`vco_lib.kg_reviewer_provenance.section_digest` of its lines.
+    digest: str = ""
+
+
+@dataclass(frozen=True)
+class TrailEntry:
+    """One parsed ``Superseded:`` line."""
+
+    old: str
+    new: str
+    date: str
+    #: the dropped fact it names, whitespace-collapsed ("" = a step line).
+    fact: str
+
+
+def _collapse(text: str) -> str:
+    return _WS_RE.sub(" ", text).strip()
+
+
+def _needle(line: str) -> str:
+    """A line's TEXT for matching: list/quote marker dropped, whitespace
+    collapsed (the same marker rule as :func:`_missing_with_index`)."""
+    return _collapse(_LINE_MARKER.sub("", line.strip(), count=1))
+
+
+def parse_trail(line: str) -> Optional[TrailEntry]:
+    """The trail entry a body line carries, or ``None``."""
+    m = _TRAIL_LINE_RE.match(line.strip())
+    if m is None:
+        return None
+    return TrailEntry(m.group("old"), m.group("new"), m.group("date") or "",
+                      _collapse(m.group("fact") or ""))
+
+
+def trail_keys(body_post: str) -> Set[str]:
+    """The section keys the body's ``Superseded:`` trail lines name (the old
+    side of each step)."""
+    return {t.old for line in _body_lines(body_post)
+            for t in [parse_trail(line)] if t is not None}
+
+
+def reviewer_sections(text: str) -> List[ReplaceableSection]:
+    """Every reviewer-shaped section of a node (``text`` CRLF-tolerant),
+    with body line indices (the body below the frontmatter, as
+    :func:`edit_violation` indexes it). Shape only — :func:`proven_sections`
+    decides which are the reviewer's."""
+    from vco_lib.kg_reviewer_provenance import section_digest
+
+    _fm, body = _split_frontmatter(text.replace("\r\n", "\n"))
+    raw = body.split("\n")
+    lines = [line.rstrip() for line in raw]
+    proposed = _guard()["proposed_change_heading"]
+    fence = [False] * len(lines)
+    inside = False
+    for i, line in enumerate(lines):
+        if _FENCE.match(line):
+            fence[i] = True
+            inside = not inside
+        elif inside:
+            fence[i] = True
+    out: List[ReplaceableSection] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if fence[i]:
+            i += 1
+            continue
+        m_status = _STATUS_HEADING_RE.match(stripped)
+        m_current = _CURRENT_HEADING_RE.match(stripped)
+        if m_status is None and m_current is None \
+                and not stripped.startswith(proposed):
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and (fence[j] or not _SECTION_END_RE.match(lines[j])):
+            j += 1
+        if m_status is not None:
+            kind, key = "status", m_status.group(1)
+        elif m_current is not None:
+            kind, key = "current", m_current.group(1)
+            for k in range(i + 1, j):
+                t = parse_trail(lines[k])
+                if t is not None:
+                    key = t.new
+        else:
+            kind = "proposed"
+            key = stripped[len(proposed):].rstrip(") \t").strip()
+        out.append(ReplaceableSection(i, j, key, stripped, kind,
+                                      section_digest(raw[i:j])))
+        i = j
+    return out
+
+
+def _is_ancestor(root: Path, commit: str, rev: str,
+                 cache: Dict[str, bool]) -> bool:
+    if commit not in cache:
+        try:
+            cache[commit] = _git(root, "merge-base", "--is-ancestor", commit,
+                                 rev, timeout=60).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            cache[commit] = False
+    return cache[commit]
+
+
+def proven_sections(root: Path, rel: str, data: Optional[bytes],
+                    rev: Optional[str], log: Optional[Log] = None
+                    ) -> List[ReplaceableSection]:
+    """The sections of node ``rel`` (bytes ``data``) a reviewer write may
+    fold: those whose CURRENT normalized bytes hash-match a provenance
+    ledger entry of this node (:mod:`vco_lib.kg_reviewer_provenance`) whose
+    commit is an ancestor of ``rev``. Anything unproven — no ledger entry,
+    an edited section, a rewritten commit, no ``rev`` — is absent, so it
+    keeps the append-only rule. Never raises."""
+    if not rev or data is None:
+        return []
+    from vco_lib import kg_reviewer_provenance as _prov
+
+    entries = _prov.entries_for(root, rel, log)
+    if not entries:
+        return []
+    commits: Dict[str, List[str]] = {}
+    for e in entries:
+        commits.setdefault(str(e["digest"]), []).append(str(e["commit"]))
+    cache: Dict[str, bool] = {}
+    return [s for s in reviewer_sections(_lf_text(data))
+            if any(_is_ancestor(root, c, rev, cache)
+                   for c in commits.get(s.digest, ()))]
+
+
+def reviewer_originated_sections(base: Optional[str], new: str,
+                                 base_proven: List[ReplaceableSection]
+                                 ) -> List[ReplaceableSection]:
+    """The reviewer sections of ``new`` (a node the reviewer is committing
+    over ``base``, its bytes in the parent commit; ``None`` = a new node)
+    whose EVERY non-blank line the reviewer originated — what
+    :func:`commit_reviewer_changes` records in the provenance ledger.
+
+    A line is FOREIGN when it carries a ``base`` line that was not inside a
+    proven reviewer section: the position the guard's own in-order matcher
+    maps that base line to, every new line equal to one, and every new line
+    containing one of at least :data:`_FOREIGN_CONTAINS_MIN` characters (an
+    owner line the reviewer annotated, quoted or enclosed under a new
+    heading) — or carrying a shorter one as a WHOLE TOKEN RUN, so an owner
+    line absorbed into a longer line and reordered out of the in-order
+    matcher's reach is still caught (:data:`_FOREIGN_SHORT_MIN`; below it
+    only equality applies). A section holding even one foreign line is not
+    recorded, so a reviewer edit can never launder the owner's text into
+    foldable text."""
+    new_body = _split_frontmatter(new.replace("\r\n", "\n"))[1]
+    post = _body_lines(new_body)
+    foreign: Set[int] = set()
+    if base is not None:
+        base_body = _split_frontmatter(base.replace("\r\n", "\n"))[1]
+        pre = _body_lines(base_body)
+        inside: Set[int] = set()
+        for s in base_proven:
+            inside.update(range(s.start, s.end))
+        needles = [n for i, line in enumerate(pre) if i not in inside
+                   for n in [_needle(line)] if n]
+        collapsed = [_collapse(line) for line in post]
+        j = 0
+        for n in needles:
+            k = j
+            while k < len(collapsed) and n not in collapsed[k]:
+                k += 1
+            if k < len(collapsed):
+                foreign.add(k)
+                j = k + 1
+        exact = set(needles)
+        long_needles = [n for n in exact if len(n) >= _FOREIGN_CONTAINS_MIN]
+        short_needles = [n for n in exact
+                         if _FOREIGN_SHORT_MIN <= len(n) < _FOREIGN_CONTAINS_MIN]
+        for k, line in enumerate(post):
+            n = _needle(line)
+            if n and (n in exact
+                      or any(f in collapsed[k] for f in long_needles)
+                      or any(_word_bounded(f, collapsed[k])
+                             for f in short_needles)):
+                foreign.add(k)
+    return [s for s in reviewer_sections(new)
+            if not any(k in foreign for k in range(s.start, s.end)
+                       if post[k].strip())]
+
+
+def _fold_removals(pre_lines: List[str], body_post: str,
+                   sections: List[ReplaceableSection]) -> List[str]:
+    """The lines of proven ``sections`` a write dropped (review
+    V02105-KGREV2 H3 — the owner's "old ones not superseded need to be
+    kept", enforced per FACT, not per section):
+
+    * every non-blank line of a folded section must still be in the new
+      body: its text (list/quote marker aside, whitespace collapsed) a
+      substring of a new line — carried into the consolidated section
+      (regrouped, prefixed "Built:" etc. as the write likes), or QUOTED on
+      the trail line that names it superseded (``Superseded: <key> → <new>
+      (<date>): <the statement>``). A statement can be dropped from the
+      prose only by being named superseded; it can never just vanish;
+    * the one exception is the section's HEADING, which a fold replaces:
+      it needs a trail line NEW in this write naming the section's key
+      (the step line ``Superseded: <key> → <new> (<date>)``).
+
+    Reordering is allowed here (a fold regroups facts); the owner's lines
+    outside the proven sections are still matched in order by
+    :func:`_missing_with_index`."""
+    post_lines = _body_lines(body_post)
+    post_collapsed = [_collapse(line) for line in post_lines]
+    pre_set = set(pre_lines)
+    named = {t.old for line in post_lines if line not in pre_set
+             for t in [parse_trail(line)] if t is not None}
+    out: List[str] = []
+    for s in sections:
+        for i in range(s.start, min(s.end, len(pre_lines))):
+            n = _needle(pre_lines[i])
+            if not n or any(n in p for p in post_collapsed):
+                continue
+            if i == s.start and s.key in named:
+                continue
+            out.append(pre_lines[i].strip())
+    return out
+
+
+def edit_violation(pre: str, post: str,
+                   replaceable: Optional[List[ReplaceableSection]] = None
+                   ) -> Optional[str]:
+    """Why an edit of an EXISTING node breaks a rule (``None`` = allowed).
+
+    ``replaceable`` (v0.2.105) names this node's PROVEN reviewer sections
+    (:func:`proven_sections`, the provenance ledger). Their lines are judged
+    per fact by :func:`_fold_removals` — each must survive in the new body
+    or be named by a new ``Superseded:`` trail line of its section — and
+    every OTHER original line by the plain in-order append-and-annotate
+    matcher, with the proven sections' lines left out of that matching (a
+    fold moves their facts; the owner's lines around them must still
+    survive in order). ``None`` / empty keeps the pre-v0.2.105 append-only
+    rule for the whole body."""
     g = _guard()
     mutable = set(g["frontmatter_mutable_keys"])
     fm_pre_raw, body_pre = _split_frontmatter(pre)
@@ -789,7 +1177,19 @@ def edit_violation(pre: str, post: str) -> Optional[str]:
                         f"{', '.join(changed)})")
     locked = lock_reason(fm_pre, body_pre)
     if locked is None:
-        removed = removed_lines(body_pre, body_post)
+        sections = replaceable or []
+        if sections:
+            pre_lines = _body_lines(body_pre)
+            inside: Set[int] = set()
+            for s in sections:
+                inside.update(range(s.start, s.end))
+            masked = "\n".join("" if i in inside else line
+                               for i, line in enumerate(pre_lines))
+            removed = [line for _idx, line
+                       in _missing_with_index(masked, body_post)]
+            removed += _fold_removals(pre_lines, body_post, sections)
+        else:
+            removed = removed_lines(body_pre, body_post)
         if removed:
             shown = "; ".join(repr(_clip(line)) for line in removed[:3])
             more = f" (+{len(removed) - 3} more)" if len(removed) > 3 else ""
@@ -1099,7 +1499,13 @@ def evidence_claims(text: str, has_id: bool) -> List[str]:
     verified" — review R33 N2; "Status: not confirmed" is not a claim), or
     the line also cites a run/test id or commit hash (``has_id``). "The
     tested path keeps the cache warm" or a heading "## Validated
-    configuration keys" is prose, not a claim."""
+    configuration keys" is prose, not a claim.
+
+    v0.2.105 (review D2.5 b): the copula arm requires the marker to be the
+    PREDICATE — it must end its clause (:func:`_predicate_at`). "it was
+    validated input" is a noun phrase whose "validated" modifies "input",
+    not a claim about an evidence level, and it used to be reverted whenever
+    the word was in nothing the reviewer read."""
     g = _guard()
     attrib = "|".join(re.escape(w) for w in g["evidence_attribution_words"])
     copula = "|".join(re.escape(w) for w in g["evidence_copula_words"])
@@ -1114,10 +1520,74 @@ def evidence_claims(text: str, has_id: bool) -> List[str]:
             head = text[:m.start()]
             if (has_id or m.group(0).isupper()
                     or after.match(text, m.end())
-                    or before.search(head) or label.search(head)):
+                    or (before.search(head) and _predicate_at(text, m.end()))
+                    or label.search(head)):
                 out.append(marker)
                 break
     return out
+
+
+def _predicate_at(text: str, end: int) -> bool:
+    """True when a marker ending at ``end`` closes its clause — i.e. it is
+    the predicate the copula before it asserts, not an adjective modifying a
+    following noun ("it was validated input" is a noun phrase).
+
+    "closes its clause" = the marker is followed by nothing, by punctuation,
+    or by one of ``[guard] evidence_predicate_followers`` (a conjunction, a
+    preposition a passive predicate takes — "verified against", "validated
+    with", "confirmed under", "tested end-to-end" (review R1 M6) — a manner
+    adverb, or a predicative adjective). Any OTHER following word makes the
+    marker a modifier, which is how ordinary prose reads."""
+    g = _guard()
+    followers = {str(w).casefold() for w in g.get("evidence_predicate_followers") or ()}
+    rest = text[end:].lstrip()
+    if not rest or rest[0] in ".,;:!?)]}`*-–—":
+        return True
+    word = re.match(r"[A-Za-z]+", rest)
+    if word is None:
+        return True
+    return word.group(0).casefold() in followers
+
+
+def _marker_token_set() -> Set[str]:
+    """The ``[guard] evidence_markers`` as comparison tokens — a marker word
+    is never a claim's own subject word."""
+    return {str(m).casefold() for m in _guard()["evidence_markers"]}
+
+
+def _marker_passages(sources: str) -> List[str]:
+    """The LINES of the read corpus that carry any evidence marker: the only
+    lines a claim can be sourced from (v0.2.105, review D2.5 a). A 30-file
+    corpus is mostly lines about other subjects; searching it whole let a
+    marker found in an unrelated passage source any claim."""
+    g = _guard()
+    markers = [re.escape(str(m)) for m in g["evidence_markers"]]
+    if not markers or not sources:
+        return []
+    any_marker = re.compile("|".join(markers), re.IGNORECASE)
+    return [line for line in sources.splitlines() if any_marker.search(line)]
+
+
+def _marker_sourced(marker: str, claim_text: str, passages: List[str]) -> bool:
+    """True when ``marker`` is sourced by the SAME PASSAGE as the claim.
+
+    v0.2.105 (review D2.5 a): the marker must occur on a corpus line that
+    shares at least ``[guard] evidence_passage_min_shared_tokens`` content
+    tokens with the claim line — the passage has to be about the claim's
+    subject, not merely contain the word somewhere. A claim line with fewer
+    distinctive tokens than the minimum cannot be tied to a passage at all
+    (it has no subject of its own), so the word being present anywhere keeps
+    it sourced; ``0`` restores the pre-v0.2.105 whole-corpus rule."""
+    g = _guard()
+    min_shared = int(g["evidence_passage_min_shared_tokens"])
+    pattern = _word(marker)
+    want = subject_tokens(claim_text) - _marker_token_set()
+    if min_shared <= 0 or len(want) < min_shared:
+        return any(pattern.search(line) for line in passages)
+    for line in passages:
+        if pattern.search(line) and len(want & subject_tokens(line)) >= min_shared:
+            return True
+    return False
 
 
 def unsourced_evidence(pre: Optional[str], post: str, sources: str
@@ -1140,6 +1610,7 @@ def unsourced_evidence(pre: Optional[str], post: str, sources: str
     needles = sorted({_LINE_MARKER.sub("", ln, count=1).strip()
                       for ln in pre_set} - {""}, key=len, reverse=True)
     out: List[Tuple[str, List[str]]] = []
+    passages = _marker_passages(sources)
     for line in _judged_lines(post):
         text = line.strip()
         if not text or text in pre_set:
@@ -1153,7 +1624,7 @@ def unsourced_evidence(pre: Optional[str], post: str, sources: str
         if not hits:
             continue
         missing = [f"marker '{m}'" for m in hits
-                   if not _word(m).search(sources)]
+                   if not _marker_sourced(m, added, passages)]
         missing += [f"id '{i}'" for i in ids if not _id_sourced(i, sources)]
         if missing:
             out.append((text, missing))
@@ -1313,14 +1784,24 @@ Resync = Callable[[List[str], Dict[str, str]], None]
 
 def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
              log: Log, resync: Optional[Resync] = None,
-             *, sources: str) -> ValidationResult:
+             *, sources: str,
+             foldable: "Optional[Dict[str, List[ReplaceableSection]]]" = None
+             ) -> ValidationResult:
     """Revert every rule-breaking change the reviewer PROVABLY made; return
     what survives. ``writes`` is :func:`attributed_writes`; ``None``
     (unattributable run) judges, reverts and keeps NOTHING. ``sources`` is
     what the reviewer read (:func:`transcript_sources` plus the commit diff,
     stat, sha and parent sha it was given): a backticked ``--flag``, an
     evidence-level word or a cited run/commit id a node gains must appear
-    there."""
+    there.
+
+    ``foldable`` (v0.2.105) is the section list the PROMPT showed the
+    reviewer (:func:`vco_lib.kg_reviewer_prompt.foldable_sections`, the same
+    ledger at the prompt's revision): when given, a fold is judged only
+    against the sections that are BOTH listed there and still proven now
+    (:func:`proven_sections` at the snapshot's HEAD) — the guard never
+    allows more than the reviewer was told, and never anything unproven.
+    ``None`` (a caller without a prompt) judges against the proven set."""
     res = ValidationResult()
     if writes is None:
         res.unattributed = True
@@ -1392,6 +1873,20 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
                                             nodes=nodes, bodies=bodies)
             else:
                 reason = edit_violation(pre_text, post_text)
+                if reason is not None and pre is not None:
+                    # v0.2.105: the removals may sit in a PROVEN reviewer
+                    # section (provenance ledger, computed only now that a
+                    # write removed lines) and are re-judged per fact with
+                    # it; nothing proven keeps the append-only verdict above.
+                    replaceable = proven_sections(root, rel, pre,
+                                                  snap.start_head, log)
+                    if foldable is not None:
+                        listed = {s.digest for s in foldable.get(rel, ())}
+                        replaceable = [s for s in replaceable
+                                       if s.digest in listed]
+                    if replaceable:
+                        reason = edit_violation(pre_text, post_text,
+                                                replaceable=replaceable)
             if reason is None:
                 bad = unsourced_flags(pre_text, post_text, sources)
                 if bad:
@@ -1459,6 +1954,16 @@ def validate(snap: Snapshot, writes: "Optional[Dict[Path, List[WriteOp]]]",
 _IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD",
                 "rebase-merge", "rebase-apply", "BISECT_LOG")
 
+#: The LONGEST a commit that found a git operation in progress waits for that
+#: operation to END before it gives up and ledgers the files (v0.2.105
+#: L-KGREV, brief item 4). The wait is also capped at what is left of the
+#: run's own wall-clock budget (``retry_deadline``), so the retry never runs
+#: past it: a review that used its whole budget gets no retry at all, and
+#: the failure mode is the pre-v0.2.105 one (files left uncommitted) plus the
+#: ledger line that names them.
+GIT_OP_RETRY_S = 20.0
+GIT_OP_POLL_S = 0.5
+
 
 def _git_path(root: Path, name: str) -> Path:
     out = _git(root, "rev-parse", "--git-path", name).stdout.decode().strip()
@@ -1466,9 +1971,64 @@ def _git_path(root: Path, name: str) -> Path:
     return p if p.is_absolute() else root / p
 
 
+def _head_bytes(root: Path, rel: str) -> "Tuple[bool, Optional[bytes]]":
+    """``(known, bytes)`` of ``rel`` in the CURRENT commit (``None`` = not in
+    it / no commit). The "is this path still a change?" test for a LEDGERED
+    leftover, whose snapshot-time bytes ARE its current bytes."""
+    proc = _git(root, "cat-file", "blob", f"HEAD:./{rel}")
+    if proc.returncode != 0:
+        return False, None
+    return True, proc.stdout
+
+
+def head_changed_paths(snap: Snapshot, end: str) -> "Optional[Set[str]]":
+    """The PROJECT-relative paths ``snap.start_head..end`` changed, or
+    ``None`` when that cannot be determined (no start commit, a git failure).
+
+    Used by :func:`commit_block_reason` to decide whether a moved HEAD
+    actually touched the reviewer's files (v0.2.105 L-KGREV, brief item 1):
+    a commit that merged / rebased / landed while the review ran is not a
+    reason to strand the nodes when none of them is in the diff. Paths
+    outside the project are named ``<repo>/<path>`` so they can never equal
+    a project-relative reviewer path."""
+    start = snap.start_head
+    if not start or not end:
+        return None
+    proc = _git(snap.root, "diff", "--name-only", "-z", f"{start}..{end}")
+    if proc.returncode != 0:
+        return None
+    prefix = repo_prefix(snap.root)
+    out: Set[str] = set()
+    for top_rel in proc.stdout.decode("utf-8", errors="surrogateescape").split("\0"):
+        if not top_rel:
+            continue
+        rel = project_rel(top_rel, prefix)
+        out.add(rel if rel is not None else f"<repo>/{top_rel}")
+    return out
+
+
+def is_git_op_block(reason: str) -> bool:
+    """True for the two block reasons that name an IN-FLIGHT git operation
+    (the ones :func:`commit_reviewer_changes` retries once, brief item 4)."""
+    return (reason.startswith("a git operation is in progress")
+            or reason.startswith("index.lock exists"))
+
+
 def commit_block_reason(snap: Snapshot, paths: List[str],
-                        attributed: bool) -> Optional[str]:
-    """Why the reviewer must NOT commit now (``None`` = safe to commit)."""
+                        attributed: bool,
+                        own_leftover: "Optional[Set[str]]" = None
+                        ) -> Optional[str]:
+    """Why the reviewer must NOT commit now (``None`` = safe to commit).
+
+    ``own_leftover`` (v0.2.105 L-KGREV) names the paths the ledger proves the
+    reviewer itself wrote in an earlier skipped run: they are dirty in this
+    run's snapshot too, but they are not the user's changes, so they do not
+    block the commit.
+
+    A HEAD that moved does not block by itself any more: the commit goes
+    through when none of ``paths`` appears in ``start_head..HEAD``, so the
+    reviewer's nodes land as a clean commit on top. When the moved HEAD DID
+    touch one of them the skip stands, exactly as before."""
     root = snap.root
     if not attributed:
         return "the run's writes could not be attributed to the reviewer"
@@ -1480,21 +2040,75 @@ def commit_block_reason(snap: Snapshot, paths: List[str],
     head = _git(root, "rev-parse", "--verify", "--quiet", "HEAD")
     now = head.stdout.decode().strip() if head.returncode == 0 else None
     if now != snap.start_head:
-        return f"HEAD moved since the review started ({snap.start_head} -> {now})"
-    user_touched = sorted(p for p in paths if p in snap.dirty_before)
+        moved = f"HEAD moved since the review started ({snap.start_head} -> {now})"
+        changed = head_changed_paths(snap, now) if now else None
+        if changed is None:
+            return moved
+        overlap = sorted(set(paths) & changed)
+        if overlap:
+            return moved + (" and it changed " + ", ".join(overlap))
+    own = own_leftover or set()
+    user_touched = sorted(p for p in paths
+                          if p in snap.dirty_before and p not in own)
     if user_touched:
         return ("the user already had uncommitted changes on "
                 + ", ".join(user_touched))
     return None
 
 
+def _retry_window(retry_deadline: Optional[float]) -> float:
+    """Seconds the git-op retry may wait: :data:`GIT_OP_RETRY_S`, capped at
+    what is left of the run's budget (``0`` when it is spent)."""
+    if retry_deadline is None:
+        return GIT_OP_RETRY_S
+    return max(0.0, min(GIT_OP_RETRY_S, retry_deadline - time.monotonic()))
+
+
+def _after_git_op(snap: Snapshot, paths: List[str], attributed: bool,
+                  own: "Set[str]", window_s: float) -> Optional[str]:
+    """Wait (bounded by ``window_s``) for an in-flight git operation to end,
+    then judge the commit once more. Returns the block reason that still
+    applies, or ``None`` when the operation ended and the commit may
+    proceed."""
+    deadline = time.monotonic() + window_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return commit_block_reason(snap, paths, attributed, own_leftover=own)
+        time.sleep(min(GIT_OP_POLL_S, remaining))
+        block = commit_block_reason(snap, paths, attributed, own_leftover=own)
+        if block is None or not is_git_op_block(block):
+            return block
+
+
+def _foldable(snap: Snapshot, paths: List[str], own: "Set[str]") -> List[str]:
+    """The paths whose current bytes are the reviewer's ALONE: clean when
+    this run started, or dirty only with a verified leftover of its own. A
+    path the user had changes on is ledgered too (so it is still named) but
+    never as foldable -- a later run must not commit the user's edit."""
+    return [p for p in paths if p not in snap.dirty_before or p in own]
+
+
 def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
                             reviewer_bytes: Dict[str, bytes],
                             short: str, subject: str, model: str,
-                            attributed: bool, log: Log) -> Optional[str]:
-    """Commit exactly ``kept`` — each path only while it still holds the
-    reviewer's bytes (``reviewer_bytes``); return the new sha, or ``None``."""
+                            attributed: bool, log: Log,
+                            retry_deadline: Optional[float] = None
+                            ) -> Optional[str]:
+    """Commit exactly ``kept`` -- each path only while it still holds the
+    reviewer's bytes (``reviewer_bytes``) -- plus the reviewer's OWN
+    leftovers from earlier skipped runs; return the new sha, or ``None``.
+
+    v0.2.105 L-KGREV: a path the ledger
+    (:mod:`vco_lib.kg_reviewer_pending`) proves the reviewer wrote in an
+    earlier run and that still holds exactly those bytes is folded into this
+    commit, so the field cascade ("once a file was left dirty every later
+    review touching it skipped too") ends by itself. A ledgered path whose
+    bytes changed is the user's: it is never committed here. Every path this
+    call leaves uncommitted is recorded in the ledger with the sha the run
+    proved, and the committed ones are dropped from it."""
     root = snap.root
+    proofs: Dict[str, str] = {}
     paths: List[str] = []
     for p in sorted(set(kept)):
         cur = _read_bytes(root / p)
@@ -1505,13 +2119,57 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
                 f"(someone else's edit) - left uncommitted")
             continue
         paths.append(p)
+        if cur is not None:
+            proofs[p] = _sha(cur)
+    # The reviewer's own leftovers from an earlier skipped run: the ledger
+    # holds the sha of the bytes it wrote, so their CURRENT bytes prove it.
+    # Only a FOLDABLE entry whose bytes at the START of this run still hash
+    # to the ledger is exempt from the "the user already had uncommitted
+    # changes" block (that dirt was the reviewer's own -- the cascade this
+    # fixes). A ledgered path the user edited since, or one ledgered while
+    # the user had changes on it, is NOT exempt: committing it would commit
+    # the user's edit under the reviewer's name. Entries whose file now
+    # equals HEAD (committed or reverted by anybody) are dropped first.
+    try:
+        _pending.prune_settled(root, root, lambda rel: _head_bytes(root, rel))
+        own: Set[str] = _pending.verified_own(
+            root, lambda rel: snap.pre_bytes(rel)[1])
+        leftovers = _pending.own_leftovers(root, root)
+    except Exception:  # noqa: BLE001 -- the fold is a convenience, never a stop
+        own, leftovers = set(), {}
+    for p in sorted(leftovers):
+        if p in paths:
+            continue
+        cur = _read_bytes(root / p)
+        if cur is None:
+            continue
+        # A leftover EQUALS its own snapshot: what says "nothing to do" here
+        # is whether the working tree still differs from HEAD, not whether it
+        # differs from the run's start (it is the same dirty file).
+        known, head_bytes = _head_bytes(root, p)
+        if known and _same(cur, head_bytes):
+            # Committed (or reverted) by someone since: nothing to fold and
+            # nothing left to warn about.
+            _pending.clear_paths(root, [p])
+            continue
+        paths.append(p)
+        proofs[p] = _sha(cur)
     if not paths:
         log("reviewer wrote nothing to commit - no commit")
         return None
-    block = commit_block_reason(snap, paths, attributed)
+    block = commit_block_reason(snap, paths, attributed, own_leftover=own)
+    window = _retry_window(retry_deadline)
+    if block and is_git_op_block(block) and window > 0:
+        log(f"commit deferred: {block}; retrying once it ends "
+            f"(up to {window:.0f}s, within the run's budget)")
+        block = _after_git_op(snap, paths, attributed, own, window)
     if block:
         log(f"commit skipped: {block}; reviewer files left uncommitted: "
             + ", ".join(paths))
+        _pending.record_skips(root, root, {p: proofs[p] for p in paths
+                                           if p in proofs},
+                              reason=block, short=short,
+                              foldable=_foldable(snap, paths, own))
         return None
     ignored = [p for p in paths
                if _git(root, "check-ignore", "-q", "--", p).returncode == 0]
@@ -1519,6 +2177,9 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         log("not committed (git-ignored, not version-controlled here): "
             + ", ".join(ignored))
     paths = [p for p in paths if p not in ignored]
+    # A git-ignored path can never be committed, so it must never keep
+    # alerting either.
+    _pending.clear_paths(root, ignored)
     if not paths:
         return None
     new = [p for p in paths
@@ -1526,8 +2187,13 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
     if new:
         added = _git(root, "add", "--", *new)
         if added.returncode != 0:
-            log(f"commit skipped: git add failed: "
-                f"{added.stderr.decode(errors='replace').strip()}")
+            detail = added.stderr.decode(errors="replace").strip()
+            log(f"commit skipped: git add failed: {detail}")
+            _pending.record_skips(root, root,
+                                  {p: proofs[p] for p in paths if p in proofs},
+                                  reason=f"git add failed: {detail}",
+                                  short=short,
+                                  foldable=_foldable(snap, paths, own))
             return None
     message = (f"{commit_subject(short, subject)}\n\n"
                f"KG nodes written by the post-commit KG reviewer ({model}) "
@@ -1543,7 +2209,13 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         if new:  # undo only OUR index additions; the worktree is untouched
             _git(root, "rm", "--cached", "-q", "--", *new)
         log(f"commit failed (files left uncommitted): {detail}")
+        _pending.record_skips(root, root,
+                              {p: proofs[p] for p in paths if p in proofs},
+                              reason=f"commit failed: {detail}",
+                              short=short,
+                              foldable=_foldable(snap, paths, own))
         return None
+    _pending.clear_paths(root, paths)
     sha = _git(root, "rev-parse", "HEAD").stdout.decode().strip()
     prefix = repo_prefix(root)
     files = set()
@@ -1559,7 +2231,74 @@ def commit_reviewer_changes(snap: Snapshot, kept: List[str], *,
         log(f"WARNING: commit {sha[:12]} also contains {', '.join(extra)} "
             f"(added by a git hook?) - review it")
     log(f"committed {sha[:12]}: {', '.join(paths)}")
+    created = {p for p in paths
+               if snap.pre_bytes(p) == (True, None)}
+    record_provenance(root, sha, paths, log, created=created)
     return sha
+
+
+def record_provenance(root: Path, sha: str, paths: List[str], log: Log,
+                      created: "Optional[Set[str]]" = None) -> bool:
+    """Ledger the reviewer sections commit ``sha`` (the reviewer's own,
+    just made) holds in each of ``paths`` (v0.2.105, review V02105-KGREV2
+    H1/H2/M1): every section :func:`reviewer_originated_sections` proves the
+    reviewer wrote against the node's bytes in the parent commit — a new
+    Status section, a consolidated Current-state section, an earlier proven
+    section it left untouched (that one keeps its ORIGINAL commit) — with
+    its digest, in :mod:`vco_lib.kg_reviewer_provenance`. Read from the
+    COMMITTED blobs, so what is ledgered is exactly what is in history.
+
+    ``created`` names the paths the reviewer CREATED in this run (absent
+    when the run started). A node whose parent commit has no blob for its
+    path is only ledgered when it is one of those: an owner-created node
+    that was never committed (the project's KG sync writes it to disk at
+    once; ``/knowledge/`` is gitignored in some trees) has no base to
+    compare against, so its sections are the OWNER's and are never recorded
+    (review V02105-DS N2). ``False`` (logged) when it could not be
+    recorded: those sections then stay append-only. Never raises."""
+    from vco_lib import kg_reviewer_provenance as _prov
+
+    created = created or set()
+    parent_proc = _git(root, "rev-parse", "--verify", "--quiet", f"{sha}^")
+    parent = (parent_proc.stdout.decode().strip()
+              if parent_proc.returncode == 0 else None)
+    out: Dict[str, List[Dict[str, str]]] = {}
+    try:
+        for p in paths:
+            if not p.endswith(".md") or not p.startswith(KNOWLEDGE_DIR + "/"):
+                continue
+            blob = _git(root, "cat-file", "blob", f"{sha}:./{p}")
+            if blob.returncode != 0:
+                continue
+            base_bytes: Optional[bytes] = None
+            if parent:
+                prev = _git(root, "cat-file", "blob", f"{parent}:./{p}")
+                if prev.returncode == 0:
+                    base_bytes = prev.stdout
+            if base_bytes is None and p not in created:
+                log(f"provenance NOT recorded for {p} in {sha[:12]}: it was "
+                    f"untracked before this run and the reviewer did not "
+                    f"create it, so its sections stay append-only")
+                continue
+            base_proven = proven_sections(root, p, base_bytes, parent, log)
+            kept_commit: Dict[str, str] = {}
+            for e in _prov.entries_for(root, p, log):
+                if any(s.digest == e["digest"] for s in base_proven):
+                    kept_commit.setdefault(str(e["digest"]), str(e["commit"]))
+            secs = reviewer_originated_sections(
+                _lf_text(base_bytes) if base_bytes is not None else None,
+                _lf_text(blob.stdout), base_proven)
+            out[p] = [{"digest": s.digest, "heading": s.heading,
+                       "key": s.key, "kind": s.kind,
+                       "keep_commit": kept_commit.get(s.digest, "")}
+                      for s in secs]
+    except Exception as exc:  # noqa: BLE001 — logged, the safe direction
+        log(f"provenance NOT recorded for {sha[:12]} ({exc}): its reviewer "
+            f"sections stay append-only (never foldable)")
+        return False
+    if not out:
+        return True
+    return _prov.record(root, sha, out, log)
 
 
 def resync_with(project_root: Path, log: Log,

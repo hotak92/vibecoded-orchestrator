@@ -33,6 +33,8 @@
   import SharedKgPicker from '$lib/components/SharedKgPicker.svelte';
   import ExtraCodegraphPathsPanel from '$lib/project-state/ExtraCodegraphPathsPanel.svelte';
   import InfraDeclarationsPanel from '$lib/project-state/InfraDeclarationsPanel.svelte';
+  import KgPrimarySharedPanel from '$lib/project-state/KgPrimarySharedPanel.svelte';
+  import GatewayAccountPicker from '$lib/components/GatewayAccountPicker.svelte';
   import type {
     ProjectIdentity,
     UpdateProjectIdentityRequest,
@@ -309,6 +311,13 @@
     }
   }
 
+  /** v0.2.105: the shared-KG banner repaired the binding — show the result. */
+  function applyRepair(res: UpdateProjectIdentityResult) {
+    identity = res.identity;
+    loadedKg = res.identity.kg_collection;
+    editKg = loadedKg;
+  }
+
   async function discard() {
     if (!identity) return;
     editKg = loadedKg;
@@ -509,6 +518,12 @@
       </div>
     </div>
 
+    <!-- v0.2.105: a non-root project bound to the SHARED KG as its primary
+         (ledger condition kg_primary_bound_to_shared) — banner + repair. -->
+    {#if !identity.is_orchestrator_root}
+      <KgPrimarySharedPanel {projectId} onRepaired={applyRepair} />
+    {/if}
+
     <!-- PR-5 (v0.2.11): Shared KG section — readonly informational card. -->
     <div class="ps-section ps-section-shared-kg">
       <h4>Shared KG</h4>
@@ -641,6 +656,10 @@
          collections, unmanaged containers, local ports) — VCO leaves it
          alone. Self-contained: loads and saves its own data. -->
     <InfraDeclarationsPanel {projectId} />
+
+    <!-- v0.2.105: which Claude login the model gateway serves this project
+         with. Self-contained; hidden while only the primary login exists. -->
+    <GatewayAccountPicker {projectId} />
   {/if}
 </section>
 

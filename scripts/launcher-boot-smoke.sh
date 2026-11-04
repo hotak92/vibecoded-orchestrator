@@ -25,6 +25,12 @@
 #            pre-ship gate calls this BEFORE its cargo leg so a missing xvfb fails
 #            in seconds, not after a three-minute build.
 #
+#   Run from a Claude Code agent: use the Bash tool's run_in_background: true.
+#   This script waits in a loop (until the launcher reports setup complete),
+#   which VCO's wait guard refuses in the foreground (a loop in a script
+#   may wait 5 s in total at most); in the background the completion
+#   notification brings the result.
+#
 # Environment handling:
 #   - HOME/XDG dirs are redirected to a throwaway temp dir so the smoke
 #     NEVER touches the operator's real ~/.vct state (fresh first-run boot).

@@ -6,7 +6,7 @@
 #
 # The ROUTER owns everything retrieval-side: KG titles keyed on module name
 # + sibling dir (the path topic — never the file content), the write-profile
-# §2.1 floor (0.65, titles-only below 0.85), an exact code-graph def+callers
+# §2.1 floor (0.70, titles-only below 0.85), an exact code-graph def+callers
 # leg ONLY when the path is a REWRITE of an existing file (a brand-new
 # file's symbols are not indexed yet — querying them would return nothing
 # or, worse, a same-named stranger), seen-store dedupe, the per-turn budget,
@@ -31,17 +31,11 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
-# v0.2.104 E-2: the hook's start, for the router's run deadline. The harness
-# timeout counts from HERE, so the router's inner budget must too (it caps
-# its anchor at this instant; see _run_deadline_anchor). EPOCHREALTIME is
-# bash 5+ and uses the locale's radix character; older bash falls back to
-# whole seconds (a coarser, never later, anchor).
-if [ -n "${EPOCHREALTIME:-}" ]; then
-    export VCO_HOOK_STARTED_AT="${EPOCHREALTIME/,/.}"
-else
-    VCO_HOOK_STARTED_AT="$(date +%s 2>/dev/null || true)"
-    export VCO_HOOK_STARTED_AT
-fi
+# v0.2.105: the hook's start, for the router's run deadline AND its hard
+# end-to-end deadline (the harness timeout counts from HERE).
+# One home: _lib/hook-start.sh (MUST MATCH the .ps1 sibling's call).
+# shellcheck source=_lib/hook-start.sh disable=SC1091
+[ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/hook-start.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/hook-start.sh" && vco_mark_hook_start
 
 # VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
 #   delegate is claude_mcp_servers/scripts/hook_context_router.py (KG +

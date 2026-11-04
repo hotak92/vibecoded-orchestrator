@@ -457,20 +457,22 @@ def test_pid_reuse_guard_holds_for_a_comm_containing_a_paren(proj: Path, tmp_pat
     the FIRST one and the remainder shifts by one field, so "starttime"
     reads stat field 21 (itrealvalue, always 0 → start = boot time), so
     any claim stamped after boot looks pre-dated by its recycled pid and
-    the reuse guard silently disengages. The binary is a copy of `sleep` named "a) b", so the
-    kernel sets comm to exactly that."""
-    sleep_bin = shutil.which("sleep")
-    if sleep_bin is None:
-        pytest.skip("sleep not on PATH")
+    the reuse guard silently disengages. The process is a shell SCRIPT named
+    "a) b": the kernel sets comm to the executed file's basename, scripts
+    included. (A copy of `sleep` no longer works: multicall coreutils, e.g.
+    the Rust coreutils of Ubuntu 26.04, dispatch on argv[0] and refuse
+    "a) b".) The loop sleeps briefly so killing the script leaves no long
+    orphan child."""
     paren_bin = tmp_path / "a) b"
-    shutil.copy2(sleep_bin, paren_bin)
+    paren_bin.write_text("#!/bin/sh\nwhile :; do sleep 0.1; done\n", encoding="utf-8")
+    paren_bin.chmod(0o755)
     pend = _pending_dir(proj)
     pend.mkdir(parents=True)
     script = textwrap.dedent(
         f"""
         set -u
         . "{LIB}"
-        "{paren_bin}" 60 &
+        "{paren_bin}" &
         LIVE_PID=$!
         sleep 0.2
         grep -q '(a) b)' "/proc/$LIVE_PID/stat" && echo COMM_HAS_PAREN

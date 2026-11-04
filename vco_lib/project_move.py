@@ -1624,6 +1624,7 @@ def execute_post_flip(
         harness=result.harness,
         codegraph_enqueued=codegraph_enqueued,
         env_reprojection_error=env_reprojection_error,
+        db_path=db_path,
     )
 
     clear_sentinel(src)
@@ -1831,6 +1832,7 @@ def _emit_move_deferrals(
     harness: Mapping[str, Any],
     codegraph_enqueued: bool,
     env_reprojection_error: Optional[str] = None,
+    db_path: Optional[Path] = None,
 ) -> list[str]:
     """Emit every ledger entry the move owes, at D. Returns the condition ids."""
     from vco_lib.config_projection import build_apply_argv
@@ -1843,6 +1845,13 @@ def _emit_move_deferrals(
     # folder's basename would walk the project's code into a DIFFERENT
     # collection: the precise failure this whole package is designed against.
     project_name = plan.project_name or plan.project_id
+    # The printed rebuild command's `--project` is the code-graph BINDING
+    # prefix (v0.2.105): the registered name or slug can sanitize to a
+    # different, zombie class set (`orchestrator-root` → `Orchestrator_root`).
+    from vco_lib.codegraph_project_prefix import resolve_for_project_id
+
+    codegraph_prefix = resolve_for_project_id(
+        plan.project_id, fallback=project_name, db_path=db_path)
 
     # Per-file conflicts — the merge is delegated to the project's own agent.
     for conflict in plan.divergent:
@@ -2005,7 +2014,7 @@ def _emit_move_deferrals(
                 command_to_apply=(
                     "# Nothing to do — the queued build clears this entry.\n"
                     "# To run it now instead of waiting for the launcher:\n"
-                    f"'{_codegraph_wrapper(dst)}' '{dst}' --project '{project_name}'"
+                    f"'{_codegraph_wrapper(dst)}' '{dst}' --project '{codegraph_prefix}'"
                 ),
                 severity="info",
                 disposition="auto_retryable",
@@ -2027,7 +2036,7 @@ def _emit_move_deferrals(
                 ),
                 command_to_apply=(
                     f"'{_codegraph_wrapper(dst)}' '{dst}' "
-                    f"--project '{project_name}'"
+                    f"--project '{codegraph_prefix}'"
                 ),
                 severity="warning",
                 disposition="action_required",

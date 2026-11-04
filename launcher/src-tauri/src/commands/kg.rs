@@ -33,7 +33,13 @@ fn weaviate_client(base: &str) -> Result<reqwest::Client, String> {
 #[derive(Debug, Serialize)]
 pub struct KgCollectionAccess {
     pub name: String,
-    pub node_count: u32,
+    /// v0.2.105 lazy-load counts: `None` = never counted (the GUI shows
+    /// "—"). Live only for the acting project's own/shared/granted
+    /// collections; everything else carries the last cached value.
+    pub node_count: Option<u32>,
+    /// Epoch-ms moment `node_count` was measured (`None` with a `None`
+    /// count). The GUI renders the age next to the number.
+    pub counted_at: Option<i64>,
     pub access: String, // "read" | "write" | "none"
     pub is_shared: bool,
 }
@@ -84,12 +90,86 @@ fn is_codegraph_class(name: &str) -> bool {
 /// those live in the dedicated /codegraph dashboard. Mixing them into
 /// the KG card grid produced 25+ tiles per project where most were
 /// duplicates of the same codebase. Reported 2026-04-28.
+/// v0.2.105 lazy-load counts: the classes the KG view may Aggregate-count
+/// LIVE — exactly the acting project's granted collections (`read`/`write`
+/// rows in `kg_collection_access`; its own primary row carries `write`),
+/// the project's OWN collections from launcher.db (`own` = primary KG +
+/// its `_Development` / `_Diagrams` siblings via
+/// `Db::own_kg_access_collections` — the dev collection has no access row
+/// on installs whose access matrix was seeded before it existed, so the
+/// grants map alone under-counts the project's own classes), plus the
+/// canonical shared/root KG. Every other class is served from the
+/// count cache, because a live Aggregate lazy-loads the class into
+/// Weaviate's RAM for good (Weaviate 1.28 never unloads), and no project
+/// has a reason to pay that for a collection it cannot read. The explicit
+/// "Refresh counts" action (`refresh_collection_counts`) is the one
+/// caller-agnostic path that counts everything.
+fn kg_live_count_scope(
+    grants: &std::collections::HashMap<String, String>,
+    canonical_shared_root: &str,
+    own: &crate::db::access::OwnKgAccessCollections,
+) -> std::collections::HashSet<String> {
+    let mut scope: std::collections::HashSet<String> = grants
+        .iter()
+        .filter(|(_, level)| matches!(level.as_str(), "read" | "write"))
+        .map(|(name, _)| name.clone())
+        .collect();
+    // The acting project's OWN collections count live regardless of the
+    // access-matrix rows: primary, dev, diagrams (all derived from the
+    // one binding-first naming rule, never from the display name alone
+    // for the root project — see `own_kg_access_collections`). An EMPTY
+    // name — a degraded resolution (no project row, a DB error) — adds
+    // NOTHING: no placeholder ever lands in the live scope (v0.2.105
+    // fix round NIT).
+    for own_name in [&own.primary, &own.dev, &own.diagrams] {
+        if !own_name.is_empty() {
+            scope.insert(own_name.to_string());
+        }
+    }
+    if !canonical_shared_root.is_empty() {
+        scope.insert(canonical_shared_root.to_string());
+    }
+    scope
+}
+
+/// The Db side of the KG live-count scope (v0.2.105 fix round, counts
+/// LOW+NIT): the acting project's OWN collections, resolved binding-first
+/// by [`Db::own_kg_access_collections`]. One home, so the Db-backed test
+/// drives the SAME function the command calls.
+///
+/// `get_project` is read ONCE here, and a missing row or a DB error
+/// degrades to `OwnKgAccessCollections::default()` — no own names, so those
+/// classes are simply served from the count cache — never to the hand-built
+/// empty-string struct that used to insert `""` into the live scope.
+fn kg_own_collections(
+    db: &Db,
+    project_id: &str,
+    canonical_root: &str,
+) -> crate::db::access::OwnKgAccessCollections {
+    db.get_project(project_id)
+        .ok()
+        .flatten()
+        .map(|p| db.own_kg_access_collections(project_id, &p.name, canonical_root))
+        .unwrap_or_default()
+}
+
 #[command]
 pub async fn kg_list_collections(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<Vec<KgCollectionAccess>, String> {
-    let base = weaviate_url(&db);
+    kg_list_collections_inner(&project_id, db.inner()).await
+}
+
+/// The command body without the Tauri `State` wrapper (v0.2.105 fix round,
+/// counts LOW): the Db-backed test drives the REAL command path — schema
+/// fetch, own/grants scope resolution, live+cached counts — against a fake
+/// Weaviate, so deleting the own-collections wiring turns it red.
+pub async fn kg_list_collections_inner(
+    project_id: &str,
+    db: &Db,
+) -> Result<Vec<KgCollectionAccess>, String> {
+    let base = weaviate_url(db);
     let client = weaviate_client(&base)?;
     // Weaviate exposes a schema listing at /v1/schema
     let schema_resp = client
@@ -117,11 +197,30 @@ pub async fn kg_list_collections(
         .unwrap_or_default();
 
     let grants: std::collections::HashMap<String, String> = db
-        .kg_list_access(&project_id)?
+        .kg_list_access(project_id)?
         .into_iter()
         .collect();
 
-    let mut out = Vec::with_capacity(classes.len());
+    // v0.2.49 access-matrix Phase 2 (item #7, S-1) — byte-equality
+    // against the persisted canonical name from
+    // `app_state['orchestrator_root_kg_collection']` (see the full
+    // rationale in the git history; a DB error reading the setting falls
+    // back to empty, which only affects the shared sort badge and the
+    // live-count scope, never access).
+    let canonical_root = db
+        .get_orchestrator_root_kg_collection()
+        .unwrap_or_else(|_| String::new());
+
+    // v0.2.105 fix: the project's OWN collections (primary KG + dev +
+    // diagrams) count live even when the access matrix carries no row
+    // for them (e.g. a pre-populate install's `_Development` class) —
+    // resolved from launcher.db alone, never from Weaviate. Soft-fail:
+    // a missing project row or a DB error degrades to NO own names (the
+    // classes are then served from the count cache), never to an error
+    // here and never to empty-string placeholders in the scope.
+    let own = kg_own_collections(db, project_id, &canonical_root);
+
+    let mut names = Vec::with_capacity(classes.len());
     for cls in classes {
         let name = cls
             .get("class")
@@ -136,40 +235,33 @@ pub async fn kg_list_collections(
         if is_codegraph_class(&name) {
             continue;
         }
+        names.push(name);
+    }
+
+    // v0.2.105 lazy-load counts: live Aggregate only for own/shared/
+    // granted; the rest from the launcher.db count cache ("—" when
+    // never counted). One home for the policy: weaviate_counts.
+    let live_scope = kg_live_count_scope(&grants, &canonical_root, &own);
+    let counts = vct_launcher_core::weaviate_counts::resolve_counts(
+        db,
+        &client,
+        &base,
+        &names,
+        &live_scope,
+    )
+    .await;
+
+    let mut out = Vec::with_capacity(names.len());
+    for (name, count) in names.into_iter().zip(counts.into_iter()) {
         let access = grants
             .get(&name)
             .cloned()
             .unwrap_or_else(|| "none".to_string());
-        let node_count = fetch_class_count(&client, &base, &name).await.unwrap_or(0);
-        // v0.2.49 access-matrix Phase 2 (item #7, S-1) — replace the
-        // historical 3-tier substring heuristic with byte-equality
-        // against the persisted canonical name from Step A's
-        // `app_state['orchestrator_root_kg_collection']`. Closes audit
-        // finding S-1: different code paths previously classified
-        // identical collection names differently because they
-        // consulted different constants (helper canonical vs literal
-        // "sharedVCT" vs lowercase("shared") substring).
-        //
-        // Tradeoff: a user-created collection named e.g. "MyShared_KG"
-        // no longer sorts with the canonical shared root. Acceptable
-        // — and arguably more honest — per the plan's S-1 disposition.
-        // The pre-v0.2.49 heuristic also flagged legacy migration
-        // names (`VibeCodedTools_KnowledgeGraph`,
-        // `VibecodedOrchestrator_KnowledgeGraph`); white-label installs
-        // override the persisted canonical via the
-        // `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env at install time, so
-        // legacy-rename detection migrates to the orchestrator-root
-        // setting row instead of being inferred from substrings.
-        //
-        // Soft-fail: a DB error reading the setting falls back to
-        // `false` (this is a display-sort heuristic, not security).
-        let canonical_root = db
-            .get_orchestrator_root_kg_collection()
-            .unwrap_or_else(|_| String::new());
         let is_shared = !canonical_root.is_empty() && name == canonical_root;
         out.push(KgCollectionAccess {
             name,
-            node_count,
+            node_count: count.count.map(|n| n as u32),
+            counted_at: count.counted_at,
             access,
             is_shared,
         });
@@ -177,6 +269,48 @@ pub async fn kg_list_collections(
     // Alphabetical, shared collections first.
     out.sort_by(|a, b| b.is_shared.cmp(&a.is_shared).then(a.name.cmp(&b.name)));
     Ok(out)
+}
+
+/// v0.2.105 "Refresh counts": explicitly live-count EVERY class on the
+/// machine once and refill the launcher.db count cache. This is the only
+/// KG-surface path (besides the equally explicit legacy/orphan wizard)
+/// that Aggregate-counts collections outside the acting project's scope —
+/// the user asked for it. Both the KG collections view's and the
+/// /codegraph page's "Refresh counts" buttons call this, then reload
+/// their list.
+#[command]
+pub async fn refresh_collection_counts(db: State<'_, Db>) -> Result<usize, String> {
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
+    let schema_resp = client
+        .get(format!("{}/v1/schema", &base))
+        .send()
+        .await
+        .map_err(|e| format!("weaviate /v1/schema: {}", e))?;
+    if !schema_resp.status().is_success() {
+        return Err(format!(
+            "weaviate returned {}",
+            schema_resp.status().as_u16()
+        ));
+    }
+    let schema: serde_json::Value = schema_resp
+        .json()
+        .await
+        .map_err(|e| format!("schema parse: {}", e))?;
+    let classes: Vec<String> = schema
+        .get("classes")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|cls| cls.get("class").and_then(|v| v.as_str()))
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let n = classes.len();
+    vct_launcher_core::weaviate_counts::refresh_counts(&db, &client, &base, &classes).await;
+    Ok(n)
 }
 
 // ─── Codegraph dashboard listing ─────────────────────────────────────────
@@ -195,11 +329,18 @@ pub struct CodegraphProjectSummary {
     /// (e.g. "MyProject" → `MyProject_CodeFunction`). Empty if the project
     /// has no codegraph_binding row yet.
     pub prefix: String,
-    pub module_count: u32,
-    pub class_count: u32,
-    pub function_count: u32,
-    pub api_count: u32,
-    pub interaction_count: u32,
+    /// v0.2.105 lazy-load counts: `None` = never counted ("—" in the GUI).
+    /// Live only for the acting project's own codegraph (write) and the
+    /// ones it was granted read access to; the rest carry the last cached
+    /// value.
+    pub module_count: Option<u32>,
+    pub class_count: Option<u32>,
+    pub function_count: Option<u32>,
+    pub api_count: Option<u32>,
+    pub interaction_count: Option<u32>,
+    /// Epoch-ms moment the newest of the five counts was measured
+    /// (`None` when none of them was ever counted).
+    pub counted_at: Option<i64>,
     /// Acting project's access level: "read" | "write" | "none". For
     /// the project's OWN codegraph this is always "write".
     pub access: String,
@@ -217,6 +358,29 @@ pub struct CodegraphProjectSummary {
 /// view; the advanced /preferences/weaviate-untracked page passes
 /// `Some(true)` to surface data from since-deleted projects. The
 /// default keeps pre-v0.2.16 callers on the clean view automatically.
+/// v0.2.105 lazy-load counts: which codegraph classes the /codegraph view
+/// may Aggregate-count LIVE — exactly the classes whose prefix the acting
+/// project owns (`write`) or was granted `read` access to via the
+/// `codegraph_access` matrix. `none`/unknown prefixes are served from the
+/// count cache instead (a live Aggregate lazy-loads the class into
+/// Weaviate's RAM for good; Weaviate 1.28 never unloads). Pure function so
+/// the policy is unit-testable without a Weaviate seam.
+fn codegraph_live_count_scope<'a>(
+    classes: impl Iterator<Item = &'a str>,
+    access_by_prefix: &std::collections::HashMap<String, String>,
+) -> std::collections::HashSet<String> {
+    classes
+        .filter(|name| {
+            let prefix = name.rsplit_once('_').map(|(p, _)| p).unwrap_or("");
+            matches!(
+                access_by_prefix.get(prefix).map(String::as_str),
+                Some("write") | Some("read")
+            )
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 #[command]
 pub async fn codegraph_list_projects(
     project_id: String,
@@ -244,8 +408,10 @@ pub async fn codegraph_list_projects(
         .cloned()
         .unwrap_or_default();
 
-    // Group <Prefix>_<Suffix> classes by Prefix.
-    let mut by_prefix: std::collections::HashMap<String, std::collections::HashMap<String, u32>> =
+    // Collect <Prefix>_<Suffix> class names first — counts are resolved
+    // in ONE batched pass after access is known (v0.2.105 lazy-load
+    // counts), not per schema row.
+    let mut by_prefix: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for cls in classes {
         let name = cls
@@ -256,12 +422,11 @@ pub async fn codegraph_list_projects(
         if name.is_empty() || !is_codegraph_class(&name) {
             continue;
         }
-        if let Some((prefix, suffix)) = name.rsplit_once('_') {
-            let count = fetch_class_count(&client, &base, &name).await.unwrap_or(0);
+        if let Some((prefix, _suffix)) = name.rsplit_once('_') {
             by_prefix
                 .entry(prefix.to_string())
                 .or_default()
-                .insert(suffix.to_string(), count);
+                .push(name);
         }
     }
 
@@ -304,15 +469,18 @@ pub async fn codegraph_list_projects(
         }
     };
 
-    let mut out: Vec<CodegraphProjectSummary> = Vec::new();
-    for (prefix, counts) in by_prefix {
+    // Resolve per-prefix access FIRST (v0.2.105: the count pass below
+    // needs it to decide live-vs-cached), then batch-resolve the counts.
+    let mut access_by_prefix: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for prefix in by_prefix.keys() {
         // v0.2.16 (W4 / 0.11): filter out untracked-project prefixes.
-        if !include_untracked && !tracked_prefixes.contains(&prefix) {
+        if !include_untracked && !tracked_prefixes.contains(prefix) {
             continue;
         }
         // Find which project owns this prefix (best effort).
         let owner_project_id = db
-            .find_project_by_codegraph_prefix(&prefix)
+            .find_project_by_codegraph_prefix(prefix)
             .ok()
             .flatten();
         let access = if let Some(ref owner_id) = owner_project_id {
@@ -330,18 +498,82 @@ pub async fn codegraph_list_projects(
             // see it but can't browse without explicit access.
             "none".to_string()
         };
+        access_by_prefix.insert(prefix.clone(), access);
+    }
+
+    // v0.2.105 lazy-load counts: live Aggregate only for the acting
+    // project's own codegraph and the ones it can read; every other
+    // prefix is served from the launcher.db count cache.
+    let kept_classes: Vec<String> = by_prefix
+        .iter()
+        .filter(|(prefix, _)| access_by_prefix.contains_key(*prefix))
+        .flat_map(|(_, names)| names.iter().cloned())
+        .collect();
+    let live_scope = codegraph_live_count_scope(
+        kept_classes.iter().map(String::as_str),
+        &access_by_prefix,
+    );
+    let counts = vct_launcher_core::weaviate_counts::resolve_counts(
+        &db,
+        &client,
+        &base,
+        &kept_classes,
+        &live_scope,
+    )
+    .await;
+    let count_of: std::collections::HashMap<&str, vct_launcher_core::weaviate_counts::ClassCount> =
+        kept_classes
+            .iter()
+            .map(String::as_str)
+            .zip(counts.into_iter())
+            .collect();
+
+    let mut out: Vec<CodegraphProjectSummary> = Vec::new();
+    for prefix in by_prefix.into_keys() {
+        let access = match access_by_prefix.get(&prefix) {
+            Some(a) => a.clone(),
+            // Filtered out above (untracked) — not rendered at all.
+            None => continue,
+        };
+        // Resolve display name from the owner row when the owner is the
+        // acting project; otherwise show the prefix (as before).
+        let owner_project_id = db
+            .find_project_by_codegraph_prefix(&prefix)
+            .ok()
+            .flatten();
         let project_name = owner_project_id
             .as_ref()
             .and_then(|id| acting.as_ref().filter(|p| &p.id == id).map(|p| p.name.clone()))
             .unwrap_or_else(|| prefix.clone());
+
+        let get = |suffix: &str| -> (Option<u32>, Option<i64>) {
+            let class_name = format!("{}_{}", prefix, suffix);
+            match count_of.get(class_name.as_str()) {
+                Some(c) => (c.count.map(|n| n as u32), c.counted_at),
+                // The class doesn't exist in Weaviate — nothing was ever
+                // counted and nothing ever will be; keep the pre-v0.2.105
+                // "absent class renders 0" behaviour.
+                None => (Some(0), None),
+            }
+        };
+        let (module_count, m_at) = get("CodeModule");
+        let (class_count, c_at) = get("CodeClass");
+        let (function_count, f_at) = get("CodeFunction");
+        let (api_count, a_at) = get("CodeAPI");
+        let (interaction_count, i_at) = get("CodeInteraction");
+        let counted_at = [m_at, c_at, f_at, a_at, i_at]
+            .into_iter()
+            .flatten()
+            .max();
         out.push(CodegraphProjectSummary {
             project_name,
             prefix: prefix.clone(),
-            module_count: counts.get("CodeModule").copied().unwrap_or(0),
-            class_count: counts.get("CodeClass").copied().unwrap_or(0),
-            function_count: counts.get("CodeFunction").copied().unwrap_or(0),
-            api_count: counts.get("CodeAPI").copied().unwrap_or(0),
-            interaction_count: counts.get("CodeInteraction").copied().unwrap_or(0),
+            module_count,
+            class_count,
+            function_count,
+            api_count,
+            interaction_count,
+            counted_at,
             access,
         });
     }
@@ -354,26 +586,13 @@ pub async fn codegraph_list_projects(
     Ok(out)
 }
 
-async fn fetch_class_count(
-    client: &reqwest::Client,
-    base_url: &str,
-    class: &str,
-) -> Result<u32, String> {
-    // Weaviate GraphQL: { Aggregate { <Class> { meta { count } } } }
-    let body = serde_json::json!({
-        "query": format!("{{ Aggregate {{ {class} {{ meta {{ count }} }} }} }}", class = class)
-    });
-    let resp = client
-        .post(format!("{}/v1/graphql", base_url))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("graphql: {}", e))?;
-    let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
-    Ok(v.pointer(&format!("/data/Aggregate/{}/0/meta/count", class))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(0) as u32)
-}
+// `fetch_class_count` (the per-file live Aggregate copy) was removed in
+// v0.2.105: the one live-fetch implementation now lives in
+// `vct_launcher_core::weaviate_counts::fetch_class_count`, shared with the
+// hub twins and the lazy-load count policy. `kg_load_graph` (an explicit
+// single-collection read the user opened, gated by require_kg_read) keeps
+// its live count through that shared function; the listing commands go
+// through resolve_counts / refresh_counts.
 
 // `kg_set_collection_access` (the singular per-row setter) was removed
 // 2026-05-09 as part of the dead-code sweep. The GUI uses
@@ -441,9 +660,9 @@ pub async fn kg_load_graph(
 
     let base = weaviate_url(&db);
     let client = weaviate_client(&base)?;
-    let total = fetch_class_count(&client, &base, &collection)
+    let total = vct_launcher_core::weaviate_counts::fetch_class_count(&client, &base, &collection)
         .await
-        .unwrap_or(0);
+        .unwrap_or(0) as u32;
 
     // Build a GraphQL query to fetch the top-N nodes with tags + typed links.
     // We intentionally request only lightweight fields (no full content) to
@@ -1238,6 +1457,344 @@ mod tests {
     use crate::db::models::ProjectHost;
     use crate::db::Db;
     use serde_json::Value as JsonValue;
+
+    // ── v0.2.105 lazy-load counts: live-count scope policies ──────────
+    //
+    // A live Aggregate lazy-loads a Weaviate class into RAM for good, so
+    // the listing commands may count LIVE only what the acting project
+    // can actually read (own + granted + the shared root on the KG side;
+    // own + read-granted prefixes on the codegraph side). Everything
+    // else comes from the launcher.db count cache. The HTTP/cache half
+    // of the policy is tested in vct_launcher_core::weaviate_counts;
+    // these tests pin the SCOPE decision both views feed it.
+
+    fn grants(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn own(primary: &str) -> crate::db::access::OwnKgAccessCollections {
+        // Derive the `_Development` / `_Diagrams` siblings exactly like
+        // `Db::own_kg_access_collections` does (suffix-swap).
+        let dev = format!("{}_Development", primary.strip_suffix("_KnowledgeGraph").unwrap_or(primary));
+        let diagrams = format!("{}_Diagrams", primary.strip_suffix("_KnowledgeGraph").unwrap_or(primary));
+        crate::db::access::OwnKgAccessCollections {
+            primary: primary.to_string(),
+            dev,
+            diagrams,
+            is_root: false,
+        }
+    }
+
+    #[test]
+    fn kg_live_scope_is_granted_plus_own_plus_shared_only() {
+        let g = grants(&[
+            ("Own_KnowledgeGraph", "write"),
+            ("Granted_KnowledgeGraph", "read"),
+            ("Revoked_KnowledgeGraph", "none"),
+        ]);
+        let scope = super::kg_live_count_scope(
+            &g,
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            &own("Own_KnowledgeGraph"),
+        );
+        // ACT: own (write) and granted (read) count live.
+        assert!(scope.contains("Own_KnowledgeGraph"));
+        assert!(scope.contains("Granted_KnowledgeGraph"));
+        // ACT: the shared root counts live even without a grant row.
+        assert!(scope.contains("VibeCodedOrchestrator_KnowledgeGraph"));
+        // LEAVE-ALONE: revoked / ungranted collections are NOT in scope —
+        // they are served from the cache and never Aggregate-queried.
+        assert!(!scope.contains("Revoked_KnowledgeGraph"));
+        assert!(!scope.contains("Strangers_KnowledgeGraph"));
+        assert_eq!(
+            scope.len(),
+            5,
+            "scope must be exactly: own kg + own dev + own diagrams + granted + shared"
+        );
+    }
+
+    // v0.2.105 fix: the project's OWN Development collection counts live
+    // even when the access matrix carries NO row for it (the state the
+    // review found: a pre-populate install's `_Development` class showed
+    // "—" or a stale cached number although it is the project's own).
+    #[test]
+    fn kg_live_scope_counts_the_projects_own_dev_and_diagrams_live() {
+        // The access matrix knows ONLY the primary KG — no dev row.
+        let g = grants(&[("Acme_KnowledgeGraph", "write")]);
+        let scope = super::kg_live_count_scope(&g, "", &own("Acme_KnowledgeGraph"));
+        // ACT: the own dev + diagrams classes are in the live scope.
+        assert!(
+            scope.contains("Acme_Development"),
+            "the project's own Development collection must count live"
+        );
+        assert!(
+            scope.contains("Acme_Diagrams"),
+            "the project's own Diagrams collection must count live"
+        );
+        // LEAVE-ALONE: another project's dev class is NOT pulled in.
+        assert!(!scope.contains("Other_Development"));
+        assert_eq!(scope.len(), 3, "primary + dev + diagrams only");
+    }
+
+    #[test]
+    fn kg_live_scope_without_shared_root_is_grants_plus_own() {
+        let g = grants(&[("Own_KnowledgeGraph", "write")]);
+        let scope = super::kg_live_count_scope(&g, "", &own("Own_KnowledgeGraph"));
+        assert_eq!(scope.len(), 3);
+        assert!(scope.contains("Own_KnowledgeGraph"));
+    }
+
+    // ── v0.2.105 fix round (counts LOW + NIT): the Db-backed wiring ──────
+    //
+    // The pure-scope tests above hand-build `own(...)`, so nothing in them
+    // could fail if the command passed an EMPTY OwnKgAccessCollections (or
+    // deleted the own computation entirely). These tests drive the SAME
+    // `kg_own_collections` the command calls, against a real seeded Db —
+    // binding-first, no access rows — and the command body itself against a
+    // fake Weaviate.
+
+    #[test]
+    fn kg_own_collections_come_from_the_binding_not_the_access_rows() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project("p1", "Acme", "/tmp/acme", ProjectHost::Base, "acme")
+            .unwrap();
+        db.set_project_kg_binding(
+            "p1", "primary", "Acme_KnowledgeGraph", None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        // NO kg_collection_access rows at all: the matrix knows nothing
+        // about Acme_Development — the pre-populate-install state the
+        // v0.2.105 fix exists for.
+        let own = super::kg_own_collections(&db, "p1", "");
+        assert_eq!(own.primary, "Acme_KnowledgeGraph");
+        assert_eq!(own.dev, "Acme_Development");
+        assert_eq!(own.diagrams, "Acme_Diagrams");
+        let scope = super::kg_live_count_scope(
+            &std::collections::HashMap::new(), "", &own);
+        assert!(
+            scope.contains("Acme_Development"),
+            "the own dev class must reach the live scope through the Db wiring: {scope:?}"
+        );
+        assert!(scope.contains("Acme_Diagrams"), "{scope:?}");
+    }
+
+    #[test]
+    fn kg_own_collections_for_an_unknown_project_never_put_empty_strings_in_scope() {
+        // LEAVE-ALONE + the NIT: no project row → the degraded default, and
+        // the scope drops the empty names instead of inserting "" placeholders.
+        let db = Db::open_in_memory().unwrap();
+        let own = super::kg_own_collections(&db, "missing", "");
+        assert_eq!(
+            (own.primary.as_str(), own.dev.as_str(), own.diagrams.as_str()),
+            ("", "", "")
+        );
+        let scope = super::kg_live_count_scope(
+            &std::collections::HashMap::new(), "", &own);
+        assert!(
+            scope.is_empty(),
+            "a degraded own-resolution must add nothing to the live scope: {scope:?}"
+        );
+    }
+
+    /// A minimal fake Weaviate over raw TCP (the same shape as the
+    /// `vct-launcher-core::weaviate_counts` test harness): serves
+    /// `GET /v1/schema` with `classes`, answers `POST /v1/graphql`
+    /// Aggregate queries out of `counts`, and records every class it was
+    /// asked to count so the test asserts EXACTLY which classes were
+    /// Aggregate-queried (a live count lazy-loads a class into RAM — the
+    /// whole reason the scope exists).
+    struct FakeWeaviate {
+        port: u16,
+        asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeWeaviate {
+        async fn start(classes: Vec<String>, counts: Vec<(String, u64)>) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let asked_srv = asked.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = match listener.accept().await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let classes = classes.clone();
+                    let counts = counts.clone();
+                    let asked = asked_srv.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        loop {
+                            match stream.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&tmp[..n]);
+                                    if let Some(hdr_end) =
+                                        buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        let headers =
+                                            String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                                        let len = headers
+                                            .lines()
+                                            .find_map(|l| {
+                                                let (k, v) = l.split_once(':')?;
+                                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                                    v.trim().parse::<usize>().ok()
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .unwrap_or(0);
+                                        if buf.len() >= hdr_end + 4 + len {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        let request_line = text.lines().next().unwrap_or("").to_string();
+                        let payload = if request_line.contains("/v1/schema") {
+                            serde_json::json!({
+                                "classes": classes.iter()
+                                    .map(|c| serde_json::json!({"class": c}))
+                                    .collect::<Vec<_>>()
+                            })
+                            .to_string()
+                        } else {
+                            // Extract the class out of "Aggregate { <Class> {".
+                            let class = text
+                                .split("Aggregate { ")
+                                .nth(1)
+                                .and_then(|rest| rest.split(" {").next())
+                                .unwrap_or("")
+                                .to_string();
+                            asked.lock().unwrap().push(class.clone());
+                            match counts.iter().find(|(c, _)| *c == class) {
+                                Some((c, n)) => serde_json::json!({
+                                    "data": {"Aggregate": {c: [{"meta": {"count": n}}]}}
+                                })
+                                .to_string(),
+                                None => serde_json::json!({"data": {}}).to_string(),
+                            }
+                        };
+                        let http = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            payload.len(),
+                            payload
+                        );
+                        let _ = stream.write_all(http.as_bytes()).await;
+                    });
+                }
+            });
+            FakeWeaviate { port, asked }
+        }
+    }
+
+    #[tokio::test]
+    async fn kg_list_collections_counts_the_projects_own_dev_class_live() {
+        // THE COMMAND PATH (counts LOW): seeded project + primary binding,
+        // NO `_Development` access row — the dev class must be counted LIVE
+        // (Some(7)) because `kg_list_collections_inner` folds the Db-resolved
+        // own collections into the scope. Deleting the `kg_own_collections`
+        // wiring (or passing an empty struct) drops it to the never-counted
+        // cache value (None) and turns this red.
+        let fake = FakeWeaviate::start(
+            vec![
+                "Acme_KnowledgeGraph".to_string(),
+                "Acme_Development".to_string(),
+                "Strangers_KnowledgeGraph".to_string(),
+            ],
+            vec![
+                ("Acme_KnowledgeGraph".to_string(), 3),
+                ("Acme_Development".to_string(), 7),
+                ("Strangers_KnowledgeGraph".to_string(), 99),
+            ],
+        )
+        .await;
+        let db = Db::open_in_memory().unwrap();
+        db.lock()
+            .execute(
+                "INSERT INTO service_endpoints \
+                 (service, mode, scheme, host, port, grpc_port, source, updated_at) \
+                 VALUES ('weaviate','adopted_external','http','127.0.0.1',?1,?1,'install_probe',0)",
+                rusqlite::params![fake.port],
+            )
+            .unwrap();
+        db.insert_project("p1", "Acme", "/tmp/acme", ProjectHost::Base, "acme")
+            .unwrap();
+        db.set_project_kg_binding(
+            "p1", "primary", "Acme_KnowledgeGraph", None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let out = super::kg_list_collections_inner("p1", &db)
+            .await
+            .expect("command");
+        let by_name = |n: &str| {
+            out.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} not listed: {out:?}"))
+        };
+        assert_eq!(
+            by_name("Acme_Development").node_count,
+            Some(7),
+            "the project's OWN dev collection counts live through the command's own-wiring"
+        );
+        assert_eq!(by_name("Acme_KnowledgeGraph").node_count, Some(3));
+        // LEAVE-ALONE: a stranger's collection is NOT Aggregate-queried —
+        // it shows the (never-set) cache value, "—" in the GUI.
+        assert_eq!(by_name("Strangers_KnowledgeGraph").node_count, None);
+        let asked = fake.asked.lock().unwrap();
+        assert!(
+            asked.iter().any(|c| c == "Acme_Development"),
+            "the dev class was never live-queried: {asked:?}"
+        );
+        assert!(
+            !asked.iter().any(|c| c == "Strangers_KnowledgeGraph"),
+            "an out-of-scope class must never be Aggregate-queried: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn codegraph_live_scope_is_write_and_read_prefixes_only() {
+        let access: std::collections::HashMap<String, String> =
+            grants(&[
+                ("Mine", "write"),
+                ("Readable", "read"),
+                ("Others", "none"),
+            ]);
+        // "Unknown" has no row at all — the implicit-deny leg.
+        let classes = [
+            "Mine_CodeModule",
+            "Mine_CodeFunction",
+            "Readable_CodeClass",
+            "Others_CodeModule",
+            "Unknown_CodeAPI",
+        ];
+        let scope = super::codegraph_live_count_scope(classes.into_iter(), &access);
+        // ACT: the acting project's own prefix and read-granted prefixes
+        // count live (all five classes of each).
+        assert!(scope.contains("Mine_CodeModule"));
+        assert!(scope.contains("Mine_CodeFunction"));
+        assert!(scope.contains("Readable_CodeClass"));
+        // LEAVE-ALONE: access "none" and unknown prefixes are cached-only.
+        assert!(!scope.contains("Others_CodeModule"));
+        assert!(!scope.contains("Unknown_CodeAPI"));
+        assert_eq!(scope.len(), 3);
+    }
 
     #[test]
     fn is_codegraph_class_matches_prefixed_names() {

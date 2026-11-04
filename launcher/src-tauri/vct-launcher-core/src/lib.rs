@@ -115,6 +115,13 @@ pub mod time;
 pub mod types;
 // v0.2.100 F-W4-09: the one byte-size rendering.
 pub mod units;
+
+// v0.2.105 ("lazy-load counts"): the ONE home for Weaviate class counts —
+// the live Aggregate fetch, the launcher.db count cache, and the
+// live-vs-cached decision that keeps the launcher's KG/codegraph pages
+// and the hub's CLI twins from counting (and so lazy-loading into RAM)
+// every collection on the machine at every render.
+pub mod weaviate_counts;
 // v0.2.100 WP-01: the ONE Rust version parser/comparator (strict X.Y.Z, owner
 // ruling Q7). Replaces seven private copies in the launcher crate; shares its
 // case table with vco_lib/version_compare.py and launcher/src/lib/version-compare.ts.

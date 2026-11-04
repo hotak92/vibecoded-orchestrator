@@ -17,6 +17,10 @@
   // present, so the home page is unchanged in the happy-path case.
   import RuntimeMissingBanner from '$lib/components/RuntimeMissingBanner.svelte';
   import SubscriptionUsageCard from '$lib/components/SubscriptionUsageCard.svelte';
+  // v0.2.105: the machine-wide per-provider switch (turn off a subscription
+  // you no longer have — its agents are parked and its model rows hidden).
+  // Self-hides on a machine with no model gateway.
+  import ModelProvidersCard from '$lib/components/ModelProvidersCard.svelte';
   import { auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
   import { modules, installedIds } from '$lib/stores/modules';
@@ -318,6 +322,10 @@
       <!-- v0.2.97: subscription usage windows from the model gateway.
            Self-hides when the gateway is not running. -->
       <SubscriptionUsageCard />
+
+      <!-- v0.2.105: machine-wide per-provider on/off switch. Self-hides when
+           no model gateway (and so no vendor) is configured. -->
+      <ModelProvidersCard />
 
       <div class="content-header">
         <div>

@@ -1207,6 +1207,14 @@ pub(crate) async fn apply_post_bundle_steps(
             scanned
         );
     }
+    if let KgSyncDecision::SkipNoContent { detail } = &kg_decision {
+        tracing::info!(
+            "[vct] kg-sync skipped for {} — no knowledge nodes on disk, so \
+             there is nothing to check ({})",
+            project_id,
+            detail
+        );
+    }
     if let KgSyncDecision::SkipInFlight { status } = &kg_decision {
         tracing::info!(
             "[vct] kg-sync skipped for {} — a sync is already {} for this \

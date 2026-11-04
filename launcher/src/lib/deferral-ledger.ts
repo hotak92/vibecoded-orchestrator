@@ -310,6 +310,11 @@ export const AUTO_RETRY_BACKED_CONDITIONS: ReadonlySet<string> = new Set([
   // `retry:py:code_embed_backend` resolves the row once the code backend
   // answers, so the retry claim is true.
   'code_embed_backend_unavailable',
+  // v0.2.105: an enabled extra code folder lost its rows.
+  // `retry:py:codegraph_extras_heal` (vco_lib.deferral_retry →
+  // retry_codegraph_extras_heal) re-indexes the folder once the code backend
+  // answers, so the retry claim is true.
+  'codegraph_extra_rows_missing',
   // DOCUMENTED EXCEPTION — no `retry_action` ON PURPOSE. The work is already
   // scheduled: the flip transaction inserted a `code_graph_builds` pending row
   // and the launcher's own build runner consumes it. A WP-H handler here would
@@ -452,4 +457,55 @@ export function findEntry(
   conditionId: string,
 ): LedgerEntry | null {
   return view?.entries.find((e) => e.condition_id === conditionId) ?? null;
+}
+
+/**
+ * The full text a row's Copy button puts on the clipboard — everything the
+ * row renders: the title, the condition id, the severity and the disposition
+ * (with its explanation), when it was detected, the body (what was detected +
+ * why it was deferred), the retry summary and each recorded attempt, the
+ * remedy command and the KG context refs.
+ *
+ * The scope is named when a view is passed, because a copied entry travels
+ * outside the panel it came from and decision #6's rider requires that a
+ * project's entry can never be read as the orchestrator root's (or the other
+ * way round).
+ *
+ * `command_to_apply` is appended VERBATIM — `#` comment lines, blank lines and
+ * all — because it is the part the user pastes into a shell; re-wrapping or
+ * trimming it here would change what they run.
+ */
+export function entryCopyText(
+  entry: LedgerEntry,
+  view?: Pick<DeferralLedgerView, 'scope' | 'scope_label'> | null,
+): string {
+  const lines: string[] = [entry.title, `Condition: ${entry.condition_id}`];
+  if (view) {
+    lines.push(
+      `Scope: ${
+        view.scope === 'orchestrator_root' ? ROOT_SCOPE_LABEL : view.scope_label
+      }`,
+    );
+  }
+  if (entry.severity) lines.push(`Severity: ${entry.severity}`);
+  lines.push(`Disposition: ${dispositionLabel(entry.disposition)} — ${dispositionExplanation(entry)}`);
+  if (entry.detected_at) lines.push(`Detected: ${entry.detected_at}`);
+  const body = [entry.detected, entry.why_deferred].filter(
+    (part) => part && part.trim().length > 0,
+  );
+  if (body.length > 0) lines.push('', ...body);
+  const retry = retryLine(entry.retries);
+  if (retry) {
+    lines.push('', retry);
+    for (const a of entry.retries?.outcomes ?? []) {
+      lines.push(`  ${a.status} ${a.ts}${a.detail ? ` ${a.detail}` : ''}`);
+    }
+  }
+  if (entry.command_to_apply) {
+    lines.push('', 'Remedy:', entry.command_to_apply);
+  }
+  if (entry.kg_node_refs.length > 0) {
+    lines.push('', `Context: ${entry.kg_node_refs.join(', ')}`);
+  }
+  return lines.join('\n');
 }

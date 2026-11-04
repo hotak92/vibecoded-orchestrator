@@ -1,0 +1,6 @@
+{
+  // JSONC comment
+  "veh_params": {"mass_kg": 1200, "dims": {"length_m": 4.5}},
+  "layers": [{"name": "a", "scale_factor": 1}, {"name": "b", "offset_m": 2}],
+  "version": 3,
+}

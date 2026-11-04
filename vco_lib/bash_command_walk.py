@@ -135,9 +135,12 @@ LOOP_OPENERS: frozenset[str] = frozenset({"while", "until", "for", "select"})
 #: 2026-10-15: ``do bash -c '…'`` recurses exactly like a bare
 #: ``bash -c '…'`` — previously the keyword hid the sub-command from every
 #: consumer). Consumers that classify a segment's verb (the wait guard)
-#: strip this same set — import it from here, one home.
+#: strip this same set — import it from here, one home. ``coproc``
+#: (v0.2.105, R9 base-equal gap) runs its command asynchronously exactly
+#: like a trailing ``&`` — the command it prefixes is judged like
+#: ``cmd &`` is: as itself.
 LEADING_COMPOUND_KEYWORDS: frozenset[str] = frozenset(
-    {"do", "then", "else", "{", "!"})
+    {"do", "then", "else", "{", "!", "coproc"})
 
 #: ``while``/``until`` are the loop openers whose CONDITION is a command
 #: (``for``/``select`` take a word list, never a command). Every segment
@@ -146,7 +149,7 @@ LEADING_COMPOUND_KEYWORDS: frozenset[str] = frozenset(
 CONDITION_OPENERS: frozenset[str] = frozenset({"while", "until"})
 
 
-def _segment_opener(stripped: List[str]) -> Optional[str]:
+def segment_opener(stripped: List[str]) -> Optional[str]:
     """The loop opener governing a segment: its FIRST token, or an opener
     immediately after a ``{`` / ``(`` group token — the function/group
     header shape ``f() { while …`` (R6, owner ruling 2026-10-15: the loop
@@ -247,6 +250,11 @@ class ChainSegment(NamedTuple):
                    EMISSION is opt-in (:func:`walk_segments`'
                    ``_with_assignments``) so :func:`walk_command`
                    collectors keep their byte-identical contract.
+    ``piped_from`` — the raw tokens of the segment whose output feeds this
+                   one through a ``|`` (empty when the segment is not a
+                   pipe consumer, or sits in a re-positioned function
+                   body). Read by the wait guard to see the code a
+                   ``… | bash`` runs (v0.2.105); collectors ignore it.
     """
 
     tokens: List[str]
@@ -255,6 +263,7 @@ class ChainSegment(NamedTuple):
     in_loop: bool
     depth: int
     assignments: Tuple[str, ...] = ()
+    piped_from: Tuple[str, ...] = ()
 
 # A collector receives ONE peeled segment (tokens) and returns whatever
 # path-ish strings it found in it.
@@ -310,8 +319,20 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
     Empty segments (e.g. trailing `;`) are dropped to keep downstream
     iteration tight.
     """
-    segments: List[List[str]] = []
+    return [seg for _op, seg in split_chain_ops(tokens)]
+
+
+def split_chain_ops(tokens: List[str]) -> List[Tuple[Optional[str], List[str]]]:
+    """:func:`split_chain` with the separator that PRECEDES each segment
+    (``None`` for the first) — the ONE splitter; :func:`split_chain` is
+    this minus the operators. A ``|`` operator marks the segment as a pipe
+    consumer of the segment before it (v0.2.105: the wait guard reads the
+    code an ``echo '…' | bash`` feeds a shell). When empty segments are
+    dropped (``a ; ; b``) the LAST separator seen is the one reported."""
+    segments: List[Tuple[Optional[str], List[str]]] = []
     current: List[str] = []
+    op: Optional[str] = None
+    pending_op: Optional[str] = None
     arith_depth = 0
     for tok in tokens:
         if arith_depth > 0:
@@ -320,15 +341,43 @@ def split_chain(tokens: List[str]) -> List[List[str]]:
             continue
         if tok in CHAIN_SEPARATORS:
             if current:
-                segments.append(current)
+                segments.append((op, current))
                 current = []
+            pending_op = tok
             continue
+        if not current:
+            op = pending_op if segments else None
         current.append(tok)
         if tok.startswith("((") and tok.count("(") > tok.count(")"):
             arith_depth = tok.count("(") - tok.count(")")
     if current:
-        segments.append(current)
+        segments.append((op, current))
     return segments
+
+
+#: A ``case`` arm's pattern word as the chain splitter leaves it at the
+#: head of a segment (``a)``, ``*)``, ``a|b)``, ``(a)``, ``*.py)``): no
+#: ``$``, backtick, ``=`` or inner paren, and a closing ``)``.
+_CASE_ARM_RE = re.compile(r"^\(?[^()$`=\s]+\)$")
+
+
+def strip_case_arm(tokens: List[str]) -> List[str]:
+    """Peel a ``case`` statement's head off a segment (v0.2.105, R9
+    base-equal gap): ``case WORD in PATTERN) cmd …`` → ``cmd …`` and an
+    arm's leading ``PATTERN) cmd …`` → ``cmd …``; ``esac`` alone peels to
+    nothing. Any other segment comes back unchanged. The command an arm
+    runs is then judged like any other segment."""
+    out = list(tokens)
+    if out and out[0] == "case":
+        try:
+            out = out[out.index("in", 1) + 1:]
+        except ValueError:
+            return list(tokens)
+    if out and out[0] == "esac":
+        return []
+    if out and out[0] != ")" and _CASE_ARM_RE.match(out[0]):
+        out = out[1:]
+    return out
 
 
 def _substitution_depth(text: str) -> int:
@@ -397,6 +446,25 @@ def _split_glued(token: str) -> List[str]:
     return out
 
 
+def command_words(tokens: List[str]) -> List[str]:
+    """A segment's tokens from its COMMAND WORD on: leading compound
+    keywords (``do``, ``then``, ``{``, ``!``, ``coproc``), subshell parens
+    and a ``case`` head or arm pattern (``case x in a) sleep 5`` →
+    ``sleep 5``, v0.2.105 R9 gap) peeled, repeatedly, until none is
+    left. (Moved here from the wait guard in the v0.2.105 fix round: the
+    bounded-loop reading in :mod:`vco_lib.wait_guard_bounded` peels the
+    same way.)"""
+    body = list(tokens)
+    while True:
+        before = body
+        while body and os.path.basename(body[0]).lower() in LEADING_COMPOUND_KEYWORDS:
+            body = body[1:]
+        body = strip_subshell_parens(body)
+        body = strip_case_arm(body)
+        if body == before:
+            return body
+
+
 def strip_env_assignments(tokens: List[str]) -> List[str]:
     """Drop leading `KEY=VAL` env assignments and return the remainder.
     Returns an empty list if every token is an env assignment (malformed,
@@ -455,6 +523,82 @@ def peel_wrapper_verbs(tokens: List[str]) -> List[str]:
             break
         out = out[i:]
     return out
+
+
+#: Wrappers :func:`peel_to_command` peels beyond :data:`WRAPPER_VERBS`
+#: (v0.2.105 — moved here from the kill guard so the rm guard shares them).
+FLAG_WRAPPERS: frozenset[str] = frozenset({"nohup", "setsid", "doas"})
+XARGS_VALUE_OPTS: frozenset[str] = frozenset({
+    "-I", "-i", "-n", "-L", "-l", "-P", "-d", "-E", "-e", "-a", "-s",
+    "--max-args", "--max-lines", "--max-procs", "--delimiter", "--arg-file",
+    "--replace", "--eof", "--max-chars"})
+TIMEOUT_VALUE_OPTS: frozenset[str] = frozenset({"-s", "-k", "--signal",
+                                                "--kill-after"})
+
+
+def command_basename(tok: str) -> str:
+    """Lower-cased last path component of a command word (``/bin/rm`` →
+    ``rm``; Windows separators too)."""
+    return tok.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _skip_opts(toks: List[str], value_opts: frozenset) -> List[str]:
+    i = 1
+    while i < len(toks) and toks[i].startswith("-") and toks[i] != "-":
+        if toks[i] == "--":
+            i += 1
+            break
+        i += 2 if toks[i] in value_opts else 1
+    return toks[i:]
+
+
+def peel_to_command(tokens: List[str]) -> Optional[Tuple[List[str], str]]:
+    """Peel ONE walked segment down to the command it actually runs:
+    leading compound keywords, subshell parens, env assignments,
+    :data:`WRAPPER_VERBS`, ``xargs`` (its own options), ``timeout`` (options
+    + duration), :data:`FLAG_WRAPPERS`, and ``command`` / ``builtin``.
+
+    Returns ``(tokens_from_the_command_word, via)`` — ``via`` names a
+    ``command X`` / ``builtin X`` prefix that was peeled ("" when none) —
+    or None when nothing is left or the segment is a ``command -v`` lookup.
+    One home for the kill guard and the rm guard (v0.2.105)."""
+    toks = list(tokens)
+    via = ""
+    for _ in range(12):
+        while toks and command_basename(toks[0]) in LEADING_COMPOUND_KEYWORDS:
+            toks = toks[1:]
+        toks = strip_subshell_parens(toks)
+        toks = strip_env_assignments(toks)
+        if not toks:
+            return None
+        base = command_basename(toks[0])
+        if base in WRAPPER_VERBS:
+            toks = peel_wrapper_verbs(toks)
+            continue
+        if base == "xargs":
+            toks = _skip_opts(toks, XARGS_VALUE_OPTS)
+            continue
+        if base in ("timeout", "gtimeout"):
+            toks = _skip_opts(toks, TIMEOUT_VALUE_OPTS)
+            if toks:  # the duration
+                toks = toks[1:]
+            continue
+        if base in FLAG_WRAPPERS:
+            toks = _skip_opts(toks, frozenset())
+            continue
+        if base in ("command", "builtin"):
+            rest = toks[1:]
+            if rest and rest[0] in ("-v", "-V"):
+                return None  # a lookup, not a call
+            while rest and rest[0] in ("-p", "--"):
+                rest = rest[1:]
+            via = "`%s %s`" % (base, rest[0] if rest else "")
+            toks = rest
+            continue
+        break
+    if not toks:
+        return None
+    return toks, via
 
 
 def _quoted_token_views(command: str) -> Optional[List[str]]:
@@ -738,7 +882,7 @@ def _loop_membership(segments: List[List[str]], inherited: bool) -> List[bool]:
         if not stripped:
             flags.append(inherited or loop_depth > 0 or in_condition)
             continue
-        opener = _segment_opener(stripped)
+        opener = segment_opener(stripped)
         first = os.path.basename(stripped[0]).lower()
         is_do = first == "do"
         if first == "done" and loop_depth > 0:
@@ -919,7 +1063,8 @@ def walk_segments(command: str, depth: int = 0, *,
                   _position_override: Optional[tuple] = None,
                   _with_substitutions: bool = False,
                   _with_function_bodies: bool = False,
-                  _with_assignments: bool = False) -> List[ChainSegment]:
+                  _with_assignments: bool = False,
+                  _with_shell_runs: bool = False) -> List[ChainSegment]:
     """Parse `command` like :func:`walk_command` but hand out
     :data:`ChainSegment` records — peeled tokens PLUS the structural
     context (position within the chain level, loop membership, recursion
@@ -967,6 +1112,13 @@ def walk_segments(command: str, depth: int = 0, *,
     and its re-joined :data:`ChainSegment.assignments`, so classifiers
     read it directly. Collectors skip empty token lists, and without the
     flag such statements are not emitted at all — the pre-R16 contract.
+
+    ``_with_shell_runs`` (opt-in, v0.2.105; :func:`walk_command` callers
+    are unchanged): a shell invoked WITHOUT a ``-c`` sub-command
+    (``bash poll.sh``, ``sh -s``, ``bash <<< '…'``, ``… | bash``) is
+    EMITTED as a segment instead of being consumed silently, so the wait
+    guard can judge the script file or the stdin code it runs. Every
+    emitted segment carries :attr:`ChainSegment.piped_from` either way.
     """
     if depth > MAX_NESTING_DEPTH:
         return []
@@ -975,7 +1127,14 @@ def walk_segments(command: str, depth: int = 0, *,
     if not tokens:
         return []
 
-    segments = split_chain(tokens)
+    seg_ops = split_chain_ops(tokens)
+    segments = [seg for _op, seg in seg_ops]
+    # Pipe producers by segment identity: re-positioned function-body rows
+    # are new lists and simply carry none.
+    piped: dict = {}
+    for k in range(1, len(seg_ops)):
+        if seg_ops[k][0] == "|":
+            piped[id(seg_ops[k][1])] = tuple(seg_ops[k - 1][1])
     chain_size = len(segments)
     flags = _loop_membership(segments, _in_loop)
     rows: List[_Row] = []
@@ -1032,13 +1191,21 @@ def walk_segments(command: str, depth: int = 0, *,
                         _position_override=(pos, size),
                         _with_substitutions=_with_substitutions,
                         _with_function_bodies=_with_function_bodies,
-                        _with_assignments=_with_assignments))
-                # Consumed either way: no sub-command (`bash script.sh`)
+                        _with_assignments=_with_assignments,
+                        _with_shell_runs=_with_shell_runs))
+                elif sub_cmd is None and _with_shell_runs:
+                    # v0.2.105: a script file / stdin run is visible to the
+                    # consumer that opted in (the wait guard).
+                    out.append(ChainSegment(peeled, pos, size, in_loop, depth,
+                                            tuple(seg_assignments),
+                                            piped.get(id(segment), ())))
+                # Otherwise consumed: no sub-command (`bash script.sh`)
                 # or over budget → nothing emitted, exactly as parse_dash_c
                 # has always done.
             else:
                 out.append(ChainSegment(peeled, pos, size, in_loop, depth,
-                                        tuple(seg_assignments)))
+                                        tuple(seg_assignments),
+                                        piped.get(id(segment), ())))
                 subst_src = segment
         elif _with_assignments and seg_assignments:
             # An assignment-only statement: emitted with EMPTY tokens
@@ -1051,7 +1218,8 @@ def walk_segments(command: str, depth: int = 0, *,
                     sub_body, depth + 1, _in_loop=in_loop,
                     _with_substitutions=True,
                     _with_function_bodies=_with_function_bodies,
-                    _with_assignments=_with_assignments))
+                    _with_assignments=_with_assignments,
+                    _with_shell_runs=_with_shell_runs))
     return out
 
 
@@ -1083,13 +1251,17 @@ __all__ = [
     "MAX_NESTING_DEPTH",
     "SHELL_DASH_C_VERBS",
     "WRAPPER_VERBS",
+    "command_words",
     "dash_c_subcommand",
     "function_header",
     "is_env_assignment",
     "literal_eval_body",
     "parse_dash_c",
     "peel_wrapper_verbs",
+    "segment_opener",
     "split_chain",
+    "split_chain_ops",
+    "strip_case_arm",
     "strip_env_assignments",
     "strip_subshell_parens",
     "substitution_bodies",

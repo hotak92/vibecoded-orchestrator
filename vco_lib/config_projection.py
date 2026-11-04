@@ -407,6 +407,12 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # (test_canonical_env_key_parity_v0273.py) passes. Value = folder path;
     # always emitted (never None).
     "KG_BASE_DIR",
+    # v0.2.105: the model-gateway account selector
+    # (``x-vco-account: <id>``, :mod:`vco_lib.gateway_accounts`). Python-only
+    # (the subset parity test allows that direction); machine-local, because
+    # the account is this user's choice on this machine. Conditionally
+    # emitted — omitted for "use the default account".
+    "ANTHROPIC_CUSTOM_HEADERS",
 )
 
 
@@ -464,6 +470,9 @@ MACHINE_LOCAL_ENV_KEYS: frozenset[str] = frozenset({
     "VCT_CODE_GRAPH_ACCESS_LIST",
     "VCT_EXTERNAL_COLLECTIONS",
     "VCT_UNMANAGED_CONTAINERS",
+    # v0.2.105: which of THIS user's Claude logins the gateway serves the
+    # project with — a per-user, per-machine choice, never committed.
+    "ANTHROPIC_CUSTOM_HEADERS",
     # machine service endpoints
     "WEAVIATE_URL",
     "WEAVIATE_PORT",
@@ -2136,6 +2145,15 @@ def project_env_from_db(
         # (vco_lib/service_endpoints.py, mirrored by the hub): row → compiled
         # default, no other leg.
         endpoint_rows = _service_endpoints.read_rows(conn)
+        # v0.2.105: the Claude account this project selects through the model
+        # gateway (Project -> Identity -> Claude account). The registry and
+        # its rule live in ONE home, vco_lib.gateway_accounts; ``None`` (no
+        # explicit choice) omits the key, so a selector VCO wrote earlier is
+        # removed and the gateway's default account applies.
+        from vco_lib import gateway_accounts as _gateway_accounts
+        gateway_account_header = _gateway_accounts.project_header_value(
+            _gateway_accounts.registry_from_conn(conn), project_id,
+        )
     finally:
         try:
             conn.close()
@@ -2332,6 +2350,8 @@ def project_env_from_db(
         # Same value; the legacy alias kept until the wrappers fully
         # migrate to VCT_ORCHESTRATOR_ROOT.
         _set("VCT_INSTALL_ROOT", str(orchestrator_root))
+
+    _set("ANTHROPIC_CUSTOM_HEADERS", gateway_account_header)
 
     if kg_access:
         _set("VCT_KG_ACCESS_LIST", ",".join(kg_access))
@@ -2804,6 +2824,9 @@ def apply_project_env(
     # NAME — a token the user typed included. It is removed only on value
     # evidence, with the user secrets below.
     canonical_keys = list_canonical_keys() - _LEGACY_SECRET_ENV_KEYS
+    # v0.2.105 review A1/A2: never written to nor removed from a committable
+    # surface (see LOCAL_ONLY_ENV_KEYS).
+    committable_keys = canonical_keys - LOCAL_ONLY_ENV_KEYS
 
     # v0.2.84 D2 (P2): snapshot the on-disk KG_COLLECTION /
     # DEVELOPMENT_COLLECTION values BEFORE writing so we can emit a repoint
@@ -2877,7 +2900,7 @@ def apply_project_env(
         keys = _write_json_surface(
             project_root, _SURFACE_CLAUDE_SETTINGS, refusals, project_id,
             lambda: _write_json_env_block(
-                path, settings_env, canonical_keys, env_key="env",
+                path, settings_env, committable_keys, env_key="env",
                 user_secret_pairs=us_pairs,
                 user_secret_strip_keys=us_strip_keys,
             ),
@@ -2904,7 +2927,7 @@ def apply_project_env(
         keys = _write_json_surface(
             project_root, _SURFACE_VSCODE_SETTINGS, refusals, project_id,
             lambda: _write_json_env_block(
-                vscode_path, vscode_env, canonical_keys, env_key="claude-code.env",
+                vscode_path, vscode_env, committable_keys, env_key="claude-code.env",
                 user_secret_pairs=us_pairs,
                 user_secret_strip_keys=vscode_strip_keys,
             ),
@@ -2962,6 +2985,18 @@ def apply_project_env(
 #: :func:`apply_project_env`): only with the same value evidence as the rest.
 _LEGACY_SECRET_ENV_KEYS: frozenset[str] = frozenset({"GITHUB_TOKEN"})
 _STORED_SLOT_FOR_ENV_KEY: dict[str, str] = {"GITHUB_TOKEN": "github_pat"}
+
+#: Canonical keys VCO projects ONLY into the private ``settings.local.json``
+#: and therefore never writes to, nor removes from, a COMMITTABLE JSON surface
+#: (``.claude/settings.json``, ``.vscode/settings.json``). A value there is the
+#: user's own (``ANTHROPIC_CUSTOM_HEADERS`` is a legitimate Claude Code key) —
+#: deleting it by name on every apply was the ``GITHUB_TOKEN`` defect again
+#: (v0.2.105 review A1). When the local layer is not usable (git tracks it or
+#: cannot say), the key is not projected anywhere and the project status says
+#: why (:func:`vco_lib.gateway_accounts.project_status`), rather than putting a
+#: per-machine account selector into a file teams commit (review A2). Read by
+#: the writer here and by :mod:`vco_lib.env_projection_check`.
+LOCAL_ONLY_ENV_KEYS: frozenset[str] = frozenset({"ANTHROPIC_CUSTOM_HEADERS"})
 
 # A condition id, not a secret: the constant's name avoids "secret" because
 # CodeQL's clear-text-storage query taints identifiers by name, and this id is

@@ -298,16 +298,14 @@ print(is_commit)
     $ToolName = if ($fields.Count -ge 1) { [string]$fields[0] } else { "" }
     $IsGitCommit = if ($fields.Count -ge 2) { [string]$fields[1] } else { "0" }
 
-    # Concurrent fan-out + wait, through the ONE spawn home (its
-    # -WindowStyle guard is what keeps Start-Process spawnable on every
-    # edition; -PassThru gives the waitable process object).
-    # KNOWN PLATFORM ARTIFACT (accepted, documented): PowerShell's
-    # Start-Process -RedirectStandardInput hands the child the file's bytes
-    # PLUS a trailing newline. Every sub-hook parses stdin as JSON, where
-    # trailing whitespace is inert, so byte-fidelity of the payload CONTENT
-    # is preserved (pinned modulo that one newline by
-    # tests/test_v02101_async_posttooluse_dispatcher.py). The .sh sibling
-    # passes the temp file as the child's stdin directly and is byte-exact.
+    # Concurrent fan-out + wait, through the ONE spawn home
+    # (Start-VcoDetachedProcess; -PassThru gives the waitable process
+    # object, whose ExitCode is the child's on every OS). Since v0.2.105
+    # neither of its branches uses Start-Process: both hand the child the
+    # temp file itself as stdin, byte-exact like the .sh sibling (the old
+    # Windows Start-Process -RedirectStandardInput appended a newline;
+    # tests/test_v02101_async_posttooluse_dispatcher.py pins the payload
+    # modulo trailing whitespace, which every JSON-parsing sub-hook ignores).
     . (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
     $childWorkDir = $null
     try { $childWorkDir = (Get-Location).Path } catch { $childWorkDir = $null }

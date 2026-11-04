@@ -435,7 +435,7 @@ def _default_emit() -> EmitFn:
 
 def _spawn_poller(pending: Path, project_root: str) -> None:  # noqa: ARG001
     """Start the detached poller. Raises on failure (caller emits inline)."""
-    from vco_lib.install_companions import detached_popen_kwargs  # noqa: PLC0415
+    from vco_lib.windowless_spawn import detached_popen_kwargs  # noqa: PLC0415
 
     env = dict(os.environ)
     # The child imports vco_lib + claude_mcp_servers exactly as this process

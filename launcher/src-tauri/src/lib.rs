@@ -797,6 +797,9 @@ pub fn run() {
     // read plus tens of rows. Soft-fail end to end: every failure path inside
     // logs a line the user can act on and none of them can block boot.
     commands::chat_model_context::seed_and_export_on_boot(&db_handle);
+    // v0.2.105: re-write the gateway's copy of the Claude account registry
+    // from the launcher DB (fire-and-forget, soft-fail).
+    commands::gateway_accounts::export_on_boot();
 
     // v0.2.21 Step 19: launcher-startup project-row backfill. Sweep
     // every registered project and ensure the v0.2.21 resolver
@@ -3188,12 +3191,23 @@ pub fn run() {
             commands::model_gateway::model_gateway_mode_set,
             commands::model_gateway::model_gateway_agents_gate,
             commands::model_gateway::model_gateway_routing_guidance,
+            // v0.2.105: the machine-wide per-provider switch (Home →
+            // Model providers). Python owns the row; these two only
+            // transport it and fire the guidance refresh after a write.
+            commands::model_providers::model_providers_status,
+            commands::model_providers::model_providers_set,
             commands::gateway_freshness::model_gateway_freshness,
             commands::gateway_freshness::model_gateway_restart_stale,
             commands::codegraph_parsers::codegraph_parser_offers,
             commands::codegraph_parsers::codegraph_parsers_decline,
             commands::codegraph_parsers::codegraph_parsers_install,
             commands::gateway_usage::model_gateway_usage_windows,
+            commands::gateway_accounts::gateway_accounts_list,
+            commands::gateway_accounts::gateway_accounts_add,
+            commands::gateway_accounts::gateway_accounts_remove,
+            commands::gateway_accounts::gateway_accounts_set_default,
+            commands::gateway_accounts::project_gateway_account_set,
+            commands::gateway_accounts::project_gateway_account_status,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.
@@ -3336,6 +3350,7 @@ pub fn run() {
             // KG dashboard
             commands::kg::kg_list_collections,
             commands::kg::codegraph_list_projects,
+            commands::kg::refresh_collection_counts,
             // (kg_set_collection_access — the singular per-row setter — is
             //  not registered: the GUI uses kg_set_collection_access_mode
             //  exclusively, which is the higher-level mode-based API that
@@ -3605,6 +3620,8 @@ pub fn run() {
             // IdentityTab can let users pick which class is canonical.
             commands::project_identity::list_orchestrator_kg_collections,
             commands::project_identity::set_shared_kg_collection_name,
+            // v0.2.105: "primary KG is the shared collection" banner + repair.
+            commands::project_identity::get_kg_primary_shared_status,
             // PR-37 (v0.2.12 / 2026-05-16): GUI-surfaced maintenance ops.
             // Backs `McpMaintenanceSection.svelte` (MCP page) and
             // `ServicesSchemaSection.svelte` (Services page) — closes the

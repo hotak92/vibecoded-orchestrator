@@ -585,6 +585,59 @@ struct ProjectConfigResponse {
     unmanaged_containers: Vec<String>,
     #[serde(default)]
     ssrf_extra_local_ports: Vec<u16>,
+    /// v0.2.105 — extra code folders the owner POSITIVELY took out of this
+    /// project's code graph (`Db::list_gone_codegraph_extras`: disabled rows
+    /// plus removed rows with their `codegraph_extra_path_removed` audit
+    /// entry). `None` (JSON `null`) when the DB read failed — the same
+    /// failure that empties `code_graph_extra_paths` above — so a client can
+    /// tell "nothing was removed" from "the hub could not say". The
+    /// removed-extras purge (`vco_lib.codegraph_source_purge`) deletes rows
+    /// only for a listed path and never on `null`. Additive: an older client
+    /// ignores it; an older hub omits it, which the Python parser reads as
+    /// unknown.
+    code_graph_extra_paths_gone: Option<Vec<String>>,
+    /// v0.2.105 fix round — the folders this project POSITIVELY moved AWAY
+    /// from (`Db::list_moved_from_codegraph_sources`: the `src` of every
+    /// move whose commit landed, minus the live `folder_path`).
+    ///
+    /// Every code-graph row carries `project_source` = the absolute root it
+    /// was walked from, and that root is mixed into the row's UUID, so after
+    /// a move the old root's rows are a second, stale copy of the same files
+    /// that nothing rewrites and `--prune-stale` may not judge. Consumer:
+    /// `vco_lib.codegraph_source_purge` removes them — but only once the
+    /// destination holds rows of its own, so a graph is never emptied by the
+    /// move itself. `None` (JSON `null`) when the DB read failed, exactly
+    /// like `code_graph_extra_paths_gone`: the client then purges nothing.
+    /// Additive; an older hub omits it and the Python parser reads unknown.
+    code_graph_moved_from_sources: Option<Vec<String>>,
+    /// v0.2.105 (#512A) — the commit the project's PRIMARY code-graph root
+    /// was last analyzed at (`project_codegraph_bindings.
+    /// last_analyzed_commit`), or `null` when the project was never analyzed
+    /// (no binding row, or a seeded binding that still carries NULL).
+    ///
+    /// Consumer: `vco_lib.codegraph_head_catchup`, spawned detached by the
+    /// Stop hook (`templates/hooks/stop-codegraph-drain.{sh,ps1}`). It
+    /// compares this with the main checkout's HEAD and indexes the
+    /// `git diff --name-only <recorded>..HEAD` files — the code that arrives
+    /// through a merge, a pull or a shell commit, which the per-edit hook
+    /// never queues (field report 2026-10-29: a graph six days / 1,070
+    /// commits behind). The new baseline is recorded through
+    /// `POST /projects/{id}/codegraph/analyzed` (advance-only).
+    ///
+    /// Additive — pre-v0.2.105 clients ignore it and the Python parser
+    /// back-fills `None` for a pre-v0.2.105 hub. `schema_version` stays 1.
+    #[serde(default)]
+    code_graph_last_analyzed_commit: Option<String>,
+    /// v0.2.105 fix round — `true` iff a `project_codegraph_bindings` row
+    /// exists for this project AND its `enabled` flag is on. The prefix
+    /// fallback above makes `code_graph_collection_prefix` non-empty even
+    /// for an UNBOUND project, so the HEAD-diff catch-up reads THIS field
+    /// to decide whether it may run at all: `false` → skip, never create
+    /// collections for an unbound project and never walk a disabled one.
+    /// Additive; a pre-fix hub omits it and the Python parser back-fills
+    /// `false` (the catch-up stays inert until the hub binary catches up).
+    #[serde(default)]
+    code_graph_bound: bool,
 }
 
 /// One enabled extra codegraph path for the resolver response.
@@ -613,6 +666,58 @@ struct CodeGraphExtraPath {
     /// clients pass this through to `code-graph-analyze --since-commit
     /// <sha>` for incremental runs.
     last_indexed_commit: Option<String>,
+}
+
+/// Step 12 of the `/config` resolver: the ENABLED extras (`code_graph_extra_paths`)
+/// and the positively-gone ones (`code_graph_extra_paths_gone`).
+///
+/// Enabled rows only in the first list — disabled rows are kept in the DB for
+/// history + label preservation but the resolver hides them so hooks / Python
+/// clients don't try to match against paths the user has paused. Service
+/// degradation (v0.2.47): a failed DB read logs and serves the list EMPTY
+/// rather than failing the resolver, since the extras are an enrichment of the
+/// core response. v0.2.105: an empty list produced that way is NOT the same
+/// as "no extras" — so the gone list is `None` whenever EITHER read failed,
+/// and the removed-extras purge, which only acts on positive knowledge, does
+/// nothing (the 2026-10-29 incident class: an emptied list must never read as
+/// "every extra was removed").
+fn extras_and_gone(db: &Db, project_id: &str) -> (Vec<CodeGraphExtraPath>, Option<Vec<String>>) {
+    let enabled = match db.list_enabled_codegraph_extras(project_id) {
+        Ok(rows) => Some(
+            rows.into_iter()
+                .map(|r| CodeGraphExtraPath {
+                    path: r.path,
+                    enabled: r.enabled,
+                    last_indexed_commit: r.last_indexed_commit,
+                })
+                .collect::<Vec<_>>(),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "[vct-hub config_api] list_enabled_codegraph_extras failed; \
+                 returning empty (gone list: unknown)",
+            );
+            None
+        }
+    };
+    let gone = match db.list_gone_codegraph_extras(project_id) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "[vct-hub config_api] list_gone_codegraph_extras failed; \
+                 serving the gone list as unknown",
+            );
+            None
+        }
+    };
+    match enabled {
+        Some(list) => (list, gone),
+        None => (Vec::new(), None),
+    }
 }
 
 // ─── Handler ─────────────────────────────────────────────────────
@@ -1220,38 +1325,10 @@ async fn project_config(
         .to_string_lossy()
         .into_owned();
 
-    // 12. Project-extra codegraph paths (v0.2.47). Read enabled rows
-    // only — disabled rows are kept in the DB for history + label
-    // preservation but the resolver hides them so hooks / Python
-    // clients don't try to match against paths the user has paused.
-    // Service degradation: if the DB read fails (unlikely — same
-    // connection that produced all 11 prior reads), log + treat the
-    // field as empty rather than failing the resolver, since the
-    // extras are an enrichment of the core response. The fail mode
-    // we want to avoid is "one bug in a v0.2.47 path breaks every
-    // resolver call".
-    let code_graph_extra_paths: Vec<CodeGraphExtraPath> =
-        match h.0.list_enabled_codegraph_extras(&project.id) {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|r| CodeGraphExtraPath {
-                    path: r.path,
-                    enabled: r.enabled,
-                    last_indexed_commit: r.last_indexed_commit,
-                })
-                .collect(),
-            Err(e) => {
-                // Soft-fail degrade: the resolver answers with no extra paths
-                // rather than failing the whole /config request.
-                tracing::warn!(
-                    project_id = %project.id,
-                    error = %e,
-                    "[vct-hub config_api] list_enabled_codegraph_extras failed; \
-                     returning empty",
-                );
-                Vec::new()
-            }
-        };
+    // 12. Project-extra codegraph paths (v0.2.47) + the positively-gone
+    // ones (v0.2.105) — see `extras_and_gone`.
+    let (code_graph_extra_paths, code_graph_extra_paths_gone) =
+        extras_and_gone(&h.0, &project.id);
 
     // v0.2.102 W5-A (M3): this project's infrastructure declarations.
     let infra = match h.0.list_infra_declarations(&project.id) {
@@ -1309,6 +1386,33 @@ async fn project_config(
         external_collections: infra.external_collections,
         unmanaged_containers: infra.unmanaged_containers,
         ssrf_extra_local_ports,
+        code_graph_extra_paths_gone,
+        // v0.2.105 fix round: the roots this project POSITIVELY moved away
+        // from (a `flipped`/`completed` move's `src`). Read failure → null
+        // ("unknown"), which the purge reads as "keep every row".
+        code_graph_moved_from_sources: match h.0.list_moved_from_codegraph_sources(&project.id)
+        {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project.id,
+                    error = %e,
+                    "[vct-hub config_api] list_moved_from_codegraph_sources failed; \
+                     serving the moved-from list as unknown",
+                );
+                None
+            }
+        },
+        // v0.2.105 (#512A): the primary root's analyzed commit, read from the
+        // SAME binding row that supplied `code_graph_collection_prefix`
+        // above.
+        code_graph_last_analyzed_commit: cg_binding
+            .as_ref()
+            .and_then(|b| b.last_analyzed_commit.clone()),
+        // v0.2.105 fix round: bound = a binding row exists AND is enabled.
+        // The catch-up refuses to run otherwise (it must not create
+        // collections for a project the launcher never bound).
+        code_graph_bound: cg_binding.as_ref().is_some_and(|b| b.enabled),
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -4118,6 +4222,106 @@ kg_tier_full = 0.8
         }
     }
 
+    /// v0.2.105 (#512A): `/config` serves the PRIMARY root's recorded
+    /// `last_analyzed_commit` so the HEAD-diff catch-up can compare it with
+    /// the checkout's HEAD without opening launcher.db.
+    #[tokio::test]
+    async fn config_serves_the_recorded_primary_analyzed_commit() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-catchup", "catchupproj");
+
+        // Never analyzed → the key is PRESENT and null (never absent: a
+        // missing key would read as "old hub" to the Python client).
+        let resp = reqwest::get(format!("{}/projects/p-catchup/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(body.get("code_graph_last_analyzed_commit").is_some(),
+                "the field is always present; body={}", body);
+        assert!(body["code_graph_last_analyzed_commit"].is_null());
+
+        // After a successful catch-up stamps a commit, it is served verbatim.
+        h.0.set_project_codegraph_binding(
+            "p-catchup", "Catchupproj",
+            Some("CodeSage-Large-v2"), Some(2048),
+            Some("0123456789abcdef"), Some(1_700_000_000_000),
+            true, &empty_json_obj(),
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-catchup/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("code_graph_last_analyzed_commit").and_then(|v| v.as_str()),
+            Some("0123456789abcdef"),
+        );
+        // The ?key= single-field filter reaches it too.
+        let resp = reqwest::get(format!(
+            "{}/projects/p-catchup/config?key=code_graph_last_analyzed_commit", base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let one: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(one.get("code_graph_last_analyzed_commit").and_then(|v| v.as_str()),
+                   Some("0123456789abcdef"));
+    }
+
+    /// v0.2.105 fix round (M3): `/config` serves `code_graph_bound` — TRUE
+    /// iff a binding row exists AND is enabled. The name-derived fallback
+    /// prefix makes `code_graph_collection_prefix` non-empty even for an
+    /// UNBOUND project, so the HEAD-diff catch-up needs a field that says
+    /// whether it may run at all (it must never create collections for an
+    /// unbound project, and never walk a disabled binding).
+    #[tokio::test]
+    async fn config_serves_the_code_graph_bound_flag() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-bound", "boundproj");
+
+        // Bound + enabled (what seed_full_project creates) → true.
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert!(body.get("code_graph_bound").is_some(),
+                "the field is always present; body={}", body);
+        assert_eq!(body["code_graph_bound"], serde_json::json!(true));
+
+        // Bound but DISABLED → false (the catch-up respects the binding's
+        // enabled flag).
+        h.0.set_project_codegraph_binding(
+            "p-bound", "Boundproj",
+            None, None, None, None,
+            false, &empty_json_obj(),
+        )
+        .unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(body["code_graph_bound"], serde_json::json!(false));
+
+        // UNBOUND (no binding row at all): false again, while the fallback
+        // prefix is still served — the exact trap this field closes (the
+        // catch-up must not mistake that prefix for permission to walk).
+        h.0.delete_project_codegraph_binding("p-bound").unwrap();
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-bound/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(body["code_graph_bound"], serde_json::json!(false));
+        assert!(body["code_graph_collection_prefix"].as_str().is_some_and(|p| !p.is_empty()),
+                "the fallback prefix is served even for an unbound project");
+    }
+
     /// Disabled rows are filtered OUT of the resolver response. They
     /// stay in the DB (for history + label preservation) but the hub
     /// hides them so hooks / Python clients don't try to match against
@@ -4157,6 +4361,135 @@ kg_tier_full = 0.8
         // time, not via auto-deletion.
         let all = h.0.list_codegraph_extras("p-mixed").unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// v0.2.105: the positively-gone list — a disabled row and a removed row
+    /// with its audit entry; an enabled row is never in it.
+    #[tokio::test]
+    async fn config_serves_positively_gone_code_graph_extra_paths() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-gone", "myproject");
+        h.0.add_codegraph_extra("p-gone", "/opt/active", None).unwrap();
+        h.0.add_codegraph_extra("p-gone", "/opt/paused", None).unwrap();
+        h.0.set_codegraph_extra_enabled("p-gone", "/opt/paused", false).unwrap();
+        h.0.audit(
+            "codegraph_extra_path_removed",
+            Some("p-gone"),
+            None,
+            &serde_json::json!({ "path": "/opt/removed" }),
+        )
+        .unwrap();
+
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-gone/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(
+            body.get("code_graph_extra_paths_gone"),
+            Some(&serde_json::json!(["/opt/paused", "/opt/removed"])),
+            "body={}",
+            body
+        );
+    }
+
+    /// v0.2.105 fix round (review NIT): the folders this project POSITIVELY
+    /// moved away from — the `src` of a move whose commit landed, minus the
+    /// live folder. A `running` or `failed` move proves nothing.
+    #[tokio::test]
+    async fn config_serves_moved_from_code_graph_sources() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-moved", "myproject");
+        {
+            let guard = h.0.lock();
+            for (id, src, dst, status, started) in [
+                ("m1", "/opt/old", "/opt/older", "completed", 1_i64),
+                ("m2", "/opt/older", "/opt/myproject", "flipped", 2),
+                ("m3", "/opt/never", "/opt/x", "failed", 3),
+            ] {
+                guard
+                    .execute(
+                        "INSERT INTO project_moves (id, project_id, src, dst, status, started_at)
+                         VALUES (?1, 'p-moved', ?2, ?3, ?4, ?5)",
+                        rusqlite::params![id, src, dst, status, started],
+                    )
+                    .unwrap();
+            }
+        }
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-moved/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        let moved = body.get("code_graph_moved_from_sources");
+        assert_eq!(
+            moved,
+            Some(&serde_json::json!(["/opt/old", "/opt/older"])),
+            "body={}",
+            body
+        );
+
+        // A project that never moved serves an (empty) list, not null —
+        // "nothing to purge", which is a different fact from "unknown".
+        seed_full_project(&h, "p-fresh", "freshproj");
+        let body: serde_json::Value = reqwest::get(format!("{}/projects/p-fresh/config", base))
+            .await
+            .expect("hub reachable")
+            .json()
+            .await
+            .expect("json body");
+        assert_eq!(
+            body.get("code_graph_moved_from_sources"),
+            Some(&serde_json::json!([])),
+            "body={}",
+            body
+        );
+    }
+
+    /// A project row the hub does not hold: the read fails → `null`
+    /// ("unknown"), never an empty list that would read as "nothing to do".
+    #[tokio::test]
+    async fn config_moved_from_read_failure_serves_null() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-mvbroken", "myproject");
+        h.0.lock().execute_batch("DROP TABLE project_moves").unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-mvbroken/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200, "the resolver still answers");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(
+            body.get("code_graph_moved_from_sources").map(|v| v.is_null()) == Some(true),
+            "a failed read is unknown, not an empty list; body={}",
+            body
+        );
+    }
+
+    /// v0.2.105 (the 2026-10-29 incident class): when the extras read FAILS
+    /// the enabled list is served empty (v0.2.47 soft-fail) AND the gone list
+    /// is `null` — "unknown", never "nothing / everything removed".
+    #[tokio::test]
+    async fn config_extras_read_failure_serves_gone_as_null() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-broken", "myproject");
+        h.0.add_codegraph_extra("p-broken", "/opt/active", None).unwrap();
+        h.0.lock()
+            .execute_batch("DROP TABLE project_codegraph_extra_paths")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-broken/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200, "the resolver still answers");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(body.get("code_graph_extra_paths"), Some(&serde_json::json!([])));
+        assert!(
+            body.get("code_graph_extra_paths_gone").map(|v| v.is_null()) == Some(true),
+            "a failed read is unknown, not an empty list; body={}",
+            body
+        );
     }
 
     /// `?key=code_graph_extra_paths` returns just the new field

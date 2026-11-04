@@ -97,6 +97,7 @@ def merge_settings_template(
     retired_removed: Optional[list] = None,
     parked: Optional[ParkedHooksState] = None,
     kept_out: Optional[list] = None,
+    duplicate_groups: Optional[list] = None,
     project_root: Optional[Path] = None,
 ) -> tuple[str, Optional[Path]]:
     """Merge the template into ``target_path``; see the shim's docstring in
@@ -132,6 +133,7 @@ def merge_settings_template(
     merged = smart_merge_settings(
         existing, template_data, retired_removed=retired_removed,
         parked=parked, kept_out=kept_out,
+        duplicate_groups=duplicate_groups,
         # v0.2.101: the settings-merge arm of the MCP retirement scrub —
         # same one-home rule table (mcp_scan_rules.toml) the ~/.claude.json
         # registration scrub reads. Only the merge path can carry it: the

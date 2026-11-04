@@ -187,6 +187,15 @@ UNKNOWN_RESET_PASSED = "reset_passed"
 
 ANTHROPIC_ID = "anthropic"
 ANTHROPIC_LABEL = "Claude"
+#: v0.2.105: an ADDED Claude account's usage rides the snapshot as its own
+#: vendor row, ``anthropic:<account id>`` / ``Claude/<account id>`` — so the
+#: status line, the picker suffixes and the launcher card render it with no
+#: per-surface code. The user's own login stays the plain ``anthropic`` row.
+ACCOUNT_ID_PREFIX = ANTHROPIC_ID + ":"
+
+#: ``() -> (primary account label, [(account id, label, bearer or None), …])``
+#: for the ADDED accounts. Called off the event loop (it may read a login).
+AccountsSource = Callable[[], "tuple[str, list[tuple[str, str, Optional[str]]]]"]
 
 #: Z.ai window identity: ``(unit, number)`` -> ``(window id, label)``. unit 3
 #: is hours, unit 6 weeks (probed 2026-09-23). Anything else — the older
@@ -822,6 +831,11 @@ def session_fetcher(
             async with session().get(
                 url,
                 headers=dict(headers),
+                # `total` bounds every phase — DNS and pool included; a
+                # side call must never hang a request path (contrast the
+                # relayed-completion policy in model_router.server's
+                # `_acquire_upstream`, where only the pre-header phases are
+                # bounded and the body is left to the idle bound).
                 timeout=aiohttp.ClientTimeout(total=timeout_s),
                 allow_redirects=False,
             ) as resp:
@@ -859,6 +873,7 @@ class UsageWindows:
         rng: Callable[[], float] = random.random,
         kimi_5h_budget: Optional[int] = None,
         resets_path: Callable[[], Optional[Path]] = usage_resets_path,
+        accounts: Optional[AccountsSource] = None,
     ) -> None:
         self._anthropic_upstream = anthropic_upstream.rstrip("/")
         self._vendors = vendors
@@ -884,6 +899,13 @@ class UsageWindows:
         #: user-agent -> when a user-agent-gated quota endpoint refused it.
         self._refused_user_agents: dict[str, float] = {}
         self._header_windows: dict[str, Window] = {}
+        #: v0.2.105: the added Claude accounts — their usage and the unified
+        #: headers relayed on answers THEY served (never mixed into the user's
+        #: own ``anthropic`` row).
+        self._accounts = accounts
+        self._primary_label: Optional[str] = None
+        self._account_usage: dict[str, VendorUsage] = {}
+        self._account_header_windows: dict[str, dict[str, Window]] = {}
         #: The ledger FALLBACK ESTIMATE per vendor id: ``{id: budget}`` for
         #: every vendor that has one (only kimi). ``kimi_5h_budget`` is the
         #: injected value; ``None`` reads :data:`KIMI_5H_BUDGET_ENV` (a
@@ -916,10 +938,16 @@ class UsageWindows:
             )
 
     # ── passive capture (request path: sync, cheap, never raises) ───────
-    def observe_anthropic_headers(self, headers: Mapping[str, str]) -> None:
-        """Take the unified rate-limit headers off a relayed first-party answer."""
+    def observe_anthropic_headers(self, headers: Mapping[str, str],
+                                  account: Optional[str] = None) -> None:
+        """Take the unified rate-limit headers off a relayed first-party
+        answer, filed under the Claude account that SERVED it (``None`` or
+        ``primary`` = the user's own login): one account's windows must never
+        be shown as another's."""
+        target = (self._header_windows if not account or account == "primary"
+                  else self._account_header_windows.setdefault(account, {}))
         for window in parse_unified_headers(headers, now=self._clock()):
-            self._header_windows[window.id] = window
+            target[window.id] = window
 
     # ── refresh scheduling ───────────────────────────────────────────────
     @property
@@ -1033,8 +1061,12 @@ class UsageWindows:
         self._last_refresh = self._clock()
 
     async def _refresh_anthropic(self) -> None:
-        usage = self._usage[ANTHROPIC_ID]
-        token = self._oauth_token()
+        await self._refresh_claude_login(
+            self._usage[ANTHROPIC_ID], self._oauth_token(), ANTHROPIC_ID)
+        await self._refresh_accounts()
+
+    async def _refresh_claude_login(self, usage: VendorUsage, token: Optional[str],
+                                    who: str) -> None:
         if not token:
             usage.problem = "no usable Claude login (see oauth_state in /health)"
             if not usage.windows:
@@ -1048,7 +1080,33 @@ class UsageWindows:
                 "Content-Type": "application/json",
             },
         )
-        self._apply(usage, status, payload, ANTHROPIC_ID, self._parse_anthropic)
+        self._apply(usage, status, payload, who, self._parse_anthropic)
+
+    async def _refresh_accounts(self) -> None:
+        """One usage fetch per ADDED Claude account, with that account's own
+        login (v0.2.105). An account no longer registered drops out."""
+        if self._accounts is None:
+            return
+        try:
+            primary_label, extras = await asyncio.to_thread(self._accounts)
+        except Exception as exc:  # noqa: BLE001 — a readout never stops a refresh
+            logger.info("model-gateway: Claude account list unavailable for usage: %s",
+                        type(exc).__name__)
+            return
+        self._primary_label = primary_label if extras else None
+        live = {account_id for account_id, _label, _token in extras}
+        for gone in set(self._account_usage) - live:
+            self._account_usage.pop(gone, None)
+            self._account_header_windows.pop(gone, None)
+        for account_id, label, token in extras:
+            usage = self._account_usage.get(account_id)
+            if usage is None or usage.name != _account_name(label):
+                usage = VendorUsage(ACCOUNT_ID_PREFIX + account_id,
+                                    f"{ANTHROPIC_LABEL}/{account_id}",
+                                    _account_name(label))
+                self._account_usage[account_id] = usage
+            await self._refresh_claude_login(
+                usage, token, f"{ANTHROPIC_ID} account {account_id}")
 
     def _parse_anthropic(self, payload: Any) -> "tuple[Optional[str], list[Window]]":
         return None, parse_anthropic_usage(payload, now=self._clock())
@@ -1278,14 +1336,25 @@ class UsageWindows:
         """The JSON-ready snapshot, aged at read time. Pure read of memory."""
         now = self._clock()
         vendors = []
+        sources: list[tuple[VendorUsage, Mapping[str, Window]]] = []
         for usage in self._usage.values():
-            windows = usage.windows
+            sources.append((usage, self._header_windows if usage.id == ANTHROPIC_ID else {}))
             if usage.id == ANTHROPIC_ID:
-                windows = _merge_headers(windows, self._header_windows)
+                # The added Claude accounts follow the user's own login.
+                for account_id, acct_usage in self._account_usage.items():
+                    sources.append((acct_usage, self._account_header_windows.get(account_id, {})))
+        for usage, header_windows in sources:
+            windows = usage.windows
+            is_claude = usage.id == ANTHROPIC_ID or usage.id.startswith(ACCOUNT_ID_PREFIX)
+            if is_claude:
+                windows = _merge_headers(windows, header_windows)
+            name = usage.name
+            if usage.id == ANTHROPIC_ID and self._primary_label:
+                name = _account_name(self._primary_label)
             entry: dict[str, Any] = {
                 "id": usage.id,
                 "label": usage.label,
-                "name": usage.name,
+                "name": name,
                 "state": usage.state,
                 "problem": usage.problem,
                 "plan": usage.plan,
@@ -1300,7 +1369,7 @@ class UsageWindows:
                     rows.insert(0, estimated)
                 elif rows[index]["percent"] is None:
                     rows[index] = estimated
-            if usage.id == ANTHROPIC_ID and usage.state != STATE_OK and any(
+            if is_claude and usage.state != STATE_OK and any(
                 w["percent"] is not None for w in entry["windows"]
             ):
                 # The endpoint failed but the relayed headers answered.
@@ -1326,6 +1395,10 @@ class UsageWindows:
             "refresh_interval_s": int(self._refresh_s),
             "vendors": vendors,
         }
+
+
+def _account_name(label: str) -> str:
+    return f"Claude subscription — {label}"
 
 
 @dataclass(frozen=True)

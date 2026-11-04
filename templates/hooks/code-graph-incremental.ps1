@@ -164,7 +164,7 @@ if (-not $ExtrasMatched -and (Test-Path $DetectPs1)) {
 }
 
 # Only process code files.
-if ($EditedFile -notmatch '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
+if ($EditedFile -notmatch '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$') {
     exit 0
 }
 

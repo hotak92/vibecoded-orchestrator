@@ -69,3 +69,21 @@ export function removeConfirm(path: string): string {
     'get worktrees there.'
   );
 }
+
+/** v0.2.105: the success toast after Remove / Disable. The removed-extras
+ *  purge deletes rows only when the hub positively knows the folder was
+ *  removed or disabled; when it could not (or only partly), the toast says
+ *  the rows were KEPT — never "pruned" for rows that are still there. */
+export function purgedToast(
+  label: string,
+  outcome: { purged_rows?: number; purge_note?: string | null },
+): string {
+  const rows = outcome.purged_rows ?? 0;
+  if (outcome.purge_note) {
+    return (
+      `Re-synced; ${rows} entries from ${label} removed — the rest are kept for now: ` +
+      outcome.purge_note
+    );
+  }
+  return `Re-synced; ${rows} entries from ${label} removed`;
+}

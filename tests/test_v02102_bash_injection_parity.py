@@ -10,7 +10,7 @@ the SAME retrieval keys the tool surface builds:
   * the same code-graph symbols (→ the same exact def+callers blocks),
 
 mapped onto the surface's OWN §2.1 profile. The profiles differ BY DESIGN
-(bash_read floor 0.75 vs read_code 0.70 — the KG_GATES/CG_POLICIES table is
+(bash_read floor 0.75 vs read_code 0.725 — the KG_GATES/CG_POLICIES table is
 the one home for that difference), so parity is asserted on the KEYS, and the
 designed profile pair is pinned per row.
 

@@ -105,16 +105,89 @@ def test_tool_docstring_names_the_worktree_rule():
 
 
 GATEWAY_AGENTS = REPO_ROOT / "templates" / "agents" / "module-gateway"
-HANDOFF = ("The coordinator commits: end your report with the exact list "
-           "of files you changed.")
+
+#: Every shipped implementer lane. Owner ruling 2026-11-03: they run isolated,
+#: so they commit their own work on the worktree's current HEAD (detached for
+#: a harness worktree; the coordinator names the branch at merge).
+IMPLEMENTER_LANES = (
+    "deepseek-implementer",
+    "glm-implementer",
+    "glm-implementer-high",
+    "kimi-implementer",
+    "qwen-flash-sweeper",
+    "qwen-implementer",
+    "qwen-implementer-high",
+)
+COMMIT_ALLOWANCE = "`git add` and `git commit` on your worktree's current HEAD only"
+COMMIT_DETACHED = ("otherwise the detached HEAD the harness created. Never create or "
+                   "switch a branch: the coordinator names the branch when it merges.")
+COMMIT_BOUNDARY = "Never push, stash, checkout, switch, restore, reset or clean"
+READ_ONLY_GIT = "Read-only `git status`, `git diff` and `git log` are fine"
 
 
-def test_every_git_forbidding_agent_carries_the_commit_handoff():
-    forbidding = [p for p in sorted(GATEWAY_AGENTS.glob("*.md"))
-                  if "NEVER run any git command" in p.read_text(encoding="utf-8")]
-    assert len(forbidding) >= 7
-    for p in forbidding:
-        assert HANDOFF in p.read_text(encoding="utf-8"), p.name
+def _squash(text: str) -> str:
+    """Collapse the definitions' hard wrapping so a phrase can be asserted."""
+    return " ".join(text.split())
+
+
+def test_every_implementer_lane_commits_on_its_own_branch():
+    """An isolated implementer lane MAY commit; the old blanket ban is gone.
+
+    Both halves are pinned because either alone is a defect: a lane told only
+    "you may commit" may push or reset, and a lane told only "not push"
+    cannot hand its work over.
+    """
+    assert len(IMPLEMENTER_LANES) >= 7
+    for name in IMPLEMENTER_LANES:
+        text = (GATEWAY_AGENTS / f"{name}.md").read_text(encoding="utf-8")
+        squashed = _squash(text)
+        assert "NEVER run any git command" not in text, name
+        assert "The coordinator commits" not in text, name
+        assert _squash(COMMIT_ALLOWANCE) in squashed, name
+        assert _squash(COMMIT_DETACHED) in squashed, name
+        assert "Co-Authored-By" in squashed, name
+        assert _squash(COMMIT_BOUNDARY) in squashed, name
+        assert _squash(READ_ONLY_GIT) in squashed, name
+        assert "own worktree branch" not in squashed, name
+
+
+def test_read_only_gateway_lanes_never_run_a_mutating_git_command():
+    """The allowance is for lanes that write source, not for report-only ones:
+    those may read history (log/diff/show) but never run a git command that
+    mutates."""
+    for name in (
+        "deepseek-researcher",
+        "glm-flash-researcher",
+        "glm-planner",
+        "glm-reviewer",
+        "kimi-reviewer",
+    ):
+        squashed = _squash(
+            (GATEWAY_AGENTS / f"{name}.md").read_text(encoding="utf-8"))
+        assert ("never run git commands that mutate" in squashed
+                or "never run a git command that mutates" in squashed), name
+
+
+def test_commit_rule_is_stated_in_the_claude_templates_and_the_guide():
+    for rel in (
+        "templates/CLAUDE.md.template",
+        "templates/ORCHESTRATOR-CLAUDE.md.template",
+    ):
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert ("commit its own work on its worktree's current HEAD (the "
+                "detached HEAD the harness created") in text, rel
+        assert "Co-Authored-By" in text, rel
+
+    guide = (
+        REPO_ROOT / "templates" / "agents" / "WORKTREE_ISOLATION_GUIDE.md"
+    ).read_text(encoding="utf-8")
+    assert "## Committing inside the worktree" in guide
+    assert "`git add` and `git commit`" in guide
+    assert "**detached HEAD**" in guide
+    assert ("never run a git command that mutates (read-only `git log` /"
+            in guide)
+    assert "still never run git:" not in guide
+    assert "never `push`" in guide
 
 
 # ---------------------------------------------------------------------------

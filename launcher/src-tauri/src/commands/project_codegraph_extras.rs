@@ -194,6 +194,60 @@ pub struct SyncOutcome {
     /// every `--extra-path`). Useful in the GUI's "what just happened"
     /// toast and audit-log forensics.
     pub paths: Vec<String>,
+    /// v0.2.105: rows removed by the removed-extras purge that a
+    /// `prune_stale` reindex runs first (0 for a single-path sync).
+    #[serde(default)]
+    pub purged_rows: u64,
+    /// v0.2.105: why the purge removed nothing although it was asked to
+    /// (the hub could not say which folders were removed, a failed child,
+    /// a partial purge) — the GUI toast says the rows were KEPT for now.
+    /// `None` when the purge ran cleanly or was not requested.
+    #[serde(default)]
+    pub purge_note: Option<String>,
+}
+
+/// v0.2.105: the removed-extras purge step of a reindex. Runs `purge` ONLY
+/// for a `prune_stale` reindex (the GUI's Remove / Disable flows) — since the
+/// stale prune is scoped to the roots a walk visits, a removed or disabled
+/// folder's rows are no longer "stale" to the walk, and this purge is what
+/// takes them out. `purge` is
+/// [`crate::services::vco_lib_bridge::codegraph_source_purge`] in production
+/// (a seam for tests); it deletes only what the hub POSITIVELY reports as
+/// removed. Returns `(rows purged, note)`; never fails the reindex.
+fn reindex_purge_step<F>(prune_stale: bool, purge: F) -> (u64, Option<String>)
+where
+    F: FnOnce() -> Result<serde_json::Value, String>,
+{
+    if !prune_stale {
+        return (0, None);
+    }
+    match purge() {
+        Ok(reply) => {
+            let rows: u64 = reply
+                .get("purged")
+                .and_then(serde_json::Value::as_object)
+                .map(|m| m.values().filter_map(serde_json::Value::as_u64).sum())
+                .unwrap_or(0);
+            let failures = reply.get("failures").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let refused = reply
+                .get("refused")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let note = if let Some(r) = refused {
+                Some(r)
+            } else if failures > 0 {
+                Some(format!(
+                    "{} row(s) could not be removed; VCO retries on the next background refresh",
+                    failures
+                ))
+            } else {
+                None
+            };
+            (rows, note)
+        }
+        Err(e) => (0, Some(format!("the purge could not run: {}", e))),
+    }
 }
 
 /// Per-progress-line event emitted to the GUI's modal.
@@ -590,10 +644,12 @@ pub async fn add_project_codegraph_extra_path(
 /// the row doesn't exist (returns Ok with no error so the GUI doesn't
 /// have to handle "nothing to delete" specially).
 ///
-/// Audit log: `codegraph_extra_path_removed`. The caller (GUI) is
+/// Audit log: `codegraph_extra_path_removed` — v0.2.105: this audit row is
+/// the POSITIVE knowledge the removed-extras purge needs (the hub lists the
+/// path in `code_graph_extra_paths_gone` only with it). The caller (GUI) is
 /// expected to follow this with `reindex_project_codegraph_after_extras_change`
-/// (prune_stale=true) so the removed path's entries are dropped from
-/// Weaviate.
+/// (prune_stale=true), whose purge step drops the removed path's entries
+/// from Weaviate.
 #[command]
 pub async fn remove_project_codegraph_extra_path(
     project_id: String,
@@ -758,6 +814,8 @@ pub async fn sync_project_codegraph_extra_path(
         project_codegraph_prefix: prefix,
         prune_stale: false,
         paths: vec![row.path.clone()],
+        purged_rows: 0,
+        purge_note: None,
     };
 
     Ok(outcome)
@@ -840,6 +898,25 @@ pub async fn reindex_project_codegraph_after_extras_change(
         args.push("--prune-stale".to_string());
     }
 
+    // v0.2.105: Remove / Disable → purge the rows of the folders the hub
+    // POSITIVELY reports removed or disabled, BEFORE the walk (the scoped
+    // `--prune-stale` below no longer touches another root's rows). Off the
+    // async executor; a refusal or failure keeps the rows and is reported.
+    let (purge_root, purge_folder) = (
+        crate::services::vco_lib_bridge::resolve_orchestrator_root(db.inner()),
+        project.folder_path.clone(),
+    );
+    let (purged_rows, purge_note) = tokio::task::spawn_blocking(move || {
+        reindex_purge_step(prune_stale, || {
+            crate::services::vco_lib_bridge::codegraph_source_purge(
+                purge_root.as_deref(),
+                &purge_folder,
+            )
+        })
+    })
+    .await
+    .unwrap_or_else(|e| (0, Some(format!("the purge could not run: {}", e))));
+
     let started = std::time::Instant::now();
     // v0.2.102 fix-round (NB-H6, reindex arm): every extra's HEAD is read
     // BEFORE the multi-root analyze — the pre-fix loop below read them AFTER,
@@ -902,6 +979,8 @@ pub async fn reindex_project_codegraph_after_extras_change(
         project_codegraph_prefix: prefix,
         prune_stale,
         paths: paths.clone(),
+        purged_rows,
+        purge_note: purge_note.clone(),
     };
 
     let mut refused_sorted: Vec<&String> = refused.iter().collect();
@@ -917,6 +996,8 @@ pub async fn reindex_project_codegraph_after_extras_change(
             "duration_ms": outcome.duration_ms,
             "prune_stale": prune_stale,
             "refused_extras": refused_sorted,
+            "purged_rows": purged_rows,
+            "purge_note": purge_note,
         }),
     );
 
@@ -1737,6 +1818,60 @@ mod tests {
         let err = refused_extra_paths(&extras, "/opt/myproj", |_e, _f| Err("no python".to_string()))
             .unwrap_err();
         assert!(err.contains("/opt/sibling") && err.contains("no python"), "{err}");
+    }
+
+    /// v0.2.105 ACT: a Remove / Disable reindex (`prune_stale`) runs the
+    /// removed-extras purge and reports its row count.
+    #[test]
+    fn reindex_purge_step_runs_for_prune_stale() {
+        let called = std::cell::Cell::new(false);
+        let (rows, note) = reindex_purge_step(true, || {
+            called.set(true);
+            Ok(serde_json::json!({
+                "ok": true,
+                "purged": { "/opt/removed": 7, "/opt/disabled": 5 },
+                "failures": 0,
+                "refused": null,
+            }))
+        });
+        assert!(called.get(), "the purge must run for a prune_stale reindex");
+        assert_eq!(rows, 12);
+        assert_eq!(note, None);
+    }
+
+    /// v0.2.105 LEAVE-ALONE: an Enable / Add reindex never purges.
+    #[test]
+    fn reindex_purge_step_skips_without_prune_stale() {
+        let (rows, note) = reindex_purge_step(false, || -> Result<serde_json::Value, String> {
+            panic!("no purge without prune_stale")
+        });
+        assert_eq!((rows, note), (0, None));
+    }
+
+    /// A refusal (no positive knowledge), a partial purge and a child that
+    /// cannot run all KEEP the rows, report why, and never fail the reindex.
+    #[test]
+    fn reindex_purge_step_reports_refusal_partial_and_failure() {
+        let (rows, note) = reindex_purge_step(true, || {
+            Ok(serde_json::json!({
+                "ok": true, "purged": {}, "failures": 0,
+                "refused": "the hub could not say which code folders were removed",
+            }))
+        });
+        assert_eq!(rows, 0);
+        assert!(note.unwrap().contains("could not say"));
+
+        let (rows, note) = reindex_purge_step(true, || {
+            Ok(serde_json::json!({
+                "ok": true, "purged": { "/opt/removed": 3 }, "failures": 2, "refused": null,
+            }))
+        });
+        assert_eq!(rows, 3);
+        assert!(note.unwrap().contains("retries"));
+
+        let (rows, note) = reindex_purge_step(true, || Err("spawn failed".to_string()));
+        assert_eq!(rows, 0);
+        assert!(note.unwrap().contains("spawn failed"));
     }
 
     #[test]

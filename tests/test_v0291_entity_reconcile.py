@@ -1107,6 +1107,10 @@ def test_driver_no_progress_names_the_stuck_rows_in_the_ledger(
     ``build_unconverged_deferral`` had no stuck-identity argument, so a stuck
     project's entry could only ever say how MANY rows were owed."""
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: 0)
+    # v0.2.105: the driver's backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
     monkeypatch.setattr(
         cr.subprocess, "run",
         lambda argv, **kw: types.SimpleNamespace(returncode=0),
@@ -1198,6 +1202,10 @@ def test_end_to_end_stuck_deferral_clears_after_a_reconciling_walk(
     reproduced on this machine on 2026-07-31.
     """
     from vco_lib.deferral_report import DeferralEntry, DeferralReport
+    # v0.2.105: the driver's backend-reachability gate must not probe a
+    # real code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
 
     _stub_embeddings(analyzer_mod, monkeypatch)
     repo = _make_repo(tmp_path)

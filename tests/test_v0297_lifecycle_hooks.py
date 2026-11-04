@@ -145,6 +145,10 @@ class _Machine:
             '      *) echo "Error: no such container $name" >&2; exit 125 ;;',
             "    esac",
             '    case "$fmt" in',
+            # v0.2.105: the container-id lookup asks `inspect --type container
+            # NAME` with NO template; a real engine answers the full JSON
+            # array (whose "Id" key is what the lookup reads).
+            '      "") echo \'[{"Id":"id-\'"$name"\'"}]\' ;;',
             '      *State.Pid*) echo "$PID" ;;',
             '      *.Id*) echo "id-$name" ;;',
             # the canonical default volume at each service's data path — what

@@ -234,6 +234,36 @@ if ($IsCompactSource -and (Test-Path -LiteralPath $Snapshot)) {
     }
 }
 
+# 5. KG reviewer pending files -- v0.2.105 L-KGREV (brief item 3). The
+#    post-commit reviewer leaves its nodes uncommitted whenever a commit is
+#    skipped (HEAD moved into its files, the same file was already dirty, a
+#    git operation in progress). The one-line alert reaches the chat through
+#    the alert channel; THIS is the durable line that keeps saying how many
+#    are still pending, on every session start and after every compaction,
+#    until they are committed. One line, bounded by the module. The section
+#    is gated on the ledger file's existence, so a project that never skipped
+#    a review pays a single Test-Path. MUST MATCH compact-context-reinject.sh.
+$S_kgsync = ""
+$KgpLedger = Join-Path $ProjectDir ".claude/state/kg_reviewer_pending.json"
+if (Test-Path -LiteralPath $KgpLedger -PathType Leaf) {
+    $KgpPy = ""
+    $KgpVenvLib = Join-Path $PSScriptRoot "_lib/resolve-vco-venv.ps1"
+    if (Test-Path -LiteralPath $KgpVenvLib -PathType Leaf) {
+        . $KgpVenvLib
+        if (Get-Command Resolve-VcoVenvPython -ErrorAction SilentlyContinue) {
+            try { $KgpPy = Resolve-VcoVenvPython -ScriptDir $PSScriptRoot } catch { $KgpPy = "" }
+        }
+    }
+    if ($KgpPy -and (Test-Path -LiteralPath $KgpPy -PathType Leaf)) {
+        try {
+            $kgpOut = @(& $KgpPy -m vco_lib.kg_reviewer_pending status --project-root $ProjectDir 2>$null)
+            if ($LASTEXITCODE -eq 0) {
+                $S_kgsync = (($kgpOut | ForEach-Object { "$_" }) -join "`n").Trim()
+            }
+        } catch { $S_kgsync = "" }
+    }
+}
+
 # -- budget the flex section, then emit every section under its budget --
 $HaveCap = [bool](Get-Command Limit-VcoHookContext -ErrorAction SilentlyContinue)
 $RbMinSection = 300   # a section's floor: its header plus a cut marker
@@ -292,6 +322,11 @@ if ($LatestPlan) { $PlanPointer = "rest is on disk: Read .claude/context/plans/$
 $Parts += Emit-RbSection $S_plan (Get-RbBudget 'plan') $PlanPointer
 $Parts += Emit-RbSection $S_commits (Get-RbBudget 'commits') "run 'git log --oneline -20' for more"
 $Parts += Emit-RbSection $S_snap (Get-RbBudget 'snapshot') "rest is on disk: Read .claude/context/pre-compact-snapshot.md"
+# v0.2.105 L-KGREV: emitted past the fixed budgets (one bounded line) --
+# same order as the .sh sibling.
+# The pointer names the interpreter that just answered (a bare `python` in a
+# user project is rarely the VCO venv, and a printed command is shipped code).
+$Parts += Emit-RbSection $S_kgsync 0 "run & '$KgpPy' -m vco_lib.kg_reviewer_pending paths --project-root '$ProjectDir' for the full list"
 
 # v0.2.102 W6-D review F4: strip the trailing newlines, cap, then write the
 # text + exactly ONE newline -- byte-for-byte what the .sh sibling's

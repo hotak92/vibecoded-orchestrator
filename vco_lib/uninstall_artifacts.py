@@ -20,7 +20,8 @@ the clone (review V02103-FINAL2 M-1):
   script and by the launcher's ``desktop_shortcut.rs``;
 * state files this cycle added under the VCO state root:
   ``state/engine-start.lock`` (``container_engine_start``),
-  ``state/codegraph-walk-claims/*.lock`` (``codegraph_walk``),
+  ``state/codegraph-walk-claims/*.lock`` and their ``*.holder`` sidecars
+  (``codegraph_walk``),
   ``model-guidance.json`` (``model_selection``) and the engine starter's log
   ``logs/engine-start.log`` (bounded in place, no rotated siblings).
   Since the v0.2.103 field run these are planned here only when the
@@ -273,6 +274,8 @@ def _plan_state_files(plan: Plan, vct_root: Path) -> None:
     if claims.is_dir() and _through_real_dirs(claims / "x", vct_root):
         for lock in sorted(claims.glob("*.lock")):
             _add_file(plan, lock, "code-graph walk claim", vct_root)
+        for holder in sorted(claims.glob("*.holder")):  # v0.2.105 holder sidecar
+            _add_file(plan, holder, "code-graph walk claim holder", vct_root)
         plan.prune_if_empty.append(claims)
     elif claims.is_dir():
         plan.keep.append((claims, "code-graph walk claims behind a symlink or junction — not followed"))

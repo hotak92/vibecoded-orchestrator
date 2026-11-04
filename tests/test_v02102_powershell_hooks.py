@@ -57,7 +57,11 @@ NEW = "Bash|PowerShell"
 #: matcher (the `*`-matcher hooks — pre-tool-use, the async dispatcher —
 #: already see PowerShell and branch on the tool name inside).
 SHELL_HOOKS = {
-    "PreToolUse": ("pre-vercel-token-guard", "pre-bash-context-inject"),
+    # v0.2.105: lean-ctx-rewrite joined (it carries the kill guard's runtime
+    # rewrite, which must see PowerShell-tool kills; compression itself
+    # stays Bash-only — see test_lean_ctx_steps_aside_for_powershell).
+    "PreToolUse": ("pre-vercel-token-guard", "pre-bash-context-inject",
+                   "lean-ctx-rewrite"),
     "PostToolUse": ("post-bash-file-sync",),
 }
 #: The wait guard is registered TWICE for the shell tools (review W5D-2): its
@@ -65,10 +69,11 @@ SHELL_HOOKS = {
 #: tool gets an if-less `PowerShell` group — a PowerShell loop keyword is not
 #: a command, so no `PowerShell(...)` rule could ever match it.
 WAIT_GUARD = "wait-guard"
-#: lean-ctx stays Bash-only: its wrapper re-runs the command through a POSIX
-#: shell (`lean-ctx -c`), so a PowerShell command cannot be wrapped; the
-#: scripts step aside on any other tool name.
-BASH_ONLY = ("lean-ctx-rewrite", WAIT_GUARD)
+#: lean-ctx COMPRESSION stays Bash-only (its wrapper re-runs the command
+#: through a POSIX shell), but since v0.2.105 the hook is registered on
+#: Bash|PowerShell for the kill guard stage — so only the wait guard keeps a
+#: bare `Bash` group.
+BASH_ONLY = (WAIT_GUARD,)
 
 
 def _load(p: Path) -> dict:
@@ -667,7 +672,9 @@ def test_vercel_guard_covers_powershell(impl, tool, cmd, rc):
 
 @pytest.mark.parametrize("impl", _IMPLS)
 def test_lean_ctx_steps_aside_for_powershell(impl, tmp_path):
-    """Bash-only by design: a PowerShell command is never rewritten."""
+    """Compression is Bash-only by design: a PowerShell command is never
+    lean-ctx-wrapped (only the kill-guard stage, for kill verbs, rewrites a
+    PowerShell call — tests/test_v02105_kill_guard.py)."""
     payload = json.dumps(_ps("npm install"))
     argv = (["bash", str(HOOKS / "lean-ctx-rewrite.sh")] if impl == "sh" else
             [PWSH, *PWSH_BASE_FLAGS, "-File", str(HOOKS / "lean-ctx-rewrite.ps1")])

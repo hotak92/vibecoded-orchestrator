@@ -303,7 +303,15 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 49
+#: 49 = migration 049_project_infra_declarations.sql (W5-A/M3, v0.2.102 —
+#: what on this machine belongs to a PROJECT, not to VCO: external
+#: collections, unmanaged containers, local ports).
+#: 50 = migration 050_collection_count_cache.sql (v0.2.105 — cached Weaviate
+#: class counts + measured-at timestamp; stops the launcher's KG/codegraph
+#: pages from Aggregate-counting every class on the machine at every render,
+#: which lazy-loaded every project's collections into Weaviate RAM). Bumped
+#: ATOMICALLY with mig 050's Rust registration.
+LAUNCHER_DB_TABLE_SET_VERSION = 50
 
 
 # ===========================================================================

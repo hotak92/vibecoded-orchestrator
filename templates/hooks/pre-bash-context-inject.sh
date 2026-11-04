@@ -48,6 +48,12 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
+# v0.2.105: the hook's start, for the router's run deadline AND its hard
+# end-to-end deadline (the harness timeout counts from HERE).
+# One home: _lib/hook-start.sh (MUST MATCH the .ps1 sibling's call).
+# shellcheck source=_lib/hook-start.sh disable=SC1091
+[ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/hook-start.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/hook-start.sh" && vco_mark_hook_start
+
 # VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7). v0.2.101: the
 #   delegate is claude_mcp_servers/scripts/hook_context_router.py (KG +
 #   code-graph legs loaded in-process, both access-aware via the weaviate_mcp
@@ -208,6 +214,14 @@ find "$STATE_DIR" -maxdepth 1 -type f -name "bash_intent_*.json" -mtime +1 -dele
 # targets/symbols join the payload (richer training labels). Query snippet
 # + payload travel via env, never string-interpolated into the python
 # source. Soft-fail; backgrounded so it never delays the user's command.
+# v0.2.105: the background SUBSHELL's own stdio is detached explicitly (the
+# redirect after `)`). The harness waits for the hook's stdout/stderr pipes
+# to CLOSE, so any background holder of them keeps the hook "running" for
+# the emit's whole duration (hub config resolve + event post, seconds under
+# load). Today bash execs the subshell's single command with its own
+# redirects, so nothing holds them; the explicit redirect keeps that true if
+# the subshell ever grows a second command. MUST MATCH the .ps1 sibling (a
+# detached process — it used to run the emit INLINE, inside the timeout).
 # Kept as a function at top-level indent so the child-env block matches the
 # pre-v0.2.101 shape the v0.2.94 root-handoff pin asserts.
 _emit_prebash_outcome() {
@@ -269,7 +283,7 @@ try:
     )
 except Exception:
     pass
-" >/dev/null 2>&1 ) &
+" >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
 }
 
 # === State file + pre_bash outcome event: READ/EDIT/SEARCH only ===

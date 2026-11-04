@@ -43,6 +43,7 @@ drift apart.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -50,7 +51,10 @@ from vco_lib.codegraph_resync import primary_sources_for
 from vco_lib.codegraph_row_classify import source_is_owned
 
 __all__ = [
+    "PruneScope",
     "preserve_keys",
+    "prune_scope_for_walk",
+    "project_has_registered_extras",
     "refused_extra_keep_sources",
     "row_owned_by_walk",
     "stale_hit",
@@ -181,3 +185,113 @@ def preserve_keys(own_sources: Iterable[str], rel: str, *, extra_root: bool) -> 
     if not extra_root:
         keys.add(("", rel))
     return keys
+
+
+# ── v0.2.105 (prune lane): the --prune-stale source SCOPE ──────────────────
+#
+# The 2026-10-29 incident: a primary-only `--prune-stale` walk (the
+# `codegraph_orphan_interactions_pending` remedy) pruned 33,464 rows of an
+# ENABLED extra code folder — 727 orphans were expected — because the stale
+# set was judged over EVERY row of the prefix, not only the walked root's.
+# Nothing re-added the rows (the extras refresh is commit-diff based), so the
+# extra folder's graph was silently gone. The scope below is the ONE home of
+# the rule that fixes it; the analyzer passes it through to
+# ``vco_lib.codegraph_prune.prune_collection``.
+
+
+@dataclass(frozen=True)
+class PruneScope:
+    """Which rows a ``--prune-stale`` pass may judge, by ``project_source``."""
+
+    #: The owned source forms of every root this walk covered (the primary
+    #: root, plus this run's ``--extra-path`` roots).
+    own_sources: Set[str]
+    #: True when legacy unstamped rows must be preserved: the project has (or
+    #: had) an extra code folder, or that is unknown, so an empty
+    #: ``project_source`` cannot be attributed to the primary root.
+    legacy_unowned: bool
+    #: ``--as-extra-path``: the walked root IS an extra folder, so an
+    #: unstamped row is most likely the primary project's and is never judged.
+    strict: bool
+    #: The walked primary root, POSIX (for the run's log line).
+    primary_root: str
+    #: How many extra roots this run walked (for the run's log line).
+    walked_extras: int = 0
+
+    def summary(self) -> str:
+        """One human-readable line naming what the prune is scoped to."""
+        extra = f" (+{self.walked_extras} extra root(s) walked this run)" if self.walked_extras else ""
+        return f"{self.primary_root}{extra}"
+
+
+def project_has_registered_extras(project_root: Any) -> bool:
+    """Has THIS project any extra code folder — enabled now, or disabled /
+    removed (the hub's ``code_graph_extra_paths_gone``)? Resolved through
+    the ONE config resolver (hub-first).
+
+    It decides whether a ``--prune-stale`` walk may judge legacy UNSTAMPED
+    rows (no ``project_source``) as the primary root's: only when the answer
+    is a POSITIVE "no extras, none removed". Anything unknown leans toward
+    KEEPING those rows (returns True): the hub is down or the project
+    unregistered, or the hub could not read its extras (it then serves the
+    enabled list empty and the gone list as unknown — the same DB failure
+    must not make an extra folder's legacy rows look like the primary's).
+    The cost of a wrong True is stale legacy rows kept one walk longer; the
+    cost of a wrong False is an extra folder's rows deleted (the 2026-10-29
+    incident class). An empty root is no project at all (False).
+    """
+    root = str(project_root or "").strip()
+    if not root:
+        return False
+    try:
+        from vco_lib import project_config
+
+        cfg = project_config.resolve(root)
+    except Exception:  # noqa: BLE001 — hub down / unregistered: unknown ⇒ keep
+        return True
+    if getattr(cfg, "code_graph_extra_paths", ()):
+        return True
+    gone = getattr(cfg, "code_graph_extra_paths_gone", None)
+    if gone is None:
+        return True  # the hub could not say (read failure / older hub)
+    return bool(gone)
+
+
+def prune_scope_for_walk(
+    primary_root: Any,
+    walked_extras: "Iterable[Any]" = (),
+    *,
+    strict_source: bool = False,
+) -> Optional[PruneScope]:
+    """The ``--prune-stale`` scope for one walk (v0.2.105 prune lane).
+
+    ``primary_root`` is the walked root's RAW POSIX form (rows are stamped
+    with it); ``walked_extras`` are the extra roots THIS run also walks
+    (``--extra-path`` argv — their rows are in the visited set and their
+    sources join the judged set); ``strict_source`` marks an
+    ``--as-extra-path`` walk (the walked root IS an extra). Returns ``None``
+    when no root is known — a direct caller without a root keeps the
+    previous unscoped semantics.
+
+    The legacy-row rule: an unstamped row (no ``project_source``) is
+    preserved (``legacy_unowned``) unless the project POSITIVELY has no extra
+    folder, enabled or removed (:func:`project_has_registered_extras` —
+    attribution is unknowable otherwise, and unknown keeps), and judged as
+    the primary root's only then.
+    """
+    raw = str(primary_root or "").strip()
+    if not raw:
+        return None
+    own: Set[str] = set(walk_own_sources(raw, raw))
+    extras = list(walked_extras or ())
+    for extra in extras:
+        own |= walk_own_sources(extra, str(extra))
+    return PruneScope(
+        own_sources=own,
+        legacy_unowned=(
+            not strict_source and project_has_registered_extras(raw)
+        ),
+        strict=strict_source,
+        primary_root=raw,
+        walked_extras=len(extras),
+    )

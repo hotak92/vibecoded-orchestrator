@@ -29,6 +29,7 @@
     parseTimeoutSeconds,
     registerBlockedReason,
     routedSubhookNote,
+    killGuardNote,
     settingsErrorBanner,
     stateLabel,
     stateTooltip,
@@ -424,7 +425,7 @@
             <td>{timeoutSeconds(h) === null ? '—' : `${timeoutSeconds(h)}s`}</td>
             <td><span class="ps-tag ps-tag-{h.source}">{h.source}</span></td>
             <td>
-              <label class="ps-state" title={stateTooltip(h.state, settingsPath) + routedSubhookNote(h, hooks)}>
+              <label class="ps-state" title={stateTooltip(h.state, settingsPath) + routedSubhookNote(h, hooks) + killGuardNote(h)}>
                 <input
                   type="checkbox"
                   checked={isChecked(h)}

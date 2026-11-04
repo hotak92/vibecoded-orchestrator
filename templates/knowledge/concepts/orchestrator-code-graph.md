@@ -140,7 +140,7 @@ The `--project` flag in `code-graph-analyze` sets this prefix.
 ```python
 search_code_graph(
     query="authentication middleware that validates JWT tokens",
-    scope="code",          # "all" | "code" | "interaction"
+    scope="code",          # "all" | "code" | "interaction" | "config"
     limit=8,
     expand_hops=1,         # 0=seed only | 1=follow call edges | 2=two hops
     layer=None,            # optional: API | Service | Data | UI | Utility
@@ -177,6 +177,8 @@ query_code_structure(
 | `composes` | Classes used as fields in target class |
 | `composed_by` | Classes that use the target as a field |
 | `type_users` | Functions that use the target type in annotations |
+| `config_users` | Code that reads a config key / `section/key` / section / file (`.tweakers`, `.ini`, `.json`), with the value next to each site |
+| `config_of` | The config values a function or module reads |
 
 Path query format:
 ```python

@@ -503,6 +503,60 @@ pub fn packs_status(root: &Path, project_folder: &Path) -> Result<serde_json::Va
     parse_ok_reply_named("packs status", &done.stdout, &done.stderr)
 }
 
+/// v0.2.105: is this project's PRIMARY KG binding the SHARED collection? —
+/// `python -m vco_lib.kg_primary_shared status --project-id … --json`, the ONE
+/// detection rule (rule A: the Python implementation the doctor and the
+/// registry clear probe also use; nothing is mirrored here). Returns the
+/// `ok: true` reply (`bound_to_shared`, `bound`, `expected`,
+/// `expected_is_shared`); an unreadable launcher.db or a child that cannot run
+/// is an `Err` — the Identity tab then shows no verdict rather than a guess.
+/// With `candidate` the reply is instead `candidate_is_shared` for that class
+/// name (the binding writers' pre-write check).
+pub fn kg_primary_shared_status(
+    root: &Path,
+    project_id: &str,
+    candidate: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.kg_primary_shared")
+        .arg("status")
+        .arg("--project-id")
+        .arg(project_id)
+        .arg("--json");
+    if let Some(name) = candidate {
+        cmd.arg("--candidate").arg(name);
+    }
+    reinject_minimal_env(&mut cmd);
+    cmd.current_dir(root);
+    let done = match vct_launcher_core::process::output_bounded(
+        &mut cmd,
+        None,
+        VCO_LIB_SHORT_VERB_TIMEOUT,
+    ) {
+        Ok(done) => done,
+        Err(vct_launcher_core::process::BoundedError::Spawn(e)) => {
+            return Err(format!(
+                "kg primary status: spawn failed (python={}): {}",
+                python.display(),
+                e
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::TimedOut { after, stderr, .. }) => {
+            return Err(format!(
+                "kg primary status: timed out after {} s. stderr: {}",
+                after.as_secs(),
+                String::from_utf8_lossy(&stderr).trim()
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::Wait(e)) => {
+            return Err(format!("kg primary status: wait failed: {}", e))
+        }
+    };
+    parse_ok_reply_named("kg primary status", &done.stdout, &done.stderr)
+}
+
 /// v0.2.102 W6-CGD (D-4): classify `extra` against the project's own folder —
 /// `python -m vco_lib.codegraph_extra_overlap --extra … --project-folder … --json`,
 /// the ONE overlap rule (rule A: the Python implementation, called from here).
@@ -530,6 +584,41 @@ pub fn codegraph_extra_overlap(
         return Err(child_failure("code folder overlap check", &done));
     }
     parse_ok_reply_named("code folder overlap check", &done.stdout, &done.stderr)
+}
+
+/// Wall-clock cap for one removed-extras purge (v0.2.105). Very long by
+/// design (owner rule: dev-machine speed must not set the ceiling) — a purge
+/// deletes row by row and a large folder holds tens of thousands of rows. A
+/// kill is harmless: the purge is resumable and records nothing as done
+/// until a pass completes without failures.
+pub(crate) const VCO_LIB_PURGE_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
+
+/// v0.2.105: remove the code-graph rows of the extra code folders the owner
+/// removed or disabled — `python -m vco_lib.codegraph_source_purge
+/// --project-root … --force --json` (rule A: the Python implementation, the
+/// same one the Stop-drain refresh calls). The child acts on POSITIVE
+/// knowledge only (the hub's `code_graph_extra_paths_gone`) and reports a
+/// refusal in its reply (`refused`) rather than failing. Returns the `ok:
+/// true` reply (`purged` = `{source: rows}`, `failures`, `refused`); a child
+/// that cannot run is an `Err`.
+pub fn codegraph_source_purge(
+    root: Option<&Path>,
+    project_folder: &str,
+) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.codegraph_source_purge")
+        .arg("--project-root")
+        .arg(project_folder)
+        .arg("--force")
+        .arg("--json");
+    let folder = Path::new(project_folder);
+    let done = run_vco_lib_collect(cmd, &python, root, folder, "", VCO_LIB_PURGE_TIMEOUT)?;
+    if !done.success {
+        return Err(child_failure("removed code folder purge", &done));
+    }
+    parse_ok_reply_named("removed code folder purge", &done.stdout, &done.stderr)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

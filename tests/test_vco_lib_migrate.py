@@ -20,8 +20,6 @@ import json
 import os
 import sys
 import unittest
-import urllib.error
-import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -29,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.common import live_weaviate as _live_weaviate  # noqa: E402
 from vco_lib import project_init  # noqa: E402
 
 
@@ -880,24 +879,12 @@ class CliMigrateCommandTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-try:
-    import weaviate as _weaviate_mod  # noqa: F401
-    _WEAVIATE_AVAILABLE = True
-except ImportError:
-    _WEAVIATE_AVAILABLE = False
-
-
 def _weaviate_reachable() -> bool:
-    """Return True only if the weaviate package is importable AND the server responds."""
-    if not _WEAVIATE_AVAILABLE:
-        return False
+    """True only when the weaviate package is importable, a gRPC port is named
+    for the instance (never defaulted to the live 50052) and the server
+    responds — :func:`tests.common.live_weaviate.skip_reason`."""
     url = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
-    try:
-        req = urllib.request.Request(f"{url.rstrip('/')}/v1/.well-known/ready")
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+    return _live_weaviate.skip_reason(url) is None
 
 
 _LIVE_TEST_COLLECTION_NAME = "VctMigrateTest"
@@ -905,7 +892,7 @@ _LIVE_TEST_COLLECTION_NAME = "VctMigrateTest"
 
 @unittest.skipUnless(
     _weaviate_reachable(),
-    "Weaviate not reachable on localhost:8081 or weaviate package not installed",
+    "Weaviate not reachable, no GRPC_PORT named for it, or weaviate package not installed",
 )
 class LiveMigrateIntegrationTest(unittest.TestCase):
     """Real Weaviate round-trip:
@@ -968,15 +955,7 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
 
     def _populate_objects(self, name: str, count: int = 5) -> list[str]:
         import uuid
-        import weaviate
-        host = self.url.replace("http://", "").replace("https://", "").split(":")[0]
-        port = int(self.url.rsplit(":", 1)[-1].split("/")[0])
-        client = weaviate.connect_to_custom(
-            http_host=host, http_port=port, http_secure=False,
-            grpc_host=host,
-            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
-            grpc_secure=False, skip_init_checks=True,
-        )
+        client = _live_weaviate.connect(self.url)
         try:
             col = client.collections.get(name)
             uuids: list[str] = []
@@ -997,15 +976,7 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
             client.close()
 
     def _count_objects(self, name: str) -> tuple[int, set[str]]:
-        import weaviate
-        host = self.url.replace("http://", "").replace("https://", "").split(":")[0]
-        port = int(self.url.rsplit(":", 1)[-1].split("/")[0])
-        client = weaviate.connect_to_custom(
-            http_host=host, http_port=port, http_secure=False,
-            grpc_host=host,
-            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
-            grpc_secure=False, skip_init_checks=True,
-        )
+        client = _live_weaviate.connect(self.url)
         try:
             col = client.collections.get(name)
             uuids = set()
@@ -1143,15 +1114,7 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
 
         # Populate staging with 5 dummy objects + named vectors.
         import uuid
-        import weaviate
-        host = self.url.replace("http://", "").replace("https://", "").split(":")[0]
-        port = int(self.url.rsplit(":", 1)[-1].split("/")[0])
-        client = weaviate.connect_to_custom(
-            http_host=host, http_port=port, http_secure=False,
-            grpc_host=host,
-            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
-            grpc_secure=False, skip_init_checks=True,
-        )
+        client = _live_weaviate.connect(self.url)
         original_uuids: set[str] = set()
         try:
             col = client.collections.get(staging_name)
@@ -1238,15 +1201,7 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
         )
         # Populate KG with 5 objects.
         import uuid
-        import weaviate
-        host = self.url.replace("http://", "").replace("https://", "").split(":")[0]
-        port = int(self.url.rsplit(":", 1)[-1].split("/")[0])
-        client = weaviate.connect_to_custom(
-            http_host=host, http_port=port, http_secure=False,
-            grpc_host=host,
-            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
-            grpc_secure=False, skip_init_checks=True,
-        )
+        client = _live_weaviate.connect(self.url)
         kg_uuids: set[str] = set()
         try:
             col = client.collections.get(self.KG_NAME)
@@ -1275,12 +1230,7 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
             {**project_init.kg_class_definition(staging_name)},
             weaviate_url=self.url,
         )
-        client = weaviate.connect_to_custom(
-            http_host=host, http_port=port, http_secure=False,
-            grpc_host=host,
-            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
-            grpc_secure=False, skip_init_checks=True,
-        )
+        client = _live_weaviate.connect(self.url)
         try:
             col = client.collections.get(staging_name)
             with col.batch.dynamic() as bw:

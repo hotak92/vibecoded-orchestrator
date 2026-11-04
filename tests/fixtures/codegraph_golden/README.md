@@ -69,6 +69,29 @@ Each is the analyzer's stored output, normalized (sorted by
 `(path, full_name)`, volatile fields stripped, `content_hash` KEPT). They are
 the CONTRACT: the P2f IR refactor must leave them byte-identical.
 
+## The config corpus (v0.2.105)
+
+`config_repo/` is a second analyzed tree, checked by
+`test_golden_config_snapshots_match` against `expected_config/` (regex
+definitions) and `expected_config_treesitter/` (tree-sitter). It holds the
+three config formats beside C++ and Python code that names their keys, so it
+pins the config module rows, the per-section rows (with every key's value in
+`class_body`) and the config-link `CodeInteraction` rows byte-for-byte. The
+first corpus (`repo/`) has no config file, so its snapshots did not change.
+
+| File | Exercises |
+|---|---|
+| `config_repo/data/ai/Driver.tweakers` | `.tweakers`: both value forms, keys with spaces and parentheses, an item outside any group |
+| `config_repo/params/vehicle.ini` | INI: multi-line value, duplicate keys, bare key, `#`/`;` section docs |
+| `config_repo/conf/app.json` | JSONC: comments, trailing comma, nested object, array of objects |
+| `config_repo/conf/big_table.json` | one 300-key section, CHUNKED by the CodeClass write (3 chunk rows) |
+| `config_repo/bin/Hidden.tweakers` | lives under `bin/` → MUST NOT appear, and its key must never link |
+| `config_repo/src/driver.cpp` | C++ literals: co-occurrence `high` links, distinctive `medium` links, a comment that must not link |
+| `config_repo/tools/load.py` | Python: top-level literals (module-only links), a file-basename link, a JSON leaf key |
+
+The two config snapshot sets differ in one field only: the C++ module's
+`file_hash` (the regex fallback's salt, see W6-L above).
+
 ## Regenerating (requires human review of the diff)
 
 Snapshots are regenerated only deliberately:

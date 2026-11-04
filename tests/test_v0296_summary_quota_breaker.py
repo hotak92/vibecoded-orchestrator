@@ -561,6 +561,8 @@ def _register_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     """
     db = make_launcher_db(tmp_path, projects=[{
         "project_id": "p1", "name": name, "folder_path": root,
+        # v0.2.105: the code leg runs on the BINDING prefix, never the name.
+        "codegraph_prefix": name,
     }])
     monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db))
 

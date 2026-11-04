@@ -21,7 +21,7 @@ if ($script:VcoCodeExtensionsSourced) { return }
 $script:VcoCodeExtensionsSourced = $true
 
 # Extension alternation, as a .NET regex suitable for `-match`.
-$script:VcoCodeExtRe = '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
+$script:VcoCodeExtRe = '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
 
 # Test-VcoIsCodeFile <Path> -- $true when the path names a code file.
 #

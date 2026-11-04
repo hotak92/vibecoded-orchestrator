@@ -132,6 +132,55 @@ impl Db {
             .map_err(|e| format!("collect list_enabled_codegraph_extras: {}", e))
     }
 
+    /// v0.2.105 — the extra paths the owner POSITIVELY took out of this
+    /// project's code graph, sorted: every DISABLED row, plus every path with
+    /// a `codegraph_extra_path_removed` audit entry for this project that has
+    /// no row any more (a re-added path is live again, so it is not gone).
+    ///
+    /// The removed-extras purge (`vco_lib.codegraph_source_purge`) deletes
+    /// rows ONLY for a path listed here — so a read failure is an `Err`
+    /// (the hub then serves the field as `null`, "unknown"), never an empty
+    /// list that would read as "nothing removed" or, worse, be confused with
+    /// "everything removed". A removal whose audit write failed is not
+    /// listed: without the trail there is no positive knowledge, and the
+    /// rows are kept.
+    pub fn list_gone_codegraph_extras(&self, project_id: &str) -> Result<Vec<String>, String> {
+        let rows = self.list_codegraph_extras(project_id)?;
+        let present: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.path.as_str()).collect();
+        let mut gone: std::collections::BTreeSet<String> = rows
+            .iter()
+            .filter(|r| !r.enabled)
+            .map(|r| r.path.clone())
+            .collect();
+        let details: Vec<String> = {
+            let guard = self.lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT detail FROM audit_log
+                     WHERE operation = 'codegraph_extra_path_removed' AND project_id = ?1",
+                )
+                .map_err(|e| format!("prepare list_gone_codegraph_extras: {}", e))?;
+            let it = stmt
+                .query_map(params![project_id], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("query list_gone_codegraph_extras: {}", e))?;
+            it.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect list_gone_codegraph_extras: {}", e))?
+        };
+        for detail in details {
+            // An unparseable detail is not positive knowledge: skip it.
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&detail) else {
+                continue;
+            };
+            if let Some(path) = v.get("path").and_then(serde_json::Value::as_str) {
+                if !path.is_empty() && !present.contains(path) {
+                    gone.insert(path.to_string());
+                }
+            }
+        }
+        Ok(gone.into_iter().collect())
+    }
+
     /// Get a single extra-path row by (project_id, path). Returns
     /// `None` if the row is absent. Used by the toggle/remove/sync
     /// commands to confirm the row exists before mutating.
@@ -905,5 +954,59 @@ mod tests {
             )
             .unwrap();
         assert!(max_v >= 26, "expected at least version 26, got {}", max_v);
+    }
+
+    // ─── v0.2.105: positive knowledge of a removed / disabled extra ─────
+
+    /// ACT: a disabled row and a removed row WITH its audit entry are gone;
+    /// LEAVE-ALONE: an enabled row, a removal without an audit trail, a
+    /// re-added path, another project's removal, and a malformed detail.
+    #[test]
+    fn list_gone_codegraph_extras_is_positive_knowledge_only() {
+        let db = make_db_with_project("pA", "Acme");
+        let slug_b = db.generate_unique_slug("Beta").unwrap();
+        db.insert_project("pB", "Beta", "/tmp/pB", ProjectHost::Base, &slug_b)
+            .unwrap();
+        db.add_codegraph_extra("pA", "/opt/enabled", None).unwrap();
+        db.add_codegraph_extra("pA", "/opt/disabled", None).unwrap();
+        db.set_codegraph_extra_enabled("pA", "/opt/disabled", false).unwrap();
+        db.add_codegraph_extra("pA", "/opt/readded", None).unwrap();
+        let removed = |pid: &str, path: &str| {
+            db.audit(
+                "codegraph_extra_path_removed",
+                Some(pid),
+                None,
+                &serde_json::json!({ "path": path }),
+            )
+            .unwrap();
+        };
+        removed("pA", "/opt/removed");
+        removed("pA", "/opt/readded"); // removed earlier, row is back now
+        removed("pB", "/opt/other-project");
+        db.audit(
+            "codegraph_extra_path_removed",
+            Some("pA"),
+            None,
+            &serde_json::json!({ "not_a_path": 1 }),
+        )
+        .unwrap();
+        // A removal with no audit trail: the row is just gone.
+        db.add_codegraph_extra("pA", "/opt/silent", None).unwrap();
+        db.remove_codegraph_extra("pA", "/opt/silent").unwrap();
+
+        let gone = db.list_gone_codegraph_extras("pA").unwrap();
+        assert_eq!(gone, vec!["/opt/disabled".to_string(), "/opt/removed".to_string()]);
+        assert!(db.list_gone_codegraph_extras("pB").unwrap()
+            == vec!["/opt/other-project".to_string()]);
+    }
+
+    /// A read that cannot run is an `Err` — never an empty "nothing gone".
+    #[test]
+    fn list_gone_codegraph_extras_read_failure_is_an_error() {
+        let db = make_db_with_project("pA", "Acme");
+        db.lock()
+            .execute_batch("DROP TABLE project_codegraph_extra_paths")
+            .unwrap();
+        assert!(db.list_gone_codegraph_extras("pA").is_err());
     }
 }

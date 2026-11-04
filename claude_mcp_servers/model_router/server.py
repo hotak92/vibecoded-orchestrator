@@ -10,6 +10,8 @@ Routes (each also served with a trailing slash — see :func:`_add_route`)::
     GET  /usage/windows             subscription usage windows per vendor,
                                     from cache (``?format=line`` = one line of
                                     text; :mod:`model_router.usage_windows`)
+    GET  /vendor-keys?model=<id>    can this model's vendor key resolve?
+                                    names only, never a value (v0.2.105)
     GET  /v1/models                 union catalog
     POST /v1/messages               proxied, streaming or not
     POST /v1/messages/count_tokens  proxied
@@ -130,8 +132,9 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
 from typing import (
     Any,
@@ -147,7 +150,16 @@ import aiohttp
 from aiohttp import web
 
 from . import __version__
-from .auth import OAuthReader, host_token_stamp, token_matches
+from vco_lib.gateway_accounts import PRIMARY_ID as PRIMARY_ACCOUNT_ID
+
+from .accounts import (
+    AccountChoice,
+    AccountService,
+    append_notice,
+    conversation_key,
+    notice_eligible,
+)
+from .auth import OAuthReader, OAuthState, host_token_stamp, token_matches
 from .catalog import (
     USER_AGENT_HEADER,
     CatalogEntry,
@@ -160,7 +172,6 @@ from .catalog import (
 from .config import (
     PICKER_USAGE_ON,
     SERVICE_NAME,
-    UPSTREAM_CONNECT_TIMEOUT_S,
     GatewayConfig,
     context_guard_margin,
 )
@@ -190,7 +201,7 @@ from .routing import (
     fallback_route,
     route as route_model,
 )
-from .secrets import TRANSIENT_RETRY_S, VendorKeyResolver
+from .secrets import TRANSIENT_RETRY_S, VendorKeyResolver, default_hub_reviver
 from .source_identity import source_sha as _package_source_sha
 from .usage_windows import (
     UsageWindows,
@@ -208,6 +219,7 @@ from .usage import (
     effort_extra,
     guard_count_tokens,
     note_count_substitution,
+    read_compaction_header,
     read_identity,
 )
 from .vendors import (
@@ -271,6 +283,10 @@ _HOP_BY_HOP_REQUEST = frozenset(
         "x-api-key",
         "accept-encoding",
         "content-encoding",
+        # v0.2.105: the gateway's own account selector (``x-vco-account``,
+        # :mod:`model_router.accounts`). It chooses a login HERE and means
+        # nothing to any upstream, first-party or vendor.
+        "x-vco-account",
     }
 )
 
@@ -435,6 +451,27 @@ def _ladder_verdict(
 #: on the most ordinary flake there is.
 RETRYABLE_HEADERS = {"x-should-retry": "true"}
 
+#: What a gateway-side 502 for an UNREACHABLE upstream (never connected:
+#: DNS, refused, the connect bound) carries, on top of
+#: :data:`RETRYABLE_HEADERS`. The gateway has already spent its bounded retry
+#: window inside itself (see :func:`_acquire_upstream`) when it writes one of
+#: these, so a client that retries immediately would just hit the same
+#: outage; a short ``retry-after`` paces the one it is going to do anyway.
+#: Clients that ignore it are no worse off than before. A failure after the
+#: connection existed is not retried in the gateway and carries
+#: :data:`RETRYABLE_HEADERS` only.
+UPSTREAM_RETRY_AFTER_S = 5
+RETRYABLE_502_HEADERS = {
+    **RETRYABLE_HEADERS,
+    "Retry-After": str(UPSTREAM_RETRY_AFTER_S),
+}
+
+#: First backoff between in-gateway retries of a transient pre-header
+#: failure, doubling per attempt up to the cap. Sub-second start so a
+#: one-failure blip costs the chat well under a second.
+_UPSTREAM_RETRY_BACKOFF_S = 0.5
+_UPSTREAM_RETRY_BACKOFF_CAP_S = 5.0
+
 #: WP-6 review MAJOR-1/MINOR-1 caps. Auth strikes: one 401 is a blip,
 #: three consecutive is a dead key (rotated/revoked) that must not keep
 #: serving from the last-good store. Echo-log cap: ``forwarded`` is
@@ -560,6 +597,110 @@ async def loopback_only_middleware(
     )
 
 
+class _UpstreamFlight:
+    """Upstream requests currently waiting to reach response headers.
+
+    The 2026-11-04 03:08 incident's signature was a request the gateway had
+    ACCEPTED and then never mentioned again: no access line, no timeout, a
+    TCP connection ESTABLISHED for hours. A counter plus the age of the
+    oldest wait is what makes that state visible from ``/health`` while it
+    is happening, instead of from a log afterwards.
+
+    Tracks the ACQUISITION phase (pool + DNS + connect + response headers,
+    including the bounded in-gateway retry window) — the phase that hung.
+    A request already STREAMING a body has a real signal of its own (the
+    idle bound, and an aborted connection when it breaks), so it is not
+    counted here. Single-threaded by construction (one event loop); plain
+    dict bookkeeping needs no lock.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._next_id = 0
+        self._waiting: dict[int, "tuple[float, str]"] = {}
+
+    def enter(self, label: str) -> int:
+        self._next_id += 1
+        self._waiting[self._next_id] = (self._clock(), label)
+        return self._next_id
+
+    def exit(self, token: int) -> None:
+        self._waiting.pop(token, None)
+
+    def report(self) -> "dict[str, object]":
+        """Names and ages only — never a URL, key or header value."""
+        now = self._clock()
+        oldest: "tuple[float, str] | None" = None
+        for started, label in self._waiting.values():
+            if oldest is None or started < oldest[0]:
+                oldest = (started, label)
+        return {
+            "count": len(self._waiting),
+            "oldest_age_s": (
+                None if oldest is None else round(now - oldest[0], 3)
+            ),
+            "oldest_label": None if oldest is None else oldest[1],
+        }
+
+
+#: Seconds without a pre-send failure on a route after which its outage
+#: EPISODE is over: the next failure opens a new one with its own WARNING.
+_UPSTREAM_OUTAGE_QUIET_S = 60.0
+
+
+class _UpstreamOutages:
+    """Outage EPISODES per route label: one WARNING when one opens, at most
+    one INFO when the route answers again.
+
+    An episode opens with a pre-send failure on a route that has had none for
+    :data:`_UPSTREAM_OUTAGE_QUIET_S` seconds, and every failure inside it
+    extends it (logged at DEBUG, so a minute of retries is one alarming line,
+    not twenty). It ends on its own once the route has been quiet that long —
+    whether or not any request succeeded — so an outage in which every
+    request gave up (or the retry window is ``0``) can never swallow the
+    WARNING of a later one. The first success inside an episode logs the
+    recovery INFO once; a failure that follows soon after (another request
+    of the same outage still failing) stays at DEBUG instead of producing
+    WARNING/INFO pairs. Labels are family ids — NAMES, never URLs. One event
+    loop, so plain dict bookkeeping needs no lock.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        #: label -> [time of the latest failure, recovery already logged]
+        self._episodes: dict[str, list] = {}
+
+    def failure(self, label: str, exc: BaseException) -> None:
+        now = self._clock()
+        episode = self._episodes.get(label)
+        if episode is not None and now - episode[0] < _UPSTREAM_OUTAGE_QUIET_S:
+            episode[0] = now
+            logger.debug(
+                "model-gateway: upstream %s still unreachable (%s)",
+                label, type(exc).__name__,
+            )
+            return
+        self._episodes[label] = [now, False]
+        logger.warning(
+            "model-gateway: upstream %s unreachable (%s, nothing was sent "
+            "upstream); the gateway retries it only while the request's retry "
+            "window has time left",
+            label, type(exc).__name__,
+        )
+
+    def recovery(self, label: str) -> None:
+        episode = self._episodes.get(label)
+        if episode is None:
+            return
+        if self._clock() - episode[0] >= _UPSTREAM_OUTAGE_QUIET_S:
+            # The episode ended unnoticed; nothing to announce.
+            del self._episodes[label]
+            return
+        if not episode[1]:
+            episode[1] = True
+            logger.info("model-gateway: upstream %s reachable again", label)
+
+
 class Gateway:
     """Everything the handlers need, built once at startup."""
 
@@ -578,7 +719,18 @@ class Gateway:
         self.config = config
         self.vendors = vendors
         self.anthropic = anthropic
-        self.oauth = oauth_reader or OAuthReader(config.credentials_file)
+        # The user's own login: on macOS its Keychain item is named after the
+        # CLAUDE_CONFIG_DIR the user's `claude` runs with (none, normally).
+        self.oauth = oauth_reader or OAuthReader(
+            config.credentials_file,
+            keychain_config_dir=os.environ.get("CLAUDE_CONFIG_DIR") or None)
+        #: v0.2.105: the Claude accounts (``primary`` is :attr:`oauth`, the
+        #: login this gateway has always used). With no registry file every
+        #: request is served by ``primary`` exactly as before.
+        self.accounts = AccountService(self.oauth, config.accounts_file)
+        #: The background login keeper (:mod:`model_router.account_refresh`),
+        #: attached by the DAEMON only — ``create_app`` starts nothing.
+        self.account_refresher: Optional[Any] = None
         self.keys = key_resolver or VendorKeyResolver(
             project=config.secret_project,
             ttl_s=config.key_ttl_s,
@@ -592,6 +744,11 @@ class Gateway:
             # stopped the hub (by design) and nine 503s followed for a key
             # that was fine. An injected resolver keeps its own default.
             serve_stale_max_age_s=config.key_stale_max_age_s,
+            # v0.2.105: a key read that finds the hub refusing connections
+            # starts it (detached, rate-limited, never during an update), so
+            # vendor keys come back without a human. An injected resolver
+            # starts nothing.
+            hub_reviver=default_hub_reviver,
         )
         self.context = ContextTableLoader(config.context_table_file)
         self.token_permissions = token_permissions
@@ -601,6 +758,14 @@ class Gateway:
         #: observation, exactly like ``token_permissions``.
         self._token_file_stamp: Optional[Mapping[str, object]] = token_file_stamp
         self._session: Optional[aiohttp.ClientSession] = None
+        #: v0.2.105 (2026-11-04 incident): upstream acquisitions waiting for
+        #: response headers, reported by ``/health`` as
+        #: ``upstream_in_flight``. See :class:`_UpstreamFlight`.
+        self.upstream_flight = _UpstreamFlight()
+        #: Per-route outage EPISODES — gates the per-episode (not
+        #: per-attempt) WARNING and the one INFO on recovery. See
+        #: :class:`_UpstreamOutages`.
+        self.upstream_outages = _UpstreamOutages()
         #: Per-vendor rewritten-id -> vendor-id maps. Per PROCESS and bounded:
         #: the client echoes an id back one turn later, so the map only has to
         #: outlive a request, and an unbounded one would grow with uptime.
@@ -655,11 +820,38 @@ class Gateway:
             vendor_key=self._catalog_vendor_key,
             fetch=session_fetcher(lambda: self.session),
             ledger_path=lambda: self.usage.path,
+            accounts=self._usage_accounts,
         )
+
+    def _usage_accounts(self) -> "tuple[str, list[tuple[str, str, Optional[str]]]]":
+        """The user's own login's label and every ADDED Claude account with its
+        current bearer, for the per-account usage rows (v0.2.105). Runs off
+        the event loop (a macOS Keychain read may be a subprocess)."""
+        reg = self.accounts.registry()
+        extras: list[tuple[str, str, Optional[str]]] = []
+        for acct in reg.accounts:
+            reader = self.accounts.reader(acct.id, reg)
+            extras.append((acct.id, reg.label_of(acct.id),
+                           reader.read().token if reader is not None else None))
+        return reg.label_of(PRIMARY_ACCOUNT_ID), extras
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def start(self) -> None:
         if self._session is None or self._session.closed:
+            # Resolver choice (2026-11-04 incident review): the DEFAULT
+            # ThreadedResolver stays. getaddrinfo runs on the loop's default
+            # executor, so a stalled lookup pins one worker thread until the
+            # OS resolver's own timeout reclaims it (glibc: 5 s x 2 attempts
+            # by default — the ~10 s the incident's failures took). Cancelling
+            # the await (which the bounded `connect` timeout in
+            # `_acquire_upstream` now does) abandons the future, not the
+            # thread, but threads are bounded by in-flight requests and the
+            # executor's own size, so the queue can degrade during an outage
+            # without hanging a request or growing without bound. Switching
+            # to AsyncResolver would need the aiodns dependency (c-ares) this
+            # repo does not ship; an unbounded private pool would trade a
+            # bounded wait for unbounded threads. Neither is justified while
+            # every request is bounded by `connect` + the headers timeout.
             self._session = aiohttp.ClientSession()
 
     def request_started(self) -> None:
@@ -711,6 +903,10 @@ class Gateway:
             async with self.session.get(
                 url,
                 headers=dict(headers),
+                # A `total` bound covers every phase — DNS and pool
+                # included — which is the right bound for a catalog fetch:
+                # unlike a relayed completion (see `_acquire_upstream`) no
+                # part of this call is allowed to run long.
                 timeout=aiohttp.ClientTimeout(total=self.config.catalog_timeout_s),
             ) as resp:
                 if resp.status != 200:
@@ -1016,10 +1212,30 @@ async def health_handler(request: web.Request) -> web.Response:
     the newest one, ``null`` before the first. Two in-memory counters and a
     path string that is resolved once and remembered: no file is opened, no
     directory is created and nothing is probed, which is what lets a liveness
-    probe carry it).
+    probe carry it),
+    ``accounts`` (v0.2.105, :mod:`model_router.accounts`: ``default``,
+    ``selector_header``, ``registry`` — ``path``/``source``
+    (``file``/``absent``)/``error`` — and one row per Claude account: ``id``,
+    ``label``, ``config_dir``, ``is_default``, ``oauth_state``,
+    ``oauth_expires_in_s``, ``usable``, ``fallbacks`` / ``last_fallback_at`` /
+    ``last_fallback_reason`` (how often a request asking for it was served by
+    another account, and why), ``refresh`` (the login keeper's last attempt,
+    ``null`` when none). One ``stat`` per account and cached parses — no
+    subprocess. The top-level ``oauth_*`` fields stay the ``primary`` login's),
+    ``upstream_in_flight`` (v0.2.105, 2026-11-04 incident: upstream requests
+    currently waiting to reach RESPONSE HEADERS — ``count``, ``oldest_age_s``
+    and ``oldest_label``, the last two ``null`` when nothing is waiting. A
+    healthy daemon shows ``count: 0``; a request stuck in DNS or connect
+    shows up here by NAME and AGE while it is stuck, which is what the
+    incident lacked — its hung request was visible only as a TCP connection
+    ESTABLISHED for hours. Covers the acquisition phase (the one that hung;
+    a streaming body has the idle bound as its own signal) and reads pure
+    in-memory counters, so the liveness promise holds).
     """
     gateway: Gateway = request.app[APP_KEY]
-    oauth = gateway.oauth.read()
+    # cached_only: /health never runs a subprocess (the macOS Keychain answer
+    # is the one the request path / login keeper cached).
+    oauth = gateway.oauth.read(cached_only=True)
     table = gateway.context.current()
     return web.json_response(
         {
@@ -1073,6 +1289,13 @@ async def health_handler(request: web.Request) -> web.Response:
             # Cached counters and a resolved path — no directory is created
             # and no file is opened, so /health's "never blocks" holds.
             "usage_ledger": gateway.usage.health(),
+            "accounts": gateway.accounts.health(
+                gateway.account_refresher.status()
+                if gateway.account_refresher is not None else None
+            ),
+            # Pure in-memory counters — see :class:`_UpstreamFlight`. Names
+            # and ages only, never a URL: /health is unauthenticated.
+            "upstream_in_flight": gateway.upstream_flight.report(),
         }
     )
 
@@ -1160,6 +1383,80 @@ async def usage_windows_handler(request: web.Request) -> web.Response:
         logger.warning("usage/windows: agent attribution rows unavailable: %s", exc)
         snapshot["agents"] = []
     return web.json_response(snapshot)
+
+
+#: Seconds ``/vendor-keys`` waits for a FIRST key resolution before it answers
+#: ``pending``. Below the Agent-launch hook's own 10 s budget; a resolution
+#: still running keeps going in the background and lands in the cache.
+VENDOR_KEY_PROBE_TIMEOUT_S = 3.0
+
+
+async def vendor_keys_handler(request: web.Request) -> web.Response:
+    """Can this gateway serve ``?model=<id>`` right now? NAMES ONLY (v0.2.105).
+
+    The pre-flight a subagent launch asks before it starts a lane on a
+    gateway model (``vco_lib.gateway_preflight``, from the Agent|Task
+    PreToolUse hook), so a lane whose vendor key cannot resolve is refused at
+    launch instead of dying on its first request ("503 no key found for
+    vendor 'qwen'", 2026-10-21). The answer::
+
+        {"model": <id>, "route": "vendor" | "anthropic" | "refused",
+         "vendor": <vendor id or null>, "state": resolved | cached | stale |
+         missing | pending, "usable": bool, "transient": bool,
+         "problem": <text built from key NAMES and store paths, or null>}
+
+    ``usable`` is true when a key is in hand (``stale`` included — that key
+    is served), false only on a DEFINITE miss; a transient failure or a
+    resolution still running reads ``usable: null`` (unknown — the caller
+    must not refuse on it). The key VALUE never appears: :class:`KeyResult`
+    is read for its state, never serialised. Host-token authorised and
+    loopback-only like ``/usage``. A miss here runs the same resolution a
+    request would — including the v0.2.105 hub revive when the hub refuses.
+    """
+    gateway: Gateway = request.app[APP_KEY]
+    started = time.monotonic()
+    if not gateway.authorised(request):
+        _log_unauthorised(gateway, request, started=started)
+        return _unauthorised()
+    model = (request.query.get("model") or "").strip()
+    decision = route_model(
+        model, gateway.vendors, gateway.anthropic,
+        known_ids=gateway.catalog.known_vendor_ids(),
+    )
+    base: dict[str, Any] = {"model": model, "vendor": None, "state": None,
+                            "usable": None, "transient": False, "problem": None}
+    if isinstance(decision, RouteError):
+        base.update(route="refused", usable=False, problem=decision.message)
+        return web.json_response(base)
+    if decision.vendor is None:
+        # First-party Claude route: no vendor key involved.
+        base.update(route="anthropic", usable=True)
+        return web.json_response(base)
+    vendor = decision.vendor
+    base.update(route="vendor", vendor=vendor.vendor_id)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.shield(gateway.keys.aresolve(vendor)),
+            timeout=VENDOR_KEY_PROBE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        base.update(
+            state="pending",
+            problem=(
+                f"the key for vendor {vendor.vendor_id!r} is still being read "
+                f"(more than {VENDOR_KEY_PROBE_TIMEOUT_S:g} s — typically a busy "
+                "OS keychain); the result lands in the gateway's cache"
+            ),
+        )
+        return web.json_response(base)
+    usable: Optional[bool] = True if result.key else (None if result.transient else False)
+    base.update(
+        state=result.state,
+        usable=usable,
+        transient=bool(result.transient),
+        problem=None if result.key else result.problem,
+    )
+    return web.json_response(base)
 
 
 async def models_handler(request: web.Request) -> web.Response:
@@ -1283,6 +1580,61 @@ class RequestFacts:
     #: (:func:`_carries_binary_blocks`, review batch-2 MEDIUM-1). ``False``
     #: when the body was not parsed — the ordinary text path.
     binary_body: bool = False
+    #: v0.2.105 (CL-4): the client's ``x-claude-code-compaction`` header, or
+    #: ``None`` when it sent none. Read through
+    #: :func:`model_router.usage.read_compaction_header` (one home for the
+    #: sanitising) and written to the ledger row so a compaction call can be
+    #: attributed instead of looking like a turn the user never typed.
+    compaction: Optional[str] = None
+    #: v0.2.105: which Claude login served this first-party request, and
+    #: whether it was a fallback (:mod:`model_router.accounts`). ``None`` on
+    #: a vendor route, where no Claude account answers.
+    account: Optional[AccountChoice] = None
+
+
+async def _read_login(reader: OAuthReader) -> OAuthState:
+    """One login read, with the bounded wait for a CLI mid-rewrite (the
+    2026-10-28 incident; see :mod:`model_router.auth`)."""
+    oauth = reader.read()
+    if oauth.token is None and oauth.retry_soon:
+        oauth = await reader.aread_with_brief_wait()
+    return oauth
+
+
+async def _choose_account(
+    gateway: "Gateway", headers: Mapping[str, str],
+) -> "tuple[AccountChoice, OAuthState, int]":
+    """The account that serves a first-party request, its login, and the
+    fallback episode (``0`` when there is no fallback).
+
+    Never refuses (owner ruling 2026-11-03): an account that cannot be used
+    is replaced by the fallback account and the fallback is recorded LOUDLY
+    (:meth:`AccountService.note_fallback`). Only when the fallback's own login
+    is unusable does the caller answer 401 — exactly today's behaviour for
+    the single-account install.
+    """
+    accounts = gateway.accounts
+    requested, source, early = accounts.requested(headers)
+    if early is None:
+        reader = accounts.reader(requested)
+        assert reader is not None  # noqa: S101 — `requested` resolved it
+        oauth = await _read_login(reader)
+        if oauth.token is not None:
+            accounts.note_usable(requested)
+            return AccountChoice(requested, source, requested), oauth, 0
+        if requested == PRIMARY_ACCOUNT_ID:
+            # The last resort itself: nothing to fall back to.
+            return AccountChoice(requested, source, requested), oauth, 0
+        reason = oauth.state
+    else:
+        reason = early
+    served = accounts.fallback_for(requested)
+    reader = accounts.reader(served)
+    assert reader is not None  # noqa: S101 — the fallback always resolves
+    oauth = await _read_login(reader)
+    choice = AccountChoice(requested, source, served, reason)
+    episode = accounts.note_fallback(choice)
+    return choice, oauth, episode
 
 
 def _route_label(decision: Route) -> str:
@@ -1380,6 +1732,12 @@ def _submit_usage(
         fallback_from=fallback_from,
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
+        compaction=facts.compaction,
+        account=facts.account.served if facts.account is not None else None,
+        account_source=facts.account.source if facts.account is not None else None,
+        account_fallback=(
+            facts.account.fallback_reason if facts.account is not None else None
+        ),
     )
     try:
         loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -2485,6 +2843,53 @@ def _ladder_escalation(
     return escalate
 
 
+def _inject_fallback_notice(
+    gateway: "Gateway",
+    choice: AccountChoice,
+    episode: int,
+    session: Optional[str],
+    client_payload: Mapping[str, Any],
+    forward_payload: dict,
+) -> Optional[tuple]:
+    """``(forward_payload with the fallback notice appended, claim key)``, or
+    ``None`` when this request must not carry it (not eligible, or the
+    conversation was already told). The conversation is recognised on the
+    CLIENT's own body (``client_payload``) so a gateway-side repair cannot
+    change it. The claim is held only until the upstream answers: the caller
+    releases it (:func:`_settle_notice_claim`) when the injected turn did not
+    reach the model, so the client's retry carries the notice again."""
+    if not notice_eligible(forward_payload):
+        return None
+    conv = conversation_key(session, client_payload)
+    if conv is None:
+        return None
+    key = (choice.requested, episode, conv)
+    if not gateway.accounts.notices.claim(key):
+        return None
+    try:
+        return append_notice(forward_payload, gateway.accounts.notice_for(choice)), key
+    except Exception:
+        gateway.accounts.notices.release(key)
+        raise
+
+
+def _settle_notice_claim(gateway: "Gateway", key: Optional[tuple],
+                         status: Optional[int]) -> None:
+    """Keep the "already told" claim only when the injected turn was
+    ANSWERED (2xx). A refused / failed / aborted turn (``status`` non-2xx or
+    ``None``) never reached the model, so the conversation was not told:
+    release the claim and let the client's retry of the same turn carry the
+    notice (review A5)."""
+    if key is None:
+        return
+    if status is not None and 200 <= status < 300:
+        return
+    try:
+        gateway.accounts.notices.release(key)
+    except Exception:  # noqa: BLE001 — a ledger hiccup never fails the chat
+        logger.debug("model-gateway: notice claim release failed", exc_info=True)
+
+
 async def messages_handler(request: web.Request) -> web.StreamResponse:
     """Proxy ``/v1/messages`` and ``/v1/messages/count_tokens``.
 
@@ -2741,6 +3146,8 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             )
         ),
         binary_body=_carries_binary_blocks(payload),
+        # CL-4: attribution only — nothing routes or shapes on this value.
+        compaction=read_compaction_header(request.headers),
     )
 
     headers = gateway.forward_headers(request)
@@ -2760,10 +3167,21 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     effort_translated = False
     text_only_images_omitted = 0
     clear_thinking_applied = False
+    account_note = ""
+    #: The "conversation already told" claim taken when the fallback notice
+    #: is injected; settled after the upstream answers (A5).
+    notice_key: Optional[tuple] = None
     if decision.is_anthropic:
-        oauth = gateway.oauth.read()
+        # v0.2.105: WHICH login serves this request (``x-vco-account``, else
+        # the default account), with the loud fallback when it cannot be
+        # used. The bounded re-read for a CLI mid-rewrite (2026-10-28: three
+        # minutes of 401 ``claude_login_unavailable``) happens inside, per
+        # account — see `_read_login`.
+        choice, oauth, episode = await _choose_account(gateway, request.headers)
+        facts = _dc_replace(facts, account=choice)
+        account_note = choice.access_fields()
         if oauth.token is None:
-            log_local(401, "claude_login_unavailable")
+            log_local(401, f"claude_login_unavailable {account_note}")
             return _json_error(401, "authentication_error", oauth.problem or "")
         headers["Authorization"] = f"Bearer {oauth.token}"
         beta = headers.get("anthropic-beta", "")
@@ -2803,6 +3221,27 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                         repair.summary(),
                         ", ".join(str(i) for i in repair.touched_indexes) or "-",
                     )
+
+        # v0.2.105 (owner ruling 2026-11-03): tell the MODEL about a
+        # fallback — once per conversation, appended LAST so the cached
+        # prompt prefix is untouched. See `model_router.accounts`.
+        if (
+            choice.fell_back
+            and forward_payload is not None
+            and payload is not None
+            and not is_count_tokens
+        ):
+            injected = _guarded(
+                _inject_fallback_notice,
+                gateway, choice, episode, facts.session, payload, forward_payload,
+                what="account fallback notice",
+            )
+            if injected is _ABANDON:
+                rewrite_failed = True
+            elif injected is not None:
+                forward_payload, notice_key = injected
+                mutated = True
+                account_note = f"{account_note} note=account_notice_injected"
     else:
         vendor = decision.vendor
         assert vendor is not None  # noqa: S101 — guaranteed by Route
@@ -2948,6 +3387,8 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
 
     body: "bytes | AsyncIterator[bytes]"
     note = "note=rewrite_failed" if rewrite_failed else ""
+    if account_note:
+        note = f"{note} {account_note}".strip()
     # Per-transform notes (items a/f). Each says a request-shaping fired,
     # with the count where one is meaningful, and none of them logs a body
     # byte. Assembled here so they ride EVERY access line this request writes.
@@ -3021,27 +3462,34 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         images=images_field,
         facts=facts,
     )
-    return await _proxy(
-        request,
-        gateway,
-        decision,
-        url,
-        headers,
-        body,
-        requested_model=str(requested_model),
-        stream_requested=stream_requested,
-        started=started,
-        note=note,
-        images=images_field,
-        facts=facts,
-        ladder_escalate=ladder_hook,
-        effort_requested=effort_requested,
-        effort_forwarded=effort_forwarded,
-    )
+    try:
+        response = await _proxy(
+            request,
+            gateway,
+            decision,
+            url,
+            headers,
+            body,
+            requested_model=str(requested_model),
+            stream_requested=stream_requested,
+            started=started,
+            note=note,
+            images=images_field,
+            facts=facts,
+            ladder_escalate=ladder_hook,
+            effort_requested=effort_requested,
+            effort_forwarded=effort_forwarded,
+        )
+    except BaseException:
+        _settle_notice_claim(gateway, notice_key, None)
+        raise
+    _settle_notice_claim(gateway, notice_key, getattr(response, "status", None))
+    return response
 
 
 def _reread_oauth_headers(
     gateway: "Gateway", headers: dict[str, str],
+    account: "Optional[AccountChoice]" = None,
 ) -> "Optional[dict[str, str]]":
     """Headers carrying a NEWER Claude login, or ``None`` if nothing changed.
 
@@ -3057,7 +3505,12 @@ def _reread_oauth_headers(
     without owning any part of the refresh protocol. ``None`` means the file
     still holds the token we just used, so a retry would only repeat the 401.
     """
-    fresh = gateway.oauth.read()
+    # v0.2.105: the SAME account's file — a 401 on one login is never
+    # answered with another login's token.
+    reader = (
+        gateway.accounts.reader(account.served) if account is not None else None
+    ) or gateway.oauth
+    fresh = reader.read(fresh=True)
     if not fresh.token:
         return None
     presented = headers.get("Authorization", "")
@@ -3066,6 +3519,186 @@ def _reread_oauth_headers(
     updated = dict(headers)
     updated["Authorization"] = f"Bearer {fresh.token}"
     return updated
+
+
+class UpstreamHeadersTimeout(asyncio.TimeoutError):
+    """The response-headers bound (:meth:`GatewayConfig.headers_timeout_s`)
+    expired. Its own class so the caller can tell it from aiohttp's
+    ``ServerTimeoutError`` family, which is ALSO an ``asyncio.TimeoutError``
+    and means something else (connect bound, idle bound)."""
+
+
+def _is_pre_send_failure(exc: BaseException) -> bool:
+    """True only for failures where aiohttp provably wrote NOTHING upstream.
+
+    ``ClientConnectorError`` (DNS failure, refused, no route) and
+    ``ConnectionTimeoutError`` are raised only from ``connector.connect()``,
+    before ``req.send()`` (aiohttp 3.13 ``client.py``
+    ``_connect_and_send_request``), so a second attempt cannot duplicate a
+    request. TLS failures (``ClientSSLError``, a ``ClientConnectorError``
+    subclass) are pre-send too but not transient: a certificate does not fix
+    itself in 75 s, so they are answered at once.
+
+    Everything else — ``ServerDisconnectedError``, ``ClientOSError`` after
+    connect (a reset), ``SocketTimeoutError`` (idle bound), the headers bound
+    — can happen after the body was fully written, so the upstream may
+    already hold (and bill) the request. aiohttp itself refuses to retry a
+    POST there (``retry_persistent_connection`` is idempotent methods only).
+    """
+    if isinstance(exc, aiohttp.ClientSSLError):
+        return False
+    return isinstance(
+        exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError),
+    )
+
+
+
+def _classify_upstream_error(exc: BaseException) -> "tuple[str, str, dict]":
+    """``(reason, access note, response headers)`` for an upstream failure
+    that reached the client (after any in-gateway retry).
+
+    * ``ClientConnectorError`` — unreachable (DNS, refused, no route, TLS):
+      never connected, so after the in-gateway retry window where one
+      applies (:func:`_acquire_upstream`); ``retry-after`` paces the client's
+      retry because the window is spent.
+    * ``ClientPayloadError`` — the GATEWAY's own streamed request body (the
+      over-buffer path) failed while being sent: not the upstream's fault,
+      and the client's retry decides.
+    * anything else — disconnected or reset after the connection existed:
+      the upstream may have the request, so the gateway did NOT re-send it.
+    """
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        return "unreachable", "upstream_unreachable", RETRYABLE_502_HEADERS
+    if isinstance(exc, aiohttp.ClientPayloadError):
+        return ("failed while the gateway was sending the request body",
+                "request_body_failed", RETRYABLE_HEADERS)
+    return ("dropped the connection before answering", "upstream_dropped",
+            RETRYABLE_HEADERS)
+
+async def _acquire_upstream(
+    gateway: Gateway,
+    url: str,
+    body: "bytes | bytearray | AsyncIterator[bytes]",
+    headers: "Mapping[str, str]",
+    *,
+    label: str,
+) -> aiohttp.ClientResponse:
+    """Open ONE upstream request and wait for its response headers.
+
+    Every phase before the headers is bounded (2026-11-04 03:08 incident:
+    a DNS resolution that stalled instead of failing was accepted and never
+    answered — ``sock_connect`` covers only the TCP handshake, DNS and the
+    connection pool were bounded only by ``connect``, which was unset, and
+    ``total`` was deliberately ``None``):
+
+    * pool + DNS + TCP connect — aiohttp's ``connect`` (set here);
+    * the wait after the upload — ``sock_read`` (the idle bound), which
+      aiohttp starts once the body is written;
+    * the whole acquisition, a stalled UPLOAD included — the headers bound
+      (:meth:`GatewayConfig.headers_timeout_s`, the idle bound plus an upload
+      allowance by default, so it never cuts a non-streaming completion the
+      idle bound would have let finish).
+
+    What is deliberately NOT bounded is the streaming body after the
+    headers: a healthy completion may run for many minutes, and the idle
+    bound (``sock_read``) stays the only body bound.
+
+    Retried — with bounded backoff while ``upstream_retry_window_s`` lasts —
+    are ONLY failures where nothing was sent upstream
+    (:func:`_is_pre_send_failure`), so a brief DNS or connect outage is
+    invisible to the chat and a request is never delivered twice. Any other
+    failure raises on its first occurrence for the caller to answer the
+    retryable 502; the client's own retry decides. A body that is not
+    re-sendable bytes (the over-buffer streaming path) is never retried.
+
+    Returns the response with headers received; the CALLER owns it (``async
+    with``). Raises ``RuntimeError`` (session not started — a programming
+    error), :class:`UpstreamHeadersTimeout`, or an ``aiohttp.ClientError`` /
+    ``OSError`` (transport).
+    """
+    config = gateway.config
+    headers_bound = config.headers_timeout_s()
+    resendable = isinstance(body, (bytes, bytearray))
+    deadline = (
+        time.monotonic() + config.upstream_retry_window_s
+        if resendable and config.upstream_retry_window_s > 0
+        else None
+    )
+    token = gateway.upstream_flight.enter(label)
+    attempt = 0
+    try:
+        while True:
+            attempt += 1
+            try:
+                ctx = gateway.session.post(
+                    url,
+                    data=body,
+                    headers=dict(headers),
+                    # NO total budget, on purpose: a completion runs as long
+                    # as it runs, and a total one cut a healthy 601 s stream
+                    # on 2026-09-09. What is bounded is every phase before
+                    # the body: REACHING the upstream (`connect`, which
+                    # unlike `sock_connect` also covers DNS resolution and
+                    # connection-pool acquisition — the 2026-11-04 hang was
+                    # exactly a phase only `connect` bounds) and going quiet
+                    # (`sock_read`). The whole acquisition is bounded by the
+                    # `asyncio.timeout` below.
+                    timeout=aiohttp.ClientTimeout(
+                        total=None,
+                        connect=config.upstream_connect_timeout_s,
+                        sock_connect=config.upstream_connect_timeout_s,
+                        sock_read=config.upstream_idle_timeout_s,
+                    ),
+                )
+                # `await ctx` runs the request INLINE in this task (no inner
+                # Task, unlike `wait_for` on 3.11), so a cancellation either
+                # lands inside aiohttp — whose own `except BaseException`
+                # closes the response and the connection — or after the
+                # response is ours, at the caller's next await, by which time
+                # the caller holds it in `async with`. Nothing can drop a
+                # received response unreleased in between.
+                bound = asyncio.timeout(headers_bound)
+                try:
+                    async with bound:
+                        response = await ctx
+                except TimeoutError as exc:
+                    if bound.expired():
+                        raise UpstreamHeadersTimeout() from exc
+                    raise
+            except RuntimeError:
+                # `gateway.session` raised before start() — a programming
+                # error, not a network condition; the caller's own branch
+                # answers it.
+                raise
+            except (aiohttp.ClientError, OSError) as exc:
+                if not _is_pre_send_failure(exc):
+                    # The upstream may already have this request: never
+                    # re-send it. (`UpstreamHeadersTimeout` — a TimeoutError,
+                    # hence an OSError — lands here too and is re-raised by
+                    # this check, for the same reason.)
+                    raise
+                now = time.monotonic()
+                gateway.upstream_outages.failure(label, exc)
+                if deadline is None or now >= deadline:
+                    if attempt > 1:
+                        logger.warning(
+                            "model-gateway: upstream %s unreachable after %d "
+                            "attempt(s) (%.0fs retry window); answering 502",
+                            label, attempt, config.upstream_retry_window_s,
+                        )
+                    raise
+                backoff = min(
+                    _UPSTREAM_RETRY_BACKOFF_CAP_S,
+                    _UPSTREAM_RETRY_BACKOFF_S * 2 ** (attempt - 1),
+                    max(0.0, deadline - now),
+                )
+                if backoff > 0:
+                    await asyncio.sleep(backoff)
+                continue
+            gateway.upstream_outages.recovery(label)
+            return response
+    finally:
+        gateway.upstream_flight.exit(token)
 
 
 async def _proxy(
@@ -3260,27 +3893,84 @@ async def _proxy(
                 )
 
     try:
-        upstream_ctx = gateway.session.post(
-            url,
-            data=body,
-            headers=headers,
-            # NO total budget, on purpose: a completion runs as long as it
-            # runs, and a total one cut a healthy 601 s stream on 2026-09-09.
-            # What is bounded is CONNECTING and going quiet — the two
-            # conditions that actually mean the upstream is not coming back.
-            timeout=aiohttp.ClientTimeout(
-                total=None,
-                sock_connect=UPSTREAM_CONNECT_TIMEOUT_S,
-                sock_read=gateway.config.upstream_idle_timeout_s,
-            ),
+        upstream = await _acquire_upstream(
+            gateway, url, body, headers, label=decision.family_id,
         )
     except RuntimeError as exc:  # session not started — a programming error
         logger.error("model-gateway: %s", exc)
         access(502, stream=stream_requested)
         return _json_error(502, "api_error", str(exc), headers=RETRYABLE_HEADERS)
+    except UpstreamHeadersTimeout:
+        # The headers bound (2026-11-04): the request was issued but no
+        # response headers arrived within the bound — a stalled upload, or
+        # an upstream that kept the connection busy without committing to a
+        # status. Never retried: the upstream may hold the request.
+        bound = gateway.config.headers_timeout_s()
+        logger.warning(
+            "model-gateway: %s -> %s sent no response headers within %ss",
+            _log_safe(decision.forward_model), decision.family_id, bound,
+        )
+        access(502, stream=stream_requested, extra="note=upstream_timeout")
+        return _json_error(
+            502,
+            "api_error",
+            f"upstream {decision.upstream} sent no response headers within "
+            f"{bound}s",
+            headers=RETRYABLE_HEADERS,
+        )
+    except aiohttp.ConnectionTimeoutError:
+        # The connect bound: pool + DNS + TCP did not complete — the
+        # upstream was never reached (the 2026-11-04 incident's phase). Must
+        # precede the idle branch below: both are `ServerTimeoutError`s.
+        bound = gateway.config.upstream_connect_timeout_s
+        logger.warning(
+            "model-gateway: %s -> %s unreachable: no connection within %ss "
+            "(connection pool, DNS or TCP connect)",
+            _log_safe(decision.forward_model), decision.family_id, bound,
+        )
+        access(502, stream=stream_requested, extra="note=upstream_unreachable")
+        return _json_error(
+            502,
+            "api_error",
+            f"upstream {decision.upstream} unreachable: no connection within "
+            f"{bound}s (connection pool, DNS or TCP connect)",
+            headers=RETRYABLE_502_HEADERS,
+        )
+    except asyncio.TimeoutError:
+        # aiohttp's `sock_read` (the idle bound) BEFORE the headers: the
+        # request went out and the upstream then said nothing for the whole
+        # idle bound — the same condition, and the same words, as going
+        # quiet mid-body below.
+        logger.warning(
+            "model-gateway: %s -> %s went quiet for %ss",
+            _log_safe(decision.forward_model), decision.family_id,
+            gateway.config.upstream_idle_timeout_s,
+        )
+        access(502, stream=stream_requested, extra="note=upstream_timeout")
+        return _json_error(
+            502,
+            "api_error",
+            f"upstream {decision.upstream} sent nothing for "
+            f"{gateway.config.upstream_idle_timeout_s}s",
+            headers=RETRYABLE_HEADERS,
+        )
+    except (aiohttp.ClientError, OSError) as exc:
+        reason, note, retry_headers = _classify_upstream_error(exc)
+        logger.warning(
+            "model-gateway: %s -> %s %s: %s",
+            _log_safe(decision.forward_model), decision.family_id, reason,
+            _log_safe(exc),
+        )
+        access(502, stream=stream_requested, extra=f"note={note}")
+        return _json_error(
+            502,
+            "api_error",
+            f"upstream {decision.upstream} {reason}: {exc}",
+            headers=retry_headers,
+        )
 
     try:
-        async with upstream_ctx as upstream:
+        async with upstream:
             if (
                 allow_oauth_retry
                 and decision.is_anthropic
@@ -3294,7 +3984,9 @@ async def _proxy(
                 # sent twice — that request carries the 401 to the client,
                 # which is what native does when its own retry is impossible.
                 # `allow_oauth_retry=False` below is what bounds this at one.
-                refreshed = _reread_oauth_headers(gateway, headers)
+                refreshed = _reread_oauth_headers(
+                    gateway, headers, facts.account if facts is not None else None,
+                )
                 if refreshed is not None:
                     return await _proxy(
                         request,
@@ -3484,6 +4176,9 @@ async def _proxy(
                 _guarded(
                     gateway.usage_windows.observe_anthropic_headers,
                     upstream.headers,
+                    # Filed under the account that SERVED it (v0.2.105).
+                    facts.account.served
+                    if facts is not None and facts.account is not None else None,
                     what="usage-window header capture",
                 )
             content_type = upstream.headers.get("Content-Type", "application/json")
@@ -4517,7 +5212,7 @@ async def not_found_handler(request: web.Request) -> web.Response:
         404,
         "not_found_error",
         f"the model gateway has no route for {request.path!r}. It serves "
-        "/health, /usage, /usage/windows, /v1/models, /v1/messages and "
+        "/health, /usage, /usage/windows, /vendor-keys, /v1/models, /v1/messages and "
         "/v1/messages/count_tokens.",
     )
 
@@ -4555,6 +5250,7 @@ def create_app(
     )
     _add_route(app, "HEAD", "/api/hello", hello_handler, name="hello_head")
     _add_route(app, "GET", "/api/hello", hello_handler, name="hello_get")
+    _add_route(app, "GET", "/vendor-keys", vendor_keys_handler, name="vendor_keys")
     _add_route(app, "GET", "/v1/models", models_handler, name="models")
     _add_route(app, "POST", "/v1/messages", messages_handler, name="messages")
     _add_route(

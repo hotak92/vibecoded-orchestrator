@@ -113,6 +113,11 @@ pub mod model_gateway;
 // itself is Python (`python -m vco_lib.model_guidance`); this module only
 // fires it and transports its payload.
 pub mod model_guidance;
+// v0.2.105: the machine-wide per-provider switch behind the Home page's
+// "Model providers" card. The setting, its reader and its writer are
+// `vco_lib.model_providers` (rung A); this module spawns it and passes the
+// payload through.
+pub mod model_providers;
 // v0.2.97: after an update, "is the running gateway still on the previous
 // release's code?" and the Continue that restarts it. Never automatic — a
 // restart ends every agent session routed through the gateway. The verdict
@@ -126,6 +131,9 @@ pub mod codegraph_parsers;
 // are the gateway's (`GET /usage/windows`), read through
 // `python -m vco_lib.gateway_usage` so the host token never enters Rust.
 pub mod gateway_usage;
+// v0.2.105: Claude accounts served by the model gateway (registry, default,
+// per-project choice), through `python -m vco_lib.gateway_accounts`.
+pub mod gateway_accounts;
 // v0.2.33 Agent A (L0): public-catalog endpoint client. Fetches paid-module
 // catalog metadata from the launcher-controlled Supabase edge function with
 // retry-with-backoff + 15min app_state-backed cache + schema_version

@@ -15,7 +15,7 @@
 #
 #   . (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
 #   & $PsExe -NoProfile -File $helper @args
-#   Start-Process -FilePath $PsExe -ArgumentList @('-NoProfile','-File',$helper)
+#   Start-VcoDetachedProcess -FilePath $PsExe -ArgumentList @('-NoProfile','-File',$helper)
 #
 # Preference order: pwsh (7+, faster startup, the flavour the helpers are
 # tested against) -> powershell (5.1 fallback - the helpers stick to
@@ -38,7 +38,10 @@ $PsExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { '
 # console window flashing on every hook fire. Beyond the field impact, an
 # unguarded site is UNTESTABLE on a Linux/macOS CI host -- the spawn dies
 # before it can be observed -- which is why the guard lives here and not at
-# five call sites.
+# five call sites. (Since v0.2.105 neither branch below calls Start-Process,
+# so the quirk can no longer bite here; QUIRK 5 says why the Windows branch
+# dropped it. The rule stands for any Start-Process a hook might add: don't -
+# call these wrappers.)
 #
 # QUIRK 2: `-RedirectStandardOutput` and `-RedirectStandardError` may not
 # name the SAME file, on any edition: "This command cannot be run because
@@ -96,15 +99,19 @@ $PsExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { '
 # pre-existing EPIPE on explicit-redirect callers such as
 # stop-drain-citations.ps1). The default stderr log lives under
 # $VCT_STATE_DIR/logs (default ~/.vct/logs) with a size bound, not /tmp,
-# so it cannot accumulate unbounded. Windows behaviour is unchanged:
-# hidden window, Start-Process, caller-provided redirects honoured
-# exactly as before.
+# so it cannot accumulate unbounded.
+#
+# QUIRK 5 (v0.2.105): on Windows a Start-Process child got a NEW console
+# that -WindowStyle Hidden only asked to hide - a console window flashed on
+# every detached spawn, several per minute in normal use. The Windows branch
+# no longer calls Start-Process at all: it hands the spawn to the ONE Python
+# home, vco_lib/windowless_spawn.py, which starts the child with
+# CREATE_NO_WINDOW (a console that has no window). See the branch itself.
 
-# True when this edition accepts `-WindowStyle`. $IsWindows is undefined on
-# PowerShell 5.1 (which only exists on Windows), so "unset" means Windows.
-function Test-VcoHiddenWindowSupported {
-    return (($null -eq $IsWindows) -or $IsWindows)
-}
+# This lib's own folder, captured while it is being dot-sourced (inside a
+# function $PSScriptRoot is not guaranteed to name it on every edition): the
+# Windows branch finds resolve-vco-venv.ps1 and the hooks folder from it.
+$script:VcoResolvePowershellLibDir = $PSScriptRoot
 
 # Bound for the shared detached-children stderr log (same diagnostic-tail
 # bound the kg-sync-debounce log uses). Past it the log is restarted
@@ -158,10 +165,6 @@ function Start-VcoDetachedProcess {
         [string]$RedirectStandardInput,
         [switch]$PassThru
     )
-    $spawn = @{
-        FilePath    = $FilePath
-        ErrorAction = 'SilentlyContinue'
-    }
     # QUIRK 2 diversion first: identical redirect targets are rejected by
     # Start-Process on every edition (Windows branch below) and would leave
     # two fd offsets interleaving on one file (POSIX branch below) - divert
@@ -176,7 +179,11 @@ function Start-VcoDetachedProcess {
     # kernel-level fd redirection instead; caller-supplied redirect paths
     # are folded into the same exec line (which also fixes the pre-existing
     # EPIPE on explicit-redirect callers such as stop-drain-citations.ps1).
-    if ($null -ne $IsWindows -and -not $IsWindows) {
+    # $script:VcoSpawnViaWindowlessHelper (set only by tests, after
+    # dot-sourcing) routes a POSIX host through the Windows branch below, so
+    # its wiring - spec, helper resolution, pid handshake, -PassThru exit
+    # code - runs end to end on a Linux/macOS CI host too.
+    if ($null -ne $IsWindows -and -not $IsWindows -and -not $script:VcoSpawnViaWindowlessHelper) {
         $proc = $null
         $failure = ''
         try {
@@ -241,59 +248,167 @@ function Start-VcoDetachedProcess {
         if ($PassThru) { return $proc }
         return
     }
-    # PowerShell 5.1 rejects an EMPTY -ArgumentList (ValidateNotNullOrEmpty),
-    # so omit the parameter entirely rather than passing @().
-    if ($ArgumentList -and $ArgumentList.Count -gt 0) {
-        # QUIRK 3 above: an ARRAY is space-joined and re-split by the child.
-        # Encode each element per CommandLineToArgvW and pass ONE joined
-        # string, so whitespace, embedded quotes, backslashes and empty
-        # elements all survive the roundtrip.
-        $parts = foreach ($el in $ArgumentList) {
-            if ($el -eq '' -or $el -match '\s' -or $el.Contains('"') -or $el.EndsWith('\')) {
-                '"' + ($el -replace '(\\*)"', '$1$1\"' -replace '(\\*)$', '$1$1') + '"'
-            } else {
-                $el
-            }
-        }
-        $spawn['ArgumentList'] = $parts -join ' '
-    }
-    if ($WorkingDirectory) { $spawn['WorkingDirectory'] = $WorkingDirectory }
-    if ($RedirectStandardInput) { $spawn['RedirectStandardInput'] = $RedirectStandardInput }
-    if ($RedirectStandardOutput) { $spawn['RedirectStandardOutput'] = $RedirectStandardOutput }
-    # QUIRK 2 diversion already applied to $errPath above (shared with the
-    # POSIX branch).
-    if ($errPath) { $spawn['RedirectStandardError'] = $errPath }
-    if (Test-VcoHiddenWindowSupported) { $spawn['WindowStyle'] = 'Hidden' }
-    # SOFT-FAIL, BUT NOT SILENT. A spawn that cannot start must never break
-    # the hook (these are all best-effort background paths), but swallowing
-    # the reason is how the two quirks above survived for releases: the work
-    # stopped happening and NOTHING said so. So: never throw, and always emit
-    # one line naming the executable and the cmdlet's own message.
-    # [Console]::Error goes straight to stderr, so it cannot pollute the
-    # -PassThru return value the way Write-Error/Write-Output would.
-    # BOTH error shapes must be caught. `Start-Process` reports some failures
-    # as NON-terminating errors (an invalid -WorkingDirectory) and others by
-    # ThrowTerminatingError (an unwritable -RedirectStandardOutput path);
-    # `-ErrorAction SilentlyContinue` only governs the first, so an
-    # ErrorVariable alone still lets PowerShell print its whole error block
-    # and, in a hook, that lands wherever the hook's stderr goes.
-    $spawnErr = $null
-    $proc = $null
-    $failure = ''
-    if ($PassThru) { $spawn['PassThru'] = $true }
-    try {
-        $proc = Start-Process @spawn -ErrorVariable spawnErr
-        if ($spawnErr -and $spawnErr.Count -gt 0) { $failure = [string]$spawnErr[0] }
-    } catch {
-        $failure = $_.Exception.Message
-    }
-    if ($failure) {
+    # Windows (v0.2.105): NEVER Start-Process. Start-Process gives every
+    # console child a NEW console (CREATE_NEW_CONSOLE / ShellExecute) and only
+    # ASKS for it to be hidden (-WindowStyle Hidden is a SW_HIDE show-window
+    # hint on that new console - which the console host may show anyway, e.g.
+    # when Windows 11 hands new consoles to its default terminal). And .NET's
+    # own Process.Start - the only CreateNoWindow spawn PowerShell has - makes
+    # the child inherit EVERY inheritable handle of this hook, the harness's
+    # stdout pipe included, so a child that outlives the hook would hold that
+    # pipe open after the hook exits. So the spawn is handed to the ONE Python
+    # home, vco_lib/windowless_spawn.py (stdlib-only, run with -I): it starts
+    # the child with CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP (its own
+    # console with NO window, which everything it starts shares) and
+    # close_fds (no inherited hook pipes), prints the child's pid, and exits.
+    # With -PassThru it instead waits for the child and exits with ITS exit
+    # code, and the helper's process object is what is returned: WaitForExit /
+    # ExitCode then speak for the child. (The helper itself, started by .NET,
+    # does inherit the hook's handles - for milliseconds without -PassThru;
+    # the -PassThru callers either wait for it or run in an async hook.)
+    $tramp = Get-VcoWindowlessTrampoline
+    if (-not $tramp.Python) {
         try {
             [Console]::Error.WriteLine(
-                "[vco] detached spawn FAILED for '$FilePath': $failure")
+                "[vco] detached spawn FAILED for '$FilePath': $($tramp.Problem)")
         } catch { }
+        return
     }
-    if ($PassThru) { return $proc }
+    $cwd = $WorkingDirectory
+    if (-not $cwd) {
+        # Start-Process's default: PowerShell's current FileSystem location
+        # (not the process cwd, which Set-Location does not move).
+        try { $cwd = (Get-Location -PSProvider FileSystem).ProviderPath } catch { $cwd = '' }
+    }
+    $stdErrTarget = $errPath
+    $stdErrAppend = $false
+    if (-not $stdErrTarget) {
+        # The same shared, bounded diagnostic tail the POSIX branch appends to.
+        $stdErrTarget = Get-VcoDetachedErrLog
+        $stdErrAppend = [bool]$stdErrTarget
+    }
+    $specB64 = New-VcoWindowlessSpawnSpec -FilePath $FilePath -ArgumentList $ArgumentList `
+        -WorkingDirectory $cwd -StdIn $RedirectStandardInput -StdOut $RedirectStandardOutput `
+        -StdErr $stdErrTarget -StdErrAppend $stdErrAppend -Wait ([bool]$PassThru)
+    # SOFT-FAIL, BUT NOT SILENT: a spawn that cannot start never breaks the
+    # hook (these are best-effort background paths), and always leaves one
+    # stderr line naming the executable and the reason. [Console]::Error goes
+    # straight to stderr, so it cannot pollute the -PassThru return value.
+    $trampProc = $null
+    $failure = ''
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $tramp.Python
+        $psi.Arguments = Get-VcoWindowlessTrampolineArguments -Script $tramp.Script -SpecB64 $specB64
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $trampProc = [System.Diagnostics.Process]::Start($psi)
+        # The pid line arrives once the child has started; EOF without one
+        # means the helper reported a failed start on stderr and exited.
+        $pidLine = $trampProc.StandardOutput.ReadLine()
+        if (-not $pidLine) {
+            $trampProc.WaitForExit()
+            $failure = ($trampProc.StandardError.ReadToEnd()).Trim()
+            if (-not $failure) {
+                $failure = "[vco] detached spawn FAILED for '$FilePath': the spawn helper exited $($trampProc.ExitCode) without starting it"
+            }
+            $trampProc = $null
+        }
+    } catch {
+        $failure = "[vco] detached spawn FAILED for '$FilePath': $($_.Exception.Message)"
+        $trampProc = $null
+    }
+    if ($failure) {
+        try { [Console]::Error.WriteLine($failure) } catch { }
+    }
+    if ($PassThru) { return $trampProc }
+}
+
+# The interpreter + script of the windowless spawn helper, resolved once per
+# hook process: @{ Python; Script; Problem }. The helper is stdlib-only and
+# ships with the orchestrator, so the VCO venv's Python runs it; failing to
+# resolve either is a BROKEN install, which the caller reports (never works
+# around).
+function Get-VcoWindowlessTrampoline {
+    if ($script:VcoWindowlessTrampoline) { return $script:VcoWindowlessTrampoline }
+    $result = @{ Python = $null; Script = $null; Problem = '' }
+    try {
+        $libDir = $script:VcoResolvePowershellLibDir
+        if (-not $libDir) { $libDir = $PSScriptRoot }
+        if (-not (Get-Command Resolve-VcoVenvPython -ErrorAction SilentlyContinue)) {
+            $venvLib = Join-Path $libDir 'resolve-vco-venv.ps1'
+            if (Test-Path -LiteralPath $venvLib -PathType Leaf) { . $venvLib }
+        }
+        $hooksDir = Split-Path -Parent $libDir
+        $py = $null
+        $helper = $null
+        if (Get-Command Resolve-VcoVenvPython -ErrorAction SilentlyContinue) {
+            $py = Resolve-VcoVenvPython -ScriptDir $hooksDir
+            $helper = Resolve-VcoOrchestratorScript -ScriptDir $hooksDir -RelPath 'vco_lib/windowless_spawn.py'
+        }
+        if (-not $py) {
+            $result.Problem = 'the VCO venv Python could not be resolved (VCT_VENV / VCT_INSTALL_ROOT unset or stale) - a broken install; re-run the orchestrator update'
+        } elseif (-not $helper) {
+            $result.Problem = 'vco_lib/windowless_spawn.py was not found under the orchestrator root (VCT_INSTALL_ROOT / VCT_ORCHESTRATOR_ROOT) - a broken install; re-run the orchestrator update'
+        } else {
+            $result.Python = $py
+            $result.Script = $helper
+        }
+    } catch {
+        $result.Problem = "the windowless spawn helper could not be resolved: $($_.Exception.Message)"
+    }
+    if ($result.Python) { $script:VcoWindowlessTrampoline = $result }
+    return $result
+}
+
+# The spawn spec the helper reads (vco_lib/windowless_spawn.py, `main`):
+# UTF-8 JSON, base64-encoded so the command line carries only
+# [A-Za-z0-9+/=] - no element can lose its boundaries, quotes or emptiness
+# on the way (QUIRK 3 cannot arise). Every argv element is its own JSON
+# string.
+function New-VcoWindowlessSpawnSpec {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$WorkingDirectory,
+        [string]$StdIn,
+        [string]$StdOut,
+        [string]$StdErr,
+        [bool]$StdErrAppend,
+        [bool]$Wait
+    )
+    $argv = New-Object System.Collections.Generic.List[string]
+    $argv.Add($FilePath)
+    if ($ArgumentList) {
+        foreach ($el in $ArgumentList) {
+            if ($null -ne $el) { $argv.Add([string]$el) }
+        }
+    }
+    $spec = [ordered]@{
+        argv          = $argv.ToArray()
+        cwd           = $WorkingDirectory
+        stdin         = $StdIn
+        stdout        = $StdOut
+        stderr        = $StdErr
+        stderr_append = $StdErrAppend
+        wait          = $Wait
+    }
+    $json = ConvertTo-Json -InputObject $spec -Compress -Depth 4
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+}
+
+# The helper's command line: isolated mode (-I: no user site, no PYTHON*
+# variables, no script directory on sys.path - nothing in the project folder
+# or the caller's env can shadow a stdlib module), the quoted script path,
+# then `detach --spec-b64 <b64>`.
+function Get-VcoWindowlessTrampolineArguments {
+    param(
+        [Parameter(Mandatory = $true)][string]$Script,
+        [Parameter(Mandatory = $true)][string]$SpecB64
+    )
+    return ('-I "{0}" detach --spec-b64 {1}' -f $Script, $SpecB64)
 }
 
 # Detached PowerShell child. $Command is a PowerShell expression run in the

@@ -84,7 +84,9 @@ EXPECTED_NOTES = [
                             "research, surveys, bulk and bounded implementation. "
                             "Users report fragile tool calls / loops on long runs "
                             "— keep tasks bounded. Accurate as a read-only "
-                            "verifier of bounded fix deltas."),
+                            "verifier of bounded fix deltas: `deepseek-researcher` "
+                            "takes fix-delta verifications and bounded code "
+                            "reviews."),
     ("glm-5.3", "**GLM-5.3** — the non-Claude model users route review/audit to; "
                 "text-only."),
     ("glm-5.3", "**GLM-5.3 as implementer** — strong on bounded lanes whose brief "
@@ -113,7 +115,9 @@ EXPECTED_NOTES = [
                       "call-site leaves the suite green while defeating the "
                       "change, and never give it unsupervised writes to a green "
                       "test suite (it broke a passing baseline test in 6.9% of "
-                      "rollouts)."),
+                      "rollouts). `glm-flash-researcher` takes bounded code "
+                      "reviews and fix-delta verifications; a large first-pass "
+                      "review stays on GLM-5.3."),
     ("qwen3.8-max", "**Qwen3.8-Max** — best prose and literal instruction-"
                     "following, but it defaults to xhigh effort (≈$5.4 per task "
                     "there) and users report it leaves work half-done and skips "

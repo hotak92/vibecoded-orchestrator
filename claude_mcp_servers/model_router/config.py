@@ -105,6 +105,35 @@ Environment knobs (all optional; every one is read by code in this package)
     memory, and raising it does the reverse. A non-numeric or non-positive
     value falls back to the default (:func:`vco_lib.env_values.env_int`): an unbounded buffer
     is not a state a typo should be able to reach.
+``VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S``
+    Seconds from issuing an upstream request to the arrival of its response
+    HEADERS. Unset, the bound is :attr:`GatewayConfig.upstream_idle_timeout_s`
+    plus :data:`UPSTREAM_UPLOAD_ALLOWANCE_S` (1800 + 600 = 2400 s), so a
+    non-streaming completion — whose headers arrive only when the whole
+    answer is ready — keeps the full idle bound it always had, counted from
+    the end of its upload. It is the backstop for a body UPLOAD that stalls
+    (an upstream that stops reading), the one pre-header phase no other bound
+    covers; DNS, the pool and the connect have their own 30 s bound. The
+    streaming body AFTER the headers is never bounded by it. Accepted range:
+    finite, above 0 and at most :data:`UPSTREAM_HEADERS_TIMEOUT_MAX_S`;
+    anything else (garbage, ``0``, a negative, ``inf``, ``nan``, too large)
+    keeps the default.
+``VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S``
+    Seconds during which the gateway may START another attempt after a
+    failure that provably sent nothing upstream — aiohttp's
+    ``ClientConnectorError`` (DNS failure, connect refused or reset, no
+    route; TLS certificate/handshake errors excepted, they are not
+    transient) and ``ConnectionTimeoutError`` (the 30 s pool + DNS + connect
+    bound) — before answering the retryable 502 (default
+    :data:`DEFAULT_UPSTREAM_RETRY_WINDOW_S`, 75; ``0`` answers the first
+    failure). Anything that can happen after the body was written (server
+    disconnected, a reset after connect, the idle or headers bound) is
+    NEVER retried here: the upstream may already have the request, so it is
+    answered with the retryable 502 at once and the client's own retry
+    decides. Only re-sendable byte bodies retry. The worst-case wait before
+    the 502 is this window plus one connect bound (75 + 30 = 105 s with the
+    defaults). Accepted range: finite, ``0`` to
+    :data:`UPSTREAM_RETRY_WINDOW_MAX_S`; anything else keeps the default.
 """
 
 from __future__ import annotations
@@ -116,7 +145,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from vco_lib.env_values import env_int
+from vco_lib.env_values import env_float, env_int
+from vco_lib.gateway_accounts import accounts_path
 from vco_lib.intfile import read_int_line
 from vco_lib.paths import claude_user_dir, vct_root_dir
 
@@ -190,14 +220,84 @@ DEFAULT_KEY_TTL_S = 300
 #: there is deliberately no total one.
 DEFAULT_UPSTREAM_IDLE_TIMEOUT_S = 1800.0
 
-#: Seconds to wait for the TCP connection to an upstream. Short and separate
-#: from the idle bound: failing to CONNECT is a different condition from a
-#: slow answer, and it is the one that should fail fast — a wrong or dead
-#: upstream must surface as a 502 the client can retry, not as a half-hour
-#: hang. Not a knob: no machine needs a different value, and the one thing
-#: that could go wrong (a network that takes 40 s to connect) is better
-#: reported than waited on.
+#: Seconds to wait for reaching an upstream — connection-pool acquisition,
+#: DNS RESOLUTION and the TCP connect together. Short and separate from the
+#: idle bound: failing to CONNECT is a different condition from a slow
+#: answer, and it is the one that should fail fast — a wrong or dead upstream
+#: must surface as a 502 the client can retry, not as a half-hour hang. Not a
+#: knob: no machine needs a different value, and the one thing that could go
+#: wrong (a network that takes 40 s to connect) is better reported than
+#: waited on.
+#:
+#: The 2026-11-04 03:08 incident is why this now has to cover DNS and the
+#: pool too, not just the socket connect: the old value was passed as
+#: aiohttp's ``sock_connect`` alone, which bounds ONLY the TCP handshake. A
+#: DNS resolution that stalled instead of failing (and a connection-pool
+#: wait, which aiohttp bounds only through ``connect``) therefore had NO
+#: bound at all while ``total`` was deliberately ``None`` — one client retry
+#: was accepted, never answered, and held its connection open for hours
+#: until VS Code was restarted. ``connect=`` bounds every phase before the
+#: socket exists; tests set it per-gateway through
+#: :attr:`GatewayConfig.upstream_connect_timeout_s` (still not an env knob —
+#: no machine needs a different value).
 UPSTREAM_CONNECT_TIMEOUT_S = 30
+
+#: Seconds of body UPLOAD the response-headers bound allows for, on top of
+#: the idle bound. The headers of a NON-streaming completion arrive only when
+#: the whole answer is ready, and before v0.2.105 the only bound on that wait
+#: was ``sock_read`` (the idle bound), which aiohttp starts AFTER the body is
+#: written. A headers bound counted from issuing the request therefore has to
+#: be the idle bound PLUS the upload time, or it cuts a completion the old
+#: code let finish. 600 s uploads a 32 MiB body (the rewrite buffer's
+#: ceiling) at about 450 kbit/s.
+UPSTREAM_UPLOAD_ALLOWANCE_S = 600.0
+
+#: Default seconds from ISSUING an upstream request to the arrival of its
+#: response HEADERS: the idle bound plus the upload allowance (2400 s), see
+#: :meth:`GatewayConfig.headers_timeout_s`. What it bounds that nothing else
+#: does is a body upload that STALLS (the upstream accepted the connection
+#: and stopped reading): aiohttp has no bound on the body write when
+#: ``total`` is ``None``. Pool + DNS + connect are bounded by
+#: :data:`UPSTREAM_CONNECT_TIMEOUT_S`, and the wait after the upload by
+#: ``sock_read`` — the 2026-11-04 hang was the connect-phase gap, closed by
+#: ``connect=``. The body AFTER the headers is never bounded by this (a
+#: healthy completion may stream for many minutes; the 2026-09-09 incident
+#: cut one at 601 s), so it is enforced around the acquisition only, never as
+#: a ``total``. Env-tunable (``VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S``)
+#: because the chaos suite and tests need sub-second bounds.
+DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S = (
+    DEFAULT_UPSTREAM_IDLE_TIMEOUT_S + UPSTREAM_UPLOAD_ALLOWANCE_S
+)
+
+#: The env var that overrides :meth:`GatewayConfig.headers_timeout_s`.
+UPSTREAM_HEADERS_TIMEOUT_ENV = "VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S"
+
+#: Largest accepted headers bound (2 h). Above it — and for ``inf`` / ``nan``
+#: — the env value is ignored: an unbounded wait is the incident's symptom
+#: and must not be reachable through a typo.
+UPSTREAM_HEADERS_TIMEOUT_MAX_S = 7200.0
+
+#: Default seconds the gateway may start another attempt after a PRE-SEND
+#: network failure — one where aiohttp provably wrote nothing to the
+#: upstream: ``ClientConnectorError`` (DNS failure, connect refused, no
+#: route) and ``ConnectionTimeoutError`` (pool + DNS + connect bound). A brief
+#: outage is then invisible to the chat, which is the owner's rule ("the
+#: gateway must NEVER cause chat failures"; an error the client retries is
+#: survivable, a silent hang is not). A failure AFTER the connection exists
+#: (server disconnected, reset, a read or headers timeout) is never retried
+#: here, because the upstream may already hold — and bill — the request;
+#: that is answered with the retryable 502 at once. 75 s: inside the 60–90 s
+#: window the owner named. The window gates STARTING an attempt, so the
+#: worst-case wait before the 502 is the window plus one connect bound
+#: (105 s). ``0`` answers the first failure, which is what the test suite
+#: configures so a dead stub upstream fails fast. Env-tunable
+#: (``VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S``).
+UPSTREAM_RETRY_WINDOW_ENV = "VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S"
+DEFAULT_UPSTREAM_RETRY_WINDOW_S = 75.0
+
+#: Largest accepted retry window (10 min); larger, ``inf`` or ``nan`` keeps
+#: the default — ``monotonic() + inf`` would retry a dead DNS forever.
+UPSTREAM_RETRY_WINDOW_MAX_S = 600.0
 
 #: How much of a request body the gateway will HOLD in memory so it can
 #: rewrite ids inside it. **Not a request ceiling**: nothing is refused for
@@ -570,6 +670,10 @@ class GatewayConfig:
     token: str = ""
     credentials_file: Path = field(default_factory=credentials_path)
     context_table_file: Path = field(default_factory=export_path)
+    #: v0.2.105: the Claude account registry the launcher exports
+    #: (``vco_lib.gateway_accounts.accounts_path`` — one home for the path and
+    #: the format). Absent is the normal single-account state.
+    accounts_file: Path = field(default_factory=accounts_path)
     seed_context_table: Path | None = None
     static_catalog_file: Path | None = None
     catalog_ttl_s: int = DEFAULT_CATALOG_TTL_S
@@ -598,6 +702,24 @@ class GatewayConfig:
     #: that cannot express 0.2 s cannot be tested without sleeping for
     #: minutes.
     upstream_idle_timeout_s: float = DEFAULT_UPSTREAM_IDLE_TIMEOUT_S
+    #: Seconds from issuing an upstream request to its response HEADERS, or
+    #: ``None`` (the default) for the idle bound plus the upload allowance —
+    #: read it through :meth:`headers_timeout_s`, never directly. ``None``
+    #: keeps the bound tied to :attr:`upstream_idle_timeout_s`, so a
+    #: non-streaming completion is never cut before the idle bound would have
+    #: cut it. Read by :func:`model_router.server._acquire_upstream`.
+    upstream_headers_timeout_s: Optional[float] = None
+    #: Seconds during which a PRE-SEND failure may be retried before the
+    #: retryable 502 is answered (see
+    #: :data:`DEFAULT_UPSTREAM_RETRY_WINDOW_S`). ``0`` fails fast on the
+    #: first attempt — what the test suite configures against dead stub
+    #: upstreams. Read by :func:`model_router.server._acquire_upstream`.
+    upstream_retry_window_s: float = DEFAULT_UPSTREAM_RETRY_WINDOW_S
+    #: The connect bound — pool + DNS + TCP, enforced as aiohttp's
+    #: ``connect`` (see :data:`UPSTREAM_CONNECT_TIMEOUT_S`). NOT an env knob;
+    #: a dataclass field only so the chaos suite and tests can set
+    #: sub-second bounds. Read by :func:`model_router.server._acquire_upstream`.
+    upstream_connect_timeout_s: float = UPSTREAM_CONNECT_TIMEOUT_S
     #: Seconds to wait for a catalog fetch. Short: ``/v1/models`` is the
     #: picker's blocking call, and a stalled vendor must fall back to the
     #: static catalog rather than hang the picker open.
@@ -621,6 +743,22 @@ class GatewayConfig:
     #: :func:`model_router.server.models_handler`; reported in ``/health``.
     picker_usage: str = DEFAULT_PICKER_USAGE
 
+    def headers_timeout_s(self) -> float:
+        """The response-headers bound in force: the explicit value, else the
+        idle bound plus :data:`UPSTREAM_UPLOAD_ALLOWANCE_S`.
+
+        Derived rather than a fixed constant so the DEFAULT bound is never
+        shorter than the idle bound it backs up — a non-streaming completion
+        waits for its headers as long as the whole answer takes, and before
+        v0.2.105 only the idle bound (counted from the end of the upload)
+        limited that wait. An explicit value is used as given (it may be
+        shorter), and an upload longer than
+        :data:`UPSTREAM_UPLOAD_ALLOWANCE_S` eats into the default's margin.
+        """
+        if self.upstream_headers_timeout_s is not None:
+            return self.upstream_headers_timeout_s
+        return self.upstream_idle_timeout_s + UPSTREAM_UPLOAD_ALLOWANCE_S
+
     @classmethod
     def from_env(cls, *, token: str = "") -> "GatewayConfig":
         return cls(
@@ -629,6 +767,7 @@ class GatewayConfig:
             token=token,
             credentials_file=credentials_path(),
             context_table_file=export_path(),
+            accounts_file=accounts_path(),
             # Positive ints; 0, negatives and garbage keep the default.
             catalog_ttl_s=env_int(
                 "VCT_MODEL_GATEWAY_CATALOG_TTL", DEFAULT_CATALOG_TTL_S, minimum=1,
@@ -639,6 +778,28 @@ class GatewayConfig:
             key_ttl_s=env_int("VCT_MODEL_GATEWAY_KEY_TTL", DEFAULT_KEY_TTL_S, minimum=1),
             key_stale_max_age_s=env_int(
                 "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S", DEFAULT_SERVE_STALE_MAX_AGE_S, minimum=1,
+            ),
+            # Floats on purpose (sub-second bounds for the chaos suite);
+            # unset/blank/garbage/non-finite/too large keeps the default
+            # (``None``: the idle bound plus the upload allowance), and a bad
+            # headers bound must never disable itself by falling through to
+            # 0 or become unbounded through ``inf``.
+            upstream_headers_timeout_s=env_float(
+                UPSTREAM_HEADERS_TIMEOUT_ENV,
+                None,
+                above=0,
+                maximum=UPSTREAM_HEADERS_TIMEOUT_MAX_S,
+                finite=True,
+            ),
+            # minimum=0: 0 is the legitimate "answer the first failure"
+            # setting, not a typo. finite + maximum: ``inf`` would retry a
+            # dead DNS forever — the incident's own symptom.
+            upstream_retry_window_s=env_float(
+                UPSTREAM_RETRY_WINDOW_ENV,
+                DEFAULT_UPSTREAM_RETRY_WINDOW_S,
+                minimum=0,
+                maximum=UPSTREAM_RETRY_WINDOW_MAX_S,
+                finite=True,
             ),
             rewrite_buffer_bytes=env_int(
                 "VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES",
@@ -681,6 +842,13 @@ __all__ = [
     "DEFAULT_STATIC_RETRY_TTL_S",
     "FALLBACK_PORT_RANGE",
     "DEFAULT_UPSTREAM_IDLE_TIMEOUT_S",
+    "DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S",
+    "UPSTREAM_HEADERS_TIMEOUT_ENV",
+    "UPSTREAM_HEADERS_TIMEOUT_MAX_S",
+    "UPSTREAM_UPLOAD_ALLOWANCE_S",
+    "DEFAULT_UPSTREAM_RETRY_WINDOW_S",
+    "UPSTREAM_RETRY_WINDOW_ENV",
+    "UPSTREAM_RETRY_WINDOW_MAX_S",
     "REWRITE_BUFFER_LIMIT_BYTES",
     "CONTEXT_GUARD_MARGIN_DEFAULT",
     "CONTEXT_GUARD_MARGIN_ENV",
@@ -689,6 +857,7 @@ __all__ = [
     "LAST_PORT_BASENAME",
     "GatewayConfig",
     "HostNotLoopbackError",
+    "accounts_path",
     "context_guard_margin",
     "credentials_path",
     "explicit_port",

@@ -109,4 +109,9 @@ export interface SyncOutcome {
   entities_indexed: number;
   duration_ms: number;
   project_codegraph_prefix: string;
+  /** v0.2.105: rows the removed-extras purge deleted (Remove / Disable). */
+  purged_rows?: number;
+  /** v0.2.105: why the purge removed nothing / not everything — the rows
+   *  are KEPT for now (null when it ran cleanly or was not requested). */
+  purge_note?: string | null;
 }

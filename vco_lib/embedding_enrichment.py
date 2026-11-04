@@ -994,8 +994,8 @@ def _emit_progress(
 def _estimate_object_count(collection: str) -> int:
     """Best-effort object count for the progress %. Returns 0 on failure.
 
-    Uses Weaviate's GraphQL aggregate endpoint, which is O(1) on Weaviate
-    1.28.4 (the version we ship). Soft-fail to 0 if anything goes wrong
+    Uses Weaviate's GraphQL aggregate endpoint, which is O(1) on the
+    Weaviate versions VCO has shipped (1.28.4, 1.37.18). Soft-fail to 0 if anything goes wrong
     — the progress callback degrades to monotonic-fake mode.
     """
     base_url = _weaviate_url()

@@ -74,6 +74,13 @@ if echo "$TOOL_RESPONSE" | grep -qE '(nothing to commit|no changes added|error:|
     exit 0
 fi
 
+# v0.2.105 L-KGREV: the session that triggered this review, so the reviewer
+# can file its "N files left uncommitted" alert for THIS chat (the shipped
+# agent-alerts-deliver hook then shows it on the next prompt / tool call).
+# Absent -> no --session-id at all: the session-start / compaction re-inject
+# line is then the channel. MUST MATCH the .ps1 sibling.
+HOOK_SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""' 2>/dev/null)
+
 # Get the last commit's short hash and subject
 cd "$PROJECT_ROOT"
 COMMIT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -120,10 +127,13 @@ if [ -n "$BROKEN_INSTALL" ]; then
 else
     # No --max-turns / --model here: each is ONE knob owned by the chain
     # (VCO_KG_REVIEW_MAX_TURNS; VCO_KG_REVIEW_MODEL / launcher Preferences).
+    SESSION_ARGS=()
+    if [ -n "$HOOK_SESSION_ID" ]; then SESSION_ARGS=(--session-id "$HOOK_SESSION_ID"); fi
     nohup "$PY" "$REVIEWER_CHAIN" run \
         --project-root "$PROJECT_ROOT" \
         --commit "$COMMIT_HASH" \
         --log "$LOG_FILE" \
+        ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
         >> "$LOG_FILE" 2>&1 &
     REVIEWER_PID=$!
 fi

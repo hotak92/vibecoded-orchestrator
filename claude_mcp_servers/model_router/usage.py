@@ -603,6 +603,27 @@ class UsageRecord:
     #: pair can only disagree through a rewrite the gateway actually made.
     effort_requested: Optional[str] = None
     effort_forwarded: Optional[str] = None
+    #: v0.2.105 (CL-4): the client's ``x-claude-code-compaction`` header, as
+    #: sent (Claude Code 2.1.273+ marks its summarisation requests with it).
+    #: ``None`` — stored as ``null`` — when the request carried no such header,
+    #: which is every ordinary turn; the '' spelling is a header that was
+    #: PRESENT and blank, and is recorded rather than folded into the null.
+    #: Attribution only: nothing in the gateway branches on it, and its value
+    #: is a client-supplied token bounded by
+    #: :func:`read_compaction_header`, never a body.
+    compaction: Optional[str] = None
+    #: v0.2.105: the Claude account whose login served this request
+    #: (``model_router.accounts``); ``None`` on a vendor route, where no
+    #: Claude account answers. A row written before the field existed reads
+    #: as ``primary`` on a first-party route.
+    account: Optional[str] = None
+    #: ``header`` (the project chose it) or ``default``.
+    account_source: Optional[str] = None
+    #: Why the request was served by a fallback account (``None`` when it
+    #: was not): ``not_registered``, ``malformed_header``,
+    #: ``registry_unreadable``, or the login state (``absent``/``expired``/
+    #: ``unreadable``). The access line carries the same word.
+    account_fallback: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
@@ -651,6 +672,10 @@ def build_record(
     fallback_from: str = "",
     effort_requested: Optional[str] = None,
     effort_forwarded: Optional[str] = None,
+    compaction: Optional[str] = None,
+    account: Optional[str] = None,
+    account_source: Optional[str] = None,
+    account_fallback: Optional[str] = None,
 ) -> UsageRecord:
     """Assemble one row. Pure — no clock unless the caller declines to pass one.
 
@@ -710,6 +735,10 @@ def build_record(
         fallback_from=str(fallback_from or ""),
         effort_requested=effort_requested,
         effort_forwarded=effort_forwarded,
+        compaction=compaction,
+        account=account,
+        account_source=account_source,
+        account_fallback=account_fallback,
     )
 
 
@@ -1321,6 +1350,36 @@ class UsageLedger:
 SESSION_HEADER = "x-claude-code-session-id"
 AGENT_HEADER = "x-claude-code-agent-id"
 PARENT_AGENT_HEADER = "x-claude-code-parent-agent-id"
+#: v0.2.105 (CL-4): Claude Code 2.1.273 sends this on the requests it spends
+#: summarising a conversation. Recorded so compaction calls can be attributed
+#: in the ledger — a row that says "this turn was a compaction" answers why a
+#: chat's context jumped without any user turn having been long.
+COMPACTION_HEADER = "x-claude-code-compaction"
+
+#: Longest compaction-header value kept. The client's real spelling is a short
+#: word; the cap exists because the value is client-controlled and lands in a
+#: file, exactly like the ids in :func:`read_identity`.
+_COMPACTION_MAX_CHARS = 64
+
+
+def read_compaction_header(headers: Mapping[str, str]) -> Optional[str]:
+    """The ``x-claude-code-compaction`` value, or ``None`` when the header is
+    absent.
+
+    THREE answers, not two, because they are three observations:
+    ``None`` = the client did not mark this request as a compaction; ``""`` =
+    it did, with a blank value; anything else = the value it sent. Only
+    whitespace and length are normalised — the token is an observation, so it
+    is not validated against a vocabulary the client is free to extend (a
+    future ``"manual"`` must reach the ledger rather than be dropped as
+    unknown). Control characters are stripped so a header can never carry a
+    line break into a log-adjacent file.
+    """
+    raw = headers.get(COMPACTION_HEADER)
+    if not isinstance(raw, str):
+        return None
+    value = "".join(ch for ch in raw if ch.isprintable()).strip()
+    return value[:_COMPACTION_MAX_CHARS]
 
 #: Longest id kept. Generous next to a UUID (36) and small next to anything
 #: abusive — see :func:`read_identity` for why a cap exists at all.
@@ -1355,6 +1414,7 @@ def read_identity(
 
 __all__ = [
     "AGENT_HEADER",
+    "COMPACTION_HEADER",
     "CLIENT_WINDOW_1M",
     "CLIENT_WINDOW_DEFAULT",
     "COUNT_SOURCE_ESTIMATE",
@@ -1383,6 +1443,7 @@ __all__ = [
     "event_payload",
     "guard_count_tokens",
     "note_count_substitution",
+    "read_compaction_header",
     "read_identity",
     "reported_model_id",
     "split_sse_events",

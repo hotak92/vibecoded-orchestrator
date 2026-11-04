@@ -88,6 +88,9 @@
 #   gate `git-commit-chain` = only when tool_input.command runs a
 #                              `git commit` segment anywhere in its chain
 #                              (v0.2.102 W6-F; the retired `if` key widened)
+# Parity note (v0.2.105): the .ps1 sibling's detached sub-hook spawns go through
+# Start-VcoDetachedProcess → vco_lib/windowless_spawn (no Start-Process, so no console window
+# on Windows). The POSIX spawn already detaches without a window — nothing to change here.
 
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null

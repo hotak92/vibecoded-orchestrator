@@ -29,6 +29,8 @@ import {
   describeStatus,
   describeDogfood,
   describeOAuthExpiry,
+  describeUpstreamInFlight,
+  UPSTREAM_WAIT_WARN_SECONDS,
   describeSupervision,
   describeWriteResult,
   gatewayPanelReady,
@@ -811,6 +813,62 @@ describe('describeSupervision', () => {
   it('says nothing about a gateway that is not running', () => {
     expect(describeSupervision(makeStatus({ supervision: 'not_running' }))).toBeNull();
     expect(describeSupervision(null)).toBeNull();
+  });
+});
+
+describe('describeUpstreamInFlight', () => {
+  function withFlight(flight: unknown) {
+    const s = makeStatus();
+    return { ...s, health: { ...s.health!, upstream_in_flight: flight as never } };
+  }
+
+  it('says nothing for a gateway that does not report it', () => {
+    expect(describeUpstreamInFlight(makeStatus())).toBeNull();
+    expect(describeUpstreamInFlight(null)).toBeNull();
+  });
+
+  it('reports an idle gateway as none waiting', () => {
+    const line = describeUpstreamInFlight(
+      withFlight({ count: 0, oldest_age_s: null, oldest_label: null }),
+    );
+    expect(line?.tone).toBe('ok');
+    expect(line?.text).toContain('none waiting');
+  });
+
+  it('names the count, route and age of a short wait without highlighting it', () => {
+    const line = describeUpstreamInFlight(
+      withFlight({ count: 2, oldest_age_s: 4.2, oldest_label: 'zai' }),
+    );
+    expect(line?.tone).toBe('ok');
+    expect(line?.text).toBe('2 requests waiting for response headers; oldest (zai) for 4 s');
+  });
+
+  it('highlights a request waiting longer than a minute', () => {
+    const line = describeUpstreamInFlight(
+      withFlight({ count: 1, oldest_age_s: UPSTREAM_WAIT_WARN_SECONDS + 1, oldest_label: 'qwen' }),
+    );
+    expect(line?.tone).toBe('warn');
+    expect(line?.text).toContain('1 request waiting');
+    expect(line?.text).toContain('(qwen)');
+    expect(line?.text).toContain('longer than 60 s');
+  });
+
+  it('keeps exactly 60 s unhighlighted and shows long waits in minutes', () => {
+    expect(
+      describeUpstreamInFlight(withFlight({ count: 1, oldest_age_s: 60, oldest_label: 'zai' }))?.tone,
+    ).toBe('ok');
+    const long = describeUpstreamInFlight(
+      withFlight({ count: 1, oldest_age_s: 3 * 3600, oldest_label: 'zai' }),
+    );
+    expect(long?.tone).toBe('warn');
+    expect(long?.text).toContain('180 min');
+  });
+
+  it('never prints a URL — the block carries names and ages only', () => {
+    const line = describeUpstreamInFlight(
+      withFlight({ count: 1, oldest_age_s: 90, oldest_label: 'anthropic' }),
+    );
+    expect(line?.text).not.toMatch(/https?:/);
   });
 });
 

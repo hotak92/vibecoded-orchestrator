@@ -263,6 +263,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "project_infra_declarations (v0.2.102 W5-A / M3 — what on this machine belongs to a PROJECT, not to VCO: external_collection = a Weaviate class the project owns, skipped by the doctor's unclaimed/fixture readings and the binding-evidence heal; unmanaged_container = a container VCO never heals, starts, re-creates, labels or adopts (hub watchdog, compose-recovery heals, service detection); local_port = a loopback port of the project's own service, projected as VCT_SSRF_EXTRA_LOCAL_PORTS for the WebFetch guard and never probed for adoption). Additive new table, ON DELETE CASCADE with the project. LAUNCHER_DB_TABLE_SET_VERSION bumps 48->49 atomically with this migration, with scripts/regen_schema_versions_json.py refreshing the committed snapshot.",
         sql: include_str!("migrations/049_project_infra_declarations.sql"),
     },
+    Migration {
+        version: 50,
+        description: "collection_count_cache (v0.2.105 — cached Weaviate class counts, keyed by class name, with the epoch-ms moment they were measured). Weaviate 1.28 loads a collection into RAM on first query and never unloads it, and the launcher's KG / codegraph pages used to run one Aggregate count per class on the machine at every render, loading every project's KG and code graph into memory. Counts for collections outside the acting project's own + shared + granted scope are served from this cache instead; a live Aggregate runs only for in-scope classes or an explicit 'Refresh counts'. Writers drop the row on invalidation (KG sync success, code-graph build finalize, orphan-cleanup delete) so a stale number reads as 'needs recount', not as fresh. Machine-global by design (a collection is one object on the machine), so no project FK. Additive new table. LAUNCHER_DB_TABLE_SET_VERSION bumps 49->50 atomically with this migration, with scripts/regen_schema_versions_json.py refreshing the committed snapshot in the same merge.",
+        sql: include_str!("migrations/050_collection_count_cache.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.

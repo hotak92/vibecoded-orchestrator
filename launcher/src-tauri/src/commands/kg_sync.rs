@@ -818,6 +818,24 @@ async fn run_sync_task(
         None,
         outcome.error_message.as_deref(),
     );
+
+    // v0.2.105 lazy-load counts: a successful sync WROTE to this
+    // project's KG/Development collections, so any cached counts for
+    // them are stale. Invalidate (the next view that needs one counts it
+    // live; this project's own view always does). Soft-fail — the sync
+    // result is already persisted and must not be disturbed.
+    if outcome.status == sync_status::SUCCESS {
+        let db = app.state::<Db>();
+        let bound: Vec<String> = db
+            .list_project_kg_bindings(&project_id)
+            .map(|rows| rows.into_iter().map(|b| b.collection_name).collect())
+            .unwrap_or_default();
+        if !bound.is_empty() {
+            if let Err(e) = db.collection_count_invalidate_many(&bound) {
+                tracing::warn!("[vct] kg_sync count-cache invalidation: {}", e);
+            }
+        }
+    }
 }
 
 /// Aggregated subprocess result. Held only inside `run_sync_task` so
@@ -1883,6 +1901,22 @@ pub(crate) fn parse_drift_output(stdout: &str) -> DriftVerdict {
     let status = v.get("status").and_then(|x| x.as_str()).unwrap_or("");
     let binding = v.get("binding").and_then(|x| x.as_str()).unwrap_or("");
     let detail = v.get("detail").and_then(|x| x.as_str()).unwrap_or("");
+    if binding == "ok" {
+        // The Python binding check's "ok": no non-archived knowledge/ content
+        // on disk — there are no nodes, so there is nothing to check (the
+        // drift scan the same run performed is trivially "ok", scanned 0).
+        // v0.2.105: this used to fall into the "no KG binding resolved"
+        // Unavailable arm below, and the update report showed it as "could
+        // NOT confirm Weaviate holds every node" — a false alarm for a
+        // project that simply has no knowledge nodes.
+        return DriftVerdict::NoContent {
+            detail: if detail.is_empty() {
+                "no knowledge/ nodes on disk".to_string()
+            } else {
+                detail.to_string()
+            },
+        };
+    }
     if binding != "bound" {
         // No collection to compare against. NOT "ok" — there is nothing that
         // could have been checked (`kg_sync_drift.check_kg_binding`'s own
@@ -2045,6 +2079,32 @@ mod v0294_drift_probe_tests {
             parse_drift_output("no sentinel anywhere\n"),
             DriftVerdict::Unavailable { .. }
         ));
+    }
+
+    /// v0.2.105 (field report): a project with NO knowledge nodes on disk
+    /// answers binding "ok" — no non-archived content to bind — and the
+    /// trivially-clean drift scan beside it. That is "nothing to check", not
+    /// "could not check": pre-fix it fell into the "no KG binding resolved"
+    /// Unavailable arm and the update report warned "could NOT confirm
+    /// Weaviate holds every node" about a project with no nodes at all.
+    #[test]
+    fn no_nodes_on_disk_is_no_content_not_unavailable() {
+        let out = sentinel(
+            r#"{"binding":"ok","status":"ok","scanned":0,"detail":"no knowledge/ nodes on disk"}"#,
+        );
+        assert_eq!(
+            parse_drift_output(&out),
+            DriftVerdict::NoContent {
+                detail: "no knowledge/ nodes on disk".to_string(),
+            }
+        );
+        // And it stays plain when the wrapper sent no detail of its own.
+        assert_eq!(
+            parse_drift_output(&sentinel(r#"{"binding":"ok","status":"ok","scanned":0}"#)),
+            DriftVerdict::NoContent {
+                detail: "no knowledge/ nodes on disk".to_string(),
+            }
+        );
     }
 
     /// v0.2.95 ship-gate MAJOR, RED-PROOF (a), consumer half: a clean store

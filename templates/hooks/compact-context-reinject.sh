@@ -296,6 +296,35 @@ $_SNAP_BODY"
     fi
 fi
 
+# 5. KG reviewer pending files -- v0.2.105 L-KGREV (brief item 3). The
+#    post-commit reviewer leaves its nodes uncommitted whenever a commit is
+#    skipped (HEAD moved into its files, the same file was already dirty, a
+#    git operation in progress). The one-line alert reaches the chat through
+#    the alert channel; THIS is the durable line that keeps saying how many
+#    are still pending, on every session start and after every compaction,
+#    until they are committed. One line, bounded by the module. The whole
+#    section is gated on the ledger file's existence, so a project that never
+#    skipped a review pays a single `[ -f ]`.
+#    MUST MATCH compact-context-reinject.ps1.
+S_kgsync=""
+_KGP_LEDGER="$PROJECT_DIR/.claude/state/kg_reviewer_pending.json"
+if [ -f "$_KGP_LEDGER" ]; then
+    _KGP_PY=""
+    if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/resolve-vco-venv.sh" ]; then
+        # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+        . "$(dirname "${BASH_SOURCE[0]}")/_lib/resolve-vco-venv.sh"
+        VCO_VENV_PYTHON=""
+        if command -v resolve_vco_venv_python >/dev/null 2>&1; then
+            resolve_vco_venv_python "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" 2>/dev/null || true
+        fi
+        _KGP_PY="${VCO_VENV_PYTHON:-}"
+    fi
+    if [ -n "$_KGP_PY" ] && [ -x "$_KGP_PY" ]; then
+        S_kgsync=$("$_KGP_PY" -m vco_lib.kg_reviewer_pending status \
+            --project-root "$PROJECT_DIR" 2>/dev/null) || S_kgsync=""
+    fi
+fi
+
 # ─── budget the flex section, then emit ────────────────────────────────────
 # RB_flex is empty (=> section 1 uncapped) when either the shared cap helper
 # or the budget table is unavailable — the pre-v0.2.102 behaviour, with the
@@ -348,4 +377,7 @@ fi
 [ -n "$S_plan" ] && _rb_emit "$S_plan" "$RB_plan" "rest is on disk: Read .claude/context/plans/$(basename "$LATEST_PLAN")"
 [ -n "$S_commits" ] && _rb_emit "$S_commits" "$RB_commits" "run 'git log --oneline -20' for more"
 [ -n "$S_snap" ] && _rb_emit "$S_snap" "$RB_snapshot" "rest is on disk: Read .claude/context/pre-compact-snapshot.md"
+# The pointer names the interpreter that just answered (a bare `python` in a
+# user project is rarely the VCO venv, and a printed command is shipped code).
+[ -n "$S_kgsync" ] && _rb_emit "$S_kgsync" "" "run \"$_KGP_PY\" -m vco_lib.kg_reviewer_pending paths --project-root \"$PROJECT_DIR\" for the full list"
 } | _reinject_cap

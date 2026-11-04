@@ -1150,27 +1150,29 @@ class CgPolicy:
 KG_GATES: Dict[str, Optional[KgGate]] = {
     # Bash READ (cat/sed -n/head/tail/git show): weak intent → 0.75 floor
     "bash_read": KgGate(floor=0.75, tier_above="single_chunk", max_rows=3),
-    # Bash EDIT (sed -i, >, heredoc): strong intent → 0.65 floor
-    "bash_edit": KgGate(floor=0.65, tier_above="single_chunk", max_rows=3),
+    # Bash EDIT (sed -i, >, heredoc): strong intent → 0.70 floor
+    # (v0.2.105 #512D: raised from 0.65 to the midpoint toward the field
+    # report's 0.75 proposal — off-topic hits at 0.66–0.70)
+    "bash_edit": KgGate(floor=0.70, tier_above="single_chunk", max_rows=3),
     # Bash SEARCH (grep identifier): no KG leg
     "bash_search": None,
     # Read(code) PostToolUse
-    "read_code": KgGate(floor=0.70, tier_above="single_chunk", max_rows=3),
+    "read_code": KgGate(floor=0.725, tier_above="single_chunk", max_rows=3),
     # Read(docs/knowledge) PostToolUse
-    "read_docs": KgGate(floor=0.70, tier_above="single_chunk", max_rows=3),
+    "read_docs": KgGate(floor=0.725, tier_above="single_chunk", max_rows=3),
     # Grep(identifier) PreToolUse: no KG leg
     "grep": None,
     # Edit / Write(code) PreToolUse: three_chunks allowed >= 0.85 (owner)
-    "edit": KgGate(floor=0.65, tier_above="three_chunks", max_rows=3),
-    "write": KgGate(floor=0.65, tier_above="three_chunks", max_rows=3),
+    "edit": KgGate(floor=0.70, tier_above="three_chunks", max_rows=3),
+    "write": KgGate(floor=0.70, tier_above="three_chunks", max_rows=3),
     # Agent brief: small + deterministic (lands in the lane's FIRST prompt)
-    "agent_brief": KgGate(floor=0.65, tier_above="three_chunks", max_rows=3,
+    "agent_brief": KgGate(floor=0.70, tier_above="three_chunks", max_rows=3,
                           max_chars=1500),
     # UserPromptSubmit (v0.2.102 W6-F): the shipped "search the KG on every
     # prompt" promise (README.md:108-113, GETTING_STARTED.md:321-323). The
     # query is the user's free-text prompt, so this is a WEAK-signal surface
-    # like the Read rows: 0.70 floor, titles-only below 0.85.
-    "prompt": KgGate(floor=0.70, tier_above="single_chunk", max_rows=3),
+    # like the Read rows: 0.725 floor, titles-only below 0.85.
+    "prompt": KgGate(floor=0.725, tier_above="single_chunk", max_rows=3),
 }
 
 #: §2.1 code-graph column.

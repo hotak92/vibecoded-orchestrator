@@ -21,11 +21,14 @@ The design constraint: **schema changes are additive**. Adding a new slot to
 an existing collection must preserve all data already in the existing slots.
 
 Background — why this module exists:
-  * Weaviate ≤1.30 (we ship 1.28.4) marks `vectorConfig` immutable. PUT/PATCH
-    to add a named-vector slot returns HTTP 422 "vector config is
-    immutable". The only way to widen a collection's slot set is to recreate
-    it with the new target schema and round-trip every object (UUID +
-    vectors) through a staging class.
+  * Weaviate ≤1.30 marks `vectorConfig` immutable. PUT/PATCH to add a
+    named-vector slot returns HTTP 422 "vector config is immutable", so the
+    only way to widen a collection's slot set there is to recreate it with
+    the new target schema and round-trip every object (UUID + vectors)
+    through a staging class. VCO shipped 1.28.4 until v0.2.105 and ships
+    1.37.18 since; 1.31+ can add a named vector in place, but this module
+    still uses the round-trip on every version (an adopted Weaviate may be
+    older), so both behave the same.
   * `project_init.migrate_collections` already implements that round-trip
     safely (`_copy_collection_with_vectors` + `__staging` double-copy +
     crash recovery). What's missing pre-v0.2.18 is: (a) a single catalog
@@ -140,6 +143,7 @@ class NamedVectorSlot:
         index_type: str = "hnsw",
         distance: str = "cosine",
         rescore_limit: int = -1,
+        index_config: Optional[dict] = None,
     ) -> dict:
         """Serialize this slot into the JSON shape Weaviate's REST
         `POST /v1/schema` expects under the `vectorConfig` key.
@@ -189,6 +193,14 @@ class NamedVectorSlot:
             Only consulted for ``index_type='hfresh'``. ``>=0`` sets
             ``vectorIndexConfig.rescoreLimit``; ``-1`` (default) omits it and
             accepts the engine default.
+
+        index_config:
+            Only consulted for ``index_type='hnsw'``. When given, emitted as
+            the slot's ``vectorIndexConfig`` — the class definitions pass
+            :func:`vco_lib.weaviate_vector_index.create_index_config` (the
+            per-collection vector-cache cap, v0.2.105). ``_schema_delta`` never
+            compares ``vectorIndexConfig``, so adding it cannot turn an
+            existing collection's ``noop`` into a migration.
         """
         it = (index_type or "hnsw").strip().lower()
         if it not in ("hnsw", "hfresh"):
@@ -201,10 +213,13 @@ class NamedVectorSlot:
             # UNCHANGED shipped shape — do not perturb the hnsw schema so
             # existing collections keep classifying as `noop` (the schema
             # delta must not see a spurious diff on a plain hnsw upgrade).
+            # The optional `index_config` is safe: the delta ignores it.
             cfg = {
                 "vectorizer": {self.vectorizer: {}},
                 "vectorIndexType": "hnsw",
             }
+            if index_config:
+                cfg["vectorIndexConfig"] = dict(index_config)
             return cfg
 
         # ── HFresh (preview, GATED) ─────────────────────────────────────
@@ -344,8 +359,9 @@ class AddSlotResult(enum.Enum):
 
     Created
         The slot was absent on the target collection and has been added
-        (via collection recreate + data round-trip — Weaviate 1.28.4 does
-        not support live PATCH-add of named vectors).
+        (via collection recreate + data round-trip — Weaviate ≤1.30 does
+        not support live PATCH-add of named vectors, and VCO uses the same
+        round-trip on every version).
     Skipped
         The slot already exists on the target collection (and, if a dim
         probe was possible, the existing stored vector dim matches the
@@ -819,13 +835,19 @@ def _default_collection_rebuilder(
     # 0. Read the existing schema; we need its properties + inverted
     #    index config to recreate the collection faithfully.
     schema = _fetch_schema(collection, weaviate_url=base_url)
+    # v0.2.105: the recreated class carries the vector-index policy (cache
+    # cap) like every other create path; RQ-8 comes from the server default.
+    from vco_lib.weaviate_vector_index import create_index_config
+
+    index_config = create_index_config(collection)
     if schema is None:
         # Collection doesn't exist — create it fresh with target slots
         # and minimal property surface.
         target_def = {
             "class": collection,
             "vectorConfig": {
-                s.name: s.to_weaviate_config() for s in target_slots
+                s.name: s.to_weaviate_config(index_config=index_config)
+                for s in target_slots
             },
             "invertedIndexConfig": {"indexNullState": True},
             "properties": [],
@@ -836,7 +858,8 @@ def _default_collection_rebuilder(
     # 1. Build the staging class def. Vector slots = union of target
     #    slots; properties + inverted index inherited from source.
     staging_name = f"{collection}{_pi._STAGING_SUFFIX}"
-    target_vc = {s.name: s.to_weaviate_config() for s in target_slots}
+    target_vc = {s.name: s.to_weaviate_config(index_config=index_config)
+                 for s in target_slots}
     target_def = {
         "class": staging_name,
         "vectorConfig": target_vc,

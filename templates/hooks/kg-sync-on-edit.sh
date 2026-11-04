@@ -29,6 +29,9 @@
 # routes it through the venv-resolving kg-sync wrapper. Soft-fail always
 # (exit 0); a missing payload / missing wrapper / non-knowledge path is a
 # clean no-op. MUST MATCH kg-sync-on-edit.ps1.
+# Parity note (v0.2.105): the .ps1 sibling stopped storing its stdin payload in the automatic
+# $Input variable (a `pwsh -File` script that names $Input gets an empty payload) and reads it
+# via $HookStdin like the other hooks. Bash reads stdin directly — nothing to change here.
 
 # (b) Scrub sensitive env BEFORE spawning any subprocess (canonical HK-2
 # list — MUST MATCH _lib/scrub-env.sh; enforced by the scrub parity gate).

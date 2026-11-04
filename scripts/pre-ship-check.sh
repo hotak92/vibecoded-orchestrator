@@ -30,6 +30,11 @@
 #   bash scripts/pre-ship-check.sh                  # auto-detect from pyproject.toml
 #   bash scripts/pre-ship-check.sh 0.2.49            # override version
 #   EXPECTED_VERSION=0.2.49 bash scripts/pre-ship-check.sh
+#   Run from a Claude Code agent: use the Bash tool's run_in_background: true.
+#   This script waits in a loop (the launcher boot smoke it runs),
+#   which VCO's wait guard refuses in the foreground (a loop in a script
+#   may wait 5 s in total at most); in the background the completion
+#   notification brings the result.
 #
 # Exit code: 0 = all gates pass, 1 = one or more gates failed.
 #

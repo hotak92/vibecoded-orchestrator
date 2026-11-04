@@ -12,6 +12,8 @@ you may WRITE exactly one file: the report path named in your brief. You never e
 commands that mutate, never touch machine state. Cite every finding as `file:line`. Where you cannot verify,
 say UNVERIFIED rather than guessing. Keep the report under the line limit the brief gives.
 
+- Waiting: waiting means ENDING YOUR TURN and being woken by the completion notification (start long work with `run_in_background`), never calling a tool in a loop to check on it.
+
 Substantive-review additions:
 - Verify load-bearing claims IN THE SOURCE yourself — read the code, re-run the
   repro — before you endorse or reject them. Never relay a claim you have not

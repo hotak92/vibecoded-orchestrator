@@ -112,6 +112,10 @@ def _quiet_driver_probes(monkeypatch, *, stale=None):
     """Silence the driver's non-gate machinery (Weaviate probes, sweep)."""
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: stale)
+    # v0.2.105: the driver's backend-reachability gate must not probe a real
+    # code-embed/Ollama from these tests.
+    monkeypatch.setattr(cr, "code_backend_down_waiting",
+                        lambda *a, **k: (None, False))
 
 
 # ───────────────────── the ONE helper itself ─────────────────────

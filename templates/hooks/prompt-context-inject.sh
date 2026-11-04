@@ -13,7 +13,7 @@
 # emit_additional_context envelope. EVERY decision — the query rule
 # (vco_lib.inject_intent.prompt_query: the user's prompt text,
 # whitespace-collapsed and capped; trivially short prompts, slash commands
-# and bang passthroughs skip), the §2.1 `prompt` gate (0.70 floor,
+# and bang passthroughs skip), the §2.1 `prompt` gate (0.725 floor,
 # titles-only below 0.85), the seen-store dedupe, the per-injection cap,
 # the RL `prompt_kg_search` task type — lives in the router and
 # vco_lib/inject_intent.py. MUST MATCH prompt-context-inject.ps1.
@@ -38,6 +38,12 @@
 # (list MUST MATCH _lib/scrub-env.sh; enforced by the scrub parity gate).
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# v0.2.105: the hook's start, for the router's run deadline AND its hard
+# end-to-end deadline (the harness timeout counts from HERE).
+# One home: _lib/hook-start.sh (MUST MATCH the .ps1 sibling's call).
+# shellcheck source=_lib/hook-start.sh disable=SC1091
+[ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/hook-start.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/hook-start.sh" && vco_mark_hook_start
 
 # v0.2.102 W6-F fix-round: per-surface kill switch (VCO_PROMPT_INJECT=off)
 # disables ONLY this prompt surface — the per-prompt python spawn (router +

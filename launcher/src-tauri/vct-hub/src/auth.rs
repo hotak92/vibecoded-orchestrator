@@ -281,48 +281,58 @@ fn is_exempt_path(path: &str) -> bool {
     false
 }
 
-/// The per-project resolver routes that accept EITHER the global
-/// `hub.token` (compat) OR the matching per-project token (v0.2.76
-/// Part 4). Both carry a `{project_id}` in the SAME URL position, so one
-/// parser serves both.
+/// The per-project resolver routes that accept ONLY the matching
+/// per-project token (v0.2.76 Part 4; the global-token compat window was
+/// removed in v0.2.97).
 ///
-/// Returns `Some(project_id)` when `path` is exactly
-/// `/api/v1/projects/{project_id}/env` or
-/// `/api/v1/projects/{project_id}/config` (a trailing slash is
-/// tolerated). Returns `None` for every other path — including the
-/// module-scoped `/api/v1/modules/.../projects/.../config` route, which
-/// starts with `/api/v1/modules/` (handled by `module_db_api`), not
-/// `/api/v1/projects/`.
+/// Returns `Some(project_id)` for the exact tails below, each carrying the
+/// `{project_id}` in the same URL position so one parser serves all of them:
 ///
-/// EXACT-tail discipline (same as the module exempt-path matcher): we
-/// match only the precise `env` / `config` leaf so a future
-/// `/api/v1/projects/{id}/env/sub` route can't inherit the per-project
-/// token path by accident.
+/// * `/api/v1/projects/{project_id}/env` and `.../config` — the secret and
+///   config resolvers;
+/// * `/api/v1/projects/{project_id}/codegraph/analyzed` (v0.2.105 fix
+///   round) — the HEAD catch-up's advance-only baseline stamp. It is a
+///   WRITE into the project's launcher.db row, so it is held to the same
+///   boundary as the two reads above: a token minted for another project
+///   must never stamp this one's baseline.
+///
+/// Returns `None` for every other path — including the module-scoped
+/// `/api/v1/modules/.../projects/.../config` route, which starts with
+/// `/api/v1/modules/` (handled by `module_db_api`), not `/api/v1/projects/`.
+///
+/// EXACT-tail discipline (same as the module exempt-path matcher): only the
+/// precise leaves listed here match, so a future `/api/v1/projects/{id}/env/
+/// sub` or `.../codegraph/<other>` route cannot inherit the per-project token
+/// path by accident.
 pub(crate) fn per_project_token_route(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/api/v1/projects/")?;
-    // rest like "{project_id}/env" or "{project_id}/config" (optional
-    // trailing slash). Split and tolerate a trailing empty segment.
+    // rest like "{project_id}/env", "{project_id}/config" or
+    // "{project_id}/codegraph/analyzed" (optional trailing slash). Split
+    // and tolerate a trailing empty segment.
     let mut parts: Vec<&str> = rest.split('/').collect();
     if parts.last() == Some(&"") {
         parts.pop();
     }
-    if parts.len() != 2 {
+    if parts.len() < 2 {
         return None;
     }
     let project_id = parts[0];
     if project_id.is_empty() {
         return None;
     }
-    match parts[1] {
-        "env" | "config" => Some(project_id),
-        _ => None,
+    let scoped = matches!(parts.as_slice()[1..], ["env"] | ["config"] | ["codegraph", "analyzed"]);
+    if scoped {
+        Some(project_id)
+    } else {
+        None
     }
 }
 
 /// v0.2.97 (owner ruling 2026-09-24): the `VCT_HUB_LEGACY_GLOBAL_ENV`
 /// opt-in escape hatch was REMOVED. From v0.2.77 to v0.2.96 it re-opened
 /// the legacy global-token path on the per-project `/env` + `/config`
-/// routes for bespoke callers; every bundled resolver has preferred the
+/// routes (and, since v0.2.105, `/codegraph/analyzed`) for bespoke
+/// callers; every bundled resolver has preferred the
 /// project-scoped `hub.token.<project_id>` since v0.2.76 (Part 4 Task 3)
 /// and the hub lazy-mints a scoped token for a project added mid-session
 /// (Part 8 Task 4a), so no bundled consumer needed it. A global
@@ -530,9 +540,10 @@ fn forbidden_response(message: &str) -> Response {
 /// auth and the CORS layer can answer it. Real requests that follow
 /// the preflight DO get gated.
 ///
-/// v0.2.76 Part 4 — the per-project `/env` + `/config` routes accept
-/// ONLY the matching per-project token (`hub.token.<id>`); the global
-/// `hub.token` is refused there (the v0.2.76-v0.2.77 one-release compat
+/// v0.2.76 Part 4 — the per-project routes (`/env`, `/config`, and
+/// `/codegraph/analyzed` since v0.2.105) accept ONLY the matching
+/// per-project token (`hub.token.<id>`); the global `hub.token` is
+/// refused there (the v0.2.76-v0.2.77 one-release compat
 /// window and its `VCT_HUB_LEGACY_GLOBAL_ENV` opt-in were removed in
 /// v0.2.97). A token minted for a different project is a hard 403. All
 /// OTHER `/api/v1/*` routes stay on the global token exactly as before.
@@ -567,9 +578,10 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
         }
     };
 
-    // v0.2.76 Part 4 (v0.2.97: compat window removed) — per-project
-    // `/env` + `/config` routes accept ONLY the matching per-project
-    // token. A token minted for a DIFFERENT project is a hard 403.
+    // v0.2.76 Part 4 (v0.2.97: compat window removed) — the per-project
+    // routes (`/env`, `/config`, `/codegraph/analyzed`) accept ONLY the
+    // matching per-project token. A token minted for a DIFFERENT project
+    // is a hard 403.
     if let Some(url_project_id) = per_project_token_route(path) {
         // The registry is injected by server.rs. If it's missing (a
         // wiring bug, or a test harness that only installs AuthState),
@@ -622,8 +634,9 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
                     return next.run(req).await;
                 }
                 return forbidden_response(
-                    "the global hub.token is refused on /env + /config \
-                     (unconditionally since v0.2.97); present the per-project \
+                    "the global hub.token is refused on the per-project \
+                     routes (/env, /config, /codegraph/analyzed — \
+                     unconditionally since v0.2.97); present the per-project \
                      token (hub.token.<project_id>) — the bundled resolvers \
                      already prefer it, and the hub lazy-mints one for a \
                      mid-session project",
@@ -970,6 +983,12 @@ mod tests {
                 "/api/v1/projects/{id}/config",
                 get(|| async { "config here" }),
             )
+            // v0.2.105 fix round: the HEAD catch-up's baseline stamp is a
+            // per-project route too (same gate as /env and /config).
+            .route(
+                "/api/v1/projects/{id}/codegraph/analyzed",
+                axum::routing::post(|| async { "stamped" }),
+            )
             // A non-per-project route to prove global-token-only behaviour
             // is unchanged there.
             .route("/api/v1/projects", get(|| async { "projects list" }));
@@ -1118,6 +1137,24 @@ mod tests {
         assert_eq!(per_project_token_route("/api/v1/projects"), None);
         assert_eq!(per_project_token_route("/api/v1/projects//env"), None);
         assert_eq!(per_project_token_route("/api/v1/projects/p1/codegraph-builds"), None);
+        // v0.2.105 fix round: the baseline stamp is per-project-scoped,
+        // and only that exact tail.
+        assert_eq!(
+            per_project_token_route("/api/v1/projects/p1/codegraph/analyzed"),
+            Some("p1")
+        );
+        assert_eq!(
+            per_project_token_route("/api/v1/projects/p1/codegraph/analyzed/"),
+            Some("p1")
+        );
+        assert_eq!(
+            per_project_token_route("/api/v1/projects/p1/codegraph/extras/indexed"),
+            None,
+            "only the analyzed leaf is scoped; the extras stamp keeps the global token"
+        );
+        assert_eq!(per_project_token_route("/api/v1/projects/p1/codegraph"), None);
+        assert_eq!(per_project_token_route("/api/v1/projects/p1/codegraph/"), None);
+        assert_eq!(per_project_token_route("/api/v1/projects//codegraph/analyzed"), None);
         // Module-scoped config route lives under /modules/, not /projects/.
         assert_eq!(
             per_project_token_route("/api/v1/modules/m/projects/p1/config"),
@@ -1212,6 +1249,74 @@ mod tests {
             .expect("hub reachable");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "config here");
+    }
+
+    // ── v0.2.105 fix round: the baseline stamp is project-scoped ────────
+
+    #[tokio::test]
+    async fn codegraph_analyzed_accepts_matching_project_token() {
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a"), ("proj-b", "tok-b")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/api/v1/projects/proj-a/codegraph/analyzed", base))
+            .header("Authorization", "Bearer tok-a")
+            .json(&serde_json::json!({"commit": "abcdef1"}))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "stamped");
+    }
+
+    #[tokio::test]
+    async fn codegraph_analyzed_refuses_the_global_token() {
+        // The route stamps the project's launcher.db baseline, so it is held
+        // to the same boundary as /env and /config: the global hub.token is
+        // refused (no DB handle wired here, so the lazy-mint rescue cannot
+        // run — the production hub mints once, then the resolver rides the
+        // scoped token).
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/api/v1/projects/proj-a/codegraph/analyzed", base))
+            .header("Authorization", "Bearer global-tok")
+            .json(&serde_json::json!({"commit": "abcdef1"}))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("hub.token.<project_id>"),
+            "403 body should name the scoped-token remediation; got: {}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn codegraph_analyzed_refuses_another_projects_token() {
+        let base = spawn_router(router_with_project_tokens(
+            "global-tok",
+            &[("proj-a", "tok-a"), ("proj-b", "tok-b")],
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/api/v1/projects/proj-a/codegraph/analyzed", base))
+            .header("Authorization", "Bearer tok-b")
+            .json(&serde_json::json!({"commit": "abcdef1"}))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
