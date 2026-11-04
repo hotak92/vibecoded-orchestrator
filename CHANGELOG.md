@@ -121,18 +121,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The model gateway can no longer hang forever on a stalled network lookup.** During a brief DNS outage
   (2026-11-04), the gateway answered 502s the clients retried — but one retry was accepted and never answered: no log
   line, no timeout, its connection open for hours, the chat hung until VS Code was restarted. The request's timeout
-  covered only the TCP connect, not DNS resolution or the wait for the upstream's response headers, and a total bound
-  is deliberately absent there (a healthy completion may stream for many minutes). Every phase BEFORE the response
-  headers is now bounded: pool acquisition, DNS and connect as one bound, plus a time-to-response-headers bound —
-  while the streaming body after the headers keeps only its idle bound and is never cut. A transient pre-header
-  failure (DNS failure or stall, connect refused or timed out) is retried inside the gateway with bounded backoff for
-  up to 75 s, so a brief outage is invisible to the chat; only then does the retryable 502 go out, now with a short
-  `retry-after`. Nothing is ever retried once response bytes have started streaming to you. One WARNING per outage
-  (not per attempt) and one INFO on recovery land in the gateway log, and `/health` now reports how many upstream
-  requests are waiting for their response headers and how old the oldest is — by name and age, no URLs — so a stuck
-  request is visible while it is stuck instead of only in a post-mortem. Two new env knobs, documented in
-  `docs/CONFIGURATION.md`: `VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S` (default 600) and
-  `VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S` (default 75, `0` answers the first failure).
+  covered only the TCP connect, not DNS resolution or the wait for a free connection, and a total bound is deliberately
+  absent there (a healthy completion may stream for many minutes). Now reaching the upstream — connection pool, DNS
+  and TCP connect together — is bounded at 30 s, and the whole wait for the response headers has a backstop bound
+  (by default the 1800 s idle bound plus 600 s for uploading the request, so a slow non-streaming answer is never cut
+  earlier than before); the streaming body after the headers keeps only its idle bound and is never cut. A failure
+  where provably nothing reached the upstream — a DNS failure, a refused connection, or the 30 s connect bound — is
+  retried inside the gateway with bounded backoff while a 75 s window lasts, so a brief outage is invisible to the
+  chat; the longest a chat waits for the 502 is then about 105 s (the window plus one connect attempt), and that 502
+  carries a short `retry-after`. Anything that can happen after the request was sent (the upstream dropping or
+  resetting the connection, or going quiet) is NEVER re-sent by the gateway, because the upstream may already have —
+  and bill — the request: it gets the retryable 502 at once and your client's own retry decides. The error now names
+  the phase that failed (could not connect, went quiet, or no response headers). One WARNING per outage (a later
+  outage gets its own, even if no request in between succeeded) and one INFO on recovery land in the gateway log.
+  `/health` reports how many upstream requests are waiting for their response headers and how old the oldest is — by
+  name and age, no URLs — and the launcher's Services page shows it on the gateway card, highlighting a request that
+  has waited longer than a minute. Two new env knobs, documented in `docs/CONFIGURATION.md`:
+  `VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S` (unset = idle bound + 600 s) and
+  `VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S` (default 75, `0` answers the first failure); `inf`, `nan` and values
+  above their maximum are ignored.
 
 - **The launcher's build and test toolchain is clear of four high-severity advisories.** The launcher's development
   dependencies are patched: vite 6.4.5 (from 6.4.4), devalue 5.9.4, source-map-js 1.2.2 and undici 7.30.1. All four

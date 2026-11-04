@@ -107,21 +107,33 @@ Environment knobs (all optional; every one is read by code in this package)
     is not a state a typo should be able to reach.
 ``VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S``
     Seconds from issuing an upstream request to the arrival of its response
-    HEADERS (default :data:`DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S`, 600). Bounds
-    pool acquisition, DNS, connect and the upstream's pre-commit thinking as
-    one phase; the streaming body AFTER the headers stays unbounded (the
-    idle bound :attr:`GatewayConfig.upstream_idle_timeout_s` is the only body
-    bound). Non-positive or garbage values keep the default. Exists because
-    the 2026-11-04 03:08 incident held one request open forever in exactly
-    this phase.
+    HEADERS. Unset, the bound is :attr:`GatewayConfig.upstream_idle_timeout_s`
+    plus :data:`UPSTREAM_UPLOAD_ALLOWANCE_S` (1800 + 600 = 2400 s), so a
+    non-streaming completion — whose headers arrive only when the whole
+    answer is ready — keeps the full idle bound it always had, counted from
+    the end of its upload. It is the backstop for a body UPLOAD that stalls
+    (an upstream that stops reading), the one pre-header phase no other bound
+    covers; DNS, the pool and the connect have their own 30 s bound. The
+    streaming body AFTER the headers is never bounded by it. Accepted range:
+    finite, above 0 and at most :data:`UPSTREAM_HEADERS_TIMEOUT_MAX_S`;
+    anything else (garbage, ``0``, a negative, ``inf``, ``nan``, too large)
+    keeps the default.
 ``VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S``
-    Seconds the gateway retries a transient pre-header network failure (DNS
-    failure or stall, connect refused or timed out, pool timeout) inside
-    itself before answering the retryable 502 (default
+    Seconds during which the gateway may START another attempt after a
+    failure that provably sent nothing upstream — aiohttp's
+    ``ClientConnectorError`` (DNS failure, connect refused or reset, no
+    route; TLS certificate/handshake errors excepted, they are not
+    transient) and ``ConnectionTimeoutError`` (the 30 s pool + DNS + connect
+    bound) — before answering the retryable 502 (default
     :data:`DEFAULT_UPSTREAM_RETRY_WINDOW_S`, 75; ``0`` answers the first
-    failure). Only pre-header failures are retried — never once response
-    bytes have started streaming to the client — and only while the request
-    body is still re-sendable bytes.
+    failure). Anything that can happen after the body was written (server
+    disconnected, a reset after connect, the idle or headers bound) is
+    NEVER retried here: the upstream may already have the request, so it is
+    answered with the retryable 502 at once and the client's own retry
+    decides. Only re-sendable byte bodies retry. The worst-case wait before
+    the 502 is this window plus one connect bound (75 + 30 = 105 s with the
+    defaults). Accepted range: finite, ``0`` to
+    :data:`UPSTREAM_RETRY_WINDOW_MAX_S`; anything else keeps the default.
 """
 
 from __future__ import annotations
@@ -230,43 +242,62 @@ DEFAULT_UPSTREAM_IDLE_TIMEOUT_S = 1800.0
 #: no machine needs a different value).
 UPSTREAM_CONNECT_TIMEOUT_S = 30
 
-#: Default seconds from ISSUING an upstream request to the arrival of its
-#: response HEADERS. Everything before the headers is "not answering yet":
-#: pool + DNS + connect (also bounded by :data:`UPSTREAM_CONNECT_TIMEOUT_S`)
-#: plus however long the upstream thinks before it commits to a status. A
-#: bound has to exist because the only other bounds (``sock_connect`` and
-#: ``sock_read``) do not cover this phase on their own — ``sock_read`` starts
-#: guarding the moment the socket is connected, but a server that accepts
-#: the connection and then never writes a byte would wait forever without
-#: it. What must stay UNBOUNDED is the body AFTER the headers: a healthy
-#: completion may stream for many minutes (the 2026-09-09 incident cut one
-#: at 601 s), so this bound is enforced around the acquisition only, never
-#: as a ``total``. 600 s sits just above the client's own ~599 s first-byte
-#: window, so when both are waiting the client is the one that gives up
-#: first — the same discipline :attr:`GatewayConfig.upstream_idle_timeout_s`
-#: follows. Env-tunable (``VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S``)
-#: because the chaos suite and tests need sub-second bounds.
-DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S = 600.0
+#: Seconds of body UPLOAD the response-headers bound allows for, on top of
+#: the idle bound. The headers of a NON-streaming completion arrive only when
+#: the whole answer is ready, and before v0.2.105 the only bound on that wait
+#: was ``sock_read`` (the idle bound), which aiohttp starts AFTER the body is
+#: written. A headers bound counted from issuing the request therefore has to
+#: be the idle bound PLUS the upload time, or it cuts a completion the old
+#: code let finish. 600 s uploads a 32 MiB body (the rewrite buffer's
+#: ceiling) at about 450 kbit/s.
+UPSTREAM_UPLOAD_ALLOWANCE_S = 600.0
 
-#: The env var that overrides :data:`DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S`.
+#: Default seconds from ISSUING an upstream request to the arrival of its
+#: response HEADERS: the idle bound plus the upload allowance (2400 s), see
+#: :meth:`GatewayConfig.headers_timeout_s`. What it bounds that nothing else
+#: does is a body upload that STALLS (the upstream accepted the connection
+#: and stopped reading): aiohttp has no bound on the body write when
+#: ``total`` is ``None``. Pool + DNS + connect are bounded by
+#: :data:`UPSTREAM_CONNECT_TIMEOUT_S`, and the wait after the upload by
+#: ``sock_read`` — the 2026-11-04 hang was the connect-phase gap, closed by
+#: ``connect=``. The body AFTER the headers is never bounded by this (a
+#: healthy completion may stream for many minutes; the 2026-09-09 incident
+#: cut one at 601 s), so it is enforced around the acquisition only, never as
+#: a ``total``. Env-tunable (``VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S``)
+#: because the chaos suite and tests need sub-second bounds.
+DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S = (
+    DEFAULT_UPSTREAM_IDLE_TIMEOUT_S + UPSTREAM_UPLOAD_ALLOWANCE_S
+)
+
+#: The env var that overrides :meth:`GatewayConfig.headers_timeout_s`.
 UPSTREAM_HEADERS_TIMEOUT_ENV = "VCT_MODEL_GATEWAY_UPSTREAM_HEADERS_TIMEOUT_S"
 
-#: Default seconds the gateway retries a TRANSIENT pre-header network failure
-#: (DNS failure or stall, connect refused or timed out, pool timeout) INSIDE
-#: itself before answering the 502 the client retries on — a brief outage is
-#: then invisible to the chat, which is the owner's rule ("the gateway must
-#: NEVER cause chat failures"; an error the client retries is survivable, a
-#: silent hang is not). 75 s: inside the 60–90 s window the owner named,
-#: shorter than the client's own give-up so the 502 still arrives in time to
-#: be retried. Retried only while the body is re-sendable bytes and nothing
-#: has been streamed to the client (the failure happened before the response
-#: headers, so both hold by construction). ``0`` disables the retrying and
-#: answers the first failure, which is what the test suite configures so a
-#: dead stub upstream fails fast. Env-tunable
-#: (``VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S``) for the same reason the
-#: headers bound is.
+#: Largest accepted headers bound (2 h). Above it — and for ``inf`` / ``nan``
+#: — the env value is ignored: an unbounded wait is the incident's symptom
+#: and must not be reachable through a typo.
+UPSTREAM_HEADERS_TIMEOUT_MAX_S = 7200.0
+
+#: Default seconds the gateway may start another attempt after a PRE-SEND
+#: network failure — one where aiohttp provably wrote nothing to the
+#: upstream: ``ClientConnectorError`` (DNS failure, connect refused, no
+#: route) and ``ConnectionTimeoutError`` (pool + DNS + connect bound). A brief
+#: outage is then invisible to the chat, which is the owner's rule ("the
+#: gateway must NEVER cause chat failures"; an error the client retries is
+#: survivable, a silent hang is not). A failure AFTER the connection exists
+#: (server disconnected, reset, a read or headers timeout) is never retried
+#: here, because the upstream may already hold — and bill — the request;
+#: that is answered with the retryable 502 at once. 75 s: inside the 60–90 s
+#: window the owner named. The window gates STARTING an attempt, so the
+#: worst-case wait before the 502 is the window plus one connect bound
+#: (105 s). ``0`` answers the first failure, which is what the test suite
+#: configures so a dead stub upstream fails fast. Env-tunable
+#: (``VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S``).
 UPSTREAM_RETRY_WINDOW_ENV = "VCT_MODEL_GATEWAY_UPSTREAM_RETRY_WINDOW_S"
 DEFAULT_UPSTREAM_RETRY_WINDOW_S = 75.0
+
+#: Largest accepted retry window (10 min); larger, ``inf`` or ``nan`` keeps
+#: the default — ``monotonic() + inf`` would retry a dead DNS forever.
+UPSTREAM_RETRY_WINDOW_MAX_S = 600.0
 
 #: How much of a request body the gateway will HOLD in memory so it can
 #: rewrite ids inside it. **Not a request ceiling**: nothing is refused for
@@ -671,14 +702,15 @@ class GatewayConfig:
     #: that cannot express 0.2 s cannot be tested without sleeping for
     #: minutes.
     upstream_idle_timeout_s: float = DEFAULT_UPSTREAM_IDLE_TIMEOUT_S
-    #: Seconds from issuing an upstream request to its response HEADERS —
-    #: pool + DNS + connect + the upstream's own thinking time, bounded as
-    #: ONE phase, with the streaming body after the headers left unbounded
-    #: (see :data:`DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S`). Read by
-    #: :func:`model_router.server._acquire_upstream`.
-    upstream_headers_timeout_s: float = DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S
-    #: Seconds the gateway retries a transient pre-header network failure
-    #: before answering the retryable 502 (see
+    #: Seconds from issuing an upstream request to its response HEADERS, or
+    #: ``None`` (the default) for the idle bound plus the upload allowance —
+    #: read it through :meth:`headers_timeout_s`, never directly. ``None``
+    #: keeps the bound tied to :attr:`upstream_idle_timeout_s`, so a
+    #: non-streaming completion is never cut before the idle bound would have
+    #: cut it. Read by :func:`model_router.server._acquire_upstream`.
+    upstream_headers_timeout_s: Optional[float] = None
+    #: Seconds during which a PRE-SEND failure may be retried before the
+    #: retryable 502 is answered (see
     #: :data:`DEFAULT_UPSTREAM_RETRY_WINDOW_S`). ``0`` fails fast on the
     #: first attempt — what the test suite configures against dead stub
     #: upstreams. Read by :func:`model_router.server._acquire_upstream`.
@@ -711,6 +743,20 @@ class GatewayConfig:
     #: :func:`model_router.server.models_handler`; reported in ``/health``.
     picker_usage: str = DEFAULT_PICKER_USAGE
 
+    def headers_timeout_s(self) -> float:
+        """The response-headers bound in force: the explicit value, else the
+        idle bound plus :data:`UPSTREAM_UPLOAD_ALLOWANCE_S`.
+
+        Derived rather than a fixed constant so the bound can never be
+        SHORTER than the idle bound it backs up — a non-streaming completion
+        waits for its headers as long as the whole answer takes, and before
+        v0.2.105 only the idle bound (counted from the end of the upload)
+        limited that wait.
+        """
+        if self.upstream_headers_timeout_s is not None:
+            return self.upstream_headers_timeout_s
+        return self.upstream_idle_timeout_s + UPSTREAM_UPLOAD_ALLOWANCE_S
+
     @classmethod
     def from_env(cls, *, token: str = "") -> "GatewayConfig":
         return cls(
@@ -732,19 +778,26 @@ class GatewayConfig:
                 "VCT_MODEL_GATEWAY_KEY_STALE_MAX_S", DEFAULT_SERVE_STALE_MAX_AGE_S, minimum=1,
             ),
             # Floats on purpose (sub-second bounds for the chaos suite);
-            # unset/blank/garbage keeps the default, and a bad headers bound
-            # must never disable itself by falling through to 0.
+            # unset/blank/garbage/non-finite/too large keeps the default
+            # (``None``: the idle bound plus the upload allowance), and a bad
+            # headers bound must never disable itself by falling through to
+            # 0 or become unbounded through ``inf``.
             upstream_headers_timeout_s=env_float(
                 UPSTREAM_HEADERS_TIMEOUT_ENV,
-                DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S,
+                None,
                 above=0,
+                maximum=UPSTREAM_HEADERS_TIMEOUT_MAX_S,
+                finite=True,
             ),
             # minimum=0: 0 is the legitimate "answer the first failure"
-            # setting, not a typo.
+            # setting, not a typo. finite + maximum: ``inf`` would retry a
+            # dead DNS forever — the incident's own symptom.
             upstream_retry_window_s=env_float(
                 UPSTREAM_RETRY_WINDOW_ENV,
                 DEFAULT_UPSTREAM_RETRY_WINDOW_S,
                 minimum=0,
+                maximum=UPSTREAM_RETRY_WINDOW_MAX_S,
+                finite=True,
             ),
             rewrite_buffer_bytes=env_int(
                 "VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES",
@@ -789,8 +842,11 @@ __all__ = [
     "DEFAULT_UPSTREAM_IDLE_TIMEOUT_S",
     "DEFAULT_UPSTREAM_HEADERS_TIMEOUT_S",
     "UPSTREAM_HEADERS_TIMEOUT_ENV",
+    "UPSTREAM_HEADERS_TIMEOUT_MAX_S",
+    "UPSTREAM_UPLOAD_ALLOWANCE_S",
     "DEFAULT_UPSTREAM_RETRY_WINDOW_S",
     "UPSTREAM_RETRY_WINDOW_ENV",
+    "UPSTREAM_RETRY_WINDOW_MAX_S",
     "REWRITE_BUFFER_LIMIT_BYTES",
     "CONTEXT_GUARD_MARGIN_DEFAULT",
     "CONTEXT_GUARD_MARGIN_ENV",

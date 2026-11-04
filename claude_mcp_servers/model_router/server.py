@@ -451,12 +451,15 @@ def _ladder_verdict(
 #: on the most ordinary flake there is.
 RETRYABLE_HEADERS = {"x-should-retry": "true"}
 
-#: What a gateway-side 502 for a PRE-HEADER network failure carries, on top
-#: of :data:`RETRYABLE_HEADERS`. The gateway has already spent its bounded
-#: retry window inside itself (see :func:`_acquire_upstream`) when it writes
-#: one of these, so a client that retries immediately would just hit the
-#: same outage; a short ``retry-after`` paces the one it is going to do
-#: anyway. Clients that ignore it are no worse off than before.
+#: What a gateway-side 502 for an UNREACHABLE upstream (never connected:
+#: DNS, refused, the connect bound) carries, on top of
+#: :data:`RETRYABLE_HEADERS`. The gateway has already spent its bounded retry
+#: window inside itself (see :func:`_acquire_upstream`) when it writes one of
+#: these, so a client that retries immediately would just hit the same
+#: outage; a short ``retry-after`` paces the one it is going to do anyway.
+#: Clients that ignore it are no worse off than before. A failure after the
+#: connection existed is not retried in the gateway and carries
+#: :data:`RETRYABLE_HEADERS` only.
 UPSTREAM_RETRY_AFTER_S = 5
 RETRYABLE_502_HEADERS = {
     **RETRYABLE_HEADERS,
@@ -640,6 +643,64 @@ class _UpstreamFlight:
         }
 
 
+#: Seconds without a pre-send failure on a route after which its outage
+#: EPISODE is over: the next failure opens a new one with its own WARNING.
+_UPSTREAM_OUTAGE_QUIET_S = 60.0
+
+
+class _UpstreamOutages:
+    """Outage EPISODES per route label: one WARNING when one opens, at most
+    one INFO when the route answers again.
+
+    An episode opens with a pre-send failure on a route that has had none for
+    :data:`_UPSTREAM_OUTAGE_QUIET_S` seconds, and every failure inside it
+    extends it (logged at DEBUG, so a minute of retries is one alarming line,
+    not twenty). It ends on its own once the route has been quiet that long —
+    whether or not any request succeeded — so an outage in which every
+    request gave up (or the retry window is ``0``) can never swallow the
+    WARNING of a later one. The first success inside an episode logs the
+    recovery INFO once; a failure that follows soon after (another request
+    of the same outage still failing) stays at DEBUG instead of producing
+    WARNING/INFO pairs. Labels are family ids — NAMES, never URLs. One event
+    loop, so plain dict bookkeeping needs no lock.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        #: label -> [time of the latest failure, recovery already logged]
+        self._episodes: dict[str, list] = {}
+
+    def failure(self, label: str, exc: BaseException) -> None:
+        now = self._clock()
+        episode = self._episodes.get(label)
+        if episode is not None and now - episode[0] < _UPSTREAM_OUTAGE_QUIET_S:
+            episode[0] = now
+            logger.debug(
+                "model-gateway: upstream %s still unreachable (%s)",
+                label, type(exc).__name__,
+            )
+            return
+        self._episodes[label] = [now, False]
+        logger.warning(
+            "model-gateway: upstream %s unreachable (%s, nothing was sent "
+            "upstream); retrying inside the gateway while the retry window "
+            "lasts",
+            label, type(exc).__name__,
+        )
+
+    def recovery(self, label: str) -> None:
+        episode = self._episodes.get(label)
+        if episode is None:
+            return
+        if self._clock() - episode[0] >= _UPSTREAM_OUTAGE_QUIET_S:
+            # The episode ended unnoticed; nothing to announce.
+            del self._episodes[label]
+            return
+        if not episode[1]:
+            episode[1] = True
+            logger.info("model-gateway: upstream %s reachable again", label)
+
+
 class Gateway:
     """Everything the handlers need, built once at startup."""
 
@@ -701,10 +762,10 @@ class Gateway:
         #: response headers, reported by ``/health`` as
         #: ``upstream_in_flight``. See :class:`_UpstreamFlight`.
         self.upstream_flight = _UpstreamFlight()
-        #: Route labels (family ids) with an UNRECOVERED transient network
-        #: outage — gates the per-EPISODE (not per-attempt) WARNING and the
-        #: one INFO on recovery. See :func:`_note_transient_failure`.
-        self._upstream_outages: "set[str]" = set()
+        #: Per-route outage EPISODES — gates the per-episode (not
+        #: per-attempt) WARNING and the one INFO on recovery. See
+        #: :class:`_UpstreamOutages`.
+        self.upstream_outages = _UpstreamOutages()
         #: Per-vendor rewritten-id -> vendor-id maps. Per PROCESS and bounded:
         #: the client echoes an id back one turn later, so the map only has to
         #: outlive a request, and an unbounded one would grow with uptime.
@@ -3460,36 +3521,35 @@ def _reread_oauth_headers(
     return updated
 
 
-def _note_transient_failure(gateway: Gateway, label: str, exc: BaseException) -> None:
-    """One WARNING per outage EPISODE, not per attempt.
+class UpstreamHeadersTimeout(asyncio.TimeoutError):
+    """The response-headers bound (:meth:`GatewayConfig.headers_timeout_s`)
+    expired. Its own class so the caller can tell it from aiohttp's
+    ``ServerTimeoutError`` family, which is ALSO an ``asyncio.TimeoutError``
+    and means something else (connect bound, idle bound)."""
 
-    An episode opens with the first transient failure of a route and closes
-    with :func:`_note_upstream_recovery`; attempts in between log at DEBUG so
-    a 60 s outage retried every few seconds is one alarming line, not
-    twenty. The label is a family id — a NAME, never a URL or a header
-    value.
+
+def _is_pre_send_failure(exc: BaseException) -> bool:
+    """True only for failures where aiohttp provably wrote NOTHING upstream.
+
+    ``ClientConnectorError`` (DNS failure, refused, no route) and
+    ``ConnectionTimeoutError`` are raised only from ``connector.connect()``,
+    before ``req.send()`` (aiohttp 3.13 ``client.py``
+    ``_connect_and_send_request``), so a second attempt cannot duplicate a
+    request. TLS failures (``ClientSSLError``, a ``ClientConnectorError``
+    subclass) are pre-send too but not transient: a certificate does not fix
+    itself in 75 s, so they are answered at once.
+
+    Everything else — ``ServerDisconnectedError``, ``ClientOSError`` after
+    connect (a reset), ``SocketTimeoutError`` (idle bound), the headers bound
+    — can happen after the body was fully written, so the upstream may
+    already hold (and bill) the request. aiohttp itself refuses to retry a
+    POST there (``retry_persistent_connection`` is idempotent methods only).
     """
-    if label in gateway._upstream_outages:
-        logger.debug(
-            "model-gateway: upstream %s still unreachable (%s), retrying",
-            label, type(exc).__name__,
-        )
-        return
-    gateway._upstream_outages.add(label)
-    logger.warning(
-        "model-gateway: upstream %s transient network failure (%s); "
-        "retrying inside the gateway",
-        label, type(exc).__name__,
+    if isinstance(exc, aiohttp.ClientSSLError):
+        return False
+    return isinstance(
+        exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError),
     )
-
-
-def _note_upstream_recovery(gateway: Gateway, label: str) -> None:
-    """The one INFO that closes an episode :func:`_note_transient_failure`
-    opened. Called on every successful acquisition; it only speaks when
-    there was an episode."""
-    if label in gateway._upstream_outages:
-        gateway._upstream_outages.discard(label)
-        logger.info("model-gateway: upstream %s reachable again", label)
 
 
 async def _acquire_upstream(
@@ -3508,29 +3568,33 @@ async def _acquire_upstream(
     connection pool were bounded only by ``connect``, which was unset, and
     ``total`` was deliberately ``None``):
 
-    * pool + DNS + TCP connect — aiohttp's ``connect`` (set here) plus the
-      headers wait below;
-    * the wait for the response headers themselves — the ``wait_for``
-      around the acquisition.
+    * pool + DNS + TCP connect — aiohttp's ``connect`` (set here);
+    * the wait after the upload — ``sock_read`` (the idle bound), which
+      aiohttp starts once the body is written;
+    * the whole acquisition, a stalled UPLOAD included — the headers bound
+      (:meth:`GatewayConfig.headers_timeout_s`, the idle bound plus an upload
+      allowance by default, so it never cuts a non-streaming completion the
+      idle bound would have let finish).
 
     What is deliberately NOT bounded is the streaming body after the
     headers: a healthy completion may run for many minutes, and the idle
     bound (``sock_read``) stays the only body bound.
 
-    A transient failure BEFORE any byte reached the client — which this
-    whole function is: the client response is not even prepared yet — is
-    retried with bounded backoff for ``upstream_retry_window_s`` seconds so
-    a brief outage is invisible to the chat, and only then raises for the
-    caller to answer the retryable 502. A body that is not re-sendable
-    bytes (the over-buffer streaming path) cannot be sent twice, so such a
-    request fails on the first attempt.
+    Retried — with bounded backoff while ``upstream_retry_window_s`` lasts —
+    are ONLY failures where nothing was sent upstream
+    (:func:`_is_pre_send_failure`), so a brief DNS or connect outage is
+    invisible to the chat and a request is never delivered twice. Any other
+    failure raises on its first occurrence for the caller to answer the
+    retryable 502; the client's own retry decides. A body that is not
+    re-sendable bytes (the over-buffer streaming path) is never retried.
 
     Returns the response with headers received; the CALLER owns it (``async
     with``). Raises ``RuntimeError`` (session not started — a programming
-    error), ``asyncio.TimeoutError`` (the headers bound), or an
-    ``aiohttp.ClientError`` (transport, after retries).
+    error), :class:`UpstreamHeadersTimeout`, or an ``aiohttp.ClientError`` /
+    ``OSError`` (transport).
     """
     config = gateway.config
+    headers_bound = config.headers_timeout_s()
     resendable = isinstance(body, (bytes, bytearray))
     deadline = (
         time.monotonic() + config.upstream_retry_window_s
@@ -3554,8 +3618,8 @@ async def _acquire_upstream(
                     # unlike `sock_connect` also covers DNS resolution and
                     # connection-pool acquisition — the 2026-11-04 hang was
                     # exactly a phase only `connect` bounds) and going quiet
-                    # (`sock_read`). The headers wait itself is bounded by
-                    # the `wait_for` around this context manager.
+                    # (`sock_read`). The whole acquisition is bounded by the
+                    # `asyncio.timeout` below.
                     timeout=aiohttp.ClientTimeout(
                         total=None,
                         connect=config.upstream_connect_timeout_s,
@@ -3563,23 +3627,34 @@ async def _acquire_upstream(
                         sock_read=config.upstream_idle_timeout_s,
                     ),
                 )
-                response = await asyncio.wait_for(
-                    ctx.__aenter__(), timeout=config.upstream_headers_timeout_s,
-                )
+                # `await ctx` runs the request INLINE in this task (no inner
+                # Task, unlike `wait_for` on 3.11), so a cancellation either
+                # lands inside aiohttp — whose own `except BaseException`
+                # closes the response and the connection — or after the
+                # response is ours, at the caller's next await, by which time
+                # the caller holds it in `async with`. Nothing can drop a
+                # received response unreleased in between.
+                bound = asyncio.timeout(headers_bound)
+                try:
+                    async with bound:
+                        response = await ctx
+                except TimeoutError as exc:
+                    if bound.expired():
+                        raise UpstreamHeadersTimeout() from exc
+                    raise
             except RuntimeError:
                 # `gateway.session` raised before start() — a programming
                 # error, not a network condition; the caller's own branch
                 # answers it.
                 raise
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError) as exc:
-                # Pre-header transient failures only: connection errors
-                # (DNS failure/stall, refused, reset), the connect timeout
-                # (a ServerTimeoutError is both a ClientConnectionError and
-                # an asyncio.TimeoutError) and the headers bound. Nothing
-                # has reached the client — the client response is not even
-                # prepared — so retrying is always safe here.
+            except (aiohttp.ClientError, OSError) as exc:
+                if not _is_pre_send_failure(exc):
+                    # The upstream may already have this request: never
+                    # re-send it. (`UpstreamHeadersTimeout` is not caught
+                    # here at all, for the same reason.)
+                    raise
                 now = time.monotonic()
-                _note_transient_failure(gateway, label, exc)
+                gateway.upstream_outages.failure(label, exc)
                 if deadline is None or now >= deadline:
                     if attempt > 1:
                         logger.warning(
@@ -3596,7 +3671,7 @@ async def _acquire_upstream(
                 if backoff > 0:
                     await asyncio.sleep(backoff)
                 continue
-            _note_upstream_recovery(gateway, label)
+            gateway.upstream_outages.recovery(label)
             return response
     finally:
         gateway.upstream_flight.exit(token)
@@ -3801,39 +3876,88 @@ async def _proxy(
         logger.error("model-gateway: %s", exc)
         access(502, stream=stream_requested)
         return _json_error(502, "api_error", str(exc), headers=RETRYABLE_HEADERS)
-    except asyncio.TimeoutError:
-        # The headers bound (2026-11-04): the upstream was reached but never
-        # committed to a status within `upstream_headers_timeout_s` — after
-        # the in-gateway retry window. Not a word about "going quiet": the
-        # idle bound owns that vocabulary, and this failure is earlier.
+    except UpstreamHeadersTimeout:
+        # The headers bound (2026-11-04): the request was issued but no
+        # response headers arrived within the bound — a stalled upload, or
+        # an upstream that kept the connection busy without committing to a
+        # status. Never retried: the upstream may hold the request.
+        bound = gateway.config.headers_timeout_s()
         logger.warning(
             "model-gateway: %s -> %s sent no response headers within %ss",
-            _log_safe(decision.forward_model), decision.family_id,
-            gateway.config.upstream_headers_timeout_s,
+            _log_safe(decision.forward_model), decision.family_id, bound,
         )
         access(502, stream=stream_requested, extra="note=upstream_timeout")
         return _json_error(
             502,
             "api_error",
             f"upstream {decision.upstream} sent no response headers within "
-            f"{gateway.config.upstream_headers_timeout_s}s",
-            headers=RETRYABLE_502_HEADERS,
+            f"{bound}s",
+            headers=RETRYABLE_HEADERS,
         )
-    except aiohttp.ClientError as exc:
-        # Unreachable after the in-gateway retry window
-        # (:func:`_acquire_upstream`) — DNS, connect refused, reset, or the
-        # connect bound. The client retries on this 502; the `retry-after`
-        # paces it because the window has already been spent.
+    except aiohttp.ConnectionTimeoutError:
+        # The connect bound: pool + DNS + TCP did not complete — the
+        # upstream was never reached (the 2026-11-04 incident's phase). Must
+        # precede the idle branch below: both are `ServerTimeoutError`s.
+        bound = gateway.config.upstream_connect_timeout_s
         logger.warning(
-            "model-gateway: %s -> %s unreachable: %s",
-            _log_safe(decision.forward_model), decision.family_id, _log_safe(exc),
+            "model-gateway: %s -> %s unreachable: no connection within %ss "
+            "(connection pool, DNS or TCP connect)",
+            _log_safe(decision.forward_model), decision.family_id, bound,
         )
         access(502, stream=stream_requested, extra="note=upstream_unreachable")
         return _json_error(
             502,
             "api_error",
-            f"upstream {decision.upstream} unreachable: {exc}",
+            f"upstream {decision.upstream} unreachable: no connection within "
+            f"{bound}s (connection pool, DNS or TCP connect)",
             headers=RETRYABLE_502_HEADERS,
+        )
+    except asyncio.TimeoutError:
+        # aiohttp's `sock_read` (the idle bound) BEFORE the headers: the
+        # request went out and the upstream then said nothing for the whole
+        # idle bound — the same condition, and the same words, as going
+        # quiet mid-body below.
+        logger.warning(
+            "model-gateway: %s -> %s went quiet for %ss",
+            _log_safe(decision.forward_model), decision.family_id,
+            gateway.config.upstream_idle_timeout_s,
+        )
+        access(502, stream=stream_requested, extra="note=upstream_timeout")
+        return _json_error(
+            502,
+            "api_error",
+            f"upstream {decision.upstream} sent nothing for "
+            f"{gateway.config.upstream_idle_timeout_s}s",
+            headers=RETRYABLE_HEADERS,
+        )
+    except (aiohttp.ClientError, OSError) as exc:
+        if isinstance(exc, aiohttp.ClientConnectorError):
+            # Unreachable — DNS, refused, no route, TLS — never connected,
+            # so after the in-gateway retry window where one applies
+            # (:func:`_acquire_upstream`). The `retry-after` paces the
+            # client's retry because the window is spent.
+            reason, note, retry_headers = (
+                "unreachable", "upstream_unreachable", RETRYABLE_502_HEADERS,
+            )
+        else:
+            # Disconnected or reset after the connection existed — the
+            # upstream may have the request, so the gateway did NOT re-send
+            # it; the client's own retry decides, at once.
+            reason, note, retry_headers = (
+                "dropped the connection before answering",
+                "upstream_dropped", RETRYABLE_HEADERS,
+            )
+        logger.warning(
+            "model-gateway: %s -> %s %s: %s",
+            _log_safe(decision.forward_model), decision.family_id, reason,
+            _log_safe(exc),
+        )
+        access(502, stream=stream_requested, extra=f"note={note}")
+        return _json_error(
+            502,
+            "api_error",
+            f"upstream {decision.upstream} {reason}: {exc}",
+            headers=retry_headers,
         )
 
     try:
