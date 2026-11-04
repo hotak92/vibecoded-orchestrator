@@ -48,6 +48,7 @@
     describeSecretScope,
     describeSupervision,
     describeUsageLedger,
+    describeUpstreamInFlight,
     describeAgentDelivery,
     describeHeldVendors,
     describeRoutingGuidance,
@@ -176,6 +177,7 @@
   // Why a gateway that is UP may still serve nothing: its secret scope.
   const gwSecretScope = $derived(describeSecretScope(gw));
   const gwUsageLedger = $derived(describeUsageLedger(gw));
+  const gwUpstreamWait = $derived(describeUpstreamInFlight(gw));
   // Only ever set by a START, and only shown when the proof REFUSED.
   const gwDogfood = $derived(describeDogfood(gw));
   const gwWarnings = $derived(pointPanelWarnings(vsInspection));
@@ -947,6 +949,12 @@
           <dt>usage ledger</dt>
           <dd>{gwUsageLedger}</dd>
         {/if}
+        {#if gwUpstreamWait}
+          <dt>upstream waits</dt>
+          <dd class="gw-upstream-wait gw-upstream-wait-{gwUpstreamWait.tone}"
+            >{gwUpstreamWait.text}</dd
+          >
+        {/if}
         <dt>token file</dt>
         <dd>
           {gw.health.token_file_permissions}
@@ -1389,6 +1397,10 @@
   }
   .gw-account-bad {
     color: var(--color-pink, #ff4fa0);
+  }
+  .gw-upstream-wait-warn {
+    color: #f5b942;
+    font-weight: 600;
   }
   .gw-head {
     display: flex;

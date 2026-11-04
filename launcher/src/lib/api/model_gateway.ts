@@ -1384,6 +1384,46 @@ export function describeSecretScope(s: ModelGatewayStatus | null): StatusLine | 
 }
 
 /**
+ * Seconds after which a request still waiting for its upstream's response
+ * headers is highlighted. A streaming answer sends its headers within a
+ * second or two; a minute without them is worth a look (a stalled network,
+ * or a long non-streaming answer) — the gateway's own bounds end it later.
+ */
+export const UPSTREAM_WAIT_WARN_SECONDS = 60;
+
+/**
+ * One line for `/health`'s `upstream_in_flight`: how many upstream requests
+ * are waiting for their response headers, and the oldest one's route and
+ * age. `null` when the gateway does not report it (older gateway). Route
+ * names and ages only — the block carries no URL.
+ */
+export function describeUpstreamInFlight(
+  s: ModelGatewayStatus | null,
+): { tone: 'ok' | 'warn'; text: string } | null {
+  const flight = s?.health?.upstream_in_flight;
+  if (!flight) return null;
+  const count = Number.isFinite(flight.count) ? flight.count : 0;
+  if (count <= 0) {
+    return { tone: 'ok', text: 'none waiting for response headers' };
+  }
+  const plural = count === 1 ? 'request' : 'requests';
+  const age = flight.oldest_age_s;
+  if (age === null || age === undefined || !Number.isFinite(age)) {
+    return { tone: 'ok', text: `${count} ${plural} waiting for response headers` };
+  }
+  const route = flight.oldest_label ? ` (${flight.oldest_label})` : '';
+  const ageText = age >= 120 ? `${Math.floor(age / 60)} min` : `${Math.round(age)} s`;
+  const text = `${count} ${plural} waiting for response headers; oldest${route} for ${ageText}`;
+  if (age > UPSTREAM_WAIT_WARN_SECONDS) {
+    return {
+      tone: 'warn',
+      text: `${text} — longer than ${UPSTREAM_WAIT_WARN_SECONDS} s: the upstream may be unreachable or slow (the gateway log names the cause)`,
+    };
+  }
+  return { tone: 'ok', text };
+}
+
+/**
  * One line for the usage ledger: where per-chat token rows land.
  *
  * Shown because a ledger whose path could not be resolved silently accounts

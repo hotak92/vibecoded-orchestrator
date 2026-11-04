@@ -57,6 +57,21 @@ export interface GatewayHealth {
     default?: string;
     accounts?: import('$lib/api/gateway_accounts').GatewayAccountView[];
   } | null;
+  /** v0.2.105: upstream requests waiting for their response headers. */
+  upstream_in_flight?: GatewayUpstreamInFlight | null;
+}
+
+/**
+ * `/health`'s `upstream_in_flight` block (v0.2.105, the 2026-11-04 incident:
+ * a request stuck before its response headers was visible only as a TCP
+ * connection open for hours). A route NAME and ages only — never a URL.
+ */
+export interface GatewayUpstreamInFlight {
+  count: number;
+  /** Seconds the oldest waiting request has waited; `null` when none. */
+  oldest_age_s: number | null;
+  /** Route (family id) of the oldest waiting request; `null` when none. */
+  oldest_label: string | null;
 }
 
 /** `/health`'s `secret_scope` block. */
