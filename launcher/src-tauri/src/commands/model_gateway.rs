@@ -612,6 +612,27 @@ pub struct GatewayHealth {
     /// lines; without this field serde dropped it on the way to the GUI.
     #[serde(default)]
     pub accounts: Option<serde_json::Value>,
+    /// v0.2.105 (the 2026-11-04 incident): upstream requests waiting for
+    /// their response headers — count, the oldest one's age and route name.
+    /// Names and ages only, never a URL. `None` from a gateway that predates
+    /// it. Without this field serde dropped it on the way to the Services
+    /// card, which highlights a wait longer than a minute.
+    #[serde(default)]
+    pub upstream_in_flight: Option<GatewayUpstreamInFlight>,
+}
+
+/// `/health`'s `upstream_in_flight` block. Every field defaults, like
+/// [`GatewayHealth`], so a partial block still parses.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GatewayUpstreamInFlight {
+    #[serde(default)]
+    pub count: u64,
+    /// Seconds the oldest waiting request has waited; `None` when none.
+    #[serde(default)]
+    pub oldest_age_s: Option<f64>,
+    /// Route (family id) of the oldest waiting request; `None` when none.
+    #[serde(default)]
+    pub oldest_label: Option<String>,
 }
 
 // ─── Login registration: the THIRD state ──────────────────────────────────
@@ -2358,6 +2379,33 @@ mod tests {
             serde_json::to_value(GatewayHealth { accounts: Some(block), ..Default::default() })
                 .unwrap();
         assert_eq!(out["accounts"]["accounts"][0]["label"], "Personal");
+    }
+
+    #[test]
+    fn health_payload_carries_the_upstream_in_flight_block() {
+        // v0.2.105: the Services card highlights a request stuck before its
+        // response headers; a struct without the field dropped it.
+        let json = r#"{"ok": true, "upstream_in_flight":
+            {"count": 2, "oldest_age_s": 75.5, "oldest_label": "zai"}}"#;
+        let parsed: GatewayHealth = serde_json::from_str(json).unwrap();
+        let flight = parsed.upstream_in_flight.clone().expect("block carried through");
+        assert_eq!(flight.count, 2);
+        assert_eq!(flight.oldest_age_s, Some(75.5));
+        assert_eq!(flight.oldest_label.as_deref(), Some("zai"));
+        let out = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(out["upstream_in_flight"]["count"], 2);
+        assert_eq!(out["upstream_in_flight"]["oldest_label"], "zai");
+
+        let idle = r#"{"ok": true, "upstream_in_flight":
+            {"count": 0, "oldest_age_s": null, "oldest_label": null}}"#;
+        let parsed: GatewayHealth = serde_json::from_str(idle).unwrap();
+        assert_eq!(
+            parsed.upstream_in_flight,
+            Some(GatewayUpstreamInFlight { count: 0, oldest_age_s: None, oldest_label: None })
+        );
+        // An older gateway without the block still parses.
+        let old: GatewayHealth = serde_json::from_str(r#"{"ok": true}"#).unwrap();
+        assert!(old.upstream_in_flight.is_none());
     }
 
     #[test]

@@ -156,3 +156,23 @@ describe('Adoption dialog wiring', () => {
     expect(text).not.toContain('reset');
   });
 });
+
+describe('Gateway upstream-wait wiring (v0.2.105)', () => {
+  it('derives the line from describeUpstreamInFlight(gw) and renders its text + tone', () => {
+    const script = (PAGE.instance as Node).content;
+    const derive = calls(script, 'describeUpstreamInFlight');
+    expect(derive.length).toBe(1);
+    expect(isIdent((derive[0].arguments as Node[])[0], 'gw')).toBe(true);
+    // The markup renders gwUpstreamWait.text under an {#if gwUpstreamWait}.
+    const guarded = [...walk(PAGE.fragment)].find(
+      (n) => n.type === 'IfBlock' && isIdent(n.test, 'gwUpstreamWait'),
+    );
+    expect(guarded, '{#if gwUpstreamWait}').toBeDefined();
+    const members = [...walk((guarded as Node).consequent)].filter(
+      (n) => n.type === 'MemberExpression' && isIdent(n.object, 'gwUpstreamWait'),
+    );
+    const props = members.map((m) => ((m.property as Node).name as string));
+    expect(props).toContain('text');
+    expect(props).toContain('tone');
+  });
+});
