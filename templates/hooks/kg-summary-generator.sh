@@ -9,6 +9,9 @@
 #   - hybrid_search (descriptions detail level)
 #
 # Content-hash dedup: skips regeneration if node content unchanged.
+# Parity note (v0.2.105): the .ps1 sibling stopped storing its stdin payload in the automatic
+# $Input variable (a `pwsh -File` script that names $Input gets an empty payload) and reads it
+# via $HookStdin like the other hooks. Bash reads stdin directly — nothing to change here.
 
 # Scrub sensitive env vars
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
