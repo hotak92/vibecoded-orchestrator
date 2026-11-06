@@ -38,6 +38,9 @@ function report(extra: Partial<UnregisterReport> = {}): UnregisterReport {
     projectId: 'p1',
     projectName: 'Gamma',
     filesPurged: [],
+    filesKeptModified: [],
+    keptAsYours: [],
+    settingsEntriesRemoved: [],
     keysPurgedFromEnv: [],
     collectionsDropped: [],
     warnings: [],
@@ -85,16 +88,97 @@ describe('ProjectRemoveFlow — the shared confirm dialog', () => {
     const text = (document.body.textContent ?? '').replace(/\s+/g, ' ');
     expect(text).toContain('Remove project');
     expect(text).toContain('Gamma');
-    // What goes: VCO's own files, env lines, and the project's collections.
-    expect(text).toContain('hooks, scripts and bundled files');
-    expect(text).toContain('knowledge graph');
-    expect(text).toContain('code graph');
+    // What goes — in the backend's own terms (vco_lib/unregister_files.py,
+    // unregister_collections.py): VCO's unchanged files of every kind, its
+    // settings entries, working folders and exclude lines, env lines, and
+    // the project's collections including diagrams.
+    expect(text).toContain('hooks, scripts, agents, skills and other files VCO installed');
+    expect(text).toContain('.claude/settings.json');
+    expect(text).toContain('.vscode/settings.json');
+    expect(text).toContain('.claude/state/');
+    expect(text).toContain('.git/info/exclude');
+    expect(text).toContain('knowledge graph, docs, diagrams and code graph');
+    // No promise the backend does not keep (review R2-1: no compose files).
+    expect(text).not.toMatch(/compose/i);
     // What stays: the folder and everything that is the user's.
     expect(text).toContain('source code');
     expect(text).toContain('.env');
     expect(text).toContain('secrets in the keychain');
     expect(yes(), 'Yes, remove button rendered').toBeTruthy();
     expect(no(), 'No button rendered').toBeTruthy();
+  });
+
+  it('No is the default focus, set explicitly', async () => {
+    await mountFlow();
+    await Promise.resolve();
+    await tick();
+    expect(document.activeElement, 'No is focused when the dialog opens').toBe(no());
+  });
+
+  it('Esc and the backdrop do nothing while a removal runs, and the stop names the project captured at Yes', async () => {
+    let fail!: (e: unknown) => void;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'delete_project_v2') {
+        return new Promise<UnregisterReport>((_res, rej) => (fail = rej));
+      }
+      return undefined;
+    });
+    await mountFlow();
+    yes().click();
+    await tick();
+    const dlg = document.querySelector('dialog')!;
+    const cancel = new Event('cancel', { cancelable: true });
+    dlg.dispatchEvent(cancel);
+    expect(cancel.defaultPrevented, 'Esc is blocked while removing').toBe(true);
+    dlg.dispatchEvent(new Event('close'));
+    dlg.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await tick();
+    expect(yes(), 'the confirm dialog stays while the removal runs').toBeTruthy();
+    fail(STOP);
+    await tick();
+    await tick();
+    const title = document.getElementById('unregister-stopped-title')?.parentElement?.textContent ?? '';
+    expect(title).toContain('"Gamma" is still registered');
+  });
+
+  it('the result names what was kept and what VCO took out (names only)', async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === 'delete_project_v2'
+        ? report({
+            filesPurged: ['.claude/agents/a.md'],
+            filesKeptModified: ['.claude/agents/planner.md'],
+            keptAsYours: ['.claude/backups/ — your earlier versions'],
+            settingsEntriesRemoved: ['hooks: 3 registration(s) VCO shipped'],
+          })
+        : undefined,
+    );
+    const toasts: { kind: string; message: string }[] = [];
+    const unsub = toast.subscribe((list) => toasts.splice(0, toasts.length, ...list));
+    await mountFlow();
+    yes().click();
+    await vi.waitFor(() => expect(yes()).toBeNull());
+    const all = toasts.map((t) => t.message).join('\n');
+    expect(all).toContain('1 files you changed kept');
+    expect(all).toContain('Kept because you changed them: .claude/agents/planner.md');
+    expect(all).toContain('Left in place: .claude/backups/');
+    expect(all).toContain("VCO's entries removed from files that stay: hooks: 3 registration(s)");
+    unsub();
+  });
+
+  it('the stop dialog focuses the SAFE action, and it comes first', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'delete_project_v2') throw STOP;
+      return undefined;
+    });
+    await mountFlow();
+    yes().click();
+    await tick();
+    await tick();
+    await Promise.resolve();
+    const keep = document.querySelector('[data-testid="unregister-stopped-keep"]') as HTMLButtonElement;
+    const anyway = document.querySelector('[data-testid="unregister-stopped-anyway"]') as HTMLButtonElement;
+    expect(document.activeElement).toBe(keep);
+    expect(keep.compareDocumentPosition(anyway) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it('No invokes nothing and closes the dialog', async () => {

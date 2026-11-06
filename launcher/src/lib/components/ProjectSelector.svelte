@@ -654,7 +654,12 @@
                         <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/>
                       </svg>
                     </button>
-                    <button class="row-action row-action-danger" title="Delete" onclick={() => startDelete(p)}>
+                    <button
+                      class="row-action row-action-danger"
+                      title="Remove"
+                      aria-label="Remove project {p.name}"
+                      onclick={() => startDelete(p)}
+                    >
                       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <polyline points="3 6 5 6 21 6"/>
                         <path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>

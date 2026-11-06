@@ -24,8 +24,15 @@
   // One decision per opening: closing the dialog (Escape, backdrop) after a
   // button already decided must not report a second, contrary answer.
   let decided = $state(false);
+  // The dialog stays mounted while closed, so the safe action is focused on
+  // every OPENING, not on mount (deferred: showModal() runs in DialogRoot's
+  // own effect and would otherwise pick the focus itself).
+  let keepButton = $state<HTMLButtonElement | undefined>(undefined);
   $effect(() => {
-    if (open) decided = false;
+    if (!open) return;
+    decided = false;
+    const btn = keepButton;
+    if (btn) queueMicrotask(() => btn.focus());
   });
 
   function decide(leaveAnyway: boolean) {
@@ -55,12 +62,25 @@
     </p>
   {/snippet}
   {#snippet footer()}
+    <!-- The SAFE action is first and focused (review R2-5): a second Enter
+         after "Yes, remove" must keep the project, never leave values. -->
     <div class="actions">
-      <button type="button" class="btn-3d btn-3d-accent btn-3d-sm" onclick={() => decide(true)}>
-        {UNREGISTER_ANYWAY_LABEL}
-      </button>
-      <button type="button" class="btn-3d btn-3d-primary btn-3d-sm" onclick={() => decide(false)}>
+      <button
+        type="button"
+        class="btn-3d btn-3d-primary btn-3d-sm"
+        data-testid="unregister-stopped-keep"
+        onclick={() => decide(false)}
+        bind:this={keepButton}
+      >
         Keep the project
+      </button>
+      <button
+        type="button"
+        class="btn-3d btn-3d-accent btn-3d-sm"
+        data-testid="unregister-stopped-anyway"
+        onclick={() => decide(true)}
+      >
+        {UNREGISTER_ANYWAY_LABEL}
       </button>
     </div>
   {/snippet}

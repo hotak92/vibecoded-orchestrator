@@ -9,14 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Remove a project right from its card on the Projects page.** Every project card now has a "Remove" button that
-  asks "are you sure?" first: the dialog says plainly what goes (VCO's hooks, scripts and bundled files, the lines VCO
-  wrote to your env files, and the project's own Weaviate collections — knowledge graph, docs and code graph) and what
-  stays (the folder, your source code, `.env` and other values that are yours, secrets in the keychain, `knowledge/`
-  notes, `CLAUDE.md`, `CONTEXT_STATE.md`, anything you changed). Two buttons — "Yes, remove" and "No" — with No as the
-  safe default, and a summary toast with the removal counts afterwards. The top-bar project list's delete action now
-  opens the same dialog (the old type-the-name step is gone). Per-option control (keep the collections, keep the
-  bundled files) stays on the project's Settings → Danger zone.
+- **Remove a project right from its card on the Projects page.** Every project card except the orchestrator's own
+  now has a "Remove" button that asks "are you sure?" first: the dialog says plainly what goes (the hooks, scripts,
+  agents, skills and other files VCO installed that you have not changed, VCO's entries in `.claude/settings.json`
+  and `.vscode/settings.json`, its working folders and `.git/info/exclude` lines, the lines VCO wrote to your env
+  files, and the project's own Weaviate collections — knowledge graph, docs, diagrams and code graph) and what stays
+  (the folder, your source code, `.env` and other values that are yours, secrets in the keychain, your own hooks,
+  agents and skills, `knowledge/` notes, `CLAUDE.md`, `CONTEXT_STATE.md`, anything you changed). Two buttons — "Yes,
+  remove" and "No" — with No focused by default; while the removal runs, Esc and clicks outside do nothing, so the
+  result always belongs to the project you confirmed. Afterwards a summary lists what was removed and names what was
+  kept because you changed it. If the removal stops, "Keep the project" is the focused choice. The top-bar project
+  list's remove action opens the same dialog (the old type-the-name step is gone). Per-option control (keep the
+  collections, keep the bundled files) stays on the project's Settings → Danger zone, whose description now matches
+  what is actually removed.
 
 ### Changed
 
@@ -26,29 +31,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only when it is unchanged since VCO wrote it. An agent, skill, hook or script you edited stays and is listed in the
   result, and files of your own are never touched. VCO's hook registrations and the permission entries it added
   come out of `.claude/settings.json`, along with its runtime folders (`.claude/state/`, `.claude/logs/`), its update
-  notes, its lines in `.git/info/exclude` and the MCP opt-outs it wrote to `~/.claude.json`. Your hooks, your own
-  permission entries and settings, `.env`, `CLAUDE.md`, `CONTEXT_STATE.md`, `knowledge/` and VCO's update backups
-  (which hold your earlier versions of files) are kept. If you also choose to delete the project's collections,
-  VCO now finds the ones the project actually uses, even after a rename, and never deletes one another project uses.
+  notes, the lines it wrote in `.git/info/exclude` (a line of your own inside VCO's block stays), the exclude
+  settings it added to `.vscode/settings.json` (the file itself goes only if VCO created it and nothing else is in
+  it) and the MCP opt-outs it wrote to `~/.claude.json`. Your hooks, your own permission entries and settings,
+  `.env`, `CLAUDE.md`, `CONTEXT_STATE.md`, `knowledge/` and VCO's update backups (which hold your earlier versions of
+  files) are kept. Nothing is ever removed through a linked folder: if `.claude` or one of its folders is a link to
+  somewhere else, what is behind the link is left alone and named in the result. If you also choose to delete the
+  project's collections, VCO now finds the ones the project actually uses, even after a rename, and never deletes
+  one another project uses.
 
 ### Fixed
 
-- **The old inline syntax-check hook is removed from your settings.** An early release registered a `py_compile`
-  one-liner on every Python write and a later one replaced it with the named `py-compile-check` hook, but projects
-  that received the first one kept both, so the old entry kept running beside the new one. A bundle update now takes
-  the old entry out — and removing a project removes it too. A command of your own that differs from it, even by one
-  character, is left where it is.
+- **The old inline syntax-check hooks are removed from your settings.** Early releases registered a `py_compile`
+  one-liner on every Python write (in two successive forms, Linux and Windows) and a later one replaced it with the
+  named `py-compile-check` hook, but projects that received an old form kept it, so it kept running beside the new
+  hook — the oldest form printed "Syntax error" on every write. A bundle update now takes every old form out — and
+  removing a project removes them too. A command of your own that differs from them, even by one character, is left
+  where it is.
 
 - **The update report no longer claims some of your hooks run twice when they do not.** When VCO could not fold a
-  duplicate hook group it listed every group sharing a matcher, including groups holding only your own scripts — the
-  report then said those hooks might be running twice. It now lists a group only when it really doubles a hook VCO
-  ships and another group runs the same hook. Groups of your own are left alone and not mentioned.
+  duplicate hook group it listed every group sharing a matcher, including groups holding only your own scripts. It
+  now lists a group only when one of its commands actually runs a hook VCO ships (a command that only mentions the
+  hook's path, such as `test -x` or `cat`, does not count) and another group on the same trigger runs the same hook,
+  and it says that hook can run twice. Groups of your own are left alone and not mentioned.
 
 - **A code-graph walk skipped because another walk was already running is no longer reported as failed.** The log
   read "skipping this run (no twin walks)" and then "reported terminal 'failed'" for a project whose graph was in
-  fact being rebuilt by the other walk. The skipped run now finishes its build row as "skipped", which the launcher
-  shows as an informational skip with the reason, never as a failure; a real analyzer failure is still reported
-  failed.
+  fact being rebuilt by the other walk, and when two update resyncs started for one project the second one took over
+  the first one's progress entry, so a walk that succeeded was later shown as "died before completing". Now a
+  second walk never takes over the entry of a walk that is still running, so the running walk reports its own real
+  outcome; a skipped run's own entry is finished as "skipped", shown as an informational skip with the reason, never
+  as a failure. A real analyzer failure is still reported failed. If the launcher's background service is older than
+  this release and does not know "skipped" yet, the entry says "failed" with the same reason instead of "died".
 
 ## [0.2.105] - 2026-10-30
 

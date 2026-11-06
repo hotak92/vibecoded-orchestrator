@@ -16,14 +16,17 @@
   //
   // Confirm step (owner asked for yes/no): two explicit buttons — "Yes,
   // remove" and "No". No typed confirmation here; No is the default focus
-  // (first button in DOM, so the native dialog's showModal() focuses it) and
-  // Esc/backdrop behave as No. The unregister STOP keeps its existing dialog
+  // (focused explicitly on open) and Esc/backdrop behave as No — but not
+  // while a removal runs: then the dialog stays until it finishes, and the
+  // stop dialog names the project captured when Yes was clicked. The
+  // unregister STOP keeps its existing dialog
   // and "Unregister anyway" escape (owner ruling, v0.2.97 review R5 F39).
   // Per-option control stays on the project's Settings → Danger zone.
 
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
-  import { removeUnregister } from '$lib/unregister-escape';
+  import { focusOnMount } from '$lib/actions/focusManagement';
+  import { describeUnregisterReport, removeUnregister } from '$lib/unregister-escape';
   import { projects } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
 
@@ -52,8 +55,15 @@
     resolveStop = null;
   }
 
-  /** No / Esc / backdrop: close the confirm dialog, invoke nothing. */
+  // The project a running removal is FOR, captured when "Yes" is clicked
+  // (review R2-3): the stop dialog names it and "Unregister anyway" re-runs
+  // it, whatever `project` holds by then.
+  let removingName = $state('');
+
+  /** No / Esc / backdrop: close the confirm dialog, invoke nothing. Ignored
+   *  while a removal runs — the dialog stays until it finishes. */
   function decline() {
+    if (removing) return;
     project = null;
   }
 
@@ -61,6 +71,7 @@
     const target = project;
     if (!target || removing) return;
     removing = true;
+    removingName = target.name;
     try {
       const outcome = await removeUnregister(
         (options) => projects.delete(target.id, options),
@@ -76,24 +87,13 @@
       // distinct enough that batching would lose information).
       for (const w of report.warnings) toast.error(w);
 
-      // One-line summary toast — counts give the user a confirmation
-      // anchor (same shape as the settings page's Danger zone).
-      const parts: string[] = [];
-      if (report.filesPurged.length > 0) {
-        parts.push(`${report.filesPurged.length} files removed`);
-      }
-      if (report.keysPurgedFromEnv.length > 0) {
-        parts.push(`${report.keysPurgedFromEnv.length} env keys cleaned`);
-      }
-      if (report.collectionsDropped.length > 0) {
-        parts.push(`${report.collectionsDropped.length} collections dropped`);
-      }
-      const summary = parts.length > 0
-        ? `Removed "${report.projectName}" — ${parts.join(', ')}`
-        : `Removed "${report.projectName}"`;
+      // One-line summary with counts, then one line per list of names —
+      // the ONE wording, shared with the settings page's Danger zone.
+      const { summary, details } = describeUnregisterReport(report, 'Removed');
       toast.success(summary);
+      for (const line of details) toast.info(line);
 
-      project = null;
+      if (project?.id === target.id) project = null;
     } catch (e) {
       // Non-stop failures keep the dialog open so the error toast has
       // context; the user can retry or No out.
@@ -112,6 +112,8 @@
   <DialogRoot
     open={true}
     onClose={decline}
+    closeOnEscape={!removing}
+    closeOnBackdrop={!removing}
     width="560px"
     ariaLabelledBy="project-remove-title"
   >
@@ -122,18 +124,24 @@
     {#snippet body()}
       <p class="goes">
         This stops tracking the project in the launcher and removes what VCO
-        put there: its hooks, scripts and bundled files (in
-        <code>.claude/hooks/</code>, <code>.claude/scripts/</code> and the
-        infra compose files), the lines VCO wrote into your env files, and
-        this project's own Weaviate collections — its knowledge graph, its
-        docs collection and its code graph.
+        put there and can prove is still its own: the hooks, scripts, agents,
+        skills and other files VCO installed that you have not changed; VCO's
+        hook registrations and permission entries in
+        <code>.claude/settings.json</code> and its exclude settings in
+        <code>.vscode/settings.json</code>; the lines VCO wrote into your env
+        files; its working folders (<code>.claude/state/</code>,
+        <code>.claude/logs/</code>) and its lines in
+        <code>.git/info/exclude</code>; and this project's own Weaviate
+        collections — its knowledge graph, docs, diagrams and code graph.
       </p>
       <p class="stays">
         The folder and everything in it that is yours stays: your source
         code, <code>.env</code> and other values that are yours, secrets in
-        the keychain, your <code>knowledge/</code> notes,
-        <code>CLAUDE.md</code>, <code>CONTEXT_STATE.md</code>, and anything
-        you changed yourself.
+        the keychain, your own hooks, agents and skills, your
+        <code>knowledge/</code> notes, <code>CLAUDE.md</code>,
+        <code>CONTEXT_STATE.md</code>, VCO's backups of your earlier files,
+        and any VCO file you changed yourself. Shared collections and other
+        projects' collections are never dropped.
       </p>
       <p class="hint">
         For finer control (keep the collections, keep the bundled files),
@@ -142,14 +150,15 @@
     {/snippet}
     {#snippet footer()}
       <div class="actions">
-        <!-- No first: the native dialog's showModal() focuses the first
-             focusable element, so "No" is the default focus. -->
+        <!-- "No" is the default focus, set explicitly (not left to DOM
+             order, which a later focusable element above would change). -->
         <button
           type="button"
           class="btn-3d btn-3d-primary btn-3d-sm"
           data-testid="project-remove-no"
           onclick={decline}
           disabled={removing}
+          use:focusOnMount
         >
           No
         </button>
@@ -174,7 +183,7 @@
 <UnregisterStoppedDialog
   bind:open={stopOpen}
   message={stopMessage}
-  projectName={project?.name ?? ''}
+  projectName={removingName}
   onDecide={onStopDecided}
 />
 
@@ -215,7 +224,7 @@
     margin: 0;
     font-size: 0.8rem;
     font-style: italic;
-    color: var(--color-muted, #475569);
+    color: var(--color-mid, #94a3b8);
   }
   .actions {
     display: flex;

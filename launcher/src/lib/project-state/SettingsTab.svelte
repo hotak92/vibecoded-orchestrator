@@ -20,7 +20,11 @@
   import { toast } from '$lib/stores/toast';
   import { openProjectLogsAction, refreshProjectEnvAction } from './project-maintenance';
   import { projects } from '$lib/stores/projects';
-  import { DEFAULT_UNREGISTER_OPTIONS, runUnregister } from '$lib/unregister-escape';
+  import {
+    DEFAULT_UNREGISTER_OPTIONS,
+    describeUnregisterReport,
+    runUnregister,
+  } from '$lib/unregister-escape';
   import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
   import type {
     ProjectView,
@@ -370,22 +374,12 @@
       // distinct enough that batching would lose information).
       for (const w of report.warnings) toast.error(w);
 
-      // One-line summary toast — counts give the user a confirmation
-      // anchor without forcing them to read the full warning stream.
-      const parts: string[] = [];
-      if (report.filesPurged.length > 0) {
-        parts.push(`${report.filesPurged.length} files removed`);
-      }
-      if (report.keysPurgedFromEnv.length > 0) {
-        parts.push(`${report.keysPurgedFromEnv.length} env keys cleaned`);
-      }
-      if (report.collectionsDropped.length > 0) {
-        parts.push(`${report.collectionsDropped.length} collections dropped`);
-      }
-      const summary = parts.length > 0
-        ? `Unregistered "${report.projectName}" — ${parts.join(', ')}`
-        : `Unregistered "${report.projectName}"`;
+      // One-line summary toast with counts, then one line per list of
+      // names (kept because changed, left in place, entries removed) —
+      // the ONE wording, shared with the Remove flow.
+      const { summary, details } = describeUnregisterReport(report, 'Unregistered');
       toast.success(summary);
+      for (const line of details) toast.info(line);
 
       goto('/projects');
     } catch (e) {
@@ -1034,19 +1028,25 @@
           <span>
             <strong>Remove launcher-managed files</strong>
             <small>
-              Removes <code>.claude/hooks/</code>, <code>.claude/scripts/</code>,
-              infra compose YAMLs, VCO's managed blocks in your
-              <code>.env</code> / <code>.claude/env</code>, the launcher's
-              routing keys in <code>.claude/settings.json</code> /
+              Removes the hooks, scripts, agents, skills and other files VCO
+              installed that you have not changed (a file you changed stays),
+              VCO's hook registrations and permission entries in
+              <code>.claude/settings.json</code>, its exclude settings in
+              <code>.vscode/settings.json</code>, its working folders
+              (<code>.claude/state/</code>, <code>.claude/logs/</code>) and its
+              lines in <code>.git/info/exclude</code>. In your env files
+              (<code>.env</code>, <code>.claude/env</code>,
+              <code>.claude/settings.json</code> /
               <code>.claude/settings.local.json</code> /
-              <code>.vscode/settings.json</code> where they still hold the
-              value the launcher writes, and a secret value in them only where
-              it equals the one the launcher stores (so VCO wrote it). A value
-              you set yourself is kept, and listed when the unregister
-              finishes.
-              Your agents, skills, <code>CONTEXT_STATE.md</code>,
-              <code>CLAUDE.md</code>, source code, and user-added
-              <code>.env</code> values are preserved.
+              <code>.vscode/settings.json</code>) it removes the routing
+              keys that still hold the value the launcher writes, and a secret
+              value only where it equals the one the launcher stores (so VCO
+              wrote it). A value you set yourself is kept, and listed when the
+              unregister finishes.
+              Your own hooks, agents and skills, <code>knowledge/</code>,
+              <code>CONTEXT_STATE.md</code>, <code>CLAUDE.md</code>, source
+              code, user-added <code>.env</code> values and VCO's backups of
+              your earlier files are preserved.
             </small>
           </span>
         </label>
@@ -1056,9 +1056,10 @@
           <span>
             <strong>Drop Weaviate collections</strong>
             <small>
-              Drops <code>{project.name}_KnowledgeGraph</code> and
-              <code>{project.name}_Development</code>. Shared collections
-              are not touched.
+              Drops this project's own collections — its knowledge graph
+              (<code>{project.name}_KnowledgeGraph</code> or the class it is
+              bound to), docs, diagrams and code graph. Shared collections
+              and collections another project also uses are not touched.
               <em>Tip: collections can always be rebuilt from
               <code>/knowledge</code> + source code via
               <code>install-bundle --update</code>.</em>

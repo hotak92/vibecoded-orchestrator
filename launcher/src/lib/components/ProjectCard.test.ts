@@ -74,10 +74,40 @@ describe('ProjectCard — the Remove button (v0.2.106)', () => {
     );
     await tick();
     expect(onOpen, 'keydown must not reach the card open handler').not.toHaveBeenCalled();
-    // And the card body itself still opens the project (control).
-    (document.querySelector('.pc-card') as HTMLElement).click();
+    // And the card's own open button still opens the project (control).
+    (document.querySelector('[data-testid="project-card-open"]') as HTMLButtonElement).click();
     await tick();
     expect(onOpen).toHaveBeenCalledWith('p1');
+  });
+
+  it('never nests an interactive control inside another (review R2-6)', async () => {
+    await mountCard();
+    const open = document.querySelector('[data-testid="project-card-open"]') as HTMLButtonElement;
+    expect(open.tagName).toBe('BUTTON');
+    expect(open.getAttribute('aria-label')).toBe('Open project Gamma');
+    expect(document.querySelector('[role="button"]'), 'no role=button wrapper').toBeNull();
+    expect(open.contains(removeButton()), 'Remove is a sibling, not a child').toBe(false);
+    expect(removeButton().closest('button, [role="button"]')).toBe(removeButton());
+  });
+
+  it('the orchestrator-root card offers no Remove; any other card does', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(ProjectCard, {
+      target,
+      props: {
+        project: { ...PROJECT, host: 'orchestrator_root' },
+        onOpen: vi.fn(),
+        onRemove: vi.fn(),
+      },
+    });
+    await tick();
+    expect(removeButton(), 'no Remove on the orchestrator root').toBeNull();
+    unmount(app);
+    app = null;
+    document.body.innerHTML = '';
+    await mountCard();
+    expect(removeButton(), 'Remove on an ordinary project').toBeTruthy();
   });
 
   it('works when the folder is missing too', async () => {

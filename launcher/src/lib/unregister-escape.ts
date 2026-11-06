@@ -84,6 +84,61 @@ export const REMOVE_UNREGISTER_OPTIONS: Readonly<{
   purgeCollections: boolean;
 }> = Object.freeze({ purgeLauncherFiles: true, purgeCollections: true });
 
+/** Whether a project may be removed from the GUI: every project except the
+ *  orchestrator root (its `.claude/` is the live install, and the backend
+ *  refuses to purge the orchestrator clone). The project card reads it; the
+ *  top-bar selector hides its whole row-action strip (rename + remove) for
+ *  the same `orchestrator_root` host. */
+export function isRemovableProject(project: { host?: string | null }): boolean {
+  return project.host !== 'orchestrator_root';
+}
+
+/** How many names a detail line lists before "and N more". */
+export const REPORT_NAMES_SHOWN = 8;
+
+function names(list: readonly string[]): string {
+  const shown = list.slice(0, REPORT_NAMES_SHOWN).join(', ');
+  const more = list.length - REPORT_NAMES_SHOWN;
+  return more > 0 ? `${shown} and ${more} more` : shown;
+}
+
+/**
+ * The ONE wording of an unregister's result, for every surface that shows it
+ * (the shared Remove flow and the Settings → Danger zone): a one-line
+ * `summary` with counts, and one `details` line per non-empty list — what was
+ * kept because the user changed it, what was left as theirs, and VCO's
+ * entries taken out of files that stay. Names only, never a value.
+ * `verb` is the surface's own word ("Removed" / "Unregistered").
+ */
+export function describeUnregisterReport(
+  report: UnregisterReport,
+  verb: string,
+): { summary: string; details: string[] } {
+  const parts: string[] = [];
+  const count = (n: number, what: string) => {
+    if (n > 0) parts.push(`${n} ${what}`);
+  };
+  count(report.filesPurged.length, 'files removed');
+  count(report.settingsEntriesRemoved.length, 'settings entries removed');
+  count(report.keysPurgedFromEnv.length, 'env keys cleaned');
+  count(report.collectionsDropped.length, 'collections dropped');
+  count(report.filesKeptModified.length, 'files you changed kept');
+  const summary = parts.length > 0
+    ? `${verb} "${report.projectName}" — ${parts.join(', ')}`
+    : `${verb} "${report.projectName}"`;
+  const details: string[] = [];
+  if (report.filesKeptModified.length > 0) {
+    details.push(`Kept because you changed them: ${names(report.filesKeptModified)}`);
+  }
+  if (report.keptAsYours.length > 0) {
+    details.push(`Left in place: ${names(report.keptAsYours)}`);
+  }
+  if (report.settingsEntriesRemoved.length > 0) {
+    details.push(`VCO's entries removed from files that stay: ${names(report.settingsEntriesRemoved)}`);
+  }
+  return { summary, details };
+}
+
 /** The shared Remove flow's unregister: {@link REMOVE_UNREGISTER_OPTIONS} with
  *  the stop (and its "Unregister anyway" escape) intact — the stop can fire,
  *  and its escape re-runs with the same options (review R6 F46). */

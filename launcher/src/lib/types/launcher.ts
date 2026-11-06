@@ -323,7 +323,16 @@ export interface UnregisterOptions {
 export interface UnregisterReport {
   projectId: string;
   projectName: string;
+  /** Relative paths removed — only what VCO could prove is its own. */
   filesPurged: string[];
+  /** Files VCO shipped that the user changed since, so they were kept. */
+  filesKeptModified: string[];
+  /** `<rel> — <reason>` for everything else left in place. Names only. */
+  keptAsYours: string[];
+  /** VCO's entries removed from files that stay (settings.json hooks and
+   *  permissions, `.git/info/exclude` blocks, `.vscode/settings.json`
+   *  excludes, `~/.claude.json` MCP opt-outs). Names only. */
+  settingsEntriesRemoved: string[];
   keysPurgedFromEnv: string[];
   collectionsDropped: string[];
   warnings: string[];

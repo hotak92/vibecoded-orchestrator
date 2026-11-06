@@ -176,6 +176,14 @@
   // the warning-severity routing and the store-row refresh, and a second
   // call-site would fork that logic.
   //
+  // Busy state: `updatingId` is the page's one running-row marker. While an
+  // update runs, every row's Update button AND the header "Update all" are
+  // disabled — consistent with the existing flows (SettingsTab locks its
+  // button while in flight; UpdateAllProjectsModal blocks the page behind a
+  // non-dismissable overlay while it runs). The engine is 5–15 s, so the
+  // button itself shows the busy label.
+  let updatingId = $state<string | null>(null);
+
   // ─── Remove project (v0.2.106, shared flow) ────────────────────────────
   //
   // The card's Remove button only opens the ONE shared confirm flow
@@ -184,14 +192,6 @@
   // performs on success makes the projects-set effect above re-take the
   // census, so a removed project's chip cannot linger.
   let removingProject = $state<RemoveTarget | null>(null);
-
-  // Busy state: `updatingId` is the page's one running-row marker. While an
-  // update runs, every row's Update button AND the header "Update all" are
-  // disabled — consistent with the existing flows (SettingsTab locks its
-  // button while in flight; UpdateAllProjectsModal blocks the page behind a
-  // non-dismissable overlay while it runs). The engine is 5–15 s, so the
-  // button itself shows the busy label.
-  let updatingId = $state<string | null>(null);
 
   async function runRowUpdate(id: string) {
     if (updatingId !== null) return;
