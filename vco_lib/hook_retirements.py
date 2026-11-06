@@ -640,6 +640,54 @@ RETIRED_REGISTRATIONS: Tuple[RetiredRegistration, ...] = (
             "true compiler message)"
         ),
     ),
+    # The OLDER `CLAUDE_TOOL_ARG_PATH` forms the stdin-JSON one-liners above
+    # replaced (cb0ffb4e, 2026-05-08). Shipped by a028ab91 (Linux, then in
+    # `settings.json.template`) and da830e45 (both OS templates) between
+    # 2026-04-28 and 2026-05-08 — verbatim from `git show cb0ffb4e^:templates/
+    # settings.json.{linux,windows}.template` line 247. No tag carries them
+    # without cb0ffb4e, so only installs taken from `main` in that window
+    # have them; Claude Code never sets that variable, so the Linux form
+    # printed "Syntax error" on every Write. Same retirement as above.
+    RetiredRegistration(
+        event="PostToolUse",
+        kind=KIND_COMMAND,
+        target=normalize_command(
+            "python -m py_compile \"$CLAUDE_TOOL_ARG_PATH\" 2>&1 || echo 'Syntax error'"
+        ),
+        reason=(
+            "the first inline py_compile one-liner read a "
+            "CLAUDE_TOOL_ARG_PATH variable Claude Code never sets, so it "
+            "printed \"Syntax error\" on every Write; it was replaced on "
+            "2026-05-08 and the inline form was superseded in v0.2.75 by the "
+            "named py-compile-check hook"
+        ),
+        retired_in="v0.2.75",
+        replacement=(
+            ".claude/hooks/py-compile-check.sh (the named hook — "
+            "VCT_DISABLE_HOOKS-guarded, env-scrubbed, and it reports the "
+            "true compiler message)"
+        ),
+    ),
+    RetiredRegistration(
+        event="PostToolUse",
+        kind=KIND_COMMAND,
+        target=normalize_command(
+            'powershell -NoProfile -Command "try { python -m py_compile '
+            "$env:CLAUDE_TOOL_ARG_PATH } catch { Write-Output 'Syntax error' }\""
+        ),
+        reason=(
+            "the Windows form of the first inline py_compile one-liner "
+            "(an unset CLAUDE_TOOL_ARG_PATH variable), replaced on "
+            "2026-05-08 and superseded in v0.2.75 by the named "
+            "py-compile-check hook"
+        ),
+        retired_in="v0.2.75",
+        replacement=(
+            ".claude/hooks/py-compile-check.ps1 (the named hook — "
+            "VCT_DISABLE_HOOKS-guarded, env-scrubbed, and it reports the "
+            "true compiler message)"
+        ),
+    ),
 )
 
 
@@ -1264,6 +1312,46 @@ def vco_hook_script_identity(command: str) -> Optional[str]:
         if m:
             return m.group(1)
     return None
+
+
+#: Leading ``NAME=value`` environment assignments at the start of a shell
+#: command segment (start, or after ``&&`` / ``||`` / ``;`` / ``|``). Only an
+#: unquoted value without whitespace is recognised; anything else is left as
+#: it is, so the walk below simply does not see a run there (it under-reports,
+#: never over-reports).
+_ENV_PREFIX_RE = re.compile(
+    r"(^|&&|\|\||;|\|)(\s*)(?:[A-Za-z_][A-Za-z0-9_]*=[^\s'\"]*\s+)+")
+#: Shell control operators, longest first.
+_CONTROL_OP_RE = re.compile(r"(&&|\|\||;|\|)")
+
+
+def vco_hook_scripts_run(command: str) -> list[str]:
+    """Every ``.claude/hooks/<name>.{sh,ps1}`` script ``command`` actually
+    RUNS — each one at an invocation anchor of the same walk as
+    :func:`vco_hook_script_identity` (first token, after a control operator,
+    after an interpreter or a PowerShell ``-File`` / ``-Command``), with a
+    segment's leading ``NAME=value`` assignments skipped
+    (``MY_FLAG=1 bash …/x.sh`` runs ``x.sh``). A path that is only an
+    ARGUMENT (``test -x …/x.sh``, ``cat …/x.sh``, ``chmod +x …/x.sh``) is not
+    a run and is not returned.
+
+    For REPORTING only (the duplicate-group "runs twice" warning, v0.2.106):
+    unlike the identity, a wrapped form here does count, but no fold or
+    rewrite decision may use this — a wrapped command is the user's."""
+    if not isinstance(command, str) or not command:
+        return []
+    # Shell reading, not the identity's: quotes JOIN their neighbours
+    # (``"$CLAUDE_PROJECT_DIR"/.claude/hooks/x.sh`` is one word), and a
+    # control operator glued to a word (``notify-me; bash …``) still ends
+    # the segment.
+    shellish = _CONTROL_OP_RE.sub(r" \1 ", command.replace('"', "").replace("'", ""))
+    stripped = _ENV_PREFIX_RE.sub(lambda m: m.group(1) + m.group(2), shellish)
+    out: list[str] = []
+    for tok in invoked_script_tokens(stripped):
+        m = _HOOK_TOKEN_RE.match(tok)
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
 
 
 def vco_hook_script_arguments(command: str) -> Optional[Tuple[str, ...]]:
@@ -2017,6 +2105,7 @@ __all__ = [
     "unit_matchers",
     "vco_hook_script_arguments",
     "vco_hook_script_identity",
+    "vco_hook_scripts_run",
 ]
 
 

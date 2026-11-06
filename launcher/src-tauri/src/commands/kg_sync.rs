@@ -100,9 +100,8 @@ const SYNC_EVENT: &str = "kg-sync-progress";
 /// dead task (or a launcher that never came back).
 const HEARTBEAT_TICK_SECS: u64 = 60;
 
-/// Floor of the staleness window: 30 min of missed 60 s ticks ⇒ the task
-/// is gone (launcher up) or the launcher is gone (next boot sweeps).
-const HEARTBEAT_STALE_FLOOR_SECS: u64 = 1800;
+/// Floor of the staleness window — one home in core, shared with the hub.
+use vct_launcher_core::db::kg_syncs::HEARTBEAT_STALE_FLOOR_SECS;
 
 /// Sweeper cadence.
 const HEARTBEAT_SWEEP_INTERVAL_SECS: u64 = 300;

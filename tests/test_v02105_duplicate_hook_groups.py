@@ -250,6 +250,35 @@ def test_a_group_that_really_doubles_a_shipped_hook_is_kept_and_reported():
             "matcher": "startup", "commands": [ENSURE]} in records
 
 
+@pytest.mark.parametrize("mention", [
+    "test -x .claude/hooks/ensure-containers.sh || echo missing",
+    "cat .claude/hooks/ensure-containers.sh",
+    "chmod +x .claude/hooks/ensure-containers.sh",
+    "ls -l .claude/hooks/ensure-containers.sh && echo ok",
+])
+def test_a_command_that_only_mentions_a_shipped_hook_path_is_not_a_double_run(mention):
+    """v0.2.106 fix round 1 (U1-3): a path that is only an ARGUMENT runs
+    nothing, so a group holding it is not reported as running a VCO hook
+    twice (the group itself stays byte for byte). RED-PROOF TARGET: count a
+    path mention anywhere (the pre-fix regex) → reported."""
+    user = copy.deepcopy(SPLIT_STARTUP)
+    user["hooks"]["SessionStart"].append({
+        "matcher": "startup", "hooks": [{"type": "command", "command": mention}]})
+    merged, records = _fold(user)
+    assert any(h["command"] == mention for g in merged["hooks"]["SessionStart"]
+               for h in g["hooks"])
+    assert [r["action"] for r in records] == ["folded"]
+
+
+def test_the_scripts_a_command_runs_are_its_anchored_hook_paths():
+    from vco_lib.hook_retirements import vco_hook_scripts_run
+
+    assert vco_hook_scripts_run("MY_FLAG=1 bash .claude/hooks/a.sh") == ["a.sh"]
+    assert vco_hook_scripts_run("x.sh && B=2 bash .claude/hooks/b.sh | tee l") == ["b.sh"]
+    assert vco_hook_scripts_run("test -x .claude/hooks/a.sh || echo no") == []
+    assert vco_hook_scripts_run("bash my-wrap.sh .claude/hooks/a.sh") == []
+
+
 def test_a_group_with_a_user_command_is_never_split_or_emptied():
     """The template's own hooks are added beside it (the merge is additive),
     but the two `startup` groups are never folded into one — and, holding

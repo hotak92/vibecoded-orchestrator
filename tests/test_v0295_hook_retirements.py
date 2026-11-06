@@ -102,6 +102,15 @@ PY_COMPILE_PS1 = (
     "$payload.tool_input.file_path; if ($fp) { python -m py_compile $fp 2>&1 } "
     '} catch { Write-Output \\"Syntax error\\" }"'
 )
+# The OLDER forms those replaced (a028ab91 / da830e45 → cb0ffb4e), the JSON
+# string values of `cb0ffb4e^:templates/settings.json.{linux,windows}.template:247`.
+PY_COMPILE_ARGPATH_LINUX = (
+    "python -m py_compile \"$CLAUDE_TOOL_ARG_PATH\" 2>&1 || echo 'Syntax error'"
+)
+PY_COMPILE_ARGPATH_PS1 = (
+    'powershell -NoProfile -Command "try { python -m py_compile '
+    "$env:CLAUDE_TOOL_ARG_PATH } catch { Write-Output 'Syntax error' }\""
+)
 
 
 def _cmds(hooks: dict, event: str) -> list:
@@ -126,6 +135,8 @@ class TableIsHonestTests(unittest.TestCase):
             ("Stop", COST_PS1, "cost-tracker.ps1"),
             ("PostToolUse", PY_COMPILE_LINUX, None),
             ("PostToolUse", PY_COMPILE_PS1, None),
+            ("PostToolUse", PY_COMPILE_ARGPATH_LINUX, None),
+            ("PostToolUse", PY_COMPILE_ARGPATH_PS1, None),
         ]
         for event, cmd, identity in cases:
             with self.subTest(cmd=cmd[:48]):
@@ -209,6 +220,9 @@ class LeaveAloneTests(unittest.TestCase):
                 "py_compile.compile(fp)",
                 "py_compile.compile(fp, doraise=True)"),
             PY_COMPILE_PS1.replace("Write-Output", "Write-Host"),
+            PY_COMPILE_ARGPATH_LINUX.replace("$CLAUDE_TOOL_ARG_PATH", "$MY_FILE"),
+            PY_COMPILE_ARGPATH_LINUX.replace("python ", "python3 "),
+            PY_COMPILE_ARGPATH_PS1.replace("Write-Output", "Write-Host"),
         ):
             with self.subTest(near=near[:60]):
                 self.assertIsNone(hr.match_retired_registration(
@@ -282,6 +296,23 @@ class MergeRemovalTests(unittest.TestCase):
         self.assertEqual(len(removed), 1)
         self.assertEqual(removed[0]["command"], PY_COMPILE_LINUX)
         self.assertEqual(removed[0]["retirement"].retired_in, "v0.2.75")
+
+    def test_the_older_arg_path_one_liners_are_removed_beside_the_named_hook(self):
+        """v0.2.106 fix round 1 (U1-4): the pre-cb0ffb4e ``CLAUDE_TOOL_ARG_PATH``
+        forms (both OS spellings) go too; the named hook stays. RED-PROOF
+        TARGET: delete their two table rows → both kept."""
+        named = 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/py-compile-check.sh"'
+        for inline in (PY_COMPILE_ARGPATH_LINUX, PY_COMPILE_ARGPATH_PS1):
+            with self.subTest(inline=inline[:40]):
+                user_hooks = {"PostToolUse": [{"matcher": "Write", "hooks": [
+                    {"type": "command", "command": inline, "timeout": 10},
+                    {"type": "command", "command": named, "timeout": 10},
+                ]}]}
+                removed: list = []
+                merged = project_init._merge_hooks_for_bundle(
+                    user_hooks, {}, retired_removed=removed)
+                self.assertEqual(_cmds(merged, "PostToolUse"), [named])
+                self.assertEqual([r["command"] for r in removed], [inline])
 
     def test_unregister_takes_the_retired_inline_command_out_too(self):
         """v0.2.106 F1: the unregister path reads the SAME retirement table

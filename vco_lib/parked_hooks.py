@@ -620,9 +620,10 @@ def report_parked_hooks(
             f"settings.json: left {len(kept_user)} duplicate hook group(s) exactly "
             f"as they are, because folding them would change a command, or a hook "
             f"setting such as a timeout, that VCO does not ship "
-            f"({_describe_groups(kept_user)}). The VCO hooks those groups share "
-            f"with another group now run twice — delete the duplicate group from "
-            f"the launcher's Hooks tab or by hand."
+            f"({_describe_groups(kept_user)}). Each of those groups runs a VCO "
+            f"hook that another group on the same trigger also runs, so that "
+            f"hook can run twice — delete the duplicate group from the "
+            f"launcher's Hooks tab or by hand if you did not mean it."
         )
     if state.readable:
         return

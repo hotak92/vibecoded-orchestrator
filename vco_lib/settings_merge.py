@@ -71,6 +71,7 @@ from vco_lib.hook_retirements import (
     scrub_retired_registrations,
     vco_hook_script_arguments,
     vco_hook_script_identity,
+    vco_hook_scripts_run,
     vco_shipped_hook_scripts,
 )
 from vco_lib.hooks_settings import normalize_matcher
@@ -760,39 +761,25 @@ def _survivor(handlers: list, spell: dict[str, set[str]]) -> Optional[dict]:
     return custom[0][0] if custom else handlers[0]
 
 
-#: A ``.claude/hooks/<basename>.{sh,ps1}`` path ANYWHERE in a command, used by
-#: the duplicate-group REPORT only (never by a fold decision, which stays
-#: spelling-exact). A wrapped form — ``MY_FLAG=1 bash …/x.sh``,
-#: ``my-wrap.sh && bash …/x.sh``, ``… | tee``, ``… > log`` — is the user's
-#: command and is never rewritten or folded, but it DOES run the hook, so a
-#: twin group running the same script is a real double run and is reported.
-_HOOK_PATH_ANYWHERE_RE = re.compile(
-    r"\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))")
-
-
 def _command_run_keys(
     command: Any, shipped_scripts: set, spell: dict[str, set[str]],
 ) -> set:
     """The run keys of ONE hook command for the duplicate REPORT (v0.2.106).
 
-    A key is an identity VCO itself owns — the hook-script basename this
-    module already resolves (:func:`vco_hook_script_identity`, plus a plain
-    path mention for the wrapped forms the anchor walk refuses to call an
-    invocation), or, for a retired inline registration with no script, the
-    whole-command spelling (:func:`_spelling_key`). A command of the user's
-    own yields nothing, which is what keeps their groups out of the report.
-    """
+    A key is an identity VCO itself owns — a shipped hook-script basename the
+    command actually RUNS (:func:`vco_hook_scripts_run`: the identity's anchor
+    walk, which also sees a wrapped form such as ``MY_FLAG=1 bash …/x.sh`` or
+    ``my-wrap.sh && bash …/x.sh``, but never a path that is only an argument —
+    ``test -x …/x.sh`` runs nothing), or, for a retired inline registration
+    with no script, the whole-command spelling (:func:`_spelling_key`). A
+    command of the user's own yields nothing, which is what keeps their
+    groups out of the report. Never used by a fold decision (those stay
+    spelling-exact)."""
     if not isinstance(command, str) or not command:
         return set()
-    ident = vco_hook_script_identity(command)
-    if ident and ident in shipped_scripts:
-        return {("script", ident)}
-    mentioned = {
-        m.group(1) for m in _HOOK_PATH_ANYWHERE_RE.finditer(
-            command.replace("\\", "/"))
-        if m.group(1) in shipped_scripts}
-    if mentioned:
-        return {("script", name) for name in mentioned}
+    ran = {name for name in vco_hook_scripts_run(command) if name in shipped_scripts}
+    if ran:
+        return {("script", name) for name in ran}
     key = _spelling_key(command)
     return {("command", key)} if key and key in spell else set()
 

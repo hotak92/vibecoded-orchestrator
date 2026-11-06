@@ -1762,6 +1762,82 @@ def test_second_driver_for_the_same_project_skips(monkeypatch, tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="flock-based claims are POSIX")
+def test_a_driver_claim_skip_closes_its_own_row_as_skipped(monkeypatch, tmp_path):
+    """v0.2.106 fix round 1 (U1-1): the driver-claim skip posts ``skipped``
+    for its own pid (a no-op on a current hub, which refused the twin's
+    registration; on an older hub it replaces the sweep's "died" verdict).
+    RED-PROOF TARGET: delete the ``_report_skip_to_hub`` call in the
+    ``LockTimeout`` branch → no report."""
+    from vco_lib import codegraph_resync as cr
+
+    reports: list = []
+    monkeypatch.setattr(cr, "_report_terminal_to_hub",
+                        lambda *a, **k: reports.append((a, k)))
+    monkeypatch.setattr(cr, "_run_resync_and_verify_slotted", lambda *a, **k: 17)
+    proc, line = _claim_holder(
+        tmp_path, cr._driver_claim_lock_path("Acme Projects"), "30")
+    assert line == "held"
+    try:
+        assert cr.run_resync_and_verify("Acme Projects", tmp_path, tmp_path / "a.py") == 0
+    finally:
+        proc.kill()
+        proc.wait(10)
+    assert [(a[0], a[1]) for a, _k in reports] == [("Acme Projects", "skipped")]
+    assert "skipped, not failed" in reports[0][1]["error_message"]
+    reports.clear()
+    # Leave-alone: with the claim free the driver runs and posts no skip.
+    assert cr.run_resync_and_verify("Acme Projects", tmp_path, tmp_path / "a.py") == 17
+    assert reports == []
+
+
+def _http_error(code: int, body: bytes):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    return urllib.error.HTTPError("http://h/x", code, "x", Message(), io.BytesIO(body))
+
+
+def test_an_older_hub_refusing_skipped_gets_failed_with_the_same_reason(monkeypatch):
+    """U1-5 version skew: a pre-v0.2.106 hub answers ``skipped`` with 400
+    ``invalid_status``; the driver retries ONCE as ``failed`` with the same
+    reason, so the row says why instead of the sweep's "died before
+    completing". Leave-alone: any other refusal, or a refused non-skip
+    status, is not retried. RED-PROOF TARGET: drop the retry → one post."""
+    from vco_lib import codegraph_resync as cr
+
+    posts: list = []
+
+    def _old_hub(project, payload, path_suffix=""):
+        posts.append(dict(payload))
+        if payload["status"] == "skipped":
+            raise _http_error(400, b'{"error":"invalid_status"}')
+        return types.SimpleNamespace(status=200)
+
+    monkeypatch.setattr(cr, "_hub_post_codegraph_build", _old_hub)
+    cr._report_skip_to_hub("P", "/r", "another walk is running")
+    assert [p["status"] for p in posts] == ["skipped", "failed"]
+    assert posts[1]["error_message"] == "another walk is running"
+
+    def _refusing(code: int, body: bytes):
+        def _post(project, payload, path_suffix=""):
+            posts.append(dict(payload))
+            raise _http_error(code, body)
+        return _post
+
+    posts.clear()
+    monkeypatch.setattr(cr, "_hub_post_codegraph_build", _refusing(404, b"not found"))
+    cr._report_skip_to_hub("P", "/r", "x")
+    assert len(posts) == 1, "a 404 (no /terminal route) is the soft skip, never a retry"
+
+    posts.clear()
+    monkeypatch.setattr(cr, "_hub_post_codegraph_build",
+                        _refusing(400, b'{"error":"invalid_status"}'))
+    cr._report_terminal_to_hub("P", "failed", error_message="x")
+    assert len(posts) == 1, "only a refused 'skipped' falls back"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock-based claims are POSIX")
 def test_a_driver_for_a_different_project_is_not_blocked(monkeypatch, tmp_path):
     from vco_lib import codegraph_resync as cr
 

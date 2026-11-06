@@ -57,6 +57,14 @@ pub struct KgSyncRow {
     pub heartbeat_at: Option<i64>,
 }
 
+/// Floor of the launcher's heartbeat staleness window: 30 min of missed
+/// 60 s ticks ⇒ the task is gone (launcher up) or the launcher is gone (next
+/// boot sweeps). The launcher's window is `max(this, 2 × stall timeout)`
+/// (`commands::kg_sync::heartbeat_stale_secs`); the hub's codegraph-build
+/// registration uses the floor to tell a live launcher-owned build (stamped
+/// every 60 s) from a ghost row. One home, read by both crates.
+pub const HEARTBEAT_STALE_FLOOR_SECS: u64 = 1800;
+
 /// BUG 2 (v0.2.89): pure staleness predicate shared by the read-time
 /// guards in `commands::{kg_sync,codegraph}` — MUST match the SQL
 /// predicate in `mark_stale_running_kg_syncs_failed` /
