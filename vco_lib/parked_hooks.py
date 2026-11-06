@@ -618,11 +618,11 @@ def report_parked_hooks(
     if kept_user:
         result["warnings"].append(
             f"settings.json: left {len(kept_user)} duplicate hook group(s) exactly "
-            f"as they are, because they hold a command, or a hook setting such as a "
-            f"timeout, that VCO does not ship ({_describe_groups(kept_user)}). VCO "
-            f"only folds duplicate groups made entirely of its own hooks with its "
-            f"own settings. If those hooks now run twice, delete the duplicate "
-            f"group from the launcher's Hooks tab or by hand."
+            f"as they are, because folding them would change a command, or a hook "
+            f"setting such as a timeout, that VCO does not ship "
+            f"({_describe_groups(kept_user)}). The VCO hooks those groups share "
+            f"with another group now run twice — delete the duplicate group from "
+            f"the launcher's Hooks tab or by hand."
         )
     if state.readable:
         return

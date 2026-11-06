@@ -2151,15 +2151,17 @@ def test_resync_driver_walk_refusal_posts_a_terminal_hub_report(
     assert "already running" in capsys.readouterr().out
 
     # Exactly ONE terminal report, posted by the refusal branch: status
-    # "failed" (the only honest terminal vocabulary the hub's /terminal
-    # route accepts for a run that did not complete) with the refusal as
-    # its error message, so the row does not read as a silent death.
+    # "skipped" (v0.2.106 — the NON-failure terminal state the hub's
+    # /terminal route accepts for a run a healthy twin made unnecessary; a
+    # "failed" here painted a red row for a project whose graph was being
+    # rebuilt) with the refusal as its reason, so the row does not read as
+    # either a silent death or an error.
     assert len(seen["terminal"]) == 1, (
         f"the walk-refusal branch must post exactly one terminal report, "
         f"got {seen['terminal']!r}")
     args, kwargs = seen["terminal"][0]
     assert args[0] == "Acme Projects"
-    assert args[1] == "failed"
+    assert args[1] == "skipped"
     assert "already running" in (kwargs.get("error_message") or "")
     assert kwargs.get("files_analyzed") == 0
 
@@ -2172,6 +2174,30 @@ def test_resync_driver_walk_refusal_posts_a_terminal_hub_report(
         "the ordinary path still posts its own terminal report")
     _args2, kwargs2 = seen["terminal"][1]
     assert "already running" not in (kwargs2.get("error_message") or "")
+
+
+def test_a_genuine_analyzer_failure_still_reports_failed(
+        monkeypatch, tmp_path, capsys):
+    """The LEAVE-ALONE half of the twin-walk skip: a run that actually ran
+    and failed must still finalize the build row ``failed``. v0.2.106 only
+    reclassified the twin-walk refusal (``WalkAlreadyRunning``), never the
+    analyzer's own non-zero exit. RED-PROOF TARGET: broadening the skip
+    status to the ordinary exit path turns this red."""
+    import subprocess
+    from types import SimpleNamespace
+
+    from vco_lib import codegraph_resync as cr
+
+    seen = _stub_driver_walk_gates(monkeypatch)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: seen["runs"].append(a) or SimpleNamespace(returncode=3))
+    rc = cr._run_resync_and_verify_slotted(
+        "Acme Projects", tmp_path, tmp_path / "a.py")
+    assert rc == 0, "the driver's own exit stays 0 on a walk it could not converge"
+    statuses = [args[1] for args, _kw in seen["terminal"]]
+    assert "failed" in statuses, f"a real failure is still failed: {seen['terminal']!r}"
+    assert "skipped" not in statuses
 
 
 def test_retry_code_graph_walk_goes_through_the_walk_claim(monkeypatch, tmp_path):

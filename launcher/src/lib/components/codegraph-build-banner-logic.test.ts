@@ -152,6 +152,30 @@ describe('buildDetailLine', () => {
     expect(line).toBe('');
   });
 
+  // v0.2.106: a `skipped` row says WHY it skipped. Before this the reason was
+  // dropped and the label claimed "no source files found" even when the skip
+  // was a twin walk already running — a healthy rebuild read as an error.
+  it('surfaces the reason on a SKIPPED row (twin-walk skip)', () => {
+    const line = buildDetailLine(
+      view({
+        status: 'skipped',
+        languages: [],
+        duration_ms: 0,
+        error_message:
+          'another code-graph walk is already running for this project — this run was skipped, not failed',
+      }),
+    );
+    expect(line).toContain('another code-graph walk is already running');
+    expect(line).toContain('Took 0.0s');
+  });
+
+  it('silences a skipped row with no reason (leave-alone)', () => {
+    const line = buildDetailLine(
+      view({ status: 'skipped', languages: [], duration_ms: null, error_message: null }),
+    );
+    expect(line).toBe('');
+  });
+
   it('does NOT put a message on a SUCCESS row', () => {
     // Nothing writes one today; if something starts to, "indexed N files"
     // must not grow an error clause without a deliberate decision.

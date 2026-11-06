@@ -190,7 +190,11 @@
           ? 'Code graph: built with stale-row cleanup warnings'
           : `Code graph: indexed ${v.files_analyzed} file${v.files_analyzed === 1 ? '' : 's'} (stale-row cleanup warnings)`;
       case 'failed': return 'Code graph: build failed';
-      case 'skipped': return 'Code graph: no source files found';
+      // v0.2.106: `skipped` is not always "no source files". A walk made
+      // unnecessary by a twin walk is reported skipped with its reason, so
+      // the label names the state and the detail line carries the reason
+      // ("another code-graph walk is already running …"). Never a failure.
+      case 'skipped': return 'Code graph: skipped';
     }
   }
 

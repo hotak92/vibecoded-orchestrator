@@ -80,8 +80,13 @@ export function buildDetailLine(view: CodeGraphBuildView): string {
   // `partial`: the text is the "N stale row(s) could not be pruned" warning
   // set by the reader — informational, not a failure (inserts succeeded).
   // `failed`: the text is the reason the build produced nothing.
+  // `skipped` (v0.2.106): the text is WHY nothing ran — "no supported source
+  // files found within depth 3", or another code-graph walk already running
+  // for this project. Informational, so it rides the amber tone, not the
+  // failure pink.
   if (
-    (view.status === 'partial' || view.status === 'failed') &&
+    (view.status === 'partial' || view.status === 'failed'
+      || view.status === 'skipped') &&
     view.error_message
   ) {
     parts.push(view.error_message);

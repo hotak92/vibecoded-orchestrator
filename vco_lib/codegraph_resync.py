@@ -3659,9 +3659,10 @@ def _register_spawn_with_hub(
 # completing" — a false failure on a healthy code graph, with files_analyzed=0
 # and log_tail NULL as the fingerprint. Rule (KG: pid-liveness-tracking-needs-
 # a-terminal-report-2026-08-28): never ship the register half without the
-# terminal half. The driver now posts success/partial/failed + stats through
-# the SAME wire it registered on; the reconciler keeps firing, but only for
-# rows with no terminal status — which is now genuinely "died or lost".
+# terminal half. The driver now posts success/partial/failed/skipped +
+# stats through the SAME wire it registered on; the reconciler keeps firing,
+# but only for rows with no terminal status — which is now genuinely "died or
+# lost". (`skipped` is v0.2.106: the run a twin walk made unnecessary.)
 
 #: Byte cap for the log tail carried on the terminal report. Mirrors the
 #: launcher DB layer's LOG_TAIL_MAX_BYTES (db/log_tail.rs) — the hub caps
@@ -3799,7 +3800,8 @@ def _report_terminal_to_hub(
     this function's soft-skip, the exact pre-fix degrade; the base route
     would instead have executed the report as a registration there). Body
     extends the registration payload: ``{"status": "success"|"partial"|
-    "failed", "pid": <driver pid>, "source": "install_resync", "repo_root":
+    "failed"|"skipped", "pid": <driver pid>, "source": "install_resync",
+    "repo_root":
     ..., "files_analyzed": N?, "duration_ms": M?, "error_message": ...?,
     "log_tail": ...?, "analyzed_commit": ...?}``. ``pid`` is this driver
     process (== the pid the spawn registered, os.getpid()); the hub finalizes
@@ -4582,17 +4584,27 @@ def _run_resync_and_verify_slotted(
         # guard makes this report a no-op — it finalizes ONLY a still-running
         # row with this exact pid. Soft-fail as everywhere: observability
         # never gates the exit.
+        # v0.2.106: the SKIP is not a failure, so it is reported as one of
+        # the hub's NON-failure terminal states ("skipped"). Before this the
+        # driver posted "failed" for a walk that never ran beside a healthy
+        # twin, and every "Update all" log read
+        #   "… skipping this run (no twin walks) … reported terminal 'failed'"
+        # — a red row for a project whose graph was in fact being rebuilt. The
+        # running walk's own completion still reports the build's real
+        # outcome, and the hub's pid guard still makes this a no-op when that
+        # walk re-registered the row under its own pid. Soft-fail as
+        # everywhere: observability never gates the exit.
         try:
             _report_terminal_to_hub(
                 project_name,
-                "failed",
+                "skipped",
                 repo_root=repo_root,
                 files_analyzed=0,
                 duration_ms=0,
                 error_message=(
-                    "refused: another code-graph walk is already running "
-                    "(this run was skipped, not failed — the running walk's "
-                    "own completion reports the build's real outcome)"
+                    "another code-graph walk is already running for this "
+                    "project — this run was skipped, not failed; the running "
+                    "walk's own completion reports the build's real outcome"
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — observability, never a gate

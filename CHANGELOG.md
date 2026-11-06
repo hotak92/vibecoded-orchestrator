@@ -20,6 +20,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (which hold your earlier versions of files) are kept. If you also choose to delete the project's collections,
   VCO now finds the ones the project actually uses, even after a rename, and never deletes one another project uses.
 
+### Fixed
+
+- **The old inline syntax-check hook is removed from your settings.** An early release registered a `py_compile`
+  one-liner on every Python write and a later one replaced it with the named `py-compile-check` hook, but projects
+  that received the first one kept both, so the old entry kept running beside the new one. A bundle update now takes
+  the old entry out — and removing a project removes it too. A command of your own that differs from it, even by one
+  character, is left where it is.
+
+- **The update report no longer claims some of your hooks run twice when they do not.** When VCO could not fold a
+  duplicate hook group it listed every group sharing a matcher, including groups holding only your own scripts — the
+  report then said those hooks might be running twice. It now lists a group only when it really doubles a hook VCO
+  ships and another group runs the same hook. Groups of your own are left alone and not mentioned.
+
+- **A code-graph walk skipped because another walk was already running is no longer reported as failed.** The log
+  read "skipping this run (no twin walks)" and then "reported terminal 'failed'" for a project whose graph was in
+  fact being rebuilt by the other walk. The skipped run now finishes its build row as "skipped", which the launcher
+  shows as an informational skip with the reason, never as a failure; a real analyzer failure is still reported
+  failed.
+
 ## [0.2.105] - 2026-10-30
 
 ### Added

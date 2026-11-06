@@ -210,7 +210,11 @@ def test_a_legacy_handler_with_the_users_own_timeout_is_kept():
 # ---------------------------------------------------------------------------
 
 
-def test_a_duplicate_group_holding_the_users_own_command_is_kept_and_reported():
+def test_a_duplicate_group_holding_only_the_users_own_command_is_not_reported():
+    """v0.2.106 (F2): a group of the project's OWN scripts shares a matcher
+    with a VCO group but runs nothing twice — it survives, and the update
+    says nothing about it. The v0.2.105 report listed it under "if those
+    hooks now run twice", which was false."""
     user = copy.deepcopy(SPLIT_STARTUP)
     user["hooks"]["SessionStart"].append({
         "matcher": "startup",
@@ -223,15 +227,33 @@ def test_a_duplicate_group_holding_the_users_own_command_is_kept_and_reported():
     assert len(kept) == 1, "the user's group survives byte for byte"
     assert len(_startup_groups(merged)) == 2, (
         "the VCO-shipped groups still fold, beside the user's group")
-    assert records[-1] == {
-        "action": "kept_user_command", "event": "SessionStart",
-        "matcher": "startup", "commands": ["bash .claude/hooks/my-own-hook.sh"],
-    }
+    assert [r["action"] for r in records] == ["folded"], (
+        "nothing runs twice, so nothing is reported")
+
+
+def test_a_group_that_really_doubles_a_shipped_hook_is_kept_and_reported():
+    """v0.2.106 (F2): the report is for a REAL double run — a group that
+    holds the user's own script AND a shipped hook another group also runs.
+    The group is still never touched; it is named so the user can delete it."""
+    user = copy.deepcopy(SPLIT_STARTUP)
+    user["hooks"]["SessionStart"].append({
+        "matcher": "startup",
+        "hooks": [{"type": "command", "command": "bash .claude/hooks/my-own-hook.sh"},
+                  _cmd("ensure-containers")],
+    })
+    merged, records = _fold(user)
+    kept = [g for g in merged["hooks"]["SessionStart"]
+            if any(h["command"] == "bash .claude/hooks/my-own-hook.sh"
+                   for h in g["hooks"])]
+    assert len(kept) == 1, "the user's group survives byte for byte"
+    assert {"action": "kept_user_command", "event": "SessionStart",
+            "matcher": "startup", "commands": [ENSURE]} in records
 
 
 def test_a_group_with_a_user_command_is_never_split_or_emptied():
     """The template's own hooks are added beside it (the merge is additive),
-    but the two `startup` groups are never folded into one."""
+    but the two `startup` groups are never folded into one — and, holding
+    only the user's script, nothing is reported either."""
     user = {"hooks": {"SessionStart": [
         {"matcher": "startup", "hooks": [_cmd("ensure-containers")]},
         {"matcher": "startup", "hooks": [{"type": "command",
@@ -243,7 +265,7 @@ def test_a_group_with_a_user_command_is_never_split_or_emptied():
     assert mine == [{"matcher": "startup",
                      "hooks": [{"type": "command", "command": "bash ~/mine.sh"}]}]
     assert len(_startup_groups(merged)) == 2
-    assert [r["action"] for r in records] == ["folded", "kept_user_command"]
+    assert [r["action"] for r in records] == ["folded"]
 
 
 ENSURE = _cmd("ensure-containers")["command"]
@@ -531,6 +553,38 @@ def test_a_real_bundle_update_folds_the_duplicate_groups(tmp_path):
 
 
 def test_a_real_bundle_update_reports_the_group_it_had_to_leave_alone(tmp_path):
+    """v0.2.106 (F2): the summary names a group only when it really doubles a
+    VCO hook — here the user's own script plus a shipped hook another group
+    also runs. A group of only the user's scripts is not reported."""
+    project_init, orch, proj = _bundle(tmp_path)
+    _split_startup(proj)
+    settings = _settings(proj)
+    settings["hooks"]["SessionStart"].append({
+        "matcher": "startup",
+        "hooks": [{"type": "command", "command": "bash .claude/hooks/my-own-hook.sh"},
+                  {"type": "command", "timeout": 10,
+                   "command": ENSURE}],
+    })
+    (proj / ".claude" / "settings.json").write_text(
+        json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    result = project_init.install_project_bundle(
+        proj, orchestrator_root=orch, update_mode=True)
+    assert result["errors"] == []
+    kept = [r for r in result["duplicate_hook_groups"]
+            if r["action"] == "kept_user_command"]
+    assert kept and kept[0]["commands"] == [ENSURE]
+    warnings = " ".join(result.get("warnings", []))
+    assert "left 1 duplicate hook group(s) exactly as they are" in warnings
+    assert "ensure-containers.sh" in warnings
+    assert any(h["command"] == "bash .claude/hooks/my-own-hook.sh"
+               for g in _settings(proj)["hooks"]["SessionStart"]
+               for h in g["hooks"])
+
+
+def test_a_real_bundle_update_is_silent_about_a_user_only_group(tmp_path):
+    """The v0.2.105 noise: a group of the project's own scripts shares a
+    matcher with a VCO group and was reported under "if those hooks now run
+    twice". It runs nothing twice, so the update says nothing."""
     project_init, orch, proj = _bundle(tmp_path)
     _split_startup(proj)
     settings = _settings(proj)
@@ -543,12 +597,10 @@ def test_a_real_bundle_update_reports_the_group_it_had_to_leave_alone(tmp_path):
     result = project_init.install_project_bundle(
         proj, orchestrator_root=orch, update_mode=True)
     assert result["errors"] == []
-    kept = [r for r in result["duplicate_hook_groups"]
-            if r["action"] == "kept_user_command"]
-    assert kept and kept[0]["commands"] == ["bash .claude/hooks/my-own-hook.sh"]
-    warnings = " ".join(result.get("warnings", []))
-    assert "left 1 duplicate hook group(s) exactly as they are" in warnings
-    assert "my-own-hook.sh" in warnings
+    assert not any(r.get("action") == "kept_user_command"
+                   for r in result.get("duplicate_hook_groups", []))
+    assert not any("duplicate hook group" in w for w in result.get("warnings", []))
+    # The user's own group is still untouched.
     assert any(h["command"] == "bash .claude/hooks/my-own-hook.sh"
                for g in _settings(proj)["hooks"]["SessionStart"]
                for h in g["hooks"])

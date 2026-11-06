@@ -238,9 +238,11 @@ impl Db {
     /// provenance — every liveness consumer, sweep and heartbeat alike,
     /// gates on `status = 'running'`, so a pid on a terminal row is inert);
     /// `heartbeat_at` untouched (always NULL for detached rows — see the
-    /// field doc). `status` must be one of the terminal trio
-    /// success/partial/failed (same vocabulary as the launcher-spawned
-    /// writer; `skipped` is a launcher-side decision, never a wire status).
+    /// field doc). `status` must be one of the terminal statuses
+    /// success/partial/failed/skipped — `skipped` (v0.2.106) is a run a twin
+    /// walk made unnecessary: a NON-failure terminal state that must not be
+    /// left to the pid-aliveness reconciler's "failed" verdict, and must not
+    /// read as an error in the GUI.
     #[allow(clippy::too_many_arguments)]
     pub fn finalize_detached_code_graph_build(
         &self,
@@ -255,7 +257,7 @@ impl Db {
     ) -> Result<bool, String> {
         if !matches!(
             status,
-            status::SUCCESS | status::PARTIAL | status::FAILED
+            status::SUCCESS | status::PARTIAL | status::FAILED | status::SKIPPED
         ) {
             return Err(format!(
                 "invalid terminal code-graph build status: {}",
@@ -1089,12 +1091,15 @@ mod tests {
         );
     }
 
-    /// Vocabulary: only the terminal trio is accepted on the wire writer.
+    /// Vocabulary: the terminal statuses are accepted on the wire writer;
+/// `running` / `pending` / garbage are not. v0.2.106: `skipped` IS a
+/// terminal status — a run a twin walk made unnecessary, reported so the
+/// pid-aliveness sweep does not later fail it.
     #[test]
     fn finalize_detached_rejects_non_terminal_status() {
         let (db, pid_str) = fresh_db_with_project();
         db.register_running_code_graph_build(&pid_str, 5).unwrap();
-        for bad in ["running", "pending", "skipped", "borked"] {
+        for bad in ["running", "pending", "borked"] {
             let err = db
                 .finalize_detached_code_graph_build(
                     &pid_str, 5, bad, 0, None, None, None, None,
@@ -1102,6 +1107,17 @@ mod tests {
                 .expect_err("must reject");
             assert!(err.contains(bad), "error names the status: {}", err);
         }
+        // The skip is a NON-failure terminal state, not a rejected one.
+        assert!(db
+            .finalize_detached_code_graph_build(
+                &pid_str, 5, status::SKIPPED, 0, Some(0), None,
+                Some("another code-graph walk is already running"), None,
+            )
+            .unwrap());
+        assert_eq!(
+            db.get_code_graph_build(&pid_str).unwrap().unwrap().status,
+            "skipped"
+        );
     }
 
     /// The #31 asymmetry, both legs: a finalized (success) row survives the

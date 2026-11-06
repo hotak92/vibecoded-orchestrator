@@ -580,6 +580,66 @@ RETIRED_REGISTRATIONS: Tuple[RetiredRegistration, ...] = (
         )
         for ext in ("sh", "ps1")
     ),
+    # ── the inline py_compile registration, retired in v0.2.75 ─────────────
+    #
+    # cb0ffb4e (2026-05-08) replaced the older `CLAUDE_TOOL_ARG_PATH` form
+    # with these stdin-JSON one-liners; 94f78f82 (shipped in v0.2.75)
+    # replaced THAT with the named, VCT_DISABLE_HOOKS-guarded and
+    # env-scrubbed `py-compile-check.{sh,ps1}` pair. The inline entry has no
+    # `.claude/hooks/` script for the supersede pass to key on, so every
+    # install that ever carried it kept it firing beside the named hook.
+    # Field evidence (the owner's v0.2.105 "Update all" report, 2026-11-05):
+    # the Linux spelling is still registered in several projects and runs on
+    # every `Write`. KIND_COMMAND: byte-equal after normalisation only — a
+    # user's own compile command that differs by one character stays.
+    RetiredRegistration(
+        event="PostToolUse",
+        kind=KIND_COMMAND,
+        target=normalize_command(
+            'python3 -c "import json,sys,py_compile; '
+            "d=json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}; "
+            "fp=d.get('tool_input',{}).get('file_path',''); "
+            'py_compile.compile(fp) if fp else None" 2>&1 || echo "Syntax error"'
+        ),
+        reason=(
+            "the inline py_compile one-liner was superseded in v0.2.75 by "
+            "the named py-compile-check hook: it carried no "
+            "VCT_DISABLE_HOOKS guard (so the documented opt-out was "
+            "incomplete), ran with an unscrubbed environment, was not "
+            "supersedable by a bundle update (no hook-script identity), and "
+            "printed a fixed \"Syntax error\" on ANY failure — including "
+            "malformed stdin, which is not a syntax error"
+        ),
+        retired_in="v0.2.75",
+        replacement=(
+            ".claude/hooks/py-compile-check.sh (the named hook — "
+            "VCT_DISABLE_HOOKS-guarded, env-scrubbed, and it reports the "
+            "true compiler message)"
+        ),
+    ),
+    RetiredRegistration(
+        event="PostToolUse",
+        kind=KIND_COMMAND,
+        target=normalize_command(
+            'powershell -NoProfile -Command "try { $payload = '
+            "[Console]::In.ReadToEnd() | ConvertFrom-Json; $fp = "
+            "$payload.tool_input.file_path; if ($fp) { python -m py_compile "
+            '$fp 2>&1 } } catch { Write-Output \\"Syntax error\\" }"'
+        ),
+        reason=(
+            "the Windows form of the same inline py_compile one-liner, "
+            "superseded in v0.2.75 by the named py-compile-check hook for "
+            "the same reasons (no VCT_DISABLE_HOOKS guard, unscrubbed env, "
+            "not supersedable by a bundle update, a fixed \"Syntax error\" "
+            "on any failure)"
+        ),
+        retired_in="v0.2.75",
+        replacement=(
+            ".claude/hooks/py-compile-check.ps1 (the named hook — "
+            "VCT_DISABLE_HOOKS-guarded, env-scrubbed, and it reports the "
+            "true compiler message)"
+        ),
+    ),
 )
 
 
