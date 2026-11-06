@@ -73,12 +73,23 @@ export async function runUnregister(
   }
 }
 
-/** The project list's quick unregister: the same unregister as the settings
- *  page's defaults ({@link DEFAULT_UNREGISTER_OPTIONS}) — the stop can fire,
+/** The REMOVE flow's options (v0.2.106): the owner's definition of removing
+ *  a project — everything the settings page's default unregister removes
+ *  PLUS the project's own Weaviate collections. Used by the ONE shared
+ *  Remove flow (`ProjectRemoveFlow.svelte`) that both the Projects-page card
+ *  and the top-bar selector open; `runUnregister` supplies
+ *  `leaveUnremovable: false` on the first call. */
+export const REMOVE_UNREGISTER_OPTIONS: Readonly<{
+  purgeLauncherFiles: boolean;
+  purgeCollections: boolean;
+}> = Object.freeze({ purgeLauncherFiles: true, purgeCollections: true });
+
+/** The shared Remove flow's unregister: {@link REMOVE_UNREGISTER_OPTIONS} with
+ *  the stop (and its "Unregister anyway" escape) intact — the stop can fire,
  *  and its escape re-runs with the same options (review R6 F46). */
-export function quickUnregister(
+export function removeUnregister(
   del: (options: UnregisterOptions) => Promise<UnregisterReport>,
   confirmLeave: (message: string) => Promise<boolean>,
 ): Promise<UnregisterOutcome> {
-  return runUnregister(del, { ...DEFAULT_UNREGISTER_OPTIONS }, confirmLeave);
+  return runUnregister(del, { ...REMOVE_UNREGISTER_OPTIONS }, confirmLeave);
 }

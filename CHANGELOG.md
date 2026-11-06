@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Remove a project right from its card on the Projects page.** Every project card now has a "Remove" button that
+  asks "are you sure?" first: the dialog says plainly what goes (VCO's hooks, scripts and bundled files, the lines VCO
+  wrote to your env files, and the project's own Weaviate collections — knowledge graph, docs and code graph) and what
+  stays (the folder, your source code, `.env` and other values that are yours, secrets in the keychain, `knowledge/`
+  notes, `CLAUDE.md`, `CONTEXT_STATE.md`, anything you changed). Two buttons — "Yes, remove" and "No" — with No as the
+  safe default, and a summary toast with the removal counts afterwards. The top-bar project list's delete action now
+  opens the same dialog (the old type-the-name step is gone). Per-option control (keep the collections, keep the
+  bundled files) stays on the project's Settings → Danger zone.
+
 ### Changed
 
 - **Removing a project takes out what is VCO's, and only that.** Before, removing a project deleted the whole

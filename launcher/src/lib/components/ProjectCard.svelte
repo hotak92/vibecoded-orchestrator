@@ -40,9 +40,17 @@
     folderMissing?: boolean;
     /** Click handler — receives the project id. */
     onOpen: (id: string) => void;
+    /**
+     * v0.2.106 Remove flow: opens the shared "Remove project" confirm
+     * dialog (ProjectRemoveFlow) for this project. Optional so call sites
+     * that only open projects are unaffected. When set, the card renders a
+     * Remove button; it stops click AND keydown propagation so activating
+     * it never triggers the card's open action.
+     */
+    onRemove?: (project: { id: string; name: string }) => void;
   }
 
-  let { project, active = false, folderMissing = false, onOpen }: Props = $props();
+  let { project, active = false, folderMissing = false, onOpen, onRemove }: Props = $props();
 
   function handleKey(e: KeyboardEvent) {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -65,6 +73,23 @@
     <h3>{project.name}</h3>
     {#if active}
       <span class="pc-badge">ACTIVE</span>
+    {/if}
+    {#if onRemove}
+      <!-- v0.2.106 Remove flow. Inside the card's clickable target, so BOTH
+           the click and the keydown are stopped before they can bubble into
+           the card's open action. Works when the folder is missing too: the
+           unregister backend never needs the folder to be present. -->
+      <button
+        type="button"
+        class="pc-remove"
+        data-testid="project-card-remove"
+        aria-label="Remove project {project.name}"
+        title="Remove {project.name} from the launcher"
+        onclick={(e) => { e.stopPropagation(); onRemove(project); }}
+        onkeydown={(e) => e.stopPropagation()}
+      >
+        Remove
+      </button>
     {/if}
   </header>
   <p class="pc-path"><code>{project.folder_path}</code></p>
@@ -169,6 +194,24 @@
     font-size: 10px;
     font-weight: 600;
     letter-spacing: 0.04em;
+  }
+  /* v0.2.106 Remove flow: quiet chrome at rest, pink accent on hover — the
+     brand's "needs attention / destructive" signal (#FF4FA0), matching the
+     danger row actions elsewhere in the launcher. */
+  .pc-remove {
+    flex-shrink: 0;
+    padding: 2px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: inherit;
+  }
+  .pc-remove:hover {
+    background: rgba(255, 79, 160, 0.08);
+    border-color: rgba(255, 79, 160, 0.5);
+    color: var(--color-pink, #ff4fa0);
   }
   .pc-warn-banner {
     display: flex;
