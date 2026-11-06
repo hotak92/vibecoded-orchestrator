@@ -93,6 +93,34 @@ def msys_drive_path_to_windows(path: str) -> "str | None":
     return f"{drive.upper()}:\\" + (rest or "").replace("/", "\\")
 
 
+def is_junction(path: Path) -> bool:
+    """True for a Windows directory junction (always False elsewhere, and on
+    any error). ``Path.is_junction`` exists from Python 3.12 only."""
+    probe = getattr(path, "is_junction", None)
+    try:
+        return bool(probe()) if probe is not None else False
+    except OSError:
+        return False
+
+
+def symlinked_component(base: Path, target: Path) -> Optional[Path]:
+    """The first path component BELOW ``base`` down to (and including)
+    ``target`` that is a symlink or a Windows junction, else ``None``.
+
+    ONE home for "does reaching ``target`` from ``base`` follow a redirect":
+    a redirected component would put every write or deletion made under it
+    somewhere other than ``base`` (the scratch sweep, the unregister purge).
+    ``target`` must be ``base`` itself or lexically below it; anything else
+    raises ``ValueError`` (the caller's bug, not a filesystem state).
+    """
+    current = base
+    for part in target.relative_to(base).parts:
+        current = current / part
+        if current.is_symlink() or is_junction(current):
+            return current
+    return None
+
+
 def looks_like_orchestrator_root(repo_path: "str | Path") -> bool:
     """Best-effort check: does ``repo_path`` look like the orchestrator clone?
 

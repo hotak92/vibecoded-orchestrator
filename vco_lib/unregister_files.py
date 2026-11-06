@@ -33,6 +33,14 @@ named in the reply.
   ``permissions`` / ``env`` goes; a file left as ``{}`` is deleted.
   ``.claude/settings.local.json`` is deleted only when nothing but an empty
   ``env`` is left in it (the env strip ran first).
+* **``.vscode/settings.json``** — VCO's exclude keys (``files.watcherExclude``,
+  ``files.exclude``, ``search.exclude``, ``python.analysis.*``) go while they
+  still hold a value VCO wrote; an edited one is the user's and stays
+  (:func:`vco_lib.vscode_excludes.strip_in_project`). The file goes only when
+  VCO created it and nothing else is left in it.
+* **Nothing through a link**: a target reached through a symlinked (or
+  junction) folder, or resolving outside the project folder, is never
+  hashed, rewritten or deleted — it is kept and named.
 * **VCO's runtime files** — every path :data:`vco_lib.git_exclude.VCO_RUNTIME_EXCLUDES`
   names as VCO's alone (``.claude/state/``, ``.claude/logs/``, the deferral
   ledger, the compaction markers, the code-format sidecar …), the
@@ -55,8 +63,10 @@ import argparse
 import json
 import shutil
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Optional
+
+from vco_lib.paths import is_junction
 
 __all__ = ["purge_project_files", "main"]
 
@@ -67,6 +77,7 @@ SHARED_VALUE_SETTINGS_KEYS: tuple[str, ...] = ("$schema", "idleCompaction", "ski
 _SETTINGS_REL = ".claude/settings.json"
 _SETTINGS_LOCAL_REL = ".claude/settings.local.json"
 _CLAUDE_ENV_REL = ".claude/env"
+_VSCODE_SETTINGS_REL = ".vscode/settings.json"
 #: Runtime namespaces that may hold the USER's bytes: kept, named.
 _KEPT_RUNTIME: dict[str, str] = {
     ".claude/backups": "VCO's update backups hold your own earlier versions of files",
@@ -82,16 +93,49 @@ class _Run:
         self.kept: list[str] = []
         self.settings_removed: list[str] = []
         self.errors: list[str] = []
+        #: The manifest's evidence paths (read before the manifest goes).
+        self.manifest_rels: list[str] = []
 
     def rel(self, path: Path) -> str:
         return path.relative_to(self.folder).as_posix()
 
+    def redirected(self, path: Path) -> Optional[str]:
+        """Why ``path`` may NOT be touched, or ``None`` when it may.
+
+        ``path`` is ``folder / rel``; reaching it must never leave the folder.
+        A symlinked (or junction) ANCESTOR between the folder and ``path``
+        would carry a hash, a rewrite or an ``rmtree`` to bytes outside the
+        project, so it is refused — even when the link points back inside the
+        folder (no link is ever followed). The resolved parent must also stay
+        under ``folder.resolve()`` (the shared containment rule). ``path``
+        itself may be a link: :meth:`delete` removes the link, never its
+        target."""
+        from vco_lib.install_weaviate import _safe_inside_project
+        from vco_lib.paths import symlinked_component
+
+        try:
+            bad = symlinked_component(self.folder, path.parent)
+        except ValueError:
+            return "it is outside the project folder"
+        if bad is not None:
+            return f"{self.rel(bad)} is a link, so it leads outside what VCO may remove"
+        if not _safe_inside_project(path.parent, self.folder):
+            return "it resolves outside the project folder"
+        return None
+
     def delete(self, path: Path) -> bool:
         """Remove a file, a link or a directory tree (a link is never
-        followed). Records the outcome."""
+        followed, and nothing is reached through a linked ancestor). Records
+        the outcome; a refused path is kept and named."""
+        why = self.redirected(path)
+        if why is not None:
+            self.kept.append(f"{self.rel(path)} — {why}; left in place")
+            return False
         try:
             if path.is_symlink() or path.is_file():
                 path.unlink()
+            elif is_junction(path):
+                path.rmdir()  # removes the junction, never its target
             elif path.is_dir():
                 shutil.rmtree(path)
             else:
@@ -105,21 +149,34 @@ class _Run:
 
 def _inside(folder: Path, rel: str) -> Optional[Path]:
     """``folder / rel`` when ``rel`` is a plain relative path that stays
-    inside ``folder``; ``None`` for an absolute or ``..`` path."""
+    inside ``folder``; ``None`` for an absolute, drive-anchored (``C:/x``,
+    ``C:x``, ``//host/share``) or ``..`` path — on Windows ``joinpath``
+    would reset to that drive and escape the folder."""
     pure = PurePosixPath(rel)
     if pure.is_absolute() or ".." in pure.parts or not pure.parts:
+        return None
+    win = PureWindowsPath(rel)
+    if win.drive or win.root or any(":" in part for part in pure.parts):
         return None
     return folder.joinpath(*pure.parts)
 
 
 def _manifest_hashes(manifest: dict) -> dict[str, str]:
     """``{posix rel: shipped sha256}`` from both manifest sections; the
-    ``files`` record wins over a ``preserved_files`` one."""
+    ``files`` record wins over a ``preserved_files`` one.
+
+    A ``preserved_files`` row with ``reason: "skip-existing"`` is NOT
+    evidence: the first install found the user's own file there and left it
+    (its writer: "don't claim ownership … it's not ours"), so equal bytes
+    prove nothing about who wrote them."""
     from vco_lib.paths import to_posix_rel
 
     out: dict[str, str] = {}
     for section, key in (("preserved_files", "shipped_sha256"), ("files", "sha256")):
         for rel, entry in (manifest.get(section) or {}).items():
+            if section == "preserved_files" and isinstance(entry, dict) \
+                    and entry.get("reason") == "skip-existing":
+                continue
             sha = entry.get(key) if isinstance(entry, dict) else None
             if isinstance(sha, str) and sha:
                 out[to_posix_rel(rel)] = sha
@@ -142,12 +199,22 @@ def _purge_shipped_files(run: _Run) -> bool:
                 "agents and skills from yours; they were left in place")
         return False
     failed = False
-    for rel, sha in sorted(_manifest_hashes(_read_manifest(run.folder)).items()):
+    hashes = _manifest_hashes(_read_manifest(run.folder))
+    run.manifest_rels = sorted(hashes)
+    for rel, sha in sorted(hashes.items()):
         if rel == "knowledge" or rel.startswith("knowledge/"):
             continue  # always the user's data
         for cand in filter(None, (rel, disabled_counterpart(rel))):
             path = _inside(run.folder, cand)
-            if path is None or not (path.is_file() or path.is_symlink()):
+            if path is None:
+                continue
+            why = run.redirected(path)
+            if why is not None:
+                if path.is_file() or path.is_symlink():
+                    run.kept.append(f"{cand} — {why}; left in place")
+                    failed = True  # the manifest stays, so a retry can still prove
+                continue
+            if not (path.is_file() or path.is_symlink()):
                 continue
             try:
                 same = not path.is_symlink() and sha256_file(path) == sha
@@ -171,6 +238,8 @@ def _drop_bytecode(py: Path) -> None:
     if py.suffix != ".py":
         return
     cache = py.parent / "__pycache__"
+    if cache.is_symlink() or is_junction(cache):
+        return  # never reach through a link
     for pyc in cache.glob(f"{py.stem}.*.pyc") if cache.is_dir() else ():
         try:
             pyc.unlink()
@@ -242,6 +311,12 @@ def _strip_settings(run: _Run, templates: Optional[list[dict]]) -> None:
 
     path = run.folder / _SETTINGS_REL
     if not path.is_file():
+        return
+    why = run.redirected(path) or (
+        "it is a link, so rewriting it would change the file it points to"
+        if path.is_symlink() or is_junction(path) else None)
+    if why is not None:
+        run.kept.append(f"{_SETTINGS_REL} — {why}; no entry was removed")
         return
     if templates is None:
         run.kept.append(f"{_SETTINGS_REL} — VCO's settings templates could not be read, so "
@@ -340,14 +415,48 @@ def _purge_runtime(run: _Run) -> None:
 
 
 def _strip_git_exclude(run: _Run) -> None:
-    from vco_lib.git_exclude import strip_vco_blocks
+    from vco_lib.git_exclude import strip_vco_blocks, vco_block_entries
 
-    outcome = strip_vco_blocks(run.folder)
+    outcome = strip_vco_blocks(
+        run.folder, vco_entries=vco_block_entries(run.manifest_rels, run.folder))
     action = outcome.get("action", "")
     if action == "stripped":
         run.settings_removed.append(f".git/info/exclude: {len(outcome['removed'])} line(s) VCO wrote")
+        if outcome.get("kept"):
+            run.kept.append(
+                f".git/info/exclude — {len(outcome['kept'])} line(s) inside VCO's block are not "
+                "lines VCO can prove it wrote, so they were left: " + ", ".join(outcome["kept"]))
     elif action.startswith(("read_failed", "write_failed")):
         run.errors.append(f".git/info/exclude left untouched ({action})")
+
+
+def _strip_vscode_settings(run: _Run) -> None:
+    """VCO's exclude keys in ``.vscode/settings.json`` — the evidence rule is
+    :func:`vco_lib.vscode_excludes.strip_in_project`'s (one home)."""
+    from vco_lib.vscode_excludes import strip_in_project
+
+    path = run.folder / _VSCODE_SETTINGS_REL
+    if not (path.is_file() or path.is_symlink()):
+        return
+    why = run.redirected(path) or (
+        "it is a link, so rewriting it would change the file it points to"
+        if path.is_symlink() or is_junction(path) else None)
+    if why is not None:
+        run.kept.append(f"{_VSCODE_SETTINGS_REL} — {why}; no entry was removed")
+        return
+    outcome = strip_in_project(run.folder)
+    action = outcome["action"]
+    if action == "deleted":
+        run.removed.append(_VSCODE_SETTINGS_REL)
+    elif action == "stripped":
+        run.settings_removed.append(
+            f"{_VSCODE_SETTINGS_REL}: {', '.join(outcome['removed_keys'])}")
+    elif action in ("unparseable", "jsonc_edit_refused") or action.startswith("write_failed"):
+        run.errors.append(f"{_VSCODE_SETTINGS_REL} left untouched ({action})")
+    if outcome["kept_keys"]:
+        run.kept.append(
+            f"{_VSCODE_SETTINGS_REL} {', '.join(outcome['kept_keys'])} — not the value VCO "
+            "wrote, so it is yours; left as it is")
 
 
 def _prune(run: _Run) -> None:
@@ -383,6 +492,7 @@ def purge_project_files(folder: Path, *, orchestrator_root: Optional[Path] = Non
     _delete_if_empty_settings_local(run)
     _purge_runtime(run)
     _strip_git_exclude(run)
+    _strip_vscode_settings(run)
     from vco_lib.manifest_paths import manifest_path
     if manifest_may_go:
         run.delete(manifest_path(folder))

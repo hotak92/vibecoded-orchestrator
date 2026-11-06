@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.child_env import child_env
-from vco_lib import git_exclude, unregister_collections, unregister_files
+from vco_lib import git_exclude, unregister_collections, unregister_files, vscode_excludes
 from vco_lib.hashing import sha256_bytes
 from vco_lib.settings_merge import strip_shipped_hooks
 
@@ -250,6 +250,7 @@ def test_settings_local_goes_only_when_nothing_of_the_users_is_left(project: Pat
 
 
 def test_vcos_git_exclude_blocks_go_and_the_users_lines_stay(project: Path):
+    _ship(project, {".claude/hooks/x.sh": b"#!/bin/bash\n"})  # the manifest proves x.sh's line
     info = project / ".git/info"
     info.mkdir(parents=True)
     (info / "exclude").write_text(
@@ -334,3 +335,195 @@ def test_drop_refuses_the_shared_class_and_reports_what_it_kept(monkeypatch):
     assert "Acme_Diagrams" in deleted
     assert [e["collection"] for e in out["errors"]] == ["Acme_KnowledgeGraph"]
     assert [k["collection"] for k in out["kept"]] == ["Acme_Development"]
+
+
+# ── fix round 1: never reach outside the folder, per-line evidence ────────
+
+def test_a_shipped_file_reached_through_a_symlinked_dir_is_never_deleted(project: Path, tmp_path):
+    """R1 F1 (act + leave-alone): a byte-identical shipped file in the
+    project's own dir goes; the same file reached through a linked dir (the
+    user's tree outside the folder) stays, and the manifest stays too."""
+    outside = tmp_path / "shared-tools"
+    outside.mkdir()
+    (outside / "kg-search").write_bytes(b"#!/bin/bash\n")
+    (project / ".claude/scripts").symlink_to(outside, target_is_directory=True)
+    _ship(project, {".claude/agents/a.md": b"a\n"})
+    manifest = json.loads((project / ".claude/.vco-manifest.json").read_text())
+    manifest["files"][".claude/scripts/kg-search"] = {"sha256": sha256_bytes(b"#!/bin/bash\n")}
+    (project / ".claude/.vco-manifest.json").write_text(json.dumps(manifest))
+
+    out = _purge(project)
+
+    assert (outside / "kg-search").read_bytes() == b"#!/bin/bash\n"
+    assert not (project / ".claude/agents/a.md").exists(), "the real dir's file still goes"
+    assert any(k.startswith(".claude/scripts/kg-search — .claude/scripts is a link")
+               for k in out["kept"])
+    assert (project / ".claude/.vco-manifest.json").exists(), "a retry can still prove"
+
+
+def test_a_symlinked_claude_dir_keeps_the_real_state_tree_outside(project: Path, tmp_path):
+    """R1 F1: ``rmtree`` of ``.claude/state`` never runs through a linked
+    ``.claude`` (the act case — a real ``.claude/state`` going — is
+    ``test_vco_runtime_files_go_and_user_bytes_stay``)."""
+    real = tmp_path / "real-claude"
+    (real / "state/scratch/lane").mkdir(parents=True)
+    (real / "state/scratch/lane/my-notes.txt").write_text("mine")
+    (project / ".claude").rmdir()
+    (project / ".claude").symlink_to(real, target_is_directory=True)
+
+    out = _purge(project)
+
+    assert (real / "state/scratch/lane/my-notes.txt").read_text() == "mine"
+    assert any(k.startswith(".claude/state — .claude is a link") for k in out["kept"])
+    assert out["removed"] == []
+
+
+def test_a_settings_file_under_a_linked_claude_dir_is_not_rewritten(project: Path, tmp_path):
+    real = tmp_path / "real-claude"
+    real.mkdir()
+    body = json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command",
+                                                       "command": _cmd("notify-stop.sh")}]}]}})
+    (real / "settings.json").write_text(body)
+    (project / ".claude").rmdir()
+    (project / ".claude").symlink_to(real, target_is_directory=True)
+    out = _purge(project)
+    assert (real / "settings.json").read_text() == body
+    assert any(k.startswith(".claude/settings.json — .claude is a link") for k in out["kept"])
+
+
+@pytest.mark.parametrize("rel", ["C:/Users/x/notes.txt", "C:notes.txt", "//host/share/x",
+                                 "a/../b", "/etc/passwd", "sub/C:/x"])
+def test_a_drive_anchored_or_escaping_manifest_key_is_refused(project: Path, rel: str):
+    """R1 F3: on Windows ``joinpath('C:', …)`` resets to the drive."""
+    assert unregister_files._inside(project, rel) is None
+
+
+def test_a_plain_manifest_key_is_accepted(project: Path):
+    assert unregister_files._inside(project, ".claude/hooks/x.sh") == project / ".claude/hooks/x.sh"
+
+
+def test_a_skip_existing_preserved_row_is_not_evidence(project: Path):
+    """R1 F4 (both ways): the user's pre-existing file, byte-equal to the
+    shipped one, stays; a ``preserve`` row with equal bytes still goes."""
+    _ship(project, {".claude/agents/a.md": b"a\n"})
+    for name in ("theirs.md", "ours.md"):
+        (project / f".claude/agents/{name}").write_text("shipped\n")
+    manifest = json.loads((project / ".claude/.vco-manifest.json").read_text())
+    sha = sha256_bytes(b"shipped\n")
+    manifest["preserved_files"] = {
+        ".claude/agents/theirs.md": {"shipped_sha256": sha, "reason": "skip-existing"},
+        ".claude/agents/ours.md": {"shipped_sha256": sha, "reason": "preserve"},
+    }
+    (project / ".claude/.vco-manifest.json").write_text(json.dumps(manifest))
+    out = _purge(project)
+    assert (project / ".claude/agents/theirs.md").exists()
+    assert not (project / ".claude/agents/ours.md").exists()
+    assert ".claude/agents/theirs.md" not in out["removed"] + out["kept_modified"]
+
+
+def test_a_settings_file_holding_only_an_empty_env_is_deleted(project: Path):
+    """R1 F6: ``{"env": {}}`` is emptied, so the file goes; a user key keeps it."""
+    path = project / ".claude/settings.json"
+    path.write_text(json.dumps({"env": {}}))
+    out = _purge(project)
+    assert not path.exists() and ".claude/settings.json" in out["removed"]
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"env": {}, "model": "x"}))
+    _purge(project)
+    assert json.loads(path.read_text()) == {"model": "x"}
+
+
+def test_a_users_line_inside_an_ended_exclude_block_stays(project: Path):
+    """R1 F2 (both ways): VCO's own lines in the block go; the user's line
+    edited in before ``# VCO end`` stays, and the reply names it."""
+    _ship(project, {".claude/hooks/x.sh": b"#!/bin/bash\n"})
+    info = project / ".git/info"
+    info.mkdir(parents=True)
+    (info / "exclude").write_text("*.local\n")
+    git_exclude.append_git_info_exclude(project, ["/.claude/hooks/x.sh", "/.claude/state/"])
+    text = (info / "exclude").read_text()
+    (info / "exclude").write_text(text.replace("# VCO end", "/my-secret-dir/\n# VCO end"))
+
+    out = _purge(project)
+
+    assert (info / "exclude").read_text() == "*.local\n/my-secret-dir/\n"
+    assert any("/my-secret-dir/" in k for k in out["kept"])
+
+
+def test_strip_keeps_an_entry_it_cannot_prove_and_drops_one_it_can(project: Path):
+    info = project / ".git/info"
+    info.mkdir(parents=True)
+    git_exclude.append_git_info_exclude(project, ["/.claude/hooks/x.sh", "/.claude/state/"])
+    out = git_exclude.strip_vco_blocks(project)
+    assert (info / "exclude").read_text() == "/.claude/hooks/x.sh\n"
+    assert out["kept"] == ["/.claude/hooks/x.sh"]
+    (info / "exclude").write_text("")
+    git_exclude.append_git_info_exclude(project, ["/.claude/hooks/x.sh", "/.claude/state/"])
+    git_exclude.strip_vco_blocks(
+        project, vco_entries=git_exclude.vco_block_entries([".claude/hooks/x.sh"], project))
+    assert (info / "exclude").read_text() == ""
+
+
+# ── .vscode/settings.json (owed item 3) ──────────────────────────────────
+
+def test_a_vscode_settings_file_vco_created_goes_whole(project: Path):
+    """VCO created it (marker) and only VCO's keys are in it → the file and
+    the emptied ``.vscode/`` go."""
+    vscode_excludes.backfill_in_project(project)
+    out = _purge(project)
+    assert not (project / ".vscode").exists()
+    assert ".vscode/settings.json" in out["removed"]
+
+
+def test_a_vscode_file_vco_created_keeps_the_users_keys_and_edited_values(project: Path):
+    vscode_excludes.backfill_in_project(project)
+    path = project / ".vscode/settings.json"
+    data = json.loads(path.read_text())
+    data["editor.tabSize"] = 2
+    data["search.exclude"]["**/my-big-dir"] = True
+    path.write_text(json.dumps(data))
+    out = _purge(project)
+    assert json.loads(path.read_text()) == {"search.exclude": data["search.exclude"],
+                                            "editor.tabSize": 2}
+    assert any(k.startswith(".vscode/settings.json search.exclude") for k in out["kept"])
+
+
+def test_a_users_vscode_file_loses_only_vcos_keys_and_is_never_deleted(project: Path):
+    """The user had the file (no marker): VCO's keys go, the file stays even
+    when nothing is left; the legacy (pre-v0.2.103) files.exclude block is
+    VCO's too; a key the user wrote with a different value stays."""
+    path = project / ".vscode/settings.json"
+    path.parent.mkdir()
+    path.write_text('{\n  // mine\n  "python.analysis.indexing": true\n}\n')
+    vscode_excludes.backfill_in_project(project)
+    data = jsonc_load(path)
+    data["files.exclude"] = dict(vscode_excludes._LEGACY_FILES_EXCLUDE_BLOCK)
+    path.write_text("{\n  // mine\n" + json.dumps(data)[1:])
+    out = _purge(project)
+    assert jsonc_load(path) == {"python.analysis.indexing": True}
+    assert "// mine" in path.read_text()
+    assert any("python.analysis.indexing" in k for k in out["kept"])
+
+    path.write_text(json.dumps({"files.watcherExclude":
+                                vscode_excludes._VSCODE_EXCLUDE_DEFAULTS["files.watcherExclude"]}))
+    _purge(project)
+    assert path.exists() and json.loads(path.read_text()) == {}
+
+
+def test_a_linked_vscode_settings_file_is_not_rewritten(project: Path, tmp_path):
+    target = tmp_path / "shared-vscode.json"
+    vscode_excludes.backfill_in_project(project)
+    path = project / ".vscode/settings.json"
+    path.rename(target)
+    path.symlink_to(target)
+    body = target.read_text()
+    out = _purge(project)
+    assert target.read_text() == body and path.is_symlink()
+    assert any(k.startswith(".vscode/settings.json — it is a link") for k in out["kept"])
+
+
+def jsonc_load(path: Path) -> dict:
+    from vco_lib import jsonc_edit
+    loaded = jsonc_edit.load_object(path)
+    assert loaded is not None
+    return loaded[0]

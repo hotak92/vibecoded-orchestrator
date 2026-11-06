@@ -77,6 +77,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
+# The redirect check has ONE home, shared with the unregister purge.
+from vco_lib.paths import is_junction as _is_junction
+from vco_lib.paths import symlinked_component as _symlinked_component
+
 #: Scratch root, relative to the project root.
 SCRATCH_REL: tuple[str, ...] = (".claude", "state", "scratch")
 
@@ -209,27 +213,6 @@ def resolve_project(project: "str | Path | None") -> Path:
 # ---------------------------------------------------------------------------
 # Safety helpers
 # ---------------------------------------------------------------------------
-
-
-def _symlinked_component(project: Path, root: Path) -> Optional[Path]:
-    """The first path component from ``<project>/.claude`` down to ``root``
-    that is a symlink (or a Windows junction), else ``None``. A redirected
-    component would put the scratch tree — and every deletion the sweep makes
-    — somewhere other than the project."""
-    current = project
-    for part in root.relative_to(project).parts:
-        current = current / part
-        if current.is_symlink() or _is_junction(current):
-            return current
-    return None
-
-
-def _is_junction(path: Path) -> bool:
-    probe: Optional[Callable[[], bool]] = getattr(path, "is_junction", None)
-    try:
-        return bool(probe()) if probe is not None else False
-    except OSError:
-        return False
 
 
 def _owner_only_acl_script(lib_text: str) -> str:

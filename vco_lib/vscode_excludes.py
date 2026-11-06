@@ -336,3 +336,94 @@ def backfill_in_project(folder: Path) -> dict:
     result["added_keys"] = added
     result["removed_entries"] = removed
     return result
+
+
+#: The marker key + value :func:`backfill_in_project` writes ONLY when it
+#: CREATES the file — the evidence that VCO, not the user, made the file.
+_CREATED_MARKER_KEY = "_template_origin"
+_CREATED_MARKER_VALUE = "vibecoded-orchestrator v0.2.11+ — vscode-excludes backfill"
+
+
+def _values_vco_wrote(key: str) -> list[object]:
+    """Every value VCO ever wrote for ``key``: the canonical one, plus — for
+    ``files.exclude`` — the pre-v0.2.103 block. Git history shows no other
+    change to the defaults since they first shipped (v0.2.11)."""
+    values: list[object] = [_VSCODE_EXCLUDE_DEFAULTS[key]]
+    if key == "files.exclude":
+        values.append(dict(_LEGACY_FILES_EXCLUDE_BLOCK))
+    return values
+
+
+def _is_vco_value(key: str, value: object) -> bool:
+    """Exact equality, booleans compared as booleans (``1`` is not ``True``)."""
+    return any(
+        json.dumps(value, sort_keys=True) == json.dumps(v, sort_keys=True)
+        for v in _values_vco_wrote(key)
+    )
+
+
+def strip_in_project(folder: Path) -> dict:
+    """"Remove project" (v0.2.106): take VCO's keys back out of
+    ``<folder>/.vscode/settings.json`` — the unregister's half of
+    :func:`backfill_in_project`, by the same evidence rule.
+
+    VCO only ever ADDS one of :data:`_VSCODE_EXCLUDE_KEYS` when the key is
+    absent, with its canonical value, so a key whose value still equals a
+    value VCO wrote is VCO's and goes. A key whose value differs (the user
+    edited it, or wrote their own) is the user's: it stays and is named in
+    ``kept_keys``. No other key is ever looked at. The marker
+    ``_template_origin`` goes when it holds VCO's text. The FILE is deleted
+    only when VCO created it (the marker was there) and nothing else is
+    left; a file the user had stays, as ``{}`` at worst. JSONC comments are
+    kept, or the file is left untouched (``jsonc_edit_refused``).
+
+    Returns ``{"action", "removed_keys", "kept_keys", "path"}``. Actions:
+    ``absent`` | ``noop`` | ``stripped`` | ``deleted`` | ``unparseable`` |
+    ``jsonc_edit_refused`` | ``write_failed:*``. Never raises.
+    """
+    settings_file = folder / ".vscode" / "settings.json"
+    result: dict = {"action": "absent", "removed_keys": [], "kept_keys": [],
+                    "path": str(settings_file)}
+    if not settings_file.is_file():
+        return result
+    loaded = jsonc_edit.load_object(settings_file)
+    if loaded is None:
+        result["action"] = "unparseable"
+        return result
+    data, raw = loaded
+    created_by_vco = data.get(_CREATED_MARKER_KEY) == _CREATED_MARKER_VALUE
+    removed: list[str] = []
+    kept: list[str] = []
+    for key in _VSCODE_EXCLUDE_KEYS:
+        if key not in data:
+            continue
+        if _is_vco_value(key, data[key]):
+            del data[key]
+            removed.append(key)
+        else:
+            kept.append(key)
+    if created_by_vco:
+        del data[_CREATED_MARKER_KEY]
+        removed.append(_CREATED_MARKER_KEY)
+    result["kept_keys"] = kept
+    if not removed:
+        result["action"] = "noop"
+        return result
+    try:
+        if created_by_vco and not data:
+            settings_file.unlink()
+            result.update(action="deleted", removed_keys=removed)
+            return result
+        text = jsonc_edit.dumps_preserving(raw, data, indent=2)
+        if text is None:
+            result["action"] = "jsonc_edit_refused"
+            return result
+        redirect = atomic_write_bytes(settings_file, text.encode("utf-8"),
+                                      fsync=False, symlink_safe=True)
+        if redirect is not None:
+            warn_symlink_redirect(settings_file, redirect)
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+    result.update(action="stripped", removed_keys=removed)
+    return result
