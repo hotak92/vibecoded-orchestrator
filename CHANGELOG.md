@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The launcher's system-tray icon was an empty square on Windows.** The tray was created with a tooltip and a menu but never an image, so the slot showed "VibeCoded Tools Launcher" over a blank square and a user could not tell the launcher was running. It now uses the bundled default window icon (`icons/icon.ico` on Windows); a build that ships no icon logs a warning instead of failing silently. A unit test pins that the tray builder is given an icon and that `tauri.conf.json` bundles one.
+
 ## [0.2.105] - 2026-10-30
 
 ### Added
