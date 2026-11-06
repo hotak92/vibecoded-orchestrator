@@ -306,6 +306,32 @@ pub fn strip_proven_secret_values(
     run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)
 }
 
+/// v0.2.106 ("Remove project"): remove from `project_folder` what is VCO's
+/// and only that — `python -m vco_lib.unregister_files purge`, the ONE home
+/// of the decision (manifest-hash evidence for shipped files, exact-spelling
+/// identity for hook registrations, VCO's runtime namespaces, its
+/// `.git/info/exclude` blocks). Returns the whole `ok: true` reply:
+/// `removed` / `kept_modified` `[rel]`, `kept` `["<rel> — <reason>"]`,
+/// `settings_removed` `[str]`, `errors` `[str]` — names only.
+pub fn purge_vco_project_files(
+    root: Option<&Path>,
+    project_folder: &Path,
+) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.unregister_files")
+        .arg("purge")
+        .arg("--project-folder")
+        .arg(project_folder);
+    if let Some(r) = root {
+        cmd.arg("--orchestrator-root").arg(r);
+    }
+    run_vco_lib_json(cmd, &python, root, project_folder, "", |out, err| {
+        parse_ok_reply_named("project file purge", out, err)
+    })
+}
+
 /// Bound on one `vco_lib.git_bundle_backup create` (two git steps, each
 /// bounded at 600 s on the Python side).
 const BUNDLE_BACKUP_TIMEOUT: Duration = Duration::from_secs(1260);

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Removing a project takes out what is VCO's, and only that.** Before, removing a project deleted the whole
+  `.claude/hooks/` and `.claude/scripts/` folders, including any script of your own in them, but left every VCO hook
+  still registered in `.claude/settings.json`, pointing at files that were gone. Now a file VCO installed is removed
+  only when it is unchanged since VCO wrote it. An agent, skill, hook or script you edited stays and is listed in the
+  result, and files of your own are never touched. VCO's hook registrations and the permission entries it added
+  come out of `.claude/settings.json`, along with its runtime folders (`.claude/state/`, `.claude/logs/`), its update
+  notes, its lines in `.git/info/exclude` and the MCP opt-outs it wrote to `~/.claude.json`. Your hooks, your own
+  permission entries and settings, `.env`, `CLAUDE.md`, `CONTEXT_STATE.md`, `knowledge/` and VCO's update backups
+  (which hold your earlier versions of files) are kept. If you also choose to delete the project's collections,
+  VCO now finds the ones the project actually uses, even after a rename, and never deletes one another project uses.
+
 ## [0.2.105] - 2026-10-30
 
 ### Added

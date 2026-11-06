@@ -688,7 +688,7 @@ pub async fn set_project_mcp_permission(
 /// (a `project_permissions` row with `config.enabled = false`). Recomputed
 /// on every toggle so the `~/.claude.json` opt-out list is always the exact
 /// desired state — a re-enable cannot leave a stale name behind.
-fn disabled_mcp_names(db: &Db, project_id: &str) -> Result<Vec<String>, String> {
+pub(crate) fn disabled_mcp_names(db: &Db, project_id: &str) -> Result<Vec<String>, String> {
     Ok(db
         .list_project_permissions(project_id)?
         .into_iter()

@@ -1,75 +1,82 @@
 //! Unregister-flow launcher-file purge.
 //!
-//! Verbatim extraction (v0.2.77 Part 7d) of the launcher-artifact filesystem
-//! purge (`purge_launcher_files_from_project`) that previously lived inline in
-//! `projects_v2.rs`. The caller-supplied-key-set NAME strippers that also
-//! lived here (`strip_named_keys_from_{env_text,claude_env_text,env_object}`)
-//! were retired in v0.2.97: unregister removes a secret value only on value
-//! evidence (`projects_v2::strip_proven_secret_values`), never by name. The
-//! facade re-exports every symbol. `UNREGISTER_PURGE_PATHS` stays in the
-//! facade (shared with the
-//! unregister command surface) and is pulled in via `super::`.
+//! Extracted from `projects_v2.rs` in v0.2.77 Part 7d. The caller-supplied-
+//! key-set NAME strippers that also lived here were retired in v0.2.97:
+//! unregister removes a secret value only on value evidence
+//! (`projects_v2::strip_proven_secret_values`), never by name. The facade
+//! re-exports every symbol.
 //!
 //! v0.2.97 (review R4 F25): the unregister's step 1 — env strip, stop
 //! decision, file purge — lives here as `unregister_purge_folder`, so the
 //! order (never purge files, forget secret rows or delete the row over a
 //! proven value that is still on disk) is testable without a Tauri state.
+//!
+//! v0.2.106 ("Remove project"): the file purge no longer deletes a fixed path
+//! list (`.claude/hooks/` and `.claude/scripts/` went whole, the user's own
+//! files in them included). It is ONE Python call, `vco_lib.unregister_files
+//! purge` ([`purge_launcher_files_from_project`]), which removes only what it
+//! can prove is VCO's and names what it kept.
 
 use std::path::Path;
 
-use super::{UnregisterReport, UNREGISTER_PURGE_PATHS};
+use super::UnregisterReport;
 
-/// Surgically remove every entry in `UNREGISTER_PURGE_PATHS` from
-/// `<folder>/`. Returns `(relative_paths_removed, warnings)`.
-///
-/// Soft-fail discipline: per-path failures (permission denied, ENOENT
-/// race, etc.) land in `warnings`; the next path is still attempted.
-/// ENOENT is silent — a missing path on a folder that never had the
-/// bundle installed is the expected case for legacy projects, not a
-/// warning condition.
-///
-/// Note: this is the FILE / DIRECTORY purge. The env-surface strip
-/// runs separately via `surgically_strip_env_surfaces` so that surfaces
-/// containing user-added keys can be partially preserved.
-pub(crate) fn purge_launcher_files_from_project(
-    folder: &Path,
-) -> (Vec<String>, Vec<String>) {
-    let mut purged: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-
-    for rel in UNREGISTER_PURGE_PATHS {
-        let target = folder.join(rel);
-        if !target.exists() {
-            continue; // silent skip
-        }
-        let meta = match std::fs::symlink_metadata(&target) {
-            Ok(m) => m,
-            Err(e) => {
-                warnings.push(format!(
-                    "could not stat {} for unregister purge: {}",
-                    target.display(), e
-                ));
-                continue;
-            }
-        };
-
-        let result = if meta.is_dir() {
-            std::fs::remove_dir_all(&target)
-        } else {
-            std::fs::remove_file(&target)
-        };
-
-        match result {
-            Ok(()) => purged.push((*rel).to_string()),
-            Err(e) => warnings.push(format!(
-                "could not remove {}: {}", target.display(), e
-            )),
-        }
-    }
-
-    (purged, warnings)
+/// What the file purge did, names only (`vco_lib.unregister_files purge`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FilePurge {
+    /// Relative paths removed.
+    pub removed: Vec<String>,
+    /// Shipped files left because the user changed them since VCO wrote them.
+    pub kept_modified: Vec<String>,
+    /// `<rel> — <reason>` for everything else VCO left in place.
+    pub kept: Vec<String>,
+    /// Entries VCO's own settings edits removed (`hooks: N registration(s)…`).
+    pub settings_removed: Vec<String>,
+    /// Soft failures: the purge went on without the named file.
+    pub warnings: Vec<String>,
 }
 
+fn strings(reply: &serde_json::Value, key: &str) -> Vec<String> {
+    reply
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A `purge` reply as a [`FilePurge`].
+pub(crate) fn file_purge_from_reply(reply: &serde_json::Value) -> FilePurge {
+    FilePurge {
+        removed: strings(reply, "removed"),
+        kept_modified: strings(reply, "kept_modified"),
+        kept: strings(reply, "kept"),
+        settings_removed: strings(reply, "settings_removed"),
+        warnings: strings(reply, "errors"),
+    }
+}
+
+/// Remove from `folder` what is VCO's (see the module doc), through the ONE
+/// Python home. Soft-fail: when the step cannot run at all, nothing was
+/// removed and the warning says so — a missing folder is a clean no-op.
+pub(crate) fn purge_launcher_files_from_project(root: Option<&Path>, folder: &Path) -> FilePurge {
+    if !folder.is_dir() {
+        return FilePurge::default();
+    }
+    match crate::services::vco_lib_bridge::purge_vco_project_files(root, folder) {
+        Ok(reply) => file_purge_from_reply(&reply),
+        Err(e) => FilePurge {
+            warnings: vec![format!(
+                "could not remove VCO's files from {}, so none were removed: {}",
+                folder.display(),
+                e
+            )],
+            ..FilePurge::default()
+        },
+    }
+}
 
 /// The unregister's stop decision after the env strip (review R4 F25): `Ok`
 /// when every proven secret value was removed; otherwise `Err` with the
@@ -164,8 +171,10 @@ pub(crate) fn write_leftovers_note(
 /// Step 1 of `delete_project_v2` for an existing folder: `strip` removes
 /// the launcher's env keys and proven secret values (returning `(keys,
 /// warnings, not_removed)` — production passes
-/// `surgically_strip_env_surfaces_checked`), then the launcher files are
-/// purged. `Err` — the command's return — when a proven value could not be
+/// `surgically_strip_env_surfaces_checked`), then `purge` removes VCO's files
+/// (production passes [`purge_launcher_files_from_project`]; its removed /
+/// kept-because-modified / kept lists land in the report, names only).
+/// `Err` — the command's return — when a proven value could not be
 /// removed: nothing is purged and `report` is untouched, so the caller stops
 /// before forgetting secret rows or deleting the project row.
 ///
@@ -179,6 +188,7 @@ pub(crate) fn write_leftovers_note(
 pub(crate) fn unregister_purge_folder(
     folder: &Path,
     strip: impl FnOnce(&Path) -> (Vec<String>, Vec<String>, Vec<String>),
+    purge: impl FnOnce(&Path) -> FilePurge,
     report: &mut UnregisterReport,
     leave_unremovable: bool,
     fallback_dir: &Path,
@@ -193,9 +203,12 @@ pub(crate) fn unregister_purge_folder(
         }
     }
     report.warnings.extend(env_warnings);
-    let (files, file_warnings) = purge_launcher_files_from_project(folder);
-    report.files_purged = files;
-    report.warnings.extend(file_warnings);
+    let purged = purge(folder);
+    report.files_purged = purged.removed;
+    report.files_kept_modified = purged.kept_modified;
+    report.kept_as_yours = purged.kept;
+    report.settings_entries_removed.extend(purged.settings_removed);
+    report.warnings.extend(purged.warnings);
     if !not_removed.is_empty() {
         let text = leftovers_note_text(&report.project_name, &report.project_id, &not_removed);
         match write_leftovers_note(folder, fallback_dir, &report.project_id, &text) {
@@ -232,18 +245,54 @@ mod tests {
         (tmp, manifest)
     }
 
-    /// Act: every proven value removed ⇒ the keys are reported and the
-    /// launcher files purged.
+    /// Stands in for the Python purge: removes the manifest and reports a
+    /// kept-because-modified agent and a kept backup dir.
+    fn fake_purge(folder: &Path) -> FilePurge {
+        std::fs::remove_file(folder.join(".claude/.vco-manifest.json")).unwrap();
+        FilePurge {
+            removed: vec![".claude/.vco-manifest.json".to_string()],
+            kept_modified: vec![".claude/agents/planner.md".to_string()],
+            kept: vec![".claude/backups/ — yours".to_string()],
+            settings_removed: vec!["hooks: 2 registration(s) VCO shipped".to_string()],
+            warnings: vec![],
+        }
+    }
+
+    /// Act: every proven value removed ⇒ the keys are reported, the
+    /// launcher files purged, and what the purge kept is in the report.
     #[test]
     fn the_unregister_purges_once_every_proven_value_is_gone() {
         let (tmp, manifest) = folder_with_a_manifest();
         let mut report = UnregisterReport::default();
         let strip = |_: &Path| (vec!["KG_COLLECTION".to_string()], vec!["w".to_string()], Vec::new());
-        unregister_purge_folder(tmp.path(), strip, &mut report, false, tmp.path()).unwrap();
+        unregister_purge_folder(tmp.path(), strip, fake_purge, &mut report, false, tmp.path()).unwrap();
         assert!(!manifest.exists());
         assert_eq!(report.files_purged, vec![".claude/.vco-manifest.json".to_string()]);
+        assert_eq!(report.files_kept_modified, vec![".claude/agents/planner.md".to_string()]);
+        assert_eq!(report.kept_as_yours, vec![".claude/backups/ — yours".to_string()]);
+        assert_eq!(report.settings_entries_removed, vec!["hooks: 2 registration(s) VCO shipped".to_string()]);
         assert_eq!(report.keys_purged_from_env, vec!["KG_COLLECTION".to_string()]);
         assert_eq!(report.warnings, vec!["w".to_string()]);
+    }
+
+    /// The `purge` reply maps field by field; `errors` become warnings.
+    #[test]
+    fn a_purge_reply_maps_onto_the_report_lists() {
+        let reply = serde_json::json!({
+            "ok": true, "removed": ["a"], "kept_modified": ["b"], "kept": ["c — why"],
+            "settings_removed": ["d"], "errors": ["e"]
+        });
+        assert_eq!(
+            file_purge_from_reply(&reply),
+            FilePurge {
+                removed: vec!["a".into()],
+                kept_modified: vec!["b".into()],
+                kept: vec!["c — why".into()],
+                settings_removed: vec!["d".into()],
+                warnings: vec!["e".into()],
+            }
+        );
+        assert_eq!(purge_launcher_files_from_project(None, Path::new("/nonexistent/vco-x")), FilePurge::default());
     }
 
     /// Leave alone (review R4 F25): a proven value still on disk stops the
@@ -262,7 +311,7 @@ mod tests {
         let strip = |_: &Path| {
             (vec!["A".to_string()], vec!["could not rewrite /p/.claude/env".to_string()], not_removed)
         };
-        let msg = unregister_purge_folder(tmp.path(), strip, &mut report, false, tmp.path())
+        let msg = unregister_purge_folder(tmp.path(), strip, fake_purge, &mut report, false, tmp.path())
             .expect_err("a stranded proven value must stop the unregister");
         assert!(manifest.exists(), "no file is purged before the stop");
         assert!(report.files_purged.is_empty() && report.keys_purged_from_env.is_empty());
@@ -293,7 +342,7 @@ mod tests {
         };
         let strip = |_: &Path| (vec!["KG_COLLECTION".to_string()], vec![], vec!["OPENAI_API_KEY in .env".to_string()]);
         let state = tempfile::tempdir().unwrap();
-        unregister_purge_folder(tmp.path(), strip, &mut report, true, state.path()).unwrap();
+        unregister_purge_folder(tmp.path(), strip, fake_purge, &mut report, true, state.path()).unwrap();
 
         assert!(!manifest.exists(), "the purge ran");
         assert_eq!(report.left_in_place, vec!["OPENAI_API_KEY in .env".to_string()]);

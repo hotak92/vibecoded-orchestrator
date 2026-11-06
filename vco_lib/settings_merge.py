@@ -81,7 +81,7 @@ from vco_lib.parked_hooks import (
     live_hook_registrations,
 )
 
-__all__ = ["merge_hooks_block", "smart_merge_settings"]
+__all__ = ["merge_hooks_block", "smart_merge_settings", "strip_shipped_hooks"]
 
 
 def _entry_cmds(entry: Any) -> list[str]:
@@ -1067,3 +1067,63 @@ def _without_kept_out(event: str, t_entries: Any, keep_out: Any) -> list:
         elif kept:
             result.append({**t_entry, "hooks": kept})
     return result
+
+
+def strip_shipped_hooks(
+    user_hooks: Any, template_hooks: list, *, keep: Any = None,
+) -> tuple[Any, list[dict]]:
+    """``user_hooks`` without the registrations VCO shipped — the unregister's
+    half of the hooks merge (v0.2.106, "Remove project").
+
+    A handler goes only when its command's spelling EQUALS one VCO ships or
+    once shipped (:func:`_shipped_spellings` over every ``template_hooks``
+    block passed — the current templates; the prior shapes and retired
+    scripts come with it). That is the same exact identity the merge folds
+    on, so a command that merely RUNS a shipped script (``my-backup.sh &&
+    bash …/x.sh``), a shipped command with an argument of the user's, and
+    every command of the user's own stay byte-for-byte, in their groups. A
+    group left with no handler goes, and an event left with no group.
+
+    ``keep(command) -> bool`` keeps a shipped handler anyway — the caller
+    keeps the registration of a hook script it did not delete (the user
+    changed it), so the script still runs.
+
+    Returns ``(new_hooks, removed)`` — ``removed`` is one ``{"event",
+    "matcher", "command"}`` record per handler taken out. Inputs are not
+    mutated; a non-dict ``user_hooks`` comes back as it is.
+    """
+    if not isinstance(user_hooks, dict):
+        return user_hooks, []
+    spell: dict[str, set[str]] = {}
+    for block in template_hooks:
+        if isinstance(block, dict):
+            for key, sigs in _shipped_spellings(block).items():
+                spell.setdefault(key, set()).update(sigs)
+    removed: list[dict] = []
+    out: dict = {}
+    for event, entries in user_hooks.items():
+        if not isinstance(entries, list):
+            out[event] = entries
+            continue
+        kept_entries: list = []
+        for entry in entries:
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(inner, list):
+                kept_entries.append(entry)
+                continue
+            kept = []
+            for h in inner:
+                cmd = h.get("command") if isinstance(h, dict) else None
+                if (_spelling_key(cmd) in spell
+                        and not (keep is not None and keep(cmd))):
+                    removed.append({"event": event, "matcher": normalize_matcher(entry),
+                                    "command": cmd})
+                    continue
+                kept.append(h)
+            if len(kept) == len(inner):
+                kept_entries.append(entry)
+            elif kept:
+                kept_entries.append({**entry, "hooks": kept})
+        if kept_entries:
+            out[event] = kept_entries
+    return out, removed

@@ -219,6 +219,44 @@ pub fn set_project_disabled_mcps(
     Ok(())
 }
 
+/// "Remove project" (v0.2.106): take the names VCO disabled for a project
+/// out of its `projects[<key>].disabledMcpServers` and leave every other
+/// name — one the user disabled through Claude Code itself stays. Returns
+/// the names removed (sorted). The list is rewritten through
+/// [`set_project_disabled_mcps`], the ONE writer of that key (an emptied
+/// list removes the key); nothing is written when no name of `vco_names` is
+/// present. `vco_names` is the launcher DB's opt-out list for the project.
+pub fn remove_project_disabled_mcps(
+    claude_json: &Path,
+    project_folder: &Path,
+    vco_names: &[String],
+) -> Result<Vec<String>, String> {
+    if vco_names.is_empty() || !claude_json.exists() {
+        return Ok(Vec::new());
+    }
+    let current: Vec<String> = {
+        let root = read_json_or_empty(claude_json)?;
+        root.get("projects")
+            .and_then(|p| p.get(project_key_for_claude_json(project_folder)))
+            .and_then(|e| e.get("disabledMcpServers"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect()
+    };
+    let (mut gone, kept): (Vec<String>, Vec<String>) =
+        current.into_iter().partition(|n| vco_names.contains(n));
+    if gone.is_empty() {
+        return Ok(gone);
+    }
+    set_project_disabled_mcps(claude_json, project_folder, &kept)?;
+    gone.sort();
+    gone.dedup();
+    Ok(gone)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // PR-23: default-orchestrator-MCP registration
 // ═══════════════════════════════════════════════════════════════════════
@@ -2166,6 +2204,29 @@ mod tests {
             json,
         );
 
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&folder).ok();
+    }
+
+    /// v0.2.106 "Remove project": the names VCO disabled go, a name the user
+    /// disabled through Claude Code stays — and the last VCO name empties the
+    /// key. Red-proof: partition on `!contains` (keep VCO's) → both fail.
+    #[test]
+    fn remove_project_disabled_mcps_takes_only_vcos_names() {
+        let target = tmp_target();
+        let folder = std::env::temp_dir().join("vct-proj-remove-mcps");
+        fs::create_dir_all(&folder).unwrap();
+        set_project_disabled_mcps(&target, &folder, &["playwright".into(), "users-own".into()]).unwrap();
+        let gone = remove_project_disabled_mcps(&target, &folder, &["playwright".to_string()]).unwrap();
+        assert_eq!(gone, vec!["playwright".to_string()]);
+        let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(project_entry(&json, &folder).unwrap()["disabledMcpServers"], serde_json::json!(["users-own"]));
+
+        let gone = remove_project_disabled_mcps(&target, &folder, &["users-own".to_string()]).unwrap();
+        assert_eq!(gone, vec!["users-own".to_string()]);
+        let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(project_entry(&json, &folder).unwrap().get("disabledMcpServers").is_none());
+        assert!(remove_project_disabled_mcps(&target, &folder, &["x".to_string()]).unwrap().is_empty());
         fs::remove_file(&target).ok();
         fs::remove_dir_all(&folder).ok();
     }

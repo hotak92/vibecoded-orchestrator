@@ -79,6 +79,7 @@ __all__ = [
     "retired_exclude_entries",
     "bundle_exclude_plan",
     "append_git_info_exclude",
+    "strip_vco_blocks",
 ]
 
 
@@ -755,6 +756,59 @@ def append_git_info_exclude(
     result["action"] = "appended" if to_add else "migrated"
     result["added"] = to_add
     result["removed"] = removed
+    return result
+
+
+def strip_vco_blocks(
+    folder: Path,
+    *,
+    write_bytes: Optional[Callable[[Path, bytes], object]] = None,
+) -> dict:
+    """Remove every block VCO wrote from ``<folder>/.git/info/exclude`` — the
+    unregister's half of :func:`append_git_info_exclude` (v0.2.106, "Remove
+    project").
+
+    A line goes only when :func:`_block_members` reads it as VCO's (an ended
+    block whole, header to end marker; a legacy block up to the first line no
+    older release could have written there), together with the blank line VCO
+    puts above each block it appends. Every other line stays, in order, with
+    its own line ending; the file itself is never deleted (git ships it).
+
+    Returns ``{"action", "removed": [stripped lines], "path"}``. Actions:
+    ``stripped`` | ``noop`` | ``not_a_git_repo`` (no ``.git`` directory) |
+    ``read_failed:*`` | ``write_failed:*``. Never raises.
+    """
+    writer = write_bytes if write_bytes is not None else _default_write_bytes
+    result: dict = {"action": "not_a_git_repo", "removed": [], "path": ""}
+    if not (folder / ".git").is_dir():
+        return result
+    exclude_path = folder / ".git" / "info" / "exclude"
+    result["path"] = str(exclude_path)
+    try:
+        existing = exclude_path.read_bytes().decode("utf-8") if exclude_path.exists() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        result["action"] = f"read_failed:{type(e).__name__}"
+        return result
+    lines = existing.splitlines(keepends=True)
+    members, _legacy_ends = _block_members(lines)
+    if not members:
+        result["action"] = "noop"
+        return result
+    drop = set(members)
+    for idx in members:
+        # The blank separator VCO writes above a block's header line.
+        if (idx > 0 and idx - 1 not in members and not lines[idx - 1].strip()
+                and lines[idx].strip().startswith(VCO_BLOCK_MARKER)
+                and not _is_end_marker(lines[idx].strip())):
+            drop.add(idx - 1)
+    result["removed"] = [lines[i].strip() for i in sorted(members)]
+    kept = "".join(line for i, line in enumerate(lines) if i not in drop)
+    try:
+        writer(exclude_path, kept.encode("utf-8"))
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+    result["action"] = "stripped"
     return result
 
 

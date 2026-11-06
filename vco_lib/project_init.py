@@ -12383,86 +12383,21 @@ def _cmd_bootstrap_collections(args: argparse.Namespace) -> int:
 
 
 def _cmd_drop_collections(args: argparse.Namespace) -> int:
-    """`drop-collections --name <project_name> [--weaviate-url <url>] --json`
+    """`drop-collections --name <project_name> [--project-id <id>]
+    [--weaviate-url <url>] --json` — drop THIS project's own classes (KG,
+    Development, Diagrams, the five code-graph classes; with `--project-id`
+    also the classes its launcher rows bind), never a shared class nor one
+    another registered project uses. The decision lives in
+    `vco_lib.unregister_collections` (v0.2.106, size ratchet).
 
-    Drop the project's OWN Weaviate collections (`<sanitized>_KnowledgeGraph`,
-    `<sanitized>_Development`, `<sanitized>_Diagrams`, and — v0.2.73 GAP-1 —
-    the 5 code-graph classes `<CodePrefix>_CodeModule/CodeClass/CodeFunction/
-    CodeAPI/CodeInteraction`). The shared KG (`VibeCodedOrchestrator_KnowledgeGraph`
-    since v0.2.23 B1, was `VibecodedOrchestrator_KnowledgeGraph` v0.2.12–v0.2.22,
-    or whatever `_SHARED_KG_NAME` resolves to — was `VibeCodedTools_KnowledgeGraph`
-    pre-v0.2.12 PR-26) is NEVER touched — every project depends on read
-    access to it, and it's owned by the orchestrator install, not by any
-    individual project.
-
-    Used by the launcher's `delete_project_v2` when the user opts in to
-    `purge_collections: true` on unregister. Soft-fails idempotently:
-    a 404 from Weaviate (collection already gone) counts as a successful
-    drop. Connection errors land in `errors[]`, never raise, exit 1.
-
-    JSON stdout schema:
-      {"dropped": ["<Project>_KnowledgeGraph", "<Project>_Development"],
-       "skipped_shared": "VibeCodedOrchestrator_KnowledgeGraph",
-       "errors": [{"collection": <name>, "error": <str>}]}
-
-    Exit 0 on clean drop (incl. 404). Exit 1 when at least one drop
-    request hit a non-404 HTTP error.
+    JSON: `{"dropped", "skipped_shared", "kept": [{"collection", "reason"}],
+    "notes", "errors": [{"collection", "error"}]}`. Exit 0 on a clean drop
+    (a 404 counts as dropped); exit 1 when any entry is in `errors`.
     """
-    derived = derive_project_collection_names(args.name)
-    # fix/a1-indexing-pipeline (2026-05-25): include the per-project
-    # Diagrams collection so unregister cleans up the full set the
-    # bootstrap path creates. Idempotent — a 404 from Weaviate on a
-    # never-created Diagrams class still counts as a successful drop
-    # (consistent with the existing KG / Dev semantics).
-    #
-    # v0.2.73 GAP-1 (H3): ALSO drop the 5 code-graph collections. Pre-fix,
-    # `drop-collections` was CODE-BLIND — a consented project-unregister with
-    # `purge_collections:true` left `<Prefix>_CodeFunction` (potentially the
-    # 87 GB monster) et al. behind → an instant orphan the wizard can't
-    # always reclaim (GAP-4). `code_collections` is [] when the code prefix
-    # can't be derived, so this is a no-op on degenerate names. Same
-    # idempotent 404-is-success semantics as the KG/DEV/DIAGRAMS drops. This
-    # is a CONSENTED drop (the user opted into purge_collections) — it does
-    # NOT scan/guess; it drops exactly THIS project's own canonical set.
-    targets = [
-        derived["kg_collection"],
-        derived["development_collection"],
-        derived["diagrams_collection"],
-    ]
-    targets.extend(derived.get("code_collections", []) or [])
-    weaviate_url = args.weaviate_url
-
-    # Defense in depth: never drop a shared collection — the constant or THIS machine's shared
-    # class (v0.2.103: the root's decided name), case-insensitively.
-    machine_shared, protected = _bcs.protected_shared_names()
-    result: dict = {
-        "dropped": [],
-        "skipped_shared": machine_shared,
-        "errors": [],
-    }
-
-    for name in targets:
-        if name.lower() in protected:
-            result["errors"].append({
-                "collection": name,
-                "error": (
-                    f"refusing to drop shared collection {name!r} — "
-                    f"shared KG is install-owned, not project-owned"
-                ),
-            })
-            continue
-        try:
-            _delete_class(name, weaviate_url=weaviate_url)
-            result["dropped"].append(name)
-        except Exception as e:
-            # Connection refused, timeout, malformed URL — surface as
-            # a per-collection error rather than crashing the whole
-            # JSON envelope. Rust caller wraps these as warnings.
-            result["errors"].append({
-                "collection": name,
-                "error": f"{type(e).__name__}: {e}",
-            })
-
+    from vco_lib.unregister_collections import drop_project_collections
+    result = drop_project_collections(
+        args.name, project_id=getattr(args, "project_id", None),
+        weaviate_url=args.weaviate_url)
     if args.json:
         print(json.dumps(result))
     else:
@@ -13946,6 +13881,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_drop.add_argument(
         "--name", required=True,
         help="Project name (raw; sanitization applied internally).",
+    )
+    p_drop.add_argument(
+        "--project-id", default=None,
+        help="launcher project id: also drop the classes its rows bind, and "
+             "keep any class another registered project uses.",
     )
     p_drop.add_argument(
         "--weaviate-url", default=None,
