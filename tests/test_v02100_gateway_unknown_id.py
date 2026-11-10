@@ -49,6 +49,20 @@ class UnknownIdRefusalTests(unittest.TestCase):
         assert isinstance(decision, RouteError)
         self.assertIn("claude-gw/qwen/deepseek-v4.1-flash[1m]", decision.suggestions)
 
+    def test_an_offered_id_is_suggested_before_a_curated_hidden_one(self) -> None:
+        """Q8 (v0.2.106): the undated ``deepseek-v4.1-flash`` is hidden from
+        the picker (still routable by name); a refusal names the OFFERED
+        ``deepseek-v4.1-flash-1017`` first — also when the hidden id is the
+        exact bare match of what was typed under the wrong namespace."""
+        offered = "claude-gw/qwen/deepseek-v4.1-flash-1017[1m]"
+        hidden = "claude-gw/qwen/deepseek-v4.1-flash[1m]"
+        for typed in ("claude-gw/deepseek-v4.1-flash[1m]",
+                      "claude-gw/deepseek-v4.1-flash-1018[1m]"):
+            decision = routing.route(typed)
+            assert isinstance(decision, RouteError), typed
+            self.assertEqual(decision.suggestions[0], offered, typed)
+            self.assertIn(hidden, decision.suggestions, typed)
+
     def test_an_id_no_row_knows_is_refused_not_sent_to_the_default_vendor(self) -> None:
         decision = routing.route("claude-gw/totally-made-up")
         assert isinstance(decision, RouteError)
