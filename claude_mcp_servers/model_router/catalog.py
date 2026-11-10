@@ -79,7 +79,7 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping, Optional, Sequence
+from typing import Awaitable, Callable, Collection, Mapping, Optional, Sequence
 
 # ``ONE_M_WINDOW`` (what the client budgets for an id carrying ``[1m]``, and
 # the threshold at which a row EARNS that suffix) lives with the table that
@@ -130,6 +130,12 @@ SOURCE_STATIC = "static"
 SOURCE_DECLARED = "declared"
 SOURCE_UNFETCHED = "unfetched"
 SOURCE_EMPTY = "unavailable"
+#: The vendor the USER switched off in the launcher (Home → Model providers,
+#: v0.2.106): no rows, and its upstream model list is not even fetched — a
+#: switched-off subscription is never called for it. Recorded as the family's
+#: source so a short picker answers "the user switched it off", not "the
+#: gateway lost it".
+SOURCE_PROVIDER_OFF = "provider-off"
 
 #: Publish only the newest version of each model family. The owner's
 #: requirement (2026-09-10): a picker that lists Fable 5.1 AND Fable 5 AND
@@ -1337,6 +1343,7 @@ class CatalogService:
         catalog_filter: str = DEFAULT_CATALOG_FILTER,
         window_rows: str = DEFAULT_WINDOW_ROWS,
         user_agent: Optional[str] = None,
+        disabled_vendors: Collection[str] = frozenset(),
     ) -> CatalogUnion:
         """Build the picker list.
 
@@ -1382,10 +1389,16 @@ class CatalogService:
         (a cache hit makes none), so the gateway's own fetch reaches the
         vendor as the client it is acting for. ``None`` sends no header and
         leaves the HTTP library's default in place.
+
+        ``disabled_vendors`` (v0.2.106) is the launcher provider switch's
+        off-list: those vendors publish NO rows and are not even fetched —
+        the family is recorded with :data:`SOURCE_PROVIDER_OFF` so a short
+        picker is attributable. First-party rows are never affected.
         """
         sources: dict[str, str] = {}
         entries: list[CatalogEntry] = []
         hidden: list[str] = []
+        off = frozenset(disabled_vendors)
 
         # Every family is fetched CONCURRENTLY. Sequentially, each stalling
         # vendor added its own timeout to the picker's wait — two vendors down
@@ -1397,7 +1410,10 @@ class CatalogService:
         # answer with a fallback family instead of raising (that is what their
         # ``source`` field records), so an exception here would be a defect
         # worth surfacing rather than a vendor being down.
-        vendors = list(self._vendors.values())
+        vendors = [v for v in self._vendors.values() if v.vendor_id not in off]
+        for skipped in self._vendors.values():
+            if skipped.vendor_id in off:
+                sources[skipped.vendor_id] = SOURCE_PROVIDER_OFF
         first, *vendor_families = await asyncio.gather(
             self._anthropic_entries(),
             *(self._vendor_entries(vendor, user_agent) for vendor in vendors),
@@ -1544,6 +1560,7 @@ __all__ = [
     "SOURCE_EMPTY",
     "SOURCE_DECLARED",
     "SOURCE_LIVE",
+    "SOURCE_PROVIDER_OFF",
     "SOURCE_STATIC",
     "SOURCE_UNFETCHED",
     "STATIC_CATALOG_PATH",

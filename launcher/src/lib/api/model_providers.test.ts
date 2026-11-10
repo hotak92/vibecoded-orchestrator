@@ -18,6 +18,7 @@ vi.mock('$lib/tauri', () => ({ invoke: vi.fn() }));
 import { invoke } from '$lib/tauri';
 import {
   anyDisabled,
+  applyOutcomeLabel,
   cardVisible,
   definitionsLabel,
   getModelProviders,
@@ -28,6 +29,7 @@ import {
   toggleNote,
   type ModelProviderRow,
   type ModelProvidersPayload,
+  type ProviderApplySummary,
 } from './model_providers';
 
 const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
@@ -52,6 +54,21 @@ function payload(over: Partial<ModelProvidersPayload> = {}): ModelProvidersPaylo
     gateway_available: true,
     providers: [row()],
     app_state_key: 'model_providers.disabled',
+    ...over,
+  };
+}
+
+/** The apply summary a stored `set` carries (v0.2.106 — the immediate leg). */
+function applySummary(over: Partial<ProviderApplySummary> = {}): ProviderApplySummary {
+  return {
+    vendor: 'kimi',
+    enabled: false,
+    held: false,
+    held_reason: '',
+    parked_projects: 0,
+    restored_projects: 0,
+    failed_projects: 0,
+    projects: [],
     ...over,
   };
 }
@@ -115,19 +132,68 @@ describe('the sentence after a toggle', () => {
       vendor: 'kimi',
       enabled: false,
       stored: true,
+      agents: applySummary({ parked_projects: 2 }),
     });
     expect(note).toContain('Kimi Code is off');
+    expect(note).toContain('parked in 2 projects');
     expect(note).toContain('.claude/agents.disabled/');
     expect(note).toContain('nothing is deleted');
     expect(note).toContain('model guidance');
     expect(note.endsWith(PROVIDER_OFF_NOTICE)).toBe(true);
   });
 
-  it('says what turning one back on does', () => {
-    const note = toggleNote(row(), true, { vendor: 'kimi', enabled: true, stored: true });
+  it('the standing notice names the gateway leg too', () => {
+    // Off is a full stop: agents parked, rows hidden, the running gateway
+    // stops serving — the card says all three.
+    expect(PROVIDER_OFF_NOTICE).toContain('.claude/agents.disabled/');
+    expect(PROVIDER_OFF_NOTICE).toContain('gateway');
+    expect(PROVIDER_OFF_NOTICE).not.toContain('next update');
+  });
+
+  it('says what turning one back on does — restored at once, no update wait', () => {
+    const note = toggleNote(row(), true, {
+      vendor: 'kimi',
+      enabled: true,
+      stored: true,
+      agents: applySummary({ enabled: true, restored_projects: 3 }),
+    });
     expect(note).toContain('is on again');
-    expect(note).toContain('next update');
+    expect(note).toContain('restored in 3 projects');
+    expect(note).not.toContain('next update');
     expect(note).toContain('model guidance');
+  });
+
+  it('a re-enable whose key does not resolve keeps the definitions parked', () => {
+    const note = toggleNote(row(), true, {
+      vendor: 'kimi',
+      enabled: true,
+      stored: true,
+      agents: applySummary({
+        enabled: true,
+        held: true,
+        held_reason: "no 'kimi' vendor key resolved",
+      }),
+    });
+    expect(note).toContain('stay parked');
+    expect(note).toContain('key');
+    expect(note).not.toContain('restored in');
+  });
+
+  it('a partially failed follow-up is named, not hidden', () => {
+    const note = toggleNote(row(), false, {
+      vendor: 'kimi',
+      enabled: false,
+      stored: true,
+      agents: applySummary({ parked_projects: 1, failed_projects: 1 }),
+    });
+    expect(note).toContain('parked in 1 project');
+    expect(note).toContain('failed in 1 project');
+  });
+
+  it('the outcome label stands alone for a missing summary', () => {
+    expect(applyOutcomeLabel({ vendor: 'kimi', enabled: false, stored: true })).toContain(
+      'did not report',
+    );
   });
 
   it('never reports an unstored change as applied', () => {

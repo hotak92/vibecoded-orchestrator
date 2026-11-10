@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The Model providers switch takes full effect at once, in both directions — no restart, no update.** Turning a
+  provider off (or back on) in Home → Model providers now applies immediately everywhere: the provider's agent
+  definitions are parked in (or restored to) `.claude/agents.disabled/` in the orchestrator root and every
+  registered project right away — through the bundle engine's own park/restore machinery, so an edited copy is
+  still left in place and a copy you parked yourself in the Agents tab is never restored — and the card says what
+  happened per project. The running model gateway follows within a couple of seconds: a switched-off provider
+  disappears from the `/v1/models` picker (its model list is not even fetched), a request naming one of its model
+  ids is refused locally with the cause and the remedy instead of being forwarded, the quota fallback ladder
+  skips it, and the subagent pre-flight refuses to launch its agents with that same reason. Switching a provider
+  back on whose key does not resolve keeps its definitions parked until the key resolves, exactly as a bundle
+  update would decide. The shell form (`python -m vco_lib.model_providers set --vendor <id> --disabled`) does the
+  same apply and prints the per-project outcome.
+
 - **Remove a project right from its card on the Projects page.** Every project card except the orchestrator's own
   now has a "Remove" button that asks "are you sure?" first: the dialog says plainly what goes (the hooks, scripts,
   agents, skills and other files VCO installed that you have not changed, VCO's entries in `.claude/settings.json`

@@ -48,11 +48,44 @@ export interface ModelProvidersPayload {
   app_state_key?: string;
 }
 
+/** One project's outcome inside the apply summary. */
+export interface ProviderApplyProjectRow {
+  project: string;
+  folder: string;
+  status: 'ok' | 'skipped' | 'held' | 'failed';
+  parked: string[];
+  already_parked: string[];
+  kept: string[];
+  restored: string[];
+  notes: string[];
+  error: string;
+}
+
+/**
+ * What the immediate apply did (v0.2.106): a stored `set` parks or restores
+ * the vendor's agent definitions in the orchestrator root and every
+ * registered project AT ONCE, and this is the per-project record of it.
+ * `held` means the vendor was switched ON but its key does not resolve, so
+ * the definitions stay parked — the same decision the delivery gate makes.
+ */
+export interface ProviderApplySummary {
+  vendor: string;
+  enabled: boolean;
+  held: boolean;
+  held_reason: string;
+  parked_projects: number;
+  restored_projects: number;
+  failed_projects: number;
+  projects: ProviderApplyProjectRow[];
+}
+
 /** The `set` payload: `stored: false` means the choice was NOT saved. */
 export interface ModelProviderSetResult {
   vendor: string;
   enabled: boolean;
   stored: boolean;
+  /** Present on a stored change: what the agents leg did, per project. */
+  agents?: ProviderApplySummary;
 }
 
 /** Every gateway provider with its switch and its key state. */
@@ -76,14 +109,47 @@ export async function setModelProviderEnabled(
 
 /**
  * The one line the card shows when a provider is off: what the choice means,
- * in the user's terms. Deliberately concrete about the three effects and about
- * the one thing that does NOT happen (nothing is deleted).
+ * in the user's terms. Deliberately concrete about the four effects and about
+ * the one thing that does NOT happen (nothing is deleted). All four apply AT
+ * ONCE (v0.2.106) — no restart, no bundle update.
  */
 export const PROVIDER_OFF_NOTICE =
-  'Off is remembered on this machine: on the next update each project moves ' +
-  'this provider\'s agent definitions to .claude/agents.disabled/ (nothing is ' +
-  'deleted — switching it back on restores them) and its rows leave the ' +
-  'model guidance in every CLAUDE.md.';
+  'Off is remembered on this machine and applies at once: this provider\'s ' +
+  'agent definitions move to .claude/agents.disabled/ in every project ' +
+  '(nothing is deleted — switching it back on restores them), its rows leave ' +
+  'the model guidance in every CLAUDE.md, and the running gateway stops ' +
+  'serving its models within seconds.';
+
+/**
+ * The one sentence reporting what the AGENTS leg of a stored toggle did —
+ * parked/restored counts, the key-held case, and any per-project failure.
+ * A stored change with no summary means the helper answered before the apply
+ * existed; say the setting landed and nothing more.
+ */
+export function applyOutcomeLabel(result: ModelProviderSetResult): string {
+  const a = result.agents;
+  if (!a) {
+    return 'The agent follow-up did not report back; the setting itself is saved.';
+  }
+  if (a.held) {
+    return (
+      `Its agent definitions stay parked (${a.held_reason || 'the key does not resolve'}) ` +
+      '— they come back by themselves once the key resolves.'
+    );
+  }
+  const moved = result.enabled ? a.restored_projects : a.parked_projects;
+  const verb = result.enabled ? 'restored in' : 'parked in';
+  let out =
+    moved > 0
+      ? `Its agent definitions were ${verb} ${moved} ${moved === 1 ? 'project' : 'projects'} right away`
+      : 'No delivered agent definitions needed moving';
+  if (a.failed_projects > 0) {
+    out +=
+      `, but the follow-up failed in ${a.failed_projects} ` +
+      `${a.failed_projects === 1 ? 'project' : 'projects'} — flip the switch again or let the next update finish it`;
+  }
+  return out + '.';
+}
 
 /** Short wording + tone for one key state. Words only — never a value. */
 export function keyStateLabel(
@@ -141,9 +207,10 @@ export function toggleNote(
   if (result.stored !== true) {
     return `Could not save the change for ${row.display}: the launcher database could not be written. Nothing was changed.`;
   }
+  const outcome = applyOutcomeLabel(result);
   return enabled
-    ? `${row.display} is on again: its agent definitions come back on the next update and its rows return to the model guidance.`
-    : `${row.display} is off. ${PROVIDER_OFF_NOTICE}`;
+    ? `${row.display} is on again: its rows return to the model guidance and the gateway serves its models again. ${outcome}`
+    : `${row.display} is off. ${outcome} ${PROVIDER_OFF_NOTICE}`;
 }
 
 /** Should the card render at all? (No gateway ⇒ the card is meaningless.) */
