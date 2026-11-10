@@ -192,7 +192,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`py-compile-check` runs on `Edit` as well as `Write`.** It was registered on `Write` only, so a Python change
   made with the Edit tool was never compiled and its edit-outcome record said "no checker". Both settings templates
-  register it on `Edit|Write`; the hook's own `.py` filter is unchanged.
+  register it on `Edit|Write`, and a bundle update moves an existing project's `Write` group to `Edit|Write` (a
+  group that also holds your own hook keeps its matcher); the hook's own `.py` filter is unchanged.
 
 - **The launcher's system-tray icon was an empty square on Windows.** The tray was created with a tooltip and a menu
   but never an image, so the slot showed "VibeCoded Tools Launcher" over a blank square and a user could not tell the

@@ -1085,6 +1085,19 @@ def _matcher_migrations() -> Tuple[MatcherMigration, ...]:
                 "rather than polled, so the wait-loop guard no longer "
                 "registers on it"
             )),
+        # v0.2.106 (review C-M1): py-compile-check also checks an Edit of a
+        # .py file — edit_post_check names it the Edit checker, so a project
+        # still on the v0.2.105 `Write` group would poll for a status record
+        # no hook writes. Without this row an updated install kept `Write`.
+        MatcherMigration(
+            event="PostToolUse", old="Write", new="Edit|Write",
+            targets=both("py-compile-check"),
+            retired_in="v0.2.106",
+            reason=(
+                "an Edit can break a Python file as surely as a Write, and "
+                "edit_post_check reports py_compile as the Edit checker; the "
+                "Write-only group never ran it on an Edit"
+            )),
     )
 
 

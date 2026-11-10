@@ -491,6 +491,67 @@ def test_py_compile_check_is_registered_on_edit_and_write():
     assert epc.covering_checker("Edit", "/p/m.py", "/p") == "py_compile"
 
 
+def _py_compile_groups(doc: dict) -> list:
+    return [g for g in doc["hooks"]["PostToolUse"]
+            if any("py-compile-check" in h.get("command", "") for h in g["hooks"])]
+
+
+def _v02105_settings(tmpl: str) -> dict:
+    """The current template with the py-compile-check group as v0.2.105
+    shipped it (matcher ``Write``; command and keys unchanged) — what an
+    installed project carries into this update."""
+    doc = json.loads((REPO_ROOT / "templates" / f"settings.json.{tmpl}.template")
+                     .read_text(encoding="utf-8"))
+    (group,) = _py_compile_groups(doc)
+    group["matcher"] = "Write"
+    return doc
+
+
+@pytest.mark.parametrize("tmpl", ["linux", "windows"])
+def test_an_updated_project_moves_py_compile_check_onto_edit(tmpl):
+    """Review C-M1, real order: v0.2.105 settings → bundle-update merge →
+    exactly one ``Edit|Write`` group, no leftover ``Write`` group; a fixed
+    point; and a user's own ``Write`` group is left exactly as it is."""
+    import copy
+
+    from vco_lib import settings_merge
+
+    template = json.loads(
+        (REPO_ROOT / "templates" / f"settings.json.{tmpl}.template")
+        .read_text(encoding="utf-8"))
+    installed = _v02105_settings(tmpl)
+    own = {"matcher": "Write",
+           "hooks": [{"type": "command", "command": "bash ~/my-write-hook.sh"}]}
+    installed["hooks"]["PostToolUse"].append(copy.deepcopy(own))
+
+    merged = settings_merge.smart_merge_settings(installed, template)
+    groups = _py_compile_groups(merged)
+    assert [g["matcher"] for g in groups] == ["Edit|Write"], groups
+    assert groups == _py_compile_groups(template)
+    assert own in merged["hooks"]["PostToolUse"], "the user's own group moved"
+    again = settings_merge.smart_merge_settings(copy.deepcopy(merged), template)
+    assert again == merged
+
+
+def test_a_user_group_mixing_py_compile_check_keeps_its_matcher():
+    """A ``Write`` group that also carries the user's own hook is theirs."""
+    import copy
+
+    from vco_lib import settings_merge
+
+    template = json.loads(
+        (REPO_ROOT / "templates" / "settings.json.linux.template")
+        .read_text(encoding="utf-8"))
+    installed = _v02105_settings("linux")
+    (group,) = _py_compile_groups(installed)
+    group["hooks"].append({"type": "command", "command": "bash ~/mine.sh"})
+    merged = settings_merge.smart_merge_settings(installed, template)
+    mixed = [g for g in merged["hooks"]["PostToolUse"]
+             if any(h.get("command") == "bash ~/mine.sh" for h in g["hooks"])]
+    assert len(mixed) == 1 and mixed[0]["matcher"] == "Write"
+    assert settings_merge.smart_merge_settings(copy.deepcopy(merged), template) == merged
+
+
 def test_both_hook_siblings_filter_by_extension():
     sh = (REPO_ROOT / "templates" / "hooks" / "py-compile-check.sh").read_text(
         encoding="utf-8")
