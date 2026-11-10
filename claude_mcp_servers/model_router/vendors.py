@@ -351,7 +351,14 @@ VENDORS: Mapping[str, Vendor] = {
         # different model is the alias trap wearing a list.
         verified_ids=("glm-5.3", "glm-5.3-flash"),
         # The owner retired glm-5.2 in v0.2.100: only glm-5.3 is provided.
-        retired_ids=("glm-5.2",),
+        # glm-5.3-flashx / glm-5.3-flashx-legal (owner 2026-11-10) are the
+        # glm-5.3-flash weights served faster at pay-as-you-go prices, and
+        # NOT on the GLM Coding Plan this row serves (z.ai docs
+        # https://docs.z.ai/guides/vlm/glm-5.3-flash: "GLM-5.3-FlashX is not
+        # yet available on the plan"). The live list carries both; retired
+        # here so they are neither published nor forwarded: the row offers
+        # only what the plan serves.
+        retired_ids=("glm-5.2", "glm-5.3-flashx", "glm-5.3-flashx-legal"),
         # Probed live 2026-09-23: 5h (unit 3, number 5) and weekly (unit 6,
         # number 1) windows, both type CREDIT_LIMIT. The endpoint is
         # undocumented and its schema changed during 2026 (older answers
@@ -390,19 +397,33 @@ VENDORS: Mapping[str, Vendor] = {
         catalog_url=(
             "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/models"
         ),
-        # The live list carries non-chat ids (probe 2026-09-22: two
-        # qwen-audio voice rows, two wan image rows, and the "auto" router
-        # alias; qwen-asr listed for the shape the vendor's docs describe).
-        # A chat picker row that answers an error is the deprecated-model
-        # trap worn by a different list, so these never become rows.
-        # Exclusion applies to the LIVE list only — the curated static_ids
-        # below need no filter.
-        # Dated deepseek flash snapshots are curated out (owner ruling
-        # 2026-09-22): the versioned line (deepseek-v4.1-flash) is the
-        # published flash; the prefix matches only dated builds, never it.
-        catalog_exclude_prefixes=("qwen-audio", "qwen-asr", "wan", "auto",
-                                "deepseek-v4-flash-"),
-        catalog_hide_ids=("qwen3.7-plus", "deepseek-v4-pro"),
+        # The live list carries non-chat ids (probe 2026-11-10: three
+        # qwen-audio voice/ASR rows, qwen-image-3.0-pro, two wan image rows,
+        # wan3.0-video, and the "auto" router alias). A chat picker row that
+        # answers an error is the deprecated-model trap worn by a different
+        # list, so these never become rows. Since v0.2.106 two RULES in the
+        # catalog do most of this for every vendor row
+        # (catalog._exclude_by_rule): a non-chat modality segment
+        # (image/video/audio/asr/tts) and a dated build (-MMDD/-YYYYMMDD
+        # tail) the row does not offer — the latter is the owner's
+        # 2026-09-22 ruling that dated snapshots never reach the picker
+        # (deepseek-v4-flash-0731, deepseek-v4-pro-0813 on that list). What
+        # is left here is what no rule can recognise: the "auto" router
+        # alias, and "wan" — the vendor's whole image/video family (every
+        # member is non-chat; the rule already catches today's ids, the
+        # prefix keeps a future member with an unrecognised modality name
+        # out). LIVE list only — the curated static_ids below need no filter.
+        catalog_exclude_prefixes=("auto", "wan"),
+        # deepseek-v4.1-flash (undated) is hidden since v0.2.106 (owner
+        # 2026-11-10): QwenCloud serves it AND the dated build
+        # deepseek-v4.1-flash-1017 separately (live probes echo each id), and
+        # does not document which weights the undated id serves — so the
+        # dated id is the published DeepSeek flash (DeepSeek changelog
+        # https://api-docs.deepseek.com/updates/, 2026-10-17: V4.1-Flash
+        # upgraded to V4.1-Flash-1017, same architecture/prompt format, new
+        # weights). Hidden, not retired: an agent file still pinned to the
+        # undated id keeps answering until its bundle update.
+        catalog_hide_ids=("qwen3.7-plus", "deepseek-v4-pro", "deepseek-v4.1-flash"),
         # The owner retired glm-5.2 in v0.2.100 (every route): the live list
         # still carries it, the gateway neither publishes nor routes it.
         retired_ids=("glm-5.2",),
@@ -413,15 +434,17 @@ VENDORS: Mapping[str, Vendor] = {
         # undocumented one.
         alias_trap=False,
         # The keyless / fetch-failed fallback, live-verified against the
-        # compatible-mode list (probe 2026-09-22): the fifteen live ids minus
-        # the six excluded (five non-chat modalities plus the dated deepseek
-        # flash snapshot, owner-curated out) and glm-5.2 (retired, below). Publishing trims two more via
-        # catalog_hide_ids below. validate_registry requires static_ids on
-        # a catalog_url row.
+        # compatible-mode list (probe 2026-11-10): the twenty live ids minus
+        # the eight non-chat ids, the two un-offered dated builds and the
+        # retired glm-5.2. Publishing trims three more via catalog_hide_ids
+        # above. deepseek-v4.1-flash-1017 is listed HERE, which is what makes
+        # it an offered id the dated-build rule keeps (owner 2026-11-10: the
+        # one approved dated build). validate_registry requires static_ids
+        # on a catalog_url row.
         static_ids=(
             "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
-            "qwen3.6-flash", "glm-5.3", "deepseek-v4.1-flash",
-            "deepseek-v4-pro",
+            "qwen3.6-flash", "glm-5.3", "deepseek-v4.1-flash-1017",
+            "deepseek-v4.1-flash", "deepseek-v4-pro",
         ),
         # No quota_url: the Token Plan is monthly credits with no endpoint
         # and no quota headers (probed 2026-09-23), so usage shows the
@@ -725,13 +748,7 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     "or has surrounding whitespace — matching is exact, so "
                     "it would retire nothing, silently",
                 )
-            offered = {
-                i.lower() for i in (
-                    *vendor.static_ids, *vendor.verified_ids,
-                    *vendor.catalog_hide_ids,
-                )
-            }
-            if retired.lower() in offered:
+            if retired.lower() in offered_ids(vendor):
                 raise RegistryError(
                     f"vendor {key!r}: retired_ids entry {retired!r} is also "
                     "declared as served (static/verified/hidden) — an id "
@@ -771,6 +788,24 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     "Claude marker, so the truth filter would keep the one "
                     "id the honest-naming guard refuses",
                 )
+
+
+def offered_ids(vendor: Vendor) -> frozenset[str]:
+    """The ids this row EXPLICITLY declares it serves, lower-cased.
+
+    ``static_ids`` + ``verified_ids`` + ``catalog_hide_ids`` (hidden is
+    "routable by name"). One home for the question three readers ask: the
+    registry gate (an id cannot be both offered and retired), the router's
+    known-id set, and the catalog's dated-build rule (a dated build reaches
+    the picker only when the row offers it by name).
+    """
+    return frozenset(
+        model_id.strip().lower()
+        for model_id in (
+            *vendor.static_ids, *vendor.verified_ids, *vendor.catalog_hide_ids,
+        )
+        if model_id and model_id.strip()
+    )
 
 
 def vendor_display_name(vendor: Vendor) -> str:
@@ -862,6 +897,7 @@ __all__ = [
     "VENDORS",
     "Vendor",
     "context_overflow_maximum",
+    "offered_ids",
     "validate_registry",
     "vendor_display_name",
 ]

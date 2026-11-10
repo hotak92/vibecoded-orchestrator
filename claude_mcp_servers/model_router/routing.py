@@ -57,6 +57,7 @@ from .vendors import (
     AnthropicFamily,
     CLAUDE_ID_MARKERS,
     Vendor,
+    offered_ids,
 )
 
 #: Claude Code's 1M-context-variant suffix.
@@ -192,7 +193,7 @@ def _known_ids(
         # list nor a declared/hidden id makes another id safe to forward.
         ids = set(vendor.verified_ids)
     else:
-        ids = {*vendor.static_ids, *vendor.verified_ids, *vendor.catalog_hide_ids}
+        ids = set(offered_ids(vendor))
         if extra is not None:
             ids.update(extra.get(vendor.vendor_id, ()))
     retired = {i.strip().lower() for i in vendor.retired_ids}

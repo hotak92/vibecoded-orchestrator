@@ -113,7 +113,7 @@ scores = ["7", "6", "6", "6*", "3", "7", "7*", "8", "8", "8", "3"]
 
 [[row]]
 id = "deepseek-v4.1-flash"
-model = "DeepSeek V4.1 Flash"
+model = "DeepSeek V4.1 Flash (1017)"
 reach_via = "deepseek-researcher / deepseek-implementer"
 providers = ["qwen"]
 # Review 6 -> 7 (2026-10-16): four read-only verify rounds of fix deltas,
@@ -121,7 +121,13 @@ providers = ["qwen"]
 # Docs 6 -> 7 (owner 2026-10-08): its research / synthesis lanes in this
 # setup's reviewed-lane record were verified accurate, each with an explicit
 # could-not-verify list.
-scores = ["7", "6", "7", "6", "9", "6", "7", "8", "7", "7", "10"]
+# v0.2.106 (owner 2026-11-10): the shipped DeepSeek lanes pin the dated
+# build deepseek-v4.1-flash-1017 (same architecture, new weights). Tools
+# 6 -> 7 from DeepSeek's own figures for that build, vendor-reported
+# (https://api-docs.deepseek.com/updates/, 2026-10-17): Terminal-Bench 4.0
+# 31.2 -> 42.3, Automation-Bench 54.8 -> 60.5. Every other cell unchanged.
+# The row `id` stays the model line's key (notes and tests reference it).
+scores = ["7", "6", "7", "6", "9", "7", "7", "8", "7", "7", "10"]
 
 [[row]]
 id = "sonnet"
@@ -189,7 +195,7 @@ text = "**Sonnet 5.5** is the most effort-sensitive model: near Opus at max, but
 [[note]]
 models = ["sonnet", "glm-5.3", "deepseek-v4.1-flash"]
 all_of = true
-text = "At medium, **Sonnet 5.5** also trails GLM-5.3 and DeepSeek V4.1 Flash on coding."
+text = "At medium, **Sonnet 5.5** also trails GLM-5.3 and DeepSeek V4.1 Flash (1017) on coding."
 
 [[note]]
 models = ["haiku"]
@@ -202,7 +208,7 @@ text = "At medium, **Haiku 5.5** sits below the flash-tier vendor lanes on code.
 
 [[note]]
 models = ["deepseek-v4.1-flash"]
-text = "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s to first token) and cheapest per task: default for research, surveys, bulk and bounded implementation. Users report fragile tool calls / loops on long runs — keep tasks bounded. Accurate as a read-only verifier of bounded fix deltas: `deepseek-researcher` takes fix-delta verifications and bounded code reviews."
+text = "**DeepSeek V4.1 Flash (1017)** — fastest (≈209 tok/s, ≈1 s to first token) and cheapest per task: default for research, surveys, bulk and bounded implementation. The 1017 build is better on agentic and terminal work and writes shorter answers than the first V4.1 Flash (vendor-reported). Users report fragile tool calls / loops on long runs — keep tasks bounded. Accurate as a read-only verifier of bounded fix deltas: `deepseek-researcher` takes fix-delta verifications and bounded code reviews."
 
 [[note]]
 models = ["glm-5.3"]

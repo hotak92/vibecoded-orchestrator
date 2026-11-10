@@ -88,13 +88,20 @@ from typing import Awaitable, Callable, Mapping, Optional, Sequence
 # duplication the modularity rule forbids. Re-exported in ``__all__`` below,
 # so every existing `catalog.ONE_M_WINDOW` reader is unaffected.
 from .context_table import ONE_M_WINDOW, ContextTable
-from .model_family import ModelIdParts, is_older_sibling, parse_model_id
+from .model_family import (
+    ModelIdParts,
+    is_dated_build,
+    is_non_chat_modality,
+    is_older_sibling,
+    parse_model_id,
+)
 from .routing import ONE_M_SUFFIX, advertised_id, with_1m
 from .vendors import (
     DEFAULT_ANTHROPIC_VERSION,
     OAUTH_BETA,
     AnthropicFamily,
     Vendor,
+    offered_ids,
     vendor_display_name,
 )
 
@@ -959,6 +966,38 @@ def _exclude_by_prefix(
     )
 
 
+def _exclude_by_rule(
+    entries: tuple[CatalogEntry, ...],
+    vendor: Vendor,
+) -> tuple[CatalogEntry, ...]:
+    """Drop LIVE ids that are non-chat modalities or un-offered dated builds.
+
+    The two RULES behind the per-vendor prefix list, so an id nobody has
+    written down yet is still caught (v0.2.106: a shipped vendor's live list
+    of 2026-11-10 carried an image model and two dated builds that no prefix
+    named):
+
+    * a **non-chat modality** (:func:`model_router.model_family.is_non_chat_modality`
+      — image, video, audio, ASR, TTS) is never a chat row;
+    * a **dated build** (:func:`model_router.model_family.is_dated_build` —
+      an ``-MMDD`` / ``-YYYYMMDD`` tail) is a snapshot, curated out of every
+      vendor picker (owner ruling 2026-09-22) UNLESS the row explicitly
+      offers that exact id (:func:`model_router.vendors.offered_ids`) — the
+      owner's way to pin one build on purpose.
+
+    Same contract as :func:`_exclude_by_prefix`: fetched entries only (the
+    row's declared ids are never second-guessed), and an excluded id is
+    neither published nor reported hidden. First-party ids never pass through
+    here — Anthropic's dated ids are its real model names.
+    """
+    offered = offered_ids(vendor)
+    return tuple(
+        entry for entry in entries
+        if not is_non_chat_modality(entry.id)
+        and not (is_dated_build(entry.id) and entry.id.lower() not in offered)
+    )
+
+
 @dataclass
 class _FamilyCache:
     entries: tuple[CatalogEntry, ...] = ()
@@ -1305,6 +1344,8 @@ class CatalogService:
             entries = _exclude_by_prefix(
                 entries, vendor.catalog_exclude_prefixes,
             )
+        if entries:
+            entries = _exclude_by_rule(entries, vendor)
         if entries and vendor.retired_ids:
             retired = {i.lower() for i in vendor.retired_ids}
             entries = tuple(

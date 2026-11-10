@@ -142,10 +142,27 @@ EFFORT_POLICIES: Mapping[tuple[str, str], EffortPolicy] = {
             "the nearest accepted values; low/high/max pass through untouched."
         ),
     ),
-    # deepseek-v4.1-flash follows the QwenCloud deepseek family: valid
+    # deepseek-v4.1-flash-1017 — THE published DeepSeek flash since v0.2.106
+    # (owner 2026-11-10) — follows the QwenCloud deepseek family: valid
     # high/max, and the endpoint itself maps low/medium->high, xhigh->max.
     # Those are VENDOR collapses (accepted, mapped server-side), so NOTHING is
     # rewritten — recorded as data per the module rule.
+    ("qwen", "deepseek-v4.1-flash-1017"): EffortPolicy(
+        accepted=frozenset({"low", "medium", "high", "xhigh", "max"}),
+        translate={},
+        collapses={"low": "high", "medium": "high", "xhigh": "max"},
+        doc_url="https://docs.qwencloud.com/api-reference/chat/anthropic",
+        note=(
+            "QwenCloud deepseek family: valid high/max (default max); low and "
+            "medium are MAPPED TO high and xhigh TO max BY THE ENDPOINT, so "
+            "all five values are accepted and the gateway rewrites none. "
+            "Live 2026-11-10: medium -> 200, model echoed as "
+            "deepseek-v4.1-flash-1017, thinking + text blocks (fixture "
+            "medium-qwen-deepseek-1017.body)."
+        ),
+    ),
+    # The undated id: curated-hidden since v0.2.106 but still routable by
+    # name, so its row stays — same family, same collapses.
     ("qwen", "deepseek-v4.1-flash"): EffortPolicy(
         accepted=frozenset({"low", "medium", "high", "xhigh", "max"}),
         translate={},

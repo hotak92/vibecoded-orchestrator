@@ -1,0 +1,125 @@
+{
+ "object": "list",
+ "data": [
+  {
+   "id": "qwen3.7-max",
+   "object": "model",
+   "created": 1780000000,
+   "owned_by": "system"
+  },
+  {
+   "id": "qwen3.7-plus",
+   "object": "model",
+   "created": 1780086400,
+   "owned_by": "system"
+  },
+  {
+   "id": "qwen3.6-flash",
+   "object": "model",
+   "created": 1780172800,
+   "owned_by": "system"
+  },
+  {
+   "id": "glm-5.2",
+   "object": "model",
+   "created": 1780259200,
+   "owned_by": "system"
+  },
+  {
+   "id": "deepseek-v4-pro",
+   "object": "model",
+   "created": 1780345600,
+   "owned_by": "system"
+  },
+  {
+   "id": "wan2.7-image",
+   "object": "model",
+   "created": 1780432000,
+   "owned_by": "system"
+  },
+  {
+   "id": "wan2.7-image-pro",
+   "object": "model",
+   "created": 1780518400,
+   "owned_by": "system"
+  },
+  {
+   "id": "qwen-audio-3.0-tts-plus",
+   "object": "model",
+   "created": 1780604800,
+   "owned_by": "system"
+  },
+  {
+   "id": "deepseek-v4-flash-0731",
+   "object": "model",
+   "created": 1785513696,
+   "owned_by": "system"
+  },
+  {
+   "id": "qwen3.8-max",
+   "object": "model",
+   "created": 1780777600,
+   "owned_by": "system"
+  },
+  {
+   "id": "qwen-audio-3.0-realtime-plus",
+   "object": "model",
+   "created": 1780864000,
+   "owned_by": "system"
+  },
+  {
+   "id": "deepseek-v4-pro-0813",
+   "object": "model",
+   "created": 1786615063,
+   "owned_by": "system"
+  },
+  {
+   "id": "qwen3.8-flash",
+   "object": "model",
+   "created": 1781036800,
+   "owned_by": "system"
+  },
+  {
+   "id": "deepseek-v4.1-flash",
+   "object": "model",
+   "created": 1789351565,
+   "owned_by": "system"
+  },
+  {
+   "id": "glm-5.3",
+   "object": "model",
+   "created": 1781209600,
+   "owned_by": "system"
+  },
+  {
+   "id": "auto",
+   "object": "model",
+   "created": 1781296000,
+   "owned_by": "system"
+  },
+  {
+   "id": "wan3.0-video",
+   "object": "model",
+   "created": 1781382400,
+   "owned_by": "system"
+  },
+  {
+   "id": "deepseek-v4.1-flash-1017",
+   "object": "model",
+   "created": 1792388476,
+   "owned_by": "system"
+  },
+  {
+   "id": "qwen-image-3.0-pro",
+   "object": "model",
+   "created": 1792656638,
+   "owned_by": "system"
+  },
+  {
+   "id": "qwen-audio-3.0-asr-flash",
+   "object": "model",
+   "created": 1781641600,
+   "owned_by": "system"
+  }
+ ]
+}

@@ -36,7 +36,8 @@ Rules that are absolute:
 Where this lane fits:
 - It is the top rung because the vendor ranks it so: Alibaba's model-selection
   guide lists qwen3.8-max under "Highest capability" and both
-  deepseek-v4.1-flash and qwen3.8-flash under "Lightweight & low-cost". That
+  deepseek-v4.1-flash (the deepseek lanes pin its 1017 build) and qwen3.8-flash
+  under "Lightweight & low-cost". That
   is the vendor's tiering, not a VCO measurement.
 - Reach for it when one lane must hold several files in view at once, or when
   the cheap flash lane has already produced a lead that needs a second,

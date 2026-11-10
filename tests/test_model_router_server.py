@@ -40,7 +40,7 @@ from aiohttp import ClientTimeout, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from tests.common.qwen_catalog import (  # noqa: E402
-    QWEN_EXCLUDED_SIX,
+    QWEN_EXCLUDED,
     QWEN_RETIRED,
     QWEN_LIVE_MODELS,
 )
@@ -1364,11 +1364,11 @@ class QwenVendorTests(GatewayTestBase):
     names, honest-naming exposure) is the row a user gets.
     """
 
-    #: The compatible-mode list as the live probe served it (2026-09-22):
+    #: The compatible-mode list as the live probe served it (2026-11-10):
     #: The one home for these lists: tests/common/qwen_catalog.py.
     #: They were a verbatim second copy here until 2026-09-22.
     LIVE_MODELS = QWEN_LIVE_MODELS
-    EXCLUDED = QWEN_EXCLUDED_SIX
+    EXCLUDED = QWEN_EXCLUDED
     RETIRED = QWEN_RETIRED
 
     async def asyncSetUp(self) -> None:
@@ -1411,25 +1411,27 @@ class QwenVendorTests(GatewayTestBase):
             row["id"] for row in body["data"]
             if row["id"].startswith("claude-gw/qwen/")
         }
-        # The owner's advertised four qwen rows (eight declared minus two
-        # latest-hidden minus two curated-hidden). The shared glm id carries
+        # The owner's advertised four qwen rows (nine declared minus two
+        # latest-hidden minus three curated-hidden; the DeepSeek flash is the
+        # dated 1017 build, owner 2026-11-10). The shared glm id carries
         # [1m] — the context table keys the bare id and that id's verified
         # window is 1M, whatever endpoint serves it.
         self.assertEqual(ids, {
             qwen_catalog_id("qwen3.8-max"), qwen_catalog_id("qwen3.8-flash"),
             qwen_catalog_id("glm-5.3"),
-            qwen_catalog_id("deepseek-v4.1-flash"),
+            qwen_catalog_id("deepseek-v4.1-flash-1017"),
         })
         hidden = body["_vct_catalog_hidden"]
-        # The two older same-family siblings plus the two curated-hidden
+        # The two older same-family siblings plus the three curated-hidden
         # ids are withheld, namespaced and REPORTED — the filter narrows the
         # picker, never the router.
         for withheld in (
             qwen_catalog_id("qwen3.7-max"), qwen_catalog_id("qwen3.6-flash"),
             qwen_catalog_id("qwen3.7-plus"), qwen_catalog_id("deepseek-v4-pro"),
+            qwen_catalog_id("deepseek-v4.1-flash"),
         ):
             self.assertIn(withheld, hidden)
-        # The six excluded ids (five non-chat modalities plus one dated snapshot) are in NEITHER list: exclusion is not
+        # The ten excluded ids (eight non-chat ids plus two un-offered dated builds) are in NEITHER list: exclusion is not
         # withholding. `hidden` answers "which model am I missing", and a
         # voice/image/router alias is not a model anybody is missing.
         listed = [row["id"] for row in body["data"]] + hidden
