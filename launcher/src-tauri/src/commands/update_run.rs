@@ -131,6 +131,28 @@ pub(crate) const PHASE_ORDER: [Phase; 13] = [
     Phase::Relaunch,
 ];
 
+/// v0.2.106: the overlay percentage each post-git phase starts at — ONE
+/// table, so the bar follows the phases in their order. The git operation's
+/// own sub-steps live below [`Phase::InstallPy`]'s value (5–30 %, in
+/// `update_pipeline`), install.py's steps fill
+/// `update_pipeline::INSTALL_PCT_START..INSTALL_PCT_END`, and every later
+/// phase sits above that band. Before this table the values were literals at
+/// each emit site and ran backwards (hub 97 % before the binary check's 96 %),
+/// and nothing spoke between install.py's exit and the hub restart, so a
+/// finished install.py still read as the install band's last value.
+pub(crate) fn phase_progress(phase: Phase) -> Option<f32> {
+    use crate::commands::update_pipeline::INSTALL_PCT_START;
+    match phase {
+        Phase::InstallPy => Some(INSTALL_PCT_START),
+        Phase::DbReopenAndRefresh => Some(91.0),
+        Phase::GateDropAndHubRestart => Some(93.0),
+        Phase::BinaryRefresh => Some(95.0),
+        Phase::Bookkeeping => Some(96.0),
+        Phase::Relaunch => Some(98.0),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PhaseStatus {
@@ -957,6 +979,13 @@ impl<'w, R: Runtime> LiveOps<'w, R> {
             crate::commands::installer::emit_progress(w, stage, message, percentage);
         }
     }
+
+    /// Emit at the phase's row of [`phase_progress`] (the one table).
+    fn emit_phase(&self, phase: Phase, stage: &str, message: &str) {
+        if let Some(pct) = phase_progress(phase) {
+            self.emit(stage, message, pct);
+        }
+    }
 }
 
 impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
@@ -1214,7 +1243,7 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         root: &Path,
         python_cmd: &str,
     ) -> impl Future<Output = Result<InstallPyRun, String>> + Send {
-        self.emit("install", "Applying updates...", 40.0);
+        self.emit_phase(Phase::InstallPy, "install", "Applying updates...");
         if let Some(g) = self.gate.as_mut() {
             g.advance_phase(crate::commands::update_gate::Phase::InstallPy);
         }
@@ -1244,6 +1273,11 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         root: &Path,
         branch: &str,
     ) -> impl Future<Output = ()> + Send {
+        self.emit_phase(
+            Phase::DbReopenAndRefresh,
+            "update",
+            "Install step finished — refreshing the update state...",
+        );
         if let Some(g) = self.gate.as_mut() {
             g.advance_phase(crate::commands::update_gate::Phase::BinaryRefresh);
         }
@@ -1261,7 +1295,7 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
     }
 
     fn restart_hub(&mut self, root: &Path, ctx: HubRestartContext) {
-        self.emit("update", "Starting vct-hub...", 97.0);
+        self.emit_phase(Phase::GateDropAndHubRestart, "update", "Starting vct-hub...");
         if let Err(e) = crate::commands::installer::ensure_hub_started_after_update(root, ctx) {
             tracing::warn!(
                 "[vct] {}: vct-hub restart reported {} (non-fatal; the next launcher boot \
@@ -1277,7 +1311,7 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         root: &Path,
         branch: &str,
     ) -> impl Future<Output = BinaryCheck> + Send {
-        self.emit("update", "Checking the new launcher binary...", 96.0);
+        self.emit_phase(Phase::BinaryRefresh, "update", "Checking the new launcher binary...");
         let root = root.to_path_buf();
         let branch = branch.to_string();
         async move {
@@ -1335,6 +1369,7 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
     }
 
     fn bookkeeping(&mut self, root: &Path) -> impl Future<Output = ()> + Send {
+        self.emit_phase(Phase::Bookkeeping, "update", "Recording the update...");
         let root = root.to_path_buf();
         let app = self.app.clone();
         async move {
@@ -1375,7 +1410,7 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         &mut self,
         root: &Path,
     ) -> impl Future<Output = Result<RelaunchOutcome, RelaunchError>> + Send {
-        self.emit("restart", "Update applied — restarting launcher...", 98.0);
+        self.emit_phase(Phase::Relaunch, "restart", "Update applied — restarting launcher...");
         // W2R-06: a relaunch ends in `app.exit(0)`, which never drops `self`
         // — release both claims NOW (the update is applied and audited), so
         // no `update.lock` naming a dead pid is left behind.
@@ -2615,6 +2650,31 @@ pub(crate) mod tests {
         for m in MUTATING.iter().filter(|m| **m != "pin_remote") {
             assert!(!ops.called(m), "pin failure: `{m}` ran: {:?}", ops.calls);
         }
+    }
+
+    /// v0.2.106: the overlay percentage of the post-git phases rises strictly
+    /// in phase order, starts at the install band's start and ends above the
+    /// band's end, so a finished install.py is visibly past it. (Red before:
+    /// the hub restart sat at 97 % and the later binary check at 96 %.)
+    #[test]
+    fn phase_progress_rises_in_phase_order_above_the_install_band() {
+        use crate::commands::update_pipeline::{INSTALL_PCT_END, INSTALL_PCT_START};
+        let pcts: Vec<(Phase, f32)> = PHASE_ORDER
+            .iter()
+            .filter_map(|p| phase_progress(*p).map(|v| (*p, v)))
+            .collect();
+        assert_eq!(pcts.first().map(|x| x.1), Some(INSTALL_PCT_START));
+        for w in pcts.windows(2) {
+            assert!(w[1].1 > w[0].1, "{:?} ({}) must be above {:?} ({})", w[1].0, w[1].1, w[0].0, w[0].1);
+        }
+        for (p, v) in &pcts[1..] {
+            assert!(*v > INSTALL_PCT_END && *v < 100.0, "{p:?} at {v}");
+        }
+        assert!(
+            phase_progress(Phase::DbReopenAndRefresh).is_some(),
+            "the first phase after install.py must speak, or a finished install.py still reads \
+             as the install band"
+        );
     }
 
     /// The happy path runs all thirteen phases, in order, each exactly once;

@@ -281,6 +281,22 @@ describe('badgeCopyFor — one wording table keyed on kind', () => {
     expect(c.buttonLabel).toBe('Fetch + Install');
   });
 
+  // v0.2.106 field report: install.py failed after a same-version pull; the
+  // badge must say the update did not finish, and offer the install-only run.
+  it('install_stale from a failed install phase says the update did not finish', () => {
+    const kind = U.pickKind({ remote_ahead: false, install_stale: true, binary_stale: false });
+    expect(kind).toBe('install_stale');
+    const c = U.badgeCopyFor(kind, {
+      source_version: '0.2.105',
+      installed_version: '0.2.105',
+      install_incomplete: true,
+    });
+    expect(c.title).toBe('Finish Update');
+    expect(c.desc).toContain('stopped before it finished');
+    expect(c.desc).not.toContain('v0.2.105 did not finish');
+    expect(c.action).toEqual({ type: 'run', kind: 'ApplyOnly' });
+  });
+
   it('every kind has a title, a button and the action of actionForKind', () => {
     const kinds: Array<import('./updater').UpdateKind> = [
       'merge_in_progress',

@@ -1709,6 +1709,74 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
     }
 }
 
+/// The update overlay's percentage band for `install.py --update`: the
+/// pipeline emits [`INSTALL_PCT_START`] as install.py starts
+/// (`update_run::phase_progress(Phase::InstallPy)`) and the post-install
+/// phases start above [`INSTALL_PCT_END`].
+pub(crate) const INSTALL_PCT_START: f32 = 40.0;
+pub(crate) const INSTALL_PCT_END: f32 = 90.0;
+
+/// Where in the install band an install.py `[VCO-EVENT]` step tag puts the
+/// bar. install.py numbers its main steps `N/M` (`"7/10"`), with letter
+/// sub-steps (`"7c/10"`) between `N` and `N+1`; un-numbered events
+/// (`"doctor"`, `"register_mcps"`, …) carry no position (`None`). A step that
+/// STARTS sits at the beginning of its slot, one that is `ok` at its end, and
+/// the final `session ok` event is the end of the band.
+pub(crate) fn install_step_percentage(step: &str, phase: &str) -> Option<f32> {
+    if step == "session" {
+        return (phase == "ok").then_some(INSTALL_PCT_END);
+    }
+    let (n_part, m_part) = step.split_once('/')?;
+    let total: f32 = m_part.trim().parse::<u32>().ok().filter(|m| *m > 0)? as f32;
+    let digits_end = n_part
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map(|(i, _)| i)
+        .unwrap_or(n_part.len());
+    let n: f32 = n_part[..digits_end].parse::<u32>().ok()? as f32;
+    // a sub-step letter: b = 1/5 of the slot, c = 2/5, … (capped below the
+    // next main step).
+    let sub = n_part[digits_end..]
+        .chars()
+        .next()
+        .filter(|c| c.is_ascii_lowercase())
+        .map(|c| ((c as u8 - b'a') as f32 / 5.0).min(0.8))
+        .unwrap_or(0.0);
+    let done = if phase == "ok" { 1.0 / 5.0 } else { 0.0 };
+    let slot = ((n - 1.0).max(0.0) + sub + done) / total;
+    let pct = INSTALL_PCT_START + (INSTALL_PCT_END - INSTALL_PCT_START) * slot.clamp(0.0, 1.0);
+    Some(pct)
+}
+
+/// The install band's running maximum: install.py's steps only ever move the
+/// bar forward (an `ok` for an earlier step, or an un-numbered event, keeps
+/// the current value). Thread-safe because the stall watchdog reads it from
+/// the same `tokio::join!` as the stdout reader.
+pub(crate) struct InstallProgressBand(std::sync::atomic::AtomicU32);
+
+impl InstallProgressBand {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::atomic::AtomicU32::new(INSTALL_PCT_START.to_bits()))
+    }
+
+    pub(crate) fn current(&self) -> f32 {
+        f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Fold one event in and return the percentage to show.
+    pub(crate) fn advance(&self, step: &str, phase: &str) -> f32 {
+        let now = self.current();
+        match install_step_percentage(step, phase) {
+            Some(p) if p > now => {
+                self.0
+                    .store(p.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                p
+            }
+            _ => now,
+        }
+    }
+}
+
 /// Run `python install.py --update` in `install_path`, record the outcome, and
 /// hand the caller the facts.
 ///
@@ -1721,9 +1789,10 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 /// were collapsed into this, and the new caller is the third call site.
 ///
 /// `stream_to`: `Some(window)` mirrors install.py's `[VCO-EVENT] <step> <phase>
-/// <detail>` lines to the progress modal as sub-messages (holding the parent
-/// percentage steady at 50 %, between the caller's 40 % "Applying" and its 90 %
-/// "Starting vct-hub"), and is the ONLY thing that sets `VCO_PROGRESS_STREAM`.
+/// <detail>` lines to the progress modal as sub-messages, the percentage
+/// following install.py's `[N/M]` step counter inside the install band
+/// ([`INSTALL_PCT_START`]..[`INSTALL_PCT_END`], [`install_step_percentage`]),
+/// and is the ONLY thing that sets `VCO_PROGRESS_STREAM`.
 /// `None` waits for the process. A surface with no progress modal must not
 /// claim one — install.py branches on that env var.
 ///
@@ -1814,6 +1883,10 @@ pub(crate) async fn run_install_py_update(
         .as_ref()
         .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
+    // Shared by the stdout reader (advances it) and the stall watchdog (reads
+    // it), so a stall notice repeats the current percentage.
+    let install_pct = InstallProgressBand::new();
+
     let read_stdout = async {
         let mut buf = Vec::<u8>::new();
         let Some(stdout) = stdout_pipe else { return buf };
@@ -1869,9 +1942,15 @@ pub(crate) async fn run_install_py_update(
                     if phase != "start" && phase != "ok" {
                         continue;
                     }
+                    // v0.2.106: the bar follows install.py's own step
+                    // counter (`[N/M]` tags) inside the install band, and
+                    // never moves backwards. It used to be pinned at 50 %
+                    // for the whole run, so a finished install.py still
+                    // read "50 %" until the post-install phases spoke.
+                    let pct = install_pct.advance(step, phase);
                     let sub_msg = installer_step_to_user_label(step, detail);
                     if !sub_msg.is_empty() {
-                        emit_progress(window, "install", &sub_msg, 50.0);
+                        emit_progress(window, "install", &sub_msg, pct);
                     }
                 }
                 Ok(None) => break, // EOF
@@ -1920,7 +1999,7 @@ pub(crate) async fn run_install_py_update(
                     // feeds (see `read_stdout` above); the message is short
                     // by construction to honour the GUI's <200-char detail
                     // contract (progress.rs unknown-step fallback).
-                    emit_progress(window, "install", &msg, 50.0);
+                    emit_progress(window, "install", &msg, install_pct.current());
                     tracing::warn!("[vct] {}: {}", surface, msg);
                 },
             )
@@ -2097,6 +2176,60 @@ mod tests {
         init_repo_pair, push_upstream_change,
     };
     use std::process::{Command as StdCommand, Stdio};
+
+    // ─── v0.2.106: the install band follows install.py's steps ───────────
+    //
+    // Field report: the overlay sat at 50 % while install.py had already
+    // finished, because every install event was emitted at a fixed 50.
+
+    #[test]
+    fn install_steps_move_the_bar_forward_through_the_band() {
+        // The order install.py --update prints its numbered events in.
+        let events = [
+            ("1/10", "start"),
+            ("2/10", "ok"),
+            ("2b/10", "start"),
+            ("3/10", "start"),
+            ("4/10", "start"),
+            ("4/10", "ok"),
+            ("4c/10", "start"),
+            ("5b/10", "start"),
+            ("7c/10", "start"),
+            ("7c/10", "ok"),
+            ("7d/10", "start"),
+            ("8/10", "start"),
+            ("9/10", "ok"),
+            ("10/10", "start"),
+            ("10/10", "ok"),
+            ("session", "ok"),
+        ];
+        let band = InstallProgressBand::new();
+        assert_eq!(band.current(), INSTALL_PCT_START);
+        let mut last = band.current();
+        for (step, phase) in events {
+            let p = band.advance(step, phase);
+            assert!(p >= last, "{step} {phase}: {p} went below {last}");
+            assert!((INSTALL_PCT_START..=INSTALL_PCT_END).contains(&p));
+            last = p;
+        }
+        assert_eq!(last, INSTALL_PCT_END, "the final `session ok` fills the band");
+        assert!(
+            install_step_percentage("7c/10", "start").unwrap() > 60.0,
+            "step 7 of 10 is well past the middle of the band, not pinned at 50"
+        );
+    }
+
+    #[test]
+    fn unnumbered_or_earlier_events_never_move_the_bar_back() {
+        let band = InstallProgressBand::new();
+        let p8 = band.advance("8/10", "start");
+        assert_eq!(band.advance("doctor", "start"), p8, "an un-numbered event keeps the value");
+        assert_eq!(band.advance("3/10", "ok"), p8, "an earlier step never moves it back");
+        assert_eq!(band.advance("session", "start"), p8);
+        assert_eq!(install_step_percentage("register_mcps", "ok"), None);
+        assert_eq!(install_step_percentage("4/0", "ok"), None, "no division by zero");
+        assert_eq!(install_step_percentage("x/10", "ok"), None);
+    }
 
     fn git_missing() -> bool {
         StdCommand::new("git")
@@ -2650,7 +2783,7 @@ mod tests {
     // The GUI surface itself (`emit_progress` into a tauri `Window`) is not
     // constructible in unit tests, so the loop is tested through an injected
     // emit collector; the production closure is 4 lines over the SAME
-    // `emit_progress(window, "install", …, 50.0)` channel the [VCO-EVENT]
+    // `emit_progress(window, "install", …, <install band %>)` channel the [VCO-EVENT]
     // parser uses.
 
     #[test]

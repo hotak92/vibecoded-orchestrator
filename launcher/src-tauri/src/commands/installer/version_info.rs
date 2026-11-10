@@ -72,6 +72,35 @@ pub(crate) fn install_manifest_flag(install_path: &Path, key: &str) -> bool {
     val.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// v0.2.106: does the install root's deferral ledger carry the
+/// `update_install_phase_failed` row — i.e. did the last launcher-driven
+/// `install.py --update` fail (or fail to spawn) AFTER the git operation had
+/// already advanced the source?
+///
+/// That row is the ONE record of a half-finished update
+/// (`installer::handle_install_phase_exit` writes it; a successful install.py
+/// run settles it). Its registry row declares `emit_surfaces = [..,
+/// "gui_badge"]`, but until v0.2.106 nothing on the badge side read it: when
+/// the update had not moved the version string (a mid-release commit, a binary
+/// refresh), `source_version == installed_version`, git reported 0 commits
+/// behind, and the badge said "up to date" over a partly-installed tree. This
+/// reader is the missing `gui_badge` consumer; `check_for_updates` folds it into
+/// `install_stale` so the badge offers the install-only finish (`ApplyOnly`).
+///
+/// Read from the JSON sidecar through the ONE ledger reader
+/// (`crate::deferral_ledger::read_ledger`); an absent or unreadable ledger is `false`
+/// (no evidence; the version comparison still applies).
+pub(crate) fn install_phase_failed_recorded(install_path: &Path) -> bool {
+    let view = crate::deferral_ledger::read_ledger(
+        crate::deferral_ledger::LedgerScope::OrchestratorRoot,
+        "orchestrator",
+        install_path,
+    );
+    view.entries
+        .iter()
+        .any(|e| e.condition_id == super::UPDATE_INSTALL_PHASE_FAILED_CID)
+}
+
 /// v0.2.60 (Piece 5): read `vct-module.json::min_upgradable_from` — the
 /// oldest installed version this release can update IN-PLACE from. Below
 /// this floor, the update routes to the guided hard-cut instead of an
