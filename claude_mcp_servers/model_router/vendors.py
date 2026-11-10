@@ -571,9 +571,11 @@ VENDORS: Mapping[str, Vendor] = {
         # K2.8 Preview without thinking (a silent substitution); for the K3.1
         # Pro series it REFUSES ("关闭思考的请求会被拒绝", models page
         # 2026-11-10; live 2026-11-10: HTTP 400 "K3.1 Pro does not support
-        # disabled thinking mode"). The gateway never forwards a k3.1-pro
-        # request with thinking off: effort.py's k3.1-pro row
-        # (``thinking_off_effort``) sends it with thinking on at low.
+        # disabled thinking mode"). The gateway never forwards a PARSED
+        # k3.1-pro request with thinking off: effort.py's k3.1-pro row
+        # (``thinking_off_effort``) sends it with thinking on at low. A body
+        # past ``rewrite_buffer_bytes`` (32 MiB default) is streamed through
+        # unparsed and unshaped, as for every rule (review B-L2).
         alias_trap=True,
         forward_verified_only=True,
         # OWNER RULING 2026-11-10: "Kimi K3.1 Pro REPLACES K3 in VCO" — the

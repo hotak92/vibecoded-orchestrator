@@ -16,6 +16,7 @@
 // `projects.delete`) and `confirmLeave` (their dialog).
 
 import type { UnregisterOptions, UnregisterReport } from '$lib/types/launcher';
+import removeOptions from './remove-unregister-options.json';
 
 /** How the Rust stop error opens. MUST MATCH `UNREGISTER_STOPPED_PREFIX` in
  *  `launcher/src-tauri/src/commands/projects_v2/unregister_strip.rs`. */
@@ -78,11 +79,19 @@ export async function runUnregister(
  *  PLUS the project's own Weaviate collections. Used by the ONE shared
  *  Remove flow (`ProjectRemoveFlow.svelte`) that both the Projects-page card
  *  and the top-bar selector open; `runUnregister` supplies
- *  `leaveUnremovable: false` on the first call. */
+ *  `leaveUnremovable: false` on the first call.
+ *
+ *  ONE source (review B-L1): the values live in
+ *  `remove-unregister-options.json`, which the terminal form
+ *  (`vct-launcher --remove-project`, `remove_project_cli.rs`) reads too —
+ *  through `include_str!` — so the two surfaces cannot drift. */
 export const REMOVE_UNREGISTER_OPTIONS: Readonly<{
   purgeLauncherFiles: boolean;
   purgeCollections: boolean;
-}> = Object.freeze({ purgeLauncherFiles: true, purgeCollections: true });
+}> = Object.freeze({
+  purgeLauncherFiles: removeOptions.purgeLauncherFiles,
+  purgeCollections: removeOptions.purgeCollections,
+});
 
 /** Whether a project may be removed from the GUI: every project except the
  *  orchestrator root (its `.claude/` is the live install, and the backend

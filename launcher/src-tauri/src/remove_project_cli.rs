@@ -7,12 +7,14 @@
 //! resolves the project row, opens the launcher DB headless and calls
 //! [`crate::commands::projects_v2::unregister_project`] — the same function the
 //! Projects-page Remove button reaches through `delete_project_v2`, with the
-//! same options the GUI Remove flow sends by default
-//! (`REMOVE_UNREGISTER_OPTIONS` in `launcher/src/lib/unregister-escape.ts`:
-//! files AND the project's own collections). The project folder and the
-//! user's own files stay; the report is printed as JSON on stdout.
+//! same options the GUI Remove flow sends by default — both read them from
+//! `launcher/src/lib/remove-unregister-options.json` (files AND the project's
+//! own collections; `REMOVE_UNREGISTER_OPTIONS` in `unregister-escape.ts`
+//! imports the same file). The project folder and the user's own files stay;
+//! the report is printed as JSON on stdout.
 //!
-//! Exit codes: 0 removed; 1 usage / lookup / DB error; 2 the removal stopped
+//! Exit codes: 0 removed (or `--help`, printed on stdout); 1 usage / lookup /
+//! DB error; 2 the removal stopped
 //! (a value VCO wrote could not be removed — rerun with `--leave-unremovable`
 //! to finish anyway, exactly the GUI's "Unregister anyway" second action).
 
@@ -32,20 +34,36 @@ pub(crate) struct RemoveProjectArgs {
     pub opts: UnregisterOptions,
 }
 
+/// What the arguments ask for: a removal, or the usage text (review B-L3: a
+/// deliberate `--help` prints to stdout and exits 0, unlike a usage error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Parsed {
+    Run(RemoveProjectArgs),
+    Help,
+}
+
+/// The GUI Remove flow's options, read from the ONE file both surfaces use
+/// (review B-L1): `launcher/src/lib/remove-unregister-options.json`, which
+/// `REMOVE_UNREGISTER_OPTIONS` in `unregister-escape.ts` imports. Fields the
+/// file does not name take [`UnregisterOptions`]' own defaults; the first
+/// call never leaves unremovable values (the stop stays the default).
+pub(crate) fn remove_flow_options() -> UnregisterOptions {
+    const SHARED: &str = include_str!("../../src/lib/remove-unregister-options.json");
+    let mut opts: UnregisterOptions =
+        serde_json::from_str(SHARED).expect("remove-unregister-options.json is valid JSON");
+    opts.leave_unremovable = false;
+    opts
+}
+
 /// Parse the arguments after `--remove-project`.
-pub(crate) fn parse_args(rest: &[String]) -> Result<RemoveProjectArgs, String> {
+pub(crate) fn parse_args(rest: &[String]) -> Result<Parsed, String> {
     let mut query: Option<String> = None;
-    // The GUI Remove flow's options (REMOVE_UNREGISTER_OPTIONS).
-    let mut opts = UnregisterOptions {
-        purge_launcher_files: true,
-        purge_collections: true,
-        leave_unremovable: false,
-    };
+    let mut opts = remove_flow_options();
     for a in rest {
         match a.as_str() {
             "--keep-collections" => opts.purge_collections = false,
             "--leave-unremovable" => opts.leave_unremovable = true,
-            "-h" | "--help" => return Err(USAGE.to_string()),
+            "-h" | "--help" => return Ok(Parsed::Help),
             s if s.starts_with("--") => return Err(format!("unknown option {}\n{}", s, USAGE)),
             s => {
                 if query.is_some() {
@@ -58,7 +76,7 @@ pub(crate) fn parse_args(rest: &[String]) -> Result<RemoveProjectArgs, String> {
     let query = query
         .filter(|q| !q.trim().is_empty())
         .ok_or_else(|| USAGE.to_string())?;
-    Ok(RemoveProjectArgs { query, opts })
+    Ok(Parsed::Run(RemoveProjectArgs { query, opts }))
 }
 
 /// Pick the ONE project `query` names: an exact id, else an exact slug, else
@@ -105,7 +123,12 @@ pub(crate) fn resolve_target(rows: &[ProjectRow], query: &str) -> Result<Project
 /// result (see the print contract in `lib.rs`).
 pub(crate) fn run(rest: &[String]) -> i32 {
     let args = match parse_args(rest) {
-        Ok(a) => a,
+        Ok(Parsed::Run(a)) => a,
+        Ok(Parsed::Help) => {
+            // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
+            println!("{}", USAGE);
+            return 0;
+        }
         Err(msg) => {
             // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
             eprintln!("{}", msg);
@@ -176,17 +199,46 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
+    fn run_args(v: &[&str]) -> RemoveProjectArgs {
+        match parse_args(&s(v)).unwrap() {
+            Parsed::Run(a) => a,
+            Parsed::Help => panic!("expected a removal, got help"),
+        }
+    }
+
     #[test]
     fn defaults_match_the_gui_remove_flow_and_flags_narrow_them() {
-        let a = parse_args(&s(&["alpha"])).unwrap();
+        let a = run_args(&["alpha"]);
         assert_eq!(a.query, "alpha");
         assert!(a.opts.purge_launcher_files && a.opts.purge_collections);
         assert!(!a.opts.leave_unremovable);
-        let b = parse_args(&s(&["--keep-collections", "alpha", "--leave-unremovable"])).unwrap();
+        let b = run_args(&["--keep-collections", "alpha", "--leave-unremovable"]);
         assert!(!b.opts.purge_collections && b.opts.leave_unremovable);
         assert!(parse_args(&s(&[])).is_err());
         assert!(parse_args(&s(&["a", "b"])).is_err());
         assert!(parse_args(&s(&["--drop-everything", "a"])).is_err());
+    }
+
+    #[test]
+    fn the_defaults_come_from_the_file_the_gui_imports() {
+        // Review B-L1: one source. The JSON is what unregister-escape.ts
+        // imports as REMOVE_UNREGISTER_OPTIONS; every key it names reaches
+        // the CLI's options.
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../src/lib/remove-unregister-options.json"
+        ))
+        .unwrap();
+        let opts = remove_flow_options();
+        assert_eq!(raw["purgeLauncherFiles"].as_bool(), Some(opts.purge_launcher_files));
+        assert_eq!(raw["purgeCollections"].as_bool(), Some(opts.purge_collections));
+        assert!(!opts.leave_unremovable);
+    }
+
+    #[test]
+    fn help_is_not_a_usage_error() {
+        assert_eq!(parse_args(&s(&["--help"])).unwrap(), Parsed::Help);
+        assert_eq!(parse_args(&s(&["-h", "alpha"])).unwrap(), Parsed::Help);
+        assert_eq!(run(&s(&["--help"])), 0);
     }
 
     #[test]
