@@ -3,6 +3,8 @@ name: kimi-implementer
 description: Kimi K3 implementation lane via the claude-gw gateway for bounded multi-file, long-context or visual/frontend fixes where quality beats speed; not a reviewer. Worktree lane — review → kimi-reviewer, research → deepseek-researcher.
 model: claude-gw/kimi/k3[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Write, Edit, Grep, Glob, Bash
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*

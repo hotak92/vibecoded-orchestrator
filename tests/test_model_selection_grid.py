@@ -27,13 +27,16 @@ from vco_lib import materialize, model_selection
 #: The source grid (medium-effort re-score, 2026-10-03; owner-approved
 #: revision 2026-10-08: Haiku 5.5 replaces Haiku 4.5, GLM-5.3 Review 8,
 #: DeepSeek V4.1 Flash Docs 7; re-score 2026-10-16: GLM-5.3 Debug 5, DeepSeek
-#: Review 7, `*` dropped on Opus Instr / Kimi Review / DeepSeek Instr), transcribed verbatim: row id -> the 11
+#: Review 7, `*` dropped on Opus Instr / Kimi Review / DeepSeek Instr;
+#: v0.2.106, owner 2026-11-10: Fable 5.1 -> Fable 5.2 (Claude Code 2.1.321)
+#: re-scored from benchmark evidence — Code/Debug/Review/Plan/Tools 10,
+#: Cost 2), transcribed verbatim: row id -> the 11
 #: column scores, in the source's row ORDER.
 #: Columns: Code, Debug, Review, Plan, Bulk, Tools, Instr, LongCtx, Docs,
 #: Vision, Cost.
 EXPECTED_SCORES = {
     "opus": ["10", "10", "9", "9", "5", "10", "8", "10", "9", "10", "4"],
-    "fable": ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"],
+    "fable": ["10", "10", "10", "10", "3", "10", "6", "10", "10", "10", "2"],
     "glm-5.3": ["7", "5", "8", "6", "6", "6", "7*", "7", "7", "—", "8"],
     # v0.2.102: scored from cited evidence, not the maintainer's
     # grid — see the comment above the row in model_selection.toml.
@@ -61,11 +64,18 @@ EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
 #: does (v0.2.103 final review L-3).
 EXPECTED_NOTES = [
     ("opus", "**Opus 5.5** leads at medium on almost every axis and costs less "
-             "per task than Fable 5.1 (≈$1.3 vs ≈$3.0); as a fix-round "
-             "implementer it converges reliably, but its first-pass lanes still "
-             "need an independent review. Keep Fable for final reviews, plans "
-             "and the hardest debugging — a Fable delta review after each fix "
-             "wave has kept finding issues that every per-lane review missed."),
+             "per task than Fable 5.2 at medium (≈$2.45 vs ≈$3.80 on the same "
+             "independent index); as a fix-round implementer it converges "
+             "reliably, but its first-pass lanes still need an independent "
+             "review."),
+    ("fable", "**Fable 5.2** — effort decides both the score and the bill: at "
+              "medium it scores above Opus 5.5 at high for about the same cost "
+              "per task (independent index: 56.4 at ≈$3.80/task); at high "
+              "≈$9/task; at max ≈$26.5/task (about twice Fable 5.1, from ~1.7× "
+              "the output tokens). Keep final reviews at high, not max. Its own "
+              "work still needs an independent review; a Fable delta review "
+              "after each fix wave has kept finding issues that every per-lane "
+              "review missed."),
     ("sonnet", "**Sonnet 5.5** is the most effort-sensitive model: near Opus at "
                "max, but well behind it on coding at medium. Not a default "
                "choice."),
@@ -133,7 +143,7 @@ EXPECTED_GENERAL_NOTES = [
     "to the exact versions above.",
 ]
 
-CLAUDE_ROWS = ("Opus 5.5", "Fable 5.1", "Sonnet 5.5", "Haiku 5.5")
+CLAUDE_ROWS = ("Opus 5.5", "Fable 5.2", "Sonnet 5.5", "Haiku 5.5")
 
 
 def _rows_rendered(markdown: str) -> set[str]:

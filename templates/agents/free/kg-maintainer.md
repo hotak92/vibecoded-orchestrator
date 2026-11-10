@@ -5,6 +5,8 @@ short_desc: KG search, node writing, duplicate + health maintenance
 keywords: ["knowledge graph", "KG", "hybrid search", "store knowledge", "KG node", "WikiLinks", "kg-sync", "duplicate nodes", "KG health", "search knowledge", "write a KG node", "curate knowledge"]
 model: sonnet
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Write, Edit, Grep, Glob, Bash, mcp__weaviate-kg__*
 disallowedTools: mcp__vct-coordination__*
 ---

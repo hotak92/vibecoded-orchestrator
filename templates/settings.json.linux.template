@@ -42,6 +42,9 @@
     ]
   },
   "idleCompaction": false,
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_EFFORT": "medium"
+  },
   "skillOverrides": {
     "loop": "user-invocable-only"
   },

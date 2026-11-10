@@ -14,6 +14,8 @@ tools:
   - mcp__weaviate-kg__*
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

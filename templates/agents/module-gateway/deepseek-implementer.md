@@ -3,6 +3,8 @@ name: deepseek-implementer
 description: DeepSeek V4.1 Flash implementation lane via the claude-gw gateway for bounded, well-specified fixes needing real reasoning; not open-ended design, not a reviewer. Worktree lane — research → deepseek-researcher, review → glm-reviewer.
 model: claude-gw/qwen/deepseek-v4.1-flash[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Write, Edit, Grep, Glob, Bash
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*

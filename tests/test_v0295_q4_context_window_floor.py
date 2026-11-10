@@ -248,6 +248,29 @@ def test_an_unknown_family_in_a_slot_stays_undecorated(tmp_path: Path):
     assert _block(path)["ANTHROPIC_SMALL_FAST_MODEL"] == "acme-1"
 
 
+def test_fable_5_2_is_the_fable_familys_newest_and_inherits_its_1m(
+        tmp_path: Path):
+    """v0.2.106: Claude Code 2.1.321 makes the ``fable`` alias Claude Fable 5.2
+    (``claude-fable-5-2``). The gateway needed NO code change: the id parses
+    structurally as family ``claude-fable`` version ``(5, 2)`` — the family's
+    newest, ahead of ``claude-fable-5-1`` — and inherits that row's 1M window
+    from the SHIPPED seed. This pins all three legs."""
+    from model_router.model_family import is_older_sibling, parse_model_id
+
+    parts = parse_model_id("claude-fable-5-2")
+    assert parts.family == "claude-fable"
+    assert parts.version == (5, 2)
+    assert is_older_sibling(parse_model_id("claude-fable-5-1"), parts)
+    assert is_older_sibling(parse_model_id("claude-fable-5"), parts)
+
+    path = _settings(tmp_path, {})
+    out = vs.point_at_gateway(
+        path, base_url=BASE_URL, token=TOKEN, model="claude-fable-5-2",
+    )
+    assert out["ok"], out["message"]
+    assert _block(path)[vs.MODEL_KEY] == "claude-fable-5-2[1m]"
+
+
 def test_the_decoration_never_touches_the_network(tmp_path: Path, monkeypatch):
     """"degrade to the table when the gateway is down" — it never asks it.
 

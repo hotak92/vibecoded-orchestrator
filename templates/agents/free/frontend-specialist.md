@@ -6,6 +6,8 @@ keywords: [React, Vue, Svelte, JSX, "component library", "CSS-in-JS", Tailwind, 
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: medium
+background: true
+autoCompactWindow: 750000
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*
 ---

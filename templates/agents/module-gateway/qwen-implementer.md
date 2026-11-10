@@ -3,6 +3,8 @@ name: qwen-implementer
 description: Qwen3.8-Max lane via the claude-gw gateway for bounded multi-file/multi-step fixes — top qwen-vendor rung above deepseek-implementer; not a reviewer. Worktree lane — research → deepseek-researcher, review → glm-reviewer/kimi-reviewer.
 model: claude-gw/qwen/qwen3.8-max[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Write, Edit, Grep, Glob, Bash
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*

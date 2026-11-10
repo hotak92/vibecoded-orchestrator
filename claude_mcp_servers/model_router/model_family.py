@@ -5,9 +5,10 @@
 Two owner requirements (2026-09-10/16) rest on that question and neither can
 be answered from an id string treated as opaque:
 
-* **the picker shows only the LATEST version of each family** — Fable 5.1, not
-  Fable 5 as well — so something has to know that ``claude-fable-5-1`` and
-  ``claude-fable-5`` are one family two versions apart;
+* **the picker shows only the LATEST version of each family** — Fable 5.2, not
+  Fable 5.1 or Fable 5 as well — so something has to know that
+  ``claude-fable-5-2``, ``claude-fable-5-1`` and ``claude-fable-5`` are one
+  family a version apart each;
 * **a NEW model inherits at least the window of the previous model in its
   family** until someone verifies its real one, so a model that ships tomorrow
   is not advertised at the client's conservative default merely because nobody

@@ -6,6 +6,8 @@ keywords: ["complex refactor", "architectural reasoning", "multi-layer", "N+1 qu
 tools: Read, Write, Edit, Grep, Glob, Bash, mcp__weaviate-kg__*
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*
 ---

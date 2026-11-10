@@ -466,8 +466,8 @@ def replace_all_settings(install_root: Path, defaults: dict, sentinel: str) -> d
 
     What replace-all resets is every user edit: nothing of the existing file is
     read. What it no longer does (v0.2.104) is drop the template's own keys —
-    ``hooks``, ``skillOverrides``, ``idleCompaction``, the permission denies —
-    until the next bundle update.
+    ``hooks``, ``skillOverrides``, ``idleCompaction``, the ``env`` block, the
+    permission denies — until the next bundle update.
 
     Raises ``OSError`` / ``ValueError`` when the shipped template cannot be read
     or parsed (a broken install; the caller leaves the file alone and says so).
