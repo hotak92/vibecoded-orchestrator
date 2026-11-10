@@ -584,12 +584,46 @@ def test_scan_finds_the_broken_class_and_the_case_pair(tmp_path):
     assert not any("Other_Development/shards" in h for h in fake.hits)
 
 
-def test_any_snapshot_ends_the_exposure_of_a_derived_name(tmp_path):
-    # after a restart the log runs ahead of the snapshot by the start's no-op +
-    # configuration entries; that alone is not exposure
+def test_a_snapshot_past_the_first_reading_ends_the_exposure_of_a_derived_name(
+        tmp_path, monkeypatch):
+    """Review A-L1: a derived name's delete index is unknown, so the first
+    reading bounds it by the log index it sees. A snapshot that PREDATES that
+    reading (snap 9 < log 11) is not proof the delete is held — exposed. Once
+    a snapshot reaches the bound, a later restart's no-op + configuration
+    entries (log runs ahead again) are not exposure."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    root = tmp_path / "vibecoded-orchestrator"
     fake = FakeWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"], log=11, snap=9)
-    result = rg.scan(URL, root=tmp_path / "vibecoded-orchestrator", http=fake)
+    result = rg.scan(URL, root=root, http=fake)
+    assert result is not None and result.case_pairs and result.exposed
+    fake.snap, fake.log = 11, 13  # a snapshot covered the bound; then a restart
+    result = rg.scan(URL, root=root, http=fake)
     assert result is not None and result.case_pairs and not result.exposed
+
+
+def test_a_marker_whose_delete_failed_is_named_in_the_refusal(monkeypatch):
+    """Review A-L2: a created marker whose DELETE failed is named, with the
+    note that the next attempt removes it; success and a refused create keep
+    their own answers."""
+    answers = {"POST": 200, "DELETE": 500}
+    monkeypatch.setattr(rg, "_method_http",
+                        lambda method, url, body=None, **k: (answers[method], b""))
+    reason = rg._write_marker("http://127.0.0.1:1")
+    assert reason is not None and "may remain in the schema" in reason
+    assert rg.MARKER_CLASS in reason and "HTTP 500" in reason
+    answers["DELETE"] = 200
+    assert rg._write_marker("http://127.0.0.1:1") is None
+    answers["POST"] = 503
+    reason = rg._write_marker("http://127.0.0.1:1")
+    assert reason is not None and "did not accept" in reason
+    assert "may remain" not in reason
+
+
+def test_a_bound_above_a_restarted_log_is_replaced(tmp_path, monkeypatch):
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    assert wch.delete_index_bounds(URL, ["A_Kg"], 500) == {"A_Kg": 500}
+    assert wch.delete_index_bounds(URL, ["A_Kg"], 900) == {"A_Kg": 500}
+    assert wch.delete_index_bounds(URL, ["A_Kg"], 4) == {"A_Kg": 4}  # new data folder
 
 
 def test_a_recorded_delete_after_the_snapshot_is_exposed(tmp_path, monkeypatch):
@@ -773,6 +807,47 @@ def test_guarded_collection_create_refuses_and_record_collection_delete_records(
     client.collections.create.assert_not_called()
 
 
+def test_the_ledger_is_keyed_by_the_clients_own_url(ledger_dir, monkeypatch):
+    """Review A-M2: a client connected to a URL other than the process
+    default records its delete under ITS URL, and the create guard on that
+    client reads it — the default URL's bucket is never involved."""
+    from vco_lib import fixture_class_guard as fcg
+    from vco_lib import weaviate_helpers as wh
+
+    fake = FakeWeaviate(log=4, snap=0)
+    monkeypatch.setattr(wch._rg, "_default_http", fake)
+    monkeypatch.setattr(wh, "weaviate_url_default", lambda: "http://elsewhere.test:9999")
+    client = mock.MagicMock()
+    client._connection.url = URL
+    fcg.record_collection_delete(client, "Proj_CodeFunction")
+    assert wch.deleted_names(URL) == ["Proj_CodeFunction"]
+    assert wch.deleted_names("http://elsewhere.test:9999") == []
+    monkeypatch.setattr(wch, "DEFAULT_WAIT_S", 0.0)
+    with pytest.raises(wch.CaseVariantCreateRefused):
+        fcg.guarded_collection_create(client, "PROJ_CodeFunction")
+    client.collections.create.assert_not_called()
+
+
+def test_loopback_spellings_share_one_ledger_bucket(ledger_dir, monkeypatch):
+    """Review A-L5: localhost / 127.0.0.1 / a trailing slash / letter case are
+    one instance; a different port is another."""
+    monkeypatch.setattr(wch._rg, "_default_http", FakeWeaviate(log=4, snap=0))
+    wch.record_deleted("Proj_Kg", "http://localhost:8081/")
+    assert wch.deleted_names("http://127.0.0.1:8081") == ["Proj_Kg"]
+    assert wch.deleted_names("HTTP://LOCALHOST:8081") == ["Proj_Kg"]
+    assert wch.deleted_names("http://[::1]:8081") == ["Proj_Kg"]
+    assert wch.deleted_names("http://127.0.0.1:8082") == []
+
+
+def test_a_ledger_written_under_the_old_key_form_is_still_read(ledger_dir):
+    path = wch.ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "instances": {
+        "http://localhost:8081": {"Proj_Kg": {"deleted_at": "x", "log_index": 3}}}}),
+        encoding="utf-8")
+    assert wch.deleted_entries("http://127.0.0.1:8081") == {"Proj_Kg": 3}
+
+
 def _run_residual_detector(monkeypatch, classes, count=5):
     import install
 
@@ -798,10 +873,11 @@ def test_the_lowercase_residual_entry_fires_and_prints_no_delete(monkeypatch):
     entries = _run_residual_detector(
         monkeypatch, ["MyProject_CodeFunction", "Myproject_codefunction",
                       "Myproject_CodeClass", "MyProject_CodeClass"])
-    by_cid = {e.condition_id: e for e in entries}
-    assert set(by_cid) == {"lowercase_codegraph_residual_Myproject_codefunction",
-                           "lowercase_codegraph_residual_Myproject_CodeClass"}
-    entry = by_cid["lowercase_codegraph_residual_Myproject_codefunction"]
+    prefix = "lowercase_codegraph_residual_"
+    by_name = {e.condition_id[len(prefix):]: e for e in entries
+               if e.condition_id.startswith(prefix)}
+    assert set(by_name) == {"Myproject_codefunction", "Myproject_CodeClass"}
+    entry = by_name["Myproject_codefunction"]
     assert "`MyProject_CodeFunction`" in entry.detected
     assert "DELETE" not in entry.command_to_apply
     assert "Do NOT drop it" in entry.why_deferred

@@ -43,6 +43,8 @@ from vco_lib import weaviate_raft_guard as _rg
 
 __all__ = [
     "CaseVariantCreateRefused",
+    "client_url",
+    "delete_index_bounds",
     "ledger_path",
     "record_deleted",
     "delete_collection",
@@ -80,8 +82,53 @@ def ledger_path() -> Path:
     return vct_root_dir() / "state" / "weaviate_deleted_classes.json"
 
 
+#: Host spellings that all name this machine's loopback interface. They are
+#: folded to one so a ``WEAVIATE_URL`` switched between ``localhost`` and
+#: ``127.0.0.1`` keeps reading the deletes recorded under the other spelling
+#: (review A-L5).
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "ip6-localhost"})
+
+
 def _key(url: str) -> str:
-    return (url or "").strip().rstrip("/").lower()
+    """The ledger key for a Weaviate URL: ``scheme://host:port``, lower-cased,
+    the scheme's default port made explicit and every loopback spelling folded
+    to ``127.0.0.1``. A string that does not parse as a URL keeps the old
+    trimmed, lower-cased form."""
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    raw = (url or "").strip().rstrip("/")
+    try:
+        parts = urlsplit(raw if "://" in raw else f"http://{raw}")
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return raw.lower()
+    if not host:
+        return raw.lower()
+    scheme = (parts.scheme or "http").lower()
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    if host in _LOOPBACK_HOSTS or host.startswith("127."):
+        host = "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{port}"
+
+
+def client_url(client: Any) -> str:
+    """The HTTP URL a weaviate-client v4 *client* is connected to — the key its
+    deletes are recorded under and its creates are guarded by (review A-M2:
+    keying by the process's DEFAULT URL let a client on any other URL record
+    a delete the guard never consulted). Falls back to the resolved
+    ``WEAVIATE_URL`` only when the client exposes no URL (a test double)."""
+    conn = getattr(client, "_connection", None)
+    for value in (getattr(conn, "url", None),
+                  getattr(getattr(conn, "_connection_params", None), "_http_url", None)):
+        if isinstance(value, str) and value.strip():
+            return value
+    from vco_lib import weaviate_helpers as _wh  # noqa: PLC0415
+
+    return _wh.weaviate_url_default()
 
 
 def _load() -> dict:
@@ -91,6 +138,13 @@ def _load() -> dict:
         return {"version": 1, "instances": {}}
     if not isinstance(data, dict) or not isinstance(data.get("instances"), dict):
         return {"version": 1, "instances": {}}
+    # Fold buckets written under an older key form (or another loopback
+    # spelling) into the normalised key; the next save persists the fold.
+    folded: dict = {}
+    for key, bucket in data["instances"].items():
+        if isinstance(bucket, dict):
+            folded.setdefault(_key(key), {}).update(bucket)
+    data["instances"] = folded
     return data
 
 
@@ -142,6 +196,39 @@ def deleted_entries(weaviate_url: str) -> dict[str, Optional[int]]:
 def deleted_names(weaviate_url: str) -> list[str]:
     """Every class name recorded as deleted on *weaviate_url*."""
     return sorted(deleted_entries(weaviate_url))
+
+
+def delete_index_bounds(weaviate_url: str, names: list[str],
+                        last_log_index: int) -> dict[str, int]:
+    """An upper bound on the raft log index of each delete in *names* whose
+    real index VCO never recorded (review A-L1).
+
+    The first reading that sees such a name stores the current
+    *last_log_index* — the delete had already happened, so its index is at
+    most that — under ``bounds`` in the ledger; later readings return the
+    stored bound. A stored bound above the current log means the log started
+    over (a new data folder), so it is replaced. Never raises: on a ledger
+    failure the current index is returned (the conservative answer)."""
+    out = {n: int(last_log_index) for n in names}
+    try:
+        data = _load()
+        bounds = data.setdefault("bounds", {})
+        if not isinstance(bounds, dict):
+            bounds = data["bounds"] = {}
+        bucket = bounds.setdefault(_key(weaviate_url), {})
+        changed = False
+        for n in names:
+            stored = bucket.get(n)
+            if isinstance(stored, int) and stored <= last_log_index:
+                out[n] = stored
+            else:
+                bucket[n] = int(last_log_index)
+                changed = True
+        if changed:
+            _save(data)
+    except Exception:  # noqa: BLE001 — the bound is best-effort evidence
+        pass
+    return out
 
 
 def _forget(weaviate_url: str, names: list[str]) -> None:

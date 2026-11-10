@@ -460,10 +460,13 @@ class GuardResult:
 
     def deferral_entry(self, *, manual_cmd: str = "python install.py --update",
                        runtime: Optional[str] = None) -> DeferralEntry:
-        """The ``service_recreate_refused_data_unknown`` row. Its inspect
-        recipe names the runtime the guard asked (*runtime* overrides; a
-        guard that never learned one prints the placeholder, never a guess —
-        review W2R-10)."""
+        """The ledger row for this refusal: :attr:`entry` when the guard set
+        one (v0.2.106: the raft guard's ``weaviate_upgrade_snapshot_refused``
+        row, :data:`REFUSE_RAFT`), else the
+        ``service_recreate_refused_data_unknown`` row. Its inspect recipe
+        names the runtime the guard asked (*runtime* overrides; a guard that
+        never learned one prints the placeholder, never a guess — review
+        W2R-10)."""
         if self.entry is not None:
             return self.entry
         rt = runtime or self.runtime or "<podman|docker>"

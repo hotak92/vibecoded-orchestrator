@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   folder, your source code, `.env` and other values that are yours, secrets in the keychain, your own hooks, agents
   and skills, `knowledge/` notes, `CLAUDE.md`, `CONTEXT_STATE.md`, anything you changed). Two buttons — "Yes, remove
   from VCO" and "No" — with No focused by default; while the removal runs, Esc and clicks outside do nothing, so the
+  result always belongs to the project you confirmed. Afterwards a summary lists what was removed and names what was
+  kept because you changed it. If the removal stops, "Keep the project" is the focused choice. The top-bar project
+  list's remove action opens the same dialog (the old type-the-name step is gone). Per-option control (keep the
+  collections, keep the bundled files) stays on the project's Settings → Danger zone, whose description now matches
+  what is actually removed. A removed folder can be added again through the normal Add flow: the files VCO removed
+  come back and a file you changed before the removal stays yours. Shared collections and other projects'
+  collections are never dropped: if the launcher's project list cannot be read at that moment, no collection is
+  dropped and the summary lists them as kept, because VCO could not check that no other project uses them.
 
 - **The Model providers switch takes full effect at once, in both directions — no restart, no update.** Turning a
   provider off (or back on) in Home → Model providers now applies immediately everywhere: the provider's agent

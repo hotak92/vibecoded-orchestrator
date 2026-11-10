@@ -323,22 +323,37 @@ def _one_off_stats(base: str) -> Optional[RaftStats]:
         return None
 
 
-def _write_marker(base: str) -> bool:
+def _write_marker(base: str) -> Optional[str]:
     """Create and delete :data:`MARKER_CLASS` — two schema COMMANDS. hashicorp
     raft refuses a snapshot while the FSM has not applied the configuration
     entry a start appends ("cannot take snapshot now, wait until the
     configuration entry at N has been applied", measured on 1.28.4), and on an
     idle node nothing would ever be applied after it. Both commands land in
-    the snapshot, so neither is ever replayed."""
+    the snapshot, so neither is ever replayed.
+
+    ``None`` on success, else the refusal reason — which names a marker class
+    left in the schema when the create landed and the delete did not (review
+    A-L2; the next attempt removes it through the 422 path)."""
+    created = False
     try:
         status, _ = _method_http("POST", f"{base}/v1/schema",
                                  body={"class": MARKER_CLASS, "vectorizer": "none"})
         if status not in (200, 422):  # 422: a leftover marker from an interrupted run
-            return False
+            return (f"the one-off snapshot container did not accept the marker class "
+                    f"{MARKER_CLASS} (HTTP {status})")
+        created = True
         status, _ = _method_http("DELETE", f"{base}/v1/schema/{MARKER_CLASS}")
-        return status in (200, 204)
-    except Exception:  # noqa: BLE001
-        return False
+        if status in (200, 204):
+            return None
+        detail = f"HTTP {status}"
+    except Exception as exc:  # noqa: BLE001
+        detail = f"{type(exc).__name__}: {exc}"
+        if not created:
+            return (f"the one-off snapshot container did not accept the marker class "
+                    f"{MARKER_CLASS} ({detail})")
+    return (f"the marker class {MARKER_CLASS} was created but its delete failed ({detail}); "
+            f"an empty {MARKER_CLASS} class may remain in the schema — the next snapshot "
+            "attempt removes it")
 
 
 def snapshot_with_container_image(
@@ -421,9 +436,9 @@ def snapshot_with_container_image(
                                   + (f": {tail[0][:300]}" if tail else ""))
                 return verdict
             if stats is not None and target is None:
-                if not _write_marker(base):
-                    verdict.reason = ("the one-off snapshot container did not accept the "
-                                      f"marker class {MARKER_CLASS}")
+                marker_error = _write_marker(base)
+                if marker_error is not None:
+                    verdict.reason = marker_error
                     return verdict
                 stats = _one_off_stats(base)
                 target = stats.last_log_index if stats is not None else None
@@ -638,11 +653,17 @@ class RaftScan:
     @property
     def exposed(self) -> bool:
         """A start can replay a case-variant delete: a recorded delete whose
-        index lies after the latest snapshot, or — when the delete's index is
-        not known — no snapshot at all (the field shape). Not "the log is
-        longer than the snapshot": every start appends a no-op and a
-        configuration entry that no snapshot can hold until the next schema
-        command, and those replay harmlessly."""
+        index lies after the latest snapshot. Not "the log is longer than the
+        snapshot": every start appends a no-op and a configuration entry that
+        no snapshot can hold until the next schema command, and those replay
+        harmlessly.
+
+        A delete whose index VCO never recorded (the root's derived names,
+        deleted before the ledger existed) gets an UPPER BOUND in :func:`scan`:
+        the log index at the first reading that saw the pair, persisted, since
+        the delete had already happened by then (review A-L1: "no snapshot at
+        all" alone read a machine whose only snapshot predates the delete as
+        safe). The ``None`` branch below is for a scan that could not bound it."""
         if self.stats is None:
             return False
         snap = self.stats.last_snapshot_index
@@ -735,6 +756,13 @@ def scan(url: str, *, root: Optional[Path] = None, http: Optional[HttpFn] = None
     recorded = recorded_names(root, url)
     result.case_pairs = case_variant_pairs(result.classes, recorded)
     result.recorded_index = {a: recorded.get(a) for a, _b in result.case_pairs}
+    if result.stats is not None:
+        unknown = [a for a, idx in result.recorded_index.items() if idx is None]
+        if unknown:
+            from vco_lib import weaviate_case_history as _wch  # noqa: PLC0415
+
+            result.recorded_index.update(_wch.delete_index_bounds(
+                url, unknown, result.stats.last_log_index))
     if check_indexes:
         live = sorted({b for _a, b in result.case_pairs})
         result.index_missing = [c for c in live if index_missing(url, c, http=http) is True]

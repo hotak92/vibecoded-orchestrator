@@ -334,11 +334,11 @@ def guarded_collection_create(client, name: str, **create_kwargs):
     box (``Wt_foo_Code*``, ``LaneCProbe*_Code*``) and which sits under a
     downward-only line ratchet, so an inline guard there was not available.
     """
-    # The client was connected to the resolved WEAVIATE_URL, which is the key
-    # a delete is recorded under (record_collection_delete).
-    from vco_lib import weaviate_helpers as _wh  # noqa: PLC0415
+    # The guard reads the deletes recorded for the URL THIS client is
+    # connected to (record_collection_delete keys them the same way).
+    from vco_lib.weaviate_case_history import client_url  # noqa: PLC0415
 
-    guard_class_create(name, weaviate_url=_wh.weaviate_url_default())
+    guard_class_create(name, weaviate_url=client_url(client))
     return client.collections.create(name=name, **create_kwargs)
 
 
@@ -358,10 +358,12 @@ def record_collection_delete(client, name: str) -> None:
     """``client.collections.delete(name)`` recorded for the case-variant create
     guard (v0.2.106) — the delete-side twin of :func:`guarded_collection_create`,
     for the same bare-v4 callers."""
-    from vco_lib import weaviate_helpers as _wh  # noqa: PLC0415
-    from vco_lib.weaviate_case_history import delete_collection  # noqa: PLC0415
+    from vco_lib.weaviate_case_history import (  # noqa: PLC0415
+        client_url,
+        delete_collection,
+    )
 
-    delete_collection(client, name, _wh.weaviate_url_default())
+    delete_collection(client, name, client_url(client))
 
 
 def guard_fixture_class_write(

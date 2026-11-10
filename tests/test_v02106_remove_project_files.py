@@ -313,11 +313,23 @@ def test_the_drop_covers_this_projects_bound_classes_and_keeps_another_projects(
                           "reason": "also used by the project 'Acme', so it was not dropped"}]
 
 
-def test_an_unreadable_registry_keeps_the_name_derived_set_and_says_so():
+def test_an_unreadable_registry_drops_nothing_and_says_so():
+    """Review A-L4: the GUI promises other projects' collections are never
+    dropped; with the registry unreadable that cannot be checked, so every
+    class is kept with the reason."""
     plan = unregister_collections.plan_drop("Acme", project_id="p1",
                                             snapshot=_Snap(resolvable=False))
+    assert plan.targets == []
+    assert [k["collection"] for k in plan.kept][:2] == [
+        "Acme_KnowledgeGraph", "Acme_Development"]
+    assert all("could not be read" in k["reason"] for k in plan.kept)
+    assert plan.notes
+
+
+def test_without_an_id_the_name_derived_set_is_dropped():
+    plan = unregister_collections.plan_drop("Acme")
     assert plan.targets[:2] == ["Acme_KnowledgeGraph", "Acme_Development"]
-    assert plan.notes and plan.kept == []
+    assert plan.kept == []
 
 
 def test_drop_refuses_the_shared_class_and_reports_what_it_kept(monkeypatch):

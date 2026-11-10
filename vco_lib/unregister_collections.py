@@ -24,9 +24,10 @@ is still exact: it drops THIS project's own classes and nothing else.
   Class names are compared ``casefold()`` — Weaviate class names collide
   case-insensitively.
 
-When the launcher registry cannot be read, the id-based widening and the
-other-project check are skipped and the reply says so (``notes``): the drop
-then covers exactly the name-derived set, as before.
+When the launcher passes the id and its registry cannot be read, nothing is
+dropped: every class is reported in ``kept`` and the reply says why
+(``notes``) — the other-project check cannot be skipped silently (review
+A-L4). Without an id (the bare CLI) the drop covers the name-derived set.
 """
 from __future__ import annotations
 
@@ -72,10 +73,17 @@ def plan_drop(
     if not project_id:
         return plan
     if snapshot is None or not getattr(snapshot, "resolvable", False):
+        # Review A-L4: the Remove flow promises that other projects'
+        # collections are never dropped. Unverifiable is not verified — keep
+        # every class and say why; the user can run the drop again once the
+        # registry reads.
+        reason = ("the launcher registry could not be read, so VCO could not check that no "
+                  "other project uses it; it was not dropped")
+        plan.kept = [{"collection": name, "reason": reason} for name in plan.targets]
+        plan.targets = []
         plan.notes.append(
-            "the launcher registry could not be read, so only the classes derived from the "
-            "project name were considered, and VCO could not check whether another project "
-            "uses them")
+            "the launcher registry could not be read, so no collection was dropped (each "
+            "is listed as kept); VCO could not check whether another project uses them")
         return plan
     me = None
     others: list[Any] = []
