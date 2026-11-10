@@ -190,6 +190,21 @@ describe('the sentence after a toggle', () => {
     expect(note).toContain('failed in 1 project');
   });
 
+  it('an unreadable project list is named, never read as "every project"', () => {
+    const label = applyOutcomeLabel({
+      vendor: 'kimi',
+      enabled: false,
+      stored: true,
+      agents: applySummary({
+        parked_projects: 1,
+        failed_projects: 1,
+        registry_error: "the launcher's project list could not be read",
+      }),
+    });
+    expect(label).toContain('failed in 1 project');
+    expect(label).toContain('project list could not be read');
+  });
+
   it('the outcome label stands alone for a missing summary', () => {
     expect(applyOutcomeLabel({ vendor: 'kimi', enabled: false, stored: true })).toContain(
       'did not report',

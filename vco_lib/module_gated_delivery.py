@@ -879,6 +879,39 @@ def parked_agents_registry(
     return dict(sorted(out.items()))
 
 
+def restore_gate(
+    vendor_ids: Iterable[str],
+    *,
+    disabled_vendors: Optional[Iterable[str]] = None,
+    vendor_probe: Optional[VendorProbe] = None,
+) -> dict[str, tuple[bool, str]]:
+    """``{vendor_id: (restore, reason)}`` — whether definitions a provider
+    switch parked for each vendor may come back now. The ONE rule both the
+    bundle update's restore (:func:`restore_parked_agents`) and the switch's
+    immediate apply (``vco_lib.model_providers``) use (review C-M4):
+
+    * a vendor still switched off stays parked (its key is never probed);
+    * a vendor switched on whose key does not resolve stays parked — exactly
+      what :func:`select_gateway_agents` would decide for its delivery, so a
+      restored file never sits at ``.claude/agents/`` without a manifest
+      entry;
+    * otherwise it is restored.
+
+    ``disabled_vendors`` defaults to the machine's off-list
+    (:func:`_default_disabled_vendors`).
+    """
+    wanted = sorted({v for v in vendor_ids if isinstance(v, str) and v})
+    off = (_default_disabled_vendors() if disabled_vendors is None
+           else frozenset(disabled_vendors))
+    out: dict[str, tuple[bool, str]] = {
+        v: (False, f"the {v!r} provider is switched off") for v in wanted if v in off}
+    reach = vendor_reachability((v for v in wanted if v not in off),
+                                vendor_probe=vendor_probe)
+    for vendor_id, (ok, reason) in reach.items():
+        out[vendor_id] = (ok, reason)
+    return out
+
+
 def restore_parked_agents(
     folder: Path,
     src_dir: Path,
@@ -888,6 +921,9 @@ def restore_parked_agents(
     skip_kinds: frozenset[str] = frozenset(),
     dry_run: bool = False,
     log: Optional[Callable[[str], None]] = None,
+    disabled_vendors: Optional[Iterable[str]] = None,
+    vendor_probe: Optional[VendorProbe] = None,
+    gate: Optional[Mapping[str, tuple[bool, str]]] = None,
 ) -> list[str]:
     """Bring back the definitions THIS switch parked, for providers now on.
 
@@ -898,8 +934,12 @@ def restore_parked_agents(
     enumeration re-deliver and refresh the definition (without it the
     ``skip-disabled`` guard would leave the definition parked forever).
 
-    What is deliberately NOT restored:
+    What is deliberately NOT restored (:func:`restore_gate` — pass ``gate``
+    when the caller already computed it, else ``disabled_vendors`` /
+    ``vendor_probe`` feed it):
     * a vendor that is still switched off (its copies stay parked);
+    * a vendor switched on whose key does not resolve (its copies stay
+      parked until the key resolves — the delivery gate would hold it);
     * a definition this release no longer ships (the parked copy is the user's
       to keep; nothing deletes it);
     * an entry whose enabled-side copy also exists (nothing is overwritten);
@@ -918,12 +958,20 @@ def restore_parked_agents(
         return []
     from vco_lib.bundle_kinds import disabled_counterpart
 
-    off = _default_disabled_vendors()
+    if gate is None:
+        gate = restore_gate(
+            (v for v in prior.values() if isinstance(v, str)),
+            disabled_vendors=disabled_vendors, vendor_probe=vendor_probe)
     restored: list[str] = []
+    held_logged: set[str] = set()
     for dest_rel, vendor_id in sorted(prior.items()):
         if not isinstance(dest_rel, str) or not isinstance(vendor_id, str):
             continue
-        if vendor_id in off:
+        ok, why = gate.get(vendor_id, (False, "no restore decision"))
+        if not ok:
+            if log is not None and vendor_id not in held_logged:
+                held_logged.add(vendor_id)
+                log(f"{vendor_id!r} definitions stay parked: {why}")
             continue
         name = _agent_definition_name(dest_rel)
         if name is None or not (Path(src_dir) / name).is_file():

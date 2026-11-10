@@ -259,17 +259,25 @@ def _install_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _switch_targets(root: Path, db_path: Optional[Path]) -> List[tuple]:
-    """``[(display name, folder)]`` — the orchestrator root first, then every
-    registered project (the root deduplicated out of the rows)."""
-    from vco_lib.project_move import registered_projects
+def _switch_targets(root: Path, db_path: Optional[Path]) -> tuple:
+    """``([(display name, folder)], registry_error)`` — the orchestrator root
+    first, then every registered project (the root deduplicated out of the
+    rows). ``registry_error`` is non-empty when the project list could not be
+    read (review C-L1): the apply then reaches the root only and must say so,
+    never report "1 of 1" as if that were every project."""
+    from vco_lib.project_move import registered_projects_or_none
 
     targets: List[tuple] = [("orchestrator root", root)]
     try:
         root_resolved = root.resolve()
     except OSError:
         root_resolved = root
-    for row in registered_projects(db_path):
+    rows = registered_projects_or_none(db_path)
+    if rows is None:
+        return targets, ("the launcher's project list could not be read, so only "
+                         "the orchestrator root was reached; switch the provider "
+                         "again once the launcher database is readable")
+    for row in rows:
         folder = Path(str(row["folder_path"]))
         try:
             if folder.resolve() == root_resolved:
@@ -277,7 +285,7 @@ def _switch_targets(root: Path, db_path: Optional[Path]) -> List[tuple]:
         except OSError:
             pass
         targets.append((str(row.get("name") or folder), folder))
-    return targets
+    return targets, ""
 
 
 def _read_project_manifest(folder: Path) -> tuple:
@@ -422,8 +430,14 @@ def _apply_on_to(
     db_path: Optional[Path],
     held: bool,
     held_reason: str,
+    gate: Dict[str, tuple],
 ) -> dict:
-    """Restore what THIS switch parked of ``vendor_id`` in one project."""
+    """Restore what THIS switch parked of ``vendor_id`` in one project.
+
+    ``gate`` is :func:`vco_lib.module_gated_delivery.restore_gate`'s answer
+    for the vendor — the SAME rule the bundle update's restore applies, so a
+    definition held here for a missing key is held there too (review C-M4).
+    """
     from vco_lib import module_gated_delivery as mgd
 
     row = _row(name, folder)
@@ -452,7 +466,7 @@ def _apply_on_to(
         return row
     restored = mgd.restore_parked_agents(
         folder, src_dir, {mgd.PARKED_AGENTS_MANIFEST_KEY: mine},
-        verdict=verdict, log=row["notes"].append)
+        verdict=verdict, log=row["notes"].append, gate=gate)
     files = manifest.get("files")
     if not isinstance(files, dict):
         files = {}
@@ -504,7 +518,10 @@ def apply_provider_switch(
     never disagree about what a switch does. The restore leg respects the key
     gate: a vendor switched ON whose key does not resolve stays held (parked),
     exactly as the delivery gate would decide, and the summary's ``held`` /
-    ``held_reason`` say so.
+    ``held_reason`` say so. The bundle update's restore applies the same gate
+    (:func:`vco_lib.module_gated_delivery.restore_gate`, one rule), so held
+    definitions come back by the first update — or switch flip — after the key
+    resolves, never before.
 
     Returns the per-project summary the CLI payload and the GUI card render::
 
@@ -527,9 +544,14 @@ def apply_provider_switch(
         "parked_projects": 0,
         "restored_projects": 0,
         "failed_projects": 0,
+        "registry_error": "",
         "projects": [],
     }
-    targets = _switch_targets(root, db_path)
+    targets, registry_error = _switch_targets(root, db_path)
+    if registry_error:
+        summary["registry_error"] = registry_error
+        summary["failed_projects"] += 1
+        _warn_line(registry_error)
     if not src_dir.is_dir():
         for name, folder in targets:
             row = _row(name, folder)
@@ -539,23 +561,42 @@ def apply_provider_switch(
             summary["projects"].append(row)
         return summary
 
+    gate: Dict[str, tuple] = {}
     if enabled:
-        # The key gate is machine-wide, so it is probed ONCE for the run.
-        reach = mgd.vendor_reachability([vendor_id], vendor_probe=vendor_probe)
-        key_ok, key_reason = reach.get(
+        # The restore gate is machine-wide, so it is decided ONCE for the run
+        # — by the same function the bundle update's restore uses. The
+        # off-list is read from THIS run's database (review C-L2).
+        gate = mgd.restore_gate(
+            [vendor_id], disabled_vendors=disabled_vendors(db_path=db_path),
+            vendor_probe=vendor_probe)
+        key_ok, key_reason = gate.get(
             vendor_id, (False, "the key probe answered nothing"))
         summary["held"] = not key_ok
         summary["held_reason"] = "" if key_ok else key_reason
 
     outcomes = [] if enabled else _held_outcomes(src_dir, vendor_id)
+    from vco_lib.atomic import LockTimeout
+    from vco_lib.bundle_manifest_lock import APPLY_WAIT_S, bundle_manifest_lock
+
     for name, folder in targets:
         try:
-            if enabled:
-                row = _apply_on_to(
-                    name, folder, src_dir, vendor_id, db_path=db_path,
-                    held=summary["held"], held_reason=summary["held_reason"])
-            else:
-                row = _apply_off_to(name, folder, vendor_id, outcomes)
+            # Review C-M2: the bundle engine rewrites the same manifest; one
+            # writer at a time (vco_lib.bundle_manifest_lock).
+            with bundle_manifest_lock(folder, timeout_s=APPLY_WAIT_S):
+                if enabled:
+                    row = _apply_on_to(
+                        name, folder, src_dir, vendor_id, db_path=db_path,
+                        held=summary["held"], held_reason=summary["held_reason"],
+                        gate=gate)
+                else:
+                    row = _apply_off_to(name, folder, vendor_id, outcomes)
+        except LockTimeout:
+            row = _row(name, folder)
+            row["status"] = "failed"
+            row["error"] = (
+                "a bundle update is running in this project, so nothing was moved "
+                "here; run Update bundle on it once that update finishes — the "
+                "update applies the stored switch")
         except Exception as exc:  # noqa: BLE001 — one project fails, not the run
             row = _row(name, folder)
             row["status"] = "failed"

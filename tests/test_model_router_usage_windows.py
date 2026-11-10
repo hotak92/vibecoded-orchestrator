@@ -505,6 +505,31 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(states["zai"], uw.STATE_UNCONFIGURED)
         self.assertEqual(self.fetch.calls, [])
 
+    async def test_a_switched_off_vendor_is_never_asked_for_its_quota(self) -> None:
+        """Review C-L4: a provider switched off in Model providers gets no
+        quota fetch and no key resolution; its row says why."""
+        from unittest import mock
+
+        from model_router import provider_switch
+
+        asked: list[str] = []
+
+        async def vendor_key(vendor: Vendor) -> Optional[str]:
+            asked.append(vendor.vendor_id)
+            return self.key
+
+        service = self.make()
+        service._vendor_key = vendor_key  # record every key resolution
+        with mock.patch.object(provider_switch, "disabled_vendors",
+                               return_value=frozenset({"zai"})):
+            await service.refresh()
+        self.assertNotIn("zai", asked)
+        self.assertNotIn("https://quota.example/limit", [url for url, _h in self.fetch.calls])
+        zai = {v["id"]: v for v in service.snapshot()["vendors"]}["zai"]
+        self.assertEqual(zai["state"], uw.STATE_UNCONFIGURED)
+        self.assertIn("switched off", zai["problem"])
+        self.assertEqual(zai["windows"], [])
+
     async def test_newer_headers_win_and_alone_make_claude_known(self) -> None:
         service = self.make()
         service.observe_anthropic_headers({

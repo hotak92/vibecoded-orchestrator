@@ -2681,6 +2681,43 @@ async def _stream_after(
         yield chunk
 
 
+def _rung_key(route: Any) -> tuple:
+    """A ladder rung's identity: ``(vendor id, forwarded model)`` — two
+    models of ONE vendor are two rungs (review C-L5)."""
+    vendor = getattr(route, "vendor", None)
+    vendor_id = vendor.vendor_id if vendor is not None else ""
+    return (vendor_id, str(getattr(route, "forward_model", "") or "").lower())
+
+
+def _first_servable_rung(
+    decision: Any,
+    first: Any,
+    switched_off: "frozenset[str] | set[str]",
+    next_rung: Callable[[Any], Any],
+    *,
+    on_skip: Optional[Callable[[Any], None]] = None,
+) -> Any:
+    """The first rung from ``first`` on whose vendor is NOT switched off, or
+    ``None``. Pure walk (review C-L5): a rung of the same vendor as the failed
+    route is a legitimate next rung — only the SKIP walk guards against a
+    cyclic table, keyed on ``(vendor, model)``, so it can never stand a real
+    rung down."""
+    seen = {_rung_key(decision)}
+    rung = first
+    while rung is not None:
+        vendor_id = rung.vendor.vendor_id if rung.vendor is not None else ""
+        if vendor_id not in switched_off:
+            return rung
+        key = _rung_key(rung)
+        if key in seen:
+            return None  # a cyclic table: stand the walk down
+        seen.add(key)
+        if on_skip is not None:
+            on_skip(rung)
+        rung = next_rung(rung)
+    return None
+
+
 def _ladder_escalation(
     *,
     request: web.Request,
@@ -2732,29 +2769,21 @@ def _ladder_escalation(
         # fabricates a success). The seen-set stands the walk down on a
         # cyclic table rather than looping forever. TTL-cached and fail-open
         # like every read of the switch (model_router.provider_switch).
-        switched_off = provider_switch.disabled_vendors()
-        seen = {decision.family_id}
-        while next_decision is not None:
-            rung_vendor = (
-                next_decision.vendor.vendor_id
-                if next_decision.vendor is not None else ""
-            )
-            if rung_vendor in seen:
-                next_decision = None
-                break
-            seen.add(rung_vendor)
-            if rung_vendor not in switched_off:
-                break
+        def _skipped(rung: Route) -> None:
+            rung_vendor = rung.vendor.vendor_id if rung.vendor is not None else ""
             logger.info(
                 "model-gateway: fallback ladder skips %s %s for %s: %s",
-                rung_vendor, next_decision.forward_model,
-                _log_safe(requested_model),
+                rung_vendor, rung.forward_model, _log_safe(requested_model),
                 provider_switch.refusal_text(
                     rung_vendor,
-                    vendor_display_name(next_decision.vendor)
-                    if next_decision.vendor is not None else rung_vendor),
+                    vendor_display_name(rung.vendor)
+                    if rung.vendor is not None else rung_vendor),
             )
-            next_decision = fallback_route(next_decision, vendors=gateway.vendors)
+
+        next_decision = _first_servable_rung(
+            decision, next_decision, provider_switch.disabled_vendors(),
+            lambda rung: fallback_route(rung, vendors=gateway.vendors),
+            on_skip=_skipped)
     if next_decision is None or payload is None:
         return None
     if facts is not None and facts.count_tokens:

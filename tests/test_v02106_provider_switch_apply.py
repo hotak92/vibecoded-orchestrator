@@ -228,6 +228,49 @@ class RestoreOnSwitchOnTests(ApplyBase):
                 self.manifest(folder)["provider_parked_agents"],
                 {f".claude/agents/{name}": "kimi" for name in KIMI_DEFS})
 
+    def test_a_bundle_update_keeps_a_key_held_restore_parked(self) -> None:
+        """Review C-M4: "held for a missing key" is a promise the bundle
+        update keeps too — the update's restore applies the SAME key gate
+        (``restore_gate``), so the definitions stay parked (no unmanaged
+        file at ``.claude/agents/``) until the key resolves, and then come
+        back with a manifest entry."""
+        no_key = mock.patch.object(mgd, "_default_vendor_probe",
+                                   lambda: (lambda _v: False))
+        with no_key:
+            code, payload, _err = self.set_cli("kimi", True)
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["agents"]["held"])
+        with no_key, t105._patch_signal(True):
+            self.install(self.proj, update=True)
+        self.assertEqual(self.enabled_names(self.proj), set())
+        self.assertEqual(self.parked_names(self.proj), set(KIMI_DEFS))
+        self.assertEqual(self.manifest(self.proj)["provider_parked_agents"],
+                         {f".claude/agents/{name}": "kimi" for name in KIMI_DEFS})
+        # The key resolves: the next update brings them back, managed.
+        with t105._patch_signal(True):
+            self.install(self.proj, update=True)
+        self.assertEqual(self.enabled_names(self.proj), set(KIMI_DEFS))
+        files = {k.replace("\\", "/") for k in self.manifest(self.proj)["files"]}
+        for name in KIMI_DEFS:
+            self.assertIn(f".claude/agents/{name}", files)
+
+    def test_the_on_leg_reads_the_off_list_from_its_own_database(self) -> None:
+        """Review C-L2: ``set --db-path X`` decides the restore from X's
+        off-list, not the default launcher.db's."""
+        other = self.tmp / "default.db"
+        shutil.copyfile(self.db_path, other)
+        # The DEFAULT database still says kimi is off; the run's own says on.
+        os.environ["VCT_LAUNCHER_DB_PATH"] = str(other)
+        with t105._patch_signal(True):
+            code, payload, _err = self.run_cli([
+                "set", "--vendor", "kimi", "--enabled", "--json",
+                "--db-path", str(self.db_path),
+                "--orchestrator-root", str(self.orch),
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["agents"]["restored_projects"], 3)
+        self.assertEqual(self.enabled_names(self.proj), set(KIMI_DEFS))
+
     def test_a_user_parked_copy_is_never_restored_by_the_switch(self) -> None:
         # The user parked kimi-reviewer in project-b BEFORE the switch moved
         # anything there: rebuild that state by hand.
@@ -254,6 +297,87 @@ class RestoreOnSwitchOnTests(ApplyBase):
                          / "kimi-implementer.md").is_file())
 
 
+class BundleUpdateRaceTests(ApplyBase):
+    """Review C-M2: the provider switch and a bundle update both rewrite the
+    manifest; they are serialized on one per-project lock."""
+
+    def test_a_switch_during_a_running_update_moves_nothing_there(self) -> None:
+        import threading
+
+        from vco_lib import bundle_manifest_lock as bml
+
+        held, release = threading.Event(), threading.Event()
+
+        def running_update() -> None:  # holds the lock as the engine does
+            with bml.bundle_manifest_lock(self.proj_b):
+                held.set()
+                release.wait(30)
+
+        worker = threading.Thread(target=running_update)
+        worker.start()
+        try:
+            assert held.wait(10)
+            with mock.patch.object(bml, "APPLY_WAIT_S", 0.3):
+                code, payload, _err = self.set_cli("kimi", False)
+        finally:
+            release.set()
+            worker.join(10)
+        self.assertEqual(code, 0)
+        agents = payload["agents"]
+        row = [p for p in agents["projects"] if p["folder"] == str(self.proj_b)][0]
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("bundle update is running", row["error"])
+        self.assertEqual(agents["failed_projects"], 1)
+        # Nothing moved in the busy project; its manifest is untouched.
+        self.assertEqual(self.enabled_names(self.proj_b), set(KIMI_DEFS))
+        self.assertNotIn("provider_parked_agents", self.manifest(self.proj_b))
+        # The others were applied.
+        self.assertEqual(self.parked_names(self.proj), set(KIMI_DEFS))
+
+    def test_a_bundle_update_waits_for_a_running_apply(self) -> None:
+        import threading
+
+        from vco_lib import bundle_manifest_lock as bml
+
+        held, release, done = threading.Event(), threading.Event(), threading.Event()
+
+        def running_apply() -> None:
+            with bml.bundle_manifest_lock(self.proj):
+                held.set()
+                release.wait(30)
+
+        def update() -> None:
+            with t105._patch_signal(True):
+                self.install(self.proj, update=True)
+            done.set()
+
+        holder = threading.Thread(target=running_apply)
+        holder.start()
+        assert held.wait(10)
+        updater = threading.Thread(target=update)
+        updater.start()
+        try:
+            self.assertFalse(done.wait(1.0),
+                             "the update wrote while the apply held the manifest")
+        finally:
+            release.set()
+            holder.join(10)
+        updater.join(120)
+        self.assertTrue(done.is_set())
+
+    def test_a_dry_run_and_a_folder_without_claude_take_no_lock(self) -> None:
+        from vco_lib import bundle_manifest_lock as bml
+
+        bare = self.tmp / "bare"
+        bare.mkdir()
+        with bml.bundle_manifest_lock(bare):
+            pass
+        self.assertFalse((bare / ".claude").exists())
+        with bml.bundle_manifest_lock(self.proj, timeout_s=0.1):
+            with t105._patch_signal(True):
+                self.install(self.proj, update=True, dry_run=True)  # no deadlock
+
+
 class SoftFailTests(ApplyBase):
     def test_one_unreadable_project_never_stops_the_rest(self) -> None:
         # A manifest that is not JSON fails THAT project, not the run.
@@ -269,6 +393,23 @@ class SoftFailTests(ApplyBase):
         self.assertTrue(row["error"])
         self.assertEqual(self.parked_names(self.proj), set(KIMI_DEFS))
         self.assertEqual(self.parked_names(self.orch), set(KIMI_DEFS))
+
+    def test_an_unreadable_project_list_is_reported_not_read_as_empty(self) -> None:
+        """Review C-L1: a registry read that fails is not "no projects" — the
+        apply reaches the root, counts the miss and says why."""
+        from vco_lib import project_move
+
+        with mock.patch("vco_lib.launcher_db_reader._open_db_readonly",
+                        return_value=None):
+            self.assertEqual(project_move.registered_projects(self.db_path), [])
+            self.assertIsNone(project_move.registered_projects_or_none(self.db_path))
+            summary = mp.apply_provider_switch(
+                "kimi", False, db_path=self.db_path, orchestrator_root=self.orch,
+                vendor_probe=lambda _v: True)
+        self.assertIn("could not be read", summary["registry_error"])
+        self.assertEqual(summary["failed_projects"], 1)
+        self.assertEqual([p["project"] for p in summary["projects"]],
+                         ["orchestrator root"])
 
     def test_a_project_without_a_manifest_is_skipped_not_failed(self) -> None:
         lone = self.tmp / "lone"

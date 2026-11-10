@@ -1052,11 +1052,25 @@ class UsageWindows:
 
     # ── the fetches ──────────────────────────────────────────────────────
     async def refresh(self) -> None:
-        """Refresh every source once. Each source fails on its own."""
+        """Refresh every source once. Each source fails on its own.
+
+        A vendor the user switched off in Model providers is never asked for
+        its quota and its key is never resolved (review C-L4 — the same
+        promise the routes keep): its row says it is switched off."""
+        from . import provider_switch  # noqa: PLC0415 — cheap TTL-cached read
+
         await self._refresh_anthropic()
+        switched_off = provider_switch.disabled_vendors()
         for vendor in self._vendors.values():
-            if vendor.quota_url:
-                await self._refresh_quota_vendor(vendor)
+            if not vendor.quota_url:
+                continue
+            if vendor.vendor_id in switched_off:
+                usage = self._usage[vendor.vendor_id]
+                usage.windows = []
+                usage.problem = "switched off in Model providers"
+                usage.state = STATE_UNCONFIGURED
+                continue
+            await self._refresh_quota_vendor(vendor)
         await self._refresh_ledger()
         self._last_refresh = self._clock()
 

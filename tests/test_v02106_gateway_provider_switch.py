@@ -445,5 +445,40 @@ class RealOrderTests(GatewayTestBase):
         self.assertEqual(len(self.vendor_up.message_requests), 2)
 
 
+class LadderWalkTests(unittest.TestCase):
+    """Review C-L5: the cycle guard of the skip walk is keyed on
+    ``(vendor, model)`` and applies only while skipping, so a same-vendor
+    rung (``zai/glm-5.3`` → ``zai/glm-5.3-flash``) is never stood down."""
+
+    @staticmethod
+    def _rung(vendor_id: str, model: str) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(vendor=SimpleNamespace(vendor_id=vendor_id),
+                               forward_model=model, family_id=vendor_id)
+
+    def _walk(self, decision, first, off, chain):
+        from model_router import server
+
+        return server._first_servable_rung(
+            decision, first, frozenset(off), lambda r: chain.get(id(r)))
+
+    def test_a_same_vendor_rung_is_served_when_nothing_is_off(self) -> None:
+        decision = self._rung("zai", "glm-5.3")
+        flash = self._rung("zai", "glm-5.3-flash")
+        self.assertIs(self._walk(decision, flash, set(), {}), flash)
+
+    def test_a_switched_off_rung_is_skipped_to_the_next(self) -> None:
+        decision = self._rung("anthropic", "claude-haiku")
+        zai, qwen = self._rung("zai", "glm-5.3-flash"), self._rung("qwen", "qwen3.8-flash")
+        self.assertIs(self._walk(decision, zai, {"zai"}, {id(zai): qwen}), qwen)
+
+    def test_a_cyclic_table_of_switched_off_rungs_stands_down(self) -> None:
+        decision = self._rung("anthropic", "claude-haiku")
+        a, b = self._rung("zai", "glm-5.3"), self._rung("zai", "glm-5.3-flash")
+        chain = {id(a): b, id(b): a}
+        self.assertIsNone(self._walk(decision, a, {"zai"}, chain))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

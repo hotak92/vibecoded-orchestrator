@@ -66,7 +66,10 @@ export interface ProviderApplyProjectRow {
  * the vendor's agent definitions in the orchestrator root and every
  * registered project AT ONCE, and this is the per-project record of it.
  * `held` means the vendor was switched ON but its key does not resolve, so
- * the definitions stay parked — the same decision the delivery gate makes.
+ * the definitions stay parked — the same decision the delivery gate makes,
+ * and the bundle update's restore makes the same one (one rule,
+ * `module_gated_delivery.restore_gate`), so they return with the first
+ * update or switch after the key resolves.
  */
 export interface ProviderApplySummary {
   vendor: string;
@@ -76,6 +79,9 @@ export interface ProviderApplySummary {
   parked_projects: number;
   restored_projects: number;
   failed_projects: number;
+  /** Non-empty when the launcher's project list could not be read: only the
+   *  orchestrator root was reached (counted in `failed_projects`). */
+  registry_error?: string;
   projects: ProviderApplyProjectRow[];
 }
 
@@ -134,7 +140,7 @@ export function applyOutcomeLabel(result: ModelProviderSetResult): string {
   if (a.held) {
     return (
       `Its agent definitions stay parked (${a.held_reason || 'the key does not resolve'}) ` +
-      '— they come back by themselves once the key resolves.'
+      '— they come back with the first bundle update (or provider switch) after the key resolves.'
     );
   }
   const moved = result.enabled ? a.restored_projects : a.parked_projects;
@@ -147,6 +153,9 @@ export function applyOutcomeLabel(result: ModelProviderSetResult): string {
     out +=
       `, but the follow-up failed in ${a.failed_projects} ` +
       `${a.failed_projects === 1 ? 'project' : 'projects'} — flip the switch again or let the next update finish it`;
+  }
+  if (a.registry_error) {
+    out += ` (${a.registry_error})`;
   }
   return out + '.';
 }

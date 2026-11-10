@@ -36,9 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   happened per project. The running model gateway follows within a couple of seconds: a switched-off provider
   disappears from the `/v1/models` picker (its model list is not even fetched), a request naming one of its model
   ids is refused locally with the cause and the remedy instead of being forwarded, the quota fallback ladder
-  skips it, and the subagent pre-flight refuses to launch its agents with that same reason. Switching a provider
-  back on whose key does not resolve keeps its definitions parked until the key resolves, exactly as a bundle
-  update would decide. The shell form (`python -m vco_lib.model_providers set --vendor <id> --disabled`) does the
+  skips it, its quota is no longer read for the usage card, and the subagent pre-flight refuses to launch its agents
+  with that same reason. Switching a provider back on whose key does not resolve keeps its definitions parked until
+  the key resolves — the bundle update's restore applies the same key check, so they come back with the first
+  update or switch after the key resolves, never before. A switch and a bundle update never write a project's
+  manifest at the same time: the switch waits up to 20 s for a running update, and a project whose update is still
+  running is reported (run Update bundle on it afterwards — the update applies the stored switch). If the launcher's
+  project list cannot be read, the card says so instead of reporting the root alone as every project. The shell form (`python -m vco_lib.model_providers set --vendor <id> --disabled`) does the
   same apply and prints the per-project outcome.
 
 - **Remove a project from a terminal.** `vct-launcher --remove-project <id|slug|name>` (the launcher binary under

@@ -78,6 +78,7 @@ from vco_lib import migration_plan_classify as _mpc
 from vco_lib import git_exclude as _git_exclude
 from vco_lib import jsonc_edit as _jsonc_edit
 from vco_lib import manifest_paths as _manifest_paths
+from vco_lib.bundle_manifest_lock import serialized_bundle_run as _serialized_bundle_run
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
 # v0.2.103 (review L-1): the formats-migration deferral emitters (whose
@@ -8550,6 +8551,7 @@ def _record_preserve(
     )
 
 
+@_serialized_bundle_run  # review C-M2: one writer of the manifest at a time
 def install_project_bundle(
     folder: Path,
     orchestrator_root: Optional[Path] = None,

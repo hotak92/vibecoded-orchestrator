@@ -55,8 +55,17 @@ use crate::db::Db;
 
 use super::model_gateway::{python_module_command, python_or_err, run_to_completion_within};
 
-/// The helper's own ceiling: one DB read plus one key-state probe per vendor.
+/// The `status` ceiling: one DB read plus one key-state probe per vendor.
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `set` ceiling (review C-L3). A `set` stores the choice and then
+/// applies it in the orchestrator root and EVERY registered project: per
+/// project it hashes and moves agent files, may wait up to 20 s for a bundle
+/// update holding that project's manifest (`vco_lib.bundle_manifest_lock`),
+/// and an ON probes the vendor key once through the hub (up to its 30 s
+/// secret-read bound). Generous by design — a slow disk or many projects
+/// must not turn a stored switch into a reported failure.
+const PROVIDER_SET_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// The argv tail of a `status` read, after the interpreter's own `-m`.
 /// Split out so the argv shape is unit-testable without a Python.
@@ -86,9 +95,30 @@ fn set_args(vendor: &str, enabled: bool) -> Vec<String> {
 /// written) and is returned as-is; the GUI renders it. Only an unparseable
 /// answer is an error.
 fn run_model_providers(args: Vec<String>) -> Result<serde_json::Value, String> {
+    let limit = if args.first().map(String::as_str) == Some("set") {
+        PROVIDER_SET_TIMEOUT
+    } else {
+        PROVIDER_TIMEOUT
+    };
     let python = python_or_err()?;
     let root = crate::commands::installer::find_local_repo_root().ok();
-    run_model_providers_with(&python, root.as_deref(), args)
+    run_model_providers_with(&python, root.as_deref(), args, limit)
+}
+
+/// Whether a `status` payload shows `vendor` in the `enabled` state — the
+/// stored choice, read back after a `set` that did not answer (killed at its
+/// bound, crashed mid-apply). Pure, so it is unit-tested.
+fn status_shows(status: &serde_json::Value, vendor: &str, enabled: bool) -> bool {
+    status
+        .get("providers")
+        .and_then(|p| p.as_array())
+        .map(|rows| {
+            rows.iter().any(|r| {
+                r.get("vendor").and_then(|v| v.as_str()) == Some(vendor)
+                    && r.get("enabled").and_then(|v| v.as_bool()) == Some(enabled)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// [`run_model_providers`] with an ALREADY-RESOLVED interpreter and install
@@ -98,13 +128,14 @@ fn run_model_providers_with(
     python: &std::path::Path,
     orchestrator_root: Option<&std::path::Path>,
     args: Vec<String>,
+    limit: Duration,
 ) -> Result<serde_json::Value, String> {
     let mut cmd = python_module_command(python, "vco_lib.model_providers", orchestrator_root);
     for a in args {
         cmd.arg(a);
     }
     let (code, stdout, stderr) =
-        run_to_completion_within(cmd, "vco_lib.model_providers", PROVIDER_TIMEOUT)?;
+        run_to_completion_within(cmd, "vco_lib.model_providers", limit)?;
     let body = stdout.trim();
     if body.is_empty() {
         return Err(format!(
@@ -149,11 +180,41 @@ pub async fn model_providers_set(
     vendor: String,
     enabled: bool,
 ) -> Result<serde_json::Value, String> {
-    let payload = tauri::async_runtime::spawn_blocking(move || {
+    let wanted = vendor.clone();
+    let answered = tauri::async_runtime::spawn_blocking(move || {
         run_model_providers(set_args(&vendor, enabled))
     })
     .await
-    .map_err(|e| format!("model-providers set task failed: {}", e))??;
+    .map_err(|e| format!("model-providers set task failed: {}", e))?;
+    let payload = match answered {
+        Ok(p) => p,
+        Err(e) => {
+            // Review C-L3: the helper stores the choice BEFORE its per-project
+            // apply, so a run that did not answer may still have stored it.
+            // Read it back; a stored switch still gets its guidance refresh,
+            // and the error says the setting stuck.
+            let check = wanted.clone();
+            let stored = tauri::async_runtime::spawn_blocking(move || {
+                run_model_providers(status_args())
+                    .map(|s| status_shows(&s, &check, enabled))
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if stored {
+                crate::commands::model_guidance::spawn_model_guidance_refresh(
+                    &db,
+                    crate::commands::model_guidance::REFRESH_TRIGGER_PROVIDERS,
+                );
+                return Err(format!(
+                    "the provider switch was saved, but applying it to the projects did not \
+                     finish ({}); run Update bundle on the projects to complete it",
+                    e
+                ));
+            }
+            return Err(e);
+        }
+    };
     if payload.get("stored").and_then(|v| v.as_bool()).unwrap_or(false) {
         // Fire-and-forget, exactly like the Secrets-panel trigger: the write
         // has already committed, so a skipped refresh is a log line, never an
@@ -226,6 +287,7 @@ mod tests {
             &fake_python,
             None,
             set_args("kimi", false),
+            PROVIDER_SET_TIMEOUT,
         )
         .expect("the recording interpreter answers JSON");
 
@@ -236,5 +298,24 @@ mod tests {
             argv.contains("-m\nvco_lib.model_providers\nset\n--vendor\nkimi\n--disabled\n--json"),
             "the child was not invoked as the Python home; argv log: {argv:?}"
         );
+    }
+
+    /// Review C-L3: a `set` that did not answer is read back from `status`;
+    /// only the vendor in the REQUESTED state counts as stored.
+    #[test]
+    fn a_stored_switch_is_recognised_from_the_status_payload() {
+        let status = serde_json::json!({"providers": [
+            {"vendor": "kimi", "enabled": false},
+            {"vendor": "zai", "enabled": true},
+        ]});
+        assert!(status_shows(&status, "kimi", false));
+        assert!(!status_shows(&status, "kimi", true));
+        assert!(!status_shows(&status, "qwen", false));
+        assert!(!status_shows(&serde_json::json!({}), "kimi", false));
+    }
+
+    #[test]
+    fn a_set_gets_a_longer_bound_than_a_status_read() {
+        assert!(PROVIDER_SET_TIMEOUT > PROVIDER_TIMEOUT);
     }
 }
