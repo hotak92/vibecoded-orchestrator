@@ -768,15 +768,12 @@ pub async fn list_legacy_codegraph_collections(
         })
         .collect();
 
-    let affected_projects: Vec<AffectedProject> = project_identities
-        .iter()
-        .filter(|(_id, _name, prefix)| prefix != LEGACY_CODEGRAPH_PREFIX)
-        .map(|(id, name, prefix)| AffectedProject {
-            project_id: id.clone(),
-            name: name.clone(),
-            current_prefix: prefix.clone(),
-        })
-        .collect();
+    // v0.2.106: only projects whose CURRENT prefix holds no code-graph data
+    // are offered a Re-analyze (field report: 21 offered, 20 of them already
+    // populated under their own prefix).
+    let prefixes_with_data: std::collections::HashSet<String> =
+        code_graph_by_prefix.keys().cloned().collect();
+    let affected_projects = projects_needing_reanalysis(&project_identities, &prefixes_with_data);
 
     // v0.2.15 (0.4): build orphan groups. For each orphan prefix found
     // in Weaviate, attempt to attribute it to a known project via the
@@ -801,6 +798,32 @@ pub async fn list_legacy_codegraph_collections(
         orphan_groups,
         action_recommended,
     })
+}
+
+/// The legacy-cleanup wizard's "Re-analyze" list: every project whose
+/// code-graph prefix is not the legacy one AND whose current prefix holds no
+/// code-graph data yet. `prefixes_with_data` is the set of prefixes with at
+/// least one non-empty code-graph class (the scan skips empty classes), keyed
+/// exactly as Weaviate names them — the same exact match the orphan
+/// protection (`protected_codegraph_prefixes`) uses.
+///
+/// Pre-v0.2.106 the second condition was missing, so every project was
+/// offered a re-analysis whenever the legacy collections existed, including
+/// projects whose own graph was already complete.
+pub(crate) fn projects_needing_reanalysis(
+    project_identities: &[(String, String, String)],
+    prefixes_with_data: &std::collections::HashSet<String>,
+) -> Vec<AffectedProject> {
+    project_identities
+        .iter()
+        .filter(|(_id, _name, prefix)| prefix != LEGACY_CODEGRAPH_PREFIX)
+        .filter(|(_id, _name, prefix)| !prefixes_with_data.contains(prefix))
+        .map(|(id, name, prefix)| AffectedProject {
+            project_id: id.clone(),
+            name: name.clone(),
+            current_prefix: prefix.clone(),
+        })
+        .collect()
 }
 
 /// Split a Weaviate class name into `(prefix, suffix)` where suffix is
@@ -1933,6 +1956,33 @@ fn _doc_imports() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.106 (field report: 21 projects offered a Re-analyze, 20 already
+    /// populated): only a project whose CURRENT prefix holds no code-graph
+    /// data is offered one; a legacy-prefix project never is.
+    #[test]
+    fn reanalysis_is_offered_only_where_the_current_prefix_has_no_data() {
+        let ids = vec![
+            ("p1".to_string(), "Alpha".to_string(), "Alpha".to_string()),
+            ("p2".to_string(), "Beta".to_string(), "Beta".to_string()),
+            (
+                "p3".to_string(),
+                "Old".to_string(),
+                LEGACY_CODEGRAPH_PREFIX.to_string(),
+            ),
+        ];
+        let with_data: std::collections::HashSet<String> =
+            ["Alpha".to_string(), LEGACY_CODEGRAPH_PREFIX.to_string()]
+                .into_iter()
+                .collect();
+        let offered = projects_needing_reanalysis(&ids, &with_data);
+        let names: Vec<&str> = offered.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta"], "Alpha has data; Old uses the legacy prefix");
+
+        let none = std::collections::HashSet::new();
+        let offered = projects_needing_reanalysis(&ids, &none);
+        assert_eq!(offered.len(), 2, "with no data anywhere both non-legacy projects need it");
+    }
 
     /// v0.2.105: the bridge reply maps field-for-field; a reply missing a
     /// field is an error, never a silent "not bound".
