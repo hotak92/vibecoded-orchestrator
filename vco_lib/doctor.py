@@ -126,6 +126,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -4467,10 +4468,21 @@ def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
     if not looks_like_orchestrator_root(root):
         return []
 
-    from vco_lib import bundle_staleness
+    from vco_lib import bundle_staleness, probe_bound
 
+    # Review C-M3: one engine dry-run per project can outlast the doctor's
+    # per-check bound on a machine with many projects. The census stops
+    # starting new projects before the bound ends (leaving a margin for the
+    # project in flight) and reports what it did not reach; a census that did
+    # not reach every project writes neither its state nor the ledger.
+    bound = probe_bound.deadline()
+    census_deadline = None
+    if bound is not None:
+        span = max(0.0, bound - time.monotonic())
+        census_deadline = bound - max(5.0, 0.2 * span)
     try:
-        payload = bundle_staleness.run_census(root, refresh_ledger=True)
+        payload = bundle_staleness.run_census(
+            root, refresh_ledger=True, deadline=census_deadline)
     except Exception as exc:  # noqa: BLE001 — census must never fail the pass
         return [
             Finding(
@@ -4501,6 +4513,28 @@ def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
                     "before the first launcher boot; never read as '0 stale'."
                 ),
                 detail={"registry": "unavailable"},
+            )
+        ]
+
+    not_reached = int(payload.get("not_checked") or 0)
+    if not_reached and stale == 0:
+        # Incomplete and nothing stale among the projects it reached: never
+        # an OK carrying the cid (that would CLEAR a real entry for the
+        # projects it did not look at).
+        return [
+            Finding(
+                probe="bundle_staleness",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"bundle census: {len(rows) - not_reached} of {len(rows)} "
+                    "registered project(s) checked within the doctor's "
+                    f"per-check bound ({current} current, "
+                    f"{unknown - not_reached} undetermined); {not_reached} not "
+                    "checked. Run `python -m vco_lib.bundle_staleness` for the "
+                    "full census (no bound), or raise VCT_DOCTOR_CHECK_TIMEOUT_S"
+                ),
+                detail={"stale": 0, "unknown": unknown, "current": current,
+                        "not_checked": not_reached},
             )
         ]
 
@@ -5160,14 +5194,26 @@ def _run_probe_bounded(
     becomes an ``unknown`` finding that says it was NOT CHECKED — never a
     failure, because "I could not look" is not "it is broken". A probe that
     raises keeps the pre-existing degrades-to-unknown contract.
+
+    Review C-M3: the worker runs inside :func:`vco_lib.probe_bound.bounded`.
+    A probe with a long legitimate runtime reads the deadline and stops in
+    time; when the bound is still overrun, the doctor CANCELS the probe and
+    every writer it can reach (the ledger emitter, the census state, the
+    case-history ledger) writes nothing from then on — an abandoned probe can
+    never change the ledger after the report said "not checked".
     """
     if timeout_s <= 0:
         return list(fn(folder, res, ctx) or [])
+    from vco_lib import probe_bound
+
     outcome: dict = {}
+    cancel = threading.Event()
+    until = time.monotonic() + timeout_s
 
     def _target() -> None:
         try:
-            outcome["findings"] = list(fn(folder, res, ctx) or [])
+            with probe_bound.bounded(until, cancel):
+                outcome["findings"] = list(fn(folder, res, ctx) or [])
         except BaseException as exc:  # noqa: BLE001 — reported, never re-raised in a thread
             outcome["error"] = exc
 
@@ -5177,6 +5223,7 @@ def _run_probe_bounded(
     worker.start()
     worker.join(timeout_s)
     if worker.is_alive():
+        cancel.set()
         return [
             Finding(
                 probe=probe_id,
@@ -5184,7 +5231,8 @@ def _run_probe_bounded(
                 summary=(
                     f"not checked — exceeded the {int(timeout_s)} s per-check "
                     "bound (raise VCT_DOCTOR_CHECK_TIMEOUT_S or re-run when "
-                    "the machine is less loaded)"
+                    "the machine is less loaded); it was cancelled and writes "
+                    "nothing"
                 ),
             )
         ]

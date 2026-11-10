@@ -426,6 +426,84 @@ def test_a_slow_probe_is_reported_not_checked_not_as_a_failure(monkeypatch):
     assert any(f.probe == "fast" for f in report.findings)
 
 
+def test_an_abandoned_probe_writes_nothing_afterwards(tmp_path, monkeypatch):
+    """Review C-M3: a probe past its bound is CANCELLED — when its thread
+    finally reaches the ledger writer, nothing is written."""
+    import threading
+
+    from vco_lib import deferral_emit, doctor
+    from vco_lib.deferral_report import DeferralEntry
+
+    release = threading.Event()
+
+    def _late_writer(folder, _res, _ctx):
+        release.wait(30)  # still running when the doctor gives up
+        with deferral_emit.locked_report(folder) as report:
+            report.add_entry(DeferralEntry(
+                condition_id="late_probe_write", title="late",
+                detected="written after the bound", why_deferred="x",
+                command_to_apply="true", severity="info", kg_node_refs=[]))
+        return []
+
+    project = tmp_path / "proj"
+    (project / ".claude" / "context").mkdir(parents=True)
+    monkeypatch.setenv("VCT_DOCTOR_CHECK_TIMEOUT_S", "1")
+    monkeypatch.setattr(doctor, "PROBES", {"late": (_late_writer, (doctor.SCOPE_FULL,))})
+    report = doctor.run_doctor(project)
+    [late] = report.findings
+    assert late.status == doctor.STATUS_UNKNOWN and "writes nothing" in late.summary
+    release.set()
+    for t in threading.enumerate():
+        if t.name == "doctor-probe-late":
+            t.join(10)
+    assert not (project / ".claude" / "context" / "UPDATE_DEFERRED.md").exists()
+    # The same writer outside a probe writes as before.
+    _late_writer(project, None, None)
+    assert (project / ".claude" / "context" / "UPDATE_DEFERRED.md").exists()
+
+
+def test_a_census_past_its_deadline_reports_the_rest_and_writes_nothing(
+        tmp_path, monkeypatch):
+    """Review C-M3: the census stops starting projects at its deadline; the
+    rest are ``unknown/not_checked_time_bound`` and an incomplete census
+    writes neither its state nor the ledger."""
+    from vco_lib import bundle_staleness as bs
+    from vco_lib import launcher_db_reader
+
+    class _Ref:
+        def __init__(self, i):
+            self.id, self.name, self.folder = f"p{i}", f"P{i}", str(tmp_path / f"p{i}")
+
+    monkeypatch.setattr(launcher_db_reader, "list_registered_projects",
+                        lambda: [_Ref(1), _Ref(2)])
+    written = []
+    monkeypatch.setattr(bs, "_write_census_state", lambda *a, **k: written.append("state"))
+    monkeypatch.setattr(bs, "refresh_root_ledger", lambda *a, **k: written.append("ledger"))
+    payload = bs.run_census(tmp_path, deadline=time.monotonic() - 1)
+    assert payload["not_checked"] == 2
+    assert {r["reason"] for r in payload["projects"]} == {bs.REASON_NOT_CHECKED}
+    assert written == []
+    payload = bs.run_census(tmp_path)  # no deadline: complete, writes as before
+    assert payload["not_checked"] == 0 and written == ["state", "ledger"]
+
+
+def test_a_partial_census_is_never_an_ok_that_clears_the_entry(monkeypatch, tmp_path):
+    from vco_lib import bundle_staleness as bs
+    from vco_lib import doctor, paths
+
+    monkeypatch.setattr(paths, "looks_like_orchestrator_root", lambda _p: True)
+    monkeypatch.setattr(bs, "run_census", lambda *a, **k: {
+        "registry": "launcher.db", "running": {"version": "x"}, "remedy": {},
+        "summary": {"stale": 0, "unknown": 1, "current": 1}, "not_checked": 1,
+        "projects": [{"name": "A", "verdict": "current"},
+                     {"name": "B", "verdict": "unknown",
+                      "reason": bs.REASON_NOT_CHECKED}]})
+    [f] = doctor.probe_bundle_staleness(tmp_path, doctor.DoctorResolvers(), {})
+    assert f.status == doctor.STATUS_UNKNOWN
+    assert f.condition_id in (None, "")
+    assert "1 not checked" in f.summary
+
+
 # ── item 7: metrics migration compares content, not bytes ───────────────────
 
 

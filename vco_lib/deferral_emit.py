@@ -155,11 +155,15 @@ def locked_report(folder: Path, *, lock_timeout_s: Optional[float] = None,
         A :class:`DeferralReport` seeded from the on-disk state, ready to
         mutate. The write is performed on exit.
     """
+    from vco_lib import probe_bound
+
     folder = Path(folder)
     with exclusive_file_lock(folder / LOCK_REL, timeout_s=lock_timeout_s):
         report = DeferralReport.read(folder)
         yield report
-        if gate is None or gate.write:
+        # v0.2.106 review C-M3: a doctor probe the doctor has given up on
+        # (its per-check bound ran out) never writes the ledger afterwards.
+        if (gate is None or gate.write) and not probe_bound.cancelled():
             report.write(folder)
 
 

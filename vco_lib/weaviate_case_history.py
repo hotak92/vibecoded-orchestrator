@@ -149,8 +149,11 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
+    from vco_lib import probe_bound  # noqa: PLC0415
     from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
 
+    if probe_bound.cancelled():
+        return  # a doctor probe past its bound writes nothing (review C-M3)
     path = ledger_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")

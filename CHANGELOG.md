@@ -200,7 +200,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process being open was folded into "problem"; that state is now reported as not-checked ("the running image's
   version cannot be read from here"), because a running binary is not a stale one. Each check also has its own
   wall-clock bound (`VCT_DOCTOR_CHECK_TIMEOUT_S`, default 120 s): a check that overruns is reported as "not checked",
-  never as a failure, and the rest of the report still runs.
+  never as a failure, and the rest of the report still runs. A check that overruns is cancelled: it writes nothing
+  afterwards (no ledger entry added or cleared behind the report). The bundle census stops starting projects before
+  the bound ends and names the ones it did not reach; a census that did not reach every project leaves the ledger
+  alone (`python -m vco_lib.bundle_staleness` runs the full census without a bound).
 
 - **The metrics migration compares content, not byte counts.** Two files holding the same rows with different line
   endings (or a BOM), or a row appended by another writer during the copy, were reported as a failed copy with a

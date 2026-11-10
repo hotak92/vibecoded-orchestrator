@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
@@ -102,6 +103,10 @@ _VERDICT_UNKNOWN = "unknown"
 #: self-check found the bundle had NOT landed. The verdict stays the
 #: existing ``unknown`` — "could not prove current" is exactly what it means.
 REASON_SELF_CHECK_FAILED = "self_check_failed"
+
+#: ``reason`` of a project a time-bounded census (the doctor's per-check
+#: bound) did not reach — ``unknown``, never a verdict (v0.2.106).
+REASON_NOT_CHECKED = "not_checked_time_bound"
 
 #: Engine action buckets whose presence means an update WOULD change files.
 #: ``always-overwrite`` is deliberately ABSENT: the engine returns it for
@@ -327,6 +332,7 @@ def run_census(
     project_filter: Optional[str] = None,
     refresh_ledger: bool = True,
     write_state: bool = True,
+    deadline: Optional[float] = None,
 ) -> dict:
     """Run the census and return the §5.1 JSON payload. Never raises.
 
@@ -350,6 +356,14 @@ def run_census(
     A full census also persists its result as the root's census state — the
     cache :func:`record_project_now_current` flips, so a bundle update never
     has to re-census every OTHER project to keep the ledger count honest.
+
+    ``deadline`` (``time.monotonic()``, v0.2.106 review C-M3): no project is
+    STARTED after it; each project not reached is an ``unknown`` row with
+    reason :data:`REASON_NOT_CHECKED`, the payload's ``not_checked`` counts
+    them, and an incomplete census writes neither its state nor the ledger
+    (a partial population must never stand in for the whole). Nothing is
+    written either when the doctor cancelled the probe running this census
+    (:func:`vco_lib.probe_bound.cancelled`).
     """
     root = Path(
         orchestrator_root
@@ -375,8 +389,15 @@ def run_census(
         registry = "launcher.db"
         if project_filter:
             refs = [r for r in refs if _ref_matches(r, project_filter)]
-        rows = [_classify_registered_project(root, r, running) for r in refs]
+        rows = []
+        for r in refs:
+            if deadline is not None and time.monotonic() >= deadline:
+                rows.append(_project_row(r.id, r.name, str(r.folder),
+                                         _VERDICT_UNKNOWN, REASON_NOT_CHECKED))
+                continue
+            rows.append(_classify_registered_project(root, r, running))
         summary = _summary_of(rows)
+    not_checked = sum(1 for r in rows if r.get("reason") == REASON_NOT_CHECKED)
 
     payload = {
         "schema": CENSUS_SCHEMA,
@@ -386,9 +407,13 @@ def run_census(
         "projects": rows,
         "summary": summary,
         "remedy": {"gui": REMEDY_GUI, "cli": REMEDY_CLI_TEMPLATE},
+        "not_checked": not_checked,
     }
 
-    if project_filter is None and registry == "launcher.db":
+    from vco_lib import probe_bound
+
+    if (project_filter is None and registry == "launcher.db"
+            and not not_checked and not probe_bound.cancelled()):
         state = dict(payload)
         state["census_at"] = _now_iso()
         if write_state:
@@ -461,6 +486,9 @@ UNKNOWN_REASON_REMEDIES: tuple[tuple[str, str], ...] = (
     ("engine_error",
      "see the per-project detail in `python -m vco_lib.bundle_staleness "
      "--json`"),
+    (REASON_NOT_CHECKED,
+     "the doctor's per-check time bound ran out before this project — run "
+     "`python -m vco_lib.bundle_staleness` (no bound)"),
 )
 
 
