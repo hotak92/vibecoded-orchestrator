@@ -646,8 +646,8 @@ def test_shipped_gateway_agents_pin_to_the_router_namespace():
         "qwen-implementer-high.md": ("qwen", "qwen3.8-max"),
         "deepseek-researcher.md": ("qwen", "deepseek-v4.1-flash"),
         "qwen-flash-sweeper.md": ("qwen", "qwen3.8-flash"),
-        "kimi-implementer.md": ("kimi", "k3"),
-        "kimi-reviewer.md": ("kimi", "k3"),
+        "kimi-implementer.md": ("kimi", "k3.1-pro"),
+        "kimi-reviewer.md": ("kimi", "k3.1-pro"),
     }
 
     # The z.ai rows ride the shared namespace every panel rule keys on; the

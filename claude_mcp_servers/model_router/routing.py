@@ -240,6 +240,19 @@ def _unknown_for_vendor(
     one_m: bool,
 ) -> RouteError:
     suggestions = _suggest(remainder, vendors, extra, one_m)
+    if vendor.forward_verified_only:
+        # This row serves its verified ids and nothing else, so they ARE the
+        # answer to "what did you mean" — even when the refused spelling is
+        # too unlike them for the fuzzy match (a retired ``k3`` against the
+        # offered ``k3.1-pro``). They lead; the fuzzy neighbours fill the rest.
+        own = tuple(
+            with_1m(f"{vendor.namespace}{i}") if one_m
+            else f"{vendor.namespace}{i}"
+            for i in sorted(_known_ids(vendor, extra))
+        )
+        suggestions = tuple(dict.fromkeys(
+            (*own, *suggestions),
+        ))[:max(MAX_SUGGESTIONS, len(own))]
     hint = (
         " Did you mean " + " or ".join(repr(s) for s in suggestions) + "?"
         if suggestions else ""

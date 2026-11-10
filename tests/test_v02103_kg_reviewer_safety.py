@@ -322,7 +322,7 @@ def test_unavailable_model_falls_back_to_glm_53_not_a_flash(chain, monkeypatch):
     d = rig.decide()
     assert d["model"] == "claude-gw/glm-5.3[1m]", (d, rig.lines)
     rig.latch("kg_reviewer:claude-gw/glm-5.3")
-    assert rig.decide()["model"] == "claude-gw/kimi/k3[1m]", rig.lines
+    assert rig.decide()["model"] == "claude-gw/kimi/k3.1-pro[1m]", rig.lines
 
 
 def test_flash_only_gateway_means_skip(chain, monkeypatch):
@@ -339,11 +339,11 @@ def test_every_comparable_rung_down_keeps_the_openai_consent_gate(
         chain, monkeypatch):
     rig = _Rig(chain, monkeypatch, catalogue=_live_ids(), consent=True)
     rig.latch("kg_reviewer:sonnet", "kg_reviewer:claude-gw/glm-5.3",
-              "kg_reviewer:claude-gw/kimi/k3")
+              "kg_reviewer:claude-gw/kimi/k3.1-pro")
     assert rig.decide()["mode"] == "openai"
     rig2 = _Rig(chain, monkeypatch, catalogue=_live_ids(), consent=False)
     rig2.latch("kg_reviewer:sonnet", "kg_reviewer:claude-gw/glm-5.3",
-               "kg_reviewer:claude-gw/kimi/k3")
+               "kg_reviewer:claude-gw/kimi/k3.1-pro")
     assert rig2.decide()["mode"] == "skip"
 
 

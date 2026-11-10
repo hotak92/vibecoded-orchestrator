@@ -29,7 +29,7 @@ Model chain (owner rulings 2026-10-11, revised 2026-10-15):
    ``claude`` CLI, or its tier is breaker-latched for a REAL signal (quota /
    429 / auth), recorded by the ``record`` subcommand below;
 2. a gateway model of COMPARABLE capability — ``[fallback] gateway_rungs``
-   in ``vco_lib/kg_reviewer_config.toml`` (GLM-5.3, then Kimi K3) — ONLY
+   in ``vco_lib/kg_reviewer_config.toml`` (GLM-5.3, then Kimi K3.1 Pro) — ONLY
    when the local model gateway actually serves it (the catalogue is ASKED
    via ``GET /v1/models``, authenticated with the daemon's host token), its
    tier is not latched, and the ``claude`` CLI the rung spawns is on PATH.

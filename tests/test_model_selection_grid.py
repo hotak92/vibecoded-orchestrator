@@ -35,9 +35,10 @@ EXPECTED_SCORES = {
     "opus": ["10", "10", "9", "9", "5", "10", "8", "10", "9", "10", "4"],
     "fable": ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"],
     "glm-5.3": ["7", "5", "8", "6", "6", "6", "7*", "7", "7", "—", "8"],
-    # v0.2.102: scored from cited evidence, not the maintainer's
-    # grid — see the comment above the row in model_selection.toml.
-    "kimi-k3": ["7", "6", "6", "6*", "3", "7", "7*", "8", "8", "8", "3"],
+    # v0.2.106 (owner 2026-11-10): K3.1 Pro replaces K3, re-scored from
+    # cited benchmark evidence (Code 7 -> 8, Tools 7 -> 8) — see the comment
+    # above the row in model_selection.toml.
+    "kimi-k3.1-pro": ["8", "6", "6", "6*", "3", "8", "7*", "8", "8", "8", "3"],
     "deepseek-v4.1-flash": ["7", "6", "7", "6", "9", "6", "7", "8", "7", "7", "10"],
     "sonnet": ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"],
     "qwen3.8-max": ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"],
@@ -48,7 +49,7 @@ EXPECTED_SCORES = {
 
 #: Rows carrying the `†` marker (only xhigh/max benchmark results).
 #: GLM-5.3 lost its dagger 2026-10-16 (owner): ~110 own medium-effort lanes.
-EXPECTED_DAGGERS = {"kimi-k3", "qwen3.8-max", "glm-5.3-flash", "qwen3.8-flash"}
+EXPECTED_DAGGERS = {"kimi-k3.1-pro", "qwen3.8-max", "glm-5.3-flash", "qwen3.8-flash"}
 
 EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
                     "Instr", "LongCtx", "Docs", "Vision", "Cost"]
@@ -98,15 +99,15 @@ EXPECTED_NOTES = [
                 "own tests and still fail in the real order: ask for a real-order "
                 "check, and move a fix that two rounds closed only partly to "
                 "another model family."),
-    ("kimi-k3", "**Kimi K3** — near-frontier code quality on real repos and "
-                "strong long-context retrieval, but the slowest and most verbose "
-                "lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about "
-                "twice the median output tokens), so queue its work and review it "
-                "later. Give it small, bounded lanes or audits. It always reasons; "
-                "it can repeat the same tool call or stop on reasoning with no "
-                "answer, and it guesses confidently when unsure (51% hallucination "
-                "rate on uncertain questions), so demand quoted evidence in its "
-                "reviews."),
+    ("kimi-k3.1-pro", "**Kimi K3.1 Pro** — a real step up on long-horizon "
+                "coding (Terminal-Bench 4.0 about level with Opus 5.5) and a much "
+                "lower hallucination rate (vendor-reported), but every published "
+                "result is at max effort; `medium` maps to high and thinking cannot "
+                "be switched off, so it is slower and more token-hungry than K3 "
+                "(≈32 tok/s, minutes to the first answer token on hard tasks) and "
+                "wrong for bulk. Give it small, bounded lanes or audits, queue its "
+                "work, and still demand quoted evidence in its reviews. Start a new "
+                "conversation rather than switching an existing one to it."),
     ("glm-5.3-flash", "**GLM-5.3-Flash** suits bulk / first-pass work behind a "
                       "verifier — tests, a diff review or a stronger second pass; "
                       "retries help it, more effort does not (longer runs helped "
@@ -181,8 +182,8 @@ class TestProviderFilter:
 
     def test_kimi_key_adds_the_kimi_row_only(self):
         md = model_selection.render_grid(providers=frozenset({"anthropic", "kimi"}))
-        assert _rows_rendered(md) == set(CLAUDE_ROWS) | {"Kimi K3 †"}
-        assert "slowest and most verbose lane" in md
+        assert _rows_rendered(md) == set(CLAUDE_ROWS) | {"Kimi K3.1 Pro †"}
+        assert "thinking cannot be switched off" in md
         assert "GLM-5.3" not in md.split("Columns:")[0].split("|---|")[1]
         assert "fragile tool calls" not in md
 
@@ -190,7 +191,7 @@ class TestProviderFilter:
         md = model_selection.render_grid(
             providers=frozenset({"anthropic", "zai", "qwen"}))
         assert "Kimi K3" not in md
-        assert "slowest and most verbose lane" not in md
+        assert "thinking cannot be switched off" not in md
 
     def test_both_keys_render_every_row(self):
         md = model_selection.render_grid(

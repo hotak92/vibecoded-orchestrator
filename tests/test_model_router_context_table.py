@@ -55,10 +55,11 @@ EXPECTED_QWEN_SEED_IDS = {
     "deepseek-v4.1-flash",
 }
 
-#: The one Kimi Code row — K3 only (owner ruling 2026-10-07): 1048576, from
-#: the vendor's models page and the live /v1/models probe of the same day
-#: (pinned in ``tests/test_v02102_kimi_vendor.py``).
-EXPECTED_KIMI_SEED_IDS = {"k3"}
+#: The one Kimi Code row — K3.1 Pro only (owner ruling 2026-11-10, replacing
+#: the 2026-10-07 K3 row): 1048576, from the vendor's models page and the
+#: live /v1/models probe of the same day (pinned in
+#: ``tests/test_v02102_kimi_vendor.py``).
+EXPECTED_KIMI_SEED_IDS = {"k3.1-pro"}
 
 #: The first-party rows, read by TWO consumers.
 #: ``vco_lib.vscode_settings.decorate_1m`` reads ``window_1m``, so a

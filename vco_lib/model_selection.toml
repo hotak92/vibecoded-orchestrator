@@ -32,7 +32,7 @@
 # at render time (vco_lib/model_selection.py). GLM-5.3 is served by BOTH
 # vendors (z.ai's own endpoint and the QwenCloud Token Plan both list it);
 # GLM-5.3-Flash by z.ai only; the DeepSeek and Qwen rows by the qwen vendor
-# only; Kimi K3 by the kimi vendor (Kimi Code) only.
+# only; Kimi K3.1 Pro by the kimi vendor (Kimi Code) only.
 #
 # A score is "1".."10" within this set, AT MEDIUM EFFORT. "*" marks an
 # assumed score (no benchmark and fewer than 3 comparison reports), "†"
@@ -95,21 +95,24 @@ providers = ["zai", "qwen"]
 # their own tests and still failed in the real order across several rounds.
 scores = ["7", "5", "8", "6", "6", "6", "7*", "7", "7", "—", "8"]
 
-# Kimi K3 (v0.2.102) is NOT from the maintainer's grid: it was scored from
-# public evidence read 2026-10-07 — Moonshot's model card and Kimi Code docs,
-# Superconductor's custom SWE-bench, Friendli's GLM-5.3 head-to-head, and
-# Artificial Analysis figures (speed, verbosity, hallucination rate).
-# Every published K3 number is at effort max (hence the dagger); VCO runs
-# medium, which Kimi Code maps to high. `*` = no benchmark and fewer than 3
-# reports (Review: no review benchmark or review report exists; Plan and
-# Instr: one user report each).
+# Kimi K3.1 Pro (v0.2.106, owner ruling 2026-11-10: it REPLACES K3, and the
+# row is RE-SCORED the same day from benchmark evidence — Moonshot's K3.1 Pro
+# tech report, Artificial Analysis and Vals). Changes from K3: Code 7 -> 8
+# (Terminal-Bench 4.0 about level with Opus 5.5 across three sources; best
+# SWE-Marathon), Tools 7 -> 8 (Terminal-Bench 4.0, AutomationBench); every
+# other cell is unchanged. The dagger STAYS for the reason it names: every
+# published K3.1 Pro result is at reasoning effort max — there is no
+# medium/high data, the model's effort floor is high (Kimi Code maps medium
+# to high) and thinking cannot be switched off. `*` = no benchmark and fewer
+# than 3 reports (Plan and Instr). The hallucination improvement is
+# vendor-reported only, so Review is unchanged until own lanes exist.
 [[row]]
-id = "kimi-k3"
-model = "Kimi K3"
+id = "kimi-k3.1-pro"
+model = "Kimi K3.1 Pro"
 dagger = true
 reach_via = "kimi-implementer / kimi-reviewer"
 providers = ["kimi"]
-scores = ["7", "6", "6", "6*", "3", "7", "7*", "8", "8", "8", "3"]
+scores = ["8", "6", "6", "6*", "3", "8", "7*", "8", "8", "8", "3"]
 
 [[row]]
 id = "deepseek-v4.1-flash"
@@ -213,8 +216,8 @@ models = ["glm-5.3"]
 text = "**GLM-5.3 as implementer** — strong on bounded lanes whose brief names the files and the acceptance criteria. Its recurring misses are \"every call-site\" coverage claims (check them with an independent grep), line-count / ASCII gates, and stray working-tree edits while proving a test red — name each in the brief. Fixes to install-order or stateful code can pass their own tests and still fail in the real order: ask for a real-order check, and move a fix that two rounds closed only partly to another model family."
 
 [[note]]
-models = ["kimi-k3"]
-text = "**Kimi K3** — near-frontier code quality on real repos and strong long-context retrieval, but the slowest and most verbose lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about twice the median output tokens), so queue its work and review it later. Give it small, bounded lanes or audits. It always reasons; it can repeat the same tool call or stop on reasoning with no answer, and it guesses confidently when unsure (51% hallucination rate on uncertain questions), so demand quoted evidence in its reviews."
+models = ["kimi-k3.1-pro"]
+text = "**Kimi K3.1 Pro** — a real step up on long-horizon coding (Terminal-Bench 4.0 about level with Opus 5.5) and a much lower hallucination rate (vendor-reported), but every published result is at max effort; `medium` maps to high and thinking cannot be switched off, so it is slower and more token-hungry than K3 (≈32 tok/s, minutes to the first answer token on hard tasks) and wrong for bulk. Give it small, bounded lanes or audits, queue its work, and still demand quoted evidence in its reviews. Start a new conversation rather than switching an existing one to it."
 
 [[note]]
 models = ["glm-5.3-flash"]

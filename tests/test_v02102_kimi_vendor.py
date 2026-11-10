@@ -2,15 +2,19 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.102 lane W1-K — the Kimi Code subscription as a gateway vendor.
 
-Owner order 2026-10-07, narrowed the same day to K3 only. What is pinned:
+Owner order 2026-10-07, narrowed the same day to K3 only; since the owner
+ruling of 2026-11-10 ("Kimi K3.1 Pro REPLACES K3 in VCO") the one offered id
+is ``k3.1-pro`` and ``k3`` is refused like every other Kimi id. What is
+pinned:
 
 * the registry row: namespace, upstream, the ``x-api-key`` auth shape, the
   secret names (``KIMI_API_KEY`` is the owner's keychain slot; the Moonshot
   pay-as-you-go name is never tried), the one offered id;
 * routing: the endpoint is a WILDCARD ALIAS (live 2026-10-07: any name
   answers 200 and is echoed back), so ``forward_verified_only`` forwards
-  ``k3`` alone and refuses every other id — namespaced, bare, inside the
-  ``k3`` family, or present on the vendor's own live list;
+  ``k3.1-pro`` alone and refuses every other id — namespaced, bare, inside
+  the ``k3`` family (``k3`` itself included), or present on the vendor's own
+  live list — each refusal naming ``claude-gw/kimi/k3.1-pro``;
 * the wire: the vendor key goes out as ``x-api-key`` with no scheme, the
   host token never leaves, and the CLIENT's user-agent is relayed — on
   ``/v1/messages``, on the model-list fetch a client's ``/v1/models``
@@ -24,14 +28,16 @@ Owner order 2026-10-07, narrowed the same day to K3 only. What is pinned:
   is deliberately not read) and monthly windows from
   ``usages.*.used_ratio``; the fetch speaks the kimi quota dialect
   (``x-api-key`` + the relayed client UA) while Z.ai keeps its own;
-* the catalog: the live list publishes only ``k3[1m]`` (everything else
-  withheld and reported), the keyless fallback (the shipped snapshot,
-  narrowed the same way) is ``k3``, an OpenAI-style
+* the catalog: the live list publishes only ``k3.1-pro[1m]`` (everything
+  else withheld and reported), the keyless fallback (the shipped snapshot,
+  narrowed the same way) is ``k3.1-pro``, an OpenAI-style
   ``context_length`` is read where no table row speaks, and the cited table
   row still wins;
-* the context table: the k3 row cites the vendor docs at 1048576 with the
-  ``[1m]`` companion (docs + live probe), and names the Plus-plan cap;
-* effort: every value Claude Code sends is accepted, so nothing is rewritten.
+* the context table: the k3.1-pro row cites the vendor docs at 1048576 with
+  the ``[1m]`` companion (docs + live probe), and names the Plus-plan cap;
+* effort: every value Claude Code sends is accepted, so nothing is rewritten;
+  thinking OFF is refused by K3.1 Pro (live 2026-11-10: HTTP 400), so such a
+  request is forwarded with thinking on at ``low`` — on the wire too.
 
 The launcher half (the seed reaching the launcher's table and the
 Preferences -> Chat model context page) is pinned in Rust:
@@ -78,9 +84,12 @@ from tests.test_model_router_usage_windows import (  # noqa: E402 — shared fak
 KIMI = VENDORS["kimi"]
 
 #: The vendor's whole live list as the coordinator's probe saw its ids
-#: (2026-10-07), with the ``context_length`` field the list carries.
+#: (2026-11-10), with the ``context_length`` field the list carries.
 LIVE_LIST = {
     "data": [
+        {"id": "k3.1-pro", "display_name": "K3.1 Pro", "context_length": 1048576},
+        {"id": "k3.1-pro-highspeed", "display_name": "K3.1 Pro Highspeed",
+         "context_length": 1048576},
         {"id": "k3", "display_name": "K3", "context_length": 1048576},
         {"id": "k3-256k", "display_name": "K3", "context_length": 262144},
         {"id": "kimi-for-coding", "display_name": "K2.8 Preview",
@@ -109,9 +118,9 @@ class RegistryRowTests(unittest.TestCase):
         self.assertEqual(KIMI.auth_header, "x-api-key")
         self.assertEqual(KIMI.auth_scheme, "")
 
-    def test_only_k3_is_offered(self) -> None:
-        """Owner ruling 2026-10-07: "only need K3"."""
-        self.assertEqual(KIMI.verified_ids, ("k3",))
+    def test_only_k3_1_pro_is_offered(self) -> None:
+        """Owner ruling 2026-11-10: "Kimi K3.1 Pro REPLACES K3 in VCO"."""
+        self.assertEqual(KIMI.verified_ids, ("k3.1-pro",))
         # Standard discovery: the fallback is the shipped snapshot.
         self.assertEqual(KIMI.static_ids, ())
         self.assertEqual(KIMI.bare_id_prefixes, ("k3",))
@@ -140,10 +149,10 @@ class RegistryRowTests(unittest.TestCase):
 class RoutingTests(unittest.TestCase):
     def test_namespaced_ids_route_to_kimi_under_their_real_id(self) -> None:
         for model_id, bare in (
-            ("claude-gw/kimi/k3", "k3"),
-            ("claude-gw/kimi/k3[1m]", "k3"),
-            ("k3", "k3"),
-            ("k3[1m]", "k3"),
+            ("claude-gw/kimi/k3.1-pro", "k3.1-pro"),
+            ("claude-gw/kimi/k3.1-pro[1m]", "k3.1-pro"),
+            ("k3.1-pro", "k3.1-pro"),
+            ("k3.1-pro[1m]", "k3.1-pro"),
         ):
             with self.subTest(model=model_id):
                 decision = routing.route(model_id)
@@ -158,9 +167,12 @@ class RoutingTests(unittest.TestCase):
         name, so forwarding one is a model the user did not choose. The
         vendor's OWN live list (``known_ids``) does not change that."""
         live = {"kimi": frozenset(
-            {"k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"},
+            {"k3.1-pro", "k3.1-pro-highspeed", "k3", "k3-256k",
+             "kimi-for-coding", "kimi-for-coding-highspeed"},
         )}
         for model_id in (
+            "claude-gw/kimi/k3", "claude-gw/kimi/k3[1m]", "k3", "k3[1m]",
+            "claude-gw/kimi/k3.1-pro-highspeed", "k3.1-pro-highspeed",
             "claude-gw/kimi/k3-256k", "k3-256k", "k3-nonsense",
             "claude-gw/kimi/kimi-for-coding", "claude-gw/kimi/nonsense-model-xyz",
             "claude-gw/kimi/kimi-for-coding-highspeed[1m]",
@@ -173,20 +185,48 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(decision.reason, "unknown_model")
                     self.assertFalse(
                         any("kimi-for-coding" in s or "k3-256k" in s
+                            or "highspeed" in s or s.endswith("/k3")
+                            or s.endswith("/k3[1m]")
+                            for s in decision.suggestions),
+                        decision.suggestions,
+                    )
+                    # The one id the row serves is always named.
+                    self.assertTrue(
+                        any(s.startswith("claude-gw/kimi/k3.1-pro")
                             for s in decision.suggestions),
                         decision.suggestions,
                     )
 
     def test_the_refusal_suggests_the_verified_id(self) -> None:
-        decision = routing.route("claude-gw/kimi/k33")
+        decision = routing.route("claude-gw/kimi/k3.2-pro")
         assert isinstance(decision, RouteError)
-        self.assertIn("claude-gw/kimi/k3", decision.suggestions)
+        self.assertIn("claude-gw/kimi/k3.1-pro", decision.suggestions)
+
+    def test_the_retired_k3_is_refused_with_k3_1_pro_as_the_suggestion(self) -> None:
+        """Owner ruling 2026-11-10: ``k3`` is no longer offered. Too unlike
+        ``k3.1-pro`` for the fuzzy match, so the row names its verified id
+        itself — in the spelling (``[1m]`` or not) the request used."""
+        for model_id, expected in (
+            ("claude-gw/kimi/k3", "claude-gw/kimi/k3.1-pro"),
+            ("claude-gw/kimi/k3[1m]", "claude-gw/kimi/k3.1-pro[1m]"),
+            ("k3", "claude-gw/kimi/k3.1-pro"),
+            ("k3[1m]", "claude-gw/kimi/k3.1-pro[1m]"),
+        ):
+            with self.subTest(model=model_id):
+                decision = routing.route(model_id)
+                assert isinstance(decision, RouteError), decision
+                self.assertEqual(decision.reason, "unknown_model")
+                self.assertEqual(decision.suggestions[0], expected)
+                self.assertIn(repr(expected), decision.message)
 
     def test_a_definition_naming_an_unverified_id_is_invalid(self) -> None:
-        ok, _reason, _ = routing.validate_model_id("claude-gw/kimi/k3[1m]")
+        ok, _reason, _ = routing.validate_model_id("claude-gw/kimi/k3.1-pro[1m]")
         self.assertTrue(ok)
-        ok, _reason, _ = routing.validate_model_id("claude-gw/kimi/kimi-for-coding")
-        self.assertFalse(ok)
+        for retired in ("claude-gw/kimi/k3[1m]", "claude-gw/kimi/kimi-for-coding"):
+            ok, _reason, suggestions = routing.validate_model_id(retired)
+            self.assertFalse(ok, retired)
+            self.assertIn("claude-gw/kimi/k3.1-pro" + (
+                "[1m]" if retired.endswith("[1m]") else ""), suggestions)
 
     def test_a_claude_id_behind_the_namespace_is_refused(self) -> None:
         decision = routing.route("claude-gw/kimi/claude-opus-5")
@@ -265,7 +305,7 @@ class KimiWireTests(GatewayTestBase):
         resp = await self.kclient.post(
             "/v1/messages",
             headers={**self.auth(), "User-Agent": CLIENT_UA},
-            json={"model": "claude-gw/kimi/k3", "messages": [], "max_tokens": 8},
+            json={"model": "claude-gw/kimi/k3.1-pro", "messages": [], "max_tokens": 8},
         )
         self.assertEqual(resp.status, 200)
         sent = self.kimi_up.message_requests[0]
@@ -273,14 +313,14 @@ class KimiWireTests(GatewayTestBase):
         self.assertEqual(headers.get("x-api-key"), FAKE_VENDOR_KEY)
         self.assertNotIn("authorization", headers)
         self.assertNotIn(HOST_TOKEN, json.dumps(sent["headers"]))
-        self.assertEqual(json.loads(sent["body"])["model"], "k3")
+        self.assertEqual(json.loads(sent["body"])["model"], "k3.1-pro")
         self.assertEqual(sent["path"], "/v1/messages")
 
     async def test_the_host_token_in_x_api_key_is_replaced_not_forwarded(self) -> None:
         await self.kclient.post(
             "/v1/messages",
             headers={"x-api-key": HOST_TOKEN, "User-Agent": CLIENT_UA},
-            json={"model": "claude-gw/kimi/k3[1m]", "messages": []},
+            json={"model": "claude-gw/kimi/k3.1-pro[1m]", "messages": []},
         )
         sent = self.kimi_up.message_requests[0]
         headers = {k.lower(): v for k, v in sent["headers"].items()}
@@ -289,11 +329,15 @@ class KimiWireTests(GatewayTestBase):
 
     async def test_an_unverified_id_never_reaches_the_upstream(self) -> None:
         self.kimi_up.models_payload = LIVE_LIST
-        # The picker read fills the live cache with all four listed ids.
+        # The picker read fills the live cache with all six listed ids.
         await self.kclient.get(
             "/v1/models", headers={**self.auth(), "User-Agent": CLIENT_UA},
         )
-        for model in ("claude-gw/kimi/k3-256k", "claude-gw/kimi/kimi-for-coding"):
+        for model in (
+            "claude-gw/kimi/k3", "claude-gw/kimi/k3[1m]",
+            "claude-gw/kimi/k3.1-pro-highspeed",
+            "claude-gw/kimi/k3-256k", "claude-gw/kimi/kimi-for-coding",
+        ):
             with self.subTest(model=model):
                 resp = await self.kclient.post(
                     "/v1/messages",
@@ -307,7 +351,7 @@ class KimiWireTests(GatewayTestBase):
         await self.kclient.post(
             "/v1/messages",
             headers={**self.auth(), "User-Agent": CLIENT_UA},
-            json={"model": "claude-gw/kimi/k3", "messages": []},
+            json={"model": "claude-gw/kimi/k3.1-pro", "messages": []},
         )
         sent = self.kimi_up.message_requests[0]
         headers = {k.lower(): v for k, v in sent["headers"].items()}
@@ -327,30 +371,35 @@ class KimiWireTests(GatewayTestBase):
         self.assertEqual(headers.get("user-agent"), CLIENT_UA)
         self.assertEqual(headers.get("x-api-key"), FAKE_VENDOR_KEY)
 
-    async def test_the_live_list_publishes_k3_only_and_reports_the_rest(self) -> None:
+    async def test_the_live_list_publishes_k3_1_pro_only_and_reports_the_rest(self) -> None:
         self.kimi_up.models_payload = LIVE_LIST
         body = await (await self.kclient.get(
             "/v1/models", headers={**self.auth(), "User-Agent": CLIENT_UA},
         )).json()
         ids = {r["id"] for r in body["data"] if r["id"].startswith("claude-gw/kimi/")}
         # The 1M window publishes the [1m] spelling alone (one model, one row).
-        self.assertEqual(ids, {"claude-gw/kimi/k3[1m]"})
-        hidden = " ".join(body["_vct_catalog_hidden"])
-        for withheld in ("k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"):
-            self.assertIn(f"claude-gw/kimi/{withheld}", hidden)
+        self.assertEqual(ids, {"claude-gw/kimi/k3.1-pro[1m]"})
+        hidden = body["_vct_catalog_hidden"]
+        for withheld in ("k3", "k3.1-pro-highspeed", "k3-256k",
+                         "kimi-for-coding", "kimi-for-coding-highspeed"):
+            self.assertTrue(
+                any(h.startswith(f"claude-gw/kimi/{withheld} ")
+                    or h == f"claude-gw/kimi/{withheld}" for h in hidden),
+                (withheld, hidden),
+            )
         health = await (await self.kclient.get("/health")).json()
         self.assertIn("kimi", health["vendors"])
         # The launcher's Services card renders this map verbatim.
         self.assertEqual(health["catalog_source"]["kimi"], SOURCE_LIVE)
 
-    async def test_without_a_key_the_snapshot_serves_k3_alone(self) -> None:
+    async def test_without_a_key_the_snapshot_serves_k3_1_pro_alone(self) -> None:
         client = await self.make_client(
             vendors={self.kimi.vendor_id: self.kimi},
             key_getter=lambda key, project=None: None,
         )
         body = await (await client.get("/v1/models", headers=self.auth())).json()
         ids = {r["id"] for r in body["data"] if r["id"].startswith("claude-gw/kimi/")}
-        self.assertEqual(ids, {"claude-gw/kimi/k3[1m]"})
+        self.assertEqual(ids, {"claude-gw/kimi/k3.1-pro[1m]"})
         self.assertEqual(self.kimi_up.requests, [], "no key, no fetch")
         health = await (await client.get("/health")).json()
         self.assertEqual(health["catalog_source"]["kimi"], SOURCE_STATIC)
@@ -396,19 +445,19 @@ class CatalogWindowTests(unittest.TestCase):
         empty = ContextTable(rows={}, source="test-empty", path=None)
         union, _ = self._union(empty, LIVE_LIST)
         ids = {e.id for e in union.entries if e.id.startswith(KIMI.namespace)}
-        self.assertEqual(ids, {"claude-gw/kimi/k3[1m]"})
+        self.assertEqual(ids, {"claude-gw/kimi/k3.1-pro[1m]"})
 
     def test_the_cited_seed_row_wins_over_the_live_window(self) -> None:
         """A live figure that disagrees with the cited row does not move it:
         the table is the window authority (``resolve_window``)."""
-        smaller = {"data": [{"id": "k3", "context_length": 262144}]}
+        smaller = {"data": [{"id": "k3.1-pro", "context_length": 262144}]}
         union, _ = self._union(load_seed(), smaller)
         ids = {e.id for e in union.entries if e.id.startswith(KIMI.namespace)}
-        self.assertEqual(ids, {"claude-gw/kimi/k3[1m]"})
+        self.assertEqual(ids, {"claude-gw/kimi/k3.1-pro[1m]"})
         empty = ContextTable(rows={}, source="test-empty", path=None)
         union, _ = self._union(empty, smaller)
         ids = {e.id for e in union.entries if e.id.startswith(KIMI.namespace)}
-        self.assertEqual(ids, {"claude-gw/kimi/k3"}, "control: no row, live wins")
+        self.assertEqual(ids, {"claude-gw/kimi/k3.1-pro"}, "control: no row, live wins")
 
     def test_no_user_agent_sends_no_header(self) -> None:
         _, seen = self._union(load_seed(), LIVE_LIST)
@@ -424,46 +473,187 @@ class SeedTests(unittest.TestCase):
     def setUp(self) -> None:
         self.seed = load_seed()
 
-    def test_the_k3_row_is_1m_with_the_companion(self) -> None:
-        row = self.seed.lookup("k3", "kimi")
+    def test_the_k3_1_pro_row_is_1m_with_the_companion(self) -> None:
+        row = self.seed.lookup("k3.1-pro", "kimi")
         assert row is not None
         self.assertEqual(row.vendor, "kimi")
         self.assertEqual(row.context_window, 1048576)
         self.assertTrue(row.window_1m, "window_1m must agree with the window")
-        self.assertTrue(self.seed.advertise_1m("k3"))
+        self.assertTrue(self.seed.advertise_1m("k3.1-pro"))
+        # Live /v1/models 2026-11-10: supports_image_in true.
         self.assertFalse(row.text_only)
         self.assertTrue(
             row.source.startswith("https://www.kimi.com/code/docs/"), row.source,
         )
 
-    def test_the_k3_note_names_the_plus_cap_and_how_to_lower_it(self) -> None:
+    def test_the_k3_1_pro_note_names_the_plus_cap_and_how_to_lower_it(self) -> None:
         """A Plus subscriber must be able to read, in the row, that their
-        plan caps k3 at 256K and where to set that."""
-        note = self.seed.rows["k3"].source_note
+        plan does not include the 1M window and where to lower it."""
+        note = self.seed.rows["k3.1-pro"].source_note
         self.assertIn("262144", note)
         self.assertIn("Chat model context", note)
-        self.assertIn("401", note)
-        self.assertIn("live /v1/models probe 2026-10-07", note)
+        self.assertIn("Pro 及以上支持 1M", note)
+        self.assertIn("live /v1/models probe 2026-11-10", note)
+        self.assertIn("owner ruling 2026-11-10", note)
 
     def test_no_other_kimi_row_ships(self) -> None:
+        """K3.1 Pro replaces K3 (owner ruling 2026-11-10): the k3 row is gone."""
         kimi_rows = {i for i, r in self.seed.rows.items() if r.vendor == "kimi"}
-        self.assertEqual(kimi_rows, {"k3"})
+        self.assertEqual(kimi_rows, {"k3.1-pro"})
+
+
+#: The vendor's own refusal of a thinking-off request, verbatim (LIVE
+#: 2026-11-10: POST /v1/messages, model k3.1-pro, ``thinking: {"type":
+#: "disabled"}`` -> HTTP 400). Body only; no header or key was kept.
+THINKING_OFF_400 = (
+    Path(__file__).parent / "fixtures" / "model_router"
+    / "kimi-k31-thinking-disabled-400.body"
+)
 
 
 class EffortTests(unittest.TestCase):
     def test_every_client_effort_is_forwarded_untouched(self) -> None:
-        for model_id in ("k3",):
-            policy = effort_policy("kimi", model_id)
-            assert policy is not None
-            self.assertEqual(policy.accepted, frozenset(EFFORT_VALUES))
-            self.assertEqual(dict(policy.translate), {})
-            self.assertEqual(dict(policy.collapses), {"medium": "high", "xhigh": "max"})
-            for effort in EFFORT_VALUES:
-                with self.subTest(model=model_id, effort=effort):
-                    payload = {"output_config": {"effort": effort}}
-                    out, changed = translate_effort(payload, "kimi", model_id)
+        """Live 2026-11-10: adaptive thinking + effort medium -> 200 with a
+        thinking block. Every value Claude Code sends is accepted."""
+        policy = effort_policy("kimi", "k3.1-pro")
+        assert policy is not None
+        self.assertEqual(policy.accepted, frozenset(EFFORT_VALUES))
+        self.assertEqual(dict(policy.collapses), {"medium": "high", "xhigh": "max"})
+        for effort in EFFORT_VALUES:
+            for thinking in (None, {"type": "adaptive"},
+                             {"type": "enabled", "budget_tokens": 4000}):
+                with self.subTest(effort=effort, thinking=thinking):
+                    payload: dict = {"output_config": {"effort": effort}}
+                    if thinking is not None:
+                        payload["thinking"] = thinking
+                    out, changed = translate_effort(payload, "kimi", "k3.1-pro")
                     self.assertFalse(changed)
                     self.assertIs(out, payload)
+
+    def test_the_retired_k3_has_no_effort_row(self) -> None:
+        self.assertIsNone(effort_policy("kimi", "k3"))
+
+    def test_the_vendor_refusal_is_the_captured_one(self) -> None:
+        body = json.loads(THINKING_OFF_400.read_text(encoding="utf-8"))
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertIn("does not support disabled thinking", body["error"]["message"])
+        policy = effort_policy("kimi", "k3.1-pro")
+        assert policy is not None
+        self.assertEqual(policy.thinking_off_effort, "low")
+        self.assertIn("does not support disabled thinking", policy.note)
+
+    def test_thinking_off_is_forwarded_with_thinking_on_at_low(self) -> None:
+        """K3.1 Pro refuses thinking OFF (HTTP 400). The gateway drops the
+        disabled ``thinking`` param — the vendor default is thinking on —
+        and asks for the lowest level, the shape that answered 200 live."""
+        payload = {
+            "model": "k3.1-pro", "max_tokens": 64,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        out, changed = translate_effort(payload, "kimi", "k3.1-pro")
+        self.assertTrue(changed)
+        self.assertNotIn("thinking", out)
+        self.assertEqual(out["output_config"], {"effort": "low"})
+        self.assertEqual(out["messages"], payload["messages"])
+        self.assertEqual(out["model"], "k3.1-pro", "the model never changes")
+        # The client's object is never mutated.
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+        self.assertNotIn("output_config", payload)
+
+    def test_thinking_off_keeps_an_effort_the_request_names(self) -> None:
+        payload = {
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "high", "other": 1},
+        }
+        out, changed = translate_effort(payload, "kimi", "k3.1-pro")
+        self.assertTrue(changed)
+        self.assertNotIn("thinking", out)
+        self.assertEqual(out["output_config"], {"effort": "high", "other": 1})
+        self.assertEqual(payload["output_config"], {"effort": "high", "other": 1})
+
+    def test_thinking_off_with_an_output_config_but_no_effort(self) -> None:
+        payload = {"thinking": {"type": "disabled"}, "output_config": {"x": 1}}
+        out, changed = translate_effort(payload, "kimi", "k3.1-pro")
+        self.assertTrue(changed)
+        self.assertEqual(out["output_config"], {"x": 1, "effort": "low"})
+        self.assertEqual(payload["output_config"], {"x": 1})
+
+    def test_the_effort_off_spellings_are_translated_to_low(self) -> None:
+        """The vendor's effort table: 'off / none / disabled' -> K3.1 Pro
+        refuses (HTTP 400)."""
+        for off in ("off", "none", "disabled"):
+            with self.subTest(effort=off):
+                out, changed = translate_effort(
+                    {"output_config": {"effort": off}}, "kimi", "k3.1-pro",
+                )
+                self.assertTrue(changed)
+                self.assertEqual(out["output_config"]["effort"], "low")
+
+    def test_thinking_off_and_an_off_effort_together(self) -> None:
+        out, changed = translate_effort(
+            {"thinking": {"type": "disabled"}, "output_config": {"effort": "none"}},
+            "kimi", "k3.1-pro",
+        )
+        self.assertTrue(changed)
+        self.assertEqual(out, {"output_config": {"effort": "low"}})
+
+    def test_thinking_off_on_another_route_is_forwarded_as_sent(self) -> None:
+        """Only a route with evidence of the refusal is rewritten."""
+        for vendor_id, model_id in (("zai", "glm-5.3"), ("qwen", "glm-5.3"),
+                                    ("kimi", "k3"), ("zai", "no-such-model")):
+            with self.subTest(route=(vendor_id, model_id)):
+                payload = {"thinking": {"type": "disabled"}}
+                out, changed = translate_effort(payload, vendor_id, model_id)
+                self.assertFalse(changed)
+                self.assertIs(out, payload)
+
+
+class KimiThinkingWireTests(GatewayTestBase):
+    """The thinking-off guarantee on the wire, through the real request
+    path: what the stub upstream RECEIVES is what Kimi would see."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.kimi_up = _Upstream()
+        url = await self.kimi_up.start()
+        self.addAsyncCleanup(self.kimi_up.stop)
+        self.kclient = await self.make_client(vendors={
+            self.vendor.vendor_id: self.vendor,
+            "kimi": replace(KIMI, upstream=url),
+        })
+
+    async def _post(self, body: dict):
+        return await self.kclient.post(
+            "/v1/messages",
+            headers={**self.auth(), "User-Agent": CLIENT_UA},
+            json=body,
+        )
+
+    async def test_a_thinking_off_request_reaches_k3_1_pro_with_thinking_on(self) -> None:
+        resp = await self._post({
+            "model": "claude-gw/kimi/k3.1-pro[1m]", "max_tokens": 64,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        self.assertEqual(resp.status, 200)
+        sent = json.loads(self.kimi_up.message_requests[0]["body"])
+        self.assertEqual(sent["model"], "k3.1-pro")
+        self.assertNotIn("thinking", sent)
+        self.assertEqual(sent["output_config"], {"effort": "low"})
+
+    async def test_an_effort_request_is_forwarded_unchanged(self) -> None:
+        resp = await self._post({
+            "model": "claude-gw/kimi/k3.1-pro", "max_tokens": 64,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        self.assertEqual(resp.status, 200)
+        sent = json.loads(self.kimi_up.message_requests[0]["body"])
+        self.assertEqual(sent["thinking"], {"type": "adaptive"})
+        self.assertEqual(sent["output_config"], {"effort": "medium"})
+        self.assertEqual(sent["model"], "k3.1-pro")
 
 
 # ── W1-K3: the usage windows ─────────────────────────────────────────────

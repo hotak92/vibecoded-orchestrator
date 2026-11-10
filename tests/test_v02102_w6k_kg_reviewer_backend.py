@@ -7,7 +7,7 @@ the CHOSEN Claude model (one machine-wide setting; these tests pin it to
 ``haiku`` through ``VCO_KG_REVIEW_MODEL`` so the chain mechanics stay the
 subject); when it is unavailable (a REAL signal — quota / 429 / auth /
 absent), fall back to the comparable non-flash gateway rungs
-``claude-gw/glm-5.3[1m]`` → ``claude-gw/kimi/k3[1m]`` — each only when the
+``claude-gw/glm-5.3[1m]`` → ``claude-gw/kimi/k3.1-pro[1m]`` — each only when the
 LOCAL MODEL GATEWAY actually serves it (the catalogue is ASKED, never
 assumed) — and use OpenAI when the user enabled OpenAI for SUMMARIES. The
 retired flash rungs are covered in tests/test_v02103_kg_reviewer_safety.py.
@@ -106,7 +106,7 @@ def test_latched_model_falls_to_the_first_served_gateway_model(
     # `claude -p`) — see test_v02102_w6n_kg_reviewer_fixes.py.
     rig = _Rig(chain, monkeypatch,
                catalogue=frozenset({"claude-gw/glm-5.3[1m]",
-                                    "claude-gw/kimi/k3[1m]"}))
+                                    "claude-gw/kimi/k3.1-pro[1m]"}))
     rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
     assert d["mode"] == "claude"
@@ -118,11 +118,11 @@ def test_latched_model_falls_to_the_first_served_gateway_model(
 def test_quota_latched_model_is_a_real_signal_and_falls_back(chain, monkeypatch):
     """The W6-K defect: an exhausted model silently skipped the review."""
     rig = _Rig(chain, monkeypatch,
-               catalogue=frozenset({"claude-gw/kimi/k3[1m]"}))
+               catalogue=frozenset({"claude-gw/kimi/k3.1-pro[1m]"}))
     rig.latched["kg_reviewer:haiku"] = {
         "reason": "quota", "until": 9e18, "remaining": 17999}
     d = rig.decide()
-    assert d["model"] == "claude-gw/kimi/k3[1m]", d
+    assert d["model"] == "claude-gw/kimi/k3.1-pro[1m]", d
     rig.assert_logged("rung haiku: latched (quota)")
     rig.assert_logged("rung claude-gw/glm-5.3: not served")
 
@@ -133,10 +133,10 @@ def test_catalogue_membership_is_asked_not_assumed(chain, monkeypatch):
     is never a rung (v0.2.103)."""
     rig = _Rig(chain, monkeypatch,
                catalogue=frozenset({"claude-gw/glm-5.3-flash[1m]",
-                                    "claude-gw/kimi/k3[1m]"}))
+                                    "claude-gw/kimi/k3.1-pro[1m]"}))
     rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
-    assert d["model"] == "claude-gw/kimi/k3[1m]"
+    assert d["model"] == "claude-gw/kimi/k3.1-pro[1m]"
     rig.assert_logged("rung claude-gw/glm-5.3: not served")
 
 

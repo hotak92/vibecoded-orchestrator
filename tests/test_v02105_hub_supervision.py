@@ -475,7 +475,7 @@ def test_preflight_lets_a_resolvable_lane_through(tmp_path, user_claude):
     _ok({"route": "vendor", "vendor": "qwen", "usable": None, "state": "pending"}),
 ])
 def test_preflight_never_refuses_on_uncertainty(tmp_path, user_claude, answer):
-    proj = _agents(tmp_path, "kimi-reviewer", "claude-gw/kimi/k3[1m]")
+    proj = _agents(tmp_path, "kimi-reviewer", "claude-gw/kimi/k3.1-pro[1m]")
     assert gp.run(_payload("kimi-reviewer"), project_dir=proj, environ={}, fetch=lambda m: answer) is None
 
 

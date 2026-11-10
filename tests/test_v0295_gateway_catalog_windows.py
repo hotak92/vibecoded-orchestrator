@@ -846,10 +846,10 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 f"claude-gw/qwen/qwen3.8-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/glm-5.3{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/deepseek-v4.1-flash{ONE_M_SUFFIX}",
-                # Kimi Code (v0.2.102, owner ruling: K3 only), from its
-                # shipped snapshot block (the injected fetch answers
+                # Kimi Code (owner ruling 2026-11-10: K3.1 Pro only), from
+                # its shipped snapshot block (the injected fetch answers
                 # nothing); its cited 1M window earns the [1m] spelling.
-                f"claude-gw/kimi/k3{ONE_M_SUFFIX}",
+                f"claude-gw/kimi/k3.1-pro{ONE_M_SUFFIX}",
             ],
         )
         self.assertEqual(
@@ -867,8 +867,10 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 "claude-gw/glm-5", "claude-gw/glm-5-turbo",
                 "claude-gw/glm-5.1",
                 # Withheld by the kimi row's verified_ids (owner ruling
-                # 2026-10-07, K3 only) from its shipped snapshot block.
+                # 2026-11-10, K3.1 Pro only) from its shipped snapshot block.
+                "claude-gw/kimi/k3",
                 "claude-gw/kimi/k3-256k",
+                "claude-gw/kimi/k3.1-pro-highspeed",
                 "claude-gw/kimi/kimi-for-coding",
                 "claude-gw/kimi/kimi-for-coding-highspeed",
                 f"claude-gw/qwen/deepseek-v4-pro{ONE_M_SUFFIX}",

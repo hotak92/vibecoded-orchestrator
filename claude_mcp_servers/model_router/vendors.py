@@ -7,10 +7,11 @@ end-to-end on a live machine — the Claude OAuth passthrough, the Z.ai/GLM
 subscription route, and the QwenCloud Token Plan route (owner order
 2026-09-21; the pay-as-you-go QwenCloud endpoint is deliberately absent until
 its model list is extracted and proven — see the ``qwen`` row) — and the Kimi
-Code subscription route (owner order 2026-10-07, K3 only). That last row was
-written from the vendor's docs and then probed live the same day (endpoint,
-auth, model list); every field cites its source, and the row says in place
-which claim still waits on a live probe (the model echo). OpenRouter, the
+Code subscription route (owner order 2026-10-07; since the owner ruling of
+2026-11-10, K3.1 Pro only — it replaces K3). That last row was written from
+the vendor's docs and then probed live (endpoint, auth, model list, 2026-10-07;
+the K3.1 Pro id and its thinking-only rule, 2026-11-10); every field cites its
+source, and the row says in place which claim still waits on a live probe. OpenRouter, the
 Moonshot pay-as-you-go platform and the mainland-China Kimi endpoint are NOT
 shipped, not even as disabled rows: a disabled row is untested code shipped
 as config.
@@ -245,7 +246,10 @@ class Vendor:
             :func:`model_router.routing._vendor_route`): every other id —
             even one the vendor's own list carries, and even one inside a
             ``bare_id_prefixes`` family — is refused locally like an unknown
-            id, and only verified ids are offered as suggestions. Without the
+            id, and only verified ids are offered as suggestions — always
+            including this row's own verified ids when the refused id is
+            under its namespace or bare-id family, however unlike the
+            refused spelling they are (``k3`` -> ``k3.1-pro``). Without the
             flag ``verified_ids`` narrows the PICKER only (the zai shape, whose
             endpoint 400s a nonsense name). :func:`validate_registry` requires
             a non-empty ``verified_ids`` on a flagged row.
@@ -450,7 +454,8 @@ VENDORS: Mapping[str, Vendor] = {
         partial_message_start_usage=True,
     ),
     # Kimi Code — the Kimi membership's coding subscription (owner order
-    # 2026-10-07). Docs read 2026-10-07; the pages:
+    # 2026-10-07; K3.1 Pro replaces K3 by owner ruling 2026-11-10). Docs read
+    # 2026-10-07, the models page re-read 2026-11-10; the pages:
     #   overview   https://www.kimi.com/code/docs/
     #   models     https://www.kimi.com/code/docs/kimi-code/models.html
     #   Claude Code https://www.kimi.com/code/docs/third-party-tools/claude-code.html
@@ -459,6 +464,11 @@ VENDORS: Mapping[str, Vendor] = {
     # LIVE-PROBED 2026-10-07 with the owner's key (coordinator probe): the
     # messages endpoint, both auth headers, the model list, a Cloudflare
     # user-agent gate and a wildcard alias — each noted at its field below.
+    # LIVE-PROBED 2026-11-10 (coordinator + lane probes, owner's key, client
+    # user-agent): /v1/models lists six ids incl. ``k3.1-pro`` (display "K3.1
+    # Pro", context_length 1048576, supports_image_in true, think_efforts
+    # low/high/max default high); POST /v1/messages with ``k3.1-pro`` answers
+    # 200 with thinking on and 400 with thinking disabled (see effort.py).
     "kimi": Vendor(
         vendor_id="kimi",
         display_suffix=" · Kimi Code subscription",
@@ -498,20 +508,21 @@ VENDORS: Mapping[str, Vendor] = {
         # so resolving it would send a platform key to the coding endpoint —
         # or borrow a project's own platform key for VCO's use.
         secret_keys=("kimi_api_key", "KIMI_API_KEY"),
-        # ``k3`` typeable without the namespace. Any other ``k3…`` id lands
-        # on this row and is refused there with ``claude-gw/kimi/k3`` as the
-        # suggestion (``forward_verified_only``) — rather than falling
+        # ``k3.1-pro`` typeable without the namespace. Any other ``k3…`` id —
+        # ``k3`` itself included, offered until the 2026-11-10 ruling — lands
+        # on this row and is refused there with ``claude-gw/kimi/k3.1-pro`` as
+        # the suggestion (``forward_verified_only``) rather than falling
         # through to the generic unknown-model refusal.
         bare_id_prefixes=("k3",),
         # ``GET <upstream>/v1/models`` answers an OpenAI-style
         # ``{"data": [...]}`` list (live 200, 2026-10-07) — the envelope the
         # catalog already parses — so the row rides the ordinary LIVE path.
         # Its ``context_length`` is read as the publisher's window
-        # (``CatalogService._parse_models``), below the cited seed row for k3
-        # — which states the same 1048576 the live list reports (live
-        # /v1/models probe 2026-10-07). ``supports_image_in`` (true for k3)
-        # and ``think_efforts`` (low/high/max, default high) are not read;
-        # the seed row and effort.py record them.
+        # (``CatalogService._parse_models``), below the cited seed row for
+        # k3.1-pro — which states the same 1048576 the live list reports
+        # (live /v1/models probe 2026-11-10). ``supports_image_in`` (true for
+        # k3.1-pro) and ``think_efforts`` (low/high/max, default high) are not
+        # read; the seed row and effort.py record them.
         catalog_path="/v1/models",
         # Claude Code is told to set ANTHROPIC_API_KEY (Claude Code page,
         # step 3), which it sends as ``X-Api-Key``. Live 2026-10-07: the
@@ -533,29 +544,36 @@ VENDORS: Mapping[str, Vendor] = {
         # router's: ``forward_verified_only`` below forwards only the
         # verified id and refuses everything else locally; the honest-naming
         # guard additionally refuses any Claude-marked id, as for every
-        # vendor. One further DOCUMENTED substitution the gateway cannot
-        # see: with thinking turned OFF the vendor answers k3 requests with
-        # K2.8 Preview without thinking ("关闭 thinking 后路由到 K2.8 Preview
-        # 无思考版"); the live list reports k3's thinking as "only" (always
-        # on), which suggests the off switch does not apply to k3 — UNVERIFIED.
+        # vendor. Thinking OFF: for the K3 series the vendor answers with
+        # K2.8 Preview without thinking (a silent substitution); for the K3.1
+        # Pro series it REFUSES ("关闭思考的请求会被拒绝", models page
+        # 2026-11-10; live 2026-11-10: HTTP 400 "K3.1 Pro does not support
+        # disabled thinking mode"). The gateway never forwards a k3.1-pro
+        # request with thinking off: effort.py's k3.1-pro row
+        # (``thinking_off_effort``) sends it with thinking on at low.
         alias_trap=True,
         forward_verified_only=True,
-        # OWNER RULING 2026-10-07: the gateway offers K3 ONLY ("only need
-        # K3"). The vendor serves four ids (models page, "共 4 个模型 ID"; the
-        # live list carries the same four). ``k3`` is the one offered and
-        # the one forwarded; ``k3-256k`` (the same model at a 256K window,
-        # "K3 的 256K 上下文版本"), ``kimi-for-coding`` (K2.8 Preview) and
-        # ``kimi-for-coding-highspeed`` (K2.7 Code HighSpeed) are WITHHELD
-        # from the picker (reported in ``_vct_catalog_hidden``; the
-        # VCT_MODEL_GATEWAY_CATALOG=all knob does not bring them back) and
-        # REFUSED by the router (``forward_verified_only``). "Verified" here
-        # means the owner's scope ruling plus the vendor's own list and docs
-        # naming k3 as K3 — it cannot mean "answered as itself", because this
-        # endpoint echoes any name (see alias_trap).
-        verified_ids=("k3",),
+        # OWNER RULING 2026-11-10: "Kimi K3.1 Pro REPLACES K3 in VCO" — the
+        # gateway forwards ``k3.1-pro`` ONLY, and ``k3`` is no longer offered
+        # (it replaced the 2026-10-07 ruling "only need K3"). The vendor
+        # serves six ids (models page 2026-11-10, "目前提供 6 个模型"; the
+        # live list carries the same six): ``k3.1-pro`` is the one offered
+        # and the one forwarded; ``k3.1-pro-highspeed`` (same model, "约为普速
+        # 版两倍" usage), ``k3``, ``k3-256k``, ``kimi-for-coding`` (K2.8
+        # Preview) and ``kimi-for-coding-highspeed`` (K2.7 Code HighSpeed)
+        # are WITHHELD from the picker (reported in ``_vct_catalog_hidden``;
+        # the VCT_MODEL_GATEWAY_CATALOG=all knob does not bring them back)
+        # and REFUSED by the router (``forward_verified_only``), each refusal
+        # naming ``claude-gw/kimi/k3.1-pro``. "Verified" here means the
+        # owner's ruling plus the vendor's own list and docs naming k3.1-pro
+        # as K3.1 Pro — it cannot mean "answered as itself", because this
+        # endpoint echoes any name (see alias_trap). The docs also advise a
+        # NEW session rather than switching a K3 conversation to K3.1 Pro
+        # (cache and reasoning-chain effects) — guidance, not a gateway rule.
+        verified_ids=("k3.1-pro",),
         # No static_ids: a standard-discovery row's keyless / fetch-failed
         # fallback is the shipped snapshot (``static_catalog.json``, family
-        # ``kimi``: the ids the live list carried on 2026-10-07), served
+        # ``kimi``: the ids the live list carried on 2026-11-10), served
         # under the ``static`` source and narrowed by verified_ids like a
         # live answer.
         # LIVE-PROBED 2026-10-07 with the owner's key (coordinator probe):
