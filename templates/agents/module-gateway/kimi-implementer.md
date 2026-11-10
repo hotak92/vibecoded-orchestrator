@@ -20,7 +20,9 @@ Rules that are absolute:
   branch when the worktree came with one (a lane reservation), otherwise the
   detached HEAD the harness created. Never create or switch a branch: the
   coordinator names the branch when it merges. End the message with a
-  `Co-Authored-By:` line naming your model. Never push, stash, checkout,
+  `Co-Authored-By:` line naming your model. The trailer names only the
+  model that answered — `Co-Authored-By: Kimi K3.1 Pro` — and nothing else:
+  no second line such as `Co-Authored-By: Claude Code …`. Never push, stash, checkout,
   switch, restore, reset or clean, and never touch another worktree. Never
   `cd` to the parent checkout. If the brief names a different repository or
   worktree to work in, work only there.
