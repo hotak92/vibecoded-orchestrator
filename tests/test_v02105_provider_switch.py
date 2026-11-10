@@ -538,7 +538,7 @@ class GuidanceTests(_Base):
             state_path=self.tmp / "model-guidance.json",
         )
         self.assertIn("kimi", reachable)
-        self.assertIn("Kimi K3", model_selection.render_grid(providers=reachable))
+        self.assertIn("Kimi K3.1 Pro", model_selection.render_grid(providers=reachable))
 
     def test_switching_a_provider_off_is_not_recorded_as_a_missing_key(self) -> None:
         """The record answers "does this machine hold the key" (a fact), so a

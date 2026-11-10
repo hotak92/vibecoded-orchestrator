@@ -87,6 +87,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Kimi K3.1 Pro replaces Kimi K3 on the model gateway.** The gateway's Kimi Code route now offers and forwards
+  `claude-gw/kimi/k3.1-pro` (1M context, image input), and the `kimi-implementer` and `kimi-reviewer` agents run on
+  `claude-gw/kimi/k3.1-pro[1m]`. `claude-gw/kimi/k3` is no longer offered: a request or agent definition that names
+  it, or any other Kimi id, is refused by the gateway with a message that names `claude-gw/kimi/k3.1-pro` as the id to
+  use. K3.1 Pro only works with thinking on — Kimi refuses a request that switches thinking off — so the gateway sends
+  such a request with thinking on at the lowest effort (`low`) instead of passing on an error; the access line and the
+  usage ledger show the effort that was actually sent. The KG commit reviewer's Kimi fallback moves to K3.1 Pro as
+  well. In the model-selection grid the row becomes "Kimi K3.1 Pro", re-scored from benchmark evidence (Code 7 → 8,
+  Tools 7 → 8; the † stays because every published K3.1 Pro result is at maximum effort), and its guidance adds:
+  start a new conversation on K3.1 Pro rather than switching an existing one to it. A Plus subscriber, whose plan
+  does not include the 1M window, lowers the `k3.1-pro` row to 262144 in Preferences → Chat model context.
+
 - **Removing a project takes out what is VCO's, and only that.** Before, removing a project deleted the whole
   `.claude/hooks/` and `.claude/scripts/` folders, including any script of your own in them, but left every VCO hook
   still registered in `.claude/settings.json`, pointing at files that were gone. Now a file VCO installed is removed

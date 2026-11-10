@@ -8,11 +8,11 @@
     {"type": "model", "id": "claude-gw/qwen/qwen3.8-max[1m]", "display_name": "qwen3.8-max · QwenCloud Token Plan · 1M ctx", "description": "", "_vct_window_source": "table"},
     {"type": "model", "id": "claude-gw/qwen/qwen3.8-flash[1m]", "display_name": "qwen3.8-flash · QwenCloud Token Plan · 1M ctx", "description": "", "_vct_window_source": "table"},
     {"type": "model", "id": "claude-gw/qwen/deepseek-v4.1-flash[1m]", "display_name": "deepseek-v4.1-flash · QwenCloud Token Plan · 1M ctx", "description": "", "_vct_window_source": "table"},
-    {"type": "model", "id": "claude-gw/kimi/k3[1m]", "display_name": "k3 · Kimi Code subscription · 1M ctx", "description": "", "_vct_window_source": "table"}
+    {"type": "model", "id": "claude-gw/kimi/k3.1-pro[1m]", "display_name": "k3.1-pro · Kimi Code subscription · 1M ctx", "description": "", "_vct_window_source": "table"}
   ],
   "has_more": false,
   "first_id": "claude-haiku-5-5",
-  "last_id": "claude-gw/kimi/k3[1m]",
+  "last_id": "claude-gw/kimi/k3.1-pro[1m]",
   "_vct_catalog_source": {"anthropic": "live", "zai": "live", "qwen": "live", "kimi": "live"},
   "_vct_catalog_hidden": ["claude-gw/glm-5.3-flash", "claude-gw/qwen/deepseek-v4.1-flash", "claude-gw/qwen/qwen3.8-flash"]
 }

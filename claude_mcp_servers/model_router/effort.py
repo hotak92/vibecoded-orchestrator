@@ -76,10 +76,24 @@ Vendor-doc backing (re-checked 2026-10-03/04; the URL is cited per row):
   https://docs.z.ai/guides/capabilities/thinking
   (``medium`` is NOT in the documented set but was ACCEPTED live — HTTP 200 —
   so it is recorded as accepted and never rewritten.)
-* Kimi Code (k3): low/high/max; the vendor maps
-  ``medium``→``high`` and ``xhigh``→``max`` itself and 400s only on values
-  outside its documented list (read 2026-10-07, not yet probed live).
+* Kimi Code (k3.1-pro, owner ruling 2026-11-10 — it replaces k3): low/high/
+  max, default high; the vendor maps ``medium``→``high`` and ``xhigh``→``max``
+  itself and 400s on values outside its documented list. K3.1 Pro is
+  THINKING-ONLY: "K3.1 Pro 系列仅支持思考模式，关闭思考的请求会被拒绝"
+  (models page, read 2026-11-10). Live 2026-11-10: ``thinking: {"type":
+  "disabled"}`` -> HTTP 400 "K3.1 Pro does not support disabled thinking
+  mode. ..."; no ``thinking`` param + ``output_config.effort`` ``low`` ->
+  HTTP 200 with a thinking block. See :attr:`EffortPolicy.thinking_off_effort`.
   https://www.kimi.com/code/docs/kimi-code/models.html
+
+Thinking OFF is the one other value a vendor can reject. A route that
+refuses it carries :attr:`EffortPolicy.thinking_off_effort`, and
+:func:`translate_effort` forwards such a request with thinking ON at that
+(lowest) effort — the nearest value the model accepts — instead of relaying
+a refusal the client cannot recover from (a user whose Claude Code has
+thinking switched off would otherwise lose every turn on that model). The
+same rule as for effort values: only a REJECTED shape is rewritten, and the
+model that answers never changes.
 """
 
 from __future__ import annotations
@@ -113,6 +127,14 @@ class EffortPolicy:
         doc_url: the vendor page the row was read from.
         note: the evidence — live capture names and the doc wording — so the
             next reader can re-check the row without re-probing.
+        thinking_off_effort: set ONLY for a route with evidence that it
+            REJECTS a request with thinking switched off (a live 400 or an
+            explicit refusal in the vendor doc). Such a request — ``thinking:
+            {"type": "disabled"}`` — is forwarded without the ``thinking``
+            param and, when it names no effort of its own, with
+            ``output_config.effort`` set to this value (the route's lowest
+            accepted level: the nearest the model offers to "no thinking").
+            ``None`` (every other route): thinking-off is forwarded as sent.
     """
 
     accepted: frozenset[str]
@@ -120,6 +142,7 @@ class EffortPolicy:
     collapses: Mapping[str, str] = field(default_factory=dict)
     doc_url: str = ""
     note: str = ""
+    thinking_off_effort: Optional[str] = None
 
 
 #: The per-(vendor_id, model_id) effort table. ``model_id`` is the BARE id the
@@ -210,31 +233,47 @@ EFFORT_POLICIES: Mapping[tuple[str, str], EffortPolicy] = {
             "(z.ai thinking guide); nothing is rewritten."
         ),
     ),
-    # ── Kimi Code route (doc-only, read 2026-10-07; no live capture yet) ──
-    # The vendor documents an effort mapping for third-party tools that
-    # ACCEPTS every value Claude Code sends and collapses two of them itself
-    # ("ultra / max / xhigh → max", "high / medium → high",
-    # "low / minimum / light → low"; "其它未知取值 → HTTP 400"). So nothing is
-    # rejected and nothing is rewritten — the collapses are recorded as data.
-    # Only k3 is offered (owner ruling 2026-10-07, see the kimi vendor row),
-    # so only it carries a row. The live /v1/models probe (2026-10-07) agrees:
-    # think_efforts valid low/high/max, default_effort high.
-    ("kimi", "k3"): EffortPolicy(
+    # ── Kimi Code route (K3.1 Pro; docs + live probe 2026-11-10) ─────────
+    # OWNER RULING 2026-11-10: "Kimi K3.1 Pro REPLACES K3 in VCO" — only
+    # k3.1-pro is offered (see the kimi vendor row), so only it carries a
+    # row. The vendor's effort table for third-party tools ("思考程度映射与
+    # 路由规则", models page read 2026-11-10) ACCEPTS every value Claude Code
+    # sends and collapses two of them itself ("ultra / max / xhigh → max",
+    # "high / medium → high", "low / minimum / light → low"; unset → the
+    # model default, high). It REJECTS two things: unknown values ("其他未知
+    # 取值 → HTTP 400") and thinking OFF ("off / none / disabled → K3.1 Pro
+    # 系列：关闭思考的请求会被拒绝（HTTP 400）"). The off spellings are
+    # translated to low (the nearest level the model has), and a
+    # ``thinking: {"type": "disabled"}`` request goes out with thinking on at
+    # low (``thinking_off_effort``). Live /v1/models (2026-11-10):
+    # think_efforts low/high/max, default high.
+    ("kimi", "k3.1-pro"): EffortPolicy(
         accepted=frozenset({"low", "medium", "high", "xhigh", "max"}),
-        translate={},
+        translate={"off": "low", "none": "low", "disabled": "low"},
         collapses={"medium": "high", "xhigh": "max"},
         doc_url="https://www.kimi.com/code/docs/kimi-code/models.html",
+        thinking_off_effort="low",
         note=(
-            "Kimi models page, 'effort 映射' table: low/high/max are the "
-            "model's levels (k3 default high); medium collapses to high and "
-            "xhigh to max vendor-side; only values outside the documented "
-            "list return HTTP 400, and Claude Code sends none of those. The "
-            "live /v1/models probe (2026-10-07) confirms the levels and the "
-            "high default; that medium/xhigh are ACCEPTED on /v1/messages is "
-            "documented, not yet probed live."
+            "Kimi models page (read 2026-11-10), effort table: low/high/max "
+            "are the model's levels (k3.1-pro default high); medium collapses "
+            "to high and xhigh to max vendor-side; 'off / none / disabled' "
+            "are refused with HTTP 400 for the K3.1 Pro series, which 'only "
+            "supports thinking mode'. LIVE 2026-11-10 (POST /v1/messages, "
+            "model k3.1-pro): thinking adaptive + effort medium -> 200 "
+            "[thinking, text]; thinking {type: disabled} -> 400 "
+            "invalid_request_error 'K3.1 Pro does not support disabled "
+            "thinking mode. Please enable thinking and try again, or choose "
+            "another model.'; no thinking param + effort low (the shape the "
+            "gateway forwards instead) -> 200 [thinking, text]."
         ),
     ),
 }
+
+
+def _thinking_is_off(payload: Mapping[str, Any]) -> bool:
+    """True when the request switches thinking OFF (``type: disabled``)."""
+    thinking = payload.get("thinking")
+    return isinstance(thinking, dict) and thinking.get("type") == "disabled"
 
 
 def effort_policy(vendor_id: str, model_id: str) -> Optional[EffortPolicy]:
@@ -257,28 +296,50 @@ def translate_effort(
     the vendors ignore or deprecate it, none rejects it, and there is no
     honest integer mapping to apply.
 
+    Thinking OFF (``thinking: {"type": "disabled"}``) is rewritten only on a
+    route whose policy sets :attr:`EffortPolicy.thinking_off_effort` (the
+    route refuses it): the ``thinking`` param is dropped — the vendor's
+    default is thinking on — and, when the request names no effort, the
+    row's lowest level is set, so the request reaches the SAME model with as
+    little thinking as it offers. An effort the request does name is kept
+    (translated first if the route rejects it).
+
     Vendor-neutral: the (vendor, model) key selects the data; this function
     names neither.
     """
     if not isinstance(payload, dict):
         return payload, False
     policy = EFFORT_POLICIES.get((vendor_id, model_id))
-    if policy is None or not policy.translate:
+    if policy is None:
         return payload, False
+    new_payload: Optional[dict] = None
     output_config = payload.get("output_config")
-    if not isinstance(output_config, dict):
-        return payload, False
-    effort = output_config.get("effort")
-    if not isinstance(effort, str):
-        return payload, False
-    replacement = policy.translate.get(effort)
-    if replacement is None:
+    if isinstance(output_config, dict):
+        effort = output_config.get("effort")
+        replacement = (
+            policy.translate.get(effort) if isinstance(effort, str) else None
+        )
+        if replacement is not None:
+            new_config = dict(output_config)
+            new_config["effort"] = replacement
+            new_payload = dict(payload)
+            new_payload["output_config"] = new_config
+    if policy.thinking_off_effort is not None and _thinking_is_off(payload):
+        if new_payload is None:
+            new_payload = dict(payload)
+        del new_payload["thinking"]
+        config = new_payload.get("output_config")
+        if not isinstance(config, dict):
+            new_payload["output_config"] = {
+                "effort": policy.thinking_off_effort,
+            }
+        elif not isinstance(config.get("effort"), str):
+            new_config = dict(config)
+            new_config["effort"] = policy.thinking_off_effort
+            new_payload["output_config"] = new_config
+    if new_payload is None:
         # Accepted (or a value with no evidence either way): byte-identical.
         return payload, False
-    new_config = dict(output_config)
-    new_config["effort"] = replacement
-    new_payload = dict(payload)
-    new_payload["output_config"] = new_config
     return new_payload, True
 
 

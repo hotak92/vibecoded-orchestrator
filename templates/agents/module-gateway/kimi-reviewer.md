@@ -1,7 +1,7 @@
 ---
 name: kimi-reviewer
-description: Kimi K3 read-only review lane via the claude-gw gateway (kimi vendor) — an independent second-family round on large diffs; one report, every finding quoted. Not edits or the pre-tag ship-gate (Fable). Needs the model gateway.
-model: claude-gw/kimi/k3[1m]
+description: Kimi K3.1 Pro read-only review lane via the claude-gw gateway (kimi vendor) — an independent second-family round on large diffs; one report, every finding quoted. Not edits or the pre-tag ship-gate (Fable). Needs the model gateway.
+model: claude-gw/kimi/k3.1-pro[1m]
 effort: medium
 background: true
 autoCompactWindow: 750000
@@ -35,6 +35,6 @@ Where this lane fits:
 - A different model family from the GLM and Claude reviewers, so it catches different defects
   (head-to-head runs show it solving tasks other strong models miss, and vice versa). Use it as an
   independent round, not as the only review.
-- K3 handles very long context (the window in effect is whatever the gateway reports), which suits
-  reviewing a large diff or many files together. It is slow: brief it for a queued round, not for quick
-  back-and-forth.
+- K3.1 Pro handles very long context (the window in effect is whatever the gateway reports), which suits
+  reviewing a large diff or many files together. It is slow (thinking is always on): brief it
+  for a queued round, not for quick back-and-forth.

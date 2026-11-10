@@ -41,7 +41,7 @@ export function kgReviewerModelHint(info: Pick<KgReviewerModelInfo, 'env_overrid
     'After each commit a background reviewer updates the KG nodes under knowledge/ ' +
     '(never docs or code), reverts any edit that breaks its rules, and commits only ' +
     'its own nodes as "kg-sync: <hash> <subject>". This model is used on every ' +
-    'project. If it is unavailable, only a comparable gateway model (GLM-5.3, Kimi K3) ' +
+    'project. If it is unavailable, only a comparable gateway model (GLM-5.3, Kimi K3.1 Pro) ' +
     'may stand in - never a flash model - otherwise the review is skipped. ' +
     `${info.env_override_key} in the environment overrides this choice.`
   );

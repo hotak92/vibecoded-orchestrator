@@ -160,7 +160,7 @@ class FallbackRouteTests(unittest.TestCase):
         self.assertIsNone(
             routing.fallback_route(
                 Route(
-                    upstream=kimi.upstream, forward_model="k3", vendor=kimi,
+                    upstream=kimi.upstream, forward_model="k3.1-pro", vendor=kimi,
                     family_id="kimi", is_anthropic=False,
                 ),
             ),

@@ -45,7 +45,7 @@ LIVE_SHAPE = (REPO_ROOT / "tests" / "fixtures" / "kg_reviewer"
 # v0.2.103 (owner ruling 2026-10-15): the fallback rungs are the comparable
 # NON-flash gateway models; the F-1 spelling rules are pinned on them.
 GLM = "claude-gw/glm-5.3[1m]"
-KIMI = "claude-gw/kimi/k3[1m]"
+KIMI = "claude-gw/kimi/k3.1-pro[1m]"
 
 
 def _load(name: str, path: Path) -> types.ModuleType:
@@ -126,12 +126,12 @@ def test_f1_live_catalogue_shape_serves_the_first_gateway_rung(
 
 @pytest.mark.parametrize("latched, expected", [
     (("kg_reviewer:claude-gw/glm-5.3",), KIMI),
-    (("kg_reviewer:claude-gw/glm-5.3", "kg_reviewer:claude-gw/kimi/k3"),
+    (("kg_reviewer:claude-gw/glm-5.3", "kg_reviewer:claude-gw/kimi/k3.1-pro"),
      None),
 ])
 def test_f1_owner_order_walks_the_namespaced_rungs(
         chain, monkeypatch, latched, expected):
-    """GLM-5.3 (z.ai, ``claude-gw/``) then Kimi K3 (``claude-gw/kimi/``);
+    """GLM-5.3 (z.ai, ``claude-gw/``) then Kimi K3.1 Pro (``claude-gw/kimi/``);
     with both latched the walk skips — never to a served flash model."""
     rig = _Rig(chain, monkeypatch, catalogue=_live_ids())
     rig.latch("kg_reviewer:haiku")
@@ -160,11 +160,11 @@ def test_f1_plain_spelling_is_matched_and_1m_row_preferred(chain,
 
 
 def test_f1_hand_spelled_ids_are_not_accepted(chain, monkeypatch):
-    """An id without the vendor's namespace (``claude-gw/k3`` is not the
+    """An id without the vendor's namespace (``claude-gw/k3.1-pro`` is not the
     Kimi row) or on another vendor (GLM through the QwenCloud namespace)
     is NOT a rung."""
     rig = _Rig(chain, monkeypatch, catalogue=frozenset(
-        {"claude-gw/k3", "claude-gw/qwen/glm-5.3"}))
+        {"claude-gw/k3.1-pro", "claude-gw/qwen/glm-5.3"}))
     rig.latch("kg_reviewer:haiku")
     assert rig.decide()["mode"] == "skip", rig.lines
 
@@ -182,7 +182,7 @@ def test_f1_rung_ids_derive_from_model_router_and_match_shipped_agents(
         if m:
             agent_models.add(m.group(1))
     rungs = chain.gateway_rungs()
-    assert rungs == ("claude-gw/glm-5.3", "claude-gw/kimi/k3")
+    assert rungs == ("claude-gw/glm-5.3", "claude-gw/kimi/k3.1-pro")
     for (vendor_id, bare), rung in zip(chain.GATEWAY_RUNG_MODELS, rungs):
         vendor = VENDORS[vendor_id]
         assert bare in (vendor.verified_ids or ()) + (vendor.static_ids or ()), (

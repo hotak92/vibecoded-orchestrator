@@ -276,9 +276,9 @@ class EffortOnTheLedgerTests(EffortObservabilityTestBase):
 
         self.vendor = replace(VENDORS["kimi"], upstream=self.vendor.upstream)
         self.client = await self.make_client()
-        self.vendor_up.messages_body = _success("k3")
+        self.vendor_up.messages_body = _success("k3.1-pro")
         await self.post({
-            "model": "claude-gw/kimi/k3",
+            "model": "claude-gw/kimi/k3.1-pro",
             "messages": [{"role": "user", "content": "hi"}],
             "output_config": {"effort": "medium"},
         })
@@ -286,8 +286,29 @@ class EffortOnTheLedgerTests(EffortObservabilityTestBase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["route"], "vendor:kimi")
         self.assertEqual(rows[0]["effort_requested"], "medium")
-        # No kimi translate entry — the collapse is the vendor's, upstream.
+        # medium is accepted — the collapse is the vendor's, upstream.
         self.assertEqual(rows[0]["effort_forwarded"], "medium")
+
+    async def test_kimi_thinking_off_records_the_low_it_was_sent_at(self) -> None:
+        """K3.1 Pro refuses thinking OFF, so the gateway sends it on at low
+        (effort.py ``thinking_off_effort``): the pair makes that visible —
+        nothing requested, ``low`` forwarded."""
+        from model_router.vendors import VENDORS
+
+        self.vendor = replace(VENDORS["kimi"], upstream=self.vendor.upstream)
+        self.client = await self.make_client()
+        self.vendor_up.messages_body = _success("k3.1-pro")
+        await self.post({
+            "model": "claude-gw/kimi/k3.1-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disabled"},
+        })
+        rows = await self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["effort_requested"])
+        self.assertEqual(rows[0]["effort_forwarded"], "low")
+        sent = json.loads(self.vendor_up.message_requests[0]["body"])
+        self.assertNotIn("thinking", sent)
 
     async def test_deepseek_route_records_the_pair(self) -> None:
         """The deepseek models ride the QWEN vendor row — same recording.

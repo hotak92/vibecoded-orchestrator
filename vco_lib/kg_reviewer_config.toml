@@ -47,7 +47,7 @@ choices = ["haiku", "sonnet", "opus"]
 # gateway spelling is derived from model_router's vendor table.
 gateway_rungs = [
     ["zai", "glm-5.3"],
-    ["kimi", "k3"],
+    ["kimi", "k3.1-pro"],
 ]
 
 [prompt]
