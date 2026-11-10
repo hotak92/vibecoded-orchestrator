@@ -79,6 +79,10 @@ services:
       MEMORY_READONLY_PERCENTAGE: "0"
       LAZY_LOAD_SHARD_COUNT_THRESHOLD: "0"
       DEFAULT_QUANTIZATION: "rq-8"
+      # v0.2.106: raft snapshot after every schema change — mirror of
+      # infrastructure/docker-compose.yml (canonical; the reason is there).
+      RAFT_SNAPSHOT_THRESHOLD: "1"
+      RAFT_SNAPSHOT_INTERVAL: "30"
       # --- HNSW TOMBSTONE-CLEANUP CHURN REDUCTION (v0.2.61) ---
       # Mirror of the tuning in infrastructure/docker-compose.yml (canonical);
       # this legacy compose path wires into the same shared volume so it must

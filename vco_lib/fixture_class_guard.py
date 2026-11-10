@@ -87,8 +87,10 @@ __all__ = [
     "fixture_stem_of",
     "fixture_writes_allowed",
     "guard_fixture_class_write",
+    "guard_class_create",
     "guarded_collection_create",
     "is_fixture_shaped_class",
+    "record_collection_delete",
     "refusal_text",
     "unregistered_folder_warning_text",
 ]
@@ -329,8 +331,34 @@ def guarded_collection_create(client, name: str, **create_kwargs):
     box (``Wt_foo_Code*``, ``LaneCProbe*_Code*``) and which sits under a
     downward-only line ratchet, so an inline guard there was not available.
     """
-    guard_fixture_class_write(name, operation="create")
+    # The client was connected to the resolved WEAVIATE_URL, which is the key
+    # a delete is recorded under (record_collection_delete).
+    from vco_lib import weaviate_helpers as _wh  # noqa: PLC0415
+
+    guard_class_create(name, weaviate_url=_wh.weaviate_url_default())
     return client.collections.create(name=name, **create_kwargs)
+
+
+def guard_class_create(name: str, *, weaviate_url: str) -> None:
+    """Every create-time refusal, in one call (v0.2.106): the fixture-class
+    rule (:func:`guard_fixture_class_write`) and the case-variant rule —
+    no create while a delete of a name differing only in case is still
+    replayable by Weaviate (:func:`vco_lib.weaviate_case_history.guard_create`,
+    raising its ``CaseVariantCreateRefused``)."""
+    from vco_lib.weaviate_case_history import guard_create  # noqa: PLC0415
+
+    guard_fixture_class_write(name, operation="create", weaviate_url=weaviate_url)
+    guard_create(name, weaviate_url)
+
+
+def record_collection_delete(client, name: str) -> None:
+    """``client.collections.delete(name)`` recorded for the case-variant create
+    guard (v0.2.106) — the delete-side twin of :func:`guarded_collection_create`,
+    for the same bare-v4 callers."""
+    from vco_lib import weaviate_helpers as _wh  # noqa: PLC0415
+    from vco_lib.weaviate_case_history import delete_collection  # noqa: PLC0415
+
+    delete_collection(client, name, _wh.weaviate_url_default())
 
 
 def guard_fixture_class_write(

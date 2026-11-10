@@ -7943,7 +7943,10 @@ async def migrate_embeddings(
     # index_null_state=True invariant (the stale-filter relies on
     # `valid_until is_none(True)` being filterable; see _stale_filter
     # docstring). This setting CANNOT be added later via Reconfigure.
-    client.collections.delete(collection_name)
+    # v0.2.106: same-name drop + create (safe on replay); recorded for the
+    # case-variant create guard (vco_lib.weaviate_case_history).
+    from vco_lib.fixture_class_guard import record_collection_delete
+    record_collection_delete(client, collection_name)
     client.collections.create(
         name=collection_name,
         properties=existing_props,

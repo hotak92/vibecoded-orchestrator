@@ -421,7 +421,7 @@ try:
     from vco_lib.kg_vector_slot import collection_vector_slots as _collection_vector_slots
     # v0.2.94: the ONE connect factory + URL resolver, and the guarded create.
     from vco_lib import weaviate_helpers as _wh
-    from vco_lib.fixture_class_guard import guarded_collection_create
+    from vco_lib.fixture_class_guard import guarded_collection_create, record_collection_delete
     from vco_lib.weaviate_vector_index import client_named_vector as _client_named_vector
     # v0.2.92: extractor-generation re-index — the force-rewalk flag
     # resolution, the all-chunks-SKIP verdict, and the completion stamp all
@@ -1651,7 +1651,7 @@ class CodeGraphAnalyzer:
         # CodeModule collection
         try:
             if force and self.client.collections.exists(self.coll_module):
-                self.client.collections.delete(self.coll_module)
+                record_collection_delete(self.client, self.coll_module)
                 print(f"🗑️  Deleted existing {self.coll_module} collection")
 
             if not self.client.collections.exists(self.coll_module):
@@ -1713,7 +1713,7 @@ class CodeGraphAnalyzer:
         # CodeClass collection
         try:
             if force and self.client.collections.exists(self.coll_class):
-                self.client.collections.delete(self.coll_class)
+                record_collection_delete(self.client, self.coll_class)
                 print(f"🗑️  Deleted existing {self.coll_class} collection")
 
             if not self.client.collections.exists(self.coll_class):
@@ -1782,7 +1782,7 @@ class CodeGraphAnalyzer:
         # CodeFunction collection
         try:
             if force and self.client.collections.exists(self.coll_function):
-                self.client.collections.delete(self.coll_function)
+                record_collection_delete(self.client, self.coll_function)
                 print(f"🗑️  Deleted existing {self.coll_function} collection")
 
             if not self.client.collections.exists(self.coll_function):
@@ -1849,7 +1849,7 @@ class CodeGraphAnalyzer:
         # CodeAPI collection
         try:
             if force and self.client.collections.exists(self.coll_api):
-                self.client.collections.delete(self.coll_api)
+                record_collection_delete(self.client, self.coll_api)
                 print(f"🗑️  Deleted existing {self.coll_api} collection")
 
             if not self.client.collections.exists(self.coll_api):
@@ -1893,7 +1893,7 @@ class CodeGraphAnalyzer:
         # CodeInteraction collection — cross-language / cross-service calls
         try:
             if force and self.client.collections.exists(self.coll_interaction):
-                self.client.collections.delete(self.coll_interaction)
+                record_collection_delete(self.client, self.coll_interaction)
                 print(f"🗑️  Deleted existing {self.coll_interaction} collection")
 
             if not self.client.collections.exists(self.coll_interaction):

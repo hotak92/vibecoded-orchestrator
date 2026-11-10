@@ -133,6 +133,25 @@ services:
       # Existing collections are switched by the install/update step
       # (vco_lib.weaviate_vector_index), never re-created.
       DEFAULT_QUANTIZATION: "rq-8"
+      # v0.2.106: take a raft snapshot of the schema after EVERY schema change
+      # (threshold 1 entry), checked every 30-60 s (raft waits a random time
+      # between the interval and twice it). Weaviate's default is 8192
+      # entries, which a small install never reaches: such a node replays
+      # its WHOLE schema log at every start. From 1.37 a replayed class delete
+      # is recorded as an "orphan" whose data is dropped at the end of the
+      # start, and the check that skips a class created again compares names
+      # case-sensitively while the on-disk index is lower-cased. So a delete
+      # of `ProjectX_KnowledgeGraph` followed by a create of
+      # `ProjectX_Knowledgegraph`, still in the log, wipes the live class at
+      # every restart (docs/TROUBLESHOOTING.md, "Weaviate collections lose
+      # their data at every restart"). After a
+      # snapshot a start restores the snapshot and replays only the entries
+      # after it. A schema snapshot is small (class definitions only, no
+      # objects). Both names are read by 1.28.4 and 1.37.18
+      # (usecases/config/environment.go); vco_lib.weaviate_raft_guard pins
+      # these values (tests/test_v02106_weaviate_raft_guard.py).
+      RAFT_SNAPSHOT_THRESHOLD: "1"
+      RAFT_SNAPSHOT_INTERVAL: "30"
       # --- HNSW TOMBSTONE-CLEANUP CHURN REDUCTION (v0.2.61) ---
       # SECOND disk-leak source, distinct from the memtable write-amp above.
       # The code-graph collections accumulate large tombstone counts (a

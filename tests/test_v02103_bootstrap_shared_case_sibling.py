@@ -183,8 +183,15 @@ def test_an_uncountable_case_sibling_is_never_dropped(machine, monkeypatch):
 
 def test_an_empty_stale_case_sibling_keeps_the_drop_and_recreate(machine, monkeypatch):
     """Pre-existing behaviour for an EMPTY sibling (nothing to lose): dropped,
-    the target created under its own name, reported as a case-conflict regen."""
+    the target created under its own name, reported as a case-conflict regen.
+    v0.2.106: on a Weaviate without the 1.37 orphan drop (here 1.28.4) — on one
+    with it the create first waits for a raft snapshot that holds the delete
+    (tests/test_v02106_weaviate_raft_guard.py)."""
     folder, _bind_root = machine
+    from vco_lib import weaviate_raft_guard as rg
+
+    monkeypatch.setattr(rg, "_default_http", lambda url, timeout: (
+        (200, b'{"version": "1.28.4"}') if url.endswith("/v1/meta") else (404, b"")))
     fake = _FakeWeaviate({DERIVED: 0})
     result = _bootstrap(monkeypatch, fake, folder)
     assert fake.deleted == [DERIVED]

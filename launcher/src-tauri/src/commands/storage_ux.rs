@@ -1989,10 +1989,24 @@ pub async fn migrate_volumes(
         return Err("no existing volumes to migrate".into());
     }
 
+    // 0. v0.2.106: the `compose up` below re-creates Weaviate from VCO's
+    //    pinned image. When that MOVES its data from Weaviate <= 1.28 onto a
+    //    release with the 1.37 orphan drop, a raft snapshot must be taken by
+    //    the OLD image first (vco_lib.weaviate_raft_guard) — else the first
+    //    start can drop live collections. Refused → nothing is stopped.
+    let root = orchestrator_root()?;
+    let prep_root = root.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::services::vco_lib_bridge::weaviate_upgrade_prepare(&prep_root)
+    })
+    .await
+    .map_err(|e| format!("weaviate snapshot check task failed: {}", e))?
+    .map_err(|e| format!("volume migration not started — {}", e))?;
+
     // 1. Stop services. NOTE: NO `--volumes` flag — this only stops
     //    containers, leaves volumes intact.
     emit_phase(&app, MigratePhase::StoppingContainers, "Stopping containers");
-    let compose_dir = orchestrator_root()?.join("infrastructure");
+    let compose_dir = root.join("infrastructure");
     let compose_status = tokio::process::Command::new(&runtime).silent()
         .args(["compose", "stop"])
         .current_dir(&compose_dir)

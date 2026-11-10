@@ -252,6 +252,12 @@ from vco_lib.playwright_mcp import CID_BROWSER_MISSING as CID_PLAYWRIGHT_BROWSER
 #: Probe, entry and the cid live in :mod:`vco_lib.kg_primary_shared`.
 from vco_lib.kg_primary_shared import CID_PRIMARY_BOUND_TO_SHARED as CID_KG_PRIMARY_SHARED  # noqa: E402
 
+#: v0.2.106: Weaviate raft snapshots / the 1.37 orphan drop / the memory cap.
+#: Probes, entries and cids live in :mod:`vco_lib.weaviate_raft_guard`.
+from vco_lib.weaviate_raft_guard import CID_INDEX_MISSING as CID_WEAVIATE_INDEX_MISSING  # noqa: E402
+from vco_lib.weaviate_raft_guard import CID_REPLAY_EXPOSED as CID_WEAVIATE_REPLAY_EXPOSED  # noqa: E402
+from vco_lib.weaviate_raft_guard import CID_UNCAPPED as CID_WEAVIATE_UNCAPPED  # noqa: E402
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -262,7 +268,8 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_INSTALL_MARKER_UNBACKED, CID_FORMER_LAUNCHER_CLI,
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
-    CID_KG_PRIMARY_SHARED,
+    CID_KG_PRIMARY_SHARED, CID_WEAVIATE_INDEX_MISSING, CID_WEAVIATE_REPLAY_EXPOSED,
+    CID_WEAVIATE_UNCAPPED,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -274,7 +281,8 @@ DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (
     CID_DISK_SPACE_LOW, CID_KG_BINDING_EVIDENCE_MISMATCH,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
-    CID_KG_PRIMARY_SHARED,
+    CID_KG_PRIMARY_SHARED, CID_WEAVIATE_INDEX_MISSING, CID_WEAVIATE_REPLAY_EXPOSED,
+    CID_WEAVIATE_UNCAPPED,
 )
 
 #: Env override for the free-space floor, in GiB (float). Default
@@ -470,6 +478,21 @@ class DoctorResolvers:
     #: or None when launcher.db cannot be read (v0.2.105). Injected so the
     #: probe is driven from described bindings, no launcher.db.
     kg_primary_shared: Optional[Callable[[], Optional[list]]] = None
+    #: (folder) -> :class:`vco_lib.weaviate_raft_guard.RaftScan` or None, and
+    #: () -> ``(MemCap, runtime, limit)`` or None (v0.2.106). Injected so the
+    #: raft / memory-cap probes run from a described Weaviate, no service.
+    weaviate_raft_scan: Optional[Callable[[Path], Any]] = None
+    weaviate_mem_cap: Optional[Callable[[], Any]] = None
+
+    def resolve_weaviate_raft_scan(self, folder: Path):
+        from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+        return (self.weaviate_raft_scan or _rg.default_scan)(folder)
+
+    def resolve_weaviate_mem_cap(self):
+        from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+        return (self.weaviate_mem_cap or _rg.default_mem_cap)()
 
     def resolve_kg_primary_shared(self) -> Optional[list]:
         """Non-root projects whose primary KG binding is the shared class —
@@ -4804,6 +4827,26 @@ def _kg_primary_shared_entry(finding: Finding):
     return kg_primary_shared.doctor_entry(finding)
 
 
+def probe_weaviate_raft(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.weaviate_raft_guard` (v0.2.106)."""
+    from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+    return _rg.probe_raft(folder, res, ctx)
+
+
+def probe_weaviate_mem_cap(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.weaviate_raft_guard` (v0.2.106)."""
+    from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+    return _rg.probe_mem_cap(folder, res, ctx)
+
+
+def _weaviate_entry(finding: Finding):
+    from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+    return _rg.doctor_entry(finding)
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4853,6 +4896,11 @@ PROBES: dict = {
     # self-resolving `kg_primary_bound_to_shared` (a binding changes only
     # through the launcher or an install/update, which is when this runs).
     "kg_primary_shared": (probe_kg_primary_shared, (SCOPE_FULL,)),
+    # v0.2.106: full-only — Weaviate REST reads (version, raft statistics, the
+    # schema, one shard-status call per class) and one container inspect.
+    # Doctor-owned, self-resolving cids (vco_lib.weaviate_raft_guard).
+    "weaviate_raft": (probe_weaviate_raft, (SCOPE_FULL,)),
+    "weaviate_mem_cap": (probe_weaviate_mem_cap, (SCOPE_FULL,)),
     # v0.2.102 W4-C L2: full-only — per registered project, one Weaviate
     # reachability probe + one hash query per populated collection (network
     # reads; same cost reasoning as kg_binding_evidence). REPORTED-not-owned:
@@ -5399,6 +5447,9 @@ _ENTRY_BUILDERS: dict = {
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED: _compose_override_pair_entry,
     CID_PLAYWRIGHT_BROWSER_MISSING: _playwright_browser_entry,
     CID_KG_PRIMARY_SHARED: _kg_primary_shared_entry,
+    CID_WEAVIATE_INDEX_MISSING: _weaviate_entry,
+    CID_WEAVIATE_REPLAY_EXPOSED: _weaviate_entry,
+    CID_WEAVIATE_UNCAPPED: _weaviate_entry,
 }
 
 

@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collections, keep the bundled files) stays on the project's Settings → Danger zone, whose description now matches
   what is actually removed.
 
+- **`vco doctor` reports Weaviate collections that lost their data, the replay risk, and an uncapped Weaviate.**
+  Three new findings, each with a ledger entry that clears itself: a collection the defect can hit (its name differs
+  only in case from one VCO derived or deleted) that is in the schema but whose data
+  index is gone (`weaviate_collection_index_missing`, with the only repair order that does not lose the rebuild
+  again: snapshot settings first, then drop + `bootstrap-collections` + `kg-sync`, then wait for a snapshot before
+  any restart — VCO never runs it for you); a schema history whose replay can still drop a live collection
+  (`weaviate_raft_replay_exposed`); and a Weaviate container running without a memory limit
+  (`weaviate_container_uncapped` — a container VCO adopted never got the limit VCO sizes from the host), with the
+  command that caps it in place without a recreate. `python -m vco_lib.weaviate_raft_guard status` prints the
+  Weaviate version, how much of the schema history the latest snapshot holds, and which case-variant collection lost
+  its data;
+  `... snapshot --container <name>` takes the snapshot with a container's own image before a move by hand.
+
 ### Changed
 
 - **Removing a project takes out what is VCO's, and only that.** Before, removing a project deleted the whole
@@ -41,6 +54,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one another project uses.
 
 ### Fixed
+
+- **Weaviate 1.37 no longer wipes a collection at every restart.** A field report: after the move to Weaviate
+  1.37.18 the orchestrator's knowledge-graph, docs and diagrams collections kept their schema but lost their data
+  at the first start, and again at every restart after they were rebuilt. The cause is upstream (a draft report is
+  ready): a small install never takes a raft snapshot, so Weaviate replays its whole schema history at every start,
+  and from 1.37 a replayed collection delete drops the data of a LIVE collection whose name differs only in letter
+  case (VCO's v0.2.88 re-spelling of the root collections, `VibecodedOrchestrator_*` → `VibeCodedOrchestrator_*`,
+  left exactly that history). Four changes end it. The shipped compose now has Weaviate take a schema snapshot
+  within a minute of any schema change (`RAFT_SNAPSHOT_THRESHOLD`, `RAFT_SNAPSHOT_INTERVAL`), and a running
+  VCO-managed container without them is recreated with them like any other config drift. Before VCO moves a data
+  folder from Weaviate 1.28 or older to a newer release — `python install.py --update`, `service_endpoints
+  hand-to-vco`, the session hooks' restart of a stopped container, a port move, the launcher's volume migration — it
+  first runs the OLD image once on the same data until a snapshot holds the whole history, then starts the old
+  container again; if that cannot be done, or the version that last wrote the data is not known, the container is
+  left as it is and
+  `weaviate_upgrade_snapshot_refused` says why. VCO no longer creates a collection while a delete of the same name
+  in other letter case could still be replayed (it waits for the next snapshot, else refuses loudly), and the
+  residual-lowercase-collection notice no longer prints a `DELETE` (Weaviate keeps both spellings in one index, so
+  deleting either removes the data of both). Checked against throwaway containers: on 1.37.18 the case-variant
+  history loses the live data at the next restart; with the snapshot settings it survives; a 1.28.4 folder with
+  that history loses its data at the first 1.37.18 start, and keeps it (also across a restart) when VCO's snapshot
+  ran first.
 
 - **The old inline syntax-check hooks are removed from your settings.** Early releases registered a `py_compile`
   one-liner on every Python write (in two successive forms, Linux and Windows) and a later one replaced it with the

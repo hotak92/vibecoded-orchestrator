@@ -440,6 +440,8 @@ from vco_lib import progress_event as _progress_event  # noqa: E402 — same imp
 # at all; `WeaviateWrapper.__init__` already reaches this same module lazily
 # for `connect_v4`.
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — same import-order constraint as the group above
+# v0.2.106: no create while a delete of a case-variant of the name is still replayable.
+from vco_lib.weaviate_case_history import guard_create as _no_case_twin  # noqa: E402 — same import-order constraint as the group above
 from vco_lib.containers import runtime_command_hint as _runtime_command_hint  # noqa: E402 — same import-order constraint as the group above
 # v0.2.101 (item 3): the archived-node predicate has ONE home. The seed's
 # change check (vco_lib.install_weaviate) must skip exactly what this script
@@ -2448,6 +2450,7 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
             for name, dt in _scalar_props.items()
         ]
 
+        _no_case_twin(COLLECTION_NAME, WEAVIATE_URL)
         server.client.collections.create(
             name=COLLECTION_NAME,
             description="Claude knowledge graph nodes with semantic search (chunked for large files)",
@@ -2561,6 +2564,7 @@ def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
             ]
 
         print(f"Creating dev collection '{DEV_COLLECTION_NAME}'...")
+        _no_case_twin(DEV_COLLECTION_NAME, WEAVIATE_URL)
         server.client.collections.create(
             name=DEV_COLLECTION_NAME,
             description="Project development documentation (docs/) — chunked, "

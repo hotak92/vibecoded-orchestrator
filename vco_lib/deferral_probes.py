@@ -1164,6 +1164,38 @@ def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
     return None
 
 
+def weaviate_raft_replay_still_exposed(ctx: ProbeContext) -> Optional[bool]:
+    """``weaviate_raft_replay_exposed`` — the SAME reading the doctor probe
+    emits from (:func:`vco_lib.weaviate_raft_guard.still_exposed`)."""
+    from vco_lib import weaviate_raft_guard as _rg
+
+    try:
+        return _rg.still_exposed(root=Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def weaviate_collection_index_still_missing(ctx: ProbeContext) -> Optional[bool]:
+    """``weaviate_collection_index_missing`` — a schema class still has no index."""
+    from vco_lib import weaviate_raft_guard as _rg
+
+    try:
+        return _rg.still_index_missing()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def weaviate_container_still_uncapped(ctx: ProbeContext) -> Optional[bool]:
+    """``weaviate_container_uncapped`` — the Weaviate container still has no
+    memory limit."""
+    from vco_lib import weaviate_raft_guard as _rg
+
+    try:
+        return _rg.still_uncapped()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def kg_primary_still_bound_to_shared(ctx: ProbeContext) -> Optional[bool]:
     """``kg_primary_bound_to_shared`` — does a non-root project still use the
     shared KG collection as its primary? The SAME reading the doctor probe
@@ -1448,6 +1480,9 @@ PROBES: dict[str, ProbeFn] = {
     "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
     "playwright_browser_still_missing": playwright_browser_still_missing,
     "kg_primary_still_bound_to_shared": kg_primary_still_bound_to_shared,
+    "weaviate_raft_replay_still_exposed": weaviate_raft_replay_still_exposed,
+    "weaviate_collection_index_still_missing": weaviate_collection_index_still_missing,
+    "weaviate_container_still_uncapped": weaviate_container_still_uncapped,
     "service_endpoint_still_unreachable": service_endpoint_still_unreachable,
     "service_endpoint_still_ambiguous": service_endpoint_still_ambiguous,
     "adopted_service_config_drift_persists": adopted_service_config_drift_persists,
