@@ -125,6 +125,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1025,9 +1026,15 @@ def probe_launcher_binary_fresh(folder: Path, res: DoctorResolvers, ctx: dict) -
         ]
     from vco_lib import deferral_probes
 
-    verdict = deferral_probes.run_probe(
-        "launcher_binary_stale_still_applies",
-        deferral_probes.ProbeContext(folder=folder, entry=None, extras=extras),
+    # v0.2.106: ask the DIAGNOSIS, not the deferral clear verdict. The clear
+    # probe folds "a launcher process is running, so I cannot read its
+    # compiled-in version" into ``True`` (conservative for an entry it must
+    # not retire); the doctor used to read that as "problem" and reported a
+    # stale binary every time the launcher VCO keeps running was open. A
+    # running process is not staleness: the on-disk binary matches the tree,
+    # and the running image is the launcher's own boot probe's question.
+    verdict = deferral_probes.launcher_binary_freshness(
+        deferral_probes.ProbeContext(folder=folder, entry=None, extras=extras)
     )
     if verdict is None:
         return [
@@ -1037,7 +1044,20 @@ def probe_launcher_binary_fresh(folder: Path, res: DoctorResolvers, ctx: dict) -
                 summary="launcher binary freshness could not be determined",
             )
         ]
-    if verdict:
+    if verdict == deferral_probes.LAUNCHER_RUNNING_UNVERIFIED:
+        return [
+            Finding(
+                probe="launcher_binary_fresh",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    "a launcher process is running; the binary on disk matches "
+                    "the tree, but the RUNNING image's version cannot be read "
+                    "from here — the launcher's own boot probe checks it (quit "
+                    "the launcher fully and reopen it to force that check)"
+                ),
+            )
+        ]
+    if verdict == deferral_probes.LAUNCHER_STALE:
         return [
             Finding(
                 probe="launcher_binary_fresh",
@@ -5061,6 +5081,70 @@ def reconcile_probe_cleared(
         return []
 
 
+#: Per-CHECK wall-clock ceiling (seconds) for one probe in :func:`run_doctor`
+#: (v0.2.106 field report: a doctor run took 14 minutes under load). There is
+#: deliberately NO whole-run cap — the owner rule is "no global timeout,
+#: per-chunk guards": each probe is bounded, a probe past the bound is reported
+#: as ``unknown`` ("not checked"), and the pass continues. ``0`` disables it.
+DEFAULT_PROBE_TIMEOUT_S = 120
+
+
+def probe_timeout_secs() -> int:
+    """``VCT_DOCTOR_CHECK_TIMEOUT_S`` — this run's per-check bound in seconds.
+
+    Unset/empty/non-numeric → :data:`DEFAULT_PROBE_TIMEOUT_S`; a negative
+    value clamps to ``0`` (disabled), a huge one to one hour.
+    """
+    from vco_lib.env_values import env_int  # noqa: PLC0415
+
+    return int(env_int("VCT_DOCTOR_CHECK_TIMEOUT_S", DEFAULT_PROBE_TIMEOUT_S,
+                       minimum=0, maximum=3600, clamp=True))
+
+
+def _run_probe_bounded(
+    probe_id: str, fn: Callable[..., list], folder: Path,
+    res: DoctorResolvers, ctx: dict, timeout_s: float,
+) -> list:
+    """Run one probe under its own wall-clock bound; never raises.
+
+    A probe that overruns is abandoned (a DAEMON thread, so a wedged probe
+    can neither block the remaining checks nor keep the process alive) and
+    becomes an ``unknown`` finding that says it was NOT CHECKED — never a
+    failure, because "I could not look" is not "it is broken". A probe that
+    raises keeps the pre-existing degrades-to-unknown contract.
+    """
+    if timeout_s <= 0:
+        return list(fn(folder, res, ctx) or [])
+    outcome: dict = {}
+
+    def _target() -> None:
+        try:
+            outcome["findings"] = list(fn(folder, res, ctx) or [])
+        except BaseException as exc:  # noqa: BLE001 — reported, never re-raised in a thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(
+        target=_target, name=f"doctor-probe-{probe_id}", daemon=True,
+    )
+    worker.start()
+    worker.join(timeout_s)
+    if worker.is_alive():
+        return [
+            Finding(
+                probe=probe_id,
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"not checked — exceeded the {int(timeout_s)} s per-check "
+                    "bound (raise VCT_DOCTOR_CHECK_TIMEOUT_S or re-run when "
+                    "the machine is less loaded)"
+                ),
+            )
+        ]
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("findings", [])
+
+
 def run_doctor(
     folder: Path,
     *,
@@ -5091,11 +5175,14 @@ def run_doctor(
     ctx = dict(context or {})
     ctx["scope"] = scope
     report = DoctorReport(folder=Path(folder), scope=scope)
+    timeout_s = probe_timeout_secs()
     for probe_id, (fn, scopes) in PROBES.items():
         if scope not in scopes:
             continue
         try:
-            report.findings.extend(fn(Path(folder), res, ctx))
+            report.findings.extend(
+                _run_probe_bounded(probe_id, fn, Path(folder), res, ctx, timeout_s)
+            )
         except Exception as exc:  # noqa: BLE001 — one probe never breaks the pass
             report.findings.append(
                 Finding(
@@ -5682,6 +5769,7 @@ __all__ = [
     "DISK_CRITICAL_FREE_BYTES",
     "DISK_MIN_FREE_ENV",
     "DISK_MIN_FREE_GB_DEFAULT",
+    "DEFAULT_PROBE_TIMEOUT_S",
     "DOCTOR_OWNED_CIDS",
     "DOCTOR_SELF_RESOLVING_CIDS",
     "GIT_TIMEOUT_SECONDS",
@@ -5721,6 +5809,7 @@ __all__ = [
     "main",
     "measure_disk_space",
     "parse_vct_guards",
+    "probe_timeout_secs",
     "probe_agent_model_ids",
     "probe_diagnostic_files",
     "probe_disk_space",

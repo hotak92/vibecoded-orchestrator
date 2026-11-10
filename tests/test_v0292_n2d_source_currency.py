@@ -866,7 +866,12 @@ class ProbeRegistrationTests(unittest.TestCase):
         question the user actually has.
         """
         res = doctor.DoctorResolvers()
-        with mock.patch("vco_lib.deferral_probes.run_probe", return_value=False):
+        # v0.2.106: the doctor reads the DIAGNOSIS now (a running launcher is
+        # its own state, never "stale"), so the seam is the diagnosis fn.
+        from vco_lib import deferral_probes
+
+        with mock.patch("vco_lib.deferral_probes.launcher_binary_freshness",
+                        return_value=deferral_probes.LAUNCHER_FRESH):
             findings = doctor.probe_launcher_binary_fresh(
                 Path("/tmp/x"), res, {"launcher_probe_extras": {"any": "thing"}})
         self.assertEqual(findings[0].status, doctor.STATUS_OK)

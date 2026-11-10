@@ -76,6 +76,39 @@ def _ascii_error_handler(exc: UnicodeError) -> "tuple[str, int]":
     return to_console_ascii(exc.object[exc.start:exc.end]), exc.end
 
 
+def console_print(*args: Any, file: Any = None, **kwargs: Any) -> bool:
+    """``print`` that can never abort the caller (v0.2.106 field report).
+
+    The Windows ``hand-to-vco`` run died with ``UnicodeEncodeError`` on an
+    arrow BEFORE it reached its stop step: the message was fine, the WRITE
+    failed, and the exception propagated out of a progress line and aborted
+    a container operation halfway. :func:`harden_stdio` prevents that for a
+    console it can reconfigure, but it cannot cover every stream (a stream
+    replaced by a host process, a reader that changed its encoding after
+    start), so the one output helper VCO's operation CLIs use also guards
+    the write itself: on an encode failure the text is retransliterated and
+    the write retried, and any remaining I/O failure is swallowed. Output is
+    a report, never a precondition of the operation.
+
+    Returns True when a line was written, False when it could not be.
+    """
+    stream = file if file is not None else getattr(sys, "stdout", None)
+    if stream is None:
+        return False
+    try:
+        print(*args, file=stream, **kwargs)
+        return True
+    except UnicodeEncodeError:
+        try:
+            print(*(to_console_ascii(str(arg)) for arg in args),
+                  file=stream, **kwargs)
+            return True
+        except (UnicodeEncodeError, OSError, ValueError):
+            return False
+    except (OSError, ValueError):
+        return False
+
+
 def _register_handler() -> None:
     try:
         codecs.lookup_error(ASCII_ERROR_HANDLER)
@@ -128,5 +161,5 @@ def harden_stdio(streams: Optional[Iterable[str]] = None, *, platform: Optional[
             continue
 
 
-__all__ = ["ASCII_ERROR_HANDLER", "ASCII_FALLBACKS", "harden_stdio", "stream_plan",
-           "to_console_ascii"]
+__all__ = ["ASCII_ERROR_HANDLER", "ASCII_FALLBACKS", "console_print", "harden_stdio",
+           "stream_plan", "to_console_ascii"]

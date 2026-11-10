@@ -566,6 +566,23 @@ def _shared_kg_from_launcher_db(project_root: Path) -> str:
     nothing is printed. The update window's real DB state is "launcher
     closed, file on disk" — the normal case, not an error.
     """
+    return _kg_binding_from_launcher_db(project_root, "shared")
+
+
+def _kg_binding_from_launcher_db(project_root: Path, role: str) -> str:
+    """The ONE hub-less launcher.db tier for a KG binding name (v0.2.106).
+
+    Both roles go through this lookup: by the registered project folder
+    (``resolve_project_id_for_folder`` → ``get_kg_binding(pid, role)``), then
+    the orchestrator-root row (host-keyed). ``""`` on any failure.
+
+    The PRIMARY role joined in v0.2.106 for the field defect where a project's
+    ``kg-sync --all`` read the env ``KG_COLLECTION`` on a hub-down run (an
+    update window) while the doctor read the launcher BINDING: the sync found
+    the notes in the shared class, reported "already current", and the doctor
+    reported the same notes disk-only. One rule (the binding is the project's
+    collection) now answers both surfaces when the hub cannot.
+    """
     try:
         from vco_lib.launcher_db_reader import (
             get_kg_binding,
@@ -575,10 +592,10 @@ def _shared_kg_from_launcher_db(project_root: Path) -> str:
 
         pid = resolve_project_id_for_folder(Path(project_root))
         if pid:
-            name = get_kg_binding(pid, "shared")
+            name = get_kg_binding(pid, role)
             return (name or "").strip()
-        _db_primary, db_shared = get_orchestrator_root_bindings()
-        return (db_shared or "").strip()
+        db_primary, db_shared = get_orchestrator_root_bindings()
+        return ((db_primary if role == "primary" else db_shared) or "").strip()
     except Exception:  # noqa: BLE001 — the tier must never raise
         return ""
 
@@ -669,25 +686,33 @@ def _resolve_collections() -> tuple[str, str, str, bool]:
         # (register issue 2, the 2026-09-20 update hang). See
         # `_shared_kg_from_launcher_db` for the V44-G1 reconciliation and
         # the soft-fail contract.
+        # v0.2.106: the PRIMARY name joins the shared one in this tier. On a
+        # hub-down run the env KG_COLLECTION used to win, so a stale/foreign
+        # value made the sync read a different class than the doctor's
+        # binding-based census (the "already current" vs "disk-only"
+        # disagreement); the binding is the one rule both surfaces use.
+        _db_primary = _kg_binding_from_launcher_db(PROJECT_ROOT, "primary")
         _db_shared = _shared_kg_from_launcher_db(PROJECT_ROOT)
-        if _db_shared:
+        _env_kg = os.getenv("KG_COLLECTION", "KnowledgeGraph")
+        if _db_primary or _db_shared:
             # WP-2 review MINOR-1: one stderr line so the tier's engagement
             # is observable — a silent middle tier that fixes the 2026-09-20
             # hang is indistinguishable from one that never ran. stderr,
             # never stdout (the JSON-contract rule).
             print(
-                f"[kg-sync] hub unreachable; shared collection resolved "
-                f"from launcher.db (read-only): {_db_shared}",
+                "[kg-sync] hub unreachable; collection binding resolved "
+                f"from launcher.db (read-only): primary="
+                f"{_db_primary or '(env)'} shared={_db_shared or '(env)'}",
                 file=sys.stderr,
             )
             return (
-                os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+                _db_primary or _env_kg,
                 os.getenv("DEVELOPMENT_COLLECTION", ""),
-                _db_shared,
-                bool(os.getenv("KG_COLLECTION", "").strip()),
+                _db_shared or os.getenv("SHARED_KG_COLLECTION", ""),
+                bool((_db_primary or os.getenv("KG_COLLECTION", "")).strip()),
             )
         return (
-            os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            _env_kg,
             os.getenv("DEVELOPMENT_COLLECTION", ""),
             os.getenv("SHARED_KG_COLLECTION", ""),
             bool(os.getenv("KG_COLLECTION", "").strip()),
@@ -5677,15 +5702,57 @@ def _regen_node_formats_after_full_sync() -> None:
             stderr=subprocess.PIPE,
             text=True,
         )
-        while True:
+        # v0.2.106 field report: this step sat silent for 28 minutes. The
+        # generator DOES print `[i/total] OK …` per node, but `communicate()`
+        # buffered it and the parent never forwarded it — so a working refresh
+        # was indistinguishable from a hang. Forward the child's lines as they
+        # arrive (high-water tails kept for the failure messages below) and
+        # keep a 120 s per-CHUNK heartbeat; there is deliberately NO whole-run
+        # cap (every LLM call inside the generator has its own per-call bound
+        # and the sidecar is persisted after each node).
+        import threading  # noqa: PLC0415
+
+        out_tail: "list[str]" = []
+        err_tail: "list[str]" = []
+
+        def _pump(stream, sink, tail: "list[str]") -> None:
             try:
-                out, err = proc.communicate(timeout=120)
-                break
+                for line in stream:
+                    sink.write(line)
+                    sink.flush()
+                    tail.append(line.rstrip("\n"))
+                    if len(tail) > 200:
+                        del tail[:100]
+            except (OSError, ValueError):
+                return
+
+        _t_out = threading.Thread(
+            target=_pump, args=(proc.stdout, sys.stdout, out_tail), daemon=True,
+        )
+        _t_err = threading.Thread(
+            target=_pump, args=(proc.stderr, sys.stderr, err_tail), daemon=True,
+        )
+        _t_out.start()
+        _t_err.start()
+        _refresh_started = time.monotonic()
+        while proc.poll() is None:
+            try:
+                proc.wait(timeout=120)
             except subprocess.TimeoutExpired:
+                _elapsed = int(time.monotonic() - _refresh_started)
+                print(
+                    f"   … KG-summary refresh still running ({_elapsed}s; each "
+                    "generator call has its own bound — no whole-run cap)",
+                    flush=True,
+                )
                 _emit_sync_event(
                     "start",
                     "refreshing KG summaries (still working — no whole-run cap)",
                 )
+        _t_out.join(5)
+        _t_err.join(5)
+        out = "\n".join(out_tail)
+        err = "\n".join(err_tail)
         if proc.returncode == _NODE_FORMATS_EXIT_NO_BACKEND:
             # "Owed, retry later" WITHOUT arming the auto-retry that re-runs
             # a full `--all` sync (review M-2): no backend was selectable at

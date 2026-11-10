@@ -800,13 +800,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif max_files <= 0:
         max_files = DEFAULT_MAX_DIFF_FILES
     log = RunLog(root / ".claude" / "logs" / LOG_NAME)
+    # v0.2.106 field report: four failed runs left a 0-byte log, so the reason
+    # was lost. The runner now writes the START (with the inputs it was given)
+    # and the FINAL OUTCOME (with the reason-carrying decision catchup
+    # returned) on every path — a failure can no longer be evidenced only by
+    # the backoff state file.
+    log(f"run start: root={root} state_dir={state_dir} analyzer={args.analyzer} "
+        f"max_files={max_files} timeout={args.timeout}s")
     try:
-        catchup(
+        outcome = catchup(
             str(root), args.analyzer, sys.executable, state_dir, log,
             max_files=max_files, timeout=args.timeout,
         )
+        log(f"run end: outcome={outcome}")
     except Exception as exc:  # noqa: BLE001 — detached child: log, never raise
         log(f"ERROR unexpected: {exc!r}")
+        log(f"run end: outcome=crashed ({type(exc).__name__})")
+        return 0
     return 0
 
 

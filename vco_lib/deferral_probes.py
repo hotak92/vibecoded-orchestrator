@@ -495,6 +495,55 @@ def launcher_dist_still_dirty(ctx: ProbeContext) -> Optional[bool]:
     return bool(_staged_new_siblings(ctx.folder, dist_rel_dir))
 
 
+#: The three answers :func:`launcher_binary_freshness` can give.
+LAUNCHER_FRESH = "fresh"
+LAUNCHER_STALE = "stale"
+LAUNCHER_RUNNING_UNVERIFIED = "running-unverified"
+
+
+def launcher_binary_freshness(ctx: ProbeContext) -> Optional[str]:
+    """The delivery's freshness as far as Python can SEE it, as one of
+    :data:`LAUNCHER_FRESH` / :data:`LAUNCHER_STALE` /
+    :data:`LAUNCHER_RUNNING_UNVERIFIED`, or ``None`` when the facts are not
+    available.
+
+    ``running-unverified`` is NOT staleness: the on-disk binary matches the
+    tree, and the only unresolved input is the RUNNING process's compiled-in
+    version — which Python structurally cannot read and the launcher's own
+    boot probe owns. The doctor used to fold this state into "stale" and
+    report a problem every time the launcher (which VCO keeps running) was
+    open (v0.2.106 field report). The deferral CLEAR probe keeps folding it
+    into ``True`` on purpose (conservative: an entry is not retired on
+    evidence it does not have); the diagnosis lets the doctor tell the two
+    apart without a second implementation of the freshness rule.
+    """
+    dist_rel_dir = ctx.extras.get("dist_rel_dir")
+    binary_name = ctx.extras.get("launcher_binary_name")
+    source_version = ctx.extras.get("source_version")
+    if not dist_rel_dir or not binary_name or not source_version:
+        return None
+
+    dirty = _dist_dirty(ctx.folder, dist_rel_dir)
+    if dirty is None:
+        return None
+    if dirty:
+        return LAUNCHER_STALE
+
+    on_disk = _on_disk_launcher_version(ctx.folder, dist_rel_dir, binary_name)
+    if not on_disk:
+        return None
+    reached = version_reached(on_disk, str(source_version), what="launcher binary sidecar")
+    if reached is None:
+        return None
+    if not reached:
+        return LAUNCHER_STALE
+
+    running = _launcher_process_running(binary_name)
+    if running is None:
+        return None
+    return LAUNCHER_RUNNING_UNVERIFIED if running else LAUNCHER_FRESH
+
+
 def launcher_binary_stale_still_applies(ctx: ProbeContext) -> Optional[bool]:
     """``launcher_binary_stale`` — is the running image still not the on-disk one?
 
@@ -508,7 +557,8 @@ def launcher_binary_stale_still_applies(ctx: ProbeContext) -> Optional[bool]:
       * sidecar version < the source version              → True (still stale)
       * a launcher process is running                     → True (can't tell
         whether it is the new image; the launcher's own boot probe owns that
-        call)
+        call — :func:`launcher_binary_freshness` names this state separately
+        as ``running-unverified`` so the doctor does not read it as stale)
       * the process SCAN itself failed                    → None (unknown —
         v0.2.91 WP-D hardening; see :func:`_launcher_process_running`)
       * otherwise                                         → False (resolve)
@@ -526,31 +576,12 @@ def launcher_binary_stale_still_applies(ctx: ProbeContext) -> Optional[bool]:
     Requires ``extras["dist_rel_dir"]``, ``extras["launcher_binary_name"]`` and
     ``extras["source_version"]``.
     """
-    dist_rel_dir = ctx.extras.get("dist_rel_dir")
-    binary_name = ctx.extras.get("launcher_binary_name")
-    source_version = ctx.extras.get("source_version")
-    if not dist_rel_dir or not binary_name or not source_version:
+    verdict = launcher_binary_freshness(ctx)
+    if verdict is None:
         return None
-
-    dirty = _dist_dirty(ctx.folder, dist_rel_dir)
-    if dirty is None:
-        return None
-    if dirty:
-        return True
-
-    on_disk = _on_disk_launcher_version(ctx.folder, dist_rel_dir, binary_name)
-    if not on_disk:
-        return None
-    reached = version_reached(on_disk, str(source_version), what="launcher binary sidecar")
-    if reached is None:
-        return None
-    if not reached:
-        return True
-
-    running = _launcher_process_running(binary_name)
-    if running is None:
-        return None
-    return True if running else False
+    # ``running-unverified`` stays True HERE: an entry is only retired on
+    # evidence this probe actually has, and the running image is not one.
+    return verdict != LAUNCHER_FRESH
 
 
 def _process_scan_available() -> bool:
@@ -2025,6 +2056,10 @@ __all__ = [
     "hub_answers_health",
     "hub_back_after_restart_failure",
     "evaluate",
+    "LAUNCHER_FRESH",
+    "LAUNCHER_RUNNING_UNVERIFIED",
+    "LAUNCHER_STALE",
+    "launcher_binary_freshness",
     "launcher_binary_stale_still_applies",
     "launcher_dist_still_dirty",
     "orchestrator_sidecars_still_present",

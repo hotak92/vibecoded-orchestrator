@@ -98,8 +98,9 @@ def test_coverage_table(tmp_path):
     project = _project(tmp_path)
     inside = str(project / "src" / "m.py")
     assert epc.covering_checker("Write", inside, str(project)) == "py_compile"
-    assert epc.covering_checker("Edit", inside, str(project)) is None, (
-        "py-compile-check is registered on Write only")
+    # v0.2.106: the hook is registered on Edit|Write in both templates, so an
+    # Edit of a .py file is covered too (it used to read ``no_checker``).
+    assert epc.covering_checker("Edit", inside, str(project)) == "py_compile"
     assert epc.covering_checker("Write", str(project / "src" / "m.md"), str(project)) is None
     assert epc.covering_checker("Write", str(project / "src" / "m.PY"), str(project)) is None, (
         "coverage must be exactly the hook's case-sensitive .py gate")
@@ -110,15 +111,15 @@ def test_coverage_table(tmp_path):
 
 def test_coverage_matches_the_shipped_checker_registration():
     """CHECKERS must name exactly the checkers the settings templates
-    register: py-compile-check, PostToolUse, matcher ``Write``."""
+    register: py-compile-check, PostToolUse, matcher ``Edit|Write``."""
     for tmpl in ("linux", "windows"):
         data = json.loads((REPO_ROOT / "templates" / f"settings.json.{tmpl}.template")
                           .read_text(encoding="utf-8"))
         matchers = [g.get("matcher") for g in data["hooks"]["PostToolUse"]
                     for h in g["hooks"] if "py-compile-check" in h.get("command", "")]
-        assert matchers == ["Write"], (tmpl, matchers)
+        assert matchers == ["Edit|Write"], (tmpl, matchers)
     assert [(c.name, c.tools, c.suffixes) for c in epc.CHECKERS] == [
-        ("py_compile", ("Write",), (".py",))]
+        ("py_compile", ("Write", "Edit"), (".py",))]
     assert 'endswith(".py")' in (HOOKS / "py-compile-check.sh").read_text(encoding="utf-8")
     assert "EndsWith('.py')" in (HOOKS / "py-compile-check.ps1").read_text(encoding="utf-8")
 
@@ -214,7 +215,9 @@ def test_a_status_older_than_the_edit_is_not_this_edits_result(tmp_path):
 def test_unchecked_file_type_is_no_signal_at_once_without_a_poller(tmp_path):
     project = _project(tmp_path)
     spawned: list = []
-    f = project / "src" / "m.py"
+    # v0.2.106: an Edit of a .py file IS covered now (matcher Edit|Write);
+    # this test is about a FILE TYPE no checker covers.
+    f = project / "src" / "m.md"
     f.write_text("x = 1\n")
     t0 = time.monotonic()
     how, rec = _record(project, f, tool="Edit", spawn=lambda p, r: spawned.append(p),
@@ -450,7 +453,7 @@ def test_hook_unchecked_edit_is_no_signal_before_the_hook_returns(tmp_path, flav
     project = _project(tmp_path)
     sink = tmp_path / "rows.jsonl"
     env = _env(tmp_path, project, _fake_venv(tmp_path, sink), VCT_EDIT_POST_CHECK_SECS="120")
-    fp = project / "src" / "mod.py"
+    fp = project / "src" / "mod.md"  # v0.2.106: .py Edits are covered now
     fp.write_text("x = 1\n")
     t0 = time.monotonic()
     r = _run("post-edit-outcome", flavour, _write_payload(fp, tool="Edit"), project, env)
@@ -497,7 +500,7 @@ def test_hook_run_sweeps_a_dead_pollers_row(tmp_path, flavour):
     rec = json.loads(spawned[0].read_text())
     rec["created_ms"] -= (1 + epc.SWEEP_GRACE_S + 5) * 1000
     spawned[0].write_text(json.dumps(rec))
-    fp = project / "src" / "now.py"
+    fp = project / "src" / "now.md"  # v0.2.106: .py Edits are covered now
     fp.write_text("x = 1\n")
     r = _run("post-edit-outcome", flavour, _write_payload(fp, tool="Edit"), project, env)
     assert r.returncode == 0, r.stderr

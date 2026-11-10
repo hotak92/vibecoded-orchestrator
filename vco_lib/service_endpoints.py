@@ -1180,4 +1180,11 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry
+    # v0.2.106: console-safe output on a Windows cp1252/OEM reader — the ONE
+    # home is vco_lib.console_text (the same call install.py and the KG CLIs
+    # make). The hand-to-vco progress line used to raise UnicodeEncodeError on
+    # its arrow before the stop step, aborting the operation halfway.
+    from vco_lib.console_text import harden_stdio
+
+    harden_stdio()
     sys.exit(_main())

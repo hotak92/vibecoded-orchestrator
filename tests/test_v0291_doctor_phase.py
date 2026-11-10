@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from vco_lib import deferral_probes  # noqa: E402
 from vco_lib import doctor  # noqa: E402
 
 
@@ -390,7 +391,10 @@ class LauncherFreshnessProbeTests(unittest.TestCase):
 
     def test_stale_binary_reports_but_never_auto_fixes(self):
         """Decision #4: anything touching a RUNNING binary is surface-only."""
-        with mock.patch("vco_lib.deferral_probes.run_probe", return_value=True):
+        # v0.2.106: the doctor asks the DIAGNOSIS (a running launcher is its
+        # own state), not the deferral clear verdict.
+        with mock.patch("vco_lib.deferral_probes.launcher_binary_freshness",
+                        return_value=deferral_probes.LAUNCHER_STALE):
             report = doctor.run_doctor(
                 Path("/tmp/x"), resolvers=_resolvers(),
                 context={"launcher_probe_extras": {"dist_rel_dir": "d",
@@ -403,7 +407,8 @@ class LauncherFreshnessProbeTests(unittest.TestCase):
         self.assertEqual(f.condition_id, "launcher_binary_stale")
 
     def test_fresh_binary_is_ok(self):
-        with mock.patch("vco_lib.deferral_probes.run_probe", return_value=False):
+        with mock.patch("vco_lib.deferral_probes.launcher_binary_freshness",
+                        return_value=deferral_probes.LAUNCHER_FRESH):
             report = doctor.run_doctor(
                 Path("/tmp/x"), resolvers=_resolvers(),
                 context={"launcher_probe_extras": {"dist_rel_dir": "d",
@@ -434,7 +439,8 @@ class EmissionTests(unittest.TestCase):
         """`launcher_binary_stale` has an owner (WP-A) with its own emit
         latch and clear probe. The doctor REPORTS it; re-emitting would fork
         its lifecycle."""
-        with mock.patch("vco_lib.deferral_probes.run_probe", return_value=True):
+        with mock.patch("vco_lib.deferral_probes.launcher_binary_freshness",
+                        return_value=deferral_probes.LAUNCHER_STALE):
             report = doctor.run_doctor(
                 Path("/tmp/x"), resolvers=_resolvers(),
                 context={"launcher_probe_extras": {"dist_rel_dir": "d",
