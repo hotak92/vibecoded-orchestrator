@@ -32,7 +32,7 @@ Default agents install to a project's `.claude/agents/` on the bundle install (d
 
 The twelve machine-gated definitions are described in the paragraph above (`templates/agents/module-gateway/`).
 
-**Turning a provider off (v0.2.105).** The Home page's **Model providers** card lists every provider the model
+**Turning a provider off (v0.2.105; immediate since v0.2.106).** The Home page's **Model providers** card lists every provider the model
 gateway knows (`model_router.vendors.VENDORS` — a new vendor is a registry row, never a code change) with its key
 state (`key detected` / `no key` / `key store unavailable`, plus the declared key NAMES — never a value) and an
 on/off switch. The choice is machine-wide and stored in one `launcher.db` `app_state` row,
@@ -40,18 +40,21 @@ on/off switch. The choice is machine-wide and stored in one `launcher.db` `app_s
 `vco_lib.model_providers`, and the launcher's `model_providers_status` / `model_providers_set` commands shell that
 helper rather than re-implementing the encoding (rung A of the cross-language ladder). No row means every
 provider is on, and an unreadable or corrupt row reads the same way — switching a provider off is a subtraction,
-so a failed read must never take one away. Switching off has three effects: the next bundle update stops
-delivering that vendor's definitions, moves an already-delivered UNMODIFIED copy to
-`.claude/agents.disabled/` (the launcher toggle's own location — parked, never deleted) and records it in the
-manifest's additive `provider_parked_agents` map; a copy you edited is left in place with a warning line and
-stays recognised; and the provider's rows leave the rendered model guidance (the grid and the
-provider-conditional `CLAUDE.md` sections), refreshed at once on the launcher toggle. Switching it back on restores the
-copies named in that manifest map and re-delivers them on the next update — copies parked by the per-project
-Agents toggle carry no such marker and are never restored. The gateway itself keeps serving every vendor id it
-is asked for: this is a delivery/guidance choice, not a routing block. Check the state from a shell with
-`python -m vco_lib.model_providers status` (and change it with `set --vendor <id> --disabled`). The shell `set`
-does not refresh the guidance by itself (the launcher toggle does): follow it with
-`python -m vco_lib.model_guidance refresh --orchestrator-root <install root> --trigger providers`, as `set` prints.
+so a failed read must never take one away. A stored flip takes full effect AT ONCE, in both directions, with no
+restart and no bundle update: the vendor's unmodified delivered definitions move to
+`.claude/agents.disabled/` (the launcher toggle's own location — parked, never deleted) in the orchestrator root
+and every registered project, recorded in the manifest's additive `provider_parked_agents` map (a copy you edited
+is left in place with a warning line and stays recognised); the provider's rows leave the rendered model guidance
+(the grid and the provider-conditional `CLAUDE.md` sections), refreshed at once on the launcher toggle; and the
+RUNNING gateway stops serving the vendor within its short cache TTL — its rows leave `/v1/models` (its upstream
+model list is not even fetched), a request naming one of its ids is refused locally with the cause and the
+remedy, the quota fallback ladder skips it, and `/vendor-keys` answers `usable: false` with the same reason so
+the subagent pre-flight refuses its launches. Switching it back on restores exactly the copies named in that
+manifest map (a vendor whose key does not resolve stays held, as delivery would decide) — copies parked by the
+per-project Agents toggle carry no such marker and are never restored. Check the state from a shell with
+`python -m vco_lib.model_providers status` (and change it with `set --vendor <id> --disabled`); the shell `set`
+parks/restores the definitions itself and prints the follow-up for the guidance render
+(`python -m vco_lib.model_guidance refresh --orchestrator-root <install root> --trigger providers`).
 
 ### Opt-in packs (`templates/packs/`)
 

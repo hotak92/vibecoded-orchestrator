@@ -7,12 +7,17 @@
 //! ## What it switches, and where the choice lives
 //!
 //! Every vendor the model gateway knows (`claude-gw/<vendor>/…`) can be turned
-//! OFF once, machine-wide: its gateway agent definitions are then not
-//! delivered (a previously delivered, unedited copy is PARKED in
-//! `.claude/agents.disabled/` on the next bundle update — never deleted) and
-//! its rows disappear from the rendered model guidance. The gateway itself
-//! keeps serving every id it is asked for: this is a delivery/guidance choice,
-//! not a routing block.
+//! OFF once, machine-wide. The change takes full effect AT ONCE (v0.2.106):
+//! the helper's stored `set` itself parks (off) or restores (on) the vendor's
+//! gateway agent definitions in the orchestrator root and every registered
+//! project (through the bundle engine's own park/restore functions — a
+//! previously delivered, unedited copy is moved to `.claude/agents.disabled/`,
+//! never deleted), the guidance refresh re-renders every CLAUDE.md's model
+//! rows (fired from here, see "After a write"), and the RUNNING gateway stops
+//! serving the vendor within its short cache TTL — its rows leave
+//! `/v1/models`, requests naming its ids are refused locally, the quota
+//! fallback ladder skips it, and `/vendor-keys` reports it so the subagent
+//! pre-flight refuses its launches.
 //!
 //! The choice is ONE `launcher.db` `app_state` row (`model_providers.disabled`,
 //! a JSON array of the OFF vendor ids) whose reader AND writer are
