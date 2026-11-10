@@ -17,10 +17,11 @@ Windows). This module keeps the three answers apart:
   the caller must word it as "could not confirm" and must not refuse the
   install on it.
 
-A timeout is retried once with a longer bound before it is reported, because
-the 8 s default is generous on an idle machine and tight beside a busy
-compiler. There is deliberately no global retry loop: one probe, two
-attempts.
+Any failed attempt (a timeout, a non-zero exit, an error starting it,
+unparseable output) is retried once with a longer bound before it is
+reported, because the 8 s default is generous on an idle machine and tight
+beside a busy compiler. There is deliberately no global retry loop: one
+probe, two attempts per executable.
 """
 from __future__ import annotations
 
@@ -138,7 +139,13 @@ def probe(
             continue
         no_answer = no_answer or PowerShellProbe(STATE_NO_ANSWER, None, exe, detail)
     # A version that answered (even a too-old one) is positive evidence; only
-    # when nothing answered do we report NO_ANSWER over absence.
+    # when nothing answered do we report NO_ANSWER over absence. Except
+    # (review C-L7): a ``pwsh`` that resolves but did not answer IS a
+    # PowerShell 6+ (only PowerShell 6 and later ship as ``pwsh``), which
+    # meets the floor — so an old ``powershell`` beside it must not refuse
+    # the install; the unconfirmed pwsh is reported (a warning), not TOO_OLD.
+    if no_answer is not None and no_answer.exe == "pwsh":
+        return no_answer
     if too_old is not None:
         return too_old
     if no_answer is not None:

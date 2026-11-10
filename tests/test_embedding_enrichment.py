@@ -135,7 +135,7 @@ class _FakeEmbeddingService:
     def __init__(
         self,
         *,
-        text_vector_slot: str = "qwen3_embed",
+        text_vector_slot: str = "arctic2_embed",
         code_vector_slot: str = "codesage_embed",
         text_ready: bool = True,
         code_ready: bool = True,
@@ -311,6 +311,24 @@ class EmptyAndNoopTests(_BaseEnrichmentTest):
         self.assertEqual(report.skipped, 3)
         self.assertEqual(report.enriched, 0)
         self.assertEqual(report.total, 3)
+
+    def test_a_text_slot_of_another_model_is_refused_before_any_write(self):
+        """Review C-L6: the TEXT leg embeds with the service's own model, so a
+        slot that is not that model's is refused like the code leg — never
+        filled with another model's vectors."""
+        objs = [_FakeObject(uuid="u0", properties={"content": "body"},
+                            vector={"qwen3_embed": [0.1] * 4})]
+        collection = _FakeCollection(objs)
+        client = _FakeClient({self.KG_COLL: collection})
+        svc = _FakeEmbeddingService(text_vector_slot="qwen3_embed")
+        with self.assertRaises(ee.SlotNotInSchemaError):
+            ee.enrich_collection_vectors(
+                collection_name=self.KG_COLL,
+                new_slot="arctic2_embed",
+                embedding_service=svc,
+                weaviate_client_factory=lambda: client,
+            )
+        self.assertEqual(svc.text_batch_calls, [])
 
 
 # ---------------------------------------------------------------------------

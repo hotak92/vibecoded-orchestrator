@@ -168,9 +168,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **"PowerShell 5.1+ is required" no longer fires on a slow answer.** The Windows install gate asked PowerShell for
   its version with an 8-second bound and read a timeout as "not installed", refusing a healthy install under load. A
-  timeout is now retried once with a longer bound, and the three outcomes are kept apart: missing (refuse), too old
-  (refuse, naming the version found), and did not answer (a warning that says the version could not be confirmed —
-  never a refusal).
+  failed attempt (a timeout, an error or an unreadable answer) is now retried once with a longer bound, and the three
+  outcomes are kept apart: missing (refuse), too old (refuse, naming the version found), and did not answer (a
+  warning that says the version could not be confirmed — never a refusal). A `pwsh` that does not answer beside an
+  old Windows PowerShell is "could not confirm", not "too old": every `pwsh` is PowerShell 6 or later.
 
 - **A hub-down `kg-sync --all` reads the project's own collection.** On an update window the sync fell back to the
   `KG_COLLECTION` environment value, while the doctor read the launcher's binding: the sync found notes in the

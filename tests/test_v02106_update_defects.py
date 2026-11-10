@@ -138,6 +138,33 @@ def test_powershell_too_old_names_the_version():
     assert answer.version_text() == "4.0"
 
 
+def test_a_silent_pwsh_beside_an_old_powershell_is_not_too_old():
+    """Review C-L7: any ``pwsh`` is PowerShell 6+, so a pwsh that resolves but
+    does not answer beside a 4.x ``powershell`` is "could not confirm" (a
+    warning), never a TOO_OLD refusal of the install."""
+    from vco_lib import windows_powershell as wp
+
+    def _run(argv, **kw):
+        if argv[0] == "pwsh":
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        return _completed(4, 0)
+
+    answer = wp.probe(which=lambda n: f"/usr/bin/{n}", run=_run)
+    assert answer.state == wp.STATE_NO_ANSWER and answer.exe == "pwsh"
+
+
+def test_a_silent_powershell_beside_nothing_else_old_stays_too_old_when_it_answered():
+    from vco_lib import windows_powershell as wp
+
+    def _run(argv, **kw):
+        if argv[0] == "pwsh":
+            return _completed(4, 0)  # not a real pwsh shape, but the rule is per exe
+        raise subprocess.TimeoutExpired(argv, kw["timeout"])
+
+    answer = wp.probe(which=lambda n: f"/usr/bin/{n}", run=_run)
+    assert answer.state == wp.STATE_TOO_OLD
+
+
 # ── item 3a: sync and doctor agree on the project's OWN collection ──────────
 
 
@@ -521,10 +548,9 @@ def test_a_concurrent_append_is_not_reported_as_a_failed_copy(tmp_path, monkeypa
     real_append = mm._append_lines
 
     def _append_then_concurrent(path, lines):
-        written = real_append(path, lines)
+        real_append(path, lines)
         with path.open("a", encoding="utf-8") as fh:
             fh.write('{"concurrent": 1}\n')  # another writer's row
-        return written
 
     monkeypatch.setattr(mm, "_append_lines", _append_then_concurrent)
     rec = mm._copy_one(src, dst, None, dry_run=False)

@@ -632,18 +632,21 @@ def enrich_collection_vectors(
             else embedding_service.text_vector_slot
         )
         same_active = active_slot == new_slot
-        if kind == "code" and not same_active:
+        if not same_active:
+            # v0.2.106 review C-L6: the TEXT leg too. The walk embeds with the
+            # service's own model and writes the vector under ``new_slot``; a
+            # slot of another (same-dimension) model would be filled with the
+            # wrong model's vectors and only a dimension mismatch stopped it.
+            # Every real caller (the install-time slot change, the KG model
+            # fill, the backfill verb) passes its service's own slot.
+            model = getattr(embedding_service,
+                            "code_model_id" if kind == "code" else "text_model_id", "?")
             raise SlotNotInSchemaError(
                 f"{collection_name!r}: slot {new_slot!r} is not the slot of this "
-                f"graph's selected code model ({getattr(embedding_service, 'code_model_id', '?')} → "
-                f"{active_slot!r}); a slot is only ever filled with its own "
-                "model's vectors. Select that model first."
+                f"project's selected {kind} model ({model} → {active_slot!r}); a "
+                "slot is only ever filled with its own model's vectors. Select "
+                "that model first."
             )
-        # v0.2.106: the TEXT leg keeps this call shape for its historical
-        # caller (the launcher's profile-change fill always passes the active
-        # slot), but the public `backfill` verb below enforces the same rule
-        # explicitly for text too — a slot is only ever filled by the model
-        # that owns it, never by whatever model happens to be active.
 
         # ── Open Weaviate client ────────────────────────────────────
         if weaviate_client_factory is not None:
@@ -1456,8 +1459,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     # remedy (v0.2.106 field report: 60 shared-KG objects lacked
     # arctic2_embed and nothing shipped could fill just those). It reuses
     # `enrich` (UPDATE-only, skips objects that already hold the slot) and
-    # resolves the slot from the model that OWNS the collection's vectors,
-    # never an arbitrary one.
+    # resolves the slot from the project's SELECTED model, never an
+    # arbitrary one.
     backfill = sub.add_parser(
         "backfill",
         help=(
@@ -1605,9 +1608,10 @@ def _cli_backfill(args: argparse.Namespace) -> int:
     named vector searches target (the duplicate scan used to abort on them).
     It reuses :func:`enrich_collection_vectors` — UPDATE-only, idempotent,
     only the rows that lack the slot — and it resolves the slot from the
-    model that OWNS the collection's vectors. A ``--slot`` that is not that
-    model's slot is REFUSED: filling it would embed one model's vectors into
-    another model's space, which never happens here.
+    project's SELECTED model (the embedding profile for text, the graph's
+    code-model selection for code). A ``--slot`` that is not that model's
+    slot is REFUSED: filling it would embed one model's vectors into another
+    model's space, which never happens here.
     """
     project_root: Optional[Path] = (
         Path(args.project_root).resolve() if args.project_root else None

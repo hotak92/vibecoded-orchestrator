@@ -229,8 +229,8 @@ def _lines_to_append(source_lines: list[str], dest_lines: list[str]) -> list[str
     return out
 
 
-def _append_lines(path: Path, lines: list[str]) -> int:
-    """Append ``lines`` to ``path``; return the bytes written.
+def _append_lines(path: Path, lines: list[str]) -> None:
+    """Append ``lines`` to ``path``.
 
     Append mode, not read-modify-rewrite: a metrics file can be receiving
     concurrent appends from a hook, and ``os.replace`` of a whole rewritten
@@ -240,12 +240,11 @@ def _append_lines(path: Path, lines: list[str]) -> int:
 
     If the destination exists and does not end in a newline (a torn previous
     append), the terminator is added first so our first row is not glued onto
-    a partial one. Those repair bytes are included in the return value, so the
-    caller's byte arithmetic still balances.
+    a partial one. (v0.2.106: no byte count is returned any more — the copy
+    is verified by content, :func:`_copy_one`, not by byte arithmetic.)
     """
     if not lines:
-        return 0
-    written = 0
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     needs_terminator = False
     try:
@@ -258,11 +257,8 @@ def _append_lines(path: Path, lines: list[str]) -> int:
     with open(path, "a", encoding="utf-8") as fh:
         if needs_terminator:
             fh.write("\n")
-            written += 1
         for line in lines:
             fh.write(line + "\n")
-            written += len(line.encode("utf-8")) + 1
-    return written
 
 
 def _load_sentinel(dest: Path) -> Optional[dict]:

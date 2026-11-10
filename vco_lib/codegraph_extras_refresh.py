@@ -415,8 +415,10 @@ class RunLog:
         except OSError:
             # v0.2.106: a log that cannot be written must not ALSO swallow the
             # reason silently — the field report had 4 failed catch-up runs and
-            # a 0-byte log. Mirror the line to stderr (the hook redirects it to
-            # the same log, so this costs nothing there; a manual run shows it).
+            # a 0-byte log. Mirror the line to stderr: a manual run shows it on
+            # the terminal. Under the hook stderr is redirected to that same
+            # unwritable log, so there the line is still lost — the mirror
+            # helps manual runs only (review C-L7).
             try:
                 sys.stderr.write(line)
                 sys.stderr.flush()
