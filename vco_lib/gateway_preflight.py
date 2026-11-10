@@ -135,8 +135,16 @@ def agent_definition(agent: str, dirs: Iterable[Path]) -> Optional[Path]:
 
 
 def gateway_model_of(agent: str, model_override: Optional[str], dirs: Iterable[Path]) -> Optional[str]:
-    """The gateway model id (``claude-gw/`` stripped) the launch will use, or
-    ``None`` when it does not go through the gateway."""
+    """The gateway model id the launch will use, or ``None`` when it does not
+    go through the gateway.
+
+    Returned EXACTLY as the agent's ``model:`` line spells it, ``claude-gw/``
+    prefix included — the same string the lane's first request carries. An
+    earlier version stripped the prefix and asked about what was left, which
+    silently rewrote every multi-segment namespace (``claude-gw/kimi/k3[1m]``
+    became ``kimi/k3[1m]``, matching no namespace and no bare-id prefix) and
+    refused the launch for an id the gateway serves. A probe must judge the
+    request, not a version of it (v0.2.106)."""
     from vco_lib.vscode_settings import GATEWAY_ID_PREFIX
 
     if model_override:
@@ -152,14 +160,18 @@ def gateway_model_of(agent: str, model_override: Optional[str], dirs: Iterable[P
         model = frontmatter_model(path)
     if not model or not model.startswith(GATEWAY_ID_PREFIX):
         return None
-    return model[len(GATEWAY_ID_PREFIX):] or None
+    return model.strip() or None
 
 
 def decide(agent: str, gateway_model: str, answer: dict) -> Optional[str]:
     """The refusal reason for a launch, or ``None`` to let it through.
 
     ``answer`` is :func:`vco_lib.gateway_client.get_json`'s result for
-    ``/vendor-keys``. Only a DEFINITE "cannot serve" refuses."""
+    ``/vendor-keys``. Only a DEFINITE "cannot serve" refuses.
+
+    ``gateway_model`` is the id as the definition spells it (``claude-gw/…``),
+    i.e. the exact string ``/vendor-keys`` was asked about and the exact string
+    the lane's first request will carry."""
     if not answer.get("ok"):
         return None  # gateway down / outdated / no token: unknown, not "cannot"
     body = answer.get("payload")
@@ -170,7 +182,7 @@ def decide(agent: str, gateway_model: str, answer: dict) -> Optional[str]:
     if route == "refused":
         return (
             f"Not launched: agent '{agent}' pins the gateway model "
-            f"'claude-gw/{gateway_model}', and the model gateway does not serve "
+            f"'{gateway_model}', and the model gateway does not serve "
             f"that id: {problem or 'unknown model'}. Fix the `model:` line of the "
             "agent's definition (or pick another agent)."
         )
@@ -185,7 +197,7 @@ def decide(agent: str, gateway_model: str, answer: dict) -> Optional[str]:
             "15 seconds."
         )
     return (
-        f"Not launched: agent '{agent}' runs on 'claude-gw/{gateway_model}' "
+        f"Not launched: agent '{agent}' runs on '{gateway_model}' "
         f"through the model gateway, and the gateway cannot resolve a key for "
         f"vendor '{vendor}' right now, so its first request would fail.{hint} "
         f"Gateway said: {problem or 'no key found'}"
