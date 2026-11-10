@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list's remove action opens the same dialog (the old type-the-name step is gone). Per-option control (keep the
   collections, keep the bundled files) stays on the project's Settings → Danger zone, whose description now matches
   what is actually removed.
+- **Every shipped agent now runs in the background and compacts at 750k tokens.** All 23 bundled agent definitions
+  (the free set and the model-gateway lanes) carry `background: true` — the agent always runs as a background task —
+  and `autoCompactWindow: 750000`, so a subagent compacts its own context at 750k tokens instead of growing to the
+  main conversation's window. A contract test fails if any shipped definition loses either key, and a delivery leg
+  proves a bundle install lands both.
+- **Subagents default to effort `medium`.** Each VCO project's `.claude/settings.json` now carries
+  `CLAUDE_CODE_SUBAGENT_EFFORT=medium` in its `env` block, so a subagent dispatch that names no effort runs at
+  medium instead of inheriting the session's effort. The key is added only when absent — a value you set yourself
+  is kept — and it is never written to `~/.claude/settings.json`.
 
 ### Changed
 
@@ -39,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   somewhere else, what is behind the link is left alone and named in the result. If you also choose to delete the
   project's collections, VCO now finds the ones the project actually uses, even after a rename, and never deletes
   one another project uses.
+- **Fable 5.2 in the model table.** Claude Code 2.1.321 makes the `fable` alias Claude Fable 5.2
+  (`claude-fable-5-2`, 1M context); the shipped model-selection grid's Fable row is renamed and re-scored from
+  benchmark evidence (Code/Debug/Review/Plan/Tools 10, Cost 2 — about $3.80 per task at medium, $9 at high, $26.5
+  at max), and its guidance now says to keep final reviews at high, not max. The gateway needs no update for the
+  new id: the structural family parser already reads `claude-fable-5-2` as the fable family's newest version, and it
+  inherits the family's 1M context window — a test pins all of that.
+- **Subagent guidance matches current Claude Code.** The Agent tool now takes an `effort` parameter, and a
+  subagent's long-running shell command is moved to the background by the harness after about 3 minutes, with the
+  completion notification waking that subagent — so the old "a lane runs its helpers in the foreground" rule is
+  replaced by "start the helper once, end your turn; the notification wakes the subagent", in both shipped CLAUDE.md
+  templates and the wait-guard's refusal messages.
 
 ### Fixed
 

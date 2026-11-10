@@ -1764,7 +1764,7 @@ def self_wake_subagent_reason(tool: str) -> str:
         + _WHY +
         " WHAT TO DO INSTEAD: subagents never self-schedule — start the work"
         " with run_in_background: true and END YOUR TURN; the completion"
-        " notification wakes you (or the parent) when it is done." + _KNOB
+        " notification wakes you when it is done." + _KNOB
     )
 
 

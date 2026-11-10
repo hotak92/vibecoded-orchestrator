@@ -3,6 +3,8 @@ name: qwen-flash-sweeper
 description: Qwen3.8-Flash bulk mechanical lane via the claude-gw gateway — one rule across many items (a report table) or fully-specified edits. Worktree lane — table and edits land in it; report-only sweeps → deepseek-researcher.
 model: claude-gw/qwen/qwen3.8-flash[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Write, Edit, Grep, Glob, Bash
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*

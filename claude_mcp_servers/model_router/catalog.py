@@ -132,9 +132,9 @@ SOURCE_UNFETCHED = "unfetched"
 SOURCE_EMPTY = "unavailable"
 
 #: Publish only the newest version of each model family. The owner's
-#: requirement (2026-09-10): a picker that lists Fable 5.1 AND Fable 5 AND
-#: three superseded versions of one vendor model is a list to read past, not
-#: a list to choose from.
+#: requirement (2026-09-10): a picker that lists Fable 5.2 AND Fable 5.1 AND
+#: Fable 5 AND three superseded versions of one vendor model is a list to
+#: read past, not a list to choose from.
 CATALOG_FILTER_LATEST = "latest"
 
 #: Publish every version both upstreams return. The escape hatch for the case

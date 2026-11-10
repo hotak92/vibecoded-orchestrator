@@ -3,6 +3,8 @@ name: kimi-reviewer
 description: Kimi K3 read-only review lane via the claude-gw gateway (kimi vendor) — an independent second-family round on large diffs; one report, every finding quoted. Not edits or the pre-tag ship-gate (Fable). Needs the model gateway.
 model: claude-gw/kimi/k3[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Grep, Glob, Bash, Write
 disallowedTools: mcp__vct-coordination__*
 ---

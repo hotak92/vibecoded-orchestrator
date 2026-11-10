@@ -76,7 +76,8 @@ def fresh_settings_from_template(
     template" — the bundle's create branch below and ``install.py
     --adopt-project-replace-all`` (v0.2.104) both start from it, so a
     whole-file rewrite can never drop a template key (``hooks``,
-    ``skillOverrides``, ``idleCompaction``, the permission denies).
+    ``skillOverrides``, ``idleCompaction``, the ``env`` block, the
+    permission denies).
 
     Raises ``OSError`` / ``ValueError`` when the template cannot be read or
     parsed — a missing shipped template is a broken install, never a case to

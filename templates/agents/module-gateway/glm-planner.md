@@ -3,6 +3,8 @@ name: glm-planner
 description: GLM 5.3 planning lane via the claude-gw gateway for bounded plans from a fully-specified brief; writes one plan file. Not implementation (glm-implementer), review (glm-reviewer) or research (glm-flash-researcher). Needs the model gateway.
 model: claude-gw/glm-5.3[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 disallowedTools: mcp__vct-coordination__*
 ---

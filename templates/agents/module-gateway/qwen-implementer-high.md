@@ -3,6 +3,8 @@ name: qwen-implementer-high
 description: High-effort sibling of qwen-implementer on Qwen3.8-Max via the claude-gw gateway — reviews and the hardest bounded implementations (QwenCloud xhigh, ~2.7x tokens). Worktree lane — research → deepseek-researcher.
 model: claude-gw/qwen/qwen3.8-max[1m]
 effort: high
+background: true
+autoCompactWindow: 750000
 tools: Read, Write, Edit, Grep, Glob, Bash
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*
