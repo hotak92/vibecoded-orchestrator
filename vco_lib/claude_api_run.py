@@ -96,7 +96,7 @@ from typing import Any, Mapping, Optional, Sequence
 from vco_lib import claude_api_review_guard as _guard
 from vco_lib import claude_cli_api_key as _cak
 
-DEFAULT_MODEL = "claude-fable-5-1"
+DEFAULT_MODEL = "claude-fable-5-2"
 DEFAULT_EFFORT = "high"
 #: Conservative ceiling for one run; always passed to the CLI.
 DEFAULT_MAX_BUDGET_USD = 25.0

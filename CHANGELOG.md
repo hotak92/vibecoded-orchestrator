@@ -125,7 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark evidence (Code/Debug/Review/Plan/Tools 10, Cost 2 — about $3.80 per task at medium, $9 at high, $26.5
   at max), and its guidance now says to keep final reviews at high, not max. The gateway needs no update for the
   new id: the structural family parser already reads `claude-fable-5-2` as the fable family's newest version, and it
-  inherits the family's 1M context window — a test pins all of that.
+  inherits the family's 1M context window — a test pins all of that. `claude-api-run` (and the `/api-review` skill)
+  now defaults to `--model claude-fable-5-2`.
 - **Subagent guidance matches current Claude Code.** The Agent tool now takes an `effort` parameter, and a
   subagent's shell command still running after about 3 minutes is moved to the background by the harness, with its
   completion notification waking that subagent. Both shipped CLAUDE.md templates and the wait guard's refusal for a

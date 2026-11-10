@@ -181,7 +181,7 @@ class TestChildEnvAndArgv:
         argv = rec["argv"]
         assert argv[:4] == ["-p", "--output-format", "stream-json",
                             "--verbose"]
-        assert argv[argv.index("--model") + 1] == "claude-fable-5-1"
+        assert argv[argv.index("--model") + 1] == "claude-fable-5-2"
         assert argv[argv.index("--effort") + 1] == "high"
         assert argv[argv.index("--max-budget-usd") + 1] == "25"
         assert "--max-turns" not in argv
@@ -374,7 +374,7 @@ class TestSummaryAndLedger:
         obj = json.loads(capsys.readouterr().out)
         assert obj["result"] == "ok"
         assert obj["ledger"] == str(harness.ledger)
-        assert obj["model"] == "claude-fable-5-1"
+        assert obj["model"] == "claude-fable-5-2"
 
     def test_an_api_error_result_is_reported_and_exits_1(
             self, harness, capsys):

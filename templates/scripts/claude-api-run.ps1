@@ -5,7 +5,7 @@
 #
 # Usage:
 #   .\claude-api-run.ps1 --prompt-file review-prompt.md --report review.md `
-#       [--model claude-fable-5-1] [--effort high] [--max-budget-usd 25] `
+#       [--model claude-fable-5-2] [--effort high] [--max-budget-usd 25] `
 #       [--max-turns N] [--policy review|edit] [--cwd DIR] [--key-name NAME] `
 #       [--json]
 #

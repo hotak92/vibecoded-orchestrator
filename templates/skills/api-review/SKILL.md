@@ -60,7 +60,7 @@ servers. The `edit` policy is an ordinary session with your settings.
      --report <scratch>/review.md
    ```
 
-   Defaults: `--model claude-fable-5-1`, `--effort high`,
+   Defaults: `--model claude-fable-5-2`, `--effort high`,
    `--max-budget-usd 25` (always passed; the CLI stops at it),
    `--policy review`. Add `--max-turns N` to cap turns, `--cwd DIR` to run
    elsewhere, `--json` for a machine-readable summary.
