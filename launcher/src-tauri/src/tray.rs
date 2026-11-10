@@ -29,8 +29,27 @@ use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    image::Image,
     AppHandle, Emitter, Listener, Manager, Runtime,
 };
+
+/// The image the tray shows. `TrayIconBuilder` has no fallback of its own:
+/// without `.icon(..)` the Windows tray shows its slot over an EMPTY square.
+/// The bundled default window icon is the normal source (icon.ico on Windows,
+/// the first bundled PNG on Linux/macOS, both from `bundle.icon` in
+/// tauri.conf.json); a build where it is absent still gets the launcher's
+/// 32x32 PNG, decoded at compile time, so the tray is never blank on any OS.
+fn tray_icon_image(default_window_icon: Option<&Image<'_>>) -> Image<'static> {
+    match default_window_icon {
+        Some(icon) => icon.clone().to_owned(),
+        None => {
+            tracing::warn!(
+                "[vct] tray: no default window icon is bundled; using the embedded 32x32 launcher icon"
+            );
+            tauri::include_image!("icons/32x32.png")
+        }
+    }
+}
 
 use crate::commands::self_update::{self, UpdateStatus};
 use crate::db::Db;
@@ -262,19 +281,12 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
     // Without an explicit icon the Windows tray shows its slot (and the
     // tooltip) over an EMPTY square: `TrayIconBuilder` does not fall back to
-    // the window icon by itself. Use the default window icon the bundle
-    // already ships (`bundle.icon` in tauri.conf.json; icon.ico on Windows).
-    let mut tray_builder = TrayIconBuilder::with_id("vct-tray")
+    // the window icon by itself. See `tray_icon_image`.
+    let _tray = TrayIconBuilder::with_id("vct-tray")
+        .icon(tray_icon_image(app.default_window_icon()))
         .tooltip("VibeCoded Tools Launcher")
         .menu(&menu)
-        .show_menu_on_left_click(TRAY_MENU_ON_LEFT_CLICK);
-    match app.default_window_icon() {
-        Some(icon) => tray_builder = tray_builder.icon(icon.clone()),
-        None => tracing::warn!(
-            "[vct] tray: no default window icon is bundled; the tray icon will be empty"
-        ),
-    }
-    let _tray = tray_builder
+        .show_menu_on_left_click(TRAY_MENU_ON_LEFT_CLICK)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => {
                 if let Some(w) = app.get_webview_window("main") {
@@ -804,20 +816,27 @@ mod tests {
 
     /// Regression pin (Windows): the tray builder was created without
     /// `.icon(..)`, so the tray slot showed the tooltip over an EMPTY square.
-    /// The production half of this file must hand the builder the bundled
-    /// default window icon, and tauri.conf.json must bundle one.
+    /// The tray image is the bundled default window icon when there is one,
+    /// and the embedded launcher PNG when there is not: never nothing.
     #[test]
-    fn tray_builder_is_given_the_bundled_icon() {
-        let src = include_str!("tray.rs");
-        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+    fn tray_icon_image_is_never_empty() {
+        let bundled = Image::new_owned(vec![1, 2, 3, 4], 1, 1);
+        let picked = tray_icon_image(Some(&bundled));
+        assert_eq!((picked.width(), picked.height()), (1, 1));
+        assert_eq!(picked.rgba(), &[1, 2, 3, 4]);
+
+        let fallback = tray_icon_image(None);
+        assert_eq!((fallback.width(), fallback.height()), (32, 32));
+        assert_eq!(fallback.rgba().len(), 32 * 32 * 4);
         assert!(
-            production.contains("default_window_icon()") && production.contains(".icon("),
-            "the tray builder must be given an icon, otherwise Windows shows an empty slot",
+            fallback.rgba().iter().any(|b| *b != 0),
+            "the fallback tray image must not be fully transparent",
         );
         let conf = include_str!("../tauri.conf.json");
         assert!(
-            conf.contains("icons/icon.ico"),
-            "tauri.conf.json must bundle icons/icon.ico: it is the default window icon on Windows",
+            conf.contains("icons/icon.ico") && conf.contains("icons/32x32.png"),
+            "tauri.conf.json must bundle icon.ico (Windows default window icon) and \
+             32x32.png (the Linux/macOS default window icon and the tray fallback)",
         );
     }
 

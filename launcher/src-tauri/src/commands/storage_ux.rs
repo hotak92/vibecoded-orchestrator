@@ -4047,6 +4047,7 @@ mod volumes_tests {
     /// reports a sensible `from_mode` based on launcher.toml and
     /// validates the target path. Anything that would mutate the
     /// filesystem should NOT happen during this call.
+    #[cfg(unix)] // fake_runtime_support (shell-script stubs) is unix-only
     #[test]
     fn dry_run_validates_target_path_without_mutating() {
         let dir = tempfile::tempdir().unwrap();
