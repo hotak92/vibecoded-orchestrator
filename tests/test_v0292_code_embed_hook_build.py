@@ -490,6 +490,11 @@ class EnsureContainersBuildGateTests(unittest.TestCase):
                   esac
                   exit 0
                 fi
+                # v0.2.106: the raft guard looks for a raft log in the data
+                # volume of a MISSING Weaviate; this machine has none.
+                if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then
+                  echo "Error: no such volume" >&2; exit 125
+                fi
                 if [ "$1" = "compose" ]; then exit 1; fi
                 exit 0
                 """))
@@ -504,6 +509,7 @@ class EnsureContainersBuildGateTests(unittest.TestCase):
             orch.mkdir()
             compose_dir = tmp / "compose"
             compose_dir.mkdir()
+            _raft_guard_compose(tmp)
             # v0.2.100 (L1-F17): compose runs only from the orchestrator's own
             # infrastructure/ — its parent carries vct-module.json id "orchestrator".
             (tmp / "vct-module.json").write_text('{"id": "orchestrator"}', encoding="utf-8")
@@ -542,6 +548,26 @@ class EnsureContainersBuildGateTests(unittest.TestCase):
         proc, calls = self._run("vco_weaviate")
         self.assertEqual(len(calls), 1, f"{calls}\n{proc.stdout}\n{proc.stderr}")
         self.assertNotIn("--build", calls[0])
+
+
+def _raft_guard_compose(tmp: Path) -> None:
+    """v0.2.106: the raft guard reads the compose file the installer merges
+    (``<root>/infrastructure/docker-compose.yml``) for the data volume a
+    MISSING Weaviate would mount, and refuses when it cannot. A minimal base
+    file names that volume; the fake podman says it does not exist yet, so the
+    guard lets the create through (a fresh Weaviate has no raft log)."""
+    infra = tmp / "infrastructure"
+    infra.mkdir(exist_ok=True)
+    (infra / "docker-compose.yml").write_text(
+        "services:\n"
+        "  weaviate:\n"
+        "    image: cr.weaviate.io/semitechnologies/weaviate:1.37.18\n"
+        "    volumes:\n"
+        "      - weaviate_data:/var/lib/weaviate\n"
+        "volumes:\n"
+        "  weaviate_data: {}\n",
+        encoding="utf-8",
+    )
 
 
 @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"),
@@ -589,6 +615,11 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
                   esac
                   exit 0
                 fi
+                # v0.2.106: the raft guard looks for a raft log in the data
+                # volume of a MISSING Weaviate; this machine has none.
+                if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then
+                  echo "Error: no such volume" >&2; exit 125
+                fi
                 if [ "$1" = "compose" ]; then exit 1; fi
                 exit 0
                 """))
@@ -603,6 +634,7 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
             orch.mkdir()
             compose_dir = tmp / "compose"
             compose_dir.mkdir()
+            _raft_guard_compose(tmp)
             # v0.2.100 (L1-F17): compose runs only from the orchestrator's own
             # infrastructure/ — its parent carries vct-module.json id "orchestrator".
             (tmp / "vct-module.json").write_text('{"id": "orchestrator"}', encoding="utf-8")

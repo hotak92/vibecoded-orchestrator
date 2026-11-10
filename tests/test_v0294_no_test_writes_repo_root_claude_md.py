@@ -46,6 +46,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -338,6 +339,10 @@ def test_real_post_edit_hook_reconciles_its_own_project_not_the_checkout(tmp_pat
         "OLLAMA_URL": "http://127.0.0.1:9",
         "CODE_EMBED_SERVICE_URL": "http://127.0.0.1:9",
         "WEAVIATE_URL": "http://127.0.0.1:9",
+        # v0.2.106: py-compile-check covers an Edit of a .py file, so the row
+        # (and the embedding it triggers) is written by the DETACHED post-check
+        # poller after its bound — a short bound, then wait for it below.
+        "VCT_EDIT_POST_CHECK_SECS": "1",
     }
 
     before_claude_md = _repo_claude_md_sha()
@@ -366,6 +371,10 @@ def test_real_post_edit_hook_reconciles_its_own_project_not_the_checkout(tmp_pat
         f"stderr={proc.stderr[-2000:]}"
     )
 
+    deadline = time.monotonic() + 120
+    while (_ledger_state(project)["UPDATE_DEFERRED.md"] == "MISSING"
+           and time.monotonic() < deadline):
+        time.sleep(0.2)
     fixture_ledger = _ledger_state(project)
     assert fixture_ledger["EMBEDDING_FAILURES.md"] != "MISSING", (
         "the hook's child never reached EmbeddingService.for_project() with "

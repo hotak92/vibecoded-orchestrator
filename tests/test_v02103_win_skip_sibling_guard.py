@@ -84,7 +84,12 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: the child's whole process GROUP (os.killpg) — a POSIX-only primitive with
 #: no .ps1 sibling (tests/test_v02105_gateway_account_refresh.py; the Windows
 #: spawn shape is unit-tested by test_windows_spawns_the_cli_without_a_console_window).
-NON_CONVENTION_BASELINE = 188
+#: 188 -> 189 (v0.2.106 wave-1 fix round, recorded in the v0.2.106 fix2
+#: round): the code-graph resync driver-claim skip test holds the claim from a
+#: helper process through ``fcntl.flock`` — a POSIX-only primitive with no
+#: .ps1 sibling (tests/test_v02102_codegraph_resync_convergence.py,
+#: test_a_driver_claim_skip_closes_its_own_row_as_skipped).
+NON_CONVENTION_BASELINE = 189
 
 
 # -- which conditions skip on Windows --------------------------------------
