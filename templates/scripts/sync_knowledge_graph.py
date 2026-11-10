@@ -575,8 +575,14 @@ def _kg_binding_from_launcher_db(project_root: Path, role: str) -> str:
     """The ONE hub-less launcher.db tier for a KG binding name (v0.2.106).
 
     Both roles go through this lookup: by the registered project folder
-    (``resolve_project_id_for_folder`` → ``get_kg_binding(pid, role)``), then
-    the orchestrator-root row (host-keyed). ``""`` on any failure.
+    (``resolve_project_id_for_folder`` → ``get_kg_binding(pid, role)``). Only
+    the SHARED role then falls back to the orchestrator-root row (host-keyed):
+    the shared class is machine-wide, so the root's shared binding is every
+    project's. The root's PRIMARY class is the root's own private KG — an
+    unregistered folder (CLI-added, mid-move, symlinked path) answers ``""``
+    for primary so the env ``KG_COLLECTION`` decides, never the root's class
+    (v0.2.106 review C-H1: the fallback would have upserted a foreign
+    project's notes into the root's KG). ``""`` on any failure.
 
     The PRIMARY role joined in v0.2.106 for the field defect where a project's
     ``kg-sync --all`` read the env ``KG_COLLECTION`` on a hub-down run (an
@@ -596,8 +602,10 @@ def _kg_binding_from_launcher_db(project_root: Path, role: str) -> str:
         if pid:
             name = get_kg_binding(pid, role)
             return (name or "").strip()
-        db_primary, db_shared = get_orchestrator_root_bindings()
-        return ((db_primary if role == "primary" else db_shared) or "").strip()
+        if role != "shared":
+            return ""
+        _db_primary, db_shared = get_orchestrator_root_bindings()
+        return (db_shared or "").strip()
     except Exception:  # noqa: BLE001 — the tier must never raise
         return ""
 

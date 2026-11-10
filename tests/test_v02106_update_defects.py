@@ -172,6 +172,40 @@ def test_hub_down_primary_comes_from_the_launcher_binding(tmp_path, monkeypatch)
     assert resolved is True
 
 
+def test_hub_down_unregistered_folder_never_takes_the_roots_primary(
+    tmp_path, monkeypatch,
+):
+    """Review C-H1: the orchestrator-root fallback is for the SHARED role only.
+
+    An unregistered folder (CLI-added, mid-move) on a hub-down run must keep
+    its env ``KG_COLLECTION`` as primary — the root's own private class is
+    never a foreign project's sync target — while the machine-wide shared
+    class still comes from the root row.
+    """
+    folder = tmp_path / "unregistered"
+    folder.mkdir()
+    monkeypatch.setenv("KG_COLLECTION", "Foo_KnowledgeGraph")
+    monkeypatch.setenv("KG_BASE_DIR", str(folder))
+    monkeypatch.delenv("SHARED_KG_COLLECTION", raising=False)
+    monkeypatch.delenv("VCT_DISABLE_HUB_RESOLVER", raising=False)
+
+    mod = _load_script("templates/scripts/sync_knowledge_graph.py", "sync_unreg")
+    with mock.patch("vco_lib.project_config.resolve",
+                    side_effect=RuntimeError("hub down")), \
+         mock.patch("vco_lib.module_gated_delivery.resolve_project_id_for_folder",
+                    return_value=None), \
+         mock.patch("vco_lib.launcher_db_reader.get_orchestrator_root_bindings",
+                    return_value=("Root_KnowledgeGraph", "Machine_Shared_KG")):
+        assert mod._kg_binding_from_launcher_db(folder, "primary") == ""
+        assert mod._kg_binding_from_launcher_db(folder, "shared") == (
+            "Machine_Shared_KG")
+        kg, _dev, shared, resolved = mod._resolve_collections()
+    assert kg == "Foo_KnowledgeGraph", (
+        "an unregistered folder must never sync into the root's primary class")
+    assert shared == "Machine_Shared_KG"
+    assert resolved is True
+
+
 # ── item 3b: the summary refresh forwards progress ──────────────────────────
 
 

@@ -158,7 +158,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A hub-down `kg-sync --all` reads the project's own collection.** On an update window the sync fell back to the
   `KG_COLLECTION` environment value, while the doctor read the launcher's binding: the sync found notes in the
   shared class and reported them "already current" while the doctor reported the same notes disk-only. Both now use
-  the same rule — the launcher binding — when the hub cannot answer.
+  the same rule — the launcher binding — when the hub cannot answer. A folder the launcher has not registered (added
+  by CLI, or mid-move) keeps its `KG_COLLECTION` value: only the machine-wide shared class falls back to the
+  orchestrator root's binding, never the root's own primary class.
 
 - **The end-of-sync summary refresh shows its progress instead of sitting silent.** The generator already printed one
   line per node, but the sync captured its output and forwarded nothing, so a working refresh could look like a
