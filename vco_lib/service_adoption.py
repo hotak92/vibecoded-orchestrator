@@ -103,6 +103,7 @@ from vco_lib import compose_provider as _compose_provider
 from vco_lib import compose_recovery as _compose_recovery
 from vco_lib import gpu_verify as _gpu_verify
 from vco_lib.atomic import atomic_write_text
+from vco_lib.console_text import console_print as _console_print
 from vco_lib.paths import vct_root_dir
 
 __all__ = [
@@ -1652,6 +1653,17 @@ def _record_adopted_rows(root: Path, plans: Sequence[ServicePlan], adopted: Sequ
             "the next `python install.py --update` records them from the running containers.")
 
 
+def _default_log() -> LogFn:
+    """The output the adoption flow uses when the caller supplies none.
+
+    v0.2.106: encoding-safe and unable to abort the run. The field report's
+    cp1252 ``UnicodeEncodeError`` on the "stop → remove" arrow killed a
+    ``hand-to-vco`` run before its stop step; a progress line must never be a
+    precondition of the operation.
+    """
+    return _console_print  # type: ignore[return-value]
+
+
 def adopt_services(
     root: Path,
     *,
@@ -1689,7 +1701,7 @@ def adopt_services(
     searched (the v0.2.96 bulk adoption)."""
     run = run or subprocess.run  # type: ignore[assignment]
     fetch = fetch or _default_fetch
-    log = log or (lambda msg: print(msg))
+    log = log or _default_log()
     root = Path(root)
     result = AdoptionResult()
 

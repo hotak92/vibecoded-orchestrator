@@ -411,7 +411,7 @@ All injection surfaces are thin wrappers around ONE Python router (`claude_mcp_s
 - `read-context-inject.sh` — after `Read`: the router injects KG titles keyed on the document's path/topic and, for code files, the exact def+callers of the file's top-level symbols from the content just read (matcher: `Read`; synchronous — the result content is what feeds the lookup, and PostToolUse is the documented surface for context about a result).
 - `post-file-edit.sh` — auto-sync on file edits: `knowledge/` → KG, `docs/` → development collection, code files → code-graph queue; duplicate detection every 10 edits (matcher: `Edit|Write`).
 - `post-bash-file-sync.sh` — the same routing for a file written from the CLI (`cat > knowledge/x.md`, a heredoc, `sed -i` on a docs page): the command is parsed for the paths it wrote and each one goes through the one routing home (matcher: `Bash|PowerShell`; PowerShell commands are read through `vco_lib/powershell_command.py`).
-- `py-compile-check.sh` — syntax check on Python writes (matcher: `Write`; the hook filters by extension internally).
+- `py-compile-check.sh` — syntax check on Python writes (matcher: `Edit|Write`; the hook filters by extension internally).
 - `post-tool-security.sh` — credential scan on written files (matcher: `Edit|Write`).
 
 **ConfigChange**:

@@ -12,8 +12,9 @@ Pieces (each has exactly one home here):
 
 * **Coverage** — :data:`CHECKERS` says which shipped PostToolUse checker
   covers which ``(tool, file suffix)``. Today that is only
-  ``py-compile-check`` (``Write`` of a ``*.py`` file; its settings matcher is
-  bare ``Write`` and the ``.py`` gate lives in the hook). There is no ruff,
+  ``py-compile-check`` (``Edit`` or ``Write`` of a ``*.py`` file; its
+  settings matcher is ``Edit|Write`` and the ``.py`` gate lives in the
+  hook). There is no ruff,
   cargo or tsc PostToolUse checker in the shipped settings. A file no
   checker covers gets ``post_check = {"status": "no_signal", "reason":
   "no_checker"}`` at once, without any wait. A file outside the project
@@ -111,10 +112,12 @@ class Checker:
 
 
 #: The coverage table. MUST MATCH the checker hooks: ``py-compile-check``
-#: is registered on bare ``Write`` in both settings templates and gates on
+#: is registered on ``Edit|Write`` in both settings templates and gates on
 #: ``.py`` itself (pinned by tests/test_v02102_w6pchk_edit_post_check.py).
+#: v0.2.106: ``Edit`` was missing, so a Python change made with the Edit
+#: tool was never compiled and its edit_outcome row read ``no_checker``.
 CHECKERS: Tuple[Checker, ...] = (
-    Checker(name="py_compile", tools=("Write",), suffixes=(".py",)),
+    Checker(name="py_compile", tools=("Write", "Edit"), suffixes=(".py",)),
 )
 
 

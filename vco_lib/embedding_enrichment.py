@@ -64,6 +64,14 @@ CLI entry::
         [--stream-progress] \\
         [--json]
 
+Supported backfill (v0.2.106) — fill only the objects that LACK the
+collection's own named-vector slot, with the model that owns that slot::
+
+    python -m vco_lib.embedding_enrichment backfill \\
+        --collection MyProject_KnowledgeGraph \\
+        [--slot arctic2_embed]   # must be the selected model's slot \\
+        [--project-root /path/to/project] [--dry-run] [--json]
+
 Output (``--json``):
 
     {
@@ -631,6 +639,11 @@ def enrich_collection_vectors(
                 f"{active_slot!r}); a slot is only ever filled with its own "
                 "model's vectors. Select that model first."
             )
+        # v0.2.106: the TEXT leg keeps this call shape for its historical
+        # caller (the launcher's profile-change fill always passes the active
+        # slot), but the public `backfill` verb below enforces the same rule
+        # explicitly for text too — a slot is only ever filled by the model
+        # that owns it, never by whatever model happens to be active.
 
         # ── Open Weaviate client ────────────────────────────────────
         if weaviate_client_factory is not None:
@@ -1439,6 +1452,44 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Output the final report as JSON (default is JSON too).",
     )
 
+    # `backfill` — the supported "some objects lack the named vector"
+    # remedy (v0.2.106 field report: 60 shared-KG objects lacked
+    # arctic2_embed and nothing shipped could fill just those). It reuses
+    # `enrich` (UPDATE-only, skips objects that already hold the slot) and
+    # resolves the slot from the model that OWNS the collection's vectors,
+    # never an arbitrary one.
+    backfill = sub.add_parser(
+        "backfill",
+        help=(
+            "Populate one collection's OWN named-vector slot on the objects "
+            "that lack it (re-embeds only those, never another model)"
+        ),
+    )
+    backfill.add_argument(
+        "--collection", required=True,
+        help="Weaviate class name to backfill (e.g. MyProject_KnowledgeGraph)",
+    )
+    backfill.add_argument(
+        "--slot", default=None,
+        help=(
+            "Optional named-vector slot. It must be the slot the selected "
+            "model writes; select that model first (launcher → Preferences "
+            "→ Embedding profile). Default: the selected model's slot."
+        ),
+    )
+    backfill.add_argument(
+        "--project-root", default=None,
+        help="Project root forwarded to EmbeddingService.for_project().",
+    )
+    backfill.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Count what would be backfilled without writing.",
+    )
+    backfill.add_argument(
+        "--json", action="store_true", default=False,
+        help="Output the report as JSON (it always is).",
+    )
+
     # `slot-counts` — read-only per-slot populated counts for one collection.
     # An operator CLI since v0.2.102 W6-J retired its last GUI consumer (the
     # model-switch modal's "keep previous model" smart default), superseded
@@ -1547,11 +1598,100 @@ def _cli_enrich(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_backfill(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.embedding_enrichment backfill ...`` (v0.2.106).
+
+    The supported remedy for a collection holding objects that lack the
+    named vector searches target (the duplicate scan used to abort on them).
+    It reuses :func:`enrich_collection_vectors` — UPDATE-only, idempotent,
+    only the rows that lack the slot — and it resolves the slot from the
+    model that OWNS the collection's vectors. A ``--slot`` that is not that
+    model's slot is REFUSED: filling it would embed one model's vectors into
+    another model's space, which never happens here.
+    """
+    project_root: Optional[Path] = (
+        Path(args.project_root).resolve() if args.project_root else None
+    )
+    kind = "code" if is_code_collection(args.collection) else "text"
+    prefix, sep, _base = args.collection.rpartition("_")
+    try:
+        svc = EmbeddingService.for_project(
+            project_root=project_root,
+            codegraph_prefix=prefix if kind == "code" and sep else None,
+            code_model_role="write",
+        )
+    except Exception as exc:  # noqa: BLE001 — pre-flight, reported as JSON
+        sys.stdout.write(json.dumps(
+            {"error": type(exc).__name__, "message": str(exc)},
+            ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 1
+
+    try:
+        active_slot = (
+            svc.code_vector_slot if kind == "code" else svc.text_vector_slot
+        )
+        requested = (args.slot or "").strip() or active_slot
+        if requested != active_slot:
+            sys.stdout.write(json.dumps({
+                "error": "SlotNotInSchemaError",
+                "message": (
+                    f"{args.collection!r}: slot {requested!r} is not the slot of "
+                    f"this project's selected {kind} model "
+                    f"({getattr(svc, 'code_model_id' if kind == 'code' else 'text_model_id', '?')}"
+                    f" -> {active_slot!r}). A slot is only ever filled with its "
+                    "own model's vectors: select that model first (launcher -> "
+                    "Preferences -> Embedding profile), then re-run backfill."
+                ),
+            }, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+            return 1
+        report = enrich_collection_vectors(
+            collection_name=args.collection,
+            new_slot=requested,
+            project_root=project_root,
+            dry_run=args.dry_run,
+            embedding_service=svc,
+        )
+    except (
+        CollectionNotFoundError,
+        UnknownSlotError,
+        SlotNotInSchemaError,
+        SchemaDimMismatchError,
+        NoEmbeddingBackendError,
+    ) as exc:
+        sys.stdout.write(json.dumps(
+            {"error": type(exc).__name__, "message": str(exc)},
+            ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 1
+    except Exception as exc:  # noqa: BLE001 — unexpected, surfaced cleanly
+        sys.stdout.write(json.dumps(
+            {"error": type(exc).__name__, "message": str(exc), "unexpected": True},
+            ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 2
+    finally:
+        try:
+            svc.close()
+        except Exception:  # noqa: BLE001 — teardown only
+            pass
+
+    payload = asdict(report)
+    payload["slot"] = requested
+    payload["kind"] = kind
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_argparser()
     args = parser.parse_args(argv)
     if args.cmd == "enrich":
         return _cli_enrich(args)
+    if args.cmd == "backfill":
+        return _cli_backfill(args)
     if args.cmd == "slot-counts":
         return _cli_slot_counts(args)
     parser.error(f"Unknown command: {args.cmd}")

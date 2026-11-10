@@ -272,9 +272,15 @@ class WindowsInstallGateTest(unittest.TestCase):
         with patch("install.platform.system", return_value="Darwin"):
             install._check_windows_shell_prereqs()
 
+    @staticmethod
+    def _probe(state, version=None, detail=""):
+        from vco_lib.windows_powershell import PowerShellProbe
+        return PowerShellProbe(state, version, "powershell", detail)
+
     def test_refuses_windows_without_pwsh(self) -> None:
         with patch("install.platform.system", return_value="Windows"), \
-                patch("install._windows_powershell_version", return_value=None), \
+                patch("install._windows_powershell_probe",
+                      return_value=self._probe("missing")), \
                 patch("install._windows_has_git_bash", return_value=False):
             with self.assertRaises(SystemExit) as cm:
                 install._check_windows_shell_prereqs()
@@ -282,7 +288,8 @@ class WindowsInstallGateTest(unittest.TestCase):
 
     def test_refuses_windows_with_only_git_bash(self) -> None:
         with patch("install.platform.system", return_value="Windows"), \
-                patch("install._windows_powershell_version", return_value=None), \
+                patch("install._windows_powershell_probe",
+                      return_value=self._probe("missing")), \
                 patch("install._windows_has_git_bash", return_value=True):
             with self.assertRaises(SystemExit) as cm:
                 install._check_windows_shell_prereqs()
@@ -290,7 +297,8 @@ class WindowsInstallGateTest(unittest.TestCase):
 
     def test_passes_windows_with_pwsh_and_git_bash(self) -> None:
         with patch("install.platform.system", return_value="Windows"), \
-                patch("install._windows_powershell_version", return_value=(5, 1)), \
+                patch("install._windows_powershell_probe",
+                      return_value=self._probe("ok", (5, 1))), \
                 patch("install._windows_has_git_bash", return_value=True):
             install._check_windows_shell_prereqs()  # should not raise
 
@@ -298,11 +306,40 @@ class WindowsInstallGateTest(unittest.TestCase):
         import io
         captured = io.StringIO()
         with patch("install.platform.system", return_value="Windows"), \
-                patch("install._windows_powershell_version", return_value=(7, 4)), \
+                patch("install._windows_powershell_probe",
+                      return_value=self._probe("ok", (7, 4))), \
                 patch("install._windows_has_git_bash", return_value=False), \
                 patch("sys.stderr", captured):
             install._check_windows_shell_prereqs()
         self.assertIn("Git Bash", captured.getvalue())
+
+    def test_a_probe_timeout_is_a_warning_never_a_refusal(self) -> None:
+        """v0.2.106 field report: an 8 s timeout under load was reported as
+        "PowerShell 5.1+ is required" and refused a healthy install."""
+        import io
+        captured = io.StringIO()
+        with patch("install.platform.system", return_value="Windows"), \
+                patch("install._windows_powershell_probe",
+                      return_value=self._probe(
+                          "no_answer", None,
+                          "powershell did not answer within 8s")), \
+                patch("install._windows_has_git_bash", return_value=True), \
+                patch("sys.stderr", captured):
+            install._check_windows_shell_prereqs()  # must not raise
+        out = captured.getvalue()
+        self.assertIn("NOT proof", out)
+        self.assertNotIn("is required", out)
+
+    def test_too_old_names_the_version_found(self) -> None:
+        with patch("install.platform.system", return_value="Windows"), \
+                patch("install._windows_powershell_probe",
+                      return_value=self._probe("too_old", (4, 0))), \
+                patch("install._windows_has_git_bash", return_value=True):
+            with self.assertRaises(SystemExit) as cm:
+                install._check_windows_shell_prereqs()
+        msg = str(cm.exception)
+        self.assertIn("4.0", msg)
+        self.assertIn("too old", msg)
 
 
 if __name__ == "__main__":

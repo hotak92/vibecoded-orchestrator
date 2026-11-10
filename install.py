@@ -293,32 +293,17 @@ def validate_source_repo(install_path: Path) -> None:
         )
 
 
-def _windows_powershell_version() -> tuple[int, int] | None:
-    """Return the (major, minor) version of the available PowerShell, or
-    None if neither `pwsh` (PowerShell 7+) nor `powershell` (Windows
-    PowerShell 5.1) resolves on PATH.
+def _windows_powershell_probe():
+    """PowerShell's state (ok/missing/too_old/no_answer) — logic in
+    ``vco_lib.windows_powershell``; this shim is the tests' patch point."""
+    from vco_lib.windows_powershell import probe
 
-    Used by the Windows install gate (audit F1, P0). PowerShell 5.1 ships
-    preinstalled on Windows 10/11 — that's the floor. `pwsh` (Core 7+) is
-    preferred when available but not required.
-    """
-    for exe in ("pwsh", "powershell"):
-        if not shutil.which(exe):
-            continue
-        try:
-            r = subprocess.run(
-                [exe, "-NoProfile", "-Command",
-                 "$PSVersionTable.PSVersion.Major; $PSVersionTable.PSVersion.Minor"],
-                capture_output=True, text=True, timeout=8,
-            )
-        except (subprocess.SubprocessError, OSError):
-            continue
-        if r.returncode != 0:
-            continue
-        nums = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
-        if len(nums) >= 2:
-            return (nums[0], nums[1])
-    return None
+    return probe()
+
+
+def _windows_powershell_version() -> tuple[int, int] | None:
+    """The (major, minor) version, or None when it could not be read."""
+    return _windows_powershell_probe().version
 
 
 def _windows_has_git_bash() -> bool:
@@ -348,20 +333,21 @@ def _check_windows_shell_prereqs() -> None:
         actionable install message.
       - Windows + Git Bash only (no PowerShell): same SystemExit — the
         `.ps1` hooks need PowerShell.
+      - Windows + PowerShell below 5.1: SystemExit naming the version found.
+      - Windows + PowerShell present but the probe did not answer: a WARNING,
+        never a refusal — "could not confirm" is not "not installed".
 
     See VCO portability audit 2026-04-30, finding F1.
     """
     if platform.system() != "Windows":
         return
 
-    pwsh_ver = _windows_powershell_version()
+    from vco_lib.windows_powershell import STATE_MISSING, STATE_NO_ANSWER, STATE_TOO_OLD
+
+    ps = _windows_powershell_probe()
     has_git_bash = _windows_has_git_bash()
 
-    pwsh_ok = pwsh_ver is not None and (
-        pwsh_ver[0] > 5 or (pwsh_ver[0] == 5 and pwsh_ver[1] >= 1)
-    )
-
-    if not pwsh_ok:
+    if ps.state == STATE_MISSING:
         msg = (
             "Refusing to install on Windows: PowerShell 5.1+ is required "
             "(Windows 10/11 ships with it; older systems need "
@@ -371,6 +357,25 @@ def _check_windows_shell_prereqs() -> None:
             "Re-run install once one of these is on PATH."
         )
         raise SystemExit(msg)
+
+    if ps.state == STATE_TOO_OLD:
+        raise SystemExit(
+            f"Refusing to install on Windows: PowerShell {ps.version_text()} is too old — "
+            "5.1+ is required for VCO's `.ps1` hooks. Install a current PowerShell "
+            "(https://aka.ms/PSWindows) and re-run install."
+        )
+
+    if ps.state == STATE_NO_ANSWER:
+        # v0.2.106: a probe timeout under load was read as "not installed"
+        # and refused a healthy install. "Could not confirm" is not absence,
+        # so install continues with a warning saying what is unverified.
+        sys.stderr.write(
+            "WARNING: PowerShell is on PATH but could not be asked for its "
+            f"version ({ps.detail}) — NOT proof it is missing or too old, so "
+            "the install continues. VCO's `.ps1` hooks need 5.1+; if they do "
+            "not fire, check `powershell -Command $PSVersionTable.PSVersion` "
+            "and re-run install.\n"
+        )
 
     if not has_git_bash:
         # PowerShell-only install: every .ps1 hook works, but the bash-only

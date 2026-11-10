@@ -77,6 +77,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that history loses its data at the first 1.37.18 start, and keeps it (also across a restart) when VCO's snapshot
   ran first.
 
+- **`hand-to-vco` no longer dies on a Windows console before it stops anything.** Its progress line carries an arrow,
+  and a cp1252 console refused to encode it: the exception escaped the progress line and aborted the hand-over
+  midway through the stop step. CLI output now goes through the one console-safe writer, which transliterates a
+  character the stream cannot encode and never lets a failed write abort the operation. The same writer is used by
+  the adoption flow every message it prints.
+
+- **"PowerShell 5.1+ is required" no longer fires on a slow answer.** The Windows install gate asked PowerShell for
+  its version with an 8-second bound and read a timeout as "not installed", refusing a healthy install under load. A
+  timeout is now retried once with a longer bound, and the three outcomes are kept apart: missing (refuse), too old
+  (refuse, naming the version found), and did not answer (a warning that says the version could not be confirmed —
+  never a refusal).
+
+- **A hub-down `kg-sync --all` reads the project's own collection.** On an update window the sync fell back to the
+  `KG_COLLECTION` environment value, while the doctor read the launcher's binding: the sync found notes in the
+  shared class and reported them "already current" while the doctor reported the same notes disk-only. Both now use
+  the same rule — the launcher binding — when the hub cannot answer.
+
+- **The end-of-sync summary refresh shows its progress instead of sitting silent.** The generator already printed one
+  line per node, but the sync captured its output and forwarded nothing, so a working refresh could look like a
+  28-minute hang. Its lines are now streamed to the terminal and a heartbeat line appears every two minutes; there is
+  still no whole-run cap (each generator call keeps its own bound).
+
+- **The duplicate scan skips objects that lack the named vector instead of failing.** A named-vector slot can be
+  reported with an empty vector for an object that never got one; the scanner counted the slot as present, and one
+  such object aborted the whole scan with "vector not found for target". Only a non-empty vector now counts. A new
+  `python -m vco_lib.embedding_enrichment backfill --collection <name>` fills just the objects that lack the
+  collection's own slot, reusing the existing update-only fill; a `--slot` that is not the selected model's slot is
+  refused, so a slot is never filled with another model's vectors.
+
+- **A failed code-graph catch-up run always leaves its reason in the log.** A run that failed four times left a
+  0-byte log, so the only evidence was the backoff file. The runner now writes a start line and a final
+  `outcome=<reason>` line on every path, and a log that cannot be written is mirrored to stderr instead of being
+  swallowed.
+
+- **`vco doctor` no longer calls a running launcher "stale", and no single check can stall the report.** A launcher
+  process being open was folded into "problem"; that state is now reported as not-checked ("the running image's
+  version cannot be read from here"), because a running binary is not a stale one. Each check also has its own
+  wall-clock bound (`VCT_DOCTOR_CHECK_TIMEOUT_S`, default 120 s): a check that overruns is reported as "not checked",
+  never as a failure, and the rest of the report still runs.
+
+- **The metrics migration compares content, not byte counts.** Two files holding the same rows with different line
+  endings (or a BOM), or a row appended by another writer during the copy, were reported as a failed copy with a
+  byte difference. The comparison now normalizes line endings and encoding and warns only when a source row is
+  actually missing or the destination lost lines.
+
+- **`py-compile-check` runs on `Edit` as well as `Write`.** It was registered on `Write` only, so a Python change
+  made with the Edit tool was never compiled and its edit-outcome record said "no checker". Both settings templates
+  register it on `Edit|Write`; the hook's own `.py` filter is unchanged.
+
 - **The old inline syntax-check hooks are removed from your settings.** Early releases registered a `py_compile`
   one-liner on every Python write (in two successive forms, Linux and Windows) and a later one replaced it with the
   named `py-compile-check` hook, but projects that received an old form kept it, so it kept running beside the new
