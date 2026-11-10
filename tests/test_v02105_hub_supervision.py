@@ -469,7 +469,7 @@ def test_preflight_lets_a_resolvable_lane_through(tmp_path, user_claude):
 
 
 @pytest.mark.parametrize("model,vendor", [
-    ("claude-gw/kimi/k3[1m]", "kimi"),                      # two-segment namespace
+    ("claude-gw/kimi/k3.1-pro[1m]", "kimi"),                # two-segment namespace
     ("claude-gw/glm-5.3[1m]", "zai"),
     ("claude-gw/qwen/deepseek-v4.1-flash[1m]", "qwen"),
 ])

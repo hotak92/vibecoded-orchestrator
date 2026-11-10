@@ -133,7 +133,9 @@ UNROUTABLE_SENTINEL_URL = "http://127.0.0.1:9"
 #: which silently refuses writes. Every entry must be grounded in ``tests/``.
 FIXTURE_PROJECT_NAMES: frozenset[str] = frozenset({
     "Acme",
+    "AcmeCode",
     "AcmeCorp",
+    "AcmeRenamed",
     "Alpha",
     "Bar",
     "Baz",
@@ -147,6 +149,7 @@ FIXTURE_PROJECT_NAMES: frozenset[str] = frozenset({
     "GhostName",
     "P1",
     "Phantom",
+    "Proj106",
     "ProjA",
     "Quux",
 })
