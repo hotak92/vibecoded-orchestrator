@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the collections; if the removal stops on a value VCO wrote and could not remove, rerun with `--leave-unremovable` to
   finish anyway (the dialog's "Unregister anyway"). A name two projects share is refused with both ids listed, and the
   orchestrator's own project cannot be removed. Refresh the launcher afterwards to update its project list.
+  `vct-cli project delete <id|slug>` (the hub's `DELETE /api/v1/cli/projects/{id}`) used to delete only the database
+  row and leave every file VCO had put in the folder; it now runs this same removal — the hub hands it to the
+  launcher binary installed beside it — with the same `--keep-collections` / `--leave-unremovable` choices and the
+  same refusals. Where no launcher binary sits beside the hub, it refuses and changes nothing.
 
 - **The menu bar shows when work is still running in the background.** After you close the "Update all" window (or add
   a project), knowledge-graph syncs, code-graph builds, summary runs and project setups keep going on their own, and

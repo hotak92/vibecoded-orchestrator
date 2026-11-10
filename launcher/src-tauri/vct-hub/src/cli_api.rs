@@ -287,17 +287,137 @@ async fn rename_project(
     })
 }
 
+/// `DELETE /cli/projects/{id|slug}` options — the terminal form's flags
+/// (`vct-launcher --remove-project --keep-collections / --leave-unremovable`).
+#[derive(Deserialize, Default)]
+struct DeleteProjectQuery {
+    #[serde(default)]
+    keep_collections: bool,
+    #[serde(default)]
+    leave_unremovable: bool,
+}
+
+/// How long one removal may run: it purges the folder and, by default, drops
+/// the project's own collections — minutes on a slow disk or a busy Weaviate,
+/// never a reason to report a removal that is still running as failed.
+const REMOVE_PROJECT_LIMIT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// The launcher binary shipped beside this hub (`launcher/dist/<arch>/`).
+fn launcher_beside_hub() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let bin = dir.join(format!("vct-launcher{}", std::env::consts::EXE_SUFFIX));
+    bin.is_file().then_some(bin)
+}
+
+/// The argv tail of `vct-launcher --remove-project` for one project id.
+fn remove_project_argv(project_id: &str, q: &DeleteProjectQuery) -> Vec<String> {
+    let mut argv = vec!["--remove-project".to_string(), project_id.to_string()];
+    if q.keep_collections {
+        argv.push("--keep-collections".to_string());
+    }
+    if q.leave_unremovable {
+        argv.push("--leave-unremovable".to_string());
+    }
+    argv
+}
+
+/// Run the launcher's removal and translate its exit contract
+/// (`remove_project_cli.rs`: 0 removed, 1 usage / lookup / DB error, 2 the
+/// removal stopped on a value VCO could not remove) into an HTTP answer.
+fn run_remove_project(launcher: &std::path::Path, argv: &[String]) -> (StatusCode, serde_json::Value) {
+    let mut cmd = std::process::Command::new(launcher);
+    cmd.args(argv);
+    let out = match vct_launcher_core::process::output_bounded(&mut cmd, None, REMOVE_PROJECT_LIMIT) {
+        Ok(o) => o,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "ok": false, "error": format!("the removal did not finish: {}", e) }),
+            )
+        }
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match out.status.code() {
+        Some(0) => {
+            let report = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .unwrap_or(serde_json::Value::Null);
+            (StatusCode::OK, serde_json::json!({ "ok": true, "report": report, "message": stderr }))
+        }
+        Some(2) => (
+            StatusCode::CONFLICT,
+            serde_json::json!({ "ok": false, "stopped": true, "error": stderr }),
+        ),
+        Some(1) => (StatusCode::BAD_REQUEST, serde_json::json!({ "ok": false, "error": stderr })),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("the removal exited {:?}: {}", other, stderr),
+            }),
+        ),
+    }
+}
+
+/// v0.2.106 (Q5): the CLI's delete runs the SAME removal as the GUI's Remove
+/// and `vct-launcher --remove-project` — `projects_v2::unregister_project`
+/// (VCO's files, settings entries and env lines out of the folder, the
+/// project's own collections dropped unless `keep_collections`, the folder
+/// and the user's own files kept). It used to delete only the database row,
+/// leaving every file VCO put in the folder behind. That removal lives in the
+/// launcher crate, so the hub DELEGATES to the launcher binary shipped beside
+/// it rather than growing a second implementation; with no such binary it
+/// refuses loudly (503) instead of falling back to a row-only delete.
 async fn delete_project(
     State(h): State<LauncherDbHandle>,
     Path(id_or_slug): Path<String>,
+    Query(q): Query<DeleteProjectQuery>,
 ) -> axum::response::Response {
-    resolve_project(&h, &id_or_slug, |project| {
-        let _ = h.0.audit("project_delete", Some(&project.id), None, &serde_json::json!({ "via": "cli" }));
-        match h.0.delete_project(&project.id) {
-            Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        }
-    })
+    let resolved = h
+        .0
+        .get_project(&id_or_slug)
+        .ok()
+        .flatten()
+        .or_else(|| h.0.get_project_by_slug(&id_or_slug).ok().flatten());
+    let Some(project) = resolved else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "project not found" })))
+            .into_response();
+    };
+    if project.host == ProjectHost::OrchestratorRoot {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "the orchestrator's own project cannot be removed: its .claude/ is the live install",
+            })),
+        )
+            .into_response();
+    }
+    let Some(launcher) = launcher_beside_hub() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "the launcher binary (vct-launcher) is not installed beside this hub, so the \
+                     project's files cannot be removed from here; nothing was changed. Use the \
+                     launcher's Remove from VCO, or run `vct-launcher --remove-project {}`",
+                    project.id
+                ),
+            })),
+        )
+            .into_response();
+    };
+    let _ = h.0.audit("project_delete", Some(&project.id), None, &serde_json::json!({ "via": "cli" }));
+    let argv = remove_project_argv(&project.id, &q);
+    let (status, body) = match tokio::task::spawn_blocking(move || run_remove_project(&launcher, &argv)).await {
+        Ok(answer) => answer,
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "ok": false, "error": format!("the removal task failed: {}", e) }),
+        ),
+    };
+    (status, Json(body)).into_response()
 }
 
 // ─── Project move (v0.2.92 WP-17 / W3) ──────────────────────────────────
@@ -3350,4 +3470,115 @@ async fn rename_collections(
                 .into_response(),
         }
     })
+}
+
+#[cfg(test)]
+mod remove_project_delegation_tests {
+    //! v0.2.106 Q5: the CLI delete runs the launcher's full removal.
+    use super::*;
+    use axum::Router;
+    use std::sync::Arc;
+
+    async fn spawn(db: Arc<Db>) -> String {
+        let handle = LauncherDbHandle(db);
+        let app: Router = Router::new().nest("/api/v1", super::router().with_state(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{}/api/v1", addr)
+    }
+
+    #[test]
+    fn the_flags_reach_the_launchers_argv() {
+        let none = DeleteProjectQuery::default();
+        assert_eq!(remove_project_argv("p1", &none), vec!["--remove-project", "p1"]);
+        let both = DeleteProjectQuery { keep_collections: true, leave_unremovable: true };
+        assert_eq!(
+            remove_project_argv("p1", &both),
+            vec!["--remove-project", "p1", "--keep-collections", "--leave-unremovable"]
+        );
+    }
+
+    #[cfg(unix)]
+    fn fake_launcher(dir: &std::path::Path, name: &str, exit: i32, stdout: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("argv.log");
+        let bin = dir.join(name);
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\necho 'stderr note' >&2\nexit {}\n",
+                log.display(),
+                stdout,
+                exit
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_contract_maps_to_http_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let argv = remove_project_argv("p1", &DeleteProjectQuery::default());
+
+        let ok = fake_launcher(tmp.path(), "ok", 0, r#"{"project_id":"p1"}"#);
+        let (status, body) = run_remove_project(&ok, &argv);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["report"]["project_id"], "p1");
+        let logged = std::fs::read_to_string(tmp.path().join("argv.log")).unwrap();
+        assert_eq!(logged, "--remove-project\np1\n");
+
+        let stopped = fake_launcher(tmp.path(), "stopped", 2, "");
+        let (status, body) = run_remove_project(&stopped, &argv);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["stopped"], true);
+        assert_eq!(body["error"], "stderr note");
+
+        let refused = fake_launcher(tmp.path(), "refused", 1, "");
+        assert_eq!(run_remove_project(&refused, &argv).0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_root_is_refused_and_an_unknown_project_is_404() {
+        let db = Db::open_in_memory().expect("db");
+        db.insert_project("root", "VCO", "/w/root", ProjectHost::OrchestratorRoot, "vco-root")
+            .unwrap();
+        let db = Arc::new(db);
+        let base = spawn(db.clone()).await;
+        let client = reqwest::Client::new();
+        let r = client.delete(format!("{}/cli/projects/root", base)).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(db.get_project("root").unwrap().is_some());
+        let r = client.delete(format!("{}/cli/projects/nope", base)).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    /// The pre-Q5 route deleted ONLY the row. With no launcher binary beside
+    /// the hub (a test binary's directory holds none) the route must refuse
+    /// loudly and leave the row, never fall back to that row-only delete.
+    #[tokio::test]
+    async fn without_a_launcher_binary_nothing_is_deleted() {
+        if launcher_beside_hub().is_some() {
+            return; // a build tree that happens to carry one: nothing to prove here
+        }
+        let db = Db::open_in_memory().expect("db");
+        db.insert_project("p1", "Alpha", "/w/p1", ProjectHost::Base, "alpha").unwrap();
+        let db = Arc::new(db);
+        let base = spawn(db.clone()).await;
+        let r = reqwest::Client::new()
+            .delete(format!("{}/cli/projects/p1", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(db.get_project("p1").unwrap().is_some(), "the row must stay");
+    }
 }

@@ -120,8 +120,20 @@ enum ProjectCmd {
         id_or_slug: String,
         new_name: String,
     },
-    /// Delete a project (id or slug).
-    Delete { id_or_slug: String },
+    /// Remove a project from VCO (id or slug) — the same removal as the
+    /// launcher's "Remove from VCO": VCO's files and settings entries leave
+    /// the folder, the project's own collections are dropped, and the folder
+    /// and your own files stay.
+    Delete {
+        id_or_slug: String,
+        /// Keep the project's Weaviate collections.
+        #[arg(long)]
+        keep_collections: bool,
+        /// Finish even when a value VCO wrote could not be removed (the
+        /// removal lists each one to clean by hand).
+        #[arg(long)]
+        leave_unremovable: bool,
+    },
     /// Print info for a single project (id or slug).
     Show { id_or_slug: String },
 }
@@ -598,6 +610,25 @@ fn print_json<T: Serialize>(v: &T) -> Result<()> {
     Ok(())
 }
 
+/// The hub path for `project delete`: the hub runs the launcher's full
+/// removal (`DELETE /cli/projects/{id}`), and the two flags travel as its
+/// `keep_collections` / `leave_unremovable` query options.
+fn delete_project_path(id_or_slug: &str, keep_collections: bool, leave_unremovable: bool) -> String {
+    let mut path = format!("/cli/projects/{}", id_or_slug);
+    let mut opts: Vec<&str> = Vec::new();
+    if keep_collections {
+        opts.push("keep_collections=true");
+    }
+    if leave_unremovable {
+        opts.push("leave_unremovable=true");
+    }
+    if !opts.is_empty() {
+        path.push('?');
+        path.push_str(&opts.join("&"));
+    }
+    path
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -652,8 +683,9 @@ fn project(hub: &Hub, cmd: ProjectCmd) -> Result<()> {
             let v: serde_json::Value = hub.patch_json(&format!("/cli/projects/{}", id_or_slug), &body)?;
             print_json(&v)
         }
-        ProjectCmd::Delete { id_or_slug } => {
-            let v: serde_json::Value = hub.delete_json(&format!("/cli/projects/{}", id_or_slug))?;
+        ProjectCmd::Delete { id_or_slug, keep_collections, leave_unremovable } => {
+            let v: serde_json::Value =
+                hub.delete_json(&delete_project_path(&id_or_slug, keep_collections, leave_unremovable))?;
             print_json(&v)
         }
         ProjectCmd::Show { id_or_slug } => {
@@ -903,6 +935,25 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use std::collections::BTreeMap;
+
+    /// v0.2.106 Q5: `project delete` runs the launcher's full removal through
+    /// the hub; its flags reach the hub as query options.
+    #[test]
+    fn project_delete_flags_become_the_hubs_query_options() {
+        assert_eq!(delete_project_path("alpha", false, false), "/cli/projects/alpha");
+        assert_eq!(
+            delete_project_path("alpha", true, true),
+            "/cli/projects/alpha?keep_collections=true&leave_unremovable=true"
+        );
+        let cli = Cli::try_parse_from(["vct-cli", "project", "delete", "alpha", "--keep-collections"])
+            .expect("parses");
+        match cli.command {
+            TopCommand::Project { cmd: ProjectCmd::Delete { keep_collections, leave_unremovable, .. } } => {
+                assert!(keep_collections && !leave_unremovable);
+            }
+            _ => panic!("parsed into another verb"),
+        }
+    }
 
     /// `cli_verbs.json` is the command tree other checks read without
     /// building this crate (tests/test_v0297_cli_program_names.py uses it to
