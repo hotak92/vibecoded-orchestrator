@@ -14553,9 +14553,10 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
     confusing duplicate search results.
 
     Strategy:
-      * For each canonical CodeXxx suffix, detect any Weaviate class whose
-        name ends in that suffix AND whose FULL name (prefix included) is a
-        pure-lowercase form of an existing canonical-cased class.
+      * Detect any Weaviate class that ends in a CodeXxx suffix (any case)
+        AND is the lower-cased form of a live class VCO minted (the minted
+        spelling with one or more letters lower-cased —
+        ``vco_lib.weaviate_case_history.lowercase_residuals``).
       * If the lowercase variant has fewer than 100 objects it is
         "clearly residual" and gets one deferral entry (UPDATE_DEFERRED.md).
       * v0.2.106: it is NEVER dropped and no DELETE is printed — Weaviate
@@ -14578,34 +14579,16 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
     except Exception:
         return  # Weaviate down — skip silently, upstream already deferred this.
 
-    all_classes: list[str] = sorted(
-        _wh.schema_class_names(schema)
-    )
-    # Build a lookup: lower(name) -> set of canonical names sharing that key.
-    from_lower: dict[str, list[str]] = {}
-    for cls in all_classes:
-        key = cls.lower()
-        from_lower.setdefault(key, []).append(cls)
-
-    # Code collection suffixes from the canonical catalog.
+    # Code collection suffixes from the canonical catalog. A residual is the
+    # LOWER-CASED form of a minted class that is also live (review A-M1: the
+    # old test — all-lower AND ending in a mixed-case suffix — could never
+    # hold, so the notice never appeared).
     from vco_lib.weaviate_schema import _CODE_COLLECTION_SUFFIXES
+    from vco_lib.weaviate_case_history import lowercase_residuals
 
-    residual: list[str] = []
-    for cls in all_classes:
-        # Skip already-canonical: class is its own lone lower-representative.
-        key = cls.lower()
-        siblings = from_lower.get(key, [])
-        # Must have a case-different sibling to qualify as residual.
-        canonical_siblings = [s for s in siblings if s != cls]
-        if not canonical_siblings:
-            continue
-        # Must end in a code-graph suffix.
-        if not any(cls.endswith(sfx) for sfx in _CODE_COLLECTION_SUFFIXES):
-            continue
-        # Must be the LOWERCASE variant (i.e. cls == key → all lower).
-        if cls != cls.lower():
-            continue
-        residual.append(cls)
+    shadows = lowercase_residuals(
+        _wh.schema_class_names(schema), _CODE_COLLECTION_SUFFIXES)
+    residual: list[str] = sorted(shadows)
 
     if not residual:
         _log_install_event(
@@ -14636,8 +14619,8 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
             )
             continue
 
-        # Qualify as residual: lowercase + case-sibling + < 100 rows.
-        canonical_siblings = [s for s in from_lower.get(cls.lower(), []) if s != cls]
+        # Qualify as residual: lower-cased form of a live minted class + < 100 rows.
+        canonical_siblings = shadows[cls]
         canonical_str = ", ".join(f"`{s}`" for s in sorted(canonical_siblings))
         deferral_report.add_entry(
             DeferralEntry(

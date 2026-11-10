@@ -49,6 +49,8 @@ __all__ = [
     "deleted_entries",
     "deleted_names",
     "guard_create",
+    "is_lowercased_form",
+    "lowercase_residuals",
 ]
 
 #: Seconds :func:`guard_create` waits for a snapshot to cover a recorded
@@ -201,3 +203,46 @@ def guard_create(
               f"the delete of {prior[0]!r} is not inside a raft snapshot yet (snapshot index "
               f"{last.last_snapshot_index} < {need}) after waiting {int(budget)} s")
     raise CaseVariantCreateRefused(name, prior[0], reason)
+
+
+def is_lowercased_form(name: str, minted: str) -> bool:
+    """True when *name* is *minted* with one or more letters lower-cased —
+    the spelling an older VCO produced for a name it now mints mixed-case.
+
+    The first character is compared case-insensitively (Weaviate capitalises a
+    class name's first letter on create, so a fully lower-cased name is stored
+    with an upper-case first letter). Every other character must be the
+    minted one or its lower-case form, and at least one must differ — so the
+    relation is one-way: the minted spelling is never the lower-cased form of
+    its own residual.
+    """
+    if not name or not minted or name == minted or len(name) != len(minted):
+        return False
+    if name[0].lower() != minted[0].lower():
+        return False
+    return all(c == m or c == m.lower() for c, m in zip(name[1:], minted[1:])) \
+        and name[1:] != minted[1:]
+
+
+def lowercase_residuals(class_names: Any, suffixes: Any) -> dict[str, list[str]]:
+    """Every live class that is the lower-cased form of a VCO-minted code-graph
+    class also present → the minted siblings it shadows (sorted).
+
+    A minted name ends in one of *suffixes* EXACTLY (``CodeFunction`` …); the
+    residual may carry the suffix in any case (``_codefunction``). Pure: the
+    caller reads the schema.
+    """
+    names = sorted({str(n) for n in class_names or () if n})
+    sfx = tuple(str(x) for x in suffixes or ())
+    by_lower: dict[str, list[str]] = {}
+    for n in names:
+        by_lower.setdefault(n.lower(), []).append(n)
+    out: dict[str, list[str]] = {}
+    for n in names:
+        if not any(n.lower().endswith(x.lower()) for x in sfx):
+            continue
+        minted = [m for m in by_lower.get(n.lower(), [])
+                  if any(m.endswith(x) for x in sfx) and is_lowercased_form(n, m)]
+        if minted:
+            out[n] = sorted(minted)
+    return out

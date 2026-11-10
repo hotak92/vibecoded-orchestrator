@@ -138,7 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `weaviate_upgrade_snapshot_refused` says why. VCO no longer creates a collection while a delete of the same name
   in other letter case could still be replayed (it waits for the next snapshot, else refuses loudly), and the
   residual-lowercase-collection notice no longer prints a `DELETE` (Weaviate keeps both spellings in one index, so
-  deleting either removes the data of both). Checked against throwaway containers: on 1.37.18 the case-variant
+  deleting either removes the data of both). That notice could never appear before: its test asked for a name that
+  was all lower-case and ended in a mixed-case suffix such as `CodeFunction`. It now reports a code-graph collection
+  that is the lower-cased spelling of a live collection VCO named (for example `Myproject_codefunction` beside
+  `MyProject_CodeFunction`). Checked against throwaway containers: on 1.37.18 the case-variant
   history loses the live data at the next restart; with the snapshot settings it survives; a 1.28.4 folder with
   that history loses its data at the first 1.37.18 start, and keeps it (also across a restart) when VCO's snapshot
   ran first.

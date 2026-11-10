@@ -773,14 +773,10 @@ def test_guarded_collection_create_refuses_and_record_collection_delete_records(
     client.collections.create.assert_not_called()
 
 
-def test_the_lowercase_residual_entry_prints_no_delete(monkeypatch):
+def _run_residual_detector(monkeypatch, classes, count=5):
     import install
 
-    # The detector requires a name that is ALL lower-case AND ends in a
-    # canonical (mixed-case) suffix, which no name can be — so the suffix
-    # table is narrowed to a lower-case one to reach the entry builder.
-    schema = {"classes": [{"class": "myproject_codefunction"},
-                          {"class": "MyProject_codefunction"}]}
+    schema = {"classes": [{"class": c} for c in classes]}
 
     class Resp:
         def read(self):
@@ -788,16 +784,51 @@ def test_the_lowercase_residual_entry_prints_no_delete(monkeypatch):
 
     monkeypatch.setattr(install.urllib.request, "urlopen", lambda *a, **k: Resp())
     from vco_lib import project_init as pi
-    from vco_lib import weaviate_schema
 
-    monkeypatch.setattr(weaviate_schema, "_CODE_COLLECTION_SUFFIXES", ("_codefunction",))
-    monkeypatch.setattr(pi, "_http_count_objects", lambda *a, **k: 5)
+    monkeypatch.setattr(pi, "_http_count_objects", lambda *a, **k: count)
     report = mock.MagicMock()
     install._emit_lowercase_codegraph_cleanup_deferrals(report)
-    [call] = report.add_entry.call_args_list
-    entry = call.args[0]
+    return [c.args[0] for c in report.add_entry.call_args_list]
+
+
+def test_the_lowercase_residual_entry_fires_and_prints_no_delete(monkeypatch):
+    """Review A-M1: the real catalog suffixes reach the entry builder — a
+    lower-cased residual (Weaviate capitalises the first letter) beside its
+    minted sibling is reported, and the entry never prints a DELETE."""
+    entries = _run_residual_detector(
+        monkeypatch, ["MyProject_CodeFunction", "Myproject_codefunction",
+                      "Myproject_CodeClass", "MyProject_CodeClass"])
+    by_cid = {e.condition_id: e for e in entries}
+    assert set(by_cid) == {"lowercase_codegraph_residual_Myproject_codefunction",
+                           "lowercase_codegraph_residual_Myproject_CodeClass"}
+    entry = by_cid["lowercase_codegraph_residual_Myproject_codefunction"]
+    assert "`MyProject_CodeFunction`" in entry.detected
     assert "DELETE" not in entry.command_to_apply
     assert "Do NOT drop it" in entry.why_deferred
+
+
+@pytest.mark.parametrize("classes", [
+    ["MyProject_CodeFunction"],                              # no sibling
+    ["MyProject_CodeFunction", "MYproject_CodeFunction"],    # neither is the other lowered
+    ["Myproject_kg", "MyProject_Kg"],                         # not a code-graph class
+    ["Foo_CodeFunction", "Bar_codefunction"],                 # different lower key
+])
+def test_the_lowercase_residual_detector_stays_quiet(monkeypatch, classes):
+    assert _run_residual_detector(monkeypatch, classes) == []
+
+
+def test_a_residual_with_real_data_is_not_reported(monkeypatch):
+    assert _run_residual_detector(
+        monkeypatch, ["MyProject_CodeFunction", "Myproject_codefunction"],
+        count=500) == []
+
+
+def test_lowercased_form_is_one_way():
+    assert wch.is_lowercased_form("Myproject_codefunction", "MyProject_CodeFunction")
+    assert wch.is_lowercased_form("myproject_CodeFunction", "MyProject_CodeFunction")
+    assert not wch.is_lowercased_form("MyProject_CodeFunction", "Myproject_codefunction")
+    assert not wch.is_lowercased_form("MyProject_CodeFunction", "MyProject_CodeFunction")
+    assert not wch.is_lowercased_form("MYPROJECT_CodeFunction", "MyProject_CodeFunction")
 
 
 # ─── item 5: the uncapped container ─────────────────────────────────────
