@@ -1224,6 +1224,30 @@ mod move_tests {
             .is_empty());
     }
 
+    /// v0.2.106 ("Remove from VCO" → add the folder again): removing a project
+    /// frees its folder and its slug, so the ordinary Add can register the
+    /// same folder under the same name again, with a fresh id.
+    #[test]
+    fn a_removed_project_folder_and_name_can_be_registered_again() {
+        let db = Db::open_in_memory().unwrap();
+        let slug = db.generate_unique_slug("Alpha").unwrap();
+        db.insert_project("old-id", "Alpha", "/w/alpha", ProjectHost::Base, &slug)
+            .unwrap();
+        assert!(
+            db.insert_project("other", "Alpha", "/w/alpha", ProjectHost::Base, "x")
+                .is_err(),
+            "while registered, the folder cannot be added twice"
+        );
+        db.delete_project("old-id").unwrap();
+
+        let again = db.generate_unique_slug("Alpha").unwrap();
+        assert_eq!(again, slug, "the removed project's slug is free again");
+        db.insert_project("new-id", "Alpha", "/w/alpha", ProjectHost::Base, &again)
+            .expect("the removed folder registers again");
+        assert!(db.get_project("old-id").unwrap().is_none());
+        assert_eq!(db.get_project("new-id").unwrap().unwrap().folder_path, "/w/alpha");
+    }
+
     #[test]
     fn moved_from_read_failure_is_an_error_not_an_empty_list() {
         let db = Db::open_in_memory().unwrap();

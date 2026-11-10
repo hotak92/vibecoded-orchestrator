@@ -656,8 +656,8 @@
                     </button>
                     <button
                       class="row-action row-action-danger"
-                      title="Remove"
-                      aria-label="Remove project {p.name}"
+                      title="Remove from VCO (the folder and your files stay on disk)"
+                      aria-label="Remove {p.name} from VCO"
                       onclick={() => startDelete(p)}
                     >
                       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

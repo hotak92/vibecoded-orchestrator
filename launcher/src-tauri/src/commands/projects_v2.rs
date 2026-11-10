@@ -5521,10 +5521,22 @@ pub async fn delete_project_v2(
     options: Option<UnregisterOptions>,
     db: State<'_, Db>,
 ) -> Result<UnregisterReport, String> {
+    unregister_project(db.inner(), &id, options.unwrap_or_default()).await
+}
+
+/// v0.2.106: the ONE implementation of "Remove from VCO", shared by the GUI
+/// command above and the terminal command `vct-launcher --remove-project`
+/// (`lib.rs::handle_remove_project_cli`). The two surfaces differ only in how
+/// they obtain the `Db` handle and print the report.
+pub(crate) async fn unregister_project(
+    db: &Db,
+    id: &str,
+    opts: UnregisterOptions,
+) -> Result<UnregisterReport, String> {
+    let id = id.to_string();
     // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
     // launcher.db, instead of `no such table` from the stand-in connection.
     db.ensure_live()?;
-    let opts = options.unwrap_or_default();
 
     // Read the row first so we have the project name for collection
     // drop AND so we never run a partial unregister against a missing

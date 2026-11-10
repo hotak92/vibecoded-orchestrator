@@ -84,11 +84,11 @@
         type="button"
         class="pc-remove"
         data-testid="project-card-remove"
-        aria-label="Remove project {project.name}"
-        title="Remove {project.name} from the launcher"
+        aria-label="Remove {project.name} from VCO"
+        title="Remove {project.name} from VCO — the folder and your files stay on disk"
         onclick={() => onRemove(project)}
       >
-        Remove
+        Remove from VCO
       </button>
     {/if}
   </header>

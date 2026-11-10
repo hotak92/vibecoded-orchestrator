@@ -9,19 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Remove a project right from its card on the Projects page.** Every project card except the orchestrator's own
-  now has a "Remove" button that asks "are you sure?" first: the dialog says plainly what goes (the hooks, scripts,
-  agents, skills and other files VCO installed that you have not changed, VCO's entries in `.claude/settings.json`
-  and `.vscode/settings.json`, its working folders and `.git/info/exclude` lines, the lines VCO wrote to your env
-  files, and the project's own Weaviate collections — knowledge graph, docs, diagrams and code graph) and what stays
-  (the folder, your source code, `.env` and other values that are yours, secrets in the keychain, your own hooks,
-  agents and skills, `knowledge/` notes, `CLAUDE.md`, `CONTEXT_STATE.md`, anything you changed). Two buttons — "Yes,
-  remove" and "No" — with No focused by default; while the removal runs, Esc and clicks outside do nothing, so the
+- **Remove a project right from its card on the Projects page.** Every project card except the orchestrator's own now
+  has a "Remove from VCO" button that asks "are you sure?" first. The dialog opens by saying that the project folder
+  is not deleted — it stays on disk with your files, `.env`, secrets and settings, only what VCO added is taken out,
+  and the folder can be added back with Add Project at any time — then says plainly what goes (the hooks, scripts,
+  agents, skills and other files VCO installed that you have not changed, VCO's entries in `.claude/settings.json` and
+  `.vscode/settings.json`, its working folders and `.git/info/exclude` lines, the lines VCO wrote to your env files,
+  and the project's own Weaviate collections — knowledge graph, docs, diagrams and code graph) and what stays (the
+  folder, your source code, `.env` and other values that are yours, secrets in the keychain, your own hooks, agents
+  and skills, `knowledge/` notes, `CLAUDE.md`, `CONTEXT_STATE.md`, anything you changed). Two buttons — "Yes, remove
+  from VCO" and "No" — with No focused by default; while the removal runs, Esc and clicks outside do nothing, so the
   result always belongs to the project you confirmed. Afterwards a summary lists what was removed and names what was
   kept because you changed it. If the removal stops, "Keep the project" is the focused choice. The top-bar project
   list's remove action opens the same dialog (the old type-the-name step is gone). Per-option control (keep the
   collections, keep the bundled files) stays on the project's Settings → Danger zone, whose description now matches
-  what is actually removed.
+  what is actually removed. A removed folder can be added again through the normal Add flow: the files VCO removed
+  come back and a file you changed before the removal stays yours.
+
+- **Remove a project from a terminal.** `vct-launcher --remove-project <id|slug|name>` (the launcher binary under
+  `launcher/dist/`) runs the same removal as the Remove button, with the same choices — your folder and files stay,
+  VCO's files and the project's own collections go — and prints the same report as JSON. `--keep-collections` keeps
+  the collections; if the removal stops on a value VCO wrote and could not remove, rerun with `--leave-unremovable` to
+  finish anyway (the dialog's "Unregister anyway"). A name two projects share is refused with both ids listed, and the
+  orchestrator's own project cannot be removed. Refresh the launcher afterwards to update its project list.
+
+- **The menu bar shows when work is still running in the background.** After you close the "Update all" window (or add
+  a project), knowledge-graph syncs, code-graph builds, summary runs and project setups keep going on their own, and
+  nothing used to show it. A small pill now appears in the menu bar while any of them runs ("2 jobs running");
+  clicking it lists each one ("Alpha — building code graph (120 files)…") and opens that project's page. It disappears
+  when the last one finishes, and it also shows jobs that were already running when the launcher window opened.
 
 - **`vco doctor` reports Weaviate collections that lost their data, the replay risk, and an uncapped Weaviate.**
   Three new findings, each with a ledger entry that clears itself: a collection the defect can hit (its name differs
@@ -125,6 +141,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`py-compile-check` runs on `Edit` as well as `Write`.** It was registered on `Write` only, so a Python change
   made with the Edit tool was never compiled and its edit-outcome record said "no checker". Both settings templates
   register it on `Edit|Write`; the hook's own `.py` filter is unchanged.
+
+- **The launcher's system-tray icon was an empty square on Windows.** The tray was created with a tooltip and a menu
+  but never an image, so the slot showed "VibeCoded Tools Launcher" over a blank square and a user could not tell the
+  launcher was running. It now uses the bundled default window icon (`icons/icon.ico` on Windows, the bundled PNG on
+  Linux and macOS); a build without one falls back to the launcher's 32×32 icon built into the binary, so the tray
+  always has an image.
+
+- **The launcher's test build compiles on Windows again.** Two tests that need Unix-only features (a shell-script
+  stand-in for the container runtime, and creating a symbolic link) now run on Linux and macOS only, so `cargo check
+  --tests` no longer stops on Windows.
+
+- **An update whose install step failed no longer looks finished.** When `install.py` failed after the update had
+  already downloaded the new source, the launcher recorded the failure in the update notes but its update badge still
+  said "up to date" (the source was current, and when the version number had not changed nothing else differed). The
+  badge and Preferences → Updates now read that record and offer "Finish Update", which runs the install step again
+  without downloading anything; the record clears when the install step succeeds.
+
+- **The update window's progress bar follows the real steps.** It sat at 50 % for the whole install step and stayed
+  there after the install had finished. It now moves with the installer's own step counter, never goes backwards, and
+  each step after the install (refresh, vct-hub, launcher binary check, recording the update, restart) moves it
+  further; before, the vct-hub step showed 97 % and the later binary check 96 %.
+
+- **"Legacy code-graph collections" offers Re-analyze only where it is needed.** It listed every registered project
+  for a re-analysis whenever old `ClaudeOrchestrator_*` classes existed, including projects that already have their
+  code graph under their own name. It now lists only projects with no code-graph data under their current name, and
+  the window no longer opens by itself when none needs it.
+
+- **Error messages show above an open dialog.** An error raised while a dialog was open (for example a failed "Let VCO
+  manage it" hand-over on the Services page) appeared behind the dialog's blurred backdrop, where it could not be read
+  or dismissed. Notifications now always appear above whatever dialog is open, on every page; the hand-over failure is
+  also shown as one.
 
 - **The old inline syntax-check hooks are removed from your settings.** Early releases registered a `py_compile`
   one-liner on every Python write (in two successive forms, Linux and Windows) and a later one replaced it with the

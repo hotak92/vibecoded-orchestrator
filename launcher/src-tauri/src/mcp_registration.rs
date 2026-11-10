@@ -2138,6 +2138,7 @@ mod tests {
     /// symlink must record its opt-out under the literal path or Claude
     /// Code never reads it. Red-proof: restoring `fs::canonicalize` in
     /// `project_key_for_claude_json` resolves the symlink → this fails.
+    #[cfg(unix)] // symlink creation needs privileges on Windows; std::os::unix::fs::symlink
     #[test]
     fn set_project_disabled_mcps_keys_by_the_as_opened_symlinked_path() {
         let target = tmp_target();

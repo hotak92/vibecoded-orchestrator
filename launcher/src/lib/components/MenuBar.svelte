@@ -13,6 +13,8 @@
   // counts the global ledger only — a project's own deferrals are badged on
   // that project's Settings tab, never here (decision #6 UX rider).
   import DeferralBadge from './DeferralBadge.svelte';
+  // v0.2.106: always-visible background-work pill (hidden while idle).
+  import BackgroundWorkIndicator from './BackgroundWorkIndicator.svelte';
 
   // MenuBar is mounted from the root layout, so it renders on every route.
   // Top-level navigation moved to the left Sidebar; MenuBar now hosts:
@@ -70,6 +72,7 @@
 
   <!-- Right: Notification bell + Deferral badge + Tier badge + Update badge + Avatar -->
   <div class="menu-right">
+    <BackgroundWorkIndicator />
     <NotificationBell />
     <DeferralBadge />
     <UpdateBadge />

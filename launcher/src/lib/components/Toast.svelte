@@ -1,8 +1,12 @@
 <script lang="ts">
   import { toast } from '$lib/stores/toast';
+  // v0.2.106: the host follows the topmost open <dialog> (top layer), so a
+  // toast raised while any modal is open renders above it, not behind its
+  // backdrop. See `top-layer-host.ts`.
+  import { topLayerHost } from '$lib/top-layer-host';
 </script>
 
-<div class="toast-host" aria-live="polite">
+<div class="toast-host" aria-live="polite" use:topLayerHost>
   {#each $toast as t (t.id)}
     <!-- v0.2.103: pointerenter/leave pause the auto-dismiss (the dwell
          policy lives in stores/toast.ts — only the hover signal is wired
@@ -27,7 +31,8 @@
   .toast-host {
     position: fixed; bottom: 16px; right: 16px;
     display: flex; flex-direction: column; gap: 8px;
-    z-index: 2000; max-width: 380px;
+    /* Above every non-dialog overlay too (the update overlay is 10000). */
+    z-index: 2147483000; max-width: 380px;
   }
   .toast {
     display: flex; align-items: flex-start; gap: 8px;

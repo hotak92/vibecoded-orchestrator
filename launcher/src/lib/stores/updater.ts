@@ -432,6 +432,9 @@ export interface BadgeCopyStatus {
   installed_version?: string;
   running_version?: string;
   on_disk_binary_version?: string;
+  /** v0.2.106: the last install.py run of an update failed after the git
+   *  operation (see `orchestrator.ts` UpdateStatus.install_incomplete). */
+  install_incomplete?: boolean;
 }
 
 export interface BadgeCopy {
@@ -531,6 +534,23 @@ export function badgeCopyFor(
         binaryAlsoStale: false,
       };
     case 'install_stale': {
+      // v0.2.106: the last update's install.py phase failed after git had
+      // already advanced the tree. The version strings may well agree (a
+      // same-version commit) and git reports nothing behind, so the version
+      // wording below would read "v0.2.105 did not finish (last: v0.2.105)".
+      if (us?.install_incomplete) {
+        return {
+          title: 'Finish Update',
+          desc:
+            'The last update downloaded the new source, but its install step ' +
+            'stopped before it finished, so hooks, services and settings may ' +
+            'still be the old ones. Click Finish Update to run the install ' +
+            'step again (nothing is downloaded).',
+          buttonLabel: 'Finish Update',
+          action,
+          binaryAlsoStale: false,
+        };
+      }
       // v0.2.60: distinguish a fresh apply from RESUMING a half-finished
       // install (installed_version present but behind the source).
       const priorInstall = !!us?.installed_version;
