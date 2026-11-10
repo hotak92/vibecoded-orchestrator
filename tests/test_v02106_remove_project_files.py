@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from tests.common.child_env import child_env
-from vco_lib import git_exclude, unregister_collections, unregister_files, vscode_excludes
+from vco_lib import git_exclude, project_init, unregister_collections, unregister_files, vscode_excludes
 from vco_lib.hashing import sha256_bytes
 from vco_lib.settings_merge import strip_shipped_hooks
 
@@ -527,3 +527,60 @@ def jsonc_load(path: Path) -> dict:
     loaded = jsonc_edit.load_object(path)
     assert loaded is not None
     return loaded[0]
+
+
+# ── re-add after Remove (v0.2.106 field request: "re-activation") ─────────
+
+def _manifest_files(folder: Path) -> dict:
+    return json.loads((folder / ".claude" / ".vco-manifest.json").read_text())["files"]
+
+
+@pytest.mark.parametrize("user_edits_a_file", [False, True])
+def test_a_removed_folder_can_be_added_again_with_the_real_bundle(
+    project: Path, user_edits_a_file: bool
+):
+    """Add (the real bundle engine, first-install mode) → Remove → Add again.
+
+    The second add must leave the folder exactly as fully installed as the
+    first: every shipped file back with the shipped bytes, a fresh manifest,
+    VCO's hook registrations back in ``settings.json`` — and the file the user
+    changed before the removal (kept by the purge) is still theirs.
+    """
+    first = project_init.install_project_bundle(project, orchestrator_root=REPO_ROOT)
+    assert first.get("ok", True) is not False, first
+    shipped = _manifest_files(project)
+    assert shipped, "the first add recorded shipped files"
+    edited_rel = next(r for r in sorted(shipped) if r.startswith(".claude/agents/"))
+    if user_edits_a_file:
+        (project / edited_rel).write_text("my edited agent\n")
+    else:
+        edited_rel = ""
+
+    out = _purge(project)
+    assert not out["errors"], out
+    if user_edits_a_file:
+        assert edited_rel in out["kept_modified"]
+    else:
+        assert not (project / ".claude" / ".vco-manifest.json").exists(), "nothing kept: manifest goes"
+    # knowledge/** is always the user's data: the purge never touches it.
+    gone = [r for r in shipped if r != edited_rel and not r.startswith("knowledge/")]
+    assert gone and all(not (project / r).exists() for r in gone)
+    settings_path = project / ".claude" / "settings.json"
+    assert not settings_path.exists() or not json.loads(settings_path.read_text()).get("hooks"), (
+        "the removal took VCO's hook registrations out"
+    )
+
+    second = project_init.install_project_bundle(project, orchestrator_root=REPO_ROOT)
+    assert second.get("ok", True) is not False, second
+    again = _manifest_files(project)
+    for rel, rec in again.items():
+        if rel == edited_rel:
+            continue
+        p = project / rel
+        assert p.is_file(), f"{rel} not re-installed"
+        assert sha256_bytes(p.read_bytes()) == rec["sha256"], rel
+    assert set(shipped) - {edited_rel} <= set(again), "every shipped file is back"
+    if user_edits_a_file:
+        assert (project / edited_rel).read_text() == "my edited agent\n", "the user's file stays theirs"
+    settings = json.loads((project / ".claude" / "settings.json").read_text())
+    assert settings.get("hooks"), "VCO's hook registrations are back"

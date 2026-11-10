@@ -54,7 +54,9 @@ afterEach(() => {
 describe('ProjectCard — the Remove button (v0.2.106)', () => {
   it('is labelled with the project name', async () => {
     await mountCard();
-    expect(removeButton().getAttribute('aria-label')).toBe('Remove project Gamma');
+    expect(removeButton().getAttribute('aria-label')).toBe('Remove Gamma from VCO');
+    expect(removeButton().textContent?.trim()).toBe('Remove from VCO');
+    expect(removeButton().getAttribute('title')).toContain('the folder and your files stay on disk');
   });
 
   it('clicking Remove opens the REMOVE flow, never the project', async () => {

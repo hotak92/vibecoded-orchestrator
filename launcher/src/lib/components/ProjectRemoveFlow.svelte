@@ -118,10 +118,16 @@
     ariaLabelledBy="project-remove-title"
   >
     {#snippet header()}
-      <h2 id="project-remove-title">Remove project</h2>
+      <h2 id="project-remove-title">Remove from VCO</h2>
       <p class="stage-tag">"{name}" — are you sure?</p>
     {/snippet}
     {#snippet body()}
+      <p class="lead" data-testid="project-remove-lead">
+        <strong>Your project folder is not deleted.</strong> It stays on disk
+        with your files, <code>.env</code>, secrets and settings; only what
+        VCO added is taken out. You can add the folder back to VCO at any
+        time with Add Project.
+      </p>
       <p class="goes">
         This stops tracking the project in the launcher and removes what VCO
         put there and can prove is still its own: the hooks, scripts, agents,
@@ -172,7 +178,7 @@
           {#if removing}
             <span class="spinner-sm"></span>
           {:else}
-            Yes, remove
+            Yes, remove from VCO
           {/if}
         </button>
       </div>
@@ -206,6 +212,11 @@
     line-height: 1.55;
     color: var(--color-text, #f1f5f9);
   }
+  .lead {
+    margin: 0 0 10px;
+    color: var(--color-text, #f1f5f9);
+  }
+  .lead strong { color: var(--color-teal, #00bfa6); }
   .stays {
     margin: 0 0 0.75rem;
     font-size: 0.85rem;

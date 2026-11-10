@@ -86,8 +86,17 @@ describe('ProjectRemoveFlow — the shared confirm dialog', () => {
     // Collapse template line-wrapping so phrase assertions are about copy,
     // not about where the markup breaks a line.
     const text = (document.body.textContent ?? '').replace(/\s+/g, ' ');
-    expect(text).toContain('Remove project');
+    expect(text).toContain('Remove from VCO');
     expect(text).toContain('Gamma');
+    // v0.2.106 (field request): say first, plainly, that the folder and the
+    // user's own files stay — only what VCO added goes — and that it can be
+    // added back.
+    const lead = document.querySelector('[data-testid="project-remove-lead"]')?.textContent?.replace(/\s+/g, ' ') ?? '';
+    expect(lead).toContain('Your project folder is not deleted.');
+    expect(lead).toContain('.env');
+    expect(lead).toContain('secrets');
+    expect(lead).toContain('only what VCO added');
+    expect(lead).toContain('add the folder back');
     // What goes — in the backend's own terms (vco_lib/unregister_files.py,
     // unregister_collections.py): VCO's unchanged files of every kind, its
     // settings entries, working folders and exclude lines, env lines, and

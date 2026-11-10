@@ -50,6 +50,14 @@ mod convergence;
 #[path = "commands/deferral_ledger.rs"]
 mod deferral_ledger;
 
+// v0.2.106: `--remove-project` — "Remove from VCO" from a terminal, through
+// the one `projects_v2::unregister_project` implementation.
+mod remove_project_cli;
+
+fn handle_remove_project_cli(rest: &[String]) -> i32 {
+    remove_project_cli::run(rest)
+}
+
 // v0.2.26: WebKitGTK pre-flight probe — public so main.rs (which is a
 // separate compilation unit from this lib) can call it before Tauri
 // init. Linux-only at the use site; the module's own `#![cfg(...)]`
@@ -128,6 +136,12 @@ use std::sync::Mutex;
 //     install.py interactive prompt to `~/.vct/storage.toml` and regenerates
 //     `infrastructure/compose.override.yaml` if needed.
 //
+//   * `--remove-project <id|slug|name> [--keep-collections] [--leave-unremovable]`
+//     (v0.2.106): "Remove from VCO" from a terminal — the SAME operation as
+//     the Projects-page Remove button (`projects_v2::unregister_project`, one
+//     implementation, the GUI's Remove-flow options by default). The folder
+//     and the user's own files stay; the JSON report goes to stdout.
+//
 // Contract: when `handle_cli_args()` returns `Some(exit_code)` we exit
 // immediately. The GUI startup path is gated on `None`. This MUST stay
 // gated before `tauri::Builder::default()` so a CLI invocation in CI /
@@ -163,6 +177,7 @@ fn handle_cli_args() -> Option<i32> {
     match args[1].as_str() {
         "--set-storage-config" => Some(handle_set_storage_config_cli(&args[2..])),
         "--register-default-mcps" => Some(handle_register_default_mcps_cli(&args[2..])),
+        "--remove-project" => Some(handle_remove_project_cli(&args[2..])),
         _ => None,
     }
 }
