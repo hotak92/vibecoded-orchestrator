@@ -142,6 +142,15 @@
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
       "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-model list (probe 2026-09-22), which the previously cited integration page predates. text_only=false: the QwenCloud DeepSeek page states verbatim 'deepseek-v4.1-flash has native visual understanding and accepts both text and image input, returning text. All other DeepSeek models accept text input only.' — so this model SEES images and its blocks are forwarded untouched."
     },
+    "deepseek-v4.1-flash-1017": {
+      "vendor": "qwen",
+      "context_window": 1000000,
+      "max_output": 393216,
+      "window_1m": true,
+      "text_only": false,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "The published DeepSeek flash since v0.2.106 (owner 2026-11-10). The window cited is the V4.1 Flash line's on QwenCloud's per-model table (see deepseek-v4.1-flash above). Also cited: DeepSeek's changelog https://api-docs.deepseek.com/updates/ (2026-10-17), which upgrades V4.1-Flash to V4.1-Flash-1017 with the SAME architecture, tokenizer and prompt format — only the weights changed — so the window, the shared output/thinking budget and the image input of deepseek-v4.1-flash (row above, cited from QwenCloud's per-model table and DeepSeek page) carry over unchanged. QwenCloud lists this id on the subscription's live compatible-mode model list (probe 2026-11-10) and answers it as itself (live 200, model echoed exactly, fixture medium-qwen-deepseek-1017.body)."
+    },
     "k3.1-pro": {
       "vendor": "kimi",
       "context_window": 1048576,

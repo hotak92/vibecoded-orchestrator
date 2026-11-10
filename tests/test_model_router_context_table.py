@@ -43,8 +43,9 @@ EXPECTED_VENDOR_SEED_IDS = {
     "glm-5-turbo", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air",
 }
 
-#: The eight Token-Plan rows (owner order 2026-09-21, expanded 2026-09-22
-#: with the live compatible-mode probe's deepseek-v4.1-flash). ``glm-5.3``
+#: The nine Token-Plan rows (owner order 2026-09-21, expanded 2026-09-22
+#: with the live compatible-mode probe's deepseek-v4.1-flash, and 2026-11-10
+#: with its dated build deepseek-v4.1-flash-1017). ``glm-5.3``
 #: is NOT duplicated here although that endpoint serves
 #: them too: lookup keys are bare ids and vendor-agnostic, and the rows
 #: above already carry the verified windows — a second row under another
@@ -53,6 +54,9 @@ EXPECTED_QWEN_SEED_IDS = {
     "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
     "qwen3.6-flash", "deepseek-v4-pro", "deepseek-v4-flash-0731",
     "deepseek-v4.1-flash",
+    # v0.2.106 (owner 2026-11-10): the published DeepSeek flash is the dated
+    # build; same architecture as the undated line, so the same figures.
+    "deepseek-v4.1-flash-1017",
 }
 
 #: The one Kimi Code row — K3.1 Pro only (owner ruling 2026-11-10, replacing
@@ -264,6 +268,7 @@ class SeedTests(unittest.TestCase):
             "deepseek-v4-pro": (1_000_000, 393_216),
             "deepseek-v4-flash-0731": (1_000_000, 393_216),
             "deepseek-v4.1-flash": (1_000_000, 393_216),
+            "deepseek-v4.1-flash-1017": (1_000_000, 393_216),
         }
         self.assertEqual(set(expected), EXPECTED_QWEN_SEED_IDS)
         for model_id, (window, max_output) in expected.items():

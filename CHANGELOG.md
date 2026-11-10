@@ -99,6 +99,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start a new conversation on K3.1 Pro rather than switching an existing one to it. A Plus subscriber, whose plan
   does not include the 1M window, lowers the `k3.1-pro` row to 262144 in Preferences → Chat model context.
 
+- **The DeepSeek lanes run the newer DeepSeek V4.1 Flash build.** `deepseek-implementer` and `deepseek-researcher`
+  now pin `claude-gw/qwen/deepseek-v4.1-flash-1017[1m]`, the build DeepSeek released on 2026-10-17 (same model and
+  prompt format, new weights; DeepSeek reports it better on agentic and terminal work, with shorter answers —
+  https://api-docs.deepseek.com/updates/). QwenCloud serves it and the undated `deepseek-v4.1-flash` side by side
+  without saying which weights the undated one runs, so the picker now shows the dated build and hides the undated
+  one — which still answers when named, so an agent file you have not updated yet keeps working. The model-selection
+  grid names the row "DeepSeek V4.1 Flash (1017)" and raises its Tools score from 6 to 7 on DeepSeek's own figures
+  (Terminal-Bench 4.0 31.2 to 42.3, Automation-Bench 54.8 to 60.5).
+
 - **Removing a project takes out what is VCO's, and only that.** Before, removing a project deleted the whole
   `.claude/hooks/` and `.claude/scripts/` folders, including any script of your own in them, but left every VCO hook
   still registered in `.claude/settings.json`, pointing at files that were gone. Now a file VCO installed is removed
@@ -228,6 +237,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manage it" hand-over on the Services page) appeared behind the dialog's blurred backdrop, where it could not be read
   or dismissed. Notifications now always appear above whatever dialog is open, on every page; the hand-over failure is
   also shown as one.
+
+- **The model picker no longer offers models that cannot chat, or old dated builds.** QwenCloud's model list now
+  carries an image model (`qwen-image-3.0-pro`), a video model and a dated build (`deepseek-v4-pro-0813`) that the
+  picker would have shown as chat models — picking one ended in an error, or in an older snapshot instead of the
+  current model. The gateway now leaves out, for every vendor, any model whose name marks it as image, video, audio,
+  speech-recognition or speech-synthesis, and any dated build (a name ending in a month-day or full date) unless
+  VCO offers that exact build on purpose. z.ai's `glm-5.3-flashx` and `glm-5.3-flashx-legal` — the same model as
+  `glm-5.3-flash`, served faster at pay-as-you-go prices and not part of the GLM Coding Plan — are neither offered
+  nor sent on; asking for one by name gets a clear refusal that suggests `glm-5.3-flash`.
 
 - **The old inline syntax-check hooks are removed from your settings.** Early releases registered a `py_compile`
   one-liner on every Python write (in two successive forms, Linux and Windows) and a later one replaced it with the

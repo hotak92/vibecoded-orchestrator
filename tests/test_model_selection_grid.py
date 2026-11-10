@@ -42,7 +42,9 @@ EXPECTED_SCORES = {
     # cited benchmark evidence (Code 7 -> 8, Tools 7 -> 8) — see the comment
     # above the row in model_selection.toml.
     "kimi-k3.1-pro": ["8", "6", "6", "6*", "3", "8", "7*", "8", "8", "8", "3"],
-    "deepseek-v4.1-flash": ["7", "6", "7", "6", "9", "6", "7", "8", "7", "7", "10"],
+    # v0.2.106 (owner 2026-11-10): Tools 6 -> 7 from DeepSeek's own 1017-build
+    # figures (vendor-reported); every other cell unchanged.
+    "deepseek-v4.1-flash": ["7", "6", "7", "6", "9", "7", "7", "8", "7", "7", "10"],
     "sonnet": ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"],
     "qwen3.8-max": ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"],
     "glm-5.3-flash": ["5", "5", "5", "5", "8", "5", "6*", "7", "6*", "8", "8"],
@@ -81,8 +83,8 @@ EXPECTED_NOTES = [
                "max, but well behind it on coding at medium. Not a default "
                "choice."),
     (("sonnet", "glm-5.3", "deepseek-v4.1-flash"),
-     "At medium, **Sonnet 5.5** also trails GLM-5.3 and DeepSeek V4.1 Flash on "
-     "coding."),
+     "At medium, **Sonnet 5.5** also trails GLM-5.3 and DeepSeek V4.1 Flash "
+     "(1017) on coding."),
     ("haiku", "**Haiku 5.5** — the fastest and cheapest Claude (≈165 tok/s, "
               "≈$0.05 per task at medium) with a 1M window: good for bulk, "
               "classification, extraction and routing. Its headline vendor "
@@ -90,9 +92,12 @@ EXPECTED_NOTES = [
               "keep coding, planning and review on larger models."),
     (("haiku", "deepseek-v4.1-flash"),
      "At medium, **Haiku 5.5** sits below the flash-tier vendor lanes on code."),
-    ("deepseek-v4.1-flash", "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s "
-                            "to first token) and cheapest per task: default for "
-                            "research, surveys, bulk and bounded implementation. "
+    ("deepseek-v4.1-flash", "**DeepSeek V4.1 Flash (1017)** — fastest (≈209 "
+                            "tok/s, ≈1 s to first token) and cheapest per task: "
+                            "default for research, surveys, bulk and bounded "
+                            "implementation. The 1017 build is better on agentic "
+                            "and terminal work and writes shorter answers than "
+                            "the first V4.1 Flash (vendor-reported). "
                             "Users report fragile tool calls / loops on long runs "
                             "— keep tasks bounded. Accurate as a read-only "
                             "verifier of bounded fix deltas: `deepseek-researcher` "
@@ -176,7 +181,7 @@ class TestProviderFilter:
         assert "the non-Claude model users route review/audit to" in md
         assert "GLM-5.3 as implementer" in md
         assert "6.9% of rollouts" in md
-        assert "DeepSeek V4.1 Flash (`" not in md and "Qwen3.8" not in md
+        assert "DeepSeek V4.1 Flash (1017) (`" not in md and "Qwen3.8" not in md
         assert "fragile tool calls" not in md
 
     def test_qwen_key_adds_qwen_vendor_rows_including_glm_5_3(self):
@@ -185,7 +190,7 @@ class TestProviderFilter:
         per-vendor-block."""
         md = model_selection.render_grid(providers=frozenset({"anthropic", "qwen"}))
         assert _rows_rendered(md) == set(CLAUDE_ROWS) | {
-            "GLM-5.3", "DeepSeek V4.1 Flash", "Qwen3.8-Max †", "Qwen3.8-Flash †",
+            "GLM-5.3", "DeepSeek V4.1 Flash (1017)", "Qwen3.8-Max †", "Qwen3.8-Flash †",
         }
         assert "GLM-5.3-Flash" not in md
         assert "best prose and literal instruction-following" in md
@@ -301,7 +306,7 @@ class TestGridData:
         every = frozenset(p for row in model_selection.load_grid().rows
                           for p in row.providers)
         full = model_selection.render_grid(providers=every)
-        assert "also trails GLM-5.3 and DeepSeek V4.1 Flash" in full
+        assert "also trails GLM-5.3 and DeepSeek V4.1 Flash (1017)" in full
         assert "sits below the flash-tier vendor lanes" in full
 
     def test_all_of_must_be_a_boolean(self, tmp_path):
