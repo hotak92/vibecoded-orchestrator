@@ -33,21 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update would decide. The shell form (`python -m vco_lib.model_providers set --vendor <id> --disabled`) does the
   same apply and prints the per-project outcome.
 
-- **Remove a project right from its card on the Projects page.** Every project card except the orchestrator's own
-  now has a "Remove" button that asks "are you sure?" first: the dialog says plainly what goes (the hooks, scripts,
-  agents, skills and other files VCO installed that you have not changed, VCO's entries in `.claude/settings.json`
-  and `.vscode/settings.json`, its working folders and `.git/info/exclude` lines, the lines VCO wrote to your env
-  files, and the project's own Weaviate collections — knowledge graph, docs, diagrams and code graph) and what stays
-  (the folder, your source code, `.env` and other values that are yours, secrets in the keychain, your own hooks,
-  agents and skills, `knowledge/` notes, `CLAUDE.md`, `CONTEXT_STATE.md`, anything you changed). Two buttons — "Yes,
-  remove" and "No" — with No focused by default; while the removal runs, Esc and clicks outside do nothing, so the
-  result always belongs to the project you confirmed. Afterwards a summary lists what was removed and names what was
-  kept because you changed it. If the removal stops, "Keep the project" is the focused choice. The top-bar project
-  list's remove action opens the same dialog (the old type-the-name step is gone). Per-option control (keep the
-  collections, keep the bundled files) stays on the project's Settings → Danger zone, whose description now matches
-  what is actually removed. A removed folder can be added again through the normal Add flow: the files VCO removed
-  come back and a file you changed before the removal stays yours.
-
 - **Remove a project from a terminal.** `vct-launcher --remove-project <id|slug|name>` (the launcher binary under
   `launcher/dist/`) runs the same removal as the Remove button, with the same choices — your folder and files stay,
   VCO's files and the project's own collections go — and prints the same report as JSON. `--keep-collections` keeps
