@@ -6,6 +6,8 @@ keywords: [SOW, "Statement of Work", "fixed-price", T&M, retainer, "outcome-base
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

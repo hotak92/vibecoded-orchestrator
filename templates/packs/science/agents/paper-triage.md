@@ -6,6 +6,8 @@ keywords: ["paper triage", "systematic review", "PDF extraction", "effect size",
 tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch, mcp__weaviate-kg__*
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

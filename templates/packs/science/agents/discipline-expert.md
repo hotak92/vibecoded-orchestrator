@@ -6,6 +6,8 @@ keywords: ["domain expert", "cross-disciplinary", "scientific consultation", "ma
 tools: Read, Write, Edit, WebSearch, Bash, Glob, Grep
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

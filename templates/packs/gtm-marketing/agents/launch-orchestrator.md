@@ -6,6 +6,8 @@ keywords: [release notes, changelog post, Product Hunt, Show HN, launch tweet, "
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

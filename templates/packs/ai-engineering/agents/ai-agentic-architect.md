@@ -6,6 +6,8 @@ keywords: [multi-agent, "agentic workflow", "task decomposition", "coordination 
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

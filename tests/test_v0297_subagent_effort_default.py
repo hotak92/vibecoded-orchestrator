@@ -139,7 +139,7 @@ def test_bundled_skills_default_to_medium() -> None:
 
 def test_orchestrator_template_documents_medium_default() -> None:
     text = ORCH_TEMPLATE.read_text(encoding="utf-8")
-    assert "Every bundled agent ships at `medium`" in text, (
+    assert "Every bundled agent ships at `medium` unless its role" in text, (
         "templates/ORCHESTRATOR-CLAUDE.md.template no longer states that "
         "bundled agents ship at `medium` (v0.2.97 default)"
     )

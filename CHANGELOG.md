@@ -67,15 +67,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its data;
   `... snapshot --container <name>` takes the snapshot with a container's own image before a move by hand.
 
-  what is actually removed.
 - **Every shipped agent now runs in the background and compacts at 750k tokens.** All 23 bundled agent definitions
-  (the free set and the model-gateway lanes) carry `background: true` — the agent always runs as a background task —
-  and `autoCompactWindow: 750000`, so a subagent compacts its own context at 750k tokens instead of growing to the
-  main conversation's window. A contract test fails if any shipped definition loses either key, and a delivery leg
+  (the free set and the model-gateway lanes) and the 19 agents of the opt-in packs carry `background: true` — the agent always runs as a background task —
+  and `autoCompactWindow: 750000`, so a subagent on a model with a larger (1M) window compacts its own context at
+  750k tokens instead of growing to the main conversation's window; on a smaller window the model's own auto-compact
+  applies. A contract test fails if any shipped definition loses either key, and a delivery leg
   proves a bundle install lands both.
 - **Subagents default to effort `medium`.** Each VCO project's `.claude/settings.json` now carries
-  `CLAUDE_CODE_SUBAGENT_EFFORT=medium` in its `env` block, so a subagent dispatch that names no effort runs at
-  medium instead of inheriting the session's effort. The key is added only when absent — a value you set yourself
+  `CLAUDE_CODE_SUBAGENT_EFFORT=medium` in its `env` block, so a subagent with no effort of its own (none in its
+  definition, none on the dispatch) runs at medium instead of inheriting the session's effort; the few shipped
+  agents that pin `effort: high` in their frontmatter keep it. The key is added only when absent — a value you set yourself
   is kept — and it is never written to `~/.claude/settings.json`.
 
 ### Changed
@@ -122,10 +123,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new id: the structural family parser already reads `claude-fable-5-2` as the fable family's newest version, and it
   inherits the family's 1M context window — a test pins all of that.
 - **Subagent guidance matches current Claude Code.** The Agent tool now takes an `effort` parameter, and a
-  subagent's long-running shell command is moved to the background by the harness after about 3 minutes, with the
-  completion notification waking that subagent — so the old "a lane runs its helpers in the foreground" rule is
-  replaced by "start the helper once, end your turn; the notification wakes the subagent", in both shipped CLAUDE.md
-  templates and the wait-guard's refusal messages.
+  subagent's shell command still running after about 3 minutes is moved to the background by the harness, with its
+  completion notification waking that subagent. Both shipped CLAUDE.md templates and the wait guard's refusal for a
+  subagent's self-wake now say so: a lane runs a long command in the foreground, lets the harness move it and ends
+  its turn. A helper a lane starts with `run_in_background` on purpose, or a subagent it spawns, may still report to
+  the root session, so the rule that a lane runs its own helpers in the foreground stays.
 
 ### Fixed
 

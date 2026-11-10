@@ -8,11 +8,12 @@ Claude Code agent definitions support ``background: true`` ("always run as a
 background task"), and since 2.1.296 ``autoCompactWindow`` (a subagent
 auto-compacts earlier than the main conversation; 2.1.312: the key only ever
 LOWERS the window, never raises it). Every shipped definition under
-``templates/agents/`` (``free/`` + ``module-gateway/``) therefore carries
-``background: true`` and ``autoCompactWindow: 750000`` — a lane still ends
-its turn to wait (2.1.318: a background subagent's long command is moved to
-the background by the harness and its completion wakes THAT subagent), but a
-750k ceiling keeps a lane from growing until its report quality degrades.
+``templates/agents/`` (``free/`` + ``module-gateway/``) and every opt-in pack
+agent (``templates/packs/*/agents/``, owner: ALL subagents background)
+therefore carries ``background: true`` and ``autoCompactWindow: 750000`` —
+on a model whose window is larger (1M) a lane compacts at 750k tokens, so it
+does not grow until its report quality degrades; on a smaller window the
+model's own auto-compact applies (the key never raises a window).
 
 Delivery keeps both keys: the gated set lands byte-identical
 (``test_install_bundle.py::ModuleGatewayAgentDeliveryTests``) and the free
@@ -37,6 +38,7 @@ from tests.common.module_gateway import MODULE_GATEWAY_AGENT_FILES
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FREE_DIR = REPO_ROOT / "templates" / "agents" / "free"
 GATED_DIR = REPO_ROOT / "templates" / "agents" / "module-gateway"
+PACKS_DIR = REPO_ROOT / "templates" / "packs"
 
 #: The two frontmatter keys every shipped agent carries, with their values.
 BACKGROUND_KEY = "background"
@@ -44,8 +46,13 @@ AUTOCOMPACT_KEY = "autoCompactWindow"
 AUTOCOMPACT_VALUE = 750_000
 
 
+def _pack_agent_files() -> list[Path]:
+    return sorted(PACKS_DIR.glob("*/agents/*.md"))
+
+
 def _shipped_agent_files() -> list[Path]:
-    return sorted(FREE_DIR.glob("*.md")) + sorted(GATED_DIR.glob("*.md"))
+    return (sorted(FREE_DIR.glob("*.md")) + sorted(GATED_DIR.glob("*.md"))
+            + _pack_agent_files())
 
 
 SHIPPED_AGENTS = _shipped_agent_files()
@@ -61,11 +68,18 @@ def _frontmatter(path: Path) -> dict:
 
 def test_the_scan_covers_the_whole_shipped_set() -> None:
     """A parametrized test over an empty glob passes vacuously — pin the
-    catalogue the scan must find (11 free + 12 gated), exactly as
-    ``test_v02100_shipped_frontmatter_parses`` pins its own scan."""
+    catalogue the scan must find (11 free + 12 gated + every pack agent the
+    packs table lists), exactly as ``test_v02100_shipped_frontmatter_parses``
+    pins its own scan."""
+    from vco_lib import packs
+
     assert len(list(FREE_DIR.glob("*.md"))) == 11
     assert len(list(GATED_DIR.glob("*.md"))) == len(MODULE_GATEWAY_AGENT_FILES) == 12
-    assert len(SHIPPED_AGENTS) == 23
+    listed = sorted(m for p in packs.load_packs(REPO_ROOT).values()
+                    for m in p.members if "/agents/" in m)
+    assert [f"{p.parent.parent.name}/agents/{p.name}" for p in _pack_agent_files()] == listed
+    assert len(listed) == 19
+    assert len(SHIPPED_AGENTS) == 23 + len(listed)
 
 
 @pytest.mark.parametrize("path", SHIPPED_AGENTS, ids=lambda p: p.name)
@@ -106,11 +120,12 @@ def _fake_orchestrator(root: Path) -> Path:
         shutil.copy(REPO_ROOT / "templates" / name, root / "templates" / name)
     shutil.copytree(REPO_ROOT / "templates" / "agents",
                     root / "templates" / "agents")
+    shutil.copytree(PACKS_DIR, root / "templates" / "packs")
     return root
 
 
 def _bundle_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
-                    gateway_on: bool) -> Path:
+                    gateway_on: bool, packs: frozenset = frozenset()) -> Path:
     """Run a real bundle install into a fresh project; return its folder."""
     from tests.common.launcher_db_fixture import insert_rows, make_launcher_db
 
@@ -130,7 +145,7 @@ def _bundle_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
     from vco_lib import project_init
 
     project_init.install_project_bundle(folder, orchestrator_root=orch,
-                                        update_mode=True)
+                                        update_mode=True, packs=set(packs))
     return folder
 
 
@@ -157,6 +172,17 @@ def test_delivery_keeps_the_keys_for_the_gateway_set(tmp_path, monkeypatch) -> N
     _assert_delivered_keys(folder, list(MODULE_GATEWAY_AGENT_FILES))
 
 
+def test_delivery_keeps_the_keys_for_every_pack_agent(tmp_path, monkeypatch) -> None:
+    """Q1 (owner: ALL subagents background): a bundle install with every pack
+    selected lands each pack agent with both keys."""
+    from vco_lib import packs as _packs
+
+    table = _packs.load_packs(REPO_ROOT)
+    folder = _bundle_install(tmp_path, monkeypatch, gateway_on=False,
+                             packs=frozenset(table))
+    _assert_delivered_keys(folder, [p.name for p in _pack_agent_files()])
+
+
 # ---------------------------------------------------------------------------
 # Guidance pins — the shipped coordinators' instructions must say what the
 # frontmatter does, or the two drift apart.
@@ -169,8 +195,7 @@ def test_shipped_guidance_says_agents_run_in_the_background(name: str) -> None:
     text = (REPO_ROOT / "templates" / name).read_text(encoding="utf-8")
     assert "background: true" in text, name
     assert "autoCompactWindow: 750000" in text, name
-    # The pre-2.1.318 claim that a background helper's notification reaches
-    # the ROOT session (so lanes had to run helpers in the foreground) is
-    # gone: the completion notification wakes the subagent itself.
-    assert "runs its own helpers in the FOREGROUND" not in text, name
-    assert "reaches the root session" not in text, name
+    # Review C-M5: the 750k bound is stated only for a larger (1M) window,
+    # and the helper rule stays for a helper started with run_in_background.
+    assert "on a smaller window the model's own auto-compact applies" in text, name
+    assert "runs its own helpers in the foreground" in text, name

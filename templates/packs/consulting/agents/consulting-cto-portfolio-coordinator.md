@@ -6,6 +6,8 @@ keywords: ["consulting portfolio", "multi-client", "stakeholder summary", "escal
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

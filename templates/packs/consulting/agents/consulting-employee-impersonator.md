@@ -6,6 +6,8 @@ keywords: [employee archetype, role impersonation, junior dev voice, account man
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

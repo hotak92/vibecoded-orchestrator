@@ -6,6 +6,8 @@ keywords: ["post-mortem", postmortem, blameless, "contributing factors", "incide
 tools: Read, Write, Edit, Glob, Grep, Bash, WebFetch
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*
 ---
