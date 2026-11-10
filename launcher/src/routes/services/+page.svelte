@@ -88,6 +88,7 @@
   import { gatewayAccountLines } from '$lib/api/gateway_accounts';
   import { projects } from '$lib/stores/projects';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import { toast } from '$lib/stores/toast';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
   import {
     ACTION_LABELS,
@@ -394,6 +395,10 @@
       await refresh();
     } catch (e) {
       error = String(e);
+      // v0.2.106: the confirmation dialog stays open on a failure, and the
+      // page banner sits behind its backdrop — the toast layer renders above
+      // any open modal (`top-layer-host.ts`), so the failure is seen.
+      toast.error(`Handing the service to VCO failed: ${String(e)}`);
     } finally {
       handBusy = false;
     }
