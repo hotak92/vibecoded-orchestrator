@@ -845,6 +845,9 @@ class ProbeRegistrationTests(unittest.TestCase):
             pin_rows=lambda: [],
             vco_lib_origin=lambda root: None,
             path_command=lambda name: None,
+            # v0.2.106: the Weaviate memory-cap probe inspects the container
+            # (its one subprocess) — injected like every other spawning seam.
+            weaviate_mem_cap=lambda: None,
         )
         with TemporaryDirectory() as td:
             root = Path(td)

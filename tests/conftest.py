@@ -763,6 +763,12 @@ def pytest_configure(config):
         "allow_real_model_cli: W-MODEL-CLI opt-in — this test may spawn the "
         "REAL model CLI (e.g. `claude`); makes real, possibly paid, calls.",
     )
+    config.addinivalue_line(
+        "markers",
+        "real_raft_guard: v0.2.106 — run the REAL "
+        "vco_lib.weaviate_raft_guard.upgrade_check (every other test gets the "
+        "stub from _stub_weaviate_raft_upgrade_check).",
+    )
 
 
 @pytest.fixture
@@ -820,6 +826,25 @@ def fake_claude_cli(tmp_path, monkeypatch) -> _FakeClaudeCli:
     monkeypatch.setenv("VCO_FAKE_CLAUDE_LOG", str(log))
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     return _FakeClaudeCli(bindir, log)
+
+
+@pytest.fixture(autouse=True)
+def _stub_weaviate_raft_upgrade_check(request, monkeypatch):
+    """v0.2.106: every Weaviate recreate asks
+    ``vco_lib.weaviate_raft_guard.upgrade_check`` whether it moves the data
+    onto a release with the 1.37 orphan drop — which inspects (and may stop
+    and run) containers through the injected ``run``. Tests about the OTHER
+    recreate rules describe their machine with fakes that know nothing of
+    that check, so they get a stub answering "not needed". The guard's own
+    tests (tests/test_v02106_weaviate_raft_guard.py) carry the
+    ``real_raft_guard`` marker and run the real function, including through
+    every caller (data_identity, service_adoption)."""
+    if request.node.get_closest_marker("real_raft_guard") is None:
+        from vco_lib import weaviate_raft_guard as _rg
+
+        monkeypatch.setattr(_rg, "upgrade_check", lambda **_kw: _rg.UpgradeVerdict(
+            _rg.NOT_NEEDED, "stubbed by tests/conftest.py"))
+    yield
 
 
 @pytest.fixture(autouse=True)

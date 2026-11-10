@@ -66,7 +66,7 @@ from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
 # in-function local imports of `to_posix_rel` elsewhere in this file are left as
 # they are — pre-existing, and harmless (same object).
 from vco_lib.paths import to_posix_rel
-from vco_lib import codegraph_orphan_snapshot as _cos
+from vco_lib import codegraph_orphan_snapshot as _cos, weaviate_case_history as _wch
 from vco_lib import codegraph_prefix_record as _cpr
 # v0.2.95 WP-9: "which plan actions may be applied without consent" is a policy,
 # not plumbing, and it had a second implementation in Rust. One home now; this
@@ -730,12 +730,8 @@ def rebuild_collections(args, log_event=None) -> None:
                     continue
                 if client.collections.exists(name):
                     print(f"  Dropping {label}: {name} ...")
-                    client.collections.delete(name)
-                    _log(
-                        "7b.1/10", "step",
-                        f"dropped {label}: {name}",
-                        data={"collection": name},
-                    )
+                    _wch.delete_collection(client, name, weaviate_url)  # v0.2.106: + recorded
+                    _log("7b.1/10", "step", f"dropped {label}: {name}", data={"collection": name})
                 else:
                     print(f"  {label} ({name}) does not exist — skipping drop")
         finally:
@@ -1014,9 +1010,9 @@ def _create_class(payload: dict, weaviate_url: Optional[str] = None) -> None:
     # them (exit 2). One rule, one escape (`VCT_ALLOW_FIXTURE_CLASS_WRITES=1`),
     # decided ONCE at add time instead of surfacing at every later sync.
     # Placed AFTER the idempotency return: an existing class is not a write.
-    from vco_lib.fixture_class_guard import guard_fixture_class_write
+    from vco_lib.fixture_class_guard import guard_class_create  # v0.2.106: + case-variant rule
 
-    guard_fixture_class_write(name, operation="create", weaviate_url=base)
+    guard_class_create(name, weaviate_url=base)
     status, body = _http_request("POST", f"{base}/v1/schema", body=payload, timeout=30)
     if status not in (200, 201):
         raise RuntimeError(f"POST /v1/schema ({name}) → HTTP {status}: {body[:300]!r}")
@@ -1042,6 +1038,7 @@ def _delete_class(name: str, weaviate_url: Optional[str] = None) -> None:
     status, body = _http_request("DELETE", f"{base}/v1/schema/{name}", timeout=30)
     if status not in (200, 204, 404):
         raise RuntimeError(f"DELETE /v1/schema/{name} → HTTP {status}: {body[:300]!r}")
+    _wch.record_deleted(name, base, status=status)  # v0.2.106: case-variant guard evidence
 
 
 def _count_objects(name: str, weaviate_url: Optional[str] = None) -> Optional[int]:

@@ -583,6 +583,57 @@ pub fn kg_primary_shared_status(
     parse_ok_reply_named("kg primary status", &done.stdout, &done.stderr)
 }
 
+/// v0.2.106: the longest a pre-move Weaviate snapshot may take — the Python
+/// side's own default bound (`VCT_WEAVIATE_SNAPSHOT_TIMEOUT_S`, 1800 s: a large
+/// data folder loads for minutes on a slow disk) plus the container stop/start
+/// around it.
+pub(crate) const VCO_LIB_WEAVIATE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(40 * 60);
+
+/// v0.2.106: before the launcher runs VCO's compose on Weaviate's data itself
+/// (the volume migration), take the raft snapshot that keeps Weaviate 1.37's
+/// replay from dropping live collections —
+/// `python -m vco_lib.weaviate_raft_guard prepare --root … --json`, the ONE
+/// rule (rule A). `Ok` = nothing to do or the snapshot was taken; `Err` names
+/// why the move must not run (nothing was removed; the old container was
+/// started again).
+pub fn weaviate_upgrade_prepare(root: &Path) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.weaviate_raft_guard")
+        .arg("prepare")
+        .arg("--root")
+        .arg(root)
+        .arg("--json");
+    reinject_minimal_env(&mut cmd);
+    cmd.current_dir(root);
+    let done = match vct_launcher_core::process::output_bounded(
+        &mut cmd,
+        None,
+        VCO_LIB_WEAVIATE_SNAPSHOT_TIMEOUT,
+    ) {
+        Ok(done) => done,
+        Err(vct_launcher_core::process::BoundedError::Spawn(e)) => {
+            return Err(format!(
+                "weaviate snapshot check: spawn failed (python={}): {}",
+                python.display(),
+                e
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::TimedOut { after, stderr, .. }) => {
+            return Err(format!(
+                "weaviate snapshot check: timed out after {} s. stderr: {}",
+                after.as_secs(),
+                String::from_utf8_lossy(&stderr).trim()
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::Wait(e)) => {
+            return Err(format!("weaviate snapshot check: wait failed: {}", e))
+        }
+    };
+    parse_ok_reply_named("weaviate snapshot check", &done.stdout, &done.stderr)
+}
+
 /// v0.2.102 W6-CGD (D-4): classify `extra` against the project's own folder —
 /// `python -m vco_lib.codegraph_extra_overlap --extra … --project-folder … --json`,
 /// the ONE overlap rule (rule A: the Python implementation, called from here).
@@ -1270,6 +1321,30 @@ mod tests {
             VCO_LIB_SHORT_VERB_TIMEOUT < VCO_LIB_ENV_PROJECTION_TIMEOUT,
             "an interactive read must not outwait a whole-project re-render"
         );
+    }
+
+    /// v0.2.106: the `weaviate_raft_guard prepare --json` replies (the shape
+    /// tests/test_v02106_weaviate_raft_guard.py pins on the Python side): a
+    /// refusal becomes an `Err` carrying the reason and the condition id, and
+    /// the bound outlasts the Python side's own 1800 s snapshot default.
+    #[test]
+    fn weaviate_prepare_replies_and_bound() {
+        let ok = parse_ok_reply_named(
+            "weaviate snapshot check",
+            br#"{"message": "", "ok": true, "status": "not_needed"}"#,
+            b"",
+        )
+        .expect("ok reply");
+        assert_eq!(ok["status"], "not_needed");
+        let err = parse_ok_reply_named(
+            "weaviate snapshot check",
+            br#"{"error": "weaviate_upgrade_snapshot_refused", "message": "version not known", "ok": false, "status": "refused"}"#,
+            b"",
+        )
+        .expect_err("refusal");
+        assert!(err.contains("version not known"), "{err}");
+        assert!(err.contains("weaviate_upgrade_snapshot_refused"), "{err}");
+        assert!(VCO_LIB_WEAVIATE_SNAPSHOT_TIMEOUT > Duration::from_secs(1800));
     }
 
     /// `reinject_minimal_env` must DROP a key that is not on the

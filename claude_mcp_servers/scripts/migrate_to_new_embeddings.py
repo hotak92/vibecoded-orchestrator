@@ -406,7 +406,10 @@ def add_named_vector_to_collection(
     # via Reconfigure on Weaviate ≤1.30, so we must include it here.
     # Audit finding 2026-04-30 (Code-M2 / KG schema gotchas).
     logger.info("Recreating '%s' with named vectors: %s", coll_name, sorted(all_vec_names))
-    client.collections.delete(coll_name)
+    # v0.2.106: same-name drop + create (safe on replay); recorded for the
+    # case-variant create guard (vco_lib.weaviate_case_history).
+    from vco_lib.fixture_class_guard import record_collection_delete
+    record_collection_delete(client, coll_name)
     client.collections.create(
         name=coll_name,
         properties=existing_props,

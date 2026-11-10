@@ -1915,6 +1915,11 @@ def _outcome_entries(result: ReconcileResult, root: Path) -> list[DeferralEntry]
         if foreign:
             remedy += "".join(
                 f"# {n} ({s}) is yours: apply the image and settings above in its own compose, if you want them.\n"
+                # v0.2.106: a newer Weaviate image on old data needs a raft
+                # snapshot taken by the old one first (vco_lib.weaviate_raft_guard).
+                + (f"#   before a newer Weaviate image starts on its data: "
+                   f"python -m vco_lib.weaviate_raft_guard snapshot --container {n}\n"
+                   if s == "weaviate" else "")
                 for s, n in foreign)
         entries.append(DeferralEntry(
             condition_id=CID_CONFIG_DRIFT,

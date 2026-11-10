@@ -330,6 +330,16 @@ _V02105_OWNED_ADDITIONS = frozenset({
     "service_image_pull_failed",
 })
 
+# v0.2.106: install step 5's recreate guard (vco_lib.data_identity →
+# vco_lib.weaviate_raft_guard) adds this row to the install run's REPORT
+# whenever it refuses a Weaviate move it cannot snapshot first, so a run that
+# no longer refuses simply does not re-emit it (family A, like the two above).
+# `hand-to-vco` emits the same row outside a run; the next update re-decides
+# it — that refusal is a one-shot record of a move that did not happen.
+_V02106_OWNED_ADDITIONS = frozenset({
+    "weaviate_upgrade_snapshot_refused",
+})
+
 
 # v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12, WP-04): fifteen ids registered in
 # wave 1 AHEAD of most of their emitters, every one `owned-drop-when-absent`
@@ -764,6 +774,11 @@ class TestRegistryCompleteness(unittest.TestCase):
             # v0.2.105: vco_lib.kg_primary_shared.doctor_entry attaches the
             # affected project set (pinned by tests/test_v02105_kg_primary_shared.py).
             "kg_primary_bound_to_shared",
+            # v0.2.106: vco_lib.weaviate_raft_guard's entry builders attach
+            # service / container, classes, pairs and container on every
+            # emit (pinned by tests/test_v02106_weaviate_raft_guard.py).
+            "weaviate_upgrade_snapshot_refused", "weaviate_collection_index_missing",
+            "weaviate_raft_replay_exposed", "weaviate_container_uncapped",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:
@@ -806,7 +821,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             | _V02100_OWNED_ADDITIONS
             | _V02101_OWNED_ADDITIONS
             | _V02103_OWNED_ADDITIONS
-            | _V02105_OWNED_ADDITIONS,
+            | _V02105_OWNED_ADDITIONS
+            | _V02106_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

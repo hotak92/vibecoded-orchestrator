@@ -7287,6 +7287,8 @@ def _apply_deferred_entries(
                     # Confirmed empty + still exists. Safe to drop.
                     del_req = urllib.request.Request(schema_url, method="DELETE")
                     urllib.request.urlopen(del_req, timeout=10)
+                    from vco_lib.weaviate_case_history import record_deleted  # v0.2.106
+                    record_deleted("VibeCodedOrchestrator_Development", weaviate_url)
                     print(f"  [ok]   {cid}: collection dropped. Marking resolved.")
                     # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
                     current_run_report.mark_resolved(cid)
@@ -12788,11 +12790,13 @@ def _ensure_collections(embed_config: dict,
     failed: list[tuple[str, str]] = []
     schema_url = f"{weaviate_url}/v1/schema"
     from vco_lib.fixture_class_guard import FixtureClassWriteRefused, guard_fixture_class_write
+    from vco_lib.weaviate_case_history import CaseVariantCreateRefused, guard_create as _no_case_twin
     for name, builder in missing:
         try:
             # v0.2.94: refuse at ADD time — created here then refused at every sync
             guard_fixture_class_write(name, operation="create", weaviate_url=weaviate_url)
-        except FixtureClassWriteRefused as refusal:
+            _no_case_twin(name, weaviate_url)  # v0.2.106: no case-variant of a replayable delete
+        except (FixtureClassWriteRefused, CaseVariantCreateRefused) as refusal:
             failed.append((name, str(refusal)))
             continue
         try:
@@ -14548,10 +14552,10 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
         name ends in that suffix AND whose FULL name (prefix included) is a
         pure-lowercase form of an existing canonical-cased class.
       * If the lowercase variant has fewer than 100 objects it is
-        "clearly residual" — safe to drop.
-      * We NEVER auto-drop. Instead, one deferral entry per qualifying
-        collection is emitted to UPDATE_DEFERRED.md with an explicit
-        single-class `DELETE /v1/schema/<class>` command (no VCO verb drops one).
+        "clearly residual" and gets one deferral entry (UPDATE_DEFERRED.md).
+      * v0.2.106: it is NEVER dropped and no DELETE is printed — Weaviate
+        keys both spellings to ONE lower-cased index, so deleting either
+        removes the other's data (vco_lib.weaviate_case_history).
 
     Idempotent — runs every update; already-absent collections produce no
     entries (the check re-reads the live schema each run).
@@ -14638,18 +14642,18 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
                     f"Collection `{cls}` ({count} objects) appears to be a "
                     f"residual lowercase variant of the canonical "
                     f"{canonical_str}. It was likely created by an older "
-                    f"version of the orchestrator and can be safely dropped."
+                    f"version of the orchestrator."
                 ),
                 why_deferred=(
-                    "The orchestrator never auto-drops populated collections "
-                    "(even with < 100 rows) to avoid accidental data loss. "
-                    "Inspect `{cls}` with the Weaviate console or the CLI, "
-                    "then drop it manually when confident the data is "
-                    "captured in the canonical collection."
+                    "Do NOT drop it: Weaviate stores a class's index under its "
+                    "LOWER-CASED name, so a DELETE of either spelling removes the "
+                    "data both share, and from Weaviate 1.37 a restart that "
+                    "replays such a delete wipes the canonical class again. "
+                    "Leave both in place."
                 ),
                 command_to_apply=(
-                    f"curl -X DELETE {weaviate_url.rstrip('/')}/v1/schema/{cls}"
-                    f"   # drops ONLY this class; confirm its rows first"
+                    "python -m vco_lib.weaviate_raft_guard status"
+                    "   # read-only: version, raft snapshot coverage, broken classes"
                 ),
                 severity="info",
                 kg_node_refs=[],

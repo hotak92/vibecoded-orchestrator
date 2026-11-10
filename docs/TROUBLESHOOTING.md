@@ -408,6 +408,52 @@ open -a Docker                           # macOS (Docker Desktop)
 
 **Insufficient memory**: Weaviate needs ~512 MB RAM minimum, 1-2 GB to run comfortably. On Docker Desktop, raise the memory limit under Settings → Resources.
 
+## Weaviate collections lose their data at every restart (Weaviate 1.37)
+
+**Symptom**: a collection is still listed in the schema, but every search or listing fails with
+`tried to browse non-existing index` / `cannot get shards status for a non-existing index`. Rebuilding it helps
+until the next restart of the Weaviate container. `vco doctor` reports `weaviate_collection_index_missing`.
+
+**Cause** (an upstream Weaviate defect, read in the 1.37.18 source): Weaviate keeps its schema in a raft log and,
+on a small install, never takes a raft snapshot (its default threshold is 8192 entries), so every start replays the
+whole log. From 1.37 a replayed collection delete is recorded as an "orphan" whose data is dropped at the end of the
+start, unless a later create used the EXACT same name. The data folder, however, is named by the lower-cased class
+name. So a delete of `ProjectX_KnowledgeGraph` followed by a create of `ProjectX_Knowledgegraph` drops the live
+collection's data at every start. VCO's v0.2.88 re-spelling of the orchestrator's own collections
+(`VibecodedOrchestrator_*` → `VibeCodedOrchestrator_*`) left exactly that history on some machines.
+
+**What VCO does since v0.2.106**:
+
+- the shipped compose has Weaviate snapshot its schema within a minute of any change (`RAFT_SNAPSHOT_THRESHOLD`,
+  `RAFT_SNAPSHOT_INTERVAL`); once a snapshot holds the history, a start replays nothing dangerous;
+- before VCO moves data from Weaviate 1.28 or older to a newer release (`python install.py --update`,
+  `python -m vco_lib.service_endpoints hand-to-vco --service weaviate`, the session restart of a stopped container,
+  a port move, the launcher's volume migration), it runs the OLD image once on the same data until a snapshot
+  holds the whole history, then starts the old container again. If it cannot, the container is left as it is and
+  `weaviate_upgrade_snapshot_refused` explains why — VCO never starts a newer Weaviate on data whose snapshot
+  state it does not know;
+- VCO does not create a collection while a delete of the same name in other letter case can still be replayed;
+- `vco doctor` reports the damage (`weaviate_collection_index_missing`) and the risk
+  (`weaviate_raft_replay_exposed`).
+
+**Check**: `python -m vco_lib.weaviate_raft_guard status` prints the Weaviate version, the raft log and snapshot
+indexes (`covered: yes` when the latest snapshot holds the whole log) and, for every collection whose name differs only in case from one VCO derived or deleted (the collections the defect can hit), whether its data index is gone.
+
+**Repair a damaged collection — in this order** (rebuilding before step 1 is wiped again at the next restart):
+
+1. Make sure the running Weaviate takes snapshots: a VCO-managed container is recreated with the settings by
+   `python install.py --update`; for one you run yourself, add the two variables above.
+2. Drop each broken collection (its data is already gone) and create it again:
+   `curl -X DELETE <weaviate-url>/v1/schema/<Collection>`, then `python install.py --update` (the orchestrator
+   root re-creates its missing collections) or, for another project,
+   `python -m vco_lib.project_init bootstrap-collections --name "<project name>" --project-folder <project folder>`.
+3. Re-fill it from its sources: `.claude/scripts/kg-sync --all` (knowledge graph from `knowledge/`, docs from
+   `docs/`).
+4. Before any restart, wait until `python -m vco_lib.weaviate_raft_guard status` prints `covered: yes`.
+
+**Moving Weaviate by hand**: before you start a newer Weaviate on data an older one wrote, take the snapshot with
+the old container's own image: `python -m vco_lib.weaviate_raft_guard snapshot --container <name>`.
+
 ## Ollama container won't start
 
 **GPU not detected**:
