@@ -81,7 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CLAUDE_CODE_SUBAGENT_EFFORT=medium` in its `env` block, so a subagent with no effort of its own (none in its
   definition, none on the dispatch) runs at medium instead of inheriting the session's effort; the few shipped
   agents that pin `effort: high` in their frontmatter keep it. The key is added only when absent — a value you set yourself
-  is kept — and it is never written to `~/.claude/settings.json`.
+  is kept — and it is never written to `~/.claude/settings.json`. "Remove from VCO" takes it out again while its
+  value is still `medium`; a value you set stays.
 
 ### Changed
 

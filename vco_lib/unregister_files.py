@@ -303,6 +303,39 @@ def _strip_permissions(data: dict, templates: list[dict], run: _Run) -> None:
         data.pop("permissions", None)
 
 
+def _strip_template_env(data: dict, templates: list[dict], run: _Run) -> None:
+    """Remove the ``env`` keys the settings TEMPLATE ships (v0.2.106:
+    ``CLAUDE_CODE_SUBAGENT_EFFORT=medium``) where the value is still VCO's.
+
+    The bundle merge adds such a key only when absent and keeps a value the
+    user set, so the value is the evidence: VCO's value goes, any other value
+    is the user's and stays (reported by name, never by value). The routing
+    keys VCO projects per project are a different surface, removed by
+    :mod:`vco_lib.unregister_env` against the projected values.
+    """
+    env = data.get("env")
+    if not isinstance(env, dict):
+        return
+    shipped: dict[str, Any] = {}
+    for t in templates:
+        tenv = t.get("env")
+        if isinstance(tenv, dict):
+            shipped.update(tenv)
+    if not shipped:
+        return
+    new_env = dict(env)
+    for key, value in sorted(shipped.items()):
+        if key not in new_env:
+            continue
+        if new_env[key] == value:
+            new_env.pop(key)
+            run.settings_removed.append(f"env: {key} (VCO's default)")
+        else:
+            run.kept.append(f"{_SETTINGS_REL} env {key} — set to your own value, so it was left")
+    if new_env != env:
+        data["env"] = new_env
+
+
 def _strip_settings(run: _Run, templates: Optional[list[dict]]) -> None:
     from vco_lib import jsonc_edit
     from vco_lib.atomic import atomic_rewrite_text
@@ -351,6 +384,7 @@ def _strip_settings(run: _Run, templates: Optional[list[dict]]) -> None:
         if key in data and any(data[key] == t.get(key) for t in templates if key in t):
             run.kept.append(f"{_SETTINGS_REL} {key} — VCO sets this value too, but so can you, "
                             "so it was left")
+    _strip_template_env(data, templates, run)
     if data.get("env") == {}:
         data.pop("env")
     if data == original:

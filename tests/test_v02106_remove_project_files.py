@@ -197,6 +197,29 @@ def test_vco_prose_keys_go_user_values_stay_and_an_emptied_file_goes(project: Pa
     assert not path.exists() and ".claude/settings.json" in out["removed"]
 
 
+def test_vcos_subagent_effort_default_goes_and_a_users_value_stays(project: Path):
+    """Q3: the template's ``CLAUDE_CODE_SUBAGENT_EFFORT=medium`` is VCO's while
+    its value is VCO's; a value the user set stays (reported by name)."""
+    path = project / ".claude/settings.json"
+    assert TEMPLATE["env"]["CLAUDE_CODE_SUBAGENT_EFFORT"] == "medium"
+    path.write_text(json.dumps({"env": {"CLAUDE_CODE_SUBAGENT_EFFORT": "medium",
+                                        "MY_OWN": "1"}}))
+    out = _purge(project)
+    assert json.loads(path.read_text()) == {"env": {"MY_OWN": "1"}}
+    assert "env: CLAUDE_CODE_SUBAGENT_EFFORT (VCO's default)" in out["settings_removed"]
+
+    path.write_text(json.dumps({"env": {"CLAUDE_CODE_SUBAGENT_EFFORT": "low"}}))
+    out = _purge(project)
+    assert json.loads(path.read_text()) == {"env": {"CLAUDE_CODE_SUBAGENT_EFFORT": "low"}}
+    assert any("CLAUDE_CODE_SUBAGENT_EFFORT" in k and "your own value" in k
+               for k in out["kept"])
+    assert "low" not in json.dumps(out["kept"])  # names only, never a value
+
+    path.write_text(json.dumps({"env": {"CLAUDE_CODE_SUBAGENT_EFFORT": "medium"}}))
+    _purge(project)
+    assert not path.exists()  # emptied file goes, as before
+
+
 def test_jsonc_comments_survive_the_strip(project: Path):
     path = project / ".claude/settings.json"
     path.write_text('{\n  // my note\n  "_comment": %s,\n  "model": "x",\n}\n'
