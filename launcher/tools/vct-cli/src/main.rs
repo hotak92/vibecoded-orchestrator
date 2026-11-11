@@ -644,8 +644,16 @@ fn print_json<T: Serialize>(v: &T) -> Result<()> {
 
 /// The hub path for `project delete`: the hub runs the launcher's full
 /// removal (`DELETE /cli/projects/{id}`), and the two flags travel as its
-/// `keep_collections` / `leave_unremovable` query options.
-fn delete_project_path(id_or_slug: &str, keep_collections: bool, leave_unremovable: bool) -> String {
+/// `keep_collections` / `leave_unremovable` query options. `confirmed` is
+/// the hub's own guard (review L7, owner ruling 2026-11-11): a removal that
+/// DROPS the collections is refused unless the request says the caller asked
+/// first — vct-cli sends `confirm=true` only after the y answer or `--yes`.
+fn delete_project_path(
+    id_or_slug: &str,
+    keep_collections: bool,
+    leave_unremovable: bool,
+    confirmed: bool,
+) -> String {
     let mut path = format!("/cli/projects/{}", id_or_slug);
     let mut opts: Vec<&str> = Vec::new();
     if keep_collections {
@@ -653,6 +661,9 @@ fn delete_project_path(id_or_slug: &str, keep_collections: bool, leave_unremovab
     }
     if leave_unremovable {
         opts.push("leave_unremovable=true");
+    }
+    if confirmed {
+        opts.push("confirm=true");
     }
     if !opts.is_empty() {
         path.push('?');
@@ -785,8 +796,14 @@ fn project(hub: &Hub, cmd: ProjectCmd) -> Result<()> {
                  waits up to 30 minutes for it); do not start another removal of it meanwhile.",
                 id_or_slug
             );
-            let v: serde_json::Value = hub
-                .delete_json_long(&delete_project_path(&id_or_slug, keep_collections, leave_unremovable))?;
+            // Past this point the removal was confirmed (`--yes`, or a y at
+            // the prompt): the hub's own guard gets `confirm=true` (L7).
+            let v: serde_json::Value = hub.delete_json_long(&delete_project_path(
+                &id_or_slug,
+                keep_collections,
+                leave_unremovable,
+                true,
+            ))?;
             print_json(&v)
         }
         ProjectCmd::Show { id_or_slug } => {
@@ -1038,13 +1055,23 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// v0.2.106 Q5: `project delete` runs the launcher's full removal through
-    /// the hub; its flags reach the hub as query options.
+    /// the hub; its flags reach the hub as query options. Review L7: the
+    /// caller's "I asked first" travels as `confirm=true` — sent only after
+    /// the y answer or `--yes` (the one caller passes `true` exactly then).
     #[test]
     fn project_delete_flags_become_the_hubs_query_options() {
-        assert_eq!(delete_project_path("alpha", false, false), "/cli/projects/alpha");
+        assert_eq!(delete_project_path("alpha", false, false, false), "/cli/projects/alpha");
         assert_eq!(
-            delete_project_path("alpha", true, true),
+            delete_project_path("alpha", true, true, false),
             "/cli/projects/alpha?keep_collections=true&leave_unremovable=true"
+        );
+        assert_eq!(
+            delete_project_path("alpha", false, false, true),
+            "/cli/projects/alpha?confirm=true"
+        );
+        assert_eq!(
+            delete_project_path("alpha", true, false, true),
+            "/cli/projects/alpha?keep_collections=true&confirm=true"
         );
         let cli = Cli::try_parse_from(["vct-cli", "project", "delete", "alpha", "--keep-collections"])
             .expect("parses");
@@ -1125,7 +1152,7 @@ mod tests {
         });
         let hub = Hub::new(Some(port)).expect("client");
         let v: serde_json::Value = hub
-            .delete_json_long(&delete_project_path("alpha", false, false))
+            .delete_json_long(&delete_project_path("alpha", false, false, true))
             .expect("the removal's answer arrives after 16 s");
         assert_eq!(v["ok"], true);
     }

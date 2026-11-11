@@ -238,6 +238,45 @@ def test_unreadable_settings_keep_the_table_answer(tmp_path):
     assert epc.registered_for("py_compile", "Edit", str(tmp_path)) is None
 
 
+# ── L3 ────────────────────────────────────────────────────────────────────
+
+
+def test_a_commented_settings_file_is_read_not_skipped(tmp_path):
+    """Review L3: settings files are JSONC. With a strict ``json.loads`` a
+    commented ``settings.json`` was silently skipped, and the readable
+    ``settings.local.json`` VCO writes in every project then answered
+    ``False`` — every ``.py`` Edit was recorded ``no_signal/no_checker``
+    although py-compile-check runs."""
+    from vco_lib import edit_post_check as epc
+
+    (tmp_path / ".claude").mkdir()
+    payload = json.dumps(
+        {"hooks": {"PostToolUse": [
+            {"matcher": "Edit|Write",
+             "hooks": [{"type": "command", "command": _PCC}]}]}},
+        indent=2)
+    commented = ("// the hook block, kept under version control with notes\n"
+                 + payload.replace('"Edit|Write"', '"Edit|Write" /* the shipped pair */'))
+    assert "/*" in commented and "//" in commented
+    (tmp_path / ".claude" / "settings.json").write_text(commented, encoding="utf-8")
+    (tmp_path / ".claude" / "settings.local.json").write_text(
+        json.dumps({"env": {"A": "1"}}), encoding="utf-8")
+    assert epc.registered_for("py_compile", "Edit", str(tmp_path)) is True
+
+
+def test_a_broken_settings_file_answers_none_even_with_a_readable_local(tmp_path):
+    """Review L3: an EXISTING settings file that cannot be parsed keeps the
+    table's answer (``None``) — the readable local file must not turn it
+    into ``False``."""
+    from vco_lib import edit_post_check as epc
+
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text("{not json", encoding="utf-8")
+    (tmp_path / ".claude" / "settings.local.json").write_text(
+        json.dumps({"env": {"A": "1"}}), encoding="utf-8")
+    assert epc.registered_for("py_compile", "Edit", str(tmp_path)) is None
+
+
 # ── L10 ───────────────────────────────────────────────────────────────────
 
 
@@ -303,7 +342,11 @@ def test_the_file_purge_preview_lists_and_changes_nothing(tmp_path):
     assert sorted(str(p) for p in folder.rglob("*")) == before, "a preview changes nothing"
     assert ".claude/agents/code-reviewer.md" in out["removed"]
     assert ".claude/state" in out["removed"] and ".claude/.vco-manifest.json" in out["removed"]
-    assert out["settings_removed"] == ["VCO's entries in .claude/settings.json"]
+    # Review L8: the preview computes the strip — a settings.json holding
+    # NOTHING of VCO's (`{}` here) gets no generic "VCO's entries" line and
+    # is not named as deleted (the real removal leaves it too).
+    assert out["settings_removed"] == []
+    assert ".claude/settings.json" not in out["removed"]
 
 
 def test_the_collection_drop_preview_drops_nothing():

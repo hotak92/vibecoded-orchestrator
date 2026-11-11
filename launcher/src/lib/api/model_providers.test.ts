@@ -185,6 +185,33 @@ describe('the sentence after a toggle', () => {
     expect(label).toContain('.claude/backups/bundle-adoptions/');
   });
 
+  it('a restored copy left as it was is named, not reported as refreshed', () => {
+    // Review L4: a restore whose backup could not be written leaves the
+    // parked (old) definition in place — the card must say so, not "brought
+    // to this release".
+    const summary = applySummary({ enabled: true, restored_projects: 1 });
+    summary.projects = [
+      {
+        project: 'Alpha',
+        folder: '/w/alpha',
+        status: 'ok',
+        parked: [],
+        already_parked: [],
+        kept: [],
+        restored: ['kimi-reviewer.md'],
+        refreshed: [],
+        not_refreshed: ['kimi-reviewer.md'],
+        notes: [],
+        error: '',
+      },
+    ];
+    const label = applyOutcomeLabel({ vendor: 'kimi', enabled: true, stored: true, agents: summary });
+    expect(label).toContain('restored in 1 project');
+    expect(label).toContain('1 restored copy is still the parked version');
+    expect(label).toContain('next Update bundle');
+    expect(label).not.toContain('came from an older release');
+  });
+
   it('a re-enable whose key does not resolve keeps the definitions parked', () => {
     const note = toggleNote(row(), true, {
       vendor: 'kimi',

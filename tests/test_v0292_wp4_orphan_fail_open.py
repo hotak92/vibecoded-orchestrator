@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -643,7 +644,6 @@ class TriOsShapeTests(unittest.TestCase):
 
     def test_write_file_atomic_documents_the_mode_it_actually_ships(self):
         """R16: the docstring said 0o755 while every caller passes 0o700."""
-        import inspect
         doc = project_init._write_file_atomic.__doc__ or ""
         self.assertIn("0o700", doc)
         # v0.2.106 (review M2): the mode rule has ONE home now, shared by the
@@ -652,12 +652,28 @@ class TriOsShapeTests(unittest.TestCase):
         self.assertEqual(bundle_file_mode(".claude/scripts/kg-search"), 0o700)
         self.assertEqual(bundle_file_mode(".claude/hooks/pre-tool-use.sh"), 0o700)
         self.assertIsNone(bundle_file_mode(".claude/agents/planner.md"))
-        src = inspect.getsource(project_init.install_project_bundle)
-        self.assertIn("bundle_file_mode(op.dest_rel)", src)
-        self.assertNotIn("0o755", src)
         # Windows: chmod is a documented no-op, and the write must not fail.
-        self.assertIn("no-op on Windows",
-                      inspect.getsource(project_init._write_file_atomic))
+        # (The note lives in the shared writer's docstring since v0.2.92
+        # merged `_write_file_atomic` into it — `atomic_write_bytes` defers
+        # the `mode` documentation to `atomic_write_text`.)
+        from vco_lib import atomic as _atomic
+        self.assertIn("no-op on Windows", _atomic.atomic_write_text.__doc__ or "")
+
+    @unittest.skipUnless(os.name == "posix", "chmod is a documented no-op on Windows")
+    def test_a_bundle_install_lands_scripts_with_the_documented_mode(self):
+        """R16 as BEHAVIOUR (review nit): the engine writes a shipped script
+        0o700 on disk — not 0o755 — so the docstring's promise is what an
+        install actually does, not a source pattern."""
+        import stat
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td) / "proj"
+            folder.mkdir()
+            out = project_init.install_project_bundle(folder, orchestrator_root=REPO_ROOT)
+            self.assertTrue(out.get("ok", True) is not False, out)
+            shipped = folder / ".claude" / "hooks" / "pre-tool-use.sh"
+            self.assertTrue(shipped.is_file())
+            mode = stat.S_IMODE(shipped.stat().st_mode)
+            self.assertEqual(mode, 0o700, oct(mode))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -67,14 +67,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal they print what would be removed — the files VCO put in the folder, the settings files whose VCO entries
   go, and the collections that would be dropped, from the same rules the removal applies — and remove only on `y`;
   `--yes` removes without asking, and without a terminal and without `--yes` they refuse and change nothing, so a
-  script cannot drop a project's collections by accident. `vct-launcher --remove-project ... --preview` prints that
-  list as JSON and changes nothing. Only the stop on a value VCO could not remove suggests `--leave-unremovable`
-  (exit 2); any other failure — say, an update holding the launcher database — says what failed (exit 3), and a
-  removal that was not confirmed exits 4. `vct-cli project delete` waits as long as the removal runs (up to 30
-  minutes) and says so, instead of giving up after 15 seconds on a removal that then finished; a second delete of the
-  same project while one runs is refused; a launcher beside the hub too old to know `--remove-project` is detected
-  before anything runs; and the hub reports success only with the launcher's report for that project, writing its
-  audit row after the outcome.
+  script cannot drop a project's collections by accident. The hub enforces this too: its DELETE route refuses a
+  removal that drops collections unless the request carries `confirm=true`, which `vct-cli` sends only after your `y`
+  or `--yes` — an older `vct-cli` or a script holding the hub token gets a 400, never the destructive default
+  (`--keep-collections` needs no confirmation — it drops nothing). `vct-launcher --remove-project ... --preview`
+  prints that list as JSON and changes nothing. Only the stop on a value VCO could not remove suggests
+  `--leave-unremovable`; any other failure — say, an update holding the launcher database — says what failed. The
+  launcher binary's exit codes: 0 removed, 1 usage or lookup error, 2 the stop that names `--leave-unremovable`,
+  3 failed for another reason, 4 not confirmed; `vct-cli` maps every failure to its own exit 1 with the hub's
+  message. On Windows the launcher is a GUI binary: started from a console it asks there; started with no console
+  at all and without `--yes` it opens a console window to ask in. `vct-cli project delete` waits as long as the
+  removal runs (up to 30 minutes) and says so, instead of giving up after 15 seconds on a removal that then
+  finished; a second delete of the same project while one runs is refused; a launcher beside the hub too old to
+  know `--remove-project` is detected before anything runs; and the hub reports success only with the launcher's
+  report for that project, writing its audit row after the outcome.
 
 - **The menu bar shows when work is still running in the background.** After you close the "Update all" window (or add
   a project), knowledge-graph syncs, code-graph builds, summary runs and project setups keep going on their own, and
@@ -94,7 +100,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Weaviate up to 90 s to take its next snapshot: a reading taken right after a start — the update's own doctor
   phase — would otherwise count that start's own fresh entries, and on a default-named clone (whose derived
   `VibecodedOrchestrator_*` names differ only in case from the live `VibeCodedOrchestrator_*` ones) report a data-loss
-  risk that does not exist. With the shipped snapshot settings the snapshot comes within a minute (measured on
+  risk that does not exist. The wait prints a line while it runs, never outlives the doctor check's own deadline,
+  and does not repeat on an install whose ledger already records the exposure (or whose dismissal of it covers the
+  same collections). With the shipped snapshot settings the snapshot comes within a minute (measured on
   1.37.18: 26-45 s after an idle restart), so a healthy install gets no entry; without them no snapshot comes and the
   exposure is reported, and the entry clears once a snapshot holds the delete — after the recreate with the shipped
   settings its remedy names. `python -m vco_lib.weaviate_raft_guard status` prints the

@@ -136,11 +136,12 @@ use std::sync::Mutex;
 //     install.py interactive prompt to `~/.vct/storage.toml` and regenerates
 //     `infrastructure/compose.override.yaml` if needed.
 //
-//   * `--remove-project <id|slug|name> [--keep-collections] [--leave-unremovable]`
-//     (v0.2.106): "Remove from VCO" from a terminal — the SAME operation as
-//     the Projects-page Remove button (`projects_v2::unregister_project`, one
-//     implementation, the GUI's Remove-flow options by default). The folder
-//     and the user's own files stay; the JSON report goes to stdout.
+//   * `--remove-project <id|slug|name> [--keep-collections] [--leave-unremovable]
+//     [--yes] [--preview]` (v0.2.106): "Remove from VCO" from a terminal —
+//     the SAME operation as the Projects-page Remove button
+//     (`projects_v2::unregister_project`, one implementation, the GUI's
+//     Remove-flow options by default). The folder and the user's own files
+//     stay; the JSON report goes to stdout.
 //
 // Contract: when `handle_cli_args()` returns `Some(exit_code)` we exit
 // immediately. The GUI startup path is gated on `None`. This MUST stay

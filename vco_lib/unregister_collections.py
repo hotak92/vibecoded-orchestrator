@@ -31,8 +31,21 @@ A-L4). Without an id (the bare CLI) the drop covers the name-derived set.
 """
 from __future__ import annotations
 
+import re
 import shlex
+import sys
 from typing import Any, Callable, Optional
+
+
+def _printed_name(name: str) -> str:
+    """A project name quoted for the shell the user will paste the printed
+    command into (review L8 nit): ``shlex.quote`` is POSIX — a name with a
+    space printed that way is a form cmd.exe does not accept. On Windows
+    double quotes group it (a name holding a literal ``"`` cannot be quoted
+    for cmd and is printed bare, as it is for any shell)."""
+    if sys.platform == "win32":
+        return f'"{name}"' if re.search(r"\s", name) and '"' not in name else name
+    return shlex.quote(name)
 
 __all__ = ["DropPlan", "plan_drop", "drop_project_collections"]
 
@@ -90,7 +103,7 @@ def plan_drop(
             "the launcher registry could not be read, so no collection was dropped (each "
             "is listed as kept); VCO could not check whether another project uses them. "
             "Once you have checked that none does, drop them with: python -m "
-            f"vco_lib.project_init drop-collections --name {shlex.quote(project_name)}")
+            f"vco_lib.project_init drop-collections --name {_printed_name(project_name)}")
         return plan
     me = None
     others: list[Any] = []

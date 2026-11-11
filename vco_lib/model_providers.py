@@ -336,6 +336,10 @@ def _row(name: str, folder: Path) -> dict:
         "restored": [],
         # restored definitions brought to this release's bytes (review M2)
         "refreshed": [],
+        # restored definitions LEFT AS THEY WERE (review L2/L4): no manifest
+        # entry, so the next Update bundle adopts them with a backup; the
+        # card names them.
+        "not_refreshed": [],
         "notes": [],
         "error": "",
     }
@@ -474,16 +478,18 @@ def _apply_on_to(
     if not isinstance(files, dict):
         files = {}
         manifest["files"] = files
-    from vco_lib.hashing import sha256_file
 
     # Review M2: a copy parked under an older release comes back with that
     # release's bytes (e.g. the retired `claude-gw/kimi/k3[1m]` pin). Bring
     # it to this release's definition the way the bundle update does —
     # the engine's own classify + adopt (backup first) — so the switch
-    # really takes effect at once.
+    # really takes effect at once. Review L5: the enumeration inside the
+    # refresh reads the off-list from THIS run's database, not the default
+    # one (`--db-path`).
     refreshed = mgd.refresh_restored_agents(
         folder, orchestrator_root, restored, verdict=verdict,
-        log=row["notes"].append, reach_hint=gate)
+        log=row["notes"].append, reach_hint=gate,
+        disabled_vendors=disabled_vendors(db_path=db_path))
     for rel in restored:
         done = refreshed.get(rel)
         if done is not None:
@@ -491,16 +497,14 @@ def _apply_on_to(
             if done["action"] in ("overwrite", "create", "adopt"):
                 row["refreshed"].append(_leaf(rel))
             continue
-        try:
-            digest = sha256_file(folder / rel)
-        except OSError:
-            continue  # moved but unreadable: the next update reconciles it
-        files[rel] = {
-            # Not classified (see the note above): the ON-DISK bytes, which
-            # the next update compares against and refreshes.
-            "sha256": digest,
-            "source": f"{mgd.GATEWAY_AGENTS_SOURCE_PREFIX}{_leaf(rel)}",
-        }
+        # Review L2: a restored file the refresh did NOT bring to this
+        # release's bytes (left as it was — its backup could not be written,
+        # or it could not be classified) gets NO manifest entry. Recording
+        # its on-disk hash would make the next update classify "overwrite"
+        # (installed == prior) and replace it — a user edit included — with
+        # no backup; with no entry the update ADOPTS (backup first) or
+        # preserves with its deferral. The card names it (review L4).
+        row["not_refreshed"].append(_leaf(rel))
     registry = mgd.parked_agents_registry(
         folder, prior, (), (), restored=restored)
     if registry:
@@ -514,6 +518,7 @@ def _apply_on_to(
         row["error"] = (f"the definitions moved but the manifest write failed "
                         f"({type(exc).__name__}): {exc}")
     row["restored"] = sorted(_leaf(rel) for rel in restored)
+    row["not_refreshed"].sort()
     return row
 
 

@@ -76,6 +76,10 @@ pub mod process;
 pub mod project_naming;
 pub mod python_resolve;
 pub mod registry;
+// v0.2.106 (review H1): the JSON key of the project id in the removal report
+// — read by both the hub (which checks the report) and the launcher crate's
+// wire test (which proves the real struct serializes under it).
+pub mod removal_report;
 // v0.2.100 W5R-02: the RL scoring lock — Rust reader of the one home,
 // `vco_lib/rl_scoring_lock.toml` (Python parses the same file).
 pub mod rl_scoring_lock;

@@ -45,7 +45,8 @@ files (.env, secrets, settings, source, knowledge/) stay, and the project's own 
 collections are dropped unless --keep-collections is given. It shows what it would remove \
 and asks first; --yes removes without asking (needed when not run from a terminal); \
 --preview prints what it would remove as JSON and changes nothing. Add the folder again any \
-time with Add Project.";
+time with Add Project. On Windows, without --yes and without a console of its own, it opens \
+a console window to ask in.";
 
 /// Exit code: the removal stopped on an unremovable value (see the module doc).
 pub(crate) const EXIT_STOPPED: i32 = 2;
@@ -196,6 +197,68 @@ fn interactive_terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
+/// Windows console plumbing for review L6. A RELEASE build is a
+/// GUI-subsystem binary (`#![windows_subsystem = "windows"]` in main.rs):
+/// started from a GUI parent (Explorer, a shortcut, the hub's windowless
+/// spawn) it gets NO console handles at all, so `interactive_terminal()` is
+/// false there, the y/N prompt could never be read, and even the refusal
+/// printed nowhere — the removal looked like it silently did nothing.
+#[cfg(windows)]
+mod win_console {
+    /// Every std handle absent — no console AND no redirection?
+    pub fn std_streams_absent() -> bool {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        unsafe {
+            [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].iter().all(|which| {
+                let h = GetStdHandle(*which);
+                h.is_null() || h == INVALID_HANDLE_VALUE
+            })
+        }
+    }
+
+    /// Attach to the parent process's console (a `start`ed console keeps no
+    /// handle inheritance). True when a console is attached afterwards.
+    pub fn attach_parent() -> bool {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+    }
+
+    /// Allocate a fresh console (a new console window opens for the prompt).
+    pub fn allocate() -> bool {
+        use windows_sys::Win32::System::Console::AllocConsole;
+        unsafe { AllocConsole() != 0 }
+    }
+}
+
+/// Review L6: give the ask path a console to ask in (Windows only).
+///
+/// Called only when the run may need to ask or to refuse — never for
+/// `--yes` / `--preview` / `--help`: the hub pipes those runs, and opening a
+/// console there would flash a window on the desktop for every hub-driven
+/// removal. Nothing happens when a terminal or redirected streams already
+/// exist (a script's captured stderr is exactly where the refusal belongs).
+/// After a successful attach/allocate `interactive_terminal()` answers true
+/// and the flow ASKS instead of refusing; when no console can be had the
+/// refusal still fires, unchanged.
+#[cfg(windows)]
+fn ensure_console_for_ask(yes: bool, preview: bool) {
+    if yes || preview || interactive_terminal() || !win_console::std_streams_absent() {
+        return;
+    }
+    if win_console::attach_parent() {
+        return;
+    }
+    win_console::allocate();
+}
+
+/// POSIX: a terminal or a redirected stream is always inherited — nothing
+/// to attach or allocate.
+#[cfg(not(windows))]
+fn ensure_console_for_ask(_yes: bool, _preview: bool) {}
+
 /// Print the preview on stderr and read the y/N answer from stdin.
 fn ask(db: &Db, row: &ProjectRow, opts: &UnregisterOptions) -> Result<bool, String> {
     use std::io::Write;
@@ -226,6 +289,10 @@ pub(crate) fn run(rest: &[String]) -> i32 {
             return 1;
         }
     };
+    // Review L6 (Windows): a release build started without a console gets
+    // one to ask in, before the confirm gate below reads it as "no terminal"
+    // and refuses into the void. No-op with --yes / --preview / on POSIX.
+    ensure_console_for_ask(args.yes, args.preview);
     let db = match Db::open() {
         Ok(d) => d,
         Err(e) => {
@@ -376,6 +443,20 @@ mod tests {
         assert_eq!(confirm_mode(true, true), Confirm::Go);
         assert_eq!(confirm_mode(false, true), Confirm::Ask);
         assert_eq!(confirm_mode(false, false), Confirm::Refuse);
+    }
+
+    /// Review L6: `ensure_console_for_ask` never changes the confirm
+    /// decision's INPUTS — on POSIX it does nothing at all (a terminal or a
+    /// redirected stream is always inherited there), and on Windows it
+    /// returns at once for --yes / --preview / an existing terminal. The
+    /// ask/refuse logic is the one tested above, unchanged.
+    #[test]
+    fn ensure_console_leaves_the_confirm_decision_alone() {
+        ensure_console_for_ask(false, false);
+        ensure_console_for_ask(true, true);
+        assert_eq!(confirm_mode(false, false), Confirm::Refuse);
+        assert_eq!(confirm_mode(false, true), Confirm::Ask);
+        assert_eq!(confirm_mode(true, false), Confirm::Go);
     }
 
     /// Review L5: only the unremovable-value stop names --leave-unremovable

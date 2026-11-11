@@ -113,7 +113,10 @@ uses are never dropped. The folder, your source code, `.env`, secrets,
   removes only when you answer `y`.
 - `--yes` removes without asking. Without a terminal (a script, CI) and
   without `--yes` it refuses and changes nothing, so a script can never drop a
-  project's collections by accident.
+  project's collections by accident. The hub enforces this too: the DELETE
+  route refuses a removal that drops collections unless the request carries
+  `confirm=true`, which `vct-cli` sends only after your `y` or `--yes`
+  (`--keep-collections` needs no confirmation — it drops nothing).
 - `--keep-collections` keeps the collections (the files still go).
 - `--leave-unremovable`: if the removal stopped because a value VCO wrote
   could not be removed, rerun with it to finish anyway (the dialog's
@@ -130,7 +133,10 @@ The launcher binary offers the same command without the hub:
 [--leave-unremovable] [--yes] [--preview]` (`--preview` prints what would be
 removed as JSON and changes nothing). Its exit codes: 0 removed, 1 usage or
 lookup error, 2 stopped on a value it could not remove, 3 failed for another
-reason (the message says which), 4 not confirmed.
+reason (the message says which), 4 not confirmed. On Windows the launcher is
+a GUI binary: started from a console it inherits it and asks there; started
+with no console at all (a shortcut, `start /b`) and without `--yes` it opens
+a console window to ask in, so the question is never invisible.
 
 `telemetry pending` is the one command that does not talk to the hub: it
 reads `~/.vibecoded/telemetry_pending.jsonl` (where opted-in telemetry waits

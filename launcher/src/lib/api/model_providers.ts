@@ -61,6 +61,13 @@ export interface ProviderApplyProjectRow {
    *  release's version the way a bundle update does (a copy that matched no
    *  shipped version is backed up first). */
   refreshed?: string[];
+  /** Restored definitions LEFT AS THEY WERE (v0.2.106 review L2/L4): the
+   *  refresh could not bring them to this release's bytes (a backup could
+   *  not be written, or the file could not be classified), so they carry no
+   *  manifest entry and the next Update bundle adopts them with a backup.
+   *  The card must say so — before this field the label reported the
+   *  restore as done while the file was still the parked copy. */
+  not_refreshed?: string[];
   notes: string[];
   error: string;
 }
@@ -162,6 +169,20 @@ export function applyOutcomeLabel(result: ModelProviderSetResult): string {
       `${refreshed === 1 ? 'was' : 'were'} brought to this release's version, as a bundle ` +
       'update would (a copy that matched no version VCO shipped is backed up under ' +
       '.claude/backups/bundle-adoptions/ first)';
+  }
+  // Review L4: a restored copy the refresh LEFT AS IT WAS (its backup could
+  // not be written, or it could not be compared) is still the parked
+  // version — name it, or the card reports the restore as done while the
+  // retired pin is still in place.
+  const notRefreshed = result.enabled
+    ? a.projects.reduce((n, p) => n + (p.not_refreshed?.length ?? 0), 0)
+    : 0;
+  if (notRefreshed > 0) {
+    out +=
+      ` — but ${notRefreshed} restored ${notRefreshed === 1 ? 'copy is' : 'copies are'} ` +
+      'still the parked version (left as it was — its backup could not be written, or it ' +
+      'could not be compared); the next Update bundle brings it to this release, backing ' +
+      'the current bytes up first';
   }
   if (a.failed_projects > 0) {
     out +=

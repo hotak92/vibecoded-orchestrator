@@ -256,7 +256,9 @@ class RestoreOnSwitchOnTests(ApplyBase):
 
     def test_the_on_leg_reads_the_off_list_from_its_own_database(self) -> None:
         """Review C-L2: ``set --db-path X`` decides the restore from X's
-        off-list, not the default launcher.db's."""
+        off-list, not the default launcher.db's. Review L5: the REFRESH's
+        enumeration reads the same database — a default that still says
+        "off" must not hold the vendor's files and skip them silently."""
         other = self.tmp / "default.db"
         shutil.copyfile(self.db_path, other)
         # The DEFAULT database still says kimi is off; the run's own says on.
@@ -270,6 +272,13 @@ class RestoreOnSwitchOnTests(ApplyBase):
         self.assertEqual(code, 0)
         self.assertEqual(payload["agents"]["restored_projects"], 3)
         self.assertEqual(self.enabled_names(self.proj), set(KIMI_DEFS))
+        # The restored files carry manifest entries (the enumeration
+        # delivered them), and nothing was silently skipped.
+        row = [p for p in payload["agents"]["projects"] if p["folder"] == str(self.proj)][0]
+        self.assertEqual(row["not_refreshed"], [])
+        files = {k.replace("\\", "/") for k in self.manifest(self.proj)["files"]}
+        for name in KIMI_DEFS:
+            self.assertIn(f".claude/agents/{name}", files)
 
     def test_a_user_parked_copy_is_never_restored_by_the_switch(self) -> None:
         # The user parked kimi-reviewer in project-b BEFORE the switch moved
@@ -354,11 +363,27 @@ class RestoreBringsTheShippedDefinitionTests(ApplyBase):
         self.assertEqual(enabled.read_text(encoding="utf-8"), self.OLD_K3)
         row = [p for p in payload["agents"]["projects"] if p["folder"] == str(self.proj)][0]
         self.assertEqual(row["refreshed"], [])
+        self.assertEqual(row["not_refreshed"], ["kimi-reviewer.md"])
         self.assertTrue(any("could not be written" in n for n in row["notes"]), row["notes"])
-        from vco_lib.hashing import sha256_file
-
+        # Review L2: NO manifest entry. Recording the on-disk hash would
+        # make the next update classify "overwrite" (installed == prior)
+        # and replace the user's edit with no backup — the one thing the
+        # adopt rule exists to prevent.
         files = {k.replace("\\", "/"): v for k, v in self.manifest(self.proj)["files"].items()}
-        self.assertEqual(files[".claude/agents/kimi-reviewer.md"]["sha256"], sha256_file(enabled))
+        self.assertNotIn(".claude/agents/kimi-reviewer.md", files)
+        # ... so the next Update bundle ADOPTS it (backup first): the same
+        # classification the engine gives a restored file it never recorded.
+        ops = [op for op in pi._enumerate_bundle_files(
+                   self.orch, project_root=self.proj,
+                   gate_verdict=mgd.GateVerdict(mgd.GateState.DELIVER, mgd.SIGNAL_MACHINE,
+                                                "test"),
+                   disabled_vendors=frozenset())
+               if op.dest_rel.replace("\\", "/") == ".claude/agents/kimi-reviewer.md"]
+        self.assertEqual(len(ops), 1)
+        action, _shipped = pi._file_action(
+            ops[0], enabled, update_mode=True, manifest=self.manifest(self.proj),
+            orchestrator_root=self.orch, project_root=self.proj)
+        self.assertEqual(action, "adopt")
 
 
 class BundleUpdateRaceTests(ApplyBase):

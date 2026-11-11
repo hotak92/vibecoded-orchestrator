@@ -28,6 +28,10 @@ pub(crate) struct RemovalPreview {
     pub files: Vec<String>,
     /// Files VCO shipped that the user changed: they would stay.
     pub files_kept_modified: Vec<String>,
+    /// `<rel> — <reason>` for what VCO would leave in place (its backups, a
+    /// linked folder, a setting a user may also have chosen) — review L8:
+    /// the preview used to drop these reasons.
+    pub kept: Vec<String>,
     /// Files whose VCO entries would be taken out (the files stay).
     pub settings_entries: Vec<String>,
     /// The project's own collections that would be dropped.
@@ -67,6 +71,7 @@ pub(crate) async fn removal_preview(
                     let fp = file_purge_from_reply(&reply);
                     p.files = fp.removed;
                     p.files_kept_modified = fp.kept_modified;
+                    p.kept = fp.kept;
                     p.settings_entries = fp.settings_removed;
                     p.notes.extend(fp.warnings);
                 }
@@ -83,6 +88,20 @@ pub(crate) async fn removal_preview(
                 "the folder {} no longer exists: only the registration goes",
                 row.folder_path
             ));
+        }
+        // Review L8: the removal also takes the per-project MCP opt-outs VCO
+        // wrote to ~/.claude.json — the preview names them (read before the
+        // row goes, exactly as the removal does).
+        match crate::commands::project_state_cmd::disabled_mcp_names(db, id) {
+            Ok(names) if !names.is_empty() => p.settings_entries.push(format!(
+                "the MCP opt-outs VCO wrote to ~/.claude.json: {}",
+                names.join(", ")
+            )),
+            Ok(_) => {}
+            Err(e) => p.notes.push(format!(
+                "could not read which MCP servers VCO disabled for this project: {}",
+                e
+            )),
         }
     }
     if opts.purge_collections {
@@ -116,7 +135,16 @@ pub(crate) fn render(p: &RemovalPreview) -> String {
     );
     list(&mut out, "These files and folders VCO put there would be removed:", &p.files);
     list(&mut out, "VCO's entries would be taken out of:", &p.settings_entries);
-    list(&mut out, "These you changed would stay:", &p.files_kept_modified);
+    // Review L8: the purge's kept reasons belong in the preview too.
+    list(&mut out, "These would stay, and why:", &p.kept);
+    // Review L8: a kept copy can be your edit OR an older VCO version that
+    // no template or git history proves VCO's (a parked copy on an install
+    // without history) — the label names both.
+    list(
+        &mut out,
+        "These you changed — or an older VCO version shipped — would stay:",
+        &p.files_kept_modified,
+    );
     if p.drops_collections {
         if p.collections.is_empty() {
             out.push_str("No Weaviate collection would be dropped.\n");
@@ -161,6 +189,10 @@ mod tests {
             folder: "/w/alpha".into(),
             files: vec![".claude/hooks/pre-tool-use.sh".into()],
             settings_entries: vec!["VCO's entries in .claude/settings.json".into()],
+            files_kept_modified: vec![".claude/agents/planner.md".into()],
+            kept: vec![".claude/backups/ — VCO's update backups hold your own earlier \
+                        versions of files"
+                .into()],
             collections: vec!["Alpha_KnowledgeGraph".into(), "Alpha_CodeFunction".into()],
             drops_collections: true,
             ..Default::default()
@@ -169,6 +201,10 @@ mod tests {
         assert!(text.contains("/w/alpha stays"));
         assert!(text.contains(".claude/hooks/pre-tool-use.sh"));
         assert!(text.contains("DROPPED") && text.contains("Alpha_KnowledgeGraph"));
+        // Review L8: the kept side is named with both reasons, never just
+        // "you changed".
+        assert!(text.contains("you changed — or an older VCO version shipped"));
+        assert!(text.contains("These would stay, and why:") && text.contains(".claude/backups/"));
         let kept = render(&RemovalPreview { drops_collections: false, ..p });
         assert!(kept.contains("collections are kept") && !kept.contains("DROPPED"));
     }

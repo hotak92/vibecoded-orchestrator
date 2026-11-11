@@ -431,7 +431,15 @@ def _strip_settings(run: _Run, templates: Optional[list[dict]]) -> None:
 
     def keep(cmd: Any) -> bool:
         name = vco_hook_script_identity(cmd) if isinstance(cmd, str) else None
-        return name is not None and (run.folder / ".claude" / "hooks" / name).exists()
+        if name is None:
+            return False
+        # A hook the purge removed keeps its registration; one that went (or,
+        # in a preview, WOULD go — ``run.removed`` holds both meanings) has
+        # its registration stripped too. A failed delete never reached
+        # ``run.removed`` (``_Run.delete`` records only a success), so the
+        # two answers agree.
+        return (run.folder / ".claude" / "hooks" / name).exists() \
+            and f".claude/hooks/{name}" not in run.removed
 
     if "hooks" in data:
         new_hooks, gone = strip_shipped_hooks(
@@ -458,6 +466,10 @@ def _strip_settings(run: _Run, templates: Optional[list[dict]]) -> None:
         return
     if not data:
         run.delete(path)
+        return
+    if run.dry_run:
+        # The preview (review L8): the entries are computed and named — and
+        # an emptied file recorded above — but nothing is rewritten.
         return
     text = jsonc_edit.dumps_preserving(raw, data, indent=2)
     if text is None:
@@ -567,6 +579,28 @@ def _prune(run: _Run) -> None:
         prune_now_empty_parents(run.folder, (run.folder / rel).parent)
 
 
+def _predict_claude_env_delete(run: _Run) -> None:
+    """The preview's ``.claude/env`` answer (review L8). In a real removal
+    the env strip runs BEFORE the purge and takes VCO's managed block out
+    whole; when nothing else is in the file it is left empty and
+    :func:`_purge_runtime` then deletes the file. The preview names that
+    deletion instead of omitting it. A file with anything outside the block
+    is left alone here — a line outside the block can still be VCO's, and
+    only the strip (with the projected values) can say."""
+    from vco_lib.unregister_env import _without_managed_block
+
+    path = run.folder / _CLAUDE_ENV_REL
+    if not path.is_file() or run.rel(path) in run.removed:
+        return
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    outside, _block = _without_managed_block(text)
+    if not outside.strip():
+        run.delete(path)
+
+
 def default_orchestrator_root() -> Path:
     """The checkout this ``vco_lib`` is imported from (an editable install)."""
     return Path(__file__).resolve().parents[1]
@@ -580,7 +614,10 @@ def purge_project_files(folder: Path, *, orchestrator_root: Optional[Path] = Non
     ``dry_run`` (v0.2.106, the terminal Remove's confirmation): nothing is
     changed; ``removed`` lists the files and folders the purge would remove,
     by the same evidence, and ``settings_removed`` names the files whose VCO
-    entries it would take out (the entries themselves are not computed)."""
+    entries it would take out. Review L8: the settings strip itself IS
+    computed (in memory, no rewrite), so the preview names the entries — and
+    a ``settings.json`` left as ``{}`` — exactly, and the ``.claude/env``
+    whose managed block is all it holds is named as deleted."""
     from vco_lib.paths import looks_like_orchestrator_root
     from vco_lib.project_init import _is_root_bundle_target
 
@@ -596,13 +633,15 @@ def purge_project_files(folder: Path, *, orchestrator_root: Optional[Path] = Non
         return _reply(run)
     manifest_may_go = _purge_shipped_files(run, root)
     if dry_run:
+        _strip_settings(run, _templates(root))  # records only (review L8)
         _purge_runtime(run)
+        _predict_claude_env_delete(run)
         from vco_lib.manifest_paths import manifest_path
         if manifest_may_go:
             run.delete(manifest_path(folder))
-        run.settings_removed = [
+        run.settings_removed += [
             f"VCO's entries in {rel}" for rel in
-            (_SETTINGS_REL, _VSCODE_SETTINGS_REL, ".git/info/exclude")
+            (_VSCODE_SETTINGS_REL, ".git/info/exclude")
             if (folder / rel).is_file()]
         return _reply(run)
     _strip_settings(run, _templates(root))

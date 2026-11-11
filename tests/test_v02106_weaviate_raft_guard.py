@@ -1023,3 +1023,109 @@ def test_every_new_condition_is_registered_with_its_lifecycle():
     assert deferral_registry.disposition_for(rg.CID_UPGRADE_REFUSED) == "action_required"
     assert deferral_registry.disposition_for(
         "lowercase_codegraph_residual_" + "myproject_codefunction") == "environmental"
+
+
+# ─── review L1: the settle wait's own bounds ─────────────────────────────
+
+
+def test_the_settle_wait_respects_the_probes_own_deadline(tmp_path, monkeypatch):
+    """Review L1: the wait used to ignore the doctor probe's per-check
+    deadline — 18 polls of 5 s (plus a statistics read each) against a
+    ``VCT_DOCTOR_CHECK_TIMEOUT_S`` below ~95 s, so a probe on an exposed
+    machine was cancelled inside the wait on EVERY run and the exposure was
+    never reported. The wait now ends within the remaining budget."""
+    import threading
+
+    from vco_lib import probe_bound
+
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    fake = SnapshottingWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"],
+                                log=7, snap=0, catch_up=10**6)
+    cancel = threading.Event()
+    # 20.5 s left: the margin (one poll + one slow read, 15 s) leaves one
+    # 5 s poll — never the 18 of the full window.
+    deadline = rg._monotonic() + 20.5
+    with probe_bound.bounded(deadline, cancel):
+        result = rg.scan(URL, root=tmp_path / "vibecoded-orchestrator", http=fake,
+                         settle_s=rg.SETTLE_S)
+    assert result is not None and result.exposed
+    assert fake.stat_reads == 1 + 1, fake.stat_reads
+
+
+def test_the_doctors_wait_says_what_it_waits_for(tmp_path, monkeypatch, capsys):
+    """Review L1: the doctor's scan (``default_scan``) passes a log, so the
+    up-to-90 s wait prints one line instead of pausing silently."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    fake = SnapshottingWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"],
+                                log=7, snap=0, catch_up=2)
+    monkeypatch.setattr(rg, "_default_http", fake)
+    monkeypatch.setattr(rg, "_weaviate_url", lambda: URL)
+    result = rg.default_scan(tmp_path / "vibecoded-orchestrator")
+    assert result is not None and not result.exposed
+    err = capsys.readouterr().err
+    assert "waiting" in err and "raft snapshot" in err
+
+
+def _recorded_root(tmp_path, *, name="vibecoded-orchestrator"):
+    """A fake install root whose deferral ledger carries the exposure entry."""
+    from vco_lib.deferral_emit import emit
+    from vco_lib.deferral_report import DeferralEntry
+
+    root = tmp_path / name
+    (root / ".claude" / "context").mkdir(parents=True)
+    entry = DeferralEntry(
+        condition_id=rg.CID_REPLAY_EXPOSED, title="t", detected="d", why_deferred="w",
+        command_to_apply="c",
+        dismiss_fields={"pairs": [["VibecodedOrchestrator_KnowledgeGraph",
+                                   "VibeCodedOrchestrator_KnowledgeGraph"]]})
+    assert emit(root, entry)
+    return root
+
+
+def test_an_install_already_recorded_exposed_does_not_wait_again(tmp_path, monkeypatch):
+    """Review L1: once the exposure stands in the install's ledger, every
+    doctor run and every update paid the 90 s wait again until the snapshot
+    settings were applied. A recorded exposure skips the wait — the entry
+    was emitted WITH it, and a snapshot that has since covered the log reads
+    clean without it."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    root = _recorded_root(tmp_path)
+    fake = SnapshottingWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"],
+                                log=7, snap=0, catch_up=10**6)
+    result = rg.scan(URL, root=root, http=fake, settle_s=rg.SETTLE_S)
+    assert result is not None and result.exposed
+    assert fake.stat_reads == 1, fake.stat_reads  # no settle poll at all
+    # ... and the snapshot that ends the condition still reads clean at once.
+    fake.snap = fake.log
+    assert not rg.scan(URL, root=root, http=fake, check_indexes=False).exposed
+
+
+def test_a_dismissal_of_the_same_exposure_skips_the_wait_but_not_of_another(
+        tmp_path, monkeypatch):
+    """Review L1: the wait also repeated after the entry was DISMISSED (the
+    dismissal suppresses the re-emit, so the wait re-confirms nothing). A
+    dismissal covering the SAME pairs skips the wait; one for a different
+    state does not — the pairs changed, so the alarm would be a fresh one."""
+    from vco_lib import deferral_dismissal as dd
+
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    root = tmp_path / "vibecoded-orchestrator"
+    root.mkdir(parents=True)
+    pairs = [["VibecodedOrchestrator_KnowledgeGraph", "VibeCodedOrchestrator_KnowledgeGraph"]]
+    assert dd.record_dismissal(root, rg.CID_REPLAY_EXPOSED, {"pairs": pairs})
+    fake = SnapshottingWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"],
+                                log=7, snap=0, catch_up=10**6)
+    result = rg.scan(URL, root=root, http=fake, settle_s=rg.SETTLE_S)
+    assert result is not None and result.exposed
+    assert fake.stat_reads == 1, fake.stat_reads
+
+    root2 = tmp_path / "vibecoded-orchestrator-2"
+    root2.mkdir()
+    assert dd.record_dismissal(root2, rg.CID_REPLAY_EXPOSED,
+                               {"pairs": [["Old_Development", "OLD_Development"]]})
+    fake2 = SnapshottingWeaviate(classes=["VibeCodedOrchestrator2_KnowledgeGraph"],
+                                 log=7, snap=0, catch_up=10**6)
+    result2 = rg.scan(URL, root=root2, http=fake2, settle_s=rg.SETTLE_S)
+    assert result2 is not None and result2.exposed
+    assert fake2.stat_reads == 1 + int(rg.SETTLE_S // rg.SETTLE_POLL_S), \
+        fake2.stat_reads  # a different state: the full wait ran

@@ -752,26 +752,75 @@ def recorded_names(root: Optional[Path], url: str) -> dict[str, Optional[int]]:
 SETTLE_S = 90.0
 SETTLE_POLL_S = 5.0
 
+#: One settle poll's worst case: the poll sleep plus one slow statistics
+#: read (:func:`_get_json` defaults to 10 s). The wait ends at least this
+#: far ahead of the doctor probe's own deadline (review L1).
+SETTLE_MARGIN_S = SETTLE_POLL_S + 10.0
+
 
 def _settle(result: RaftScan, url: str, http: Optional[HttpFn], settle_s: float,
             log: Optional[LogFn]) -> None:
     """Re-read the raft statistics until the scan is no longer exposed or
     *settle_s* has passed (counted in polls, so a test's no-op sleep stays
-    deterministic). Stops early under a cancelled doctor probe."""
+    deterministic). Stops early under a cancelled doctor probe.
+
+    Review L1: the wait never outlives the probe's OWN bound — the doctor
+    gives each probe a deadline (:func:`vco_lib.probe_bound.deadline`); a
+    settle that ignores it is why a probe with a short bound (a low
+    ``VCT_DOCTOR_CHECK_TIMEOUT_S``, or slow statistics reads) overruns and
+    reports "not checked" instead of the exposure it saw. The wait is capped
+    at the remaining budget minus one poll's worst case (a poll plus a slow
+    statistics read, :data:`SETTLE_MARGIN_S`); an exposed reading that runs
+    out of budget stands as the verdict, as it did before the settle
+    existed."""
     from vco_lib import probe_bound  # noqa: PLC0415
 
     polls = int(settle_s // SETTLE_POLL_S) if settle_s > 0 else 0
+    deadline = probe_bound.deadline()
+    if deadline is not None:
+        budget = deadline - _monotonic() - SETTLE_MARGIN_S
+        polls = min(polls, max(0, int(budget // SETTLE_POLL_S)))
     said = False
     while polls > 0 and result.exposed and not probe_bound.cancelled():
         if log is not None and not said:
             said = True
-            log(f"waiting up to {int(settle_s)} s for Weaviate's next raft snapshot "
-                "(the shipped settings take one within a minute) ...")
+            log(f"waiting up to {int(polls * SETTLE_POLL_S)} s for Weaviate's next raft "
+                "snapshot (the shipped settings take one within a minute) ...")
         _sleep(SETTLE_POLL_S)
         polls -= 1
         stats = read_raft_stats(url, http=http)
         if stats is not None:
             result.stats = stats
+
+
+def _exposure_already_recorded(root: Optional[Path], result: "RaftScan") -> bool:
+    """Review L1: True when the install rooted at *root* already RECORDS the
+    exposure this reading shows — a ``weaviate_raft_replay_exposed`` entry in
+    its deferral ledger, or a dismissal of that entry that still covers the
+    same case-variant pairs. The settle wait exists to keep a FRESH false
+    alarm down; neither case can raise one (a standing entry was emitted with
+    the wait, a suppressed re-emit never reaches the ledger), and a snapshot
+    that has since covered the log reads clean without the wait and clears
+    the entry — so the wait would only make every doctor run and every
+    update pay :data:`SETTLE_S` again while the condition stands. Best
+    effort: an unreadable ledger or dismissal store settles as before."""
+    if root is None or not result.exposed:
+        return False
+    try:
+        from vco_lib.deferral_report import DeferralReport  # noqa: PLC0415
+
+        if DeferralReport.read(Path(root)).has_condition(CID_REPLAY_EXPOSED):
+            return True
+    except Exception:  # noqa: BLE001 — an unreadable ledger settles as before
+        pass
+    try:
+        from vco_lib import deferral_dismissal as _dd  # noqa: PLC0415
+
+        return _dd.dismissal_suppresses(
+            Path(root), CID_REPLAY_EXPOSED,
+            {"pairs": [list(p) for p in result.case_pairs]})
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def scan(url: str, *, root: Optional[Path] = None, http: Optional[HttpFn] = None,
@@ -790,7 +839,11 @@ def scan(url: str, *, root: Optional[Path] = None, http: Optional[HttpFn] = None
     snapshot before it stands (:data:`SETTLE_S`, review H1). Every bound and
     recorded index keeps its meaning — the wait only gives a Weaviate that
     takes snapshots the time to take one, so "exposed" means no snapshot
-    covering the delete came, not "the reading was taken too early"."""
+    covering the delete came, not "the reading was taken too early". Two
+    bounds keep the wait honest (review L1): it never outlives the doctor
+    probe's own deadline (:func:`_settle`), and it does not run at all on an
+    install whose ledger already records the exposure (or whose dismissal of
+    it covers the same pairs) — :func:`_exposure_already_recorded`."""
     from vco_lib import weaviate_helpers as _wh  # noqa: PLC0415
 
     schema = _get_json(f"{url.rstrip('/')}/v1/schema", http)
@@ -810,7 +863,8 @@ def scan(url: str, *, root: Optional[Path] = None, http: Optional[HttpFn] = None
             result.recorded_index.update(_wch.delete_index_bounds(
                 url, unknown, result.stats.last_log_index))
         if has_orphan_drop(result.version):
-            _settle(result, url, http, settle_s, log)
+            wait = 0.0 if _exposure_already_recorded(root, result) else settle_s
+            _settle(result, url, http, wait, log)
     if check_indexes:
         live = sorted({b for _a, b in result.case_pairs})
         result.index_missing = [c for c in live if index_missing(url, c, http=http) is True]
@@ -1088,8 +1142,13 @@ def default_mem_cap() -> Optional[tuple[MemCap, str, Optional[str]]]:
 
 
 def default_scan(folder: Path) -> Optional[RaftScan]:
+    """The doctor probe's scan: the settle window (:data:`SETTLE_S`) with a
+    stderr line while it waits (review L1 — the wait used to be silent, so a
+    doctor run or an update's doctor phase paused up to 90 s without a
+    word)."""
     try:
-        return scan(_weaviate_url(), root=Path(folder), settle_s=SETTLE_S)
+        return scan(_weaviate_url(), root=Path(folder), settle_s=SETTLE_S,
+                    log=lambda m: print(m, file=sys.stderr))
     except Exception:  # noqa: BLE001 — could not look is not a verdict
         return None
 

@@ -222,21 +222,37 @@ def registered_for(checker_name: str, tool_name: str, project_root: str) -> Opti
     migration leaves a mixed group alone) and a hook disabled in the launcher
     (its registration is removed). Without this read each ``.py`` Edit there
     started a poller that waited the whole window for a record no hook writes
-    and logged ``no_signal/timeout``."""
+    and logged ``no_signal/timeout``.
+
+    Review L3: the files are JSONC (comments are supported everywhere VCO
+    reads settings), so the read goes through :mod:`vco_lib.jsonc_edit` —
+    with strict ``json.loads`` a commented ``settings.json`` was silently
+    SKIPPED and a readable ``settings.local.json`` (VCO writes one in every
+    project) then answered ``False``, turning every checked edit into
+    ``no_signal/no_checker``. An EXISTING file that cannot be parsed answers
+    ``None`` (keep the table's answer): skipping it and answering ``False``
+    from another file is how the regression read."""
     from vco_lib.hook_retirements import vco_hook_script_identity  # noqa: PLC0415
+    from vco_lib.jsonc_edit import load_object  # noqa: PLC0415
 
     checker = next((c for c in CHECKERS if c.name == checker_name), None)
     if checker is None:
         return False
     read_any = False
+    unreadable = False
     for leaf in _SETTINGS_FILES:
-        try:
-            data = json.loads((Path(project_root) / ".claude" / leaf).read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        path = Path(project_root) / ".claude" / leaf
+        if not path.is_file():
             continue
-        except (OSError, ValueError):
+        try:
+            loaded = load_object(path)
+        except Exception:  # noqa: BLE001 — treated as unparseable below
+            loaded = None
+        if loaded is None:
+            unreadable = True
             continue
         read_any = True
+        data, _raw = loaded
         groups = ((data.get("hooks") or {}).get("PostToolUse") or []) \
             if isinstance(data, dict) and isinstance(data.get("hooks"), dict) else []
         for group in groups if isinstance(groups, list) else []:
@@ -246,6 +262,8 @@ def registered_for(checker_name: str, tool_name: str, project_root: str) -> Opti
                 cmd = hook.get("command") if isinstance(hook, dict) else None
                 if isinstance(cmd, str) and vco_hook_script_identity(cmd) in checker.scripts:
                     return True
+    if unreadable:
+        return None
     return False if read_any else None
 
 

@@ -55,6 +55,11 @@ def _purge(folder: Path) -> dict:
     return unregister_files.purge_project_files(folder, orchestrator_root=REPO_ROOT)
 
 
+def _preview(folder: Path) -> dict:
+    return unregister_files.purge_project_files(folder, orchestrator_root=REPO_ROOT,
+                                                dry_run=True)
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
     folder = tmp_path / "my-project"
@@ -349,6 +354,21 @@ def test_an_unreadable_registry_drops_nothing_and_says_so():
     assert plan.notes
 
 
+def test_the_printed_drop_command_quotes_the_name_for_the_users_shell(monkeypatch):
+    """Review L8 nit: the note's command is pasted into the user's shell —
+    ``shlex.quote`` is POSIX, so on Windows a name with a space printed that
+    way is a form cmd.exe does not accept."""
+    import sys
+
+    assert unregister_collections._printed_name("My Project") == "'My Project'"
+    assert unregister_collections._printed_name("Acme") == "Acme"
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert unregister_collections._printed_name("My Project") == '"My Project"'
+    assert unregister_collections._printed_name("Acme") == "Acme"
+    # a name cmd cannot quote is printed bare, never POSIX-escaped
+    assert unregister_collections._printed_name('say "hi"') == 'say "hi"'
+
+
 def test_without_an_id_the_name_derived_set_is_dropped():
     plan = unregister_collections.plan_drop("Acme")
     assert plan.targets[:2] == ["Acme_KnowledgeGraph", "Acme_Development"]
@@ -568,6 +588,76 @@ def jsonc_load(path: Path) -> dict:
 
 def _manifest_files(folder: Path) -> dict:
     return json.loads((folder / ".claude" / ".vco-manifest.json").read_text())["files"]
+
+
+# ── the dry-run preview (review L8) ──────────────────────────────────────
+
+
+def test_the_preview_names_a_settings_file_it_would_empty_and_its_entries(
+        project: Path):
+    """Review L8: the removal deletes ``.claude/settings.json`` when only
+    VCO's entries were in it, but the preview never said so — it printed
+    one generic "VCO's entries in …" line and no deletion. The dry-run now
+    computes the strip (in memory; nothing is rewritten), names the
+    entries, and names the emptied file as removed."""
+    _ship(project, {})
+    (project / ".claude" / "settings.json").write_text(json.dumps({
+        "_comment": TEMPLATE["_comment"],
+        "hooks": TEMPLATE["hooks"],
+    }))
+    reply = _preview(project)
+    assert not reply["errors"], reply
+    assert ".claude/settings.json" in reply["removed"]
+    assert any(s.startswith("hooks:") for s in reply["settings_removed"])
+    assert "_comment" in reply["settings_removed"]
+    # Nothing was changed: the file is still there, byte for byte.
+    assert json.loads((project / ".claude" / "settings.json").read_text())["hooks"]
+
+
+def test_the_preview_keeps_a_settings_file_with_the_users_own_entries(
+        project: Path):
+    """The strip runs in the preview against the WOULD-BE-removed hooks: a
+    settings.json whose only extra content is the user's own hook
+    registration stays (the purge would rewrite it, not delete it)."""
+    hook = b"#!/bin/sh\nexit 0\n"
+    _ship(project, {".claude/hooks/pre-tool-use.sh": hook})
+    settings = {"hooks": json.loads(json.dumps(TEMPLATE["hooks"]))}
+    settings["hooks"].setdefault("PostToolUse", []).append(
+        {"matcher": "*", "hooks": [{"type": "command", "command": "my-linter"}]})
+    (project / ".claude" / "settings.json").write_text(json.dumps(settings))
+    reply = _preview(project)
+    assert not reply["errors"], reply
+    assert ".claude/hooks/pre-tool-use.sh" in reply["removed"]
+    assert ".claude/settings.json" not in reply["removed"]
+    assert any(s.startswith("hooks:") for s in reply["settings_removed"])
+
+
+def test_the_preview_names_a_claude_env_holding_only_vcos_block(project: Path):
+    """Review L8: the removal deletes ``.claude/env`` once the env strip
+    empties it; the preview names that when the managed block is all the
+    file holds."""
+    from vco_lib import config_projection as cp
+
+    _ship(project, {})
+    env = project / ".claude" / "env"
+    env.write_text(
+        f"{cp.CLAUDE_ENV_MANAGED_BEGIN}\nKG_COLLECTION=X_KG\n{cp.CLAUDE_ENV_MANAGED_END}\n")
+    reply = _preview(project)
+    assert ".claude/env" in reply["removed"]
+    assert env.is_file(), "a preview changes nothing"
+
+
+def test_the_preview_does_not_name_a_claude_env_with_the_users_lines(
+        project: Path):
+    from vco_lib import config_projection as cp
+
+    _ship(project, {})
+    env = project / ".claude" / "env"
+    env.write_text(
+        f"{cp.CLAUDE_ENV_MANAGED_BEGIN}\nKG_COLLECTION=X_KG\n"
+        f"{cp.CLAUDE_ENV_MANAGED_END}\nMY_OWN_KEY=1\n")
+    reply = _preview(project)
+    assert ".claude/env" not in reply["removed"]
 
 
 @pytest.mark.parametrize("user_edits_a_file", [False, True])

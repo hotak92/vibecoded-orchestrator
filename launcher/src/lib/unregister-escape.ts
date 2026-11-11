@@ -137,7 +137,12 @@ export function describeUnregisterReport(
     : `${verb} "${report.projectName}"`;
   const details: string[] = [];
   if (report.filesKeptModified.length > 0) {
-    details.push(`Kept because you changed them: ${names(report.filesKeptModified)}`);
+    // v0.2.106 review L8: a kept copy can also be an older VCO version that
+    // no template or git history proves VCO's (e.g. a parked copy on a
+    // tarball install) — the label names both, never just "you changed".
+    details.push(
+      `Kept because you changed them or an older VCO version shipped them: ${names(report.filesKeptModified)}`,
+    );
   }
   if (report.keptAsYours.length > 0) {
     details.push(`Left in place: ${names(report.keptAsYours)}`);

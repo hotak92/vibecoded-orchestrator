@@ -4834,6 +4834,11 @@ impl Default for UnregisterOptions {
 /// they just stay empty. The UI relies on `len()` to decide whether to
 /// surface a section in the toast.
 #[derive(Debug, Clone, Serialize, Default)]
+// camelCase: the hub reads this report's id as `projectId`
+// (vct_launcher_core::removal_report::REMOVAL_REPORT_PROJECT_ID_KEY, the ONE
+// spelling both sides share — v0.2.106 review H1). MUST MATCH that constant;
+// `the_report_names_its_project_id_in_camel_case` pins it against the real
+// serialization.
 #[serde(rename_all = "camelCase")]
 pub struct UnregisterReport {
     pub project_id: String,
@@ -6284,6 +6289,35 @@ pub(crate) fn is_orchestrator_root_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── v0.2.106 (review H1): the removal report's wire shape ────────────
+
+    /// The hub (`vct-hub cli_api`) decides a delegated removal succeeded by
+    /// reading the project id out of this struct's JSON. Both sides spell
+    /// the key through ONE constant; this test proves the REAL serialization
+    /// carries it (a rename of the field or the serde rule fails here and in
+    /// the hub at once, never silently).
+    #[test]
+    fn the_report_names_its_project_id_in_camel_case() {
+        let report = UnregisterReport {
+            project_id: "p1".to_string(),
+            project_name: "Alpha".to_string(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(
+            value[vct_launcher_core::removal_report::REMOVAL_REPORT_PROJECT_ID_KEY],
+            serde_json::json!("p1"),
+            "the hub reads the id under this exact key: {}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
+        // The snake-case spelling must NOT appear — a reader written against
+        // it (the v0.2.106 H1 bug) sees no report at all.
+        assert!(value.get("project_id").is_none());
+        // And the GUI's mirror keys stay camelCase too (it reads filesPurged).
+        assert!(value.get("filesPurged").is_some());
+        assert!(value.get("files_purged").is_none());
+    }
 
     // ─── v0.2.97: bundle_materialization registry write (act + soft-fail) ─
 

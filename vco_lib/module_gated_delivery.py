@@ -1025,6 +1025,7 @@ def refresh_restored_agents(
     verdict: Optional[GateVerdict] = None,
     log: Optional[Callable[[str], None]] = None,
     reach_hint: Optional[Mapping[str, tuple[bool, str]]] = None,
+    disabled_vendors: Optional[Iterable[str]] = None,
 ) -> dict[str, dict[str, Any]]:
     """Bring definitions :func:`restore_parked_agents` just moved back to the
     bytes THIS release ships, the way a bundle update does (v0.2.106 review
@@ -1040,17 +1041,25 @@ def refresh_restored_agents(
     dropped the entry — and an ``adopt`` goes through
     :func:`vco_lib.bundle_backup.adopt_write` (the current bytes backed up
     under ``.claude/backups/bundle-adoptions/<ts>/`` first). A backup that
-    cannot be written leaves the file as it is (the engine's preserve
-    fallback); the next Update bundle classifies it again and reports it.
+    cannot be written leaves the file as it is AND NO MANIFEST ENTRY (review
+    L2): recording the on-disk hash would make the next update classify
+    "overwrite" (installed == prior) and replace the user's edit with no
+    backup; with no entry the update ADOPTS (backup first) or preserves
+    with its deferral. The same holds for any other left-as-it-was action.
+
+    *disabled_vendors* (review L5): the run's OWN off-list, threaded into
+    the enumeration so it cannot read the DEFAULT database's instead (a
+    ``--db-path`` run whose database says "on" while the default says "off"
+    would hold the vendor's files, match no op and silently skip them).
 
     Returns ``{dest_rel: {"action", "sha256", "source", "backup"}}`` for
-    every restored file it could classify; ``sha256`` is what the manifest
-    records (the shipped hash once the shipped bytes are on disk, the
-    on-disk hash for a file left as it was). Never raises.
+    every restored file it BROUGHT TO THIS RELEASE'S BYTES or found current;
+    a file left as it was gets NO entry, so the caller records nothing for
+    it either. Never raises.
     """
     from vco_lib import bundle_backup as _bb
     from vco_lib import project_init as _pi
-    from vco_lib.hashing import sha256_bytes, sha256_file
+    from vco_lib.hashing import sha256_bytes
     from vco_lib.paths import to_posix_rel
 
     by_posix = {to_posix_rel(r): r for r in restored}
@@ -1061,7 +1070,8 @@ def refresh_restored_agents(
     try:
         ops = [op for op in _pi._enumerate_bundle_files(
                    Path(orchestrator_root), project_root=Path(folder),
-                   gate_verdict=verdict, gate_reach=reach_hint)
+                   gate_verdict=verdict, gate_reach=reach_hint,
+                   disabled_vendors=disabled_vendors)
                if to_posix_rel(op.dest_rel) in by_posix]
     except Exception as exc:  # noqa: BLE001 — the restore already happened
         say(f"the restored definitions could not be compared with this release's "
@@ -1088,21 +1098,35 @@ def refresh_restored_agents(
                     entry["backup"], _redirect = _bb.adopt_write(
                         folder, rel, target, shipped, ts)
                 except _bb.AdoptionBackupFailed as exc:
-                    entry["action"] = "preserve"
-                    entry["sha256"] = sha256_file(target)
+                    # Review L2: no entry (see the docstring) — the next
+                    # update adopts with a backup instead of overwriting
+                    # blind.
                     say(f"{rel}: differs from this release's definition and its backup "
                         f"could not be written ({exc}); left as it is — run Update "
                         "bundle once the backup folder is writable")
+                    continue
                 else:
                     say(f"{rel}: brought to this release's definition; the restored "
                         f"copy is backed up at {entry['backup']}")
             elif action != "noop":
-                entry["sha256"] = sha256_file(target)
+                # preserve / keep-regenerated / skip-existing / skip-disabled:
+                # the file was left as it was — no entry (review L2, same
+                # reason as the backup-failed adopt).
+                say(f"{rel}: left as it is ({action}) — the next Update bundle "
+                    "classifies it again")
+                continue
         except Exception as exc:  # noqa: BLE001 — one file, one note
             say(f"{rel}: could not be brought to this release's definition "
                 f"({type(exc).__name__}: {exc}); run Update bundle to refresh it")
             continue
         out[rel] = entry
+    # Review L5: a restored file no op covered (held by the enumeration, or
+    # the vendor on the off-list the enumeration read) is named, never
+    # silently skipped.
+    for posix, rel in sorted(by_posix.items()):
+        if posix not in {to_posix_rel(op.dest_rel) for op in ops}:
+            say(f"{rel}: restored but no delivery op covers it, so it stays as it "
+                "is — the next Update bundle classifies it")
     return out
 
 

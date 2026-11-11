@@ -168,7 +168,9 @@ describe('ProjectRemoveFlow — the shared confirm dialog', () => {
     await vi.waitFor(() => expect(yes()).toBeNull());
     const all = toasts.map((t) => t.message).join('\n');
     expect(all).toContain('1 files you changed kept');
-    expect(all).toContain('Kept because you changed them: .claude/agents/planner.md');
+    expect(all).toContain(
+      'Kept because you changed them or an older VCO version shipped them: .claude/agents/planner.md',
+    );
     expect(all).toContain('Left in place: .claude/backups/');
     expect(all).toContain("VCO's entries removed from files that stay: hooks: 3 registration(s)");
     unsub();

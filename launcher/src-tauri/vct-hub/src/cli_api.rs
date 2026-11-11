@@ -291,13 +291,20 @@ async fn rename_project(
 }
 
 /// `DELETE /cli/projects/{id|slug}` options — the terminal form's flags
-/// (`vct-launcher --remove-project --keep-collections / --leave-unremovable`).
+/// (`vct-launcher --remove-project --keep-collections / --leave-unremovable`)
+/// plus `confirm`: the caller's proof it asked first (review L7).
 #[derive(Deserialize, Default)]
 struct DeleteProjectQuery {
     #[serde(default)]
     keep_collections: bool,
     #[serde(default)]
     leave_unremovable: bool,
+    /// Owner ruling 2026-11-11 ("never a silent drop"): a removal that DROPS
+    /// the project's collections runs only when the request carries
+    /// `confirm=true` — `vct-cli project delete` sends it after the y/N
+    /// answer or `--yes`. `keep_collections` needs no confirmation.
+    #[serde(default)]
+    confirm: bool,
 }
 
 /// How long one removal may run: it purges the folder and, by default, drops
@@ -420,7 +427,15 @@ fn run_remove_project(
         Some(0) => {
             let report = serde_json::from_slice::<serde_json::Value>(&out.stdout)
                 .unwrap_or(serde_json::Value::Null);
-            if report.get("project_id").and_then(|v| v.as_str()) != Some(project_id) {
+            // The report's `UnregisterReport` serializes camelCase: its id is
+            // `projectId` (v0.2.106 review H1 — reading `project_id` here
+            // answered 502 for every removal that worked). The key name is
+            // shared with the launcher crate's wire test, never hand-spelled.
+            if report
+                .get(vct_launcher_core::removal_report::REMOVAL_REPORT_PROJECT_ID_KEY)
+                .and_then(|v| v.as_str())
+                != Some(project_id)
+            {
                 return (
                     StatusCode::BAD_GATEWAY,
                     serde_json::json!({
@@ -492,6 +507,25 @@ async fn delete_project(
             Json(serde_json::json!({
                 "ok": false,
                 "error": "the orchestrator's own project cannot be removed: its .claude/ is the live install",
+            })),
+        )
+            .into_response();
+    }
+    // Review L7 + owner ruling 2026-11-11 ("never a silent drop"): a removal
+    // that would DROP the project's collections runs only with `confirm=true`
+    // — `vct-cli` sends it after the y/N answer or `--yes`; an older client
+    // or a script holding the hub token gets a 4xx, never the destructive
+    // default. `keep_collections=true` drops nothing and needs no
+    // confirmation.
+    if !q.keep_collections && !q.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "confirm_required": true,
+                "error": "this removal drops the project's Weaviate collections; resend with \
+                          confirm=true to confirm the drop (vct-cli sends it after a y answer or \
+                          --yes), or with keep_collections=true to keep them. Nothing was changed.",
             })),
         )
             .into_response();
@@ -3723,7 +3757,8 @@ mod remove_project_delegation_tests {
     fn the_flags_reach_the_launchers_argv() {
         let none = DeleteProjectQuery::default();
         assert_eq!(remove_project_argv("p1", &none), vec!["--remove-project", "p1", "--yes"]);
-        let both = DeleteProjectQuery { keep_collections: true, leave_unremovable: true };
+        let both =
+            DeleteProjectQuery { keep_collections: true, leave_unremovable: true, confirm: true };
         assert_eq!(
             remove_project_argv("p1", &both),
             vec!["--remove-project", "p1", "--keep-collections", "--leave-unremovable", "--yes"]
@@ -3779,17 +3814,45 @@ mod remove_project_delegation_tests {
         bin
     }
 
+    /// What `vct-launcher --remove-project` really prints on success: the
+    /// `UnregisterReport` serializes camelCase (`projectId`, not
+    /// `project_id`) — the wire shape the launcher crate's
+    /// `the_report_names_its_project_id_in_camel_case` pins against a REAL
+    /// struct. The fake launcher must print THIS shape, or the exit contract
+    /// is tested against a report no launcher ever emits (review H1).
+    #[cfg(unix)]
+    fn real_report_shape(project_id: &str) -> String {
+        serde_json::json!({
+            "projectId": project_id,
+            "projectName": "Alpha",
+            "filesPurged": [".claude/hooks/pre-tool-use.sh"],
+            "filesKeptModified": [],
+            "keptAsYours": [],
+            "settingsEntriesRemoved": ["hooks: 3 registration(s) VCO shipped"],
+            "keysPurgedFromEnv": ["KG_COLLECTION"],
+            "collectionsDropped": ["Alpha_KnowledgeGraph"],
+            "leftInPlace": [],
+            "leftoversNote": null,
+            "warnings": []
+        })
+        .to_string()
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_exit_contract_maps_to_http_answers() {
         let tmp = tempfile::tempdir().unwrap();
         let argv = remove_project_argv("p1", &DeleteProjectQuery::default());
 
-        let ok = fake_launcher(tmp.path(), "ok", 0, r#"{"project_id":"p1"}"#);
+        let ok = fake_launcher(tmp.path(), "ok", 0, &real_report_shape("p1"));
         let (status, body) = run_remove_project(&ok, &argv, "p1");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
-        assert_eq!(body["report"]["project_id"], "p1");
+        assert_eq!(
+            body["report"][vct_launcher_core::removal_report::REMOVAL_REPORT_PROJECT_ID_KEY],
+            "p1"
+        );
+        assert_eq!(body["report"]["collectionsDropped"][0], "Alpha_KnowledgeGraph");
         let logged = std::fs::read_to_string(tmp.path().join("argv.log")).unwrap();
         assert_eq!(logged, "--remove-project\np1\n--yes\n");
 
@@ -3798,7 +3861,7 @@ mod remove_project_delegation_tests {
         let (status, body) = run_remove_project(&silent, &argv, "p1");
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["ok"], false);
-        let other = fake_launcher(tmp.path(), "other", 0, r#"{"project_id":"p2"}"#);
+        let other = fake_launcher(tmp.path(), "other", 0, &real_report_shape("p2"));
         assert_eq!(run_remove_project(&other, &argv, "p1").0, StatusCode::BAD_GATEWAY);
 
         let stopped = fake_launcher(tmp.path(), "stopped", 2, "");
@@ -3845,11 +3908,53 @@ mod remove_project_delegation_tests {
         let db = Arc::new(db);
         let base = spawn(db.clone()).await;
         let r = reqwest::Client::new()
-            .delete(format!("{}/cli/projects/p1", base))
+            .delete(format!("{}/cli/projects/p1?confirm=true", base))
             .send()
             .await
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert!(db.get_project("p1").unwrap().is_some(), "the row must stay");
+    }
+
+    /// Review L7 + owner ruling 2026-11-11 ("never a silent drop"): a DELETE
+    /// that would drop the collections without `confirm=true` is refused
+    /// before anything runs — an older vct-cli or a script holding the hub
+    /// token gets a 4xx, never the destructive default. `keep_collections`
+    /// needs no confirmation, and a confirmed request passes the gate (it
+    /// then meets the next refusal: no launcher beside a test binary).
+    #[tokio::test]
+    async fn a_removal_that_drops_collections_needs_the_caller_confirm() {
+        if launcher_beside_hub().is_some() {
+            return; // a build tree that happens to carry one: see the 503 arms below
+        }
+        let db = Db::open_in_memory().expect("db");
+        db.insert_project("p1", "Alpha", "/w/p1", ProjectHost::Base, "alpha").unwrap();
+        let db = Arc::new(db);
+        let base = spawn(db.clone()).await;
+        let client = reqwest::Client::new();
+
+        let r = client.delete(format!("{}/cli/projects/p1", base)).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["confirm_required"], true);
+        assert!(db.get_project("p1").unwrap().is_some(), "nothing was removed");
+
+        // keep_collections drops nothing: no confirmation needed (the request
+        // passes the confirm gate and meets the no-launcher refusal).
+        let r = client
+            .delete(format!("{}/cli/projects/p1?keep_collections=true", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        // An explicit confirm passes the gate the same way.
+        let r = client
+            .delete(format!("{}/cli/projects/p1?confirm=true", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(db.get_project("p1").unwrap().is_some(), "still nothing removed");
     }
 }
