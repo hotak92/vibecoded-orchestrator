@@ -316,6 +316,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a failure. A real analyzer failure is still reported failed. If the launcher's background service is older than
   this release and does not know "skipped" yet, the entry says "failed" with the same reason instead of "died".
 
+- **The RL citation drain no longer re-embeds the same chat text for every retrieval, and its chunks fit the
+  embedding model.** A field report from a CPU-only machine showed an embedding burst about every 30 minutes of work,
+  each leaving a "shrink" row of 90-190k characters in `embedding_failures.jsonl`. The source is the Stop-hook
+  citation drain, which embeds the up to 25 000-token answer window that follows each staged retrieval. It chunked
+  that window with the knowledge-graph chunker, whose chunks are sized for prose and so were refused by the model on
+  tool-call and code text and retried shorter (the tail of each chunk was lost), and whose boundaries depend on where
+  the window starts, so the overlapping windows of one chat never shared a chunk and the same text was embedded once
+  per retrieval (one run on a test machine embedded 44 windows). The answer window now has its own chunker: chunks
+  are sized to the model's window for dense text, and their boundaries are chosen by the content itself, so
+  overlapping windows produce the same chunks and the embed cache reuses them. The second-model embedding of a
+  dual-model citation is cached the same way. In a 40-retrieval test the text sent to the model drops by about two
+  thirds, and no chunk exceeds the model window. The citation drain is unrelated to v0.2.105's commit, merge and
+  pull catch-up for the code graph, which embeds only changed code and skips unchanged entries.
+
 ## [0.2.105] - 2026-10-30
 
 ### Added

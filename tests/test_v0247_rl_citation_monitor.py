@@ -13,7 +13,7 @@ Two functions under test:
    literal_cited, runs the unified-target formula, and writes the
    citation event via the centralized ``RLTelemetryWriter``.
 
-For (2) we mock ``Chunker.for_model``, ``_get_embedding_service``, and
+For (2) we mock the answer chunker (``answer_chunking.chunk_answer_window``), ``_get_embedding_service``, and
 ``_get_rl_telemetry_writer`` so the test exercises the orchestration
 logic without standing up real Ollama / Weaviate / launcher-hub stacks.
 """
@@ -102,7 +102,7 @@ def _fake_chunk(text: str) -> SimpleNamespace:
 
 
 class _FakeChunker:
-    """Stand-in for ``Chunker.for_model(...)``. Splits on newline."""
+    """Stand-in for the answer chunker. Splits on newline."""
 
     def chunk_text(self, text: str, source_id: str = "") -> list:
         return [_fake_chunk(p) for p in text.split("\n") if p.strip()]
@@ -133,14 +133,22 @@ class _FakeTelemetryWriter:
         self.calls.append(dict(kwargs))
 
 
+def _patch_answer_chunker(chunker):
+    """Route ``citation_compute``'s answer chunker through ``chunker``."""
+    def _chunks(answer, model):
+        return [c.content for c in chunker.chunk_text(answer, source_id="")]
+
+    return patch(
+        "claude_mcp_servers.rl_client.answer_chunking.chunk_answer_window",
+        side_effect=_chunks,
+    )
+
+
 def _patch_helpers(svc, writer, chunker=None):
     """Patch the four module-level seams in one place."""
     chunker = chunker or _FakeChunker()
     return (
-        patch(
-            "claude_mcp_servers.weaviate_mcp.server.Chunker.for_model",
-            return_value=chunker,
-        ),
+        _patch_answer_chunker(chunker),
         patch(
             "claude_mcp_servers.weaviate_mcp.server._get_embedding_service",
             return_value=svc,
@@ -218,10 +226,7 @@ class TestComputeAndWriteCitations:
             "nodes": [{"title": "A", "n_emb": [1.0, 0.0]}],
         }
         # _get_embedding_service returns None — service unavailable.
-        p1 = patch(
-            "claude_mcp_servers.weaviate_mcp.server.Chunker.for_model",
-            return_value=_FakeChunker(),
-        )
+        p1 = _patch_answer_chunker(_FakeChunker())
         p2 = patch(
             "claude_mcp_servers.weaviate_mcp.server._get_embedding_service",
             return_value=None,
@@ -314,10 +319,7 @@ class TestComputeAndWriteCitations:
             "active_model": "qwen3-embedding:0.6b",
             "nodes": [{"title": "A", "n_emb": [1.0, 0.0]}],
         }
-        p1 = patch(
-            "claude_mcp_servers.weaviate_mcp.server.Chunker.for_model",
-            return_value=_FakeChunker(),
-        )
+        p1 = _patch_answer_chunker(_FakeChunker())
         p2 = patch(
             "claude_mcp_servers.weaviate_mcp.server._get_embedding_service",
             return_value=svc,

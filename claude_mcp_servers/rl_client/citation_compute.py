@@ -11,7 +11,7 @@ citation event and write it." Called by BOTH:
 
 Honours the modularity ruling (one concern, one home) + the
 >50-lines-to-a->5k-line-file extraction rule (server.py is ~8k lines). The
-server.py-local primitives this depends on (``Chunker``, the embedding service,
+server.py-local primitives this depends on (the embedding service,
 ``_cosine``, ``_rl_is_literal_cited``, the telemetry writer) are reached via a
 lazy import of ``weaviate_mcp.server`` at call time — the same defensible
 dependency direction ``search_pipeline.py`` uses (this module lives in
@@ -31,6 +31,8 @@ import hashlib
 import logging
 from typing import Optional
 
+from claude_mcp_servers.rl_client import answer_chunking
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["compute_citation", "CitationResult"]
@@ -48,6 +50,22 @@ def _answer_chunk_hash(text: str) -> str:
     one-way, so nothing reconstructs the answer from it.
     """
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+#: Per-process memo for OTHER-slot answer-chunk vectors (v0.2.106). The active
+#: slot's ``EmbeddingService.embed_text`` / ``embed_code`` already memoise per
+#: process; the other-slot embed goes straight to the backend adapter and did
+#: not, so the shared chunks of overlapping answer windows (see
+#: ``answer_chunking``) were embedded again for every citation of one drain run.
+#: Keyed on (source, model, chunk hash); bounded FIFO like the service memo.
+_OTHER_SLOT_MEMO: "dict[tuple[str, str, str], list[float]]" = {}
+_OTHER_SLOT_MEMO_CAP = 512
+
+
+def _other_slot_memo_put(key: "tuple[str, str, str]", vec: "list[float]") -> None:
+    if len(_OTHER_SLOT_MEMO) >= _OTHER_SLOT_MEMO_CAP:
+        _OTHER_SLOT_MEMO.pop(next(iter(_OTHER_SLOT_MEMO)))
+    _OTHER_SLOT_MEMO[key] = vec
 
 
 class CitationResult(dict):
@@ -100,7 +118,6 @@ def compute_citation(
     # module docstring). A failed import → soft-fail None.
     try:
         from claude_mcp_servers.weaviate_mcp.server import (
-            Chunker,
             _cosine,
             _get_embedding_service,
             _get_rl_telemetry_writer,
@@ -125,9 +142,13 @@ def compute_citation(
     is_code = ctx.get("retrieval_kind") == "code"
 
     # --- Step 1: chunk + embed the answer ---
+    # v0.2.106: the answer window is chunked by ``answer_chunking`` (dense
+    # transcript budget, content-defined boundaries), NOT by the KG document
+    # chunker — see that module's docstring for the two defects this removes
+    # (every maximal chunk refused and shrunk; overlapping windows of one chat
+    # re-embedding the same text because their chunks never lined up).
     try:
-        chunker = Chunker.for_model(active_model)
-        chunks = chunker.chunk_text(answer, source_id=task_id)
+        chunks = answer_chunking.chunk_answer_window(answer, active_model)
     except Exception as exc:  # noqa: BLE001
         logger.debug("citation_compute: chunker failed (%s)", exc)
         return None
@@ -325,7 +346,6 @@ def _write_other_slot_citation(
 
     try:
         from claude_mcp_servers.weaviate_mcp.server import (
-            Chunker,
             _cosine,
             _get_embedding_service,
             _get_rl_telemetry_writer_for,
@@ -340,11 +360,10 @@ def _write_other_slot_citation(
     if svc is None:
         return
 
-    # Chunk the answer with the OTHER model's preset, then embed each chunk in the
-    # OTHER model's space (model-aware: arctic vs qwen3 differ ~4x in chunk size).
+    # Chunk the answer to the OTHER model's window, then embed each chunk in the
+    # OTHER model's space (model-aware: arctic vs qwen3 differ ~3x in budget).
     try:
-        chunker = Chunker.for_model(other_model)
-        chunks = chunker.chunk_text(answer, source_id=f"{task_id}:{other_source}")
+        chunks = answer_chunking.chunk_answer_window(answer, other_model)
     except Exception as exc:  # noqa: BLE001
         logger.debug("_write_other_slot_citation: chunker failed (%s)", exc)
         return
@@ -363,8 +382,13 @@ def _write_other_slot_citation(
         )
         if not text:
             continue
+        memo_key = (other_source, other_model, _answer_chunk_hash(text))
+        vec = _OTHER_SLOT_MEMO.get(memo_key)
         try:
-            vec = _embed_text_in_other_model(svc, text, other_source, other_model)
+            if vec is None:
+                vec = _embed_text_in_other_model(svc, text, other_source, other_model)
+                if vec:
+                    _other_slot_memo_put(memo_key, vec)
         except Exception as exc:  # noqa: BLE001
             logger.debug("_write_other_slot_citation: chunk embed failed (%s)", exc)
             continue
