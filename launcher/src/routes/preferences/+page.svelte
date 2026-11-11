@@ -48,6 +48,7 @@
   // Settings tab with scope="project" for that project's own choices.
   import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
   import KgEmbedStatus from '$lib/preferences/KgEmbedStatus.svelte';
+  import OllamaIdleUnload from '$lib/preferences/OllamaIdleUnload.svelte';
   // Machine-global Artifact-tool switch. Own component (this page is already
   // ~4k lines) and, unlike everything else here, it edits CLAUDE CODE's own
   // user-scope settings file rather than launcher.db — see
@@ -4084,6 +4085,15 @@
            model vs the selected one + fill progress, and the duplicate scan
            with its "objects missing the vector" list. -->
       <KgEmbedStatus />
+    </section>
+
+    <!-- v0.2.106 (owner ruling 2026-11-11): how long Ollama keeps a model
+         loaded after VCO last used it. Machine-wide, app_state
+         `ollama.idle_unload`, applied by the hub (it owns unloading); the
+         component carries the field, its help text and the override note. -->
+    <section class="pr-section" aria-labelledby="pr-ollama-idle-title">
+      <h2 class="pr-section-title" id="pr-ollama-idle-title">Ollama model unloading</h2>
+      <OllamaIdleUnload />
     </section>
 
     <!-- v0.2.23 F2 wave 2b: Volume location. Relocated from the popover.

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Choose how long Ollama keeps a model loaded, and see what is loaded.** Preferences has a new "Ollama model
+  unloading" setting: how long an embedding or summary model stays in memory after the last VCO request that used it
+  (2, 5, 10 or 30 minutes, "as soon as idle", or a duration you type; 10 minutes when unset, as before). The background
+  hub now owns unloading for every project: it checks Ollama's list of loaded models every few seconds and unloads a
+  model once it has been idle that long, so a change applies within half a minute without restarting anything. The
+  Services page has a new "Ollama models" card listing each loaded model with its RAM and VRAM use, when the hub will
+  unload it, the recent unloads, and an "Unload now" button. VCO's requests now ask Ollama to keep a model for 45
+  minutes, so a model still unloads on its own if the hub is not running. Setting `VCO_OLLAMA_KEEP_ALIVE` yourself
+  still works and wins: the hub leaves the models loaded with your value alone (the card says so), which is also the
+  way to keep a model loaded for good (`-1`). A number such as `-1` or `3600` in that variable is now sent to Ollama
+  as a number of seconds, the form Ollama accepts. The configuration reference describes the setting, the variable and
+  how to unload a model right away.
+
 - **Remove a project right from its card on the Projects page.** Every project card except the orchestrator's own now
   has a "Remove from VCO" button that asks "are you sure?" first. The dialog opens by saying that the project folder
   is not deleted — it stays on disk with your files, `.env`, secrets and settings, only what VCO added is taken out,
@@ -364,11 +377,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves the real interpreter it started running), nothing noticed at all. The server now gives in-flight work 30
   seconds after its stdin closes and then exits, and it exits within five seconds of the process that started it
   exiting. Telemetry that is written at exit is still written.
-- **The Ollama keep-alive setting now says where to set it and how to unload a model at once.** The configuration
-  reference names every process that reads `VCO_OLLAMA_KEEP_ALIVE`, how to set it for all of them (a user
-  environment variable, then restart VS Code and the launcher) or for one project (`.claude/settings.local.json`),
-  explains that the knowledge-graph lookups made on every tool call keep the model loaded while you work whatever the
-  value, and gives the `ollama ps` / `ollama stop` commands that unload a model right away.
 
 ## [0.2.105] - 2026-10-30
 

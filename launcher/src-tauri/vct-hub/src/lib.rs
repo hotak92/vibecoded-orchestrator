@@ -73,6 +73,9 @@ pub mod module_health;
 pub mod module_supervisor;
 pub mod module_db_api;
 pub mod modules_api;
+// v0.2.106 (owner ruling 2026-11-11): the hub owns how long Ollama keeps a
+// model loaded — unloads idle models, serves the Services card's model list.
+pub mod ollama_lifetime;
 // v0.2.76 Part 4 — per-project resolver tokens (`hub.token.<id>`) minted
 // at startup so `/env` + `/config` callers present a project-scoped
 // credential instead of the coarse hub-wide `hub.token`.

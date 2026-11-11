@@ -62,6 +62,33 @@ impl Db {
         Ok(format!("{state}|{bindings}"))
     }
 
+    /// v0.2.106: poison-tolerant raw string reader, for the hub's Ollama
+    /// unloader task (`vct_hub::ollama_lifetime`), which reads the idle-time
+    /// preference on every tick and must never panic. Same semantics as
+    /// [`Db::app_state_get`]; recovery rationale as in
+    /// [`Db::app_state_set_nonpanicking`].
+    pub fn app_state_get_nonpanicking(&self, key: &str) -> Option<String> {
+        let guard = self.lock_recover();
+        guard
+            .query_row(
+                "SELECT value FROM app_state WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    /// v0.2.106: delete ONE row by its exact key (no LIKE wildcards — `_` in
+    /// a key is a LIKE wildcard, so [`Db::app_state_delete_like`] is not an
+    /// exact delete). Returns whether a row was removed.
+    pub fn app_state_delete(&self, key: &str) -> Result<bool, String> {
+        let guard = self.lock();
+        let n = guard
+            .execute("DELETE FROM app_state WHERE key = ?1", params![key])
+            .map_err(|e| format!("app_state_delete({}): {}", key, e))?;
+        Ok(n > 0)
+    }
+
     /// v0.2.62 (CONCERN-6 remediation): poison-tolerant boolean reader for
     /// the hub's detached infra-watchdog task, which must never panic.
     ///

@@ -91,6 +91,7 @@
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import { toast } from '$lib/stores/toast';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
+  import OllamaModelsCard from '$lib/components/OllamaModelsCard.svelte';
   import {
     ACTION_LABELS,
     buildCandidateReport,
@@ -1197,6 +1198,12 @@
       </ul>
     {/if}
   </section>
+
+  <!-- v0.2.106 (owner ruling 2026-11-11): which models Ollama has loaded,
+       their RAM / VRAM, when the hub unloads them, and "Unload now" — all
+       through the hub, which owns unloading. Outside the snapshot guard like
+       the gateway card: it reads the hub, not the container table. -->
+  <OllamaModelsCard />
 
   <ExternalServicesDialog
     bind:open={endpointDialogOpen}

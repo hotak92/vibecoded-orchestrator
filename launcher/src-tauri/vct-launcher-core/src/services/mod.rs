@@ -64,6 +64,11 @@ pub mod service_endpoints;
 // (the hub used to hand-mirror the launcher's structs), built from the rows.
 pub mod service_status;
 
+// v0.2.106 (owner ruling 2026-11-11): how long Ollama keeps a model loaded —
+// the shared table, Preferences key and duration parser behind the hub's
+// unloader (`vct_hub::ollama_lifetime`) and the launcher's Preferences field.
+pub mod ollama_lifetime;
+
 // v0.2.97 (R7a F7): the ONE service-probe HTTP client rule — no redirect is
 // followed, only a 2xx is "answers" (mirror of vco_lib/service_probe_http.py).
 pub mod probe_http;

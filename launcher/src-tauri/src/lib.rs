@@ -3097,6 +3097,10 @@ pub fn run() {
             // process, live) and projected to every project as VCO_LOG_LEVEL.
             commands::logging_prefs::get_logging_level,
             commands::logging_prefs::set_logging_level,
+            commands::ollama_lifetime_prefs::get_ollama_idle_unload,
+            commands::ollama_lifetime_prefs::set_ollama_idle_unload,
+            commands::ollama_lifetime_prefs::ollama_models_status,
+            commands::ollama_lifetime_prefs::ollama_unload_model,
             // v0.2.71: GUI-only per-project worktree-repo mode (T-WT) — the
             // subagent-git modal's create-local/adopt/opt-out choice.
             commands::worktree_repo_mode::set_worktree_repo_mode,
