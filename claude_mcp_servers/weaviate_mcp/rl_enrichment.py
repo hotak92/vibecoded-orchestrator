@@ -3156,7 +3156,11 @@ def _rl_enrich_nodes_with_linked_embs(
             each node also gets ``emb_other`` (the OTHER slot's per-node
             vector pulled from the SAME already-fetched objects — no second
             Weaviate query, case-(a) 1:1 fan-out) and ``cos_qn_other``
-            (cos(other_query_emb, emb_other)). Empty → no dual-log enrichment.
+            (cos(other_query_emb, emb_other)). v0.2.106 additionally packs
+            ``linked_embs_other`` / ``linked_type_names_other`` (the OTHER
+            slot's linked-slot vectors, same packer + caps as ``linked_embs``)
+            so the dual-log twin can carry its own linked context (survey
+            G1). Empty → no dual-log enrichment.
         other_query_emb: The query vector in the OTHER slot's space, used to
             compute ``cos_qn_other``. Required for ``cos_qn_other``; absent →
             ``emb_other`` may still be attached, ``cos_qn_other`` is skipped.
@@ -3361,6 +3365,34 @@ def _rl_enrich_nodes_with_linked_embs(
             )
             n["linked_embs"] = packed_embs
             n["linked_type_names"] = packed_types
+
+            # v0.2.106 (training-readiness survey G1, 2026-11-11): pack the
+            # OTHER slot's linked vectors from the SAME already-fetched
+            # objects — the one packer call is the shape/caps contract, so
+            # the twin's linked slots are neighbour-first ordered and
+            # _RL_MAX_LINKED capped exactly like the active event's. Pre-106
+            # dual-log twins shipped with the linked fields stripped
+            # (search_pipeline._ACTIVE_SPACE_ONLY_FIELDS), so the other
+            # slot's net trained with 5 zeroed linked slots while an
+            # other-slot-ACTIVE install would have filled them (train/serve
+            # skew). A linked row lacking the other-slot vector is skipped
+            # by the packer — never fabricated — so a twin node may carry
+            # fewer slots than the active record; the trainer zero-pads.
+            if other_slot:
+                try:
+                    packed_other, types_other = server._rl_pack_linked_embs_for_node(
+                        n,
+                        sibling_objs_by_source_id,
+                        link_objs_by_title,
+                        other_slot,
+                    )
+                    n["linked_embs_other"] = packed_other
+                    n["linked_type_names_other"] = types_other
+                except Exception as exc:  # noqa: BLE001 — enrich never breaks search
+                    server.logger.debug(
+                        "dual-log: other-slot linked pack failed for %r (%s)",
+                        (n.get("title") or "")[:60], exc,
+                    )
 
             # n_emb: prefer the existing emb (already on the dict from search).
             n_emb = n.get("emb")

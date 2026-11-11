@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -1007,22 +1008,44 @@ def _populate_citation_cache(
             from claude_mcp_servers.rl_client.citation_pending import stage_pending
             from .telemetry_emit import resolve_session_id
 
-            # v0.2.75 P3g: read the counter from its single home (``rl_state``),
-            # not the stale re-exported ``srv._rl_call_seq`` copy.
-            try:
-                from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
-                staged_seq = getattr(_rl_state, "_rl_call_seq", None)
-            except Exception:  # noqa: BLE001 — soft-fail, staging is best-effort
-                staged_seq = getattr(srv, "_rl_call_seq", None)
-            source = "mcp" if task_type == "mcp_interactive" else "hook"
-            staged_path = stage_pending(
-                session_id=resolve_session_id(session_id or ""),
-                task_id=task_id,
-                seq=staged_seq if source == "mcp" else None,
-                query=query,
-                ctx=ctx_dict,
-                source=source,
-            )
+            staged_session = resolve_session_id(session_id or "")
+            # v0.2.106 (training-readiness survey G5): a pending file is only
+            # useful when a CHAT exists that a drain can attribute it to —
+            # either an explicit session anchor (the hook paths' VCT_SESSION_ID
+            # from the hook payload) or a Claude Code session around this
+            # process (``CLAUDE_CODE_SESSION_ID`` — exported to MCP servers and
+            # Bash-tool commands, verified v0.2.105), whose transcript a drain
+            # can hold the query against. With NEITHER (a human running
+            # ``kg-search`` in a plain shell) no answer will ever follow and
+            # no transcript can ever be attributed: the file would rot for
+            # the 7-day abandoned collector (measured: every kg_search_cli
+            # retrieval on the maintainer's install unpaired; the collector
+            # removes such files as ``no_transcript``). Stage nothing — the
+            # retrieval event still emits (query-distribution signal).
+            if staged_session or os.environ.get("CLAUDE_CODE_SESSION_ID"):
+                # v0.2.75 P3g: read the counter from its single home
+                # (``rl_state``), not the stale re-exported ``srv._rl_call_seq``
+                # copy.
+                try:
+                    from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
+                    staged_seq = getattr(_rl_state, "_rl_call_seq", None)
+                except Exception:  # noqa: BLE001 — soft-fail, staging is best-effort
+                    staged_seq = getattr(srv, "_rl_call_seq", None)
+                source = "mcp" if task_type == "mcp_interactive" else "hook"
+                staged_path = stage_pending(
+                    session_id=staged_session,
+                    task_id=task_id,
+                    seq=staged_seq if source == "mcp" else None,
+                    query=query,
+                    ctx=ctx_dict,
+                    source=source,
+                )
+            else:
+                logger.debug(
+                    "_populate_citation_cache: no chat anchor (no session id, no "
+                    "CLAUDE_CODE_SESSION_ID); pending file not staged for %s",
+                    task_id[:8],
+                )
         except Exception as exc:
             logger.debug("_populate_citation_cache: stage_pending failed (%s)", exc)
 
@@ -1227,9 +1250,17 @@ def slot_suffixed_task_id(task_id: str, embedding_source: str) -> str:
 
 #: Fields of an ACTIVE-slot log record that live in the ACTIVE embedding space
 #: (vectors, or cosines computed against active-space vectors). The dual-log
-#: twin must never carry them — they would be a qwen3-space feature inside an
-#: arctic-space sample. ``linked_type_names`` is the index-parallel label array
-#: of ``linked_embs`` and goes with it.
+#: twin must never carry them AS THE ACTIVE SPACE WROTE THEM — they would be a
+#: qwen3-space feature inside an arctic-space sample. The twin DROPS them and
+#: then re-adds the ones it has an OTHER-space source for (``emb``/``n_emb`` ←
+#: ``emb_other``, ``cos_qn`` ← ``cos_qn_other``, ``emb_truncated`` ←
+#: ``emb_other_truncated``, and since v0.2.106 ``linked_embs`` /
+#: ``linked_type_names`` ← ``linked_embs_other`` / ``linked_type_names_other`` —
+#: survey G1: the v2 net's linked slots must not be zero for every twin).
+#: ``cos_ql`` / ``cos_nl`` stay dropped: they are active-space scalars with no
+#: other-space counterpart, and the offline trainer treats them as optional.
+#: ``linked_type_names`` is the index-parallel label array of ``linked_embs``
+#: and goes with it.
 _ACTIVE_SPACE_ONLY_FIELDS = (
     "emb", "n_emb", "cos_qn", "cos_ql", "cos_nl",
     "linked_embs", "linked_type_names", "emb_truncated",
@@ -1255,9 +1286,15 @@ def _build_other_slot_log_nodes(
     active-space fields (:data:`_ACTIVE_SPACE_ONLY_FIELDS`) are dropped and
     replaced by the other slot's: ``emb`` / ``n_emb`` ← ``emb_other``,
     ``cos_qn`` ← ``cos_qn_other``, ``emb_truncated`` ← ``emb_other_truncated``
-    (only-when-known). Candidates lacking an ``emb_other`` are SKIPPED (the
-    twin only carries nodes whose other-slot vector genuinely exists — never
-    fabricates); ``tier`` keeps the candidate's ORIGINAL index, as before.
+    (only-when-known), and — v0.2.106, survey G1 — ``linked_embs`` /
+    ``linked_type_names`` ← ``linked_embs_other`` / ``linked_type_names_other``
+    (packed by the enrichment from the SAME fetched rows, same order and
+    _RL_MAX_LINKED cap, so the twin's linked slots have the active event's
+    SHAPE in the other slot's SPACE; a linked row without an other-slot
+    vector is absent, never fabricated). Candidates lacking an ``emb_other``
+    are SKIPPED (the twin only carries nodes whose other-slot vector
+    genuinely exists — never fabricates); ``tier`` keeps the candidate's
+    ORIGINAL index, as before.
     """
     base = _build_log_nodes(candidates, limit)
     if ranked is not None:
@@ -1281,6 +1318,15 @@ def _build_other_slot_log_nodes(
         cos_other = n.get("cos_qn_other")
         if cos_other is not None:
             twin["cos_qn"] = cos_other
+        # v0.2.106 (survey G1): the OTHER slot's linked-slot vectors, with the
+        # same field names the trainer reads — same packing order and cap as
+        # the active record's (the enrichment calls the ONE packer for both).
+        linked_other = n.get("linked_embs_other")
+        if linked_other:
+            twin["linked_embs"] = linked_other
+            types_other = n.get("linked_type_names_other")
+            if types_other:
+                twin["linked_type_names"] = types_other
         out.append(twin)
     return out
 

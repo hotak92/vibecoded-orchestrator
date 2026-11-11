@@ -148,6 +148,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Citation events name the labelling regime they were computed under.** v0.2.106 changed how citation labels are
+  computed (the answer window is chunked by the shared chunker's answer mode with a dense budget), so every citation
+  event now carries a `label_regime` field naming the regime, from one constant in one home. A trainer can filter or
+  weight rows across that change; every row recorded before it has no field and reads as the previous regime through
+  the shipped resolver.
+
 - **Kimi K3.1 Pro replaces Kimi K3 on the model gateway.** The gateway's Kimi Code route now offers and forwards
   `claude-gw/kimi/k3.1-pro` (1M context, image input), and the `kimi-implementer` and `kimi-reviewer` agents run on
   `claude-gw/kimi/k3.1-pro[1m]`. `claude-gw/kimi/k3` is no longer offered: a request or agent definition that names
@@ -202,6 +208,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release mechanics:** version 0.2.105 → 0.2.106 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No code-graph extractor-generation rung this release: the only change on the extractor surface routes the analyzer's collection deletes through the raft-replay guard's recorder, so existing code graphs are not re-walked.
 
 ### Fixed
+
+- **Dual-log twins now carry the other embedding slot's linked-node vectors.** The second (other-slot) retrieval event
+  that dual logging writes for every search previously dropped the linked context entirely, so the second model's
+  training samples always had five empty linked inputs while an install with that model active would have filled
+  them. The enrichment now packs the other slot's linked vectors from the same already-fetched rows — same order and
+  same cap as the active event's — and the twin event carries them under the field names the trainer reads. Vectors
+  from the active embedding space still never appear in a twin, and a linked row without an other-slot vector is
+  skipped rather than fabricated.
+
+- **The citation drain stops re-visiting files whose chat ended without a locatable transcript.** A pending citation
+  whose owning chat ended, but whose transcript is not in this project's transcripts folder, could never be scored
+  (by the same-folder rule) — yet every drain run re-claimed it, re-read it and left it again, keeping the session's
+  end marker alive, until the abandoned-file collector removed it a week later. The finalize pass now removes such a
+  file and records it as unscored immediately, exactly as the collector would, so the end marker clears and later
+  drain runs stop paying for it.
+
+- **The `kg-search` CLI no longer stages a pending citation file when no chat is around.** A search run in a plain
+  shell (no session id and no Claude Code session in the environment) has no transcript a drain could ever attribute
+  it to, so its staged file could only sit for a week until the collector removed it. Such a run stages nothing now;
+  its retrieval event is still emitted as before. A search run from inside a Claude Code session (including through
+  the Bash tool) still stages, and is paired by the drain against that session's transcript.
 
 - **Stopping a service for maintenance now actually keeps it down.** The launcher's services watcher ignored the
   shared pause marker the hub's watchdog honors: about 30 seconds after you stopped Weaviate from the Services page,

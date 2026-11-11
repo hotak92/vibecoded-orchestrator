@@ -59,7 +59,12 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .hub_writer import post_rl_event
-from .rl_logger import RLDataLogger, _round_emb, serialize_node_record
+from .rl_logger import (
+    CITATION_LABEL_REGIME,
+    RLDataLogger,
+    _round_emb,
+    serialize_node_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -652,6 +657,9 @@ class RLTelemetryWriter:
             "embedding_source": self._embedding_source,
             "embedding_dim": self._embedding_dim,
             "embedding_model": self._embedding_model,
+            # v0.2.106 (G4): mirror the label regime onto the consented-upload
+            # payload — same constant, same home, as the launcher.db event.
+            "label_regime": CITATION_LABEL_REGIME,
             "citations": {
                 title: (bool(cited) if cited is not None else None)
                 for title, cited in citations.items()
@@ -811,6 +819,13 @@ class RLTelemetryWriter:
             "task_id": task_id,
             "task_type": task_type,
             "embedding_source": self._embedding_source,
+            # v0.2.106 (training-readiness G4): the label regime under which
+            # this event's cosine_sims were computed. One constant, one home
+            # (``rl_logger.CITATION_LABEL_REGIME``); pre-106 rows carry no
+            # field and resolve to the legacy regime
+            # (``rl_logger.resolve_label_regime``) so the trainer can filter
+            # or weight across the v0.2.106 chunker change.
+            "label_regime": CITATION_LABEL_REGIME,
             # R3-7 step 3: the config dim is DELIBERATE here — a citation event
             # carries no query/answer query-vector to measure against (the
             # answer_chunk_embs are per-chunk, not the event's embedding space), so

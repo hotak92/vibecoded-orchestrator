@@ -56,8 +56,9 @@ citation event::
         "task_id":     "abc123",
         "task_type":   "implementation",
         "citations":   {"Foo": true, "Bar": false},   # None = inconclusive
-        "cosine_sims": {"Foo": 0.812, "Bar": 0.341}  # optional: cos(node, agent_output)
-    }
+        "cosine_sims": {"Foo": 0.812, "Bar": 0.341},  # optional: cos(node, agent_output)
+        "label_regime": "answer-window-dense-v1"      # v0.2.106+; absent = the
+    }                                                # legacy regime (resolve_label_regime)
 
 The same ``task_id`` links a retrieval event with its citation event.
 Stored embeddings are frozen at scoring time (Weaviate node content may change
@@ -424,6 +425,53 @@ def resolve_emb_truncation_state(
     return TRUNCATION_UNKNOWN
 
 
+# ── v0.2.106: the citation-label regime tag (training-readiness G4) ─────────
+#
+# v0.2.106 changed HOW citation labels are computed: the answer window is now
+# chunked by the shared chunker's ANSWER mode (``chunking.chunk_answer_window``
+# — dense transcript budget, content-defined boundaries) instead of the KG
+# document chunking path, so ``cosine_sims`` (max over answer chunks) shift at
+# the install boundary. Every label recorded by a build BEFORE that change is
+# from the old regime, and old labels cannot be re-chunked offline (the answer
+# text is not stored, only the chunk vectors). A trainer mixing regimes must
+# be able to filter or weight by regime, so every citation event this module's
+# consumers write carries an explicit ``label_regime`` naming the regime it
+# was computed under. ONE constant, ONE home: it lives here — the schema home
+# this module already is — and every writer imports it; a future regime change
+# bumps THIS constant and nothing else.
+
+#: The label regime of the CURRENT build: answer window chunked by the shared
+#: chunker's ANSWER mode (dense budget, content-defined boundaries) — the
+#: regime introduced with v0.2.106.
+CITATION_LABEL_REGIME = "answer-window-dense-v1"
+
+#: The regime every citation event WITHOUT a ``label_regime`` field was
+#: computed under (all pre-v0.2.106 rows — the field could not have existed).
+LEGACY_CITATION_LABEL_REGIME = "answer-window-legacy"
+
+
+def resolve_label_regime(event: "dict[str, Any] | None") -> str:
+    """The label regime a stored CITATION event was computed under.
+
+    Args:
+        event: one citation event payload (the ``payload_json`` shape the
+            writers emit, or a queue payload of the same fields).
+
+    Returns:
+        ``event["label_regime"]`` when present, else
+        :data:`LEGACY_CITATION_LABEL_REGIME` — a missing field means the
+        event predates v0.2.106, which IS the answer. Use this reader, never
+        ``event.get("label_regime")`` alone, so pre-106 rows are classified
+        consistently everywhere.
+    """
+    if isinstance(event, dict):
+        tag = event.get("label_regime")
+        if isinstance(tag, str) and tag:
+            return tag
+    return LEGACY_CITATION_LABEL_REGIME
+
+
+
 class RLDataLogger:
     """
     Append-only JSONL data logger for RL retrieval training.
@@ -725,6 +773,9 @@ class RLDataLogger:
             "embedding_source": self._embedding_source,
             "embedding_dim": self._embedding_dim,
             "embedding_model": self._embedding_model,
+            # v0.2.106 (G4): the label regime this module's schema home owns —
+            # stamped by this legacy writer too so both citation writers agree.
+            "label_regime": CITATION_LABEL_REGIME,
             "citations": {
                 title: (bool(cited) if cited is not None else None)
                 for title, cited in citations.items()

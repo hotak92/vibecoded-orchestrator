@@ -726,9 +726,38 @@ def drain_session(
                         continue  # unreadable: the collector records it
                     source = _answer_source(payload)
                     if not source:
-                        logger.info(
-                            "rl_drain_citations: %s ended but its transcript is "
-                            "not found; the citation stays unscored", path.name)
+                        # v0.2.106 (training-readiness survey G5): the owning
+                        # chat ENDED and its transcript is not locatable (same
+                        # folder only, owner ruling R7-3) — under that ruling
+                        # no later drain and no collector pass can ever score
+                        # this file, yet the old "leave it" path re-visited it
+                        # on EVERY drain (measured: 1 084 "transcript is not
+                        # found" retries in one project's drain log) until the
+                        # 7-day collector removed it unscored anyway. Remove +
+                        # record it NOW, exactly as the collector would, so the
+                        # session's end marker can be cleared and later drains
+                        # stop paying for it. Guarded on ``known`` (a drain
+                        # without its own transcript cannot conclude anything
+                        # about other folders) and on the file being that
+                        # session's OWN (a session id in the payload); a file
+                        # staged WITHOUT a session id may still belong to a
+                        # live chat elsewhere, so it keeps the old leave rule.
+                        if (
+                            known
+                            and str(payload.get("session_id") or "") == sid
+                        ):
+                            summary["finalized_unscored"] += 1
+                            delete_pending(claimed)
+                            record_unscored(
+                                path.parent, path.name, payload, "no_transcript",
+                                when="session_ended",
+                            )
+                            claimed = None
+                        else:
+                            logger.info(
+                                "rl_drain_citations: %s ended but its transcript "
+                                "is not found; the citation stays unscored",
+                                path.name)
                         continue
                     if _finalize_claimed(path, claimed, payload, source, ""):
                         claimed = None
