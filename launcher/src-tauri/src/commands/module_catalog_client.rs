@@ -674,8 +674,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn canonical_fixture() -> &'static str {
-        // Mirrors `docs/v0.2.33-l0-seed-vct-rl-reranker.json` wrapped in the
-        // L0 envelope. If the seed file's shape changes, update both.
+        // The shape of the v0.2.33 L0 seed for the (then paid) RL reranker,
+        // wrapped in the L0 envelope. The seed file itself was retired in
+        // v0.2.106 with the RL reranker's paid catalog entry; this fixture
+        // stays the reference shape of an L0 catalog record.
         r#"{
           "schema_version": 1,
           "fetched_at": "2026-05-24T12:34:56Z",

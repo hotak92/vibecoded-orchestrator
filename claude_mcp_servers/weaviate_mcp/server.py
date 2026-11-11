@@ -1085,13 +1085,14 @@ weaviate_client = None
 #
 # As of Stream 1 (2026-05-19), the direct HTTP wiring to ``rl_server.py``
 # has moved into the ``rl_client`` package. The legacy ``rl_server/``
-# sub-package was relocated to the private ``paid-modules/vct-rl-reranker``
-# repo and ships as a paid container; this MCP talks to it via
+# sub-package now lives in ``claude_mcp_servers/rl_reranker`` (v0.2.106; it
+# was a separately distributed paid container before) and runs as a
+# container built from this repository; this MCP talks to it via
 # ``RLClient`` instead of importing the server code directly.
 #
-# Free tier: ``RL_SERVER_URL`` / ``RL_SERVER_PORT`` unset → ``RLClient``
-# runs in "disabled mode" and ``cache_nodes`` returns inputs unchanged.
-# Pro/MAO tier with container running → real reranking + online training.
+# ``RL_SERVER_URL`` / ``RL_SERVER_PORT`` unset → ``RLClient`` runs in
+# "disabled mode" and ``cache_nodes`` returns inputs unchanged. Container
+# running (and the scoring lock lifted) → real reranking + online training.
 #
 # ``RL_SERVER_URL`` retained as a back-compat env var read by
 # ``rl_client.client._resolve_base_url``. Default kept at the legacy

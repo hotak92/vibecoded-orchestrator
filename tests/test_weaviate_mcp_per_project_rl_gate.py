@@ -2,24 +2,23 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.49 Stream B — per-project RL Reranker enable toggle (MCP gate).
 
-The launcher's GUI lets the user silence the RL Reranker per-project
-even when the license tier would permit reranking. The hub exposes the
+The launcher's GUI lets the user silence the RL Reranker per-project. The hub exposes the
 state as ``ProjectConfig.rl_reranker_enabled_for_project`` and the MCP
 consults it in ``_rl_cache_and_rerank`` BEFORE issuing a rerank request.
 
 These tests pin three contracts:
 
 1. **Hub absent / resolver returns None** → fall open (rerank as
-   before). Never silently disable a paying user's reranker because
-   the hub crashed.
-2. **Hub returns ``True``** → rerank fires (or the tier check already
-   skipped it for other reasons — unchanged).
+   before). Never silently disable the reranker because the hub crashed.
+2. **Hub returns ``True``** → rerank fires (or the shipped scoring lock
+   already skipped it — unchanged).
 3. **Hub returns ``False``** → rerank is skipped; telemetry log still
    fires (the SERVER's local JSONL writer is untouched).
 
 The tests stub ``_try_resolve_project_config`` directly so the test
-doesn't need a live hub. The free-tier license path is exercised via
-the import-shim used by the existing telemetry-on-failure tests.
+doesn't need a live hub. ``VCThelpers`` is shimmed away in every case:
+since v0.2.106 no licence is consulted, so its absence must change
+nothing (the rerank is skipped by the shipped scoring lock).
 """
 from __future__ import annotations
 
@@ -103,10 +102,9 @@ class PerProjectRlGateTest(unittest.TestCase):
         )
 
     def test_per_project_enabled_does_not_short_circuit(self):
-        """Hub returns toggle as True → existing tier-based gating
-        decides. With VCThelpers absent (free-tier ImportError branch),
-        rerank still skipped — but for the OLD reason (free tier), not
-        the new gate. Validates the gate is additive, not destructive."""
+        """Hub returns toggle as True → the gate does not short-circuit;
+        the rerank is still skipped by the shipped scoring lock, not by
+        the toggle. Validates the gate is additive, not destructive."""
         writer = _StubWriter()
         fake_cfg = SimpleNamespace(rl_reranker_enabled_for_project=True)
         with patch.object(srv, "_get_rl_telemetry_writer", return_value=writer), \
@@ -118,17 +116,16 @@ class PerProjectRlGateTest(unittest.TestCase):
                 self._make_nodes(),
                 1,
             ))
-        # Free-tier behaviour unchanged.
+        # Lock-off behaviour unchanged.
         self.assertEqual(len(result), 1)
         self.assertEqual(len(writer.calls), 1)
 
     def test_resolver_none_falls_open_to_tier_decision(self):
-        """Hub unreachable (resolver returns None) → gate falls open
-        and the tier-based logic alone decides. This is the safety
-        net: a hub crash must NEVER silently disable a paying user's
-        reranker. With VCThelpers absent, free-tier still skips
-        rerank — the test verifies the function reaches that branch
-        instead of raising or hanging."""
+        """Hub unreachable (resolver returns None) → gate falls open.
+        This is the safety net: a hub crash must NEVER silently disable
+        the reranker. The scoring lock still skips the rerank — the test
+        verifies the function reaches that branch instead of raising or
+        hanging."""
         writer = _StubWriter()
         with patch.object(srv, "_get_rl_telemetry_writer", return_value=writer), \
              patch.object(srv, "_try_resolve_project_config", return_value=None), \
@@ -139,7 +136,7 @@ class PerProjectRlGateTest(unittest.TestCase):
                 self._make_nodes(),
                 1,
             ))
-        # Free-tier path executes cleanly: returns cosine order.
+        # Lock-off path executes cleanly: returns cosine order.
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["title"], "N1")
         # Telemetry write still landed.
@@ -148,7 +145,7 @@ class PerProjectRlGateTest(unittest.TestCase):
     def test_resolver_raises_falls_open(self):
         """If the resolver itself raises (e.g. ProjectConfig parser
         error on a corrupted hub response), the gate logs at debug
-        and leaves _rl_enabled at whatever the tier check decided.
+        and leaves _rl_enabled at whatever the lock decided.
         This is the second safety net — never silently disable
         because of a resolver bug."""
         writer = _StubWriter()
@@ -165,7 +162,7 @@ class PerProjectRlGateTest(unittest.TestCase):
                 self._make_nodes(),
                 1,
             ))
-        # Function returns normally; tier check (free) skipped rerank;
+        # Function returns normally; the scoring lock skipped rerank;
         # telemetry write landed.
         self.assertEqual(len(result), 1)
         self.assertEqual(len(writer.calls), 1)
@@ -188,7 +185,7 @@ class PerProjectRlGateTest(unittest.TestCase):
                 self._make_nodes(),
                 1,
             ))
-        # Free-tier still returns cosine order; gate did not flip.
+        # Still cosine order (scoring lock); gate did not flip.
         self.assertEqual(len(result), 1)
         self.assertEqual(len(writer.calls), 1)
 

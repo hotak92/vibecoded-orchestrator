@@ -37,8 +37,8 @@ Out of the box, Claude can only read what you point it at. VCO registers local M
 **Secrets — credentials resolve, they never get pasted.**
 The usual failure mode: an agent needs a GitHub token, so it ends up in a chat message, an environment dump, or a committed `.env`. VCO stores secrets in your OS keychain (plus a permission-locked file store) and gives agents a resolver: a credential is injected into the child process that needs it, by key name, without ever being printed. Grepping the environment for tokens is blocked by a hook. You feel it when `git push` just works and the token never appears in the transcript.
 
-**RL retrieval reranking (Pro) — search that learns what you actually use.**
-Vector search returns plausible results; the one you needed is ranked fifth. The Pro module tracks which retrieved chunks actually get used and reranks future retrievals accordingly, so relevance improves the longer you work. Without a license nothing breaks — retrieval uses plain cosine ordering.
+**RL retrieval reranking — search that learns what you actually use.**
+Vector search returns plausible results; the one you needed is ranked fifth. The RL reranker tracks which retrieved chunks actually get used and reranks future retrievals accordingly, so relevance improves the longer you work. It is part of this repository (`claude_mcp_servers/rl_reranker`, built locally as a container, trained weights bundled), and needs no licence. Its scores stay switched off until a trained model ships: until then, and whenever the reranker is not running, retrieval uses plain cosine ordering and nothing breaks.
 
 **Launcher GUI — one control panel instead of config sprawl.**
 Everything above is per-project configuration, containers, collections, and toggles — hand-maintaining that stack would be a project in itself. The launcher GUI is where you add a project (it indexes existing knowledge, docs, and source code in the background), enable or disable agents/skills/hooks per project, manage secrets, watch service health, and update in place without losing your customizations. You feel it when adding an existing repo takes one click and comes out fully indexed.
@@ -252,15 +252,14 @@ vibecoded-orchestrator/
 
 ## Tiers
 
-The whole repository is AGPL-3.0. The codebase you see here is the Free tier — fully functional. Optional paid modules ship as separate signed binaries delivered through the launcher; their source is not in this repo.
+The whole repository is AGPL-3.0. The codebase you see here is the Free tier — fully functional, the RL retrieval reranker included.
 
 | Tier            | Price                | What you get                                                                                  |
 |-----------------|----------------------|-----------------------------------------------------------------------------------------------|
 | **Free**        | €0                   | Full orchestrator: KG, code graph, 51 hooks, 11 agents, 7 skills, all default MCP servers (see [Under the hood](#under-the-hood)). AGPL-3.0. |
-| **Pro**         | €19/month            | Free + RL-scored retrieval reranking module. Modules ship as separate signed binaries via the launcher. |
 | **Enterprise**  | Contact us           | Free + commercial AGPL exemption, priority support, custom SLAs. [team@vibecodedtools.com](mailto:team@vibecodedtools.com) |
 
-Pricing finalized at module launch. The Free tier is the whole repository — no source-level dual licensing, no feature gating in the OSS code. RL retrieval falls back to cosine ordering when the Pro module isn't installed.
+The Free tier is the whole repository — no source-level dual licensing, no feature gating in the OSS code. RL retrieval falls back to cosine ordering when the reranker container isn't installed or running.
 
 ## Telemetry
 

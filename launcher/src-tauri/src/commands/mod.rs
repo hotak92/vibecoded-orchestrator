@@ -13,6 +13,10 @@ pub mod blocking;
 // staleness census. Three-state (current/stale/unknown); a probe that
 // could not run reports "could not determine", never "all current".
 pub mod bundle_staleness;
+// v0.2.106: modules whose source ships in the checkout (built locally with
+// `install.method = "container_build"`, no registry, no licence) — the RL
+// reranker. One home for catalog, install, build and update logic.
+pub mod bundled_modules;
 pub mod changes_cmd;
 pub mod claude_env;
 pub mod kg_reviewer_model;

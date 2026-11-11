@@ -55,7 +55,6 @@ These exist but are **not** in the OSS bundle:
 
 | Component | Description | Where |
 |---|---|---|
-| RL reranker | Reinforcement-learning result reranking server | Pro module; MCP falls through cleanly when absent |
 
 ---
 
@@ -71,7 +70,7 @@ These exist but are **not** in the OSS bundle:
 | **CodeSage** | CodeSage-Large-v2 — 1.3B-parameter code embedding model (GPU service, Apache 2.0) |
 | **RAG** | Retrieval-Augmented Generation — feeding search results into an LLM context |
 | **GraphRAG** | Graph-augmented RAG — follows typed WikiLinks between KG nodes to expand context |
-| **RL reranking** | Reinforcement-learning-trained search result reranker (Pro tier) |
+| **RL reranking** | Reinforcement-learning-trained search result reranker (`claude_mcp_servers/rl_reranker`, free since v0.2.106) |
 | **AGPL-3.0** | GNU Affero General Public License v3 — copyleft applies to network use |
 | **LS** | Lemon Squeezy — payment processor used for license key issuance |
 | **Hub API** | Local HTTP server (`port 7700`) bundled in the Launcher for CLI and inter-app IPC |

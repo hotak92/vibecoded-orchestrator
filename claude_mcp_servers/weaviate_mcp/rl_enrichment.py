@@ -370,7 +370,7 @@ def _rl_is_literal_cited(node: dict, answer_text_lower: str) -> bool:
 
     Skips titles shorter than ``_RL_LITERAL_CITED_MIN_TITLE_LEN`` (default 3)
     to avoid the "RL" / "AI" / "url" / "curl" false-positive class. Same
-    rule as ``paid-modules/vct-rl-reranker/retrieval_rl.py``.
+    rule as ``claude_mcp_servers/rl_reranker/retrieval_rl.py``.
     """
     if not isinstance(node, dict):
         return False
@@ -2429,7 +2429,7 @@ def _rl_pack_linked_embs_for_node(
 ) -> tuple[list[list[float]], list[str]]:
     """Pack up to ``_RL_MAX_LINKED`` linked-slot vectors for one node.
 
-    Order matches what ``paid-modules/vct-rl-reranker/retrieval_rl.py::_train_rl_model``
+    Order matches what ``claude_mcp_servers/rl_reranker/retrieval_rl.py::_train_rl_model``
     builds online today (lines 914-918):
 
         linked_raws = extra_chunks_of_same_node + actual_linked_nodes

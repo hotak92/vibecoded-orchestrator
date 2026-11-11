@@ -3,7 +3,7 @@
 //! converted to declarative-action manifest entries.
 //!
 //! These commands back the boolean toggles + the global-training-source
-//! enumeration declared in `paid-modules/vct-rl-reranker/vct-module.json`'s
+//! enumeration declared in `claude_mcp_servers/rl_reranker/vct-module.json`'s
 //! `gui.config_tab` block (via `ActionRef::Legacy("set_rl_use_global")`
 //! etc.). Settings are stored in `module_settings` (the generic per-
 //! project, per-module KV blob table) under `module_id = "vct-rl-reranker"`.

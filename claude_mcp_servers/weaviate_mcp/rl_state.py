@@ -68,7 +68,7 @@ def _resolve_overfetch(default: int = 2) -> int:
 
 _RL_OVERFETCH = _resolve_overfetch()
 # v0.2.47 RL-6: maximum linked-slot vectors packed per node in the v3
-# retrieval event. Must MATCH `paid-modules/vct-rl-reranker/rl_model.py::MAX_LINKED`
+# retrieval event. Must MATCH `claude_mcp_servers/rl_reranker/rl_model.py::MAX_LINKED`
 # (= 5). The container's `_rl_model.update(q_raw, n_raw, linked_raws, n_type_idx)`
 # only consumes the first MAX_LINKED entries — over-shipping wastes bytes.
 # Packing order is fixed: `extra_chunks_of_same_node + actual_linked_nodes`,
@@ -196,7 +196,7 @@ _RL_MIN_ANSWER_CHARS_FOR_CITATION: int = (
 # Minimum title length for the literal-citation regex. Below this we skip
 # the per-node regex entirely — two-letter titles like "AI" / "RL" produce
 # enough false-positives ("curl", "url", "fail") to swamp any signal.
-# Matches the rule in paid-modules/vct-rl-reranker/retrieval_rl.py.
+# Matches the rule in claude_mcp_servers/rl_reranker/retrieval_rl.py.
 _RL_LITERAL_CITED_MIN_TITLE_LEN: int = 3
 
 # ─── RLClient + telemetry-writer lazy singletons (Stream 1 / v0.2.20) ────

@@ -11,9 +11,10 @@ point routes through the same chokepoint.
 
 Test surface:
 1. Returns non-empty ``ranked`` when candidates non-empty.
-2. Free-tier path (``feature_enabled("rl_retrieval") == False``) returns
-   the Weaviate input order, doesn't hit the RL container.
-3. Telemetry emit fires regardless of rerank path (free-tier still
+2. RL-off path (``_resolve_rl_enabled() == False``: scoring locked or the
+   project opted out) returns the Weaviate input order, doesn't hit the RL
+   container.
+3. Telemetry emit fires regardless of rerank path (RL off still
    accumulates training corpus).
 4. Answer-monitor spawn happens iff ``spawn_answer_monitor=True`` AND
    candidates list non-empty.
@@ -21,7 +22,7 @@ Test surface:
 
 Sister A is concurrently refactoring ``_rl_cache_and_rerank`` to call
 ``rerank_and_emit``. To avoid coupling, we mock the deepest dependencies
-(``_get_rl_client``, ``_rl_node_content_cache``, ``feature_enabled``)
+(``_get_rl_client``, ``_rl_node_content_cache``, ``_resolve_rl_enabled``)
 rather than importing the in-flight refactor.
 
 Async-test pattern: pytest-asyncio is not a declared dependency.  Each
@@ -125,8 +126,8 @@ def test_task_id_echoed_or_generated():
 # ----------------------------------------------------------------------
 
 
-def test_free_tier_skips_rerank_returns_weaviate_order():
-    """When feature_enabled('rl_retrieval') is False, the pipeline does
+def test_rl_off_skips_rerank_returns_weaviate_order():
+    """When the RL gate resolves off, the pipeline does
     NOT call _do_rerank; ranked is the input order truncated to limit."""
     async def _inner():
         req = _make_request(limit=2)
@@ -140,7 +141,7 @@ def test_free_tier_skips_rerank_returns_weaviate_order():
     _run(_inner())
 
 
-def test_pro_tier_calls_rerank_when_candidates_present():
+def test_rl_on_calls_rerank_when_candidates_present():
     """When RL is enabled, the pipeline routes through _do_rerank with
     the candidates list. Free-tier behaviour confirmed in prior test."""
     async def _inner():
@@ -181,7 +182,7 @@ def test_rerank_failure_falls_back_to_weaviate_order():
 # ----------------------------------------------------------------------
 
 
-def test_telemetry_emit_fires_on_free_tier():
+def test_telemetry_emit_fires_with_rl_off():
     """Free-tier installs still emit retrieval events — the historical
     corpus accumulates regardless of license. This is the load-bearing
     "upgrade-path users get a head start" behaviour."""
@@ -195,7 +196,7 @@ def test_telemetry_emit_fires_on_free_tier():
     _run(_inner())
 
 
-def test_telemetry_emit_fires_on_pro_tier():
+def test_telemetry_emit_fires_with_rl_on():
     """Pro-tier obviously needs the emit; assert it explicitly so a
     regression that gates emit on tier surfaces immediately."""
     async def _inner():

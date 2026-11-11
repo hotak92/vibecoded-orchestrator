@@ -148,6 +148,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The RL reranker is part of the orchestrator and free.** Its server, model, trainer, maintainer scripts, tests
+  and Dockerfile now live in this repository, in `claude_mcp_servers/rl_reranker` (AGPL-3.0). It was a separately
+  distributed, licence-gated module before. The licence gate is gone everywhere: `rl_retrieval` is no longer a
+  tier feature, the retrieval pipeline and `rl-doctor` no longer ask the licence validator, the dashboard's
+  "RL-Scored Retrieval" switch is no longer Pro-only, and the root `CLAUDE.md` RL section now renders from the same
+  two gates the pipeline applies. Two gates remain, unchanged: the shipped RL scoring lock (still set until a trained
+  model ships) and the per-project RL toggle.
+- **The RL reranker's container is built locally.** Installing or updating the "RL Reranker" module in the launcher
+  builds `localhost/vco-rl-reranker:<version>-<cpu|cuda|rocm>` from `claude_mcp_servers/rl_reranker`. This is a new
+  `container_build` install method, and nothing is pulled from a registry. The module's manifest and database
+  migrations come from the checkout, so the module's tables are now created on install (a `container_pull` install
+  never received them). The catalog card, install, update and update checks all read the module's version from the
+  checkout manifest, and an older paid-catalog record with the same id is ignored. `infrastructure/docker-compose.yml`
+  gains an `rl_reranker` service behind the `rl` profile, for a standalone build or run outside the launcher.
+- **The RL reranker's trained weights are bundled in the repository.** `claude_mcp_servers/rl_reranker/weights/
+  manifest.json` names the checkpoint shipped for each embedding profile, qwen3 and arctic. None ships yet. The image
+  build checks the manifest against the files. The server seeds its state from the checkpoint for the active
+  profile and never overwrites an existing one. With no checkpoint shipped, `/health` reports `"model": "not
+  trained"` and `trained: false`. `POST /reset {"strategy": "bundled"}` re-seeds a project from the shipped
+  checkpoint, and the module tab's two "Download default weights" buttons now use it.
+- **The paid distribution path is retired for the RL reranker.** It no longer uses the GHCR image, the paid-catalog
+  entry or the paid-module weights bucket. The launcher no longer downloads its weights after install, and the
+  daily weights poll stands down for it. The manual RL image smoke workflow now builds the image from the checkout
+  instead of pulling a private image.
+- **The RL reranker uses the orchestrator's own logger and training-target code.** It used to carry its own copies
+  of `rl_client/rl_logger.py` and `vco_lib/rl_training_targets.py`, and the copy of the logger had fallen a full
+  schema version behind without the drift check noticing (that check skipped whenever the module was absent). It now
+  imports the originals, writes its checkpoints and logs through `vco_lib.atomic` and `vco_lib.log_setup` like the rest
+  of the orchestrator, and its default event-log path comes from the logger's own resolver. Its image copies these
+  files from where they live, building from the checkout root with a root `.dockerignore` that admits only what the
+  image needs. `scripts/sync-vendored-files.sh` and
+  `tests/test_vendored_file_sync.py` are retired, and a new test checks that the image copies every file the reranker
+  imports.
+
 - **Kimi K3.1 Pro replaces Kimi K3 on the model gateway.** The gateway's Kimi Code route now offers and forwards
   `claude-gw/kimi/k3.1-pro` (1M context, image input), and the `kimi-implementer` and `kimi-reviewer` agents run on
   `claude-gw/kimi/k3.1-pro[1m]`. `claude-gw/kimi/k3` is no longer offered: a request or agent definition that names

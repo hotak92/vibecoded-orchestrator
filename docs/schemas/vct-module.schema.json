@@ -427,6 +427,13 @@
           "enum": [
             "container_pull"
           ]
+        },
+        {
+          "description": "v0.2.106: BUILD the container image locally from a directory of the orchestrator checkout (`install.container.build_context`) instead of pulling it. Used by modules whose source ships inside the orchestrator (the RL reranker): no registry, no pull token, no licence gate. The image is tagged `install.container.image` + the same variant tag `container_pull` would use, so every start / resume / health path that runs a container image treats the two methods alike (see [`InstallMethod::runs_container_image`]); only the registry-specific steps (authed pre-pull, pullability pre-flight, pull-failure reconcile) stay `container_pull`-only.",
+          "type": "string",
+          "enum": [
+            "container_build"
+          ]
         }
       ]
     },
@@ -469,11 +476,10 @@
       }
     },
     "ContainerInstallBlock": {
-      "description": "Container-pull install metadata. Carries the registry image reference + the signed-URL token gateway endpoint. The launcher's installer engine POSTs the user's validated-tier JWT to `pull_token_endpoint` before invoking `podman/docker pull` — no anonymous registry access is ever attempted.",
+      "description": "Container install metadata, shared by both container install methods.\n\n* `container_pull`: the registry image reference + the signed-URL token gateway endpoint. The launcher's installer engine POSTs the user's validated-tier JWT to `pull_token_endpoint` before invoking `podman/docker pull` — no anonymous registry access is ever attempted. * `container_build` (v0.2.106): `image` is the LOCAL tag the launcher builds (e.g. `localhost/vco-rl-reranker`), `build_context` is the build context inside the orchestrator checkout and `dockerfile` the Dockerfile (default `<build_context>/Dockerfile`). `pull_token_endpoint` is unused and may be omitted.",
       "type": "object",
       "required": [
-        "image",
-        "pull_token_endpoint"
+        "image"
       ],
       "properties": {
         "image": {
@@ -494,7 +500,8 @@
           ]
         },
         "pull_token_endpoint": {
-          "description": "HTTPS endpoint that issues short-lived pull tokens against the user's validated-tier JWT. POST-only. Returns `{ image, tag, pull_token, expires_at }`. TTL ~15 minutes.",
+          "description": "HTTPS endpoint that issues short-lived pull tokens against the user's validated-tier JWT. POST-only. Returns `{ image, tag, pull_token, expires_at }`. TTL ~15 minutes. Required by `container_pull`; empty (the default) for `container_build`, which never contacts a registry for its image.",
+          "default": "",
           "type": "string"
         },
         "pull_token_method": {
@@ -509,6 +516,22 @@
         },
         "rotate_weights_endpoint": {
           "description": "HTTPS endpoint that returns the latest available weights bundle version + a signed download URL. Polled on launcher startup + once per day per the project's locked decision (2026-05-16).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "build_context": {
+          "description": "`container_build` only: the image's build context, RELATIVE to the orchestrator checkout root (`.` for the checkout itself). It must stay inside the checkout; `bundled_modules::build_inputs` enforces that. `None` for `container_pull`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dockerfile": {
+          "description": "`container_build` only: the Dockerfile, RELATIVE to the orchestrator checkout root (e.g. `claude_mcp_servers/rl_reranker/Dockerfile`). `None` = `<build_context>/Dockerfile`. A module whose image needs files from elsewhere in the checkout uses the root as its context and names its Dockerfile here (the root `.dockerignore` limits what enters the context).",
           "default": null,
           "type": [
             "string",

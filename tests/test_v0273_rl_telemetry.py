@@ -1131,7 +1131,7 @@ def test_nemb_dedup_legacy_jsonl_writer_dedups_too():
 
 def test_nemb_dedup_written_event_is_consumable_by_offline_trainer_field():
     """Contract anchor: the offline trainer reads the node vector via
-    `node.get("emb")` (paid-modules/vct-rl-reranker/offline_trainer.py
+    `node.get("emb")` (claude_mcp_servers/rl_reranker/offline_trainer.py
     `extract_samples` + `train_epoch`). Assert the written v3 event exposes the
     vector under exactly that key for both the KG (dual-key) and code
     (n_emb-only) shapes — so nothing the trainer needs is lost by the dedup."""

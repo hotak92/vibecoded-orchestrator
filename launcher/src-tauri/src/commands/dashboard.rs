@@ -104,7 +104,9 @@ pub struct FeatureFlags {
     /// pass unknown slugs through verbatim.
     pub tier: String,
     pub can_auto_update: bool,
-    pub has_rl_retrieval: bool,
+    // v0.2.106: `has_rl_retrieval` REMOVED — owner ruling 2026-11-11, "the
+    // RL reranker is no more paid". RL scoring is no tier feature; the
+    // switch is gated by the shipped scoring lock alone.
     pub has_curated_agents: bool,
     pub has_mao: bool,
 }
@@ -121,7 +123,6 @@ fn feature_flags_for_tier(tier: &str) -> FeatureFlags {
     FeatureFlags {
         tier: tier.to_string(),
         can_auto_update: pro,
-        has_rl_retrieval: pro,
         has_curated_agents: pro,
         has_mao: mao,
     }
@@ -211,7 +212,8 @@ fn with_rl_scoring_default(db: &Db, mut config: OrchestratorConfig) -> Orchestra
 }
 
 /// Write the RL-scoring global default (the host-wide row) and audit it,
-/// like `module_set_global_enabled`. Tier-gated by the caller.
+/// like `module_set_global_enabled`. Not tier-gated (v0.2.106): the only gate
+/// is the scoring lock, applied by [`apply_rl_scoring_switch`].
 fn set_rl_scoring_global_default(db: &Db, enabled: bool) -> Result<(), String> {
     use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
     db.module_set_global_enabled(RL_RERANKER_MODULE_ID, enabled)?;
@@ -221,6 +223,16 @@ fn set_rl_scoring_global_default(db: &Db, enabled: bool) -> Result<(), String> {
         Some(RL_RERANKER_MODULE_ID),
         &serde_json::json!({ "enabled": enabled, "scope": "global", "via": "rl_scored_retrieval_switch" }),
     )
+}
+
+/// The "RL-Scored Retrieval" switch: refuse "on" while `lock` is set (the
+/// shipped RL scoring lock — `vct_launcher_core::rl_scoring_lock`), then write
+/// the host-wide default. Licence and tier play no part since v0.2.106 (owner
+/// ruling 2026-11-11: the reranker ships with the orchestrator). Takes the
+/// lock explicitly so the post-unlock behaviour stays testable.
+fn apply_rl_scoring_switch(db: &Db, enabled: bool, lock: Option<&str>) -> Result<(), String> {
+    vct_launcher_core::rl_scoring_lock::refuse_enable_with_lock(lock, enabled)?;
+    set_rl_scoring_global_default(db, enabled)
 }
 
 /// Load the full orchestrator config.
@@ -262,19 +274,18 @@ async fn update_orchestrator_setting_inner(
         }
         "rl_retrieval_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
-            // v0.2.100 W5R-02: the shipped RL scoring lock refuses "on" first —
-            // a Pro licence cannot lift it.
-            vct_launcher_core::rl_scoring_lock::refuse_enable_while_locked(
-                vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID,
+            // v0.2.100 W5R-02: the shipped RL scoring lock refuses "on" first.
+            // v0.2.106: it is the ONLY gate — no tier check (the reranker is
+            // free). The value is the GLOBAL DEFAULT of the per-project RL
+            // toggle (the host-wide module_settings row the hub resolver
+            // reads), not a key of orchestrator.json that nothing read.
+            apply_rl_scoring_switch(
+                db,
                 val,
+                vct_launcher_core::rl_scoring_lock::module_effect_lock(
+                    vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID,
+                ),
             )?;
-            if val && !flags.has_rl_retrieval {
-                return Err(tier_required_message("pro", "RL-scored retrieval"));
-            }
-            // v0.2.100: the GLOBAL DEFAULT of the per-project RL toggle (the
-            // host-wide module_settings row the hub resolver reads), not a
-            // key of orchestrator.json that nothing read.
-            set_rl_scoring_global_default(db, val)?;
             config.rl_retrieval_enabled = val;
         }
         "telemetry_enabled" => {
@@ -1023,7 +1034,6 @@ mod tests {
         let f = feature_flags_for_tier("free");
         assert_eq!(f.tier, "free");
         assert!(!f.can_auto_update);
-        assert!(!f.has_rl_retrieval);
         assert!(!f.has_curated_agents);
         assert!(!f.has_mao);
     }
@@ -1033,7 +1043,6 @@ mod tests {
         let f = feature_flags_for_tier("pro");
         assert_eq!(f.tier, "pro");
         assert!(f.can_auto_update);
-        assert!(f.has_rl_retrieval);
         assert!(f.has_curated_agents);
         assert!(!f.has_mao, "pro must not unlock MAO features");
     }
@@ -1048,7 +1057,7 @@ mod tests {
             let f = feature_flags_for_tier(slug);
             assert_eq!(f.tier, slug);
             assert!(f.can_auto_update, "{slug} must unlock pro features");
-            assert!(f.has_rl_retrieval, "{slug} must unlock pro features");
+            assert!(f.has_curated_agents, "{slug} must unlock pro features");
             assert!(f.has_mao, "{slug} must unlock MAO features");
         }
     }
@@ -1964,5 +1973,27 @@ mod rl_scoring_default_tests {
         assert!(!cfg.rl_retrieval_enabled);
         assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(false));
         assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap());
+    }
+
+    /// v0.2.106 (owner ruling 2026-11-11, "the RL reranker is no more
+    /// paid"): with the lock lifted, an install WITHOUT any licence turns the
+    /// switch on — no tier is consulted — and the project inherits it. Red
+    /// before v0.2.106: the arm refused "on" for the free tier ("Pro").
+    #[test]
+    fn an_unlicensed_install_can_enable_once_unlocked() {
+        let (db, pid) = db_with_project();
+        apply_rl_scoring_switch(&db, true, None).expect("no licence gate");
+        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(true));
+        assert!(db.rl_scoring_enabled_with_lock(&pid, None).unwrap());
+        // ...and the shipped lock still wins over the stored row.
+        assert!(apply_rl_scoring_switch(&db, true, Some("locked")).is_err());
+        assert!(!db.rl_scoring_enabled_with_lock(&pid, Some("locked")).unwrap());
+    }
+
+    /// The free tier's flags carry no RL field at all any more.
+    #[test]
+    fn feature_flags_have_no_rl_tier_field() {
+        let json = serde_json::to_value(feature_flags_for_tier("free")).unwrap();
+        assert!(json.get("has_rl_retrieval").is_none(), "{json}");
     }
 }

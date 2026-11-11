@@ -400,11 +400,11 @@ def legacy_claude_rl_data_dir() -> Path:
 
     The directory BASENAME is deliberately the same on both sides, and is
     repeated in ``rl_logger._RL_DATA_DIRNAME`` rather than shared: that module
-    is byte-identical-VENDORED into the paid RL container image, which builds
-    without ``vco_lib``, so it cannot import this one at module scope.
+    is COPIED into the RL reranker's container image, which carries no
+    ``vco_lib.paths``, so it cannot import this one at module scope.
     ``tests/test_v0292_regclean_rl_migrate_archive.py`` pins the two strings
     equal, which is the mirror-with-a-parity-test tier of the CLAUDE.md A>B>C
-    rule, chosen because tier A is closed by the vendoring constraint.
+    rule, chosen because tier A is closed by that image constraint.
 
     Cross-OS: inherits :func:`claude_user_dir` (``$VCT_CLAUDE_DIR``), so it
     resolves on Linux, macOS and Windows with no per-OS branch. Does not create

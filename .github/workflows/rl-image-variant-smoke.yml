@@ -3,81 +3,53 @@
 # WHY THIS EXISTS
 # The v0.2.72 supervisor fix made image resolution variant-aware
 # (`resolve_variant_tag`: `{version}-cpu` / `-cuda` / `-rocm` per the
-# manifest's `gpu_image_variants`), but no live smoke ever pulled a
-# variant-resolved image and confirmed a started container can reach the
-# hub (RL audit item RL-13; the v0.2.75 Part-4 supervisor-conditional
+# manifest's `gpu_image_variants`), but no live smoke ever started a
+# variant-resolved image and confirmed the container can reach the hub
+# (RL audit item RL-13; the v0.2.75 Part-4 supervisor-conditional
 # bind-widen — `resolve_hub_bind_ip` / `VCT_HUB_BIND_ALL` — is what makes
 # container→hub reach passable on default installs).
 #
-# ONE job: pull the CPU-variant image (GitHub runners have no GPU, so the
-# variant a real supervisor would resolve here IS `-cpu`), start the
-# container, and from INSIDE it curl the hub's /health (no auth) plus one
-# bearer-authed route (/services/status) via host.containers.internal —
-# the exact address the supervisor injects for module containers.
+# v0.2.106: the RL reranker ships IN this repository
+# (`claude_mcp_servers/rl_reranker`) and its image is BUILT LOCALLY by the
+# launcher (`install.method = "container_build"`) — there is no private
+# registry image and no credential any more. So this smoke now builds the
+# CPU variant from the checkout exactly as the launcher does (same
+# Dockerfile, same `VARIANT` build arg, same `localhost/vco-rl-reranker:
+# <version>-cpu` tag), starts it, checks it reports its weights state on
+# /health, and checks container→hub reach. GitHub runners have no GPU, so
+# the variant a real supervisor would resolve here IS `-cpu`.
 #
-# ── PENDING-CREDENTIAL STATE (read before wondering why this is gray) ──
-# The image lives in a PRIVATE GHCR package. This workflow ships NOW as a
-# dormant skeleton and goes LIVE the moment the E-1 ops item provisions
-# the bot PAT (read:packages) as the repo secret `GHCR_SMOKE_TOKEN`
-# (+ optionally `GHCR_SMOKE_USER`, defaulting to the package owner).
-# Until then: the `check-secret` job publishes has_token=false and the
-# smoke job self-skips. Job-level `if:` cannot read the `secrets` context,
-# hence the two-job presence probe.
-#
-# Trigger: manual (workflow_dispatch) only — this hits GHCR + Supabase-less
-# hub paths and there's no point burning minutes per-push while the bucket
-# / GHCR publish pipeline (E-1) is still pending. Add a weekly `schedule:`
-# once the credential lands and the first manual run is green.
+# Trigger: manual (workflow_dispatch) only — the build downloads the CPU
+# PyTorch wheel; there is no point burning minutes per push.
 
 name: RL Image Variant Smoke
 
 on:
   workflow_dispatch:
-    inputs:
-      image_version:
-        description: >-
-          RL Reranker module version to smoke (the CPU variant tag
-          `<version>-cpu` is derived from it, mirroring
-          resolve_variant_tag's `{version}-cpu` template).
-        required: false
-        default: "0.2.10"
-      image_repo:
-        description: Fully-qualified image repo (no tag).
-        required: false
-        default: "ghcr.io/hotak92/vct-rl-reranker"
 
 jobs:
-  # `secrets` is not readable from a job-level `if:` — expose presence as a
-  # job output instead (standard dance; value never leaks, only a boolean).
-  check-secret:
-    runs-on: ubuntu-latest
-    outputs:
-      has_token: ${{ steps.probe.outputs.has_token }}
-    steps:
-      - id: probe
-        env:
-          GHCR_SMOKE_TOKEN: ${{ secrets.GHCR_SMOKE_TOKEN }}
-        run: |
-          if [ -n "$GHCR_SMOKE_TOKEN" ]; then
-            echo "has_token=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_token=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::GHCR_SMOKE_TOKEN not provisioned yet (E-1 ops item pending) — smoke self-skips."
-          fi
-
   variant-smoke:
-    needs: check-secret
-    if: needs.check-secret.outputs.has_token == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      IMAGE_REF: ${{ inputs.image_repo || 'ghcr.io/hotak92/vct-rl-reranker' }}:${{ inputs.image_version || '0.2.10' }}-cpu
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: launcher/src-tauri
+
+      - name: Resolve the image tag from the shipped manifest
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 -c "import json; print(json.load(open('claude_mcp_servers/rl_reranker/vct-module.json'))['version'])")"
+          IMAGE="$(python3 -c "import json; print(json.load(open('claude_mcp_servers/rl_reranker/vct-module.json'))['install']['container']['image'])")"
+          echo "IMAGE_REF=${IMAGE}:${VERSION}-cpu" >> "$GITHUB_ENV"
+
+      - name: Build the CPU variant from the checkout (as the launcher does)
+        run: |
+          set -euo pipefail
+          docker build --build-arg VARIANT=cpu \
+            --file claude_mcp_servers/rl_reranker/Dockerfile --tag "$IMAGE_REF" .
 
       - name: Build vct-hub
         working-directory: launcher/src-tauri
@@ -106,17 +78,7 @@ jobs:
           # Host-side sanity before involving the container at all.
           curl -fsS "http://127.0.0.1:${HUB_PORT}/api/v1/health"
 
-      - name: Pull variant-resolved image
-        env:
-          GHCR_SMOKE_TOKEN: ${{ secrets.GHCR_SMOKE_TOKEN }}
-          GHCR_SMOKE_USER: ${{ secrets.GHCR_SMOKE_USER }}
-        run: |
-          set -euo pipefail
-          echo "$GHCR_SMOKE_TOKEN" | docker login ghcr.io \
-            -u "${GHCR_SMOKE_USER:-hotak92}" --password-stdin
-          docker pull "$IMAGE_REF"
-
-      - name: Start container + smoke container→hub reach
+      - name: Start container + smoke /health and container→hub reach
         run: |
           set -euo pipefail
           # host-gateway maps host.containers.internal (the podman-style
@@ -125,7 +87,7 @@ jobs:
           # install has after the bind-widen.
           docker run -d --name rl-smoke \
             --add-host host.containers.internal:host-gateway \
-            -e RL_SERVER_PORT=11438 \
+            -e ACTIVE_EMBEDDING=qwen3 \
             -e PYTHONUNBUFFERED=1 \
             "$IMAGE_REF"
           # The image must actually boot (not crash-loop on defaults).
@@ -134,6 +96,19 @@ jobs:
             [ "$state" = "running" ] || { echo "container state=$state"; docker logs rl-smoke; exit 1; }
             sleep 1
           done
+
+          # 0. The server reports its weights state: `trained` is a bool and
+          #    `weights.bundled_version` matches the shipped manifest.
+          docker exec rl-smoke python3 -c "
+          import json, sys, urllib.request
+          from rl_reranker.bundled_weights import resolve_bundled_weights
+          with urllib.request.urlopen('http://127.0.0.1:11450/health', timeout=10) as r:
+              h = json.load(r)
+          shipped = resolve_bundled_weights('/app/weights', 'qwen3')
+          assert isinstance(h['trained'], bool), h
+          assert h['weights']['bundled_version'] == (shipped.version if shipped else None), h
+          print('health:', h['model'], h['weights'])
+          "
 
           HUB_TOKEN="$(cat "$VCT_STATE_DIR/hub.token")"
           # 1. Unauthenticated liveness: /api/v1/health.
@@ -158,7 +133,7 @@ jobs:
               sys.exit(0 if e.code == 401 else 1)
           sys.exit(1)  # unauthenticated request must NOT succeed
           "
-          echo "container→hub reach + auth gate: OK"
+          echo "health + container→hub reach + auth gate: OK"
 
       - name: Dump logs on failure
         if: failure()
@@ -170,4 +145,3 @@ jobs:
         if: always()
         run: |
           docker rm -f rl-smoke >/dev/null 2>&1 || true
-          docker logout ghcr.io >/dev/null 2>&1 || true

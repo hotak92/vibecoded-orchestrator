@@ -387,7 +387,7 @@ A project that runs its own local service (its own Ollama on `11436`, say) can l
 
 ## Paid-module license framework
 
-This repo is fully functional standalone. Optional paid modules (RL retrieval reranking, MAO multi-agent runtime, specialist agent packs) activate only when a license key is present. Without a key, retrieval falls back to plain Weaviate cosine ordering — nothing breaks.
+This repo is fully functional standalone. Optional paid modules (MAO multi-agent runtime, specialist agent packs) activate only when a license key is present. The RL retrieval reranker is NOT one of them since v0.2.106: it ships in this repository and needs no key (see below).
 
 License resolution priority (first match wins; see `VCThelpers/license/validator.py`):
 
@@ -400,9 +400,9 @@ License resolution priority (first match wins; see `VCThelpers/license/validator
 
 **Network policy**: fail-OPEN to free tier on any transport failure. Never block startup, never raise.
 
-**Free-tier RL gate** (in `claude_mcp_servers/weaviate_mcp/server.py`): `_rl_cache_and_rerank` skips RL reranking when `feature_enabled("rl_retrieval") == False`. Pro/MAO licenses unlock RL. Free-tier users get plain Weaviate cosine ordering.
+**RL gates** (in `claude_mcp_servers/rl_client/search_pipeline.py::_resolve_rl_enabled`): RL reranking runs when the shipped RL scoring lock (`vco_lib/rl_scoring_lock.toml`) is lifted AND the project's RL reranker toggle (launcher Modules panel; hub-served `rl_reranker_enabled_for_project`) is on. There is no licence gate: v0.2.106 removed `rl_retrieval` from the tier table (owner ruling 2026-11-11). Otherwise — and whenever the reranker container is down — results keep plain Weaviate cosine ordering.
 
-**RL module env vars** (only meaningful with Pro+ license):
+**RL module env vars**:
 
 | Var | Default | What it does |
 |---|---|---|
@@ -412,7 +412,7 @@ License resolution priority (first match wins; see `VCThelpers/license/validator
 
 ### RL event retention and archives
 
-The `rl_events` table in `launcher.db` is written on every ranked retrieval regardless of tier (only the *reranking* is Pro-gated), so its retention knobs apply to free installs too. The prune driver is `claude_mcp_servers/rl_client/rl_retention.py`; the delete and the archive are executed hub-side, by the process that owns `launcher.db`.
+The `rl_events` table in `launcher.db` is written on every ranked retrieval whether or not the reranking runs, so its retention knobs apply to every install. The prune driver is `claude_mcp_servers/rl_client/rl_retention.py`; the delete and the archive are executed hub-side, by the process that owns `launcher.db`.
 
 | Var | Default | What it does |
 |---|---|---|

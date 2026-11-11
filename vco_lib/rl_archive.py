@@ -25,7 +25,7 @@ Format contract (MUST MATCH ``db/rl_events.rs``)
   identical to ``vct-hub``'s ``RlEventOut`` — the exact JSON the offline trainer
   already consumes from ``GET /api/v1/rl/events``. So a row read back from an
   archive can be handed straight to
-  ``paid-modules/vct-rl-reranker/hub_event_loader.py::_reshape_hub_row`` with no
+  ``claude_mcp_servers/rl_reranker/hub_event_loader.py::_reshape_hub_row`` with no
   new parser and no field mapping:
 
       id, event_type, schema_version, ts_ms, project_id, project_name,

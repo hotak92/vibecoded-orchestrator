@@ -371,7 +371,7 @@ A per-project MCP toggle (launcher's project Permissions tab) is written to `~/.
 The code-embedding FastAPI service is backend infrastructure, not an MCP.
 
 {{#if_module_active rl_retrieval}}
-**RL retrieval reranking is active for this project** (license-gated: `feature_enabled("rl_retrieval")`). Retrieval results are reranked by the trained model before they reach you, and its training logs are collected even when you do not use the feature. If retrieval ever falls back to plain cosine ordering, the license gate closed — say so rather than working around it.
+**RL retrieval reranking is active for this project** (the RL scoring lock is lifted and the reranker is enabled for this project in the launcher's Modules panel). Retrieval results are reranked by the trained model before they reach you, and its training logs are collected even when you do not use the feature. If retrieval ever falls back to plain cosine ordering, the reranker container is down or out of step with this client — run `python claude_mcp_servers/scripts/rl_doctor.py` and say so rather than working around it.
 {{/if_module_active}}
 
 ### Hook System
@@ -701,7 +701,7 @@ If you're seeing this orchestrator for the first time, here's the 60-second ment
 
 - **What it is**: an infrastructure layer for Claude Code that adds persistent memory (KG), semantic code search (code graph), and a set of hooks that run automatically. You keep using Claude Code the way you already do; the orchestrator works in the background via hooks and MCP servers.
 - **What runs locally**: Weaviate (vector DB) on `:8081`, Ollama (local LLM + embeddings) on `:11435`. Both started automatically by the `SessionStart` hook if not already running.
-- **Free vs Pro**: this repo is fully functional standalone. Optional paid modules (RL retrieval reranking, MAO multi-agent runtime, specialist agent packs) activate only when a license key is present. Without a key, retrieval falls back to cosine ordering — nothing breaks.
+- **Free vs Pro**: this repo is fully functional standalone, the RL retrieval reranker included (it needs no key since v0.2.106; its scores stay off until a trained model ships, and retrieval keeps cosine ordering meanwhile). Optional paid modules (MAO multi-agent runtime, specialist agent packs) activate only when a license key is present — nothing breaks without one.
 
 If install hasn't run yet (or you're not sure):
 

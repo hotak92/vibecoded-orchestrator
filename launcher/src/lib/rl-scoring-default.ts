@@ -6,8 +6,9 @@
 // What it is: the GLOBAL DEFAULT of the per-project RL reranker toggle. It is
 // the host-wide `enabled_for_project` row of module `vct-rl-reranker`
 // (`module_set_global_enabled` / `module_is_global_enabled`); a project with
-// no explicit row inherits it. The licence gate is unchanged and sits in
-// front of it.
+// no explicit row inherits it. v0.2.106: no licence gate sits in front of it
+// any more (owner 2026-11-11, "the RL reranker is no more paid") — the lock
+// below is its only gate.
 //
 // What it is NOT: a switch on data collection. Event logging is gated by its
 // own flags (RL_LOCAL_LOGGING_DISABLED*) and never consults this one.
@@ -44,7 +45,6 @@ export interface RlScoringSwitchView {
  */
 export function rlScoringSwitchView(
   globalEnabled: boolean | null | undefined,
-  hasRlRetrieval: boolean,
   lockReason: string | null | undefined,
 ): RlScoringSwitchView {
   if (lockReason === undefined) {
@@ -63,7 +63,7 @@ export function rlScoringSwitchView(
   }
   return {
     checked: globalEnabled === true,
-    disabled: !hasRlRetrieval,
+    disabled: false,
     notice: null,
     storedNote: null,
   };

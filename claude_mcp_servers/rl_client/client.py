@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Async HTTP client for the vct-rl-reranker container (paid module).
+"""Async HTTP client for the vct-rl-reranker container
+(``claude_mcp_servers/rl_reranker``, built locally from this repository).
 
 The client is designed to be **always-safe to construct** even when
-the paid container isn't installed. Free-tier behavior:
+the container isn't installed or running. Behaviour without it:
 
   * ``RL_SERVER_URL`` / ``RL_SERVER_PORT`` env unset → "disabled mode":
     ``cache_nodes`` returns the input nodes truncated to ``top_k``;
@@ -13,8 +14,7 @@ the paid container isn't installed. Free-tier behavior:
     "no rerank" (same as disabled mode) but the instance is NOT
     permanently disabled; subsequent calls retry.
 
-This preserves the v0.2.x ``feature_enabled('rl_retrieval')`` gate
-semantics: free-tier users get plain Weaviate cosine ordering;
+Without the container, search gets plain Weaviate cosine ordering;
 nothing crashes when the container is down.
 
 Constructor takes ``text_dim`` (for query_emb sanity-checking) and

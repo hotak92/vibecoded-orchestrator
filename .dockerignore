@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# Build context of every image built with the CHECKOUT ROOT as its context —
+# today only the RL reranker (claude_mcp_servers/rl_reranker/Dockerfile; the
+# launcher's `container_build` install and the `rl_reranker` compose service
+# both build it from here). It needs the root because it imports files that
+# live outside its own directory and must not be duplicated into it:
+# claude_mcp_servers/rl_client/rl_logger.py and the stdlib-only
+# vco_lib/{rl_training_targets,atomic,log_setup}.py.
+#
+# Whitelist, so a root-context build never ships the rest of the checkout
+# (launcher sources, node_modules, cargo targets, .venv, state). Keep it in
+# step with the Dockerfile's COPY set: tests/rl_reranker/test_image_sources.py
+# fails when a file the reranker imports is not both COPYed and listed here.
+# (podman and docker both read `.dockerignore` at the context root.)
+*
+!claude_mcp_servers/rl_reranker/
+claude_mcp_servers/rl_reranker/**/__pycache__
+claude_mcp_servers/rl_reranker/scripts/
+!claude_mcp_servers/rl_client/rl_logger.py
+!vco_lib/rl_training_targets.py
+!vco_lib/atomic.py
+!vco_lib/log_setup.py

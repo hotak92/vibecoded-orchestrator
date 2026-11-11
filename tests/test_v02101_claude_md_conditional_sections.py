@@ -17,8 +17,8 @@ What is pinned here:
   stderr line, never a raise — the value feeds a render;
 * ``model_gateway`` follows the DELIVERY gate (SKIP hides, DELIVER and
   UNKNOWN render), ``lean_ctx`` follows the folder's own settings.json hook
-  registration, ``rl_retrieval`` follows the license validator call the RL
-  pipeline itself gates on;
+  registration, ``rl_retrieval`` follows the RL pipeline's own gates (the
+  scoring lock, then the hub's per-project toggle — v0.2.106: no licence);
 * D4: the bundle path resolves the folder to its launcher.db UUID, so an
   explicit ``project_modules`` row finally reaches the project render (the
   old call passed ``str(folder)`` where the table keys on the UUID — a row
@@ -197,7 +197,9 @@ class TestConservativeProbeFailures:
 
         monkeypatch.setattr(mgd, "resolve_project_id_for_folder", _raiser)
         monkeypatch.setattr(mgd, "gateway_agents_gate", _raiser)
-        monkeypatch.setitem(sys.modules, "VCThelpers.license", None)
+        from vco_lib import rl_scoring_lock
+
+        monkeypatch.setattr(rl_scoring_lock, "rl_scoring_lock_reason", _raiser)
         # lean-ctx: settings.json is a DIRECTORY → read raises OSError.
         settings = folder / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True)
@@ -221,7 +223,7 @@ class TestConservativeProbeFailures:
         assert "project_modules probe failed" in err
         assert "model-gateway probe failed" in err
         assert "could not be read" in err
-        assert "license validator unavailable" in err
+        assert "RL scoring-lock probe failed" in err
 
     def test_render_never_crashes_when_the_resolver_is_broken(
             self, tmp_path, monkeypatch):
@@ -245,37 +247,82 @@ class TestConservativeProbeFailures:
         assert "{{#" not in text and "{{/if_" not in text
         assert "section resolver failed" in err.getvalue()
 
-    def test_rl_probe_uses_the_pipelines_own_call_shape(self, tmp_path, monkeypatch):
-        folder = tmp_path / "proj"
-        folder.mkdir()
+    @staticmethod
+    def _licence_spy(monkeypatch) -> list:
+        """A ``VCThelpers.license`` that records any call: v0.2.106 removed
+        the licence gate, so the RL probe must never ask it."""
         calls: list = []
         fake = types.ModuleType("VCThelpers.license")
 
-        def feature_enabled(feature, module_id=None):
-            calls.append((feature, module_id))
+        def feature_enabled(*a, **k):
+            calls.append((a, k))
             return False
 
-        fake.feature_enabled = feature_enabled
+        fake.feature_enabled = feature_enabled  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "VCThelpers.license", fake)
+        return calls
+
+    def test_rl_probe_is_off_while_the_shipped_lock_is_set(self, tmp_path, monkeypatch):
+        """The pipeline's FIRST gate: a set scoring lock is a definitive no,
+        and the per-project probe is not even reached."""
+        folder = tmp_path / "proj"
+        folder.mkdir()
+        licence_calls = self._licence_spy(monkeypatch)
+        from vco_lib import project_config
+
+        def _must_not_resolve(*_a, **_k):
+            raise AssertionError("per-project probe reached while locked")
+
+        monkeypatch.setattr(project_config, "resolve", _must_not_resolve)
+        assert cms.RL_RETRIEVAL not in cms.active_sections(folder, needed={cms.RL_RETRIEVAL})
+        assert licence_calls == []
+
+    @pytest.mark.parametrize("toggle, expected", [(True, True), (False, False), (None, True)])
+    def test_rl_probe_follows_the_per_project_toggle_once_unlocked(
+        self, tmp_path, monkeypatch, toggle, expected,
+    ):
+        """Below the lock, the hub's ``rl_reranker_enabled_for_project``
+        decides, exactly as ``search_pipeline._resolve_rl_enabled`` does
+        (an absent attribute defaults on). Red before v0.2.106: an
+        unlicensed machine never rendered the section."""
+        folder = tmp_path / "proj"
+        folder.mkdir()
+        licence_calls = self._licence_spy(monkeypatch)
+        from vco_lib import project_config, rl_scoring_lock
+
+        monkeypatch.setattr(rl_scoring_lock, "rl_scoring_lock_reason", lambda: None)
+        cfg = types.SimpleNamespace()
+        if toggle is not None:
+            cfg.rl_reranker_enabled_for_project = toggle
+        seen: list = []
+        monkeypatch.setattr(project_config, "resolve", lambda f: seen.append(f) or cfg)
         sections = cms.active_sections(folder, needed={cms.RL_RETRIEVAL})
-        assert cms.RL_RETRIEVAL not in sections
-        # The SAME call the retrieval pipeline gates on (search_pipeline.py),
-        # so the section and the behaviour cannot drift apart.
-        assert calls == [("rl_retrieval", "vct-rl-reranker")]
+        assert (cms.RL_RETRIEVAL in sections) is expected
+        assert seen == [folder]
+        assert licence_calls == []
 
     def test_rl_probe_exception_renders(self, tmp_path, monkeypatch, capsys):
         folder = tmp_path / "proj"
         folder.mkdir()
-        fake = types.ModuleType("VCThelpers.license")
+        from vco_lib import project_config, rl_scoring_lock
 
-        def feature_enabled(*_a, **_k):
-            raise RuntimeError("validator exploded")
+        monkeypatch.setattr(rl_scoring_lock, "rl_scoring_lock_reason", lambda: None)
 
-        fake.feature_enabled = feature_enabled
-        monkeypatch.setitem(sys.modules, "VCThelpers.license", fake)
+        def _hub_down(_folder):
+            raise RuntimeError("hub unreachable")
+
+        monkeypatch.setattr(project_config, "resolve", _hub_down)
         assert cms.RL_RETRIEVAL in cms.active_sections(
             folder, needed={cms.RL_RETRIEVAL})
-        assert "RL license probe failed" in capsys.readouterr().err
+        assert "RL per-project toggle probe failed" in capsys.readouterr().err
+
+        def _lock_broken():
+            raise RuntimeError("table unreadable")
+
+        monkeypatch.setattr(rl_scoring_lock, "rl_scoring_lock_reason", _lock_broken)
+        assert cms.RL_RETRIEVAL in cms.active_sections(
+            folder, needed={cms.RL_RETRIEVAL})
+        assert "RL scoring-lock probe failed" in capsys.readouterr().err
 
 
 class TestLeanCtxDetection:
@@ -520,7 +567,7 @@ class TestNeededFilter:
     def test_untagged_template_probes_nothing(self, tmp_path, monkeypatch):
         """``needed`` is the hermeticity + cost contract: a document that
         carries no tag for a feature never triggers that feature's probe (the
-        license probe in particular may contact the licensing backend)."""
+        RL probe in particular asks the hub once the scoring lock lifts)."""
         folder = tmp_path / "proj"
         folder.mkdir()
         calls: list[str] = []

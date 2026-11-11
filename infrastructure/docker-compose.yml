@@ -403,6 +403,65 @@ services:
     profiles:
       - gpu  # Only started when `--profile gpu` is passed
 
+  # v0.2.106: the RL reranker (claude_mcp_servers/rl_reranker) — built from
+  # this checkout like code_embed, never pulled from a registry.
+  #
+  # The LAUNCHER is what normally builds and runs it: installing the
+  # "RL Reranker" module (install.method = "container_build" in
+  # claude_mcp_servers/rl_reranker/vct-module.json) runs
+  # `<engine> build --build-arg VARIANT=<cpu|cuda|rocm> --file
+  #  claude_mcp_servers/rl_reranker/Dockerfile --tag
+  #  localhost/vco-rl-reranker:<version>-<variant> <checkout root>` — the SAME
+  # build context and Dockerfile — then the hub's module supervisor runs it with
+  # its per-install env (hub token, ports, mounts). This service is the
+  # standalone entry point — a manual build, or running the reranker
+  # outside the launcher for debugging — and is behind the `rl` profile so
+  # no ensure/up path ever starts it:
+  #
+  #   cd infrastructure && podman-compose --profile rl build rl_reranker
+  #   cd infrastructure && podman-compose --profile rl up -d rl_reranker
+  #
+  # Do not run it next to a launcher-managed RL module: both bind host port
+  # 11450. The trained weights it serves are the ones bundled under
+  # claude_mcp_servers/rl_reranker/weights (manifest.json); with none
+  # shipped for ACTIVE_EMBEDDING, /health reports "not trained".
+  rl_reranker:
+    build:
+      # The CHECKOUT ROOT is the context (the image COPYs rl_client/rl_logger.py
+      # and vco_lib/rl_training_targets.py from where they live — one copy);
+      # the root .dockerignore whitelists what enters it.
+      context: ${VCT_RL_RERANKER_BUILD_CONTEXT:-..}
+      dockerfile: claude_mcp_servers/rl_reranker/Dockerfile
+      args:
+        VARIANT: "${RL_RERANKER_VARIANT:-cpu}"
+    image: localhost/vco-rl-reranker:${RL_RERANKER_TAG:-standalone-cpu}
+    # No fixed `container_name`: the fixed names are the ones the
+    # ensure-containers hook manages (vco_lib.containers.CANONICAL_CONTAINERS,
+    # pinned against this file), and the hook never starts this service.
+    restart: "no"
+    ports:
+      - "127.0.0.1:${RL_RERANKER_PORT:-11450}:11450"
+    environment:
+      ACTIVE_EMBEDDING: "${ACTIVE_EMBEDDING:-qwen3}"
+      RL_PORT: "11450"
+      RL_BIND_HOST: "0.0.0.0"
+      RL_PROJECT_ROOT: "/data"
+      RL_WEIGHTS_DIR: "/app/weights"
+      OLLAMA_URL: "http://vco_ollama:11434"
+    # No volume: a standalone run keeps its state inside the container and
+    # loses it with the container (the launcher-managed module mounts its
+    # own per-install state). VCO's named volumes are the data volumes the
+    # runtime reconcile tracks (vco_lib.runtime_reconcile.VCO_VOLUME_NAMES);
+    # a debugging run is not one of them.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:11450/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    profiles:
+      - rl  # Standalone only; the launcher's module supervisor runs it normally
+
 # Named volumes — explicit `name:` declarations are required so
 # Bug-31-style overrides in docker-compose.override.yml can alias them
 # to external pre-existing volumes (otherwise podman-compose 1.5.x
