@@ -348,6 +348,18 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "is outside the extractor surface. _CHUNKER_REVISION unchanged at "
         "v0.2.92.1; CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7."
     ),
+    "0.2.106": (
+        "No extraction-semantics change. `git diff v0.2.105..HEAD` across the "
+        "extractor surface touches only templates/scripts/analyze_code_graph.py "
+        "(12 lines): the five collection deletes of a reset now go through "
+        "fixture_class_guard.record_collection_delete, which records the delete "
+        "for the Weaviate raft-replay guard before issuing it. How an entity is "
+        "found, named, hashed, chunked or truncated is unchanged; the RL "
+        "answer-window chunker (rl_client/answer_chunking.py) is outside the "
+        "extractor surface. _CHUNKER_REVISION unchanged at v0.2.92.1; "
+        "CODEGRAPH_EMBED_REVISION unchanged at 1; "
+        "CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 9."
+    ),
 }
 
 #: The newest generation a freshly-built graph satisfies.

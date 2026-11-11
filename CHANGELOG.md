@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.106] - 2026-11-11
+
 ### Added
 
 - **A switch for automatic service restarts, in Preferences → Services.** The launcher's services watcher has been
@@ -196,6 +198,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subagent's self-wake now say so: a lane runs a long command in the foreground, lets the harness move it and ends
   its turn. A helper a lane starts with `run_in_background` on purpose, or a subagent it spawns, may still report to
   the root session, so the rule that a lane runs its own helpers in the foreground stays.
+
+- **Release mechanics:** version 0.2.105 → 0.2.106 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No code-graph extractor-generation rung this release: the only change on the extractor surface routes the analyzer's collection deletes through the raft-replay guard's recorder, so existing code graphs are not re-walked.
 
 ### Fixed
 
