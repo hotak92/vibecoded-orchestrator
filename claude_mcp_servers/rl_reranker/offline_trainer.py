@@ -320,6 +320,74 @@ def resolve_features(
 # Task-level sample extraction
 # ---------------------------------------------------------------------------
 
+def citation_targets(
+    cit_ev: "dict[str, Any]",
+) -> "tuple[dict[str, float], float] | None":
+    """The training targets and loss weight one citation event yields.
+
+    The ONE home of the per-citation training policy; :func:`extract_samples`
+    and the offline export (``rl_reranker.export``) both call it, so the
+    shards a volunteer shares carry exactly the labels this trainer would use.
+
+    Returns ``({title: target}, sample_weight)``, or ``None`` when the pair
+    must be DISCARDED from training.
+
+    Targets: the unified-target formula over ``cosine_sims`` (+ the v3
+    ``literal_cited`` / ``cross_encoder_cited`` flag dicts; v2 events lack them
+    and the formula degenerates to cosine-only); events without
+    ``cosine_sims`` fall back to binary ``citations`` labels.
+
+    Soft-label policy (2026-07-22): a citation fired via the soft-terminal
+    path (below-terminal-floor answer window) is weaker evidence than a hard
+    terminal citation.
+
+    * window < SOFT_MIN_WINDOW_TOKENS (default 1000 ≈ <2 chunker chunks):
+      DISCARD (maintainer ruling — a ~1-chunk window degenerates "max over
+      answer-chunks" to one query-echo-dominated comparison; the label is
+      noise). A soft event MISSING ``window_tokens`` is discarded too
+      (conservative default: the precondition cannot be confirmed). The stored
+      event is untouched — it stays re-labelable later.
+    * window ≥ floor: keep, weighted by SOFT_LABEL_WEIGHT.
+
+    Hard citations always weigh 1.0 (they fired at the 2000-token terminal
+    floor or the 25k gate — always multi-chunk).
+    """
+    if bool(cit_ev.get("soft_label")):
+        window_tokens = int(cit_ev.get("window_tokens") or 0)
+        if window_tokens < SOFT_MIN_WINDOW_TOKENS:
+            return None
+        sample_weight = SOFT_LABEL_WEIGHT
+    else:
+        sample_weight = 1.0
+
+    cosine_sims: dict[str, float] = {
+        k: float(v) for k, v in (cit_ev.get("cosine_sims") or {}).items()
+    }
+    if cosine_sims:
+        literal_cited = {
+            k: bool(v) for k, v in (cit_ev.get("literal_cited") or {}).items()
+        }
+        cross_encoder_cited_raw = cit_ev.get("cross_encoder_cited") or {}
+        cross_encoder_cited = {
+            k: bool(v) for k, v in cross_encoder_cited_raw.items()
+        } if cross_encoder_cited_raw else None
+        targets = compute_targets_from_cosine_sims(
+            cosine_sims,
+            literal_cited=literal_cited or None,
+            cross_encoder_cited=cross_encoder_cited,
+        )
+    else:
+        # Fallback: binary labels (events that predate the schema_version=2
+        # cosine_sims field, or events where citation detection failed to
+        # compute cosines).
+        targets = {
+            t: (1.0 if cited else 0.0)
+            for t, cited in (cit_ev.get("citations") or {}).items()
+            if cited is not None
+        }
+    return targets, sample_weight
+
+
 def extract_samples(
     pairs: "list[tuple[dict, dict]]",
     link_sim: "dict[str, float]",
@@ -338,35 +406,16 @@ def extract_samples(
             continue
         q_emb = np.array(q_emb_raw, dtype=np.float32)
 
-        cosine_sims: dict[str, float] = {
-            k: float(v) for k, v in cit_ev.get("cosine_sims", {}).items()
-        }
-        if cosine_sims:
-            # v3 events ship ``literal_cited`` + (optionally)
-            # ``cross_encoder_cited`` per-node flag dicts. v2 events lack
-            # these — the unified helper treats missing entries as False
-            # (= cosine-only path), so the call is back-compat.
-            literal_cited = {
-                k: bool(v) for k, v in cit_ev.get("literal_cited", {}).items()
-            }
-            cross_encoder_cited_raw = cit_ev.get("cross_encoder_cited") or {}
-            cross_encoder_cited = {
-                k: bool(v) for k, v in cross_encoder_cited_raw.items()
-            } if cross_encoder_cited_raw else None
-            targets = compute_targets_from_cosine_sims(
-                cosine_sims,
-                literal_cited=literal_cited or None,
-                cross_encoder_cited=cross_encoder_cited,
+        task_id = ret_ev.get("task_id", "")
+        decided = citation_targets(cit_ev)
+        if decided is None:
+            logger.debug(
+                "extract_samples: discarding soft-label pair task_id=%s "
+                "(window_tokens below floor %d)",
+                task_id[:8], SOFT_MIN_WINDOW_TOKENS,
             )
-        else:
-            # Fallback: binary labels (events that predate the schema_version=2
-            # cosine_sims field, or events where citation detection failed
-            # to compute cosines).
-            targets = {
-                t: (1.0 if cited else 0.0)
-                for t, cited in cit_ev.get("citations", {}).items()
-                if cited is not None
-            }
+            continue
+        targets, sample_weight = decided
 
         # Pre-convert node embeddings to numpy once
         node_map: dict[str, dict] = {}
@@ -379,33 +428,6 @@ def extract_samples(
             n2["_emb_np"] = np.array(emb_raw, dtype=np.float32)
             node_map[title] = n2
 
-        task_id = ret_ev.get("task_id", "")
-        # Soft-label handling (2026-07-22): a citation fired via the
-        # soft-terminal path (below-terminal-floor answer window) is weaker
-        # evidence than a hard terminal citation.
-        #   * window < SOFT_MIN_WINDOW_TOKENS (default 1000 ≈ <2 chunker
-        #     chunks): DISCARD the pair from training (maintainer ruling —
-        #     a ~1-chunk window degenerates "max over answer-chunks" to one
-        #     query-echo-dominated comparison; the label is noise, and noisy
-        #     labels on a small ranking corpus drive predict-the-mean
-        #     collapse). The stored event is untouched — re-labelable later.
-        #     A soft event MISSING window_tokens is discarded too
-        #     (conservative default: can't confirm the precondition).
-        #   * window ≥ floor: keep, weighted by SOFT_LABEL_WEIGHT.
-        # Hard citations always keep weight 1.0 (they fired at the 2000-token
-        # terminal floor or the 25k gate — always multi-chunk).
-        if bool(cit_ev.get("soft_label")):
-            window_tokens = int(cit_ev.get("window_tokens") or 0)
-            if window_tokens < SOFT_MIN_WINDOW_TOKENS:
-                logger.debug(
-                    "extract_samples: discarding soft-label pair task_id=%s "
-                    "(window_tokens=%d < floor %d)",
-                    task_id[:8], window_tokens, SOFT_MIN_WINDOW_TOKENS,
-                )
-                continue
-            sample_weight = SOFT_LABEL_WEIGHT
-        else:
-            sample_weight = 1.0
         for title, target in targets.items():
             node = node_map.get(title)
             if node is None:
@@ -887,6 +909,10 @@ def train(
         train_loss, train_mse, train_delta, train_mae = _epoch(
             net, train_s, opt, batch_size, lambda_rank, training=True, emb_dim=emb_dim
         )
+        # Local training on top of whatever base this checkpoint came from:
+        # the server's startup precedence keeps a trained local checkpoint
+        # over the bundled one only when it carries such steps.
+        rl_model.record_local_train_steps(math.ceil(len(train_s) / batch_size))
         val_loss, val_mse, val_delta, val_mae = (
             _epoch(net, val_s, None, batch_size, lambda_rank, training=False, emb_dim=emb_dim)
             if val_s else (train_loss, train_mse, train_delta, train_mae)

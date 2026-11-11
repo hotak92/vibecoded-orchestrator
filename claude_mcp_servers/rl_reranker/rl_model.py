@@ -155,6 +155,23 @@ QUERY_TYPE_IDX: int = NULL_TYPE_IDX + 1      # 7 -- query entity marker
 UNKNOWN_TYPE_IDX: int = QUERY_TYPE_IDX + 1   # 8 -- linked node, unknown type
 N_ENTITY_TYPES: int = UNKNOWN_TYPE_IDX + 1   # 9 builtin slots
 
+#: Embedding profiles whose linked-entity slots (2..6) are MASKED: always NULL
+#: padding (zero vector, NULL_TYPE_IDX, cosines (0, 0)), in training AND in
+#: serving. Arctic training data comes from dual-log twins, which carry no
+#: linked vectors by design (search_pipeline ``_ACTIVE_SPACE_ONLY_FIELDS``),
+#: so a model trained on them never saw a filled linked slot. An
+#: arctic-ACTIVE install's online path would fill those slots, and the model
+#: would score inputs it was never trained on. The trainer
+#: (``shard_trainer``) and the server's scoring path both read
+#: :func:`linked_slots_masked` — one rule, both sides. Remove a profile from
+#: this set only together with weights trained on its linked vectors.
+LINKED_SLOTS_MASKED_PROFILES: frozenset[str] = frozenset({"arctic"})
+
+
+def linked_slots_masked(profile: str) -> bool:
+    """True when the linked-entity slots are masked for ``profile``."""
+    return (profile or "").strip().lower() in LINKED_SLOTS_MASKED_PROFILES
+
 # ---------------------------------------------------------------------------
 # D1' — sidecar dynamic-type embeddings layout (v0.2.2+).
 #
@@ -645,6 +662,36 @@ class _RLNet(_NetBase):  # type: ignore[misc,valid-type]
 # 2026-05-22 ablation sweep proved _RLNet won.
 # ---------------------------------------------------------------------------
 
+def read_checkpoint_meta(path: Path) -> "dict | None":
+    """The metadata fields of a checkpoint, or ``None`` when it cannot be read.
+
+    Returns ``{"weights_version", "embedding_source", "base_weights_version",
+    "local_train_steps", "arch_version", "emb_dim"}`` (missing fields -> ""/0).
+    Loads with ``weights_only=True`` on the CPU; never raises.
+    """
+    if not _HAS_TORCH:
+        return None
+    try:
+        ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
+    except Exception as exc:  # noqa: BLE001 - unreadable = not a candidate
+        logger.warning("RLModel: cannot read checkpoint metadata of %s: %s", path, exc)
+        return None
+    if not isinstance(ckpt, dict):
+        return None
+    try:
+        steps = max(0, int(ckpt.get("local_train_steps", 0) or 0))
+    except (TypeError, ValueError):
+        steps = 0
+    return {
+        "weights_version": str(ckpt.get("weights_version", "") or ""),
+        "embedding_source": str(ckpt.get("embedding_source", "") or ""),
+        "base_weights_version": str(ckpt.get("base_weights_version", "") or ""),
+        "local_train_steps": steps,
+        "arch_version": str(ckpt.get("arch_version", "v1") or "v1"),
+        "emb_dim": ckpt.get("emb_dim"),
+    }
+
+
 class RLModel:
     """v0.2.0 reranker with v1-compatible public API + arch_version selection.
 
@@ -728,6 +775,15 @@ class RLModel:
         self._arch_version = arch_version
         self._weights_version = weights_version
         self._embedding_source = embedding_source
+        # Training history on top of a released checkpoint (v0.2.106):
+        # ``base_weights_version`` = the released version this network
+        # started from ("" = a fresh initialisation, or a checkpoint older
+        # than this field); ``local_train_steps`` = gradient steps applied
+        # on THIS machine since then. The server's startup choice between a
+        # local checkpoint and the bundled one reads both
+        # (``rl_server.choose_local_checkpoint``).
+        self._base_weights_version = ""
+        self._local_train_steps = 0
         self._state_path = Path(state_path)
         self._pt_path = self._state_path.with_suffix(".pt")
 
@@ -779,6 +835,30 @@ class RLModel:
     def embedding_source(self) -> str:
         """v0.2.7+ — embedder this network was trained against, empty if unknown."""
         return self._embedding_source
+
+    @property
+    def base_weights_version(self) -> str:
+        """The released version this network started from ("" = none known)."""
+        return self._base_weights_version
+
+    @property
+    def local_train_steps(self) -> int:
+        """Gradient steps applied locally on top of :attr:`base_weights_version`."""
+        return self._local_train_steps
+
+    def mark_as_release_base(self) -> None:
+        """Stamp this network as the release ``weights_version`` itself.
+
+        Used when a release checkpoint is produced: its base is its own
+        version and it carries no local training on top.
+        """
+        self._base_weights_version = self._weights_version
+        self._local_train_steps = 0
+
+    def record_local_train_steps(self, n: int) -> None:
+        """Count ``n`` gradient steps applied outside :meth:`update`."""
+        if n > 0:
+            self._local_train_steps += int(n)
 
     @property
     def emb_dim(self) -> int:
@@ -926,6 +1006,7 @@ class RLModel:
         loss = F.binary_cross_entropy(out, target_t)
         loss.backward()
         self._opt.step()
+        self._local_train_steps += 1
         return float(loss.detach())
 
     # ------------------------------------------------------------------
@@ -1235,6 +1316,10 @@ class RLModel:
                     # missing keys as empty).
                     "weights_version": self._weights_version,
                     "embedding_source": self._embedding_source,
+                    # v0.2.106: training history on top of a release (see
+                    # __init__). Absent in older checkpoints -> "" / 0.
+                    "base_weights_version": self._base_weights_version,
+                    "local_train_steps": int(self._local_train_steps),
                     "type_registry": builtin_registry,
                     "next_type_slot": N_ENTITY_TYPES,
                     "types_layout": "v2",  # forensic tag
@@ -1379,6 +1464,11 @@ class RLModel:
         # reporting (dashboard widget reads via rl_weights_state.weights_version).
         # Empty string = unknown (legacy / pre-v0.2.7 checkpoint).
         self._weights_version = ckpt.get("weights_version", self._weights_version)
+        self._base_weights_version = str(ckpt.get("base_weights_version", "") or "")
+        try:
+            self._local_train_steps = max(0, int(ckpt.get("local_train_steps", 0) or 0))
+        except (TypeError, ValueError):
+            self._local_train_steps = 0
 
         # D1' (v0.2.2+) truncates type_embs.weight to N_ENTITY_TYPES rows
         # before pickling, but the in-memory nn.Embedding stays sized

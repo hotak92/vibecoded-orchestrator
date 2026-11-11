@@ -146,6 +146,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is kept — and it is never written to `~/.claude/settings.json`. "Remove from VCO" takes it out again while its
   value is still `medium`; a value you set stays.
 
+- **An offline training pipeline for the RL reranker's shipped weights.** `claude_mcp_servers/rl_reranker/training/`
+  (kept out of the reranker image) has three tools. `python -m claude_mcp_servers.rl_reranker.training.export` reads
+  `launcher.db` read-only, one project at a time, and writes the training set as float16 vectors plus index arrays.
+  It uses the trainer's own pairing, target and soft-label rules, keeps the last copy of a duplicated event, and
+  leaves out test-fixture projects, rows with no project, and arctic dual-log twins written before the project ran
+  v0.2.101. The export contains no text, titles, project names or paths: projects appear only as a salted hash,
+  and the salt stays on the machine. `--list-projects` shows each project's row counts and whether it would be
+  exported before anything is written, and `--project` / `--exclude-project` choose. `training/FIELDS.md`, which
+  the export also copies into its output, documents every field, so a user can check an export before sharing
+  it. `shard_trainer train` trains one embedding profile from one or more exports, including exports other users
+  share. It sweeps learning rates with fixed seeds, caps any one project's share of each epoch, and applies the same
+  linked-slot masking as the server. It then measures the model against plain cosine ordering on a later time
+  window and on a project it never trained on (NDCG@10, plus MRR@10 and Recall@10 on literal citations).
+  `shard_trainer ship` writes checkpoints into `weights/` only when both qwen3 and arctic pass the unlock bar.
+- **No trained RL weights ship yet, and RL scoring stays locked.** The first full run on the maintainer's data
+  (95 374 qwen3 and 78 944 arctic queries, 2.4 M labelled nodes) did not meet the unlock bar (NDCG@10 at least 2%
+  above cosine on both hold-outs, and no project worse than cosine). The qwen3 model gained 3.7% on the later time
+  window and 3.6% on the held-out project, but it was 1.8% below cosine on a second project it never saw. On that
+  project and on the held-out one, it pushed the nodes the answer cited by name down the ranking (MRR@10 0.32 →
+  0.06 on the held-out project). The arctic model gained 2.7% on the time window but lost 0.2% on the held-out
+  project. Training with a random rotation of the vectors stops the model from memorising which nodes helped, and
+  removes those regressions, but its gains are below the bar (qwen3 +1.1% / +1.6%, arctic +0.4% / −0.8%). The
+  profiles ship together, so neither ships.
+
 ### Changed
 
 - **Citation events name the labelling regime they were computed under.** v0.2.106 changed how citation labels are
@@ -273,6 +297,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release mechanics:** version 0.2.105 → 0.2.106 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No code-graph extractor-generation rung this release: the only change on the extractor surface routes the analyzer's collection deletes through the raft-replay guard's recorder, so existing code graphs are not re-walked.
 
 ### Fixed
+
+- **Shipped RL weights are no longer hidden by an untrained local checkpoint.** At startup the RL server used to
+  load the checkpoint whose file name sorted last, and the `rl_model_<profile>_local.pt` it writes when nothing has
+  shipped sorts after every versioned file, so an install kept its untrained model after new weights shipped. The
+  bundled checkpoint now wins over a local one with no training history or an older base version. A local
+  checkpoint is kept when it has its own training on top of the current bundled version, or when its base is newer.
+  The same rule applies to each project's own checkpoint. Checkpoints now record their base version and the
+  training steps applied on top of it (older checkpoints count as having no history). Which local files count as the
+  user's own comes from `vco_lib/rl_weights_ownership.toml`. That table now holds the launcher's existing
+  "Download default weights" rule (a symlink or a copy with a `.vct-managed` marker is the orchestrator's and can be
+  replaced, any other file is the user's and is kept), and the launcher reads it from there instead of its own
+  copy.
 
 - **Dual-log twins now carry the other embedding slot's linked-node vectors.** The second (other-slot) retrieval event
   that dual logging writes for every search previously dropped the linked context entirely, so the second model's

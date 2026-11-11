@@ -219,6 +219,31 @@ def is_fixture_shaped_class(class_name: object) -> bool:
     return fixture_stem_of(class_name) is not None
 
 
+def is_fixture_project_name(name: object) -> bool:
+    """True when a PROJECT name (not a class name) is a test-fixture name.
+
+    Accepts the bare stem (``"Foo"``), the class-name shape
+    (``"Foo_KnowledgeGraph"``) and the underscore-less display shape some
+    writers record (``"FooKnowledgeGraph"`` — the ``project_name`` column of
+    test rows that reached a real ``rl_events`` table). Case-insensitive, like
+    :func:`fixture_stem_of`. Used by the RL training export to keep test
+    residue out of shipped weights.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return False
+    candidate = name.strip()
+    if candidate.casefold() in _FIXTURE_FOLDED:
+        return True
+    folded = candidate.casefold()
+    for suffix in COLLECTION_FAMILY_SUFFIXES:
+        for tail in ("_" + suffix, suffix):
+            t = tail.casefold()
+            if len(folded) > len(t) and folded.endswith(t):
+                if folded[: -len(t)] in _FIXTURE_FOLDED:
+                    return True
+    return False
+
+
 def fixture_writes_allowed() -> bool:
     """Has this process DECLARED that it owns the fixture classes it writes?
 

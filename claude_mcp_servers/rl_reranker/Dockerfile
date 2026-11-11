@@ -127,6 +127,8 @@ COPY --chown=app:app claude_mcp_servers/rl_client/rl_logger.py                  
 COPY --chown=app:app vco_lib/rl_training_targets.py                             /app/vco_lib/rl_training_targets.py
 COPY --chown=app:app vco_lib/atomic.py                                          /app/vco_lib/atomic.py
 COPY --chown=app:app vco_lib/log_setup.py                                       /app/vco_lib/log_setup.py
+COPY --chown=app:app vco_lib/rl_weights_ownership.py                            /app/vco_lib/rl_weights_ownership.py
+COPY --chown=app:app vco_lib/rl_weights_ownership.toml                          /app/vco_lib/rl_weights_ownership.toml
 
 # The verified weights tree (manifest + every listed checkpoint).
 COPY --chown=app:app --from=builder /build/weights /app/weights

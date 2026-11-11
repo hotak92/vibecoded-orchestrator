@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# RL WEIGHTS OWNERSHIP — the ONE home of "is this local weights file the
+# orchestrator's or the user's own?" (v0.2.106; the rule itself dates from
+# the launcher's v0.2.42 RT-5 override protection, extracted here so the RL
+# reranker server reads the same definition).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A weights file found at a slot is classified by its on-disk shape:
+#
+#   * a symlink                       -> the launcher's mirror of a download;
+#   * a regular file WITH a sibling   -> the launcher's copy (the fallback
+#     "<file><managed_marker_suffix>"    where a symlink is not possible);
+#   * a regular file WITHOUT one      -> the user's own (hand-placed, or a
+#                                        checkpoint the server trained/wrote).
+#
+# "managed" files are replaceable; "user" files are never clobbered.
+#
+# ## Readers (parse THIS file)
+#
+#   * Rust:   launcher/src-tauri/src/commands/module_default_weights.rs
+#             (include_str!): the marker name it writes next to a copy, and
+#             whether "Download default weights" may replace a slot.
+#   * Python: vco_lib/rl_weights_ownership.py (tomllib): the RL reranker
+#             server's startup choice between a local checkpoint and the
+#             bundled one (rl_server.choose_local_checkpoint) — a managed
+#             file is judged by its release version only; local training
+#             counts for a user-owned file.
+
+format_version = 1
+
+managed_marker_suffix = ".vct-managed"
+
+[ownership]
+symlink = "managed"
+file_with_marker = "managed"
+file_without_marker = "user"

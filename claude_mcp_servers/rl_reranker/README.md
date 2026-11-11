@@ -203,6 +203,7 @@ length plus the qwen3 cutover date (2026-04-14).
 | `migrate_rl_log_v1_to_v2.py` | ports legacy JSONL events to the v2 schema |
 | `db/` | the module's own launcher.db migrations (`rl_state`, `rl_weights_state`, …) |
 | `scripts/` | maintainer training scripts over the frozen JSONL bake-off corpus (`RL_TRAIN_WORKDIR`, see `scripts/_workdir.py`) |
+| `training/` | export → shard trainer → evaluation for the shipped weights (see "Training the shipped weights"; not in the image) |
 | `vct-module.json` | the module manifest the launcher installs from |
 
 ## Tests
@@ -261,8 +262,35 @@ in the suite.
 
 On first start the server copies the current checkpoint for the active profile
 into `state/` as `rl_model_<profile>_<version>.pt` and never overwrites one
-that is already there. Shipping new weights is a commit to `weights/` (strip
-the optimizer state first); an orchestrator update then rebuilds the image.
+that is already there. It then serves that copy unless a local checkpoint has
+earned its place (`rl_server.choose_local_checkpoint`): a checkpoint with no
+training history (a fresh `rl_model_<profile>_local.pt`) or an older base never
+shadows the bundled one; one with its own training on top of the current base,
+or a newer base, is kept. Which local files count as the user's own is decided
+by `vco_lib/rl_weights_ownership.toml`, the table the launcher's "Download
+default weights" reads as well. Shipping new weights is a commit to `weights/`;
+an orchestrator update then rebuilds the image.
+
+## Training the shipped weights
+
+`training/` (kept out of the image) holds the offline pipeline:
+
+```bash
+# 1. export: launcher.db (read-only) -> text-free float16 shards; FIELDS.md documents every field
+python -m claude_mcp_servers.rl_reranker.training.export --list-projects
+python -m claude_mcp_servers.rl_reranker.training.export --out <dir>
+# 2. train + evaluate one profile against plain cosine ordering (both hold-outs)
+python -m claude_mcp_servers.rl_reranker.training.shard_trainer train \
+    --data <dir> [--data <volunteer dir> ...] --profile qwen3 --out <run dir> --version <semver>
+# 3. install the checkpoints into weights/ — refused unless BOTH profiles pass the unlock bar
+python -m claude_mcp_servers.rl_reranker.training.shard_trainer ship \
+    --report <run dir>/report_qwen3.json --report <run dir>/report_arctic.json \
+    --weights-root claude_mcp_servers/rl_reranker/weights
+```
+
+The unlock bar (`training/eval_harness.py`): NDCG@10 at least 2% above plain
+cosine ordering on a later time window AND on a project never trained on, and
+no project worse than cosine.
 
 ## License
 

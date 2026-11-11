@@ -76,6 +76,7 @@ from collections import OrderedDict
 
 from vco_lib.atomic import atomic_copy_file
 from vco_lib.log_setup import configure_logging
+from vco_lib.rl_weights_ownership import classify as classify_weights_owner
 
 from .bundled_weights import BundledWeights, resolve_bundled_weights
 from .retrieval_rl import RetrievalRL
@@ -181,6 +182,82 @@ def _glob_weights_files(state_dir: "Path", source: str) -> "list[Path]":
     # _try_load is the safety: it refuses any .pt whose embedding_source
     # field disagrees with the container's pinned source.
     return sorted(state_dir.glob(f"rl_model_{source}_*.pt"))
+
+
+def _semver_key(version: str) -> "tuple[int, int, int] | None":
+    """``(major, minor, patch)`` of a release version, ``None`` otherwise."""
+    parts = (version or "").strip().split(".")
+    if len(parts) < 3:
+        return None
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2].split("-")[0])
+    except ValueError:
+        return None
+
+
+def choose_local_checkpoint(
+    candidates: "list[Path]",
+    bundled_version: str,
+    *,
+    exclude: "tuple[Path, ...]" = (),
+    read_meta: Any = None,
+) -> "Path | None":
+    """The local checkpoint to serve INSTEAD of the bundled one, if any.
+
+    Rule (v0.2.106): the bundled ``current`` wins over a local checkpoint that
+    has no training history (a fresh initialisation, e.g. the
+    ``rl_model_<source>_local.pt`` a server writes when nothing shipped) or
+    whose base is an OLDER release. A local checkpoint is kept only when
+
+    * its base release is NEWER than the bundled one (a user rotated to a
+      later release), or
+    * its base IS the bundled release and it carries its own training on top
+      (``local_train_steps > 0``).
+
+    The base is ``base_weights_version`` (falling back to ``weights_version``
+    for checkpoints older than that field). Unreadable checkpoints and
+    non-release bases ("", "local") never win. Among several keepers the
+    newest base, then the most steps, then the latest mtime wins. ``exclude``
+    names files not to consider (the seeded copy of the bundled checkpoint
+    itself). Returns ``None`` when the bundled checkpoint should be served.
+
+    Ownership comes from the one shared table (``vco_lib/rl_weights_ownership``,
+    also read by the launcher's "Download default weights"): a MANAGED file
+    (the launcher's symlink or marked copy of a downloaded release) is judged
+    by its release version only — training recorded on it does not count, as
+    the launcher replaces such a file on its next download; local training
+    counts for a USER-owned file only.
+    """
+    from .rl_model import read_checkpoint_meta
+
+    reader = read_meta or read_checkpoint_meta
+    bundled_key = _semver_key(bundled_version)
+    if bundled_key is None:
+        return None
+    excluded = {Path(p).resolve() for p in exclude}
+    best: "tuple[tuple, Path] | None" = None
+    for cand in candidates:
+        if Path(cand).resolve() in excluded:
+            continue
+        meta = reader(cand)
+        if not meta:
+            continue
+        base_key = _semver_key(meta.get("base_weights_version") or meta.get("weights_version") or "")
+        if base_key is None:
+            continue
+        steps = int(meta.get("local_train_steps") or 0)
+        if classify_weights_owner(Path(cand)) == "managed":
+            steps = 0
+        if base_key < bundled_key or (base_key == bundled_key and steps <= 0):
+            continue
+        try:
+            mtime = Path(cand).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        rank = (base_key, steps, mtime)
+        if best is None or rank > best[0]:
+            best = (rank, Path(cand))
+    return best[1] if best else None
 
 
 def _resolve_model_tag_and_dim() -> tuple[str, int]:
@@ -895,10 +972,19 @@ class RLServer:
         )
         _seed_bundled_weights(self._bundled_weights, state_dir)
         candidate_files = _glob_weights_files(state_dir, rl_model_tag)
-        if candidate_files:
-            # Pick the lexically-greatest filename (matches semver ordering
-            # for the version segment; "local" sorts after "0.x.y" which is
-            # what we want — newest local fork wins over any older release).
+        if self._bundled_weights is not None:
+            # A trained model ships for this profile: serve it unless a local
+            # checkpoint has earned its place (choose_local_checkpoint — an
+            # untrained local fork or an older base never shadows it).
+            seeded = state_dir / _build_weights_filename(
+                rl_model_tag, self._bundled_weights.version,
+            )
+            state_path = choose_local_checkpoint(
+                candidate_files, self._bundled_weights.version, exclude=(seeded,),
+            ) or seeded
+        elif candidate_files:
+            # Nothing ships: pick the lexically-greatest filename (the
+            # pre-v0.2.106 rule; "local" sorts after "0.x.y").
             state_path = candidate_files[-1]
         else:
             # No checkpoint on disk yet — use the local-fork sentinel.
@@ -1031,6 +1117,9 @@ class RLServer:
             "head_loads": 0,
             "head_load_failures": 0,
             "base_fallback_no_weights": 0,
+            # v0.2.106: a project's own checkpoint was set aside because the
+            # bundled weights supersede it (choose_local_checkpoint).
+            "project_head_superseded_by_bundled": 0,
         }
 
         # Seed the LRU with the base context built in __init__ above.
@@ -1155,6 +1244,15 @@ class RLServer:
         project_state_dir = _per_project_state_dir(self._state_dir, project_id)
         project_state_dir.mkdir(parents=True, exist_ok=True)
         candidate_files = _glob_weights_files(project_state_dir, self._rl_model_tag)
+        if candidate_files and self._bundled_weights is not None:
+            # Same precedence as the base model: a project checkpoint is used
+            # only when it has earned it over the shipped one.
+            chosen = choose_local_checkpoint(candidate_files, self._bundled_weights.version)
+            if chosen is not None:
+                candidate_files = [chosen]
+            else:
+                candidate_files = []
+                self._routing_counters["project_head_superseded_by_bundled"] += 1
         if candidate_files:
             target_path = candidate_files[-1]
             is_fallback = False

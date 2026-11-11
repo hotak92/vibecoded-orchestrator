@@ -21,6 +21,9 @@ Public surface:
                    resolved at startup from ACTIVE_EMBEDDING)
 - offline_trainer — batch trainer over launcher.db events read through the hub
 - bundled_weights — the shipped-weights manifest reader
+- training/      — offline export, shard trainer and evaluation harness for
+                   the shipped weights (maintainer/volunteer side; not in the
+                   image)
 
 Per-embedding-source policy: each TEXT embedding source (qwen3, arctic,
 openai, future text embedders) gets its own RLModel weights file to avoid

@@ -104,7 +104,15 @@ def test_the_external_imports_are_the_two_shared_modules():
         "vco_lib.rl_training_targets",
         "vco_lib.atomic",
         "vco_lib.log_setup",
+        "vco_lib.rl_weights_ownership",
     }
+
+
+def test_the_ownership_table_travels_with_its_reader():
+    """``vco_lib/rl_weights_ownership.py`` reads the table beside it."""
+    rel = "vco_lib/rl_weights_ownership.toml"
+    assert _copies().get(rel) == "/app/vco_lib/rl_weights_ownership.toml"
+    assert _dockerignore_admits(rel)
 
 
 def test_every_imported_external_module_is_copied_to_its_import_path():
@@ -140,6 +148,7 @@ def test_the_build_context_admits_what_the_image_needs_and_nothing_else():
         "vco_lib/paths.py",
         "claude_mcp_servers/rl_client/client.py",
         "claude_mcp_servers/rl_reranker/scripts/train_and_eval.py",
+        "claude_mcp_servers/rl_reranker/training/export.py",
         "claude_mcp_servers/weaviate_mcp/server.py",
     ):
         assert not _dockerignore_admits(rel), rel

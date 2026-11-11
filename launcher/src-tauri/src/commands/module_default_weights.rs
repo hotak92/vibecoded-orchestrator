@@ -272,18 +272,113 @@ pub fn weights_file_path(module_id: &str, embedding_source: &str, version: &str)
 // The user can still place a hand-crafted override by deleting the
 // marker file (or never having a copy at all).
 
+// v0.2.106: the ownership rule above ("symlink or marked copy = ours,
+// replaceable; any other regular file = the user's own, never clobbered")
+// lives in ONE table, `vco_lib/rl_weights_ownership.toml`, which the RL
+// reranker server parses too (its startup choice between a local checkpoint
+// and the bundled one: `rl_server.choose_local_checkpoint`). This module reads
+// the marker suffix and the three ownership classes from it; nothing here
+// re-types them.
+
+/// Embedded copy of the ownership table, read at compile time. Path: 4 levels
+/// up from this file (`commands` → `src` → `src-tauri` → `launcher` → repo
+/// root), then into `vco_lib/` — the same shape as `rl_scoring_lock.rs`.
+const RL_WEIGHTS_OWNERSHIP_TOML: &str =
+    include_str!("../../../../vco_lib/rl_weights_ownership.toml");
+
+const OWNERSHIP_FORMAT_VERSION: u32 = 1;
+
+/// Who owns a weights file found at a slot (`vco_lib/rl_weights_ownership.toml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WeightsOwner {
+    /// Placed by the orchestrator (a symlink, or a copy with the marker):
+    /// replaceable on the next download.
+    Managed,
+    /// The user's own (hand-placed or trained): never clobbered.
+    User,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OwnershipClasses {
+    symlink: WeightsOwner,
+    file_with_marker: WeightsOwner,
+    file_without_marker: WeightsOwner,
+}
+
+/// The parsed ownership table.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WeightsOwnership {
+    format_version: u32,
+    managed_marker_suffix: String,
+    ownership: OwnershipClasses,
+}
+
+/// Parse and validate an ownership table.
+pub fn parse_weights_ownership(text: &str) -> Result<WeightsOwnership, String> {
+    let t: WeightsOwnership =
+        toml::from_str(text).map_err(|e| format!("rl_weights_ownership.toml: {e}"))?;
+    if t.format_version != OWNERSHIP_FORMAT_VERSION {
+        return Err(format!(
+            "rl_weights_ownership.toml: unsupported format_version {} (this reader reads {})",
+            t.format_version, OWNERSHIP_FORMAT_VERSION
+        ));
+    }
+    let s = &t.managed_marker_suffix;
+    if !s.starts_with('.') || s.len() < 2 || s.contains('/') || s.contains('\\') {
+        return Err(format!(
+            "rl_weights_ownership.toml: managed_marker_suffix {s:?} must be a '.'-prefixed file suffix"
+        ));
+    }
+    Ok(t)
+}
+
+/// The shipped table. Unreadable only in a broken build (the
+/// `shipped_ownership_table_parses` test pins the parse); if it ever is,
+/// EVERY file is treated as the user's — the conservative answer for a rule
+/// that gates replacing files.
+static OWNERSHIP: std::sync::LazyLock<WeightsOwnership> = std::sync::LazyLock::new(|| {
+    parse_weights_ownership(RL_WEIGHTS_OWNERSHIP_TOML).unwrap_or_else(|e| {
+        tracing::error!("[module_default_weights] {e}; treating every weights file as user-owned");
+        WeightsOwnership {
+            format_version: OWNERSHIP_FORMAT_VERSION,
+            // Unreachable in a tested build; any suffix works here because
+            // every class below is `User` (nothing is ever replaced).
+            managed_marker_suffix: ".vct-managed".to_string(),
+            ownership: OwnershipClasses {
+                symlink: WeightsOwner::User,
+                file_with_marker: WeightsOwner::User,
+                file_without_marker: WeightsOwner::User,
+            },
+        }
+    })
+});
+
+/// Class of a file at a slot, from its shape (the table's three rows).
+pub fn classify_weights_owner(is_symlink: bool, has_marker: bool) -> WeightsOwner {
+    let o = &OWNERSHIP.ownership;
+    if is_symlink {
+        o.symlink
+    } else if has_marker {
+        o.file_with_marker
+    } else {
+        o.file_without_marker
+    }
+}
+
 /// v0.2.42 RT-5: sibling marker file that signals "this weights file was
 /// placed here by the orchestrator (copy fallback) and is safe to
 /// replace on the next download". Without this marker, override-protection
 /// treats a regular `.pt` file as a deliberate user override and skips it.
 ///
-/// Naming convention: `<weights_file>.vct-managed` — sibling of the `.pt`,
-/// same stem + `.vct-managed` extension. Created by the `fs::copy` fallback
-/// path; deleted alongside the file on re-link.
+/// Naming convention: `<weights_file><managed_marker_suffix>` (the suffix is
+/// `.vct-managed`, read from `vco_lib/rl_weights_ownership.toml`) — sibling of
+/// the `.pt`. Created by the `fs::copy` fallback path; deleted alongside the
+/// file on re-link.
 pub fn managed_marker_path(weights_path: &Path) -> PathBuf {
     let mut p = weights_path.to_path_buf();
     let stem = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-    p.set_file_name(format!("{}.vct-managed", stem));
+    p.set_file_name(format!("{}{}", stem, OWNERSHIP.managed_marker_suffix));
     p
 }
 
@@ -361,31 +456,35 @@ pub async fn link_global_into_project_mount(
     // forever on Windows systems where symlinks require Developer Mode.
     let marker = managed_marker_path(&target);
     match tokio::fs::symlink_metadata(&target).await {
-        Ok(meta) if !meta.file_type().is_symlink() => {
-            // Regular file in the slot. Check the marker.
-            let is_managed = tokio::fs::metadata(&marker).await.is_ok();
-            if is_managed {
-                // Orchestrator-managed copy: remove + marker so we can refresh.
-                let _ = tokio::fs::remove_file(&target).await;
-                let _ = tokio::fs::remove_file(&marker).await;
-                // Fall through to the link/copy path below.
-            } else {
-                // No marker → genuine user override — preserve.
-                return Ok(target);
+        Ok(meta) => {
+            let is_symlink = meta.file_type().is_symlink();
+            let has_marker = !is_symlink && tokio::fs::metadata(&marker).await.is_ok();
+            match classify_weights_owner(is_symlink, has_marker) {
+                WeightsOwner::User => {
+                    // The user's own file (by the shared ownership table: a
+                    // regular file with no marker) — preserve.
+                    return Ok(target);
+                }
+                WeightsOwner::Managed if is_symlink => {
+                    // Existing symlink — remove so we can refresh.
+                    if let Err(e) = tokio::fs::remove_file(&target).await {
+                        return Err(format!(
+                            "remove stale symlink {}: {}",
+                            target.display(),
+                            e
+                        ));
+                    }
+                    // Clean up any stale marker file left from a prior copy-
+                    // then-symlink transition (defensive; harmless if absent).
+                    let _ = tokio::fs::remove_file(&marker).await;
+                }
+                WeightsOwner::Managed => {
+                    // Orchestrator-managed copy: remove + marker so we can
+                    // refresh. Fall through to the link/copy path below.
+                    let _ = tokio::fs::remove_file(&target).await;
+                    let _ = tokio::fs::remove_file(&marker).await;
+                }
             }
-        }
-        Ok(_) => {
-            // Existing symlink — remove so we can refresh.
-            if let Err(e) = tokio::fs::remove_file(&target).await {
-                return Err(format!(
-                    "remove stale symlink {}: {}",
-                    target.display(),
-                    e
-                ));
-            }
-            // Clean up any stale marker file left from a prior copy-then-
-            // symlink transition (defensive; should be absent but harmless).
-            let _ = tokio::fs::remove_file(&marker).await;
         }
         Err(_) => {
             // Nothing there — proceed.
@@ -2489,6 +2588,29 @@ mod tests {
             "error must list supported sources: {}",
             err
         );
+    }
+
+    // ─── v0.2.106: the shared ownership table ──────────────────────────
+
+    #[test]
+    fn shipped_ownership_table_parses_with_the_rt5_classes() {
+        let t = parse_weights_ownership(RL_WEIGHTS_OWNERSHIP_TOML)
+            .expect("vco_lib/rl_weights_ownership.toml must parse");
+        assert_eq!(t.managed_marker_suffix, ".vct-managed");
+        assert_eq!(classify_weights_owner(true, false), WeightsOwner::Managed);
+        assert_eq!(classify_weights_owner(false, true), WeightsOwner::Managed);
+        assert_eq!(classify_weights_owner(false, false), WeightsOwner::User);
+    }
+
+    #[test]
+    fn ownership_table_rejects_bad_versions_suffixes_and_classes() {
+        let ok = "format_version = 1\nmanaged_marker_suffix = \".m\"\n[ownership]\n\
+                  symlink = \"managed\"\nfile_with_marker = \"managed\"\n\
+                  file_without_marker = \"user\"\n";
+        assert!(parse_weights_ownership(ok).is_ok());
+        assert!(parse_weights_ownership(&ok.replace("format_version = 1", "format_version = 2")).is_err());
+        assert!(parse_weights_ownership(&ok.replace("\".m\"", "\"m/x\"")).is_err());
+        assert!(parse_weights_ownership(&ok.replace("\"user\"", "\"nobody\"")).is_err());
     }
 
     // ─── v0.2.42 RT-5: .vct-managed marker for copy fallback ─────────────
