@@ -194,3 +194,13 @@ def test_other_slot_chunks_are_embedded_once_per_process():
     assert first > 0
     assert len(calls) == first  # the second citation hit the memo
     citation_compute._OTHER_SLOT_MEMO.clear()
+
+
+def test_crlf_windows_keep_start_independent_boundaries():
+    """A transcript written with CRLF line ends (Windows) is split at its blank
+    lines too, so overlapping windows still share chunks (review W3-L2)."""
+    paras = [p.replace("\n", "\r\n") for p in _transcript_paragraphs()]
+    a = chunk_answer_window("".join(paras[0:]), ARCTIC)
+    b = chunk_answer_window("".join(paras[13:]), ARCTIC)
+    shared = [c for c in b if c in set(a)]
+    assert len(shared) >= len(b) - 2

@@ -21,9 +21,19 @@ it, both closed here:
    thread-pool executor, and interpreter shutdown joins its worker threads —
    a tool call blocked in a slow Weaviate / Ollama request (shipped timeouts
    are long by design) kept a disconnected server alive for its whole
-   duration. After EOF the server now gives in-flight work a bounded grace
+   duration. After EOF the server now gives executor work a bounded grace
    (:data:`EXIT_GRACE_SECONDS`), runs the ``atexit`` handlers (telemetry
-   flushes such as the embedding-fidelity summary) and exits.
+   flushes such as the embedding-fidelity summary, bounded by
+   :data:`EXIT_HANDLERS_SECONDS`) and exits. Limit: weaviate-kg's tools are
+   synchronous and run ON the event loop, so the stdio loop only sees EOF once
+   the running tool call returns — the grace cannot cut such a call short.
+   A client that is gone is caught by the parent watchdog (1.) instead, which
+   runs on its own thread and does not wait for the loop.
+3. **A wrapper that exits on purpose (POSIX).** A launcher that starts the
+   server and then exits while the client keeps the pipe (a double fork)
+   looks exactly like a dead client: the server is reparented and exits.
+   VCO registers the server so Claude Code spawns it directly; do not put an
+   exiting wrapper in front of it.
 
 The reaper in :mod:`vco_lib.mcp_singleton` stays as it was: it handles
 cross-workspace peers at spawn time; this module makes each server end itself.
@@ -57,6 +67,11 @@ __all__ = [
 #: process exits anyway. Its results can no longer be delivered (the client is
 #: gone); the bound only lets a write that is already under way finish.
 EXIT_GRACE_SECONDS = 30.0
+
+#: Upper bound on the ``atexit`` handlers run at exit: a handler that blocks
+#: (a flush to a hung disk or service) must not keep a dead client's server
+#: alive, which is the whole point of :func:`_finish`.
+EXIT_HANDLERS_SECONDS = 10.0
 
 #: How often the parent watchdog checks that the spawning process still lives.
 PARENT_POLL_SECONDS = 5.0
@@ -224,10 +239,18 @@ def _finish(name: str, reason: str, code: int = 0, *,
     the process exits without joining worker threads, which is the point.
     """
     logger.warning("%s: %s — exiting", name, reason)
-    try:
-        atexit._run_exitfuncs()  # noqa: SLF001 — CPython's documented-by-use hook
-    except Exception:  # noqa: BLE001 — a failing handler must not block the exit
-        pass
+    def _handlers() -> None:
+        try:
+            atexit._run_exitfuncs()  # noqa: SLF001 — CPython's documented-by-use hook
+        except Exception:  # noqa: BLE001 — a failing handler must not block the exit
+            pass
+
+    runner = threading.Thread(target=_handlers, name=f"{name}-exit-handlers", daemon=True)
+    runner.start()
+    runner.join(EXIT_HANDLERS_SECONDS)
+    if runner.is_alive():
+        logger.warning("%s: exit handlers still running after %.0f s; exiting without them",
+                       name, EXIT_HANDLERS_SECONDS)
     try:
         logging.shutdown()
     except Exception:  # noqa: BLE001

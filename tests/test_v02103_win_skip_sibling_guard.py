@@ -94,7 +94,10 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: read /proc zombie state — POSIX-only primitives with no .ps1 sibling; the
 #: Windows parent-handle arm is unit-tested with a fake kernel32
 #: (test_parent_watch_windows_arm_reads_the_parent_handle).
-NON_CONVENTION_BASELINE = 191
+#: 191 -> 192 (v0.2.106 fix4): tests/test_v0292_wp4_orphan_fail_open.py now
+#: installs a real bundle and stats pre-tool-use.sh's POSIX mode bits (0o700)
+#: instead of scanning source — file modes do not exist on Windows.
+NON_CONVENTION_BASELINE = 192
 
 
 # -- which conditions skip on Windows --------------------------------------

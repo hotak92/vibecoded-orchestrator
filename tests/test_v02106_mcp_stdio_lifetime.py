@@ -263,3 +263,20 @@ def test_the_weaviate_server_serves_through_the_lifetime_helper():
     main = src[src.index('if __name__ == "__main__":'):]
     assert "run_stdio_server(mcp.run_stdio_async" in main
     assert "asyncio.run(mcp.run_stdio_async())" not in main
+
+
+def test_finish_does_not_wait_forever_on_a_blocking_exit_handler(monkeypatch):
+    """A hung atexit handler must not keep a dead client's server alive
+    (review W3-L1): _finish exits after EXIT_HANDLERS_SECONDS anyway."""
+    import threading
+    import time
+
+    release = threading.Event()
+    monkeypatch.setattr(lt, "EXIT_HANDLERS_SECONDS", 0.2)
+    monkeypatch.setattr(lt.atexit, "_run_exitfuncs", lambda: release.wait(30))
+    exited = []
+    t0 = time.monotonic()
+    lt._finish("x", "test", 0, _exit=lambda code: exited.append(code))
+    release.set()
+    assert exited == [0]
+    assert time.monotonic() - t0 < 5

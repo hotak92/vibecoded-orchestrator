@@ -360,10 +360,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   machine short of memory showed MCP servers that missed the 30-second connect timeout staying alive after Claude
   Code gave up on them. VCO's server could do the same in two ways: when its stdin closed while a tool call was still
   waiting on a slow Weaviate or Ollama request, the process waited for that request before exiting; and when the
-  process that started it died without closing the pipe (on Windows, killing a virtual environment's `python.exe`
-  leaves the real interpreter it started running), nothing noticed at all. The server now gives in-flight work 30
-  seconds after its stdin closes and then exits, and it exits within five seconds of the process that started it
-  exiting. Telemetry that is written at exit is still written.
+  session that started it went away without closing the pipe, nothing noticed at all (on Windows the server runs under
+  the virtual environment's `python.exe` launcher, which stays alive as long as the server, so watching it never
+  fired). The server now exits within five seconds of the session that started it exiting, looking past that launcher
+  on Windows. When its stdin closes it exits once the tool call that is running returns, giving background work it
+  started at most 30 more seconds; a tool call still blocked on a slow request is not cut short, so a closed session
+  is ended by the five-second check instead. Telemetry that is written at exit is still written, within 10 seconds.
 - **The Ollama keep-alive setting now says where to set it and how to unload a model at once.** The configuration
   reference names every process that reads `VCO_OLLAMA_KEEP_ALIVE`, how to set it for all of them (a user
   environment variable, then restart VS Code and the launcher) or for one project (`.claude/settings.local.json`),

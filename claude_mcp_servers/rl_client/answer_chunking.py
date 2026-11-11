@@ -81,7 +81,7 @@ MIN_CHUNK_FRACTION = 0.25
 # Paragraph = text up to and including a run of blank-line newlines. The
 # lookbehind split keeps the separator on the left piece, so
 # "".join(paragraphs) == the input byte for byte.
-_PARAGRAPH_SPLIT = re.compile(r"(?<=\n\n)(?=[^\n])")
+_PARAGRAPH_SPLIT = re.compile(r"(?<=\n\n)(?=[^\n])|(?<=\r\n\r\n)(?=[^\r\n])")
 
 #: Fallback budget for a model with no registered window (chars). Matches the
 #: smallest registered dense bound's order of magnitude rather than guessing
