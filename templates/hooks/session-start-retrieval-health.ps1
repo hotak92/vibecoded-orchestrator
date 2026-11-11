@@ -178,7 +178,12 @@ print("Retrieval: %s, %s." % (kg_part, code_part))
 '@
 
 try {
-    & $PY -c $pyCode 2>$null
+    # v0.2.106: the body runs as a temp FILE through
+    # _lib/run-python-program.ps1 - `& $PY -c $pyCode` loses every
+    # embedded double quote under Windows PowerShell 5.1 (the retrieval
+    # health line never printed on a 5.1 host).
+    . (Join-Path $PSScriptRootLocal "_lib/run-python-program.ps1")
+    Invoke-VcoPythonProgram -Python $PY -Body $pyCode 2>$null
 } catch { }
 
 # -- KG WRITE path (v0.2.95) ------------------------------------------------
@@ -382,7 +387,9 @@ if (Test-Path -LiteralPath $MetricsLib) {
             $env:KG_FAIL_JSONL = $KgFailJsonl
             $env:KG_FAIL_ROOT = $KgFailRoot
             $env:KG_FAIL_MARKER = Join-Path $KgFailState "kg-sync-failures.seen"
-            & $PY -c $kgFailCode 2>$null
+            # v0.2.106: temp FILE via _lib/run-python-program.ps1 (5.1
+            # `-c` quoting); dot-sourced above with the health probe.
+            Invoke-VcoPythonProgram -Python $PY -Body $kgFailCode 2>$null
         }
     } catch { }
 }

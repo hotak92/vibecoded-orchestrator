@@ -969,7 +969,18 @@ print("" if p is None else
     $saved = $env:PYTHONPATH
     try {
         if ($root) { $env:PYTHONPATH = if ($saved) { "$root$sep$saved" } else { $root } }
-        $out = & $Python -c $code $RuntimeBin $ComposeCmd 2>$null
+        # v0.2.106: the body runs as a temp FILE through the hooks' shared
+        # _lib/run-python-program.ps1 - `& $Python -c $code` loses every
+        # embedded double quote under Windows PowerShell 5.1 (this wrapper
+        # documents itself as 5.1-compatible). A missing helper is a broken
+        # checkout: label detection answers '' (this function's documented
+        # "cannot say" contract), never a hard failure.
+        $runPyLib = if ($script:VctScriptDir) {
+            Join-Path (Join-Path (Split-Path -Parent $script:VctScriptDir) "templates") "hooks/_lib/run-python-program.ps1"
+        } else { '' }
+        if (-not $runPyLib -or -not (Test-Path -LiteralPath $runPyLib)) { return '' }
+        . $runPyLib
+        $out = Invoke-VcoPythonProgram -Python $Python -Body $code -Arguments @($RuntimeBin, $ComposeCmd) 2>$null
         if ($LASTEXITCODE -ne 0) { return '' }
     } finally {
         $env:PYTHONPATH = $saved

@@ -29,6 +29,10 @@ $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 if (-not $PY) { exit 0 }
+# v0.2.106: the ONE home for running the embedded Python loss-ledger body
+# below (Windows PowerShell 5.1 mangles `python -c` bodies containing
+# quotes; this body was quote-free today, but the class is gone for good).
+. (Join-Path $ScriptDir "_lib/run-python-program.ps1")
 
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
@@ -124,7 +128,7 @@ function Record-OutcomeLoss {
         $env:VCT_PB_LOSS_REASON = $Reason
         $env:PYTHONPATH = if ($prevPath) { "$root$([IO.Path]::PathSeparator)$prevPath" } else { $root }
         try {
-            & $PY -c @'
+            Invoke-VcoPythonProgram -Python $PY -Body @'
 import json, os
 task_id = ''
 try:

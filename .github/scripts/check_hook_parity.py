@@ -94,6 +94,12 @@ PS1_ONLY_LIB = frozenset({
     # it is given, so there is nothing to mirror. Must also be listed in the
     # ratchet test's PS1_ONLY_LIB.
     "utf8-nobom.ps1",
+    # v0.2.106: the ONE runner for embedded Python program bodies. Windows
+    # PowerShell 5.1 mangles `python -c <body>` arguments containing double
+    # quotes; bash heredocs have no command-line quoting to lose, so there
+    # is nothing to mirror. Must also be listed in the ratchet test's
+    # PS1_ONLY_LIB.
+    "run-python-program.ps1",
     # v0.2.102 W6-ALERTS2: the pending path of agent-alerts-deliver.ps1, out
     # of the hook file so PowerShell does not parse it on every tool call
     # (matcher *). bash reads a script as it runs it — nothing to split.

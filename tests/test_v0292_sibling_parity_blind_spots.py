@@ -53,6 +53,11 @@ PS1_ONLY_LIB: frozenset[str] = frozenset({
     # of the hook file so PowerShell does not parse it on every tool call
     # (matcher *). bash reads a script as it runs it — nothing to split.
     "agent-alerts-deliver-pending.ps1",
+    # v0.2.106: the ONE runner for embedded Python program bodies; Windows
+    # PowerShell 5.1 mangles `python -c <body>` arguments containing double
+    # quotes, bash heredocs have no quoting to lose. Mirrored in
+    # `.github/scripts/check_hook_parity.py`.
+    "run-python-program.ps1",
 })
 
 
