@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A switch for automatic service restarts, in Preferences → Services.** The launcher's services watcher has been
+  configurable through the setting `launcher.services_watcher_enabled` since its first release, but no interface ever
+  wrote it. Preferences now has a Services section with "Restart stopped services automatically" (on by default). It
+  is one switch for BOTH automatic restarters — the launcher's watcher and the hub's watchdog read the same setting
+  on every check, so turning it off stands both down within half a minute, with nothing to restart. Turning it off
+  stops nothing; it only disables automatic restarts, and a service you stop from the Services page stays down
+  either way.
+
 - **Choose how long Ollama keeps a model loaded, and see what is loaded.** Preferences has a new "Ollama model
   unloading" setting: how long an embedding or summary model stays in memory after the last VCO request that used it
   (2, 5, 10 or 30 minutes, "as soon as idle", or a duration you type; 10 minutes when unset, as before). The background
@@ -190,6 +198,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the root session, so the rule that a lane runs its own helpers in the foreground stays.
 
 ### Fixed
+
+- **Stopping a service for maintenance now actually keeps it down.** The launcher's services watcher ignored the
+  shared pause marker the hub's watchdog honors: about 30 seconds after you stopped Weaviate from the Services page,
+  the launcher restarted it AND deleted the pause marker — mid-copy volume backups were ruined by the container
+  coming back. Both automatic restarters now follow one rule, read through the one shared helper: a service with a
+  pause marker is skipped (the watcher logs a `skipped_paused` row instead of restarting), and no automatic restart
+  ever clears a marker — the watcher's restart goes through a separate path that never touches it. Only an explicit
+  user action (Start or Restart from the GUI or CLI) clears a pause. The Services page and the troubleshooting guide
+  now document the supported backup path: stop from the Services page, copy, Start; a stop from a terminal still
+  looks like a crash to VCO and is restarted.
 
 - **Windows: every `.ps1` hook's embedded Python now actually runs.** Users on Windows 11 saw
   `kg-update-nudge exit=1 ... SyntaxError: unterminated string literal` logged for every tool call: Claude Code

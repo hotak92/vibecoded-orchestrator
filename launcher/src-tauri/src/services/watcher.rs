@@ -12,6 +12,14 @@
 //! Configurable via the app_state key `launcher.services_watcher_enabled`
 //! (default `true`). The Preferences → Services panel toggles this.
 //!
+//! v0.2.106: ONE pause rule for every automatic restarter. The shared
+//! watchdog-pause marker (`vct_launcher_core::services::watchdog_pause`,
+//! `<vct_root>/state/watchdog-paused/<service>` — the SAME primitive the
+//! hub's infra watchdog consults) means "the user stopped this service on
+//! purpose". This watcher skips a paused service (`skipped_paused` log
+//! row) and NEVER clears its marker; only an explicit user action
+//! (Start / Restart from the GUI or CLI) clears it.
+//!
 //! Logs land at `<install>/state/logs/services-watcher.jsonl` — one
 //! JSON line per event. Append-only, never rotated by the launcher
 //! (operators can rotate with logrotate / cron). The path is resolved
@@ -238,6 +246,30 @@ async fn handle_service_tick<R: Runtime + 'static>(
                 return;
             }
 
+            // v0.2.106: ONE pause rule for every automatic restarter. The
+            // shared watchdog-pause marker is the user's "stopped on
+            // purpose" signal — the watcher leaves the service down AND
+            // never touches the marker (only an explicit user Start /
+            // Restart clears it). Checked BEFORE the managed gate so the
+            // log row names the real reason.
+            if vct_launcher_core::services::watchdog_pause::is_service_paused(&svc.name) {
+                log_event(WatcherLogEvent {
+                    ts: now_iso(),
+                    service: &svc.name,
+                    event: "skipped_paused",
+                    prev_running: prev_running_logged,
+                    new_running: Some(false),
+                    attempt: None,
+                    error: None,
+                    container_name: svc.container_name.as_deref(),
+                    container_status: None,
+                });
+                // Quiet until the service recovers — a user Start clears
+                // the marker and brings it back.
+                entry.given_up = true;
+                return;
+            }
+
             // v0.2.97: only VCO's OWN services are restarted — the row says
             // which. An adopted container's stop is its owner's decision
             // (respected until the next session, plan §4b); an adopted URL
@@ -305,9 +337,12 @@ async fn schedule_restart<R: Runtime + 'static>(
     // Run the actual restart in a detached task so a slow restart
     // doesn't hold up the next watcher tick. Subtle: this means
     // multiple restarts could overlap if the loop also re-detects
-    // "stopped" mid-attempt. We accept that — `service_restart` is
+    // "stopped" mid-attempt. We accept that — the restart verb is
     // idempotent (compose stop+start; or runtime start which no-ops if
-    // already running).
+    // already running). It goes through `service_restart_automatic`,
+    // the split path that NEVER clears a watchdog pause marker
+    // (v0.2.106): an automatic restart must not undo the user's
+    // "stopped on purpose" signal.
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
         log_event(WatcherLogEvent {
@@ -321,7 +356,7 @@ async fn schedule_restart<R: Runtime + 'static>(
             container_name: None,
             container_status: None,
         });
-        match lifecycle::service_restart(svc_name.clone()).await {
+        match lifecycle::service_restart_automatic(svc_name.clone()).await {
             Ok(()) => {
                 log_event(WatcherLogEvent {
                     ts: now_iso(),
@@ -382,7 +417,10 @@ async fn schedule_restart<R: Runtime + 'static>(
 }
 
 /// May the watcher restart `svc`? Only a `vco_managed` service that is
-/// enabled (its `service_endpoints` row — or none: VCO's own stack). Pure.
+/// enabled (its `service_endpoints` row — or none: VCO's own stack), AND
+/// has no shared watchdog-pause marker (v0.2.106: ONE pause rule for every
+/// automatic restarter — the same marker file the hub's infra watchdog
+/// consults, via the one shared helper). Pure except that marker read.
 ///
 /// This replaces the v0.2.7 "pinned container" check (`needs_user_pick`):
 /// which container a service is, is now its row, never a discovery the
@@ -390,6 +428,7 @@ async fn schedule_restart<R: Runtime + 'static>(
 pub(crate) fn watcher_may_restart(svc: &ServiceRuntimeState) -> bool {
     svc.mode == Some(vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged)
         && svc.endpoint.as_ref().map_or(true, |r| r.enabled)
+        && !vct_launcher_core::services::watchdog_pause::is_service_paused(&svc.name)
 }
 
 /// Read the watcher-enabled toggle from app_state. Returns Ok(None) when
@@ -574,9 +613,13 @@ mod tests {
     }
 
     /// v0.2.97: the watcher restarts VCO's own services only. Red if the
-    /// gate stops consulting the row's mode.
+    /// gate stops consulting the row's mode. (v0.2.106: the gate also reads
+    /// the shared pause marker, so the test redirects the state dir to stay
+    /// hermetic.)
     #[test]
+    #[serial_test::serial]
     fn watcher_restarts_only_vco_managed_services() {
+        let _g = vct_launcher_core::test_env::state_dir_guard();
         use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
         use vct_launcher_core::services::service_endpoints::CoreService;
         use vct_launcher_core::services::service_status::service_state;
@@ -595,5 +638,35 @@ mod tests {
         assert!(watcher_may_restart(&service_state(CoreService::CodeEmbed, Some(c.clone()))));
         c.enabled = false;
         assert!(!watcher_may_restart(&service_state(CoreService::CodeEmbed, Some(c))));
+    }
+
+    /// v0.2.106: ONE pause rule for every automatic restarter. The shared
+    /// watchdog-pause marker (the same file the hub's infra watchdog
+    /// consults, through the same `vct_launcher_core` helper) means "the
+    /// user stopped this service on purpose". The watcher must (a) not
+    /// restart a paused service, (b) not clear the marker — only an
+    /// explicit user Start / Restart does that.
+    #[test]
+    #[serial_test::serial]
+    fn watcher_never_restarts_a_paused_service_and_leaves_the_marker() {
+        use vct_launcher_core::services::service_endpoints::CoreService;
+        use vct_launcher_core::services::service_status::service_state;
+        use vct_launcher_core::services::watchdog_pause::{
+            create_pause_marker, is_service_paused, remove_pause_marker,
+        };
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        let svc = service_state(CoreService::Weaviate, None);
+        assert!(watcher_may_restart(&svc), "no marker = restart allowed");
+        create_pause_marker("weaviate").expect("create marker");
+        assert!(
+            !watcher_may_restart(&svc),
+            "a paused service must never be restarted by the watcher"
+        );
+        assert!(
+            is_service_paused("weaviate"),
+            "the restart gate must not clear the pause marker"
+        );
+        remove_pause_marker("weaviate").expect("remove marker");
+        assert!(watcher_may_restart(&svc), "clearing the marker re-enables restarts");
     }
 }

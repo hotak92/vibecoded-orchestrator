@@ -67,6 +67,11 @@
     engineAutostartHint,
   } from '$lib/engine-autostart';
   import {
+    DEFAULT_SERVICES_WATCHER,
+    resolveServicesWatcher,
+    servicesWatcherHint,
+  } from '$lib/services-watcher';
+  import {
     resolveModuleUpdateAutoCheck,
     moduleUpdateAutoCheckHint,
     DEFAULT_MODULE_UPDATE_AUTO_CHECK,
@@ -1836,6 +1841,44 @@
     }
   }
 
+  // v0.2.106: "Restart stopped services automatically" — the GUI switch
+  // for `launcher.services_watcher_enabled`, the ONE row both automatic
+  // restarters read (this launcher's services watcher and the hub's infra
+  // watchdog). Turns the watcher module's long-standing doc promise into a
+  // real control.
+  let servicesWatcher = $state(DEFAULT_SERVICES_WATCHER);
+  let servicesWatcherBusy = $state(false);
+  let servicesWatcherError = $state<string | null>(null);
+
+  async function loadServicesWatcher() {
+    try {
+      servicesWatcher = resolveServicesWatcher(
+        await PREF_LOADERS.servicesWatcher.load(),
+      );
+    } catch (e) {
+      // Unreachable command (browser mode / partial install): show the
+      // SHIPPED default, because that is what the watcher will do.
+      servicesWatcher = resolveServicesWatcher(null);
+      console.warn('get_services_watcher_enabled failed', e);
+    }
+  }
+
+  async function toggleServicesWatcher(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const enable = target.checked;
+    servicesWatcherBusy = true;
+    servicesWatcherError = null;
+    try {
+      await invoke('set_services_watcher_enabled', { enabled: enable });
+      servicesWatcher = enable;
+    } catch (e) {
+      servicesWatcherError = e instanceof Error ? e.message : String(e);
+      target.checked = servicesWatcher;
+    } finally {
+      servicesWatcherBusy = false;
+    }
+  }
+
   // ── Module updates: the 24 h automatic check (v0.2.100) ───────────────
   // Opt-out for `spawn_module_update_check_loop`. The shipped default is ON;
   // the switch renders that default while the read is in flight or fails.
@@ -2311,6 +2354,7 @@
     bootAutostart: loadBootAutostart,
     sessionAutostart: loadSessionAutostart,
     engineAutostart: loadEngineAutostart,
+    servicesWatcher: loadServicesWatcher,
     moduleUpdateAutoCheck: loadModuleUpdateAutoCheck,
     services: refreshServices,
     activeEmbedding: loadActiveEmbedding,
@@ -3926,6 +3970,32 @@
           checked={engineAutostart}
           disabled={engineAutostartBusy}
           onchange={toggleEngineAutostart}
+        />
+      </div>
+    </section>
+
+    <!-- v0.2.106: Services — the shared auto-restart switch. ONE toggle for
+         BOTH automatic restarters (the launcher's services watcher and the
+         hub's infra watchdog); a Stop from the Services page pauses both
+         until Start, independent of this switch. -->
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['servicesWatcher'] }} aria-labelledby="pr-services-watcher-title">
+      <h2 class="pr-section-title" id="pr-services-watcher-title">Services</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Restart stopped services automatically</strong>
+          <span class="pr-onboarding-hint">
+            {servicesWatcherHint(servicesWatcher)}
+          </span>
+          {#if servicesWatcherError}
+            <span class="pr-onboarding-hint pr-startup-error">{servicesWatcherError}</span>
+          {/if}
+        </div>
+        <input
+          type="checkbox"
+          data-testid="services-watcher-enabled"
+          checked={servicesWatcher}
+          disabled={servicesWatcherBusy}
+          onchange={toggleServicesWatcher}
         />
       </div>
     </section>

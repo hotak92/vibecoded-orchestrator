@@ -611,6 +611,20 @@
       Manage the shared Weaviate / Ollama / code_embed containers used by
       every project.
     </p>
+    <!-- v0.2.106: Stop is the supported maintenance path. A stop from this
+         page drops the shared pause marker, so BOTH automatic restarters
+         (this launcher's services watcher and the hub's watchdog) leave
+         the service down until you press Start. A stop done outside VCO
+         (`docker stop` / `podman stop` in a terminal) cannot be told apart
+         from a crash and WILL be auto-restarted — use the buttons here. -->
+    <p class="muted">
+      <strong>Stop pauses automatic restarts.</strong> A service stopped here
+      stays down (for backup, maintenance, …) until you press Start — neither
+      the launcher watcher nor the hub watchdog will bring it back. A stop
+      from a terminal (<code>podman stop</code>) looks like a crash and is
+      restarted automatically; use these buttons instead. The auto-restart
+      behaviour itself has a switch in Preferences → Services.
+    </p>
   </header>
 
   {#if !snapshot}
