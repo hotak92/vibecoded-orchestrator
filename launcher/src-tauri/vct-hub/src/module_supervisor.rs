@@ -676,7 +676,7 @@ pub async fn resume_containers_on_startup_with_starter(
 
         // Runtime-type gate (NEW-3 widening, v0.2.38).
         let is_container_distributed =
-            manifest.install.method == InstallMethod::ContainerPull
+            manifest.install.method.runs_container_image()
                 && matches!(manifest.runtime.r#type.as_str(), "container" | "service");
         if !is_container_distributed {
             continue;
@@ -1779,6 +1779,8 @@ mod tests {
                     pull_token_method: "POST".into(),
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
+                    build_context: None,
+                    dockerfile: None,
                 }),
                 scope: vct_launcher_core::manifest::InstallScope::PerProject,
             },

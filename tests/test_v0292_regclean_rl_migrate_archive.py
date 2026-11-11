@@ -284,8 +284,8 @@ def test_legacy_claude_rl_data_dir_never_creates_anything(tmp_path, monkeypatch)
 def test_the_corpus_dirname_matches_the_loggers_copy():
     """Class-C mirror pin: the archive resolver and the live logger agree.
 
-    ``rl_client/rl_logger.py`` is byte-identical-VENDORED into the paid RL
-    container image, which builds WITHOUT ``vco_lib``, so it cannot import the
+    ``rl_client/rl_logger.py`` is COPIED into the RL reranker's container
+    image, which carries no ``vco_lib.paths``, so it cannot import the
     shared constant — tier A of the CLAUDE.md A>B>C rule is closed by a
     packaging constraint. The permitted fallback is the mirror plus a parity
     test; this is it.

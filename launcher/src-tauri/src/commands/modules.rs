@@ -650,6 +650,19 @@ pub(crate) fn list_module_catalog_impl_with_l0(
         modules.push(entry);
     }
 
+    // v0.2.106: modules bundled in this checkout. Their card comes from the
+    // checkout's manifest (offline-safe, no L0 needed) and REPLACES any L0
+    // record with the same id — an older paid-catalog entry must not offer a
+    // registry install of a module the orchestrator now builds itself. No
+    // licence gate: bundled modules are free.
+    for (manifest, path) in crate::commands::bundled_modules::list_bundled_manifests() {
+        let entry = bundled_catalog_entry(db, &manifest, &path);
+        match modules.iter().position(|e| e.id == manifest.id) {
+            Some(i) => modules[i] = entry,
+            None => modules.push(entry),
+        }
+    }
+
     // Walk installed rows for any module_id NOT present in L0 (deprecated /
     // withdrawn). Render as kind=installed with the catalog warning.
     let l0_ids: std::collections::HashSet<&str> =
@@ -727,6 +740,40 @@ pub(crate) fn list_module_catalog_impl_with_l0(
         parse_errors,
         dev_affordance_hint,
     }
+}
+
+/// v0.2.106: the catalog card of a module bundled in this checkout — the
+/// L0 branch's install-state → kind mapping, against the checkout version.
+fn bundled_catalog_entry(
+    db: &Db,
+    manifest: &ModuleManifest,
+    path: &std::path::Path,
+) -> ModuleCatalogEntry {
+    let mut entry = ModuleCatalogEntry::from_manifest(
+        manifest,
+        true,
+        format!("bundled:{}", path.display()),
+    );
+    match lookup_install_state(db, &manifest.id) {
+        InstallState::None => {}
+        InstallState::Installed { version } => {
+            let (kind, warning) = installed_catalog_kind(&version, &manifest.version);
+            entry.kind = kind.into();
+            entry.version = version;
+            if let Some(w) = warning {
+                entry.catalog_warning = w;
+            }
+        }
+        InstallState::Broken { version } => {
+            entry.kind = "broken".into();
+            entry.version = version;
+        }
+        InstallState::Pending { status, version } => {
+            entry.kind = status;
+            entry.version = version;
+        }
+    }
+    entry
 }
 
 /// What `module_installs` says about a given module_id (aggregated
@@ -1339,6 +1386,10 @@ pub(crate) enum ManifestSource {
     /// will overwrite the on-disk file immediately after `container_pull`
     /// succeeds.
     L0Synth,
+    /// v0.2.106: the module ships in this orchestrator checkout
+    /// (`bundled_modules`): its manifest is the checkout's own
+    /// `<dir>/vct-module.json`, always — for install AND update.
+    Bundled(PathBuf),
 }
 
 impl ManifestSource {
@@ -1349,6 +1400,7 @@ impl ManifestSource {
             ManifestSource::Installed(p) => format!("installed:{}", p.display()),
             ManifestSource::Dev(p) => format!("dev:{}", p.display()),
             ManifestSource::L0Synth => "l0-synth".to_string(),
+            ManifestSource::Bundled(p) => format!("bundled:{}", p.display()),
         }
     }
 }
@@ -1387,6 +1439,15 @@ pub(crate) fn resolve_manifest_for_install(
     db: &Db,
     module_id: &str,
 ) -> Result<(ModuleManifest, ManifestSource), String> {
+    // Phase 0 (v0.2.106): a module bundled in this checkout is installed
+    // and updated from the checkout's own manifest, never from an on-disk
+    // copy or L0 (an older paid-catalog record with the same id must not
+    // steer it back to a registry pull). A broken bundled manifest is a
+    // broken checkout: refuse, naming it.
+    if let Some(bundled) = crate::commands::bundled_modules::read_bundled_manifest(module_id) {
+        let (manifest, path) = bundled?;
+        return Ok((manifest, ManifestSource::Bundled(path)));
+    }
     // Phase 1: on-disk extracted manifest.
     //
     // v0.2.45 V45-C: the original v0.2.33 contract was "on-disk wins
@@ -2181,8 +2242,7 @@ pub async fn install_module_for_project(
             // vct-rl-reranker `{module_id}` failure: install pulled fine,
             // container start failed, but the success toast fired anyway.
             let (resolved_container_name, container_start_error): (Option<String>, Option<String>) =
-                if manifest.install.method
-                == crate::manifest::InstallMethod::ContainerPull
+                if manifest.install.method.runs_container_image()
                 && matches!(manifest.runtime.r#type.as_str(), "container" | "service")
             {
                 // v0.2.49 Stream A: select global vs per-project start
@@ -2251,7 +2311,14 @@ pub async fn install_module_for_project(
                         // shipped, the download soft-fails with a
                         // clear 404 message and the deferred-flag is
                         // set. See multi-Opus pre-push review item 5.
+                        //
+                        // v0.2.106: never for a `container_build` module —
+                        // its image is built from this checkout WITH its
+                        // bundled weights, so there is no remote default
+                        // to fetch (and the edge endpoint would refuse an
+                        // unlicensed install anyway).
                         if module_id == crate::commands::module_service::RL_RERANKER_MODULE_ID
+                            && manifest.install.method != crate::manifest::InstallMethod::ContainerBuild
                             && is_module_licensed(&manifest, &db)
                         {
                             let app_clone = app.clone();
@@ -3516,7 +3583,7 @@ mod tests {
     fn builtin_catalog_lists_zero_coming_soon_entries() {
         // Phase 1C (2026-05-16): rl-reranker was promoted from `coming_soon`
         // to `available` once its manifest landed at
-        // `paid-modules/vct-rl-reranker/vct-module.json` and the launcher's
+        // `claude_mcp_servers/rl_reranker/vct-module.json` and the launcher's
         // installer gained the ContainerPull recipe. The pre-flip test
         // pinned "exactly one coming_soon entry, must be rl-reranker" —
         // now we pin the inverse: no vapor entries should resurface.
@@ -3540,7 +3607,7 @@ mod tests {
 
     // v0.2.33 (Agent B, L0a): deleted —
     // `builtin_catalog_lists_rl_reranker_as_available_paid_module`. The
-    // hardcoded vct-rl-reranker entry was removed from
+    // hardcoded vct-paid-example entry was removed from
     // `builtin_catalog_entries`; paid-module metadata now comes from L0
     // (`module_catalog_client::cached_module_catalog`). The new
     // `list_module_catalog_renders_l0_module_as_available_when_uninstalled`
@@ -4096,12 +4163,12 @@ mod tests {
 
     static CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Build a canonical L0CatalogModule for vct-rl-reranker at the given
+    /// Build a canonical L0CatalogModule for vct-paid-example at the given
     /// version. Used by every L0-driven test below to keep the fixture
     /// shape consistent.
     fn fake_l0_rl(version: &str) -> L0CatalogModule {
         L0CatalogModule {
-            id: "vct-rl-reranker".into(),
+            id: "vct-paid-example".into(),
             name: "RL Reranker".into(),
             version: version.into(),
             description: "RL-based reranker".into(),
@@ -4123,7 +4190,7 @@ mod tests {
             install: L0Install {
                 method: "container_pull".into(),
                 container: L0InstallContainer {
-                    image: "ghcr.io/hotak92/vct-rl-reranker".into(),
+                    image: "ghcr.io/hotak92/vct-paid-example".into(),
                     tag_from_version: true,
                     registry: Some("ghcr.io".into()),
                     pull_token_endpoint: "https://example/pull-token".into(),
@@ -4139,6 +4206,48 @@ mod tests {
             deprecation_migration_url: String::new(),
             post_install_manifest_path: "vct-module.json".into(),
         }
+    }
+
+    /// v0.2.106: the bundled RL reranker's card comes from the checkout
+    /// manifest and REPLACES an L0 record with the same id (an older paid
+    /// catalog entry): no licence, version from the checkout, source
+    /// `bundled:`. Red before v0.2.106: the L0 record (paid, unlicensed for
+    /// a free tier) was what the catalog showed.
+    #[test]
+    fn bundled_rl_reranker_card_replaces_an_l0_record_and_needs_no_licence() {
+        let (_lock, _tmp) = isolate_state();
+        let db = open_db();
+        let mut paid_record = fake_l0_rl("0.2.12");
+        paid_record.id = "vct-rl-reranker".into();
+        let response = list_module_catalog_impl_with_l0(&db, ok_envelope(vec![paid_record]));
+
+        let checkout = crate::commands::bundled_modules::read_bundled_manifest("vct-rl-reranker")
+            .expect("bundled")
+            .expect("valid shipped manifest")
+            .0;
+        let cards: Vec<_> = response.modules.iter().filter(|e| e.id == "vct-rl-reranker").collect();
+        assert_eq!(cards.len(), 1, "exactly one RL card: {:?}", cards);
+        let rl = cards[0];
+        assert!(rl.manifest_source.starts_with("bundled:"), "{:?}", rl.manifest_source);
+        assert_eq!(rl.version, checkout.version);
+        assert_eq!(rl.kind, "available");
+        assert!(!rl.license_required);
+        assert!(rl.is_licensed, "a free tier may install the bundled module");
+    }
+
+    /// v0.2.106: install and update of the RL reranker resolve the CHECKOUT
+    /// manifest first (phase 0), even with an L0 record for the same id in
+    /// the catalog cache.
+    #[test]
+    fn resolve_manifest_for_install_takes_the_bundled_manifest_first() {
+        let (_lock, _tmp) = isolate_state();
+        let db = open_db();
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker").expect("bundled manifest");
+        assert!(matches!(source, ManifestSource::Bundled(_)), "{:?}", source);
+        assert_eq!(manifest.install.method, crate::manifest::InstallMethod::ContainerBuild);
+        assert!(!manifest.license.required);
+        assert!(is_module_licensed(&manifest, &db), "free tier, no key");
     }
 
     fn ok_envelope(modules: Vec<L0CatalogModule>) -> Result<L0CatalogResponse, String> {
@@ -4219,12 +4328,15 @@ mod tests {
         assert!(ids.contains(&"orchestrator"), "missing orchestrator: {:?}", ids);
         assert!(ids.contains(&"knowledge-graph"), "missing KG: {:?}", ids);
         assert!(ids.contains(&"code-graph"), "missing code-graph: {:?}", ids);
-        // No vct-rl-reranker (placeholder removed in v0.2.33).
+        // No paid placeholder (removed in v0.2.33).
         assert!(
-            !ids.contains(&"vct-rl-reranker"),
-            "vct-rl-reranker placeholder must NOT be present when L0 is empty; \
+            !ids.contains(&"vct-paid-example"),
+            "a paid placeholder must NOT be present when L0 is empty; \
              v0.2.33 removed the hardcoded entry"
         );
+        // v0.2.106: the bundled RL reranker IS present with L0 empty — its
+        // card comes from the checkout manifest, not from L0.
+        assert!(ids.contains(&"vct-rl-reranker"), "bundled RL card missing: {:?}", ids);
         // L0 status is Ok with 0 modules.
         match response.l0_status {
             L0Status::Ok { modules_count, .. } => assert_eq!(modules_count, 0),
@@ -4251,13 +4363,13 @@ mod tests {
         l0.deprecated = true;
         l0.deprecation_message = "Use v2; EOL 2027-01-01.".into();
         l0.deprecation_eol_date = "2027-01-01".into();
-        seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
+        seed_install(&db, "vct-paid-example", "0.2.7", ModuleStatus::Installed);
         let response =
             list_module_catalog_impl_with_l0(&db, ok_envelope(vec![l0]));
         let entry = response
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
+            .find(|e| e.id == "vct-paid-example")
             .expect("L0 entry present");
         assert!(entry.deprecated, "deprecated must reach the catalog entry");
         assert_eq!(entry.deprecation_message, "Use v2; EOL 2027-01-01.");
@@ -4266,13 +4378,13 @@ mod tests {
 
         // Same module, unmarked: the not-otherwise case.
         let db2 = open_db();
-        seed_install(&db2, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
+        seed_install(&db2, "vct-paid-example", "0.2.7", ModuleStatus::Installed);
         let response2 =
             list_module_catalog_impl_with_l0(&db2, ok_envelope(vec![fake_l0_rl("0.2.7")]));
         let entry2 = response2
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
+            .find(|e| e.id == "vct-paid-example")
             .expect("L0 entry present");
         assert!(!entry2.deprecated, "an unmarked row must stay undeprecated");
     }
@@ -4291,8 +4403,8 @@ mod tests {
         let rl = response
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
-            .expect("vct-rl-reranker must be in catalog after L0 advertises it");
+            .find(|e| e.id == "vct-paid-example")
+            .expect("vct-paid-example must be in catalog after L0 advertises it");
         assert_eq!(rl.kind, "available", "no install row → kind=available");
         assert_eq!(rl.version, "0.2.7", "version must come from L0");
         assert_eq!(rl.min_orchestrator_tier, "pro");
@@ -4323,8 +4435,8 @@ mod tests {
         let rl = response
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
-            .expect("vct-rl-reranker must be present");
+            .find(|e| e.id == "vct-paid-example")
+            .expect("vct-paid-example must be present");
         assert!(
             rl.is_licensed,
             "admin tier must auto-license paid modules; pre-v0.2.33 \
@@ -4352,8 +4464,8 @@ mod tests {
         let rl = response
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
-            .expect("vct-rl-reranker must be present");
+            .find(|e| e.id == "vct-paid-example")
+            .expect("vct-paid-example must be present");
         assert!(
             !rl.is_licensed,
             "free tier must NOT unlock a pro-tier paid module; if this \
@@ -4369,7 +4481,7 @@ mod tests {
     fn list_module_catalog_renders_update_available_when_l0_newer_than_installed() {
         let (_lock, _tmp) = isolate_state();
         let db = open_db();
-        let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
+        let _ = seed_install(&db, "vct-paid-example", "0.2.7", ModuleStatus::Installed);
 
         let response = list_module_catalog_impl_with_l0(
             &db,
@@ -4379,7 +4491,7 @@ mod tests {
         let rl = response
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
+            .find(|e| e.id == "vct-paid-example")
             .expect("entry present");
         assert_eq!(rl.kind, "update_available", "L0 newer than installed");
         assert_eq!(
@@ -4395,7 +4507,7 @@ mod tests {
     fn list_module_catalog_renders_installed_when_versions_match() {
         let (_lock, _tmp) = isolate_state();
         let db = open_db();
-        let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
+        let _ = seed_install(&db, "vct-paid-example", "0.2.7", ModuleStatus::Installed);
 
         let response = list_module_catalog_impl_with_l0(
             &db,
@@ -4405,7 +4517,7 @@ mod tests {
         let rl = response
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
+            .find(|e| e.id == "vct-paid-example")
             .expect("entry present");
         assert_eq!(rl.kind, "installed", "versions match → installed");
         assert_eq!(rl.version, "0.2.7");
@@ -4418,7 +4530,7 @@ mod tests {
     fn list_module_catalog_renders_broken_when_status_is_broken() {
         let (_lock, _tmp) = isolate_state();
         let db = open_db();
-        let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Broken);
+        let _ = seed_install(&db, "vct-paid-example", "0.2.7", ModuleStatus::Broken);
 
         let response = list_module_catalog_impl_with_l0(
             &db,
@@ -4428,7 +4540,7 @@ mod tests {
         let rl = response
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
+            .find(|e| e.id == "vct-paid-example")
             .expect("entry present");
         assert_eq!(
             rl.kind, "broken",
@@ -4461,7 +4573,7 @@ mod tests {
         assert!(ids.contains(&"vct-launcher"));
         assert!(ids.contains(&"orchestrator"));
         // No paid modules.
-        assert!(!ids.contains(&"vct-rl-reranker"));
+        assert!(!ids.contains(&"vct-paid-example"));
 
     }
 
@@ -4499,7 +4611,7 @@ mod tests {
         let rl = response
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
+            .find(|e| e.id == "vct-paid-example")
             .expect("stale cache contents must still render");
         assert_eq!(rl.version, "0.2.6");
 
@@ -4558,11 +4670,11 @@ mod tests {
         )
         .expect("write cache");
 
-        let slice = resolve_install_metadata(&db, "vct-rl-reranker")
+        let slice = resolve_install_metadata(&db, "vct-paid-example")
             .expect("must find the L0 slice when cache is populated");
-        assert_eq!(slice.id, "vct-rl-reranker");
+        assert_eq!(slice.id, "vct-paid-example");
         assert_eq!(slice.version, "0.2.7");
-        assert_eq!(slice.install.container.image, "ghcr.io/hotak92/vct-rl-reranker");
+        assert_eq!(slice.install.container.image, "ghcr.io/hotak92/vct-paid-example");
 
         let missing = resolve_install_metadata(&db, "vct-not-in-l0");
         assert!(missing.is_err(), "unknown module must Err");
@@ -4693,11 +4805,11 @@ mod tests {
 
         // Plant a synthetic install-root with a dev manifest.
         let install_root = plant_install_root(tmp.path(), &db);
-        let dev_dir = install_root.join("paid-modules").join("vct-rl-reranker");
+        let dev_dir = install_root.join("paid-modules").join("vct-paid-example");
         std::fs::create_dir_all(&dev_dir).unwrap();
         let dev_manifest = serde_json::json!({
             "manifest_version": 1,
-            "id": "vct-rl-reranker",
+            "id": "vct-paid-example",
             "name": "RL Reranker (DEV)",
             "version": "9.9.9",
             "description": "dev fixture",
@@ -4707,7 +4819,7 @@ mod tests {
             "install": {
                 "method": "container_pull",
                 "container": {
-                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "image": "ghcr.io/hotak92/vct-paid-example",
                     "pull_token_endpoint": "https://example/token"
                 }
             },
@@ -4724,7 +4836,7 @@ mod tests {
         let rl_off = response_off
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
+            .find(|e| e.id == "vct-paid-example")
             .expect("L0 entry present");
         assert_eq!(
             rl_off.version, "0.2.7",
@@ -4741,7 +4853,7 @@ mod tests {
         let rl_on = response_on
             .modules
             .iter()
-            .find(|e| e.id == "vct-rl-reranker")
+            .find(|e| e.id == "vct-paid-example")
             .expect("entry present");
         assert_eq!(
             rl_on.version, "9.9.9",
@@ -4792,7 +4904,7 @@ mod tests {
         // tempdir via isolate_state, so `~/.vct/modules/` is empty
         // under that prefix. And isolate_state cleared the dev env var.
         assert!(
-            find_installed_manifest(&db, "vct-rl-reranker").is_err(),
+            find_installed_manifest(&db, "vct-paid-example").is_err(),
             "test pre-cond: no on-disk manifest"
         );
         assert!(
@@ -4802,7 +4914,7 @@ mod tests {
 
         // Exercise the resolver.
         let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("L0-synth must succeed when catalog cache is populated");
         assert_eq!(source, ManifestSource::L0Synth, "must take phase 3");
 
@@ -4811,7 +4923,7 @@ mod tests {
         // Phase 3 of `installer_engine::run_install_inner` would consume
         // these fields IF we proceeded to actually pull (we don't —
         // that'd require podman).
-        assert_eq!(manifest.id, "vct-rl-reranker");
+        assert_eq!(manifest.id, "vct-paid-example");
         assert_eq!(manifest.version, "0.2.7");
         assert_eq!(
             manifest.install.method,
@@ -4822,7 +4934,7 @@ mod tests {
             .container
             .as_ref()
             .expect("synth carries install.container");
-        assert_eq!(c.image, "ghcr.io/hotak92/vct-rl-reranker");
+        assert_eq!(c.image, "ghcr.io/hotak92/vct-paid-example");
         assert!(c.tag_from_version);
         // License gate is_module_licensed (called immediately after the
         // resolver in install_module_for_project) reads these — pinning
@@ -4872,11 +4984,11 @@ mod tests {
         // VCT_STATE_DIR-redirected modules tree. The contents mirror
         // what Agent C's extract step would have written after a real
         // pull.
-        let module_dir = tmp.path().join("modules").join("vct-rl-reranker");
+        let module_dir = tmp.path().join("modules").join("vct-paid-example");
         std::fs::create_dir_all(&module_dir).unwrap();
         let installed_manifest = serde_json::json!({
             "manifest_version": 1,
-            "id": "vct-rl-reranker",
+            "id": "vct-paid-example",
             "name": "RL Reranker",
             "version": "0.2.7",
             "description": "installed-on-disk fixture",
@@ -4890,7 +5002,7 @@ mod tests {
             "install": {
                 "method": "container_pull",
                 "container": {
-                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "image": "ghcr.io/hotak92/vct-paid-example",
                     "pull_token_endpoint": "https://example/pull-token"
                 }
             },
@@ -4903,7 +5015,7 @@ mod tests {
         .unwrap();
 
         let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("must resolve");
         // Phase 1 wins — must NOT be L0Synth.
         match &source {
@@ -4958,11 +5070,11 @@ mod tests {
         // Plant a dev paid-modules entry with a sentinel version that
         // we can distinguish from the L0 version (0.2.7 → 9.9.9).
         let install_root = plant_install_root(tmp.path(), &db);
-        let dev_dir = install_root.join("paid-modules").join("vct-rl-reranker");
+        let dev_dir = install_root.join("paid-modules").join("vct-paid-example");
         std::fs::create_dir_all(&dev_dir).unwrap();
         let dev_manifest = serde_json::json!({
             "manifest_version": 1,
-            "id": "vct-rl-reranker",
+            "id": "vct-paid-example",
             "name": "RL Reranker (DEV)",
             "version": "9.9.9",
             "description": "dev paid-modules fixture",
@@ -4976,7 +5088,7 @@ mod tests {
             "install": {
                 "method": "container_pull",
                 "container": {
-                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "image": "ghcr.io/hotak92/vct-paid-example",
                     "pull_token_endpoint": "https://example/pull-token"
                 }
             },
@@ -4992,7 +5104,7 @@ mod tests {
         // takes over and we'd see v0.2.7.
         std::env::remove_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH");
         let (manifest_off, source_off) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("L0-synth path");
         assert_eq!(
             source_off,
@@ -5007,7 +5119,7 @@ mod tests {
         // Phase B: env var ON → dev branch fires, v9.9.9 wins.
         std::env::set_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH", "1");
         let (manifest_on, source_on) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("dev path");
         match &source_on {
             ManifestSource::Dev(p) => {
@@ -5056,7 +5168,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let log_path = tmp.path().join("launcher_errors.jsonl");
         let err = ManifestParseError {
-            module_id: "vct-rl-reranker".into(),
+            module_id: "vct-paid-example".into(),
             source: "L0:/functions/v1/module-catalog".into(),
             error: "missing field `version`".into(),
         };
@@ -5068,7 +5180,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(lines[0]).expect("each line must be valid JSON");
         assert_eq!(parsed["kind"], "manifest_parse_error");
-        assert_eq!(parsed["module_id"], "vct-rl-reranker");
+        assert_eq!(parsed["module_id"], "vct-paid-example");
         assert_eq!(parsed["source"], "L0:/functions/v1/module-catalog");
         assert_eq!(parsed["error"], "missing field `version`");
         assert!(
@@ -5128,11 +5240,11 @@ mod tests {
     /// touches matter — the rest are filled to ModuleManifest's required
     /// shape.
     fn plant_installed_manifest(tmp: &std::path::Path, version: &str) {
-        let module_dir = tmp.join("modules").join("vct-rl-reranker");
+        let module_dir = tmp.join("modules").join("vct-paid-example");
         std::fs::create_dir_all(&module_dir).unwrap();
         let installed_manifest = serde_json::json!({
             "manifest_version": 1,
-            "id": "vct-rl-reranker",
+            "id": "vct-paid-example",
             "name": "RL Reranker",
             "version": version,
             "description": "v0.2.45 V45-C fixture",
@@ -5146,7 +5258,7 @@ mod tests {
             "install": {
                 "method": "container_pull",
                 "container": {
-                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "image": "ghcr.io/hotak92/vct-paid-example",
                     "pull_token_endpoint": "https://example/pull-token"
                 }
             },
@@ -5171,12 +5283,12 @@ mod tests {
         plant_installed_manifest(tmp.path(), "0.2.7");
         // Sanity: cache is empty → resolve_install_metadata returns Err.
         assert!(
-            resolve_install_metadata(&db, "vct-rl-reranker").is_err(),
+            resolve_install_metadata(&db, "vct-paid-example").is_err(),
             "test pre-cond: L0 cache must be empty for this branch",
         );
 
         let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("phase 1 must succeed when L0 is absent");
         match &source {
             ManifestSource::Installed(_) => {}
@@ -5210,7 +5322,7 @@ mod tests {
         .unwrap();
 
         let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("phase 1 must succeed for equal versions");
         match &source {
             ManifestSource::Installed(_) => {}
@@ -5246,7 +5358,7 @@ mod tests {
         .unwrap();
 
         let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("phase 3 must succeed when L0 is newer + cache populated");
         assert_eq!(
             source,
@@ -5274,11 +5386,11 @@ mod tests {
         version: &str,
         scope: &str,
     ) {
-        let module_dir = tmp.join("modules").join("vct-rl-reranker");
+        let module_dir = tmp.join("modules").join("vct-paid-example");
         std::fs::create_dir_all(&module_dir).unwrap();
         let installed_manifest = serde_json::json!({
             "manifest_version": 1,
-            "id": "vct-rl-reranker",
+            "id": "vct-paid-example",
             "name": "RL Reranker",
             "version": version,
             "description": "scope-backstop fixture",
@@ -5293,7 +5405,7 @@ mod tests {
                 "method": "container_pull",
                 "scope": scope,
                 "container": {
-                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "image": "ghcr.io/hotak92/vct-paid-example",
                     "pull_token_endpoint": "https://example/pull-token"
                 }
             },
@@ -5346,7 +5458,7 @@ mod tests {
         .unwrap();
 
         let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("must resolve on a newer-version update");
 
         // It still takes the synth path (newer version) ...
@@ -5407,7 +5519,7 @@ mod tests {
         .unwrap();
 
         let (manifest, _source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("must resolve");
         assert_eq!(
             manifest.install.scope,
@@ -5440,7 +5552,7 @@ mod tests {
         .unwrap();
 
         let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
+            resolve_manifest_for_install(&db, "vct-paid-example")
                 .expect("phase 1 must succeed when L0 is older");
         match &source {
             ManifestSource::Installed(_) => {}
@@ -5472,12 +5584,12 @@ mod tests {
         plant_installed_manifest(tmp.path(), "1.2.3");
         let good = tmp.path().join("modules");
         // The bad one: the same shape, a version a <=0.2.99 launcher accepted.
-        let raw = std::fs::read_to_string(good.join("vct-rl-reranker").join("vct-module.json")).unwrap();
+        let raw = std::fs::read_to_string(good.join("vct-paid-example").join("vct-module.json")).unwrap();
         let bad = good.join("beta-mod");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(
             bad.join("vct-module.json"),
-            raw.replace("\"vct-rl-reranker\"", "\"beta-mod\"").replace("\"1.2.3\"", "\"1.0.0-beta\""),
+            raw.replace("\"vct-paid-example\"", "\"beta-mod\"").replace("\"1.2.3\"", "\"1.0.0-beta\""),
         )
         .unwrap();
         std::fs::create_dir_all(good.join("no-manifest")).unwrap();
@@ -5491,7 +5603,7 @@ mod tests {
         assert!(detected.contains("beta-mod") && detected.contains("vct-module.json"), "{detected}");
         assert!(command.contains("Update (or Reinstall) beta-mod"), "{command}");
         // Leave-alone: valid manifests and module dirs without one are not named.
-        assert!(!detected.contains("vct-rl-reranker") && !detected.contains("no-manifest"));
+        assert!(!detected.contains("vct-paid-example") && !detected.contains("no-manifest"));
         assert!(invalid_installed_manifests(&tmp.path().join("absent")).is_empty());
     }
 
@@ -5512,7 +5624,7 @@ mod tests {
         )
         .unwrap();
 
-        let (manifest, source) = resolve_manifest_for_install(&db, "vct-rl-reranker")
+        let (manifest, source) = resolve_manifest_for_install(&db, "vct-paid-example")
             .expect("the validated L0 entry resolves");
         assert!(
             !matches!(source, ManifestSource::Installed(_)),
@@ -5524,7 +5636,7 @@ mod tests {
         // the value that no longer parses.
         let ledger = TEST_MANIFEST_LEDGER.lock().unwrap().clone();
         assert!(
-            ledger.iter().any(|e| e.contains("vct-rl-reranker") && e.contains("abc")),
+            ledger.iter().any(|e| e.contains("vct-paid-example") && e.contains("abc")),
             "the unreadable installed manifest must be recorded: {ledger:?}"
         );
     }

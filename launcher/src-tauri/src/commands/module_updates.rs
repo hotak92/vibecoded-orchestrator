@@ -173,8 +173,6 @@ pub fn compute_updates_available(
     installed: &[ModuleInstallRow],
     catalog: &L0CatalogResponse,
 ) -> Vec<ModuleUpdateAvailable> {
-    use crate::db::models::ModuleStatus;
-
     let by_id: std::collections::HashMap<&str, &L0CatalogModule> = catalog
         .modules
         .iter()
@@ -183,40 +181,80 @@ pub fn compute_updates_available(
 
     let mut out: Vec<ModuleUpdateAvailable> = installed
         .iter()
-        .filter(|row| {
-            matches!(
-                row.status,
-                ModuleStatus::Installed | ModuleStatus::Running | ModuleStatus::Stopped
-            )
-        })
         .filter_map(|row| {
             let catalog_entry = by_id.get(row.module_id.as_str())?;
-            match semver_less(&row.module_version, &catalog_entry.version) {
-                Ok(true) => {}
-                Ok(false) => return None,
-                Err(e) => {
-                    tracing::warn!(
-                        "[module_updates] {}: update check skipped — {}",
-                        row.module_id, e
-                    );
-                    return None;
-                }
-            }
-            Some(ModuleUpdateAvailable {
-                // project_id is Option<String> on the row (global modules
-                // have None). Surface the empty string for those — the
-                // renderer treats `""` as the orchestrator-root / global
-                // scope when filtering badges.
-                project_id: row.project_id.clone().unwrap_or_default(),
-                module_id: row.module_id.clone(),
-                current_version: row.module_version.clone(),
-                available_version: catalog_entry.version.clone(),
-            })
+            row_update(row, &catalog_entry.version)
         })
         .collect();
 
     out.sort_by(|a, b| a.module_id.cmp(&b.module_id));
     out
+}
+
+/// v0.2.106: update availability for EVERY installed row — the L0 catalog
+/// decides for published modules, the checkout manifest for modules bundled
+/// in this orchestrator (`bundled_modules`; `bundled` is `(id, version)`).
+/// A bundled module's L0 record (an older paid-catalog entry with the same
+/// id) is ignored: updating the orchestrator is what updates it. `catalog`
+/// is `None` when L0 could not be fetched — bundled modules are still
+/// checked (they need no network).
+pub fn compute_all_updates(
+    installed: &[ModuleInstallRow],
+    catalog: Option<&L0CatalogResponse>,
+    bundled: &[(String, String)],
+) -> Vec<ModuleUpdateAvailable> {
+    let is_bundled = |id: &str| bundled.iter().any(|(b, _)| b == id);
+    let (bundled_rows, published_rows): (Vec<ModuleInstallRow>, Vec<ModuleInstallRow>) =
+        installed.iter().cloned().partition(|r| is_bundled(&r.module_id));
+
+    let mut out = match catalog {
+        Some(c) => compute_updates_available(&published_rows, c),
+        None => Vec::new(),
+    };
+    for row in &bundled_rows {
+        let Some((_, version)) = bundled.iter().find(|(b, _)| *b == row.module_id) else {
+            continue;
+        };
+        if let Some(u) = row_update(row, version) {
+            out.push(u);
+        }
+    }
+    out.sort_by(|a, b| a.module_id.cmp(&b.module_id));
+    out
+}
+
+/// One installed row against an available version — the ONE status filter
+/// + comparator, shared by the L0 path (`compute_updates_available`) and the
+/// bundled path (`compute_all_updates`). Only `installed | running | stopped`
+/// rows are candidates; an unreadable version is never "update available".
+fn row_update(row: &ModuleInstallRow, available: &str) -> Option<ModuleUpdateAvailable> {
+    use crate::db::models::ModuleStatus;
+    if !matches!(
+        row.status,
+        ModuleStatus::Installed | ModuleStatus::Running | ModuleStatus::Stopped
+    ) {
+        return None;
+    }
+    match semver_less(&row.module_version, available) {
+        Ok(true) => Some(ModuleUpdateAvailable {
+            // project_id is Option<String> on the row (global modules have
+            // None). Surface the empty string for those — the renderer
+            // treats `""` as the orchestrator-root / global scope when
+            // filtering badges.
+            project_id: row.project_id.clone().unwrap_or_default(),
+            module_id: row.module_id.clone(),
+            current_version: row.module_version.clone(),
+            available_version: available.to_string(),
+        }),
+        Ok(false) => None,
+        Err(e) => {
+            tracing::warn!(
+                "[module_updates] {}: update check skipped — {}",
+                row.module_id, e
+            );
+            None
+        }
+    }
 }
 
 // ─── Tauri commands ─────────────────────────────────────────────────────
@@ -242,18 +280,24 @@ pub async fn check_module_updates_available(
 ) -> Result<Vec<ModuleUpdateAvailable>, String> {
     let installed = db.list_module_installs_for_project(&project_id)?;
     let catalog = match cached_module_catalog(db.inner()).await {
-        Ok(c) => c,
+        Ok(c) => Some(c),
         Err(e) => {
+            // Soft-fail: published modules report nothing; bundled modules
+            // (v0.2.106) are still checked — they need no catalog.
             tracing::warn!(
                 "[module_updates] check_module_updates_available({}) catalog fetch \
-                 failed (soft-fail to empty list): {}",
+                 failed (published modules skipped): {}",
                 project_id, e
             );
-            return Ok(vec![]);
+            None
         }
     };
 
-    Ok(compute_updates_available(&installed, &catalog))
+    Ok(compute_all_updates(
+        &installed,
+        catalog.as_ref(),
+        &crate::commands::bundled_modules::bundled_versions(),
+    ))
 }
 
 /// Convenience wrapper around `update_module_for_project` that:
@@ -282,15 +326,22 @@ pub async fn update_module_to_latest(
         })?;
     let previous_version = installed.module_version.clone();
 
-    let catalog = cached_module_catalog(db.inner())
-        .await
-        .map_err(|e| format!("module catalog fetch: {}", e))?;
-    let catalog_entry = catalog
-        .modules
-        .iter()
-        .find(|m| m.id == module_id)
-        .ok_or_else(|| format!("module {} not in catalog", module_id))?;
-    let catalog_version = catalog_entry.version.clone();
+    // v0.2.106: a bundled module's target version is its checkout manifest
+    // (no catalog round-trip); every other module's is the L0 catalog's.
+    let catalog_version = match crate::commands::bundled_modules::read_bundled_manifest(&module_id) {
+        Some(bundled) => bundled?.0.version,
+        None => {
+            let catalog = cached_module_catalog(db.inner())
+                .await
+                .map_err(|e| format!("module catalog fetch: {}", e))?;
+            let catalog_entry = catalog
+                .modules
+                .iter()
+                .find(|m| m.id == module_id)
+                .ok_or_else(|| format!("module {} not in catalog", module_id))?;
+            catalog_entry.version.clone()
+        }
+    };
 
     // 2. Already-latest fast path. Both `semver_less` returning false
     //    AND the versions matching exactly are treated as "already
@@ -452,13 +503,16 @@ pub fn spawn_module_update_check_loop<R: Runtime>(app: AppHandle<R>) {
 /// flow stays tight. The `tick_db` is the per-tick connection owned by
 /// `spawn_module_update_check_loop`.
 async fn run_poll_tick<R: Runtime>(app: &AppHandle<R>, tick_db: &Db) {
+    // v0.2.106: an unreachable catalog no longer ends the tick — bundled
+    // modules are checked against the checkout either way.
     let catalog = match cached_module_catalog(tick_db).await {
-        Ok(c) => c,
+        Ok(c) => Some(c),
         Err(e) => {
             tracing::error!("[module_updates] poll tick: catalog fetch failed: {}", e);
-            return;
+            None
         }
     };
+    let bundled = crate::commands::bundled_modules::bundled_versions();
 
     // List every project, intersect each with the catalog.
     let projects = match tick_db.list_projects() {
@@ -482,14 +536,14 @@ async fn run_poll_tick<R: Runtime>(app: &AppHandle<R>, tick_db: &Db) {
                 continue;
             }
         };
-        all_updates.extend(compute_updates_available(&installs, &catalog));
+        all_updates.extend(compute_all_updates(&installs, catalog.as_ref(), &bundled));
     }
 
     // Also pull global-scope modules (project_id is None on those rows).
     // `list_global_module_installs` is the canonical reader.
     match tick_db.list_global_module_installs() {
         Ok(rows) => {
-            all_updates.extend(compute_updates_available(&rows, &catalog));
+            all_updates.extend(compute_all_updates(&rows, catalog.as_ref(), &bundled));
         }
         Err(e) => {
             tracing::error!(
@@ -680,6 +734,41 @@ mod tests {
             fetched_at: "2026-06-09T00:00:00Z".into(),
             modules,
         }
+    }
+
+    /// v0.2.106: a bundled module is compared against its CHECKOUT version
+    /// and its L0 record is ignored (an older paid-catalog entry must not
+    /// drive it); published modules still follow L0; with L0 unreachable
+    /// (`None`) the bundled row is still checked.
+    #[test]
+    fn compute_all_updates_takes_bundled_versions_from_the_checkout() {
+        let installed = vec![
+            install_row("vct-rl-reranker", "0.2.12", None, ModuleStatus::Installed),
+            install_row("vct-mao", "0.1.0", Some("p1"), ModuleStatus::Installed),
+        ];
+        let catalog = catalog_response(vec![
+            catalog_module("vct-rl-reranker", "0.9.9"),
+            catalog_module("vct-mao", "0.1.1"),
+        ]);
+        let bundled = vec![("vct-rl-reranker".to_string(), "0.3.0".to_string())];
+
+        let out = compute_all_updates(&installed, Some(&catalog), &bundled);
+        let rl = out.iter().find(|u| u.module_id == "vct-rl-reranker").expect("rl update");
+        assert_eq!(rl.available_version, "0.3.0", "checkout version, not L0's 0.9.9");
+        assert_eq!(rl.project_id, "", "global row");
+        let mao = out.iter().find(|u| u.module_id == "vct-mao").expect("mao update");
+        assert_eq!(mao.available_version, "0.1.1");
+
+        let offline = compute_all_updates(&installed, None, &bundled);
+        assert_eq!(offline.len(), 1, "{offline:?}");
+        assert_eq!(offline[0].module_id, "vct-rl-reranker");
+
+        // Up to date with the checkout -> nothing, whatever L0 says.
+        let current = vec![install_row("vct-rl-reranker", "0.3.0", None, ModuleStatus::Running)];
+        assert!(compute_all_updates(&current, Some(&catalog), &bundled).is_empty());
+        // A broken row is never an update candidate (same filter as L0).
+        let broken = vec![install_row("vct-rl-reranker", "0.2.12", None, ModuleStatus::Broken)];
+        assert!(compute_all_updates(&broken, None, &bundled).is_empty());
     }
 
     #[test]

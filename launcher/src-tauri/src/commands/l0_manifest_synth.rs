@@ -241,6 +241,8 @@ pub fn synthesize_install_manifest_from_l0(
         // extracted manifest's flags, not the synth's.
         rotate_weights: false,
         rotate_weights_endpoint: None,
+        build_context: None,
+        dockerfile: None,
     };
     let install = InstallBlock {
         method: InstallMethod::ContainerPull,

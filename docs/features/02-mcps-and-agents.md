@@ -118,7 +118,7 @@ Use `search_code_graph` first to discover entity names, then `query_code_structu
 </details>
 
 ### RL Reranking (ambient, opt-in)
-When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcement-learning reranker before being returned. When it's not, free-tier installs see plain cosine-ordered results — no error, no warning. The RL server is a **Pro-tier component** shipped as a signed binary via CDN; it is not in the OSS bundle.
+When `RL_SERVER_URL` is reachable (and the shipped RL scoring lock is lifted), KG search results pass through a reinforcement-learning reranker before being returned. When it's not, results stay in plain cosine order — no error, no warning. The RL server is part of this repository since v0.2.106 (`claude_mcp_servers/rl_reranker`): the launcher builds its container image locally when you install the "RL Reranker" module, with the trained weights bundled in `claude_mcp_servers/rl_reranker/weights/`. No licence is needed.
 
 ### v0.2.53: case-rebind for the dev-collection suffix swap (NEW-2)
 
@@ -139,7 +139,7 @@ v0.2.53 Track F adds a case-insensitive resolver: `launcher/src-tauri/vct-hub/sr
 | `DEVELOPMENT_COLLECTION` | `""` | Project docs collection |
 | `CODE_GRAPH_PROJECT` | `""` | Project name prefix for code collections |
 | `ACTIVE_EMBEDDING` | `qwen3` | Which embedding model drives search vectors |
-| `RL_SERVER_URL` | `http://localhost:11439` | Optional RL reranking endpoint (Pro) |
+| `RL_SERVER_URL` | `http://localhost:11439` | Optional RL reranking endpoint |
 | `WEAVIATE_URL` | `http://localhost:8081` | Weaviate HTTP endpoint |
 | `OLLAMA_URL` | `http://localhost:11435` | Ollama endpoint for embeddings |
 

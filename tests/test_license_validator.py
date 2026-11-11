@@ -440,7 +440,18 @@ class TestPublicAPI:
         assert fresh_validator.feature_enabled("hypothetical_future_feature") is True
 
     def test_feature_enabled_pro_feature_off_for_free(self, fresh_validator):
-        assert fresh_validator.feature_enabled("rl_retrieval") is False
+        assert fresh_validator.feature_enabled("auto_update") is False
+
+    def test_rl_retrieval_is_not_licence_gated(self, fresh_validator):
+        """v0.2.106 (owner 2026-11-11, "the RL reranker is no more paid"):
+        the RL reranker ships with the orchestrator, so ``rl_retrieval`` is
+        no longer a tier feature and a free install is not refused it.
+        Red before v0.2.106 (``rl_retrieval`` was mapped to ``pro``)."""
+        assert "rl_retrieval" not in fresh_validator.TIER_FEATURES
+        assert fresh_validator.feature_enabled("rl_retrieval") is True
+        assert fresh_validator.feature_enabled(
+            "rl_retrieval", module_id="vct-rl-reranker"
+        ) is True
 
     def test_license_status_no_key(self, fresh_validator):
         s = fresh_validator.license_status()

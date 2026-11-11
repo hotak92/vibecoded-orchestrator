@@ -3,10 +3,10 @@
 """Pydantic wire-contract schemas for the RL reranker HTTP API.
 
 These models pin the request/response shape that
-``paid-modules/vct-rl-reranker/rl_server.py`` (the paid container)
+``claude_mcp_servers/rl_reranker/rl_server.py`` (the reranker container)
 must accept. If a field name changes here, the same change MUST land
-in the server's handlers — otherwise the launcher's free-tier
-plumbing will silently fail to talk to the paid module.
+in the server's handlers — otherwise the MCP plumbing will silently
+fail to talk to the reranker.
 
 The wire contract is derived directly from the server source as of
 2026-05-19:

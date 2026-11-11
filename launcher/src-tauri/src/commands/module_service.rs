@@ -1160,7 +1160,7 @@ pub(crate) async fn auto_migrate_per_project_to_global_with(
         if matches!(
             manifest.runtime.r#type.as_str(),
             "container" | "service"
-        ) && manifest.install.method == InstallMethod::ContainerPull
+        ) && manifest.install.method.runs_container_image()
         {
             match ops.start_global(&manifest, db).await {
                 Ok(name) => {
@@ -2931,7 +2931,7 @@ where
         // declaring a long-running (`container` | `service`) runtime
         // are auto-resumed. Older / non-container modules (git_clone,
         // local) and on-demand runtime types are excluded.
-        let is_container_distributed = manifest.install.method == InstallMethod::ContainerPull
+        let is_container_distributed = manifest.install.method.runs_container_image()
             && matches!(manifest.runtime.r#type.as_str(), "container" | "service");
         if !is_container_distributed {
             continue;
@@ -3143,6 +3143,20 @@ where
     // managed-connection close the update pipeline does for the
     // install.py window. See `update_gate::skip_if_update_in_progress`.
     if crate::commands::update_gate::skip_if_update_in_progress("module_service_poll") {
+        return;
+    }
+
+    // v0.2.106: SUPERSEDED for the RL reranker — it is a bundled module now
+    // (`bundled_modules`): its trained weights ship in the repository and
+    // inside the image the launcher builds, so there is no remote weights
+    // channel to poll (owner ruling 2026-11-11 retired the paid-module
+    // weights bucket for it). The RL reranker is the only module this sweep
+    // serves, so the sweep stands down whenever it is bundled.
+    if crate::commands::bundled_modules::is_bundled(RL_RERANKER_MODULE_ID) {
+        tracing::debug!(
+            "[module_service] daily weights poll: {} is bundled (weights ship in the image) — skipping",
+            RL_RERANKER_MODULE_ID
+        );
         return;
     }
 
@@ -3822,6 +3836,8 @@ mod tests {
                     pull_token_method: "POST".into(),
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
+                    build_context: None,
+                    dockerfile: None,
                 }),
                 scope: crate::manifest::InstallScope::PerProject,
             },

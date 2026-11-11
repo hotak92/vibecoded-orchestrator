@@ -20,8 +20,8 @@ describe('RL-Scored Retrieval switch view (W5R-02: render the truth)', () => {
     expect(SHIPPED_REASON).toMatch(/until the model is trained/);
   });
 
-  it('locked: never checked, even with a stored host-wide ON and a Pro licence', () => {
-    const v = rlScoringSwitchView(true, true, SHIPPED_REASON);
+  it('locked: never checked, even with a stored host-wide ON', () => {
+    const v = rlScoringSwitchView(true, SHIPPED_REASON);
     expect(v.checked).toBe(false);
     expect(v.disabled).toBe(true);
     expect(v.notice).toBe(SHIPPED_REASON);
@@ -29,12 +29,12 @@ describe('RL-Scored Retrieval switch view (W5R-02: render the truth)', () => {
   });
 
   it('locked with no stored ON: no stored note', () => {
-    expect(rlScoringSwitchView(null, true, SHIPPED_REASON).storedNote).toBeNull();
-    expect(rlScoringSwitchView(false, true, SHIPPED_REASON).storedNote).toBeNull();
+    expect(rlScoringSwitchView(null, SHIPPED_REASON).storedNote).toBeNull();
+    expect(rlScoringSwitchView(false, SHIPPED_REASON).storedNote).toBeNull();
   });
 
   it('lock not loaded (undefined): disabled and unchecked, never a guess', () => {
-    expect(rlScoringSwitchView(true, true, undefined)).toEqual({
+    expect(rlScoringSwitchView(true, undefined)).toEqual({
       checked: false,
       disabled: true,
       notice: null,
@@ -42,24 +42,26 @@ describe('RL-Scored Retrieval switch view (W5R-02: render the truth)', () => {
     });
   });
 
-  it('unlocked: the stored row and the licence decide', () => {
-    expect(rlScoringSwitchView(true, true, null)).toEqual({
+  it('unlocked: the stored row alone decides — no licence input (v0.2.106)', () => {
+    expect(rlScoringSwitchView(true, null)).toEqual({
       checked: true,
       disabled: false,
       notice: null,
       storedNote: null,
     });
-    expect(rlScoringSwitchView(null, true, null).checked).toBe(false);
-    expect(rlScoringSwitchView(false, false, null).disabled).toBe(true);
+    expect(rlScoringSwitchView(null, null).checked).toBe(false);
+    // Red before v0.2.106: an unlicensed install rendered the switch disabled.
+    expect(rlScoringSwitchView(false, null).disabled).toBe(false);
+    expect(rlScoringSwitchView.length).toBe(2);
   });
 });
 
 const SWITCH = fileURLToPath(new URL('./components/RlScoringSwitch.svelte', import.meta.url));
 
 describe('RlScoringSwitch renders the view as DOM state (W5R-09)', () => {
-  it('locked + stored ON + Pro: the input is disabled and NOT checked', async () => {
+  it('locked + stored ON: the input is disabled and NOT checked', async () => {
     const html = await renderSvelte(SWITCH, {
-      view: rlScoringSwitchView(true, true, SHIPPED_REASON),
+      view: rlScoringSwitchView(true, SHIPPED_REASON),
       onToggle: () => {},
     });
     const input = /<input[^>]*data-testid="rl-scoring-switch"[^>]*>/.exec(html)![0];
@@ -67,9 +69,9 @@ describe('RlScoringSwitch renders the view as DOM state (W5R-09)', () => {
     expect(input).not.toMatch(/\schecked/);
   });
 
-  it('unlocked + stored ON + Pro: checked and enabled (the render is not constant)', async () => {
+  it('unlocked + stored ON: checked and enabled (the render is not constant)', async () => {
     const html = await renderSvelte(SWITCH, {
-      view: rlScoringSwitchView(true, true, null),
+      view: rlScoringSwitchView(true, null),
       onToggle: () => {},
     });
     const input = /<input[^>]*data-testid="rl-scoring-switch"[^>]*>/.exec(html)![0];
@@ -107,8 +109,10 @@ describe('McpDashboard mounts the switch with the lock-aware view', () => {
     ]);
     expect(attrs).toContainEqual(['view', '{rlSwitch}']);
     expect(src).toMatch(
-      /rlScoringSwitchView\(config\.rl_retrieval_enabled,\s*features\.has_rl_retrieval,\s*rlLock\)/,
+      /rlScoringSwitchView\(config\.rl_retrieval_enabled,\s*rlLock\)/,
     );
     expect(src).toMatch(/invoke<string \| null>\('rl_scoring_lock'\)/);
+    // v0.2.106: no tier flag gates the RL switch any more.
+    expect(src).not.toMatch(/has_rl_retrieval/);
   });
 });

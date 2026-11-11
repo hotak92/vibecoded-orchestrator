@@ -29,7 +29,6 @@
   interface FeatureFlags {
     tier: string;
     can_auto_update: boolean;
-    has_rl_retrieval: boolean;
     has_curated_agents: boolean;
     has_mao: boolean;
   }
@@ -117,7 +116,7 @@
   // truth — unchecked, disabled, with the reason (see $lib/rl-scoring-default).
   const rlSwitch = $derived(
     config && features
-      ? rlScoringSwitchView(config.rl_retrieval_enabled, features.has_rl_retrieval, rlLock)
+      ? rlScoringSwitchView(config.rl_retrieval_enabled, rlLock)
       : null,
   );
 
@@ -299,9 +298,6 @@
                 view={rlSwitch}
                 onToggle={(checked) => updateSetting('rl_retrieval_enabled', String(checked))}
               />
-              {#if !features.has_rl_retrieval}
-                <span class="upgrade-hint">Pro</span>
-              {/if}
             </div>
           </div>
 

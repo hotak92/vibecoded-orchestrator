@@ -11,7 +11,7 @@ Covers the Python-side contract for the multi-key model:
   T2 — `feature_enabled(feature, module_id=...)` falls through to the
        per-module overlay when the orchestrator tier alone wouldn't
        satisfy the feature gate. A user on orchestrator tier=free with
-       a per-module RL key unlocks `rl_retrieval`.
+       a per-module key unlocks a pro feature (`curated_agent_packs`).
   T3 — Setting a key for module A's overlay entry does not affect
        module B's per-module state. The two are independent.
 
@@ -185,7 +185,7 @@ class TestFeatureEnabledModulePath:
         _write_license_cache(fresh_validator, tier="free", valid=True)
         assert (
             fresh_validator.feature_enabled(
-                "rl_retrieval", module_id="vct-rl-reranker"
+                "curated_agent_packs", module_id="vct-rl-reranker"
             )
             is False
         )
@@ -205,7 +205,7 @@ class TestFeatureEnabledModulePath:
         )
         assert (
             fresh_validator.feature_enabled(
-                "rl_retrieval", module_id="vct-rl-reranker"
+                "curated_agent_packs", module_id="vct-rl-reranker"
             )
             is True
         )
@@ -236,19 +236,19 @@ class TestFeatureEnabledModulePath:
         # the feature.
         assert (
             fresh_validator.feature_enabled(
-                "rl_retrieval", module_id="vct-rl-reranker"
+                "curated_agent_packs", module_id="vct-rl-reranker"
             )
             is True
         )
         # And the bare-call (no module_id) also returns True.
-        assert fresh_validator.feature_enabled("rl_retrieval") is True
+        assert fresh_validator.feature_enabled("curated_agent_packs") is True
 
     def test_backward_compat_no_module_id_kwarg(self, fresh_validator):
         # Pre-L1 call sites pass only the feature name. Behaviour MUST
         # match the v0.2.39 contract for the default-args path.
         _write_license_cache(fresh_validator, tier="free", valid=True)
         # Pro-gated feature on free tier → False (legacy).
-        assert fresh_validator.feature_enabled("rl_retrieval") is False
+        assert fresh_validator.feature_enabled("curated_agent_packs") is False
         # Unknown feature → fail-open True (legacy).
         assert fresh_validator.feature_enabled("hypothetical_new") is True
 
@@ -285,10 +285,10 @@ class TestPerModuleIndependence:
                 "vct-rl-reranker": {"tier": "pro", "source": "per-module"},
             },
         )
-        # Module A entitled → rl_retrieval unlocked.
+        # Module A entitled → curated_agent_packs unlocked.
         assert (
             fresh_validator.feature_enabled(
-                "rl_retrieval", module_id="vct-rl-reranker"
+                "curated_agent_packs", module_id="vct-rl-reranker"
             )
             is True
         )
@@ -356,12 +356,12 @@ class TestLegacyCompat:
             # First call performs the remote validation + caches Pro.
             assert fresh_validator.get_tier(force_refresh=True) == "pro"
         # The bare feature_enabled call returns True (legacy contract).
-        assert fresh_validator.feature_enabled("rl_retrieval") is True
+        assert fresh_validator.feature_enabled("curated_agent_packs") is True
         # And the new module_id kwarg still returns True (Pro tier
         # short-circuits before the overlay path).
         assert (
             fresh_validator.feature_enabled(
-                "rl_retrieval", module_id="vct-rl-reranker"
+                "curated_agent_packs", module_id="vct-rl-reranker"
             )
             is True
         )

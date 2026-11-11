@@ -9,7 +9,7 @@ How VibeCoded Orchestrator gates paid features.
   MCP servers, default agents/skills all work standalone.
 - Paid features activate when a valid key is present and the tier resolves
   to `pro` or higher. Per `TIER_FEATURES` in `validator.py`: `pro` unlocks
-  `rl_retrieval`, `auto_update`, `curated_agent_packs`; `mao` adds
+  `auto_update`, `curated_agent_packs`; `mao` adds
   `multi_agent_orchestration`; `enterprise` adds `soc2_compliance` and
   `priority_support`.
 
@@ -51,7 +51,7 @@ unlocks every feature of the tiers below it:
       `licenses/activate`, looks up the variant in `VARIANT_MAP`, and
       returns `{valid, tier, expires_at, machine_count, machine_limit}`.
 4. Orchestrator caches the result in `~/.vibecoded/license_cache.json`.
-5. Subsequent feature checks (`feature_enabled("rl_retrieval")`) consult
+5. Subsequent feature checks (`feature_enabled("auto_update")`) consult
    the cached tier — no network call.
 
 ## Flow (free / OSS user)
@@ -78,7 +78,7 @@ unlocks every feature of the tiers below it:
 from VCThelpers.license import (
     get_tier,           # -> "free" | "pro" | "mao" | "enterprise" | "admin"
     require_tier,       # require_tier("pro") -> bool (>= comparison on TIER_ORDER)
-    feature_enabled,    # feature_enabled("rl_retrieval") -> bool
+    feature_enabled,    # feature_enabled("auto_update") -> bool
     validate_license,   # force a fresh remote call
     license_status,     # introspection dict (no network)
 )

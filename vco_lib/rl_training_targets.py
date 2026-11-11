@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-# This file is VENDORED into paid-modules/vct-rl-reranker/_training_targets.py
-# Both copies MUST stay byte-identical. The byte-identity test in
-# tests/test_vendored_file_sync.py enforces this on every CI run.
-# To re-sync after an edit: ./scripts/sync-vendored-files.sh
+# One copy (v0.2.106): the RL reranker (claude_mcp_servers/rl_reranker) imports
+# this file as `vco_lib.rl_training_targets`; its container image COPYs it from
+# here (see that Dockerfile). There is no vendored duplicate to keep in sync.
 """Unified RL training-target computation — single source of truth.
 
 Used by THREE paths that must agree numerically:
 
 1. **MCP-side citation detection** (`claude_mcp_servers/weaviate_mcp/server.py::_rl_answer_monitor`)
-   — writes the citation event for all tiers (free + Pro) directly to JSONL.
+   — writes the citation event directly to JSONL.
 
-2. **Container-side online training** (`paid-modules/vct-rl-reranker/retrieval_rl.py::_update`)
+2. **Container-side online training** (`claude_mcp_servers/rl_reranker/retrieval_rl.py::_update`)
    — consumes the same inputs to derive training targets for the online gradient step.
 
-3. **Container-side offline training** (`paid-modules/vct-rl-reranker/offline_trainer.py`)
+3. **Container-side offline training** (`claude_mcp_servers/rl_reranker/offline_trainer.py`)
    — replays historical JSONL events through the same formula at batch-training time.
 
 History — pre-v0.2.9, each path had its own subtly different formula

@@ -1,0 +1,14 @@
+{
+    "schema_version": 1,
+    "_doc": "Bundled RL reranker weights. Read ONLY through claude_mcp_servers/rl_reranker/bundled_weights.py (layout + failure policy in its docstring). Each profile names the version the image serves (`current`, null = no trained model ships: the server reports 'not trained'); each listed version lives at <profile>/<version>/rl_model_<profile>_<version>.pt with its sha256 here. qwen3 and arctic ship together (owner rule). tests/rl_reranker/test_bundled_weights.py verifies every listed file against this manifest.",
+    "profiles": {
+        "qwen3": {
+            "current": null,
+            "versions": {}
+        },
+        "arctic": {
+            "current": null,
+            "versions": {}
+        }
+    }
+}

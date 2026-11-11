@@ -3052,7 +3052,7 @@ pub fn run() {
             commands::orchestrator_core::validate_clone_manifest,
             // RL Reranker per-project settings (Stream 2 / 2026-05-19).
             // Backs the schema-rendered controls declared in
-            // paid-modules/vct-rl-reranker/vct-module.json's
+            // claude_mcp_servers/rl_reranker/vct-module.json's
             // gui.config_tab. The four reset/retrain stubs that
             // previously lived here (rl_reset_to_global,
             // rl_reset_and_specialize, retrain_global_online,

@@ -21,7 +21,7 @@ MCP-tool-shape concerns + module globals).
 Signal contract (do NOT change shape): per node,
 ``cosine_sims[title] = max over answer-chunks of _cosine(answer_chunk, n_emb)``;
 ``literal_cited[title]`` via the node-identity word-boundary check;
-``compute_unified_targets`` (vendored formula) derives the binary ``cited`` map.
+``compute_unified_targets`` (the shared formula, `vco_lib/rl_training_targets.py`) derives the binary ``cited`` map.
 Tool RETURNS are already excluded upstream by the answer-window extractor.
 """
 

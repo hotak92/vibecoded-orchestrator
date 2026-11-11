@@ -5,21 +5,22 @@
 
 WHY THIS EXISTS
 ---------------
-RL soft-fails everywhere by design (a down container / broken hub / license
-hiccup must never break the user-facing KG search — the candidates are always
-returned in cosine order). The cost of that discipline is DIAGNOSABILITY: when a
-paying Pro user's reranker silently stops reranking, every failure path is a
+RL soft-fails everywhere by design (a down container / broken hub must never
+break the user-facing KG search — the candidates are always returned in cosine
+order). The cost of that discipline is DIAGNOSABILITY: when a user's reranker
+silently stops reranking, every failure path is a
 ``logger.debug`` line the user never sees. "Why isn't RL reranking?" was, before
 this tool, unanswerable without reading source.
 
 ``rl-doctor`` is the answer. It is a **read-only** diagnostic that reports every
 gate and outcome on the RL path:
 
-  1. License / feature gate — is ``rl_retrieval`` enabled for this install
-     (and the per-module overlay), or is the user on free-tier cosine?
+  1. Scoring lock + per-project toggle — is RL scoring unlocked
+     (``vco_lib/rl_scoring_lock.toml``) and enabled for this project? (There
+     is no licence gate since v0.2.106: the reranker ships with VCO.)
   2. Container reachability + negotiated protocol/embedding version (RL-10) —
-     is the paid container up, and does its wire contract + embedding space
-     match this client?
+     is the reranker container up, and does its wire contract + embedding
+     space match this client?
   3. Last rerank outcome — did the last rerank RPC actually run, or fall back
      to cosine, and WHY (RL-3 fallback counter on disk)?
   4. Telemetry write status — can the hub-backed rl_events writer reach the hub?
@@ -46,8 +47,9 @@ USAGE
     python claude_mcp_servers/scripts/rl_doctor.py --project-root /path
     python claude_mcp_servers/scripts/rl_doctor.py --prune    # + one retention pass
 
-Exit code: 0 when the RL path is healthy OR legitimately free-tier (nothing to
-fix); 1 when RL is ENABLED but a fixable problem was found (container down,
+Exit code: 0 when the RL path is healthy OR legitimately off (locked or
+opted out — nothing to fix); 1 when RL is ENABLED but a fixable problem was
+found (container down,
 version mismatch, hub unreachable) so the tool is CI/script-friendly.
 """
 from __future__ import annotations
@@ -85,37 +87,10 @@ def _resolve_project_root(explicit: Optional[str] = None) -> str:
 # ── individual probes (each soft-fails to a status dict) ────────────────
 
 
-def _probe_license() -> Dict[str, Any]:
-    """License / feature gate. Never raises."""
-    try:
-        from VCThelpers.license import feature_enabled
-    except ImportError:
-        return {
-            "status": "free_tier",
-            "enabled": False,
-            "detail": "VCThelpers.license not importable (pure free-tier install).",
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "unknown", "enabled": False, "detail": f"license import raised: {exc}"}
-    try:
-        enabled = bool(feature_enabled("rl_retrieval", module_id="vct-rl-reranker"))
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "unknown", "enabled": False, "detail": f"feature_enabled raised: {exc}"}
-    return {
-        "status": "enabled" if enabled else "free_tier",
-        "enabled": enabled,
-        "detail": (
-            "rl_retrieval feature is licensed (Pro/MAO or module overlay)."
-            if enabled
-            else "rl_retrieval not licensed → cosine ordering (nothing to fix)."
-        ),
-    }
-
-
 def _probe_scoring_lock() -> Dict[str, Any]:
     """The shipped RL scoring lock (``vco_lib/rl_scoring_lock.toml``), read
     through the SAME resolver the MCP's scoring gate uses. While locked, RL
-    scoring is off whatever the licence and toggle say; logging is unaffected.
+    scoring is off whatever the toggle says; logging is unaffected.
     """
     try:
         from claude_mcp_servers.rl_client.search_pipeline import _rl_scoring_lock_reason
@@ -396,7 +371,6 @@ def _probe_retention() -> Dict[str, Any]:
 def run_diagnostics(project_root: str) -> Dict[str, Any]:
     """Run every probe and assemble the report dict. Pure aggregation."""
     lock = _probe_scoring_lock()
-    lic = _probe_license()
     toggle = _probe_per_project_toggle()
     container = _probe_container()
     fallback = _probe_fallback_counter(project_root)
@@ -404,19 +378,16 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
     retention = _probe_retention()
     quarantine = _probe_quarantine()
 
-    # v0.2.100 W5R-02: the scoring lock wins over the licence and the toggle.
-    rl_enabled = (
-        lock.get("locked") is False
-        and bool(lic.get("enabled"))
-        and toggle.get("enabled") is not False
-    )
+    # v0.2.100 W5R-02: the scoring lock wins over the toggle. v0.2.106: the
+    # licence gate that sat between them is gone (the pipeline has none).
+    rl_enabled = lock.get("locked") is False and toggle.get("enabled") is not False
 
-    # Healthy iff: free-tier (nothing to fix) OR (enabled AND container
-    # compatible AND hub up). Version mismatch / container down / hub down on
-    # an ENABLED install = unhealthy (fixable).
+    # Healthy iff: off (nothing to fix) OR (enabled AND container compatible
+    # AND hub up). Version mismatch / container down / hub down on an ENABLED
+    # install = unhealthy (fixable).
     healthy: bool
     if not rl_enabled:
-        healthy = True  # locked / free-tier / opted-out → legitimately cosine
+        healthy = True  # locked / opted-out → legitimately cosine
     else:
         healthy = bool(container.get("compatible")) and telemetry.get("reachable") is True
 
@@ -425,7 +396,6 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
         "healthy": healthy,
         "project_root": project_root,
         "scoring_lock": lock,
-        "license": lic,
         "per_project_toggle": toggle,
         "container": container,
         "last_fallback": fallback,
@@ -451,7 +421,6 @@ def format_human(report: Dict[str, Any]) -> str:
         lines.append(f"    {d.get('detail', '')}")
 
     _sec("scoring lock", report.get("scoring_lock", {"status": "unknown", "detail": ""}))
-    _sec("license gate", report["license"])
     _sec("per-project toggle", report["per_project_toggle"])
     _sec("container / negotiation", report["container"])
     _sec("last rerank fallback", report["last_fallback"])

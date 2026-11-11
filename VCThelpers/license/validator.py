@@ -82,7 +82,10 @@ TIER_FEATURES: dict[str, Tier] = {
     "code_graph": "free",
     "hooks": "free",
     "hybrid_search": "free",
-    "rl_retrieval": "pro",
+    # v0.2.106: `rl_retrieval` (was "pro") REMOVED — owner ruling 2026-11-11,
+    # "the RL reranker is no more paid": it ships in the public repository and
+    # every install may use it. Its remaining gates are the RL scoring lock
+    # (`vco_lib/rl_scoring_lock.toml`) and the per-project module toggle.
     "auto_update": "pro",
     "curated_agent_packs": "pro",
     "multi_agent_orchestration": "mao",
@@ -635,13 +638,13 @@ def feature_enabled(feature: str, module_id: Optional[str] = None) -> bool:
     Unknown features default to True (fail-open for features not yet gated).
 
     v0.2.40 L1 — multi-key licensing: pass `module_id=` to gate on
-    PER-MODULE entitlements (e.g. the user activated a `vct-rl-reranker`
+    PER-MODULE entitlements (e.g. the user activated a paid module's
     key independently of the orchestrator tier). When `module_id` is
     set, the function:
 
       1. Returns True immediately if the orchestrator tier already
          covers the feature (legacy behaviour — a Pro-tier user
-         doesn't need a per-module RL key).
+         doesn't need a per-module key).
       2. Otherwise, consults the cached `module_licenses` overlay from
          `~/.vibecoded/license_cache.json` (mirror of the launcher's
          `tier_cache.module_licenses` SQLite column) and returns True
@@ -680,8 +683,8 @@ def is_module_licensed(module_id: str) -> bool:
     Distinct from `require_tier(min_tier)`: this checks an INDEPENDENT
     per-module entitlement granted by the user activating a paid
     module's specific license key. A user can have orchestrator
-    tier=free + a paid RL Reranker key → `is_module_licensed(
-    "vct-rl-reranker")` returns True, but `require_tier("pro")` returns
+    tier=free + a paid module key → `is_module_licensed(
+    "<that module id>")` returns True, but `require_tier("pro")` returns
     False.
     """
     if not module_id:

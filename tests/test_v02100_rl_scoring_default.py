@@ -11,9 +11,11 @@ now" - and logs are ALWAYS collected.
   it is set, ``search_pipeline._resolve_rl_enabled`` is False whatever the
   per-project row, the host-wide row, the licence or the hub say (including
   hub-down, which used to fall open to the licence alone).
-* Beneath the lock, the hub-served ``rl_reranker_enabled_for_project`` and the
-  licence still decide (pinned with the lock patched off, i.e. the state that
-  applies again once a trained model ships).
+* Beneath the lock, the hub-served ``rl_reranker_enabled_for_project`` alone
+  decides (pinned with the lock patched off, i.e. the state that applies again
+  once a trained model ships). v0.2.106 (owner 2026-11-11, "the RL reranker is
+  no more paid"): the licence gate is gone — every cell below runs with a
+  licence stub answering BOTH ways and the outcome must not change.
 * W5R-09: logging independence is exercised through the REAL consumer gates
   (``_retrieval_emit_has_consumer`` / ``_should_capture_citations``) with local
   logging on. The only patched boundaries are ``emit_rl_event`` (the writer),
@@ -123,20 +125,31 @@ class TestLockForcesScoringOff:
 
 
 class TestResolverBeneathTheLock:
-    """The cascade that applies again once the lock lifts (unchanged)."""
+    """The cascade that applies again once the lock lifts: the per-project
+    row alone (v0.2.106 — no licence gate)."""
 
-    def test_row_off_resolves_scoring_off_even_with_a_licence(self):
-        assert _resolve(True, ROW_FALSE, unlocked=True) is False
+    @pytest.mark.parametrize("licensed", [True, False], ids=["licence-on", "licence-off"])
+    def test_row_off_resolves_scoring_off(self, licensed):
+        assert _resolve(licensed, ROW_FALSE, unlocked=True) is False
 
-    def test_row_on_is_honoured_when_licensed(self):
-        assert _resolve(True, ROW_TRUE, unlocked=True) is True
+    @pytest.mark.parametrize("licensed", [True, False], ids=["licence-on", "licence-off"])
+    def test_row_on_is_honoured_without_any_licence(self, licensed):
+        """Red before v0.2.106: an unlicensed install resolved OFF here."""
+        assert _resolve(licensed, ROW_TRUE, unlocked=True) is True
 
-    def test_licence_gate_still_beats_a_true_row(self):
-        assert _resolve(False, ROW_TRUE, unlocked=True) is False
+    @pytest.mark.parametrize("licensed", [True, False], ids=["licence-on", "licence-off"])
+    def test_hub_unreachable_falls_open(self, licensed):
+        assert _resolve(licensed, HUB_DOWN, unlocked=True) is True
 
-    def test_hub_unreachable_falls_open_to_the_licence_decision(self):
-        assert _resolve(True, HUB_DOWN, unlocked=True) is True
-        assert _resolve(False, HUB_DOWN, unlocked=True) is False
+    def test_no_licence_validator_at_all_still_resolves_on(self):
+        """A machine with no licence module (``VCThelpers`` unimportable)
+        is not a reason to switch the reranker off any more."""
+        import claude_mcp_servers.weaviate_mcp.server as srv
+
+        with patch.dict(sys.modules, {"VCThelpers": None, "VCThelpers.license": None}), \
+                patch.object(srv, "_try_resolve_project_config", return_value=ROW_TRUE), \
+                patch.object(search_pipeline, "_rl_scoring_lock_reason", return_value=None):
+            assert search_pipeline._resolve_rl_enabled() is True
 
 
 # ─── W5R-09: logging is independent of the lock and every scoring state ─────
@@ -211,8 +224,8 @@ def test_logging_is_identical_in_every_scoring_state(monkeypatch, cfg, licensed,
     assert staged == ["T"]
     assert res.emit_success is True
 
-    # Scoring follows the lock, then the licence + row.
-    scoring_expected = unlocked and licensed and cfg is not ROW_FALSE
+    # Scoring follows the lock, then the row (v0.2.106: never the licence).
+    scoring_expected = unlocked and cfg is not ROW_FALSE
     assert bool(reranks) is scoring_expected
     assert res.rl_used is False  # the fake rerank RPC answers "fell back"
 

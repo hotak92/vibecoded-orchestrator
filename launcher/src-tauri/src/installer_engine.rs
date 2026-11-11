@@ -71,6 +71,10 @@ pub enum InstallStage {
     /// short "Pulling image" string; `percent` is a coarse mid-install
     /// marker.
     Pulling,
+    /// v0.2.106: emitted right before a `container_build` module's image is
+    /// built from the orchestrator checkout (the build downloads the
+    /// variant's PyTorch wheel, so it is the slow phase of that install).
+    Building,
     Done,
     /// v0.2.31 (#27): emitted via `report_error` before an error return.
     /// Pre-v0.2.31 errors propagated as `Result::Err` but the progress
@@ -366,6 +370,28 @@ async fn run_install_inner(
                 &image_ref,
                 &manifest.id,
                 &runtime,
+            )
+            .await?;
+        }
+        InstallMethod::ContainerBuild => {
+            // v0.2.106: a module whose source ships in this checkout. Build
+            // the variant image locally (no registry, no pull token, no
+            // licence) and materialise install_dir — manifest + DB
+            // migrations — from the build context, so the steps below and
+            // every later reader of the installed manifest are unchanged.
+            emit_progress(
+                app,
+                project_id,
+                &manifest.id,
+                InstallStage::Building,
+                step_index,
+                total_steps,
+                "Building image",
+            );
+            crate::commands::bundled_modules::build_and_materialize(
+                manifest,
+                &install_dir,
+                gpu_mode,
             )
             .await?;
         }
@@ -2336,6 +2362,8 @@ async fn run_upgrade_inner(
 ///   - `GitClone`: `git pull` if `install_dir/.git` exists, else
 ///     wipe + re-clone (handles user-corrupted dirs gracefully).
 ///   - `ContainerPull`: `podman pull` the resolved variant tag.
+///   - `ContainerBuild` (v0.2.106): rebuild the variant image from the
+///     checkout and re-materialise install_dir (manifest + migrations).
 ///   - `Local`: no-op (user has already updated by hand).
 ///
 /// v0.2.35 (Agent N): returns `Some(actual_tag)` when the install
@@ -2449,6 +2477,15 @@ async fn refetch_artifact(
             )
             .await?;
             return Ok(Some(actual_tag));
+        }
+        InstallMethod::ContainerBuild => {
+            let built_tag = crate::commands::bundled_modules::build_and_materialize(
+                manifest,
+                install_dir,
+                gpu_mode,
+            )
+            .await?;
+            return Ok(Some(built_tag));
         }
     }
     Ok(None)

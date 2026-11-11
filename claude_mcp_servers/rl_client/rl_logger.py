@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# This file is VENDORED into paid-modules/vct-rl-reranker/rl_logger.py
-# Both copies MUST stay byte-identical. The byte-identity test in
-# tests/test_vendored_file_sync.py enforces this on every CI run.
-# To re-sync after an edit: ./scripts/sync-vendored-files.sh
+# One copy (v0.2.106): the RL reranker (claude_mcp_servers/rl_reranker) imports
+# this file as `rl_client.rl_logger`; its container image COPYs it from here
+# (see that Dockerfile). There is no vendored duplicate to keep in sync.
 """
 Global RL data logger for retrieval training data collection.
 
@@ -149,8 +148,8 @@ def default_rl_data_dir() -> Path:
         ImportError: if :mod:`vco_lib` is not importable. Deliberate and loud —
             ``vco_lib`` ships in every healthy VCO install, so a failure here
             means a broken one, and guessing a path would hide it. This module
-            is also VENDORED into the paid RL module's container image, which
-            has no ``vco_lib``; the import is inside this function (not at
+            is also COPIED into the RL reranker's container image, which
+            carries no ``vco_lib.paths``; the import is inside this function (not at
             module scope) precisely so that image can still import the module
             and use ``serialize_node_record`` / ``SCHEMA_VERSION`` / an
             explicitly-pathed ``RLDataLogger(log_path=...)``. It passes
@@ -296,7 +295,7 @@ def serialize_node_record(
     }
     # v0.2.73 (n_emb payload-dedup): the node vector is serialized ONCE, under
     # `emb` — the field the offline trainer actually reads
-    # (paid-modules/vct-rl-reranker/offline_trainer.py `extract_samples`/
+    # (claude_mcp_servers/rl_reranker/offline_trainer.py `extract_samples`/
     # `train_epoch` both read `node.get("emb")`; NO offline consumer reads a
     # stored `n_emb`). The KG enrichment site mirrors the SAME vector into both
     # `emb` and `n_emb` on the candidate dict, so pre-dedup every KG retrieval
@@ -484,7 +483,7 @@ class RLDataLogger:
         log_path: Path to the JSONL log file. Defaults to
                   :func:`default_rl_log_path` — ``$VCT_STATE_DIR`` (or ``~/.vct``)
                   ``/retrieval_rl_data/rl_events.jsonl``. Callers that run
-                  without ``vco_lib`` on the path (the vendored container copy)
+                  without ``vco_lib`` on the path (the RL reranker image, which copies it)
                   MUST pass this explicitly.
         project:  Project name tag written to every event.
     """

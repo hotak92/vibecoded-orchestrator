@@ -32,7 +32,7 @@ export interface RlFlagSummary {
  * Translate the three RL flag booleans into user-facing copy.
  *
  * The semantics encoded here mirror the module manifest's tooltip text
- * (`paid-modules/vct-rl-reranker/vct-module.json`'s `gui.config_tab`).
+ * (`claude_mcp_servers/rl_reranker/vct-module.json`'s `gui.config_tab`).
  * Keep in sync if the tooltips ever change.
  *
  * Precedence:

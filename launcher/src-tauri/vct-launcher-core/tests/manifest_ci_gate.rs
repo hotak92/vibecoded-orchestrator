@@ -495,6 +495,8 @@ fn make_container_install_block(tag_from_version: bool, _tag_ref: Option<&str>) 
         pull_token_method: "POST".into(),
         rotate_weights: false,
         rotate_weights_endpoint: None,
+        build_context: None,
+        dockerfile: None,
     }
 }
 

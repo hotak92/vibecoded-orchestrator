@@ -34,6 +34,12 @@ For the launcher binary's compiled-in Rust crates, see `launcher/dist/THIRD_PART
 - **Loaded by:** `claude_mcp_servers/code_embed_service` (FastAPI shim around sentence-transformers)
 - **Upstream:** <https://huggingface.co/codesage/codesage-large-v2>
 
+### RL reranker container (`claude_mcp_servers/rl_reranker`)
+
+- **Built locally** from this repository (no third-party model weights: the trained checkpoints in `claude_mcp_servers/rl_reranker/weights/` are produced by this project).
+- **Python packages installed into the image** (`claude_mcp_servers/rl_reranker/requirements.txt`): PyTorch (BSD-3-Clause), NumPy (BSD-3-Clause), aiohttp (Apache 2.0). The ROCm variant adds pytorch-triton-rocm (MIT) and torch's runtime dependencies filelock (Unlicense), networkx (BSD-3-Clause), Jinja2 (BSD-3-Clause), SymPy (BSD-3-Clause), fsspec (BSD-3-Clause), typing-extensions (PSF-2.0).
+- **Base image:** `python:3.12-slim` (Python: PSF-2.0; Debian packages under their own licences).
+
 ## License compatibility note
 
 The orchestrator is AGPL-3.0; all bundled third-party software is under permissive (MIT, Apache 2.0, BSD) or LGPL licenses. AGPL is compatible with redistribution of MIT/Apache/BSD-licensed dependencies under their own license terms. Vendored copies retain their original LICENSE files verbatim; modifying any vendor directory triggers the vendoring discipline in its `VENDORED.md` file. (The mermaid/excalidraw diagrams stack this file documented through v0.2.101 was removed in v0.2.102; removing the code removes the attribution obligation.)

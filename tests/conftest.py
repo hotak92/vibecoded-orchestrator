@@ -569,6 +569,11 @@ _PINNED_LOCALHOST_KEYS: tuple[tuple[str, str], ...] = (
     ("WEAVIATE_GRPC_PORT", _UNROUTABLE_PORT_STR),
     ("OLLAMA_URL", _fixture_guard.UNROUTABLE_SENTINEL_URL),
     ("VCT_HUB_PORT", _UNROUTABLE_PORT_STR),
+    # v0.2.106: the RL reranker server (claude_mcp_servers/rl_reranker, now in
+    # this repository) reaches the hub through its own full-URL default,
+    # `http://127.0.0.1:7700` — the LIVE hub — read at import into
+    # `rl_server._HUB_BASE_URL`, so it is pinned here at import too.
+    ("VCT_HUB_BASE_URL", _fixture_guard.UNROUTABLE_SENTINEL_URL),
 )
 
 if not _ALLOW_REAL_STATE:

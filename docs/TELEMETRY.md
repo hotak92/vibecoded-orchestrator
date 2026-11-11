@@ -71,7 +71,7 @@ Until then telemetry stays local, on disk, and visible.
 
 ## RL retrieval telemetry — what is collected and what it means
 
-The RL retrieval reranker (Pro/MAO modules) keeps a **separate** telemetry path from the install/hardware collector above. This section documents its current-state data posture. Read it before enabling any upload endpoint — no Supabase-side upload path for this data is live.
+The RL retrieval reranker (`claude_mcp_servers/rl_reranker`, part of the orchestrator since v0.2.106) keeps a **separate** telemetry path from the install/hardware collector above. This section documents its current-state data posture. Read it before enabling any upload endpoint — no Supabase-side upload path for this data is live.
 
 **What is uploaded on consent.** When RL online training is enabled, an upload carries the **query embedding** (`query_emb`) plus a per-retrieved-node **embedding vector** (`emb`). The raw query **text is stripped** — it is not uploaded. What ships are the numeric vectors and the retrieval outcome labels used to train the reranker.
 

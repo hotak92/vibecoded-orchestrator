@@ -18,11 +18,12 @@ the pipeline stays orthogonal to whether the search was BM25-hybrid,
 pure vector, with graph traversal, or a CLI near_vector); the pipeline
 owns:
 
-  1. License-tier gate (``feature_enabled("rl_retrieval")``) — free
-     tier skips the rerank-RPC but still emits telemetry.
+  1. RL scoring lock (``vco_lib/rl_scoring_lock.toml``) — while locked,
+     the rerank-RPC is skipped but telemetry is still emitted.
   2. Per-project enable toggle (hub-resolved
      ``rl_reranker_enabled_for_project``) — owners can opt one project
-     out without revoking the license.
+     out. (There is no licence gate: the reranker ships with the
+     orchestrator since v0.2.106.)
   3. RL rerank RPC via the cached ``RLClient`` (one client per
      (active_embedding, project_id) — keyed so the
      ``X-VCT-Project-ID`` header routes to the right per-project model
@@ -164,7 +165,7 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # ---- ensure task_id ----
     task_id = req.task_id or new_task_id()
 
-    # ---- license tier gate + per-project enable toggle ----
+    # ---- scoring lock + per-project enable toggle ----
     rl_enabled = _resolve_rl_enabled()
 
     # ---- v0.2.73 Concern-A: is there ANY consumer of the citation capture? ----
@@ -176,7 +177,7 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # log line). Gate the whole CAPTURE — monitor spawn + citation cache +
     # pending-file staging — on "does a consumer exist?". The rerank itself
     # (``_do_rerank``, gated by ``rl_enabled``) is a SEPARATE concern and is NOT
-    # gated here: a Pro user with logging off still gets rerank.
+    # gated here: a user with logging off still gets rerank.
     capture_citations = _should_capture_citations(rl_enabled)
 
     # ---- rerank or pass through ----
@@ -440,7 +441,7 @@ def _drive_retention_housekeeping() -> None:
     in-flight-citation floor, same soft-fail). Project scope resolves the
     same way the writer's does (the hub ProjectConfig); resolution failure
     degrades to a global prune, matching the writer's project_id=None
-    free-tier behaviour. Never raises.
+    behaviour. Never raises.
     """
     project_id: Optional[str] = None
     try:
@@ -508,11 +509,11 @@ def _should_capture_citations(rl_enabled: bool) -> bool:
 
       * the local hub write   → needs ``not _local_logging_disabled()``
       * the upload queue       → needs ``_upload_consent_granted()``
-      * the ONLINE ``/rl_update`` training path (paid ``vct-rl-reranker``) →
-        needs ``rl_enabled`` (license tier + per-project toggle) AND the online
+      * the ONLINE ``/rl_update`` training path (``vct-rl-reranker``) →
+        needs ``rl_enabled`` (scoring lock + per-project toggle) AND the online
         training opt-out to be OFF (``not _online_training_disabled()``). The
         monitor's fire path calls ``client.rl_update_v3`` off the SAME single
-        compute (Concern-D), so an rl-enabled Pro user with local logging off
+        compute (Concern-D), so an rl-enabled user with local logging off
         still has a live consumer — UNLESS they globally/per-project disabled
         online training for performance.
 
@@ -566,42 +567,29 @@ def _rl_scoring_lock_reason() -> Optional[str]:
 
 
 def _resolve_rl_enabled() -> bool:
-    """Scoring lock + license-tier + per-project toggle gate. Returns True
+    """Scoring lock + per-project toggle gate. Returns True
     iff the caller should hit the RL container for rerank.
 
     The RL SCORING LOCK (v0.2.100, W5R-02, owner 2026-10-01: keep RL
     inactive until the network is trained) is checked FIRST and wins over
     everything below: explicit per-project ``true`` rows, a host-wide
-    ``true`` row, a Pro licence, and the hub-down fall-open. It gates
-    reranking only; event logging (``_retrieval_emit_has_consumer`` and the
-    citation capture) never consults it.
+    ``true`` row, and the hub-down fall-open. It gates reranking only;
+    event logging (``_retrieval_emit_has_consumer`` and the citation
+    capture) never consults it.
 
-    Below the lock, two independent gates, both falling open on resolver
-    errors:
+    Below the lock, ONE gate — the per-project enable toggle,
+    ``ProjectConfig.rl_reranker_enabled_for_project``. Owners can opt one
+    project out via the launcher GUI's per-project Modules panel. The
+    hub-down branch falls open (True): never silently disable the reranker
+    because the hub crashed mid-session (not reached while the scoring lock
+    is set).
 
-      1. License tier — ``feature_enabled("rl_retrieval", module_id=
-         "vct-rl-reranker")``. Free → False. Pro / MAO → True. The
-         per-module overlay in ``~/.vibecoded/license_cache.json``
-         lets a user explicitly activated the paid module key reach
-         True even when the orchestrator tier is free.
-      2. Per-project enable toggle — ``ProjectConfig.
-         rl_reranker_enabled_for_project``. Owners can opt one project
-         out via the launcher GUI's per-project Modules panel without
-         revoking the license. Hub-down branch falls open (True): never
-         silently disable a paying user's reranker because the hub
-         crashed mid-session (not reached while the scoring lock is set).
+    v0.2.106 (owner ruling 2026-11-11, "the RL reranker is no more paid"):
+    the licence gate that sat between the two (``feature_enabled(
+    "rl_retrieval")``) is gone — every install may use the reranker. The
+    lock and the toggle are unchanged.
     """
     if _rl_scoring_lock_reason() is not None:
-        return False
-    try:
-        from VCThelpers.license import feature_enabled
-        if not feature_enabled("rl_retrieval", module_id="vct-rl-reranker"):
-            return False
-    except ImportError:
-        # VCThelpers not available (pure-free install) → no RL.
-        return False
-    except Exception as exc:
-        logger.debug("_resolve_rl_enabled: license probe raised (%s); free tier", exc)
         return False
     # Per-project toggle. Soft-fail to enabled.
     try:
@@ -742,7 +730,7 @@ def _record_rl_fallback(reason: str) -> None:
     """v0.2.73 RL-3: persist a rerank-fallback counter + WARN once per process.
 
     Writes ``<project_root>/.claude/state/rl_fallback_counter.json`` with
-    ``{count, success_count, last_reason, last_ts}`` so "my Pro rerank
+    ``{count, success_count, last_reason, last_ts}`` so "my rerank
     silently stopped working" is diagnosable from disk (rl-doctor material,
     RL-12). Soft-fail throughout — the counter must never break a search.
     """
