@@ -13,7 +13,8 @@ Two functions under test:
    literal_cited, runs the unified-target formula, and writes the
    citation event via the centralized ``RLTelemetryWriter``.
 
-For (2) we mock the answer chunker (``answer_chunking.chunk_answer_window``), ``_get_embedding_service``, and
+For (2) we mock the answer chunker (the shared chunker's ANSWER mode, bound in
+``citation_compute`` as ``chunk_answer_window``), ``_get_embedding_service``, and
 ``_get_rl_telemetry_writer`` so the test exercises the orchestration
 logic without standing up real Ollama / Weaviate / launcher-hub stacks.
 """
@@ -139,7 +140,7 @@ def _patch_answer_chunker(chunker):
         return [c.content for c in chunker.chunk_text(answer, source_id="")]
 
     return patch(
-        "claude_mcp_servers.rl_client.answer_chunking.chunk_answer_window",
+        "claude_mcp_servers.rl_client.citation_compute.chunk_answer_window",
         side_effect=_chunks,
     )
 

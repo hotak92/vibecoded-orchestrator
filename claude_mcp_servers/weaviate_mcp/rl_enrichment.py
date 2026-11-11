@@ -3480,11 +3480,15 @@ def _resolve_dual_rl_log_enabled() -> bool:
       2. ``_resolve_write_all_slots()`` (the dual-WRITE gate) is True.
 
     If dual-log is requested but dual-write is OFF, this returns False (forced
-    off) — the second event is never emitted (see the tests). TODO(T-B-flags):
-    the launcher.db → ProjectConfig → settings.json projection of this flag is a
-    SEPARATE track; this reads the env channel only (the canonical override for
-    CLI/dev + what settings.json mirrors), NOT launcher.db directly — do not add
-    a DB read here.
+    off) — the second event is never emitted (see the tests). The value this
+    reads arrives via the launcher.db → ProjectConfig → settings.json env
+    projection (v0.2.71 T-B-flags; ``vco_lib/config_projection.py``
+    ``APP_STATE_KEY_DUAL_RL_LOG_DEFAULT`` per-project override, global
+    ``embedding.dual_rl_log_default`` fallback, pinned by
+    ``tests/test_dual_flags_projection.py``) — this env read IS the projected
+    channel; there is deliberately no launcher.db read here (the projection
+    runs at project-open time, so a mid-session DB change reaches the next
+    session's env, not this process).
     """
     raw = os.environ.get(server.DUAL_RL_LOG_ENABLED_ENV, "").strip().lower()
     if raw not in ("1", "true", "yes", "on"):

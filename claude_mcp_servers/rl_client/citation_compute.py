@@ -31,7 +31,7 @@ import hashlib
 import logging
 from typing import Optional
 
-from claude_mcp_servers.rl_client import answer_chunking
+from claude_mcp_servers.weaviate_mcp.chunking import chunk_answer_window
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,8 @@ def _answer_chunk_hash(text: str) -> str:
 #: slot's ``EmbeddingService.embed_text`` / ``embed_code`` already memoise per
 #: process; the other-slot embed goes straight to the backend adapter and did
 #: not, so the shared chunks of overlapping answer windows (see
-#: ``answer_chunking``) were embedded again for every citation of one drain run.
+#: ``chunking.chunk_answer_window``, the shared chunker's ANSWER mode) were
+#: embedded again for every citation of one drain run.
 #: Keyed on (source, model, chunk hash); bounded FIFO like the service memo.
 _OTHER_SLOT_MEMO: "dict[tuple[str, str, str], list[float]]" = {}
 _OTHER_SLOT_MEMO_CAP = 512
@@ -142,13 +143,14 @@ def compute_citation(
     is_code = ctx.get("retrieval_kind") == "code"
 
     # --- Step 1: chunk + embed the answer ---
-    # v0.2.106: the answer window is chunked by ``answer_chunking`` (dense
-    # transcript budget, content-defined boundaries), NOT by the KG document
-    # chunker — see that module's docstring for the two defects this removes
-    # (every maximal chunk refused and shrunk; overlapping windows of one chat
-    # re-embedding the same text because their chunks never lined up).
+    # v0.2.106: the answer window is chunked by the shared chunker's ANSWER
+    # mode (``chunking.chunk_answer_window`` — dense transcript budget,
+    # content-defined boundaries), NOT by the KG document path — see that
+    # mode's comment block for the two defects this removes (every maximal
+    # chunk refused and shrunk; overlapping windows of one chat re-embedding
+    # the same text because their chunks never lined up).
     try:
-        chunks = answer_chunking.chunk_answer_window(answer, active_model)
+        chunks = chunk_answer_window(answer, active_model)
     except Exception as exc:  # noqa: BLE001
         logger.debug("citation_compute: chunker failed (%s)", exc)
         return None
@@ -363,7 +365,7 @@ def _write_other_slot_citation(
     # Chunk the answer to the OTHER model's window, then embed each chunk in the
     # OTHER model's space (model-aware: arctic vs qwen3 differ ~3x in budget).
     try:
-        chunks = answer_chunking.chunk_answer_window(answer, other_model)
+        chunks = chunk_answer_window(answer, other_model)
     except Exception as exc:  # noqa: BLE001
         logger.debug("_write_other_slot_citation: chunker failed (%s)", exc)
         return

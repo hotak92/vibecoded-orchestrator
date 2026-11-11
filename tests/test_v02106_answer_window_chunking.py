@@ -29,8 +29,9 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_mcp_servers.rl_client import answer_chunking, citation_compute
-from claude_mcp_servers.rl_client.answer_chunking import (
+from claude_mcp_servers.rl_client import citation_compute
+from claude_mcp_servers.weaviate_mcp import chunking
+from claude_mcp_servers.weaviate_mcp.chunking import (
     answer_chunk_budget,
     chunk_answer_window,
 )
@@ -114,7 +115,7 @@ def test_budget_is_the_dense_bound_of_the_model_window():
 
     assert answer_chunk_budget(ARCTIC) == _char_budget_for_model(ARCTIC, conservative=True)
     # An unregistered model never gets a generous guess.
-    assert answer_chunk_budget("no-such-model") == answer_chunking._FALLBACK_BUDGET_CHARS
+    assert answer_chunk_budget("no-such-model") == chunking._FALLBACK_BUDGET_CHARS
 
 
 def test_a_paragraph_longer_than_the_budget_is_split_from_its_own_start():
@@ -204,3 +205,60 @@ def test_crlf_windows_keep_start_independent_boundaries():
     b = chunk_answer_window("".join(paras[13:]), ARCTIC)
     shared = [c for c in b if c in set(a)]
     assert len(shared) >= len(b) - 2
+
+
+# ── one home (owner ruling 2026-11-11) ──────────────────────────────────
+
+
+def test_the_shared_chunker_is_the_one_home():
+    """The answer-window mode is a mode of the SHARED chunker
+    (weaviate_mcp/chunking.py), and the rl_client second home is gone: the
+    binding ``citation_compute`` calls IS the shared module's function, and
+    the former module no longer exists to import."""
+    import importlib
+
+    assert citation_compute.chunk_answer_window is chunk_answer_window
+    with pytest.raises(ImportError):
+        importlib.import_module("claude_mcp_servers.rl_client.answer_chunking")
+
+
+@pytest.mark.parametrize("other", [QWEN, ARCTIC])
+def test_dual_log_chunks_once_per_model_budget(other):
+    """Dual embeddings: each slot's answer chunks are chunked with THAT
+    model's budget. When the two budgets give identical chunks (same model
+    both sides) the chunk sets are identical — the content hashes pair for
+    cross-slot dedup; when they differ, each slot keeps its own chunks and
+    every chunk fits its own model's window."""
+    citation_compute._OTHER_SLOT_MEMO.clear()
+    seen: list[str] = []
+
+    def _other(svc, text, source, model=""):
+        seen.append(text)
+        return [0.5, 0.5]
+
+    answer = "".join(_transcript_paragraphs())[:50_000]
+    extra = {
+        "dual_log": True,
+        "other_nodes": [{"title": "Node", "n_emb": [0.5, 0.5]}],
+        "other_embedding_source": "qwen3" if other == QWEN else "arctic",
+        "other_embedding_model": other,
+        "other_embedding_dim": 2,
+    }
+    svc = _MemoSvc()
+    with patch("claude_mcp_servers.weaviate_mcp.server._embed_text_in_other_model",
+               side_effect=_other):
+        _run(answer, svc, model=QWEN, ctx_extra=extra)
+    # The other slot saw exactly the OTHER model's chunks, all within its
+    # own dense budget (qwen 19 560 vs arctic 7 065 — different budgets).
+    assert seen
+    assert max(len(t) for t in seen) <= answer_chunk_budget(other)
+    assert set(seen) == set(chunk_answer_window(answer, other))
+    if other == QWEN:
+        # Identical budgets → identical chunks → the two slots' artifacts
+        # share hashes (the G4 cross-slot dedup key).
+        assert set(seen) == set(svc.backend_texts)
+    else:
+        # Different budgets → separate chunks: the active (qwen) slot has
+        # chunks the arctic window cannot have, and vice versa.
+        assert set(svc.backend_texts) != set(seen)
+    citation_compute._OTHER_SLOT_MEMO.clear()

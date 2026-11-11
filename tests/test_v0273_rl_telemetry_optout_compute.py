@@ -540,7 +540,7 @@ def test_single_compute_feeds_log_and_online(monkeypatch):
     import vco_lib.rl_training_targets as rtt
 
     with patch.object(citation_compute, "logger"), \
-         patch("claude_mcp_servers.rl_client.answer_chunking.chunk_answer_window",
+         patch("claude_mcp_servers.rl_client.citation_compute.chunk_answer_window",
                side_effect=lambda text, model: [c.content for c in _FakeChunker().chunk_text(text)]), \
          patch("claude_mcp_servers.weaviate_mcp.server._get_embedding_service", return_value=fake), \
          patch("claude_mcp_servers.weaviate_mcp.server._get_rl_telemetry_writer", return_value=_FakeWriter()), \
