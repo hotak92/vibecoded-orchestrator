@@ -317,6 +317,24 @@ pub fn purge_vco_project_files(
     root: Option<&Path>,
     project_folder: &Path,
 ) -> Result<serde_json::Value, String> {
+    run_project_file_purge(root, project_folder, false)
+}
+
+/// v0.2.106 (review L7): what [`purge_vco_project_files`] WOULD remove —
+/// the same Python call with `--dry-run`, which changes nothing. The
+/// terminal Remove prints it before asking "are you sure?".
+pub fn preview_vco_project_files(
+    root: Option<&Path>,
+    project_folder: &Path,
+) -> Result<serde_json::Value, String> {
+    run_project_file_purge(root, project_folder, true)
+}
+
+fn run_project_file_purge(
+    root: Option<&Path>,
+    project_folder: &Path,
+    dry_run: bool,
+) -> Result<serde_json::Value, String> {
     let python = vco_lib_python()?;
     let mut cmd = Command::new(&python).silent();
     cmd.arg("-m")
@@ -326,6 +344,9 @@ pub fn purge_vco_project_files(
         .arg(project_folder);
     if let Some(r) = root {
         cmd.arg("--orchestrator-root").arg(r);
+    }
+    if dry_run {
+        cmd.arg("--dry-run");
     }
     run_vco_lib_json(cmd, &python, root, project_folder, "", |out, err| {
         parse_ok_reply_named("project file purge", out, err)

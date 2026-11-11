@@ -605,7 +605,9 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 ### CLI-facing endpoints (`hub/cli_api.rs`)
 Mirror of Tauri commands so the headless `vct-cli` can drive the launcher without IPC into the Tauri app. All actions audit with `via: "cli"` tagged in the detail JSON.
 - `POST /api/v1/cli/projects` — create a project.
-- `PATCH, DELETE /api/v1/cli/projects/{id_or_slug}` — rename / delete.
+- `PATCH /api/v1/cli/projects/{id_or_slug}` — rename.
+- `DELETE /api/v1/cli/projects/{id_or_slug}[?keep_collections=true&leave_unremovable=true]` — **Remove from VCO**, not a row delete: the hub runs `vct-launcher --remove-project <id> --yes` beside it (the launcher's own removal — VCO's files and settings entries leave the folder and, without `keep_collections`, the project's own collections are dropped; the folder and the user's files stay). The hub answers when the removal ends (bounded at 30 minutes), so `vct-cli` waits that long; a second DELETE of the same project while one runs answers 409 `busy: true`. 200 only with the launcher's report for that project; 409 `stopped: true` when it stopped on a value it could not remove (retry with `leave_unremovable`); 500 for any other failure; 502 when the launcher beside the hub is too old to know `--remove-project`; 503 when there is no launcher beside the hub (nothing is changed). The `project_delete` audit row is written after the outcome, with it. `vct-cli project delete` asks y/N in a terminal before it sends this (see `launcher/docs/CLI.md`).
+- `GET /api/v1/cli/projects/{id_or_slug}/removal-preview[?keep_collections=true]` — what that DELETE would remove (files, settings files, collections), from the same dry-run rules; changes nothing.
 - `GET /api/v1/cli/audit` — read audit log (mirrors `list_audit_events`).
 - `GET /api/v1/cli/license` — current tier + cache status.
 - `POST /api/v1/cli/license/activate` — activate a license key (writes to keychain).

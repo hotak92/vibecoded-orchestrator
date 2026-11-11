@@ -5333,6 +5333,10 @@ pub(crate) fn report_left_secret_values(reply: &serde_json::Value) -> Option<Str
 // Python `vco_lib.unregister_files purge` (no fixed path list any more).
 mod unregister_strip;
 pub(crate) use unregister_strip::*;
+// v0.2.106 (review L7): what a Remove WOULD remove, for the terminal's
+// "are you sure?" (`vct-launcher --remove-project`, `vct-cli project delete`).
+mod removal_preview;
+pub(crate) use removal_preview::*;
 
 /// Soft-fail subprocess driver: drop a project's owned Weaviate
 /// collections via `python -m vco_lib.project_init drop-collections`.
@@ -5347,7 +5351,14 @@ pub(crate) use unregister_strip::*;
 /// launcher rows bind (not only the name-derived ones) and keep every class
 /// another registered project uses, each reported in `kept` (a warning
 /// here). Runs before the project row is deleted, so the rows are readable.
-async fn drop_owned_collections(project_name: &str, project_id: &str) -> (Vec<String>, Vec<String>) {
+///
+/// `dry_run` (v0.2.106, review L7): `--dry-run` — nothing is dropped and the
+/// first element lists what WOULD be dropped (the terminal Remove's preview).
+async fn drop_owned_collections(
+    project_name: &str,
+    project_id: &str,
+    dry_run: bool,
+) -> (Vec<String>, Vec<String>) {
     let mut dropped: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -5402,8 +5413,11 @@ async fn drop_owned_collections(project_name: &str, project_id: &str) -> (Vec<St
         "--project-id",
         project_id,
         "--json",
-    ])
-    .current_dir(&orch_root)
+    ]);
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    cmd.current_dir(&orch_root)
     .stdin(std::process::Stdio::null());
 
     #[cfg(windows)]
@@ -5619,7 +5633,7 @@ pub(crate) async fn unregister_project(
 
     // Step 2: collection drop (default OFF, opt-in).
     if opts.purge_collections {
-        let (dropped, drop_warnings) = drop_owned_collections(&row.name, &row.id).await;
+        let (dropped, drop_warnings) = drop_owned_collections(&row.name, &row.id, false).await;
         report.collections_dropped = dropped;
         report.warnings.extend(drop_warnings);
     }

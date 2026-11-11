@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 VibeCoded Tools
 //! v0.2.106: `vct-launcher --remove-project <id|slug|name> [--keep-collections]
-//! [--leave-unremovable]` — "Remove from VCO" from a terminal.
+//! [--leave-unremovable] [--yes] [--preview]` — "Remove from VCO" from a
+//! terminal.
 //!
 //! The operation is NOT re-implemented here: this file parses the arguments,
 //! resolves the project row, opens the launcher DB headless and calls
@@ -13,25 +14,54 @@
 //! imports the same file). The project folder and the user's own files stay;
 //! the report is printed as JSON on stdout.
 //!
-//! Exit codes: 0 removed (or `--help`, printed on stdout); 1 usage / lookup /
-//! DB error; 2 the removal stopped
-//! (a value VCO wrote could not be removed — rerun with `--leave-unremovable`
-//! to finish anyway, exactly the GUI's "Unregister anyway" second action).
+//! It ASKS first (owner ruling 2026-11-11, review L7): in an interactive
+//! terminal it prints what would be removed — the files and the collections,
+//! from [`crate::commands::projects_v2::removal_preview`] — and removes only
+//! on an explicit y. `--yes` skips the question; without a terminal and
+//! without `--yes` it refuses and changes nothing (never a silent drop).
+//! `--preview` prints that preview as JSON and changes nothing (the hub's
+//! `GET /cli/projects/{id}/removal-preview`, so `vct-cli` asks the same way).
+//!
+//! Exit codes (the hub maps each to its own HTTP answer, `vct-hub cli_api`):
+//! * 0 — removed (or `--help` / `--preview`, printed on stdout);
+//! * 1 — usage / lookup / DB-open error;
+//! * 2 — the removal STOPPED on a value VCO wrote and could not remove: rerun
+//!   with `--leave-unremovable` to finish anyway, exactly the GUI's
+//!   "Unregister anyway" second action (the only error that names the flag);
+//! * 3 — the removal failed for another reason (e.g. an update holds the
+//!   launcher database); the message says which;
+//! * 4 — not confirmed: nothing was changed.
 
-use crate::commands::projects_v2::{unregister_project, UnregisterOptions};
+use crate::commands::projects_v2::{
+    is_yes, removal_preview, unregister_project, UnregisterOptions, UNREGISTER_STOPPED_PREFIX,
+};
 use crate::db::models::{ProjectHost, ProjectRow};
 use crate::db::Db;
 
 pub(crate) const USAGE: &str = "usage: vct-launcher --remove-project <id|slug|name> \
-[--keep-collections] [--leave-unremovable]\n\
+[--keep-collections] [--leave-unremovable] [--yes] [--preview]\n\
 Removes the project from VCO: what VCO added to the folder goes, the folder and your own \
-files (.env, secrets, settings, source, knowledge/) stay. Add the folder again any time with \
-Add Project.";
+files (.env, secrets, settings, source, knowledge/) stay, and the project's own Weaviate \
+collections are dropped unless --keep-collections is given. It shows what it would remove \
+and asks first; --yes removes without asking (needed when not run from a terminal); \
+--preview prints what it would remove as JSON and changes nothing. Add the folder again any \
+time with Add Project.";
+
+/// Exit code: the removal stopped on an unremovable value (see the module doc).
+pub(crate) const EXIT_STOPPED: i32 = 2;
+/// Exit code: the removal failed for another reason.
+pub(crate) const EXIT_FAILED: i32 = 3;
+/// Exit code: not confirmed, nothing changed.
+pub(crate) const EXIT_NOT_CONFIRMED: i32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoveProjectArgs {
     pub query: String,
     pub opts: UnregisterOptions,
+    /// `--yes`: remove without asking.
+    pub yes: bool,
+    /// `--preview`: print what would be removed (JSON), change nothing.
+    pub preview: bool,
 }
 
 /// What the arguments ask for: a removal, or the usage text (review B-L3: a
@@ -59,10 +89,13 @@ pub(crate) fn remove_flow_options() -> UnregisterOptions {
 pub(crate) fn parse_args(rest: &[String]) -> Result<Parsed, String> {
     let mut query: Option<String> = None;
     let mut opts = remove_flow_options();
+    let (mut yes, mut preview) = (false, false);
     for a in rest {
         match a.as_str() {
             "--keep-collections" => opts.purge_collections = false,
             "--leave-unremovable" => opts.leave_unremovable = true,
+            "--yes" | "-y" => yes = true,
+            "--preview" => preview = true,
             "-h" | "--help" => return Ok(Parsed::Help),
             s if s.starts_with("--") => return Err(format!("unknown option {}\n{}", s, USAGE)),
             s => {
@@ -76,7 +109,7 @@ pub(crate) fn parse_args(rest: &[String]) -> Result<Parsed, String> {
     let query = query
         .filter(|q| !q.trim().is_empty())
         .ok_or_else(|| USAGE.to_string())?;
-    Ok(Parsed::Run(RemoveProjectArgs { query, opts }))
+    Ok(Parsed::Run(RemoveProjectArgs { query, opts, yes, preview }))
 }
 
 /// Pick the ONE project `query` names: an exact id, else an exact slug, else
@@ -119,6 +152,64 @@ pub(crate) fn resolve_target(rows: &[ProjectRow], query: &str) -> Result<Project
     Ok(row)
 }
 
+/// The exit code and the message for a removal that returned `Err` (review
+/// L5): only the unremovable-value stop names `--leave-unremovable`; every
+/// other failure (an update holding the database, an audit or row-delete
+/// error) says what failed and exits [`EXIT_FAILED`].
+pub(crate) fn failure(name: &str, msg: &str) -> (i32, String) {
+    if msg.starts_with(UNREGISTER_STOPPED_PREFIX) {
+        (
+            EXIT_STOPPED,
+            format!(
+                "[vct] the removal of {:?} stopped: {}\n\
+                 To finish anyway and leave those values, rerun with --leave-unremovable.",
+                name, msg
+            ),
+        )
+    } else {
+        (EXIT_FAILED, format!("[vct] the removal of {:?} failed: {}", name, msg))
+    }
+}
+
+/// Whether to go ahead without asking, ask, or refuse (owner ruling
+/// 2026-11-11): `--yes` goes ahead; an interactive terminal asks; anything
+/// else refuses — a removal that drops collections is never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Confirm {
+    Go,
+    Ask,
+    Refuse,
+}
+
+pub(crate) fn confirm_mode(yes: bool, interactive: bool) -> Confirm {
+    if yes {
+        Confirm::Go
+    } else if interactive {
+        Confirm::Ask
+    } else {
+        Confirm::Refuse
+    }
+}
+
+fn interactive_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// Print the preview on stderr and read the y/N answer from stdin.
+fn ask(db: &Db, row: &ProjectRow, opts: &UnregisterOptions) -> Result<bool, String> {
+    use std::io::Write;
+    let preview = tauri::async_runtime::block_on(removal_preview(db, &row.id, opts))?;
+    // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
+    eprint!("{}Remove {:?} from VCO? [y/N] ", preview.text, row.name);
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| format!("could not read the answer: {}", e))?;
+    Ok(is_yes(&answer))
+}
+
 /// Run the command; returns the process exit code. Prints are the CLI's
 /// result (see the print contract in `lib.rs`).
 pub(crate) fn run(rest: &[String]) -> i32 {
@@ -159,6 +250,47 @@ pub(crate) fn run(rest: &[String]) -> i32 {
             return 1;
         }
     };
+    if args.preview {
+        return match tauri::async_runtime::block_on(removal_preview(&db, &row.id, &args.opts)) {
+            Ok(p) => {
+                // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
+                println!("{}", serde_json::to_string_pretty(&p).unwrap_or_else(|_| "{}".to_string()));
+                0
+            }
+            Err(msg) => {
+                // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
+                eprintln!("[vct] could not list what the removal of {:?} would do: {}", row.name, msg);
+                EXIT_FAILED
+            }
+        };
+    }
+    match confirm_mode(args.yes, interactive_terminal()) {
+        Confirm::Go => {}
+        Confirm::Refuse => {
+            // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
+            eprintln!(
+                "[vct] not removing {:?}: this is not an interactive terminal, so VCO cannot ask \
+                 first, and the removal drops the project's collections unless \
+                 --keep-collections is given. Nothing was changed. Run it from a terminal to see \
+                 what would be removed, or rerun with --yes.",
+                row.name
+            );
+            return EXIT_NOT_CONFIRMED;
+        }
+        Confirm::Ask => match ask(&db, &row, &args.opts) {
+            Ok(true) => {}
+            Ok(false) => {
+                // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
+                eprintln!("[vct] not removed; nothing was changed.");
+                return EXIT_NOT_CONFIRMED;
+            }
+            Err(msg) => {
+                // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
+                eprintln!("[vct] not removed ({}); nothing was changed.", msg);
+                return EXIT_NOT_CONFIRMED;
+            }
+        },
+    }
     match tauri::async_runtime::block_on(unregister_project(&db, &row.id, args.opts)) {
         Ok(report) => {
             // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
@@ -175,13 +307,10 @@ pub(crate) fn run(rest: &[String]) -> i32 {
             0
         }
         Err(msg) => {
+            let (code, text) = failure(&row.name, &msg);
             // [vct-print-contract] CLI output — see handle_cli_args() in lib.rs.
-            eprintln!(
-                "[vct] the removal of {:?} stopped: {}\n\
-                 To finish anyway and leave those values, rerun with --leave-unremovable.",
-                row.name, msg
-            );
-            2
+            eprintln!("{}", text);
+            code
         }
     }
 }
@@ -232,6 +361,34 @@ mod tests {
         assert_eq!(raw["purgeLauncherFiles"].as_bool(), Some(opts.purge_launcher_files));
         assert_eq!(raw["purgeCollections"].as_bool(), Some(opts.purge_collections));
         assert!(!opts.leave_unremovable);
+    }
+
+    /// Owner ruling 2026-11-11 (review L7): the removal asks unless `--yes`;
+    /// with no terminal and no `--yes` it refuses — never a silent drop.
+    #[test]
+    fn the_removal_asks_unless_yes_and_refuses_without_a_terminal() {
+        let a = run_args(&["alpha"]);
+        assert!(!a.yes && !a.preview);
+        assert!(run_args(&["alpha", "--yes"]).yes);
+        assert!(run_args(&["-y", "alpha"]).yes);
+        assert!(run_args(&["alpha", "--preview"]).preview);
+        assert_eq!(confirm_mode(true, false), Confirm::Go);
+        assert_eq!(confirm_mode(true, true), Confirm::Go);
+        assert_eq!(confirm_mode(false, true), Confirm::Ask);
+        assert_eq!(confirm_mode(false, false), Confirm::Refuse);
+    }
+
+    /// Review L5: only the unremovable-value stop names --leave-unremovable
+    /// and exits 2; an update holding the database (or any other failure)
+    /// exits 3 with its own message.
+    #[test]
+    fn only_the_stop_names_leave_unremovable() {
+        let (code, text) = failure("Alpha", &format!("{} — values left", UNREGISTER_STOPPED_PREFIX));
+        assert_eq!(code, EXIT_STOPPED);
+        assert!(text.contains("--leave-unremovable"));
+        let (code, text) = failure("Alpha", "the launcher database is held by install.py --update");
+        assert_eq!(code, EXIT_FAILED);
+        assert!(!text.contains("--leave-unremovable") && text.contains("held by install.py"));
     }
 
     #[test]

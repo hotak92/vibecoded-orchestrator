@@ -86,8 +86,12 @@ _KEPT_RUNTIME: dict[str, str] = {
 
 
 class _Run:
-    def __init__(self, folder: Path) -> None:
+    def __init__(self, folder: Path, *, dry_run: bool = False) -> None:
         self.folder = folder
+        #: a preview (``purge --dry-run``, the terminal Remove's "are you
+        #: sure?"): :meth:`delete` records what it WOULD remove and removes
+        #: nothing; the settings edits are not run at all.
+        self.dry_run = dry_run
         self.removed: list[str] = []
         self.kept_modified: list[str] = []
         self.kept: list[str] = []
@@ -131,6 +135,11 @@ class _Run:
         if why is not None:
             self.kept.append(f"{self.rel(path)} — {why}; left in place")
             return False
+        if self.dry_run:
+            if not (path.exists() or path.is_symlink()):
+                return False
+            self.removed.append(self.rel(path))
+            return True
         try:
             if path.is_symlink() or path.is_file():
                 path.unlink()
@@ -183,7 +192,7 @@ def _manifest_hashes(manifest: dict) -> dict[str, str]:
     return out
 
 
-def _purge_shipped_files(run: _Run) -> bool:
+def _purge_shipped_files(run: _Run, root: Optional[Path] = None) -> bool:
     """Delete the manifest-tracked files still byte-identical to what VCO
     wrote. Returns True when the manifest may go (it existed and every proven
     file was removed)."""
@@ -226,10 +235,68 @@ def _purge_shipped_files(run: _Run) -> bool:
                 run.kept_modified.append(cand)
                 continue
             if run.delete(path):
-                _drop_bytecode(path)
+                if not run.dry_run:
+                    _drop_bytecode(path)
             else:
                 failed = True
+    if not _purge_parked_provider_agents(run, _read_manifest(run.folder), root):
+        failed = True
     return not failed
+
+
+def _purge_parked_provider_agents(run: _Run, manifest: dict, root: Optional[Path]) -> bool:
+    """The copies the provider switch parked (review L1). Parking drops the
+    ``files`` entry and records the move in the manifest's
+    ``provider_parked_agents`` map instead, so :func:`_manifest_hashes`
+    never sees them: a Remove left them in ``.claude/agents.disabled/`` and a
+    re-added folder then answered ``skip-disabled`` for them forever (the
+    map that would restore them is gone with the manifest).
+
+    The proof that a parked copy is VCO's bytes is the same as the bundle
+    engine's for a file with no manifest hash: equal to the shipped template
+    or to any version of it in the orchestrator's git history
+    (:func:`vco_lib.shipped_artifact.installed_matches_template_history`).
+    A copy that matches neither is listed as changed and kept. Returns False
+    when one could not be removed (the manifest then stays, so a retry can
+    still find them)."""
+    from vco_lib.bundle_kinds import disabled_counterpart
+    from vco_lib.hashing import sha256_file
+    from vco_lib.module_gated_delivery import GATEWAY_AGENTS_DIR, PARKED_AGENTS_MANIFEST_KEY
+    from vco_lib.paths import to_posix_rel
+    from vco_lib.shipped_artifact import installed_matches_template_history
+
+    parked = manifest.get(PARKED_AGENTS_MANIFEST_KEY)
+    if not isinstance(parked, dict):
+        return True
+    ok = True
+    for rel in sorted(r for r in parked if isinstance(r, str)):
+        dis = disabled_counterpart(to_posix_rel(rel))
+        if not dis:
+            continue
+        path = _inside(run.folder, dis)
+        if path is None or not (path.is_file() or path.is_symlink()):
+            continue
+        why = run.redirected(path)
+        if why is not None or path.is_symlink():
+            run.kept.append(f"{dis} — {why or 'it is a link'}; left in place")
+            continue
+        try:
+            digest = sha256_file(path)
+            proven = False
+            if root is not None:
+                template = root / "templates" / "agents" / GATEWAY_AGENTS_DIR / path.name
+                proven = template.is_file() and (
+                    sha256_file(template) == digest
+                    or installed_matches_template_history(template, digest, root))
+        except OSError as exc:
+            run.errors.append(f"could not read {dis}: {exc}")
+            ok = False
+            continue
+        if not proven:
+            run.kept_modified.append(dis)
+        elif not run.delete(path):
+            ok = False
+    return ok
 
 
 def _drop_bytecode(py: Path) -> None:
@@ -505,14 +572,20 @@ def default_orchestrator_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def purge_project_files(folder: Path, *, orchestrator_root: Optional[Path] = None) -> dict:
+def purge_project_files(folder: Path, *, orchestrator_root: Optional[Path] = None,
+                        dry_run: bool = False) -> dict:
     """Run the purge on ``folder``; see the module docstring. Never raises
-    for a per-file failure — each is in ``errors`` and the rest still runs."""
+    for a per-file failure — each is in ``errors`` and the rest still runs.
+
+    ``dry_run`` (v0.2.106, the terminal Remove's confirmation): nothing is
+    changed; ``removed`` lists the files and folders the purge would remove,
+    by the same evidence, and ``settings_removed`` names the files whose VCO
+    entries it would take out (the entries themselves are not computed)."""
     from vco_lib.paths import looks_like_orchestrator_root
     from vco_lib.project_init import _is_root_bundle_target
 
     folder = Path(folder)
-    run = _Run(folder)
+    run = _Run(folder, dry_run=dry_run)
     root = orchestrator_root if orchestrator_root is not None else default_orchestrator_root()
     if not folder.is_dir():
         return _reply(run)
@@ -521,7 +594,17 @@ def purge_project_files(folder: Path, *, orchestrator_root: Optional[Path] = Non
             "this folder is a VCO orchestrator clone: its .claude/ is the live install, so no "
             "file was removed from it")
         return _reply(run)
-    manifest_may_go = _purge_shipped_files(run)
+    manifest_may_go = _purge_shipped_files(run, root)
+    if dry_run:
+        _purge_runtime(run)
+        from vco_lib.manifest_paths import manifest_path
+        if manifest_may_go:
+            run.delete(manifest_path(folder))
+        run.settings_removed = [
+            f"VCO's entries in {rel}" for rel in
+            (_SETTINGS_REL, _VSCODE_SETTINGS_REL, ".git/info/exclude")
+            if (folder / rel).is_file()]
+        return _reply(run)
     _strip_settings(run, _templates(root))
     _delete_if_empty_settings_local(run)
     _purge_runtime(run)
@@ -542,8 +625,9 @@ def _reply(run: _Run) -> dict:
 def _cli_purge(args: argparse.Namespace) -> int:
     result = purge_project_files(
         Path(args.project_folder),
-        orchestrator_root=Path(args.orchestrator_root) if args.orchestrator_root else None)
-    print(json.dumps({"ok": True, **result}))
+        orchestrator_root=Path(args.orchestrator_root) if args.orchestrator_root else None,
+        dry_run=bool(args.dry_run))
+    print(json.dumps({"ok": True, "dry_run": bool(args.dry_run), **result}))
     return 0
 
 
@@ -554,6 +638,8 @@ def _build_parser() -> argparse.ArgumentParser:
                                          "folder (names only on stdout)")
     purge.add_argument("--project-folder", required=True)
     purge.add_argument("--orchestrator-root", default=None)
+    purge.add_argument("--dry-run", action="store_true",
+                       help="change nothing; list what the purge would remove")
     purge.set_defaults(handler=_cli_purge)
     return parser
 

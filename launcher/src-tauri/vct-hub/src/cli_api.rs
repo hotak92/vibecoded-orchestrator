@@ -66,6 +66,9 @@ pub fn router() -> Router<LauncherDbHandle> {
         // Projects
         .route("/cli/projects", post(create_project))
         .route("/cli/projects/{id_or_slug}", patch(rename_project).delete(delete_project))
+        // v0.2.106 (review L7): what a delete WOULD remove — `vct-cli project
+        // delete` prints it and asks y/N before it sends the DELETE.
+        .route("/cli/projects/{id_or_slug}/removal-preview", get(removal_preview))
         // v0.2.92 WP-17: the project-move state machine (begin/commit/finish/
         // abort). ONE route rather than four because the four are phases of
         // one operation and must never be reachable out of order — the state
@@ -311,6 +314,9 @@ fn launcher_beside_hub() -> Option<std::path::PathBuf> {
 }
 
 /// The argv tail of `vct-launcher --remove-project` for one project id.
+/// `--yes`: the launcher asks "are you sure?" in a terminal (owner ruling
+/// 2026-11-11); here the asking was done by the caller — `vct-cli project
+/// delete` showed the preview and got a y, or was given `--yes`.
 fn remove_project_argv(project_id: &str, q: &DeleteProjectQuery) -> Vec<String> {
     let mut argv = vec!["--remove-project".to_string(), project_id.to_string()];
     if q.keep_collections {
@@ -319,13 +325,84 @@ fn remove_project_argv(project_id: &str, q: &DeleteProjectQuery) -> Vec<String> 
     if q.leave_unremovable {
         argv.push("--leave-unremovable".to_string());
     }
+    argv.push("--yes".to_string());
     argv
 }
 
+/// The argv tail of the launcher's preview of that removal (changes nothing).
+fn removal_preview_argv(project_id: &str, q: &DeleteProjectQuery) -> Vec<String> {
+    let mut argv = vec!["--remove-project".to_string(), project_id.to_string(), "--preview".to_string()];
+    if q.keep_collections {
+        argv.push("--keep-collections".to_string());
+    }
+    argv
+}
+
+/// How long the preview may run (two dry-run Python calls).
+const REMOVE_PREVIEW_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long `vct-launcher --remove-project --help` may take (it prints a
+/// constant and exits; an older launcher starts its window instead).
+const LAUNCHER_PROBE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// What `--remove-project --help` prints first. MUST MATCH `USAGE` in
+/// `launcher/src-tauri/src/remove_project_cli.rs`.
+const REMOVE_USAGE_MARK: &str = "usage: vct-launcher --remove-project";
+
+/// Review L6: a launcher from v0.2.105 or older does not know
+/// `--remove-project` — it ignores the flag and starts (or hands off to) its
+/// window, exits 0 and removes nothing. Ask it for its usage text first; the
+/// binaries beside the hub can be from different releases after a partial
+/// refresh. `Err` carries the answer for the client.
+fn launcher_knows_remove(launcher: &std::path::Path) -> Result<(), String> {
+    use vct_launcher_core::process::CommandExt as _;
+    let mut cmd = std::process::Command::new(launcher).silent();
+    cmd.args(["--remove-project", "--help"]);
+    match vct_launcher_core::process::output_bounded(&mut cmd, None, LAUNCHER_PROBE_LIMIT) {
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains(REMOVE_USAGE_MARK) => Ok(()),
+        Ok(_) | Err(_) => Err(format!(
+            "the launcher binary beside this hub ({}) does not know --remove-project — it is \
+             older than this hub (a partial update?), so nothing was removed. Update the \
+             orchestrator (both binaries), or use the launcher's Remove from VCO",
+            launcher.display()
+        )),
+    }
+}
+
+/// One running removal per project (review M1): a retry while the first is
+/// still running — `vct-cli` gave up, the hub did not — must not start a
+/// second `vct-launcher --remove-project` on the same folder and row.
+fn removals_in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+/// Held for the whole removal; dropping it frees the project for the next one.
+struct RemovalClaim(String);
+
+impl Drop for RemovalClaim {
+    fn drop(&mut self) {
+        if let Ok(mut set) = removals_in_flight().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+fn claim_removal(project_id: &str) -> Option<RemovalClaim> {
+    let mut set = removals_in_flight().lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(project_id.to_string()).then(|| RemovalClaim(project_id.to_string()))
+}
+
 /// Run the launcher's removal and translate its exit contract
-/// (`remove_project_cli.rs`: 0 removed, 1 usage / lookup / DB error, 2 the
-/// removal stopped on a value VCO could not remove) into an HTTP answer.
-fn run_remove_project(launcher: &std::path::Path, argv: &[String]) -> (StatusCode, serde_json::Value) {
+/// (`remove_project_cli.rs`: 0 removed, 1 usage / lookup / DB-open error,
+/// 2 the removal stopped on a value VCO could not remove, 3 it failed for
+/// another reason, 4 not confirmed) into an HTTP answer. A 0 counts only
+/// with a report for `project_id` (review L6): anything else is a 502 — never
+/// `ok: true` for a removal nobody reported.
+fn run_remove_project(
+    launcher: &std::path::Path,
+    argv: &[String],
+    project_id: &str,
+) -> (StatusCode, serde_json::Value) {
     use vct_launcher_core::process::CommandExt as _;
     let mut cmd = std::process::Command::new(launcher).silent();
     cmd.args(argv);
@@ -343,6 +420,20 @@ fn run_remove_project(launcher: &std::path::Path, argv: &[String]) -> (StatusCod
         Some(0) => {
             let report = serde_json::from_slice::<serde_json::Value>(&out.stdout)
                 .unwrap_or(serde_json::Value::Null);
+            if report.get("project_id").and_then(|v| v.as_str()) != Some(project_id) {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": format!(
+                            "the launcher binary exited 0 without a removal report for project {} \
+                             (an older launcher that ignores --remove-project?); it may not have \
+                             been removed — check `vct-cli project list`. {}",
+                            project_id, stderr
+                        ),
+                    }),
+                );
+            }
             (StatusCode::OK, serde_json::json!({ "ok": true, "report": report, "message": stderr }))
         }
         Some(2) => (
@@ -350,6 +441,17 @@ fn run_remove_project(launcher: &std::path::Path, argv: &[String]) -> (StatusCod
             serde_json::json!({ "ok": false, "stopped": true, "error": stderr }),
         ),
         Some(1) => (StatusCode::BAD_REQUEST, serde_json::json!({ "ok": false, "error": stderr })),
+        Some(3) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "ok": false, "error": stderr }),
+        ),
+        Some(4) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("the launcher did not get a confirmation; nothing was changed. {}", stderr),
+            }),
+        ),
         other => (
             StatusCode::INTERNAL_SERVER_ERROR,
             serde_json::json!({
@@ -409,15 +511,141 @@ async fn delete_project(
         )
             .into_response();
     };
-    let _ = h.0.audit("project_delete", Some(&project.id), None, &serde_json::json!({ "via": "cli" }));
+    let Some(claim) = claim_removal(&project.id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "busy": true,
+                "error": "a removal of this project is already running; wait for it to finish \
+                          (`vct-cli project list` shows when the project is gone)",
+            })),
+        )
+            .into_response();
+    };
     let argv = remove_project_argv(&project.id, &q);
-    let (status, body) = match tokio::task::spawn_blocking(move || run_remove_project(&launcher, &argv)).await {
+    let id = project.id.clone();
+    // The claim moves INTO the blocking task: a client that disconnects drops
+    // this handler, not the removal, so the project stays claimed until the
+    // removal really ends (review M1).
+    let (status, body) = match tokio::task::spawn_blocking(move || {
+        let _claim = claim;
+        if let Err(msg) = launcher_knows_remove(&launcher) {
+            return (StatusCode::BAD_GATEWAY, serde_json::json!({ "ok": false, "error": msg }));
+        }
+        run_remove_project(&launcher, &argv, &id)
+    })
+    .await
+    {
         Ok(answer) => answer,
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             serde_json::json!({ "ok": false, "error": format!("the removal task failed: {}", e) }),
         ),
     };
+    // Review L6: the audit row records the OUTCOME, after it is known.
+    let _ = h.0.audit(
+        "project_delete",
+        Some(&project.id),
+        None,
+        &serde_json::json!({
+            "via": "cli",
+            "status": status.as_u16(),
+            "ok": body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        }),
+    );
+    (status, Json(body)).into_response()
+}
+
+/// Run the launcher's preview of a removal (changes nothing) and return its
+/// JSON — required to name the requested project (review L6's rule for the
+/// removal itself holds here too).
+fn run_removal_preview(
+    launcher: &std::path::Path,
+    argv: &[String],
+    project_id: &str,
+) -> (StatusCode, serde_json::Value) {
+    use vct_launcher_core::process::CommandExt as _;
+    let mut cmd = std::process::Command::new(launcher).silent();
+    cmd.args(argv);
+    let out = match vct_launcher_core::process::output_bounded(&mut cmd, None, REMOVE_PREVIEW_LIMIT) {
+        Ok(o) => o,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "ok": false, "error": format!("the preview did not finish: {}", e) }),
+            )
+        }
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.code() != Some(0) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "ok": false, "error": format!("the preview failed: {}", stderr) }),
+        );
+    }
+    let preview = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or(serde_json::Value::Null);
+    if preview.get("project_id").and_then(|v| v.as_str()) != Some(project_id) {
+        return (
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({
+                "ok": false,
+                "error": "the launcher binary did not return a removal preview (an older launcher \
+                          that does not know --remove-project?); nothing was changed",
+            }),
+        );
+    }
+    (StatusCode::OK, serde_json::json!({ "ok": true, "preview": preview }))
+}
+
+/// `GET /cli/projects/{id|slug}/removal-preview[?keep_collections=true]` —
+/// what `DELETE` would remove (review L7). Same refusals as the delete.
+async fn removal_preview(
+    State(h): State<LauncherDbHandle>,
+    Path(id_or_slug): Path<String>,
+    Query(q): Query<DeleteProjectQuery>,
+) -> axum::response::Response {
+    let resolved = h
+        .0
+        .get_project(&id_or_slug)
+        .ok()
+        .flatten()
+        .or_else(|| h.0.get_project_by_slug(&id_or_slug).ok().flatten());
+    let Some(project) = resolved else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "project not found" })))
+            .into_response();
+    };
+    if project.host == ProjectHost::OrchestratorRoot {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "the orchestrator's own project cannot be removed: its .claude/ is the live install",
+            })),
+        )
+            .into_response();
+    }
+    let Some(launcher) = launcher_beside_hub() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "the launcher binary (vct-launcher) is not installed beside this hub, so \
+                          the project cannot be removed from here",
+            })),
+        )
+            .into_response();
+    };
+    let argv = removal_preview_argv(&project.id, &q);
+    let id = project.id.clone();
+    let (status, body) =
+        match tokio::task::spawn_blocking(move || run_removal_preview(&launcher, &argv, &id)).await {
+            Ok(answer) => answer,
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "ok": false, "error": format!("the preview task failed: {}", e) }),
+            ),
+        };
     (status, Json(body)).into_response()
 }
 
@@ -3494,12 +3722,40 @@ mod remove_project_delegation_tests {
     #[test]
     fn the_flags_reach_the_launchers_argv() {
         let none = DeleteProjectQuery::default();
-        assert_eq!(remove_project_argv("p1", &none), vec!["--remove-project", "p1"]);
+        assert_eq!(remove_project_argv("p1", &none), vec!["--remove-project", "p1", "--yes"]);
         let both = DeleteProjectQuery { keep_collections: true, leave_unremovable: true };
         assert_eq!(
             remove_project_argv("p1", &both),
-            vec!["--remove-project", "p1", "--keep-collections", "--leave-unremovable"]
+            vec!["--remove-project", "p1", "--keep-collections", "--leave-unremovable", "--yes"]
         );
+        assert_eq!(
+            removal_preview_argv("p1", &both),
+            vec!["--remove-project", "p1", "--preview", "--keep-collections"]
+        );
+    }
+
+    /// Review M1: a second removal of the same project while the first runs
+    /// is refused; another project, or the same one afterwards, is not.
+    #[test]
+    fn one_removal_per_project_at_a_time() {
+        let first = claim_removal("m1-p").expect("free");
+        assert!(claim_removal("m1-p").is_none(), "a retry must not start a second removal");
+        let other = claim_removal("m1-q").expect("another project is free");
+        drop(first);
+        assert!(claim_removal("m1-p").is_some(), "freed once the first removal ends");
+        drop(other);
+    }
+
+    /// Review L6: a launcher that does not print the --remove-project usage
+    /// (an older one starting its window) is detected before anything runs.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_launcher_is_detected_before_the_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = fake_launcher(tmp.path(), "old", 0, "");
+        assert!(launcher_knows_remove(&old).unwrap_err().contains("older than this hub"));
+        let new = fake_launcher(tmp.path(), "new", 0, "usage: vct-launcher --remove-project <id>");
+        assert!(launcher_knows_remove(&new).is_ok());
     }
 
     #[cfg(unix)]
@@ -3530,21 +3786,35 @@ mod remove_project_delegation_tests {
         let argv = remove_project_argv("p1", &DeleteProjectQuery::default());
 
         let ok = fake_launcher(tmp.path(), "ok", 0, r#"{"project_id":"p1"}"#);
-        let (status, body) = run_remove_project(&ok, &argv);
+        let (status, body) = run_remove_project(&ok, &argv, "p1");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
         assert_eq!(body["report"]["project_id"], "p1");
         let logged = std::fs::read_to_string(tmp.path().join("argv.log")).unwrap();
-        assert_eq!(logged, "--remove-project\np1\n");
+        assert_eq!(logged, "--remove-project\np1\n--yes\n");
+
+        // Review L6: exit 0 without a report for THIS project is no success.
+        let silent = fake_launcher(tmp.path(), "silent", 0, "");
+        let (status, body) = run_remove_project(&silent, &argv, "p1");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["ok"], false);
+        let other = fake_launcher(tmp.path(), "other", 0, r#"{"project_id":"p2"}"#);
+        assert_eq!(run_remove_project(&other, &argv, "p1").0, StatusCode::BAD_GATEWAY);
 
         let stopped = fake_launcher(tmp.path(), "stopped", 2, "");
-        let (status, body) = run_remove_project(&stopped, &argv);
+        let (status, body) = run_remove_project(&stopped, &argv, "p1");
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["stopped"], true);
         assert_eq!(body["error"], "stderr note");
 
+        // Review L5: any other failure is not "stopped".
+        let failed = fake_launcher(tmp.path(), "failed", 3, "");
+        let (status, body) = run_remove_project(&failed, &argv, "p1");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.get("stopped").is_none());
+
         let refused = fake_launcher(tmp.path(), "refused", 1, "");
-        assert_eq!(run_remove_project(&refused, &argv).0, StatusCode::BAD_REQUEST);
+        assert_eq!(run_remove_project(&refused, &argv, "p1").0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

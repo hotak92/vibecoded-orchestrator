@@ -65,7 +65,7 @@ vct-cli project list
 vct-cli project show <id_or_slug>
 vct-cli project create --name <name> --path <dir> [--host base|mao]
 vct-cli project rename <id_or_slug> <new_name>
-vct-cli project delete <id_or_slug>
+vct-cli project delete <id_or_slug> [--keep-collections] [--leave-unremovable] [--yes]
 
 vct-cli module list
 vct-cli module installed <project_id_or_slug>
@@ -97,6 +97,40 @@ vct-cli codegraph search <query> --project <id|slug> [--collections <c1,c2>] [--
 
 Every command outputs JSON for machine consumption. Pipe through `jq`
 for human-readable formatting.
+
+`project delete` is **Remove from VCO**, the same removal as the launcher's
+button — not a row delete. What VCO put in the folder goes (the hooks,
+scripts, agents and skills it installed that you have not changed, its entries
+in `.claude/settings.json`, `.vscode/settings.json` and `.git/info/exclude`,
+the lines it wrote to your env files, its runtime folders), and **the
+project's own Weaviate collections are dropped** — knowledge graph, docs,
+diagrams and code graph; shared collections and collections another project
+uses are never dropped. The folder, your source code, `.env`, secrets,
+`knowledge/` and anything you changed stay.
+
+- It **asks first**: in a terminal it prints what would be removed — the files
+  and the collections, computed by the same rules the removal uses — and
+  removes only when you answer `y`.
+- `--yes` removes without asking. Without a terminal (a script, CI) and
+  without `--yes` it refuses and changes nothing, so a script can never drop a
+  project's collections by accident.
+- `--keep-collections` keeps the collections (the files still go).
+- `--leave-unremovable`: if the removal stopped because a value VCO wrote
+  could not be removed, rerun with it to finish anyway (the dialog's
+  "Unregister anyway"); the report lists each value to clean by hand.
+- A removal can take several minutes on a large project; `vct-cli` waits up
+  to 32 minutes for the hub's answer, and a second delete of the same project
+  while one runs is refused (HTTP 409, `busy: true`).
+- To re-register a project, add it again (`project create` or Add Project): a
+  delete followed by a create starts with EMPTY collections unless the delete
+  had `--keep-collections`.
+
+The launcher binary offers the same command without the hub:
+`vct-launcher --remove-project <id|slug|name> [--keep-collections]
+[--leave-unremovable] [--yes] [--preview]` (`--preview` prints what would be
+removed as JSON and changes nothing). Its exit codes: 0 removed, 1 usage or
+lookup error, 2 stopped on a value it could not remove, 3 failed for another
+reason (the message says which), 4 not confirmed.
 
 `telemetry pending` is the one command that does not talk to the hub: it
 reads `~/.vibecoded/telemetry_pending.jsonl` (where opted-in telemetry waits

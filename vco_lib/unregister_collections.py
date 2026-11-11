@@ -31,6 +31,7 @@ A-L4). Without an id (the bare CLI) the drop covers the name-derived set.
 """
 from __future__ import annotations
 
+import shlex
 from typing import Any, Callable, Optional
 
 __all__ = ["DropPlan", "plan_drop", "drop_project_collections"]
@@ -81,9 +82,15 @@ def plan_drop(
                   "other project uses it; it was not dropped")
         plan.kept = [{"collection": name, "reason": reason} for name in plan.targets]
         plan.targets = []
+        # Review L10: the Remove deletes the project row anyway, so "run the
+        # drop again" cannot name the project by id afterwards — print the
+        # form that works without the row (it drops the classes derived from
+        # the name; a class a rename gave another name is dropped by hand).
         plan.notes.append(
             "the launcher registry could not be read, so no collection was dropped (each "
-            "is listed as kept); VCO could not check whether another project uses them")
+            "is listed as kept); VCO could not check whether another project uses them. "
+            "Once you have checked that none does, drop them with: python -m "
+            f"vco_lib.project_init drop-collections --name {shlex.quote(project_name)}")
         return plan
     me = None
     others: list[Any] = []
@@ -124,10 +131,14 @@ def drop_project_collections(
     project_id: Optional[str] = None,
     weaviate_url: Optional[str] = None,
     delete_class: Optional[Callable[..., None]] = None,
+    dry_run: bool = False,
 ) -> dict:
     """Run the drop. Returns ``{"dropped", "skipped_shared", "kept", "notes",
     "errors": [{"collection", "error"}]}``; a 404 counts as dropped (the
-    ``_delete_class`` contract). Never raises."""
+    ``_delete_class`` contract). Never raises.
+
+    ``dry_run``: nothing is dropped; ``dropped`` lists what the drop WOULD
+    drop (the plan, after every keep rule) and ``dry_run`` is ``True``."""
     from vco_lib import bootstrap_case_sibling as _bcs
     from vco_lib import project_init as _pi
 
@@ -140,6 +151,8 @@ def drop_project_collections(
                      protected_shared=frozenset(p.casefold() for p in protected))
     result: dict = {"dropped": [], "skipped_shared": machine_shared,
                     "kept": plan.kept, "notes": plan.notes, "errors": []}
+    if dry_run:
+        result["dry_run"] = True
     deleter = delete_class if delete_class is not None else _pi._delete_class
     for name in plan.targets:
         if name.lower() in protected:
@@ -148,6 +161,9 @@ def drop_project_collections(
                 "error": (f"refusing to drop shared collection {name!r} — "
                           f"shared KG is install-owned, not project-owned"),
             })
+            continue
+        if dry_run:
+            result["dropped"].append(name)
             continue
         try:
             deleter(name, weaviate_url=weaviate_url)
