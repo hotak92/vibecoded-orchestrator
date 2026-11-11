@@ -33,6 +33,9 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
 # The ONE guarded detached-spawn home (Start-VcoDetachedProcess).
 . (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
+# v0.2.106: the ONE home for running the embedded Python extractor below
+# (Windows PowerShell 5.1 mangles `python -c` bodies containing quotes).
+. (Join-Path $ScriptDir "_lib/run-python-program.ps1")
 $venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 $generator = Join-Path $ProjectRoot ".claude/scripts/generate-kg-summary.py"
 
@@ -93,7 +96,11 @@ except Exception:
     print('')
 '@
     try {
-        $FilePath = ($HookStdin | & $PY -c $code 2>$null | Out-String).Trim()
+        # v0.2.106: the body runs as a temp FILE through
+        # _lib/run-python-program.ps1 (dot-sourced above) - `& $PY -c $code`
+        # loses every embedded double quote under Windows PowerShell 5.1.
+        # The payload stays on the child's stdin (-Stdin), like the pipe did.
+        $FilePath = (Invoke-VcoPythonProgram -Python $PY -Body $code -Stdin $HookStdin 2>$null | Out-String).Trim()
     } catch { }
 }
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Parity-touch 2026-11-11 (v0.2.106): the .ps1 sibling now runs its embedded Python body through _lib/run-python-program.ps1 (Windows PowerShell 5.1 drops embedded double quotes from `python -c` arguments — SyntaxError on every run); no .sh-side behaviour change.
 # Parity: kept in step with kg-update-nudge.ps1 (key incident-fix logic on
 # both sides is pinned by tests/test_hook_ps1_body_parity.py; every
 # behaviour must match the kg-update-nudge.ps1 sibling).

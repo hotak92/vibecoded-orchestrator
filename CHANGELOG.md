@@ -178,6 +178,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows: every `.ps1` hook's embedded Python now actually runs.** Users on Windows 11 saw
+  `kg-update-nudge exit=1 ... SyntaxError: unterminated string literal` logged for every tool call: Claude Code
+  runs `.ps1` hooks with Windows PowerShell 5.1, whose `python -c <body>` argument passing drops embedded double
+  quotes, so each hook's multi-line Python program was truncated at its first `"` — the KG-update nudge, the
+  update-deferral surface, the retrieval-health line, the stop-failure ledger/notification, the session work
+  counter and the async dispatcher's routing never fired. All of these bodies now run through one shared helper
+  (`_lib/run-python-program.ps1`) that writes the program to a private temp file and runs that, which no command
+  line can corrupt — identical behaviour on Windows PowerShell 5.1 and pwsh 7.
+
 - **Weaviate 1.37 no longer wipes a collection at every restart.** A field report: after the move to Weaviate
   1.37.18 the orchestrator's knowledge-graph, docs and diagrams collections kept their schema but lost their data
   at the first start, and again at every restart after they were rebuilt. The cause is upstream (a draft report is

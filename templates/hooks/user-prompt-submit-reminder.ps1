@@ -189,7 +189,13 @@ except Exception:
     pass
 print(total)
 '@
-    $scanOut = $HookStdin | & $PY -c $scanSrc
+    # v0.2.106: the body runs as a temp FILE through
+    # _lib/run-python-program.ps1 - `& $PY -c $scanSrc` loses every
+    # embedded double quote under Windows PowerShell 5.1 (the work counter
+    # never ran on a 5.1 host, so every reminder carried a stale total).
+    # The payload stays on the child's stdin (-Stdin), like the pipe did.
+    . (Join-Path $PSScriptRoot "_lib/run-python-program.ps1")
+    $scanOut = Invoke-VcoPythonProgram -Python $PY -Body $scanSrc -Stdin $HookStdin
     $scanRc = $LASTEXITCODE
     Remove-Item Env:_UPSR_HOOK_DIR, Env:_UPSR_STATE, Env:_UPSR_OFFSET -ErrorAction SilentlyContinue
     if ($scanRc -ne 0) { exit 1 }  # broken install: the python side already said why on stderr
