@@ -73,12 +73,13 @@ def serialized_bundle_run(fn: F) -> F:
     @functools.wraps(fn)
     def run(folder: Any, *args: Any, **kwargs: Any) -> Any:
         writes = not (kwargs.get("dry_run") or kwargs.get("_classification_only"))
+        target: Path | None = None
         try:
             target = Path(folder).resolve()
             usable = target.is_dir()
         except (OSError, TypeError, ValueError):
             usable = False
-        if not writes or not usable:
+        if not writes or not usable or target is None:
             return fn(folder, *args, **kwargs)
         with bundle_manifest_lock(target):
             return fn(folder, *args, **kwargs)

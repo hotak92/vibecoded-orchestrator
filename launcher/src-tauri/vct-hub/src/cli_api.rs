@@ -326,7 +326,8 @@ fn remove_project_argv(project_id: &str, q: &DeleteProjectQuery) -> Vec<String> 
 /// (`remove_project_cli.rs`: 0 removed, 1 usage / lookup / DB error, 2 the
 /// removal stopped on a value VCO could not remove) into an HTTP answer.
 fn run_remove_project(launcher: &std::path::Path, argv: &[String]) -> (StatusCode, serde_json::Value) {
-    let mut cmd = std::process::Command::new(launcher);
+    use vct_launcher_core::process::CommandExt as _;
+    let mut cmd = std::process::Command::new(launcher).silent();
     cmd.args(argv);
     let out = match vct_launcher_core::process::output_bounded(&mut cmd, None, REMOVE_PROJECT_LIMIT) {
         Ok(o) => o,
