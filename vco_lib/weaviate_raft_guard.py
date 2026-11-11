@@ -654,16 +654,21 @@ class RaftScan:
     def exposed(self) -> bool:
         """A start can replay a case-variant delete: a recorded delete whose
         index lies after the latest snapshot. Not "the log is longer than the
-        snapshot": every start appends a no-op and a configuration entry that
-        no snapshot can hold until the next schema command, and those replay
-        harmlessly.
+        snapshot": every start appends entries of its own (a no-op and, on
+        1.28, a configuration entry no snapshot can hold until the next
+        schema command; 1.37.18 with the shipped settings snapshots them
+        within a minute — measured), and those replay harmlessly.
 
         A delete whose index VCO never recorded (the root's derived names,
         deleted before the ledger existed) gets an UPPER BOUND in :func:`scan`:
         the log index at the first reading that saw the pair, persisted, since
         the delete had already happened by then (review A-L1: "no snapshot at
         all" alone read a machine whose only snapshot predates the delete as
-        safe). The ``None`` branch below is for a scan that could not bound it."""
+        safe). A first reading taken seconds after a start stores a bound
+        that includes that start's own entries; :func:`scan`'s settle window
+        (doctor + ``status``) lets the next snapshot reach it before the
+        reading stands (review H1). The ``None`` branch below is for a scan
+        that could not bound it."""
         if self.stats is None:
             return False
         snap = self.stats.last_snapshot_index
@@ -736,15 +741,56 @@ def recorded_names(root: Optional[Path], url: str) -> dict[str, Optional[int]]:
     return names
 
 
+#: Seconds a doctor reading gives a Weaviate WITH the orphan drop to take its
+#: next raft snapshot before it calls the log exposed (review H1). Measured
+#: on 1.37.18 with the shipped settings (threshold 1, interval 30): an idle
+#: restart's own entries — and any schema command — are inside a snapshot
+#: within one snapshot check, i.e. 30-60 s. A reading taken seconds after a
+#: start (the update's doctor phase) would otherwise see those fresh entries
+#: as uncovered. Without the settings no snapshot ever comes, so a real
+#: exposure is still reported once the window has passed.
+SETTLE_S = 90.0
+SETTLE_POLL_S = 5.0
+
+
+def _settle(result: RaftScan, url: str, http: Optional[HttpFn], settle_s: float,
+            log: Optional[LogFn]) -> None:
+    """Re-read the raft statistics until the scan is no longer exposed or
+    *settle_s* has passed (counted in polls, so a test's no-op sleep stays
+    deterministic). Stops early under a cancelled doctor probe."""
+    from vco_lib import probe_bound  # noqa: PLC0415
+
+    polls = int(settle_s // SETTLE_POLL_S) if settle_s > 0 else 0
+    said = False
+    while polls > 0 and result.exposed and not probe_bound.cancelled():
+        if log is not None and not said:
+            said = True
+            log(f"waiting up to {int(settle_s)} s for Weaviate's next raft snapshot "
+                "(the shipped settings take one within a minute) ...")
+        _sleep(SETTLE_POLL_S)
+        polls -= 1
+        stats = read_raft_stats(url, http=http)
+        if stats is not None:
+            result.stats = stats
+
+
 def scan(url: str, *, root: Optional[Path] = None, http: Optional[HttpFn] = None,
-         check_indexes: bool = True) -> Optional[RaftScan]:
+         check_indexes: bool = True, settle_s: float = 0.0,
+         log: Optional[LogFn] = None) -> Optional[RaftScan]:
     """Read version, raft indexes and the class list of the Weaviate at
     *url*, match the class list against VCO's case-variant records and
     (optionally) check the index of each LIVE class of such a pair — the
     only classes the orphan drop can hit through VCO's history. Only those:
     a shard-status read can load a lazily-unloaded shard, and loading every
     shard of every class is the memory spike VCO's lazy loading exists to
-    avoid. ``None`` when the schema could not be read at all."""
+    avoid. ``None`` when the schema could not be read at all.
+
+    *settle_s* > 0 (the doctor probe and ``status``): on a release with the
+    orphan drop, an exposed reading waits up to that long for the next raft
+    snapshot before it stands (:data:`SETTLE_S`, review H1). Every bound and
+    recorded index keeps its meaning — the wait only gives a Weaviate that
+    takes snapshots the time to take one, so "exposed" means no snapshot
+    covering the delete came, not "the reading was taken too early"."""
     from vco_lib import weaviate_helpers as _wh  # noqa: PLC0415
 
     schema = _get_json(f"{url.rstrip('/')}/v1/schema", http)
@@ -763,6 +809,8 @@ def scan(url: str, *, root: Optional[Path] = None, http: Optional[HttpFn] = None
 
             result.recorded_index.update(_wch.delete_index_bounds(
                 url, unknown, result.stats.last_log_index))
+        if has_orphan_drop(result.version):
+            _settle(result, url, http, settle_s, log)
     if check_indexes:
         live = sorted({b for _a, b in result.case_pairs})
         result.index_missing = [c for c in live if index_missing(url, c, http=http) is True]
@@ -847,6 +895,9 @@ def probe_raft(folder: Path, res: Any, ctx: dict) -> list:
                                   condition_id=CID_REPLAY_EXPOSED,
                                   summary=("raft snapshot covers the schema log"
                                            if result.stats.covered else
+                                           "the latest raft snapshot holds every recorded "
+                                           "case-variant class delete"
+                                           if result.case_pairs else
                                            "no case-variant class history recorded")))
     return findings
 
@@ -1038,7 +1089,7 @@ def default_mem_cap() -> Optional[tuple[MemCap, str, Optional[str]]]:
 
 def default_scan(folder: Path) -> Optional[RaftScan]:
     try:
-        return scan(_weaviate_url(), root=Path(folder))
+        return scan(_weaviate_url(), root=Path(folder), settle_s=SETTLE_S)
     except Exception:  # noqa: BLE001 — could not look is not a verdict
         return None
 
@@ -1086,7 +1137,8 @@ def prepare_for_compose(root: Path, *, runtime: Optional[str] = None,
 
 
 def _status(url: str, as_json: bool) -> int:
-    result = scan(url, root=Path(__file__).resolve().parent.parent, check_indexes=True)
+    result = scan(url, root=Path(__file__).resolve().parent.parent, check_indexes=True,
+                  settle_s=SETTLE_S, log=lambda m: print(m, file=sys.stderr))
     if result is None:
         print(f"Weaviate at {url}: schema not readable", file=sys.stderr)
         return 2

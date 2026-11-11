@@ -601,6 +601,79 @@ def test_a_snapshot_past_the_first_reading_ends_the_exposure_of_a_derived_name(
     assert result is not None and result.case_pairs and not result.exposed
 
 
+class SnapshottingWeaviate(FakeWeaviate):
+    """A Weaviate with the shipped snapshot settings: its next snapshot
+    covers the whole log after *catch_up* statistics reads (measured on
+    1.37.18: an idle restart's own entries are snapshotted within a minute)."""
+
+    def __init__(self, *, catch_up: int, **kw):
+        super().__init__(**kw)
+        self.catch_up, self.stat_reads = catch_up, 0
+
+    def __call__(self, url, timeout):
+        if url.endswith("/v1/cluster/statistics"):
+            self.stat_reads += 1
+            if self.stat_reads > self.catch_up:
+                self.snap = self.log
+        return super().__call__(url, timeout)
+
+
+def test_a_first_reading_right_after_a_restart_is_not_exposure(tmp_path, monkeypatch):
+    """Review H1: a default-clone root derives ``VibecodedOrchestrator_*``
+    beside the live ``VibeCodedOrchestrator_*`` — a pair with no real delete.
+    Its first reading, taken seconds after a restart (the update's doctor
+    phase: the snapshot covers every schema command, the start's own two
+    entries are not in it yet), must not report the start as a data-loss
+    risk; neither may any later idle restart."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    root = tmp_path / "vibecoded-orchestrator"
+    fake = SnapshottingWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"],
+                                log=42, snap=40, catch_up=3)
+    result = rg.scan(URL, root=root, http=fake, settle_s=rg.SETTLE_S)
+    assert result is not None and result.case_pairs
+    assert result.recorded_index == {"VibecodedOrchestrator_KnowledgeGraph": 42}
+    assert not result.exposed
+    # an idle restart later: two more entries, not yet snapshotted
+    fake.log, fake.stat_reads = 44, 0
+    assert not rg.scan(URL, root=root, http=fake, check_indexes=False).exposed
+
+
+def test_the_doctor_reading_waits_for_the_snapshot(tmp_path, monkeypatch):
+    """The doctor's own scan (``default_scan``) carries the settle window."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    fake = SnapshottingWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"],
+                                log=42, snap=40, catch_up=2)
+    monkeypatch.setattr(rg, "_default_http", fake)
+    monkeypatch.setattr(rg, "_weaviate_url", lambda: URL)
+    result = rg.default_scan(tmp_path / "vibecoded-orchestrator")
+    assert result is not None and result.case_pairs and not result.exposed
+
+
+def test_a_log_no_snapshot_ever_covers_is_still_exposed(tmp_path, monkeypatch):
+    """The field case: no snapshot settings, no snapshot at all. The settle
+    window passes (a bounded number of reads) and the exposure stands."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    fake = SnapshottingWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"],
+                                log=7, snap=0, catch_up=10**6)
+    result = rg.scan(URL, root=tmp_path / "vibecoded-orchestrator", http=fake,
+                     settle_s=rg.SETTLE_S)
+    assert result is not None and result.exposed
+    assert fake.stat_reads == 1 + int(rg.SETTLE_S // rg.SETTLE_POLL_S)
+    # ... and a snapshot that holds the bound (the remedy: the shipped
+    # settings) clears it on the next reading.
+    fake.snap = fake.log
+    assert not rg.scan(URL, root=tmp_path / "vibecoded-orchestrator", http=fake,
+                       check_indexes=False).exposed
+
+
+def test_a_release_without_the_orphan_drop_is_not_kept_waiting(tmp_path, monkeypatch):
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    fake = SnapshottingWeaviate(classes=["VibeCodedOrchestrator_KnowledgeGraph"],
+                                version="1.28.4", log=7, snap=0, catch_up=10**6)
+    rg.scan(URL, root=tmp_path / "vibecoded-orchestrator", http=fake, settle_s=rg.SETTLE_S)
+    assert fake.stat_reads == 1
+
+
 def test_a_marker_whose_delete_failed_is_named_in_the_refusal(monkeypatch):
     """Review A-L2: a created marker whose DELETE failed is named, with the
     note that the next attempt removes it; success and a refused create keep

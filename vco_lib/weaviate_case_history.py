@@ -35,9 +35,10 @@ from __future__ import annotations
 import json
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from vco_lib import weaviate_raft_guard as _rg
 
@@ -148,6 +149,25 @@ def _load() -> dict:
     return data
 
 
+#: How long a ledger read-modify-write waits for another one (review L4).
+LEDGER_LOCK_WAIT_S = 30.0
+
+
+@contextmanager
+def _ledger_locked() -> Iterator[None]:
+    """Hold the ledger's sidecar lock for one read-modify-write (review L4: a
+    code-graph rebuild recording deletes while a doctor scan stores a bound
+    must not save over each other — a lost delete record makes
+    :func:`guard_create` blind for that name). Raises
+    :class:`vco_lib.atomic.LockTimeout` after :data:`LEDGER_LOCK_WAIT_S`;
+    every caller already treats a raise as "could not record"."""
+    from vco_lib.atomic import exclusive_file_lock  # noqa: PLC0415
+
+    lock = ledger_path().with_name(ledger_path().name + ".lock")
+    with exclusive_file_lock(lock, timeout_s=LEDGER_LOCK_WAIT_S):
+        yield
+
+
 def _save(data: dict) -> None:
     from vco_lib import probe_bound  # noqa: PLC0415
     from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
@@ -168,13 +188,14 @@ def record_deleted(name: str, weaviate_url: str, *,
         return
     try:
         stats = _rg.read_raft_stats(weaviate_url, http=http)
-        data = _load()
-        bucket = data["instances"].setdefault(_key(weaviate_url), {})
-        bucket[name] = {
-            "deleted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "log_index": stats.last_log_index if stats is not None else None,
-        }
-        _save(data)
+        with _ledger_locked():
+            data = _load()
+            bucket = data["instances"].setdefault(_key(weaviate_url), {})
+            bucket[name] = {
+                "deleted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "log_index": stats.last_log_index if stats is not None else None,
+            }
+            _save(data)
     except Exception as exc:  # noqa: BLE001 — the delete already happened
         print(f"  ! could not record the delete of Weaviate class {name!r} in "
               f"{ledger_path()}: {exc}", file=sys.stderr)
@@ -214,21 +235,22 @@ def delete_index_bounds(weaviate_url: str, names: list[str],
     failure the current index is returned (the conservative answer)."""
     out = {n: int(last_log_index) for n in names}
     try:
-        data = _load()
-        bounds = data.setdefault("bounds", {})
-        if not isinstance(bounds, dict):
-            bounds = data["bounds"] = {}
-        bucket = bounds.setdefault(_key(weaviate_url), {})
-        changed = False
-        for n in names:
-            stored = bucket.get(n)
-            if isinstance(stored, int) and stored <= last_log_index:
-                out[n] = stored
-            else:
-                bucket[n] = int(last_log_index)
-                changed = True
-        if changed:
-            _save(data)
+        with _ledger_locked():
+            data = _load()
+            bounds = data.setdefault("bounds", {})
+            if not isinstance(bounds, dict):
+                bounds = data["bounds"] = {}
+            bucket = bounds.setdefault(_key(weaviate_url), {})
+            changed = False
+            for n in names:
+                stored = bucket.get(n)
+                if isinstance(stored, int) and stored <= last_log_index:
+                    out[n] = stored
+                else:
+                    bucket[n] = int(last_log_index)
+                    changed = True
+            if changed:
+                _save(data)
     except Exception:  # noqa: BLE001 — the bound is best-effort evidence
         pass
     return out
@@ -236,11 +258,12 @@ def delete_index_bounds(weaviate_url: str, names: list[str],
 
 def _forget(weaviate_url: str, names: list[str]) -> None:
     try:
-        data = _load()
-        bucket = data["instances"].get(_key(weaviate_url)) or {}
-        for n in names:
-            bucket.pop(n, None)
-        _save(data)
+        with _ledger_locked():
+            data = _load()
+            bucket = data["instances"].get(_key(weaviate_url)) or {}
+            for n in names:
+                bucket.pop(n, None)
+            _save(data)
     except Exception:  # noqa: BLE001 — a stale entry only costs a later re-check
         pass
 
