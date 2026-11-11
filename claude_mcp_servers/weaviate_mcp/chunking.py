@@ -247,9 +247,10 @@ CHARS_PER_TOKEN_CODE: float = 3.5   # source code; denser than prose
 # part (3 684 chars) does NOT reliably fit the served 1 024-token window
 # on real code, and the margin is NOT a guarantee for the code tier. What
 # makes an over-dense part honest is the CodeEmbed service REFUSING it
-# (HTTP 400, W1) and the caller shrinking on that refusal
-# (`_embed_shrinking_on_overflow`), which tags the result — the same net
-# `truncate: false` provides on the Ollama side.
+# (HTTP 400, W1) and the caller handling that refusal — since v0.2.106 by
+# splitting the part and combining the piece vectors
+# (`embedding_service._embed_whole_on_overflow`), so nothing is cut off — the
+# same net `truncate: false` provides on the Ollama side.
 #
 # v0.2.106: this margin is no longer the only bound. The model-aware presets
 # are ALSO clamped to ``dense_char_budget`` (the measured-minimum
@@ -448,7 +449,8 @@ def query_prefix_for_model(model_name: str, task: "str | None" = None) -> str:
 #     (2 273). The old maxima measured 122-136% of their windows on dense
 #     text (JSON, code, base64, CJK); the runner refused them and the shrink
 #     ladder embedded a leading sub-window, so the chunk's tail never reached
-#     its vector. The code-entity budget (``code_truncation``) moved to the
+#     its vector. (Content denser still is refused even at the new size; it
+#     is split on refusal — ``vco_lib.embed_split`` — never cut.) The code-entity budget (``code_truncation``) moved to the
 #     same bound, so the code graph re-chunks too (extractor-generation rung
 #     0.2.106 delivers it).
 #     BOUNDARY IMPACT: nodes above the new single-chunk threshold re-chunk

@@ -181,20 +181,21 @@ def _code_service() -> EmbeddingService:
 def test_a_non_truncating_code_fan_out_clears_the_prior_call_s_verdict(monkeypatch):
     """Decision pin: the per-call truncation record describes THIS embed.
 
-    Call 1 shrinks the codesage secondary (over the staged service's
-    window) → ``codesage_embed`` is recorded truncated. Call 2 embeds a
-    snippet nothing refuses — the record must not still carry call 1's
-    verdict. LEAVE-ALONE arm included: the reset may not cripple the
+    Call 1 refuses the codesage secondary (over the staged service's
+    window). Since v0.2.106 that is a SPLIT, not a truncation, so no call can
+    leave ``codesage_embed`` True any more; the record a prior call left is
+    therefore SEEDED here, and call 2 — a snippet nothing refuses — must not
+    still carry it. LEAVE-ALONE arm included: the reset may not cripple the
     record, so this call's own (full-fidelity) verdict is still assigned.
     """
     monkeypatch.setenv("DUAL_EMBEDDING_WRITE_ALL_SLOTS", "1")
     svc = _code_service()
 
     svc.embed_code_all_configured("z" * 40_000)
-    assert svc._last_truncated_slots.get("codesage_embed") is True, (
-        "fixture premise: the first call must produce a code-side "
-        "truncation verdict"
+    assert not svc._last_truncated_slots.get("codesage_embed"), (
+        "split on refusal: a refused secondary is embedded whole"
     )
+    svc._last_truncated_slots["codesage_embed"] = True  # a prior call's record
 
     svc.embed_code_all_configured("def f(): pass")
     assert "codesage_embed" not in svc._last_truncated_slots, (
@@ -217,7 +218,7 @@ def test_a_single_code_embed_clears_the_prior_call_s_verdict(monkeypatch):
     svc = _code_service()
 
     svc.embed_code_all_configured("z" * 40_000)
-    assert svc._last_truncated_slots.get("codesage_embed") is True
+    svc._last_truncated_slots["codesage_embed"] = True  # a prior call's record
 
     # Fresh input, so the per-instance memo cannot short-circuit the embed.
     svc.embed_code("def g(): pass")

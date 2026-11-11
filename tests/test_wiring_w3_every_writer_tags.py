@@ -778,10 +778,26 @@ def test_enrichment_on_a_pre_record_row_writes_the_vector_only():
     assert coll.updates[0]["vector"] == {"arctic2_embed": [0.1, 0.2]}
 
 
-def test_enrichment_short_content_leaves_the_slot_unmeasured():
-    """No positive evidence either way — the batch API hides the per-item
-    shrink that runs after a whole-batch refusal — so the patch writes
+def test_enrichment_short_content_is_proven_whole_on_the_split_legs():
+    """v0.2.106: the Ollama / CodeEmbed batch legs split an over-budget or
+    refused input and combine the pieces, so every character of what was
+    handed in reaches the vector — the fresh slot is PROVEN full and merged
+    into the row's complete record as measured, not truncated."""
+    obj = _EnrichObj({"content": "tiny", TRUNCATED_SLOTS_PROP: [ACTIVE_SLOT],
+                      MEASURED_SLOTS_PROP: [ACTIVE_SLOT]})
+    coll = _run_enrichment([obj])
+
+    upd = coll.updates[0]
+    assert upd["vector"] == {"arctic2_embed": [0.1, 0.2]}
+    assert upd["properties"][TRUNCATED_SLOTS_PROP] == [ACTIVE_SLOT]
+    assert upd["properties"][MEASURED_SLOTS_PROP] == ["arctic2_embed", ACTIVE_SLOT]
+
+
+def test_enrichment_on_the_openai_leg_leaves_the_slot_unmeasured(monkeypatch):
+    """LEAVE-ALONE twin: the OpenAI batch leg reports nothing back about its
+    window, so there is no positive evidence either way — the patch writes
     NOTHING and the slot resolves UNKNOWN rather than a wrong False."""
+    monkeypatch.setattr(_EnrichService, "text_vector_slot", "openai_text_embed")
     obj = _EnrichObj({"content": "tiny", TRUNCATED_SLOTS_PROP: [ACTIVE_SLOT],
                       MEASURED_SLOTS_PROP: [ACTIVE_SLOT]})
     coll = _run_enrichment([obj])

@@ -132,7 +132,6 @@ from vco_lib.child_process import last_json_object  # noqa: E402
 from vco_lib.embedding_service import (  # noqa: E402
     EmbeddingService,
     NoEmbeddingBackendError,
-    _bounded_for_model,
 )
 # W3 (v0.2.92 wiring audit): the truncation-tag merge for single-slot
 # patches — ONE shared merger (vco_lib home), so enrichment and the
@@ -751,37 +750,36 @@ def _run_enrichment_loop(
     def _item_truncation_verdict(idx: int, model_id: str) -> "Optional[bool]":
         """W3: was THIS batch item's vector embedded from a leading window?
 
-        TRI-STATE. ``True`` only when positively provable, from one of two
-        causes:
-          1. the content exceeded ``EMBED_INPUT_CHAR_CAP`` before the embed
-             (``pending_texts`` holds the capped slice); or
-          2. the shared ``_bounded_for_model`` bound — the SAME function the
-             batch legs apply internally to the SAME capped input (text via
-             ``_embed_ollama_batch_bounded``, code via
-             ``_embed_codeembed_batch_bounded``), so the pre-bound verdict is
-             EXACT for what the batch call sent.
+        TRI-STATE.
 
-        Everything else is ``None`` (UNKNOWN), never ``False``. The residual
-        gap is the PER-ITEM shrink that runs after a whole-batch refusal
-        (``_embed_codeembed_one_bounded`` / ``_embed_ollama_one_bounded``):
-        the batch API returns vectors only, so a shrink applied there is
-        invisible from here. That happens routinely — the CodeEmbed batch
-        pre-bounds to ~3 684 chars, which still exceeds the measured 1 024-
-        token codesage window on much real code, so a batch carrying one
-        maximal entity degrades to per-item calls and says so in its
-        "isolating to per-item embed" warning. Returning ``False`` here
-        would turn that invisible shrink into a stored full-fidelity claim;
-        returning ``None`` leaves the slot UNMEASURED on the row, so the
-        shared reader answers UNKNOWN. This path UNDER-reports truncation by
-        construction and never over-claims fidelity.
+        * ``True`` when the content exceeded ``EMBED_INPUT_CHAR_CAP`` before
+          the embed (``pending_texts`` holds the capped slice).
+        * ``False`` on the Ollama and CodeEmbed batch legs (v0.2.106): they
+          split an over-budget or refused input into pieces and combine the
+          piece vectors (``EmbeddingService._embed_batch_whole``), so every
+          character of what was handed in reached the vector — positively
+          known, by construction, for every item that got a vector at all.
+        * ``None`` (UNKNOWN, never ``False``) on the OpenAI batch leg, whose
+          adapter handles its own windows and reports nothing back.
+
+        ``model_id`` is kept for the call shape; the verdict no longer needs
+        a pre-bound estimate (the retired ``_bounded_for_model`` pre-bound was
+        what used to make this ``True``).
         """
+        del model_id
         if pending_full_lens[idx] > EMBED_INPUT_CHAR_CAP:
             return True
         try:
-            _bounded, trunc = _bounded_for_model(pending_texts[idx], model_id)
-        except Exception:  # noqa: BLE001 — bound must never break the write
+            slot = (
+                embedding_service.code_vector_slot
+                if kind == "code"
+                else embedding_service.text_vector_slot
+            )
+        except Exception:  # noqa: BLE001 — verdict must never break the write
             return None
-        return True if trunc else None
+        if not isinstance(slot, str) or "openai" in slot:
+            return None
+        return False
 
     def _flush_batch() -> None:
         nonlocal enriched, failed, dry_run_pending

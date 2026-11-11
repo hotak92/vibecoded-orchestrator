@@ -3504,6 +3504,12 @@ except ImportError as _exc:
     _reraise_vco_lib_import(_exc, "kg_truncation_tags.truncation_tag_properties")
 
 try:
+    # v0.2.106 split on refusal — the ONE row driver kg-sync also uses.
+    from vco_lib import embed_split as _embed_split  # noqa: E402
+except ImportError as _exc:
+    _reraise_vco_lib_import(_exc, "embed_split")
+
+try:
     from . import kg_chunk_plan as _kg_chunk_plan  # noqa: E402
 except ImportError as _exc:
     _reraise_shipped_submodule_import(_exc, ".kg_chunk_plan")
@@ -5634,145 +5640,86 @@ async def store_knowledge_node(
                 [s for s in _truncated_all if s == _slot],
             )
 
-        if _plan.is_single:
-            # Single-object insert — store explicit chunk properties for consistency
-            properties["chunk_num"] = 1
-            properties["total_chunks"] = 1
-            properties["source_node_id"] = _write_source_node_id
-            properties["content_hash"] = _content_hash
-            if EMBEDDING_SOURCE == "weaviate":
-                collection.data.insert(properties=properties)
-            elif DUAL_EMBEDDING_ENABLED:
-                # W3: the SINGLE-chunk branch persists the truncation record
-                # too — through the SAME atomic capture
-                # (``_get_all_kg_embeddings_tagged``) and the SAME shared
-                # stamper (``truncation_tag_properties``) the multi-chunk
-                # branch uses. Pre-fix this branch used the untagged gather,
-                # so every MCP-written single-chunk row (the overwhelming
-                # majority) resolved UNKNOWN for every slot.
-                vectors, truncated_all = await _get_all_kg_embeddings_tagged(content)
+        # v0.2.106 (owner ruling 2026-11-11, split on refusal): the ROWS are
+        # the plan's chunks, except that a chunk the ACTIVE model refuses
+        # whole is split at its best boundary nearest the middle and stored as
+        # several rows of this node, each embedded whole — the SAME row driver
+        # kg-sync uses (``vco_lib.embed_split.embed_rows_async`` /
+        # ``embed_rows``), so both writers store the same rows for the same
+        # node. A single-chunk plan embeds (and stores) the full content.
+        #
+        # v0.2.73 D-2 order, unchanged: EVERY row is embedded before anything
+        # is written, then the new rows are inserted, then the stale rows are
+        # deleted LAST — a failed embed (backend down, a piece still refused at
+        # the split floor) raises out of the driver with ZERO new rows written
+        # and the old rows untouched.
+        #
+        # WP-O rework (2026-07-22, no-functionality-loss rule): chunk
+        # boundaries follow the ACTIVE model's OWN preset — unclamped by the
+        # tighter secondaries — and the SECONDARY slots of each row are embedded
+        # whole by ``EmbeddingService`` (split + combine, v0.2.106), recorded
+        # through the atomic capture (``embed_text_all_configured_tagged``).
+        _plan_texts = (
+            [content] if _plan.is_single else [c.content for c in _plan.chunks]
+        )
+
+        async def _embed_row(text: str):
+            """One row's ``(vector_arg, truncation_properties)``.
+
+            R3-2 + v0.2.92 (m-R6-1) + W3: the per-call truncation record is
+            captured ATOMICALLY with the vectors and persisted through the
+            SHARED stamper (``truncation_tag_properties``) — ``truncated_slots``
+            (the complete record; its presence marks a row that can answer for
+            every slot) and ``secondary_truncated_slots`` (the active slot
+            dropped, byte-identical to R3-2's property). The active-slot name
+            comes from the session-cached service (warm: the capture just ran
+            through it).
+            """
+            if DUAL_EMBEDDING_ENABLED:
+                vectors, truncated_all = await _get_all_kg_embeddings_tagged(text)
                 truncated_all = list(truncated_all)
                 vectors = await complete_kg_write_vectors(
-                    vectors, truncated_all, content, target_collection_name)
-                properties.update(
+                    vectors, truncated_all, text, target_collection_name)
+                return (
+                    vectors if vectors else None,
                     _truncation_tag_properties(
                         truncated_all, _active_text_slot_name(),
                         measured_slots=vectors or (),
-                    )
+                    ),
                 )
-                collection.data.insert(
-                    properties=properties,
-                    vector=vectors if vectors else None,
-                )
-            else:
-                # Legacy flat-vector path — see `_legacy_vector_and_record`.
-                vector, _slot, _record = await _legacy_vector_and_record(content)
-                properties.update(
-                    _truncation_tag_properties(
-                        _record, _slot, measured_slots=(_slot,),
-                    )
-                )
-                collection.data.insert(properties=properties, vector=vector)
-            chunk_count = 1
+            # Legacy flat-vector path — see `_legacy_vector_and_record`.
+            vector, _slot, _record = await _legacy_vector_and_record(text)
+            return (
+                vector,
+                _truncation_tag_properties(_record, _slot, measured_slots=(_slot,)),
+            )
+
+        if EMBEDDING_SOURCE == "weaviate":
+            # Weaviate vectorises server-side: nothing is embedded here, so
+            # there is no refusal to answer and the rows are the plan's.
+            _rows = [(text, None, {}) for text in _plan_texts]
         else:
-            # Multi-chunk insert: split then embed each chunk independently.
-            # v0.2.73 D-2: embed ALL chunks BEFORE inserting any, so a mid-loop
-            # embed failure (the routine outage case) aborts with ZERO new rows
-            # written and the stale rows still pending deletion below — no
-            # partial-chunk state, no data loss.
-            #
-            # WP-O rework (2026-07-22, no-functionality-loss rule):
-            # chunk boundaries follow the ACTIVE model's OWN preset — UNCLAMPED.
-            # The earlier G5/fix-r2 "min-across-slots" clamp sized boundaries to
-            # the TIGHTEST configured slot (e.g. arctic 4 096), which DEGRADED the
-            # active qwen3 slot's chunk fidelity below the single-write baseline —
-            # forbidden: a dual-write install must produce active-slot data ≥
-            # identical to single-write. So the ACTIVE slot keeps its full boundary
-            # budget here, and the SECONDARY slots absorb the degradation instead:
-            # embedding_service.embed_text_all_configured embeds each secondary
-            # from a BOUNDED, EXPLICITLY-TAGGED sub-window when the chunk exceeds
-            # that secondary's num_ctx (the per-call record svc captures — see
-            # ``embed_text_all_configured_tagged`` — records which),
-            # rather than clamping the active chunk or letting Ollama/OpenAI
-            # silently truncate. The active model is resolved via the R2-3
-            # resolver so the openai-active case (empty EMBEDDING_MODEL +
-            # ACTIVE_EMBEDDING=openai) sizes to the OpenAI model, not a bare env
-            # read; single-write installs are byte-UNCHANGED (the resolver returns
-            # EMBEDDING_MODEL when set). Lazy resolver (loud-fallback to
-            # EMBEDDING_MODEL on a stale-copy install — never fails startup).
-            raw_chunks = _plan.chunks
-            chunk_count = _plan.total
-            prepared_inserts: list[tuple[dict, "list | dict | None"]] = []
-            for chunk in raw_chunks:
-                chunk_props = dict(properties)
-                # W8: RAW chunk content — no "[chunk N/total]" prefix (kg-sync's
-                # stored shape; the chunk_num/total_chunks properties carry the
-                # ordering, and `_stored_plan_matches_current` compares raw).
-                chunk_props["content"] = chunk.content
-                # Explicit chunk properties for efficient retrieval
-                chunk_props["chunk_num"] = chunk.chunk_number + 1   # 1-indexed
-                chunk_props["total_chunks"] = chunk.total_chunks
-                chunk_props["source_node_id"] = _write_source_node_id
-                chunk_props["content_hash"] = _content_hash
-                if EMBEDDING_SOURCE == "weaviate":
-                    prepared_inserts.append((chunk_props, None))
-                elif DUAL_EMBEDDING_ENABLED:
-                    # R3-2 + v0.2.92 (m-R6-1): capture the per-call truncation
-                    # record ATOMICALLY with the vectors (``embed_text_all_
-                    # configured_tagged`` — the COMPLETE record, the ACTIVE slot
-                    # included) and persist it as TWO chunk properties derived
-                    # from that ONE capture by the SHARED stamper
-                    # (``truncation_tag_properties`` — W3 routed every writer
-                    # through it so the derivation cannot drift):
-                    #   * ``truncated_slots`` — the complete record verbatim.
-                    #     Its PRESENCE is the era marker: rows that carry it can
-                    #     answer "was slot S a leading window?" for EVERY slot;
-                    #     rows that predate it resolve UNKNOWN for the active
-                    #     slot (rl_enrichment._stored_slot_truncation_state).
-                    #   * ``secondary_truncated_slots`` — the SECONDARY-only
-                    #     view (the active slot dropped), byte-identical to what
-                    #     R3-2 wrote, so pre-v0.2.92 readers and the dual-log
-                    #     other-slot leg keep seeing the same property they
-                    #     always did. An empty list means every stored SECONDARY
-                    #     vector for this chunk is faithful.
-                    # The active-slot name for the view comes from the
-                    # session-cached service (warm here: the capture above just
-                    # ran through it; a cold cache means the inline fallback ran,
-                    # whose record is empty, so the exclusion is a no-op).
-                    vectors, truncated_all = await _get_all_kg_embeddings_tagged(
-                        chunk.content
-                    )
-                    truncated_all = list(truncated_all)
-                    vectors = await complete_kg_write_vectors(
-                        vectors, truncated_all, chunk.content, target_collection_name)
-                    chunk_props.update(
-                        _truncation_tag_properties(
-                            truncated_all, _active_text_slot_name(),
-                            measured_slots=vectors or (),
-                        )
-                    )
-                    prepared_inserts.append(
-                        (chunk_props, vectors if vectors else None)
-                    )
-                else:
-                    # Legacy flat-vector path — the SAME one-home helper the
-                    # single-chunk branch uses. W3: this leg embedded through
-                    # the bare ``get_embedding`` and stamped NOTHING, which
-                    # made it the last untagged store leg in the MCP.
-                    vector, _slot, _record = await _legacy_vector_and_record(
-                        chunk.content
-                    )
-                    chunk_props.update(
-                        _truncation_tag_properties(
-                            _record, _slot, measured_slots=(_slot,),
-                        )
-                    )
-                    prepared_inserts.append((chunk_props, vector))
-            for chunk_props, chunk_vec in prepared_inserts:
-                if EMBEDDING_SOURCE == "weaviate":
-                    collection.data.insert(properties=chunk_props)
-                else:
-                    collection.data.insert(properties=chunk_props, vector=chunk_vec)
+            _pieces = await _embed_split.embed_rows_async(_plan_texts, _embed_row)
+            _rows = [(p.text, p.payload[0], p.payload[1]) for p in _pieces]
+        chunk_count = len(_rows)
+        prepared_inserts: list[tuple[dict, "list | dict | None"]] = []
+        for _row_index, (_row_text, _row_vec, _row_tags) in enumerate(_rows):
+            row_props = dict(properties)
+            # W8: RAW row text — no "[chunk N/total]" prefix (kg-sync's stored
+            # shape; chunk_num/total_chunks carry the ordering, and
+            # `_stored_plan_matches_current` compares raw).
+            row_props["content"] = _row_text
+            row_props["chunk_num"] = _row_index + 1   # 1-indexed
+            row_props["total_chunks"] = chunk_count
+            row_props["source_node_id"] = _write_source_node_id
+            row_props["content_hash"] = _content_hash
+            row_props.update(_row_tags)
+            prepared_inserts.append((row_props, _row_vec))
+        for row_props, row_vec in prepared_inserts:
+            if EMBEDDING_SOURCE == "weaviate":
+                collection.data.insert(properties=row_props)
+            else:
+                collection.data.insert(properties=row_props, vector=row_vec)
 
         # v0.2.73 D-2: delete the stale rows LAST — the new rows are safely in.
         for _stale_uuid in _stale_uuids:

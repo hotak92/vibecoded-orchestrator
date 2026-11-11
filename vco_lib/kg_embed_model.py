@@ -488,7 +488,14 @@ def complete_write_vectors(svc: Any, slots: "dict[str, list]", text: str,
         cslot = text_model_slot(res.carry)[0]
         if not slots.get(cslot):
             sib = sibling_text_service(svc, res.carry)
-            slots[cslot] = sib.embed_text(text)
+            # v0.2.106: the row set is the TARGET model's decision (a row
+            # writer's split-on-refusal scope); the carry model embeds the
+            # SAME row text, so a refusal there combines pieces instead of
+            # adding rows (``vco_lib.embed_split.row_split_suspended``).
+            from vco_lib.embed_split import row_split_suspended
+
+            with row_split_suspended():
+                slots[cslot] = sib.embed_text(text)
             if truncated is not None and (getattr(sib, "_last_truncated_slots", None) or {}).get(cslot):
                 truncated.append(cslot)
     return slots

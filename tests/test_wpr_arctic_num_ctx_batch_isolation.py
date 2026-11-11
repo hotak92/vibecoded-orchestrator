@@ -137,9 +137,10 @@ def test_context_overflow_error_detector():
 
 
 def test_oversized_item_no_longer_400s_the_batch():
-    """An over-num_ctx item is trimmed to a leading sub-window BEFORE Ollama sees
-    it, so the whole batch succeeds (pre-fix: the batch 400'd and every item was
-    lost)."""
+    """An over-num_ctx item is split into pieces within the budget BEFORE Ollama
+    sees it (v0.2.106 — it used to be trimmed to a leading sub-window), so the
+    whole batch succeeds (pre-fix: the batch 400'd and every item was lost) and
+    every character of the item is embedded."""
     stub = _StubOllama()
     svc = _svc_with(stub)
     oversized = "a" * (ARCTIC_CHAR_BUDGET + 20000)  # would 400 unbounded
@@ -147,11 +148,15 @@ def test_oversized_item_no_longer_400s_the_batch():
     vecs = svc.embed_text_batch([oversized, normal])
     assert len(vecs) == 2
     assert all(v for v in vecs), "every item got a vector"
-    # The batch call the stub received had the oversized item already trimmed.
+    # The batch call the stub received had the oversized item already split.
     assert stub.batch_calls, "batch path was taken"
     sent = stub.batch_calls[0]
-    assert len(sent[0]) == ARCTIC_CHAR_BUDGET, "oversized item was bounded"
-    assert len(sent[1]) == 500, "normal item untouched"
+    pieces, last = sent[:-1], sent[-1]
+    assert len(pieces) >= 2 and "".join(pieces) == oversized, (
+        "the oversized item is split, never cut"
+    )
+    assert all(len(p) <= ARCTIC_CHAR_BUDGET for p in pieces)
+    assert last == normal, "normal item untouched"
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +234,11 @@ def test_code_batch_ollama_fallback_shares_the_bounded_path():
     vecs = svc.embed_code_batch([oversized, "small"])
     assert len(vecs) == 2 and all(v for v in vecs)
     assert stub.batch_calls, "ollama code fallback batch taken"
-    assert len(stub.batch_calls[0][0]) == ARCTIC_CHAR_BUDGET, "code item bounded"
+    sent = stub.batch_calls[0]
+    assert "".join(sent[:-1]) == oversized and sent[-1] == "small", (
+        "code item split within the budget, not cut"
+    )
+    assert all(len(p) <= ARCTIC_CHAR_BUDGET for p in sent[:-1])
 
 
 # ---------------------------------------------------------------------------
@@ -237,27 +246,28 @@ def test_code_batch_ollama_fallback_shares_the_bounded_path():
 # ---------------------------------------------------------------------------
 
 
-def test_trimmed_items_logged_at_warning(caplog):
-    """An over-num_ctx item that gets bounded to a sub-window must emit a WARNING
-    with the trimmed-item count — the fidelity loss can no longer be silent
-    (R3-4(a): the delta's 'degradation is tagged, never silent' rule)."""
+def test_split_items_are_logged_and_never_trimmed(caplog):
+    """An over-num_ctx item is SPLIT (v0.2.106), so there is no fidelity loss
+    to warn about: no "bounded leading sub-window" WARNING any more, and the
+    split is still visible — an INFO line naming the count (1 of 2)."""
     import logging
 
     stub = _StubOllama()
     svc = _svc_with(stub)
     oversized = "a" * (ARCTIC_CHAR_BUDGET + 20000)
     normal = "b" * 500
-    with caplog.at_level(logging.WARNING, logger="vco_lib.embedding_service"):
+    with caplog.at_level(logging.INFO, logger="vco_lib.embedding_service"):
         vecs = svc.embed_text_batch([oversized, normal])
     assert len(vecs) == 2 and all(v for v in vecs)
-    # Exactly the trim WARNING is present, naming the count (1 of 2).
-    trim_logs = [
+    assert not [
         r for r in caplog.records
         if "bounded leading sub-window" in r.getMessage()
+    ], "nothing is trimmed any more"
+    split_logs = [
+        r for r in caplog.records if "several pieces" in r.getMessage()
     ]
-    assert trim_logs, "the sub-window trim must be logged at WARNING"
-    assert "1/2" in trim_logs[0].getMessage(), (
-        "the WARNING must name the trimmed-item count (1 of 2)"
+    assert split_logs and "1/2" in split_logs[0].getMessage(), (
+        "the split must be logged with the item count (1 of 2)"
     )
 
 

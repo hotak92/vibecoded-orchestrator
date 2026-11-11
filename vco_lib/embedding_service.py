@@ -86,6 +86,15 @@ from typing import Any, Callable, Mapping, Optional
 import requests
 
 from vco_lib.containers import runtime_command_hint
+from vco_lib.embed_split import (
+    SPLIT_FLOOR_CHARS,
+    ChunkOverflowError,
+    UnsplittableTextError,
+    combine_vectors,
+    embed_split_pieces,
+    pieces_within,
+    row_split_active,
+)
 from vco_lib.embedding_providers import (
     CodeEmbedAdapter,
     OllamaAdapter,
@@ -1174,10 +1183,12 @@ class _SecondarySlotBreaker:
 #      asked for — see ``rl_logger.resolve_emb_truncation_state``.
 #      Absence must never be read as "not truncated".
 # This is strictly better than the silent-Ollama-truncation status quo (same
-# coverage, now labelled AND persisted). The ACTIVE slot is no longer
-# guaranteed full-fidelity: since round-5 its shrink-on-refusal is recorded in
-# the SAME per-call record as the secondaries' bounding, so the active fact is
-# persisted like the secondary fact instead of living in a WARNING log.
+# coverage, now labelled AND persisted). Since round-5 the ACTIVE slot's
+# truncation is recorded in the SAME per-call record as the secondaries', so the
+# active fact is persisted like the secondary fact instead of living in a
+# WARNING log. Since v0.2.106 (split on refusal) a stored DOCUMENT is never cut
+# on either slot — a refused text is split (``vco_lib.embed_split``) — so the
+# record names a slot only for a search QUERY that was cut to a leading window.
 #
 # We approximate the num_ctx-worth of text by a CHARACTER budget derived from
 # num_ctx. v0.2.92 defect-1 fix (2026-09-04): the budget uses PER-MODEL
@@ -1217,8 +1228,9 @@ class _SecondarySlotBreaker:
 #
 # Declaring the MEDIAN is safe because a denser-than-median chunk is not lost
 # silently: every embed sends `truncate: false`, so the runner REFUSES it, and
-# the caller shrinks and retries until it fits
-# (`_embed_secondary_with_refusal_retry`).
+# the caller splits the refused piece and retries until every piece fits
+# (`_embed_secondary_with_refusal_retry` → `_embed_whole_on_overflow`, v0.2.106;
+# a QUERY still shrinks — the history below is the shrink ladder's).
 #
 # CORRECTED (round-3/4). This block previously claimed truncation was "detected
 # EXACTLY" from `prompt_eval_count` pinning at `num_ctx`, and concluded "so
@@ -1290,10 +1302,10 @@ _EMBED_BOUND_MIN_CHARS_PER_TOKEN: dict[str, float] = {
 _EMBED_BOUND_MIN_CHARS_PER_TOKEN_FLOOR: float = 2.30
 # User-set safety margin (2026-09-04). Do NOT exceed 0.25.
 _EMBED_BOUND_SAFETY_MARGIN: float = 0.25
-#: Chars below which an overflow is not a window problem. Every shrink path
-#: (primary single embed, secondary fan-out, batch single-item) reaches it
-#: through the ONE helper `_embed_shrinking_on_overflow`, so they cannot drift.
-_EMBED_RETRY_FLOOR_CHARS: int = 512
+#: Chars below which an overflow is not a window problem. The query shrink
+#: ladder (`_embed_shrinking_on_overflow`) and the document split
+#: (`vco_lib.embed_split`) stop at the SAME value — one home, the split module.
+_EMBED_RETRY_FLOOR_CHARS: int = SPLIT_FLOOR_CHARS
 
 
 def _min_chars_per_token_for(model_id: str, conservative: bool = False) -> float:
@@ -1344,8 +1356,9 @@ def _char_budget_for_model(
     lands at 75% of the true token window *for content as dense as the sample*
     — and denser content exists (markdown tables 1.41 chars/token, box-drawing
     1.61, CJK 1.35), so a budgeted text CAN still overflow. Nothing may rely on
-    this value being unrefusable; the caller shrinks on refusal
-    (``_embed_shrinking_on_overflow``).
+    this value being unrefusable; the caller splits on refusal
+    (``_embed_whole_on_overflow`` / ``vco_lib.embed_split``; a query shrinks,
+    ``_embed_shrinking_on_overflow``).
     """
     num_ctx = _num_ctx_for_secondary(model_id)
     if not num_ctx or num_ctx <= 0:
@@ -1516,6 +1529,8 @@ def _note_fidelity(kind: str, model_id: str, *args: Any) -> None:
 
         if kind == "shrink":
             embedding_fidelity.note_shrink(model_id, *args)
+        elif kind == "split":
+            embedding_fidelity.note_split(model_id, *args)
         else:
             embedding_fidelity.note_floor_refusal(model_id, *args)
     except Exception:  # noqa: BLE001 — telemetry never breaks the embed
@@ -1535,6 +1550,17 @@ def _embed_shrinking_on_overflow(
     Returns ``(result, sent_len)`` — ``sent_len`` is how many characters were
     actually embedded, so the caller decides truncation LOCALLY (we know we
     sent less than we were given) rather than inferring it from the response.
+
+    v0.2.106 (owner ruling 2026-11-11, split on refusal): QUERY VECTORS ONLY.
+    Stored content no longer comes here — a refused chunk is split, never cut
+    (``_embed_whole_on_overflow`` for one vector, ``vco_lib.embed_split``'s
+    row driver for more rows). A search query keeps this ladder because it
+    is embedded once, on a latency-bounded hook path, and is never stored:
+    a query longer than the window is already bounded by the enrichment
+    budget (``query_enrichment._resolve_budget``), so the ladder only fires
+    on a hand-typed query denser than that budget, and a leading-window
+    query vector costs one search, not a stored row's fidelity. Its
+    shrinks keep being recorded (``note_shrink``) so they stay visible.
 
     THE one home for this loop (v0.2.92 round-5). Three paths need it and it
     existed as two near-identical copies while the third — the PRIMARY single
@@ -1589,61 +1615,125 @@ def _embed_shrinking_on_overflow(
             return result
 
 
+def _embed_whole_on_overflow(
+    embed_fn: Callable[[str], "list[float]"],
+    text: str,
+    *,
+    model_id: str,
+    pre_split_chars: int = 0,
+    on_split: Optional[Callable[[str, int], None]] = None,
+) -> "tuple[list[float], int]":
+    """ONE vector for ``text`` with every character embedded: split on refusal.
+
+    v0.2.106 (owner ruling 2026-11-11). The document twin of
+    ``_embed_shrinking_on_overflow``: where the shrink ladder embedded a
+    leading window and dropped the tail, this splits a refused text at the
+    best boundary nearest its middle (``vco_lib.embed_split.split_point``),
+    embeds both halves — recursively, until accepted — and combines the piece
+    vectors (length-weighted mean, L2-normalised). ``pre_split_chars`` (> 0)
+    splits up front where an estimate already says the text is too long, so
+    a certain refusal is not paid for.
+
+    Returns ``(vector, pieces)``. A text that fits is ONE piece and its vector
+    is exactly ``embed_fn(text)`` — byte-identical to every earlier release.
+    A piece at the floor that is still refused raises
+    ``UnsplittableTextError`` (recorded as a floor refusal): that slot gets no
+    vector and the caller reports it, as before. Non-overflow exceptions
+    propagate untouched.
+
+    Used by every ONE-vector document path: the secondary text slots, the
+    active text leg outside a row writer, the active and secondary code legs
+    (the code graph keeps one row per planned code chunk), the batch legs the
+    enrichment backfill of an existing row uses, and the carry vector during
+    a model fill. Row writers instead split into MORE ROWS
+    (``vco_lib.embed_split.embed_rows``).
+    """
+    try:
+        pieces = embed_split_pieces(
+            embed_fn, text,
+            is_overflow=_is_context_overflow_error,
+            model_id=model_id,
+            pre_split_chars=pre_split_chars,
+            floor_chars=_EMBED_RETRY_FLOOR_CHARS,
+        )
+    except UnsplittableTextError as exc:
+        _note_fidelity("floor_refusal", model_id, exc.chars, exc.cause)
+        raise
+    if len(pieces) > 1:
+        _note_fidelity("split", model_id, len(text), len(pieces))
+        if on_split is not None:
+            try:
+                on_split(model_id, len(pieces))
+            except Exception:  # noqa: BLE001 — logging must never break the embed
+                pass
+    return combine_vectors(pieces), len(pieces)
+
+
 def _embed_secondary_with_refusal_retry(
     ollama: Any,
     model_id: str,
     text: str,
+    *,
+    query: bool = False,
 ) -> "tuple[list[float], bool]":
-    """Embed a SECONDARY slot, shrinking on a context overflow until it fits.
+    """Embed a SECONDARY slot so the runner accepts it. Returns ``(vec, truncated)``.
 
-    v0.2.92 round-4. The previous form had exactly TWO tiers — attempt at the
-    secondary budget, then one fallback at the "measured minimum" ratio — and
-    claimed to terminate by arithmetic. It did not. That floor was derived from
-    PROSE (2.30 chars/token); real KG content is far denser: markdown tables
-    measure 1.41, box-drawing 1.61, CJK 1.35. For those, the single fallback
-    ALSO overflowed, the second refusal propagated, and the slot got no vector
-    at all — the very outcome the retry existed to prevent, on the dominant
-    non-prose content.
+    DOCUMENT (default, v0.2.106 split on refusal): a text longer than the
+    secondary's char budget (``_char_budget_for_model(..., full_coverage=
+    False)`` — the estimate; chunks are sized for the ACTIVE model, often a
+    wider one) is split into pieces within that budget, each piece the runner
+    still refuses is split again, and the piece vectors are combined into the
+    row's one secondary vector (``_embed_whole_on_overflow``). Nothing is cut
+    off, so ``truncated`` is False unless the response's own token count
+    proves a piece was cut (``_embed_with_exact_truncation`` — the ONE-WAY
+    signal; under ``truncate: false`` it does not fire in practice).
 
-    So the tier count is not fixed: shrink until the runner accepts or the
-    floor is reached. The first shrink drops to the measured-MIN tier and every
-    shrink after that halves (``_shrink_step``) — going straight to half would
-    give up about a third of the window on exactly the code-dense content the
-    MIN ratio was measured on. It terminates for ANY density, because each step
-    is strictly smaller and ``_EMBED_RETRY_FLOOR_CHARS`` cannot exceed any
-    supported window.
+    QUERY (``query=True``): one prefixed query vector, the leading-window
+    ladder this function always had (``_embed_shrinking_on_overflow``) — see
+    that function for why a query keeps it. ``truncated`` is then "we sent
+    less than we were given", known locally.
 
-    The shrink loop itself lives in ``_embed_shrinking_on_overflow`` — the one
-    home shared with the batch path and the two ACTIVE-slot paths — and keys on
-    ``_is_context_overflow_error`` rather than a second detector: the round-4
-    review found the private one I had added matched NARROWER than the existing
-    helper (False on two documented older Ollama phrasings), so an older
-    runner's refusal would have propagated instead of retrying. One home, one
-    behaviour.
-
-    Non-overflow exceptions propagate untouched: shrinking is a remedy for
-    "too long", and applying it to an auth error would turn a diagnosable
-    failure into a silent half-answer.
+    Both arms detect a refusal with ``_is_context_overflow_error`` (one
+    detector); non-overflow exceptions propagate untouched.
     """
-    sub, bounded = _bounded_for_model(text, model_id, full_coverage=False)
+    if query:
+        sub, bounded = _bounded_for_model(text, model_id, full_coverage=False)
 
-    def _attempt(candidate: str) -> "tuple[list[float], Optional[bool]]":
-        return _embed_with_exact_truncation(
-            ollama, model_id, candidate, bounded or len(candidate) < len(text)
+        def _attempt(candidate: str) -> "tuple[list[float], Optional[bool]]":
+            return _embed_with_exact_truncation(
+                ollama, model_id, candidate, bounded or len(candidate) < len(text)
+            )
+
+        def _log(model: str, new_len: int) -> None:
+            logger.info(
+                "%s secondary query overflowed its window; retrying under a "
+                "tighter %d-char sub-window", model, new_len,
+            )
+
+        (vec, _exact), sent = _embed_shrinking_on_overflow(
+            _attempt, sub, model_id=model_id, on_shrink=_log,
         )
+        return vec, sent < len(text)
 
-    def _log(model: str, new_len: int) -> None:
+    exact_cut: list[bool] = []
+
+    def _piece(candidate: str) -> "list[float]":
+        vector, cut = _embed_with_exact_truncation(ollama, model_id, candidate, False)
+        exact_cut.append(bool(cut))
+        return vector
+
+    def _log_split(model: str, pieces: int) -> None:
         logger.info(
-            "%s secondary overflowed its window; retrying under a tighter "
-            "%d-char sub-window", model, new_len,
+            "%s secondary: a %d-char chunk exceeded its window and was embedded "
+            "as %d pieces (nothing cut off)", model, len(text), pieces,
         )
 
-    (vec, _exact), sent = _embed_shrinking_on_overflow(
-        _attempt, sub, model_id=model_id, on_shrink=_log,
+    vec, _pieces = _embed_whole_on_overflow(
+        _piece, text, model_id=model_id,
+        pre_split_chars=_char_budget_for_model(model_id, full_coverage=False),
+        on_split=_log_split,
     )
-    # Truncated iff we sent less than the caller gave us — known locally and
-    # exactly, not inferred from the response.
-    return vec, sent < len(text)
+    return vec, any(exact_cut)
 
 def _embed_with_exact_truncation(
     ollama: Any,
@@ -2054,9 +2144,9 @@ class EmbeddingService:
         self._embed_memo_cap: int = 512
 
         # v0.2.92: ONE per-call record of EVERY slot — the ACTIVE text/code
-        # slots included — whose embed used a bounded leading sub-window
-        # (chunk exceeded that model's num_ctx, or the runner REFUSED the full
-        # text and the shrink loop fell back to a leading window). Reset at the
+        # slots included — whose embed used a bounded leading sub-window (since
+        # v0.2.106 only a search QUERY can: a refused or over-budget DOCUMENT is
+        # split and every character embedded, so its entry is False). Reset at the
         # start of every ``embed_text_all_configured`` / ``embed_code_all_configured``
         # / ``embed_code`` call. TWO views are
         # DERIVED from it and must stay derived — a second parallel record here
@@ -2404,12 +2494,11 @@ class EmbeddingService:
         """Whether the ACTIVE TEXT slot's last embed was shrunk after a refusal.
 
         A VIEW over the single per-call record ``_last_truncated_slots``: the
-        ACTIVE TEXT slot's own entry. Normally False: chunks are sized to the
-        active model's own preset, so the primary sees the whole chunk. It goes
-        True when the runner refused the full text and
-        ``_embed_shrinking_on_overflow`` fell back to a leading sub-window — a
-        real fidelity loss on the slot retrieval reads, already logged at
-        WARNING.
+        ACTIVE TEXT slot's own entry. False for every DOCUMENT embed since
+        v0.2.106 (a refused text is split and every character embedded). It
+        goes True only when a search QUERY was refused and
+        ``_embed_shrinking_on_overflow`` fell back to a leading sub-window —
+        logged at WARNING.
 
         Scope, stated exactly because a looser sentence here would be wrong:
         the entry is ASSIGNED (not raised) by every text embed that actually
@@ -2418,8 +2507,8 @@ class EmbeddingService:
 
         * ``embed_text`` is memoised, so a cache HIT does not re-embed and
           leaves the entry describing the last real embed;
-        * the OpenAI active leg has no shrink path at all, so the entry stays
-          at whatever the last Ollama embed set.
+        * the OpenAI active leg records its entry like the Ollama leg (since
+          v0.2.106 both run through the same refusal handling).
 
         ``embed_text_all_configured`` resets the whole record up front, which
         is why the tagged variant reads cleanly per call. The ACTIVE CODE leg
@@ -2675,8 +2764,8 @@ class EmbeddingService:
 
         Applies the active model's query-side instruction from the one table
         (``chunking.MODEL_QUERY_PREFIXES``); a model that needs none (or an
-        unknown model) resolves to an empty prefix and this is byte-identical
-        to ``embed_text``. Queries are keyed in the memo under a distinct
+        unknown model) resolves to an empty prefix and the vector equals
+        ``embed_text``'s for any query that fits the window. Queries are keyed in the memo under a distinct
         namespace so a query and a document with the same text cannot collide.
 
         Raises:
@@ -2685,14 +2774,20 @@ class EmbeddingService:
         from claude_mcp_servers.weaviate_mcp.chunking import query_prefix_for_model
 
         prefix = query_prefix_for_model(self.text_model_id, task)
-        if not prefix:
-            return self.embed_text(text)
         prefixed = prefix + text
         key = _memo_key("query:" + prefixed)
         cached = self._embed_memo_text.get(key)
         if cached is not None:
             return cached
-        vec = self._retry_once_on_503(self._embed_text_via_active, prefixed)
+        # v0.2.106: the QUERY arm of the active leg — a query keeps the
+        # leading-window ladder; stored content is split instead (see
+        # ``_embed_text_via_active``). A model with no prefix therefore no
+        # longer delegates to ``embed_text`` (the document leg): the vector is
+        # the same for every query that fits, and only the over-window
+        # handling differs.
+        vec = self._retry_once_on_503(
+            lambda t: self._embed_text_via_active(t, query=True), prefixed
+        )
         self._memo_put(self._embed_memo_text, key, vec)
         return vec
 
@@ -2761,9 +2856,10 @@ class EmbeddingService:
         Order is preserved. See provider docs for batch-size limits
         (CodeEmbed: 256, OpenAI: chunked at 100).
 
-        WP-R (2026-07-22): for the ACTIVE Ollama text model, each input is first
-        bounded to the model's own num_ctx via ``_bounded_for_model`` (the shared
-        WP-O sub-window rule), and a whole-batch ``/api/embed`` failure is
+        WP-R (2026-07-22), v0.2.106: for the ACTIVE Ollama text model, an input
+        over the model's own char budget is split into pieces within it (and
+        its piece vectors combined — nothing cut off; ``_embed_batch_whole``),
+        and a whole-batch ``/api/embed`` failure is
         ISOLATED to a per-item retry so one oversized item can never fail the
         batch. Root cause this closes: a small-num_ctx ACTIVE model (arctic
         4 096, jina 2 048, …) on a corpus whose chunks were
@@ -2785,218 +2881,189 @@ class EmbeddingService:
     def _embed_ollama_batch_bounded(
         self, model_id: str, texts: list[str]
     ) -> list[list[float]]:
-        """Ollama batch embed with per-model sub-window bounding + failure isolation.
+        """Ollama batch embed, every input whole, one refusal never fails the batch.
 
         WP-R shared path for both ``embed_text_batch`` and the Ollama code
-        fallback in ``embed_code_batch`` (one home — search-before-add). Two
-        layers of protection against the num_ctx/whole-batch-rejection hazard:
-
-          1. PRE-BOUND every input to ``model_id``'s num_ctx (``_bounded_for_model``)
-             so an over-window chunk is trimmed to a leading sub-window BEFORE it
-             reaches Ollama. This is the primary fix — with it, the 400 never
-             fires in the common case. The trim is a fidelity loss on the ACTIVE
-             slot (the sub-window is embedded, not the full chunk), so a per-batch
-             trimmed-item count is logged at WARNING (R3-4 — loud degradation, the
-             delta's "never silent" rule); the alternative was Ollama's silent
-             whole-batch 400, strictly worse.
-          2. ISOLATE a whole-batch failure PER ITEM: if the single ``/api/embed``
-             batch call still raises (a pathological item, or a model whose true
-             tokenizer ratio is denser than the char heuristic), fall back to
-             per-item embed and COLLECT results — each item is retried alone under
-             a TIGHTER sub-window on a context-overflow error. A genuinely
-             un-embeddable item (still overflowing at the 512-char floor, or a
-             non-window error) yields an EMPTY-VECTOR SENTINEL (``[]``) for THAT
-             index only; every survivor keeps its computed vector. The consumer
-             (``embedding_enrichment._flush_batch``) already treats an empty
-             vector at an index as a per-object failure ("embed returned empty
-             vector") and enriches the rest — so one hard failure marks exactly
-             one uuid failed, never discarding the survivors (R3-4).
-
-        Order is preserved. Returns exactly ``len(texts)`` entries in both paths;
-        on the per-item fallback a failed index is ``[]`` (the caller's per-object
-        failure sentinel) rather than raising and dropping the survivors.
+        fallback in ``embed_code_batch``; the loop itself is
+        ``_embed_batch_whole`` (shared with the CodeEmbed twin). Ollama's
+        ``/api/embed`` rejects the ENTIRE batch if ANY single input overflows
+        (observed: 1 011/1 011 failed on an arctic enrich of a qwen3-sized
+        corpus), so an input over ``model_id``'s char budget is split into
+        pieces within it BEFORE the call and its piece vectors are combined
+        afterwards (v0.2.106 — this used to embed a leading sub-window and
+        drop the rest).
         """
-        bounded_pairs = [_bounded_for_model(t, model_id) for t in texts]
-        bounded = [text for text, _ in bounded_pairs]
-        trimmed_count = sum(1 for _, truncated in bounded_pairs if truncated)
-        if trimmed_count:
-            # Loud-degradation: a bounded sub-window is a fidelity loss, not a
-            # no-op — record how many of this batch were trimmed so an
-            # arctic-active enrich over a qwen3-sized corpus is not silent.
-            logger.warning(
-                "Ollama batch embed: %d/%d input(s) exceeded model %r's num_ctx "
-                "and were embedded from a bounded leading sub-window (fidelity "
-                "loss on those items) to avoid a whole-batch context-overflow "
-                "rejection.",
-                trimmed_count, len(bounded), model_id,
+        return self._embed_batch_whole(
+            texts, model_id,
+            lambda batch: self._retry_once_on_503(
+                self.ollama.embed_batch, model_id, batch
+            ),
+            lambda text: self._embed_ollama_one_bounded(model_id, text),
+            "Ollama",
+        )
+
+    def _embed_batch_whole(
+        self,
+        texts: list[str],
+        model_id: str,
+        batch_fn: Callable[[list[str]], "list[list[float]]"],
+        one_fn: Callable[[str], "list[float]"],
+        label: str,
+    ) -> list[list[float]]:
+        """The ONE batch loop for the Ollama and CodeEmbed legs (v0.2.106).
+
+        1. PRE-SPLIT every input over ``model_id``'s char budget
+           (``_char_budget_for_model``) into pieces within it
+           (``vco_lib.embed_split.pieces_within``), embed all pieces in ONE
+           batch call, and combine each input's piece vectors
+           (``combine_vectors``). An input that fits is one piece and keeps
+           exactly the vector it had before.
+        2. ISOLATE a whole-batch failure PER ITEM: a budget-sized piece can
+           still be refused on content denser than the estimate, and the
+           endpoint then rejects the whole batch. Each ORIGINAL input is
+           retried alone through ``one_fn`` (split on refusal, combine). A
+           genuinely un-embeddable item (still refused at the split floor, or
+           a non-window error) yields an EMPTY-VECTOR SENTINEL (``[]``) for
+           THAT index only; the consumer (``embedding_enrichment.
+           _flush_batch``) marks that uuid failed and keeps the survivors.
+
+        Order is preserved; returns exactly ``len(texts)`` entries.
+        """
+        budget = _char_budget_for_model(model_id)
+        split_inputs = [pieces_within(t, budget) for t in texts]
+        flat = [piece for pieces in split_inputs for piece in pieces]
+        split_count = sum(1 for pieces in split_inputs if len(pieces) > 1)
+        if split_count:
+            logger.info(
+                "%s batch embed: %d/%d input(s) exceeded model %r's char "
+                "budget and are embedded as several pieces each (combined "
+                "per input; nothing cut off).",
+                label, split_count, len(texts), model_id,
             )
         try:
-            return self._retry_once_on_503(
-                self.ollama.embed_batch, model_id, bounded
-            )
+            flat_vectors = batch_fn(flat)
+            if len(flat_vectors) != len(flat):
+                raise RuntimeError(
+                    f"{label} batch returned {len(flat_vectors)} vectors for "
+                    f"{len(flat)} inputs"
+                )
         except Exception as batch_exc:  # noqa: BLE001 — isolate to per-item
             logger.warning(
-                "Ollama batch embed failed for %d input(s) with model %r (%s); "
-                "isolating to per-item embed so one un-embeddable item can't fail "
-                "the surviving items",
-                len(bounded), model_id, batch_exc,
+                "%s batch embed failed for %d input(s) with model %r (%s); "
+                "isolating to per-item embed so one un-embeddable item can't "
+                "fail the surviving items",
+                label, len(texts), model_id, batch_exc,
             )
             results: list[list[float]] = []
             hard_failures = 0
-            for text in bounded:
+            for text in texts:
                 try:
-                    results.append(self._embed_ollama_one_bounded(model_id, text))
+                    results.append(one_fn(text))
                 except Exception as item_exc:  # noqa: BLE001 — isolate per item
-                    # Empty-vector sentinel for THIS index only: the consumer
-                    # (_flush_batch) marks the matching uuid failed and continues.
                     hard_failures += 1
                     logger.warning(
-                        "Ollama per-item embed failed for one input with model "
-                        "%r (%s); marking that item failed (empty-vector "
+                        "%s per-item embed failed for one input with model %r "
+                        "(%s); marking that item failed (empty-vector "
                         "sentinel) and preserving the batch's survivors",
-                        model_id, item_exc,
+                        label, model_id, item_exc,
                     )
                     results.append([])
             if hard_failures:
                 logger.warning(
-                    "Ollama per-item fallback: %d/%d input(s) still un-embeddable "
-                    "after the tighter sub-window retry (marked failed); %d "
-                    "survivor(s) embedded",
-                    hard_failures, len(bounded), len(bounded) - hard_failures,
+                    "%s per-item fallback: %d/%d input(s) still un-embeddable "
+                    "after splitting (marked failed); %d survivor(s) embedded",
+                    label, hard_failures, len(texts), len(texts) - hard_failures,
                 )
             return results
+        out: list[list[float]] = []
+        cursor = 0
+        for pieces in split_inputs:
+            vecs = flat_vectors[cursor:cursor + len(pieces)]
+            cursor += len(pieces)
+            if len(pieces) == 1:
+                out.append(vecs[0])
+            else:
+                _note_fidelity(
+                    "split", model_id, sum(len(p) for p in pieces), len(pieces)
+                )
+                out.append(combine_vectors(list(zip(pieces, vecs))))
+        return out
 
     def _embed_ollama_one_bounded(self, model_id: str, text: str) -> list[float]:
-        """Embed ONE text via Ollama, retrying a context overflow under a tighter
-        sub-window (WP-R).
+        """Embed ONE text via Ollama with every character in the vector.
 
-        Already-bounded ``text`` is embedded once; on a context-overflow error
-        (Ollama HTTP 400 "input exceeds context length" — the char heuristic can
-        still under-shoot on very dense content, exactly what WP-P's live arctic
-        backfill hit) it shrinks and retries down to ``_EMBED_RETRY_FLOOR_CHARS``.
-        Raises the last error if even the floor sub-window overflows, so the
-        caller's per-object soft-fail records THIS item and continues.
-
-        The shrink itself lives in ``_embed_shrinking_on_overflow`` (round-5).
-        This used to be its own copy of the loop with a literal 512 floor, one
-        of the two copies that existed while the PRIMARY single-embed path had
-        none — which is how a P1 regression hid in a file that already
-        contained its fix twice.
+        A context-overflow refusal (Ollama HTTP 400 "input exceeds context
+        length" — the char budget can under-shoot on dense content) is
+        answered with a split, not a shrink (v0.2.106,
+        ``_embed_whole_on_overflow``): the pieces are embedded and combined.
+        Raises ``UnsplittableTextError`` if a piece at the floor is still
+        refused, so the caller's per-object soft-fail records THIS item and
+        continues.
         """
-        def _log(model: str, new_len: int) -> None:
+        def _log(model: str, pieces: int) -> None:
             logger.debug(
-                "Ollama single embed context overflow with model %r; "
-                "retrying under a tighter %d-char sub-window", model, new_len,
+                "Ollama single embed with model %r: a %d-char input was "
+                "embedded as %d pieces", model, len(text), pieces,
             )
 
-        vec, _sent = _embed_shrinking_on_overflow(
+        vec, _pieces = _embed_whole_on_overflow(
             lambda candidate: self._retry_once_on_503(
                 self.ollama.embed, model_id, candidate
             ),
             text,
             model_id=model_id,
-            on_shrink=_log,
+            on_split=_log,
         )
         return vec
 
     def _embed_codeembed_one_bounded(self, code: str) -> "tuple[list[float], bool]":
-        """Embed ONE code entity via the CodeEmbed service, shrinking on the
-        service's over-window refusal. Returns ``(vector, truncated)``.
+        """Embed ONE code entity via the CodeEmbed service, splitting on the
+        service's over-window refusal. Returns ``(vector, truncated)`` —
+        ``truncated`` is always False since v0.2.106 (nothing is cut off; the
+        tuple shape is kept for the callers that persist the verdict).
 
         W1 / MAJOR-W2 (wiring audit, 2026-09-05): the service's gpu backend
         refuses over-window input with HTTP 400 ("input length exceeds the
         context length"); its ``ollama`` backend 502s wrapping the IDENTICAL
         Ollama phrase. Both surface through the CodeEmbedAdapter as a
         RuntimeError whose text ``_is_context_overflow_error`` matches, so
-        the ONE shared detector covers both backend modes and the shrink
-        loop is the same one every other leg uses — no fourth copy.
+        the ONE shared detector covers both backend modes and the refusal
+        handler is the same one every other leg uses.
         """
-        def _log(model: str, new_len: int) -> None:
+        def _log(model: str, pieces: int) -> None:
             logger.debug(
-                "CodeEmbed service embed context overflow with model %r; "
-                "retrying under a tighter %d-char sub-window", model, new_len,
+                "CodeEmbed service embed with model %r: a %d-char entity was "
+                "embedded as %d pieces", model, len(code), pieces,
             )
 
-        vec, sent = _embed_shrinking_on_overflow(
+        vec, _pieces = _embed_whole_on_overflow(
             lambda candidate: self._retry_once_on_503(
                 self.codeembed.embed, candidate
             ),
             code,
             model_id=self.code_model_id,
-            on_shrink=_log,
+            on_split=_log,
         )
-        return vec, sent < len(code)
+        return vec, False
 
     def _embed_codeembed_batch_bounded(
         self, codes: list[str]
     ) -> list[list[float]]:
-        """CodeEmbed-service batch embed with sub-window bounding + failure
-        isolation — the twin of ``_embed_ollama_batch_bounded`` (W1).
-
-        The service's ``/embed`` rejects the WHOLE batch when any single
-        text is over-window, exactly like Ollama's ``/api/embed``, so the
-        same two layers apply:
-
-          1. PRE-BOUND every input to the model's num_ctx budget
-             (``_bounded_for_model``); a per-batch trimmed count is logged
-             at WARNING (loud degradation — same contract as the Ollama
-             twin).
-          2. ISOLATE a whole-batch failure PER ITEM through the shared
-             shrink loop (``_embed_codeembed_one_bounded``); a genuinely
-             un-embeddable item yields the EMPTY-VECTOR sentinel (``[]``)
-             for that index only, which the consumer
-             (``embedding_enrichment._flush_batch``) already treats as a
-             per-object failure.
-
-        Before W1 the batch leg was a bare ``embed_batch`` call: one
-        over-window entity either 400/502'd the entire batch, or — gpu
-        backend, pre-refusal — was silently half-embedded at HTTP 200.
+        """CodeEmbed-service batch embed — the twin of
+        ``_embed_ollama_batch_bounded`` (W1), through the SAME loop
+        (``_embed_batch_whole``): the service's ``/embed`` rejects the WHOLE
+        batch when any single text is over-window, exactly like Ollama's
+        ``/api/embed``, so over-budget entities are split into pieces up front
+        and a whole-batch refusal is isolated per item.
         """
-        model_id = self.code_model_id
-        bounded_pairs = [_bounded_for_model(t, model_id) for t in codes]
-        bounded = [text for text, _ in bounded_pairs]
-        trimmed_count = sum(1 for _, truncated in bounded_pairs if truncated)
-        if trimmed_count:
-            logger.warning(
-                "CodeEmbed batch embed: %d/%d input(s) exceeded model %r's "
-                "num_ctx and were embedded from a bounded leading sub-window "
-                "(fidelity loss on those items) to avoid a whole-batch "
-                "context-overflow rejection.",
-                trimmed_count, len(bounded), model_id,
-            )
-        try:
-            return self._retry_once_on_503(self.codeembed.embed_batch, bounded)
-        except Exception as batch_exc:  # noqa: BLE001 — isolate to per-item
-            logger.warning(
-                "CodeEmbed batch embed failed for %d input(s) with model %r "
-                "(%s); isolating to per-item embed so one un-embeddable item "
-                "can't fail the survivors",
-                len(bounded), model_id, batch_exc,
-            )
-            results: list[list[float]] = []
-            hard_failures = 0
-            for text in bounded:
-                try:
-                    vec, _trunc = self._embed_codeembed_one_bounded(text)
-                    results.append(vec)
-                except Exception as item_exc:  # noqa: BLE001 — isolate per item
-                    hard_failures += 1
-                    logger.warning(
-                        "CodeEmbed per-item embed failed for one input with "
-                        "model %r (%s); marking that item failed "
-                        "(empty-vector sentinel) and preserving the batch's "
-                        "survivors",
-                        model_id, item_exc,
-                    )
-                    results.append([])
-            if hard_failures:
-                logger.warning(
-                    "CodeEmbed per-item fallback: %d/%d input(s) still "
-                    "un-embeddable after the tighter sub-window retry "
-                    "(marked failed); %d survivor(s) embedded",
-                    hard_failures, len(bounded), len(bounded) - hard_failures,
-                )
-            return results
+        return self._embed_batch_whole(
+            codes, self.code_model_id,
+            lambda batch: self._retry_once_on_503(
+                self.codeembed.embed_batch, batch
+            ),
+            lambda code: self._embed_codeembed_one_bounded(code)[0],
+            "CodeEmbed",
+        )
 
     def embed_code_batch(self, codes: list[str]) -> list[list[float]]:
         """Batched code embedding. Empty input → empty output.
@@ -3153,9 +3220,11 @@ class EmbeddingService:
         # (no-functionality-loss rule): chunk boundaries already follow the
         # active model's own preset, and here the active embed sees the whole
         # chunk. The one exception is the runner REFUSING that whole chunk
-        # (denser than the token counter assumed), in which case
-        # ``_embed_text_via_active`` shrinks, warns, and sets
-        # ``last_active_truncated`` — a leading-window vector, never no vector.
+        # (denser than the token counter assumed): inside a row writer's
+        # ``row_split_scope`` the refusal is raised as ``ChunkOverflowError``
+        # and the writer stores the chunk as more rows; anywhere else the text
+        # is split and the piece vectors combined (v0.2.106). Never no vector,
+        # never a leading window.
         if include_active:
             try:
                 if is_query:
@@ -3164,6 +3233,11 @@ class EmbeddingService:
                     result[self._text_slot] = self.embed_text_query(text, task)
                 else:
                     result[self._text_slot] = self._embed_text_via_active(text)
+            except ChunkOverflowError:
+                # A row writer asked for the refusal (``row_split_scope``): it
+                # splits this chunk into more rows and calls again per piece.
+                # Swallowing it here would store a row with no active vector.
+                raise
             except Exception as exc:
                 logger.warning("Active text backend failed: %s", exc)
 
@@ -3182,12 +3256,14 @@ class EmbeddingService:
                 self._note_secondary_embed_skipped("qwen3_embed")
             else:
                 try:
-                    # Attempt at the secondary budget, then shrink on a LENGTH
+                    # Split at the secondary budget, then split again on a LENGTH
                     # refusal until the runner accepts (round-3 BLOCKER-B:
                     # truncate=false makes an over-window chunk a hard 400, so an
-                    # unhandled refusal loses the vector entirely).
+                    # unhandled refusal loses the vector entirely; v0.2.106:
+                    # split + combine, nothing cut — a query still shrinks).
                     result["qwen3_embed"], trunc = _embed_secondary_with_refusal_retry(
-                        self.ollama, DEFAULT_TEXT_MODEL, _q(DEFAULT_TEXT_MODEL, text)
+                        self.ollama, DEFAULT_TEXT_MODEL, _q(DEFAULT_TEXT_MODEL, text),
+                        query=is_query,
                     )
                     if trunc:
                         self._last_truncated_slots["qwen3_embed"] = True
@@ -3225,10 +3301,12 @@ class EmbeddingService:
                 self._note_secondary_embed_skipped("arctic2_embed")
             else:
                 try:
-                    # Attempt at the secondary budget, then shrink on a LENGTH
-                    # refusal until the runner accepts (round-3 BLOCKER-B).
+                    # Split at the secondary budget, then split again on a LENGTH
+                    # refusal until the runner accepts (round-3 BLOCKER-B;
+                    # v0.2.106 split + combine — a query still shrinks).
                     result["arctic2_embed"], trunc = _embed_secondary_with_refusal_retry(
-                        self.ollama, ARCTIC_SECONDARY_MODEL, _q(ARCTIC_SECONDARY_MODEL, text)
+                        self.ollama, ARCTIC_SECONDARY_MODEL, _q(ARCTIC_SECONDARY_MODEL, text),
+                        query=is_query,
                     )
                     if trunc:
                         self._last_truncated_slots["arctic2_embed"] = True
@@ -3277,19 +3355,38 @@ class EmbeddingService:
                     # The secondary tier is 14 129.
                     #
                     # Estimate-only by necessity: the OpenAI adapter exposes no
-                    # token count on its response, so no exact verdict exists here
-                    # — and unlike Ollama there is no shrink-on-refusal either.
-                    # OpenAI's over-length error text is its own; matching it with
-                    # `_is_context_overflow_error` would be a guess, so an
-                    # over-length OpenAI secondary is dropped with a warning rather
-                    # than silently half-embedded. The bound is what keeps that
+                    # token count on its response, so no exact verdict exists
+                    # here. A DOCUMENT over the budget is pre-split to pieces
+                    # within it (v0.2.106), so an over-length answer is rare. If
+                    # one still comes back, it is split again only when
+                    # `_is_context_overflow_error` recognises it (OpenAI's 400
+                    # names the "maximum context length"; that wording is matched
+                    # by the detector's markers but was not re-checked against a
+                    # live response in v0.2.106); otherwise the secondary is
+                    # dropped with a warning rather than silently half-embedded,
+                    # as before. The bound is what keeps that
                     # rare; it is not a guarantee.
-                    sub, trunc = _bounded_for_secondary(
-                        _q(openai_model, text), openai_model, full_coverage=False
-                    )
-                    result["openai_text_embed"] = self.openai.embed(
-                        openai_model, sub
-                    )
+                    # v0.2.106: a DOCUMENT over that budget is split into
+                    # pieces within it and the piece vectors are combined —
+                    # nothing cut off (the budget stays the estimate that keeps
+                    # an OpenAI over-length error rare; it is not detected).
+                    # A QUERY keeps the bounded leading window.
+                    if is_query:
+                        sub, trunc = _bounded_for_secondary(
+                            _q(openai_model, text), openai_model, full_coverage=False
+                        )
+                        result["openai_text_embed"] = self.openai.embed(
+                            openai_model, sub
+                        )
+                    else:
+                        trunc = False
+                        result["openai_text_embed"], _n = _embed_whole_on_overflow(
+                            lambda piece: self.openai.embed(openai_model, piece),
+                            text, model_id=openai_model,
+                            pre_split_chars=_char_budget_for_model(
+                                openai_model, full_coverage=False
+                            ),
+                        )
                     if trunc:
                         self._last_truncated_slots["openai_text_embed"] = True
                         logger.info(
@@ -3378,8 +3475,9 @@ class EmbeddingService:
                 self._note_secondary_embed_skipped("codesage_embed")
             else:
                 try:
-                    # W1 (2026-09-05): shrink on the service's over-window
-                    # refusal and TAG it, like every secondary leg. Without this
+                    # W1 (2026-09-05): catch the service's over-window refusal,
+                    # like every secondary leg (v0.2.106: split + combine,
+                    # nothing cut, so ``trunc`` is False). Without this
                     # the service's new 400 refusal would DROP the slot where
                     # the gpu backend used to silently half-embed it — a
                     # refusal with no catcher is strictly worse than the silent
@@ -3556,7 +3654,7 @@ class EmbeddingService:
 
     # ---- internal dispatch -------------------------------------------
 
-    def _embed_text_via_active(self, text: str) -> list[float]:
+    def _embed_text_via_active(self, text: str, *, query: bool = False) -> list[float]:
         """Route a single text embed to the configured backend.
 
         For the OpenAI backend, ``text_model_id`` may have been populated
@@ -3567,49 +3665,77 @@ class EmbeddingService:
 
         The Ollama leg attempts the WHOLE text — the primary slot is never
         pre-bounded (R45 primary full coverage; chunks are already sized to
-        this model's own preset) — and shrinks ONLY if the runner refuses it.
+        this model's own preset) — and acts ONLY if the runner refuses it.
+        R45 sends ``truncate: false``, so an over-window input is a hard
+        refusal, never a silent tail loss; what happens next (v0.2.106, owner
+        ruling 2026-11-11 "split on refusal"):
 
-        Why the shrink is here at all (v0.2.92 round-5 BLOCKER): R45 sends
-        ``truncate: false`` on every Ollama embed, so an over-window input is
-        a hard refusal instead of a silent tail loss. That is the right trade
-        ONLY where something catches it. The batch path caught it; this path,
-        which is what kg-sync and the MCP ``store_knowledge_node`` write use,
-        did not — so a chunk denser than the counter assumed (CJK, a
-        box-drawing diagram, a symbolic table, all inside the normal preset
-        range) lost its ACTIVE vector entirely and the node stored nothing,
-        where v0.2.91 had stored a leading-window vector. Losing the P1
-        retrieval vector is strictly worse than the tail loss it replaced.
-
-        A shrink here is a real fidelity loss on the slot retrieval reads, so
-        it logs at WARNING (not info) and sets ``last_active_truncated``.
+        * inside a row writer (``vco_lib.embed_split.row_split_scope`` — kg-sync,
+          the MCP ``store_knowledge_node``, the sidecar builder) the refusal is
+          raised as ``ChunkOverflowError`` and the writer stores the chunk as
+          MORE ROWS of the same node, each embedded whole;
+        * any other document embed splits the text and combines the piece
+          vectors (``_embed_whole_on_overflow``) — every character embedded;
+        * a search QUERY (``query=True``) keeps the leading-window ladder
+          (``_embed_shrinking_on_overflow``; why: see there), logs at WARNING
+          and records the truncation under the active slot.
         """
+        model_id = self.text_model_id
         if "openai" in self._text_slot:
-            self._require_openai_embeddings(self.text_model_id, "the KG text profile")
-            return self.openai.embed(
-                _to_openai_api_model(self.text_model_id), text
+            self._require_openai_embeddings(model_id, "the KG text profile")
+            api_model = _to_openai_api_model(model_id)
+
+            # OpenAI's over-length answer is an HTTP 400 naming the "maximum
+            # context length", which the shared detector's markers match, so
+            # the same three arms apply (v0.2.106; the wording was not
+            # re-checked against a live response). An answer the detector does
+            # not recognise propagates exactly as it did before.
+            def _embed(candidate: str) -> "list[float]":
+                return self.openai.embed(api_model, candidate)
+        else:
+            def _embed(candidate: str) -> "list[float]":
+                return self.ollama.embed(model_id, candidate)
+
+        if query:
+            def _warn(model: str, new_len: int) -> None:
+                logger.warning(
+                    "ACTIVE query embed refused by %s for a %d-char query "
+                    "(num_ctx exceeded); retrying under a tighter %d-char "
+                    "sub-window — this query's vector covers only its "
+                    "leading window",
+                    model, len(text), new_len,
+                )
+
+            vec, sent = _embed_shrinking_on_overflow(
+                _embed, text, model_id=model_id, on_shrink=_warn,
+            )
+            # Record under the ACTIVE TEXT slot (assign, never latch).
+            self._last_truncated_slots[self._text_slot] = sent < len(text)
+            return vec
+
+        if row_split_active():
+            try:
+                vec = _embed(text)
+            except Exception as exc:  # noqa: BLE001 — re-raised (typed when an overflow)
+                if _is_context_overflow_error(exc):
+                    raise ChunkOverflowError(model_id, len(text), str(exc)) from exc
+                raise
+            self._last_truncated_slots[self._text_slot] = False
+            return vec
+
+        def _log_split(model: str, pieces: int) -> None:
+            logger.info(
+                "ACTIVE text embed: %s refused a %d-char input whole; embedded "
+                "it as %d pieces and combined them (nothing cut off)",
+                model, len(text), pieces,
             )
 
-        def _warn(model: str, new_len: int) -> None:
-            logger.warning(
-                "ACTIVE text embed refused by %s for a %d-char input "
-                "(num_ctx exceeded); retrying under a tighter %d-char "
-                "sub-window — this chunk's primary vector covers only its "
-                "leading window",
-                model, len(text), new_len,
-            )
-
-        vec, sent = _embed_shrinking_on_overflow(
-            lambda candidate: self.ollama.embed(self.text_model_id, candidate),
-            text,
-            model_id=self.text_model_id,
-            on_shrink=_warn,
+        vec, _pieces = _embed_whole_on_overflow(
+            _embed, text, model_id=model_id, on_split=_log_split,
         )
-        # Record under the ACTIVE TEXT slot, in the SAME per-call record the
-        # secondary legs write (assign, never latch: a shrink on one chunk must
-        # not make the next chunk's full-fidelity vector report as truncated).
-        # The tagged fan-out captures this atomically, so the active slot's
-        # truncation is PERSISTED like the secondaries' (v0.2.92 m-R6-1).
-        self._last_truncated_slots[self._text_slot] = sent < len(text)
+        # Every character embedded — the active slot is never a leading
+        # window on a document embed any more (assign, never latch).
+        self._last_truncated_slots[self._text_slot] = False
         return vec
 
     def _require_openai_embeddings(self, model: str, what: str) -> None:
@@ -3734,8 +3860,16 @@ class EmbeddingService:
         model); every other local model → Ollama. OpenAI path applies the
         same catalog-id-prefix strip as ``_embed_text_via_active``.
 
-        The Ollama leg shrinks on refusal for the same reason the text leg
-        does (round-6 BLOCKER, the twin of round-5's): `truncate: false` makes
+        On a refusal (v0.2.106, split on refusal): a DOCUMENT entity is split
+        and the piece vectors combined (``_embed_whole_on_overflow``) — the
+        code graph keeps exactly one row per planned code chunk, whose ids and
+        content hashes its skip/stamp logic pins, so a refused entity gains no
+        extra row but loses no text either; a QUERY (``is_query``) keeps the
+        leading-window ladder. The history below explains why a refusal must
+        be caught at all.
+
+        The Ollama leg shrank on refusal for the same reason the text leg
+        did (round-6 BLOCKER, the twin of round-5's): `truncate: false` makes
         an over-window input a hard 400, and this is the path the code-graph
         analyzer uses PER ENTITY — so without a catcher an entity the runner
         refuses gets no vector at all.
@@ -3749,8 +3883,8 @@ class EmbeddingService:
         warning and no tag. The service now refuses over-window input with
         HTTP 400 carrying the phrase `_is_context_overflow_error` already
         matches, and this leg routes that refusal through the ONE shared
-        shrink loop — a tagged leading-window vector, never a silent
-        halving and never a dropped entity. The same wiring also covers the
+        refusal handler — never a silent halving and never a dropped entity.
+        The same wiring also covers the
         service's ``ollama`` backend mode (MAJOR-W2), whose 502 wraps the
         identical Ollama phrase.
 
@@ -3761,56 +3895,63 @@ class EmbeddingService:
         1 719 tokens for 4 800 chars, qwen3 9 491 for 28 000) and
         2.96-3.47 on CodeSage budget-window slices (measured 2026-09-05,
         W1). A maximal entity therefore overflows its own budget on
-        ORDINARY code. The shrink makes that correct rather than fatal;
+        ORDINARY code. The split makes that correct rather than fatal;
         retuning the 3.5 constant would move code-graph boundaries and
         force a re-embed, so it is a separate, user-owned decision and is
         deliberately NOT taken here.
         """
-        def _warn(model: str, new_len: int) -> None:
-            logger.warning(
-                "ACTIVE code embed refused by %s for a %d-char entity "
-                "(num_ctx exceeded); retrying under a tighter %d-char "
-                "sub-window — this entity's vector covers only its leading "
-                "window",
-                model, len(code), new_len,
-            )
-
         if "openai" in self._code_slot:
             # v0.2.102 W6-B: the consent refusal gates this leg before any
             # cost-bearing OpenAI call (see embed_code_batch).
             self._raise_if_code_backend_down()
-            return self.openai.embed(
-                _to_openai_api_model(self.code_model_id), code
-            )
-        self._raise_if_code_backend_down()
-        if self._code_served_by_container():
+            api_model = _to_openai_api_model(self.code_model_id)
+
+            def _embed(candidate: str) -> "list[float]":
+                return self.openai.embed(api_model, candidate)
+        elif self._code_served_by_container():
+            self._raise_if_code_backend_down()
             self._require_container_serves_code_model()
-            # W1: through the ONE shared shrink loop — see docstring.
-            # Records under the ACTIVE CODE slot exactly like the
-            # Ollama leg below (assign, never latch).
+
+            def _embed(candidate: str) -> "list[float]":
+                return self.codeembed.embed(candidate, is_query=is_query, task=task)
+        else:
+            self._raise_if_code_backend_down()
+            model_id = self.code_model_id
+
+            def _embed(candidate: str) -> "list[float]":
+                return self.ollama.embed(model_id, candidate)
+
+        if is_query:
+            def _warn(model: str, new_len: int) -> None:
+                logger.warning(
+                    "ACTIVE code query refused by %s for a %d-char query "
+                    "(num_ctx exceeded); retrying under a tighter %d-char "
+                    "sub-window — this query's vector covers only its "
+                    "leading window",
+                    model, len(code), new_len,
+                )
+
             vec, sent = _embed_shrinking_on_overflow(
-                lambda candidate: self.codeembed.embed(
-                    candidate, is_query=is_query, task=task
-                ),
-                code,
-                model_id=self.code_model_id,
-                on_shrink=_warn,
+                _embed, code, model_id=self.code_model_id, on_shrink=_warn,
             )
+            # Record under the ACTIVE CODE slot (assign, never latch). The KG
+            # write path never captures this key (its record resets on every
+            # ``embed_text_all_configured``), so a code verdict cannot leak
+            # into a persisted text tag.
             self._last_truncated_slots[self._code_slot] = sent < len(code)
             return vec
 
-        vec, sent = _embed_shrinking_on_overflow(
-            lambda candidate: self.ollama.embed(self.code_model_id, candidate),
-            code,
-            model_id=self.code_model_id,
-            on_shrink=_warn,
+        def _log_split(model: str, pieces: int) -> None:
+            logger.info(
+                "ACTIVE code embed: %s refused a %d-char entity whole; embedded "
+                "it as %d pieces and combined them (nothing cut off)",
+                model, len(code), pieces,
+            )
+
+        vec, _pieces = _embed_whole_on_overflow(
+            _embed, code, model_id=self.code_model_id, on_split=_log_split,
         )
-        # Record under the ACTIVE CODE slot, in the same per-call record the
-        # text legs write (assign, never latch — same contract as the text
-        # leg). The KG write path never captures this key (its record resets
-        # on every ``embed_text_all_configured``), so a code verdict cannot
-        # leak into a persisted text tag.
-        self._last_truncated_slots[self._code_slot] = sent < len(code)
+        self._last_truncated_slots[self._code_slot] = False
         return vec
 
     # ---- catalogue discovery (classmethods) ----------------------------

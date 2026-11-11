@@ -160,17 +160,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snowflake-arctic-embed2, text-embedding-3-small, and CodeSage / jina for code). The model refused those chunks, and
   the retry embedded only their first part, so the rest of the chunk never reached search. Chunks are now sized for
   dense text (qwen3-embedding: at most 19 560 characters instead of 32 768; arctic: 7 065 instead of 12 800;
-  CodeSage: 2 273 instead of 3 584), so a long node is split into more, smaller chunks and nothing is cut off. What
-  you notice: after the update VCO re-chunks your knowledge graph once — the update's own KG sync re-embeds only the
-  nodes and documents whose chunks changed (on qwen3-embedding, the ones longer than about 19 500 characters; on
-  arctic, longer than about 7 000), and the code graph re-walks in the background and re-embeds only the code
-  entities whose chunks changed. Expect seconds to a few minutes with a GPU, and longer on a CPU-only machine with a
-  large knowledge graph; searches keep working meanwhile, and nothing is deleted before its new vectors are written
-  (the KG sync now embeds first and only then replaces a node's old rows). The next update re-embeds nothing. The
+  CodeSage: 2 273 instead of 3 584), so a long node is split into more, smaller chunks. Some text is denser still
+  (measured: JSON, minified code, base64, tables and CJK at 1.35 to 1.84 characters per token), and the model can
+  refuse a chunk even at the new size. Such a chunk is no longer cut: it is split in two at the best boundary near its
+  middle (a paragraph break, else a sentence end, a line break or a space), both halves are embedded, and a half the
+  model still refuses is split again. In the knowledge graph and in the docs collection the pieces become extra
+  chunks of the same node; where one vector is needed for a text (the secondary embedding slots, code-graph
+  entities, the backfill of a missing slot), the vectors of the pieces are averaged into one. Either way every
+  character reaches a vector, and chunks that fit are embedded exactly as before. A piece the model refuses even at
+  512 characters is reported and the node keeps its old rows. Rows written by earlier versions that recorded their
+  search vector as covering only the start of their text are re-embedded once by the next sync. The query enrichment that adds recent
+  conversation to a short search query is now sized for dense text too (for qwen3-embedding at most 19 560
+  characters instead of 36 864). What you notice: after the update VCO re-chunks your knowledge graph once — the
+  update's own KG sync re-embeds only the nodes and documents whose chunks changed (on qwen3-embedding, the ones
+  longer than about 19 500 characters; on arctic, longer than about 7 000) or whose stored vector was cut, and the
+  code graph re-walks in the background and re-embeds only the code entities whose chunks changed. Expect seconds to
+  a few minutes with a GPU, and longer on a CPU-only machine with a large knowledge graph; searches keep working
+  meanwhile, and nothing is deleted before its new vectors are written (the KG sync now embeds first and only then
+  replaces a node's old rows; `store_knowledge_node` already did). The next update re-embeds nothing. The
   `chunker_preset_overhaul_pending` entry in `UPDATE_DEFERRED.md` records the pass and clears itself when both
   halves have run; its code-graph command is now the non-destructive `--force-rewalk` (it used to drop and rebuild
   the code graph). The bundled pre-computed embeddings for the curated knowledge nodes were rebuilt for the new
-  chunks and now name the chunk layout they were built for, so a stale set is never ingested.
+  chunks with the same splitting, so none of their vectors is cut, and they name the chunk layout they were built
+  for, so a stale set is never ingested. The known issue about the arctic secondary slot embedding only the start of
+  oversized chunks is closed by the same change.
 
 - **Kimi K3.1 Pro replaces Kimi K3 on the model gateway.** The gateway's Kimi Code route now offers and forwards
   `claude-gw/kimi/k3.1-pro` (1M context, image input), and the `kimi-implementer` and `kimi-reviewer` agents run on

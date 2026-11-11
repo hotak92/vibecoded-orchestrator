@@ -8,7 +8,7 @@ named-vector slot — holding pre-computed embedding vectors for every bundled
 curated KG node, so a 3rd-party install INGESTS them at seed time instead of
 re-embedding all ~115 nodes locally (the arctic-on-CPU install-hang class).
 The ingest plumbing shipped in v0.2.70 (``sync_knowledge_graph.py``,
-``_shipped_vector_for`` / ``_shipped_chunk_vector``); v0.2.89 ships the DATA
+today ``_shipped_rows_for``); v0.2.89 ships the DATA
 for the two canonical local slots (``qwen3_embed`` + ``arctic2_embed``).
 
 HASH SCHEME — the one non-negotiable detail
@@ -32,7 +32,7 @@ model would produce: ``TokenCounter.count_tokens(full file text) <=
 chunking_preset_for_model(model_id).max`` → one chunk embedding the FULL
 file text; otherwise ``Chunker.for_model(model_id).chunk_text(...)`` and one
 vector per ``chunk.content`` (``chunk_num`` 1-indexed, matching
-``_shipped_chunk_vector``). Note the layouts legitimately DIFFER per slot
+``_shipped_rows_for``). Note the layouts legitimately DIFFER per slot
 (since v0.2.106 qwen3's preset max is 4 890 units; arctic2's is 1 766 — a
 number of larger nodes are multi-chunk in the arctic sidecar only). The ingest-side
 chunk-count guard turns any residual mismatch into a conservative
@@ -47,30 +47,28 @@ resolution could silently substitute a different model), the model→slot
 mapping is cross-checked against ``TEXT_SLOT_MAP``, and an unreachable
 backend / missing model / wrong-dim vector aborts with a non-zero exit.
 
-Context-overflow fallback (token-dense nodes, small-num_ctx models)
--------------------------------------------------------------------
-The chunk gate counts tokens with the same approximation the sync path uses
-(~4 chars/token); token-DENSE content (LaTeX-heavy nodes) can pass the gate
-yet exceed a small model's real context window (arctic2 num_ctx 4 096) —
-modern Ollama then rejects the embed with HTTP 400 "input length exceeds the
-context length". The production compute path hits the identical wall (the
-active-slot embed fails the node; the WP-O secondary fan-out's
-4-chars/token ``_bounded_for_model`` budget passes such texts and fails
-too), while OLDER Ollama builds silently truncate and embed the leading
-window. For those nodes this tool ships what the truncating builds compute:
-the full text is tried FIRST (full fidelity for every node that fits); on a
-context-overflow 400 the LEADING sub-window is embedded instead, with a
-char budget tightened stepwise from the model's num_ctx (ratios 4→3→2→1
-chars/token — ratio 1 always fits since BPE tokens are ≥1 char). Every
-bounded node is printed loudly and summarized so a release run can't ship
-bounded vectors invisibly (an unexpected entry here — e.g. any qwen3 node —
-signals an Ollama runner-state problem: re-run against a fresh runner).
+Refused chunks — split, never cut (v0.2.106)
+--------------------------------------------
+The chunk gate counts tokens at ~4 chars/token, so token-DENSE content (JSON,
+tables, LaTeX, CJK) can pass it yet exceed the model's real window; Ollama
+then refuses the embed (HTTP 400, ``truncate: false``). This tool used to ship
+a LEADING-WINDOW vector for such a chunk (34 of 188 arctic chunks at the
+v0.2.106 chunker revision). It now embeds through the SAME row driver as
+kg-sync and the MCP store (``vco_lib.embed_split.embed_rows``): a refused
+chunk is split at its best boundary nearest the middle and both halves are
+embedded, recursively, so it ships as several rows, each embedded whole. The
+entry's ``splits`` map records the lengths of those pieces per plan chunk, and
+the ingest rebuilds the same rows from it. A piece still refused at the split
+floor aborts the build (loud-fail).
 
 Output schema (v0.2.70 ``schema_version`` 1; ``chunker_revision`` v0.2.106)
 ---------------------------------------------------------------------------
 ``{"schema_version": 1, "slot", "model_id", "dim", "chunker_revision",
 "nodes": {<sig>:
-{"total_chunks": N, "chunks": [{"chunk_num": 1..N, "vector": [...]}]}}}``
+{"total_chunks": N, "chunks": [{"chunk_num": 1..N, "vector": [...]}],
+"splits": {"<plan chunk, 1-based>": [<piece lengths>]}}}}`` — ``N`` counts
+ROWS (plan chunks plus split pieces); ``splits`` is present only when a chunk
+was split.
 Floats are rounded to 7 significant decimals (cosine impact ≪ 1e-6); the
 file is written atomically via ``vco_lib.atomic.atomic_write_text``.
 
@@ -252,58 +250,47 @@ def _round7(x: float) -> float:
     return v
 
 
-def _is_ctx_overflow(exc: Exception) -> bool:
-    """True for Ollama's context-overflow rejection (HTTP 400 body match)."""
-    return "exceeds the context length" in str(exc)
+def _row_embed_fn(
+    embed_fn: Callable[[str], List[float]], model_id: str
+) -> Callable[[str], List[float]]:
+    """``embed_fn`` as the row driver needs it: a refusal is a ChunkOverflowError.
 
-
-def _embed_with_ctx_fallback(
-    embed_fn: Callable[[str], List[float]],
-    chunk_text: str,
-    model_id: str,
-    label: str,
-) -> Tuple[List[float], bool]:
-    """Embed *chunk_text*; on a context-overflow 400, embed a leading sub-window.
-
-    Returns ``(vector, bounded)``. The full text is ALWAYS tried first (full
-    fidelity whenever the model fits it — the compute path's behaviour). On
-    overflow, the char budget is tightened from ``num_ctx × 4`` (the shared
-    ``_bounded_for_model`` heuristic) down through ratios 3, 2, 1 until the
-    backend accepts — ratio 1 (``num_ctx`` chars) always fits because BPE
-    tokens consume ≥1 character. This mirrors what silently-truncating
-    Ollama builds compute for the same node; see the module docstring.
-    Non-overflow errors propagate untouched (loud-fail).
+    The real ``EmbeddingService.embed_text`` already raises it inside the row
+    driver's scope; an injected embedder (tests, a bare adapter) raises the
+    backend's own overflow error, which the ONE detector
+    (``embedding_service._is_context_overflow_error``) recognises here.
+    Every other error propagates untouched (loud-fail).
     """
-    try:
-        return embed_fn(chunk_text), False
-    except Exception as exc:  # noqa: BLE001 — inspect, re-raise non-overflow
-        if not _is_ctx_overflow(exc):
-            raise
-    from vco_lib.embedding_service import _num_ctx_for_secondary
+    from vco_lib.embed_split import ChunkOverflowError
+    from vco_lib.embedding_service import _is_context_overflow_error
 
-    num_ctx = _num_ctx_for_secondary(model_id) or 4096
-    last_exc: Optional[Exception] = None
-    for ratio in (4, 3, 2, 1):
-        budget = num_ctx * ratio
-        if budget >= len(chunk_text):
-            continue  # window wouldn't shrink the input — same failure again
+    def _fn(text: str) -> List[float]:
         try:
-            vec = embed_fn(chunk_text[:budget])
-            print(
-                f"     ⚠️  {label}: full text exceeds {model_id} context "
-                f"(num_ctx {num_ctx}); shipped LEADING {budget}-char window "
-                f"(ratio {ratio} chars/token)",
-                flush=True,
-            )
-            return vec, True
-        except Exception as exc:  # noqa: BLE001 — inspect, re-raise non-overflow
-            if not _is_ctx_overflow(exc):
-                raise
-            last_exc = exc
-    raise RuntimeError(
-        f"{label}: cannot fit within {model_id}'s context even at "
-        f"{num_ctx} chars ({last_exc})"
-    )
+            return embed_fn(text)
+        except ChunkOverflowError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — typed when an overflow, else re-raised
+            if _is_context_overflow_error(exc):
+                raise ChunkOverflowError(model_id, len(text), str(exc)) from exc
+            raise
+
+    return _fn
+
+
+def expected_rows(content: str, model_id: str, entry: dict) -> Optional[List[str]]:
+    """The row texts an install rebuilds for *content* from a sidecar *entry*.
+
+    The plan (``chunk_plan``) with the entry's ``splits`` applied — the SAME
+    ``vco_lib.embed_split.apply_row_layout`` the ingest side calls. None when
+    the layout does not describe this plan.
+    """
+    from vco_lib.embed_split import apply_row_layout
+
+    plan_texts = [text for _num, text in chunk_plan(content, model_id)]
+    rows = apply_row_layout(plan_texts, entry.get("splits") or {})
+    if rows is None:
+        return None
+    return [text for _src, text in rows]
 
 
 def build_slot_data(
@@ -320,11 +307,22 @@ def build_slot_data(
     ``EmbeddingService.embed_text``. Every vector is validated (length ==
     *dim*, finite floats) BEFORE rounding — a wrong-dim or NaN vector aborts
     the build (release tool: loud-fail, never ship bad data).
+
+    v0.2.106 (split on refusal): the rows are embedded through the SAME row
+    driver kg-sync and the MCP store use (``vco_lib.embed_split.embed_rows``),
+    so a plan chunk the model refuses whole ships as several rows, each
+    embedded whole — no shipped vector is a leading window any more. The
+    entry's ``splits`` records which plan chunks were split and the lengths
+    of their pieces (``row_layout``); the ingest rebuilds the identical row
+    texts from it. An entry without ``splits`` is one row per plan chunk.
     """
+    from vco_lib.embed_split import embed_rows, row_layout
+
+    row_fn = _row_embed_fn(embed_fn, model_id)
     nodes: Dict[str, dict] = {}
     files = iter_shipped_nodes()
     n_chunks_total = 0
-    bounded: List[str] = []
+    split_nodes: List[str] = []
     for i, node in enumerate(files, 1):
         rel = node.relative_to(TEMPLATES_KNOWLEDGE).as_posix()
         text = node.read_text(encoding="utf-8")
@@ -336,14 +334,11 @@ def build_slot_data(
                 print(f"  [{i}/{len(files)}] {rel} — duplicate signature, reusing entry")
             continue
         plan = chunk_plan(text, model_id)
+        rows = embed_rows([chunk_text for _num, chunk_text in plan], row_fn)
         chunks_out: List[dict] = []
-        for chunk_num, chunk_text in plan:
-            label = f"{rel} chunk {chunk_num}"
-            vec, was_bounded = _embed_with_ctx_fallback(
-                embed_fn, chunk_text, model_id, label
-            )
-            if was_bounded:
-                bounded.append(label)
+        for row_num, row in enumerate(rows, 1):
+            vec = row.payload
+            label = f"{rel} row {row_num}"
             if not isinstance(vec, list) or len(vec) != dim:
                 raise RuntimeError(
                     f"{label}: backend returned "
@@ -351,22 +346,32 @@ def build_slot_data(
                     f"values, expected dim={dim} — refusing to ship"
                 )
             chunks_out.append(
-                {"chunk_num": chunk_num, "vector": [_round7(x) for x in vec]}
+                {"chunk_num": row_num, "vector": [_round7(x) for x in vec]}
             )
-        nodes[sig] = {"total_chunks": len(chunks_out), "chunks": chunks_out}
+        entry: dict = {"total_chunks": len(chunks_out), "chunks": chunks_out}
+        layout = row_layout(rows)
+        if layout:
+            entry["splits"] = layout
+            split_nodes.append(
+                f"{rel}: {len(plan)} plan chunk(s) -> {len(rows)} rows"
+            )
+        nodes[sig] = entry
         n_chunks_total += len(chunks_out)
         if progress:
-            print(f"  [{i}/{len(files)}] {rel} ({len(plan)} chunk(s))", flush=True)
+            print(
+                f"  [{i}/{len(files)}] {rel} ({len(plan)} chunk(s), "
+                f"{len(rows)} row(s))",
+                flush=True,
+            )
 
     if progress:
-        print(f"  → {len(nodes)} node entries, {n_chunks_total} chunk vectors")
-        if bounded:
+        print(f"  → {len(nodes)} node entries, {n_chunks_total} row vectors")
+        if split_nodes:
             print(
-                f"  ⚠️  {len(bounded)} chunk(s) shipped LEADING-WINDOW vectors "
-                f"(context overflow — inspect the list; any unexpected entry "
-                f"means an Ollama runner-state problem, re-run):"
+                f"  ✂️  {len(split_nodes)} node(s) had a chunk the model refused "
+                f"whole; shipped as extra rows (nothing cut off):"
             )
-            for label in bounded:
+            for label in split_nodes:
                 print(f"       - {label}")
     return {
         "schema_version": 1,
@@ -472,9 +477,10 @@ def verify_slots(slot_models: Optional[Dict[str, str]] = None) -> List[str]:
 
       * present + parseable + schema_version 1 + slot field == filename slot;
       * ``model_id`` maps to this slot via TEXT_SLOT_MAP and ``dim`` matches;
-      * EVERY current node's signature has an entry whose chunk count equals
-        the chunk plan the ingest side would compute (the
-        goes-red-on-unregenerated-edit invariant);
+      * EVERY current node's signature has an entry whose row count equals
+        the rows the ingest side would rebuild — the chunk plan with the
+        entry's ``splits`` applied (the goes-red-on-unregenerated-edit
+        invariant; a layout that does not fit the plan is a problem too);
       * chunk_nums are exactly 1..N, every vector has ``dim`` finite floats;
       * no stale orphan entries (signatures matching no current node).
     """
@@ -541,13 +547,19 @@ def verify_slots(slot_models: Optional[Dict[str, str]] = None) -> List[str]:
                     f"`python scripts/build_shipped_kg_embeddings.py`"
                 )
                 continue
-            expected = chunk_plan(text, model_id)
+            expected = expected_rows(text, model_id, entry)
+            if expected is None:
+                problems.append(
+                    f"{name}: {rel} split layout {entry.get('splits')!r} does "
+                    f"not describe the current chunk plan — regenerate"
+                )
+                continue
             chunks = entry.get("chunks")
             if not isinstance(chunks, list) or len(chunks) != len(expected):
                 problems.append(
                     f"{name}: {rel} ships "
                     f"{len(chunks) if isinstance(chunks, list) else 'malformed'} "
-                    f"chunk(s), ingest expects {len(expected)} — regenerate"
+                    f"row(s), ingest expects {len(expected)} — regenerate"
                 )
                 continue
             if entry.get("total_chunks") != len(chunks):

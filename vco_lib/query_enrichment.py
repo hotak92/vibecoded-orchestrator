@@ -42,6 +42,7 @@ from claude_mcp_servers.weaviate_mcp.chunking import (
     _BUDGET_SAFETY_MARGIN_RATIO,  # noqa: SLF001 -- ONE home, see comment below
     _num_ctx_for_model,  # noqa: SLF001 -- shared lookup rule, see comment below
     chunking_preset_for_models,
+    dense_char_budget,
 )
 from vco_lib.env_values import env_float, env_int
 from vco_lib.paths import vct_metrics_dir
@@ -207,7 +208,9 @@ def _resolve_budget(embedding_models: Optional[Sequence[str]]) -> Tuple[int, int
     """Return ``(budget_tokens, target_tokens, conservative)``.
 
     ``budget_tokens`` is the EMBEDDING model's own input window (its
-    ``num_ctx``, i.e. the MODEL_TOKEN_LIMITS value) minus the safety margin —
+    ``num_ctx``, i.e. the MODEL_TOKEN_LIMITS value) minus the safety margin,
+    clamped (v0.2.106) to the model's DENSE char budget in the same 4-char
+    unit (``chunking.dense_char_budget`` — see the body) —
     standing ruling R29: *the enrichment budget is the EMBEDDING model's input
     window, not the chat model's context*. Sizing it on the CHUNKING PRESET's
     ``max_tokens`` instead (as WP-E first shipped) overshoots, because a
@@ -248,7 +251,19 @@ def _resolve_budget(embedding_models: Optional[Sequence[str]]) -> Tuple[int, int
     _min, _preset_max, target = chunking_preset_for_models(names)
     del _min, _preset_max
     min_num_ctx = min(c for c in ctxs if c is not None)
-    budget = int(min_num_ctx * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
+    window_budget = int(min_num_ctx * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
+    # v0.2.106: the budget's unit is CHARS_PER_TOKEN_TEXT (4) characters, and
+    # 9 216 such units on qwen3 is 36 864 characters — about twice what the
+    # model's window holds of dense text (JSON, code, tables, CJK measure
+    # 1.35-1.84 chars/token). So the window budget is also clamped to the
+    # model's DENSE budget, the one source every chunk-sizing path uses
+    # (``chunking.dense_char_budget``: num_ctx × measured-minimum chars/token ×
+    # 0.75), converted to the same unit. An enriched query then fits the
+    # window on the first try for content as dense as the measured minimum.
+    dense_units = min(
+        dense_char_budget(n) // _approx_chars_per_token() for n in names
+    )
+    budget = min(window_budget, dense_units) if dense_units > 0 else window_budget
     return budget, target, False
 
 
