@@ -301,3 +301,16 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .bg-glyph-spin { animation: none; }
 }
+
+/* ─── IDLE WINDOW: NO ANIMATION ─── */
+/* v0.2.106: `lib/window-activity.ts` sets `data-window-inactive` on <html>
+   while the launcher window is minimised or hidden. WebView2 is never told
+   about a minimise (the page stays "visible"), so without this every
+   spinner and pulse kept rendering frames nobody could see. Paused, not
+   removed: the animation resumes where it stopped when the window is
+   shown again. */
+:root[data-window-inactive] *,
+:root[data-window-inactive] *::before,
+:root[data-window-inactive] *::after {
+  animation-play-state: paused !important;
+}

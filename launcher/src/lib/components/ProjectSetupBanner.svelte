@@ -21,6 +21,7 @@
   // where it is unit-tested.
 
   import { onDestroy } from 'svelte';
+  import { pollWhileActive } from '$lib/window-activity';
   import { projectSetup } from '$lib/stores/project-setup';
   import { selectedProject } from '$lib/stores/projects';
   import { invoke } from '$lib/tauri';
@@ -33,14 +34,14 @@
 
   // Tick a 1Hz clock for the elapsed indicator + the terminal auto-hide.
   let now = $state(Date.now());
-  let tick: ReturnType<typeof setInterval> | null = null;
+  let tick: (() => void) | null = null;
 
   $effect(() => {
     const needTick = setupBannerNeedsTick($projectSetup.active, now);
     if (needTick && tick === null) {
-      tick = setInterval(() => (now = Date.now()), 1000);
+      tick = pollWhileActive(() => (now = Date.now()), 1000);
     } else if (!needTick && tick !== null) {
-      clearInterval(tick);
+      tick();
       tick = null;
     }
   });
@@ -54,7 +55,7 @@
   });
 
   onDestroy(() => {
-    if (tick !== null) clearInterval(tick);
+    if (tick !== null) tick();
   });
 
   async function retry(projectId: string) {

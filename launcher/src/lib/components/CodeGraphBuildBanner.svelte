@@ -19,6 +19,7 @@
   // error message, log tail, and a "Retry build" button.
 
   import { onDestroy, onMount } from 'svelte';
+  import { pollWhileActive } from '$lib/window-activity';
   import { listen, invoke, safeInvoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type {
@@ -69,7 +70,7 @@
   let now = $state(Date.now());
   // Tick the clock once per second only while we're in a terminal state
   // that needs auto-hide. Cheaper than a constant 1Hz timer.
-  let tickHandle: ReturnType<typeof setInterval> | null = null;
+  let tickHandle: (() => void) | null = null;
 
   async function rerun() {
     if (rerunning) return;
@@ -101,10 +102,10 @@
     const terminal =
       v.status === 'success' || v.status === 'skipped' || v.status === 'partial';
     if (terminal && v.finished_at_iso && tickHandle === null) {
-      tickHandle = setInterval(() => { now = Date.now(); }, 1000);
+      tickHandle = pollWhileActive(() => { now = Date.now(); }, 1000);
     }
     if (!terminal && tickHandle !== null) {
-      clearInterval(tickHandle);
+      tickHandle();
       tickHandle = null;
     }
   }
@@ -161,7 +162,7 @@
 
   onDestroy(() => {
     unlisten?.();
-    if (tickHandle !== null) clearInterval(tickHandle);
+    if (tickHandle !== null) tickHandle();
   });
 
   function statusGlyph(s: CodeGraphBuildStatus): string {

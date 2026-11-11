@@ -330,6 +330,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thirds, and no chunk exceeds the model window. The citation drain is unrelated to v0.2.105's commit, merge and
   pull catch-up for the code graph, which embeds only changed code and skips unchanged entries.
 
+- **An idle launcher window no longer keeps several CPU cores busy.** A field report from a 20-core Windows machine
+  showed the launcher's WebView2 process at about 17% of total CPU with the launcher idle. The Home page's background
+  glow drifted forever, and every frame of that drift redrew two large blurs and re-blurred every glass card above
+  them. The glow is now still. WebView2 is also never told when the launcher window is minimised, so animations and
+  polling went on for a window nobody could see: the launcher now notices a minimised or hidden window, pauses every
+  animation and skips its periodic checks (the change poller, the restart banner, the subscription usage card, the
+  Services page, the module health refresh and the banners' clocks) until the window is shown again, then refreshes
+  once at once. The restart banner also no longer redraws when its five-second check returns the same answer.
+
 ## [0.2.105] - 2026-10-30
 
 ### Added

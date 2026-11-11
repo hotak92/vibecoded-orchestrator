@@ -12,6 +12,7 @@
   //   currently render a busy spinner while waiting.
 
   import { onMount, onDestroy } from 'svelte';
+  import { pollWhileActive } from '$lib/window-activity';
   import { invoke } from '@tauri-apps/api/core';
   import { goto } from '$app/navigation';
   import { modules, installedIds } from '$lib/stores/modules';
@@ -362,8 +363,7 @@
   }
   $effect(() => {
     void loadHealth();
-    const handle = setInterval(() => void loadHealth(), HEALTH_REFRESH_MS);
-    return () => clearInterval(handle);
+    return pollWhileActive(loadHealth, HEALTH_REFRESH_MS);
   });
 
   // v0.2.101 (owner ruling Q4): modules whose last DB-migration apply
@@ -399,10 +399,9 @@
   }
 
   $effect(() => {
-    const handle = setInterval(() => {
+    return pollWhileActive(() => {
       now = Date.now();
     }, 60 * 1000);
-    return () => clearInterval(handle);
   });
 
   function fetchedAtIso(status: typeof mState.l0Status): string | null {

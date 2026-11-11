@@ -29,6 +29,7 @@
 
   import { onDestroy, onMount } from 'svelte';
   import { safeInvoke } from '$lib/tauri';
+  import { pollWhileActive } from '$lib/window-activity';
   import { orchestrator } from '$lib/stores/orchestrator';
   import { updater } from '$lib/stores/updater';
 
@@ -59,7 +60,7 @@
   const restarting = $derived($updater.updating && $updater.op === 'restart');
   let dismissed = $state(false);
   let installPath = $state<string>('');
-  let pollHandle: ReturnType<typeof setInterval> | null = null;
+  let pollHandle: (() => void) | null = null;
 
   // Track install path from the orchestrator store so we always poll the
   // correct UPDATE_DEFERRED.md when the user reconfigures their install.
@@ -79,6 +80,9 @@
         'get_launcher_restart_status',
         { installRoot: installPath },
       );
+      // v0.2.106: an unchanged answer (the common case, every 5 s) is not
+      // re-assigned, so nothing that derives from `status` re-renders.
+      if (next && status && JSON.stringify(next) === JSON.stringify(status)) return;
       if (next) {
         // If status moved from "something" -> "nothing", auto-undismiss
         // for the next time an entry appears.
@@ -105,11 +109,12 @@
 
   onMount(() => {
     void poll();
-    pollHandle = setInterval(() => void poll(), 5_000);
+    // v0.2.106: no polling while the window is minimised or hidden.
+    pollHandle = pollWhileActive(poll, 5_000);
   });
 
   onDestroy(() => {
-    if (pollHandle !== null) clearInterval(pollHandle);
+    if (pollHandle !== null) pollHandle();
     unsubOrchestrator();
   });
 
