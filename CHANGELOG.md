@@ -148,6 +148,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Knowledge-graph and code-graph chunks now fit the embedding model, and every install re-chunks once after this
+  update.** Chunks were sized at 4 characters per token, which is right for prose but not for JSON, code, tables or
+  non-Latin text: a full-size chunk needed up to about a third more tokens than the model accepts (qwen3-embedding,
+  snowflake-arctic-embed2, text-embedding-3-small, and CodeSage / jina for code). The model refused those chunks, and
+  the retry embedded only their first part, so the rest of the chunk never reached search. Chunks are now sized for
+  dense text (qwen3-embedding: at most 19 560 characters instead of 32 768; arctic: 7 065 instead of 12 800;
+  CodeSage: 2 273 instead of 3 584), so a long node is split into more, smaller chunks and nothing is cut off. What
+  you notice: after the update VCO re-chunks your knowledge graph once — the update's own KG sync re-embeds only the
+  nodes and documents whose chunks changed (on qwen3-embedding, the ones longer than about 19 500 characters; on
+  arctic, longer than about 7 000), and the code graph re-walks in the background and re-embeds only the code
+  entities whose chunks changed. Expect seconds to a few minutes with a GPU, and longer on a CPU-only machine with a
+  large knowledge graph; searches keep working meanwhile, and nothing is deleted before its new vectors are written
+  (the KG sync now embeds first and only then replaces a node's old rows). The next update re-embeds nothing. The
+  `chunker_preset_overhaul_pending` entry in `UPDATE_DEFERRED.md` records the pass and clears itself when both
+  halves have run; its code-graph command is now the non-destructive `--force-rewalk` (it used to drop and rebuild
+  the code graph). The bundled pre-computed embeddings for the curated knowledge nodes were rebuilt for the new
+  chunks and now name the chunk layout they were built for, so a stale set is never ingested.
+
 - **Kimi K3.1 Pro replaces Kimi K3 on the model gateway.** The gateway's Kimi Code route now offers and forwards
   `claude-gw/kimi/k3.1-pro` (1M context, image input), and the `kimi-implementer` and `kimi-reviewer` agents run on
   `claude-gw/kimi/k3.1-pro[1m]`. `claude-gw/kimi/k3` is no longer offered: a request or agent definition that names
@@ -378,9 +396,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same text was embedded once per retrieval (one run on a test machine embedded 44 windows). The shared chunker
   (`claude_mcp_servers/weaviate_mcp/chunking.py`) now has an answer-window mode beside its document path: answer
   chunks are sized to the model's window for dense text, and their boundaries are chosen by the content itself, so
-  overlapping windows produce the same chunks and the embed cache reuses them. The knowledge-graph and document
-  chunking output is byte-for-byte unchanged (pinned by a golden test against the pre-change output), so
-  `_CHUNKER_REVISION` stays `v0.2.92.1` and nothing is re-embedded. A dual-model citation chunks the answer once per
+  overlapping windows produce the same chunks and the embed cache reuses them. (The knowledge-graph and document
+  chunking changed separately in this release, on purpose — see "Knowledge-graph and code-graph chunks now fit the
+  embedding model" under Changed.) A dual-model citation chunks the answer once per
   model with that model's budget; the second-model embedding is cached per process. In a 40-retrieval test the text
   sent to the model drops by about two thirds, and no chunk exceeds the model window. The citation drain is unrelated
   to v0.2.105's commit, merge and pull catch-up for the code graph, which embeds only changed code and skips

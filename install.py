@@ -13824,6 +13824,10 @@ def _seed_weaviate_impl(
             # leg's own reporting: `vco_lib.install_weaviate`.
             _install_weaviate.announce_kg_metadata_repair_leg(_log_install_event)
             _sync_all = True
+        elif _install_weaviate.kg_rechunk_due_now(PROJECT_ROOT):
+            # v0.2.106 — leg (e), the one-time chunker re-chunk (see the helper).
+            _install_weaviate.announce_kg_rechunk_leg(_log_install_event)
+            _sync_all = True
         else:
             # Context unchanged — attempt per-file content-hash diff.
             knowledge_root = PROJECT_ROOT / "knowledge"

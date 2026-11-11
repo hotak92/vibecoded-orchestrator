@@ -106,8 +106,14 @@ class TestBudgetDerivesFromEmbeddingWindow:
         )
         num_ctx = chunking.MODEL_TOKEN_LIMITS["qwen3-embedding:0.6b"]
         capacity_budget = int(num_ctx * (1 - chunking._BUDGET_SAFETY_MARGIN_RATIO))
+        # v0.2.106: the model's dense-content budget is a third clamp, and
+        # for qwen3 it binds (4 890 units < 8 192 policy < 9 216 capacity).
+        dense_units = (
+            chunking.dense_char_budget("qwen3-embedding:0.6b")
+            // chunking.CHARS_PER_TOKEN_TEXT
+        )
         assert max_t == min(
-            chunking.CHUNK_TOKEN_POLICY_CEILING, capacity_budget
+            chunking.CHUNK_TOKEN_POLICY_CEILING, capacity_budget, dense_units
         )
         assert max_t < 13_500, "xlarge tier max must be clamped below 13 500"
 
@@ -133,6 +139,8 @@ class TestBudgetDerivesFromEmbeddingWindow:
             budget = min(
                 int(num_ctx * (1 - chunking._BUDGET_SAFETY_MARGIN_RATIO)),
                 chunking.CHUNK_TOKEN_POLICY_CEILING,
+                # v0.2.106: the model's dense-content budget (counter units).
+                chunking.dense_char_budget(model) // chunking.CHARS_PER_TOKEN_TEXT,
             )
             resolved = chunking.chunking_preset_for_model(model)
             if tier[1] <= budget:
@@ -190,10 +198,20 @@ class TestUnknownModelUnderFills:
 
     def test_known_small_window_models_keep_their_own_tier(self) -> None:
         # The conservative unknown default never widens a KNOWN model's own
-        # tighter tier: arctic (4 096 ctx) keeps medium, byte-identical.
+        # tighter tier: arctic (4 096 ctx) ROUTES to medium, byte-identical…
+        assert chunking._preset_for_limit(
+            chunking._num_ctx_for_model("snowflake-arctic-embed2:latest")
+        ) == chunking.CHUNKING_PRESETS["medium_context"]
+        # …and since v0.2.106 the model-aware resolver clamps that tier to
+        # arctic's dense budget (7 065 chars → 1 766 units), never to the
+        # unknown-model small tier.
+        units = (
+            chunking.dense_char_budget("snowflake-arctic-embed2:latest")
+            // chunking.CHARS_PER_TOKEN_TEXT
+        )
         assert chunking.chunking_preset_for_model(
             "snowflake-arctic-embed2:latest"
-        ) == chunking.CHUNKING_PRESETS["medium_context"]
+        ) == tuple(min(v, units) for v in chunking.CHUNKING_PRESETS["medium_context"])
 
     def test_singleton_multi_matches_single_model_resolver_for_unknown(self) -> None:
         """The documented singleton contract (``for_models([x]) ==
@@ -322,10 +340,14 @@ class TestR39PolicyCeiling:
             "qwen3's window budget must genuinely sit above the policy for "
             "this discriminator to bind"
         )
-        _min, max_t, _target = chunking.chunking_preset_for_model(
-            "qwen3-embedding:0.6b"
+        # The window path (``_preset_for_limit`` on num_ctx alone) is where
+        # the policy-vs-capacity rule lives; the model-aware resolver adds the
+        # v0.2.106 dense budget on top, which is tighter still.
+        _min, max_t, _target = chunking._preset_for_limit(
+            chunking.MODEL_TOKEN_LIMITS["qwen3-embedding:0.6b"]
         )
         assert max_t == ceiling == 8_192
+        assert chunking.chunking_preset_for_model("qwen3-embedding:0.6b")[1] < ceiling
 
     def test_capacity_still_clamps_downward_below_policy(self) -> None:
         # R39: where the window legitimately enters, it clamps DOWNWARD

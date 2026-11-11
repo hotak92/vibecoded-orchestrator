@@ -283,12 +283,13 @@ def _sentences(n: int) -> str:
     )
 
 
-#: ~7 800 counter-units: OVER the retired MCP gate (2 000) and UNDER the
-#: qwen3 preset max (8 192). Pre-fix this was the divergence: the MCP
-#: chunked it, kg-sync stored it whole.
-BODY_BETWEEN_THE_TWO_GATES = _sentences(450)
+#: ~4 300 counter-units: OVER the retired MCP gate (2 000) and UNDER the
+#: qwen3 preset max (4 890 since the v0.2.106 dense budget; 8 192 before).
+#: Pre-fix this was the divergence: the MCP chunked it, kg-sync stored it
+#: whole.
+BODY_BETWEEN_THE_TWO_GATES = _sentences(250)
 
-#: Comfortably over 8 192 units: BOTH writers chunk — boundaries and stored
+#: Comfortably over the qwen3 preset max: BOTH writers chunk — boundaries and stored
 #: text must match byte-for-byte (pre-fix the MCP prefixed "[chunk i/N]").
 BODY_MULTI = _sentences(3000)
 
@@ -382,7 +383,7 @@ class W8SharedChunkPlanTests(unittest.TestCase):
     # -- tests -----------------------------------------------------------
 
     def test_node_between_the_two_gates_is_single_chunk_on_both(self):
-        """~7 800 units: over the retired 2 000-token MCP gate, under the
+        """~4 300 units: over the retired 2 000-token MCP gate, under the
         qwen3 preset max. Pre-fix the MCP chunked it and kg-sync did not —
         the exact input that made an MCP-written node get re-planned and
         re-embedded by the next ``kg-sync --all``."""
@@ -392,7 +393,7 @@ class W8SharedChunkPlanTests(unittest.TestCase):
         from weaviate_mcp.chunking import TokenCounter
         units = TokenCounter.count_tokens(final_text)
         self.assertGreater(units, 2_000, "fixture must exceed the retired MCP gate")
-        self.assertLessEqual(units, 8_192, "fixture must fit the qwen3 preset max")
+        self.assertLessEqual(units, 4_890, "fixture must fit the qwen3 preset max")
 
         self.assertEqual(len(sync_rows), 1)
         self.assertEqual(len(mcp_rows), 1)

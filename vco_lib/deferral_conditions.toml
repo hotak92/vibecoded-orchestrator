@@ -1879,9 +1879,14 @@ comparison for exactly as long as the row lives (documented there as \
 transitional). Now: each half of the printed remedy stamps \
 `.claude/state/chunker-resync.json` at the one point that proves it ran (a \
 fully successful `kg-sync --all`; a completed `code-graph-analyze \
---force-recreate`), and `probe:py:chunker_resync_still_owed` clears the row \
-when BOTH name the current revision. A later revision crossing re-arms it for \
-free — the gate re-emits and the old stamps no longer match."""
+--force-recreate` or, since v0.2.106, a completed whole-repo `--force-rewalk`), \
+and `probe:py:chunker_resync_still_owed` clears the row when BOTH name the \
+current revision. A later revision crossing re-arms it for free — the gate \
+re-emits and the old stamps no longer match. v0.2.106: the update STARTS both \
+halves itself — `vco_lib.chunker_revision.kg_rechunk_owed` makes the launcher's \
+`kg-sync --check-drift` probe (`rechunk_owed`) and install.py's root seed run \
+the KG pass, and the extractor-generation rung re-walks the code graph — and \
+the printed code-graph remedy is the non-destructive `--force-rewalk`."""
 
 [conditions.project_bundles_stale]
 class = "action_required"

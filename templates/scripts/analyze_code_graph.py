@@ -6921,8 +6921,8 @@ def main():
         _cem.finish_analyzer_run(project_name, _cem_plan, embedding_service, scoped=_cem_scoped, repo_root=repo_path, index_dot_claude=analyzer.index_dot_claude, stats=stats, revision=CODEGRAPH_EMBED_REVISION)
         # v0.2.91 wave-3 fix (MAJOR-1): the NARROW paired clear, at the only
         # point that proves the walk actually happened. v0.2.95 F1 adds the
-        # chunker re-sync's code-graph half here (force-recreate walks only).
-        _deferral_op("record_successful_walk", deferral_root, args.force_recreate)
+        # chunker re-sync's code-graph half (force-recreate, or v0.2.106 a whole-repo force re-walk).
+        _deferral_op("record_successful_walk", deferral_root, args.force_recreate, bool(_stamped))
         return 0
 
     finally:

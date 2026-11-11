@@ -33,8 +33,8 @@ chunking_preset_for_model(model_id).max`` → one chunk embedding the FULL
 file text; otherwise ``Chunker.for_model(model_id).chunk_text(...)`` and one
 vector per ``chunk.content`` (``chunk_num`` 1-indexed, matching
 ``_shipped_chunk_vector``). Note the layouts legitimately DIFFER per slot
-(qwen3's preset max is 13 500 tokens; arctic2's is 3 200 — a handful of
-larger nodes are multi-chunk in the arctic sidecar only). The ingest-side
+(since v0.2.106 qwen3's preset max is 4 890 units; arctic2's is 1 766 — a
+number of larger nodes are multi-chunk in the arctic sidecar only). The ingest-side
 chunk-count guard turns any residual mismatch into a conservative
 compute-locally fallback, never a bad ingest.
 
@@ -66,9 +66,10 @@ bounded node is printed loudly and summarized so a release run can't ship
 bounded vectors invisibly (an unexpected entry here — e.g. any qwen3 node —
 signals an Ollama runner-state problem: re-run against a fresh runner).
 
-Output schema (v0.2.70 ``schema_version`` 1 — unchanged)
---------------------------------------------------------
-``{"schema_version": 1, "slot", "model_id", "dim", "nodes": {<sig>:
+Output schema (v0.2.70 ``schema_version`` 1; ``chunker_revision`` v0.2.106)
+---------------------------------------------------------------------------
+``{"schema_version": 1, "slot", "model_id", "dim", "chunker_revision",
+"nodes": {<sig>:
 {"total_chunks": N, "chunks": [{"chunk_num": 1..N, "vector": [...]}]}}}``
 Floats are rounded to 7 significant decimals (cosine impact ≪ 1e-6); the
 file is written atomically via ``vco_lib.atomic.atomic_write_text``.
@@ -168,6 +169,13 @@ def content_signature(text: str) -> str:
     here — the parity test pins this delegation.
     """
     return _sync_module()._content_signature_excluding_updated(text)
+
+
+def current_chunker_revision() -> str:
+    """The live ``_CHUNKER_REVISION`` — the same module ``chunk_plan`` plans with."""
+    from weaviate_mcp.chunking import _CHUNKER_REVISION
+
+    return _CHUNKER_REVISION
 
 
 def chunk_plan(content: str, model_id: str) -> List[Tuple[int, str]]:
@@ -365,6 +373,11 @@ def build_slot_data(
         "slot": slot,
         "model_id": model_id,
         "dim": dim,
+        # v0.2.106: the chunker revision the plans above were made under. The
+        # ingest side refuses a sidecar naming any other revision (a chunker
+        # change can move boundaries while keeping the chunk COUNT, which the
+        # per-entry count guard cannot see).
+        "chunker_revision": current_chunker_revision(),
         "nodes": nodes,
     }
 
@@ -489,6 +502,13 @@ def verify_slots(slot_models: Optional[Dict[str, str]] = None) -> List[str]:
             problems.append(
                 f"{name}: slot field {data.get('slot')!r} != {slot!r} "
                 f"(the file-level slot guard would reject this at ingest)"
+            )
+        if data.get("chunker_revision") != current_chunker_revision():
+            problems.append(
+                f"{name}: chunker_revision {data.get('chunker_revision')!r} != "
+                f"{current_chunker_revision()!r} — the ingest guard would ignore "
+                f"the whole file; regenerate with "
+                f"`python scripts/build_shipped_kg_embeddings.py`"
             )
         model_id = data.get("model_id") or default_model
         map_slot, map_dim = _resolve_text_slot(model_id)

@@ -689,7 +689,16 @@ class TestSSotParityAcrossConsumers:
         window_budget = int(MODEL_TOKEN_LIMITS[_QWEN3] * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
         assert budget_tokens == window_budget == 9_216
         assert budget_tokens <= MODEL_TOKEN_LIMITS[_QWEN3] == 10_240
-        assert chunk_max == min(window_budget, CHUNK_TOKEN_POLICY_CEILING) == 8_192
+        # v0.2.106: the chunk max is ALSO clamped to the model's dense-content
+        # budget (19 560 chars → 4 890 units), which binds for qwen3.
+        from claude_mcp_servers.weaviate_mcp.chunking import (
+            CHARS_PER_TOKEN_TEXT,
+            dense_char_budget,
+        )
+        assert chunk_max == min(
+            window_budget, CHUNK_TOKEN_POLICY_CEILING,
+            dense_char_budget(_QWEN3) // CHARS_PER_TOKEN_TEXT,
+        ) == 4_890
         assert chunk_max <= budget_tokens
 
 

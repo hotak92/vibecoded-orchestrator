@@ -5650,34 +5650,30 @@ def _emit_chunker_revision_resync_deferral(
 
     detected = (
         f"The KG chunker revision changed from `{prev_revision}` to "
-        f"`{cur_revision}` (see `_CHUNKER_REVISION` in "
-        f"`claude_mcp_servers/weaviate_mcp/chunking.py`). For entries whose "
-        f"content now plans differently under the new revision (for this "
-        f"transition: content above the new 8 192-unit qwen3 chunk budget), "
-        f"the boundaries differ from the rows already in this project's "
-        f"KG + code graph — search recall degrades on long answers because "
-        f"relevant content lives in a chunk the new preset would fold "
-        f"differently. Re-sync to re-chunk under the current revision."
+        f"`{cur_revision}` (`_CHUNKER_REVISION` in "
+        f"`claude_mcp_servers/weaviate_mcp/chunking.py`; its revision history "
+        f"says what moved). Entries whose content now plans differently keep "
+        f"their old chunk boundaries in this project's KG + code graph until "
+        f"they are re-chunked once."
     )
     cmd = _chunker_revision.resync_commands(
         folder,
-        "# The kg-sync half re-chunks only entries whose stored chunk plan\n"
-        "# differs from the current revision (everything else is hash-\n"
-        "# skipped); the code-graph half re-embeds every entity. Both run\n"
-        "# embed I/O through Ollama — consider a quiet moment.",
+        "# Both halves re-embed only what changed; searches keep working\n"
+        "# while they run.",
     )
     entry = DeferralEntry(
         condition_id="chunker_preset_overhaul_pending",
-        title="KG + codegraph re-sync recommended (chunker revision changed)",
+        title="KG + codegraph re-chunk (chunker revision changed)",
         detected=detected,
         why_deferred=(
-            "Auto-rechunking at update time (every code-graph entity, plus "
-            "the KG entries whose boundaries changed) would run significant "
-            "embed I/O on the user's backends at a moment they did not pick. "
-            "We defer the decision so the user can choose a quiet moment. "
-            "Searches WORK in the meantime — they just return less relevant "
-            "top-k results. Once you run the re-sync commands below, this "
-            "deferral self-resolves on the next bundle update."
+            "The update starts the re-chunk itself: the KG pass runs with the "
+            "update's knowledge sync (launcher bundle update / install.py), "
+            "and the code graph re-walks in the background (extractor-"
+            "generation rung). Each half stamps itself when it completes, and "
+            "this entry then clears on the next bundle update. Run the "
+            "commands below only if a half did not complete (a backend was "
+            "down, the walk was interrupted) — they are the same passes, and "
+            "nothing is deleted before its new vectors are written."
         ),
         command_to_apply=cmd,
         severity="info",

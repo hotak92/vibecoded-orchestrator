@@ -224,11 +224,14 @@ def _write_node(path: Path, title: str, body: str) -> None:
 
 def _write_sidecar(knowledge_root: Path, slot: str, content_hash: str,
                    vector: list[float], *, total_chunks: int = 1) -> None:
+    from claude_mcp_servers.weaviate_mcp.chunking import _CHUNKER_REVISION
+
     sidecar = {
         "schema_version": 1,
         "slot": slot,
         "model_id": "fixture-model",
         "dim": len(vector),
+        "chunker_revision": _CHUNKER_REVISION,  # v0.2.106 ingest guard
         "nodes": {
             content_hash: {
                 "total_chunks": total_chunks,

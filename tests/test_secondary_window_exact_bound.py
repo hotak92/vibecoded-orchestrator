@@ -72,11 +72,14 @@ def _own_chunker_max(model: str) -> int:
     from claude_mcp_servers.weaviate_mcp.chunking import CHARS_PER_TOKEN_TEXT, Chunker
     return Chunker.for_model(model).max_tokens * CHARS_PER_TOKEN_TEXT
 
+# v0.2.106: the chunkers are clamped to the dense budget (arctic 7 064 / qwen3
+# 19 560 chars), so the own-chunker floor no longer binds for a registered
+# model and the attempt budget is the median-ratio bound itself.
 ARCTIC_BUDGET = max(int(ARCTIC_NUM_CTX * ARCTIC_ATTEMPT_RATIO * 0.75),
-                    _own_chunker_max(ARCTIC_MODEL))                   # 12800
+                    _own_chunker_max(ARCTIC_MODEL))                   # 9815
 ARCTIC_FALLBACK = int(ARCTIC_NUM_CTX * ARCTIC_MIN_RATIO * 0.75)       # 7065 fallback
 QWEN3_BUDGET = max(int(QWEN3_NUM_CTX * QWEN3_ATTEMPT_RATIO * 0.75),
-                   _own_chunker_max(QWEN3_MODEL))                     # 32768
+                   _own_chunker_max(QWEN3_MODEL))                     # 30543
 QWEN3_FALLBACK = int(QWEN3_NUM_CTX * QWEN3_MIN_RATIO * 0.75)  # 19560
 
 
@@ -94,13 +97,13 @@ def test_arctic_budget_is_measured_min_ratio_with_margin():
     in full; the fallback uses the measured MINIMUM so it is provably under the
     window even at worst density, and therefore cannot be refused again.
     """
-    assert _char_budget_for_model(ARCTIC_MODEL) == ARCTIC_BUDGET == 12800
+    assert _char_budget_for_model(ARCTIC_MODEL) == ARCTIC_BUDGET == 9815
     assert _char_budget_for_model(ARCTIC_MODEL, conservative=True) == ARCTIC_FALLBACK == 7065
 
 
 def test_qwen3_budget_is_measured_min_ratio_with_margin():
     """qwen3 ATTEMPT: 10240 × 3.977 × 0.75 = 30543; FALLBACK: × 2.547 = 19560."""
-    assert _char_budget_for_model(QWEN3_MODEL) == QWEN3_BUDGET == 32768
+    assert _char_budget_for_model(QWEN3_MODEL) == QWEN3_BUDGET == 30543
     assert _char_budget_for_model(QWEN3_MODEL, conservative=True) == QWEN3_FALLBACK == 19560
 
 
@@ -184,7 +187,7 @@ def test_sixteen_thousand_char_text_truncates_for_arctic():
 
 
 def test_median_density_text_inside_the_window_is_not_truncated():
-    """12 000 chars at the MEDIAN ratio is ~3 756 tokens — inside the 4 096
+    """9 000 chars at the MEDIAN ratio is ~2 817 tokens — inside the 4 096
     window — so it must pass UNTOUCHED.
 
     Rewritten 2026-09-04. The previous version asserted the opposite, because
@@ -199,8 +202,12 @@ def test_median_density_text_inside_the_window_is_not_truncated():
     arctic always refused). The caller retries once at the provable fallback
     budget. Estimation decides what we attempt; the runner decides what fits.
     """
-    text = "y" * 12_000
+    # v0.2.106: 9 000 chars, inside the 9 815-char median attempt. (The
+    # former 12 000 passed only through the own-chunker-max floor, 12 800 —
+    # gone now that arctic's chunker max is its 7 064-char dense budget.)
+    text = "y" * 9_000
     assert len(text) / ARCTIC_MEDIAN_RATIO < ARCTIC_NUM_CTX
+    assert len(text) <= ARCTIC_BUDGET
     sub, trunc = _bounded_for_model(text, ARCTIC_MODEL)
     assert trunc is False, "text that fits at median density must not be cut"
     assert sub == text, "byte-for-byte fidelity below the attempt budget"
@@ -700,9 +707,21 @@ def test_openai_secondary_uses_the_secondary_tier_not_the_primary_floor(monkeypa
     """
     from vco_lib.embedding_service import _bounded_for_model, _bounded_for_secondary
 
+    import claude_mcp_servers.weaviate_mcp.chunking as _chunking
+
     openai_model = "text-embedding-3-small"
+    # v0.2.106: every registered chunker is clamped to its dense budget, so
+    # the primary's own-chunker-max floor no longer exceeds the ratio bound
+    # for any shipped model and the two tiers coincide. To keep this guard
+    # DISCRIMINATING (the alias must deliver the SECONDARY tier, not the
+    # primary default), give the model a chunker maximum above its ratio
+    # bound — the pre-v0.2.106 large tier, 6 400 units = 25 600 chars.
+    monkeypatch.setattr(
+        _chunking, "chunking_preset_for_model", lambda _m: (2200, 6400, 4600)
+    )
     primary = _char_budget_for_model(openai_model)
     secondary = _char_budget_for_model(openai_model, full_coverage=False)
+    assert primary == 25_600
     assert secondary < primary, (
         "the secondary tier must be tighter than the primary's chunker-max floor"
     )

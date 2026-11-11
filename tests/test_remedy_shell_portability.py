@@ -420,7 +420,7 @@ def test_chunker_resync_remedy_is_pasteable_on_windows(on_windows):
     _assert_pasteable_on_windows(block, "chunker resync")
     assert "kg-sync.ps1" in block and "--all" in block
     assert "code-graph-analyze.ps1" in block
-    assert "--from-resolver --force-recreate" in block
+    assert "--from-resolver --force-rewalk" in block
     # No `cd` precondition survives: the wrapper is absolute and the analyzer
     # takes the folder as its positional repo_path.
     assert not any(line.startswith("cd ") for line in _command_lines(block))
@@ -428,7 +428,9 @@ def test_chunker_resync_remedy_is_pasteable_on_windows(on_windows):
 
 def test_chunker_resync_remedy_shape_on_posix(on_posix):
     """POSIX keeps naming the bash wrappers, and the identity flag is not a
-    Windows-only nicety — ``--force-recreate`` DROPS five classes on both."""
+    Windows-only nicety — without it the walk targets a basename-derived
+    family on both. (v0.2.106: the code-graph half is the non-destructive
+    ``--force-rewalk``; ``--force-recreate`` dropped five classes first.)"""
     from vco_lib import chunker_revision
 
     block = chunker_revision.resync_commands(Path("/proj"), "# tail")
@@ -436,7 +438,7 @@ def test_chunker_resync_remedy_shape_on_posix(on_posix):
     assert "/proj/.claude/scripts/kg-sync --all" in lines
     assert (
         "/proj/.claude/scripts/code-graph-analyze /proj "
-        "--from-resolver --force-recreate" in lines
+        "--from-resolver --force-rewalk" in lines
     )
 
 

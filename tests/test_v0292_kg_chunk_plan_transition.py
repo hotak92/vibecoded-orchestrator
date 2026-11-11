@@ -5,7 +5,8 @@
 The defect these tests pin: ``sync_node``/``sync_doc``'s embed-skip gate
 treats a SELF-CONSISTENT row set (stored ``total_chunks`` == number of
 stored rows) as current. When ``_CHUNKER_REVISION`` crosses (this cycle:
-the qwen3 chunk budget clamped 13 500 → 8 192 counter-units), a boundary
+the qwen3 chunk budget clamped 13 500 → 8 192 counter-units; v0.2.106:
+8 192 → 4 890 by the dense-content budget), a boundary
 change is invisible to that check — every entry is skipped forever with
 stale boundaries, and the ``chunker_preset_overhaul_pending`` deferral's
 printed remedy (``kg-sync --all``) re-chunks nothing.
@@ -42,10 +43,12 @@ SHARED_KG = "V0292T_Shared_KnowledgeGraph"
 DEV_COLL = "V0292T_Development"
 RESYNC_CID = "chunker_preset_overhaul_pending"
 
-# The pre-v0.2.92 qwen3 (xlarge) preset, unclamped — what existing rows on a
-# crossing install were written under (see CHUNKING_PRESETS history in
-# weaviate_mcp/chunking.py).
-OLD_PRESET = (4600, 13500, 9500)
+# The previous revision's qwen3 preset — what existing rows on a crossing
+# install were written under (see the revision history in
+# weaviate_mcp/chunking.py). v0.2.106 moved it from the v0.2.92.1 preset
+# (4600, 8192, 8192) to the dense-budget (4600, 4890, 4890); before that the
+# fixture was the pre-v0.2.92 unclamped (4600, 13500, 9500).
+OLD_PRESET = (4600, 8192, 8192)
 
 
 # ─── In-memory fake Weaviate client (per-collection stores) ──────────────
@@ -245,13 +248,13 @@ def _sentences(n: int) -> str:
     return " ".join(f"Sentence number {i} ends here." for i in range(n))
 
 
-# ~7.8 counter-units per sentence (deterministic): 1200 sentences ≈ 9.4k
-# units (old preset: single chunk ≤ 13 500; current: 2 chunks > 8 192) and
-# 2100 sentences ≈ 16.5k units (old 2 chunks [~10 578, ~5 943]; current
-# 2 chunks [~9 082, ~7 439] — SAME COUNT, DIFFERENT BOUNDARIES, the exact
+# ~7.8 counter-units per sentence (deterministic): 800 sentences ≈ 6.2k
+# units (old preset: single chunk ≤ 8 192; current: 2 chunks > 4 890) and
+# 1150 sentences ≈ 8.9k units (old 2 chunks [~8 186, ~735]; current
+# 2 chunks [~4 885, ~4 036] — SAME COUNT, DIFFERENT BOUNDARIES, the exact
 # shape a count-only comparison would miss).
-BODY_SINGLE_TO_MULTI = _sentences(1200)
-BODY_SAME_COUNT_DIFF_BOUND = _sentences(2100)
+BODY_SINGLE_TO_MULTI = _sentences(800)
+BODY_SAME_COUNT_DIFF_BOUND = _sentences(1150)
 BODY_SMALL = _sentences(200)
 
 
@@ -672,9 +675,13 @@ class DeferralRemedyTextTests(unittest.TestCase):
             self.assertIn(
                 ".claude/scripts/code-graph-analyze", content,
             )
-            self.assertIn("--from-resolver --force-recreate", content)
+            # v0.2.106: the code-graph half re-walks instead of dropping the
+            # five Code* classes first (nothing is deleted before its new
+            # vectors exist).
+            self.assertIn("--from-resolver --force-rewalk", content)
+            self.assertNotIn("--force-recreate", content)
             self.assertNotIn(
-                "code-graph-analyze . --force-recreate", content,
+                "code-graph-analyze . --force-rewalk", content,
             )
             # The now-false blanket claim about the KG half is gone…
             self.assertNotIn("re-embeds every chunk", content)

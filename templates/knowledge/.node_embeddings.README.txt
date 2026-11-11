@@ -43,6 +43,12 @@ One file per named-vector slot, living in `knowledge/` alongside the node
   "slot": "qwen3_embed",                 // named-vector slot these vectors fill
   "model_id": "qwen3-embedding:0.6b",    // provenance (informational)
   "dim": 1024,                           // provenance (informational)
+  "chunker_revision": "v0.2.106",        // REQUIRED since v0.2.106: the
+                                         //   chunker the plans were made
+                                         //   under; a file naming any other
+                                         //   revision (or none) is ignored
+                                         //   at ingest and the nodes are
+                                         //   embedded locally
   "nodes": {
     "<content_signature>": {             // FULL 64-hex sha256 — see "Hash
                                          //   convention" below. NOT the

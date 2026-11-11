@@ -1257,6 +1257,13 @@ def _build_vector_arg(
 _SHIPPED_EMBED_CACHE: Dict[Tuple[str, str], Optional[dict]] = {}
 
 
+def _current_chunker_revision() -> str:
+    """The live ``_CHUNKER_REVISION`` of the chunker this script plans with."""
+    from weaviate_mcp.chunking import _CHUNKER_REVISION
+
+    return _CHUNKER_REVISION
+
+
 def _shipped_embeddings_path(knowledge_root: Path, slot: str) -> Path:
     """Path to the per-slot shipped-embeddings sidecar under knowledge/."""
     return knowledge_root / f".node_embeddings.{slot}.json"
@@ -1268,7 +1275,16 @@ def _load_shipped_embeddings(knowledge_root: Path, slot: str) -> Optional[dict]:
     Returns None (cached) when the sidecar is absent, unparseable, schema-
     incompatible, or declares a DIFFERENT slot than requested (slot-mismatch
     guard at the file level — a defensive second check on top of the
-    filename, in case a file is mis-named). Soft-fail: never raises.
+    filename, in case a file is mis-named), or was built under a DIFFERENT
+    chunker revision (v0.2.106). Soft-fail: never raises.
+
+    The revision guard closes a silent wrong-vector ingest: the per-entry
+    guards check the content hash and the chunk COUNT, but a chunker change
+    can move boundaries while keeping the count (measured at the v0.2.106
+    revision: 3 of 113 curated nodes — 2 chunks before, 2 chunks after, with
+    different text in each). A sidecar that does not name the CURRENT
+    ``_CHUNKER_REVISION`` (absent included: every pre-v0.2.106 file) is
+    therefore treated as absent and the node is embedded locally.
     """
     key = (str(knowledge_root), slot)
     if key in _SHIPPED_EMBED_CACHE:
@@ -1288,6 +1304,9 @@ def _load_shipped_embeddings(knowledge_root: Path, slot: str) -> Optional[dict]:
                 # we were asked for. A mismatch means this file is for another
                 # model — treat as absent (never cross-model ingest).
                 and data.get("slot") == slot
+                # Chunker-revision guard (v0.2.106): vectors planned under
+                # other chunk boundaries are never ingested.
+                and data.get("chunker_revision") == _current_chunker_revision()
             ):
                 result = data
     except Exception:
@@ -3560,11 +3579,15 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 # Soft-fail: fall through to the delete-and-re-embed path.
                 print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
 
-        # Fast path didn't apply (or no existing objects). Delete old
-        # versions and re-embed. The `content_hash` written below means
-        # the NEXT re-sync will hit the fast path.
-        if existing is not None:
-            for obj in existing:
+        # Fast path didn't apply (or no existing objects). Re-embed, then
+        # replace the old versions. The `content_hash` written below means
+        # the NEXT re-sync will hit the fast path. v0.2.106: the delete runs
+        # only once every new vector exists (see `sync_node`'s note) — a
+        # failed embed leaves the doc's old rows in place.
+        _old_doc_rows = list(existing or [])
+
+        def _delete_old_doc_rows() -> None:
+            for obj in _old_doc_rows:
                 coll.data.delete_by_id(obj.uuid)
 
         source_id = str(uuid.uuid4())
@@ -3608,6 +3631,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     measured_slots=slots_written,
                 )
             )
+            _delete_old_doc_rows()  # v0.2.106: only now — the vector exists
             coll.data.insert(properties=data_obj, vector=vec_arg)
             print(f"   ✓ Stored doc as single chunk (vectors={sorted(slots_written)})")
             return SyncOutcome(OUTCOME_SYNCED, doc_data["file_path"])
@@ -3617,10 +3641,18 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         chunks = _plan.chunks
         print(f"   Split into {len(chunks)} chunks", flush=True)
         last_slots: Mapping[str, List[float]] = {}
+        # v0.2.106: every chunk's vectors first, then the delete, then the
+        # inserts (a failed embed raises here with the old rows intact).
+        _prepared_doc: List[Tuple[Any, Any, Mapping[str, List[float]], Any]] = []
         for i, chunk in enumerate(chunks):
             vec_arg, last_slots, truncated_slots = _build_vector_arg(
                 server, chunk.content, DEV_COLLECTION_NAME
             )
+            _prepared_doc.append((chunk, vec_arg, last_slots, truncated_slots))
+            print(f"   ✓ Embedded chunk {i + 1}/{len(chunks)}", flush=True)
+            _heartbeat_note_chunk()
+        _delete_old_doc_rows()
+        for i, (chunk, vec_arg, last_slots, truncated_slots) in enumerate(_prepared_doc):
             data_obj = {
                 "title": doc_data["title"],
                 "content": chunk.content,
@@ -4956,13 +4988,22 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # debugging knows the fast path tried but didn't apply.
             print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
 
-        deleted_count = 0
-        for obj in existing_rows:  # exact-path rows only (v0.2.101 B3)
-            collection.data.delete_by_id(obj.uuid)
-            deleted_count += 1
+        # v0.2.106: the old rows are deleted only once EVERY new vector for
+        # this node exists (`_delete_old_rows` runs right before the first
+        # insert). Deleting first meant a failed embed — backend down, a
+        # refusal the shrink ladder could not resolve — left the node with NO
+        # rows until a later sync; a chunker-revision re-chunk runs this path
+        # for every re-planned node, so that window would have been opened
+        # across the whole KG at once.
+        _old_rows = list(existing_rows)  # exact-path rows only (v0.2.101 B3)
 
-        if deleted_count > 0:
-            print(f"   ✓ Deleted {deleted_count} old version(s)")
+        def _delete_old_rows() -> None:
+            deleted_count = 0
+            for obj in _old_rows:
+                collection.data.delete_by_id(obj.uuid)
+                deleted_count += 1
+            if deleted_count > 0:
+                print(f"   ✓ Deleted {deleted_count} old version(s)")
 
         # Check if content needs chunking.
         # W8 (v0.2.92 wiring audit): the gate AND the boundaries come from
@@ -5074,6 +5115,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # `ensure_collection_exists` declares every slot up-front for
             # older Weaviate versions where post-create adds aren't
             # supported.
+            _delete_old_rows()  # v0.2.106: only now — the vector exists
             obj_uuid = collection.data.insert(
                 properties=data_obj,
                 vector=vec_arg
@@ -5120,7 +5162,11 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # Store each chunk
             last_slots: Mapping[str, List[float]] = {}
             _total_chunks = len(chunks)
-            for i, chunk in enumerate(chunks):
+            # v0.2.106: EVERY chunk's vectors first, then the delete of the
+            # old rows, then the inserts — a failed embed raises out of this
+            # first loop with the old rows still in place.
+            _prepared: List[Tuple[Any, Any, Mapping[str, List[float]], Any, Any]] = []
+            for chunk in chunks:
                 # v0.2.70 Part 2: per-chunk shipped-vector ingest (NO-OP this
                 # release). Same guards as the single-object path. The shipped
                 # entry must cover EXACTLY this node's chunk count; if the node
@@ -5135,6 +5181,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     chunk_num=chunk.chunk_number + 1,
                     expected_chunks=_total_chunks,
                 )
+                truncated_slots = None
                 if _shipped is not None:
                     vec_arg, last_slots = _shipped
                     # Shipped sidecar vector — no truncation record: the row
@@ -5147,7 +5194,16 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                     vec_arg, last_slots, truncated_slots = _build_vector_arg(
                         server, chunk.content, target_collection_name
                     )
-
+                _prepared.append((chunk, vec_arg, last_slots, truncated_slots, _shipped))
+                # Heartbeat per EMBEDDED chunk: the embeds are the slow part,
+                # and the launcher's stall watchdog re-arms on every line.
+                print(
+                    f"   ✓ Embedded chunk {chunk.chunk_number + 1}/{_total_chunks}",
+                    flush=True,
+                )
+                _heartbeat_note_chunk()
+            _delete_old_rows()
+            for chunk, vec_arg, last_slots, truncated_slots, _shipped in _prepared:
                 # Prepare data object (tags, links, typed_links, external_links shared across all chunks)
                 data_obj = {
                     "title": node_data["title"],
@@ -6067,7 +6123,7 @@ def _emit_node_formats_no_backend_deferral(project_root: Path) -> None:
 DRIFT_SENTINEL_PREFIX = "KG_DRIFT_JSON "
 
 
-def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
+def _print_drift_sentinel(binding, report, repair_owed=None, rechunk_owed=None) -> None:
     """Emit the machine-readable drift verdict. Best-effort; never raises.
 
     Always printed — including on the ``unbound`` early exit, where ``report``
@@ -6084,6 +6140,13 @@ def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
     wire as true: ``None`` means the stamp could not be read, and "could not
     look" must leave the launcher on its prior behaviour rather than spawn a
     pass on every update forever.
+
+    ``rechunk_owed`` (v0.2.106) is the THIRD question, on the same footing:
+    a chunker-revision crossing left this project's stored chunk boundaries
+    stale (the ledger carries ``chunker_preset_overhaul_pending`` and the KG
+    half has not run under the current revision —
+    ``vco_lib.chunker_revision.kg_rechunk_owed``). The texts did not change,
+    so ``status`` cannot see it either; only a positive True reaches the wire.
     """
     import json  # local import — this script imports json per-function
 
@@ -6104,6 +6167,7 @@ def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
                 else (getattr(binding, "detail", "") or "no KG binding")
             ),
             "repair_owed": repair_owed is True,
+            "rechunk_owed": rechunk_owed is True,
         }
         print(DRIFT_SENTINEL_PREFIX + json.dumps(payload), flush=True)
     except Exception as exc:  # noqa: BLE001 — a report line never breaks a scan
@@ -6232,8 +6296,24 @@ def _run_check_drift() -> None:
             "whole-tree `--all` patches them (property writes only; a node "
             "whose content hash matches is never re-embedded to do it)."
         )
+    # v0.2.106: the chunker re-chunk, same gating and the same "only a
+    # positive True" rule (`kg_rechunk_owed` returns None on anything it
+    # could not read). The whole-tree `--all` the launcher then spawns is
+    # armed by the same ledger entry, re-embeds only nodes whose stored plan
+    # differs, and stamps the KG half — so the next probe answers False.
+    rechunk_owed = False
+    if binding.status == "bound":
+        from vco_lib.chunker_revision import kg_rechunk_owed
+
+        rechunk_owed = kg_rechunk_owed(PROJECT_ROOT) is True
+    if rechunk_owed:
+        print(
+            "♻️  KG re-chunk: owed — the chunker revision changed and this "
+            "project's KG has not been re-chunked under it yet. A whole-tree "
+            "`--all` re-embeds only the nodes whose chunks changed."
+        )
     surface_drift(PROJECT_ROOT, report)
-    _print_drift_sentinel(binding, report, repair_owed)
+    _print_drift_sentinel(binding, report, repair_owed, rechunk_owed)
     sys.exit(0)
 
 

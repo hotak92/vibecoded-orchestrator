@@ -1263,6 +1263,14 @@ pub(crate) async fn apply_post_bundle_steps(
                  re-embeds, and it runs once (the run stamps itself).",
                 project_id, scanned
             ),
+            KgSyncSpawnReason::RechunkOwed { scanned } => tracing::info!(
+                "[vct] kg-sync spawned for {} — Weaviate holds every one of \
+                 {} node(s), but the chunker revision changed and this \
+                 project's KG has not been re-chunked under it. The pass \
+                 re-embeds only nodes whose chunks changed (content-hash \
+                 gated) and runs once (the run stamps itself).",
+                project_id, scanned
+            ),
         }
     }
     if matches!(kg_decision, KgSyncDecision::Spawn(_)) {

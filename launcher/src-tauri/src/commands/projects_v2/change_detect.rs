@@ -224,6 +224,13 @@ pub(crate) enum DriftVerdict {
     /// `--all` it spawns performs the repair on its way past every node and
     /// writes the same stamp, so a second signal would be redundant.
     MetadataRepairOwed { scanned: usize },
+    /// No drift — AND a chunker-revision crossing left this project's stored
+    /// chunk boundaries stale (v0.2.106; `vco_lib.chunker_revision.
+    /// kg_rechunk_owed`). Same shape as `MetadataRepairOwed` and for the same
+    /// reason: the node texts did not change, so no hash can see it. The
+    /// `--all` it spawns re-embeds only nodes whose stored plan differs and
+    /// stamps itself, so the next probe answers `Ok`. `Drift` still wins.
+    RechunkOwed { scanned: usize },
     /// No verdict (no binding, Weaviate down, wrapper failed, unparseable
     /// output). Carries WHY.
     Unavailable { detail: String },
@@ -239,6 +246,9 @@ pub(crate) enum KgSyncSpawnReason {
     DriftDetected { missing: usize, stale: usize, scanned: usize },
     /// The project has never run the v0.2.95 KG metadata-repair pass.
     MetadataRepairOwed { scanned: usize },
+    /// The project's KG has not been re-chunked under the current chunker
+    /// revision (v0.2.106).
+    RechunkOwed { scanned: usize },
 }
 
 /// The gate's verdict. `Skip` is split so the caller can be honest about which
@@ -323,6 +333,9 @@ pub(crate) fn decide_kg_sync_on_bundle(
         },
         Some(DriftVerdict::MetadataRepairOwed { scanned }) => {
             KgSyncDecision::Spawn(KgSyncSpawnReason::MetadataRepairOwed { scanned })
+        }
+        Some(DriftVerdict::RechunkOwed { scanned }) => {
+            KgSyncDecision::Spawn(KgSyncSpawnReason::RechunkOwed { scanned })
         }
         Some(DriftVerdict::Ok { scanned }) => KgSyncDecision::SkipConfirmed { scanned },
         Some(DriftVerdict::NoContent { detail }) => KgSyncDecision::SkipNoContent { detail },
@@ -487,6 +500,37 @@ mod v0294_gate_tests {
                 Some(DriftVerdict::MetadataRepairOwed { scanned: 78 }),
             ),
             KgSyncDecision::Spawn(KgSyncSpawnReason::MetadataRepairOwed { scanned: 78 })
+        );
+    }
+
+    /// v0.2.106 RED-PROOF at the decision: a complete store whose chunk
+    /// boundaries predate the current chunker revision spawns the one
+    /// whole-tree pass — and an in-flight sync still wins (no doubled run).
+    #[test]
+    fn a_rechunk_owed_project_spawns_even_with_a_complete_store() {
+        assert_eq!(
+            decide_kg_sync_on_bundle(
+                false,
+                false,
+                &ok_status(),
+                Some(DriftVerdict::RechunkOwed { scanned: 78 }),
+            ),
+            KgSyncDecision::Spawn(KgSyncSpawnReason::RechunkOwed { scanned: 78 })
+        );
+        assert!(matches!(
+            decide_kg_sync_on_bundle(
+                false,
+                false,
+                &LastKgSync::InFlight { status: "running".into() },
+                Some(DriftVerdict::RechunkOwed { scanned: 78 }),
+            ),
+            KgSyncDecision::SkipInFlight { .. }
+        ));
+        assert_eq!(
+            kg_sync_decision_warning(&KgSyncDecision::Spawn(
+                KgSyncSpawnReason::RechunkOwed { scanned: 78 }
+            )),
+            None
         );
     }
 

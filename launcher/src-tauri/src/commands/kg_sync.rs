@@ -1897,6 +1897,8 @@ pub(crate) fn parse_drift_output(stdout: &str) -> DriftVerdict {
     // does not emit it, and that must read as "nothing extra owed", never as
     // owed-on-every-update.
     let repair_owed = v.get("repair_owed").and_then(|x| x.as_bool()).unwrap_or(false);
+    // v0.2.106: the chunker re-chunk, read the same way (absent ⇒ false).
+    let rechunk_owed = v.get("rechunk_owed").and_then(|x| x.as_bool()).unwrap_or(false);
     let status = v.get("status").and_then(|x| x.as_str()).unwrap_or("");
     let binding = v.get("binding").and_then(|x| x.as_str()).unwrap_or("");
     let detail = v.get("detail").and_then(|x| x.as_str()).unwrap_or("");
@@ -1931,7 +1933,10 @@ pub(crate) fn parse_drift_output(stdout: &str) -> DriftVerdict {
             scanned: field("scanned"),
         },
         // Drift above wins when both are true: the `--all` it spawns visits
-        // every node anyway, repairing and stamping on the way past.
+        // every node anyway, repairing and stamping on the way past. A
+        // re-chunk ranks next — its `--all` performs the metadata repair on
+        // the way past too, so the more specific reason is the one logged.
+        "ok" if rechunk_owed => DriftVerdict::RechunkOwed { scanned: field("scanned") },
         "ok" if repair_owed => {
             DriftVerdict::MetadataRepairOwed { scanned: field("scanned") }
         }
@@ -2154,6 +2159,36 @@ mod v0294_drift_probe_tests {
         );
     }
 
+    /// v0.2.106 RED-PROOF, consumer half: a clean store whose chunk
+    /// boundaries predate the current chunker revision is a SPAWN. Pre-fix
+    /// the field was ignored, this parsed to `Ok`, the gate skipped, and the
+    /// re-chunk the revision bump owed never ran on its own.
+    #[test]
+    fn a_clean_store_that_still_owes_the_rechunk_is_not_ok() {
+        let out = sentinel(
+            r#"{"binding":"bound","status":"ok","scanned":78,"repair_owed":false,"rechunk_owed":true}"#,
+        );
+        assert_eq!(parse_drift_output(&out), DriftVerdict::RechunkOwed { scanned: 78 });
+        // Both owed: the re-chunk names the run (its `--all` repairs too).
+        let both = sentinel(
+            r#"{"binding":"bound","status":"ok","scanned":5,"repair_owed":true,"rechunk_owed":true}"#,
+        );
+        assert_eq!(parse_drift_output(&both), DriftVerdict::RechunkOwed { scanned: 5 });
+        // Once stamped (or an older wrapper without the field): plain ok.
+        let done = sentinel(
+            r#"{"binding":"bound","status":"ok","scanned":78,"rechunk_owed":false}"#,
+        );
+        assert_eq!(parse_drift_output(&done), DriftVerdict::Ok { scanned: 78 });
+        // Real drift still wins.
+        let drift = sentinel(
+            r#"{"binding":"bound","status":"drift","missing":1,"stale":0,"scanned":9,"rechunk_owed":true}"#,
+        );
+        assert_eq!(
+            parse_drift_output(&drift),
+            DriftVerdict::Drift { missing: 1, stale: 0, scanned: 9 }
+        );
+    }
+
     /// A verdict we could not trust must NOT be upgraded by a stamp file:
     /// spawning `--all` at an unreachable Weaviate repairs nothing.
     #[test]
@@ -2161,6 +2196,7 @@ mod v0294_drift_probe_tests {
         for body in [
             r#"{"binding":"unbound","status":"unknown","detail":"no KG binding","repair_owed":true}"#,
             r#"{"binding":"bound","status":"unknown","detail":"weaviate unreachable","repair_owed":true}"#,
+            r#"{"binding":"bound","status":"unknown","detail":"weaviate unreachable","rechunk_owed":true}"#,
         ] {
             assert!(
                 matches!(parse_drift_output(&sentinel(body)), DriftVerdict::Unavailable { .. }),
