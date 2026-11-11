@@ -261,6 +261,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its retrieval event is still emitted as before. A search run from inside a Claude Code session (including through
   the Bash tool) still stages, and is paired by the drain against that session's transcript.
 
+- **Citations of retrievals made by subagents and worktree lanes are scored against their own transcript.** A
+  staged retrieval now records the exact transcript of the chat that made it: the main chat's own transcript, or a
+  subagent's own transcript (even though a subagent's hook events name the parent's). The drain scores the citation
+  against exactly that file, whichever drain handles it, so a chat whose transcript sits in a different transcripts
+  folder from the draining chat's is no longer removed as unscored, and a subagent launched by a workflow (whose
+  transcript sits one level deeper) is found. A recorded transcript that no longer exists means the citation is
+  recorded as unscored; no other transcript stands in for it. Retrievals whose chat cannot be known when they are
+  staged (the MCP server and the `kg-search` CLI are not told which chat calls them) keep the existing rule: the chat
+  whose transcript holds the query. A `kg-search` run by a lane inside a git worktree now stages its file in the
+  chat's project, where that chat's drains look, instead of nowhere (a worktree outside the project) or inside the
+  worktree (a worktree under the project's `.claude/worktrees/`). Files staged before this release are handled as
+  before. The unscored-citation log now names the recorded transcript, if any.
+
 - **Stopping a service for maintenance now actually keeps it down.** The launcher's services watcher ignored the
   shared pause marker the hub's watchdog honors: about 30 seconds after you stopped Weaviate from the Services page,
   the launcher restarted it AND deleted the pause marker — mid-copy volume backups were ruined by the container

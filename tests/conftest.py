@@ -916,6 +916,18 @@ def _claude_project_dir_pin_for(test_file: str) -> "str | None":
 if not _ALLOW_REAL_STATE:
     os.environ["CLAUDE_PROJECT_DIR"] = str(_SCRATCH_PROJECT_DIR)
 
+# v0.2.106: the AMBIENT `KG_BASE_DIR` goes too, at import, so the suite sees
+# what CI sees (no such key). A Claude Code chat exports it — its project's
+# settings `env` — into every Bash command, pytest included, and the pending
+# citation queue stages a retrieval made without `CLAUDE_PROJECT_DIR` under
+# that project (`citation_pending._chat_project_root`): with the key left in
+# place, a test that removes `CLAUDE_PROJECT_DIR` (the opt-out files above,
+# or a `monkeypatch.delenv`) staged its fixture files into the developer's
+# REAL project queue (found 2026-11-11). Tests that need the key set
+# it themselves (monkeypatch / `child_env`, which pins its own sentinel).
+if not _ALLOW_REAL_STATE:
+    os.environ.pop("KG_BASE_DIR", None)
+
 
 # Files that isolate the state dir THEMSELVES and must not have `VCT_STATE_DIR`
 # pinned over the top of their own mechanism. The redirect is POPPED for these,
@@ -2349,6 +2361,22 @@ def _pin_claude_project_dir(request):
             os.environ.pop("CLAUDE_PROJECT_DIR", None)
         else:
             os.environ["CLAUDE_PROJECT_DIR"] = prev
+
+
+@pytest.fixture(autouse=True)
+def _drop_staging_transcript_env():
+    """v0.2.106: `VCT_TRANSCRIPT_PATH` is the per-run channel through which
+    the context router hands `citation_pending.stage_pending` its chat's
+    transcript. The router writes it straight into `os.environ` (one run per
+    process in production), so a test that drives `router.main` in-process
+    would leave it set, and every later `stage_pending` of the suite would
+    record that test's (soon deleted) transcript. Cleared before and after
+    every test."""
+    os.environ.pop("VCT_TRANSCRIPT_PATH", None)
+    try:
+        yield
+    finally:
+        os.environ.pop("VCT_TRANSCRIPT_PATH", None)
 
 
 @pytest.fixture(autouse=True)
