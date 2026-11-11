@@ -3269,9 +3269,7 @@ def _enumerate_bundle_files(
       whose VENDOR the user switched off is held with
       `SIGNAL_PROVIDER_DISABLED` and never enumerated — the orphan walk parks
       an earlier delivery instead (see `module_gated_delivery`).
-      v0.2.106 (review L5): `disabled_vendors` lets a run hand in the off-list
-      it read from ITS OWN database (`--db-path`); omitted, the machine's
-      default is read, as before.
+      v0.2.106: `disabled_vendors` = the off-list from the run's own DB (`--db-path`); omitted → the default DB's.
       .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
       .claude/specializations/<rel>        from templates/specializations/<rel>
                                            (recursive PLAIN copy, no substitution —
@@ -3407,8 +3405,7 @@ def _enumerate_bundle_files(
                    _mgd.gateway_agents_gate(
                        orchestrator_root if project_root is None else project_root))
         gw_files, gw_held = _mgd.select_gateway_agents(
-            gateway_agents_src, verdict, reach_hint=gate_reach,
-            disabled_vendors=disabled_vendors)
+            gateway_agents_src, verdict, reach_hint=gate_reach, disabled_vendors=disabled_vendors)
         if gate_outcomes is not None:
             gate_outcomes += [(_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict), *gw_held]
         for agent_file in gw_files:

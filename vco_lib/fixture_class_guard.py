@@ -152,6 +152,7 @@ FIXTURE_PROJECT_NAMES: frozenset[str] = frozenset({
     "Proj106",
     "ProjA",
     "Quux",
+    "VibeCodedOrchestrator2",  # v0.2.106 raft-guard test: a second install-root class
 })
 
 #: Class-name families VCO mints per project. A fixture-shaped class is a
