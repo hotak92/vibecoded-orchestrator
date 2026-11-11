@@ -336,8 +336,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them. The glow is now still. WebView2 is also never told when the launcher window is minimised, so animations and
   polling went on for a window nobody could see: the launcher now notices a minimised or hidden window, pauses every
   animation and skips its periodic checks (the change poller, the restart banner, the subscription usage card, the
-  Services page, the module health refresh and the banners' clocks) until the window is shown again, then refreshes
-  once at once. The restart banner also no longer redraws when its five-second check returns the same answer.
+  Services page, the module health refresh and the banners' clocks) until the window is shown again, then
+  refresh once. The restart banner also no longer redraws when its five-second check returns the same answer.
+
+- **The weaviate-kg MCP server no longer outlives the Claude Code session that started it.** A field report from a
+  machine short of memory showed MCP servers that missed the 30-second connect timeout staying alive after Claude
+  Code gave up on them. VCO's server could do the same in two ways: when its stdin closed while a tool call was still
+  waiting on a slow Weaviate or Ollama request, the process waited for that request before exiting; and when the
+  process that started it died without closing the pipe (on Windows, killing a virtual environment's `python.exe`
+  leaves the real interpreter it started running), nothing noticed at all. The server now gives in-flight work 30
+  seconds after its stdin closes and then exits, and it exits within five seconds of the process that started it
+  exiting. Telemetry that is written at exit is still written.
+- **The Ollama keep-alive setting now says where to set it and how to unload a model at once.** The configuration
+  reference names every process that reads `VCO_OLLAMA_KEEP_ALIVE`, how to set it for all of them (a user
+  environment variable, then restart VS Code and the launcher) or for one project (`.claude/settings.local.json`),
+  explains that the knowledge-graph lookups made on every tool call keep the model loaded while you work whatever the
+  value, and gives the `ollama ps` / `ollama stop` commands that unload a model right away.
 
 ## [0.2.105] - 2026-10-30
 

@@ -8186,5 +8186,14 @@ if __name__ == "__main__":
     logger.info(f"Code Graph Project: {CODE_GRAPH_PROJECT if CODE_GRAPH_PROJECT else '(all projects)'}")
     logger.info(f"Code Graph Collections: {_code_collection('Code*')}")
 
-    # Run server with stdio transport
-    asyncio.run(mcp.run_stdio_async())
+    # Run server with stdio transport. v0.2.106: the process ends with its
+    # client — on stdin EOF (bounded grace for in-flight tool work instead of
+    # joining a blocked executor thread forever) and when the process that
+    # spawned it exits without closing the pipe (a timed-out connect on a
+    # loaded machine; Windows' venv launcher killed, its interpreter child
+    # left running). See vco_lib/mcp_stdio_lifetime.py.
+    try:
+        from vco_lib.mcp_stdio_lifetime import run_stdio_server  # type: ignore
+    except ImportError as _lifetime_import_err:
+        _reraise_vco_lib_import(_lifetime_import_err, "mcp_stdio_lifetime.run_stdio_server")
+    run_stdio_server(mcp.run_stdio_async, name="weaviate-kg")
