@@ -3691,6 +3691,11 @@ pub fn run() {
             // auto-start (read by the Python home + the core Rust pre-check).
             commands::engine_autostart_pref::get_container_engine_autostart,
             commands::engine_autostart_pref::set_container_engine_autostart,
+            // v0.2.106: the GUI switch for the shared auto-restart toggle
+            // (read on every tick by the services watcher AND the hub's
+            // infra watchdog).
+            commands::services_watcher_pref::get_services_watcher_enabled,
+            commands::services_watcher_pref::set_services_watcher_enabled,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,

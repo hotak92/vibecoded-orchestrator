@@ -408,6 +408,16 @@ open -a Docker                           # macOS (Docker Desktop)
 
 **Insufficient memory**: Weaviate needs ~512 MB RAM minimum, 1-2 GB to run comfortably. On Docker Desktop, raise the memory limit under Settings → Resources.
 
+## Backing up the Weaviate volume
+
+VCO has TWO automatic restarters that can bring a stopped service back mid-copy: the launcher's services watcher (a ~30 s poll) and the hub's infra watchdog. Since v0.2.106 both honor the same pause marker, and **Stop on the launcher's Services page is the supported way to hold them off**:
+
+1. In the launcher, open **Services** and press **Stop** on Weaviate (or **Stop All**). That writes the shared pause marker, so BOTH restarters leave the service down until you press Start again. A stop done outside VCO (`podman stop` / `docker stop` in a terminal) cannot be told apart from a crash and WILL be auto-restarted — use the buttons, not the terminal.
+2. Copy the volume while the service is down, e.g. `podman volume export vco_weaviate_data -o weaviate-backup.tar` (or copy the volume directory under the runtime's volume root).
+3. Press **Start** on Weaviate — that clears the pause and supervision resumes.
+
+Keep the launcher running (not restarted) while the pause must hold: on launcher start the boot auto-start deliberately brings the stack back up. If you need automatic restarts off for longer, Preferences → Services has a **"Restart stopped services automatically"** switch that stands down both restarters.
+
 ## Weaviate collections lose their data at every restart (Weaviate 1.37)
 
 **Symptom**: a collection is still listed in the schema, but every search or listing fails with

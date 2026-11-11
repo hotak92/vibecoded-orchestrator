@@ -275,6 +275,11 @@ pub mod session_autostart;
 // whose logic lives in `vco_lib/container_engine_start.py` and whose
 // readers are the hub, the launcher setup and the session hooks.
 pub mod engine_autostart_pref;
+// v0.2.106: Preferences → Services "Restart stopped services automatically"
+// — the GUI switch for the `launcher.services_watcher_enabled` app_state row
+// that BOTH automatic restarters read (the launcher's services watcher and
+// the hub's infra watchdog).
+pub mod services_watcher_pref;
 // v0.2.91 decision #26: named process-wide single-flight guard. Refuses (does
 // NOT queue) a second concurrent run of a long-running destructive command —
 // `update_all_projects` and the orchestrator update (`run_orchestrator_update`
