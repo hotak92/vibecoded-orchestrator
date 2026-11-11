@@ -20,6 +20,7 @@
 
 import { writable, get } from 'svelte/store';
 import { safeInvoke, tauriAvailable } from '$lib/tauri';
+import { pollWhileActive } from '$lib/window-activity';
 
 export interface ChangeRow {
   seq: number;
@@ -36,7 +37,7 @@ type Listener = (row: ChangeRow) => void;
 const listeners = new Map<string, Set<Listener>>();
 
 let cursor: number = 0;
-let timer: ReturnType<typeof setInterval> | null = null;
+let timer: (() => void) | null = null;
 let started = false;
 
 export const lastPolledAt = writable<number | null>(null);
@@ -91,12 +92,14 @@ export async function startChangePoller(): Promise<void> {
     const head = await safeInvoke<number>('current_change_seq');
     if (typeof head === 'number') cursor = head;
   } catch {}
-  timer = setInterval(pollOnce, POLL_INTERVAL_MS);
+  // v0.2.106: no ticks while the window is minimised or hidden; one
+  // catch-up poll when it is shown again (the cursor loses nothing).
+  timer = pollWhileActive(pollOnce, POLL_INTERVAL_MS);
   pollerActive.set(true);
 }
 
 export function stopChangePoller(): void {
-  if (timer) clearInterval(timer);
+  if (timer) timer();
   timer = null;
   started = false;
   pollerActive.set(false);

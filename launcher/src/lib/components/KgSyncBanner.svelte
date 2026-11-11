@@ -19,6 +19,7 @@
   // and action verbs; nothing about the rendered result changed.
 
   import { onDestroy, onMount } from 'svelte';
+  import { pollWhileActive } from '$lib/window-activity';
   import { listen, invoke, safeInvoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { KgSyncStatus, KgSyncView } from '$lib/types/launcher';
@@ -47,7 +48,7 @@
   let retrying = $state(false);
   let dismissed = $state(false);
   let now = $state(Date.now());
-  let tickHandle: ReturnType<typeof setInterval> | null = null;
+  let tickHandle: (() => void) | null = null;
 
   async function retry() {
     if (retrying) return;
@@ -74,10 +75,10 @@
   function maybeStartTick(v: KgSyncView) {
     const terminal = v.status === 'success' || v.status === 'skipped';
     if (terminal && v.finished_at_iso && tickHandle === null) {
-      tickHandle = setInterval(() => { now = Date.now(); }, 1000);
+      tickHandle = pollWhileActive(() => { now = Date.now(); }, 1000);
     }
     if (!terminal && tickHandle !== null) {
-      clearInterval(tickHandle);
+      tickHandle();
       tickHandle = null;
     }
   }
@@ -137,7 +138,7 @@
 
   onDestroy(() => {
     unlisten?.();
-    if (tickHandle !== null) clearInterval(tickHandle);
+    if (tickHandle !== null) tickHandle();
   });
 
   function statusGlyph(s: KgSyncStatus): string {

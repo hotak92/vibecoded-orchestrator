@@ -333,6 +333,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a failure. A real analyzer failure is still reported failed. If the launcher's background service is older than
   this release and does not know "skipped" yet, the entry says "failed" with the same reason instead of "died".
 
+- **The RL citation drain no longer re-embeds the same chat text for every retrieval, and its chunks fit the
+  embedding model.** A field report from a CPU-only machine showed an embedding burst about every 30 minutes of work,
+  each leaving a "shrink" row of 90-190k characters in `embedding_failures.jsonl`. The source is the Stop-hook
+  citation drain, which embeds the up to 25 000-token answer window that follows each staged retrieval. It chunked
+  that window with the knowledge-graph chunker, whose chunks are sized for prose and so were refused by the model on
+  tool-call and code text and retried shorter (the tail of each chunk was lost), and whose boundaries depend on where
+  the window starts, so the overlapping windows of one chat never shared a chunk and the same text was embedded once
+  per retrieval (one run on a test machine embedded 44 windows). The answer window now has its own chunker: chunks
+  are sized to the model's window for dense text, and their boundaries are chosen by the content itself, so
+  overlapping windows produce the same chunks and the embed cache reuses them. The second-model embedding of a
+  dual-model citation is cached the same way. In a 40-retrieval test the text sent to the model drops by about two
+  thirds, and no chunk exceeds the model window. The citation drain is unrelated to v0.2.105's commit, merge and
+  pull catch-up for the code graph, which embeds only changed code and skips unchanged entries.
+
+- **An idle launcher window no longer keeps several CPU cores busy.** A field report from a 20-core Windows machine
+  showed the launcher's WebView2 process at about 17% of total CPU with the launcher idle. The Home page's background
+  glow drifted forever, and every frame of that drift redrew two large blurs and re-blurred every glass card above
+  them. The glow is now still. WebView2 is also never told when the launcher window is minimised, so animations and
+  polling went on for a window nobody could see: the launcher now notices a minimised or hidden window, pauses every
+  animation and skips its periodic checks (the change poller, the restart banner, the subscription usage card, the
+  Services page, the module health refresh and the banners' clocks) until the window is shown again, then
+  refresh once. The restart banner also no longer redraws when its five-second check returns the same answer.
+
+- **The weaviate-kg MCP server no longer outlives the Claude Code session that started it.** A field report from a
+  machine short of memory showed MCP servers that missed the 30-second connect timeout staying alive after Claude
+  Code gave up on them. VCO's server could do the same in two ways: when its stdin closed while a tool call was still
+  waiting on a slow Weaviate or Ollama request, the process waited for that request before exiting; and when the
+  process that started it died without closing the pipe (on Windows, killing a virtual environment's `python.exe`
+  leaves the real interpreter it started running), nothing noticed at all. The server now gives in-flight work 30
+  seconds after its stdin closes and then exits, and it exits within five seconds of the process that started it
+  exiting. Telemetry that is written at exit is still written.
+- **The Ollama keep-alive setting now says where to set it and how to unload a model at once.** The configuration
+  reference names every process that reads `VCO_OLLAMA_KEEP_ALIVE`, how to set it for all of them (a user
+  environment variable, then restart VS Code and the launcher) or for one project (`.claude/settings.local.json`),
+  explains that the knowledge-graph lookups made on every tool call keep the model loaded while you work whatever the
+  value, and gives the `ollama ps` / `ollama stop` commands that unload a model right away.
+
 ## [0.2.105] - 2026-10-30
 
 ### Added

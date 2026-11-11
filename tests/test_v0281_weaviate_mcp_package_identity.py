@@ -114,6 +114,12 @@ def test_bare_script_makes_server_the_one_canonical_object():
             try: coro.close()
             except Exception: pass
         asyncio.run = _noop
+        # v0.2.106: the server serves through vco_lib.mcp_stdio_lifetime
+        # (which EXITS the process on stdin EOF) — neuter that too.
+        sys.path.insert(0, {str(REPO_ROOT)!r})
+        import vco_lib.mcp_stdio_lifetime as _lt
+        _lt.run_stdio_server = lambda *a, **k: None
+        sys.path.remove({str(REPO_ROOT)!r})
         # Exec server.py source into THIS __main__ (faithful bare-script: __name__
         # == '__main__', sys.modules['__main__'] IS us — exactly `python server.py`).
         main = sys.modules["__main__"]
@@ -161,6 +167,12 @@ def test_bare_script_embeddings_query_time_relative_import_resolves():
             try: coro.close()
             except Exception: pass
         asyncio.run = _noop
+        # v0.2.106: the server serves through vco_lib.mcp_stdio_lifetime
+        # (which EXITS the process on stdin EOF) — neuter that too.
+        sys.path.insert(0, {str(REPO_ROOT)!r})
+        import vco_lib.mcp_stdio_lifetime as _lt
+        _lt.run_stdio_server = lambda *a, **k: None
+        sys.path.remove({str(REPO_ROOT)!r})
         main = sys.modules["__main__"]
         main.__file__ = SERVER
         exec(compile(open(SERVER).read(), SERVER, "exec"), main.__dict__)
@@ -253,6 +265,12 @@ def test_bare_script_reconciles_repo_root_package_key_to_main():
             try: coro.close()
             except Exception: pass
         asyncio.run = _noop
+        # v0.2.106: the server serves through vco_lib.mcp_stdio_lifetime
+        # (which EXITS the process on stdin EOF) — neuter that too.
+        sys.path.insert(0, {str(REPO_ROOT)!r})
+        import vco_lib.mcp_stdio_lifetime as _lt
+        _lt.run_stdio_server = lambda *a, **k: None
+        sys.path.remove({str(REPO_ROOT)!r})
         main = sys.modules["__main__"]
         main.__file__ = SERVER
         exec(compile(open(SERVER).read(), SERVER, "exec"), main.__dict__)

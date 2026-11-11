@@ -89,7 +89,12 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: helper process through ``fcntl.flock`` — a POSIX-only primitive with no
 #: .ps1 sibling (tests/test_v02102_codegraph_resync_convergence.py,
 #: test_a_driver_claim_skip_closes_its_own_row_as_skipped).
-NON_CONVENTION_BASELINE = 189
+#: 189 -> 191 (v0.2.106 perf lane): tests/test_v02106_mcp_stdio_lifetime.py's
+#: two process tests SIGKILL a parent and wait for its reparented child /
+#: read /proc zombie state — POSIX-only primitives with no .ps1 sibling; the
+#: Windows parent-handle arm is unit-tested with a fake kernel32
+#: (test_parent_watch_windows_arm_reads_the_parent_handle).
+NON_CONVENTION_BASELINE = 191
 
 
 # -- which conditions skip on Windows --------------------------------------

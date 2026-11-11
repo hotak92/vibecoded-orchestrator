@@ -8,6 +8,7 @@
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { isWindowActive, onWindowActivityChange, pollWhileActive } from '$lib/window-activity';
   import {
     agentAnswer,
     agentIdentity,
@@ -51,7 +52,14 @@
   onMount(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let stopped = false;
+    // v0.2.106: a poll due while the window is minimised or hidden waits
+    // for it to be shown again, then runs at once.
+    let deferred = false;
     const poll = async () => {
+      if (!isWindowActive()) {
+        deferred = true;
+        return;
+      }
       const next = await fetchUsage();
       if (stopped) return;
       card = settle(card, next);
@@ -59,12 +67,19 @@
       timer = setTimeout(poll, nextPollMs(next));
     };
     void poll();
+    const unsubActivity = onWindowActivityChange((active) => {
+      if (active && deferred && !stopped) {
+        deferred = false;
+        void poll();
+      }
+    });
     // Countdowns move between polls.
-    const clock = setInterval(() => (now = Date.now()), 30_000);
+    const stopClock = pollWhileActive(() => (now = Date.now()), 30_000);
     return () => {
       stopped = true;
       if (timer) clearTimeout(timer);
-      clearInterval(clock);
+      stopClock();
+      unsubActivity();
     };
   });
 </script>

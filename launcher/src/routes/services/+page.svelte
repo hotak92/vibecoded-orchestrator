@@ -15,6 +15,7 @@
 
   import { onMount, onDestroy } from 'svelte';
   import { invoke, listen } from '$lib/tauri';
+  import { pollWhileActive } from '$lib/window-activity';
   // PR-37 (v0.2.12 / 2026-05-16): schema-health card surfaces the two
   // schema migrations introduced in PR-24 (Development temporal props
   // + shared KG indexNullState). Soft-fails to a "Weaviate not
@@ -131,7 +132,7 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let progress = $state<LifecycleProgress | null>(null);
-  let pollerHandle: ReturnType<typeof setInterval> | null = null;
+  let pollerHandle: (() => void) | null = null;
   let unlistenProgress: (() => void) | null = null;
 
   // ─── Model gateway card ────────────────────────────────────────────────
@@ -564,7 +565,8 @@
     // this page was the entry point.
     await projects.load();
     await loadGuidanceFlags();
-    pollerHandle = setInterval(() => {
+    // v0.2.106: no polling while the window is minimised or hidden.
+    pollerHandle = pollWhileActive(() => {
       refresh();
       refreshGateway();
     }, 5000);
@@ -586,7 +588,7 @@
   });
 
   onDestroy(() => {
-    if (pollerHandle) clearInterval(pollerHandle);
+    if (pollerHandle) pollerHandle();
     if (unlistenProgress) unlistenProgress();
   });
 </script>
