@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
 from vco_lib import mcp_stdio_lifetime as lt
 
 REPO = Path(__file__).resolve().parents[1]
@@ -83,6 +84,7 @@ def test_stdin_eof_exits_even_with_stuck_tool_work():
     proc = subprocess.Popen(
         [sys.executable, "-c", _SERVER.format(repo=str(REPO))],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=child_env(),
     )
     try:
         assert proc.stdout is not None and proc.stdin is not None
@@ -115,7 +117,7 @@ def test_parent_death_ends_the_server_without_eof():
     )
     proc = subprocess.Popen(
         [sys.executable, "-c", middle, _SERVER.format(repo=str(REPO)), str(r)],
-        stdout=subprocess.PIPE, pass_fds=(r,),
+        stdout=subprocess.PIPE, pass_fds=(r,), env=child_env(),
     )
     server_pid = None
     try:
@@ -153,6 +155,31 @@ def test_parent_watch_without_a_windows_handle_never_says_gone():
     w = lt.ParentWatch(_getppid=lambda: 4242, _platform="win32")
     if sys.platform != "win32":
         assert w.parent_gone() is False
+
+
+def test_parent_watch_windows_arm_reads_the_parent_handle(monkeypatch):
+    import ctypes
+
+    state = {"exited": False, "opened": None}
+
+    class _K32:
+        def OpenProcess(self, access, inherit, pid):  # noqa: N802 — Win32 name
+            state["opened"] = (access, pid)
+            return 77
+
+        def WaitForSingleObject(self, handle, ms):  # noqa: N802
+            assert handle == 77 and ms == 0
+            return 0 if state["exited"] else 0x102  # WAIT_OBJECT_0 / WAIT_TIMEOUT
+
+    class _WinDll:
+        kernel32 = _K32()
+
+    monkeypatch.setattr(ctypes, "windll", _WinDll(), raising=False)
+    w = lt.ParentWatch(_getppid=lambda: 4242, _platform="win32")
+    assert state["opened"] == (0x00100000, 4242)  # SYNCHRONIZE on the parent
+    assert w.parent_gone() is False
+    state["exited"] = True
+    assert w.parent_gone() is True
 
 
 def test_parent_watch_without_a_parent_id_never_says_gone():
