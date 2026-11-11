@@ -73,8 +73,8 @@ def _clean_keep_alive_env():
 # ── Item 1: keep_alive default 10m ───────────────────────────────────────
 
 
-def test_keep_alive_default_is_10m():
-    assert ollama_mod._keep_alive() == "10m"
+def test_keep_alive_default_is_the_shared_caller_value():
+    assert ollama_mod._keep_alive() == "45m"  # v0.2.106: 10m until the hub took over unloading
 
 
 def test_compose_ollama_keep_alive_and_queue():
@@ -146,7 +146,7 @@ def test_embed_request_builder_canonical_shape():
         "prompt": "x",
         "options": {"num_ctx": 10_240},
         "truncate": False,
-        "keep_alive": "10m",
+        "keep_alive": "45m",
     }
     batch = builder("qwen3-embedding:0.6b", input=["x", "y"])
     assert batch["input"] == ["x", "y"] and "prompt" not in batch
@@ -166,7 +166,7 @@ def test_options_identity_adapter_matches_builder():
             assert got["options"] == expected["options"] == {
                 "num_ctx": MODEL_TOKEN_LIMITS[model]
             }, (model, method, got)
-            assert got["keep_alive"] == expected["keep_alive"] == "10m"
+            assert got["keep_alive"] == expected["keep_alive"] == "45m"
             assert got["truncate"] is False
 
 
@@ -264,7 +264,7 @@ def test_options_identity_weaviate_mcp_inline_legs(monkeypatch):
     for call, model in zip(captured, expected_models):
         want = builder(model, prompt="hello")
         assert call["json"]["options"] == want["options"], (model, call)
-        assert call["json"]["keep_alive"] == want["keep_alive"] == "10m", model
+        assert call["json"]["keep_alive"] == want["keep_alive"] == "45m", model
         assert call["json"]["truncate"] is False, model
 
 
@@ -291,7 +291,7 @@ def test_options_identity_code_embed_service_ollama_tier(monkeypatch):
     builder = ollama_mod.embed_request_body
     want = builder("unclemusclez/jina-embeddings-v2-base-code:latest", prompt="hello")
     assert captured[0]["json"]["options"] == want["options"] == {"num_ctx": 2_048}
-    assert captured[0]["json"]["keep_alive"] == "10m"
+    assert captured[0]["json"]["keep_alive"] == "45m"
 
 
 def test_options_identity_migrate_and_search_fallbacks(monkeypatch):
@@ -317,7 +317,7 @@ def test_options_identity_migrate_and_search_fallbacks(monkeypatch):
     mig.get_text_embedding("hello")
     want = builder("qwen3-embedding:0.6b", prompt="hello")
     assert captured[0]["json"]["options"] == want["options"], captured
-    assert captured[0]["json"]["keep_alive"] == "10m", captured
+    assert captured[0]["json"]["keep_alive"] == "45m", captured
 
     # (search_knowledge.get_embedding's direct-Ollama leg was removed in
     # v0.2.102 W6-B2 — owner ruling 2026-10-10, no other embedding model.)
@@ -351,7 +351,7 @@ def test_generate_calls_carry_keep_alive(monkeypatch):
 
     monkeypatch.setattr(sb.urllib.request, "urlopen", _fake_urlopen)
     sb.call_ollama("prompt", model="qwen3.5:9b")
-    assert urllib_capture[0].get("keep_alive") == "10m", urllib_capture
+    assert urllib_capture[0].get("keep_alive") == "45m", urllib_capture
 
 
 # ── Item 3 / 6: 503 + connection-refused are retryable, never a drop ─────

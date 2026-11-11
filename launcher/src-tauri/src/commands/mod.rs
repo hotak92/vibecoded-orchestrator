@@ -99,6 +99,8 @@ pub mod licensing;
 // preference. Writes app_state `logging.level` — the key
 // `vct_launcher_core::logging` resolves and `crate::logging` applies.
 pub mod logging_prefs;
+// v0.2.106: Preferences idle-unload time + Services Ollama model list (hub-owned).
+pub mod ollama_lifetime_prefs;
 pub mod maintenance;
 pub mod manifest;
 // v0.2.92 WP-12: the model gateway's GUI surface — lifecycle (start / stop /

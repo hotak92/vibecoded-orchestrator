@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# How long Ollama keeps a model loaded after VCO last used it (v0.2.106,
+# owner ruling 2026-11-11: "the hub manages unloading").
+#
+# ONE table, two readers (A>B>C option B: the Python callers cannot ask the
+# hub on every embed without adding latency to the hook path):
+#   * vco_lib/ollama_embed_body.py reads `caller_keep_alive` and sends it on
+#     every Ollama request VCO makes (embeds, generate calls, the code-embed
+#     container's body template);
+#   * launcher/src-tauri/vct-launcher-core/src/services/ollama_lifetime.rs
+#     embeds this file (include_str!) for the hub's unloader and the
+#     launcher's Preferences field.
+#
+# The hub unloads a model after the idle time the user picks in Preferences
+# (stored in launcher.db, `app_state[ollama.idle_unload]`; `default_idle`
+# when unset, at most `max_idle`). The callers' keep_alive is the fail-safe:
+# it is longer than any idle time the hub accepts, so Ollama never unloads
+# first while the hub runs, and a model still unloads on its own after
+# `caller_keep_alive` when the hub is down.
+#
+# Durations use Ollama's notation restricted to whole h/m/s units ("45m",
+# "1m30s"); "0" means zero.
+caller_keep_alive = "45m"
+default_idle = "10m"
+max_idle = "30m"

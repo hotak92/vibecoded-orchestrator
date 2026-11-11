@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tomllib
+from pathlib import Path
 from typing import Any
 
 #: The env key that carries the resolved body template into the code_embed
@@ -68,35 +71,57 @@ def _num_ctx_for_model(model: str) -> int:
     return int(val) if val is not None else _NUM_CTX_FALLBACK
 
 
-# v0.2.77 Part 9 task 6: keep the embedding model resident in Ollama between
-# calls. Ollama's default keep_alive is ~5 min; after any idle gap the next
-# embed pays a ~1.9 s model reload (measured in the hook-latency audit
-# 2026-07-11). Sending keep_alive on every embed request pins the model so the
-# recurring reload tax vanishes. This is a REQUEST-level fix (works regardless
-# of the compose env default) and it is IDEMPOTENT — Ollama refreshes the TTL on
-# every request that carries it.
+# v0.2.77 Part 9 task 6: every embed request carries a keep_alive so the
+# model stays resident between calls (Ollama's own default is ~5 min, and a
+# reload costs ~1.9 s). v0.2.102 W4-E dropped the value from 24h to 10m
+# (owner ruling 2026-10-08: one KG search had pinned 8.3 GB of VRAM for a day).
 #
-# v0.2.102 W4-E: default dropped from "24h" to "10m" (owner ruling 2026-10-08,
-# after a live measurement: ONE KG search pinned qwen3-embedding 2.4 GB +
-# snowflake-arctic-embed2 1.15 GB in VRAM for 24 h each — 8.3 GB idle total).
-# 10 m accepts the ~1.9 s reload after a genuinely idle gap in exchange for
-# releasing idle VRAM, while still covering the multi-second cadence of a
-# search/sync session (models stay resident across consecutive calls). The user
-# can override via VCO_OLLAMA_KEEP_ALIVE (any value Ollama accepts: a duration
-# like "30m"/"2h", "-1" for never-evict, or "0" to opt back into immediate
-# unload). An empty override string means "send no keep_alive" (defer to
-# Ollama's own default / the OLLAMA_KEEP_ALIVE server env) — an explicit
-# opt-out.
-_KEEP_ALIVE_DEFAULT = "10m"
+# v0.2.106 (owner ruling 2026-11-11, "the hub manages unloading"): the
+# callers no longer own the timer. vct-hub unloads a model once no VCO request
+# has used it for the idle time set in Preferences (10 min when unset — the
+# pre-v0.2.106 behaviour). What the callers send is the FAIL-SAFE: one
+# bounded value, longer than any idle time the hub accepts, so Ollama never
+# unloads first while the hub runs and a model still unloads on its own when
+# the hub is down. The numbers live in ``ollama_model_lifetime.toml`` beside
+# this module, which the hub embeds too (A>B>C option B), so the hub can tell
+# a VCO-loaded model (unloaded by the hub) from one somebody pinned
+# differently (left to Ollama's own timer).
+#
+# ``VCO_OLLAMA_KEEP_ALIVE`` stays the explicit override and wins over the hub:
+# any value Ollama accepts ("30m", "2h", "-1" = never evict, "0" = unload
+# after each request); a model whose expiry does not match the shared value is
+# left alone by the hub. An EMPTY value sends no keep_alive at all (Ollama's
+# server-side OLLAMA_KEEP_ALIVE applies — 10m in the shipped compose files).
+_LIFETIME_TABLE = Path(__file__).with_name("ollama_model_lifetime.toml")
 
 
-def _keep_alive(environ: "Any" = None) -> str | None:
-    """Resolve the keep_alive value to attach to embed requests.
+def _caller_keep_alive_default() -> str:
+    """``caller_keep_alive`` from the shared table — read once. The file
+    ships beside this module, so a read or parse failure is a broken install
+    and raises (loud), never a guessed default."""
+    with _LIFETIME_TABLE.open("rb") as fh:
+        value = tomllib.load(fh)["caller_keep_alive"]
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{_LIFETIME_TABLE}: caller_keep_alive must be a duration string")
+    return value.strip()
 
-    Returns the string to send, or ``None`` to send no keep_alive field
-    (explicit opt-out via an empty ``VCO_OLLAMA_KEEP_ALIVE``). Respecting an
-    explicit user override is required by the task-6 spec. ``environ``
+
+_KEEP_ALIVE_DEFAULT = _caller_keep_alive_default()
+
+_BARE_NUMBER = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)$")
+
+
+def _keep_alive(environ: "Any" = None) -> "str | int | float | None":
+    """Resolve the keep_alive value to attach to Ollama requests.
+
+    Returns the value to send, or ``None`` to send no keep_alive field
+    (explicit opt-out via an empty ``VCO_OLLAMA_KEEP_ALIVE``). ``environ``
     defaults to this process's environment.
+
+    A bare number (``"-1"``, ``"0"``, ``"3600"``) is sent as a JSON NUMBER:
+    Ollama reads a number as seconds (negative = never evict) but parses a
+    STRING as a Go duration, which needs a unit — so the documented
+    ``VCO_OLLAMA_KEEP_ALIVE=-1`` must not go out as the string ``"-1"``.
     """
     val = (os.environ if environ is None else environ).get("VCO_OLLAMA_KEEP_ALIVE")
     if val is None:
@@ -105,6 +130,9 @@ def _keep_alive(environ: "Any" = None) -> str | None:
     if val == "":
         # Explicit opt-out: caller wants Ollama's own default behaviour.
         return None
+    if _BARE_NUMBER.match(val):
+        number = float(val)
+        return int(number) if number.is_integer() else number
     return val
 
 
