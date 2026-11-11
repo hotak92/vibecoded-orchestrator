@@ -157,9 +157,7 @@ def test_parent_watch_without_a_windows_handle_never_says_gone():
         assert w.parent_gone() is False
 
 
-def test_parent_watch_windows_arm_reads_the_parent_handle(monkeypatch):
-    import ctypes
-
+def test_parent_watch_windows_arm_reads_the_watched_handle(monkeypatch):
     state = {"exited": False, "opened": None}
 
     class _K32:
@@ -171,15 +169,46 @@ def test_parent_watch_windows_arm_reads_the_parent_handle(monkeypatch):
             assert handle == 77 and ms == 0
             return 0 if state["exited"] else 0x102  # WAIT_OBJECT_0 / WAIT_TIMEOUT
 
-    class _WinDll:
-        kernel32 = _K32()
-
-    monkeypatch.setattr(ctypes, "windll", _WinDll(), raising=False)
+    monkeypatch.setattr(lt, "_kernel32", lambda: _K32())
+    # The venv-stub climb resolved the client to pid 100 (the stub is 4242).
+    monkeypatch.setattr(lt, "_win_watch_pid", lambda ppid: 100 if ppid == 4242 else ppid)
     w = lt.ParentWatch(_getppid=lambda: 4242, _platform="win32")
-    assert state["opened"] == (0x00100000, 4242)  # SYNCHRONIZE on the parent
+    assert state["opened"] == (0x00100000, 100)  # SYNCHRONIZE on the client, not the stub
     assert w.parent_gone() is False
     state["exited"] = True
     assert w.parent_gone() is True
+
+
+# Windows venv launcher stub (field case: orphaned "venv launcher + child" pairs
+# whose grandparent, Claude Code, was gone). The stub waits for its child, so the
+# client to watch is the stub's parent. The real process tree is exercised by
+# vct-coordination's Windows CI (same rule, test_windows_parent_watch_real.py).
+_VENV = r"C:\proj\.venv\Scripts\python.exe"
+_BASE = r"C:\Python312\python.exe"
+
+
+def test_watch_climbs_past_the_venv_launcher_stub():
+    assert lt.pick_watch_pid(200, _VENV, _BASE, _VENV, 100) == 100
+
+
+def test_watch_keeps_a_parent_that_is_not_the_stub():
+    assert lt.pick_watch_pid(200, r"C:\bin\claude.exe", _BASE, _VENV, 100) == 200
+
+
+def test_watch_keeps_the_parent_when_we_are_the_venv_image():
+    assert lt.pick_watch_pid(200, _VENV, _VENV, _VENV, 100) == 200
+
+
+def test_watch_keeps_the_parent_when_anything_is_unknown():
+    assert lt.pick_watch_pid(200, None, _BASE, _VENV, 100) == 200
+    assert lt.pick_watch_pid(200, _VENV, _BASE, _VENV, None) == 200
+    assert lt.pick_watch_pid(200, _VENV, None, _VENV, 100) == 200
+
+
+def test_win_watch_pid_falls_back_to_the_parent_off_windows():
+    # No kernel32 here: the climb fails closed to the parent itself.
+    if sys.platform != "win32":
+        assert lt._win_watch_pid(4242) == 4242
 
 
 def test_parent_watch_without_a_parent_id_never_says_gone():

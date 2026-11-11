@@ -84,7 +84,7 @@ class ParentWatch:
         except Exception:  # noqa: BLE001 — no parent id → never "gone"
             self._initial_ppid = None
         if self._windows and self._initial_ppid:
-            self._handle = _win_open_process(self._initial_ppid)
+            self._handle = _win_open_process(_win_watch_pid(self._initial_ppid))
 
     @property
     def initial_ppid(self) -> Optional[int]:
@@ -101,13 +101,107 @@ class ParentWatch:
             return False
 
 
+def _same_path(a: Optional[str], b: Optional[str]) -> bool:
+    if not a or not b:
+        return False
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def pick_watch_pid(parent_pid: int, parent_image: Optional[str], own_image: Optional[str],
+                   venv_executable: Optional[str], grandparent_pid: Optional[int]) -> int:
+    """The pid whose exit means our client is gone (pure; unit-tested).
+
+    On Windows a venv's ``Scripts\\python.exe`` is a launcher stub that starts
+    the base interpreter as its child and WAITS for it: the stub lives exactly
+    as long as we do, so watching it never fires when the client (Claude Code)
+    dies — the field case of orphaned "venv launcher + child" pairs. The parent
+    is that stub when its image is ``sys.executable`` (the venv's python.exe)
+    while our own image is a different file; then the client is its parent.
+    Same rule as vct-coordination's lifecycle module (separate project), whose
+    Windows CI runs the real process tree."""
+    if (grandparent_pid and _same_path(parent_image, venv_executable)
+            and own_image and not _same_path(own_image, venv_executable)):
+        return grandparent_pid
+    return parent_pid
+
+
+def _kernel32() -> Any:
+    """kernel32 with typed signatures: an untyped int is passed as a 32-bit C
+    int, which truncates a 64-bit HANDLE."""
+    import ctypes  # noqa: PLC0415
+    from ctypes import wintypes  # noqa: PLC0415
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    return k32
+
+
+def _win_image(k32: Any, pid: int) -> Optional[str]:
+    import ctypes  # noqa: PLC0415
+    from ctypes import wintypes  # noqa: PLC0415
+
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buf))
+        return buf.value if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)) else None
+    finally:
+        k32.CloseHandle(h)
+
+
+def _win_parent_of(k32: Any, pid: int) -> Optional[int]:
+    import ctypes  # noqa: PLC0415
+    from ctypes import wintypes  # noqa: PLC0415
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.th32ProcessID == pid:
+                return int(entry.th32ParentProcessID)
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+        return None
+    finally:
+        k32.CloseHandle(snap)
+
+
+def _win_watch_pid(parent_pid: int) -> int:
+    """Climb past the venv launcher stub (Windows). Any failure → the parent."""
+    try:
+        k32 = _kernel32()
+        return pick_watch_pid(parent_pid, _win_image(k32, parent_pid),
+                              _win_image(k32, os.getpid()), sys.executable,
+                              _win_parent_of(k32, parent_pid))
+    except Exception:  # noqa: BLE001 — conservative: keep watching the parent
+        return parent_pid
+
+
 def _win_open_process(pid: int) -> Any:
     """SYNCHRONIZE handle to ``pid`` (Windows), or None."""
     try:
-        import ctypes  # noqa: PLC0415
-
-        synchronize = 0x00100000
-        handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, pid)  # type: ignore[attr-defined]
+        handle = _kernel32().OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
         return handle or None
     except Exception:  # noqa: BLE001
         return None
@@ -115,10 +209,8 @@ def _win_open_process(pid: int) -> Any:
 
 def _win_process_exited(handle: Any) -> bool:
     try:
-        import ctypes  # noqa: PLC0415
-
         wait_object_0 = 0
-        return ctypes.windll.kernel32.WaitForSingleObject(handle, 0) == wait_object_0  # type: ignore[attr-defined]
+        return _kernel32().WaitForSingleObject(handle, 0) == wait_object_0
     except Exception:  # noqa: BLE001
         return False
 
