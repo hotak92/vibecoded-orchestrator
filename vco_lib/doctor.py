@@ -4437,6 +4437,29 @@ def probe_former_launcher_cli(folder: Path, res: DoctorResolvers, ctx: dict) -> 
 CID_BUNDLES_STALE = "project_bundles_stale"
 
 
+def _stale_project_finding(row: dict) -> Optional[Finding]:
+    """The per-project finding of one STALE census row — one builder for the
+    census's final report and for its partial results (review L2)."""
+    if row.get("verdict") != "stale":
+        return None
+    changed = row.get("changed_files") or []
+    name = row.get("name") or "?"
+    return Finding(
+        probe="bundle_staleness",
+        status=STATUS_PROBLEM,
+        summary=f"{name}: {len(changed)} bundle file(s) differ from what an update would ship",
+        fix=FIX_DEFER,
+        command=("python -m vco_lib.project_init install-bundle "
+                 f"--folder \"{row.get('folder')}\" --update --json"),
+        detail={
+            "project": name,
+            "changed_files": changed,
+            "recorded": row.get("recorded"),
+            "user_modified": row.get("user_modified", 0),
+        },
+    )
+
+
 def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
     """Are any registered projects' bundles older than the running orchestrator?
 
@@ -4480,9 +4503,17 @@ def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
     if bound is not None:
         span = max(0.0, bound - time.monotonic())
         census_deadline = bound - max(5.0, 0.2 * span)
+    def _publish(row: dict) -> None:
+        # Review L2: a census the bound cancels still hands back the stale
+        # projects it found (per-project findings carry no condition id, so
+        # a partial result never clears the machine-wide entry).
+        finding = _stale_project_finding(row)
+        if finding is not None:
+            probe_bound.publish(finding)
+
     try:
         payload = bundle_staleness.run_census(
-            root, refresh_ledger=True, deadline=census_deadline)
+            root, refresh_ledger=True, deadline=census_deadline, on_row=_publish)
     except Exception as exc:  # noqa: BLE001 — census must never fail the pass
         return [
             Finding(
@@ -4592,28 +4623,9 @@ def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
         verdict = row.get("verdict")
         name = row.get("name") or "?"
         if verdict == "stale":
-            changed = row.get("changed_files") or []
-            findings.append(
-                Finding(
-                    probe="bundle_staleness",
-                    status=STATUS_PROBLEM,
-                    summary=(
-                        f"{name}: {len(changed)} bundle file(s) differ from "
-                        f"what an update would ship"
-                    ),
-                    fix=FIX_DEFER,
-                    command=(
-                        "python -m vco_lib.project_init install-bundle "
-                        f"--folder \"{row.get('folder')}\" --update --json"
-                    ),
-                    detail={
-                        "project": name,
-                        "changed_files": changed,
-                        "recorded": row.get("recorded"),
-                        "user_modified": row.get("user_modified", 0),
-                    },
-                )
-            )
+            stale_finding = _stale_project_finding(row)
+            if stale_finding is not None:
+                findings.append(stale_finding)
         elif verdict == "unknown":
             findings.append(
                 Finding(
@@ -5171,6 +5183,14 @@ def reconcile_probe_cleared(
 DEFAULT_PROBE_TIMEOUT_S = 120
 
 
+#: What to run instead when a probe's bound cancels it (review L2): the
+#: unbounded command doing the same check, named in the "not checked" line.
+PROBE_CANCEL_HINTS: dict[str, str] = {
+    "bundle_staleness": (
+        "The full census runs without a bound: python -m vco_lib.bundle_staleness"),
+}
+
+
 def probe_timeout_secs() -> int:
     """``VCT_DOCTOR_CHECK_TIMEOUT_S`` — this run's per-check bound in seconds.
 
@@ -5209,10 +5229,11 @@ def _run_probe_bounded(
     outcome: dict = {}
     cancel = threading.Event()
     until = time.monotonic() + timeout_s
+    partial: list = []
 
     def _target() -> None:
         try:
-            with probe_bound.bounded(until, cancel):
+            with probe_bound.bounded(until, cancel, partial):
                 outcome["findings"] = list(fn(folder, res, ctx) or [])
         except BaseException as exc:  # noqa: BLE001 — reported, never re-raised in a thread
             outcome["error"] = exc
@@ -5224,6 +5245,8 @@ def _run_probe_bounded(
     worker.join(timeout_s)
     if worker.is_alive():
         cancel.set()
+        hint = PROBE_CANCEL_HINTS.get(probe_id)
+        done = list(partial)  # what the probe published before the bound
         return [
             Finding(
                 probe=probe_id,
@@ -5233,8 +5256,11 @@ def _run_probe_bounded(
                     "bound (raise VCT_DOCTOR_CHECK_TIMEOUT_S or re-run when "
                     "the machine is less loaded); it was cancelled and writes "
                     "nothing"
+                    + (f"; {len(done)} partial result(s) follow" if done else "")
+                    + (f". {hint}" if hint else "")
                 ),
-            )
+            ),
+            *done,
         ]
     if "error" in outcome:
         raise outcome["error"]

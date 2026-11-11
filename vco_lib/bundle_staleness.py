@@ -64,7 +64,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from vco_lib.manifest_paths import manifest_path as _manifest_path
 
@@ -333,8 +333,14 @@ def run_census(
     refresh_ledger: bool = True,
     write_state: bool = True,
     deadline: Optional[float] = None,
+    on_row: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """Run the census and return the §5.1 JSON payload. Never raises.
+
+    ``on_row`` (review L2) is called with each project's row as soon as it is
+    classified — the doctor probe publishes stale rows through it, so a
+    census its bound cancels still hands back what it found. A raising
+    callback is ignored.
 
     Args:
         orchestrator_root: the orchestrator clone/tarball root. ``None`` →
@@ -396,6 +402,11 @@ def run_census(
                                          _VERDICT_UNKNOWN, REASON_NOT_CHECKED))
                 continue
             rows.append(_classify_registered_project(root, r, running))
+            if on_row is not None:
+                try:
+                    on_row(rows[-1])
+                except Exception:  # noqa: BLE001 — a reporting hook never breaks the census
+                    pass
         summary = _summary_of(rows)
     not_checked = sum(1 for r in rows if r.get("reason") == REASON_NOT_CHECKED)
 

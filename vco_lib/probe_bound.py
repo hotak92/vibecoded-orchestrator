@@ -28,23 +28,36 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Any, Iterator, List, Optional
 
-__all__ = ["bounded", "deadline", "cancelled"]
+__all__ = ["bounded", "deadline", "cancelled", "publish"]
 
 _local = threading.local()
 
 
 @contextmanager
-def bounded(until: float, cancel: threading.Event) -> Iterator[None]:
+def bounded(until: float, cancel: threading.Event,
+            partial: Optional[List[Any]] = None) -> Iterator[None]:
     """Mark the CURRENT thread as a doctor probe bound to ``until``
-    (``time.monotonic()``) and cancelled once ``cancel`` is set."""
-    prior = (getattr(_local, "until", None), getattr(_local, "cancel", None))
-    _local.until, _local.cancel = until, cancel
+    (``time.monotonic()``) and cancelled once ``cancel`` is set.
+    ``partial`` receives what the probe hands over with :func:`publish`."""
+    prior = (getattr(_local, "until", None), getattr(_local, "cancel", None),
+             getattr(_local, "partial", None))
+    _local.until, _local.cancel, _local.partial = until, cancel, partial
     try:
         yield
     finally:
-        _local.until, _local.cancel = prior
+        _local.until, _local.cancel, _local.partial = prior
+
+
+def publish(item: Any) -> None:
+    """Hand one finding to the doctor AS the probe goes (review L2): when the
+    bound cancels the probe, the doctor reports these beside its "not
+    checked" line instead of discarding everything the probe had found. A
+    no-op outside a doctor probe, and once the probe is cancelled."""
+    sink = getattr(_local, "partial", None)
+    if sink is not None and not cancelled():
+        sink.append(item)
 
 
 def deadline() -> Optional[float]:

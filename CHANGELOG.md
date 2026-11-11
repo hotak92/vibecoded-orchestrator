@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what is actually removed. A removed folder can be added again through the normal Add flow: the files VCO removed
   come back and a file you changed before the removal stays yours. Shared collections and other projects'
   collections are never dropped: if the launcher's project list cannot be read at that moment, no collection is
-  dropped and the summary lists them as kept, because VCO could not check that no other project uses them.
+  dropped and the summary lists them as kept, because VCO could not check that no other project uses them; it names
+  the command that drops them once you have checked (`python -m vco_lib.project_init drop-collections --name
+  <project>`), which works after the project is gone.
 
 - **The Model providers switch takes full effect at once, in both directions — no restart, no update.** Turning a
   provider off (or back on) in Home → Model providers now applies immediately everywhere: the provider's agent
@@ -39,9 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips it, its quota is no longer read for the usage card, and the subagent pre-flight refuses to launch its agents
   with that same reason. Switching a provider back on whose key does not resolve keeps its definitions parked until
   the key resolves — the bundle update's restore applies the same key check, so they come back with the first
-  update or switch after the key resolves, never before. A switch and a bundle update never write a project's
-  manifest at the same time: the switch waits up to 20 s for a running update, and a project whose update is still
-  running is reported (run Update bundle on it afterwards — the update applies the stored switch). If the launcher's
+  update or switch after the key resolves, never before. A definition parked under an older release comes back as
+  this release's: switching Kimi back on after updating from v0.2.105 restores `kimi-implementer` and `kimi-reviewer`
+  pinned to K3.1 Pro (not the retired `claude-gw/kimi/k3[1m]`) and with the newer frontmatter keys — the switch
+  brings each restored file to the shipped version exactly as a bundle update would (a restored copy that matches
+  no version VCO shipped is backed up under `.claude/backups/bundle-adoptions/` first; if that backup cannot be
+  written the file is left as it is and the card says so), and the card says how many it brought up to date. A switch, a bundle update and a deferral
+  dismissal never write a project's manifest at the same time: the switch waits up to 20 s for a running update, and a
+  project whose update is still running is reported (run Update bundle on it afterwards — the update applies the
+  stored switch); a second update waiting for the first prints a "waiting for another bundle run" line every minute
+  and gives up after four hours with an error naming the lock, instead of waiting silently. If the launcher's
   project list cannot be read, the card says so instead of reporting the root alone as every project. The shell form (`python -m vco_lib.model_providers set --vendor <id> --disabled`) does the
   same apply and prints the per-project outcome.
 
@@ -54,7 +63,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `vct-cli project delete <id|slug>` (the hub's `DELETE /api/v1/cli/projects/{id}`) used to delete only the database
   row and leave every file VCO had put in the folder; it now runs this same removal — the hub hands it to the
   launcher binary installed beside it — with the same `--keep-collections` / `--leave-unremovable` choices and the
-  same refusals. Where no launcher binary sits beside the hub, it refuses and changes nothing.
+  same refusals. Where no launcher binary sits beside the hub, it refuses and changes nothing. Both ask first: in a
+  terminal they print what would be removed — the files VCO put in the folder, the settings files whose VCO entries
+  go, and the collections that would be dropped, from the same rules the removal applies — and remove only on `y`;
+  `--yes` removes without asking, and without a terminal and without `--yes` they refuse and change nothing, so a
+  script cannot drop a project's collections by accident. `vct-launcher --remove-project ... --preview` prints that
+  list as JSON and changes nothing. Only the stop on a value VCO could not remove suggests `--leave-unremovable`
+  (exit 2); any other failure — say, an update holding the launcher database — says what failed (exit 3), and a
+  removal that was not confirmed exits 4. `vct-cli project delete` waits as long as the removal runs (up to 30
+  minutes) and says so, instead of giving up after 15 seconds on a removal that then finished; a second delete of the
+  same project while one runs is refused; a launcher beside the hub too old to know `--remove-project` is detected
+  before anything runs; and the hub reports success only with the launcher's report for that project, writing its
+  audit row after the outcome.
 
 - **The menu bar shows when work is still running in the background.** After you close the "Update all" window (or add
   a project), knowledge-graph syncs, code-graph builds, summary runs and project setups keep going on their own, and
@@ -70,7 +90,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any restart — VCO never runs it for you); a schema history whose replay can still drop a live collection
   (`weaviate_raft_replay_exposed`); and a Weaviate container running without a memory limit
   (`weaviate_container_uncapped` — a container VCO adopted never got the limit VCO sizes from the host), with the
-  command that caps it in place without a recreate. `python -m vco_lib.weaviate_raft_guard status` prints the
+  command that caps it in place without a recreate. Before it calls a schema history exposed, the doctor gives
+  Weaviate up to 90 s to take its next snapshot: a reading taken right after a start — the update's own doctor
+  phase — would otherwise count that start's own fresh entries, and on a default-named clone (whose derived
+  `VibecodedOrchestrator_*` names differ only in case from the live `VibeCodedOrchestrator_*` ones) report a data-loss
+  risk that does not exist. With the shipped snapshot settings the snapshot comes within a minute (measured on
+  1.37.18: 26-45 s after an idle restart), so a healthy install gets no entry; without them no snapshot comes and the
+  exposure is reported, and the entry clears once a snapshot holds the delete — after the recreate with the shipped
+  settings its remedy names. `python -m vco_lib.weaviate_raft_guard status` prints the
   Weaviate version, how much of the schema history the latest snapshot holds, and which case-variant collection lost
   its data;
   `... snapshot --container <name>` takes the snapshot with a container's own image before a move by hand.
@@ -124,7 +151,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   files) are kept. Nothing is ever removed through a linked folder: if `.claude` or one of its folders is a link to
   somewhere else, what is behind the link is left alone and named in the result. If you also choose to delete the
   project's collections, VCO now finds the ones the project actually uses, even after a rename, and never deletes
-  one another project uses.
+  one another project uses. The agent definitions a provider switch parked in `.claude/agents.disabled/` go too when
+  they match a version VCO shipped (an edited one stays and is listed), so a folder added back later gets them fresh
+  instead of skipping them forever.
 - **Fable 5.2 in the model table.** Claude Code 2.1.321 makes the `fable` alias Claude Fable 5.2
   (`claude-fable-5-2`, 1M context); the shipped model-selection grid's Fable row is renamed and re-scored from
   benchmark evidence (Code/Debug/Review/Plan/Tools 10, Cost 2 — about $3.80 per task at medium, $9 at high, $26.5
@@ -210,7 +239,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never as a failure, and the rest of the report still runs. A check that overruns is cancelled: it writes nothing
   afterwards (no ledger entry added or cleared behind the report). The bundle census stops starting projects before
   the bound ends and names the ones it did not reach; a census that did not reach every project leaves the ledger
-  alone (`python -m vco_lib.bundle_staleness` runs the full census without a bound).
+  alone (`python -m vco_lib.bundle_staleness` runs the full census without a bound). A census the bound cancels
+  still lists the stale projects it had found, and its "not checked" line names that command.
 
 - **The metrics migration compares content, not byte counts.** Two files holding the same rows with different line
   endings (or a BOM), or a row appended by another writer during the copy, were reported as a failed copy with a
@@ -220,7 +250,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`py-compile-check` runs on `Edit` as well as `Write`.** It was registered on `Write` only, so a Python change
   made with the Edit tool was never compiled and its edit-outcome record said "no checker". Both settings templates
   register it on `Edit|Write`, and a bundle update moves an existing project's `Write` group to `Edit|Write` (a
-  group that also holds your own hook keeps its matcher); the hook's own `.py` filter is unchanged.
+  group that also holds your own hook keeps its matcher); the hook's own `.py` filter is unchanged. Where the
+  project's settings do not run it on `Edit` — such a group of your own, or the hook switched off in the launcher —
+  an Edit's outcome record says "no checker" at once instead of waiting 20 s for a result no hook writes.
 
 - **The launcher's system-tray icon was an empty square on Windows.** The tray was created with a tooltip and a menu
   but never an image, so the slot showed "VibeCoded Tools Launcher" over a blank square and a user could not tell the
