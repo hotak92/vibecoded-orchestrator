@@ -253,11 +253,16 @@ def _write_embeddings_sidecar(
     *,
     total_chunks: int = 1,
 ) -> None:
+    from claude_mcp_servers.weaviate_mcp.chunking import _CHUNKER_REVISION
+
     sidecar = {
         "schema_version": 1,
         "slot": slot,
         "model_id": "qwen3-embedding:0.6b",
         "dim": len(vector),
+        # v0.2.106: the ingest refuses a sidecar planned under another
+        # chunker revision (see ``_load_shipped_embeddings``).
+        "chunker_revision": _CHUNKER_REVISION,
         "nodes": {
             content_hash: {
                 "total_chunks": total_chunks,
@@ -361,6 +366,34 @@ class ShippedEmbeddingIngestTest(unittest.TestCase):
             server.embed_calls, 1,
             "with no shipped sidecar the embed path must compute as before",
         )
+
+    # v0.2.106: a sidecar planned under ANOTHER chunker revision (or naming
+    # none — every pre-v0.2.106 file) is treated as absent. A chunker change
+    # can move boundaries while keeping the chunk count, which the per-entry
+    # count guard cannot see; ingesting would attach vectors to other text.
+    def test_sidecar_from_another_chunker_revision_is_rejected(self):
+        for revision in (None, "v0.2.92.1"):
+            with self.subTest(revision=revision):
+                mod = _load_sync_module(self.root)
+                server = _CountingServer(slot="qwen3_embed")
+                c_hash = _node_content_hash(mod, self.node)
+                sidecar = {
+                    "schema_version": 1,
+                    "slot": "qwen3_embed",
+                    "nodes": {c_hash: {"total_chunks": 1, "chunks": [
+                        {"chunk_num": 1, "vector": self.SHIPPED_VEC}]}},
+                }
+                if revision is not None:
+                    sidecar["chunker_revision"] = revision
+                (self.knowledge / ".node_embeddings.qwen3_embed.json").write_text(
+                    json.dumps(sidecar), encoding="utf-8"
+                )
+                self.assertTrue(mod.sync_node(server, self.node))
+                self.assertEqual(
+                    server.embed_calls, 1,
+                    "a sidecar from another chunker revision must be ignored "
+                    "and the node embedded locally",
+                )
 
     # Defensive: a slot-named file that DECLARES a different slot is rejected.
     def test_misnamed_slot_in_file_body_rejected(self):

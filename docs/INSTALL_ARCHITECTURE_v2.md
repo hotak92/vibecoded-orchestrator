@@ -395,19 +395,27 @@ the revision is bumped. On the
 next update the launcher (and the Python emitter) compares the live revision
 against the persisted `chunker.last_seen_revision` marker and, on a change,
 writes a resync deferral to `UPDATE_DEFERRED.md` naming both revisions plus the
-commands the user runs to re-chunk and re-embed:
+commands that re-chunk and re-embed:
 
 ```
 <folder>/.claude/scripts/kg-sync --all
-<folder>/.claude/scripts/code-graph-analyze <folder> --from-resolver --force-recreate
+<folder>/.claude/scripts/code-graph-analyze <folder> --from-resolver --force-rewalk
 ```
 
-`--from-resolver` is not optional decoration: `--force-recreate` DROPS the five
-`<prefix>_Code*` classes, and without an identity flag the analyzer's last
-resolution rung is the folder BASENAME (`.claude/env` is sourced for hooks, not
-for the terminal a user pastes this into). `vco_lib.codegraph_drop_guard`
-refuses the drop at run time if the resolved family is not this project's bound
-one.
+Since v0.2.106 the update runs both halves itself: the KG half is the update's
+own KG pass (the launcher's bundle update spawns `kg-sync --all` when
+`kg-sync --check-drift` reports `rechunk_owed`; `install.py` takes seed leg (e)
+for the root — both ask `vco_lib.chunker_revision.kg_rechunk_owed`), and the
+code-graph half is the extractor-generation rung's background `--force-rewalk`.
+Each re-embeds only what re-planned (content-hash gated), writes the new vectors
+before it deletes a node's old rows, and stamps its half in
+`.claude/state/chunker-resync.json`; the entry clears once both halves name the
+current revision. The printed commands are the same two passes, for a half that
+did not complete. `--force-rewalk` replaced `--force-recreate` there: the
+latter dropped the five `<prefix>_Code*` classes before rebuilding them.
+`--from-resolver` keeps the walk on this project's bound collections instead of
+a family derived from the folder BASENAME (`.claude/env` is sourced for hooks,
+not for the terminal a user pastes this into).
 
 It fires **once per revision** (the marker advances after the write; first boot
 seeds the marker without a deferral) and is independent of the file-hash bundle

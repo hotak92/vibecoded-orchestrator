@@ -2516,6 +2516,35 @@ def announce_kg_metadata_repair_leg(log_event: "Optional[Callable]" = None) -> N
     )
 
 
+def kg_rechunk_due_now(project_root: Path) -> bool:
+    """Leg (e) of the root KG seed (v0.2.106): a chunker re-chunk is owed.
+
+    The root's half of the "every install re-chunks its KG once" trigger —
+    registered projects get theirs from the launcher's bundle update (the
+    ``rechunk_owed`` field of ``kg-sync --check-drift``). Both ask the one
+    question :func:`vco_lib.chunker_revision.kg_rechunk_owed` answers; only a
+    positive True selects the leg (an unreadable state must not start a
+    whole-tree pass on every update). The ``--all`` it selects is armed by
+    the same ledger entry, re-embeds only nodes whose chunks changed, and
+    stamps the KG half, so the next update falls through to leg (c).
+    """
+    from vco_lib.chunker_revision import kg_rechunk_owed
+
+    return kg_rechunk_owed(Path(project_root)) is True
+
+
+def announce_kg_rechunk_leg(log_event: "Optional[Callable]" = None) -> None:
+    """Report that leg (e) — the one-time chunker re-chunk — was chosen."""
+    print("  CI-10: chunker revision changed → full sync (re-embeds only the "
+          "nodes whose chunks changed)")
+    _install_log(log_event)(
+        "7c/10", "info",
+        "chunker re-chunk owed (chunker_preset_overhaul_pending) → one "
+        "whole-tree pass; content-hash gated, only re-planned nodes embed",
+        data={"reason": "chunker_rechunk"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # v0.2.100 AD-9 / L1-F18 — ONE gate for every Weaviate-writing install step
 # ---------------------------------------------------------------------------

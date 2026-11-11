@@ -8,12 +8,22 @@ the data is collected for. The perf lane had added a SECOND chunking home
 (``rl_client/answer_chunking.py``); this file pins the merge back into the one
 home:
 
-* the KG / document chunking output is BYTE-IDENTICAL to the pre-change
-  output — pinned by a golden fixture generated from the pre-change chunker
-  (``tests/fixtures/kg_chunk_path_golden.json``), so ``_CHUNKER_REVISION``
-  semantics cannot drift silently and no user re-embeds;
+* the KG / document chunking output is pinned BYTE-FOR-BYTE by a golden
+  fixture (``tests/fixtures/kg_chunk_path_golden.json``), so
+  ``_CHUNKER_REVISION`` semantics cannot drift silently;
 * the answer-window entry points (``answer_chunk_budget`` /
   ``chunk_answer_window``) are importable from the shared module.
+
+GOLDEN REGENERATED DELIBERATELY (owner ruling 2026-11-11, "fix + re-embed").
+The fixture was first generated from the pre-v0.2.106 chunker, to prove the
+answer-window merge left the KG path untouched. The same release then
+changed the KG path on purpose: every model-aware preset is clamped to the
+model's dense-content budget (``chunking.dense_char_budget``) and the packer
+sizes a chunk on its joined text — so ``_CHUNKER_REVISION`` moved
+``v0.2.92.1`` → ``v0.2.106`` and the fixture was regenerated from the NEW
+chunker (``python tests/test_v02106_shared_chunker_one_home.py
+--regenerate``). Any further change to this output is again a revision bump
+plus a re-embed for every user, and must be made the same deliberate way.
 """
 
 from __future__ import annotations
@@ -105,18 +115,22 @@ def _kg_path_output() -> dict:
 
 
 def test_kg_document_path_is_byte_identical_to_the_pregenerated_golden():
-    """The KG path's output must not change AT ALL when the answer-window
-    mode is added to the shared chunker: the golden was generated from the
-    PRE-change chunker. A change here means ``_CHUNKER_REVISION`` semantics
-    changed and every user's knowledge graph would need re-embedding."""
+    """The KG path's output is pinned byte-for-byte to the golden, which was
+    regenerated from the v0.2.106 dense-budget chunker (see the module
+    docstring). A change here means ``_CHUNKER_REVISION`` semantics changed
+    and every user's knowledge graph needs re-embedding — bump the revision
+    and regenerate deliberately, never to make this test pass."""
     golden = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert _kg_path_output() == golden
 
 
-def test_chunker_revision_is_unchanged():
-    # The hard-contract sentinel: moving the answer-window mode in must not
-    # re-chunk anyone's KG (see the golden test above).
-    assert chunking._CHUNKER_REVISION == "v0.2.92.1"
+def test_chunker_revision_matches_the_golden():
+    # The hard-contract sentinel moves WITH the golden: the fixture records
+    # the revision it was generated under, so a regenerated golden without a
+    # revision bump (or the reverse) fails here.
+    assert chunking._CHUNKER_REVISION == "v0.2.106"
+    golden = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    assert golden["chunker_revision"] == chunking._CHUNKER_REVISION
 
 
 def test_answer_window_entry_points_live_in_the_shared_module():
@@ -127,3 +141,16 @@ def test_answer_window_entry_points_live_in_the_shared_module():
     assert callable(chunking.answer_chunk_budget)
     assert chunking.chunk_answer_window("", "qwen3-embedding:0.6b") == []
     assert chunking.answer_chunk_budget("snowflake-arctic-embed2") > 0
+
+
+if __name__ == "__main__":  # pragma: no cover — deliberate regeneration only
+    import sys
+
+    if sys.argv[1:] == ["--regenerate"]:
+        FIXTURE.write_text(
+            json.dumps(_kg_path_output(), indent=1, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"regenerated {FIXTURE}")
+    else:
+        print("usage: python tests/test_v02106_shared_chunker_one_home.py --regenerate")

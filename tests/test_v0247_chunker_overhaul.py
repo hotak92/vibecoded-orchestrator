@@ -29,15 +29,28 @@ from pathlib import Path
 import pytest
 
 from claude_mcp_servers.weaviate_mcp.chunking import (
+    CHARS_PER_TOKEN_TEXT,
     CHUNK_TOKEN_POLICY_CEILING,
     CHUNKING_PRESETS,
     MODEL_TOKEN_LIMITS,
+    _num_ctx_for_model as _chunk_num_ctx,
+    _preset_for_limit,
     chunking_preset_for_model,
+    dense_char_budget,
 )
+
 from claude_mcp_servers.weaviate_mcp.server import (
     _rl_find_all_transcripts_in_dir,
 )
 from vco_lib.embedding_providers.ollama import _num_ctx_for_model
+
+
+def _dense_clamped(preset: tuple, model_name: str) -> tuple:
+    """``preset`` clamped componentwise to the model's v0.2.106 dense budget
+    (counter units) — what the model-aware resolver returns for a registered
+    model on top of its tier routing."""
+    units = dense_char_budget(model_name) // CHARS_PER_TOKEN_TEXT
+    return tuple(min(v, units) for v in preset)
 
 
 # ----------------------------------------------------------------------
@@ -129,11 +142,19 @@ class TestChunkingPresets:
         ],
     )
     def test_routing(self, model_name: str, expected_preset_name: str) -> None:
-        actual = chunking_preset_for_model(model_name)
+        # The tier ROUTE is decided on num_ctx alone; since v0.2.106 the
+        # model-aware resolver then clamps the routed tier to the model's
+        # dense budget (an unregistered model has none and keeps its tier).
         expected = CHUNKING_PRESETS[expected_preset_name]
-        assert actual == expected, (
-            f"{model_name} routed to {actual}, expected {expected_preset_name}={expected}"
+        routed = _preset_for_limit(_chunk_num_ctx(model_name))
+        assert routed == expected, (
+            f"{model_name} routed to {routed}, expected {expected_preset_name}={expected}"
         )
+        actual = chunking_preset_for_model(model_name)
+        if _chunk_num_ctx(model_name) is None:
+            assert actual == expected
+        else:
+            assert actual == _dense_clamped(expected, model_name)
 
     def test_codesage_routes_to_small_clamped_to_its_measured_window(self) -> None:
         """Wiring-audit W1 (v0.2.92): CodeSage's served window is 1 024, not
@@ -163,10 +184,13 @@ class TestChunkingPresets:
             "plateau rather than trusting the architectural cap"
         )
         budget = int(window * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
+        # v0.2.106: the dense-content budget (2 273 chars → 568 units at the
+        # measured 2.96 chars/token) is tighter than the window margin.
+        budget = min(budget, dense_char_budget("codesage-large-v2") // CHARS_PER_TOKEN_TEXT)
         min_t, max_t, target_t = CHUNKING_PRESETS["small_context"]
         assert chunking_preset_for_model("codesage-large-v2") == (
             min(min_t, budget), min(max_t, budget), min(target_t, budget)
-        )
+        ) == (550, 568, 568)
         # And the load-bearing property, stated independently of the formula:
         # nothing the chunker emits may exceed the window the model serves.
         assert max(chunking_preset_for_model("codesage-large-v2")) <= window
@@ -180,10 +204,18 @@ class TestChunkingPresets:
         # policy binds for qwen3 (8 192 < 9 216), so a max-packed chunk
         # can never exceed the embedding window (silent Ollama truncation)
         # NOR the retrieval-quality ceiling.
+        #
+        # v0.2.106 (owner ruling "fix + re-embed"): the dense-content budget
+        # (19 560 chars → 4 890 units at the measured 2.547 chars/token)
+        # binds below both — a max-packed 8 192-unit chunk measured ~126% of
+        # the window on dense text.
         capacity = int(MODEL_TOKEN_LIMITS["qwen3-embedding:0.6b"] * (1 - 0.1))
-        budget = min(capacity, CHUNK_TOKEN_POLICY_CEILING)
+        budget = min(
+            capacity, CHUNK_TOKEN_POLICY_CEILING,
+            dense_char_budget("qwen3-embedding:0.6b") // CHARS_PER_TOKEN_TEXT,
+        )
         assert chunking_preset_for_model("qwen3-embedding:0.6b") == (
-            4_600, 8_192, 8_192
+            4_600, 4_890, 4_890
         ) == (
             min(4_600, budget), min(13_500, budget), min(9_500, budget)
         )

@@ -159,20 +159,20 @@ class ChunkPlanSharedParityTests(unittest.TestCase):
         self.assertEqual(plan, self._expected_plan(content, model_id))
 
     def test_class_variant_same_content_different_preset_tiers(self):
-        """Identical content: single chunk under qwen3's window-clamped
-        xlarge budget (max 8_192 units -- D16+R39 v0.2.92:
-        min(policy 8 192, int(10 240 * 0.9) = 9 216))
-        but multi-chunk under arctic2's medium_context budget (max 3_200
-        tokens) -- proves the plan is driven by the model id's preset tier,
-        not a hardcoded threshold."""
+        """Identical content: single chunk under qwen3's clamped xlarge
+        budget (max 4_890 units -- v0.2.106: min(policy 8 192,
+        int(10 240 * 0.9) = 9 216, dense budget 19 560 chars = 4 890 units))
+        but multi-chunk under arctic2's dense-clamped medium_context budget
+        (max 1_766 units) -- proves the plan is driven by the model id's
+        preset tier, not a hardcoded threshold."""
         gen = _load_generator()
-        content = _sentences(400)  # sized between the two models' max_t
+        content = _sentences(250)  # sized between the two models' max_t
         qwen_model = gen.DEFAULT_SLOT_MODELS["qwen3_embed"]
         arctic_model = gen.DEFAULT_SLOT_MODELS["arctic2_embed"]
 
         token_count = TokenCounter.count_tokens(content)
-        self.assertGreater(token_count, 3_200)
-        self.assertLessEqual(token_count, 8_192)
+        self.assertGreater(token_count, 1_766)
+        self.assertLessEqual(token_count, 4_890)
 
         qwen_plan = gen.chunk_plan(content, qwen_model)
         arctic_plan = gen.chunk_plan(content, arctic_model)

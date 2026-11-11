@@ -304,12 +304,13 @@ def _patch_store(monkeypatch, tmp_path, coll, all_tag_map):
 
 
 def _big_multichunk_text() -> str:
-    # Two ~33.8k-char chunks + a ~1.4k tail under the qwen3 preset: the big
-    # leading chunks "truncate" (per the tag map), the tail does not.
+    # Two ~19.5k-char chunks + a ~1.4k tail under the qwen3 preset (v0.2.106
+    # dense budget, max 19 560 chars): the big leading chunks "truncate" (per
+    # the tag map), the tail does not.
     sentence = "The retrieval model scores each candidate node against the query. "
     return " ".join(
         f"{sentence}Item {i} details here and more words to pad this nicely."
-        for i in range(560)
+        for i in range(330)
     )
 
 
@@ -335,7 +336,7 @@ def test_store_persists_complete_record_and_derived_secondary_view(
     record (active included); ``secondary_truncated_slots`` is the same list
     with the active slot DROPPED — the R3-2 property's meaning is unchanged."""
     def all_tag_map(chunk_text: str) -> list[str]:
-        if len(chunk_text) > 20_000:
+        if len(chunk_text) > 15_000:
             return ["arctic2_embed", "qwen3_embed"]
         return []
 

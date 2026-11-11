@@ -223,14 +223,16 @@ def _big_multichunk_text() -> str:
     # arctic's num_ctx (so its arctic secondary truncates) and the small trailing
     # chunk fits (so its arctic secondary does NOT) — a mixed corpus that PROVES
     # per-chunk partitioning.
-    # 560 items (defect-1 bound, v0.2.92): chunks are ≈ 33.8k / 33.6k / 1.4k
-    # chars — the first two exceed arctic's 7 065-char budget (truncated),
-    # the 1.4k tail fits (full fidelity). At the previous 640 items the tail
-    # was 11.2k chars and ALSO exceeded the budget, collapsing the partition.
+    # 330 items (v0.2.106 dense chunk budget — qwen3 chunks max 19 560
+    # chars): chunks are ≈ 19.5k / 19.6k / 1.4k chars — the first two exceed
+    # arctic's 7 065-char budget (truncated), the 1.4k tail fits (full
+    # fidelity). (Under the v0.2.92 presets 560 items gave 33.8k / 33.6k /
+    # 1.4k; at 560 items today the tail is 10.1k and ALSO exceeds the budget,
+    # collapsing the partition.)
     sentence = "The retrieval model scores each candidate node against the query. "
     return " ".join(
         f"{sentence}Item {i} details here and more words to pad this nicely."
-        for i in range(560)
+        for i in range(330)
     )
 
 

@@ -143,8 +143,10 @@ def test_v0292_jina_budget_matches_chunking_ssot_not_stale_8192():
         "not code_truncation.py's derivation"
     )
     for key in jina_keys:
-        # 2048 tokens * 3.5 chars/token = 7168, NOT the stale 8192 * 3.5 = 28672.
-        assert _max_chars_for_model(key) == 7168
+        # v0.2.106: the shared dense bound — 2048 tokens * 2.30 (the measured
+        # floor; jina's tokenizer is unmeasured) * 0.75 = 3532. Before:
+        # 2048 * 3.5 = 7168; never the stale 8192 * 3.5 = 28672.
+        assert _max_chars_for_model(key) == 3532
         assert _max_chars_for_model(key) != 28672
 
 
@@ -168,7 +170,10 @@ def test_v0292_w1_codesage_budget_is_the_served_window_not_the_arch_cap():
             "chunking.py's SSOT itself changed — update this test's "
             "expectation, not code_truncation.py's derivation"
         )
-        assert _max_chars_for_model(key) == 3584
+        # v0.2.106: 1 024 × 2.96 (measured minimum) × 0.75 = 2 273 — the
+        # shared dense bound; the W1 figure 1 024 × 3.5 = 3 584 still
+        # overflowed the window on dense code (~118%).
+        assert _max_chars_for_model(key) == 2273
         assert _max_chars_for_model(key) != 7168, (
             "the 2 048-derived budget fed CodeSage 2.1x its served window"
         )

@@ -1380,9 +1380,13 @@ def _char_budget_for_model(
     try:
         from claude_mcp_servers.weaviate_mcp.chunking import (
             CHARS_PER_TOKEN_TEXT,
-            _preset_for_limit,
+            chunking_preset_for_model,
         )
-        _min_t, max_t, _target_t = _preset_for_limit(num_ctx)
+        # The model-aware resolver (v0.2.106): the chunker's maximum for THIS
+        # model includes its dense-budget clamp, so the floor names what the
+        # chunker really produced. (It calls back into this function with
+        # conservative=True, which returns above, before this block.)
+        _min_t, max_t, _target_t = chunking_preset_for_model(model_id)
         own_chunker_max_chars = int(max_t) * int(CHARS_PER_TOKEN_TEXT)
         budget = max(budget, own_chunker_max_chars)
     except Exception:

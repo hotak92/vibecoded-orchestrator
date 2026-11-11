@@ -737,10 +737,11 @@ def test_requeue_on_a_deleted_config_file(tmp_path: Path) -> None:
 
 
 def test_generation_bump_requeues_graphs_built_before_config_links() -> None:
-    assert gen.CURRENT_EXTRACTOR_GENERATION == "0.2.105"
+    # v0.2.106 appended the dense-budget re-chunk rung on top of 0.2.105.
+    assert "0.2.105" in gen.EXTRACTOR_GENERATION_BUMPS
     assert "config" in gen.EXTRACTOR_GENERATION_RUNG_REASONS["0.2.105"]
     assert not gen.generation_is_current("0.2.102")
-    assert gen.generation_is_current("0.2.105")
+    assert gen.generation_is_current(gen.CURRENT_EXTRACTOR_GENERATION)
 
 
 def _git_commit(root: Path, msg: str) -> str:

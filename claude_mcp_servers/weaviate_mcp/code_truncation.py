@@ -15,19 +15,21 @@ Priority order for code embedding text:
 
 Token budget is model-aware. The source of truth for per-model token limits
 is ``chunking.py``'s ``MODEL_TOKEN_LIMITS`` (via ``_num_ctx_for_model``) —
-this module no longer keeps its own copy (see v0.2.92 WP-E note below):
-  - CodeSage-Large-v2: 1024 tokens (3 584 chars at 3.5 chars/token — the
-    SERVED window per sentence_bert_config.json, not the 2 048
-    architectural cap; wiring-audit W1, 2026-09-05). The 3.5 ratio is an
-    ESTIMATE that does not bound real code: CodeSage tokenises real repo
-    Python at 2.96–3.47 chars/token on budget-window slices, so a maximal
-    entity can still exceed the served window. That case is the service's
-    HTTP-400 refusal + the caller's shrink-on-refusal (tagged leading
-    window), never a silent truncation.
-  - jina-v2-base-code: 2048 tokens (~7168 chars; v2 is trained at 512, 2048
-    is the shipped conservative ceiling — NOT 8192, a stale value this
-    module carried until v0.2.92 WP-E)
-  - Fallback: 2048 tokens (conservative)
+this module no longer keeps its own copy (see v0.2.92 WP-E note below).
+Since v0.2.106 the CHARACTER budget of a registered model is the shared
+dense-content bound (``chunking.dense_char_budget``: window × measured-minimum
+chars/token × 0.75), not window × 3.5:
+  - CodeSage-Large-v2: 1024 tokens (the SERVED window per
+    sentence_bert_config.json, not the 2 048 architectural cap; wiring-audit
+    W1, 2026-09-05) → 2 273 chars at its measured 2.96 chars/token. The old
+    3 584 (3.5 chars/token) overflowed the window on real code (~118%), so
+    the service refused maximal entities and the shrink ladder dropped their
+    tails; the refusal-shrink net stays for denser-than-measured code.
+  - jina-v2-base-code: 2048 tokens (v2 is trained at 512, 2048 is the
+    shipped conservative ceiling — NOT 8192, a stale value this module
+    carried until v0.2.92 WP-E) → 3 532 chars (unmeasured tokenizer: the
+    measured floor 2.30 chars/token)
+  - Unregistered model: 1024 tokens × 3.5 (no window to bound densely)
 """
 
 from __future__ import annotations
@@ -91,19 +93,34 @@ def _max_chars_for_model(model: str | None = None) -> int:
     the stale value silently over-budgeted truncation for real installs.
     Now delegates straight to the SSOT (``chunking._num_ctx_for_model``)
     so there is exactly one place these numbers are declared.
+
+    v0.2.106 (owner ruling 2026-11-11, "fix + re-embed"): a REGISTERED model's
+    budget is the shared DENSE-content bound (``chunking.dense_char_budget`` —
+    the window at the measured-minimum chars/token, 25% margin), not
+    ``num_ctx × 3.5``. The 3.5 estimate let a maximal entity overflow the
+    served window on real code (CodeSage: 3 584 chars ≈ 1 211 tokens at the
+    measured 2.96 against 1 024 — 118%), so the service refused it and the
+    shrink ladder embedded a leading sub-window. Entities between the two
+    budgets now CHUNK instead (every line still reaches a vector). An
+    unregistered model keeps ``_DEFAULT_TOKEN_LIMIT × 3.5`` — it has no window
+    the dense bound could be computed from, and the refusal-shrink net covers
+    it.
     """
     if model is None:
         model = _default_code_model()
     try:
         # Sibling first — see the module-level note: the absolute path can bind
         # another checkout's chunking and silently swap MODEL_TOKEN_LIMITS.
-        from .chunking import _num_ctx_for_model
+        from .chunking import _num_ctx_for_model, dense_char_budget
     except ImportError:  # pragma: no cover - bare-module import path.
         from claude_mcp_servers.weaviate_mcp.chunking import (  # type: ignore[no-redef]
             _num_ctx_for_model,
+            dense_char_budget,
         )
-    token_limit = _num_ctx_for_model(model) or _DEFAULT_TOKEN_LIMIT
-    return int(token_limit * _CHARS_PER_TOKEN)
+    token_limit = _num_ctx_for_model(model)
+    if token_limit is None:
+        return int(_DEFAULT_TOKEN_LIMIT * _CHARS_PER_TOKEN)
+    return min(int(token_limit * _CHARS_PER_TOKEN), dense_char_budget(model))
 
 
 def _extract_docstring(body: str, language: str = "python") -> str:
@@ -458,7 +475,8 @@ def chunk_or_truncate_for_embedding(
     Over-budget case (~7-9%): the entity is larger than the budget. We split
     the FULL assembled text (signature + docstring + full body) into N chunks
     sized for the model via ``Chunker.for_model(model)`` (reusing the KG
-    chunker — small_context = (550,1600,1100) for CodeSage), then prefix each
+    chunker — CodeSage resolves to (550, 568, 568) under the v0.2.106 dense
+    budget), then prefix each
     chunk with a ``[chunk i/N]`` header (1-indexed in the header text). The
     first chunk leads with the priority head (signature + docstring) so the
     signature is always searchable in chunk 0.
