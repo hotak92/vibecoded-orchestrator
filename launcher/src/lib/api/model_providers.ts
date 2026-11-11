@@ -57,6 +57,10 @@ export interface ProviderApplyProjectRow {
   already_parked: string[];
   kept: string[];
   restored: string[];
+  /** Restored definitions parked under an older release and brought to this
+   *  release's version the way a bundle update does (a copy that matched no
+   *  shipped version is backed up first). */
+  refreshed?: string[];
   notes: string[];
   error: string;
 }
@@ -149,6 +153,16 @@ export function applyOutcomeLabel(result: ModelProviderSetResult): string {
     moved > 0
       ? `Its agent definitions were ${verb} ${moved} ${moved === 1 ? 'project' : 'projects'} right away`
       : 'No delivered agent definitions needed moving';
+  const refreshed = result.enabled
+    ? a.projects.reduce((n, p) => n + (p.refreshed?.length ?? 0), 0)
+    : 0;
+  if (refreshed > 0) {
+    out +=
+      ` — ${refreshed} of them came from an older release and ` +
+      `${refreshed === 1 ? 'was' : 'were'} brought to this release's version, as a bundle ` +
+      'update would (a copy that matched no version VCO shipped is backed up under ' +
+      '.claude/backups/bundle-adoptions/ first)';
+  }
   if (a.failed_projects > 0) {
     out +=
       `, but the follow-up failed in ${a.failed_projects} ` +

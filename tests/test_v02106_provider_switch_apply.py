@@ -297,6 +297,70 @@ class RestoreOnSwitchOnTests(ApplyBase):
                          / "kimi-implementer.md").is_file())
 
 
+class RestoreBringsTheShippedDefinitionTests(ApplyBase):
+    """Review M2: a copy parked under an older release (the v0.2.105 Kimi K3
+    definition, pinning ``claude-gw/kimi/k3[1m]`` and lacking the v0.2.106
+    frontmatter keys) must come back as THIS release's definition — the way a
+    bundle update adopts it (backup first) — or the switch has not taken
+    effect at once: every dispatch of the restored pin is refused."""
+
+    OLD_K3 = ("---\nname: kimi-reviewer\ndescription: Kimi K3 review lane\n"
+              "model: claude-gw/kimi/k3[1m]\neffort: medium\n---\n\nold body\n")
+
+    def setUp(self) -> None:
+        super().setUp()
+        code, payload, _ = self.set_cli("kimi", False)
+        assert code == 0 and payload["stored"]
+        self.parked = self.proj / ".claude" / "agents.disabled" / "kimi-reviewer.md"
+        self.parked.write_text(self.OLD_K3, encoding="utf-8")
+        self.shipped = (self.orch / "templates" / "agents" / "module-gateway"
+                        / "kimi-reviewer.md").read_bytes()
+
+    def test_a_k3_copy_comes_back_as_the_k3_1_pro_definition(self) -> None:
+        code, payload, _err = self.set_cli("kimi", True)
+        self.assertEqual(code, 0)
+        enabled = self.proj / ".claude" / "agents" / "kimi-reviewer.md"
+        self.assertEqual(enabled.read_bytes(), self.shipped)
+        text = enabled.read_text(encoding="utf-8")
+        self.assertIn("model: claude-gw/kimi/k3.1-pro[1m]", text)
+        self.assertIn("background: true", text)
+        self.assertIn("autoCompactWindow: 750000", text)
+        # The restored (old) bytes are backed up first, exactly as an adopt.
+        backups = list((self.proj / ".claude" / "backups" / "bundle-adoptions")
+                       .glob("*/.claude/agents/kimi-reviewer.md"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), self.OLD_K3)
+        # The manifest records the SHIPPED hash, so the next update is a noop.
+        from vco_lib.hashing import sha256_bytes
+
+        files = {k.replace("\\", "/"): v for k, v in self.manifest(self.proj)["files"].items()}
+        self.assertEqual(files[".claude/agents/kimi-reviewer.md"]["sha256"],
+                         sha256_bytes(self.shipped))
+        row = [p for p in payload["agents"]["projects"] if p["folder"] == str(self.proj)][0]
+        self.assertEqual(row["refreshed"], ["kimi-reviewer.md"])
+        self.assertTrue(any("backed up" in n for n in row["notes"]), row["notes"])
+        # An untouched parked copy (the implementer) came back unchanged and
+        # is not reported as refreshed.
+        self.assertNotIn("kimi-implementer.md", row["refreshed"])
+
+    def test_a_failed_backup_leaves_the_restored_copy_as_it_is(self) -> None:
+        from vco_lib import project_init as pi
+
+        with mock.patch.object(pi, "_backup_bytes_for_adoption",
+                               side_effect=OSError("read-only backups")):
+            code, payload, _err = self.set_cli("kimi", True)
+        self.assertEqual(code, 0)
+        enabled = self.proj / ".claude" / "agents" / "kimi-reviewer.md"
+        self.assertEqual(enabled.read_text(encoding="utf-8"), self.OLD_K3)
+        row = [p for p in payload["agents"]["projects"] if p["folder"] == str(self.proj)][0]
+        self.assertEqual(row["refreshed"], [])
+        self.assertTrue(any("could not be written" in n for n in row["notes"]), row["notes"])
+        from vco_lib.hashing import sha256_file
+
+        files = {k.replace("\\", "/"): v for k, v in self.manifest(self.proj)["files"].items()}
+        self.assertEqual(files[".claude/agents/kimi-reviewer.md"]["sha256"], sha256_file(enabled))
+
+
 class BundleUpdateRaceTests(ApplyBase):
     """Review C-M2: the provider switch and a bundle update both rewrite the
     manifest; they are serialized on one per-project lock."""

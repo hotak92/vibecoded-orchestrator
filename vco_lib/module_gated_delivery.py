@@ -558,9 +558,16 @@ def select_gateway_agents(
     *,
     vendor_probe: Optional[VendorProbe] = None,
     disabled_vendors: Optional[Iterable[str]] = None,
+    reach_hint: Optional[Mapping[str, tuple[bool, str]]] = None,
 ) -> tuple[list[Path], list[GateOutcome]]:
     """The gated definitions to deliver, and the held ones' carry-forward
     outcomes (see the table above).
+
+    ``reach_hint`` (review L10): key answers the same run already got —
+    the restore gate's (:func:`restore_gate`). A vendor named there is not
+    probed again, so the restore and the delivery cannot disagree about one
+    key inside one run (a restored file the delivery then holds would sit at
+    ``.claude/agents/`` with no manifest entry).
 
     Only consulted when the module gate DELIVERs — a SKIP or UNKNOWN verdict
     already decided the whole bucket, and no key is probed for it. Each held
@@ -590,10 +597,13 @@ def select_gateway_agents(
         disabled = _default_disabled_vendors()
     else:
         disabled = frozenset(disabled_vendors)
-    reach = vendor_reachability(
-        (v for v in vendor_of.values() if v is not None and v not in disabled),
+    hint = {v: r for v, r in (reach_hint or {}).items() if v not in disabled}
+    reach = dict(hint)
+    reach.update(vendor_reachability(
+        (v for v in vendor_of.values()
+         if v is not None and v not in disabled and v not in hint),
         vendor_probe=vendor_probe,
-    )
+    ))
     deliver: list[Path] = []
     held: list[GateOutcome] = []
     for f in files:
@@ -1007,6 +1017,95 @@ def restore_parked_agents(
     return restored
 
 
+def refresh_restored_agents(
+    folder: Path,
+    orchestrator_root: Path,
+    restored: Iterable[str],
+    *,
+    verdict: Optional[GateVerdict] = None,
+    log: Optional[Callable[[str], None]] = None,
+    reach_hint: Optional[Mapping[str, tuple[bool, str]]] = None,
+) -> dict[str, dict[str, Any]]:
+    """Bring definitions :func:`restore_parked_agents` just moved back to the
+    bytes THIS release ships, the way a bundle update does (v0.2.106 review
+    M2: a copy parked under an older release came back with its old pin —
+    ``claude-gw/kimi/k3[1m]``, which the gateway now refuses — and without
+    the newer frontmatter keys, so the switch did not take effect at once).
+
+    It is the bundle engine's own per-file path, not a second one: the ops
+    come from ``project_init._enumerate_bundle_files`` (same source, same
+    placeholder transform), the action from ``project_init._file_action``
+    against a manifest that has NO entry for the file — exactly what the
+    update's enumeration sees after its own restore pass, since parking
+    dropped the entry — and an ``adopt`` goes through
+    :func:`vco_lib.bundle_backup.adopt_write` (the current bytes backed up
+    under ``.claude/backups/bundle-adoptions/<ts>/`` first). A backup that
+    cannot be written leaves the file as it is (the engine's preserve
+    fallback); the next Update bundle classifies it again and reports it.
+
+    Returns ``{dest_rel: {"action", "sha256", "source", "backup"}}`` for
+    every restored file it could classify; ``sha256`` is what the manifest
+    records (the shipped hash once the shipped bytes are on disk, the
+    on-disk hash for a file left as it was). Never raises.
+    """
+    from vco_lib import bundle_backup as _bb
+    from vco_lib import project_init as _pi
+    from vco_lib.hashing import sha256_bytes, sha256_file
+    from vco_lib.paths import to_posix_rel
+
+    by_posix = {to_posix_rel(r): r for r in restored}
+    out: dict[str, dict[str, Any]] = {}
+    if not by_posix:
+        return out
+    say = log or (lambda _m: None)
+    try:
+        ops = [op for op in _pi._enumerate_bundle_files(
+                   Path(orchestrator_root), project_root=Path(folder),
+                   gate_verdict=verdict, gate_reach=reach_hint)
+               if to_posix_rel(op.dest_rel) in by_posix]
+    except Exception as exc:  # noqa: BLE001 — the restore already happened
+        say(f"the restored definitions could not be compared with this release's "
+            f"({type(exc).__name__}: {exc}); run Update bundle to refresh them")
+        return out
+    ts: Optional[str] = None
+    for op in ops:
+        rel = by_posix[to_posix_rel(op.dest_rel)]
+        target = Path(folder) / rel
+        try:
+            action, shipped = _pi._file_action(
+                op, target, update_mode=True, manifest={"files": {}},
+                orchestrator_root=Path(orchestrator_root), project_root=Path(folder))
+            shipped_hash = sha256_bytes(shipped)
+            entry: dict[str, Any] = {"action": action, "sha256": shipped_hash,
+                                     "source": op.source_rel, "backup": ""}
+            if action in ("overwrite", "create"):
+                _pi._write_file_atomic(target, shipped, mode=_bb.bundle_file_mode(rel))
+                say(f"{rel}: brought to this release's definition")
+            elif action == "adopt":
+                if ts is None:
+                    ts = _pi._adopt_backup_timestamp()
+                try:
+                    entry["backup"], _redirect = _bb.adopt_write(
+                        folder, rel, target, shipped, ts)
+                except _bb.AdoptionBackupFailed as exc:
+                    entry["action"] = "preserve"
+                    entry["sha256"] = sha256_file(target)
+                    say(f"{rel}: differs from this release's definition and its backup "
+                        f"could not be written ({exc}); left as it is — run Update "
+                        "bundle once the backup folder is writable")
+                else:
+                    say(f"{rel}: brought to this release's definition; the restored "
+                        f"copy is backed up at {entry['backup']}")
+            elif action != "noop":
+                entry["sha256"] = sha256_file(target)
+        except Exception as exc:  # noqa: BLE001 — one file, one note
+            say(f"{rel}: could not be brought to this release's definition "
+                f"({type(exc).__name__}: {exc}); run Update bundle to refresh it")
+            continue
+        out[rel] = entry
+    return out
+
+
 def provider_restore_pass(
     folder: Path,
     orchestrator_root: Path,
@@ -1015,9 +1114,11 @@ def provider_restore_pass(
     skip_kinds: frozenset[str] = frozenset(),
     dry_run: bool = False,
     log: Optional[Callable[[str], None]] = None,
+    reach_out: Optional[dict[str, tuple[bool, str]]] = None,
 ) -> tuple[Optional[GateVerdict], list[str]]:
     """The bundle update's first provider-switch step: ``(gate verdict,
-    restored dest_rels)``.
+    restored dest_rels)``. ``reach_out`` receives the restore gate's key
+    answers, for the enumeration's ``reach_hint`` (review L10).
 
     A provider switched BACK ON gets the definitions an earlier run parked
     restored BEFORE enumeration, so ``_file_action``'s skip-disabled guard
@@ -1032,9 +1133,15 @@ def provider_restore_pass(
     if not src_dir.is_dir():
         return None, []
     verdict = gateway_agents_gate(folder)
+    prior = (manifest or {}).get(PARKED_AGENTS_MANIFEST_KEY)
+    gate: Optional[dict[str, tuple[bool, str]]] = None
+    if isinstance(prior, dict) and prior and verdict.delivers and "agents" not in skip_kinds:
+        gate = restore_gate(v for v in prior.values() if isinstance(v, str))
+        if reach_out is not None:
+            reach_out.update(gate)
     restored = restore_parked_agents(
         folder, src_dir, manifest, verdict=verdict, skip_kinds=skip_kinds,
-        dry_run=dry_run, log=log)
+        dry_run=dry_run, log=log, gate=gate)
     return verdict, restored
 
 

@@ -163,6 +163,28 @@ describe('the sentence after a toggle', () => {
     expect(note).toContain('model guidance');
   });
 
+  it('a re-enable says when restored definitions were brought to this release', () => {
+    const summary = applySummary({ enabled: true, restored_projects: 1 });
+    summary.projects = [
+      {
+        project: 'Alpha',
+        folder: '/w/alpha',
+        status: 'ok',
+        parked: [],
+        already_parked: [],
+        kept: [],
+        restored: ['kimi-reviewer.md', 'kimi-implementer.md'],
+        refreshed: ['kimi-reviewer.md'],
+        notes: [],
+        error: '',
+      },
+    ];
+    const label = applyOutcomeLabel({ vendor: 'kimi', enabled: true, stored: true, agents: summary });
+    expect(label).toContain('restored in 1 project');
+    expect(label).toContain("1 of them came from an older release and was brought to this release's");
+    expect(label).toContain('.claude/backups/bundle-adoptions/');
+  });
+
   it('a re-enable whose key does not resolve keeps the definitions parked', () => {
     const note = toggleNote(row(), true, {
       vendor: 'kimi',

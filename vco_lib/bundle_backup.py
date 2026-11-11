@@ -15,8 +15,20 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import Optional
 
-__all__ = ["adopt_backup_timestamp", "backup_bytes_for_adoption"]
+__all__ = [
+    "AdoptionBackupFailed",
+    "adopt_backup_timestamp",
+    "adopt_write",
+    "backup_bytes_for_adoption",
+    "bundle_file_mode",
+]
+
+
+class AdoptionBackupFailed(Exception):
+    """:func:`adopt_write` could not capture the current bytes, so it wrote
+    nothing — the caller keeps the file (the engine's preserve + deferral)."""
 
 
 def adopt_backup_timestamp() -> str:
@@ -85,3 +97,45 @@ def backup_bytes_for_adoption(
     for part in rel_parts:
         backup_rel = backup_rel / part
     return str(backup_rel)
+
+
+def bundle_file_mode(dest_rel: str) -> Optional[int]:
+    """The file mode the engine writes a bundle file with: ``0o700`` for a
+    shell script or anything under ``.claude/scripts/`` (many have no
+    extension), else ``None`` (the umask default). 0o700, not 0o755/0o750:
+    CodeQL py/overly-permissive-file flags group/world access, and the
+    project folder belongs to the user."""
+    from vco_lib.paths import to_posix_rel
+
+    if dest_rel.endswith(".sh") or "/scripts/" in to_posix_rel(dest_rel):
+        return 0o700
+    return None
+
+
+def adopt_write(
+    folder: Path, dest_rel: str, target_path: Path, source_bytes: bytes, ts: str,
+) -> tuple[str, Optional[Path]]:
+    """The engine's ``adopt`` action for ONE file (v0.2.84 D7): back up the
+    CURRENT bytes under ``bundle-adoptions/<ts>/``, THEN write the shipped
+    bytes. Returns ``(backup_rel, redirect)`` — ``redirect`` is the
+    ``.vco-new`` sibling a symlink-blocked write went to, else ``None``.
+
+    Raises :class:`AdoptionBackupFailed` when the backup could not be taken
+    (nothing was written), and lets a failed shipped write raise as itself
+    (the backup exists, the file is unchanged — the atomic write never
+    replaces partially). The backup goes through
+    ``vco_lib.project_init._backup_bytes_for_adoption`` — the patch point the
+    adoption tests use — so a test that fails the backup fails it for every
+    caller: the bundle engine's loop and the provider switch's restore
+    (v0.2.106 review M2) alike.
+    """
+    from vco_lib import project_init as _pi
+
+    try:
+        current = target_path.read_bytes()
+        backup_rel = _pi._backup_bytes_for_adoption(folder, dest_rel, ts, current)
+    except Exception as exc:  # noqa: BLE001 — any backup failure means "do not adopt"
+        raise AdoptionBackupFailed(f"{type(exc).__name__}: {exc}") from exc
+    redirect = _pi._write_file_atomic(target_path, source_bytes,
+                                      mode=bundle_file_mode(dest_rel))
+    return backup_rel, redirect

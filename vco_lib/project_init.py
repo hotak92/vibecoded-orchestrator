@@ -3236,6 +3236,7 @@ def _enumerate_bundle_files(
     sink: "Any" = None,
     project_name: Optional[str] = None,
     gate_verdict: "Any" = None,
+    gate_reach: "Any" = None,
 ) -> list[_BundleFileOp]:
     """Build the list of files to install. Hooks ship BOTH .sh + .ps1
     flavours on every OS (vco_lib.bundle_globs policy, v0.2.54 Track G).
@@ -3401,7 +3402,8 @@ def _enumerate_bundle_files(
         verdict = (gate_verdict if gate_verdict is not None else
                    _mgd.gateway_agents_gate(
                        orchestrator_root if project_root is None else project_root))
-        gw_files, gw_held = _mgd.select_gateway_agents(gateway_agents_src, verdict)
+        gw_files, gw_held = _mgd.select_gateway_agents(
+            gateway_agents_src, verdict, reach_hint=gate_reach)
         if gate_outcomes is not None:
             gate_outcomes += [(_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict), *gw_held]
         for agent_file in gw_files:
@@ -4112,8 +4114,9 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
 # names stay HERE as the patch point the adoption tests use.
 from vco_lib.bundle_backup import (  # noqa: E402
     adopt_backup_timestamp as _adopt_backup_timestamp,
-    backup_bytes_for_adoption as _backup_bytes_for_adoption,
+    backup_bytes_for_adoption as _backup_bytes_for_adoption,  # noqa: F401  # pyright: ignore[reportUnusedImport] — the patch point adopt_write calls through
 )
+from vco_lib import bundle_backup as _bundle_backup  # noqa: E402
 
 
 def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
@@ -8930,9 +8933,11 @@ def install_project_bundle(
     # v0.2.105 per-provider switch: restore what the switch parked BEFORE
     # enumeration (see module_gated_delivery.provider_restore_pass).
     from vco_lib import module_gated_delivery as _mgd
+    _gw_reach: dict = {}  # the restore gate's key answers (review L10)
     _gw_verdict, _gw_restored = _mgd.provider_restore_pass(
         folder, orchestrator_root, manifest, skip_kinds=skip_kinds,
-        dry_run=dry_run, log=lambda m: _log("4.bundle.gated", "info", m))
+        dry_run=dry_run, log=lambda m: _log("4.bundle.gated", "info", m),
+        reach_out=_gw_reach)
     if _gw_restored:
         result["provider_agents_restored"] = _gw_restored
 
@@ -8940,7 +8945,8 @@ def install_project_bundle(
                                   gate_outcomes=_gate_outcomes,
                                   sink=_materialize_sink,
                                   project_name=project_name,
-                                  gate_verdict=_gw_verdict)
+                                  gate_verdict=_gw_verdict,
+                                  gate_reach=_gw_reach)
     # §3.2: pack member ops join the enumeration with default-shaped dest_rels
     # (`.claude/agents|skills/...`), so kind classification, skip-disabled,
     # `--skip-kind` and the orphan machinery all apply to them unchanged.
@@ -9045,16 +9051,17 @@ def install_project_bundle(
                 # which also skip the FS write and manifest record below).
                 pass
             else:
+                if _adopt_backup_ts is None:
+                    _adopt_backup_ts = _adopt_backup_timestamp()
+                # The backup-then-write pair is ONE helper
+                # (`vco_lib.bundle_backup.adopt_write`), shared with the
+                # provider switch's restore (v0.2.106 review M2).
                 try:
-                    current_bytes = target_path.read_bytes()
-                    if _adopt_backup_ts is None:
-                        _adopt_backup_ts = _adopt_backup_timestamp()
-                    backup_rel = _backup_bytes_for_adoption(
-                        folder, op.dest_rel, _adopt_backup_ts, current_bytes,
-                    )
-                except Exception as e:
+                    backup_rel, _redirect = _bundle_backup.adopt_write(
+                        folder, op.dest_rel, target_path, source_bytes, _adopt_backup_ts)
+                except _bundle_backup.AdoptionBackupFailed as e:
                     # Backup failed → do NOT adopt. Fall back to preserve.
-                    err = f"{type(e).__name__}: {e}"
+                    err = str(e)
                     _log("4.bundle.adopt", "warn",
                          f"{op.dest_rel}: adoption backup failed ({err}) — "
                          "falling back to preserve + deferral",
@@ -9070,26 +9077,20 @@ def install_project_bundle(
                     # default-to-safety policy that no longer exists.
                     backup_failures.append((op.dest_rel, err))
                     action = "preserve"
+                except Exception as e:
+                    # The backup was captured but the shipped write failed —
+                    # do NOT claim the manifest entry, do NOT record an
+                    # adoption. The on-disk file is unchanged (atomic write
+                    # never partially replaced it). Skip to the next op.
+                    err = f"{type(e).__name__}: {e}"
+                    _log("4.bundle.adopt", "error",
+                         f"{op.dest_rel}: shipped write failed after backup: {err}",
+                         data={"path": op.dest_rel, "error": err})
+                    result["errors"].append({"path": op.dest_rel, "error": err})
+                    continue
                 else:
-                    # Backup captured — write the shipped bytes.
-                    try:
-                        mode: Optional[int] = None
-                        if op.dest_rel.endswith((".sh",)) or "/scripts/" in _to_posix_rel(op.dest_rel):
-                            mode = 0o700
-                        _redirect = _write_file_atomic(target_path, source_bytes, mode=mode)
-                        if _redirect is not None:
-                            symlink_redirect_events.append((target_path, _redirect))
-                    except Exception as e:
-                        err = f"{type(e).__name__}: {e}"
-                        _log("4.bundle.adopt", "error",
-                             f"{op.dest_rel}: shipped write failed after backup: {err}",
-                             data={"path": op.dest_rel, "error": err})
-                        result["errors"].append({"path": op.dest_rel, "error": err})
-                        # Bytes were backed up but the shipped write failed —
-                        # do NOT claim the manifest entry, do NOT record an
-                        # adoption. The on-disk file is unchanged (atomic write
-                        # never partially replaced it). Skip to the next op.
-                        continue
+                    if _redirect is not None:
+                        symlink_redirect_events.append((target_path, _redirect))
                     adopted_paths.append((op.dest_rel, backup_rel))
                     record_in_manifest = True
 
@@ -9193,20 +9194,14 @@ def install_project_bundle(
         elif action in ("create", "overwrite", "always-overwrite"):
             if not dry_run:
                 try:
-                    mode: Optional[int] = None
-                    # Preserve executable bit for shell scripts on POSIX.
-                    if op.dest_rel.endswith((".sh",)) or "/scripts/" in _to_posix_rel(op.dest_rel):
-                        # Many launcher scripts have no extension (kg-search,
-                        # code-graph-query, kg-sync). Mark all of
-                        # .claude/scripts/ + *.sh as executable. 0o700
-                        # (owner-only rwx) — CodeQL py/overly-permissive-file
-                        # flagged both 0o755 (world) and 0o750 (group) as
-                        # overly permissive. The project folder belongs to
-                        # the user; group/world access is unnecessary.
-                        mode = 0o700
+                    # Executable bit for shell scripts on POSIX (incl. the
+                    # extension-less .claude/scripts/ launchers): one rule,
+                    # `vco_lib.bundle_backup.bundle_file_mode`.
                     # v0.2.70 (Bug B): capture a `.vco-new` redirect (symlink-
                     # blocking) so the consolidated symlink deferral lists it.
-                    _redirect = _write_file_atomic(target_path, source_bytes, mode=mode)
+                    _redirect = _write_file_atomic(
+                        target_path, source_bytes,
+                        mode=_bundle_backup.bundle_file_mode(op.dest_rel))
                     if _redirect is not None:
                         symlink_redirect_events.append((target_path, _redirect))
                 except Exception as e:
@@ -12396,7 +12391,7 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
     from vco_lib.unregister_collections import drop_project_collections
     result = drop_project_collections(
         args.name, project_id=getattr(args, "project_id", None),
-        weaviate_url=args.weaviate_url)
+        weaviate_url=args.weaviate_url, dry_run=bool(getattr(args, "dry_run", False)))
     if args.json:
         print(json.dumps(result))
     else:
@@ -13894,6 +13889,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_drop.add_argument(
         "--json", action="store_true",
         help="Emit a single JSON object on stdout.",
+    )
+    p_drop.add_argument(
+        "--dry-run", action="store_true",
+        help="Drop nothing; `dropped` lists what would be dropped.",
     )
     p_drop.set_defaults(func=_cmd_drop_collections)
 

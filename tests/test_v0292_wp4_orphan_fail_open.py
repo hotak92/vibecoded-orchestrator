@@ -646,9 +646,15 @@ class TriOsShapeTests(unittest.TestCase):
         import inspect
         doc = project_init._write_file_atomic.__doc__ or ""
         self.assertIn("0o700", doc)
+        # v0.2.106 (review M2): the mode rule has ONE home now, shared by the
+        # engine's write and adopt paths and the provider switch's restore.
+        from vco_lib.bundle_backup import bundle_file_mode
+        self.assertEqual(bundle_file_mode(".claude/scripts/kg-search"), 0o700)
+        self.assertEqual(bundle_file_mode(".claude/hooks/pre-tool-use.sh"), 0o700)
+        self.assertIsNone(bundle_file_mode(".claude/agents/planner.md"))
         src = inspect.getsource(project_init.install_project_bundle)
-        self.assertIn("mode = 0o700", src)
-        self.assertNotIn("mode = 0o755", src)
+        self.assertIn("bundle_file_mode(op.dest_rel)", src)
+        self.assertNotIn("0o755", src)
         # Windows: chmod is a documented no-op, and the write must not fail.
         self.assertIn("no-op on Windows",
                       inspect.getsource(project_init._write_file_atomic))

@@ -334,6 +334,8 @@ def _row(name: str, folder: Path) -> dict:
         "already_parked": [],
         "kept": [],
         "restored": [],
+        # restored definitions brought to this release's bytes (review M2)
+        "refreshed": [],
         "notes": [],
         "error": "",
     }
@@ -431,6 +433,7 @@ def _apply_on_to(
     held: bool,
     held_reason: str,
     gate: Dict[str, tuple],
+    orchestrator_root: Path,
 ) -> dict:
     """Restore what THIS switch parked of ``vendor_id`` in one project.
 
@@ -473,15 +476,28 @@ def _apply_on_to(
         manifest["files"] = files
     from vco_lib.hashing import sha256_file
 
+    # Review M2: a copy parked under an older release comes back with that
+    # release's bytes (e.g. the retired `claude-gw/kimi/k3[1m]` pin). Bring
+    # it to this release's definition the way the bundle update does —
+    # the engine's own classify + adopt (backup first) — so the switch
+    # really takes effect at once.
+    refreshed = mgd.refresh_restored_agents(
+        folder, orchestrator_root, restored, verdict=verdict,
+        log=row["notes"].append, reach_hint=gate)
     for rel in restored:
+        done = refreshed.get(rel)
+        if done is not None:
+            files[rel] = {"sha256": done["sha256"], "source": done["source"]}
+            if done["action"] in ("overwrite", "create", "adopt"):
+                row["refreshed"].append(_leaf(rel))
+            continue
         try:
             digest = sha256_file(folder / rel)
         except OSError:
             continue  # moved but unreadable: the next update reconciles it
         files[rel] = {
-            # The ON-DISK bytes (what the next update compares against), not
-            # the current shipped hash — the parked copy predates any source
-            # change since it was parked.
+            # Not classified (see the note above): the ON-DISK bytes, which
+            # the next update compares against and refreshes.
             "sha256": digest,
             "source": f"{mgd.GATEWAY_AGENTS_SOURCE_PREFIX}{_leaf(rel)}",
         }
@@ -587,7 +603,7 @@ def apply_provider_switch(
                     row = _apply_on_to(
                         name, folder, src_dir, vendor_id, db_path=db_path,
                         held=summary["held"], held_reason=summary["held_reason"],
-                        gate=gate)
+                        gate=gate, orchestrator_root=root)
                 else:
                     row = _apply_off_to(name, folder, vendor_id, outcomes)
         except LockTimeout:
