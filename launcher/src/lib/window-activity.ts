@@ -120,6 +120,7 @@ export async function startWindowActivity(): Promise<void> {
   if (started || typeof document === 'undefined') return;
   started = true;
   const root = document.documentElement;
+  watchUserIdle(root, window);
   activity.subscribe((active) => applyInactiveAttr(root, active));
   const readHidden = () => setWindowState({ hidden: document.visibilityState === 'hidden' });
   document.addEventListener('visibilitychange', readHidden);
@@ -142,4 +143,40 @@ export async function startWindowActivity(): Promise<void> {
   } catch (e) {
     console.warn('[window-activity] window events unavailable:', e);
   }
+}
+
+/** `<html>` attribute set after {@link USER_IDLE_MS} without input. Only
+ *  decorative motion keys on it (the Home aurora): a spinner the user is
+ *  waiting on must keep turning while they sit still. */
+export const USER_IDLE_ATTR = 'data-user-idle';
+export const USER_IDLE_MS = 60_000;
+
+const USER_INPUT_EVENTS = ['pointermove', 'pointerdown', 'keydown', 'wheel', 'touchstart'] as const;
+
+/**
+ * Mark `root` idle after `idleMs` without input; clear it on the next input.
+ * Returns a stop function. Timers are injectable for tests.
+ */
+export function watchUserIdle(
+  root: Element,
+  target: Pick<EventTarget, 'addEventListener' | 'removeEventListener'>,
+  idleMs: number = USER_IDLE_MS,
+  timers: { set: typeof setTimeout; clear: typeof clearTimeout } = { set: setTimeout, clear: clearTimeout },
+): () => void {
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const arm = () => {
+    if (handle !== undefined) timers.clear(handle);
+    handle = timers.set(() => root.setAttribute(USER_IDLE_ATTR, ''), idleMs);
+  };
+  const onInput = () => {
+    root.removeAttribute(USER_IDLE_ATTR);
+    arm();
+  };
+  for (const ev of USER_INPUT_EVENTS) target.addEventListener(ev, onInput, { passive: true });
+  arm();
+  return () => {
+    if (handle !== undefined) timers.clear(handle);
+    for (const ev of USER_INPUT_EVENTS) target.removeEventListener(ev, onInput);
+    root.removeAttribute(USER_IDLE_ATTR);
+  };
 }
