@@ -492,17 +492,24 @@
     overflow: hidden;
   }
 
-  /* v0.2.106: the aurora is STATIC. It used to drift forever (a 12 s
-     infinite transform animation); every frame of that drift re-rendered two
-     120 px blurs AND re-blurred every glass card above them (their
-     backdrop-filter samples what is behind), which kept the WebView busy
-     at full frame rate on an idle Home page — a field report measured ~17%
-     of a 20-core machine. Static, it is rasterised once. */
+  /* The aurora drifts while someone is using the window and holds still
+     otherwise. Every frame of the drift re-renders two 120 px blurs and
+     re-blurs every glass card above them (their backdrop-filter samples what
+     is behind), so an endless drift kept an IDLE window busy at full frame
+     rate — a field report measured ~17% of a 20-core machine (v0.2.106).
+     It pauses after a minute without input (`data-user-idle`, set by
+     lib/window-activity.ts) and whenever the window is hidden or minimised
+     (`data-window-inactive`, app.css); the next input resumes it. */
   .aurora-subtle {
     position: absolute;
     border-radius: 50%;
     filter: blur(120px);
     opacity: 0.07;
+    will-change: transform;
+  }
+
+  :global(:root[data-user-idle]) .aurora-subtle {
+    animation-play-state: paused;
   }
 
   .aurora-subtle-1 {
@@ -511,6 +518,7 @@
     background: var(--color-teal);
     top: -100px;
     right: -150px;
+    animation: aurora-drift 12s ease-in-out infinite;
   }
 
   .aurora-subtle-2 {
@@ -519,6 +527,12 @@
     background: var(--color-purple);
     bottom: -80px;
     left: -100px;
+    animation: aurora-drift 12s ease-in-out infinite reverse;
+  }
+
+  @keyframes aurora-drift {
+    0%, 100% { transform: translate(0, 0); }
+    50% { transform: translate(40px, -30px); }
   }
 
   .main-inner {

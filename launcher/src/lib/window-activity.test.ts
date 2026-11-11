@@ -9,8 +9,10 @@
 //     through it — while minimised no `poll_changes` IPC is made;
 //   - while inactive `<html data-window-inactive>` is set and app.css pauses
 //     every animation under it;
-//   - the Home page's aurora carries no infinite animation (it re-blurred the
-//     glass cards above it every frame).
+//   - the Home page's aurora drifts while the window is in use and pauses
+//     after a minute without input (`data-user-idle`) or while the window is
+//     inactive — an endless drift re-blurred the glass cards above it every
+//     frame of an IDLE window (the field report's ~17% CPU).
 //
 // RED-PROOF: on the pre-fix tree `window-activity.ts` does not exist (every
 // test here fails to import), `changes.ts` uses a bare `setInterval`
@@ -156,16 +158,48 @@ describe('CSS: nothing animates for an idle window', () => {
     expect(css).toMatch(rule);
   });
 
-  it('the Home page aurora has no infinite animation', () => {
+  it('the Home page aurora drifts, and pauses for an idle user', () => {
     const src = readFileSync(resolve(here, '../routes/+page.svelte'), 'utf8');
     const out = compile(src, { filename: '+page.svelte', css: 'external' });
     const css = out.css?.code ?? '';
-    expect(css).toContain('aurora-subtle');
-    const auroraRules = css
-      .split('}')
-      .filter((r) => r.includes('aurora'));
-    for (const r of auroraRules) {
-      expect(r).not.toMatch(/animation[^;]*infinite/);
-    }
+    expect(css).toMatch(/aurora-subtle-1[^{]*\{[^}]*animation:[^;]*aurora-drift/);
+    expect(css).toMatch(/\[data-user-idle\][^{]*aurora-subtle[^{]*\{[^}]*animation-play-state:\s*paused/);
+  });
+});
+
+describe('watchUserIdle: decorative motion rests when nobody is using the window', () => {
+  function fakeRoot() {
+    const attrs = new Set<string>();
+    return {
+      attrs,
+      setAttribute: (n: string) => void attrs.add(n),
+      removeAttribute: (n: string) => void attrs.delete(n),
+    } as unknown as Element & { attrs: Set<string> };
+  }
+
+  afterEach(() => vi.useRealTimers());
+
+  it('sets data-user-idle after the idle time, clears it on input, re-arms', async () => {
+    vi.useFakeTimers();
+    const { watchUserIdle, USER_IDLE_ATTR } = await import('./window-activity');
+    const root = fakeRoot();
+    const target = new EventTarget();
+    const stop = watchUserIdle(root, target, 1000);
+    vi.advanceTimersByTime(999);
+    expect(root.attrs.has(USER_IDLE_ATTR)).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(root.attrs.has(USER_IDLE_ATTR)).toBe(true);
+    target.dispatchEvent(new Event('pointermove'));
+    expect(root.attrs.has(USER_IDLE_ATTR)).toBe(false);
+    vi.advanceTimersByTime(500);
+    target.dispatchEvent(new Event('keydown'));
+    vi.advanceTimersByTime(999);
+    expect(root.attrs.has(USER_IDLE_ATTR)).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(root.attrs.has(USER_IDLE_ATTR)).toBe(true);
+    stop();
+    expect(root.attrs.has(USER_IDLE_ATTR)).toBe(false);
+    vi.advanceTimersByTime(5000);
+    expect(root.attrs.has(USER_IDLE_ATTR)).toBe(false);
   });
 });

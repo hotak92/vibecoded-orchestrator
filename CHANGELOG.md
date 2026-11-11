@@ -385,7 +385,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An idle launcher window no longer keeps several CPU cores busy.** A field report from a 20-core Windows machine
   showed the launcher's WebView2 process at about 17% of total CPU with the launcher idle. The Home page's background
   glow drifted forever, and every frame of that drift redrew two large blurs and re-blurred every glass card above
-  them. The glow is now still. WebView2 is also never told when the launcher window is minimised, so animations and
+  them. The glow now drifts only while you are using the window and holds still after a minute without input (the
+  next mouse move or key press resumes it); loading spinners are not affected. WebView2 is also never told when the launcher window is minimised, so animations and
   polling went on for a window nobody could see: the launcher now notices a minimised or hidden window, pauses every
   animation and skips its periodic checks (the change poller, the restart banner, the subscription usage card, the
   Services page, the module health refresh and the banners' clocks) until the window is shown again, then
