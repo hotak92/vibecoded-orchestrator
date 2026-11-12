@@ -232,7 +232,6 @@ class _Gate:
         pass
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="argv/venv stubs are POSIX-shaped")
 def test_main_non_interactive_fails_fast_before_the_venv(monkeypatch, capsys):
     """install.py main(), fresh non-interactive install, podman without a
     provider: exit 1 right after step 2 — nothing past it (system-info print,
