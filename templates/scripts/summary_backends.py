@@ -2064,6 +2064,26 @@ def _ollama_local_deferred(weights_mb: "int | None" = None) -> "str | None":
     return None
 
 
+def local_summary_model_off() -> "str | None":
+    """Why the local tier is turned OFF by the user, or ``None`` (v0.2.106).
+
+    The ONE switch lives in :mod:`vco_lib.local_summary_model`
+    (``VCT_LOCAL_SUMMARY_MODEL``, else launcher Preferences → KG Summaries →
+    "Local summary model", else ON). With it off the pull plan never
+    downloaded the model, so the ladder moves straight on to the next tier.
+    A ``vco_lib`` that cannot be imported reads as ON — the tier's own
+    probes then report the broken interpreter exactly as before."""
+    try:
+        from vco_lib.local_summary_model import ENV_SWITCH, resolve
+    except ImportError:
+        return None
+    setting = resolve()
+    if setting.enabled:
+        return None
+    via = ENV_SWITCH if setting.source == "env" else "launcher Preferences"
+    return f"the local summary model is turned off ({via})"
+
+
 def ollama_available() -> bool:
     """The Ollama tier is usable only when Ollama answers AND already HOLDS
     the summary model (``OLLAMA_DEFAULT_MODEL``).
@@ -2082,7 +2102,15 @@ def ollama_available() -> bool:
     reasons — a machine that simply lacks the model must log "does not hold
     <model> — not pulling it", not "deferred — low VRAM", and the model's
     on-disk size from the same ``/api/tags`` reply is what sizes the floor.
+
+    v0.2.106 (owner 2026-11-12): a user who turned the local summary model
+    OFF (:func:`local_summary_model_off`) never had it pulled — the tier is
+    skipped before Ollama is asked, so no "does not hold" noise.
     """
+    off_reason = local_summary_model_off()
+    if off_reason:
+        _log(f"  Ollama summary tier skipped: {off_reason}")
+        return False
     model = ollama_default_model()
     if not model:
         _log("  Ollama summary tier unavailable: no generation model resolved "
@@ -2471,6 +2499,16 @@ def select_backend(
                 "Preferences → KG Summaries, or pass --force-api. "
                 "Skipping for this run."
             )
+            _BACKEND_CACHE["choice"] = "skip"
+            return "skip"
+        # v0.2.106: a pinned `ollama` while the user turned the local
+        # summary model OFF — the model was deliberately not pulled, so
+        # calling it could only 404. Skip (never substitute another tier for
+        # a forced one) and say which setting disagrees with the pin.
+        off_reason = local_summary_model_off() if forced == "ollama" else None
+        if off_reason:
+            _log(f"  {label}: the backend is pinned to ollama but {off_reason}. "
+                 "Skipping for this run.")
             _BACKEND_CACHE["choice"] = "skip"
             return "skip"
         _BACKEND_CACHE["choice"] = forced

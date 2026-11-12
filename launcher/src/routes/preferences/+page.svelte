@@ -49,6 +49,7 @@
   import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
   import KgEmbedStatus from '$lib/preferences/KgEmbedStatus.svelte';
   import OllamaIdleUnload from '$lib/preferences/OllamaIdleUnload.svelte';
+  import LocalSummaryModel from '$lib/preferences/LocalSummaryModel.svelte';
   // Machine-global Artifact-tool switch. Own component (this page is already
   // ~4k lines) and, unlike everything else here, it edits CLAUDE CODE's own
   // user-scope settings file rather than launcher.db — see
@@ -1264,6 +1265,10 @@
   // `get_summary_model_info`) — named by the "No Ollama models" hint.
   let summaryTiers = $state<SummaryTier[]>([]);
   let kgSummaryLoading = $state(false);
+  // v0.2.106: the Local summary model row mounts only once this lazy section
+  // has loaded — its status probe (Ollama tags + a container inspect) must
+  // not run at page mount.
+  let kgSummaryLoadedOnce = $state(false);
   let kgSummarySaving = $state(false);
   let kgSummaryError = $state<string | null>(null);
   let kgSummarySaved = $state(false);
@@ -1320,6 +1325,7 @@
       kgSummaryError = String(e);
     } finally {
       kgSummaryLoading = false;
+      kgSummaryLoadedOnce = true;
     }
   }
 
@@ -2643,6 +2649,12 @@
         embedded — but summaries improve the score-driven retrieval
         tiers significantly.
       </p>
+
+      <!-- v0.2.106 (owner ruling 2026-11-12): the opt-out for the local
+           summary model download (vco_lib.local_summary_model). -->
+      {#if kgSummaryLoadedOnce}
+        <div class="pr-kgsum-block"><LocalSummaryModel /></div>
+      {/if}
 
       {#if kgSummaryLoading}
         <p class="pr-hint">Loading…</p>
