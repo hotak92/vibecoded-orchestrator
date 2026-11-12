@@ -3296,6 +3296,7 @@ pub fn run() {
             commands::module_enabled::rl_events_count,
             // v0.2.100 W5R-02: the RL scoring lock every RL scoring control renders.
             commands::module_enabled::rl_scoring_lock,
+            commands::module_enabled::rl_scoring_default,
             // v0.2.102 (owner decision 2026-10-08): `is_project_module_active`
             // was REMOVED from here — after the Diagrams tab went it had zero
             // callers (the invoke census recorded it as an open finding). The

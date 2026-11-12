@@ -233,6 +233,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Modules page, where install and licensing live. Free and bundled modules are not store items; the RL reranker is
   managed from its Modules tile and the project's RL panel. The list is declared once, in
   `launcher/src/lib/store-catalog.ts`.
+- **RL scoring's default follows the bundled weights.** When neither the project nor the host-wide default has a
+  choice set, RL scoring is on only if a trained model is bundled for the active embedding profile
+  (`claude_mcp_servers/rl_reranker/weights/manifest.json` names a `current` version for it), and off otherwise. No
+  trained model ships yet, so the default is off today. The user's choice always wins, on or off. A manifest that
+  cannot be read, or a profile it does not list, counts as off. The decision lives in one place,
+  `vco_lib/rl_scoring_default.py` (`python -m vco_lib.rl_scoring_default --profile <profile>`): the hub's served
+  `rl_reranker_enabled_for_project`, the launcher's module cascade, the MCP dashboard's RL switch and the
+  boot-time "enough training events" prompt all take it from there, and the launcher's RL controls say "Off — no
+  trained model bundled yet for <profile>" or "On — trained model bundled for <profile>". `rl_doctor` reports it
+  under "scoring default". `install.py` no longer writes a host-wide "off" row for the RL reranker on a fresh
+  install, because that row would keep the default off after a trained model ships. The hub and the launcher now
+  share one Rust resolver for the active embedding profile (`vct-launcher-core/src/active_embedding.rs`) instead
+  of a copy each.
 - **RL scoring needs the project's own "on".** A project whose RL toggle cannot be read (the hub is down, or no
   project configuration was found) is now treated as off; before, it was treated as on. An older hub that does not
   send the toggle at all also counts as off. The citation of an answer is now sent to the reranker container only

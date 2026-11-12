@@ -33,13 +33,44 @@ export const RL_RERANKER_MODULE_ID = 'vct-rl-reranker';
 // RL control (the per-project Modules control, the host-wide default switch,
 // the "enough training events" toast) renders it from here.
 export const RL_OPT_IN_EXPLAINER =
-  "Off by default. When on, the reranker learns from this project's own citations " +
+  'Off by default until a trained model is bundled for your embedding profile ' +
+  "(then on by default); your own choice always wins. When on, the reranker learns from this project's own citations " +
   '(the search results your answers actually use) and reorders its searches only once ' +
   "this project's model beats plain search on its own check — every query scored before " +
   'the model learns from it, judged over its whole history with a margin that holds at ' +
   'high confidence however often it is re-checked, not a lucky stretch. ' +
   'Until then, and whenever it stops passing, results keep their plain search order. ' +
   'You can turn it off any time.';
+
+/**
+ * v0.2.106 (owner ruling 2026-11-12): what RL scoring resolves to when
+ * nothing is chosen. Wire shape of the Rust
+ * `vct_launcher_core::rl_scoring_default::RlScoringDefault`, served by the
+ * `rl_scoring_default` command and in `ModuleEnableState.rl_default`. The
+ * decision itself lives once, in `vco_lib/rl_scoring_default.py`; the GUI
+ * never decides, it only words the served answer.
+ */
+export interface RlScoringDefault {
+  /** The active embedding profile (e.g. `qwen3`). */
+  profile: string;
+  /** A trained model is bundled for `profile`. */
+  bundled_model: boolean;
+  /** The default: on exactly when a trained model is bundled. */
+  default_on: boolean;
+  /** Why the answer could not be confirmed (the default is then off). */
+  error?: string | null;
+}
+
+/**
+ * The ONE wording of RL scoring's default. `undefined`/`null` = not loaded or
+ * the read failed: the default is then treated as off, and says so.
+ */
+export function rlDefaultLine(d: RlScoringDefault | null | undefined): string {
+  if (!d) return 'Off — the bundled-model check has not answered (treated as off).';
+  if (d.default_on) return `On — trained model bundled for ${d.profile}.`;
+  if (d.error) return `Off — no trained model could be confirmed for ${d.profile || 'the active profile'}.`;
+  return `Off — no trained model bundled yet for ${d.profile}.`;
+}
 
 /** The opt-in explainer for `moduleId`'s enable control, or null for other modules. */
 export function rlOptInExplainer(moduleId: string): string | null {

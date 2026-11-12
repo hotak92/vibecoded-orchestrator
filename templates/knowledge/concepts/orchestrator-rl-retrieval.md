@@ -3,7 +3,7 @@ title: Orchestrator RL Retrieval
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, reinforcement-learning, retrieval, weaviate, context-injection]
 created: 2026-04-27T18:30:00Z
-updated: 2026-11-12T18:00:00Z
+updated: 2026-11-12T20:00:00Z
 status: active
 ---
 
@@ -25,7 +25,7 @@ The reranker ships in the orchestrator repository itself:
 
 **Scoring gates** (in order, one home each):
 1. The shipped **scoring lock** `vco_lib/rl_scoring_lock.toml` — lifted in v0.2.106 (`locked = false`, owner ruling 2026-11-12); when set, reranking is off in every state (an explicit per-project row, a host-wide row, nothing overrides it). It gates scoring only, never event logging.
-2. The per-project toggle `rl_reranker_enabled_for_project` (hub-served; launcher Modules panel) — OPT-IN: off by default, and off when it cannot be read.
+2. The per-project toggle `rl_reranker_enabled_for_project` (hub-served; launcher Modules panel). An explicit choice (the project's, else the host-wide one) wins both ways; with none, the default follows the bundled weights (owner ruling 2026-11-12): on only when `weights/manifest.json` names a trained `current` model for the active embedding profile — none ships yet, so off today. One decision, `vco_lib/rl_scoring_default.py`, which the hub and launcher call; an unreadable manifest, an unknown profile, or a toggle that cannot be read are all off.
 3. The container's **per-project serving gate** (below): with the toggle on, a project's own model reranks its searches only once it qualifies; until then the project keeps its own search order, exactly as with the toggle off.
 
 The pre-v0.2.106 licence gate (`feature_enabled("rl_retrieval")`) is gone — every install may use the reranker.

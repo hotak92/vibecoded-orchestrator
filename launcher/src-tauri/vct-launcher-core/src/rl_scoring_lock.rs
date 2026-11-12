@@ -22,10 +22,12 @@
 //! Stored rows are never rewritten: they apply again once unlocked.
 //!
 //! v0.2.106 (owner rulings 2026-11-12): the table ships `locked = false` —
-//! per-project online adaptation, OPT-IN. Scoring stays off by default
-//! through the enable cascade (the RL reranker's system default is off,
-//! [`crate::db::settings::module_enable_system_default`]); the user turns it
-//! on per project.
+//! per-project online adaptation. With nothing chosen, scoring follows the
+//! bundled weights through the enable cascade (the RL reranker's system
+//! default, [`crate::db::settings::module_enable_system_default`], is ON only
+//! with a trained model bundled for the active profile —
+//! [`crate::rl_scoring_default`]; none ships yet, so off); the user's choice
+//! always wins.
 
 use std::sync::LazyLock;
 

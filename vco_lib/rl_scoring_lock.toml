@@ -58,12 +58,18 @@
 #     and 50 citing ones on.
 #
 # What `locked = false` means now — and what it does NOT:
-#   * RL scoring is still OFF by default. The per-project toggle and the
-#     host-wide default both default to off (`Db::module_effective_enabled`'s
-#     system default for vct-rl-reranker; the Python fallback of a toggle it
-#     cannot read is off too). The user turns it on per project in the
-#     launcher's Modules panel. Toggle off = no call to the container: no
-#     rerank, no /rl_update, search order unchanged.
+#   * RL scoring's DEFAULT follows the bundled weights (owner ruling
+#     2026-11-12): with no per-project and no host-wide choice it is ON only
+#     when a trained model is bundled for the active embedding profile
+#     (`claude_mcp_servers/rl_reranker/weights/manifest.json` names a
+#     `current` for it), OFF otherwise — and none ships yet, so OFF today.
+#     The decision's one home is `vco_lib/rl_scoring_default.py` (Rust calls
+#     it: `vct-launcher-core/src/rl_scoring_default.rs`, applied as the
+#     system default of `Db::module_effective_enabled`). The user's choice
+#     always wins, on or off (launcher Modules panel / host-wide default).
+#     An unreadable manifest, an unknown profile, or a toggle a process
+#     cannot read are OFF. Toggle off = no call to the container: no rerank,
+#     no /rl_update, search order unchanged.
 #   * Toggle on = the project's citations train its own model online
 #     (`claude_mcp_servers/rl_reranker/online_learning.py`), and the
 #     container reranks that project's searches only while the model passes
