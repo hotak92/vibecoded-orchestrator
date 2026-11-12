@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from rl_reranker.training import export as ex
+from tests.common.launcher_db_fixture import create_empty_launcher_db
 
 DIM = 1024
 DAY = 86_400_000
@@ -63,23 +64,15 @@ def _citation(tid: str, n_nodes: int, *, soft: bool = False, window: int = 3000)
 class _DB:
     def __init__(self, path: Path) -> None:
         self.path = path
+        # The real launcher schema (rl_events = migration 025 + 039), never a hand-rolled guess.
+        create_empty_launcher_db(path)
         self.conn = sqlite3.connect(path)
-        self.conn.executescript("""
-            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL,
-                folder_path TEXT NOT NULL UNIQUE, host TEXT NOT NULL,
-                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, slug TEXT);
-            CREATE TABLE rl_events (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL, schema_version INTEGER NOT NULL DEFAULT 3,
-                ts INTEGER NOT NULL, project_id TEXT, project_name TEXT,
-                task_id TEXT NOT NULL, task_type TEXT, embedding_source TEXT,
-                embedding_dim INTEGER, embedding_model TEXT, payload_json TEXT NOT NULL,
-                quarantined_at INTEGER, quarantine_reason TEXT);
-            CREATE INDEX idx_rl_events_project_ts ON rl_events(project_id, ts);
-        """)
 
     def project(self, pid: str, name: str) -> None:
-        self.conn.execute("INSERT INTO projects VALUES (?,?,?,?,?,?,?)",
-                          (pid, name, f"/home/someone/{name.lower()}", "base", 0, 0, None))
+        self.conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (pid, name, f"/home/someone/{name.lower()}", "base", name.lower(), 0, 0))
 
     def event(self, pid, etype, ts, tid, source, payload, task_type="pre_bash_kg_search",
               pname=None):
