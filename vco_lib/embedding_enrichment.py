@@ -180,11 +180,14 @@ BATCH_SIZE = 100
 #: regression (every object failing).
 MAX_FAILURE_DETAILS = 20
 
-#: Maximum chars of content fed into a single embed call. Matches the
-#: conservative cap used by ``migrate_to_new_embeddings.py``; keeps Ollama
-#: from choking on multi-megabyte node bodies. The exact token-aware
-#: truncation is the embedder's job — we just protect against the worst
-#: cases.
+#: Maximum chars of a row's content this backfill embeds. Keeps Ollama from
+#: choking on multi-megabyte legacy bodies. Since v0.2.106 (owner rulings
+#: "split on refusal" / "extra rows in both places") a longer row is NOT cut
+#: to a leading window any more: it is left unfilled (counted failed, with
+#: the reason) and its writer — kg-sync's active-slot gate, the code-graph
+#: walk's vector check — re-embeds the node, splitting a chunk the model
+#: refuses into rows. A row within the cap is embedded whole; one the model
+#: refuses gets no vector and takes the same writer path.
 EMBED_INPUT_CHAR_CAP = 16000
 
 
@@ -473,13 +476,15 @@ def enrich_collection_vectors(
     * Write the resulting vector to the new slot ONLY (single-slot
       update — Weaviate's ``coll.data.update(uuid=..., vector={new_slot:
       v})`` preserves every other slot's data), and — when the item's
-      vector positively came from a bounded leading window AND the row
-      already carries a complete ``truncated_slots`` record — merge that
-      verdict into the record via the shared
-      ``vco_lib.kg_truncation_tags.merge_slot_truncation`` (W3). Rows
-      predating the record, and items whose verdict is not provable, get
-      NO property patch: the slot stays out of the row's measured set and
-      reads as UNKNOWN, never a guessed False.
+      verdict is provable AND the row already carries a complete
+      ``truncated_slots`` record — merge that verdict into the record via
+      the shared ``vco_lib.kg_truncation_tags.merge_slot_truncation`` (W3).
+      Rows predating the record, and items whose verdict is not provable,
+      get NO property patch: the slot stays out of the row's measured set
+      and reads as UNKNOWN, never a guessed False. Since v0.2.106 nothing
+      is cut or averaged here: a row is embedded WHOLE, and one over
+      :data:`EMBED_INPUT_CHAR_CAP` or refused by the model is left unfilled
+      (``failed``, with the reason) for its writer to re-lay as split rows.
     * Soft-fail per object: an exception during embed OR write
       increments ``failed`` and appends a redacted detail row to
       ``failures`` (up to :data:`MAX_FAILURE_DETAILS`). The remaining
@@ -727,12 +732,11 @@ def _run_enrichment_loop(
 
     pending_uuids: list[Any] = []
     pending_texts: list[str] = []
-    # W3: per-pending-item context for the truncation-tag merge — the FULL
-    # content length (``pending_texts`` holds the EMBED_INPUT_CHAR_CAP-capped
-    # slice, so the cap itself is invisible downstream) and the row's EXISTING
-    # complete ``truncated_slots`` record (None when the row predates it —
-    # those rows legitimately get NO merge; see merge_slot_truncation).
-    pending_full_lens: list[int] = []
+    # W3: per-pending-item context for the truncation-tag merge — the row's
+    # EXISTING complete ``truncated_slots`` record (None when the row predates
+    # it — those rows legitimately get NO merge; see merge_slot_truncation).
+    # Every pending text is the row's WHOLE content (v0.2.106: a row over
+    # EMBED_INPUT_CHAR_CAP is never cut — it is left to its writer below).
     pending_existing_props: list["Optional[dict]"] = []
 
     # We need a total estimate for the progress %. v4's iterator doesn't
@@ -744,31 +748,28 @@ def _run_enrichment_loop(
     def _clear_pending() -> None:
         pending_uuids.clear()
         pending_texts.clear()
-        pending_full_lens.clear()
         pending_existing_props.clear()
 
     def _item_truncation_verdict(idx: int, model_id: str) -> "Optional[bool]":
         """W3: was THIS batch item's vector embedded from a leading window?
 
-        TRI-STATE.
+        Never ``True`` since v0.2.106: the row's whole content is handed in
+        (a row over ``EMBED_INPUT_CHAR_CAP`` is not embedded here at all).
 
-        * ``True`` when the content exceeded ``EMBED_INPUT_CHAR_CAP`` before
-          the embed (``pending_texts`` holds the capped slice).
         * ``False`` on the Ollama and CodeEmbed batch legs (v0.2.106): they
-          split an over-budget or refused input into pieces and combine the
-          piece vectors (``EmbeddingService._embed_batch_whole``), so every
-          character of what was handed in reached the vector — positively
-          known, by construction, for every item that got a vector at all.
+          embed every input WHOLE (``EmbeddingService._embed_batch_whole``) —
+          an input the model refuses gets no vector at all (the empty-vector
+          sentinel, counted failed below, re-laid as split rows by its
+          writer), never a cut or averaged one — so every item that got a
+          vector covers every character it was handed, by construction.
         * ``None`` (UNKNOWN, never ``False``) on the OpenAI batch leg, whose
           adapter handles its own windows and reports nothing back.
 
-        ``model_id`` is kept for the call shape; the verdict no longer needs
-        a pre-bound estimate (the retired ``_bounded_for_model`` pre-bound was
-        what used to make this ``True``).
+        ``idx`` / ``model_id`` are kept for the call shape; the verdict no
+        longer depends on the item (the retired char cap and
+        ``_bounded_for_model`` pre-bound were what used to make it ``True``).
         """
-        del model_id
-        if pending_full_lens[idx] > EMBED_INPUT_CHAR_CAP:
-            return True
+        del idx, model_id
         try:
             slot = (
                 embedding_service.code_vector_slot
@@ -846,8 +847,18 @@ def _run_enrichment_loop(
                 continue
             vec = vectors[idx]
             if not vec:
+                # v0.2.106 ("extra rows in both places"): the batch legs embed
+                # every input whole — a row the model refuses is NOT split and
+                # averaged here (this fill cannot add rows); its writer re-lays
+                # it: kg-sync's active-slot gate / the code-graph walk's vector
+                # check re-embed that node and split the refused chunk.
                 failed += 1
-                _append_failure(failures, str(uid), "embed returned empty vector")
+                _append_failure(
+                    failures, str(uid),
+                    "no vector: the model refused this row whole or the embed "
+                    "failed; its writer (kg-sync / the code-graph walk) re-embeds "
+                    "the node and splits a refused chunk into rows",
+                )
                 continue
             # W3: merge this item's truncation verdict into the row's stored
             # record (shared merger). ``None`` = no honest merge (row has no
@@ -915,12 +926,22 @@ def _run_enrichment_loop(
                 # (not failure): some KG nodes legitimately have empty
                 # content (e.g. placeholder index pages).
                 skipped += 1
+            elif len(content) > EMBED_INPUT_CHAR_CAP:
+                # v0.2.106: never a leading-window vector — the row is left
+                # for its writer to re-embed (and split into rows if refused).
+                failed += 1
+                _append_failure(
+                    failures, str(obj.uuid),
+                    f"content is {len(content)} chars, over the "
+                    f"{EMBED_INPUT_CHAR_CAP}-char backfill cap: not cut to a "
+                    "leading window; its writer (kg-sync / the code-graph walk) "
+                    "re-embeds the node and splits a refused chunk into rows",
+                )
             else:
                 pending_uuids.append(obj.uuid)
-                pending_texts.append(content[:EMBED_INPUT_CHAR_CAP])
-                # W3: remember the uncapped length + the row's existing
-                # truncation record for the merge at flush time.
-                pending_full_lens.append(len(content))
+                pending_texts.append(content)
+                # W3: remember the row's existing truncation record for the
+                # merge at flush time.
                 _props = obj.properties if isinstance(obj.properties, dict) else None
                 pending_existing_props.append(_props)
 

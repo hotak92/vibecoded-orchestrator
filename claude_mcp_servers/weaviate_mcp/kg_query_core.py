@@ -1008,6 +1008,11 @@ def _format_result_by_tier(
         base["content"] = f"{prefix}{body}"
         base["chunks_shown"] = len(chunks)
         base["chunks_total"] = total_chunks
+        # v0.2.106 (owner ruling 2026-11-11, "so we know which chunk actually
+        # matched"): the row that won (1-based, text order — a chunk the model
+        # refused is stored as consecutive rows, so its pieces are numbered in
+        # place and the window above is its true neighbours).
+        base["matched_chunk"] = hit_chunk
         # Coverage hint (2026-06-15): tell the caller explicitly when the
         # returned chunks already cover the ENTIRE node, so it doesn't waste a
         # Read on the source file. Only emitted when coverage is 100% — when

@@ -17,8 +17,11 @@ v0.2.92 behaviours never reached it:
   retrieval reads, and its only disclosure was a WARNING to MCP stderr or a
   detached kg-sync's stdout — i.e. to nobody. Since v0.2.106 (split on
   refusal) stored content is never shrunk: a refused chunk is SPLIT
-  (``vco_lib.embed_split``) — more rows, or piece vectors combined into one —
-  so a shrink is now recorded only for a search QUERY vector.
+  (``vco_lib.embed_split``) into more rows of the same node or entity, every
+  row embedded whole by every model of its vector set; only a one-vector
+  consumer outside a row writer (RL regen/recovery, the migrate script, the
+  MCP backfill tool) combines piece vectors — so a shrink is now recorded
+  only for a search QUERY vector.
 * **floor refusal** — a piece still refused at the floor, so that slot got NO
   vector at all.
 * **split** (v0.2.106) — a refused input was split and EVERY character
@@ -85,10 +88,10 @@ Wiring status — read this before crediting the module
   :func:`note_split` and :func:`note_floor_refusal` through its guarded
   ``_note_fidelity`` helper: shrinks from ``_embed_shrinking_on_overflow``
   (query vectors only since v0.2.106), splits and floor refusals from
-  ``_embed_whole_on_overflow`` and the batch loop ``_embed_batch_whole``
-  (every one-vector document path). ``vco_lib/embed_split.py`` records the
-  ROW splits of the row writers (kg-sync, the MCP store, the sidecar builder)
-  and their floor refusals. A ladder or a recursion is recorded ONCE per
+  ``_embed_whole_on_overflow`` (the one-vector document embeds outside a row
+  writer). ``vco_lib/embed_split.py`` records the ROW splits of the row
+  writers (kg-sync, the MCP store, the sidecar builder, ``process_documents``,
+  the code-graph analyzer) and their floor refusals. A ladder or a recursion is recorded ONCE per
   input, with its outcome; every call is a dict update and no IO, so it is
   safe on a per-chunk path and the single summary row lands at process exit.
 
@@ -174,8 +177,9 @@ def note_split(model_id: str, chars: int, pieces: int) -> None:
     """Record that ``model_id`` refused a ``chars``-long input whole and it was
     split into ``pieces`` accepted pieces (v0.2.106, owner ruling 2026-11-11).
 
-    Not a fidelity loss — every character reached a vector, either as extra
-    rows of the same node or combined into one vector — so it is counted
+    Not a fidelity loss — every character reached a vector, as extra rows
+    of the same node or entity (or, for a one-vector consumer outside a row
+    writer, combined into one vector) — so it is counted
     apart from :func:`note_shrink` and never rendered as a loss in the
     SessionStart notice. In-memory only, like the other notes.
     """

@@ -11,13 +11,14 @@ item 400'd, and Ollama's ``/api/embed`` rejects the ENTIRE batch of 100 if ANY
 single input overflows → 100 % failure, 0 enriched (observed live: 1 011/1 011).
 
 Fix (this test red-proofs it):
-  1. Every ACTIVE Ollama batch input is bounded to the model's num_ctx via the
-     shared ``_bounded_for_model`` (generalised from WP-O's secondary helper —
-     ONE home) BEFORE it reaches Ollama, so the 400 never fires in the common
-     case.
+  1. An ACTIVE Ollama batch input over the model's char budget is kept OUT of
+     the batch call and embedded alone, so the batch 400 never fires in the
+     common case.
   2. A whole-batch ``/api/embed`` failure is ISOLATED to a per-item embed so one
-     oversized item can never fail the batch; the item is retried under a tighter
-     sub-window on a context-overflow error.
+     oversized item can never fail the batch. Since v0.2.106 ("extra rows in
+     both places") every item is embedded WHOLE: a refused one gets the
+     empty-vector sentinel and its row is re-laid as split rows by its writer —
+     never a leading window, never an averaged vector.
 
 The stub backend below reproduces Ollama's contract: it 400s ("input exceeds the
 context length") whenever a single input exceeds the arctic char budget, and it
@@ -137,26 +138,22 @@ def test_context_overflow_error_detector():
 
 
 def test_oversized_item_no_longer_400s_the_batch():
-    """An over-num_ctx item is split into pieces within the budget BEFORE Ollama
-    sees it (v0.2.106 — it used to be trimmed to a leading sub-window), so the
-    whole batch succeeds (pre-fix: the batch 400'd and every item was lost) and
-    every character of the item is embedded."""
+    """An over-num_ctx item is kept OUT of the batch call (pre-fix: the batch
+    400'd and every item was lost) and embedded alone, whole. Refused, it gets
+    the empty-vector sentinel — v0.2.106 "extra rows in both places": the
+    enrichment batch fills existing rows it cannot re-lay, so it neither cuts
+    the item (the old leading window) nor averages pieces into one vector
+    (the first split-on-refusal build); the row's writer splits it into rows."""
     stub = _StubOllama()
     svc = _svc_with(stub)
     oversized = "a" * (ARCTIC_CHAR_BUDGET + 20000)  # would 400 unbounded
     normal = "b" * 500
     vecs = svc.embed_text_batch([oversized, normal])
     assert len(vecs) == 2
-    assert all(v for v in vecs), "every item got a vector"
-    # The batch call the stub received had the oversized item already split.
-    assert stub.batch_calls, "batch path was taken"
-    sent = stub.batch_calls[0]
-    pieces, last = sent[:-1], sent[-1]
-    assert len(pieces) >= 2 and "".join(pieces) == oversized, (
-        "the oversized item is split, never cut"
-    )
-    assert all(len(p) <= ARCTIC_CHAR_BUDGET for p in pieces)
-    assert last == normal, "normal item untouched"
+    assert vecs[1] == stub._vec(normal), "the batch succeeded for the survivor"
+    assert vecs[0] == [], "refused whole → sentinel, never pieces"
+    assert stub.batch_calls == [[normal]], "the oversized item never joined the batch"
+    assert stub.single_calls == [oversized], "attempted once, whole"
 
 
 # ---------------------------------------------------------------------------
@@ -210,17 +207,17 @@ class _DenseItemStub(_StubOllama):
         raise RuntimeError("Ollama /api/embed returned HTTP 400: input exceeds context length")
 
 
-def test_dense_item_retries_under_tighter_subwindow_without_failing_others():
+def test_dense_item_is_marked_failed_without_failing_others():
     stub = _DenseItemStub()
     svc = _svc_with(stub)
-    # One item over the 800-char single-embed budget → must be halved until it
-    # fits; two items already under it embed on the first single attempt.
+    # One item over the 800-char single-embed window → refused whole → the
+    # sentinel (its writer re-lays it as split rows); two items under it embed
+    # on their single attempt. Nothing is retried in pieces or averaged.
     texts = ["z" * 2000, "s" * 200, "t" * 300]
     vecs = svc.embed_text_batch(texts)
     assert len(vecs) == 3
-    assert all(v for v in vecs)
-    # The dense item was retried at least once (>3 single calls total).
-    assert len(stub.single_calls) > 3
+    assert vecs[0] == [] and vecs[1] and vecs[2]
+    assert stub.single_calls == texts, "each item attempted once, whole"
 
 
 def test_code_batch_ollama_fallback_shares_the_bounded_path():
@@ -232,13 +229,9 @@ def test_code_batch_ollama_fallback_shares_the_bounded_path():
     svc.codeembed.is_reachable = lambda: False  # type: ignore[assignment]
     oversized = "c" * (ARCTIC_CHAR_BUDGET + 9000)
     vecs = svc.embed_code_batch([oversized, "small"])
-    assert len(vecs) == 2 and all(v for v in vecs)
-    assert stub.batch_calls, "ollama code fallback batch taken"
-    sent = stub.batch_calls[0]
-    assert "".join(sent[:-1]) == oversized and sent[-1] == "small", (
-        "code item split within the budget, not cut"
-    )
-    assert all(len(p) <= ARCTIC_CHAR_BUDGET for p in sent[:-1])
+    assert len(vecs) == 2 and vecs[1] and vecs[0] == []
+    assert stub.batch_calls == [["small"]], "ollama code fallback batch taken"
+    assert stub.single_calls == [oversized], "the code item is tried whole, never cut"
 
 
 # ---------------------------------------------------------------------------
@@ -246,10 +239,10 @@ def test_code_batch_ollama_fallback_shares_the_bounded_path():
 # ---------------------------------------------------------------------------
 
 
-def test_split_items_are_logged_and_never_trimmed(caplog):
-    """An over-num_ctx item is SPLIT (v0.2.106), so there is no fidelity loss
-    to warn about: no "bounded leading sub-window" WARNING any more, and the
-    split is still visible — an INFO line naming the count (1 of 2)."""
+def test_oversized_items_are_logged_and_never_trimmed(caplog):
+    """An over-num_ctx item is never trimmed (v0.2.106): no "bounded leading
+    sub-window" WARNING, and its separate whole attempt is visible — an INFO
+    line naming the count (1 of 2)."""
     import logging
 
     stub = _StubOllama()
@@ -258,16 +251,16 @@ def test_split_items_are_logged_and_never_trimmed(caplog):
     normal = "b" * 500
     with caplog.at_level(logging.INFO, logger="vco_lib.embedding_service"):
         vecs = svc.embed_text_batch([oversized, normal])
-    assert len(vecs) == 2 and all(v for v in vecs)
+    assert len(vecs) == 2 and vecs[1]
     assert not [
         r for r in caplog.records
         if "bounded leading sub-window" in r.getMessage()
     ], "nothing is trimmed any more"
-    split_logs = [
-        r for r in caplog.records if "several pieces" in r.getMessage()
+    alone_logs = [
+        r for r in caplog.records if "one by one, whole" in r.getMessage()
     ]
-    assert split_logs and "1/2" in split_logs[0].getMessage(), (
-        "the split must be logged with the item count (1 of 2)"
+    assert alone_logs and "1/2" in alone_logs[0].getMessage(), (
+        "the separate whole attempt must be logged with the item count (1 of 2)"
     )
 
 
@@ -326,7 +319,7 @@ def test_hard_failure_isolated_survivors_keep_vectors(caplog):
     assert vecs[0] and vecs[2], "both survivors embedded"
     assert vecs[1] == [], "the un-embeddable item is the empty-vector sentinel"
     assert any(
-        "still un-embeddable" in r.getMessage() for r in caplog.records
+        "could not be embedded whole" in r.getMessage() for r in caplog.records
     ), "the hard failure count must be logged"
 
 

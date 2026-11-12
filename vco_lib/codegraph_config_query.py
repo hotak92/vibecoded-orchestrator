@@ -55,6 +55,7 @@ from vco_lib.codegraph_config_refs import (
     key_lookup_names,
     section_endpoint,
 )
+from vco_lib.codegraph_guards import join_chunk_bodies
 from vco_lib.codegraph_lang.config import CONFIG_FORMATS, config_format, parse_body_line
 from vco_lib.codegraph_lookup import code_identity_rows, pick_canonical_chunk
 from vco_lib.codegraph_references import read_cross_reference
@@ -158,8 +159,15 @@ def _sections_from_rows(rows: Iterable[Any]) -> List[_Section]:
             fmt=_text(head.get("language")).lower(), name=_text(head.get("name")),
             file_path=path, root=root, line=head.get("start_line"),
         )
-        for chunk in chunks:
-            for line in str(chunk.get("class_body") or "").splitlines():
+        # v0.2.106: a section whose refused chunk was split into rows is read
+        # as ONE text — a line cut at the split point would otherwise parse as
+        # two broken halves (``codegraph_guards.join_chunk_bodies`` glues the
+        # pieces back exactly and strips the chunk headers).
+        body = join_chunk_bodies(
+            [(c.get("chunk_num") or 0, str(c.get("class_body") or "")) for c in chunks],
+        )
+        if body:
+            for line in body.splitlines():
                 parsed = parse_body_line(line.strip())
                 if parsed is None:
                     continue

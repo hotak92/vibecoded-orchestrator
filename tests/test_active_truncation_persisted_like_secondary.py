@@ -133,10 +133,12 @@ def test_tagged_capture_includes_active_and_secondary_in_one_record(monkeypatch)
     adapter = _RefuseList({QWEN3_MODEL: 13_000, ARCTIC_MODEL: 3_000})
     svc = _dual_service(monkeypatch, adapter)
 
-    # DOCUMENT arm (v0.2.106 split on refusal): both refusals are split, so
-    # the complete record is EMPTY — nothing was cut — and both slots exist.
+    # DOCUMENT arm (v0.2.106): nothing is cut, so the complete record is
+    # EMPTY. Outside a row writer the refusing SECONDARY is left empty (never
+    # averaged — a row writer splits the chunk into rows instead); the active
+    # one-vector embed still covers every character.
     slots, truncated = svc.embed_text_all_configured_tagged("z" * 20_000)
-    assert "qwen3_embed" in slots and "arctic2_embed" in slots
+    assert "qwen3_embed" in slots and "arctic2_embed" not in slots
     assert truncated == []
 
     # QUERY arm — the one path that still embeds a leading window — fills the

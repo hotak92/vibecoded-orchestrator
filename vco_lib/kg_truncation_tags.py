@@ -68,8 +68,9 @@ So the answerable set is stored explicitly:
 The residual honest gap this leaves is UNDER-reporting, never
 over-claiming: e.g. the enrichment batch flush proves a leading window only
 from its own char cap, and since v0.2.106 proves ``False`` on the Ollama and
-CodeEmbed legs (they split a refused input and combine the pieces, so every
-character is embedded) — but the OpenAI leg reports nothing back, so it
+CodeEmbed legs (they embed every input whole; a refused one gets no vector
+and is re-laid as split rows by its writer) — but the OpenAI leg reports
+nothing back, so it
 passes ``None`` there and the slot reads UNKNOWN instead of a wrong
 ``False``.
 

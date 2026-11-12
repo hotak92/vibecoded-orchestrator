@@ -135,7 +135,7 @@ def _truthy_env(name: str) -> bool:
 # (the primary source — `_resolve_embed_revision` regex-parses it from the
 # resolved analyzer file so the two can't silently drift on a normal install;
 # this constant only covers a missing/unreadable analyzer).
-_FALLBACK_EMBED_REVISION = 1
+_FALLBACK_EMBED_REVISION = 2
 
 _EMBED_REVISION_RE = re.compile(
     r"^CODEGRAPH_EMBED_REVISION\s*:\s*int\s*=\s*(\d+)", re.MULTILINE
@@ -1836,10 +1836,9 @@ def count_cleanup_owed_rows(
 # props). The right shape is a Weaviate-side `data.update` pass: PATCH
 # semantics — no vector touch, no tombstone, no embed.
 
-# Chunked bodies carry a leading `[chunk N/total]\n\n` header. MUST MATCH
-# templates/scripts/analyze_code_graph.py::_CHUNK_HEADER_RE (and
-# server._parse_chunk_header).
-_CHUNK_HEADER_RE = re.compile(r"^\[chunk \d+/\d+\]\n\n")
+# Chunked bodies carry a leading `[chunk N/total]\n\n` header — the ONE pattern
+# is `codegraph_guards.CODE_CHUNK_HEADER_RE` (the analyzer reads it there too).
+from vco_lib.codegraph_guards import CODE_CHUNK_HEADER_RE as _CHUNK_HEADER_RE  # noqa: E402
 
 
 def _resolve_metadata_helpers():

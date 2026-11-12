@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from claude_mcp_servers.weaviate_mcp.chunking import chunk_answer_window
 
@@ -67,6 +67,33 @@ def _other_slot_memo_put(key: "tuple[str, str, str]", vec: "list[float]") -> Non
     if len(_OTHER_SLOT_MEMO) >= _OTHER_SLOT_MEMO_CAP:
         _OTHER_SLOT_MEMO.pop(next(iter(_OTHER_SLOT_MEMO)))
     _OTHER_SLOT_MEMO[key] = vec
+
+
+def _embed_answer_pieces(
+    text: str,
+    embed_fn: "Callable[[str], list[float]]",
+    model_id: str,
+) -> "list[tuple[str, list[float]]]":
+    """``[(piece, vector), ...]`` for ONE answer chunk — never an averaged vector.
+
+    v0.2.106 (owner ruling 2026-11-11, "extra rows in both places"): an
+    answer chunk the model refuses whole is split into pieces through the ONE
+    row driver (``vco_lib.embed_split.embed_rows``) and each piece becomes its
+    own answer vector. The citation cosine is a MAX over answer vectors, so a
+    piece that matches a node keeps its full similarity instead of being
+    diluted in a mean of the chunk's pieces. A refusal by ``embed_fn`` (the
+    service's document legs raise it inside the driver's scope; a bare
+    adapter's overflow error is typed by ``_embed_whole_or_refuse``) splits;
+    every other error propagates to the caller's soft-fail.
+    """
+    from vco_lib.embed_split import embed_rows
+    from vco_lib.embedding_service import _embed_whole_or_refuse
+
+    rows = embed_rows(
+        [text],
+        lambda piece: _embed_whole_or_refuse(embed_fn, piece, model_id=model_id),
+    )
+    return [(row.text, row.payload) for row in rows]
 
 
 class CitationResult(dict):
@@ -179,13 +206,19 @@ def compute_citation(
         try:
             # RL-2b: code ctx → embed in the code model's space so the cosine
             # against the staged code-slot n_emb is same-space and meaningful.
-            vec = svc.embed_code(text) if is_code else svc.embed_text(text)
+            # v0.2.106: a refused chunk yields one vector PER PIECE.
+            pieces = _embed_answer_pieces(
+                text,
+                svc.embed_code if is_code else svc.embed_text,
+                str(getattr(svc, "code_model_id" if is_code else "text_model_id", "") or ""),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("citation_compute: chunk embed failed (%s); continuing", exc)
             continue
-        if vec:
-            answer_chunk_embs.append(vec)
-            answer_chunk_hashes.append(_answer_chunk_hash(text))
+        for piece, vec in pieces:
+            if vec:
+                answer_chunk_embs.append(vec)
+                answer_chunk_hashes.append(_answer_chunk_hash(piece))
 
     if not answer_chunk_embs:
         return None
@@ -384,19 +417,29 @@ def _write_other_slot_citation(
         )
         if not text:
             continue
-        memo_key = (other_source, other_model, _answer_chunk_hash(text))
-        vec = _OTHER_SLOT_MEMO.get(memo_key)
+
+        def _other(piece: str) -> "list[float]":
+            # Memo per PIECE (a whole chunk that fits is its own one piece).
+            key = (other_source, other_model, _answer_chunk_hash(piece))
+            cached = _OTHER_SLOT_MEMO.get(key)
+            if cached is not None:
+                return cached
+            got = _embed_text_in_other_model(svc, piece, other_source, other_model)
+            if got:
+                _other_slot_memo_put(key, got)
+            return got
+
         try:
-            if vec is None:
-                vec = _embed_text_in_other_model(svc, text, other_source, other_model)
-                if vec:
-                    _other_slot_memo_put(memo_key, vec)
+            # v0.2.106: a chunk the OTHER model refuses whole is split into
+            # pieces, one answer vector each (never dropped, never averaged).
+            pieces = _embed_answer_pieces(text, _other, other_model)
         except Exception as exc:  # noqa: BLE001
             logger.debug("_write_other_slot_citation: chunk embed failed (%s)", exc)
             continue
-        if vec:
-            answer_chunk_embs.append(vec)
-            answer_chunk_hashes.append(_answer_chunk_hash(text))
+        for piece, vec in pieces:
+            if vec:
+                answer_chunk_embs.append(vec)
+                answer_chunk_hashes.append(_answer_chunk_hash(piece))
     if not answer_chunk_embs:
         return
 

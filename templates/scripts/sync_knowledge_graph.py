@@ -3281,8 +3281,9 @@ def _truncation_record_ask(declared_props: "Optional[set]") -> List[str]:
     """``["truncated_slots"]`` when the class POSITIVELY declares the property.
 
     v0.2.106: the embed-skip gates read the stored truncation record so a row
-    whose ACTIVE vector was a leading window (written by the retired shrink
-    ladder, before split on refusal) is re-embedded once. Asked only when the
+    whose vector of a slot this sync writes was a leading window (written by
+    the retired shrink ladder, before split on refusal) is re-embedded once
+    (``_split_rows_heal_reason``). Asked only when the
     schema probe saw the property: naming an undeclared property errors the
     whole read, and an unknown schema keeps the pre-existing ask.
     """
@@ -3293,24 +3294,116 @@ def _truncation_record_ask(declared_props: "Optional[set]") -> List[str]:
     return []
 
 
-def _active_vector_was_cut(rows, active_slot: str) -> bool:
-    """True when a stored row's truncation record names the ACTIVE slot.
+def _kg_write_models(
+    server: "WeaviateMCPServer", collection_name: str, active_slot: str,
+) -> Dict[str, str]:
+    """``{slot: model}`` for every slot a sync of ``collection_name`` rewrites.
 
-    That row's active vector covers only a leading window of its text — the
-    shrink ladder's output before v0.2.106. Re-embedding it now splits the
-    refused chunk into rows instead, and the new rows record no truncation,
-    so this fires once per affected node. Unknown (no record, no slot name,
-    an unreadable value) is False: the gate keeps its pre-existing skip.
+    The service's document fan-out set (``EmbeddingService.
+    configured_text_write_models`` — the ONE decision the fan-out itself gates
+    on) plus the carry model of a pending model fill (``kg_embed_model``), so
+    the re-embed-once gate below re-lays a row only for a slot the rewrite
+    actually produces. A slot outside it (an RL slot regen's store-back, a
+    secondary switched off since) is never a reason to re-embed: the rewrite
+    would not write it, and the gate would fire again on every sync.
+    Soft-fails to the active slot alone.
     """
-    if not active_slot:
-        return False
+    svc = getattr(server, "embedding_service", None)
+    models: Dict[str, str] = {}
+    try:
+        models = dict(svc.configured_text_write_models())  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 — degenerate wrapper / double
+        models = {}
+    target = str(getattr(svc, "text_model_id", "") or "")
+    if active_slot and active_slot not in models:
+        models[active_slot] = target
+    try:
+        res = _kg_embed_model.resolve_kg_model(
+            collection_name, role="write", target=target or None,
+        )
+        if res.carry:
+            models.setdefault(_kg_embed_model.text_model_slot(res.carry)[0], res.carry)
+    except Exception:  # noqa: BLE001 — no record resolvable → no carry
+        pass
+    return models
+
+
+def _split_rows_heal_reason(
+    server: "WeaviateMCPServer",
+    collection_name: str,
+    rows: Any,
+    content: str,
+    active_slot: str,
+) -> Optional[str]:
+    """Why a content-current node must still be re-embedded once, or None.
+
+    v0.2.106 (owner rulings 2026-11-11, "split on refusal" and "extra rows in
+    both places"): every slot a sync writes is now embedded whole or the
+    chunk is split into rows, so two kinds of stored row are stale although
+    their text is current. The ONE gate for both, shared by ``sync_node`` and
+    ``sync_doc``:
+
+    1. a row whose truncation record names a slot this sync writes — its
+       vector covers only a leading window (the shrink ladder, v0.2.105 and
+       before, recorded it). Re-embedded rows record no cut, so it fires once.
+    2. while a chunker-revision crossing is pending (the update's one-time
+       re-chunk window; ``_chunker_resync_pending``): a row holding the
+       vector of a NON-active slot this sync writes (an enabled secondary, the
+       fill's carry) whose model may have refused a chunk of this node
+       (``embedding_service.text_may_exceed_window`` on the plan's chunks).
+       Such a vector may be the length-weighted mean the first split-on-
+       refusal build wrote — that build recorded nothing on the row, so the
+       crossing (bumped for exactly this, ``_CHUNKER_REVISION`` v0.2.106.1)
+       is the only "once". A chunk that provably fits every such model was
+       never refused, and its node keeps its vectors.
+
+    Unknown (no record, an unreadable value, no vector payload) never forces
+    work beyond these: the gate keeps its pre-existing skip.
+    """
     from vco_lib.kg_truncation_tags import TRUNCATED_SLOTS_PROP
 
-    for obj in rows or ():
+    rows = list(rows or ())
+    named: set = set()
+    for obj in rows:
         record = (getattr(obj, "properties", None) or {}).get(TRUNCATED_SLOTS_PROP)
-        if isinstance(record, (list, tuple)) and active_slot in record:
-            return True
-    return False
+        if isinstance(record, (list, tuple)):
+            named.update(str(s) for s in record if isinstance(s, str))
+    write_models: Optional[Dict[str, str]] = None
+    if named:
+        write_models = _kg_write_models(server, collection_name, active_slot)
+        cut = sorted(named & set(write_models))
+        if cut:
+            return (
+                f"a stored row's {', '.join(cut)} vector covers only part of its "
+                "text (written before split on refusal)"
+            )
+    if not _chunker_resync_pending():
+        return None
+    if write_models is None:
+        write_models = _kg_write_models(server, collection_name, active_slot)
+    present: set = set()
+    for obj in rows:
+        vec_field = getattr(obj, "vector", None)
+        if isinstance(vec_field, dict):
+            present.update(s for s, v in vec_field.items() if v)
+    others = {
+        s: m for s, m in write_models.items()
+        if s != active_slot and s in present and m
+    }
+    if not others:
+        return None
+    from vco_lib.embedding_service import text_may_exceed_window
+
+    plan = _plan_for(server, content, source_id="split-rows-heal")
+    texts = [content] if plan.is_single else [c.content for c in plan.chunks]
+    for slot in sorted(others):
+        if any(text_may_exceed_window(t, others[slot]) for t in texts):
+            return (
+                f"a stored row's {slot} vector may be an average of split pieces "
+                "(written before split rows; re-laid once on this chunker-revision "
+                "crossing)"
+            )
+    return None
 
 
 def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
@@ -3571,14 +3664,18 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 _self_consistent = (
                     chunk_count_ok and hashes_ok and slots_ok and shapes_ok
                 )
-                # v0.2.106: a row whose ACTIVE vector is a recorded leading
-                # window is not current — re-embed once (split on refusal).
-                if _self_consistent and _active_vector_was_cut(existing, active_slot):
-                    _self_consistent = False
-                    print(
-                        "   ♻️  Re-embedding: a stored row's active vector covers "
-                        "only part of its text (written before split on refusal)"
+                # v0.2.106: a row whose vector of a slot this sync writes is a
+                # recorded leading window, or (on the chunker-revision crossing)
+                # may be an averaged one, is not current — re-embed once.
+                _heal = (
+                    _split_rows_heal_reason(
+                        server, DEV_COLLECTION_NAME, existing, content, active_slot,
                     )
+                    if _self_consistent else None
+                )
+                if _heal:
+                    _self_consistent = False
+                    print(f"   ♻️  Re-embedding: {_heal}")
                 _plan_ok = True
                 # v0.2.96 F-L5: the plan check hard-asks chunk props, so on an
                 # old-schema class it can only ever answer False — a needless
@@ -3646,8 +3743,8 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             },
         )
 
-        # v0.2.106 split on refusal: rows are the plan's chunks, a chunk the
-        # active model refuses whole becoming several rows (the ONE row embed
+        # v0.2.106 split on refusal: rows are the plan's chunks, a chunk any
+        # model of the row refuses whole becoming several rows (the ONE row embed
         # `sync_node` uses, `_embed_node_rows`). Every row is embedded before
         # the old rows are deleted.
         if _plan.is_single:
@@ -4471,8 +4568,9 @@ def _embed_node_rows(
 
     Returns ``[(row_text, vector_arg, slots_map, truncated_slots), ...]``.
     v0.2.106 split on refusal: through ``vco_lib.embed_split.embed_rows``, so a
-    chunk the ACTIVE model refuses whole comes back as several rows, each
-    embedded whole (the same driver the MCP `store_knowledge_node` and the
+    chunk ANY model of the row refuses whole (the active one, an enabled
+    secondary, the carry of a model fill) comes back as several rows, each
+    embedded whole by every model (the same driver the MCP `store_knowledge_node` and the
     shipped-sidecar builder use). Every row is embedded before this returns,
     which is what lets the callers delete the old rows only afterwards. A
     piece still refused at the split floor raises
@@ -4964,17 +5062,21 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                         f"residue)"
                     )
             _self_consistent = _hashes_and_shape_ok and _slots_ok
-            # v0.2.106: a row whose ACTIVE vector is a recorded leading window
-            # (the retired shrink ladder) is not current — re-embed once; the
-            # refused chunk is now split into rows instead.
-            if _self_consistent and _active_vector_was_cut(
-                existing_rows, _active_slot_for_gate
-            ):
-                _self_consistent = False
-                print(
-                    "   ♻️  Re-embedding: a stored row's active vector covers "
-                    "only part of its text (written before split on refusal)"
+            # v0.2.106: a row whose vector of a slot this sync writes is a
+            # recorded leading window (the retired shrink ladder), or — on the
+            # chunker-revision crossing — may be an averaged one (the first
+            # split-on-refusal build), is not current: re-embed once; a refused
+            # chunk is now split into rows for every model instead.
+            _heal = (
+                _split_rows_heal_reason(
+                    server, target_collection_name, existing_rows, content,
+                    _active_slot_for_gate,
                 )
+                if _self_consistent else None
+            )
+            if _heal:
+                _self_consistent = False
+                print(f"   ♻️  Re-embedding: {_heal}")
             _plan_ok = True
             # WP-2 review MINOR-2: the plan check hard-asks chunk props, so
             # on an old-schema class (chunk props undeclared) it can only
@@ -5085,7 +5187,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         _max_tokens = _plan.threshold
 
         # v0.2.106 (owner ruling 2026-11-11, split on refusal): the ROWS are
-        # the plan's chunks, except that a chunk the active model refuses
+        # the plan's chunks, except that a chunk any model of the row refuses
         # whole is split at its best boundary nearest the middle and stored
         # as several rows of this node, each embedded whole — nothing is cut
         # off. A single-chunk plan embeds the FULL file text (as before); its

@@ -6,8 +6,12 @@ When the embedding model refuses a chunk (context window exceeded), the chunk
 is split in two at the best boundary nearest its middle and both halves are
 embedded, recursively, so no content is ever lost. Row writers (kg-sync node
 and doc paths, the MCP ``store_knowledge_node``, the shipped-sidecar builder)
-store the pieces as extra rows of the same node; every one-vector path
-combines the piece vectors. Prose that fits keeps today's chunks and vectors.
+store the pieces as extra rows of the same node — and since the follow-up
+ruling ("extra rows in both places") a refusal by ANY model of the row
+(secondary, carry) splits the rows too, so no stored vector is averaged; only
+a one-vector consumer outside a row writer combines the piece vectors. Prose
+that fits keeps today's chunks and vectors. The code-graph half lives in
+``tests/test_v02106_split_rows.py``.
 
 Every fake embedder here refuses above a TOKEN limit computed at a dense
 ratio (1.5 chars/token), the shape of the real refusals measured on JSON,
@@ -296,12 +300,15 @@ class TestEmbedRows:
         ]
         assert all(emb.saw_scope)
 
-    def test_suspended_scope_turns_the_raise_off(self):
+    def test_scope_nests_and_resets(self):
+        # v0.2.106 "extra rows in both places": there is no suspended scope any
+        # more — the carry splits rows like every other model of the row.
+        assert not hasattr(ES, "row_split_suspended")
         with ES.row_split_scope():
+            with ES.row_split_scope():
+                assert ES.row_split_active()
             assert ES.row_split_active()
-            with ES.row_split_suspended():
-                assert not ES.row_split_active()
-            assert ES.row_split_active()
+        assert not ES.row_split_active()
 
 
 class TestLayout:
@@ -426,14 +433,27 @@ class TestServiceWiring:
     def test_secondary_document_is_whole_and_not_tagged(self):
         from vco_lib.embedding_service import _embed_secondary_with_refusal_retry
 
-        fake = _FakeOllama(450)
+        fake = _FakeOllama(100_000)
         text = _dense_text(12)
         vec, truncated = _embed_secondary_with_refusal_retry(
             fake, "snowflake-arctic-embed2:latest", text
         )
         assert truncated is False
-        assert "".join(t for _m, t in fake.accepted) == text
-        assert len(vec) == 4
+        assert [t for _m, t in fake.accepted] == [text]  # ONE whole call
+        assert vec == _vec_for(text)
+
+    def test_secondary_document_refusal_raises_never_averages(self):
+        # Red-proof target: afa192f4 pre-split by the char budget and combined
+        # the piece vectors into the row's one secondary vector.
+        from vco_lib.embedding_service import _embed_secondary_with_refusal_retry
+
+        fake = _FakeOllama(450)
+        with pytest.raises(ES.ChunkOverflowError) as info:
+            _embed_secondary_with_refusal_retry(
+                fake, "snowflake-arctic-embed2:latest", _dense_text(12)
+            )
+        assert info.value.model_id == "snowflake-arctic-embed2:latest"
+        assert fake.accepted == []  # nothing embedded, nothing averaged
 
     def test_secondary_query_still_bounds(self):
         from vco_lib.embedding_service import _embed_secondary_with_refusal_retry
@@ -444,7 +464,9 @@ class TestServiceWiring:
         )
         assert truncated is True
 
-    def test_batch_splits_over_budget_items_and_keeps_fitting_ones_identical(self):
+    def test_batch_embeds_over_budget_items_whole_and_alone(self):
+        # The batch only fills EXISTING rows (enrichment): an over-budget item
+        # is kept out of the batch call and embedded whole — never pieces.
         from vco_lib.embedding_service import _char_budget_for_model
 
         model = "snowflake-arctic-embed2:latest"
@@ -453,20 +475,19 @@ class TestServiceWiring:
         big = (_dense_text(12) * 8)[: budget * 2 + 7]
         small = "a short row"
         out = svc._embed_ollama_batch_bounded(model, [small, big])
-        assert out[0] == _vec_for(small)
-        sent = [t for _m, t in svc.ollama.accepted if t != small]
-        assert "".join(sent) == big and all(len(t) <= budget for t in sent)
-        assert out[1] == ES.combine_vectors([(t, _vec_for(t)) for t in sent])
+        assert out == [_vec_for(small), _vec_for(big)]
+        assert [t for _m, t in svc.ollama.accepted] == [small, big]
 
-    def test_batch_refusal_isolates_per_item_and_still_embeds_whole(self):
+    def test_batch_refusal_yields_the_sentinel_never_an_average(self):
         model = "qwen3-embedding:0.6b"
         svc = _service(400, model=model)
         text = _dense_text(12)  # under the char budget, over the dense limit
         out = svc._embed_ollama_batch_bounded(model, ["fits", text])
         assert out[0] == _vec_for("fits")
-        assert out[1] and len(out[1]) == 4
+        assert out[1] == []  # the row's writer re-lays it as split rows
+        assert all(t != text for _m, t in svc.ollama.accepted)
 
-    def test_carry_embed_combines_instead_of_adding_rows(self, monkeypatch):
+    def test_carry_refusal_splits_rows_instead_of_averaging(self, monkeypatch):
         from vco_lib import kg_embed_model as K
 
         carry_svc = _service(450)
@@ -477,10 +498,78 @@ class TestServiceWiring:
         monkeypatch.setattr(K, "resolve_kg_model", lambda *a, **k: _Res())
         monkeypatch.setattr(K, "sibling_text_service", lambda svc, model: carry_svc)
         target = _service(100_000)
-        slots = {target.text_vector_slot: [1.0, 0, 0, 0]}
+        text = _dense_text(12)
         with ES.row_split_scope():
-            out = K.complete_write_vectors(target, slots, _dense_text(12), "Coll", [])
-        assert K.text_model_slot(_Res.carry)[0] in out
+            with pytest.raises(ES.ChunkOverflowError):
+                K.complete_write_vectors(
+                    target, {target.text_vector_slot: [1.0, 0, 0, 0]}, text, "Coll", [])
+
+        # Through the row driver: every row carries BOTH models' whole vectors.
+        def _row(piece: str):
+            slots = {target.text_vector_slot: target._embed_text_via_active(piece)}
+            return K.complete_write_vectors(target, slots, piece, "Coll", [])
+
+        rows = ES.embed_rows([text], _row)
+        assert len(rows) > 1 and "".join(r.text for r in rows) == text
+        carry_slot = K.text_model_slot(_Res.carry)[0]
+        for r in rows:
+            assert r.payload[carry_slot] == _vec_for(r.text)
+            assert r.payload[target.text_vector_slot] == _vec_for(r.text)
+
+    def test_secondary_refusal_splits_rows_for_every_model(self, monkeypatch):
+        # The finest split any model of the row's vector set needs: the active
+        # model accepts the chunk, the arctic secondary refuses it → BOTH
+        # models embed every piece; no row lacks a vector, none is averaged.
+        monkeypatch.setenv("DUAL_EMBEDDING_WRITE_ALL_SLOTS", "true")
+        monkeypatch.setenv("DUAL_EMBEDDING_ARCTIC_SECONDARY", "true")
+
+        class _TwoWindows(_FakeOllama):
+            def embed(self, model_id, text):
+                limit = 450 if "arctic" in model_id else 100_000
+                if _tokens(text) > limit:
+                    raise _overflow_exc(len(text))
+                self.accepted.append((model_id, text))
+                return _vec_for(model_id + text)
+
+        svc = _service(100_000)
+        svc.ollama = _TwoWindows(0)
+        text = _dense_text(12)
+        rows = ES.embed_rows([text], svc.embed_text_all_configured_tagged)
+        assert len(rows) > 1 and "".join(r.text for r in rows) == text
+        for r in rows:
+            slots, truncated = r.payload
+            assert set(slots) == {"qwen3_embed", "arctic2_embed"}
+            assert slots["arctic2_embed"] == _vec_for("snowflake-arctic-embed2:latest" + r.text)
+            assert slots["qwen3_embed"] == _vec_for("qwen3-embedding:0.6b" + r.text)
+            assert truncated == []
+        # Deterministic for the model set: the same chunk → the same rows.
+        again = ES.embed_rows([text], svc.embed_text_all_configured_tagged)
+        assert [r.text for r in again] == [r.text for r in rows]
+
+    def test_secondary_refusal_outside_a_row_writer_leaves_the_slot_empty(self, monkeypatch):
+        monkeypatch.setenv("DUAL_EMBEDDING_WRITE_ALL_SLOTS", "true")
+        monkeypatch.setenv("DUAL_EMBEDDING_ARCTIC_SECONDARY", "true")
+
+        class _ArcticRefuses(_FakeOllama):
+            def embed(self, model_id, text):
+                if "arctic" in model_id:
+                    raise _overflow_exc(len(text))
+                return _vec_for(text)
+
+        svc = _service(100_000)
+        svc.ollama = _ArcticRefuses(0)
+        slots = svc.embed_text_all_configured(_dense_text(12))
+        assert "arctic2_embed" not in slots and "qwen3_embed" in slots
+
+    def test_a_combined_vector_is_never_memoized_for_a_row_writer(self):
+        svc = _service(400)
+        text = _dense_text(12)
+        outside = svc.embed_text(text)  # one-vector consumer: combined
+        assert len(svc.ollama.accepted) > 1
+        with ES.row_split_scope():
+            with pytest.raises(ES.ChunkOverflowError):
+                svc.embed_text(text)  # a row writer must split, not reuse it
+        assert outside
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +722,92 @@ class TestWriters:
                 assert bool(mod.sync_node(server, path))
             assert len(server.embedded) == expect_embeds, buf.getvalue()[-800:]
             assert phrase in buf.getvalue()
+
+    @staticmethod
+    def _writing(models, client=None):
+        """A refusing sync server whose service WRITES exactly ``models``."""
+        import types as _t
+
+        server = _RefusingSyncServer()
+        server.embedding_service = _t.SimpleNamespace(
+            text_model_id="qwen3-embedding:0.6b",
+            configured_text_write_models=lambda: dict(models),
+        )
+        if client is not None:
+            server.client = client
+        return server
+
+    def test_a_secondary_recorded_as_cut_is_re_embedded_only_when_written(
+        self, harness, monkeypatch,
+    ):
+        """v0.2.105 and before recorded a secondary's leading window in the
+        row's truncation record. A sync that WRITES that slot re-lays the
+        node once; a sync that does not write it must not re-embed for it
+        (it would never clear: an RL slot regen re-adds such a record)."""
+        import types as _t
+
+        class _OldArcticCut(W8._SyncServer):
+            def _get_all_kg_embeddings_tagged(self, text):
+                return ({self.text_vector_slot: [0.1, 0.2], "arctic2_embed": [0.3, 0.4]},
+                        ["arctic2_embed"])
+
+        rel = "knowledge/concepts/arctic_was_cut.md"
+        mod, old, path, _out = self._sync(harness, rel, "short prose. " * 40,
+                                          server=_OldArcticCut())
+        monkeypatch.setattr(mod._kg_embed_model, "resolve_kg_model",
+                            lambda *a, **k: _t.SimpleNamespace(carry=None))
+        qwen_only = self._writing({"qwen3_embed": "qwen3-embedding:0.6b"}, old.client)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert bool(mod.sync_node(qwen_only, path))
+        assert qwen_only.embedded == [] and "Embed-skip" in buf.getvalue()
+
+        dual = self._writing({"qwen3_embed": "qwen3-embedding:0.6b",
+                              "arctic2_embed": "snowflake-arctic-embed2:latest"}, old.client)
+        for expect, phrase in ((1, "arctic2_embed vector covers only part"), (1, "Embed-skip")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                assert bool(mod.sync_node(dual, path))
+            assert len(dual.embedded) == expect, buf.getvalue()[-800:]
+            assert phrase in buf.getvalue()
+
+    def test_crossing_re_lays_a_possibly_averaged_secondary_once(self, harness, monkeypatch):
+        """The first split-on-refusal build AVERAGED a refusing secondary's
+        pieces and recorded nothing. The chunker-revision crossing (bumped to
+        v0.2.106.1 for exactly this) re-lays a node holding such a slot when
+        its model may have refused one of the node's chunks — and only then."""
+        import types as _t
+
+        from weaviate_mcp.chunking import _CHUNKER_REVISION
+
+        assert _CHUNKER_REVISION == "v0.2.106.1"
+
+        class _OldAveraged(W8._SyncServer):
+            def _get_all_kg_embeddings_tagged(self, text):
+                return {self.text_vector_slot: [0.1, 0.2], "arctic2_embed": [0.3, 0.4]}, []
+
+        big_rel, small_rel = "knowledge/concepts/maybe_avg.md", "knowledge/concepts/fits.md"
+        mod, old, big_path, _o = self._sync(
+            harness, big_rel, "lorem ipsum dolor sit amet. " * 300, server=_OldAveraged())
+        same_store = _OldAveraged()
+        same_store.client = old.client
+        _m2, _o2, small_path, _o3 = self._sync(
+            harness, small_rel, "short prose. " * 20, server=same_store)
+        monkeypatch.setattr(mod._kg_embed_model, "resolve_kg_model",
+                            lambda *a, **k: _t.SimpleNamespace(carry=None))
+        dual = self._writing({"qwen3_embed": "qwen3-embedding:0.6b",
+                              "arctic2_embed": "snowflake-arctic-embed2:latest"}, old.client)
+        # Not crossing: unrecorded vectors are trusted (no blanket re-embed).
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert bool(mod.sync_node(dual, big_path))
+        assert dual.embedded == []
+        monkeypatch.setattr(mod, "_chunker_resync_pending", lambda: True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert bool(mod.sync_node(dual, big_path))
+            assert bool(mod.sync_node(dual, small_path))
+        assert len(dual.embedded) == 1, buf.getvalue()[-1200:]
+        assert "may be an average of split pieces" in buf.getvalue()
 
     def test_stored_split_rows_count_as_the_current_plan(self, harness):
         rel = "knowledge/concepts/split_plan.md"

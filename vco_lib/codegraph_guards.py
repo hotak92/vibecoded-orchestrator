@@ -26,7 +26,9 @@ actually does on a re-walk.
 PURITY
 ------
 Zero I/O, zero Weaviate imports, zero analyzer state. Parameters in, an action
-out. The analyzer owns the constants (``CODEGRAPH_EMBED_REVISION``,
+out. (The two point-read helpers — :func:`read_object_fingerprint` and
+:func:`stored_split_rows` — do I/O only through the collection object the
+caller passes in.) The analyzer owns the constants (``CODEGRAPH_EMBED_REVISION``,
 ``_EMBED_SPACE_COMPATIBLE_FROM_REVISION``, ``_EMBED_REVISION_VECTORLESS``) and
 passes them as arguments — moving them here would break
 ``codegraph_resync._resolve_embed_revision`` (which parses the analyzer file for
@@ -47,10 +49,39 @@ floor`` means the vector lives in a stale embedding space (a model/chunking
 bump raised the floor) → EMBED. Only ``floor ≤ rev < current`` with a
 byte-identical content hash and a matching chunk shape is a cheap metadata
 STAMP.
+
+EMBED REVISIONS (``analyze_code_graph.CODEGRAPH_EMBED_REVISION``)
+-----------------------------------------------------------------
+The constant bumps whenever the way an entity's TEXT is turned into vectors
+changes so that stored vectors are invalid although the text is not — the
+same source line now lands in a different embedding than the stored row
+carries. It is per-object, riding the SAME point-read as ``content_hash``:
+each row self-heals the first time a walk visits it at the new revision, so a
+resync is incremental and resumable (a per-collection marker could not say
+"this row is fresh, that one stale"). ``embed_revision`` is an additive
+property; a NULL is "unknown" → EMBED (above).
+
+* **1 (v0.2.72, P3)** — pre-v0.2.72 an over-budget Function/Class had
+  everything past ``_max_chars_for_model`` DROPPED from its single embedding;
+  P3 chunks such entities into N rows (``chunk_num``/``total_chunks``). The
+  ~7-9% over-budget rows had unchanged text, so the content-hash skip would
+  have kept their truncated vectors forever; the revision forced them (and
+  only them — the rest matched) to re-embed.
+* **2 (v0.2.106, owner ruling 2026-11-11 "extra rows in both places")** — a
+  chunk a model refuses is now split into more chunk rows, each embedded
+  whole by every model (:func:`fan_out_chunk_writes`). Rows written before
+  carry no mark of a refusal: v0.2.105 and earlier embedded a refused text's
+  LEADING WINDOW, the first split-on-refusal build AVERAGED its pieces. The
+  floor stays 1 (a vector of a text the model accepted whole is valid), and
+  the STAMP of a rev-1 row is vetoed exactly when its text may have been
+  refused by a model of the writer's vector set (:func:`may_have_been_refused`
+  — a provable byte bound, no model call): such a row re-embeds once, every
+  other row is stamped.
 """
 from __future__ import annotations
 
 import logging
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -756,7 +787,8 @@ def dispatch_deferred_embed(
     is_multi_chunk: bool,
     resolver: Optional[Callable[[], None]],
     eager_shape_fn: Callable[[Any], Any],
-) -> None:
+    split_scope: bool = False,
+) -> bool:
     """v0.2.73 (FIX-B2) + v0.2.92 (Defect A): route one entity's deferred embed.
 
     Walkers pass a zero-arg embed callable as ``insert_params['_deferred_embed']``
@@ -779,59 +811,105 @@ def dispatch_deferred_embed(
 
     No-op when ``insert_params`` is not a dict or carries no ``_deferred_embed``
     key (call sites that still set ``vector`` eagerly).
+
+    v0.2.106 (owner ruling 2026-11-11, "extra rows in both places"):
+    ``split_scope`` (a chunkable Function/Class entity) runs the embed inside
+    ``vco_lib.embed_split.row_split_scope``. A model of the row's vector set
+    that refuses the single text raises ``ChunkOverflowError``; it is caught
+    HERE and reported as ``True`` (no vector set) — the caller then writes
+    the entity as split chunk rows (:func:`fan_out_chunk_writes`) instead of
+    one averaged vector. Returns False otherwise.
     """
     if not isinstance(insert_params, dict):
-        return
+        return False
     if "_deferred_embed" not in insert_params:
-        return
+        return False
     if is_multi_chunk:
         insert_params.pop("_deferred_embed", None)
-        return
-    if resolver is not None:
-        resolver()
-        return
-    deferred = insert_params.pop("_deferred_embed", None)
-    if not callable(deferred):
-        return
+        return False
+    import contextlib
+
+    from vco_lib.embed_split import ChunkOverflowError, row_split_scope
+
+    scope = row_split_scope() if split_scope else contextlib.nullcontext()
     try:
-        embedding = deferred()
-    except Exception:  # noqa: BLE001 — an embed failure must not wedge a write
-        embedding = None
+        with scope:
+            if resolver is not None:
+                resolver()
+                return False
+            deferred = insert_params.pop("_deferred_embed", None)
+            if not callable(deferred):
+                return False
+            try:
+                embedding = deferred()
+            except ChunkOverflowError:
+                raise
+            except Exception:  # noqa: BLE001 — an embed failure must not wedge a write
+                embedding = None
+    except ChunkOverflowError:
+        insert_params.pop("_deferred_embed", None)
+        insert_params.pop("vector", None)
+        return True
     shaped = eager_shape_fn(embedding)
     if shaped:
         insert_params["vector"] = shaped
+    return False
 
 
 def fan_out_chunk_writes(
     insert_params: dict,
     props: dict,
     chunk_texts: Sequence[str],
-    chunk_uuids: Sequence[str],
     is_function: bool,
     *,
     embed_fn: Callable[[str], Any],
     write_fn: Callable[[str, dict], str],
+    uuid_fn: Callable[[int], str],
 ) -> Optional[str]:
-    """v0.2.92: write one entity's N chunk rows; return the CANONICAL uuid.
+    """v0.2.92: write one entity's chunk rows; return the CANONICAL uuid.
 
-    Each chunk gets its OWN vector from ``embed_fn(chunk_text)`` — never the
-    parent's full-body vector, which describes a different text
-    (:func:`build_chunk_write_params` drops an inherited ``vector`` when the
-    chunk's own is falsy). ``write_fn(uuid, params)`` is the analyzer's single
-    write primitive; what it returns for chunk 0 is the canonical uuid the
-    caller's ``func_uuid`` / ``class_uuid`` captures.
+    Each row gets its OWN vector — never the parent's full-body vector, which
+    describes a different text (:func:`build_chunk_write_params` drops an
+    inherited ``vector`` when the row's own is falsy). ``write_fn(uuid,
+    params)`` is the analyzer's single write primitive; what it returns for
+    row 0 is the canonical uuid the caller's ``func_uuid`` / ``class_uuid``
+    captures. ``uuid_fn(k)`` mints row ``k``'s deterministic uuid
+    (:func:`chunk_identities`' key space: the bare key for 0, ``<key>::<k>``).
+
+    v0.2.106 (owner ruling 2026-11-11, "extra rows in both places"): the
+    chunk texts go through the ONE row driver (``vco_lib.embed_split.
+    embed_rows``), so a chunk ANY model of the row's vector set refuses (the
+    active code model, the fill's carry, an enabled secondary) is stored as
+    several consecutive rows, each embedded whole by every model — never one
+    averaged vector. Rows are numbered in text order (``chunk_num`` 0..N-1,
+    ``total_chunks`` N); a continuation piece carries no ``[chunk i/n]``
+    header, which is how readers glue it back (:func:`join_chunk_bodies`).
+    EVERY row is embedded before the first write, so a piece still refused at
+    the split floor (``UnsplittableTextError``) raises with the entity's
+    stored rows untouched.
     """
-    total = len(chunk_texts)
+    from vco_lib.embed_split import embed_rows
+
+    rows = embed_rows(list(chunk_texts), embed_fn)
+    total = len(rows)
     canonical: Optional[str] = None
-    for i, chunk_text in enumerate(chunk_texts):
+    for i, row in enumerate(rows):
         chunk_params = build_chunk_write_params(
-            insert_params, props, chunk_text, is_function, i, total,
-            embed_fn(chunk_text),
+            insert_params, props, row.text, is_function, i, total, row.payload,
         )
-        written = write_fn(chunk_uuids[i], chunk_params)
+        written = write_fn(uuid_fn(i), chunk_params)
         if i == 0:
             canonical = written
     return canonical
+
+
+def chunk_key(identity_key: str, index: int) -> str:
+    """The identity key of chunk row ``index``: the BARE key for row 0 (its
+    UUID is byte-identical to the single-object UUID), ``<key>::<index>``
+    after — the chunk ordinal of the key-space banner above. The ONE rule;
+    :func:`chunk_identities`, the fan-out's writes and the split-row reads
+    all mint uuids through it."""
+    return identity_key if index == 0 else f"{identity_key}::{index}"
 
 
 def chunk_identities(
@@ -858,8 +936,7 @@ def chunk_identities(
     hashes: List[str] = []
     body_key = "function_body" if is_function else "class_body"
     for i, chunk_text in enumerate(chunk_texts):
-        key = identity_key if i == 0 else f"{identity_key}::{i}"
-        uuids.append(uuid_fn(key))
+        uuids.append(uuid_fn(chunk_key(identity_key, i)))
         chunk_props = dict(props)
         chunk_props[body_key] = chunk_text
         chunk_props["chunk_num"] = i
@@ -912,8 +989,14 @@ def all_chunks_stampable(
     current_revision: int,
     floor_revision: int,
     vectorless_sentinel: int = 0,
+    restamp_blocked: Optional[Callable[[int], bool]] = None,
 ) -> bool:
     """v0.2.82 (G1 task 3): pure verdict for the multi-chunk STAMP fast path.
+
+    ``restamp_blocked(i)`` (v0.2.106) vetoes the STAMP of row ``i`` whose
+    stored vector may not be what the current writer produces for its text
+    (:func:`may_have_been_refused` — a refusal the pre-split-rows writers cut
+    or averaged); one veto re-embeds the entity.
 
     True iff EVERY chunk row is present, hash-matched, and classifies
     :attr:`RowAction.STAMP` (``floor ≤ rev < current`` with a positive vector
@@ -929,7 +1012,7 @@ def all_chunks_stampable(
     """
     if not fingerprints or len(fingerprints) != len(chunk_hashes):
         return False
-    for fp, ch in zip(fingerprints, chunk_hashes):
+    for index, (fp, ch) in enumerate(zip(fingerprints, chunk_hashes)):
         if fp is None or not ch:
             return False
         action = classify_row(
@@ -942,6 +1025,8 @@ def all_chunks_stampable(
             computed_total_chunks=total,
         )
         if action is not RowAction.STAMP:
+            return False
+        if restamp_blocked is not None and restamp_blocked(index):
             return False
     return True
 
@@ -1011,6 +1096,7 @@ def stamp_all_chunks(
     vectorless_sentinel: int = 0,
     read_fp: Callable[[str], Optional[dict]],
     patch_rev: Callable[[str], bool],
+    restamp_blocked: Optional[Callable[[int], bool]] = None,
 ) -> bool:
     """v0.2.82 (G1 task 3): the multi-chunk STAMP fast path, orchestration + all.
 
@@ -1032,6 +1118,7 @@ def stamp_all_chunks(
         current_revision=current_revision,
         floor_revision=floor_revision,
         vectorless_sentinel=vectorless_sentinel,
+        restamp_blocked=restamp_blocked,
     ):
         return False
     for cu in chunk_uuids:
@@ -1051,6 +1138,7 @@ def skip_or_stamp_all_chunks(
     read_fp: Callable[[str], Optional[dict]],
     patch_rev: Callable[[str], bool],
     note_visited: Callable[[str], None],
+    restamp_blocked: Optional[Callable[[int], bool]] = None,
 ) -> bool:
     """v0.2.92: "does this multi-chunk entity need ANY embed?" — both branches.
 
@@ -1104,6 +1192,7 @@ def skip_or_stamp_all_chunks(
         vectorless_sentinel=vectorless_sentinel,
         read_fp=_fp,
         patch_rev=patch_rev,
+        restamp_blocked=restamp_blocked,
     )
 
 
@@ -1127,6 +1216,148 @@ def stamp_single_chunk_props(coll_name: str, props: Any) -> None:
         props["chunk_num"] = 0
     if "total_chunks" not in props:
         props["total_chunks"] = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SPLIT ROWS (v0.2.106, owner ruling 2026-11-11 "extra rows in both places")
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A chunk any model of the row's vector set refuses is stored as several
+# consecutive chunk rows of the entity (:func:`fan_out_chunk_writes`), in text
+# order, each embedded whole — never one averaged vector. The row model needs
+# NO new property: the plan chunk boundaries are in-band. Every plan chunk of a
+# multi-chunk plan starts with its ``[chunk i/n]`` header
+# (``code_truncation._chunk_header``) and a single-chunk plan has none, so a
+# row that is NOT the first of its entity and does not start with a header is
+# a CONTINUATION piece of the row before it. ``chunk_num`` / ``total_chunks``
+# are the row index / count, the bare key and ``<key>::<k>`` its uuids, and
+# each row's content hash covers its own text — so the skip / stamp / re-walk
+# logic above works per row unchanged. What a second walk needs to recognise
+# an unchanged split entity is :func:`stored_split_rows`.
+
+#: The chunk header every plan chunk of a multi-chunk entity starts with.
+#: MUST MATCH ``code_truncation._chunk_header`` (1-indexed ``[chunk i/n]``
+#: plus a blank line); the analyzer and ``codegraph_resync`` read it here.
+CODE_CHUNK_HEADER_RE = re.compile(r"^\[chunk \d+/\d+\]\n\n")
+
+
+def strip_chunk_header(text: str) -> str:
+    """Remove a leading ``[chunk i/n]`` header (no-op when absent)."""
+    return CODE_CHUNK_HEADER_RE.sub("", text, count=1)
+
+
+def join_chunk_bodies(
+    rows: Sequence[Tuple[Any, Any]], separator: str = "\n",
+) -> str:
+    """One entity's chunk rows ``[(chunk_num, body), ...]`` back into text.
+
+    Rows are taken in the given order (callers sort by ``chunk_num``); headers
+    are stripped. A CONTINUATION piece (a row whose ``chunk_num`` directly
+    follows the previous row's and whose body carries no header) is glued to
+    the previous row with nothing in between — split pieces concatenate
+    exactly, so a separator would corrupt a hard-cut boundary (an identifier,
+    a base64 run). Rows that start a plan chunk are joined with
+    ``separator``. Used by every reader that reassembles an entity: the
+    analyzer's call-linking parse, the MCP / CLI tier renderer and the config
+    query.
+    """
+    from vco_lib.embed_split import join_row_texts
+
+    texts: List[str] = []
+    glued: List[bool] = []
+    prev: Optional[int] = None
+    for chunk_num, body in rows:
+        text = body if isinstance(body, str) else ""
+        try:
+            num: Optional[int] = int(chunk_num)
+        except (TypeError, ValueError):
+            num = None
+        glued.append(
+            bool(texts) and num is not None and prev is not None
+            and num == prev + 1 and CODE_CHUNK_HEADER_RE.match(text) is None
+        )
+        texts.append(strip_chunk_header(text))
+        prev = num
+    return join_row_texts(texts, glued, separator)
+
+
+def stored_split_rows(
+    collection: Any,
+    plan_texts: Sequence[str],
+    body_field: str,
+    *,
+    uuid_fn: Callable[[int], str],
+    read_fp: Callable[[str], Optional[dict]],
+) -> Optional[List[str]]:
+    """The stored row texts of an entity whose refused chunk(s) were split,
+    when they are EXACTLY the current plan's chunks split into consecutive
+    pieces; None otherwise (no split stored, the plan changed, a row is
+    missing or unreadable — the caller then plans as usual and embeds).
+
+    Why it exists: the split depends on a model's refusal, which a walk must
+    not re-ask to decide that an unchanged entity is unchanged. The stored
+    rows ARE the layout: chunk 0's fingerprint (``read_fp``, the analyzer's
+    memoized point-read) gives the stored row count; only when it exceeds the
+    plan's chunk count are the bodies read (one point-read per row, uuids by
+    ``uuid_fn``) and compared with ``embed_split.stored_rows_cover_plan``.
+    The returned texts then go through the ordinary per-row skip / stamp
+    check, so a second walk of an unchanged split entity embeds nothing.
+    """
+    from vco_lib.embed_split import stored_rows_cover_plan
+
+    if not plan_texts:
+        return None
+    fp = read_fp(uuid_fn(0))
+    if not fp:
+        return None
+    try:
+        stored_total = int(fp.get("total_chunks") or 1)
+    except (TypeError, ValueError):
+        return None
+    if stored_total <= len(plan_texts):
+        return None
+    try:
+        fetch = collection.query.fetch_object_by_id
+        bodies: List[str] = []
+        for k in range(stored_total):
+            obj = fetch(uuid_fn(k), return_properties=[body_field])
+            body = (getattr(obj, "properties", None) or {}).get(body_field) if obj else None
+            if not isinstance(body, str) or not body:
+                return None
+            bodies.append(body)
+    except Exception:  # noqa: BLE001 — unreadable → unknown → plan + embed
+        return None
+    return bodies if stored_rows_cover_plan(bodies, list(plan_texts)) else None
+
+
+#: The property holding the embedded text of a NON-chunkable code row, for
+#: the revision-2 heal below (its embed text is a truncation of this value,
+#: so the value fitting proves the embed text fit).
+HEAL_TEXT_FIELDS: Dict[str, str] = {
+    "CodeModule": "module_summary",
+    "CodeAPI": "api_description",
+    "CodeInteraction": "description",
+}
+
+
+def may_have_been_refused(text: Any, models: Sequence[str]) -> bool:
+    """True when ANY of ``models`` could have refused ``text`` whole.
+
+    ``CODEGRAPH_EMBED_REVISION`` 2 (v0.2.106) is the one-time heal of code
+    rows written before split rows: a refusal there was cut to a leading
+    window (v0.2.105 and before) or averaged (the first split-on-refusal
+    build), and neither left a mark on the row. A row whose text PROVABLY fits
+    every model of the writer's vector set
+    (``embedding_service.text_may_exceed_window``) was never refused, so its
+    stored vector is valid and it takes the cheap revision STAMP; every other
+    row re-embeds once. A non-string text (unknown) is True — re-embedding is
+    the fail-safe side.
+    """
+    if not isinstance(text, str):
+        return True
+    from vco_lib.embedding_service import text_may_exceed_window
+
+    return any(text_may_exceed_window(text, m) for m in models if m)
 
 
 def classify_stale_kind(

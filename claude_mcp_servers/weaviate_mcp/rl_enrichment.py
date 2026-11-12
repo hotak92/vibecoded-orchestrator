@@ -2376,7 +2376,11 @@ def _embed_text_in_other_model(
     from the identical backend path (no third embed implementation).
 
     Returns the vector, or None on soft-fail (empty text / backend down / unknown
-    source). Never raises into the citation compute — the caller drops the chunk.
+    source). The ONE exception it raises is ``ChunkOverflowError`` when the
+    model refuses the text for length (v0.2.106): the citation compute splits
+    that answer chunk into pieces (``citation_compute._embed_answer_pieces``)
+    instead of dropping it; the slot regen's caller (``embed_regen``) still
+    soft-fails it to None.
     """
     if not text or not text.strip():
         return None
@@ -2397,6 +2401,11 @@ def _embed_text_in_other_model(
         vec = ollama.embed(model, text)
         return vec or None
     except Exception as exc:  # noqa: BLE001
+        from vco_lib.embed_split import ChunkOverflowError
+        from vco_lib.embedding_service import _is_context_overflow_error
+
+        if _is_context_overflow_error(exc):
+            raise ChunkOverflowError(model, len(text), str(exc)) from exc
         server.logger.debug(
             "_embed_text_in_other_model: embed in %s (%s) failed (%s)",
             other_source, model, exc,
