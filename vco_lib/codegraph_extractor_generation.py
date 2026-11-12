@@ -202,9 +202,14 @@ logger = logging.getLogger(__name__)
 #:          also records the code-graph half of the
 #:          ``chunker_preset_overhaul_pending`` re-sync
 #:          (``codegraph_deferrals.record_successful_walk``).
-#:          ``CODEGRAPH_EMBED_REVISION`` is NOT bumped: a row whose embed text
-#:          did not change keeps a valid vector, and every row whose text did
-#:          change already re-embeds through its content hash.
+#:          ``CODEGRAPH_EMBED_REVISION`` went 1 → 2 in the same release for a
+#:          separate reason (owner ruling 2026-11-11, "extra rows in both
+#:          places"): a chunk a model refuses is now split into more rows, and
+#:          a content-unchanged row whose text MAY have been refused before
+#:          (cut to a leading window, or averaged — neither marked the row)
+#:          must re-embed once. This re-walk is what visits those rows; every
+#:          row whose text provably fits every model is only stamped
+#:          (``codegraph_guards.may_have_been_refused``).
 EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = (
     "0.2.92", "0.2.93", "0.2.94", "0.2.102", "0.2.105", "0.2.106",
 )
@@ -395,7 +400,8 @@ EXTRACTOR_GENERATION_RUNG_REASONS: dict[str, str] = {
     ),
     "0.2.106": (
         "re-chunked code entities to fit the embedding model's window on "
-        "dense code (no entity's tail is dropped any more)"
+        "dense code, and stores a chunk the model refuses as more rows "
+        "(no entity's tail is dropped or averaged any more)"
     ),
 }
 

@@ -1,41 +1,53 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Split-on-refusal: the ONE home for embedding a text the model refuses.
+"""Split-on-refusal: the ONE home for embedding a text a model refuses.
 
-Owner ruling 2026-11-11 ("split on refusal"): when an embedding model refuses
-an input because it exceeds its context window, the input is SPLIT in two at
-the best boundary nearest its middle and both halves are embedded,
-recursively, until every piece is accepted. Nothing is cut off any more — the
-shrink ladder this replaces embedded only a leading window and dropped the
-tail.
+Owner rulings 2026-11-11 ("split on refusal"; then "extra rows in both
+places, so we know which chunk actually matched"): when an embedding model
+refuses an input because it exceeds its context window, the input is SPLIT in
+two at the best boundary nearest its middle and both halves are embedded,
+recursively, until every piece is accepted. Nothing is cut off, and a stored
+row's vector is never an average of piece vectors.
 
-Two consumers, two shapes, one recursion:
+Rows (every writer of stored rows): the KG and document writers (kg-sync's
+node and document paths, the MCP ``store_knowledge_node``, the shipped
+sidecar builder, ``process_documents``) and the code-graph analyzer turn each
+refused chunk into MORE ROWS of the same node or entity, in text order:
+:func:`embed_rows` / :func:`embed_rows_async`. Inside a
+:func:`row_split_scope`, EVERY document leg of the embedding service (the
+active model, each enabled secondary slot, the carry model of a model fill,
+the code legs) raises :class:`ChunkOverflowError` on a refusal instead of
+handling it, and the row driver splits that chunk. The row layout is
+therefore the FINEST split any model of the row's vector set needs: if one
+model refuses chunk C, C is split for all of them, and every resulting row
+carries every model's vector. Deterministic for a given model set
+(:func:`split_point` is pure, a model's refusal of a given text is
+deterministic). Adding a model can only refine the layout (a piece every
+model accepted before is split further only if the new model refuses it);
+removing one keeps the finer rows, which stay exact for the remaining models.
 
-* **Row writers** (kg-sync's node and document paths, the MCP
-  ``store_knowledge_node``, the shipped-sidecar builder) turn each refused
-  chunk into MORE ROWS of the same node: :func:`embed_rows` /
-  :func:`embed_rows_async`. Inside a :func:`row_split_scope`, the embedding
-  service's ACTIVE text leg raises :class:`ChunkOverflowError` instead of
-  handling the refusal itself, and the row driver splits that chunk. Which
-  rows exist is decided by the ACTIVE model alone, so the row set does not
-  depend on which secondary slots happen to be configured.
-* **One-vector paths** (secondary slots of a row, code-graph entities, the
-  enrichment backfill of an existing row, the carry vector during a model
-  fill) need exactly one vector for a text whose row set is already fixed:
-  :func:`embed_split_pieces` + :func:`combine_vectors` embed every piece and
-  average the piece vectors weighted by their length (then L2-normalise).
-  Every character still reaches the vector.
-
-Determinism: :func:`split_point` is a pure function of the text, and the
-refusal of a given text by a given model is deterministic, so re-running a
-sync over unchanged content reproduces the same pieces — same row texts,
-same row count, nothing re-embedded.
+One-vector consumers OUTSIDE a row writer (``embedding_service.
+_embed_whole_on_overflow``): a caller that needs exactly one vector for a
+text that is not a stored row (the RL n_emb recovery and slot regen of an
+existing row for a model outside its write set, the legacy migrate script,
+the MCP ``backfill_embeddings`` tool) still gets :func:`embed_split_pieces`
++ :func:`combine_vectors` — every character reaches the vector. Search
+queries never come here (a query keeps its leading window by design).
 
 Floor and depth: a piece of at most :data:`SPLIT_FLOOR_CHARS` characters that
 is STILL refused is not a window problem (no supported model has a window
 that small); it raises :class:`UnsplittableTextError` — the caller reports
 it (the node fails, its old rows stay in place), it is never silently
 dropped. :data:`MAX_SPLIT_DEPTH` bounds the recursion independently.
+
+Layout records: :func:`row_layout` (``{"<1-based plan chunk>": [piece
+lengths]}``) is what the shipped sidecar stores so an install rebuilds the
+identical rows without asking a model (:func:`apply_row_layout`);
+:func:`stored_rows_cover_plan` recognises stored rows that are the plan's
+chunks or consecutive pieces of them (kg-sync's plan check, the code-graph
+analyzer's skip of an unchanged split entity); :func:`join_row_texts` glues
+consecutive rows back into text (a continuation piece with nothing in
+between).
 """
 
 from __future__ import annotations
@@ -73,7 +85,9 @@ MAX_SPLIT_DEPTH: int = 32
 
 
 class ChunkOverflowError(RuntimeError):
-    """The ACTIVE model refused a whole chunk inside a :func:`row_split_scope`.
+    """A model of the row's vector set refused a whole chunk inside a
+    :func:`row_split_scope` (the active model, an enabled secondary, the carry
+    of a model fill, a code leg).
 
     Raised by the embedding service instead of handling the refusal itself,
     so the row driver can split the chunk into more rows. Carries the
@@ -292,7 +306,10 @@ _ROW_SPLIT: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
 
 @contextlib.contextmanager
 def row_split_scope() -> Iterator[None]:
-    """While active, the ACTIVE text leg raises :class:`ChunkOverflowError`.
+    """While active, every document embed leg raises :class:`ChunkOverflowError`
+    on a refusal: the active model, each enabled secondary, the carry model of
+    a model fill and the code legs (``embedding_service.
+    _embed_whole_or_refuse``).
 
     A ``ContextVar``, so it follows ``asyncio.to_thread`` (which copies the
     caller's context) into the worker thread the MCP embeds in, and never
@@ -305,23 +322,8 @@ def row_split_scope() -> Iterator[None]:
         _ROW_SPLIT.reset(token)
 
 
-@contextlib.contextmanager
-def row_split_suspended() -> Iterator[None]:
-    """Turn the row scope OFF for one embed whose row set is already decided.
-
-    The carry vector during a model fill (``kg_embed_model``) embeds the same
-    row text with ANOTHER model: that model's refusal must not add rows, so
-    it combines instead.
-    """
-    token = _ROW_SPLIT.set(False)
-    try:
-        yield
-    finally:
-        _ROW_SPLIT.reset(token)
-
-
 def row_split_active() -> bool:
-    """True inside :func:`row_split_scope` (and not suspended)."""
+    """True inside :func:`row_split_scope`."""
     return _ROW_SPLIT.get()
 
 
@@ -412,9 +414,11 @@ def embed_rows(
 ) -> List[RowPiece]:
     """Embed every plan chunk in ``texts``; a refused chunk becomes more rows.
 
-    ``embed_fn`` runs inside :func:`row_split_scope`, so the service's active
-    text leg raises :class:`ChunkOverflowError` on a refusal; that chunk is
-    split at :func:`split_point` and both halves are embedded, recursively.
+    ``embed_fn`` runs inside :func:`row_split_scope`, so every model the
+    service embeds a row with raises :class:`ChunkOverflowError` on a
+    refusal; that chunk is split at :func:`split_point` and both halves are
+    embedded with every model again, recursively — the finest split any
+    model of the row's vector set needs.
     Every row is embedded BEFORE this returns, so a writer that calls it
     before touching the stored rows never deletes a node it cannot replace.
     """
@@ -540,6 +544,30 @@ def stored_rows_cover_plan(
     return position == len(stored_contents)
 
 
+def join_row_texts(
+    texts: Sequence[str],
+    continuation: Sequence[bool],
+    separator: str = "\n",
+) -> str:
+    """Join consecutive stored row texts back into readable text.
+
+    A CONTINUATION piece (the 2nd..nth row a refused chunk was split into)
+    is glued to the row before it with NOTHING in between: split pieces
+    concatenate exactly to their chunk, so a separator would corrupt the
+    text wherever the split point was a hard cut (base64, a long
+    identifier). Rows that start a chunk are joined with ``separator``.
+    ``continuation`` aligns with ``texts``; a length mismatch joins
+    everything with ``separator`` (the behaviour before split rows existed).
+    """
+    if not texts:
+        return ""
+    if len(continuation) != len(texts):
+        return separator.join(texts)
+    out = [texts[0]]
+    for text, glued in zip(texts[1:], continuation[1:]):
+        out.append(("" if glued else separator) + text)
+    return "".join(out)
+
 
 __all__ = [
     "ChunkOverflowError",
@@ -552,11 +580,11 @@ __all__ = [
     "embed_rows",
     "embed_rows_async",
     "embed_split_pieces",
+    "join_row_texts",
     "pieces_within",
     "row_layout",
     "row_split_active",
     "row_split_scope",
-    "row_split_suspended",
     "split_in_two",
     "split_point",
     "stored_rows_cover_plan",

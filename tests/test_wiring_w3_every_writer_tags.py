@@ -744,12 +744,32 @@ def _run_enrichment(objects):
     return coll
 
 
-def test_enrichment_merges_the_fresh_slot_into_an_existing_record():
-    """A row that already carries a complete record gains the freshly-filled
-    slot's verdict; the vector write is unchanged."""
-    huge = "x" * (200_000)   # over EMBED_INPUT_CHAR_CAP → provably a window
+def test_enrichment_never_cuts_an_over_cap_row():
+    """v0.2.106 (owner rulings "split on refusal" / "extra rows in both
+    places"): a row over EMBED_INPUT_CHAR_CAP used to be embedded from its
+    first 16 000 characters and tagged truncated. It is now left unfilled —
+    no vector, no record patch — for its writer to re-embed and split.
+
+    Red-proof: restore ``pending_texts.append(content[:EMBED_INPUT_CHAR_CAP])``
+    and this row gets a leading-window vector again (one update)."""
+    from vco_lib.embedding_enrichment import EMBED_INPUT_CHAR_CAP
+
+    huge = "x" * (EMBED_INPUT_CHAR_CAP + 1)
     obj = _EnrichObj(
         {"content": huge, TRUNCATED_SLOTS_PROP: [ACTIVE_SLOT],
+         MEASURED_SLOTS_PROP: [ACTIVE_SLOT]},
+    )
+    coll = _run_enrichment([obj])
+
+    assert coll.updates == []
+
+
+def test_enrichment_merges_the_fresh_slot_into_an_existing_record():
+    """A row that already carries a complete record gains the freshly-filled
+    slot's verdict (whole: False) beside the record it already had; the
+    vector write is unchanged."""
+    obj = _EnrichObj(
+        {"content": "x" * 2_000, TRUNCATED_SLOTS_PROP: [ACTIVE_SLOT],
          MEASURED_SLOTS_PROP: [ACTIVE_SLOT]},
     )
     coll = _run_enrichment([obj])
@@ -757,10 +777,7 @@ def test_enrichment_merges_the_fresh_slot_into_an_existing_record():
     assert len(coll.updates) == 1
     upd = coll.updates[0]
     assert upd["vector"] == {"arctic2_embed": [0.1, 0.2]}
-    assert upd["properties"][TRUNCATED_SLOTS_PROP] == [
-        "arctic2_embed", ACTIVE_SLOT,
-    ]
-    assert upd["properties"][SECONDARY_TRUNCATED_SLOTS_PROP] == ["arctic2_embed"]
+    assert upd["properties"][TRUNCATED_SLOTS_PROP] == [ACTIVE_SLOT]
     assert upd["properties"][MEASURED_SLOTS_PROP] == [
         "arctic2_embed", ACTIVE_SLOT,
     ]
@@ -770,7 +787,7 @@ def test_enrichment_on_a_pre_record_row_writes_the_vector_only():
     """LEAVE-ALONE twin: the row predates the complete record, so no honest
     single-slot merge exists — the vector still lands, the row stays
     UNKNOWN."""
-    obj = _EnrichObj({"content": "x" * 200_000})
+    obj = _EnrichObj({"content": "x" * 2_000})
     coll = _run_enrichment([obj])
 
     assert len(coll.updates) == 1
@@ -779,10 +796,10 @@ def test_enrichment_on_a_pre_record_row_writes_the_vector_only():
 
 
 def test_enrichment_short_content_is_proven_whole_on_the_split_legs():
-    """v0.2.106: the Ollama / CodeEmbed batch legs split an over-budget or
-    refused input and combine the pieces, so every character of what was
-    handed in reaches the vector — the fresh slot is PROVEN full and merged
-    into the row's complete record as measured, not truncated."""
+    """v0.2.106: the Ollama / CodeEmbed batch legs embed every input whole (a
+    refused one gets no vector), so every vector covers every character of
+    the row — the fresh slot is PROVEN full and merged into the row's
+    complete record as measured, not truncated."""
     obj = _EnrichObj({"content": "tiny", TRUNCATED_SLOTS_PROP: [ACTIVE_SLOT],
                       MEASURED_SLOTS_PROP: [ACTIVE_SLOT]})
     coll = _run_enrichment([obj])

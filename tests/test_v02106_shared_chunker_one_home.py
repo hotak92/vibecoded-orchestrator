@@ -127,8 +127,10 @@ def test_kg_document_path_is_byte_identical_to_the_pregenerated_golden():
 def test_chunker_revision_matches_the_golden():
     # The hard-contract sentinel moves WITH the golden: the fixture records
     # the revision it was generated under, so a regenerated golden without a
-    # revision bump (or the reverse) fails here.
-    assert chunking._CHUNKER_REVISION == "v0.2.106"
+    # revision bump (or the reverse) fails here. v0.2.106.1 (split rows) is a
+    # delivery-only bump: the boundaries — the rest of this golden — are the
+    # v0.2.106 ones, unchanged (``test_..._golden`` above still matches them).
+    assert chunking._CHUNKER_REVISION == "v0.2.106.1"
     golden = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert golden["chunker_revision"] == chunking._CHUNKER_REVISION
 

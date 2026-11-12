@@ -347,7 +347,9 @@ class TestChunkerRevisionBumped:
             "content (JSON, code, CJK); the revision must advance so installs "
             "re-chunk to the dense-budget boundaries (v0.2.106)"
         )
-        assert _CHUNKER_REVISION == "v0.2.106"
+        # v0.2.106.1: the split-rows heal's one-time crossing (no boundary
+        # change — see the revision history in chunking.py).
+        assert _CHUNKER_REVISION == "v0.2.106.1"
 
 
 # ===========================================================================

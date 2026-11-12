@@ -1822,6 +1822,16 @@ def _format_code_result_by_tier(
         _total_for_note = int(properties.get("total_chunks") or 1)
     except (TypeError, ValueError):
         _total_for_note = 1
+    # v0.2.106 (owner ruling 2026-11-11, "so we know which chunk actually
+    # matched"): a multi-row entity — chunked, or split into rows because a
+    # model refused a chunk — reports which row won the collapse (1-based,
+    # text order). The entity is still ONE result (make_code_collapse_fn).
+    if _total_for_note > 1:
+        try:
+            out["matched_chunk"] = int(properties.get("chunk_num") or 0) + 1
+        except (TypeError, ValueError):
+            pass
+        out["chunks_total"] = _total_for_note
 
     if tier == "single_chunk" or chunk_fetcher is None:
         out[body_field] = matched_body
@@ -1876,8 +1886,12 @@ def _format_code_result_by_tier(
             )
         return out
 
-    assembled = "\n\n".join(
-        _strip_chunk_header_text(c.get(body_field, "") or "") for c in chunks
+    # v0.2.106: the pieces a refused chunk was split into glue back EXACTLY
+    # (no separator inside a split point); whole chunks keep the blank line.
+    from vco_lib.codegraph_guards import join_chunk_bodies
+
+    assembled = join_chunk_bodies(
+        [(c.get("chunk_num"), c.get(body_field, "") or "") for c in chunks], "\n\n",
     )
     # v0.2.73 M2: prepend the chunk-map header (▶ shown / · unshown) built
     # from the code sidecar's per-chunk summaries. "" when no sidecar data —
@@ -5642,7 +5656,7 @@ async def store_knowledge_node(
             )
 
         # v0.2.106 (owner ruling 2026-11-11, split on refusal): the ROWS are
-        # the plan's chunks, except that a chunk the ACTIVE model refuses
+        # the plan's chunks, except that a chunk any model of the row refuses
         # whole is split at its best boundary nearest the middle and stored as
         # several rows of this node, each embedded whole — the SAME row driver
         # kg-sync uses (``vco_lib.embed_split.embed_rows_async`` /
@@ -5657,9 +5671,12 @@ async def store_knowledge_node(
         #
         # WP-O rework (2026-07-22, no-functionality-loss rule): chunk
         # boundaries follow the ACTIVE model's OWN preset — unclamped by the
-        # tighter secondaries — and the SECONDARY slots of each row are embedded
-        # whole by ``EmbeddingService`` (split + combine, v0.2.106), recorded
-        # through the atomic capture (``embed_text_all_configured_tagged``).
+        # tighter secondaries — and every slot of each row is embedded whole
+        # by ``EmbeddingService``, recorded through the atomic capture
+        # (``embed_text_all_configured_tagged``). v0.2.106 ("extra rows in
+        # both places"): a refusal by ANY model of the row (active, secondary,
+        # carry) splits the chunk into rows inside the driver's scope, so
+        # every row carries every model's vector and none is an average.
         _plan_texts = (
             [content] if _plan.is_single else [c.content for c in _plan.chunks]
         )
@@ -8029,7 +8046,23 @@ async def backfill_embeddings(
             skipped += 1
             continue
 
-        vec = await embed_fn(content[:8000])
+        # v0.2.106 (owner rulings "split on refusal" / "extra rows in both
+        # places"): the row's WHOLE content, inside a row-split scope. This
+        # tool fills one slot of an EXISTING row and cannot add rows, so a
+        # model that refuses it gives NO vector (an error for this object,
+        # logged) — never the leading window it used to embed (the first
+        # 8 000 characters) and never an averaged vector; kg-sync's
+        # active-slot gate re-lays such a node as split rows.
+        try:
+            with _embed_split.row_split_scope():
+                vec = await embed_fn(content)
+        except Exception as exc:  # noqa: BLE001 — one object, never the run
+            logger.warning(
+                "backfill_embeddings: %s not embedded whole (%s); left for its "
+                "writer to re-lay", obj.uuid, exc,
+            )
+            errors += 1
+            continue
         if vec is None:
             errors += 1
             continue

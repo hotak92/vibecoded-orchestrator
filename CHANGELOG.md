@@ -208,26 +208,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (measured: JSON, minified code, base64, tables and CJK at 1.35 to 1.84 characters per token), and the model can
   refuse a chunk even at the new size. Such a chunk is no longer cut: it is split in two at the best boundary near its
   middle (a paragraph break, else a sentence end, a line break or a space), both halves are embedded, and a half the
-  model still refuses is split again. In the knowledge graph and in the docs collection the pieces become extra
-  chunks of the same node; where one vector is needed for a text (the secondary embedding slots, code-graph
-  entities, the backfill of a missing slot), the vectors of the pieces are averaged into one. Either way every
-  character reaches a vector, and chunks that fit are embedded exactly as before. A piece the model refuses even at
-  512 characters is reported and the node keeps its old rows. Rows written by earlier versions that recorded their
-  search vector as covering only the start of their text are re-embedded once by the next sync. The query enrichment that adds recent
-  conversation to a short search query is now sized for dense text too (for qwen3-embedding at most 19 560
-  characters instead of 36 864). What you notice: after the update VCO re-chunks your knowledge graph once — the
-  update's own KG sync re-embeds only the nodes and documents whose chunks changed (on qwen3-embedding, the ones
-  longer than about 19 500 characters; on arctic, longer than about 7 000) or whose stored vector was cut, and the
-  code graph re-walks in the background and re-embeds only the code entities whose chunks changed. Expect seconds to
-  a few minutes with a GPU, and longer on a CPU-only machine with a large knowledge graph; searches keep working
-  meanwhile, and nothing is deleted before its new vectors are written (the KG sync now embeds first and only then
-  replaces a node's old rows; `store_knowledge_node` already did). The next update re-embeds nothing. The
+  model still refuses is split again. The pieces become extra rows of the same node, document or code entity, stored
+  in text order. This holds for every model that writes a vector for the row: if any of them refuses a chunk (the
+  active model, a secondary slot such as arctic beside qwen3, or the previous model while a model change is being
+  filled in), the chunk is split for all of them, so every row carries a whole vector from every model and no stored
+  vector is an average of pieces. A search therefore reports the piece that matched: knowledge-graph and code-graph
+  results show the matching row with its neighbours (split pieces are joined back exactly), a result over several
+  rows names the row that matched (`matched_chunk`, with `chunks_total`), and a code entity is still one result. Chunks that fit are embedded
+  exactly as before. A piece the model refuses even at 512 characters is reported and the node keeps its old rows.
+  Filling a missing vector slot on existing rows never cuts or averages either: a row the model refuses there, or one
+  longer than 16 000 characters, gets no vector and the next sync or code-graph walk splits it into rows. The query
+  enrichment that adds recent conversation to a short search query is now sized for dense text too (for
+  qwen3-embedding at most 19 560 characters instead of 36 864). What you notice: after the update VCO re-chunks your
+  knowledge graph once — the update's own KG sync re-embeds only the nodes and documents whose chunks changed (on
+  qwen3-embedding, the ones longer than about 19 500 characters; on arctic, longer than about 7 000), whose stored
+  vector covered only the start of their text, or, if you write a secondary slot, whose secondary vector may not
+  have fitted that model — and the code graph re-walks in the background and re-embeds the code entities whose
+  chunks changed or whose text may not have fitted the code model's window (every other code row only has its
+  revision number updated). Expect seconds to a few minutes with a GPU, and longer on a CPU-only machine with a large
+  knowledge graph; searches keep working meanwhile, and nothing is deleted before its new vectors are written (the
+  KG sync, the code-graph walk and the document processor now embed every row first and only then replace the old
+  ones; `store_knowledge_node` already did). The next update re-embeds nothing. The
   `chunker_preset_overhaul_pending` entry in `UPDATE_DEFERRED.md` records the pass and clears itself when both
   halves have run; its code-graph command is now the non-destructive `--force-rewalk` (it used to drop and rebuild
-  the code graph). The bundled pre-computed embeddings for the curated knowledge nodes were rebuilt for the new
-  chunks with the same splitting, so none of their vectors is cut, and they name the chunk layout they were built
-  for, so a stale set is never ingested. The known issue about the arctic secondary slot embedding only the start of
-  oversized chunks is closed by the same change.
+  the code graph). The bundled pre-computed embeddings for the curated knowledge nodes were built for the new chunks
+  with the same splitting, one model at a time, so none of their vectors is cut or averaged, and they name the chunk
+  layout they were built for, so a stale set is never ingested. The known issue about the arctic secondary slot
+  embedding only the start of oversized chunks is closed by the same change.
 
 - **The RL reranker is part of the orchestrator and free.** Its server, model, trainer, maintainer scripts, tests
   and Dockerfile now live in this repository, in `claude_mcp_servers/rl_reranker` (AGPL-3.0). It was a separately

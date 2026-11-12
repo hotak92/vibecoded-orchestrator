@@ -1252,16 +1252,28 @@ class _DemoteColl:
         return iter(self.rows)
 
 
+def _current_revision() -> int:
+    """The revision the audit treats as current when no analyzer file is
+    resolvable (``codegraph_resync._FALLBACK_EMBED_REVISION``, which MUST match
+    the analyzer constant — 2 since v0.2.106's split rows)."""
+    from vco_lib import codegraph_resync as cr
+
+    return cr._FALLBACK_EMBED_REVISION
+
+
+_CUR = _current_revision()
+
+
 def _demote_world():
     fn = _DemoteColl("Acme_CodeFunction", [
-        ("no-vector", {"embed_revision": 1}, {}),
-        ("empty-slot", {"embed_revision": 1}, {"codesage_embed": []}),
-        ("has-vector", {"embed_revision": 1}, {"codesage_embed": [0.1]}),
-        ("other-slot-only", {"embed_revision": 1}, {"qwen3_embed": [0.2]}),
+        ("no-vector", {"embed_revision": _CUR}, {}),
+        ("empty-slot", {"embed_revision": _CUR}, {"codesage_embed": []}),
+        ("has-vector", {"embed_revision": _CUR}, {"codesage_embed": [0.1]}),
+        ("other-slot-only", {"embed_revision": _CUR}, {"qwen3_embed": [0.2]}),
         ("already-stale", {"embed_revision": 0}, {}),
-        ("unjudgeable", {"embed_revision": 1}, None),
+        ("unjudgeable", {"embed_revision": _CUR}, None),
     ])
-    mod = _DemoteColl("Acme_CodeModule", [("mod-no-vec", {"embed_revision": 1}, {})],
+    mod = _DemoteColl("Acme_CodeModule", [("mod-no-vec", {"embed_revision": _CUR}, {})],
                       slots=("qwen3_embed",))  # undeclared active slot → skipped
     colls = {"Acme_CodeFunction": fn, "Acme_CodeModule": mod}
     return _purge_client(colls), fn, mod
@@ -1277,7 +1289,7 @@ def test_vectorless_audit_demotes_only_current_rows_missing_the_active_slot():
     assert sorted(fn.updates) == ["empty-slot", "no-vector", "other-slot-only"]
     assert fn.iter_kwargs == [["codesage_embed"]]
     assert mod.updates == [], "a class without the slot cannot gain it by re-embedding"
-    assert {r.uuid: r.properties["embed_revision"] for r in fn.rows}["has-vector"] == 1
+    assert {r.uuid: r.properties["embed_revision"] for r in fn.rows}["has-vector"] == _CUR
 
 
 def test_vectorless_audit_is_one_time_per_key_and_resumable():
@@ -1290,7 +1302,7 @@ def test_vectorless_audit_is_one_time_per_key_and_resumable():
         "Acme", slot_resolver=lambda: "codesage_embed", client=client)
     assert first == {"demoted": 2, "failed": 1}
     assert audits.recorded_key(audits.AUDIT_VECTORLESS, "Acme") is None, "partial ≠ done"
-    assert cr.vectorless_audit_owed("Acme", 1)
+    assert cr.vectorless_audit_owed("Acme", _CUR)
 
     fn.fail.clear()
     fn.updates.clear()
@@ -1298,8 +1310,8 @@ def test_vectorless_audit_is_one_time_per_key_and_resumable():
         "Acme", slot_resolver=lambda: "codesage_embed", client=client)
     assert fn.updates == ["no-vector"], "the re-run touches only what is left"
     assert second == {"demoted": 1, "failed": 0}
-    assert audits.recorded_key(audits.AUDIT_VECTORLESS, "Acme") == "codesage_embed@1"
-    assert not cr.vectorless_audit_owed("Acme", 1)
+    assert audits.recorded_key(audits.AUDIT_VECTORLESS, "Acme") == f"codesage_embed@{_CUR}"
+    assert not cr.vectorless_audit_owed("Acme", _CUR)
 
     fn.updates.clear()
     assert cr._maybe_run_vectorless_audit(

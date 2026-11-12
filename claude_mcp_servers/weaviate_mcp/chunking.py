@@ -248,9 +248,9 @@ CHARS_PER_TOKEN_CODE: float = 3.5   # source code; denser than prose
 # on real code, and the margin is NOT a guarantee for the code tier. What
 # makes an over-dense part honest is the CodeEmbed service REFUSING it
 # (HTTP 400, W1) and the caller handling that refusal — since v0.2.106 by
-# splitting the part and combining the piece vectors
-# (`embedding_service._embed_whole_on_overflow`), so nothing is cut off — the
-# same net `truncate: false` provides on the Ollama side.
+# splitting the part into more chunk rows of the entity (the analyzer's row
+# scope, `vco_lib.embed_split`), so nothing is cut off and no row is an
+# averaged vector — the same net `truncate: false` provides on the Ollama side.
 #
 # v0.2.106: this margin is no longer the only bound. The model-aware presets
 # are ALSO clamped to ``dense_char_budget`` (the measured-minimum
@@ -438,6 +438,18 @@ def query_prefix_for_model(model_name: str, task: "str | None" = None) -> str:
 # tests/test_deferral_command_argparse_sweep.py.)
 #
 # Revision history:
+#   v0.2.106.1 (2026-11-11, owner ruling "extra rows in both places"): NO
+#     boundary change — every plan chunk is identical to v0.2.106. The bump is
+#     the one-time DELIVERY signal for the split-rows heal: a refused chunk is
+#     now split into rows for EVERY model of the row's vector set (active,
+#     enabled secondaries, the fill's carry), where the first split-on-refusal
+#     build averaged a refusing SECONDARY's (or carry's) piece vectors into
+#     one vector and recorded nothing on the row. The crossing arms
+#     ``sync_knowledge_graph._split_rows_heal_reason``, which re-lays exactly
+#     the rows holding such a slot whose model may have refused one of the
+#     node's chunks (``embedding_service.text_may_exceed_window``); every
+#     other node keeps skipping. An install crossing from v0.2.92.1 pays one
+#     crossing, not two.
 #   v0.2.106 (2026-11-11, owner ruling "fix + re-embed" — dense budget):
 #     every model-aware preset is ALSO clamped to the model's dense-content
 #     budget (``dense_char_budget`` = embedding_service's measured-minimum
@@ -521,7 +533,7 @@ def query_prefix_for_model(model_name: str, task: "str | None" = None) -> str:
 #   v0.2.47.5 (2026-06-04): re-cast as num_ctx (was: model architectural max).
 #     Quadrupled qwen3 chunks (1500 → 13500 max tokens). 5-tier presets.
 #   pre-v0.2.47.5: 3-tier presets, MODEL_TOKEN_LIMITS = model architectural max.
-_CHUNKER_REVISION: str = "v0.2.106"
+_CHUNKER_REVISION: str = "v0.2.106.1"
 
 
 # Default chunking presets by model class.

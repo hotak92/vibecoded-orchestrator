@@ -2775,15 +2775,16 @@ class ArcticSecondaryFanoutTests(unittest.TestCase):
         self.assertEqual(sub3, big)
 
     def test_oversized_chunk_splits_arctic_secondary_active_full_fidelity(self):
-        """WP-O rework + v0.2.106 split on refusal: a chunk larger than
-        arctic's num_ctx must (a) NOT tag arctic2_embed — (b) the arctic
-        secondary is embedded as PIECES within its budget that together cover
-        the whole chunk (they used to be one bounded leading sub-window), while
-        (c) the ACTIVE qwen3 slot is embedded from the FULL text in one call.
-        Reverting the secondary to a bounded leading window would leave the
-        pieces short of the chunk → this fails.
+        """WP-O rework + v0.2.106 ("extra rows in both places"): a chunk
+        larger than arctic's char-budget ESTIMATE must (a) NOT tag
+        arctic2_embed — (b) the arctic secondary is attempted WHOLE, in one
+        call (it used to be one bounded leading sub-window, then pieces within
+        the budget averaged into one vector; a model that accepts the text
+        now gets the text), while (c) the ACTIVE qwen3 slot is embedded from
+        the FULL text in one call. A real refusal splits the chunk into rows
+        inside a row writer (tests/test_v02106_split_on_refusal.py).
         """
-        from vco_lib.embedding_service import _CHARS_PER_TOKEN, _char_budget_for_model
+        from vco_lib.embedding_service import _CHARS_PER_TOKEN
         with _EnvIsolation(), patch.dict(
             os.environ,
             {
@@ -2814,12 +2815,8 @@ class ArcticSecondaryFanoutTests(unittest.TestCase):
             self.assertIn("arctic2_embed", slots)
             # (a) nothing was cut, so nothing is tagged.
             self.assertFalse(truncated.get("arctic2_embed"))
-            # (b) arctic embedded as pieces within its budget covering the chunk.
-            arctic = captured[ARCTIC_SECONDARY_MODEL]
-            self.assertGreater(len(arctic), 1)
-            self.assertEqual(sum(arctic), len(big))
-            budget = _char_budget_for_model(ARCTIC_SECONDARY_MODEL, full_coverage=False)
-            self.assertTrue(all(n <= budget for n in arctic))
+            # (b) arctic attempted whole, once — no estimate pre-split.
+            self.assertEqual(captured[ARCTIC_SECONDARY_MODEL], [len(big)])
             # (c) the ACTIVE qwen3 slot saw the FULL text (fidelity ≥ single-write).
             self.assertEqual(
                 captured[DEFAULT_TEXT_MODEL], [len(big)],
