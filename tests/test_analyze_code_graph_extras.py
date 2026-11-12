@@ -504,3 +504,79 @@ def test_argparse_extra_path_default_is_empty_list() -> None:
     assert "default=[]" in src, (
         "default=[] not declared on --extra-path argparse entry"
     )
+
+
+# ── v0.2.106: replace() of a not-yet-existing object falls back to insert() ──
+#
+# Field report 2026-11-12 (fresh macOS install, Weaviate 1.37.18 + weaviate-client
+# 4.21): replace() of a new UUID raises UnexpectedStatusCodeError 404 "Object was
+# not replaced"; the analyzer only recognised the older 500 "no object with id"
+# text, so EVERY new code entity was dropped. Behavioural (real exception type,
+# real _dedup_insert), replacing a source-text scan that could not see this.
+
+
+def _weaviate_status_error(status: int, text: str) -> BaseException:
+    import httpx
+    from weaviate.exceptions import UnexpectedStatusCodeError
+
+    return UnexpectedStatusCodeError(
+        text, httpx.Response(status, request=httpx.Request("PUT", "http://w/v1/objects/X/u"))
+    )
+
+
+def _replace_failing_stub(exc: BaseException):
+    class _Stub:
+        project_name = "MyProject"
+        _track_visited = False
+        _current_language = ""
+        _current_source = ""
+        visited_uuids: set = set()
+
+        class _Coll:
+            name = "MyProject_CodeFunction"
+            inserted: list = []
+
+            class _Data:
+                @classmethod
+                def replace(cls, uuid: str, **kwargs):
+                    raise exc
+
+                @classmethod
+                def insert(cls, uuid: str, **kwargs):
+                    _Stub._Coll.inserted.append(uuid)
+
+            data = _Data
+
+    return _Stub
+
+
+@pytest.mark.parametrize("exc", [
+    _weaviate_status_error(404, "Object was not replaced."),
+    RuntimeError("Unexpected status code: 500, with response body: no object with id 'u'"),
+])
+def test_dedup_insert_inserts_when_replace_reports_a_missing_object(
+    analyzer_mod: types.ModuleType, exc: BaseException,
+) -> None:
+    stub_cls = _replace_failing_stub(exc)
+    dedup = _bind_dedup(analyzer_mod, stub_cls(), stub_cls)
+    det = dedup(stub_cls._Coll, {"properties": {"name": "foo"}}, "foo", file_path_rel="src/foo.py")
+    assert stub_cls._Coll.inserted == [det], "a missing object must be INSERTED, not dropped"
+
+
+def test_dedup_insert_surfaces_a_real_replace_failure(analyzer_mod: types.ModuleType) -> None:
+    stub_cls = _replace_failing_stub(_weaviate_status_error(500, "subtract prop lengths: property not found"))
+    dedup = _bind_dedup(analyzer_mod, stub_cls(), stub_cls)
+    with pytest.raises(Exception):
+        dedup(stub_cls._Coll, {"properties": {"name": "foo"}}, "foo", file_path_rel="src/foo.py")
+    assert stub_cls._Coll.inserted == [], "a real write failure must not be papered over by insert()"
+
+
+def test_replace_target_missing_predicate() -> None:
+    from vco_lib.codegraph_guards import replace_target_missing as missing
+
+    assert missing(_weaviate_status_error(404, "Object was not replaced."))
+    assert missing(RuntimeError("no object with id 'x'"))
+    assert missing(RuntimeError("Object was not replaced.! Unexpected status code: 404, with response body: None."))
+    assert not missing(_weaviate_status_error(500, "boom"))
+    assert not missing(_weaviate_status_error(422, "id already exists"))
+    assert not missing(RuntimeError("subtract prop lengths: property not found"))

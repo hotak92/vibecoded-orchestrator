@@ -409,6 +409,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The code graph stores new entities again on Weaviate 1.37.** The analyzer writes with `replace()` and falls back
+  to `insert()` when the object does not exist yet, but it recognised "does not exist" only by the older
+  "no object with id" text. Weaviate 1.37 with weaviate-client 4.21 reports it as a 404 ("Object was not replaced"),
+  so every entity not already in the collection was dropped, and a fresh install's code graph stayed empty. The
+  check now has one home (`codegraph_guards.replace_target_missing`, status 404 or either text). Files whose writes
+  failed were already un-stamped, so the next code-graph run re-walks them and fills what was missing.
+
 - **The macOS installer no longer prints "$!: unbound variable" when it opens the launcher.** The launcher was started
   inside a subshell, so the script read an unset `$!`; macOS's bash 3.2 aborts on that under `set -u` even with a
   default. It is now started in the script's own shell.

@@ -91,6 +91,27 @@ from vco_lib import git_meta
 logger = logging.getLogger(__name__)
 
 
+def replace_target_missing(exc: BaseException) -> bool:
+    """Did ``collection.data.replace()`` fail because the object does not exist yet?
+
+    ``replace()`` is not an upsert: it only rewrites an existing object, so a
+    first write must fall back to ``insert()``. The signal differs by version:
+    older servers / clients raised a 500 whose text says ``no object with id``;
+    Weaviate 1.37 with weaviate-client 4.21 raises ``UnexpectedStatusCodeError``
+    with status 404 ("Object was not replaced", field report 2026-11-12 — every
+    NEW code entity was dropped on a fresh install). Both mean "missing"; any
+    other failure is a real write error.
+    """
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    text = str(exc).lower()
+    return (
+        "no object with id" in text
+        or "no object with uuid" in text
+        or ("not replaced" in text and "404" in text)
+    )
+
+
 def provenance_line(
     model: Any, dim: Any, embed_revision: int, repo_path: Any, *, filling: bool = False,
 ) -> str:

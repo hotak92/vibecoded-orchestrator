@@ -3103,12 +3103,12 @@ class CodeGraphAnalyzer:
         try:
             collection.data.replace(uuid=det_uuid, **insert_params)
         except BaseException as exc:
-            # Detect Weaviate's "object does not exist" signal. The error
-            # text is stable across v4.x ("no object with id 'X'"); we
-            # match conservatively on substring so a future error-prefix
-            # change (e.g. "no object with uuid") still trips the branch.
-            err_text = str(exc)
-            is_not_found = "no object with id" in err_text or "no object with uuid" in err_text
+            # "Object does not exist" — the signal changed between versions
+            # (a 500 "no object with id" before; a 404 "Object was not
+            # replaced" on Weaviate 1.37 + weaviate-client 4.21, which this
+            # text match missed and so dropped every new entity). One home:
+            # `codegraph_guards.replace_target_missing`.
+            is_not_found = _guards.replace_target_missing(exc)
             if is_not_found:
                 try:
                     collection.data.insert(uuid=det_uuid, **insert_params)
