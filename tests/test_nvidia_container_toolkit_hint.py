@@ -36,6 +36,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.common.hosts import names_domain, names_host
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -100,7 +102,7 @@ def test_hint_pacman_aur(install_module) -> None:
         hint = install_module._nvidia_container_toolkit_install_hint()
     # Either an AUR helper command (yay/paru) or the AUR URL.
     aur_marker = ("yay" in hint or "paru" in hint or
-                  "aur.archlinux.org" in hint or "AUR" in hint)
+                  names_host(hint, "aur.archlinux.org") or "AUR" in hint)
     assert aur_marker, f"pacman hint must reference AUR; got:\n{hint}"
     assert "nvidia-container-toolkit" in hint
 
@@ -127,7 +129,7 @@ def test_hint_apk(install_module) -> None:
     assert "nvidia-container-toolkit" in hint
     # Alpine + NVIDIA is non-trivial (musl-compat); wiki link required
     # so users don't get stuck on the driver side.
-    assert "alpinelinux.org" in hint or "Alpine" in hint
+    assert names_domain(hint, "alpinelinux.org") or "Alpine" in hint
 
 
 def test_hint_empty_on_unknown_pkgmgr(install_module) -> None:

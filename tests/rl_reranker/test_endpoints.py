@@ -46,7 +46,6 @@ torch = pytest.importorskip("torch")
 import rl_reranker.rl_server as rl_server_mod  # noqa: E402
 from rl_reranker.rl_server import (  # noqa: E402
     RLServer,
-    _is_path_under,
     _safe_weights_path,
     JobState,
 )
@@ -166,11 +165,10 @@ def layout_paths(tmp_path, monkeypatch):
     """Build a /data-equivalent layout under tmp_path and patch the
     safe-path validators to accept those tmp dirs.
 
-    The production layout has hardcoded /data/state, /data/logs,
-    /data/global allowlists in the safe-path helpers. For tests we
-    monkey-patch those helpers so the same paths under tmp_path pass
-    validation — the handlers under test only call through the
-    `_safe_weights_path` module attribute, so a setattr swap is sufficient.
+    The production layout has hardcoded /data/state, /data/global roots
+    (``_WEIGHTS_ROOTS``). For tests we point that attribute at the same
+    dirs under tmp_path, so the REAL validators (containment + the
+    listing-rebuilt path a checkpoint is read from) run on every request.
     """
     data_root = tmp_path / "data"
     state_dir = data_root / "state"
@@ -179,17 +177,10 @@ def layout_paths(tmp_path, monkeypatch):
     for d in (state_dir, logs_dir, global_dir):
         d.mkdir(parents=True)
 
-    def _safe_weights(p):
-        if not p or not isinstance(p, str):
-            return None
-        cand = Path(p)
-        if not cand.is_absolute():
-            return None
-        return cand if _is_path_under(
-            cand, (f"{state_dir}/", f"{global_dir}/")
-        ) else None
-
-    monkeypatch.setattr(rl_server_mod, "_safe_weights_path", _safe_weights)
+    # The real validators run; only their roots move to the tmp tree.
+    monkeypatch.setattr(
+        rl_server_mod, "_WEIGHTS_ROOTS", (f"{state_dir}/", f"{global_dir}/"),
+    )
 
     return {
         "root": data_root,
@@ -857,5 +848,146 @@ class TestGlobalRetrainEarliestDate:
                 },
             )
             assert resp.status == 202
+
+        _run_async(_with_client(srv, _body))
+
+
+# ---------------------------------------------------------------------------
+# v0.2.106 CodeQL hardening: request-supplied paths and project ids
+# ---------------------------------------------------------------------------
+
+#: Every route; the project-id header is refused before any handler runs.
+_ALL_ROUTES = (
+    ("GET", "/health"), ("POST", "/cache_nodes"), ("POST", "/rl_update"),
+    ("POST", "/rotate_weights"), ("POST", "/reset"), ("POST", "/finetune"),
+    ("GET", "/finetune_status"), ("POST", "/global/retrain"),
+    ("GET", "/state_summary"), ("GET", "/project_status"),
+)
+
+_HOSTILE_IDS = ("../../escape", "..", "a/b", "proj\nFAKE", "x" * 65, "proj id")
+
+
+class TestRequestSuppliedPathsContained:
+    """RED-PROOF (CodeQL py/path-injection + py/unsafe-deserialization): no
+    request value names a file outside the /data roots, and a checkpoint a
+    request names is read through the path rebuilt from the roots' listing."""
+
+    @pytest.mark.parametrize("hostile", [h for h in _HOSTILE_IDS if "\n" not in h])
+    def test_hostile_project_header_is_400_on_every_route(
+        self, tmp_path, layout_paths, monkeypatch, hostile,
+    ):
+        # (A header value cannot carry a newline on the wire; the newline
+        # case is pinned on the path helpers below.)
+        srv = _make_server(tmp_path, layout_paths, monkeypatch)
+        before = sorted(tmp_path.rglob("*"))
+
+        async def _body(client):
+            for method, route in _ALL_ROUTES:
+                resp = await client.request(
+                    method, route, json={}, headers={"X-VCT-Project-ID": hostile},
+                )
+                assert resp.status == 400, (route, resp.status)
+                body = await resp.json()
+                assert "invalid project id" in body["error"]
+
+        _run_async(_with_client(srv, _body))
+        # Nothing was created anywhere (pre-fix: ``../../escape`` made
+        # ``<data>/escape`` beside the state root).
+        assert sorted(tmp_path.rglob("*")) == before
+        assert not (layout_paths["root"] / "escape").exists()
+
+    def test_hostile_project_id_never_builds_a_path(self, tmp_path):
+        base = tmp_path / "state"
+        base.mkdir()
+        for hostile in _HOSTILE_IDS:
+            with pytest.raises(rl_server_mod.InvalidProjectId):
+                rl_server_mod._per_project_state_dir(base, hostile)
+            with pytest.raises(rl_server_mod.InvalidProjectId):
+                rl_server_mod._per_project_log_path(tmp_path, hostile)
+            with pytest.raises(rl_server_mod.InvalidProjectId):
+                rl_server_mod._ensure_project_state_dir(base, hostile)
+        assert sorted(tmp_path.rglob("*")) == [base]
+
+    def test_a_project_dir_symlinked_out_of_the_state_dir_is_not_used(self, tmp_path):
+        base = tmp_path / "state"
+        (base / "projects").mkdir(parents=True)
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        (base / "projects" / "p1").symlink_to(outside, target_is_directory=True)
+        assert rl_server_mod._existing_project_state_dir(base, "p1") is None
+        with pytest.raises(rl_server_mod.InvalidProjectId):
+            rl_server_mod._ensure_project_state_dir(base, "p1")
+        assert rl_server_mod._global_retrain_seed(base, "p1", "qwen3") is None
+        # A real project dir is returned as the listing names it.
+        (base / "projects" / "p2").mkdir()
+        assert rl_server_mod._ensure_project_state_dir(base, "p2") == base / "projects" / "p2"
+
+    def test_global_retrain_refuses_a_hostile_project_id_in_the_body(
+        self, tmp_path, layout_paths, monkeypatch,
+    ):
+        srv = _make_server(tmp_path, layout_paths, monkeypatch)
+
+        async def _body(client):
+            resp = await client.post(
+                "/global/retrain",
+                json={"mode": "offline", "project_ids": ["ok-id", "../../x"]},
+            )
+            assert resp.status == 400
+            assert "invalid project id" in (await resp.json())["error"]
+
+        _run_async(_with_client(srv, _body))
+
+    def test_rotate_refuses_a_symlink_that_escapes_the_roots(
+        self, tmp_path, layout_paths, monkeypatch,
+    ):
+        srv = _make_server(tmp_path, layout_paths, monkeypatch)
+        outside = tmp_path / "outside.pt"
+        _write_fake_checkpoint(outside, emb_dim=srv._rl_emb_dim)
+        link = layout_paths["state"] / "rl_model_link.pt"
+        link.symlink_to(outside)
+        sibling = layout_paths["root"] / "state-x" / "a.pt"
+        _write_fake_checkpoint(sibling, emb_dim=srv._rl_emb_dim)
+
+        async def _body(client):
+            for path in (str(link), str(layout_paths["state"] / ".." / ".." / "outside.pt"),
+                         str(sibling)):
+                resp = await client.post("/rotate_weights", json={"weights_path": path})
+                assert resp.status == 400, path
+
+        _run_async(_with_client(srv, _body))
+
+    def test_finetune_refuses_a_base_outside_the_roots(
+        self, tmp_path, layout_paths, monkeypatch,
+    ):
+        srv = _make_server(tmp_path, layout_paths, monkeypatch)
+        outside = tmp_path / "outside.pt"
+        _write_fake_checkpoint(outside, emb_dim=srv._rl_emb_dim)
+
+        async def _body(client):
+            for path in (str(outside), "/etc/passwd",
+                         str(layout_paths["state"] / ".." / ".." / "outside.pt")):
+                resp = await client.post(
+                    "/finetune", json={"base_weights_path": path, "days": 30},
+                    headers={"X-VCT-Project-ID": "proj-ok"},
+                )
+                assert resp.status == 400, path
+
+        _run_async(_with_client(srv, _body))
+
+    def test_rotate_reads_the_listing_rebuilt_path(
+        self, tmp_path, layout_paths, monkeypatch,
+    ):
+        """A request path spelled with ``.`` and ``..`` that stays inside the
+        roots still loads, and what is loaded/reported is the resolved file."""
+        srv = _make_server(tmp_path, layout_paths, monkeypatch)
+        ckpt = layout_paths["state"] / "sub" / "rl_model_new.pt"
+        _write_fake_checkpoint(ckpt, emb_dim=1024)
+        spelled = layout_paths["state"] / "sub" / ".." / "sub" / "." / "rl_model_new.pt"
+
+        async def _body(client):
+            resp = await client.post("/rotate_weights", json={"weights_path": str(spelled)})
+            assert resp.status == 200, await resp.text()
+            assert (await resp.json())["loaded"] == str(ckpt)
+            assert srv._state_path == ckpt
 
         _run_async(_with_client(srv, _body))

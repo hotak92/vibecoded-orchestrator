@@ -767,6 +767,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started at most 30 more seconds; a tool call still blocked on a slow request is not cut short, so a closed session
   is ended by the five-second check instead. Telemetry that is written at exit is still written, within 10 seconds.
 
+### Security
+
+- **The RL reranker refuses a project id that could name a path outside its data.** The container used the
+  `X-VCT-Project-ID` header verbatim as a directory and log-file name, relying on the client to sanitize it; any
+  other caller could send `../..` and have it create directories and read checkpoints outside `/data/state`. Every
+  route now answers 400 to a header that fails the project-id rule (letters, digits, `-`, `_`, 1..64), and so does
+  `/global/retrain` for such an id in its body. The rule has one home, `rl_client.rerank_wire.sanitize_project_id`,
+  which the client also uses; it now uses `fullmatch`, so an id with a trailing newline no longer passes.
+- **Request-named weights files are contained and read only from the roots' directory listings.** `/rotate_weights`
+  and `/finetune` resolve the path (`..` and symlinks removed) before checking it lies under `/data/state` or
+  `/data/global`, and load the checkpoint through a path rebuilt from the directory entries, so only a file that
+  exists there can be read. One helper module serves every such path: `vco_lib/safe_paths.py` (shipped in the image).
+- **Checkpoints are read in one place, with `weights_only=True`.** `rl_model.load_checkpoint` refuses a `.pt` that
+  carries a pickled callable instead of running it; every checkpoint VCO writes still loads.
+- **Request- and file-derived values are logged on one line.** The reranker logs project ids, paths, type names and
+  checkpoint fields through `vco_lib.log_setup.log_safe`, which spells out CR, LF and control characters; it is the
+  model gateway's former `_log_safe`, moved so both use the same rule.
+- **The code-embedding service no longer returns exception text.** `/health` and the 503 on `/embed` and
+  `/api/embeddings` report a model-load failure as a fixed sentence plus an error id; the full error is in the
+  service log under that id.
+- **Tests compare hosts exactly.** Assertions that a text or command names `api.anthropic.com`, `mirror.gcr.io`,
+  `aur.archlinux.org` or `alpinelinux.org` now extract the hostnames and compare them (`tests/common/hosts.py`)
+  instead of matching a substring. The product code they cover already compared registry hosts exactly.
+
 ## [0.2.105] - 2026-10-30
 
 ### Added

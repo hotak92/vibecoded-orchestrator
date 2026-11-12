@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
@@ -36,7 +35,11 @@ try:
 except ImportError:  # pragma: no cover (httpx is a hard dep)
     httpx = None  # type: ignore[assignment]
 
-from .rerank_wire import RERANK_PROTOCOL_VERSION, encode_rerank_features
+from .rerank_wire import (  # sanitize_project_id: re-exported (one home)
+    RERANK_PROTOCOL_VERSION,
+    encode_rerank_features,
+    sanitize_project_id,
+)
 from .schemas import (
     HealthResponse,
     RLUpdateResponse,
@@ -136,61 +139,11 @@ class NegotiationResult:
     per_project_gate: Optional[bool] = None
 
 
-# ─── v0.2.49: per-project routing header sanitization ────────────────
-# Stream C's vct-rl-reranker v0.2.10 container reads the
-# ``X-VCT-Project-ID`` header and uses the value VERBATIM as a
-# filesystem path component (``/data/state/projects/<project_id>/``)
-# and a JSONL filename suffix (``rl_events_<project_id>.jsonl``).
-# Path-traversal risk: a malicious / malformed project_id value like
-# ``../etc/passwd`` would land state files outside ``/data/state/``.
-# Stream C's report explicitly flagged this as launcher-side
-# responsibility: the container does not sanitise.
-#
-# This sanitizer is the defensive guard at the launcher → container
-# seam. Accepts a small character set (UUID + alphanumeric + dash +
-# underscore), rejects everything else. Length capped at 64 chars
-# (UUID = 36; slugs we see in practice are <= 32; 64 is a generous
-# headroom that still bounds filesystem path length).
-
-# Match UUID v4 case-insensitive OR alphanumeric/dash/underscore
-# (slugs the launcher generates from project names). Length 1..64.
-# Anchored — partial matches not accepted.
-_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-
-def sanitize_project_id(value: Optional[str]) -> Optional[str]:
-    """Return ``value`` if it's a safe-for-filesystem project identifier,
-    else ``None``. Used to gate the ``X-VCT-Project-ID`` header sent to
-    the vct-rl-reranker container (v0.2.10+).
-
-    Safe characters: ASCII letters, digits, dash, underscore. Length
-    1..64. Anything else (path separators, control chars, dots, slashes,
-    spaces, NUL, unicode) → None.
-
-    Returning None means "do NOT send the header at all" — the container
-    falls back to the base model. This is the intended fail-mode: a
-    malformed project_id should result in the base model being used,
-    not in an error AND not in the malformed value reaching the
-    container.
-
-    Examples:
-        sanitize_project_id("02fbc934-ada5-433c-b606-d1f56194035a")
-            → "02fbc934-ada5-433c-b606-d1f56194035a"  (UUID v4 OK)
-        sanitize_project_id("orchestrator-root")
-            → "orchestrator-root"  (slug OK)
-        sanitize_project_id("../etc/passwd")
-            → None  (path traversal blocked)
-        sanitize_project_id("project id")
-            → None  (space blocked)
-        sanitize_project_id(None) → None
-        sanitize_project_id("") → None
-        sanitize_project_id("a" * 65) → None  (length cap)
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    if not _PROJECT_ID_RE.match(value):
-        return None
-    return value
+# ─── per-project routing header sanitization ─────────────────────────
+# The rule (and its history) lives with the wire format both sides share:
+# ``rerank_wire.sanitize_project_id``. The client drops an unsafe id (no
+# header is sent: the container serves the base model); the container
+# refuses a request that carries one anyway (400).
 
 
 def _deprecation_warning() -> Optional[str]:

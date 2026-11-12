@@ -88,7 +88,8 @@ except ImportError:
 from collections import OrderedDict
 
 from vco_lib.atomic import atomic_copy_file
-from vco_lib.log_setup import configure_logging
+from vco_lib.log_setup import configure_logging, log_safe
+from vco_lib.safe_paths import contained_path, existing_entry, locate_existing
 from vco_lib.rl_weights_ownership import classify as classify_weights_owner
 
 from .bundled_weights import BundledWeights, resolve_bundled_weights
@@ -96,7 +97,7 @@ from .online_learning import DEFAULT_CONFIG, OnlineConfig, ProjectLearner, compu
 from .retrieval_rl import RetrievalRL
 from rl_client.rl_logger import RLDataLogger, default_rl_log_path
 from .rl_model import N_ENTITY_TYPES, RLModel, linked_slots_masked
-from rl_client.rerank_wire import RERANK_PROTOCOL_VERSION
+from rl_client.rerank_wire import RERANK_PROTOCOL_VERSION, sanitize_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +219,9 @@ def _global_retrain_seed(state_dir: "Path", project_id: str, source: str) -> "Pa
     """
     dirs = [state_dir]
     if project_id and project_id != _BASE_PROJECT_SENTINEL:
-        dirs.insert(0, _per_project_state_dir(state_dir, project_id))
+        project_dir = _existing_project_state_dir(state_dir, project_id)
+        if project_dir is not None:
+            dirs.insert(0, project_dir)
     for d in dirs:
         cands = [p for p in _glob_weights_files(d, source)
                  if p.is_file() and not p.stem.endswith("_finetuned")]
@@ -722,7 +725,7 @@ class _HubClient:
                         logger.warning(
                             "_HubClient.list_rl_events(%s): status=%d (returning %d "
                             "collected so far)",
-                            project_id, resp.status, len(collected),
+                            log_safe(project_id), resp.status, len(collected),
                         )
                         return collected
                     body = await resp.json()
@@ -772,7 +775,7 @@ class _HubClient:
         except Exception as exc:
             logger.debug(
                 "_HubClient.list_rl_events(%s) soft-failed: %s (returning %d collected)",
-                project_id, exc, len(collected),
+                log_safe(project_id), exc, len(collected),
             )
             return collected
 
@@ -845,8 +848,22 @@ class _ProjectHead:
     project_dir: "Path | None" = None
 
 
+class InvalidProjectId(ValueError):
+    """A project id that fails ``rerank_wire.sanitize_project_id``: it can
+    never name a directory or a log file here."""
+
+
+def _checked_project_id(project_id: str) -> str:
+    """``project_id`` when it passes the shared project-id rule, else
+    :class:`InvalidProjectId` (the request layer already answered 400 for a
+    header that fails it; this is the guard at every path built from one)."""
+    if sanitize_project_id(project_id) is None:
+        raise InvalidProjectId(f"invalid project id {log_safe(project_id)}")
+    return project_id
+
+
 def _per_project_state_dir(base_state_dir: Path, project_id: str) -> Path:
-    """Return the per-project state subdirectory.
+    """Return the per-project state subdirectory (it may not exist yet).
 
     Layout: ``<base_state_dir>/projects/<project_id>/``. The base directory
     (``/data/state/``) keeps the legacy single-project layout for the
@@ -854,12 +871,52 @@ def _per_project_state_dir(base_state_dir: Path, project_id: str) -> Path:
     so the two layouts don't collide and a future migration can move
     legacy users in-place.
 
+    The id must pass the shared project-id rule and the result is resolved
+    and contained in ``base_state_dir`` (``vco_lib.safe_paths``): the value
+    returned is the checked one. For a directory to CREATE; a checkpoint is
+    read only through :func:`_existing_project_state_dir`.
+
     POSIX-only inside the container (host-side bind-mount handling is the
     launcher's responsibility, see Stream A).
     """
     if project_id == _BASE_PROJECT_SENTINEL:
         return base_state_dir
-    return base_state_dir / "projects" / project_id
+    candidate = base_state_dir / "projects" / _checked_project_id(project_id)
+    contained = contained_path(candidate, (base_state_dir,))
+    if contained is None:
+        raise InvalidProjectId(
+            f"project dir {log_safe(candidate)} resolves outside {base_state_dir}"
+        )
+    return Path(contained)
+
+
+def _existing_project_state_dir(base_state_dir: Path, project_id: str) -> "Path | None":
+    """The project's state dir when it EXISTS, as the ``projects/`` listing
+    names it (``vco_lib.safe_paths.existing_entry``), else ``None``. Every
+    checkpoint read under a project dir goes through this, so the path a
+    ``torch.load`` opens is built from directory entries, never from the
+    request's project id."""
+    if project_id == _BASE_PROJECT_SENTINEL:
+        return base_state_dir
+    found = existing_entry(base_state_dir / "projects", _checked_project_id(project_id))
+    if found is None or not os.path.isdir(found):
+        return None
+    # A ``projects/<id>`` symlink pointing out of the state dir is not it.
+    if contained_path(found, (base_state_dir,)) is None:
+        return None
+    return Path(found)
+
+
+def _ensure_project_state_dir(base_state_dir: Path, project_id: str) -> Path:
+    """Create the project's state dir (contained, see
+    :func:`_per_project_state_dir`) and return it as the listing names it
+    (:func:`_existing_project_state_dir`) — the one home of "the dir a
+    project's checkpoints are written to and read from"."""
+    _per_project_state_dir(base_state_dir, project_id).mkdir(parents=True, exist_ok=True)
+    found = _existing_project_state_dir(base_state_dir, project_id)
+    if found is None:
+        raise OSError(f"project state dir for {log_safe(project_id)} vanished after mkdir")
+    return found
 
 
 def _per_project_log_path(log_root: Path, project_id: str) -> Path:
@@ -868,11 +925,16 @@ def _per_project_log_path(log_root: Path, project_id: str) -> Path:
     Format: ``<log_root>/rl_events_<project_id>.jsonl`` matching the manifest's
     ``runtime.log_path_template``. For ``_base`` (no header), uses the legacy
     unscoped filename to stay compatible with pre-v0.2.10 single-project
-    installs.
+    installs. The id must pass the shared project-id rule, and the path is
+    resolved and contained in ``log_root``.
     """
     if project_id == _BASE_PROJECT_SENTINEL:
         return log_root / "rl_events.jsonl"
-    return log_root / f"rl_events_{project_id}.jsonl"
+    candidate = log_root / f"rl_events_{_checked_project_id(project_id)}.jsonl"
+    contained = contained_path(candidate, (log_root,))
+    if contained is None:
+        raise InvalidProjectId(f"log path {log_safe(candidate)} resolves outside {log_root}")
+    return Path(contained)
 
 
 @dataclass
@@ -896,46 +958,39 @@ class JobState:
     error: "str | None" = None
 
 
-def _is_path_under(candidate: Path, roots: tuple[str, ...]) -> bool:
-    """Return True iff ``candidate`` lies under one of the allowed roots.
-
-    Resolves symlinks and ``..`` so a request can't sneak out via
-    ``/data/state/../../etc/passwd``. Roots are matched as literal
-    string prefixes after resolution; trailing slash on each root keeps
-    ``/data/state-x`` from passing the ``/data/state`` check.
-    """
-    try:
-        resolved = str(candidate.resolve(strict=False))
-    except Exception:
-        return False
-    # Path.resolve() strips the trailing slash; re-append for prefix match.
-    if not resolved.endswith("/"):
-        resolved_check = resolved + "/"
-    else:
-        resolved_check = resolved
-    return any(resolved.startswith(r) or resolved_check.startswith(r) for r in roots)
+#: Where a request may name a weights file: /rotate_weights and /finetune
+#: legitimately reference checkpoints in the state and global dirs. A module
+#: attribute so the test suite can point it at a tmp ``/data`` tree.
+_WEIGHTS_ROOTS: tuple[str, ...] = ("/data/state/", "/data/global/")
 
 
 def _safe_weights_path(p: str) -> "Path | None":
-    """Validate a request-supplied weights path. Returns the Path on
-    success or None when the path is empty / not under a safe root.
-
-    We accept ``/data/state/`` and ``/data/global/`` because both
-    /rotate_weights and /reset legitimately reference files in those
-    locations.
+    """Validate a request-supplied weights path. Returns the RESOLVED path
+    (``..`` and symlinks gone) when it lies under one of
+    :data:`_WEIGHTS_ROOTS`, ``None`` when the path is empty, relative or
+    anywhere else. ``/data/state-x`` is not ``/data/state``.
     """
     if not p or not isinstance(p, str):
         return None
-    candidate = Path(p)
     # Reject relative paths outright — caller MUST give an absolute
     # container-side path (the launcher already does this; see
     # container_weights_path() in rl_service.rs).
-    if not candidate.is_absolute():
+    if not os.path.isabs(p):
         return None
-    allowed = ("/data/state/", "/data/global/")
-    if not _is_path_under(candidate, allowed):
+    contained = contained_path(p, _WEIGHTS_ROOTS)
+    return Path(contained) if contained is not None else None
+
+
+def _existing_weights_file(path: Path) -> "Path | None":
+    """The existing regular file ``path`` names under :data:`_WEIGHTS_ROOTS`,
+    rebuilt from the roots' directory listings
+    (``vco_lib.safe_paths.locate_existing``) — the path a request-named
+    checkpoint is deserialized from. ``None`` when it does not exist, is not
+    a file, or lies outside the roots."""
+    found = locate_existing(path, _WEIGHTS_ROOTS)
+    if found is None or not os.path.isfile(found):
         return None
-    return candidate
+    return Path(found)
 
 
 # NOTE (v0.2.11): `_safe_events_path` + `_filter_events_by_days` were removed
@@ -948,6 +1003,25 @@ def _safe_weights_path(p: str) -> "Path | None":
 
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+
+
+_INVALID_PROJECT_ID_ERROR = (
+    "invalid project id: letters, digits, '-' and '_' only, 1..64 characters"
+)
+
+
+@web.middleware
+async def _reject_invalid_project_header(request: "web.Request", handler):
+    """400 for a request whose ``X-VCT-Project-ID`` header fails the shared
+    project-id rule (``rerank_wire.sanitize_project_id``), on EVERY route and
+    before any handler runs: the id names a directory and a log file here,
+    and a request does not have to come from the client that sanitizes it."""
+    header_val = request.headers.get(_HEADER_PROJECT_ID, "").strip()
+    if header_val and sanitize_project_id(header_val) is None:
+        return web.json_response(
+            {"ok": False, "error": _INVALID_PROJECT_ID_ERROR}, status=400,
+        )
+    return await handler(request)
 
 
 class _seeded_init:
@@ -1144,6 +1218,15 @@ class RLServer:
         # routed project on every request (v0.2.106 fix: a header-less request
         # used to inherit the previous request's project).
         self._env_project_id = self._project_id
+        if self._env_project_id and sanitize_project_id(self._env_project_id) is None:
+            # It would name a directory and a log file: never route on it.
+            logger.warning(
+                "RLServer: VCT_PROJECT_ID %s fails the project-id rule "
+                "(letters, digits, '-', '_'; 1..64); header-less requests use "
+                "the base model",
+                log_safe(self._env_project_id),
+            )
+            self._env_project_id = ""
         self._hub_client: "_HubClient | None" = _HubClient()
         if not self._project_id:
             logger.info(
@@ -1153,7 +1236,7 @@ class RLServer:
                 "functionality unaffected.",
             )
 
-        self._app = web.Application()
+        self._app = web.Application(middlewares=[_reject_invalid_project_header])
         self._app.router.add_get("/health", self._health)
         self._app.router.add_post("/cache_nodes", self._cache_nodes)
         self._app.router.add_post("/rl_update", self._rl_update)
@@ -1260,7 +1343,9 @@ class RLServer:
         header_val = request.headers.get(_HEADER_PROJECT_ID, "").strip()
         if header_val:
             self._routing_counters["requests_with_header"] += 1
-            return header_val
+            # ``_reject_invalid_project_header`` already answered 400 for a
+            # header that fails the rule; checked again where it is used.
+            return _checked_project_id(header_val)
         self._routing_counters["requests_without_header"] += 1
         # Legacy single-project env fallback. When VCT_PROJECT_ID is set
         # (the pre-v0.2.10 deployment shape), treat it as if every request
@@ -1275,7 +1360,7 @@ class RLServer:
         logger.info(
             "routing: no_project_id_using_base (path=%s); request will use "
             "base model without per-project personalization",
-            request.rel_url.path if request.rel_url is not None else "<unknown>",
+            log_safe(request.rel_url.path) if request.rel_url is not None else "<unknown>",
         )
         return _BASE_PROJECT_SENTINEL
 
@@ -1336,8 +1421,7 @@ class RLServer:
         # state_path is correct here: it returns a NEW RLModel instance
         # initialised from the same .pt, so subsequent online updates on
         # this head do NOT contaminate the base or other projects' heads).
-        project_state_dir = _per_project_state_dir(self._state_dir, project_id)
-        project_state_dir.mkdir(parents=True, exist_ok=True)
+        project_state_dir = _ensure_project_state_dir(self._state_dir, project_id)
         candidate_files = _glob_weights_files(project_state_dir, self._rl_model_tag)
         if candidate_files and self._bundled_weights is not None:
             # Same precedence as the base model: a project checkpoint is used
@@ -1363,7 +1447,7 @@ class RLServer:
                 "routing: no_project_head_using_base project_id=%s source=%s "
                 "(no rl_model_%s_*.pt found in %s); request will use a clone "
                 "of base weights",
-                project_id, source, self._rl_model_tag, project_state_dir,
+                log_safe(project_id), source, self._rl_model_tag, log_safe(project_state_dir),
             )
 
         learner: "ProjectLearner | None" = None
@@ -1398,7 +1482,7 @@ class RLServer:
             logger.warning(
                 "routing: head_load_failed project_id=%s source=%s path=%s "
                 "err=%s; falling back to shared base model in-process",
-                project_id, source, target_path, exc,
+                log_safe(project_id), source, log_safe(target_path), log_safe(exc),
             )
             new_model = self._rl._rl_model
             target_path = self._state_path
@@ -1441,7 +1525,7 @@ class RLServer:
                     logger.info(
                         "routing: evicted project head project_id=%s source=%s "
                         "(LRU size=%d)",
-                        evicted.project_id, evicted.embedding_source,
+                        log_safe(evicted.project_id), evicted.embedding_source,
                         self._project_head_lru_size,
                     )
                     break
@@ -1452,7 +1536,7 @@ class RLServer:
         logger.info(
             "routing: loaded_project_head project_id=%s source=%s path=%s "
             "fallback=%s",
-            project_id, source, target_path, is_fallback,
+            log_safe(project_id), source, log_safe(target_path), is_fallback,
         )
         if learner is not None:
             # The launcher's RL panel reads the rl_online_state row, not this
@@ -2202,7 +2286,7 @@ class RLServer:
                     logger.info(
                         "rl_update: online training off for project_id=%s "
                         "(online_training_disabled / use_global); %d events feed "
-                        "the gate's record only", project_id, len(task_ids),
+                        "the gate's record only", log_safe(project_id), len(task_ids),
                     )
                 self._capture_head_state(head)
 
@@ -2256,7 +2340,7 @@ class RLServer:
         try:
             result = await asyncio.to_thread(compute_round, job)
         except Exception as exc:  # noqa: BLE001 — a failed round never breaks serving
-            logger.exception("online round failed for project_id=%s: %s", head.project_id, exc)
+            logger.exception("online round failed for project_id=%s: %s", log_safe(head.project_id), exc)
             async with self._routing_lock:
                 learner.abandon_round()
             return
@@ -2267,7 +2351,7 @@ class RLServer:
         if applied:
             logger.info(
                 "online round project_id=%s: %d steps (%d queries) in %.2fs; serving=%s (%s)",
-                head.project_id, result.steps, result.trained_queries, result.runtime_s,
+                log_safe(head.project_id), result.steps, result.trained_queries, result.runtime_s,
                 learner.serving, learner.reason,
             )
             await self._push_rl_online_state(head)
@@ -2320,7 +2404,7 @@ class RLServer:
             learner.save(head.project_dir)
         except Exception as exc:  # noqa: BLE001 — persistence is best-effort
             logger.warning("online learning: saving project_id=%s failed: %s",
-                           head.project_id, exc)
+                           log_safe(head.project_id), exc)
 
     def _save_learner(self, head: _ProjectHead) -> None:
         """Save a head's learner state alone (eviction / shutdown)."""
@@ -2330,7 +2414,7 @@ class RLServer:
             head.learner.save(head.project_dir)
         except Exception as exc:  # noqa: BLE001
             logger.warning("online learning: saving learner of project_id=%s failed: %s",
-                           head.project_id, exc)
+                           log_safe(head.project_id), exc)
 
     def _online_summary(self) -> dict[str, Any]:
         """Loaded projects and how many are served their model (for /health)."""
@@ -2489,7 +2573,10 @@ class RLServer:
                 )},
                 status=400,
             )
-        if not safe.exists() or not safe.is_file():
+        # The checkpoint is read only through the path rebuilt from the
+        # roots' directory listing: no request byte reaches torch.load.
+        weights = _existing_weights_file(safe)
+        if weights is None:
             return web.json_response(
                 {"ok": False, "error": f"weights file not found: {safe}"},
                 status=400,
@@ -2504,14 +2591,14 @@ class RLServer:
         # weights file they uploaded.
         try:
             new_model = RLModel.load_or_create(
-                state_path=safe,
+                state_path=weights,
                 emb_dim=self._rl_emb_dim,
                 arch_version=self._rl_arch_version,
                 device=self._rl_device_spec,
                 embedding_source=self._active_emb_source,  # R4 cross-source guard
             )
         except Exception as exc:
-            logger.exception("rotate_weights: load failed for %s", safe)
+            logger.exception("rotate_weights: load failed for %s", weights)
             return web.json_response(
                 {"ok": False, "error": f"load failed: {exc}"}, status=500
             )
@@ -2528,21 +2615,21 @@ class RLServer:
             self._rl._rl_model = new_model
             # v0.2.8 — track the new active path so _push_rl_weights_state
             # reports the rotated-in file, not the original startup file.
-            self._state_path = safe
+            self._state_path = weights
             logger.info(
                 "rotate_weights: swapped in %s (emb_dim=%d, project_id=%s)",
-                safe, self._rl_emb_dim, project_id,
+                weights, self._rl_emb_dim, log_safe(project_id),
             )
             # v0.2.6 — refresh hub state cache + bump last_rotated_at.
             # v0.2.8 — also bump rl_global_weights_state when rotating to
             # a global slot (any .pt under /data/global/).
             await self._push_rl_state()
             await self._push_rl_weights_state(last_rotated=True)
-            if str(safe).startswith("/data/global/"):
+            if str(weights).startswith("/data/global/"):
                 await self._push_rl_global_weights_state(last_rotated=True)
             self._capture_head_state(head)
         return web.json_response(
-            {"ok": True, "loaded": str(safe), "emb_dim": self._rl_emb_dim}
+            {"ok": True, "loaded": str(weights), "emb_dim": self._rl_emb_dim}
         )
 
     async def _reset(self, request: web.Request) -> web.Response:
@@ -2636,8 +2723,7 @@ class RLServer:
         # right per-project state subdir. We resolve project_id BEFORE the
         # copy so the file system path is project-correct from the start.
         project_id, head = await self._route_request(request)
-        project_state_dir = _per_project_state_dir(self._state_dir, project_id)
-        project_state_dir.mkdir(parents=True, exist_ok=True)
+        project_state_dir = _ensure_project_state_dir(self._state_dir, project_id)
         # Project-side fork keeps the same filename to preserve provenance.
         project_path = project_state_dir / global_path.name
 
@@ -2685,7 +2771,7 @@ class RLServer:
                 logger.info(
                     "reset: %s → %s (no specialize, project_id=%s)",
                     "seeded bundled" if strategy == "bundled" else "forked global",
-                    project_path, project_id,
+                    log_safe(project_path), log_safe(project_id),
                 )
                 # v0.2.6 — refresh hub state cache + bump last_rotated_at.
                 await self._push_rl_state()
@@ -2727,7 +2813,7 @@ class RLServer:
             logger.info(
                 "reset: fork+specialize scheduled job=%s base=%s days=%d "
                 "project_id=%s (DB-only)",
-                job_id, project_path, days, project_id,
+                job_id, log_safe(project_path), days, log_safe(project_id),
             )
             # v0.2.6 — fork-side rotation already happened above; push it now.
             # last_finetuned_at gets stamped later when the bg job lands at "done".
@@ -2781,11 +2867,15 @@ class RLServer:
                 },
                 status=400,
             )
-        if not base_path.exists():
+        # The job copies and deserializes it: only through the path rebuilt
+        # from the roots' directory listing (no request byte reaches it).
+        base_file = _existing_weights_file(base_path)
+        if base_file is None:
             return web.json_response(
                 {"ok": False, "error": f"base_weights_path not found: {base_path}"},
                 status=400,
             )
+        base_path = base_file
 
         try:
             days = int(body.get("days", 30))
@@ -2841,7 +2931,7 @@ class RLServer:
             )
             logger.info(
                 "finetune: scheduled job=%s base=%s days=%d project_id=%s (DB-only)",
-                job_id, base_path, days, project_id,
+                job_id, base_path, days, log_safe(project_id),
             )
             self._capture_head_state(head)
         return web.json_response({"job_id": job_id}, status=202)
@@ -2922,6 +3012,10 @@ class RLServer:
         # keyed by project_id), not just an audit log. Must be non-empty, and
         # no '_base' sentinel (the base model has no project events to train on).
         project_ids = [str(p) for p in project_ids if p and str(p) != _BASE_PROJECT_SENTINEL]
+        if any(sanitize_project_id(p) is None for p in project_ids):
+            return web.json_response(
+                {"ok": False, "error": _INVALID_PROJECT_ID_ERROR}, status=400,
+            )
         if not project_ids:
             return web.json_response(
                 {
@@ -3033,7 +3127,7 @@ class RLServer:
             logger.info(
                 "global/retrain: scheduled job=%s mode=%s projects=%d days=%d "
                 "requested_by_project=%s (DB-only)",
-                job_id, mode, len(project_ids), days, request_project_id,
+                job_id, mode, len(project_ids), days, log_safe(request_project_id),
             )
         return web.json_response({"job_id": job_id}, status=202)
 
@@ -3105,8 +3199,7 @@ class RLServer:
             # resumes from; the caller must explicitly /rotate_weights to make
             # it live. (Before: ``<state>/<active stem>_finetuned.pt``, read
             # from whichever head was swapped in when the job got to run.)
-            project_dir = _per_project_state_dir(self._state_dir, project_id)
-            project_dir.mkdir(parents=True, exist_ok=True)
+            project_dir = _ensure_project_state_dir(self._state_dir, project_id)
             stem = base_weights_path.stem.removesuffix("_finetuned")
             result_path = project_dir / f"{stem}_finetuned.pt"
             # Seed the result file FROM the base so train() resumes from the
@@ -3342,7 +3435,7 @@ class RLServer:
             )
             logger.info(
                 "global/retrain job=%s done: %s (mode=%s, project_ids=%s)",
-                job_id, global_path, mode, project_ids,
+                job_id, global_path, mode, log_safe(project_ids),
             )
 
         except Exception as exc:

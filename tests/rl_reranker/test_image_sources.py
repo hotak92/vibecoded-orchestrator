@@ -105,6 +105,7 @@ def test_the_external_imports_are_the_two_shared_modules():
         "vco_lib.rl_training_targets",
         "vco_lib.atomic",
         "vco_lib.log_setup",
+        "vco_lib.safe_paths",
         "vco_lib.rl_weights_ownership",
     }
 

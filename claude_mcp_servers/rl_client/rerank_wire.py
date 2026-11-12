@@ -40,6 +40,7 @@ it); the decode side (server) uses numpy, which the image always carries.
 from __future__ import annotations
 
 import base64
+import re
 import struct
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
@@ -231,3 +232,38 @@ def decode_rerank_features(features: Any) -> DecodedFeatures:
             linked_types=[str(x or "") for x in names],
         ))
     return DecodedFeatures(dim=dim, query=query, nodes=out)
+
+
+# ─── X-VCT-Project-ID: the project-id rule both sides apply ──────────────
+# The container uses the header value as a filesystem path component
+# (``/data/state/projects/<project_id>/``) and a JSONL filename suffix
+# (``rl_events_<project_id>.jsonl``), so a value like ``../etc`` would put
+# state outside ``/data/state/``. The client sends only an id that passes
+# this rule (else no header: the container serves the base model), and the
+# container refuses a request whose header fails it (400) — a request does
+# not have to come from this client. Accepted: ASCII letters, digits, dash,
+# underscore; 1..64 characters (a launcher UUID is 36, slugs <= 32).
+# ``fullmatch``, never ``match`` + ``$``: ``$`` also matches before a
+# trailing newline, so ``"abc\n"`` used to pass.
+PROJECT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def sanitize_project_id(value: Optional[str]) -> Optional[str]:
+    """``value`` when it is a safe-for-filesystem project identifier, else
+    ``None`` (never raises).
+
+    Examples:
+        sanitize_project_id("02fbc934-ada5-433c-b606-d1f56194035a")
+            -> "02fbc934-ada5-433c-b606-d1f56194035a"  (UUID v4 OK)
+        sanitize_project_id("orchestrator-root") -> "orchestrator-root"
+        sanitize_project_id("../etc/passwd") -> None  (path traversal blocked)
+        sanitize_project_id("project id") -> None  (space blocked)
+        sanitize_project_id("abc\n") -> None  (trailing newline blocked)
+        sanitize_project_id(None) -> None; sanitize_project_id("") -> None
+        sanitize_project_id("a" * 65) -> None  (length cap)
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if PROJECT_ID_RE.fullmatch(value) is None:
+        return None
+    return value
