@@ -15,6 +15,9 @@ this tool, unanswerable without reading source.
 ``rl-doctor`` is the answer. It is a **read-only** diagnostic that reports every
 gate and outcome on the RL path:
 
+  0. Scoring state — ONE line: does search use the reranker right now, and
+     if not, which gate says no (lock, project toggle, no container wired,
+     container down / too old / wrong space, no trained weights)?
   1. Scoring lock + per-project toggle — is RL scoring unlocked
      (``vco_lib/rl_scoring_lock.toml``) and enabled for this project? (There
      is no licence gate since v0.2.106: the reranker ships with VCO.)
@@ -215,7 +218,53 @@ def _probe_container() -> Dict[str, Any]:
         # shows both halves of the comparison.
         "client_text_dim": text_dim,
         "client_active_embedding": active,
+        "trained": neg.trained,
+        "weights_version": neg.weights_version,
+        "linked_slots_masked": neg.linked_slots_masked,
         "detail": neg.detail,
+    }
+
+
+# Why scoring is off, per container verdict (the negotiation statuses of
+# rl_client.client.RLClient.negotiate).
+_SCORING_OFF_REASONS = {
+    "disabled": "no container wired (no RL_SERVER_URL / RL_SERVER_PORT): searches keep "
+                "their search order and nothing is sent to a container.",
+    "not_trained": "the container has no trained weights; it is not called until it has.",
+    "unreachable": "a container is configured but does not answer; searches keep their "
+                   "search order (counted as fallbacks).",
+    "degraded_old_server": "the container is too old to score (protocol < 2); rebuild the "
+                           "reranker image.",
+    "incompatible_new_server": "the container is newer than this client; update the "
+                               "orchestrator.",
+    "embedding_space_mismatch": "the container's embedding space does not match this "
+                                "project's.",
+}
+
+
+def _scoring_state(
+    lock: Dict[str, Any], toggle: Dict[str, Any], container: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Which scoring state applies, and why: the gates of the search path in
+    its order (``search_pipeline._resolve_rl_enabled``, then the negotiation
+    gate of ``_do_rerank``). Pure."""
+    if lock.get("locked") is not False:
+        return {"status": "off_locked", "scoring": False,
+                "detail": f"scoring lock is set: {lock.get('detail') or 'locked'}"}
+    if toggle.get("enabled") is False:
+        return {"status": "off_project_disabled", "scoring": False,
+                "detail": "the reranker is disabled for this project."}
+    status = container.get("status") or "unknown"
+    if status == "compatible":
+        version = container.get("weights_version") or "version not reported"
+        return {"status": "on", "scoring": True,
+                "detail": f"searches are reranked by the container's trained model ({version})."}
+    return {
+        "status": f"off_{status}",
+        "scoring": False,
+        "detail": _SCORING_OFF_REASONS.get(
+            status, f"container state unknown: {container.get('detail', '')}"
+        ),
     }
 
 
@@ -381,13 +430,20 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
     # v0.2.100 W5R-02: the scoring lock wins over the toggle. v0.2.106: the
     # licence gate that sat between them is gone (the pipeline has none).
     rl_enabled = lock.get("locked") is False and toggle.get("enabled") is not False
+    scoring = _scoring_state(lock, toggle, container)
 
     # Healthy iff: off (nothing to fix) OR (enabled AND container compatible
     # AND hub up). Version mismatch / container down / hub down on an ENABLED
-    # install = unhealthy (fixable).
+    # install = unhealthy (fixable). A container without trained weights is
+    # legitimately off (v0.2.106): nothing the user can fix there.
     healthy: bool
     if not rl_enabled:
-        healthy = True  # locked / opted-out → legitimately cosine
+        healthy = True  # locked / opted-out → legitimately search order
+    elif container.get("status") == "not_trained":
+        # No trained weights: the search path does not call the container
+        # (search_pipeline._NEGOTIATION_OFF_STATUSES); not fixable here. "No
+        # container wired" on an ENABLED install stays a finding, as before.
+        healthy = telemetry.get("reachable") is True
     else:
         healthy = bool(container.get("compatible")) and telemetry.get("reachable") is True
 
@@ -395,6 +451,7 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
         "rl_enabled": rl_enabled,
         "healthy": healthy,
         "project_root": project_root,
+        "scoring": scoring,
         "scoring_lock": lock,
         "per_project_toggle": toggle,
         "container": container,
@@ -420,6 +477,7 @@ def format_human(report: Dict[str, Any]) -> str:
         lines.append(f"[{title}] {d.get('status', '?')}")
         lines.append(f"    {d.get('detail', '')}")
 
+    _sec("scoring state", report.get("scoring", {"status": "unknown", "detail": ""}))
     _sec("scoring lock", report.get("scoring_lock", {"status": "unknown", "detail": ""}))
     _sec("per-project toggle", report["per_project_toggle"])
     _sec("container / negotiation", report["container"])

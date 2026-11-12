@@ -718,178 +718,51 @@ class TestStateSummary:
 
 
 # ---------------------------------------------------------------------------
-# /cache_nodes — session_id thread-through (v0.2.4, RL telemetry audit #5)
+# /cache_nodes — session_id is accepted; the container writes no retrieval
+# event (v0.2.106)
 #
-# The orchestrator-side audit (rl-logging-audit-report-2026-05-23.md) found
-# session_id populated 0.1% of the time. Two halves:
-#   1. Container must accept session_id from the request body. ← this test
-#   2. Client (AGPL-side weaviate_mcp/server.py) must pass it. ← orchestrator chat
+# v0.2.4 threaded session_id into a container-side retrieval JSONL. That
+# write sat after the never-wired query embedding and so never ran; the MCP
+# logs every retrieval event (with session_id and the same vectors) to
+# rl_events, which is what training reads. The container scores only.
 # ---------------------------------------------------------------------------
 
 
 class TestCacheNodesSessionId:
-    """The orchestrator-side audit (rl-logging-audit-report-2026-05-23.md)
-    found session_id populated 0.1% of the time. The container side has
-    two responsibilities:
-      1. Accept session_id from the request body (v0.2.4+).
-      2. Thread it through to RLDataLogger.log_retrieval.
+    def _payload(self, srv, **extra):
+        from rl_client.rerank_wire import encode_rerank_features
 
-    Root cause of the pre-existing test failure (Task D investigation):
-      _make_server sets ACTIVE_EMBEDDING=arctic so self._rl._rl_model is
-      an active RLModel. In rerank_query_aware, when _rl_model is not None,
-      scoring goes through the batched neural path (score_batch). A freshly-
-      initialised network produces random scores that are typically BELOW
-      RELEVANCE_THRESHOLD (0.3). When all nodes fall below threshold, no
-      nodes enter above_scores and log_retrieval is never called.
-
-    Fix: patch score_batch on the live model to return scores above threshold
-    (0.9) for all candidates. This correctly exercises the log_retrieval call
-    path while keeping the test isolated from torch weight initialisation.
-
-    Note on the spy object: _cache_nodes calls _route_request + _swap_in_head
-    which sets self._rl._data_logger = head.data_logger. For the _base sentinel
-    (no X-VCT-Project-ID header), _get_or_load_project_head returns the cached
-    base head whose data_logger IS self._rl._data_logger (set in __init__ and
-    kept live via the sync in _get_or_load_project_head). The spy on
-    srv._rl._data_logger.log_retrieval therefore IS on the object actually used.
-    """
-
-    def _spy_log_retrieval(self, srv):
-        """Replace data_logger.log_retrieval with a spy capturing kwargs."""
-        captured: list[dict] = []
-        original = srv._rl._data_logger.log_retrieval
-
-        def spy(**kwargs):
-            captured.append(kwargs)
-            return original(**kwargs)
-
-        srv._rl._data_logger.log_retrieval = spy  # type: ignore[assignment]
-        return captured
-
-    def _mock_embed(self, srv):
-        """Mock RetrievalRL._embed to return a deterministic vector
-        without touching Ollama. Required because tests run without an
-        Ollama server — the real _embed falls through to the no-vector
-        path which short-circuits before log_retrieval.
-        """
-        emb_dim = srv._rl_emb_dim
-
-        async def _fake_embed(text: str) -> list[float]:
-            # Vector close to the node vectors below — pushes cosine
-            # similarity above RELEVANCE_THRESHOLD so log_retrieval fires.
-            return [0.5] * emb_dim
-
-        srv._rl._embed = _fake_embed  # type: ignore[assignment]
-
-    def _mock_score_batch_above_threshold(self, srv):
-        """Patch RLModel.score_batch to return 0.9 for every candidate.
-
-        The freshly-initialised RLModel produces random scores that are
-        typically below RELEVANCE_THRESHOLD (0.3). This patch forces all
-        nodes above threshold so log_retrieval fires, letting us assert
-        session_id plumbing without depending on torch weight initialisation.
-        """
-
-
-        def _high_score_batch(q_raw, candidates):
-            return [0.9] * len(candidates)
-
-        srv._rl._rl_model.score_batch = _high_score_batch  # type: ignore[assignment]
-
-    def test_session_id_threaded_when_provided(
-        self, tmp_path, layout_paths, monkeypatch
-    ):
-        srv = _make_server(tmp_path, layout_paths, monkeypatch)
-        self._mock_embed(srv)
-        self._mock_score_batch_above_threshold(srv)
-        captured = self._spy_log_retrieval(srv)
-
-        emb_dim = srv._rl_emb_dim
+        dim = srv._rl_emb_dim
         nodes = [
-            {
-                "title": f"Node{i}", "content": "body",
-                "node_type": "concept",
-                "emb": [0.5 + 0.001 * i] * emb_dim,
-                "links": [],
-            }
+            {"title": f"Node{i}", "node_type": "concept", "emb": [0.5 + 0.001 * i] * dim}
             for i in range(3)
         ]
+        body = {
+            "task_id": "test-task-001",
+            "query": "q",
+            "nodes": [{"title": n["title"], "node_type": "concept"} for n in nodes],
+            "limit": 2,
+            "features": encode_rerank_features([0.5] * dim, nodes, dim=dim),
+        }
+        body.update(extra)
+        return body
 
-        async def _body(client):
-            resp = await client.post("/cache_nodes", json={
-                "task_id": "test-task-001",
-                "query": "test query body",
-                "nodes": nodes,
-                "limit": 2,
-                "session_id": "sess-abc-123",
-            })
-            assert resp.status == 200
-
-        _run_async(_with_client(srv, _body))
-
-        assert len(captured) >= 1, (
-            "log_retrieval was not invoked — score_batch mock should have forced "
-            "all nodes above RELEVANCE_THRESHOLD. Check _mock_score_batch_above_threshold."
-        )
-        assert captured[-1].get("session_id") == "sess-abc-123"
-        assert captured[-1].get("task_id") == "test-task-001"
-
-    def test_session_id_defaults_to_empty_string_when_omitted(
-        self, tmp_path, layout_paths, monkeypatch
+    @pytest.mark.parametrize("extra", [{"session_id": "sess-abc-123"}, {}])
+    def test_session_id_accepted_and_no_container_retrieval_event(
+        self, tmp_path, layout_paths, monkeypatch, extra,
     ):
-        """Backward-compat: a request body without session_id (older
-        clients) reaches log_retrieval as an empty string, never None /
-        missing key."""
         srv = _make_server(tmp_path, layout_paths, monkeypatch)
-        self._mock_embed(srv)
-        self._mock_score_batch_above_threshold(srv)
-        captured = self._spy_log_retrieval(srv)
-
-        emb_dim = srv._rl_emb_dim
-        nodes = [
-            {
-                "title": f"Node{i}", "content": "body",
-                "node_type": "concept",
-                "emb": [0.5 + 0.001 * i] * emb_dim,
-                "links": [],
-            }
-            for i in range(3)
-        ]
+        calls: list = []
+        srv._rl._data_logger.log_retrieval = lambda **kw: calls.append(kw)  # type: ignore[assignment]
 
         async def _body(client):
-            resp = await client.post("/cache_nodes", json={
-                "task_id": "test-task-002",
-                "query": "no session",
-                "nodes": nodes,
-                "limit": 2,
-                # session_id intentionally omitted
-            })
+            resp = await client.post("/cache_nodes", json=self._payload(srv, **extra))
             assert resp.status == 200
+            data = await resp.json()
+            assert data["scored"] is True and sorted(data["order"]) == [0, 1, 2]
 
         _run_async(_with_client(srv, _body))
-
-        assert len(captured) >= 1, (
-            "log_retrieval was not invoked — score_batch mock should have forced "
-            "all nodes above RELEVANCE_THRESHOLD. Check _mock_score_batch_above_threshold."
-        )
-        assert captured[-1].get("session_id") == ""
-        assert "session_id" in captured[-1]
-
-    def test_rerank_query_aware_signature_accepts_session_id(self):
-        """Plumbing-level guard: rerank_query_aware must accept the
-        session_id kwarg. Catches signature regressions even when the
-        end-to-end test skips on threshold filtering."""
-        import inspect
-
-        from rl_reranker.retrieval_rl import RetrievalRL
-
-        sig = inspect.signature(RetrievalRL.rerank_query_aware)
-        assert "session_id" in sig.parameters
-        # Default must be "" (empty string), not None — keeps the schema
-        # consistent with rl_logger's defaulting behavior.
-        assert sig.parameters["session_id"].default == ""
-
-
+        assert calls == []
 # ---------------------------------------------------------------------------
 # /global/retrain — earliest_date body param (v0.2.7, R2 in feedback doc)
 #

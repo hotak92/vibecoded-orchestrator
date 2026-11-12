@@ -4,11 +4,12 @@
 Standalone HTTP server exposing RetrievalRL for training from external clients.
 
 Primary consumer: the weaviate-kg MCP server, which calls this server to:
-  1. Cache over-fetched nodes and receive a reranked top-k for each KG search call.
+  1. Score the candidates of each KG search with the loaded model (from the
+     vectors the client sends) and receive the reranked order + scores.
   2. Submit Claude's agent_output (text after the KG call) for citation detection + online training.
 
 Endpoints:
-  POST /cache_nodes      — over-fetched nodes → rerank → cache → return reranked top-k
+  POST /cache_nodes      — candidates + serve-time features → model scores → reranked order
   POST /rl_update        — task_ids + agent_output → citation detection + online train
   GET  /health           — liveness check
   POST /rotate_weights   — hot-swap loaded RLModel to a new .pt without restart       (v0.1.1)
@@ -81,7 +82,8 @@ from vco_lib.rl_weights_ownership import classify as classify_weights_owner
 from .bundled_weights import BundledWeights, resolve_bundled_weights
 from .retrieval_rl import RetrievalRL
 from rl_client.rl_logger import RLDataLogger, default_rl_log_path
-from .rl_model import N_ENTITY_TYPES, RLModel
+from .rl_model import N_ENTITY_TYPES, RLModel, linked_slots_masked
+from rl_client.rerank_wire import RERANK_PROTOCOL_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -907,7 +909,6 @@ class RLServer:
         log_path: str,
         reranker_model: str | None = None,
         port: int = 0,
-        embedding_fn = None,  # async callable (text: str) -> list[float] | None
         bind_host: str = "127.0.0.1",
         weights_root: "Path | None" = None,
     ) -> None:
@@ -1009,7 +1010,6 @@ class RLServer:
             ollama_url=ollama_url,
             rl_model=rl_model,
             data_logger=data_logger,
-            embedding_fn=embedding_fn,
         )
         # Per-source (tag, dim, arch) — stashed for /rotate_weights bookkeeping
         # and /reset's global-weights file resolution.
@@ -1449,6 +1449,15 @@ class RLServer:
                 "bundled_version": bundled.version if bundled else None,
             },
             "active_embedding": self._active_emb_source,
+            # RL-10 negotiation fields (rl_client.client.RLClient.negotiate):
+            # the /cache_nodes wire contract this server speaks, and the
+            # embedding space its model expects.
+            "protocol_version": RERANK_PROTOCOL_VERSION,
+            "embedding_dim": self._rl_emb_dim,
+            "embedding_space": self._active_emb_source,
+            # The client leaves the linked slots out of its features when
+            # they are masked for this profile (this server masks anyway).
+            "linked_slots_masked": linked_slots_masked(self._rl_model_tag),
             "arch_version": self._rl_arch_version,
             "model_tag": self._rl_model_tag,
             "emb_dim": self._rl_emb_dim,
@@ -1804,83 +1813,116 @@ class RLServer:
         await self._push_rl_global_weights_state(last_rotated=True)
 
     async def _cache_nodes(self, request: web.Request) -> web.Response:
-        """
-        Body JSON:
-          task_id:    str
-          query:      str
-          nodes:      list[dict]   — all 2× over-fetched nodes (title, content, node_type, emb?)
-          limit:      int          — how many to return as top-k
-          session_id: str          — optional run-level grouping id (v0.2.4+).
-                                    Threaded into the JSONL event for offline
-                                    analysis. Empty string when client doesn't
-                                    have one.
+        """Score one search's candidates with the loaded model.
 
-        Response JSON:
-          top_k: list[dict]     — reranked, truncated to limit
-          task_id: str
+        Body JSON (wire protocol v2, ``rl_client.rerank_wire``):
+          task_id:          str
+          nodes:            list[dict] — slim candidates (``title``,
+                            ``node_type``), in search order
+          limit:            int — how many to return in ``top_k``
+          features:         dict — the serve-time feature block (query vector,
+                            per-node vector / linked vectors / types), aligned
+                            with ``nodes``
+          active_embedding: str — optional; a mismatch with this container's
+                            pinned source is refused (409)
+          query, session_id: accepted and unused — the container writes no
+                            retrieval events (the MCP logs them, with the same
+                            vectors, to ``rl_events``)
+
+        Response JSON (200):
+          ok, task_id, scored (true),
+          order:   request-node indices, best first (a permutation),
+          scores:  model score per request node (null = node had no vector),
+          top_k:   ``nodes`` in ``order``, truncated to ``limit``,
+          weights_version, linked_slots_masked
+
+        400 malformed body; 409 embedding mismatch; 422 features missing or
+        malformed; 500 unexpected error (logged here, not echoed).
         """
         try:
-            body: dict[str, Any] = await request.json()
-            task_id: str = body["task_id"]
-            query: str = body.get("query", "")
-            nodes: list[dict] = body.get("nodes", [])
-            limit: int = int(body.get("limit", len(nodes) // 2 or 1))
-            session_id: str = body.get("session_id", "")
+            body = await request.json()
+        except Exception:  # noqa: BLE001 — any undecodable body is a 400
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+        if not isinstance(body, dict) or not isinstance(body.get("task_id"), str):
+            return web.json_response(
+                {"ok": False, "error": "task_id (string) is required"}, status=400,
+            )
+        task_id: str = body["task_id"]
+        nodes = body.get("nodes")
+        if not isinstance(nodes, list):
+            return web.json_response(
+                {"ok": False, "error": "nodes must be a list"}, status=400,
+            )
+        try:
+            limit = int(body.get("limit", len(nodes)))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"ok": False, "error": "limit must be an integer"}, status=400,
+            )
 
-            # Cross-check the request's active_embedding against this
-            # container's pinned source. Mismatch = the client is talking to
-            # the wrong RL container (Scenario B: one Python client serving
-            # multiple projects with different embedders). We refuse loudly
-            # rather than silently scoring with the wrong network.
-            req_active = body.get("active_embedding")
-            mismatch = self._embedding_mismatch_response(req_active)
-            if mismatch is not None:
-                return mismatch
+        # Cross-check the request's active_embedding against this container's
+        # pinned source: a mismatch means the client is talking to the wrong
+        # container; refuse loudly rather than score with the wrong network.
+        mismatch = self._embedding_mismatch_response(body.get("active_embedding"))
+        if mismatch is not None:
+            return mismatch
 
-            # v0.2.10 — per-project routing. Resolve project_id from the
-            # X-VCT-Project-ID header (falling back to env / base sentinel)
-            # and load-or-cache the per-project model head + data logger.
-            # Hold the routing lock for the duration of the operation so
-            # concurrent rerank requests for different projects don't race
+        features = body.get("features")
+        if features is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "features_required",
+                    "hint": (
+                        "The container does not embed anything; send the "
+                        "serve-time features (rl_client.rerank_wire, protocol "
+                        f"v{RERANK_PROTOCOL_VERSION})."
+                    ),
+                },
+                status=422,
+            )
+
+        try:
+            # v0.2.10 per-project routing: X-VCT-Project-ID header (falling
+            # back to env / base sentinel) selects the model head. The lock
+            # keeps concurrent requests for different projects from racing
             # on the shared RetrievalRL instance.
-            project_id, head = await self._route_request(request)
+            _project_id, head = await self._route_request(request)
             async with self._routing_lock:
                 self._swap_in_head(head)
-
-                # v0.2.8 — if rl_use_global=true for this project, swap the
-                # in-memory model to the latest global checkpoint for this
-                # source before reranking. Soft-fails to the project-local
-                # model on any error so reranking stays operational.
+                # v0.2.8: rl_use_global=true scores with the latest global
+                # checkpoint for this source (soft-fails to the local model).
                 flags = await self._fetch_project_flags()
                 if flags.get("rl_use_global"):
                     await self._ensure_global_model_loaded()
-
-                ranked = await self._rl.rerank_query_aware(
-                    nodes=nodes,
-                    task_type="mcp_interactive",
-                    query=query,
-                    target_k=limit,
-                    task_id=task_id,
-                    session_id=session_id,
+                try:
+                    result = self._rl.rerank(
+                        features, len(nodes), profile=self._rl_model_tag,
+                    )
+                except ValueError as exc:
+                    return web.json_response(
+                        {"ok": False, "error": "invalid_features", "detail": str(exc)},
+                        status=422,
+                    )
+                weights_version = str(
+                    getattr(self._rl._rl_model, "weights_version", "") or ""
                 )
-                # cache_nodes is called inside rerank_query_aware; the cache is
-                # used by the live rerank path only. v0.2.9 C8 retired the
-                # ``candidate_pool`` arg together with the missed-citation
-                # penalty in _train_rl_model (the only consumer).
-                self._rl.cache_nodes(
-                    task_id,
-                    ranked.top_k + ranked.extra_reference,
-                    query=query,
-                )
-                top_k = ranked.top_k[:limit]
-                # Persist any post-handler state changes (e.g. global model
-                # swap mutated state_path) back to the LRU entry.
                 self._capture_head_state(head)
-            return web.json_response({"ok": True, "task_id": task_id, "top_k": top_k})
-
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — never crash the handler
             logger.exception("cache_nodes error: %s", exc)
-            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+            return web.json_response({"ok": False, "error": "internal_error"}, status=500)
+
+        top_k = [nodes[i] for i in result.order][: max(0, limit)]
+        return web.json_response({
+            "ok": True,
+            "task_id": task_id,
+            "scored": True,
+            "order": result.order,
+            "scores": result.scores,
+            "top_k": top_k,
+            "weights_version": weights_version or None,
+            "linked_slots_masked": result.linked_slots_masked,
+        })
 
     async def _rl_update(self, request: web.Request) -> web.Response:
         """v0.2.9 (C8) pre-packed payload contract.

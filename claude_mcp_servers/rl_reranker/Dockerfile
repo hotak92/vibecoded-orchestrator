@@ -8,7 +8,9 @@
 # The build context is the CHECKOUT ROOT, not this directory: the reranker
 # imports files that live elsewhere in the repository and are NOT duplicated
 # here (one copy, one home) — `claude_mcp_servers/rl_client/rl_logger.py`
-# (as `rl_client.rl_logger`) and the stdlib-only `vco_lib` modules
+# (as `rl_client.rl_logger`), `claude_mcp_servers/rl_client/rerank_wire.py`
+# (the /cache_nodes feature format, shared with the client) and the
+# stdlib-only `vco_lib` modules
 # `rl_training_targets`, `atomic` (every atomic write) and `log_setup`
 # (root-logger setup). The root `.dockerignore` whitelists
 # exactly what this file COPYs, so the rest of the checkout never enters the
@@ -124,6 +126,7 @@ COPY --chown=app:app claude_mcp_servers/rl_reranker/math_utils.py               
 COPY --chown=app:app claude_mcp_servers/rl_reranker/migrate_rl_log_v1_to_v2.py  /app/rl_reranker/migrate_rl_log_v1_to_v2.py
 COPY --chown=app:app claude_mcp_servers/rl_reranker/bundled_weights.py          /app/rl_reranker/bundled_weights.py
 COPY --chown=app:app claude_mcp_servers/rl_client/rl_logger.py                  /app/rl_client/rl_logger.py
+COPY --chown=app:app claude_mcp_servers/rl_client/rerank_wire.py                /app/rl_client/rerank_wire.py
 COPY --chown=app:app vco_lib/rl_training_targets.py                             /app/vco_lib/rl_training_targets.py
 COPY --chown=app:app vco_lib/atomic.py                                          /app/vco_lib/atomic.py
 COPY --chown=app:app vco_lib/log_setup.py                                       /app/vco_lib/log_setup.py

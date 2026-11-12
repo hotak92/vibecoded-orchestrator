@@ -125,7 +125,7 @@ class TestPureTrainContract:
         async def _body() -> list:
             model = _RecordingRLModel()
             rl = RetrievalRL(
-                project_root=tmp_path, rl_model=model, embedding_fn=None  # type: ignore[arg-type]
+                project_root=tmp_path, rl_model=model
             )
             await rl._update(**_build_payload())
             return model.calls
@@ -143,7 +143,6 @@ class TestPureTrainContract:
                 project_root=tmp_path,
                 rl_model=_RecordingRLModel(),  # type: ignore[arg-type]
                 data_logger=logger,  # type: ignore[arg-type]
-                embedding_fn=None,
             )
             await rl._update(**_build_payload())
             return logger.citation_calls
@@ -161,7 +160,7 @@ class TestPureTrainContract:
         async def _body() -> list:
             model = _RecordingRLModel()
             rl = RetrievalRL(
-                project_root=tmp_path, rl_model=model, embedding_fn=None  # type: ignore[arg-type]
+                project_root=tmp_path, rl_model=model
             )
             await rl._update(**_build_payload(emb_dim=16))
             return model.calls
@@ -177,7 +176,7 @@ class TestPureTrainContract:
         async def _body() -> list:
             model = _RecordingRLModel()
             rl = RetrievalRL(
-                project_root=tmp_path, rl_model=model, embedding_fn=None  # type: ignore[arg-type]
+                project_root=tmp_path, rl_model=model
             )
             await rl._update(**_build_payload(with_linked=True))
             return model.calls
@@ -196,7 +195,7 @@ class TestPureTrainContract:
         async def _body() -> list:
             model = _RecordingRLModel()
             rl = RetrievalRL(
-                project_root=tmp_path, rl_model=model, embedding_fn=None  # type: ignore[arg-type]
+                project_root=tmp_path, rl_model=model
             )
             await rl._update(**_build_payload(with_linked=True))
             return model.calls
@@ -216,7 +215,7 @@ class TestPureTrainContract:
         async def _body() -> list:
             model = _RecordingRLModel()
             rl = RetrievalRL(
-                project_root=tmp_path, rl_model=model, embedding_fn=None  # type: ignore[arg-type]
+                project_root=tmp_path, rl_model=model
             )
             await rl._update(**_build_payload())
             return model.calls
@@ -229,7 +228,7 @@ class TestPureTrainContract:
         async def _body() -> list:
             model = _RecordingRLModel()
             rl = RetrievalRL(
-                project_root=tmp_path, rl_model=model, embedding_fn=None  # type: ignore[arg-type]
+                project_root=tmp_path, rl_model=model
             )
             await rl._update(
                 task_id="t",
@@ -252,7 +251,7 @@ class TestPureTrainContract:
         async def _body() -> list:
             model = _RecordingRLModel()
             rl = RetrievalRL(
-                project_root=tmp_path, rl_model=model, embedding_fn=None  # type: ignore[arg-type]
+                project_root=tmp_path, rl_model=model
             )
             await rl._update(
                 task_id="t",

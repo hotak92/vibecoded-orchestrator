@@ -298,6 +298,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The RL reranker now actually reranks.** Its server was meant to embed the query itself through a function that
+  nothing ever connected, so every search came back in its original order and the client counted a fallback each
+  time (one machine recorded 14 794 fallbacks and no reranked search). The client now sends the vectors it already
+  logs for training: the query vector and, for each result, its vector, its linked vectors and their types. They
+  travel as compact float16 data: about 0.5 MB for 30 results with 1024-dimension vectors and five linked vectors
+  each, an eighth of the same vectors written as JSON numbers. The server scores the results with its loaded model and returns the new order and the scores. It
+  builds the model input the same way the training does (a test feeds one logged search through both and compares
+  the inputs), including the arctic profile, whose linked slots stay empty as in training. A result without a vector
+  keeps its place. The server no longer embeds anything.
+- **The RL reranker is only called when it can help.** The client now calls the reranker only when its scoring lock
+  is off, the reranker is enabled for the project, a reranker container is configured, and that container reports
+  trained weights, the current data format and the project's embedding model. A container without trained weights,
+  or no container at all, is a normal "off" state and is no longer counted as a fallback. A real failure (container
+  down, too old, wrong embedding model, timeout) keeps the original order, is counted, and logs one warning per
+  session instead of one per search. `rl_doctor` has a new "scoring state" line that says whether searches are
+  reranked and, if not, which of these conditions stops it.
 - **Shipped RL weights are no longer hidden by an untrained local checkpoint.** At startup the RL server used to
   load the checkpoint whose file name sorted last, and the `rl_model_<profile>_local.pt` it writes when nothing has
   shipped sorts after every versioned file, so an install kept its untrained model after new weights shipped. The

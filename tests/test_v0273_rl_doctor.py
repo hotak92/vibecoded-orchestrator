@@ -20,6 +20,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MCP_DIR = PROJECT_ROOT / "claude_mcp_servers"
 for _p in (str(PROJECT_ROOT), str(MCP_DIR)):
@@ -218,3 +220,54 @@ def test_run_diagnostics_is_read_only(tmp_path):
         rl_doctor.run_diagnostics(str(tmp_path))
     after = set(p.name for p in tmp_path.rglob("*"))
     assert before == after
+
+
+# ── v0.2.106: the "scoring state" line ──────────────────────────────────
+
+_ENABLED = {"status": "enabled", "enabled": True, "detail": ""}
+_HUB_UP = {"status": "hub_up", "reachable": True, "detail": ""}
+
+
+@pytest.mark.parametrize("lock, toggle, container, status, needle", [
+    ({"locked": True, "detail": "until trained"}, _ENABLED, {"status": "compatible"},
+     "off_locked", "until trained"),
+    (_UNLOCKED, {"enabled": False}, {"status": "compatible"},
+     "off_project_disabled", "disabled for this project"),
+    (_UNLOCKED, _ENABLED, {"status": "disabled"}, "off_disabled", "no container wired"),
+    (_UNLOCKED, _ENABLED, {"status": "not_trained"}, "off_not_trained", "no trained weights"),
+    (_UNLOCKED, _ENABLED, {"status": "unreachable"}, "off_unreachable", "does not answer"),
+    (_UNLOCKED, _ENABLED, {"status": "degraded_old_server"}, "off_degraded_old_server",
+     "too old to score"),
+    (_UNLOCKED, _ENABLED, {"status": "embedding_space_mismatch"},
+     "off_embedding_space_mismatch", "embedding space"),
+    (_UNLOCKED, _ENABLED, {"status": "compatible", "weights_version": "1.2.3"}, "on", "1.2.3"),
+])
+def test_scoring_state_names_the_gate(lock, toggle, container, status, needle):
+    state = rl_doctor._scoring_state(lock, toggle, container)
+    assert state["status"] == status
+    assert state["scoring"] is (status == "on")
+    assert needle in state["detail"]
+
+
+def test_not_trained_container_is_a_legitimate_off_state():
+    report = _run_with_probes(
+        toggle=_ENABLED,
+        container={"status": "not_trained", "compatible": False, "reachable": True, "detail": ""},
+        telemetry=_HUB_UP,
+        retention={"status": "active", "detail": ""},
+    )
+    assert report["rl_enabled"] is True
+    assert report["healthy"] is True
+    assert report["scoring"]["status"] == "off_not_trained"
+    assert "[scoring state] off_not_trained" in rl_doctor.format_human(report)
+
+
+def test_unwired_container_on_an_enabled_install_still_needs_attention():
+    report = _run_with_probes(
+        toggle=_ENABLED,
+        container={"status": "disabled", "compatible": False, "reachable": False, "detail": ""},
+        telemetry=_HUB_UP,
+        retention={"status": "active", "detail": ""},
+    )
+    assert report["healthy"] is False
+    assert report["scoring"]["status"] == "off_disabled"

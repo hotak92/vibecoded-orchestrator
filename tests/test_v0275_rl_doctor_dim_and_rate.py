@@ -93,9 +93,8 @@ class _Transport:
 
     async def post(self, url, json=None, headers=None, timeout=None):
         self.post_calls += 1
-        nodes = (json or {}).get("nodes") or []
-        limit = (json or {}).get("limit") or len(nodes)
-        return _Resp(200, {"top_k": list(nodes[:limit])})
+        n = len((json or {}).get("nodes") or [])
+        return _Resp(200, {"scored": True, "order": list(range(n)), "scores": [0.5] * n})
 
     async def aclose(self):  # pragma: no cover
         pass
@@ -150,7 +149,7 @@ def _patched_probe(monkeypatch, health_payload: dict):
 def test_probe_compatible_on_matching_1536_container(_service_1536, monkeypatch):
     out = _patched_probe(monkeypatch, {
         "ok": True, "model": "rl", "protocol_version": PROTOCOL_VERSION,
-        "embedding_dim": 1536, "embedding_space": "openai",
+        "embedding_dim": 1536, "embedding_space": "openai", "trained": True,
     })
     assert out["client_text_dim"] == 1536
     assert out["client_active_embedding"] == "openai"
@@ -183,9 +182,11 @@ def test_success_counter_increments_on_successful_rerank(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
     client = RLClient(
         base_url="http://127.0.0.1:65535",
-        text_dim=1024,
+        text_dim=4,
         active_embedding="qwen3",
-        client=_Transport({"ok": True, "model": "rl"}),
+        client=_Transport({"ok": True, "model": "rl", "trained": True,
+                           "protocol_version": PROTOCOL_VERSION,
+                           "embedding_dim": 4, "embedding_space": "qwen3"}),
     )
 
     async def _once():
@@ -195,10 +196,11 @@ def test_success_counter_increments_on_successful_rerank(tmp_path, monkeypatch):
         ):
             return await search_pipeline._do_rerank(
                 query="q",
-                candidates=[{"title": "A", "score": 0.9}],
+                candidates=[{"title": "A", "score": 0.9, "emb": [0.5] * 4}],
                 limit=1,
                 task_id="tid-success",
                 session_id=None,
+                query_emb=[1.0] * 4,
             )
 
     assert _run(_once()) is not None

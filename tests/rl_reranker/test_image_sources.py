@@ -101,6 +101,7 @@ def test_the_external_imports_are_the_two_shared_modules():
     """A new cross-package import must be added to the image on purpose."""
     assert _external_imports() == {
         "rl_client.rl_logger",
+        "rl_client.rerank_wire",
         "vco_lib.rl_training_targets",
         "vco_lib.atomic",
         "vco_lib.log_setup",

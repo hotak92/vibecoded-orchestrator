@@ -35,6 +35,7 @@ try:
 except ImportError:  # pragma: no cover (httpx is a hard dep)
     httpx = None  # type: ignore[assignment]
 
+from .rerank_wire import RERANK_PROTOCOL_VERSION, encode_rerank_features
 from .schemas import (
     HealthResponse,
     RLUpdateResponse,
@@ -67,8 +68,9 @@ _DEFAULT_HEALTH_TIMEOUT = 1.0
 #   * compatible          — container advertises a protocol the client
 #                           supports (>= MIN_SERVER_PROTOCOL, <= our own).
 #   * degraded_old_server — container is older than we require, OR omitted
-#                           the field entirely (pre-RL-10). We still talk
-#                           to it (extra=allow tolerance) but flag it.
+#                           the field entirely (pre-RL-10). Since v0.2.106
+#                           it is NOT called: such a container cannot score
+#                           (see MIN_SERVER_PROTOCOL).
 #   * incompatible_new_server — container advertises a protocol NEWER than
 #                           this client understands. Refuse rerank, use
 #                           cosine, surface loudly (upgrade the client).
@@ -76,13 +78,19 @@ _DEFAULT_HEALTH_TIMEOUT = 1.0
 #                           does not match the client's active space
 #                           (RL-2b). Refuse rerank for that space rather
 #                           than train/query the wrong network.
+#   * not_trained         — (v0.2.106) the container's model is not a
+#                           released, trained checkpoint; refuse rerank (its
+#                           scores would be noise) without counting a fault.
 # Bump PROTOCOL_VERSION when the request/response SHAPE changes in a way
 # an older peer cannot tolerate. Additive optional fields do NOT need a
-# bump (extra=allow handles them).
-PROTOCOL_VERSION = 1
-# The oldest container protocol this client will engage without flagging
-# a degraded pairing. Pre-RL-10 containers advertise None → treated as v1.
-MIN_SERVER_PROTOCOL = 1
+# bump (extra=allow handles them). v2 (v0.2.106): /cache_nodes carries the
+# serve-time feature block (``rerank_wire``) and answers with ``order``.
+PROTOCOL_VERSION = RERANK_PROTOCOL_VERSION
+# The oldest container protocol this client will rerank with. A v1 (or
+# non-advertising, pre-RL-10) container embedded the query through a
+# function no caller ever wired, so it could not score: it is reported as
+# ``degraded_old_server`` and NOT called.
+MIN_SERVER_PROTOCOL = 2
 
 
 @dataclass(frozen=True)
@@ -91,8 +99,9 @@ class NegotiationResult:
 
     ``compatible`` is the single boolean the pipeline gates on. ``status``
     is a stable machine tag (compatible / degraded_old_server /
-    incompatible_new_server / embedding_space_mismatch / unreachable /
-    disabled) for rl-doctor + logs. ``detail`` is a human-readable line
+    incompatible_new_server / embedding_space_mismatch / not_trained /
+    unreachable / disabled) for rl-doctor + logs. Only ``compatible``
+    reranks. ``detail`` is a human-readable line
     (never carries user data). ``server_protocol`` / ``server_embedding_*``
     echo what the container advertised (None when it did not / unreachable).
     """
@@ -103,6 +112,12 @@ class NegotiationResult:
     server_protocol: Optional[int] = None
     server_embedding_dim: Optional[int] = None
     server_embedding_space: Optional[str] = None
+    # v0.2.106: what the container said about its model (None = not said /
+    # not reached) — whether it is trained, the loaded weights version, and
+    # whether its profile masks the linked slots.
+    trained: Optional[bool] = None
+    weights_version: Optional[str] = None
+    linked_slots_masked: Optional[bool] = None
 
 
 # ─── v0.2.49: per-project routing header sanitization ────────────────
@@ -215,6 +230,17 @@ class RLClientUnreachableError(RLClientError):
     """
 
 
+def _slim_node(node: Any) -> dict:
+    """What ``/cache_nodes`` needs of a candidate besides its vectors (those
+    travel in the ``features`` block): its title and type, as strings."""
+    if not isinstance(node, dict):
+        return {"title": "", "node_type": ""}
+    return {
+        "title": str(node.get("title") or ""),
+        "node_type": str(node.get("node_type") or ""),
+    }
+
+
 def _resolve_base_url() -> Optional[str]:
     """Resolve the RL server base URL from env vars.
 
@@ -277,6 +303,9 @@ class RLClient:
         # cosine by a container 4xx (e.g. the env-pin 409) now gets a signal.
         self.last_call_ok: bool = False
         self.last_error: Optional[str] = None
+        # Model score per node of the last successful rerank (None = the
+        # node carried no vector and kept its search position).
+        self.last_scores: List[Optional[float]] = []
         self._warned_4xx: bool = False
 
         # v0.2.49: per-project routing header. Stored as the sanitized
@@ -344,86 +373,90 @@ class RLClient:
         task_id: str,
         query_emb: Optional[List[float]] = None,
         session_id: str = "",
+        include_linked: bool = True,
     ) -> List[Any]:
-        """Rerank ``nodes`` and return the top-k.
+        """Rerank ``nodes`` with the container's model and return the top-k.
 
-        Behavior:
-            * Disabled mode → returns ``nodes[:top_k]`` unchanged.
-            * Reachable + 200 → returns the server's ``top_k`` list.
-            * Connection refused / timeout / 5xx → returns
-              ``nodes[:top_k]`` unchanged. Logs at debug level; does
-              NOT raise so the surrounding KG search keeps working.
+        The container scores from the vectors the candidates already carry
+        (the ones the retrieval event logs): ``query_emb`` plus each node's
+        ``emb`` / ``linked_embs`` / ``linked_type_names`` / ``node_type``,
+        sent as float16 (``rerank_wire.encode_rerank_features``). The nodes
+        themselves travel slim (``title`` + ``node_type``); the returned list
+        holds the caller's own dicts, in the container's order.
+
+        Behavior (``last_call_ok`` / ``last_error`` describe the outcome):
+            * Disabled mode -> ``nodes[:top_k]``, no HTTP call.
+            * Nothing scorable (no ``text_dim``-long query vector, or no node
+              with a vector) -> ``nodes[:top_k]``, no HTTP call.
+            * 200 with a valid ``order`` -> the reranked top-k
+              (``last_scores`` holds the model score per returned node,
+              None = not scored).
+            * Connection refused / timeout / 5xx / 4xx / malformed answer ->
+              ``nodes[:top_k]``. Never raises, so the KG search keeps working.
 
         Args:
-            query: Search query text.
-            nodes: All over-fetched nodes (free-form dicts). Each
-                should have at minimum ``title`` and ``score``.
+            query: Search query text (forwarded for the container's logs).
+            nodes: The candidates, in search order.
             top_k: How many to return after reranking.
-            task_id: Unique identifier linking this retrieval to a
-                later ``rl_update`` call. Required.
-            query_emb: Optional query embedding (sanity-checked
-                against ``self.text_dim``).
-            session_id: Optional Claude Code session id; forwarded to
-                the container so server-side telemetry rows can be
-                grouped by chat (v0.2.31 telemetry audit fix —
-                container ships matching ``session_id`` kwarg in
-                ``vct-rl-reranker`` v0.2.4+). Defaults to empty string
-                for backward-compat with older containers (the field
-                is ignored when absent).
+            task_id: Identifier linking this retrieval to a later
+                ``rl_update``. Required.
+            query_emb: The search's query vector (the active search vector,
+                the same one the retrieval event logs).
+            session_id: Claude Code session id, forwarded for grouping.
+            include_linked: False leaves the linked vectors out (the
+                container reported that its profile masks them).
         """
-        # Defensive: drop misshaped query_emb rather than raising.
-        if query_emb is not None and len(query_emb) != self.text_dim:
-            logger.debug(
-                "RLClient.cache_nodes: query_emb dim=%d != configured text_dim=%d; "
-                "dropping query_emb from request",
-                len(query_emb),
-                self.text_dim,
-            )
-            query_emb = None
-
         # v0.2.73 RL-3: reset the per-call outcome surface up front so a
         # caller reading it after this call sees THIS call's result.
         self.last_call_ok = False
         self.last_error = None
+        self.last_scores = []
 
         if not self.enabled:
             self.last_error = "disabled"
             return list(nodes[:top_k])
 
-        # Build the request payload. ``nodes`` are passed as-is
-        # (server tolerates extra fields).
+        features = encode_rerank_features(
+            query_emb, nodes, dim=self.text_dim, include_linked=include_linked,
+        )
+        if features is None:
+            self.last_error = (
+                "nothing to score: no query vector of the configured dimension "
+                "or no candidate carries a vector"
+            )
+            return list(nodes[:top_k])
+
         payload = {
             "task_id": task_id,
             "query": query,
-            "nodes": list(nodes),
+            "nodes": [_slim_node(n) for n in nodes],
             "limit": int(top_k),
+            "features": features,
             "embedding_source": self.active_embedding,
             "active_embedding": self.active_embedding,
             "session_id": str(session_id or ""),
         }
-        if query_emb is not None:
-            payload["query_emb"] = query_emb
 
         try:
             data = await self._post_json("/cache_nodes", payload, timeout=self._timeout)
         except RLClientUnreachableError as exc:
-            # Routine transient class (container starting / stopped / 5xx) —
-            # keep at debug; the pipeline-level fallback counter aggregates.
+            # Routine transient class (container starting / stopped / 5xx /
+            # timeout) — keep at debug; the pipeline counts the fallback and
+            # warns once per session.
             self.last_error = str(exc)
             logger.debug("RLClient.cache_nodes: unreachable (%s); falling back to no-rerank", exc)
             return list(nodes[:top_k])
         except RLClientError as exc:
             # v0.2.73 RL-3: a 4xx is NOT transient — it means the container
             # actively refused (env-pin 409, contract mismatch, bad request)
-            # and every subsequent call will refuse too: the paying user is
-            # PERMANENTLY on cosine until it's fixed. Surface loudly once per
-            # client instance, then degrade to debug.
+            # and every subsequent call will refuse too. Surface loudly once
+            # per client instance, then degrade to debug.
             self.last_error = str(exc)
             if not self._warned_4xx:
                 self._warned_4xx = True
                 logger.warning(
                     "RLClient.cache_nodes: container REFUSED the rerank "
-                    "request (%s). RL reranking is falling back to cosine "
+                    "request (%s). RL reranking is falling back to search "
                     "order and will keep doing so until the container/config "
                     "mismatch is resolved.", exc,
                 )
@@ -431,15 +464,27 @@ class RLClient:
                 logger.debug("RLClient.cache_nodes: error (%s); falling back to no-rerank", exc)
             return list(nodes[:top_k])
 
-        top = data.get("top_k") or []
-        if not isinstance(top, list):
-            self.last_error = f"malformed top_k ({type(top).__name__})"
-            logger.debug("RLClient.cache_nodes: malformed top_k (%r); falling back", type(top))
+        order = data.get("order")
+        if (
+            data.get("scored") is not True
+            or not isinstance(order, list)
+            or not all(isinstance(o, int) and not isinstance(o, bool) for o in order)
+            or sorted(order) != list(range(len(nodes)))
+        ):
+            self.last_error = "malformed rerank answer (no valid order)"
+            logger.debug("RLClient.cache_nodes: malformed answer (%r); falling back", order)
             return list(nodes[:top_k])
+        scores = data.get("scores")
+        if not isinstance(scores, list) or len(scores) != len(nodes):
+            scores = [None] * len(nodes)
 
-        # Server may return more / fewer than requested; trim defensively.
         self.last_call_ok = True
-        return list(top[:top_k])
+        ranked_idx = order[: max(0, int(top_k))]
+        self.last_scores = [
+            float(scores[i]) if isinstance(scores[i], (int, float)) else None
+            for i in ranked_idx
+        ]
+        return [nodes[i] for i in ranked_idx]
 
     async def rl_update(
         self,
@@ -711,21 +756,48 @@ class RLClient:
                 server_embedding_space=srv_space,
             )
 
-        # Old / non-advertising container: still usable (extra=allow), but flag.
+        trained = h.trained
+        weights = getattr(h, "weights", None)
+        weights_version = (
+            weights.get("loaded_version") if isinstance(weights, dict) else None
+        )
+        model_fields = {
+            "server_protocol": server_proto,
+            "server_embedding_dim": srv_dim,
+            "server_embedding_space": srv_space,
+            "trained": trained,
+            "weights_version": weights_version,
+            "linked_slots_masked": h.linked_slots_masked,
+        }
+
+        # Old / non-advertising container: it embedded the query through a
+        # function nothing wired, so it cannot score — do not call it.
         if server_proto is None or server_proto < MIN_SERVER_PROTOCOL:
             return NegotiationResult(
-                compatible=True,
+                compatible=False,
                 status="degraded_old_server",
                 detail=(
-                    "container did not advertise a protocol version (pre-RL-10) "
+                    "container did not advertise a protocol version (pre-RL-10)"
                     if server_proto is None
                     else f"container protocol v{server_proto} < required "
-                    f"v{MIN_SERVER_PROTOCOL} "
+                    f"v{MIN_SERVER_PROTOCOL}"
                 )
-                + "— engaging via best-effort tolerance.",
-                server_protocol=server_proto,
-                server_embedding_dim=srv_dim,
-                server_embedding_space=srv_space,
+                + " — it cannot score; rebuild the reranker image.",
+                **model_fields,
+            )
+
+        # Not a released, trained checkpoint (or the container did not say):
+        # its scores would be noise, so reranking stays off. Not a fault.
+        if trained is not True:
+            return NegotiationResult(
+                compatible=False,
+                status="not_trained",
+                detail=(
+                    "the container's model is not a trained checkpoint "
+                    f"(model={h.model!r}); reranking stays off until trained "
+                    "weights are loaded."
+                ),
+                **model_fields,
             )
 
         return NegotiationResult(
@@ -733,11 +805,10 @@ class RLClient:
             status="compatible",
             detail=(
                 f"container protocol v{server_proto} compatible with client "
-                f"v{PROTOCOL_VERSION}."
+                f"v{PROTOCOL_VERSION}; trained weights "
+                f"{weights_version or '(version not reported)'}."
             ),
-            server_protocol=server_proto,
-            server_embedding_dim=srv_dim,
-            server_embedding_space=srv_space,
+            **model_fields,
         )
 
     # ---- transport ----------------------------------------------------
@@ -783,10 +854,11 @@ class RLClient:
             headers["X-VCT-Project-ID"] = self._project_id
 
         # v0.2.74 T5-1b (BLOCKER-2): coerce the body to a JSON-safe dict at the
-        # single POST choke point BEFORE httpx serializes it. ``cache_nodes``
-        # passes candidate node dicts VERBATIM (``payload["nodes"] =
-        # list(nodes)``), and a candidate may embed a ``uuid.UUID`` (a links /
-        # wikilink / enrichment field). httpx's ``json=`` path uses the stdlib
+        # single POST choke point BEFORE httpx serializes it. ``rl_update``
+        # bodies carry caller-built node dicts (and, until v0.2.106 slimmed
+        # them, ``cache_nodes`` sent candidate dicts verbatim), and such a
+        # dict may embed a ``uuid.UUID`` (a links / wikilink / enrichment
+        # field). httpx's ``json=`` path uses the stdlib
         # encoder, which raises ``TypeError: Object of type UUID is not JSON
         # serializable`` — the POST then fails, RLClient falls back to cosine
         # order, and the paying user is silently demoted per query.

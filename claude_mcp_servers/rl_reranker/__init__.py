@@ -13,8 +13,8 @@ directory (``Dockerfile``); the MCP side talks to it through
 Public surface:
 - RLServer       — aiohttp server exposing /cache_nodes + /rl_update and the
                    model-management endpoints (rl_server.py)
-- RetrievalRL    — citation-aware online learner (depends on injected
-                   embedding_fn — caller wires this to the active KG embedding)
+- RetrievalRL    — scores candidates from the vectors the client sends
+                   (``rl_client.rerank_wire``) and trains online on citations
 - RLDataLogger   — append-only JSONL logger for retrieval + citation events
                    (imported from ``rl_client.rl_logger`` — one copy)
 - RLModel        — PyTorch model wrapper (per-embedding-source tag/dim

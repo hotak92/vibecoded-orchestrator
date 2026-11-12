@@ -307,6 +307,14 @@ class _RecorderRLModel:
         return self._type_map.setdefault(t or "concept", len(self._type_map))
 
 
+def _features(srv):
+    """A one-node serve-time feature block in the server's dimension."""
+    from rl_client.rerank_wire import encode_rerank_features
+
+    dim = srv._rl_emb_dim
+    return encode_rerank_features([0.5] * dim, [{"emb": [0.25] * dim}], dim=dim)
+
+
 class TestCacheNodesRouting:
     def test_no_header_uses_base_and_increments_counter(self, tmp_path, layout, monkeypatch):
         srv = _make_server(tmp_path, layout, monkeypatch)
@@ -319,13 +327,10 @@ class TestCacheNodesRouting:
                 "limit": 1,
                 "session_id": "s",
                 "active_embedding": "arctic",
+                "features": _features(srv),
             }
             resp = await client.post("/cache_nodes", json=payload)
-            # Reranking with no embedding_fn returns empty top_k but the
-            # endpoint itself returns 200 (it does NOT need to actually rank).
-            # Either 200 OK or 500 (no embedder) — what we care about is
-            # the routing fired the counter.
-            assert resp.status in (200, 500)
+            assert resp.status == 200
 
         _run_async(_with_client(srv, _body))
         # The handler called _resolve_request_project_id at least once.
@@ -342,13 +347,14 @@ class TestCacheNodesRouting:
                 "limit": 1,
                 "session_id": "s",
                 "active_embedding": "arctic",
+                "features": _features(srv),
             }
             resp = await client.post(
                 "/cache_nodes",
                 json=payload,
                 headers={_HEADER_PROJECT_ID: "my-project-uuid"},
             )
-            assert resp.status in (200, 500)
+            assert resp.status == 200
 
         _run_async(_with_client(srv, _body))
         assert srv._routing_counters["requests_with_header"] == 1

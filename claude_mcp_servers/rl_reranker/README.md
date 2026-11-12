@@ -28,7 +28,7 @@ launcher-driven model-lifecycle management.
 | Method | Path           | Purpose |
 |--------|----------------|---------|
 | GET    | `/health`      | Liveness + weights state: `{ "ok": true, "model": "RLModel loaded" \| "not trained", "trained": bool, "weights": { "profile", "loaded_version", "bundled_version" }, ... }`. |
-| POST   | `/cache_nodes` | Rerank over-fetched KG nodes and cache them for later citation scoring. Called per KG search. |
+| POST   | `/cache_nodes` | Score one search's candidates with the loaded model and return the reranked order + scores. The client sends the vectors it already logs (query vector, node vectors, linked vectors, node types) as float16 in a `features` block (`claude_mcp_servers/rl_client/rerank_wire.py`, wire protocol 2); the container embeds nothing. A body without `features` gets 422. |
 | POST   | `/rl_update`   | Submit Claude's `agent_output` to trigger citation detection + online training for the cached task_ids. |
 
 ### v0.1.1 — model lifecycle (launcher-driven)
@@ -199,7 +199,7 @@ length plus the qwen3 cutover date (2026-04-14).
 | `rl_model.py` / `rl_model_v1.py` | the v2 network (default) / the v1 snapshot (`RL_ARCH_VERSION=v1`) |
 | `offline_trainer.py`, `hub_event_loader.py` | offline training over launcher.db events read through the hub |
 | `bundled_weights.py` | the ONE reader of `weights/manifest.json` (stdlib only) |
-| (imported, not copied) | `rl_client.rl_logger` (`claude_mcp_servers/rl_client/rl_logger.py`) plus the stdlib-only `vco_lib.rl_training_targets`, `vco_lib.atomic` (every atomic write) and `vco_lib.log_setup` (logging setup) — one copy each; the image COPYs them from where they live (`tests/rl_reranker/test_image_sources.py` pins the COPY set) |
+| (imported, not copied) | `rl_client.rl_logger` (`claude_mcp_servers/rl_client/rl_logger.py`), `rl_client.rerank_wire` (the `/cache_nodes` feature format) plus the stdlib-only `vco_lib.rl_training_targets`, `vco_lib.atomic` (every atomic write) and `vco_lib.log_setup` (logging setup) — one copy each; the image COPYs them from where they live (`tests/rl_reranker/test_image_sources.py` pins the COPY set) |
 | `migrate_rl_log_v1_to_v2.py` | ports legacy JSONL events to the v2 schema |
 | `db/` | the module's own launcher.db migrations (`rl_state`, `rl_weights_state`, …) |
 | `scripts/` | maintainer training scripts over the frozen JSONL bake-off corpus (`RL_TRAIN_WORKDIR`, see `scripts/_workdir.py`) |

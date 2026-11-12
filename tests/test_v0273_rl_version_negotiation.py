@@ -23,6 +23,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MCP_DIR = PROJECT_ROOT / "claude_mcp_servers"
 for _p in (str(PROJECT_ROOT), str(MCP_DIR)):
@@ -68,6 +70,7 @@ def test_matching_protocol_is_compatible():
         protocol_version=PROTOCOL_VERSION,
         embedding_dim=1024,
         embedding_space="qwen3",
+        trained=True,
     )
     res = asyncio.run(c.negotiate(health=h))
     assert res.compatible is True
@@ -75,16 +78,18 @@ def test_matching_protocol_is_compatible():
     assert res.server_protocol == PROTOCOL_VERSION
 
 
-def test_missing_protocol_is_degraded_but_usable():
-    # Pre-RL-10 container: /health omits protocol_version entirely.
+def test_missing_protocol_is_degraded_and_not_used():
+    # Pre-RL-10 container: /health omits protocol_version entirely. Since
+    # v0.2.106 such a container is NOT called: it cannot score (it embedded
+    # the query through a function no caller ever wired).
     c = _client()
-    res = asyncio.run(c.negotiate(health=HealthResponse(ok=True, model="rl")))
-    assert res.compatible is True  # still engaged via extra=allow tolerance
+    res = asyncio.run(c.negotiate(health=HealthResponse(ok=True, model="rl", trained=True)))
+    assert res.compatible is False
     assert res.status == "degraded_old_server"
     assert res.server_protocol is None
 
 
-def test_older_than_min_protocol_is_degraded_but_usable():
+def test_older_than_min_protocol_is_degraded_and_not_used():
     # The OTHER trigger of the degraded branch: the container advertises a
     # protocol, but one below what this client requires.
     c = _client()
@@ -94,9 +99,10 @@ def test_older_than_min_protocol_is_degraded_but_usable():
         protocol_version=MIN_SERVER_PROTOCOL - 1,
         embedding_dim=1024,
         embedding_space="qwen3",
+        trained=True,
     )
     res = asyncio.run(c.negotiate(health=h))
-    assert res.compatible is True  # still engaged via extra=allow tolerance
+    assert res.compatible is False
     assert res.status == "degraded_old_server"
     assert res.server_protocol == MIN_SERVER_PROTOCOL - 1
 
@@ -149,10 +155,29 @@ def test_matching_embedding_space_is_compatible():
         protocol_version=PROTOCOL_VERSION,
         embedding_dim=1024,
         embedding_space="qwen3",
+        trained=True,
     )
     res = asyncio.run(c.negotiate(health=h))
     assert res.compatible is True
     assert res.status == "compatible"
+
+
+@pytest.mark.parametrize("trained", [False, None])
+def test_untrained_or_unstated_model_is_not_trained(trained):
+    """v0.2.106: a container whose model is not a trained checkpoint (or
+    that does not say) is not used — its scores would be noise."""
+    c = _client(text_dim=1024, active_embedding="qwen3")
+    h = HealthResponse(
+        ok=True,
+        model="not trained",
+        protocol_version=PROTOCOL_VERSION,
+        embedding_dim=1024,
+        embedding_space="qwen3",
+        trained=trained,
+    )
+    res = asyncio.run(c.negotiate(health=h))
+    assert res.compatible is False
+    assert res.status == "not_trained"
 
 
 def test_negotiate_never_raises_on_health_probe_failure():
@@ -186,8 +211,9 @@ def test_post_advertises_protocol_header():
 
             return _Resp()
 
-    c = RLClient(base_url="http://127.0.0.1:65535", client=_CaptureClient())
+    c = RLClient(base_url="http://127.0.0.1:65535", client=_CaptureClient(), text_dim=4)
     asyncio.run(
-        c.cache_nodes(query="q", nodes=[{"title": "N", "score": 1.0}], top_k=1, task_id="t")
+        c.cache_nodes(query="q", nodes=[{"title": "N", "score": 1.0, "emb": [1.0] * 4}],
+                      top_k=1, task_id="t", query_emb=[1.0] * 4)
     )
     assert captured["headers"].get("X-VCT-RL-Protocol") == str(PROTOCOL_VERSION)

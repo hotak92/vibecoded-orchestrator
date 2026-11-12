@@ -6,7 +6,7 @@
 # launcher's `container_build` install and the `rl_reranker` compose service
 # both build it from here). It needs the root because it imports files that
 # live outside its own directory and must not be duplicated into it:
-# claude_mcp_servers/rl_client/rl_logger.py and the stdlib-only
+# claude_mcp_servers/rl_client/{rl_logger,rerank_wire}.py and the stdlib-only
 # vco_lib/{rl_training_targets,atomic,log_setup,rl_weights_ownership}.py (+ the
 # rl_weights_ownership.toml table that last one reads).
 #
@@ -21,6 +21,7 @@ claude_mcp_servers/rl_reranker/**/__pycache__
 claude_mcp_servers/rl_reranker/scripts/
 claude_mcp_servers/rl_reranker/training/
 !claude_mcp_servers/rl_client/rl_logger.py
+!claude_mcp_servers/rl_client/rerank_wire.py
 !vco_lib/rl_training_targets.py
 !vco_lib/atomic.py
 !vco_lib/log_setup.py

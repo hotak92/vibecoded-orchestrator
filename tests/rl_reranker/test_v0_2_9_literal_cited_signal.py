@@ -87,7 +87,6 @@ def _build_rl(tmp_path: Path) -> tuple[RetrievalRL, _TargetCapturingRLModel]:
         project_root=tmp_path,
         rl_model=fake_model,  # type: ignore[arg-type]
         data_logger=None,
-        embedding_fn=None,  # pure-train path should NEVER call _embed
     )
     return rl, fake_model
 
