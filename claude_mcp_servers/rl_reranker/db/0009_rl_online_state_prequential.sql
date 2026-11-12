@@ -3,8 +3,8 @@
 --
 -- v0.2.106 — the serving gate judges the project's CUMULATIVE PREQUENTIAL
 -- record (owner ruling 2026-11-12, after the rlgate2 study): every query is
--- scored by the model in place when it arrived, before that model trained on
--- it; once the record holds `min_queries` queries and `min_cited_queries`
+-- scored at the first round after it arrived, by the model in place at that
+-- round, before that model trained on it; once the record holds `min_queries` queries and `min_cited_queries`
 -- citing ones, every round is a check, the k-th at confidence
 -- 1 - error_budget / (k (k+1)) (total false-pass probability <= error_budget
 -- over all checks), and the model is served while both lower bounds clear
