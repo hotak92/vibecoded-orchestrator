@@ -2,13 +2,10 @@
 // Shared runtime config readers for VCO Supabase edge functions.
 //
 // Centralises env-var lookups that need shape validation + sane fallbacks
-// across multiple functions. Its consumer was `rl-artifact-url` (the paid
-// RL reranker's GHCR pull-token gateway), retired with the paid RL backend
-// in v0.2.106 (the reranker now ships bundled and free). No deployed
-// function imports it today; it is kept, with its tests, for the next paid
-// module's pull-token gateway — the same owner ruling that keeps the
-// launcher's `module_default_weights.rs`. `_shared/` is never deployed on
-// its own (`release.yml` skips it), so keeping it resurrects nothing.
+// across multiple functions. Its consumer is `rl-artifact-url`, the paid
+// pull-token gateway — kept deployed (v0.2.106, owner 2026-11-12) as
+// paid-module infrastructure for future paid modules; the bundled, free RL
+// reranker never calls it.
 //
 // Design notes:
 //

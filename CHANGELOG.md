@@ -311,11 +311,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The paid distribution path is retired for the RL reranker.** It no longer uses the GHCR image, the paid-catalog
   entry or the paid-module weights bucket. The launcher no longer downloads its weights after install, and the
   daily weights poll stands down for it. The manual RL image smoke workflow now builds the image from the checkout
-  instead of pulling a private image. The three edge functions of the paid backend (`rl-artifact-url`,
-  `rl-latest-version`, `rl-latest-weights`) and their `launcher/supabase/config.toml` stanzas are removed, so the
-  tag-time deploy, which deploys every directory under `launcher/supabase/functions/`, can no longer re-create them
-  after they are deleted server-side. The shared helpers they used (`_shared/config.ts`,
-  `_shared/tier_revalidation.ts`) stay for a future paid module, as `module_default_weights.rs` does.
+  instead of pulling a private image. Only the RL module's paid catalog listing is retired: the paid-module
+  infrastructure stays for future paid modules. The edge functions (`rl-artifact-url`, `rl-latest-version`,
+  `rl-latest-weights`, with their `launcher/supabase/config.toml` stanzas and shared helpers) stay in the repository
+  and stay deployed, and so does the launcher's download machinery (`module_default_weights.rs`). The bundled
+  reranker calls none of them.
 - **The RL reranker uses the orchestrator's own logger and training-target code.** It used to carry its own copies
   of `rl_client/rl_logger.py` and `vco_lib/rl_training_targets.py`, and the copy of the logger had fallen a full
   schema version behind without the drift check noticing (that check skipped whenever the module was absent). It now

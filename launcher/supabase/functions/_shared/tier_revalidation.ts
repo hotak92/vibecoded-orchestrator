@@ -20,13 +20,6 @@
 // pull token, signed Storage URL). Fail closed: every error path
 // returns `{ valid: false, tier: "free" }` with a bounded `reason`
 // string (≤200 chars of upstream detail) for the function log.
-//
-// v0.2.106: its three consumers (the paid RL reranker's functions) were
-// retired with the paid RL backend (the reranker ships bundled and free).
-// No deployed function imports it today; it is kept for the next paid
-// module's credential-issuing function (same owner ruling that keeps the
-// launcher's `module_default_weights.rs`). `_shared/` is never deployed
-// on its own, so keeping it resurrects nothing.
 
 import { type OrchestratorTier } from "./variant_map.ts";
 

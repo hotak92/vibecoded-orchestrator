@@ -2342,8 +2342,8 @@ pub fn run() {
             // WeightsUpdatePrompt component. Soft-fail throughout —
             // never blocks setup, never crashes the launcher.
             // v0.2.106: the poll stands down while the RL reranker is a
-            // bundled module (its endpoint is retired with the paid RL
-            // backend); see `module_service::spawn_daily_weights_poll`.
+            // bundled module (its weights ship in its image); see
+            // `module_service::spawn_daily_weights_poll`.
             //
             // Step 24 Phase 2 (commit b) relocates the resume + poller
             // implementations into `vct-hub::module_supervisor`; the
