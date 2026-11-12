@@ -428,6 +428,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check now has one home (`codegraph_guards.replace_target_missing`, status 404 or either text). Files whose writes
   failed were already un-stamped, so the next code-graph run re-walks them and fills what was missing.
 
+- **Re-running an install that stopped early no longer flags VCO's own `.claude/settings.json` as yours.** When a
+  first install stopped after the bundle had created the orchestrator root's `settings.json` but before step 9 marked
+  it as VCO-managed, the next run treated the file as user-owned: it wrote `settings.json.vco-new` and asked you to run
+  `--adopt-project-replace-all`. The bundle manifest now records that VCO created the file (a fingerprint of
+  everything but `env`, which the env projection writes), and step 9 adopts a file that still matches: defaults filled
+  in, managed-keys marker added, no deferral. A file you edited in between keeps the user-owned path, and that
+  entry now lists the safe fixes first (add the `_vco_managed_keys` line by hand, or merge from `.vco-new`). It also
+  says what replace-all resets. `.vco-new` uses this install's collection names when the launcher database has them,
+  and says not to copy its `env` block when it does not.
+
 - **The macOS installer no longer prints "$!: unbound variable" when it opens the launcher.** The launcher was started
   inside a subshell, so the script read an unset `$!`; macOS's bash 3.2 aborts on that under `set -u` even with a
   default. It is now started in the script's own shell.

@@ -3115,6 +3115,7 @@ def _hook_globs_for_os() -> tuple[str, ...]:
 # v0.2.102 (W6-HTAB): the OS template pick moved to its one home beside the
 # merge I/O, so the launcher's parked-hook carry check reads the same file.
 from vco_lib.bundle_settings_io import settings_template_path as _settings_template_path  # noqa: E402
+from vco_lib import settings_provenance as _settings_prov  # noqa: E402
 
 
 # v0.2.92: `_prune_now_empty_parents` moved to `vco_lib.fs_prune`. This module
@@ -9600,6 +9601,7 @@ def install_project_bundle(
     # maps `--skip-materialize-claude-dir` to `--skip-kind ... settings` so the
     # legacy "don't rewrite my settings" intent is preserved.
     settings_template = _settings_template_path(orchestrator_root)
+    _settings_fp_before = _settings_prov.fingerprint_before(folder)  # v0.2.106: as FOUND
     if "settings" not in skip_kinds and settings_template.exists():
         try:
             settings_target = folder / ".claude" / "settings.json"
@@ -9974,6 +9976,8 @@ def install_project_bundle(
                 _gate_outcomes, restored=_gw_restored)
             if _parked:
                 manifest_payload[_PARKED_KEY] = _parked
+            _settings_prov.carry_record(manifest_payload, manifest, folder,  # v0.2.106
+                                        result.get("settings_action"), _settings_fp_before)
             _write_manifest_atomic(folder, manifest_payload)
             result["manifest_written"] = True
 
