@@ -204,6 +204,27 @@ def _glob_weights_files(state_dir: "Path", source: str) -> "list[Path]":
     return sorted(state_dir.glob(f"rl_model_{source}_*.pt"))
 
 
+def _global_retrain_seed(state_dir: "Path", project_id: str, source: str) -> "Path | None":
+    """The checkpoint a first-ever ``/global/retrain`` seeds the global model
+    from, or ``None`` (then the global model starts from a fresh init).
+
+    The requesting project's own checkpoints (``projects/<project_id>/``)
+    come first, the shared base dir second; within a dir the NEWEST file
+    (mtime, then name) of the writers' naming (``_glob_weights_files``) wins.
+    A ``*_finetuned.pt`` sibling is not a live model (it waits for an explicit
+    ``/rotate_weights``) and is never a seed.
+    """
+    dirs = [state_dir]
+    if project_id and project_id != _BASE_PROJECT_SENTINEL:
+        dirs.insert(0, _per_project_state_dir(state_dir, project_id))
+    for d in dirs:
+        cands = [p for p in _glob_weights_files(d, source)
+                 if p.is_file() and not p.stem.endswith("_finetuned")]
+        if cands:
+            return max(cands, key=lambda p: (p.stat().st_mtime_ns, p.name))
+    return None
+
+
 def _semver_key(version: str) -> "tuple[int, int, int] | None":
     """``(major, minor, patch)`` of a release version, ``None`` otherwise."""
     parts = (version or "").strip().split(".")
@@ -1151,6 +1172,9 @@ class RLServer:
         # Rounds running off the event loop (references kept so they are not
         # garbage-collected mid-flight; ``wait_for_rounds`` awaits them).
         self._round_tasks: "set[asyncio.Task]" = set()
+        # rl_online_state pushes made when a project head loads (same
+        # reference-keeping; ``wait_for_rounds`` awaits them too).
+        self._push_tasks: "set[asyncio.Task]" = set()
 
         # v0.2.10 — per-project routing infrastructure.
         #
@@ -1428,6 +1452,15 @@ class RLServer:
             "fallback=%s",
             project_id, source, target_path, is_fallback,
         )
+        if learner is not None:
+            # The launcher's RL panel reads the rl_online_state row, not this
+            # process: re-publish what THIS load found (a recreated container,
+            # a learner state discarded for another checkpoint, a state dir
+            # that is gone), so the row never keeps claiming a model is served
+            # that this container does not hold. Off the request path.
+            task = asyncio.create_task(self._push_rl_online_state(head))
+            self._push_tasks.add(task)
+            task.add_done_callback(self._push_tasks.discard)
         return head
 
     async def _route_request(self, request: "web.Request") -> "tuple[str, _ProjectHead]":
@@ -2236,9 +2269,11 @@ class RLServer:
             await self._push_rl_online_state(head)
 
     async def wait_for_rounds(self) -> None:
-        """Await every round in flight (tests, and a clean shutdown)."""
-        while self._round_tasks:
-            await asyncio.gather(*list(self._round_tasks), return_exceptions=True)
+        """Await every round in flight, and every pending state push (tests,
+        and a clean shutdown)."""
+        while self._round_tasks or self._push_tasks:
+            await asyncio.gather(*list(self._round_tasks), *list(self._push_tasks),
+                                 return_exceptions=True)
 
     def _project_checkpoint_path(self, head: _ProjectHead) -> Path:
         """Where the project's trained model is saved: its current file when
@@ -2973,6 +3008,7 @@ class RLServer:
                     global_path=global_path,
                     days=days,
                     project_ids=project_ids,
+                    seed_project_id=request_project_id,
                 )
             )
             logger.info(
@@ -3150,8 +3186,12 @@ class RLServer:
         global_path: Path,
         days: int,
         project_ids: list[str],
+        seed_project_id: str = "",
     ) -> None:
         """Background global-retrain job (v0.2.11 — DB-only).
+
+        ``seed_project_id``: the requesting project; its newest checkpoint
+        seeds a first-ever global model (``_global_retrain_seed``).
 
         Trains ONE global model on the union of several projects' events,
         read from launcher.db via the hub (keyed by project_id). No JSONL.
@@ -3186,11 +3226,13 @@ class RLServer:
             global_path.parent.mkdir(parents=True, exist_ok=True)
 
             if not global_path.exists():
-                # First-ever global retrain: seed from the current project's
-                # weights so the model resumes from a good checkpoint rather
-                # than random init.
-                project_seed = self._state_dir / f"rl_model_{self._rl_model_tag}.pt"
-                if project_seed.exists():
+                # First-ever global retrain: seed from the requesting
+                # project's weights (else the base model's) so the model
+                # resumes from a good checkpoint rather than random init.
+                project_seed = _global_retrain_seed(
+                    self._state_dir, seed_project_id, self._rl_model_tag,
+                )
+                if project_seed is not None:
                     shutil.copy2(project_seed, global_path)
                     logger.info(
                         "global/retrain: seeded global from project weights %s",

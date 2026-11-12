@@ -1790,6 +1790,29 @@ pub struct RuntimeBlock {
     /// (from `install.container.tag_from_version`) is used unchanged.
     #[serde(default)]
     pub gpu_image_variants: Option<GpuImageVariants>,
+
+    /// v0.2.106: the numeric user the image's process runs as (its
+    /// `USER`). When set, the start paths map the HOST user onto it, so the
+    /// container can write its bind-mounted `volumes` and every file it
+    /// writes there stays owned by the host user (who can back it up or
+    /// delete it without a root shell): podman gets
+    /// `--userns=keep-id:uid=<uid>,gid=<gid>` (rootless on Linux, and the
+    /// podman machine on macOS / Windows), docker on Linux runs the
+    /// container as the host user (`--user <host uid>:<host gid>`), and
+    /// Docker Desktop (macOS / Windows) needs nothing — its file sharing
+    /// already maps ownership. Without it a non-root image cannot write a
+    /// host directory under rootless podman (its uid maps to a subordinate
+    /// id that does not own the directory). See
+    /// `container_runtime::host_user_mapping_args`.
+    #[serde(default)]
+    pub image_user: Option<ImageUser>,
+}
+
+/// [`RuntimeBlock::image_user`]: the image's runtime uid / gid.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ImageUser {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// NEW-3.B (2026-05-28): Defaulting helpers for container-runtime fields.

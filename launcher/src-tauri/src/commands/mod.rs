@@ -243,6 +243,7 @@ pub mod project_hooks_settings;
 pub mod packs_cmd;
 pub mod project_state_cmd;
 pub mod project_state_populate;
+pub mod registry_module_retirement;
 pub mod restart;
 // v0.2.89 BUG 1 (Windows field audit): ONE home for the
 // (program, prefix-args) resolution used to spawn bundled

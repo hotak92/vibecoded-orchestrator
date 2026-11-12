@@ -97,6 +97,11 @@ RUN apt-get update \
 
 COPY --from=builder /install /usr/local
 
+# The image user. Must match `runtime.image_user` in vct-module.json: the
+# launcher maps the HOST user onto this uid/gid (podman `--userns=keep-id`),
+# so the server can write the host directories mounted at /data/state,
+# /data/logs and /data/global and the host user keeps owning what it writes
+# (tests/rl_reranker/test_module_persistence.py pins the parity).
 ARG APP_UID=1000
 ARG APP_GID=1000
 RUN groupadd --system --gid ${APP_GID} app \
@@ -113,7 +118,7 @@ WORKDIR /app
 # code the image does not need); `vco_lib.paths` is deliberately absent — see
 # `rl_client/rl_logger.py::default_rl_data_dir` (the server always passes an
 # explicit log path).
-RUN mkdir -p /app/rl_reranker /app/rl_client /app/vco_lib /app/weights /data/state /data/logs \
+RUN mkdir -p /app/rl_reranker /app/rl_client /app/vco_lib /app/weights /data/state /data/logs /data/global \
     && touch /app/rl_client/__init__.py /app/vco_lib/__init__.py
 COPY --chown=app:app claude_mcp_servers/rl_reranker/__init__.py                 /app/rl_reranker/__init__.py
 COPY --chown=app:app claude_mcp_servers/rl_reranker/rl_server.py                /app/rl_reranker/rl_server.py

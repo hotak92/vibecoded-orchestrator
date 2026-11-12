@@ -821,6 +821,18 @@
               "type": "null"
             }
           ]
+        },
+        "image_user": {
+          "description": "v0.2.106: the numeric user the image's process runs as (its `USER`). When set, the start paths map the HOST user onto it, so the container can write its bind-mounted `volumes` and every file it writes there stays owned by the host user (who can back it up or delete it without a root shell): podman gets `--userns=keep-id:uid=<uid>,gid=<gid>` (rootless on Linux, and the podman machine on macOS / Windows), docker on Linux runs the container as the host user (`--user <host uid>:<host gid>`), and Docker Desktop (macOS / Windows) needs nothing — its file sharing already maps ownership. Without it a non-root image cannot write a host directory under rootless podman (its uid maps to a subordinate id that does not own the directory). See `container_runtime::host_user_mapping_args`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ImageUser"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -925,6 +937,26 @@
         "rocm": {
           "description": "ROCm variant tag (e.g. `\"0.1.0-rocm\"`). Used for `GpuMode::Rocm`.",
           "type": "string"
+        }
+      }
+    },
+    "ImageUser": {
+      "description": "[`RuntimeBlock::image_user`]: the image's runtime uid / gid.",
+      "type": "object",
+      "required": [
+        "gid",
+        "uid"
+      ],
+      "properties": {
+        "uid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "gid": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
         }
       }
     },

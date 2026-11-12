@@ -457,6 +457,59 @@ pub fn gpu_passthrough_args(
     }
 }
 
+/// v0.2.106: the argv that maps the HOST user onto a manifest's
+/// `runtime.image_user` (the image's non-root `USER`), so the container can
+/// write its bind-mounted volumes and what it writes stays owned by the host
+/// user. Empty when the manifest declares no image user.
+///
+/// * podman (every OS: rootless on Linux, the podman machine on macOS /
+///   Windows): `--userns=keep-id:uid=<uid>,gid=<gid>` maps the invoking
+///   user to the image user (podman >= 4.3). Without it the image user maps
+///   to a subordinate id that cannot write a directory the host user owns.
+/// * docker on Linux: `--user <host uid>:<host gid>`, the process runs as
+///   the host user (the image's own files are world-readable, its writable
+///   paths are the mounts).
+/// * docker elsewhere (Docker Desktop): nothing, its file sharing maps
+///   ownership itself.
+pub fn host_user_mapping_args(
+    engine: &str,
+    image_user: Option<crate::manifest::ImageUser>,
+) -> Vec<String> {
+    host_user_mapping_args_for(engine, image_user, host_uid_gid(), cfg!(target_os = "linux"))
+}
+
+/// [`host_user_mapping_args`] with the host identity and OS injected (pure).
+pub fn host_user_mapping_args_for(
+    engine: &str,
+    image_user: Option<crate::manifest::ImageUser>,
+    host: Option<(u32, u32)>,
+    linux: bool,
+) -> Vec<String> {
+    let Some(user) = image_user else {
+        return Vec::new();
+    };
+    if engine == "docker" {
+        return match (linux, host) {
+            (true, Some((uid, gid))) => vec!["--user".into(), format!("{}:{}", uid, gid)],
+            _ => Vec::new(),
+        };
+    }
+    vec![format!("--userns=keep-id:uid={},gid={}", user.uid, user.gid)]
+}
+
+/// The invoking user's uid / gid (`None` off Unix).
+fn host_uid_gid() -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid/getgid take no arguments and cannot fail.
+        Some(unsafe { (libc::getuid(), libc::getgid()) })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 // ─── Pure helpers ──────────────────────────────────────────────────────
 
 /// Resolve `{project_slug}` (and any other launcher-wide tokens) into a
@@ -990,6 +1043,8 @@ pub fn build_podman_run_args_with_env(
         gpu_mode,
         runtime.gpu_image_variants.is_some(),
     ));
+    // v0.2.106: the host user owns what the container writes to its mounts.
+    args.extend(host_user_mapping_args(engine, runtime.image_user));
 
     // Ports: one `-p [bind:]host:container` per entry.
     for port in &runtime.ports {
@@ -1219,6 +1274,8 @@ pub fn build_podman_run_args_global_inheriting(
         gpu_mode,
         runtime.gpu_image_variants.is_some(),
     ));
+    // v0.2.106: the host user owns what the container writes to its mounts.
+    args.extend(host_user_mapping_args(engine, runtime.image_user));
 
     for port in &runtime.ports {
         args.push("-p".into());
@@ -2809,6 +2866,15 @@ pub async fn ensure_volume_host_dirs(
 /// resolved endpoint (L0 override → L1 manifest → env override) is
 /// empty or matches a known placeholder pattern. Mirrors the launcher's
 /// `installer_engine::RL_ARTIFACT_URL_DEFAULT_ENDPOINT`.
+///
+/// v0.2.106: the function it names (`rl-artifact-url`, the paid RL
+/// reranker's gateway) is retired and no longer ships from
+/// `launcher/supabase/functions/`. The RL reranker is a `container_build`
+/// module now and never pulls; this fallback is reached only by a
+/// `container_pull` manifest — an old paid RL install not yet updated to
+/// the bundled module (its pull then fails with the gateway's 404, and the
+/// start path continues from the cached image) or a future paid module
+/// that ships no endpoint of its own.
 pub const RL_ARTIFACT_URL_DEFAULT_ENDPOINT: &str =
     "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
 
@@ -3502,6 +3568,7 @@ mod tests {
                 min_gpu_vram_gb: None,
                 gpu_optional: true,
                 gpu_image_variants: None,
+                image_user: None,
                 log_path_template: None,
                 container_name_template: Some("vct-rl-reranker-{project_slug}".into()),
                 image_ref: Some("{install.container.image}:{install.container.tag}".into()),
@@ -5569,6 +5636,7 @@ mod tests {
                 image_ref: None,
                 auto_restart: false,
                 gpu_image_variants: None,
+                image_user: None,
                 log_file: None,
                 log_path_template: None,
                 min_gpu_vram_gb: None,
@@ -6892,6 +6960,66 @@ mod tests {
         }
         let at = args.iter().position(|a| a == "--label").expect("--label present");
         assert_eq!(args[at..at + 2].to_vec(), want);
+    }
+
+    /// v0.2.106 (B2): the SHIPPED bundled RL manifest runs with its host
+    /// mounts (state, logs, global model) and the host-user mapping, so a
+    /// recreate (every module update, every hub restart of the container)
+    /// finds the per-project models it saved. Before the fix the manifest
+    /// mounted nothing and the models lived in the container's writable
+    /// layer.
+    #[test]
+    fn the_shipped_rl_manifest_runs_with_its_mounts() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../claude_mcp_servers/rl_reranker/vct-module.json");
+        let raw = std::fs::read_to_string(&path).expect("shipped RL manifest");
+        let manifest = crate::manifest::ModuleManifest::from_json(&raw).expect("parses");
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let data = ctx.vct_data.display().to_string();
+        let want_mounts: Vec<String> = ["state", "logs", "global"]
+            .iter()
+            .map(|d| format!("{}/vct-rl-reranker/_bundled/{}:/data/{}:Z", data, d, d))
+            .collect();
+        let mounts = |args: &[String]| -> Vec<String> {
+            args.windows(2).filter(|w| w[0] == "-v").map(|w| w[1].clone()).collect()
+        };
+
+        let podman = build_podman_run_args_global(
+            &manifest, &ctx, 11450, "vct-rl-reranker", "localhost/vco-rl-reranker:0.3.1-cpu",
+            "podman", None, &[],
+        )
+        .unwrap();
+        assert_eq!(mounts(&podman), want_mounts);
+        assert!(podman.iter().any(|a| a == "--userns=keep-id:uid=1000,gid=1000"), "{podman:?}");
+
+        // The per-project builder (same manifest fields) carries them too.
+        let project = make_project();
+        let per = build_podman_run_args(&manifest, &ctx, &project, 11533, "c", "img:1", "podman", None)
+            .unwrap();
+        assert_eq!(mounts(&per), want_mounts);
+        assert!(per.iter().any(|a| a.starts_with("--userns=keep-id:")));
+    }
+
+    /// The host-user mapping per engine / OS, and nothing without an
+    /// `image_user` (every other module's argv is unchanged).
+    #[test]
+    fn host_user_mapping_follows_the_engine() {
+        let u = Some(crate::manifest::ImageUser { uid: 1000, gid: 1001 });
+        assert_eq!(
+            host_user_mapping_args_for("podman", u, Some((501, 20)), false),
+            vec!["--userns=keep-id:uid=1000,gid=1001".to_string()]
+        );
+        assert_eq!(
+            host_user_mapping_args_for("podman", u, Some((1000, 1000)), true),
+            vec!["--userns=keep-id:uid=1000,gid=1001".to_string()]
+        );
+        assert_eq!(
+            host_user_mapping_args_for("docker", u, Some((1234, 5678)), true),
+            vec!["--user".to_string(), "1234:5678".to_string()]
+        );
+        assert!(host_user_mapping_args_for("docker", u, Some((501, 20)), false).is_empty());
+        assert!(host_user_mapping_args_for("podman", None, Some((1000, 1000)), true).is_empty());
+        assert!(host_user_mapping_args_for("docker", None, Some((1000, 1000)), true).is_empty());
     }
 }
 

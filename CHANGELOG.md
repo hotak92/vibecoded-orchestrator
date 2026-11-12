@@ -308,7 +308,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The paid distribution path is retired for the RL reranker.** It no longer uses the GHCR image, the paid-catalog
   entry or the paid-module weights bucket. The launcher no longer downloads its weights after install, and the
   daily weights poll stands down for it. The manual RL image smoke workflow now builds the image from the checkout
-  instead of pulling a private image.
+  instead of pulling a private image. The three edge functions of the paid backend (`rl-artifact-url`,
+  `rl-latest-version`, `rl-latest-weights`) and their `launcher/supabase/config.toml` stanzas are removed, so the
+  tag-time deploy, which deploys every directory under `launcher/supabase/functions/`, can no longer re-create them
+  after they are deleted server-side. The shared helpers they used (`_shared/config.ts`,
+  `_shared/tier_revalidation.ts`) stay for a future paid module, as `module_default_weights.rs` does.
 - **The RL reranker uses the orchestrator's own logger and training-target code.** It used to carry its own copies
   of `rl_client/rl_logger.py` and `vco_lib/rl_training_targets.py`, and the copy of the logger had fallen a full
   schema version behind without the drift check noticing (that check skipped whenever the module was absent). It now
@@ -374,6 +378,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The RL reranker keeps what it learns when its container is recreated.** Its manifest mounted nothing, so each
+  project's online model and learner state (`/data/state/projects/<project_id>/`), the event logs and the global
+  model lived in the container's writable layer and were lost on every module update and every recreate. The
+  manifest (now module version 0.3.1, so an installed copy is offered the update) mounts three host directories,
+  `<vct root>/data/vct-rl-reranker/_bundled/state`, `logs` and `global` (no project slug can be `_bundled`, and
+  uninstalling with "purge data" still removes them), created by the start path. A new manifest field,
+  `runtime.image_user`, names the image's non-root user; the start paths map the host user onto it (podman
+  `--userns=keep-id:uid=…,gid=…` on Linux, macOS and Windows; `--user <host uid>:<host gid>` for docker on Linux;
+  nothing under Docker Desktop), so the container can write those directories and the host user owns what it
+  writes. The paid module's per-project directories (`<vct root>/data/vct-rl-reranker/<slug>/state`) are not
+  mounted, moved or deleted.
+- **Moving from the paid RL module to the bundled one cleans up after itself.** Once the bundled container is
+  running, the install removes the old registry image (every local tag of the previous manifest's image, with a plain
+  `rmi`, so an image a container still uses stays) and the launcher-placed default weights: symlinks and marked
+  copies, by `vco_lib/rl_weights_ownership.toml`. The user's own files stay. When an old data directory still holds
+  files, the install names it in an info notice, since the bundled module does not read it.
+- **The RL panel no longer shows a model as served by a container that does not hold it.** The panel reads the
+  module-DB `rl_online_state` row, which was written only after a training round, so after a recreate it could
+  still say "served". The server now rewrites the row whenever it loads a project's model.
+- **The first global retrain starts from the project's model.** With no global model yet it was meant to seed from
+  the requesting project's checkpoint, but it looked for `rl_model_<profile>.pt`, a name nothing writes, so it
+  started from a fresh model. It now seeds from that project's newest checkpoint (else the base model's), using the
+  name pattern the writers use, and never from an un-rotated `_finetuned` file.
+- **A busy project's online learning no longer trains on queries whose purge gap has not passed.** Past
+  `max_staged_queries` waiting queries, the oldest were released for training early, against the rule that a query
+  waits a full purge gap after leaving the held-out window. They are now dropped untrained (counted in
+  `dropped_untrained`).
 - **The code-graph analyzer now uses the configured Weaviate gRPC port.** It always passed port 50052, which
   overrode `GRPC_PORT`, so an install whose Weaviate listens for gRPC on another port had the analyzer's reads go to
   the wrong place. It now leaves the port to the shared Weaviate connection helper, which reads `GRPC_PORT`.

@@ -65,6 +65,14 @@ export interface ModuleInstallProgress {
   failed: boolean;
 }
 
+/** v0.2.106: the `notices` of a `module://install-complete` payload
+ *  (non-empty strings only; anything malformed is no notice). */
+export function installNotices(payload: unknown): string[] {
+  const n = (payload as { notices?: unknown } | null | undefined)?.notices;
+  if (!Array.isArray(n)) return [];
+  return n.filter((x): x is string => typeof x === 'string' && x.length > 0);
+}
+
 /**
  * v0.2.67: pure reducer for an incoming `module://install-progress`
  * event → the next `installProgress` map. Extracted so the merge is
@@ -196,6 +204,9 @@ function createModulesStore() {
       // v0.2.67: clear the per-module progress entry too, so a stale
       // percent doesn't linger on the tile after completion.
       const completedId = e.payload?.module_id;
+      // v0.2.106: what the install wants the user to know (where an earlier
+      // registry install's data is kept, ...): informational, non-blocking.
+      for (const line of installNotices(e.payload)) toast.info(line);
       update((s) => {
         const installProgress = { ...s.installProgress };
         if (completedId) delete installProgress[completedId];

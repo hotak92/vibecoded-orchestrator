@@ -3,6 +3,24 @@
 //! v0.2.32 #D: download the default RL weights bundle from Supabase
 //! and stage it under `<vct_root>/modules/<module_id>/weights/`.
 //!
+//! ## Status (v0.2.106): no live endpoint, kept for future paid modules
+//!
+//! The paid RL reranker's backend is RETIRED: its edge functions
+//! (`rl-latest-weights`, `rl-latest-version`, `rl-artifact-url`) are no
+//! longer in `launcher/supabase/functions/`, so the tag-time deploy cannot
+//! re-create them, and the endpoints named below answer 404 once the owner
+//! deletes the deployed copies. Nothing reachable for the RL reranker calls
+//! this flow: the module is bundled (`container_build`, weights built into
+//! its image), its manifest carries no `module_download_default_weights`
+//! action, the post-install auto-download skips `container_build` modules
+//! (`modules::install_module_for_project`), and the daily weights poll
+//! stands down for bundled modules (`module_service::spawn_daily_weights_poll`).
+//! The code below is kept (owner ruling) as the download machinery a future
+//! paid module would reuse with its OWN endpoints; the RL-named constants
+//! are historical defaults, and the ownership table reader
+//! (`vco_lib/rl_weights_ownership.toml`) stays live — the bundled server and
+//! `registry_module_retirement` read it.
+//!
 //! ## Why this exists (separate from `module_service::download_weights`)
 //!
 //! `module_service::apply_weights_update` is the full
@@ -66,7 +84,9 @@ use crate::commands::module_db::get_or_issue_module_token;
 use crate::db::Db;
 
 /// Default Supabase edge endpoint. Operators override via
-/// `VCT_RL_LATEST_WEIGHTS_URL` for staging / dev.
+/// `VCT_RL_LATEST_WEIGHTS_URL` for staging / dev. v0.2.106: the function is
+/// retired with the paid RL backend (see the module doc) — a call answers
+/// 404, which this flow already reports as "not deployed".
 ///
 /// Distinct from `module_service::DEFAULT_RL_LATEST_VERSION_ENDPOINT`
 /// — that one (`/rl-latest-version`) is the daily-poller endpoint that
@@ -364,6 +384,11 @@ pub fn classify_weights_owner(is_symlink: bool, has_marker: bool) -> WeightsOwne
     } else {
         o.file_without_marker
     }
+}
+
+/// The managed-marker suffix (`.vct-managed`) from the ownership table.
+pub fn managed_marker_suffix() -> &'static str {
+    &OWNERSHIP.managed_marker_suffix
 }
 
 /// v0.2.42 RT-5: sibling marker file that signals "this weights file was

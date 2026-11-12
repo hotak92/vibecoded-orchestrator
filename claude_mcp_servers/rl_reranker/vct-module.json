@@ -2,7 +2,7 @@
     "manifest_version": 1,
     "id": "vct-rl-reranker",
     "name": "RL Reranker",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "description": "Reinforcement-learning reranker for Knowledge Graph retrieval, part of the orchestrator (AGPL-3.0, no licence needed). Per-text-embedding-source neural networks (qwen3 / arctic / openai) personalize on your local citation patterns. The container image is built locally from claude_mcp_servers/rl_reranker and carries the trained weights bundled in the repository (none shipped yet for a profile = the model reports 'not trained'). Supports hot-swap, reset, finetune, and global-retrain endpoints so the launcher can drive model lifecycle without restarting the container. Installed once per machine (install.scope=global) and routes requests to per-project model heads via the X-VCT-Project-ID header. RL scoring is opt-in per project (off by default): once turned on, a project's model learns online from that project's own citations and reranks its searches only while it beats plain cosine ordering on the project's own recent held-out queries (judged on 90% confidence bounds: NDCG@10 at least +2% and the cited node's MRR@10 not below cosine's); otherwise searches keep their own order.",
     "publisher": "VibeCoded Tools",
     "repository": "https://github.com/hotak92/vibecoded-orchestrator",
@@ -72,7 +72,28 @@
             "cuda": "{version}-cuda",
             "rocm": "{version}-rocm"
         },
-        "log_path_template": "/data/logs/rl_events_{project_id}.jsonl"
+        "log_path_template": "/data/logs/rl_events_{project_id}.jsonl",
+        "volumes": [
+            {
+                "host": "{VCT_DATA}/{MODULE_ID}/_bundled/state",
+                "container": "/data/state",
+                "mode": "Z"
+            },
+            {
+                "host": "{VCT_DATA}/{MODULE_ID}/_bundled/logs",
+                "container": "/data/logs",
+                "mode": "Z"
+            },
+            {
+                "host": "{VCT_DATA}/{MODULE_ID}/_bundled/global",
+                "container": "/data/global",
+                "mode": "Z"
+            }
+        ],
+        "image_user": {
+            "uid": 1000,
+            "gid": 1000
+        }
     },
     "db": {
         "migrations_dir": "db/",
