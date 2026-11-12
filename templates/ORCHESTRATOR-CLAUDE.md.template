@@ -371,7 +371,7 @@ A per-project MCP toggle (launcher's project Permissions tab) is written to `~/.
 The code-embedding FastAPI service is backend infrastructure, not an MCP.
 
 {{#if_module_active rl_retrieval}}
-**RL retrieval reranking is active for this project** (the RL scoring lock is lifted and the reranker is enabled for this project in the launcher's Modules panel). Retrieval results are reranked by the trained model before they reach you, and its training logs are collected even when you do not use the feature. If retrieval ever falls back to plain cosine ordering, the reranker container is down or out of step with this client — run `python claude_mcp_servers/scripts/rl_doctor.py` and say so rather than working around it.
+**RL retrieval reranking is active for this project** (turned on for this project in the launcher's Modules panel; it is opt-in and off by default). The reranker learns from this project's own citations — which retrieved nodes your answers actually use — and reorders search results with this project's model only while that model beats plain search on its own check (the project's most recent queries, held out of training): NDCG@10 at least 2% above plain cosine ordering and the cited node ranked no lower than plain cosine ranks it. Until then, and whenever it stops passing, results keep their plain search order. Training logs are collected whether or not the feature is on. `python claude_mcp_servers/scripts/rl_doctor.py` shows whether this project's model is being served and why; if the reranker container is down or out of step with this client, say so rather than working around it.
 {{/if_module_active}}
 
 ### Hook System

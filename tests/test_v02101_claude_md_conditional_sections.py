@@ -264,11 +264,14 @@ class TestConservativeProbeFailures:
 
     def test_rl_probe_is_off_while_the_shipped_lock_is_set(self, tmp_path, monkeypatch):
         """The pipeline's FIRST gate: a set scoring lock is a definitive no,
-        and the per-project probe is not even reached."""
+        and the per-project probe is not even reached. (v0.2.106 ships the
+        table unlocked, so the lock is set explicitly here.)"""
         folder = tmp_path / "proj"
         folder.mkdir()
         licence_calls = self._licence_spy(monkeypatch)
-        from vco_lib import project_config
+        from vco_lib import project_config, rl_scoring_lock
+
+        monkeypatch.setattr(rl_scoring_lock, "rl_scoring_lock_reason", lambda: "locked")
 
         def _must_not_resolve(*_a, **_k):
             raise AssertionError("per-project probe reached while locked")
@@ -277,14 +280,14 @@ class TestConservativeProbeFailures:
         assert cms.RL_RETRIEVAL not in cms.active_sections(folder, needed={cms.RL_RETRIEVAL})
         assert licence_calls == []
 
-    @pytest.mark.parametrize("toggle, expected", [(True, True), (False, False), (None, True)])
+    @pytest.mark.parametrize("toggle, expected", [(True, True), (False, False), (None, False)])
     def test_rl_probe_follows_the_per_project_toggle_once_unlocked(
         self, tmp_path, monkeypatch, toggle, expected,
     ):
         """Below the lock, the hub's ``rl_reranker_enabled_for_project``
         decides, exactly as ``search_pipeline._resolve_rl_enabled`` does
-        (an absent attribute defaults on). Red before v0.2.106: an
-        unlicensed machine never rendered the section."""
+        (v0.2.106, opt-in: an absent attribute is OFF). Red before v0.2.106:
+        an unlicensed machine never rendered the section."""
         folder = tmp_path / "proj"
         folder.mkdir()
         licence_calls = self._licence_spy(monkeypatch)

@@ -1945,25 +1945,40 @@ mod rl_scoring_default_tests {
         assert!(!rl_scoring_global_default(&db));
     }
 
-    /// v0.2.100 W5R-02: while the RL scoring lock is set the setting arm
-    /// refuses "on" for EVERY tier (Pro included) and writes nothing; "off"
-    /// is accepted and written.
+    /// v0.2.100 W5R-02: while an RL scoring lock is set the switch refuses
+    /// "on" and writes nothing; "off" is accepted and written.
     #[test]
-    fn the_setting_arm_refuses_on_while_locked_for_every_tier() {
+    fn the_switch_refuses_on_while_locked() {
+        let (db, pid) = db_with_project();
+        let err = apply_rl_scoring_switch(&db, true, Some("locked")).unwrap_err();
+        assert!(err.contains("locked"), "{err}");
+        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), None);
+        apply_rl_scoring_switch(&db, false, Some("locked")).expect("off is always allowed");
+        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(false));
+        assert!(!db.rl_scoring_enabled_with_lock(&pid, None).unwrap());
+    }
+
+    /// v0.2.106 (owner 2026-11-12, opt-in): the shipped lock is lifted, so
+    /// the setting arm accepts "on" for every tier and the project inherits
+    /// it; "off" turns it back off. Nothing turns it on without this write.
+    #[test]
+    fn the_setting_arm_turns_on_and_off_with_the_lock_lifted() {
         let (_tmp, _g) = super::tests::setup_temp_env_for_sibling();
         let (db, pid) = db_with_project();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_some(), "ships locked");
+        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_none(), "ships unlocked");
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "off until the user turns it on");
 
         for tier in ["free", "pro", "mao"] {
-            let err = rt
+            let cfg = rt
                 .block_on(update_orchestrator_setting_inner(
                     "rl_retrieval_enabled".into(), "true".into(), tier, &db,
                 ))
-                .unwrap_err();
-            assert!(err.contains("locked"), "{tier}: {err}");
-            assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), None, "{tier}");
+                .unwrap();
+            assert!(cfg.rl_retrieval_enabled, "{tier}");
+            assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(true), "{tier}");
         }
+        assert!(db.rl_scoring_enabled_for_project(&pid).unwrap());
 
         let cfg = rt
             .block_on(update_orchestrator_setting_inner(

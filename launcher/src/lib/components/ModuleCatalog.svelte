@@ -90,6 +90,8 @@
     type ModuleTriChoice,
   } from '$lib/module-enable';
   import { listen as tauriListen } from '$lib/tauri';
+  // v0.2.106: what turning the RL reranker on does (opt-in, owner 2026-11-12).
+  import { rlOptInExplainer } from '$lib/rl-scoring-default';
   // v0.2.97 (lane V): the hub polls each module's `runtime.health_check`;
   // the tile shows the result as a pill (unknown is never shown as down).
   import {
@@ -877,6 +879,9 @@
         >
       {/if}
     </p>
+    {#if rlOptInExplainer(m.id)}
+      <p class="mc-enable-line" data-testid="mc-enable-opt-in">{rlOptInExplainer(m.id)}</p>
+    {/if}
   </div>
 {/snippet}
 

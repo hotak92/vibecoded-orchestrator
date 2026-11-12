@@ -44,9 +44,34 @@
 #
 # To unlock once a trained model ships: set `locked = false` (keep `reason`
 # for the record) and update the tests that pin the shipped value.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# UNLOCKED in v0.2.106 — OWNER RULINGS (2026-11-12):
+#   * the product is PER-PROJECT ONLINE adaptation (no global weights ship);
+#   * it ships OPT-IN: "for now opt-in, then we'll try to find how to make the
+#     model generalize";
+#   * the bar for a project's model to be SERVED: NDCG@10 >= +2% over plain
+#     cosine AND MRR@10 of the literally cited node >= cosine's, measured on
+#     that project's own recent held-out queries.
+#
+# What `locked = false` means now — and what it does NOT:
+#   * RL scoring is still OFF by default. The per-project toggle and the
+#     host-wide default both default to off (`Db::module_effective_enabled`'s
+#     system default for vct-rl-reranker; the Python fallback of a toggle it
+#     cannot read is off too). The user turns it on per project in the
+#     launcher's Modules panel. Toggle off = no call to the container: no
+#     rerank, no /rl_update, search order unchanged.
+#   * Toggle on = the project's citations train its own model online
+#     (`claude_mcp_servers/rl_reranker/online_learning.py`), and the
+#     container reranks that project's searches only while the model passes
+#     the bar above on the project's held-out queries; otherwise it hands
+#     the search order back.
+#   * `reason` below is the pre-v0.2.106 text, kept for the record (it is
+#     only shown while `locked = true`).
+# ═══════════════════════════════════════════════════════════════════════════
 
 format_version = 1
 
-locked = true
+locked = false
 
 reason = "RL scoring stays inactive until the model is trained. Data collection continues regardless."

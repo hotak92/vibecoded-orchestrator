@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from '$lib/tauri';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
-  import { rlScoringSwitchView } from '$lib/rl-scoring-default';
+  import { RL_OPT_IN_EXPLAINER, rlScoringSwitchView } from '$lib/rl-scoring-default';
   import RlScoringSwitch from '$lib/components/RlScoringSwitch.svelte';
 
   let { onClose }: { onClose: () => void } = $props();
@@ -287,6 +287,7 @@
               <div class="feature-info">
                 <h3>RL-Scored Retrieval</h3>
                 <p>Default for every project's RL reranker toggle — projects with no setting of their own follow it</p>
+                <p class="rl-opt-in" data-testid="rl-opt-in-explainer">{RL_OPT_IN_EXPLAINER}</p>
                 {#if rlSwitch?.notice}
                   <p class="rl-locked-notice" data-testid="rl-scoring-locked-notice">{rlSwitch.notice}</p>
                 {/if}
@@ -505,6 +506,7 @@
   .feature-info h3 { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
   .feature-info p { font-size: 12px; color: var(--color-muted); }
   .rl-locked-notice { margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--color-purple, #7b5fff); }
+  .rl-opt-in { margin-top: 4px; font-size: 0.85em; opacity: 0.85; }
   .upgrade-hint {
     font-size: 11px;
     color: var(--color-purple);

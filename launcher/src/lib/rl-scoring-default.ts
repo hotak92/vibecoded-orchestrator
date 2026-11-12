@@ -24,6 +24,33 @@
 
 export const RL_RERANKER_MODULE_ID = 'vct-rl-reranker';
 
+// v0.2.106 (owner rulings 2026-11-12): the lock is lifted and RL scoring is
+// OPT-IN per project — per-project online learning, served only while the
+// project's model beats plain search on its own held-out queries. This is the
+// ONE home of the sentence that tells the user what turning it on does; every
+// RL control (the per-project Modules control, the host-wide default switch,
+// the "enough training events" toast) renders it from here.
+export const RL_OPT_IN_EXPLAINER =
+  "Off by default. When on, the reranker learns from this project's own citations " +
+  '(the search results your answers actually use) and reorders its searches only once ' +
+  "this project's model beats plain search on its own check — its most recent queries, " +
+  'held out of training. Until then, and whenever it stops passing, results keep their ' +
+  'plain search order. You can turn it off any time.';
+
+/** The opt-in explainer for `moduleId`'s enable control, or null for other modules. */
+export function rlOptInExplainer(moduleId: string): string | null {
+  return moduleId === RL_RERANKER_MODULE_ID ? RL_OPT_IN_EXPLAINER : null;
+}
+
+/** The toast shown once enough training events exist to make turning it on worthwhile. */
+export function rlAutoEnableToast(eventCount: number, threshold: number): string {
+  return (
+    `RL Reranker: ${eventCount}/${threshold} training events collected. It is off ` +
+    "until you turn it on for a project (Modules → RL Reranker); it then learns from that " +
+    "project's own citations and reranks only once it beats plain search."
+  );
+}
+
 export interface RlScoringSwitchView {
   /** Whether RL scoring is ON by default — never true while locked. */
   checked: boolean;

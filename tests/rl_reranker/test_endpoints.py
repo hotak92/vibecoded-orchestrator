@@ -758,7 +758,10 @@ class TestCacheNodesSessionId:
             resp = await client.post("/cache_nodes", json=self._payload(srv, **extra))
             assert resp.status == 200
             data = await resp.json()
-            assert data["scored"] is True and sorted(data["order"]) == [0, 1, 2]
+            # v0.2.106: a request without a project id is answered with its
+            # own search order (models are per project) — still a 200.
+            assert data["ok"] is True and sorted(data["order"]) == [0, 1, 2]
+            assert data["serving"] == "search_order" and data["scored"] is False
 
         _run_async(_with_client(srv, _body))
         assert calls == []

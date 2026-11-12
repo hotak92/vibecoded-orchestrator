@@ -277,17 +277,42 @@ def test_train_and_serve_build_the_same_model_inputs(tmp_path, profile):
 @pytest.fixture(scope="module")
 def trained_model(tmp_path_factory) -> RLModel:
     """A D=16 network trained on synthetic data: high score when the node is
-    close to the query, low for an unrelated node."""
+    close to the query, low for an unrelated node. Trained through the
+    server's own online path (``ProjectLearner`` rounds with the offline
+    objective) — v0.2.106 has no other way to train a serving model."""
+    from rl_reranker.online_learning import OnlineConfig, ProjectLearner
+
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
     m = RLModel(emb_dim=D, state_path=tmp_path_factory.mktemp("trained") / "rl.pt",
                 device="cpu", embedding_source="qwen3")
-    for _ in range(300):
+    cfg = OnlineConfig(holdout_queries=1, min_cited_queries=0, purge_gap_ms=0, round_every=16,
+                       batch_queries=4,
+                       max_steps_per_round=8, lr=1e-3)
+    learner = ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
+    for i in range(600):
         q = rng.normal(size=D).astype(np.float32)
-        m.update(q, (q + 0.3 * rng.normal(size=D)).astype(np.float32), [], 0, target=0.95)
-        m.update(q, rng.normal(size=D).astype(np.float32), [], 0, target=0.05)
+        learner.ingest({
+            "nodes_packed": [
+                {"title": "rel", "node_type": "concept",
+                 "n_emb": (q + 0.3 * rng.normal(size=D)).astype(np.float32)},
+                {"title": "unrel", "node_type": "concept",
+                 "n_emb": rng.normal(size=D).astype(np.float32)},
+            ],
+            "query_emb": q, "cosine_sims": {"rel": 0.95, "unrel": 0.05}, "literal_cited": {},
+        }, ts_ms=i)
+        if learner.round_due():
+            learner.run_round_now(m, now_ms=i)
+    assert m.local_train_steps > 100  # ~150 steps of 4 queries
     m._weights_version = "9.9.9"  # a released, trained checkpoint
     return m
+
+
+#: The project the rerank-path tests route to (its gate is opened for them:
+#: they test the scoring path once a project's model is served; the gate
+#: itself is tested in test_online_learning.py).
+PID = "p-serve"
+HDR = {"X-VCT-Project-ID": PID}
 
 
 def _known_pair() -> tuple[list[float], list[dict]]:
@@ -312,11 +337,23 @@ def _make_server(tmp_path, monkeypatch, model: "RLModel | None", source: str = "
     root.mkdir()
     srv = RLServer(project_root=root,
                    log_path=str(tmp_path / "logs" / "rl_events.jsonl"), port=0)
+    srv._hub_client = None  # never contact a live hub from a test
     if model is not None:
         srv._rl._rl_model = model
         for key, head in srv._project_heads.items():
             head.rl_model = model
+    # The routed project's head, its gate open (served), with `model` in it.
+    head = asyncio.run(srv._get_or_load_project_head(PID))
+    if model is not None:
+        head.rl_model = model
+    assert head.learner is not None
+    head.learner.serving = True
+    head.learner.reason = "gate opened by the test"
     return srv
+
+
+def _project_model(srv) -> RLModel:
+    return srv._project_heads[(PID, srv._active_emb_source)].rl_model
 
 
 async def _serve(srv, body):
@@ -328,9 +365,10 @@ async def _serve(srv, body):
         await ts.close()
 
 
-async def _post(base: str, payload: dict) -> tuple[int, dict]:
+async def _post(base: str, payload: dict, headers: "dict | None" = None) -> tuple[int, dict]:
     async with httpx.AsyncClient() as c:
-        r = await c.post(f"{base}/cache_nodes", json=payload)
+        r = await c.post(f"{base}/cache_nodes", json=payload,
+                         headers=HDR if headers is None else headers)
         return r.status_code, r.json()
 
 
@@ -348,9 +386,33 @@ def test_server_swaps_the_known_pair(tmp_path, monkeypatch, trained_model):
     status, data = _run(_serve(srv, lambda base: _post(base, payload)))
     assert status == 200, data
     assert data.get("order") == [1, 0], data
+    assert data["serving"] == "model"
     assert [n["title"] for n in data["top_k"]] == ["related", "unrelated"]
     s_unrel, s_rel = data["scores"]
     assert s_rel > s_unrel
+
+
+def test_a_project_whose_gate_is_closed_gets_its_search_order(tmp_path, monkeypatch,
+                                                              trained_model):
+    """v0.2.106: the same trained model, the gate closed -> the client's own
+    order comes back unchanged (scored false), with the gate's reason; a
+    request without a project id likewise."""
+    q, nodes = _known_pair()
+    srv = _make_server(tmp_path, monkeypatch, trained_model)
+    head = srv._project_heads[(PID, "qwen3")]
+    head.learner.serving = False
+    head.learner.reason = "collecting held-out queries (3/300)"
+    payload = {"task_id": "t1", "nodes": [{"title": n["title"]} for n in nodes], "limit": 2,
+               "features": wire.encode_rerank_features(q, nodes, dim=D)}
+    async def both(base):
+        return [await _post(base, payload, headers=h) for h in (HDR, {})]
+
+    answers = _run(_serve(srv, both))
+    for (status, data), why in zip(answers, ("collecting held-out queries", "no project id")):
+        assert status == 200, data
+        assert data["scored"] is False and data["serving"] == "search_order"
+        assert data["order"] == [0, 1] and why in data["reason"]
+        assert [n["title"] for n in data["top_k"]] == ["unrelated", "related"]
 
 
 def test_server_health_advertises_the_scoring_contract(tmp_path, monkeypatch, trained_model):
@@ -364,6 +426,8 @@ def test_server_health_advertises_the_scoring_contract(tmp_path, monkeypatch, tr
     assert h["protocol_version"] == wire.RERANK_PROTOCOL_VERSION
     assert h["embedding_dim"] == D and h["embedding_space"] == "qwen3"
     assert h["trained"] is True and h["linked_slots_masked"] is False
+    assert h["per_project_gate"] is True
+    assert h["online_learning"]["bar"]["min_ndcg_gain"] == pytest.approx(0.02)
 
 
 @pytest.mark.parametrize("payload_patch, code", [
@@ -395,7 +459,7 @@ def test_arctic_server_masks_linked_slots_it_is_sent(tmp_path, monkeypatch, trai
         seen.extend(candidates)
         return [0.5] * len(candidates)
 
-    srv._rl._rl_model.score_batch = spy  # type: ignore[method-assign]
+    _project_model(srv).score_batch = spy  # type: ignore[method-assign]
     rng = np.random.default_rng(9)
     nodes = [{"title": "a", "emb": _unit(rng), "linked_embs": [_unit(rng)],
               "linked_type_names": ["tool"]}]
@@ -418,7 +482,7 @@ def test_rerank_requires_a_model(tmp_path):
 
 
 def _http_client(base: str) -> RLClient:
-    return RLClient(base_url=base, text_dim=D, active_embedding="qwen3")
+    return RLClient(base_url=base, text_dim=D, active_embedding="qwen3", project_id=PID)
 
 
 def test_client_reranks_through_the_real_server(tmp_path, monkeypatch, trained_model):

@@ -21,16 +21,19 @@ owns:
   1. RL scoring lock (``vco_lib/rl_scoring_lock.toml``) — while locked,
      the rerank-RPC is skipped but telemetry is still emitted.
   2. Per-project enable toggle (hub-resolved
-     ``rl_reranker_enabled_for_project``) — owners can opt one project
-     out. (There is no licence gate: the reranker ships with the
-     orchestrator since v0.2.106.)
+     ``rl_reranker_enabled_for_project``) — OPT-IN since v0.2.106 (owner
+     2026-11-12): off unless the user turned it on for the project, and
+     off when it cannot be read. (There is no licence gate: the reranker
+     ships with the orchestrator since v0.2.106.)
   3. RL rerank RPC via the cached ``RLClient`` (one client per
      (active_embedding, project_id) — keyed so the
      ``X-VCT-Project-ID`` header routes to the right per-project model
      head in vct-rl-reranker v0.2.10+). The container is called only when
-     its negotiated verdict is ``compatible`` (trained weights, feature
-     protocol, matching space); it scores from ``query_emb`` + the vectors
-     the candidates carry (``rerank_wire``).
+     its negotiated verdict is ``compatible`` (feature protocol, matching
+     space, and trained weights or the per-project gate); it scores from
+     ``query_emb`` + the vectors the candidates carry (``rerank_wire``) —
+     or hands the search order back while the project's own model has not
+     passed its held-out check.
   4. Citation-cache population (``_rl_node_content_cache`` in
      server.py) so the answer monitor can compute citations later
      without re-fetching from Weaviate.
@@ -525,8 +528,9 @@ def _should_capture_citations(rl_enabled: bool) -> bool:
     answer-embed) only when NONE of the three consumers exists.
 
     FALL OPEN: any probe import/read failure returns True (capture) so a
-    transient error never silently drops a paying user's training corpus —
-    mirrors ``_resolve_rl_enabled``'s soft-fail-to-enabled style.
+    transient error never silently drops the training corpus (logs are
+    always collected). The capture is local; whether anything is SENT to the
+    container is ``_resolve_rl_enabled``'s call, which falls closed.
     """
     try:
         from .telemetry_writer import (
@@ -582,27 +586,30 @@ def _resolve_rl_enabled() -> bool:
     capture) never consults it.
 
     Below the lock, ONE gate — the per-project enable toggle,
-    ``ProjectConfig.rl_reranker_enabled_for_project``. Owners can opt one
-    project out via the launcher GUI's per-project Modules panel. The
-    hub-down branch falls open (True): never silently disable the reranker
-    because the hub crashed mid-session (not reached while the scoring lock
-    is set).
+    ``ProjectConfig.rl_reranker_enabled_for_project``, which the user turns
+    on per project in the launcher's Modules panel.
 
-    v0.2.106 (owner ruling 2026-11-11, "the RL reranker is no more paid"):
-    the licence gate that sat between the two (``feature_enabled(
-    "rl_retrieval")``) is gone — every install may use the reranker. The
-    lock and the toggle are unchanged.
+    v0.2.106 (owner ruling 2026-11-12): RL scoring is OPT-IN per project
+    ("for now opt-in"): the toggle defaults off (no per-project row and no
+    host-wide row resolve to off, ``Db::module_effective_enabled``), and a
+    toggle this process cannot read — hub down, no project config, a probe
+    error — is OFF too: an opt-in feature runs only when the user's choice is
+    positively confirmed. (Before v0.2.106 that branch fell open.) Off means
+    no call to the container at all: no rerank, no ``/rl_update``. The licence
+    gate that sat between lock and toggle is gone (owner 2026-11-11, "the RL
+    reranker is no more paid").
     """
     if _rl_scoring_lock_reason() is not None:
         return False
-    # Per-project toggle. Soft-fail to enabled.
     try:
         cfg = _kg_server()._try_resolve_project_config()
-        if cfg is not None and not getattr(cfg, "rl_reranker_enabled_for_project", True):
-            return False
-    except Exception as exc:
-        logger.debug("_resolve_rl_enabled: per-project toggle probe raised (%s)", exc)
-    return True
+    except Exception as exc:  # noqa: BLE001 — cannot confirm the opt-in: off
+        logger.debug("_resolve_rl_enabled: per-project toggle probe raised (%s); off", exc)
+        return False
+    if cfg is None:
+        logger.debug("_resolve_rl_enabled: no project config (hub down?); RL scoring off")
+        return False
+    return getattr(cfg, "rl_reranker_enabled_for_project", False) is True
 
 
 # The ONE negotiation verdict that reranks (v0.2.106): the container speaks
@@ -758,6 +765,15 @@ async def _do_rerank(
     if not getattr(client, "last_call_ok", True):
         _record_rl_fallback(
             getattr(client, "last_error", None) or "unknown", session_id=resolved_session,
+        )
+        return None
+    # v0.2.106 per-project gate: the container handed the search order back
+    # because this project's model has not passed its own held-out check —
+    # a healthy answer (not a fallback, not a rerank).
+    if getattr(client, "last_served", True) is False:
+        logger.debug(
+            "_do_rerank: project's model not served (%s); search order",
+            getattr(client, "last_not_served_reason", None) or "gate",
         )
         return None
     # NEW-3 sibling (v0.2.75): count SUCCESSES next to the fallbacks so the

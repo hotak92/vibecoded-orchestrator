@@ -334,16 +334,14 @@
       try {
         const { listen: rlListen } = await import('$lib/tauri');
         const { toast: rlToast } = await import('$lib/stores/toast');
+        const { rlAutoEnableToast } = await import('$lib/rl-scoring-default');
         rlListen<{ event_count: number; threshold: number; module_id: string }>(
           'vct-rl-auto-enable-available',
           (e) => {
             const dismissed = localStorage.getItem('vct.rl_auto_enable_dismissed') === '1';
             if (dismissed) return;
             const { event_count, threshold } = e.payload;
-            rlToast.info(
-              `RL Reranker: ${event_count}/${threshold} training events ` +
-                `accumulated — visit Preferences → Modules to enable.`,
-            );
+            rlToast.info(rlAutoEnableToast(event_count, threshold));
           },
         );
       } catch (e) {

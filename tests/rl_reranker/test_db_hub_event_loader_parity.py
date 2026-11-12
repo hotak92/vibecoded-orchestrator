@@ -223,7 +223,7 @@ def _hub_events(events: list[dict[str, Any]], *, emb_source: str = "", page_size
 def _samples_signature(events: list[dict[str, Any]]):
     """Reduce extract_samples output to a comparable, order-independent set."""
     pairs = pair_events(events)
-    samples = extract_samples(pairs, link_sim={})
+    samples = extract_samples(pairs)
     sig = set()
     for s in samples:
         sig.add((

@@ -180,7 +180,7 @@ class TestResolveRequestProjectId:
 
     def test_no_header_no_env_returns_base_sentinel(self, tmp_path, layout, monkeypatch):
         srv = _make_server(tmp_path, layout, monkeypatch)
-        srv._project_id = ""  # ensure no env fallback
+        srv._env_project_id = ""  # ensure no env fallback
 
         class _FakeRequest:
             headers = {}
@@ -193,7 +193,7 @@ class TestResolveRequestProjectId:
     def test_no_header_env_set_returns_env_value(self, tmp_path, layout, monkeypatch):
         srv = _make_server(tmp_path, layout, monkeypatch)
         # Simulate legacy single-project install with VCT_PROJECT_ID set.
-        srv._project_id = "legacy-project-id"
+        srv._env_project_id = "legacy-project-id"
 
         class _FakeRequest:
             headers = {}
@@ -202,6 +202,25 @@ class TestResolveRequestProjectId:
         resolved = srv._resolve_request_project_id(_FakeRequest())
         assert resolved == "legacy-project-id"
         assert srv._routing_counters["requests_without_header"] == 1
+
+    def test_no_header_never_inherits_the_previous_requests_project(
+        self, tmp_path, layout, monkeypatch,
+    ):
+        """v0.2.106: ``_swap_in_head`` rewrites ``_project_id`` to the routed
+        project; a later header-less request must still resolve to the env
+        value (here: none -> base), not to that previous project."""
+        monkeypatch.delenv("VCT_PROJECT_ID", raising=False)
+        srv = _make_server(tmp_path, layout, monkeypatch)
+        srv._env_project_id = ""
+        head = asyncio.run(srv._get_or_load_project_head("p-earlier"))
+        srv._swap_in_head(head)
+        assert srv._project_id == "p-earlier"
+
+        class _FakeRequest:
+            headers = {}
+            rel_url = type("U", (), {"path": "/test"})()
+
+        assert srv._resolve_request_project_id(_FakeRequest()) == _BASE_PROJECT_SENTINEL
 
 
 # ---------------------------------------------------------------------------

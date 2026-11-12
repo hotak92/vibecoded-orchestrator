@@ -20,6 +20,12 @@
 //! It gates SCORING only. The module-enable cascade (which projects receive
 //! the module's settings) and event collection (`rl_events`) never read it.
 //! Stored rows are never rewritten: they apply again once unlocked.
+//!
+//! v0.2.106 (owner rulings 2026-11-12): the table ships `locked = false` —
+//! per-project online adaptation, OPT-IN. Scoring stays off by default
+//! through the enable cascade (the RL reranker's system default is off,
+//! [`crate::db::settings::module_enable_system_default`]); the user turns it
+//! on per project.
 
 use std::sync::LazyLock;
 
@@ -108,18 +114,22 @@ pub fn refuse_enable_with_lock(lock: Option<&str>, enabling: bool) -> Result<(),
 mod tests {
     use super::*;
 
+    /// v0.2.106 (owner rulings 2026-11-12): per-project online adaptation
+    /// ships OPT-IN, so the lock is lifted (scoring stays off by default
+    /// through the enable cascade, not through this table). The owner ruling
+    /// is recorded in the table itself.
     #[test]
-    fn shipped_table_parses_and_is_locked_with_the_owner_reason() {
+    fn shipped_table_parses_and_is_unlocked_with_the_owner_ruling_recorded() {
         let parsed = parse_lock(RL_SCORING_LOCK_TOML).expect("shipped table parses");
-        let reason = parsed.expect("v0.2.100 ships LOCKED (owner 2026-10-01)");
-        assert!(reason.contains("until the model is trained"), "{reason}");
-        assert!(reason.contains("Data collection continues"), "{reason}");
-        assert_eq!(rl_scoring_lock(), Some(reason.as_str()));
+        assert_eq!(parsed, None, "v0.2.106 ships UNLOCKED (owner 2026-11-12, opt-in)");
+        assert_eq!(rl_scoring_lock(), None);
+        assert!(RL_SCORING_LOCK_TOML.contains("2026-11-12"), "the ruling is recorded inline");
+        assert!(RL_SCORING_LOCK_TOML.contains("OPT-IN"), "the ruling is recorded inline");
     }
 
     #[test]
     fn the_lock_applies_to_the_rl_reranker_only() {
-        assert!(module_effect_lock(RL_RERANKER_MODULE_ID).is_some());
+        assert_eq!(module_effect_lock(RL_RERANKER_MODULE_ID), rl_scoring_lock());
         assert_eq!(module_effect_lock("vct-coordination"), None);
     }
 
@@ -138,6 +148,8 @@ mod tests {
         assert!(refuse_enable_with_lock(Some("r"), false).is_ok());
         assert!(refuse_enable_with_lock(None, true).is_ok());
         assert!(refuse_enable_while_locked("vct-coordination", true).is_ok());
-        assert!(refuse_enable_while_locked(RL_RERANKER_MODULE_ID, true).is_err());
+        // v0.2.106: unlocked — turning the reranker on for a project is the
+        // user's opt-in and is accepted.
+        assert!(refuse_enable_while_locked(RL_RERANKER_MODULE_ID, true).is_ok());
     }
 }

@@ -317,6 +317,25 @@ pub fn set_module_enabled_for_project_v2_with_db(
     module_id: &str,
     value: Option<bool>,
 ) -> Result<ModuleEnableState, String> {
+    set_module_enabled_for_project_v2_with_lock(
+        db,
+        project_id,
+        module_id,
+        value,
+        vct_launcher_core::rl_scoring_lock::module_effect_lock(module_id),
+    )
+}
+
+/// [`set_module_enabled_for_project_v2_with_db`] with an explicit effect
+/// lock (the shipped one for the real command), so both the locked and the
+/// unlocked behaviour stay testable whatever the shipped table says.
+pub fn set_module_enabled_for_project_v2_with_lock(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+    value: Option<bool>,
+    effect_lock: Option<&str>,
+) -> Result<ModuleEnableState, String> {
     if db.get_project(project_id)?.is_none() {
         return Err(format!(
             "project {} not found; cannot set module enable flag",
@@ -329,7 +348,7 @@ pub fn set_module_enabled_for_project_v2_with_db(
 
     // v0.2.100 W5R-02: refuse an explicit ON while locked. OFF and CLEAR stay
     // allowed: neither can turn scoring on, and the rows are the user's.
-    vct_launcher_core::rl_scoring_lock::refuse_enable_while_locked(module_id, value == Some(true))?;
+    vct_launcher_core::rl_scoring_lock::refuse_enable_with_lock(effect_lock, value == Some(true))?;
     db.module_write_enabled_for_project(project_id, module_id, value)?;
 
     db.audit(
@@ -1163,29 +1182,49 @@ mod tests {
     fn rl_auto_enable_never_prompts_while_locked() {
         assert!(should_emit_rl_auto_enable(10_000, Some(false), 500, None));
         assert!(!should_emit_rl_auto_enable(10_000, Some(false), 500, Some("locked")));
-        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_some(), "ships locked");
+        // v0.2.106: the shipped table is unlocked (owner 2026-11-12, opt-in).
+        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_none(), "ships unlocked");
     }
 
     /// v0.2.100 W5R-02: while locked, the per-project setter refuses an
-    /// explicit ON and writes nothing; OFF and CLEAR are allowed; the
-    /// resolved state carries the lock reason.
+    /// explicit ON and writes nothing; OFF and CLEAR are allowed.
     #[test]
     fn locked_setter_refuses_on_and_allows_off_and_clear() {
         let db = mkdb();
         mkproject(&db, "p1", "p1");
         let m = "vct-rl-reranker";
-        let err = set_module_enabled_for_project_v2_with_db(&db, "p1", m, Some(true)).unwrap_err();
+        let lock = Some("locked");
+        let err = set_module_enabled_for_project_v2_with_lock(&db, "p1", m, Some(true), lock)
+            .unwrap_err();
         assert!(err.contains("locked"), "{err}");
         assert_eq!(db.resolve_module_enable("p1", m).unwrap().explicit, None, "nothing written");
 
-        let st = set_module_enabled_for_project_v2_with_db(&db, "p1", m, Some(false)).unwrap();
+        let st = set_module_enabled_for_project_v2_with_lock(&db, "p1", m, Some(false), lock).unwrap();
         assert_eq!(st.explicit, Some(false));
-        assert!(st.lock_reason.is_some());
-        let st = set_module_enabled_for_project_v2_with_db(&db, "p1", m, None).unwrap();
+        let st = set_module_enabled_for_project_v2_with_lock(&db, "p1", m, None, lock).unwrap();
         assert_eq!(st.explicit, None);
 
         // Unlocked modules are unaffected.
         assert!(set_module_enabled_for_project_v2_with_db(&db, "p1", "vct-coordination", Some(true)).is_ok());
+    }
+
+    /// v0.2.106 (owner 2026-11-12, opt-in): with the shipped lock lifted the
+    /// per-project control turns the RL reranker ON for that project only,
+    /// and the hub-served answer follows; turning it off is honoured.
+    #[test]
+    fn unlocked_setter_turns_rl_scoring_on_for_one_project_only() {
+        let db = mkdb();
+        mkproject(&db, "p1", "p1");
+        mkproject(&db, "p2", "p2");
+        let m = "vct-rl-reranker";
+        assert!(!db.rl_scoring_enabled_for_project("p1").unwrap(), "off by default");
+        let st = set_module_enabled_for_project_v2_with_db(&db, "p1", m, Some(true)).unwrap();
+        assert_eq!(st.explicit, Some(true));
+        assert_eq!(st.lock_reason, None, "no lock is reported");
+        assert!(db.rl_scoring_enabled_for_project("p1").unwrap());
+        assert!(!db.rl_scoring_enabled_for_project("p2").unwrap(), "another project stays off");
+        set_module_enabled_for_project_v2_with_db(&db, "p1", m, Some(false)).unwrap();
+        assert!(!db.rl_scoring_enabled_for_project("p1").unwrap());
     }
 
     /// Boot probe decision matrix.

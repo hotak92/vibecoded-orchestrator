@@ -400,7 +400,7 @@ License resolution priority (first match wins; see `VCThelpers/license/validator
 
 **Network policy**: fail-OPEN to free tier on any transport failure. Never block startup, never raise.
 
-**RL gates** (in `claude_mcp_servers/rl_client/search_pipeline.py::_resolve_rl_enabled`): RL reranking runs when the shipped RL scoring lock (`vco_lib/rl_scoring_lock.toml`) is lifted AND the project's RL reranker toggle (launcher Modules panel; hub-served `rl_reranker_enabled_for_project`) is on. There is no licence gate: v0.2.106 removed `rl_retrieval` from the tier table (owner ruling 2026-11-11). Otherwise — and whenever the reranker container is down — results keep plain Weaviate cosine ordering.
+**RL gates** (in `claude_mcp_servers/rl_client/search_pipeline.py::_resolve_rl_enabled`): the reranker container is called when the shipped RL scoring lock (`vco_lib/rl_scoring_lock.toml`, lifted in v0.2.106) is not set AND the project's RL reranker toggle (launcher Modules panel; hub-served `rl_reranker_enabled_for_project`) is positively on. The toggle is opt-in: off by default, and off when it cannot be read (hub down, no project config). There is no licence gate: v0.2.106 removed `rl_retrieval` from the tier table (owner ruling 2026-11-11). With the toggle on, the container still reranks a project only while that project's own model passes its held-out check (NDCG@10 ≥ +2% over cosine and the cited node's MRR@10 not below cosine's); otherwise — and whenever the reranker container is down — results keep their plain search order.
 
 **RL module env vars**:
 

@@ -107,7 +107,12 @@ class CacheNodesResponse(BaseModel):
     top_k: List[Any] = Field(default_factory=list)
     # Protocol v2: request-node indices best first, and the model score per
     # request node (None = the node had no vector and was not scored).
+    # ``scored: false`` with ``serving: "search_order"`` (v0.2.106) = the
+    # project's model is not served (it has not passed its own held-out
+    # check); ``order`` is then the identity and ``reason`` says why.
     scored: bool = False
+    serving: Optional[str] = None
+    reason: Optional[str] = None
     order: List[int] = Field(default_factory=list)
     scores: List[Optional[float]] = Field(default_factory=list)
     error: Optional[str] = None
@@ -188,3 +193,8 @@ class HealthResponse(BaseModel):
     # masks the linked slots (``rl_model.LINKED_SLOTS_MASKED_PROFILES``).
     trained: Optional[bool] = None
     linked_slots_masked: Optional[bool] = None
+    # v0.2.106: the container gates every project's model on that project's
+    # own held-out queries and answers a project whose model does not pass
+    # with its search order (``serving: "search_order"``). True = the client
+    # may call it even while ``trained`` is false.
+    per_project_gate: Optional[bool] = None
