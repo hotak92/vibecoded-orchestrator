@@ -226,12 +226,14 @@ print("RESULT", ok)
 
 
 def _child_env_no_sentinels(tmp_path: Path) -> dict:
-    from tests.common.child_env import child_env
+    """os.environ minus the pytest sentinels, plus a private VCT_STATE_DIR. The
+    caller wraps it in ``child_env(base, …)`` at the spawn site."""
+    import os
 
     state = tmp_path / "state"
     state.mkdir(parents=True, exist_ok=True)
     (state / "hub.token").write_text("test-token", encoding="utf-8")
-    env = child_env()
+    env = dict(os.environ)
     env.update(VCT_STATE_DIR=str(state))
     for key in (
         "PYTEST_CURRENT_TEST", "RL_HUB_POST_DISABLED", "VCT_HUB_ALLOW_TEST_POST",
@@ -247,6 +249,8 @@ def test_guard_blocks_the_post_even_without_the_pytest_sentinel(tmp_path) -> Non
     ``RL_HUB_POST_DISABLED`` opt-out is set — while the SAME child WITHOUT
     the opt-out does connect, proving the listener and the child both work
     and it is the guard that suppressed the write."""
+    from tests.common.child_env import child_env
+
     server = _RecordingServer()
     try:
         base = _child_env_no_sentinels(tmp_path)
@@ -254,8 +258,7 @@ def test_guard_blocks_the_post_even_without_the_pytest_sentinel(tmp_path) -> Non
         # Control: no opt-out — the child reaches the listener (the hub route
         # answers 2xx, so post_rl_event returns True). Without this leg, a
         # "no connection" assertion could pass for the wrong reason.
-        env_open = dict(base)
-        env_open["VCT_HUB_PORT"] = str(server.port)
+        env_open = child_env(base, VCT_HUB_PORT=str(server.port))
         result = subprocess.run(
             [sys.executable, "-c", _CHILD_POST], env=env_open,
             capture_output=True, text=True, timeout=60,
@@ -265,9 +268,9 @@ def test_guard_blocks_the_post_even_without_the_pytest_sentinel(tmp_path) -> Non
 
         # The guard: the opt-out alone suppresses the POST (no connection).
         server.requests.clear()
-        env_guarded = dict(base)
-        env_guarded["VCT_HUB_PORT"] = str(server.port)
-        env_guarded["RL_HUB_POST_DISABLED"] = "1"
+        env_guarded = child_env(
+            base, VCT_HUB_PORT=str(server.port), RL_HUB_POST_DISABLED="1",
+        )
         result = subprocess.run(
             [sys.executable, "-c", _CHILD_POST], env=env_guarded,
             capture_output=True, text=True, timeout=60,

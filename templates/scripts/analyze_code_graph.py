@@ -1326,7 +1326,7 @@ class CodeGraphAnalyzer:
     """Analyzes codebase and extracts entities into Weaviate code graph."""
 
     def __init__(self, project_name: str, weaviate_url: "str | None" = None,
-                 grpc_port: int = 50052, named_vectors: bool = DUAL_EMBEDDING_ENABLED):
+                 grpc_port: Optional[int] = None, named_vectors: bool = DUAL_EMBEDDING_ENABLED):
         self.project_name = project_name
         # v0.2.94: env-resolved (`$WEAVIATE_URL`), not a hardcoded literal.
         self.weaviate_url = weaviate_url or _wh.weaviate_url_default()

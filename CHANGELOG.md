@@ -325,6 +325,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The code-graph analyzer now uses the configured Weaviate gRPC port.** It always passed port 50052, which
+  overrode `GRPC_PORT`, so an install whose Weaviate listens for gRPC on another port had the analyzer's reads go to
+  the wrong place. It now leaves the port to the shared Weaviate connection helper, which reads `GRPC_PORT`.
+
 - **The RL reranker now actually reranks.** Its server was meant to embed the query itself through a function that
   nothing ever connected, so every search came back in its original order and the client counted a fallback each
   time (one machine recorded 14 794 fallbacks and no reranked search). The client now sends the vectors it already
