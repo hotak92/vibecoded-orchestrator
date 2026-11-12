@@ -24,16 +24,23 @@ not below cosine's (the second half guards against the answer-cosine target's
 centrality component: ranking generic nodes first raises NDCG and lowers the
 named node).
 
-The serving gate applies the bar to a CONFIDENCE BOUND, not to the point
-estimate (owner ruling 2026-11-12, after a replay showed the point check
-passing by noise on 20-50 citing queries): :func:`paired_bootstrap_bounds`
-resamples the held-out queries with replacement — one resample for both
-rankers (paired) — and the bar must hold for the one-sided
-:data:`GATE_CONFIDENCE` lower bound of each half.
+The serving gate applies the bar to CONFIDENCE BOUNDS on the project's
+CUMULATIVE PREQUENTIAL record (owner ruling 2026-11-12, after the rlgate2
+study showed a held-out window re-tested every round passing on lucky
+windows): every query is scored by the model in place when it arrived, before
+that model trained on it, and the k-th check of a project's model judges the
+bar at confidence :func:`check_confidence` ``(k)`` = ``1 - 0.10 / (k (k+1))``
+— an alpha-spending schedule whose error rates sum to at most
+:data:`GATE_ERROR_BUDGET` over ALL checks, so re-checking after every round
+cannot accumulate false passes. The bounds are :func:`paired_normal_bounds`
+(a paired normal approximation: a bootstrap cannot resolve the tiny error
+rates of late checks). No verdict before :data:`GATE_MIN_CITED_QUERIES`
+queries in the record cite a node.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import NormalDist
 from typing import Optional
 
 import numpy as np
@@ -42,16 +49,16 @@ import numpy as np
 UNLOCK_MIN_REL_GAIN = 0.02
 #: Metric cut-off.
 K = 10
-#: The serving gate's one-sided confidence level and bootstrap resample count
-#: (owner ruling 2026-11-12: serve only when a paired bootstrap says, at 90%
-#: confidence, that the NDCG@10 gain is >= +2% AND the cited-node MRR@10
-#: difference is >= 0). 1000 resamples bound the 10th percentile to about
-#: +-1 percentile point at a few tens of ms per check on a 2,000-query window.
-GATE_CONFIDENCE = 0.90
-GATE_BOOTSTRAP_SAMPLES = 1000
-#: Resamples drawn per vectorised block (bounds the check's memory to
-#: ``block * n_queries`` indices).
-_BOOT_BLOCK = 125
+#: The serving gate's total false-pass probability over every check of one
+#: model (owner ruling 2026-11-12: the k-th check runs at confidence
+#: ``1 - GATE_ERROR_BUDGET / (k (k+1))``; the rates sum to the budget).
+GATE_ERROR_BUDGET = 0.10
+#: No verdict before the record holds this many queries that literally cite a
+#: node (chosen a priori, 2026-11-12): the MRR half of the bar is a mean of
+#: per-query differences in [-1, 1], and below ~50 values neither the normal
+#: approximation of that mean nor a served-search MRR point estimate means
+#: much (the rlgate2 study saw acceptance "verdicts" on 4-9 citing queries).
+GATE_MIN_CITED_QUERIES = 50
 
 
 def dcg_at_k(gains_in_rank_order: np.ndarray, k: int) -> float:
@@ -141,90 +148,71 @@ def nan_mean(x: np.ndarray) -> float:
     return float(x[ok].mean()) if ok.any() else float("nan")
 
 
+def check_confidence(k: int, error_budget: float = GATE_ERROR_BUDGET) -> float:
+    """One-sided confidence of the ``k``-th check (``k >= 1``):
+    ``1 - error_budget / (k (k+1))``. Summed over every ``k`` the error rates
+    are ``error_budget`` (telescoping ``1/k - 1/(k+1)``), so the probability
+    that ANY check passes a model that does not meet the bar is at most
+    ``error_budget`` — an anytime-valid schedule."""
+    k = int(k)
+    if k < 1:
+        raise ValueError(f"checks are numbered from 1, got {k}")
+    return 1.0 - float(error_budget) / (k * (k + 1))
+
+
 @dataclass(frozen=True)
-class BootstrapBounds:
+class GateBounds:
     """One-sided lower confidence bounds of the bar's two halves.
 
     ``ndcg_gain_lb``: of the relative NDCG@k gain of the model over the
-    baseline (gain of the resampled MEANS, ``mean(model) / mean(base) - 1``).
-    ``mrr_diff_lb``: of ``MRR@k(model) - MRR@k(base)`` on the citing queries
-    of each resample. ``-inf`` when the bound is undefined (no query, or too
-    many resamples without a defined value) — a failing bound.
-    ``empty_cited_resamples``: resamples that drew no citing query; each
-    counts as a FAILING resample of the MRR half (its difference is ``-inf``),
-    so a window whose citing queries are rare cannot pass on the resamples
-    that happen to miss them.
+    baseline (``mean(model) / mean(base) - 1`` over the queries where both are
+    defined). ``mrr_diff_lb``: of ``MRR@k(model) - MRR@k(base)`` over the
+    citing queries. ``-inf`` when a bound is undefined (fewer than two
+    defined queries, a zero baseline mean) — a failing bound. ``n_ndcg`` /
+    ``n_cited``: the queries each bound used.
     """
 
     ndcg_gain_lb: float
     mrr_diff_lb: float
-    n_boot: int
     confidence: float
-    empty_cited_resamples: int
+    n_ndcg: int
+    n_cited: int
 
 
-def _lower_bound(values: np.ndarray, confidence: float) -> float:
-    """The one-sided ``confidence`` lower bound: the ``1 - confidence``
-    order statistic (no interpolation, so ``-inf`` entries stay failing)."""
-    if values.size == 0:
-        return float("-inf")
-    return float(np.quantile(values, 1.0 - confidence, method="lower"))
+def paired_normal_bounds(model: QueryMetrics, base: QueryMetrics, *,
+                         confidence: float) -> GateBounds:
+    """Paired normal-approximation lower bounds of the bar over the per-query
+    metrics of two rankers on the SAME queries (from :func:`per_query_metrics`).
 
-
-def paired_bootstrap_bounds(
-    model: QueryMetrics,
-    base: QueryMetrics,
-    *,
-    n_boot: int = GATE_BOOTSTRAP_SAMPLES,
-    confidence: float = GATE_CONFIDENCE,
-    seed: int = 0,
-) -> BootstrapBounds:
-    """Paired bootstrap of the bar over the per-query metrics of two rankers
-    on the SAME queries (from :func:`per_query_metrics`).
-
-    Each resample draws ``n`` query indices with replacement (``n`` = the
-    window size) and uses them for both rankers. NDCG: queries whose NDCG is
-    undefined (ideal DCG 0) are left out of both means; a resample with none
-    defined, or a zero baseline mean, is failing (``-inf``). MRR: only the
-    resample's citing queries count; a resample with none is failing.
-    Deterministic for a given ``seed`` (``numpy.random.default_rng``).
+    NDCG: the ratio of means by the delta method — standard error of
+    ``mean(model - r * base) / mean(base)`` with ``r`` the observed ratio;
+    queries whose NDCG is undefined for either ranker are left out. MRR: the
+    mean of the paired differences on the queries both define (the citing
+    ones) and its standard error. Each bound is ``estimate - z * SE`` with
+    ``z`` the standard normal ``confidence`` quantile. Deterministic.
     """
     n = int(len(model.ndcg))
     if n != len(base.ndcg) or n != len(model.mrr) or n != len(base.mrr):
-        raise ValueError("paired bootstrap needs both rankers' metrics on the same queries")
-    n_boot = max(1, int(n_boot))
-    if n == 0:
-        return BootstrapBounds(float("-inf"), float("-inf"), n_boot, confidence, n_boot)
-    nd_ok = ~np.isnan(model.ndcg) & ~np.isnan(base.ndcg)
-    nd_m = np.where(nd_ok, model.ndcg, 0.0)
-    nd_b = np.where(nd_ok, base.ndcg, 0.0)
-    mr_ok = ~np.isnan(model.mrr) & ~np.isnan(base.mrr)
-    mr_d = np.where(mr_ok, model.mrr - base.mrr, 0.0)
-    nd_okf = nd_ok.astype(np.float64)
-    mr_okf = mr_ok.astype(np.float64)
-
-    rng = np.random.default_rng(seed)
-    gains = np.empty(n_boot, dtype=np.float64)
-    diffs = np.empty(n_boot, dtype=np.float64)
-    for lo in range(0, n_boot, _BOOT_BLOCK):
-        b = min(_BOOT_BLOCK, n_boot - lo)
-        idx = rng.integers(0, n, size=(b, n))
-        s_m = nd_m[idx].sum(axis=1)
-        s_b = nd_b[idx].sum(axis=1)
-        c_nd = nd_okf[idx].sum(axis=1)
-        ok = (c_nd > 0) & (s_b > 0)
-        g = np.full(b, -np.inf)
-        g[ok] = s_m[ok] / s_b[ok] - 1.0   # equal counts: ratio of sums = ratio of means
-        s_d = mr_d[idx].sum(axis=1)
-        c_mr = mr_okf[idx].sum(axis=1)
-        d = np.full(b, -np.inf)
-        has = c_mr > 0
-        d[has] = s_d[has] / c_mr[has]
-        gains[lo:lo + b] = g
-        diffs[lo:lo + b] = d
-    return BootstrapBounds(
-        ndcg_gain_lb=_lower_bound(gains, confidence),
-        mrr_diff_lb=_lower_bound(diffs, confidence),
-        n_boot=n_boot, confidence=float(confidence),
-        empty_cited_resamples=int(np.sum(np.isneginf(diffs))),  # -inf only when none cites
-    )
+        raise ValueError("paired bounds need both rankers' metrics on the same queries")
+    if not 0.5 <= confidence < 1.0:
+        raise ValueError(f"confidence must be in [0.5, 1), got {confidence}")
+    z = NormalDist().inv_cdf(float(confidence))
+    m_nd = np.asarray(model.ndcg, dtype=np.float64)
+    b_nd = np.asarray(base.ndcg, dtype=np.float64)
+    ok = ~np.isnan(m_nd) & ~np.isnan(b_nd)
+    m_nd, b_nd = m_nd[ok], b_nd[ok]
+    gain_lb = float("-inf")
+    if m_nd.size >= 2 and b_nd.mean() > 0:
+        r = m_nd.mean() / b_nd.mean()
+        resid = m_nd - r * b_nd
+        se = float(np.sqrt(resid.var(ddof=1) / m_nd.size)) / b_nd.mean()
+        gain_lb = float(r - 1.0 - z * se)
+    m_mr = np.asarray(model.mrr, dtype=np.float64)
+    b_mr = np.asarray(base.mrr, dtype=np.float64)
+    okm = ~np.isnan(m_mr) & ~np.isnan(b_mr)
+    d = m_mr[okm] - b_mr[okm]
+    diff_lb = float("-inf")
+    if d.size >= 2:
+        diff_lb = float(d.mean() - z * np.sqrt(d.var(ddof=1) / d.size))
+    return GateBounds(ndcg_gain_lb=gain_lb, mrr_diff_lb=diff_lb, confidence=float(confidence),
+                      n_ndcg=int(m_nd.size), n_cited=int(d.size))

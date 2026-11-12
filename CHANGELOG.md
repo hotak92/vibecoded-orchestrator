@@ -164,18 +164,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one project in the launcher (Modules → RL Reranker), or for every project through the host-wide default; while it
   is off, nothing is sent to the reranker container and searches keep their order. When it is on, the reranker
   learns from that project's own citations (the search results its answers actually use) and reranks the
-  project's searches only while its model beats plain search on its own check: on the project's most recent
-  queries, held out of training, NDCG@10 must be at least 2% above plain cosine ordering and the node the answer
-  names must rank no lower than plain cosine ranks it — both at a one-sided 90% confidence bound from a paired
-  bootstrap of the check's queries (1 000 resamples, about 12 ms on a full 2 000-query check), not on the raw
-  averages, which passed by chance on checks with 20-50 citing queries. `/project_status`, the panel and
-  `rl_doctor` show the bounds beside the measured values (module-DB migration `0008_rl_online_state_bounds.sql`).
-  A replay of real histories still found projects where the searches the model served ranked the cited node lower
-  than plain cosine, so the check is a guard, not a guarantee. A new project starts with exactly its plain search order;
-  when the model stops passing, the order goes back to plain search order. Training runs every 32 citation events
-  (at most 16 steps of 8 queries, off the server's request loop, so searches are never held up by it) with the same
-  objective as the offline trainer. A query is never trained on while it is in the check, and only 24 hours after it
-  left. Each project's model and its state are saved in the project's own folder of the container. `rl_doctor`, the
+  project's searches only while its model beats plain search on its own check. Every query is first scored by the
+  model in place when it arrived, before the model trains on it, and the check judges the project's whole record of
+  such queries: NDCG@10 must be at least 2% above plain cosine ordering and the node the answer names must rank no
+  lower than plain cosine ranks it, both on one-sided lower confidence bounds, not on the raw averages. No verdict is
+  given before the record holds 300 queries and 50 that name a node. After that every training round is a check, and
+  the k-th check runs at confidence 1 − 0.10/(k(k+1)), so all the checks together pass a model that does not meet the
+  bar with probability at most 10%. An earlier version of this check re-tested a window of the project's most recent
+  queries, held out of training, at 90% confidence after every round; on a replay of real histories it passed on
+  lucky windows, and the queries that followed a passing window showed the model ranking the cited node lower than
+  plain cosine. `/project_status`, the panel and `rl_doctor` show the record, the last check's bounds and number, and
+  what the searches the model served got (module-DB migrations `0008_rl_online_state_bounds.sql` and
+  `0009_rl_online_state_prequential.sql`). A new project starts with exactly its plain search order; when the model
+  stops passing, the order goes back to plain search order. Training runs every 32 citation events (at most 16 steps
+  of 8 queries, off the server's request loop, so searches are never held up by it) with the same objective as the
+  offline trainer. Each project's model and its state are saved in the project's own folder of the container. `rl_doctor`, the
   container's new `/project_status` route, `/health` and the launcher's RL Reranker panel show whether the
   project's model is used and why. `python -m claude_mcp_servers.rl_reranker.training.transfer replay` replays an
   export through this same code. The owner chose this design on 2026-11-12, and the scoring lock is lifted for it
@@ -401,10 +404,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the requesting project's checkpoint, but it looked for `rl_model_<profile>.pt`, a name nothing writes, so it
   started from a fresh model. It now seeds from that project's newest checkpoint (else the base model's), using the
   name pattern the writers use, and never from an un-rotated `_finetuned` file.
-- **A busy project's online learning no longer trains on queries whose purge gap has not passed.** Past
-  `max_staged_queries` waiting queries, the oldest were released for training early, against the rule that a query
-  waits a full purge gap after leaving the held-out window. They are now dropped untrained (counted in
-  `dropped_untrained`).
 - **The code-graph analyzer now uses the configured Weaviate gRPC port.** It always passed port 50052, which
   overrode `GRPC_PORT`, so an install whose Weaviate listens for gRPC on another port had the analyzer's reads go to
   the wrong place. It now leaves the port to the shared Weaviate connection helper, which reads `GRPC_PORT`.

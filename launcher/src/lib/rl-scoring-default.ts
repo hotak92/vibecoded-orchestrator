@@ -26,16 +26,18 @@ export const RL_RERANKER_MODULE_ID = 'vct-rl-reranker';
 
 // v0.2.106 (owner rulings 2026-11-12): the lock is lifted and RL scoring is
 // OPT-IN per project — per-project online learning, served only while the
-// project's model beats plain search on its own held-out queries (judged on
-// 90% paired-bootstrap lower bounds, owner ruling 2026-11-12). This is the
+// project's model beats plain search on its own record of queries scored
+// before the model trained on them (judged on confidence bounds with a 10%
+// total error budget over every check, owner ruling 2026-11-12). This is the
 // ONE home of the sentence that tells the user what turning it on does; every
 // RL control (the per-project Modules control, the host-wide default switch,
 // the "enough training events" toast) renders it from here.
 export const RL_OPT_IN_EXPLAINER =
   "Off by default. When on, the reranker learns from this project's own citations " +
   '(the search results your answers actually use) and reorders its searches only once ' +
-  "this project's model beats plain search on its own check — its most recent queries, " +
-  'held out of training, with a margin that holds at 90% confidence, not a lucky sample. ' +
+  "this project's model beats plain search on its own check — every query scored before " +
+  'the model learns from it, judged over its whole history with a margin that holds at ' +
+  'high confidence however often it is re-checked, not a lucky stretch. ' +
   'Until then, and whenever it stops passing, results keep their plain search order. ' +
   'You can turn it off any time.';
 

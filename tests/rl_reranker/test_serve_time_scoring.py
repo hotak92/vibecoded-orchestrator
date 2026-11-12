@@ -278,9 +278,7 @@ def trained_model(tmp_path_factory) -> RLModel:
     rng = np.random.default_rng(0)
     m = RLModel(emb_dim=D, state_path=tmp_path_factory.mktemp("trained") / "rl.pt",
                 device="cpu", embedding_source="qwen3")
-    cfg = OnlineConfig(holdout_queries=1, min_cited_queries=0, purge_gap_ms=0, round_every=16,
-                       batch_queries=4,
-                       max_steps_per_round=8, lr=1e-3)
+    cfg = OnlineConfig(round_every=16, batch_queries=4, max_steps_per_round=8, lr=1e-3)
     learner = ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
     for i in range(600):
         q = rng.normal(size=D).astype(np.float32)
@@ -393,14 +391,14 @@ def test_a_project_whose_gate_is_closed_gets_its_search_order(tmp_path, monkeypa
     srv = _make_server(tmp_path, monkeypatch, trained_model)
     head = srv._project_heads[(PID, "qwen3")]
     head.learner.serving = False
-    head.learner.reason = "collecting held-out queries (3/300)"
+    head.learner.reason = "collecting queries scored before training (3/300 queries, 0/50 citing a node)"
     payload = {"task_id": "t1", "nodes": [{"title": n["title"]} for n in nodes], "limit": 2,
                "features": wire.encode_rerank_features(q, nodes, dim=D)}
     async def both(base):
         return [await _post(base, payload, headers=h) for h in (HDR, {})]
 
     answers = _run(_serve(srv, both))
-    for (status, data), why in zip(answers, ("collecting held-out queries", "no project id")):
+    for (status, data), why in zip(answers, ("collecting queries scored before training", "no project id")):
         assert status == 200, data
         assert data["scored"] is False and data["serving"] == "search_order"
         assert data["order"] == [0, 1] and why in data["reason"]

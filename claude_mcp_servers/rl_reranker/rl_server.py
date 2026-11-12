@@ -6,16 +6,18 @@ Standalone HTTP server exposing RetrievalRL for training from external clients.
 Primary consumer: the weaviate-kg MCP server, which calls this server to:
   1. Score the candidates of each KG search with the project's model (from
      the vectors the client sends) and receive the reranked order + scores —
-     or, while the project's model does not pass its own held-out check, the
+     or, while the project's model does not pass its own check, the
      client's own order back (``serving: "search_order"``).
   2. Submit each answer's citation event (frozen vectors + answer cosines +
      literal citations) for the project's online learning.
 
 Per-project online learning (v0.2.106, owner ruling 2026-11-12; opt-in on the
 client side): ``online_learning.ProjectLearner`` — the offline objective in
-bounded rounds, a held-out window of the project's newest queries with a
-purge gap, and a gate that serves the model only while it beats plain cosine
-(NDCG@10 >= +2% AND cited-node MRR@10 not below cosine's).
+bounded rounds, every arriving query scored by the model in place before it
+trains on it (the project's cumulative prequential record), and a gate that
+serves the model only while that record shows it beats plain cosine
+(NDCG@10 >= +2% AND cited-node MRR@10 not below cosine's) at an
+anytime-valid confidence (the k-th check at 1 - 0.10/(k(k+1))).
 
 Endpoints:
   POST /cache_nodes      — candidates + serve-time features → the project's reranked order
@@ -1516,10 +1518,10 @@ class RLServer:
         live = self._rl._rl_model
         if head.learner is not None and live is not None and live is not head.rl_model:
             # v0.2.106: every model swap of a project (/rotate_weights,
-            # /reset, the rl_use_global switch) lands here. The held-out
-            # window may have been trained on by the new model, so the gate
-            # starts over and the project is served its search order until
-            # the new model passes on fresh queries.
+            # /reset, the rl_use_global switch) lands here. The prequential
+            # record measured the old model, so the gate starts over and the
+            # project is served its search order until the new model passes
+            # on fresh queries.
             head.learner.on_model_replaced(live, "rotate / reset / global model")
         head.state_path = self._state_path
         head.rl_model = live
@@ -1594,7 +1596,7 @@ class RLServer:
             # they are masked for this profile (this server masks anyway).
             "linked_slots_masked": linked_slots_masked(self._rl_model_tag),
             # v0.2.106 (owner 2026-11-12): every project's model is gated by
-            # this server on that project's own held-out queries; a project
+            # this server on that project's own prequential record; a project
             # whose model does not pass gets its own search order back
             # (``serving: "search_order"``). So the client may call this
             # server even while ``trained`` is false.
@@ -2043,7 +2045,7 @@ class RLServer:
                 )
                 # v0.2.106 per-project gate: the model reranks only for a
                 # project whose model passes the owner's bar on that
-                # project's own held-out queries; every other request gets
+                # project's own prequential record; every other request gets
                 # the client's own order back, unchanged.
                 learner = head.learner
                 if learner is None or not learner.serving:
@@ -2117,14 +2119,16 @@ class RLServer:
         ``tasks[id]`` carries the frozen retrieval-time vectors + the citation
         inputs (cosine_sims, literal_cited, cross_encoder_cited). v0.2.106:
         each task enters the routed project's online learner
-        (``online_learning.ProjectLearner.ingest``: unified target formula,
-        held-out window, purge gap); every ``round_every`` events a training
-        round + gate evaluation runs off the event loop (``_finish_round``).
+        (``online_learning.ProjectLearner.ingest``: unified target formula);
+        every ``round_every`` events a round runs off the event loop
+        (``_finish_round``): it scores the queries that arrived since the
+        last round with the model in place, then trains on them, then checks
+        the gate on the cumulative record.
         Nothing trains for a request without a project id. Container does NO
         embedding / chunking / data-logger writes (MCP is sole citation
         writer).
 
-        Training is skipped (the events still feed the held-out check) when
+        Training is skipped (the events are still scored for the gate) when
         the project set ``rl_online_training_disabled`` or ``rl_use_global``
         (the shared model is read-only for the project).
 
@@ -2198,7 +2202,7 @@ class RLServer:
                     logger.info(
                         "rl_update: online training off for project_id=%s "
                         "(online_training_disabled / use_global); %d events feed "
-                        "the held-out check only", project_id, len(task_ids),
+                        "the gate's record only", project_id, len(task_ids),
                     )
                 self._capture_head_state(head)
 
@@ -2336,9 +2340,10 @@ class RLServer:
             "projects_serving_model": sum(1 for lr in learners if lr.serving),
             "bar": {"min_ndcg_gain": self._online_cfg.min_ndcg_gain,
                     "cited_mrr_not_below_cosine": True,
-                    "judged_on": "paired-bootstrap lower bounds",
-                    "confidence": self._online_cfg.confidence,
-                    "holdout_queries": self._online_cfg.holdout_queries},
+                    "judged_on": "cumulative prequential record, anytime-valid lower bounds",
+                    "error_budget": self._online_cfg.error_budget,
+                    "min_queries": self._online_cfg.min_queries,
+                    "min_cited_queries": self._online_cfg.min_cited_queries},
         }
 
     async def _project_status(self, request: web.Request) -> web.Response:
@@ -2382,7 +2387,9 @@ class RLServer:
                 or head.project_id == _BASE_PROJECT_SENTINEL):
             return
         st = learner.status()
-        ev = st.get("last_eval") or {}
+        chk = st.get("last_check") or {}
+        rec = st["record"]
+        srv = st["served_searches"]
         c = st["counters"]
         fields: dict[str, Any] = {
             "embedding_source": self._active_emb_source,
@@ -2394,21 +2401,33 @@ class RLServer:
             "queries_trained": c["queries_trained"],
             "train_steps": c["train_steps"],
             "rounds": c["rounds"],
-            "holdout_queries": st["holdout_queries"],
-            "holdout_target": st["holdout_target"],
             "serving_turned_off": c["serving_turned_off"],
-            "last_eval_at": int((ev.get("at_ms") or 0) // 1000),
-            "ndcg_gain": ev.get("ndcg_gain"),
-            "ndcg": ev.get("ndcg"),
-            "cos_ndcg": ev.get("cos_ndcg"),
-            "mrr": ev.get("mrr"),
-            "cos_mrr": ev.get("cos_mrr"),
-            "cited_queries": ev.get("n_cited"),
-            # migration 0008: the bounds the serving decision used (owner ruling
-            # 2026-11-12; None = undefined, a failing bound)
-            "ndcg_gain_lb": ev.get("ndcg_gain_lb"),
-            "mrr_diff_lb": ev.get("mrr_diff_lb"),
-            "gate_confidence": ev.get("confidence"),
+            # 0007 columns, since migration 0009 about the whole prequential
+            # record (each query scored before the model trained on it)
+            "last_eval_at": int((chk.get("at_ms") or 0) // 1000),
+            "ndcg_gain": rec["ndcg_gain"],
+            "ndcg": rec["ndcg"],
+            "cos_ndcg": rec["cos_ndcg"],
+            "mrr": rec["mrr"],
+            "cos_mrr": rec["cos_mrr"],
+            "cited_queries": rec["cited_queries"],
+            # 0008 columns: the bounds of the last check and its confidence
+            # (None = undefined, a failing bound / no check yet)
+            "ndcg_gain_lb": chk.get("ndcg_gain_lb"),
+            "mrr_diff_lb": chk.get("mrr_diff_lb"),
+            "gate_confidence": chk.get("confidence"),
+            # migration 0009: the record's size, the verdict minimums, the
+            # check count, and what the served searches got
+            "record_queries": rec["queries"],
+            "min_queries": st["bar"]["min_queries"],
+            "min_cited_queries": st["bar"]["min_cited_queries"],
+            "checks": st["checks"],
+            "error_budget": st["bar"]["error_budget"],
+            "served_queries": srv["queries"],
+            "served_cited_queries": srv["cited_queries"],
+            "served_ndcg_gain": srv["ndcg_gain"],
+            "served_mrr": srv["mrr"],
+            "served_cos_mrr": srv["cos_mrr"],
         }
         try:
             # Single-column key (the hub resolves ONE primary-key column):

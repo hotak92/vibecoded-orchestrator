@@ -828,9 +828,10 @@ def train(
         DEFAULT_CONFIG,
         VectorStore,
         build_table,
-        evaluate,
         fit,
+        score_queries,
     )
+    from .ranking_metrics import nan_mean
 
     cfg = DEFAULT_CONFIG
     batch_queries = int(batch_queries or cfg.batch_queries)
@@ -880,7 +881,7 @@ def train(
     def val_ndcg() -> float:
         if val_tbl is None:
             return float("nan")
-        return evaluate(rl_model._net, val_tbl, cfg, 0, seed=seed).ndcg
+        return nan_mean(score_queries(rl_model._net, val_tbl, cfg.k)[0].ndcg)
 
     pt_path = model_state_path.with_suffix(".pt")
     run_log_path = pt_path.with_name(pt_path.stem + "_train_log.json")

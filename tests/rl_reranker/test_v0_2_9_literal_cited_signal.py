@@ -92,14 +92,20 @@ class TestLiteralCitedDefaultsToFalse:
 
 
 class TestSkipTrainStillRespected:
-    def test_training_off_events_feed_the_window_but_never_train(self):
+    def test_training_off_events_are_scored_but_never_trained(self, tmp_path):
         """``rl_online_training_disabled``: the event is judged, not trained on."""
-        cfg = OnlineConfig(holdout_queries=2, min_cited_queries=0, purge_gap_ms=0, round_every=1,
-                           batch_queries=1, max_steps_per_round=4)
+        from rl_reranker.rl_model import RLModel
+
+        cfg = OnlineConfig(round_every=6, batch_queries=1, max_steps_per_round=4)
         lr = ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
         for i in range(6):
             assert lr.ingest(_task({"A": 0.4, "B": 0.6}, {"B": True}), ts_ms=i, train=False)
+        assert lr.status()["waiting_to_score"] == 6
+        m = RLModel(emb_dim=D, state_path=tmp_path / "rl.pt", device="cpu",
+                    embedding_source="qwen3")
+        lr.run_round_now(m, now_ms=6)
+        assert len(lr.record) == 6                    # scored for the gate ...
         assert lr.status()["pending_train_queries"] == 0
-        assert lr.counters["dropped_untrained"] == 4  # left the window, never trained
-        assert lr.holdout_size == 2
+        assert lr.counters["dropped_untrained"] == 6  # ... never trained
+        assert lr.counters["queries_trained"] == 0 and m.local_train_steps == 0
         assert lr.status()["training"].startswith("off")
