@@ -3,15 +3,16 @@
 """Per-project online learning + the serving gate (v0.2.106).
 
 Owner rulings 2026-11-12: per-project ONLINE adaptation, opt-in; a project's
-model is served only while, on its own recent held-out queries, the 90%
-paired-bootstrap lower bounds say NDCG@10 is >= +2% over plain cosine AND the
-cited node's MRR@10 is not below cosine's (test_gate_confidence_bound.py).
+model is served only while its cumulative prequential record (every query
+scored by the model in place when it arrived, before training on it) shows,
+at an anytime-valid confidence, NDCG@10 >= +2% over plain cosine AND the
+cited node's MRR@10 not below cosine's (test_gate_prequential.py).
 
 Two layers:
 
-* the learner (``online_learning``): the held-out window and purge gap, the
-  round's objective (exactly ``objective.batch_loss`` + AdamW), the gate,
-  determinism, persistence, model swaps, dynamic-type rows;
+* the learner (``online_learning``): scoring before training, the round's
+  objective (exactly ``objective.batch_loss`` + AdamW), determinism,
+  persistence, model swaps, dynamic-type rows;
 * the real server in-process over HTTP: a synthetic project stream starts at
   the search order, qualifies, is served reranked results, and a degraded
   stream makes the gate stop serving.
@@ -23,7 +24,6 @@ import asyncio
 import copy
 import math
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pytest
@@ -88,86 +88,70 @@ def _event(rng, *, good: bool = True, n: int = 6) -> tuple[dict, list[dict]]:
     return task, cands
 
 
-# ─── the window and the purge gap ──────────────────────────────────────
+# ─── prequential: scored before trained on ────────────────────────────
 
 
-def test_no_query_is_trained_on_while_in_the_window_or_within_the_gap():
-    cfg = ol.OnlineConfig(holdout_queries=5, min_cited_queries=0, purge_gap_ms=10,
-                          max_staged_queries=1000)
+def test_every_query_is_scored_by_the_model_before_any_step_trains_on_it(tmp_path):
+    """A round scores its arrivals with the network as it was BEFORE the
+    round's steps, and a query never reaches a training batch before the
+    round that scored it."""
+    cfg = ol.OnlineConfig(round_every=6, batch_queries=4, max_steps_per_round=2, lr=1e-2)
     lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
+    m = _model(tmp_path)
     rng = np.random.default_rng(0)
     for t in range(60):
-        lr.ingest(_event(rng)[0], ts_ms=t * 3)
-        window = lr._queue.window()
-        assert len(window) == min(t + 1, 5)
-        if lr._pending:
-            newest_trainable = max(q.ts_ms for q in lr._pending)
-            assert newest_trainable <= min(q.ts_ms for q in window) - cfg.purge_gap_ms
-            assert not ({id(q) for q in lr._pending} & {id(q) for q in window})
-    assert len(lr._pending) > 0
-
-
-def test_the_window_grows_until_it_holds_enough_citing_queries():
-    """On a busy project a fixed-size window can hold no citing query; the
-    window extends (up to the cap) until the MRR half of the bar is judgeable."""
-    cfg = ol.OnlineConfig(holdout_queries=4, min_cited_queries=3, max_holdout_queries=30,
-                          purge_gap_ms=0)
-    lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
-    rng = np.random.default_rng(1)
-    for t in range(20):
-        task = _event(rng)[0]
-        if t % 5:  # only every 5th query cites a node
-            task["literal_cited"] = {}
-        lr.ingest(task, ts_ms=t)
-    w = lr._queue.window()
-    assert sum(q.cites for q in w) == 3 == lr._queue.window_cited
-    # citing queries at t = 0, 5, 10, 15: the shortest run with three of them
-    # (and >= 4 queries) starts at t = 5 and ends at t = 19
-    assert len(w) == 15 and w[0].ts_ms == 5 and w[0].cites
-    # the cap wins when citations never come
-    for t in range(20, 80):
-        task = _event(rng)[0]
-        task["literal_cited"] = {}
-        lr.ingest(task, ts_ms=t)
-    assert lr.holdout_size == 30
-
-
-def test_max_staged_drops_the_oldest_and_never_trains_before_the_gap():
-    """The staging cap bounds memory on a busy project by DROPPING the oldest
-    waiting queries; it never releases one whose purge gap has not passed
-    (the held-out invariant of the module docstring holds without exception)."""
-    cfg = ol.OnlineConfig(holdout_queries=3, min_cited_queries=0, purge_gap_ms=10**12,
-                          max_staged_queries=4)
-    lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
-    rng = np.random.default_rng(2)
-    for t in range(20):
         lr.ingest(_event(rng)[0], ts_ms=t)
-    assert lr._queue.staged == 4
-    assert len(lr._pending) == 0
-    assert lr.counters["dropped_untrained"] == 20 - 3 - 4
+        if not lr.round_due():
+            continue
+        job = lr.prepare_round(m, now_ms=t)
+        assert job is not None and job.fresh is not None
+        before = ol.score_queries(copy.deepcopy(job.net), job.fresh, cfg.k)
+        res = ol.compute_round(job)
+        assert res.scores is not None
+        np.testing.assert_array_equal(res.scores.model.ndcg, before[0].ndcg)
+        np.testing.assert_array_equal(res.scores.model.mrr, before[0].mrr)
+        assert lr.apply_round(m, res) is True
+        # nothing trained so far that the record does not already hold
+        assert lr.counters["queries_trained"] <= len(lr.record)
+    assert len(lr.record) == lr.counters["events_seen"] - len(lr._fresh)
+    assert lr.counters["queries_trained"] <= len(lr.record)
+    assert lr.counters["queries_trained"] > 0
 
 
-def test_max_staged_still_releases_queries_whose_gap_has_passed():
-    cfg = ol.OnlineConfig(holdout_queries=3, min_cited_queries=0, purge_gap_ms=5,
-                          max_staged_queries=2)
+def test_a_query_ingested_with_training_off_is_scored_but_never_trained(tmp_path):
+    cfg = ol.OnlineConfig(round_every=8, batch_queries=4, max_steps_per_round=4)
     lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
-    rng = np.random.default_rng(4)
-    for t in range(40):
-        lr.ingest(_event(rng)[0], ts_ms=t * 3)
-        window = lr._queue.window()
-        if lr._pending:
-            newest_trainable = max(q.ts_ms for q in lr._pending)
-            assert newest_trainable <= min(q.ts_ms for q in window) - cfg.purge_gap_ms
-        assert lr._queue.staged <= cfg.max_staged_queries
-    assert len(lr._pending) > 0
+    m = _model(tmp_path)
+    rng = np.random.default_rng(1)
+    for t in range(16):
+        lr.ingest(_event(rng)[0], ts_ms=t, train=False)
+        if lr.round_due():
+            lr.run_round_now(m, now_ms=t)
+    assert len(lr.record) == 16
+    assert lr.counters["queries_trained"] == 0 and lr.counters["dropped_untrained"] == 16
+    assert m.local_train_steps == 0
+
+
+def test_the_served_flag_is_the_gate_state_when_the_query_arrived(tmp_path):
+    cfg = ol.OnlineConfig(round_every=4, batch_queries=4)
+    lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
+    m = _model(tmp_path)
+    rng = np.random.default_rng(2)
+    flags = []
+    for t in range(12):
+        lr.serving = t >= 6         # as if a check had opened the gate at t = 6
+        flags.append(lr.serving)
+        lr.ingest(_event(rng)[0], ts_ms=t)
+        if lr.round_due():
+            lr.run_round_now(m, now_ms=t)
+    np.testing.assert_array_equal(lr.record.served, flags)
 
 
 # ─── a round is exactly the offline objective ─────────────────────────
 
 
 def test_a_round_steps_on_objective_batch_loss_with_adamw(tmp_path):
-    cfg = ol.OnlineConfig(holdout_queries=4, min_cited_queries=0, purge_gap_ms=0,
-                          round_every=1000, batch_queries=4, max_steps_per_round=3, lr=1e-3)
+    cfg = ol.OnlineConfig(round_every=1000, batch_queries=4, max_steps_per_round=3, lr=1e-3)
     lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
     rng = np.random.default_rng(3)
     for t in range(20):
@@ -176,8 +160,12 @@ def test_a_round_steps_on_objective_batch_loss_with_adamw(tmp_path):
     job = lr.prepare_round(m, now_ms=20)
     assert job is not None and len(job.steps) == 3
 
-    # the reference: a fresh copy of the same net, AdamW, batch_loss, same seed
+    # the reference: a fresh copy of the same net, scored first (the round's
+    # prequential scoring), then AdamW on batch_loss with the same seed
     ref = copy.deepcopy(m._net)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(job.seed)
+        ol.score_queries(ref, job.fresh, cfg.k)
     opt = torch.optim.AdamW(ref.parameters(), lr=cfg.lr, weight_decay=WEIGHT_DECAY)
     gen = torch.Generator(device="cpu")
     gen.manual_seed(job.seed)
@@ -230,8 +218,7 @@ def test_the_linked_slot_mask_is_applied_in_training(tmp_path):
 
 
 def test_dynamic_type_rows_match_training_after_a_round(tmp_path):
-    cfg = ol.OnlineConfig(holdout_queries=2, min_cited_queries=0, purge_gap_ms=0,
-                          batch_queries=2, max_steps_per_round=4, lr=1e-2)
+    cfg = ol.OnlineConfig(batch_queries=2, max_steps_per_round=4, lr=1e-2)
     lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
     m = _model(tmp_path)
     rows = [m.get_type_idx("pattern"), m.get_type_idx("decision")]
@@ -246,45 +233,15 @@ def test_dynamic_type_rows_match_training_after_a_round(tmp_path):
         assert torch.allclose(w[r], mean)
 
 
-# ─── the gate ──────────────────────────────────────────────────────────
-
-
-def _ev(**over) -> ol.Evaluation:
-    base: "dict[str, Any]" = dict(at_ms=0, n_queries=300, n_cited=25, ndcg=0.96, cos_ndcg=0.93,
-                mrr=0.40, cos_mrr=0.35, search_ndcg=0.93, search_mrr=0.35,
-                ndcg_gain_lb=0.025, mrr_diff_lb=0.01, confidence=0.9, n_boot=1000)
-    base.update(over)
-    return ol.Evaluation(**base)
-
-
-@pytest.mark.parametrize("ev, serve, needle", [
-    (None, False, "no evaluation"),
-    (_ev(n_queries=120), False, "collecting held-out queries (120/300)"),
-    (_ev(n_cited=4), False, "only 4 held-out queries name a node"),
-    (_ev(ndcg_gain_lb=0.015), False, "the bound needs +2.00%"),
-    (_ev(ndcg_gain_lb=float("-inf")), False, "lower bound n/a"),
-    (_ev(cos_ndcg=0.0, ndcg=0.0, ndcg_gain_lb=float("-inf")), False, "n/a"),
-    (_ev(mrr_diff_lb=-0.02), False, "lower bound of the difference is -0.020, below 0"),
-    (_ev(mrr_diff_lb=float("-inf")), False, "difference is n/a"),
-    # the point estimates never decide: a point MRR below cosine with a
-    # passing bound cannot occur from the bootstrap, a passing point with a
-    # failing bound is the noise the bound refuses
-    (_ev(mrr=0.36, cos_mrr=0.35, mrr_diff_lb=-0.05), False, "below 0"),
-    (_ev(), True, "over plain cosine"),
-    (_ev(mrr_diff_lb=0.0), True, "difference +0.000 >= 0"),  # equal passes ("not below")
-    (_ev(ndcg_gain_lb=0.02), True, "+2.00% >= +2.00%"),         # exactly the bar passes
-])
-def test_gate_decision_is_the_owner_bar(ev, serve, needle):
-    got, why = ol.gate_decision(ev, ol.OnlineConfig())
-    assert got is serve and needle in why, why
+# ─── the gate: tests/rl_reranker/test_gate_prequential.py ─────────────
 
 
 # ─── determinism, persistence, swaps ──────────────────────────────────
 
 
 def _drive(tmp_path, name, n=48):
-    cfg = ol.OnlineConfig(holdout_queries=8, min_cited_queries=2, purge_gap_ms=0,
-                          round_every=8, batch_queries=4, max_steps_per_round=4, lr=3e-3)
+    cfg = ol.OnlineConfig(min_queries=8, min_cited_queries=2, round_every=8,
+                          batch_queries=4, max_steps_per_round=4, lr=3e-3)
     lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
     m = _model(tmp_path, name)
     rng = np.random.default_rng(6)
@@ -298,33 +255,43 @@ def _drive(tmp_path, name, n=48):
 def test_the_same_stream_gives_the_same_model_and_gate(tmp_path):
     a, ma = _drive(tmp_path, "a")
     b, mb = _drive(tmp_path, "b")
-    assert a.last_eval == b.last_eval and a.serving == b.serving and a.counters == b.counters
+    assert a.last_check == b.last_check and a.serving == b.serving and a.counters == b.counters
+    assert a.checks == b.checks > 0
+    for c in ol.RECORD_COLUMNS:
+        np.testing.assert_array_equal(a.record.column(c), b.record.column(c))
     for k, v in ma._net.state_dict().items():
         assert torch.equal(v, mb._net.state_dict()[k]), k
 
 
 def test_state_round_trips_and_a_foreign_checkpoint_resets_it(tmp_path):
     lr, m = _drive(tmp_path, "p")
+    rng = np.random.default_rng(13)
+    for t in range(5):              # arrivals not scored yet, one of them frozen
+        lr.ingest(_event(rng)[0], ts_ms=1000 + t, train=t != 2)
     m.save()
     lr.model_fingerprint = ol.model_fingerprint(m)
     d = tmp_path / "state"
     lr.save(d)
     back = ol.ProjectLearner.load(d, profile="qwen3", emb_dim=D, model=m, cfg=lr.cfg)
-    assert back.counters == lr.counters and back.last_eval == lr.last_eval
-    assert back.serving == lr.serving
-    assert [q.ts_ms for q in back._queue] == [q.ts_ms for q in lr._queue]
-    assert back.holdout_size == lr.holdout_size
-    w0, w1 = lr._queue.window()[0], back._queue.window()[0]
+    assert back.counters == lr.counters and back.last_check == lr.last_check
+    assert back.serving == lr.serving and back.checks == lr.checks
+    assert len(back.record) == len(lr.record)
+    queued = list(lr._fresh) + list(lr._pending)
+    back_q = list(back._fresh) + list(back._pending)
+    assert queued and [q.ts_ms for q in back_q] == [q.ts_ms for q in queued]
+    w0, w1 = queued[0], back_q[0]
     np.testing.assert_array_equal(lr._store.take(w0.node_rows), back._store.take(w1.node_rows))
     np.testing.assert_array_equal(w0.target, w1.target)
+    assert [(q.served, q.trainable) for q in back_q] == [(q.served, q.trainable) for q in queued]
+    assert [q.trainable for q in back._fresh] == [True, True, False, True, True]
     # the checkpoint moved on without this learner (rotated / reset elsewhere)
     m.record_local_train_steps(1)
     fresh = ol.ProjectLearner.load(d, profile="qwen3", emb_dim=D, model=m, cfg=lr.cfg)
-    assert fresh.serving is False and len(fresh._queue) == 0
+    assert fresh.serving is False and len(fresh.record) == 0 and not fresh._pending
     assert fresh.counters["model_replaced"] == lr.counters["model_replaced"] + 1
 
 
-def test_a_model_swap_clears_the_window_and_discards_a_running_round(tmp_path):
+def test_a_model_swap_clears_the_record_and_discards_a_running_round(tmp_path):
     lr, m = _drive(tmp_path, "s")
     lr.serving = True
     rng = np.random.default_rng(8)
@@ -334,13 +301,13 @@ def test_a_model_swap_clears_the_window_and_discards_a_running_round(tmp_path):
     assert job is not None
     other = _model(tmp_path, "other")
     lr.on_model_replaced(other, "test")
-    assert lr.serving is False and len(lr._queue) == 0 and "model replaced" in lr.reason
+    assert lr.serving is False and len(lr.record) == 0 and lr.checks == 0
+    assert not lr._fresh and not lr._pending and "model replaced" in lr.reason
     assert lr.apply_round(m, ol.compute_round(job)) is False  # stale generation: dropped
 
 
 def test_the_vector_store_stays_bounded(tmp_path):
-    cfg = ol.OnlineConfig(holdout_queries=4, min_cited_queries=0, purge_gap_ms=0,
-                          round_every=4, batch_queries=4, max_steps_per_round=4)
+    cfg = ol.OnlineConfig(round_every=4, batch_queries=4, max_steps_per_round=4)
     lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
     m = _model(tmp_path)
     rng = np.random.default_rng(9)
@@ -370,7 +337,7 @@ def _server(tmp_path, monkeypatch) -> RLServer:
     srv = RLServer(project_root=root,
                    log_path=str(tmp_path / "logs" / "rl_events.jsonl"), port=0)
     srv._online_cfg = ol.OnlineConfig(
-        holdout_queries=24, min_cited_queries=8, purge_gap_ms=0, round_every=8,
+        min_queries=24, min_cited_queries=8, round_every=8,
         batch_queries=4, max_steps_per_round=8, lr=3e-3)
     srv._hub_client = None  # never contact a live hub from a test
     return srv
@@ -451,9 +418,10 @@ def test_a_project_stream_starts_at_search_order_qualifies_and_is_turned_off(
 
     q = out["qualified"]
     assert q["serving"] is True, out["timeline"]
-    ev = q["online"]["last_eval"]
+    ev = q["online"]["last_check"]
     assert ev["ndcg_gain"] >= 0.02 and ev["mrr"] >= ev["cos_mrr"]
-    assert ev["ndcg_gain_lb"] >= 0.02 and ev["mrr_diff_lb"] >= 0.0 and ev["n_boot"] > 0
+    assert ev["ndcg_gain_lb"] >= 0.02 and ev["mrr_diff_lb"] >= 0.0
+    assert ev["k"] == q["online"]["checks"] >= 1
     assert "over plain cosine" in q["reason"]
     events_to_qualify = q["online"]["counters"]["events_seen"]
     assert 24 <= events_to_qualify <= 320
@@ -539,7 +507,12 @@ def test_rounds_run_off_the_event_loop_and_never_block_serving(tmp_path, monkeyp
 
 
 def test_nan_safe_ndcg_gain_property():
-    assert math.isnan(_ev(cos_ndcg=0.0).ndcg_gain)
+    chk = ol.Check(k=1, at_ms=0, confidence=0.95, n_queries=0, n_cited=0, ndcg=0.0,
+                   cos_ndcg=0.0, mrr=float("nan"), cos_mrr=float("nan"),
+                   ndcg_gain_lb=float("-inf"), mrr_diff_lb=float("-inf"), serve=False, reason="")
+    assert math.isnan(chk.ndcg_gain)
+    d = chk.as_dict()
+    assert d["ndcg_gain"] is None and d["ndcg_gain_lb"] is None and d["mrr"] is None
 
 
 # ─── the launcher's view: the rl_online_state row ─────────────────────

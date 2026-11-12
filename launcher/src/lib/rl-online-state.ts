@@ -3,10 +3,13 @@
 
 // v0.2.106 (owner rulings 2026-11-12): what the RL panel says about a
 // project's reranking — per-project online learning, opt-in, and a serving
-// gate (the project's model reranks only while a paired bootstrap over the
-// project's own held-out queries says, at 90% confidence, that NDCG@10 is
-// >= +2% over plain cosine AND the cited node's MRR@10 is not below cosine's —
-// the gate decides on those lower bounds, not on the point estimates).
+// gate judged on the project's CUMULATIVE PREQUENTIAL record: every query is
+// scored by the model in place when it arrived, before the model trained on
+// it, and the k-th check of the whole record runs at confidence
+// 1 - 0.10 / (k (k+1)) (a 10% total error budget over all checks). The model
+// reranks only while the lower bounds show NDCG@10 >= +2% over plain cosine
+// AND the cited node's MRR@10 not below cosine's; no verdict before the record
+// holds `min_queries` queries and `min_cited_queries` citing ones.
 //
 // Inputs (both read-only):
 //   * whether RL scoring is ON for the project — the enable cascade
@@ -14,13 +17,13 @@
 //     (`lock_reason`): OFF means the container is never called;
 //   * the container's `rl_online_state` row (module DB, written after every
 //     online round by `rl_server._push_rl_online_state`; migrations
-//     `claude_mcp_servers/rl_reranker/db/0007_rl_online_state.sql` and
-//     `0008_rl_online_state_bounds.sql`).
+//     `claude_mcp_servers/rl_reranker/db/0007_rl_online_state.sql`,
+//     `0008_rl_online_state_bounds.sql` and `0009_rl_online_state_prequential.sql`).
 //
 // Pure (no invoke, no DOM) so every branch is unit-testable; the panel
 // (`RlRerankerStatusPanel.svelte`) only renders what this returns.
 
-/** The `rl_online_state` row (column names of migrations 0007 + 0008). */
+/** The `rl_online_state` row (column names of migrations 0007 + 0008 + 0009). */
 export interface RlOnlineStateRow {
   embedding_source?: string | null;
   refreshed_at?: number | null;
@@ -31,9 +34,8 @@ export interface RlOnlineStateRow {
   queries_trained?: number | null;
   train_steps?: number | null;
   rounds?: number | null;
-  holdout_queries?: number | null;
-  holdout_target?: number | null;
   serving_turned_off?: number | null;
+  /** 0007, since 0009 about the whole prequential record. */
   last_eval_at?: number | null;
   ndcg_gain?: number | null;
   ndcg?: number | null;
@@ -41,19 +43,31 @@ export interface RlOnlineStateRow {
   mrr?: number | null;
   cos_mrr?: number | null;
   cited_queries?: number | null;
-  /** 0008: the bounds the serving decision used (null = undefined, failing). */
+  /** 0008: the last check's bounds and confidence (null = undefined / no check). */
   ndcg_gain_lb?: number | null;
   mrr_diff_lb?: number | null;
   gate_confidence?: number | null;
+  /** 0009: the record's size, the verdict minimums, the check count, the served searches. */
+  record_queries?: number | null;
+  min_queries?: number | null;
+  min_cited_queries?: number | null;
+  checks?: number | null;
+  error_budget?: number | null;
+  served_queries?: number | null;
+  served_cited_queries?: number | null;
+  served_ndcg_gain?: number | null;
+  served_mrr?: number | null;
+  served_cos_mrr?: number | null;
 }
 
 /** The fields the panel reads (passed to `module_db_read_row`). */
 export const RL_ONLINE_STATE_FIELDS: readonly string[] = [
   'embedding_source', 'refreshed_at', 'serving', 'reason', 'training_enabled',
-  'events_seen', 'queries_trained', 'train_steps', 'rounds', 'holdout_queries',
-  'holdout_target', 'serving_turned_off', 'last_eval_at', 'ndcg_gain', 'ndcg',
-  'cos_ndcg', 'mrr', 'cos_mrr', 'cited_queries', 'ndcg_gain_lb', 'mrr_diff_lb',
-  'gate_confidence',
+  'events_seen', 'queries_trained', 'train_steps', 'rounds', 'serving_turned_off',
+  'last_eval_at', 'ndcg_gain', 'ndcg', 'cos_ndcg', 'mrr', 'cos_mrr', 'cited_queries',
+  'ndcg_gain_lb', 'mrr_diff_lb', 'gate_confidence',
+  'record_queries', 'min_queries', 'min_cited_queries', 'checks', 'error_budget',
+  'served_queries', 'served_cited_queries', 'served_ndcg_gain', 'served_mrr', 'served_cos_mrr',
 ];
 
 export type RlOnlineKey = 'unknown' | 'off' | 'locked' | 'waiting' | 'not_serving' | 'serving';
@@ -62,27 +76,43 @@ export interface RlOnlineSummary {
   key: RlOnlineKey;
   /** One line: is the project's model reranking its searches, and why. */
   headline: string;
-  /** Detail lines (counters, the last check's numbers). */
+  /** Detail lines (counters, the record, the last check, the served searches). */
   details: string[];
 }
 
+function isNum(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
 function n(v: number | null | undefined): number {
-  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+  return isNum(v) ? v : 0;
 }
 
 function pct(v: number | null | undefined): string {
-  if (typeof v !== 'number' || !Number.isFinite(v)) return 'n/a';
+  if (!isNum(v)) return 'n/a';
   const s = (100 * v).toFixed(2);
   return `${v >= 0 ? '+' : ''}${s}%`;
 }
 
 function num(v: number | null | undefined, digits = 3): string {
-  return typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : 'n/a';
+  return isNum(v) ? v.toFixed(digits) : 'n/a';
 }
 
 function signed(v: number | null | undefined, digits = 3): string {
-  if (typeof v !== 'number' || !Number.isFinite(v)) return 'n/a';
+  if (!isNum(v)) return 'n/a';
   return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}`;
+}
+
+/**
+ * A check's confidence: `95.0%` while its error rate is at least 0.1%, else
+ * `1 - 3.1e-8` (late checks run at tiny error rates; a percentage would read
+ * 100.0% and hide that).
+ */
+export function confidenceText(c: number | null | undefined): string {
+  if (!isNum(c)) return 'n/a';
+  const alpha = 1 - c;
+  if (alpha >= 1e-3) return `${(100 * c).toFixed(1)}%`;
+  return `1 - ${alpha.toExponential(1)}`;
 }
 
 function truthy(v: number | boolean | null | undefined): boolean {
@@ -140,19 +170,29 @@ export function summarizeOnlineState(
       (truthy(row.training_enabled) ? '' : ' — online training is off for this project'),
   );
   details.push(
-    `Held-out check: ${n(row.holdout_queries)}/${n(row.holdout_target)} recent queries, ` +
-      `${n(row.cited_queries)} of them name a node`,
+    `Record (each query scored before the model trained on it): ${n(row.record_queries)} ` +
+      `queries, ${n(row.cited_queries)} of them name a node — a verdict needs ` +
+      `${n(row.min_queries)} and ${n(row.min_cited_queries)}` +
+      (isNum(row.ndcg_gain)
+        ? `; NDCG@10 ${pct(row.ndcg_gain)} vs plain cosine, cited-node MRR@10 ` +
+          `${num(row.mrr)} vs ${num(row.cos_mrr)}`
+        : ''),
   );
-  if (typeof row.ndcg_gain === 'number' || typeof row.ndcg_gain_lb === 'number') {
-    const conf =
-      typeof row.gate_confidence === 'number' && Number.isFinite(row.gate_confidence)
-        ? `${Math.round(100 * row.gate_confidence)}%`
-        : '90%';
+  const checks = n(row.checks);
+  if (checks > 0) {
+    const budget = isNum(row.error_budget) ? `${Math.round(100 * row.error_budget)}%` : 'n/a';
     details.push(
-      `Last check (${conf} lower bounds decide): NDCG@10 gain ${pct(row.ndcg_gain_lb)} ` +
-        `(needs +2.00%; measured ${pct(row.ndcg_gain)}), cited-node MRR@10 difference ` +
-        `${signed(row.mrr_diff_lb)} (must not be below 0; measured ${num(row.mrr)} vs ` +
-        `${num(row.cos_mrr)} on ${n(row.cited_queries)} citing queries)`,
+      `Check ${checks} (lower bounds at confidence ${confidenceText(row.gate_confidence)} ` +
+        `decide; ${budget} total error budget over all checks): NDCG@10 gain ` +
+        `${pct(row.ndcg_gain_lb)} (needs +2.00%), cited-node MRR@10 difference ` +
+        `${signed(row.mrr_diff_lb)} (must not be below 0)`,
+    );
+  }
+  if (n(row.served_queries) > 0) {
+    details.push(
+      `Searches the model served: ${n(row.served_queries)} ` +
+        `(${n(row.served_cited_queries)} name a node) — NDCG@10 ${pct(row.served_ndcg_gain)} ` +
+        `vs plain cosine, cited-node MRR@10 ${num(row.served_mrr)} vs ${num(row.served_cos_mrr)}`,
     );
   }
   if (n(row.serving_turned_off) > 0) {
@@ -165,7 +205,8 @@ export function summarizeOnlineState(
       details,
     };
   }
-  const waiting = n(row.holdout_queries) < n(row.holdout_target);
+  // No check yet = the record is still below the verdict minimums.
+  const waiting = checks === 0;
   return {
     key: waiting ? 'waiting' : 'not_serving',
     headline:

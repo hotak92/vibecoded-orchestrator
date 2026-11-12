@@ -242,7 +242,7 @@
          local model. Neither says whether reranking is influencing search
          results. v0.2.106 (owner 2026-11-12): that is now a per-project
          fact — the opt-in toggle, then the container's serving gate on the
-         project's own held-out queries — so it is read and said here
+         project's own prequential record — so it is read and said here
          (superseding the pre-v0.2.106 "not live yet" note). -->
     <p class="dormant online-{onlineSummary.key}" data-testid="rl-reranking-state">
       <strong>Reranking:</strong> {onlineSummary.headline}

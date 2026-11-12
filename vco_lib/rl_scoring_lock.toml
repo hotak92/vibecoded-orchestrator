@@ -51,8 +51,11 @@
 #   * it ships OPT-IN: "for now opt-in, then we'll try to find how to make the
 #     model generalize";
 #   * the bar for a project's model to be SERVED: NDCG@10 >= +2% over plain
-#     cosine AND MRR@10 of the literally cited node >= cosine's, measured on
-#     that project's own recent held-out queries.
+#     cosine AND MRR@10 of the literally cited node >= cosine's, judged on
+#     that project's cumulative prequential record (every query scored by
+#     the model in place before it trained on it) at an anytime-valid
+#     confidence (the k-th check at 1 - 0.10 / (k (k+1))), from 300 queries
+#     and 50 citing ones on.
 #
 # What `locked = false` means now — and what it does NOT:
 #   * RL scoring is still OFF by default. The per-project toggle and the
@@ -64,7 +67,7 @@
 #   * Toggle on = the project's citations train its own model online
 #     (`claude_mcp_servers/rl_reranker/online_learning.py`), and the
 #     container reranks that project's searches only while the model passes
-#     the bar above on the project's held-out queries; otherwise it hands
+#     the bar above on the project's prequential record; otherwise it hands
 #     the search order back.
 #   * `reason` below is the pre-v0.2.106 text, kept for the record (it is
 #     only shown while `locked = true`).

@@ -233,8 +233,12 @@ def test_doctor_reads_project_status_through_the_client():
             assert url.endswith("/project_status")
             return httpx.Response(200, json={"ok": True, "serving": False, "reason": "collecting",
                                              "online": {"counters": {"events_seen": 3},
-                                                        "holdout_queries": 3,
-                                                        "holdout_target": 300}})
+                                                        "record": {"queries": 3,
+                                                                   "cited_queries": 1},
+                                                        "bar": {"min_queries": 300,
+                                                                "min_cited_queries": 50},
+                                                        "checks": 0,
+                                                        "served_searches": {"queries": 0}}})
 
         async def aclose(self):
             pass
@@ -251,6 +255,8 @@ def test_doctor_reads_project_status_through_the_client():
              "client_active_embedding": "qwen3"},
             {"enabled": True, "project_id": "proj-1"})
     assert got["status"] == "not_serving" and got["reason"] == "collecting"
+    assert "prequential record 3 queries (1 citing; a verdict needs 300 / 50)" in got["detail"]
+    assert "0 checks" in got["detail"] and "no search served by the model yet" in got["detail"]
     assert t.headers["X-VCT-Project-ID"] == "proj-1"
 
 
@@ -276,7 +282,7 @@ _HEALTH = {"ok": True, "model": "not trained", "trained": False, "protocol_versi
            "embedding_dim": 4, "embedding_space": "qwen3", "linked_slots_masked": False,
            "per_project_gate": True}
 _NOT_SERVED = {"ok": True, "scored": False, "serving": "search_order",
-               "reason": "collecting held-out queries (3/300)", "order": [0, 1],
+               "reason": "collecting queries scored before training (3/300 queries, 1/50 citing a node)", "order": [0, 1],
                "scores": [None, None], "top_k": []}
 
 
@@ -317,7 +323,7 @@ def test_a_search_order_answer_is_healthy_and_not_resent_for_a_minute(tmp_path, 
     a, b = asyncio.run(run())
     assert a is None and b is None  # not reranked: the caller keeps its order
     assert c.last_call_ok is True and c.last_served is False
-    assert c.last_not_served_reason == "collecting held-out queries (3/300)"
+    assert c.last_not_served_reason == "collecting queries scored before training (3/300 queries, 1/50 citing a node)"
     assert t.posts == 1  # the second search did not resend the vectors
     counter = tmp_path / ".claude" / "state" / "rl_fallback_counter.json"
     assert not counter.exists() or json.loads(counter.read_text()).get("count", 0) == 0

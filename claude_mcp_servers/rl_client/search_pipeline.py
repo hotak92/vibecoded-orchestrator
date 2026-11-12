@@ -33,7 +33,7 @@ owns:
      space, and trained weights or the per-project gate); it scores from
      ``query_emb`` + the vectors the candidates carry (``rerank_wire``) —
      or hands the search order back while the project's own model has not
-     passed its held-out check.
+     passed its own check.
   4. Citation-cache population (``_rl_node_content_cache`` in
      server.py) so the answer monitor can compute citations later
      without re-fetching from Weaviate.
@@ -768,7 +768,7 @@ async def _do_rerank(
         )
         return None
     # v0.2.106 per-project gate: the container handed the search order back
-    # because this project's model has not passed its own held-out check —
+    # because this project's model has not passed its own check —
     # a healthy answer (not a fallback, not a rerank).
     if getattr(client, "last_served", True) is False:
         logger.debug(

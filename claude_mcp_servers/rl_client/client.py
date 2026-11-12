@@ -86,7 +86,7 @@ _DEFAULT_HEALTH_TIMEOUT = 1.0
 #                           ``per_project_gate`` (v0.2.106, per-project online
 #                           learning): it is ``compatible`` and hands a
 #                           project its search order until that project's own
-#                           model passes its held-out check.
+#                           model passes its own check.
 # Bump PROTOCOL_VERSION when the request/response SHAPE changes in a way
 # an older peer cannot tolerate. Additive optional fields do NOT need a
 # bump (extra=allow handles them). v2 (v0.2.106): /cache_nodes carries the
@@ -132,7 +132,7 @@ class NegotiationResult:
     weights_version: Optional[str] = None
     linked_slots_masked: Optional[bool] = None
     # v0.2.106: the container gates each project's model on that project's
-    # own held-out queries (None = not said).
+    # own prequential record (None = not said).
     per_project_gate: Optional[bool] = None
 
 
@@ -344,7 +344,7 @@ class RLClient:
         self.last_scores: List[Optional[float]] = []
         # v0.2.106: False when the last call got the project's SEARCH ORDER
         # back because its model is not served (it has not passed its own
-        # held-out check) — a healthy answer, not a fault; the reason is in
+        # check) — a healthy answer, not a fault; the reason is in
         # ``last_not_served_reason``. While ``_not_served_until`` (monotonic
         # seconds) is in the future, cache_nodes answers that from memory
         # without sending the vectors again: the serving state only changes
@@ -520,7 +520,7 @@ class RLClient:
 
         if data.get("scored") is False and data.get("serving") == "search_order":
             # v0.2.106 per-project gate: the project's model has not passed
-            # its own held-out check (or no longer does) — the search order
+            # its own check (or no longer does) — the search order
             # stands. A healthy answer, not a fallback.
             self.last_call_ok = True
             self.last_served = False
@@ -871,8 +871,8 @@ class RLClient:
             )
 
         # v0.2.106 (owner 2026-11-12, per-project online adaptation): the
-        # container gates each project's model on that project's own held-out
-        # queries and hands back the search order until it passes, so it is
+        # container gates each project's model on that project's own
+        # prequential record and hands back the search order until it passes, so it is
         # safe to call without a trained base model.
         if per_project_gate is True:
             return NegotiationResult(

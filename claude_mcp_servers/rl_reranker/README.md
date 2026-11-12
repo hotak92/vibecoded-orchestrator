@@ -13,11 +13,16 @@ them to the agent. Reranking is learned online, per project
 server trains that project's own `RLModel` (small PyTorch network) on them in
 bounded rounds with the offline trainer's objective (`objective.py`). A
 project's model reranks its searches only while it beats plain cosine
-ordering on the project's own held-out recent queries, judged on one-sided
-90% paired-bootstrap lower bounds (the NDCG@10 gain at least +2% AND the cited
-node's MRR@10 minus cosine's at least 0; `ranking_metrics.paired_bootstrap_bounds`);
-until then, and whenever it stops passing, the server hands the client its
-own search order back. The
+ordering on the project's own cumulative PREQUENTIAL record — every query
+scored by the model in place when it arrived, before that model trained on
+it — judged on one-sided lower bounds (the NDCG@10 gain at least +2% AND the
+cited node's MRR@10 minus cosine's at least 0; `ranking_metrics.paired_normal_bounds`)
+at an anytime-valid confidence: the k-th check runs at `1 - 0.10 / (k (k+1))`
+(`ranking_metrics.check_confidence`), so re-checking after every round keeps
+the total false-pass probability at or below 10%. No verdict before the
+record holds 300 queries and 50 that cite a node. Until it passes, and from
+the first check it fails, the server hands the client its own search order
+back. The
 MCP-side client is `claude_mcp_servers/rl_client`.
 
 Whether the container is called at all is decided on the client side: RL
@@ -37,9 +42,9 @@ launcher-driven model-lifecycle management.
 | Method | Path           | Purpose |
 |--------|----------------|---------|
 | GET    | `/health`      | Liveness + weights state: `{ "ok": true, "model": "RLModel loaded" \| "not trained", "trained": bool, "weights": { "profile", "loaded_version", "bundled_version" }, "per_project_gate": true, "online_learning": { "projects_loaded", "projects_serving_model", "bar" }, ... }`. |
-| POST   | `/cache_nodes` | Score one search's candidates with the routed project's model and return the reranked order + scores (`scored: true`, `serving: "model"`) — or, while that project's model does not pass its held-out check (or the request has no project id), the identity order with `scored: false`, `serving: "search_order"` and the `reason`. The client sends the vectors it already logs (query vector, node vectors, linked vectors, node types) as float16 in a `features` block (`claude_mcp_servers/rl_client/rerank_wire.py`, wire protocol 2); the container embeds nothing. A body without `features` gets 422. |
-| POST   | `/rl_update`   | Submit citation events (`tasks: {task_id: {nodes_packed, query_emb, cosine_sims, literal_cited, cross_encoder_cited}}`, `RLClient.rl_update_v3`) to the routed project's online learner; every 32 events a training round + held-out check runs off the event loop. No project id = nothing learned (`skipped: "no_project_id"`). |
-| GET    | `/project_status` | The routed project's online learning and serving gate: serving yes/no and why, the last check's NDCG@10 / cited-node MRR@10 for the model and for cosine with the 90% lower bounds that decided (`ndcg_gain_lb`, `mrr_diff_lb`), the window size, events seen / trained, how often serving was stopped. |
+| POST   | `/cache_nodes` | Score one search's candidates with the routed project's model and return the reranked order + scores (`scored: true`, `serving: "model"`) — or, while that project's model does not pass its own check (or the request has no project id), the identity order with `scored: false`, `serving: "search_order"` and the `reason`. The client sends the vectors it already logs (query vector, node vectors, linked vectors, node types) as float16 in a `features` block (`claude_mcp_servers/rl_client/rerank_wire.py`, wire protocol 2); the container embeds nothing. A body without `features` gets 422. |
+| POST   | `/rl_update`   | Submit citation events (`tasks: {task_id: {nodes_packed, query_emb, cosine_sims, literal_cited, cross_encoder_cited}}`, `RLClient.rl_update_v3`) to the routed project's online learner; every 32 events a round runs off the event loop: it scores the events that arrived since the last round with the model in place, then trains on them, then checks the gate on the cumulative record. No project id = nothing learned (`skipped: "no_project_id"`). |
+| GET    | `/project_status` | The routed project's online learning and serving gate: serving yes/no and why; the prequential record (`record`: queries, citing queries, NDCG@10 / cited-node MRR@10 of the model, of cosine and of the search order); the check count `checks` and the last check (`last_check`: k, its confidence, the lower bounds that decided — `ndcg_gain_lb`, `mrr_diff_lb`); what the searches the model actually served got (`served_searches`); the bar (`bar`: +2%, error budget 0.10, minimum 300 queries / 50 citing); events seen / trained, how often serving was stopped. |
 
 ### v0.1.1 — model lifecycle (launcher-driven)
 
@@ -206,7 +211,7 @@ length plus the qwen3 cutover date (2026-04-14).
 |---|---|
 | `rl_server.py` | aiohttp server, per-project routing, model-lifecycle endpoints, hub client |
 | `retrieval_rl.py` | the live rerank of one search |
-| `online_learning.py` | per-project online learning: the held-out window + purge gap, training rounds, the serving gate, per-project state files |
+| `online_learning.py` | per-project online learning: scoring every arriving query before training on it (the prequential record), training rounds, the serving gate, per-project state files |
 | `objective.py` | the training objective + input builder (one home: the offline trainer and the online learner) |
 | `ranking_metrics.py` | NDCG@k / MRR@k and the bar (one home: `training/eval_harness.py` and the serving gate) |
 | `rl_model.py` / `rl_model_v1.py` | the v2 network (default) / the v1 snapshot (`RL_ARCH_VERSION=v1`) |
@@ -322,17 +327,19 @@ python -m claude_mcp_servers.rl_reranker.training.transfer adapt \
 
 To see what the SERVER's own online learning does on a project's real history,
 replay the export through it (the same `ProjectLearner` the server drives:
-rounds, held-out window, gate), per profile and project:
+rounds, the prequential record, the gate), per profile and project:
 
 ```bash
 python -m claude_mcp_servers.rl_reranker.training.transfer replay \
-    --data <dir> --profile qwen3 --out <run dir> [--lr 1e-4 --holdout 300 --min-cited 20 --purge-gap-hours 24 --confidence 0.9 --bootstrap 1000]
+    --data <dir> --profile qwen3 --out <run dir> [--lr 1e-4 --min-queries 300 --min-cited 50 --error-budget 0.10]
 ```
 
 It reports the events each project needs before its model is served, the
 NDCG@10 gain over cosine and the cited-node MRR@10 of the searches served by
-the model (scored when they arrive, before the model learns from them), and
-how often the gate stopped serving.
+the model (scored when they arrive, before the model learns from them) with
+how many of them cite a node, whether those served searches meet the bar on
+their point estimates (`acceptance`), the whole prequential record, the
+number of checks, and how often the gate stopped serving.
 
 The `lopo` / `adapt` commands take the `train` options (`--init none|cosine|<checkpoint>`,
 `--l2sp`, `--entity-dropout`, `--arch v2|v1`, `--purge-hours`, the loss

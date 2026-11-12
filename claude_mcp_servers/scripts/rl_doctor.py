@@ -273,8 +273,9 @@ def _probe_project_online(container: Dict[str, Any], toggle: Dict[str, Any]) -> 
     container's ``/project_status`` through the SAME base URL and embedding
     the container probe used (read-only). Never raises.
 
-    ``serving`` / ``not_serving`` (with the container's reason and the last
-    held-out check), or ``not_checked`` / ``unavailable`` with why.
+    ``serving`` / ``not_serving`` (with the container's reason, the last
+    check on the project's prequential record and what the served searches
+    got), or ``not_checked`` / ``unavailable`` with why.
     """
     if container.get("status") != "compatible":
         return {"status": "not_checked", "detail": "the container is not called (see above)."}
@@ -308,19 +309,38 @@ def _probe_project_online(container: Dict[str, Any], toggle: Dict[str, Any]) -> 
     if not isinstance(data, dict) or not data.get("ok"):
         return {"status": "unavailable", "detail": "the container did not answer /project_status."}
     online = data.get("online") or {}
-    last = online.get("last_eval") or {}
+    last = online.get("last_check") or {}
     counters = online.get("counters") or {}
+    record = online.get("record") or {}
+    bar = online.get("bar") or {}
+    served = online.get("served_searches") or {}
+
+    def pct(v: Any) -> str:
+        return "n/a" if not isinstance(v, (int, float)) else f"{100 * v:+.2f}%"
+
+    def num(v: Any) -> str:
+        return "n/a" if not isinstance(v, (int, float)) else f"{v:.3f}"
+
+    served_txt = (
+        f"served searches {served.get('queries', 0)} ({served.get('cited_queries', 0)} citing): "
+        f"NDCG@10 {pct(served.get('ndcg_gain'))} vs plain cosine, cited-node MRR@10 "
+        f"{num(served.get('mrr'))} vs {num(served.get('cos_mrr'))}"
+        if served.get("queries") else "no search served by the model yet"
+    )
     return {
         "status": "serving" if data.get("serving") else "not_serving",
         "reason": data.get("reason"),
         "detail": (
             f"{'SERVED' if data.get('serving') else 'not served'}: {data.get('reason')}; "
             f"{counters.get('events_seen', 0)} citation events, "
-            f"{counters.get('queries_trained', 0)} trained on, held-out window "
-            f"{online.get('holdout_queries', 0)}/{online.get('holdout_target', 0)}, "
-            f"served-then-stopped {counters.get('serving_turned_off', 0)}x"
+            f"{counters.get('queries_trained', 0)} trained on, prequential record "
+            f"{record.get('queries', 0)} queries ({record.get('cited_queries', 0)} citing; "
+            f"a verdict needs {bar.get('min_queries', '?')} / "
+            f"{bar.get('min_cited_queries', '?')}), {online.get('checks', 0)} checks, "
+            f"served-then-stopped {counters.get('serving_turned_off', 0)}x; {served_txt}"
         ),
-        "last_eval": last or None,
+        "last_check": last or None,
+        "served_searches": served or None,
         "counters": counters or None,
         "training": online.get("training"),
     }
@@ -379,7 +399,7 @@ def _scoring_state(
         if container.get("per_project_gate"):
             return {"status": "on", "scoring": True,
                     "detail": "the container is called; it reranks only with a project model "
-                              "that passes its own held-out check (this project's state "
+                              "that passes its own check (this project's state "
                               f"could not be read: {o.get('detail') or 'unknown'})."}
         return {"status": "on", "scoring": True,
                 "detail": f"searches are reranked by the container's trained model ({version})."}

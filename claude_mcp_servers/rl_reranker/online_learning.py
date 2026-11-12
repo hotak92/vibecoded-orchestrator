@@ -3,12 +3,13 @@
 """Per-project online learning of the RL reranker, behind a per-project serving gate.
 
 OWNER RULINGS (2026-11-12): the product is PER-PROJECT ONLINE adaptation; it
-ships OPT-IN; no global weights ship; a project's model is SERVED only while,
-on that project's own recent held-out queries, a PAIRED BOOTSTRAP says at 90%
-confidence (one-sided) that its NDCG@10 is at least +2% above plain cosine
-ordering AND that the MRR@10 of the literally cited node is not below
-cosine's. Otherwise the project keeps its own search order, exactly as with
-RL scoring off.
+ships OPT-IN; no global weights ship; a project's model is SERVED only while
+its NDCG@10 is at least +2% above plain cosine ordering AND the MRR@10 of the
+literally cited node is not below cosine's — judged on the project's
+CUMULATIVE PREQUENTIAL record with an anytime-valid error budget (the rlgate2
+study, 2026-11-12: a held-out window re-tested every round passed on lucky
+windows whose gains the following queries did not show). Otherwise the
+project keeps its own search order, exactly as with RL scoring off.
 
 What one project's :class:`ProjectLearner` does with the citation events the
 MCP posts to ``/rl_update`` (``RLServer._rl_update``):
@@ -16,55 +17,56 @@ MCP posts to ``/rl_update`` (``RLServer._rl_update``):
 1. **Ingest** (:meth:`ProjectLearner.ingest`): the event's targets are the
    unified target formula (``vco_lib.rl_training_targets``, the one copy) over
    its answer cosines + literal citations, its vectors the frozen
-   retrieval-time ones. The query is appended to a time-ordered queue.
-2. **Held-out window** (:class:`TimeQueue`): the shortest run of the newest
-   queries holding :attr:`OnlineConfig.holdout_queries` queries and
-   :attr:`OnlineConfig.min_cited_queries` citing ones (capped at
-   :attr:`OnlineConfig.max_holdout_queries`) is the evaluation window. A query
-   is NEVER trained on while it is in the window, nor before a purge gap has
-   passed after it left (:attr:`OnlineConfig.purge_gap_ms`): consecutive
-   queries of one task look alike, and without a gap the window would measure
-   recall of what was trained just before it. On a busy project the queries
-   waiting out the gap are bounded by :attr:`OnlineConfig.max_staged_queries`:
-   past it the OLDEST waiting queries are dropped untrained — never released
-   early.
-3. **Training round** (every :attr:`OnlineConfig.round_every` new events —
-   bounded compute, never per event): the released queries train the
-   project's network with the offline objective, ``objective.batch_loss``
-   (query-grouped mini-batches of :attr:`OnlineConfig.batch_queries` queries,
-   pairs only within a query), at most :attr:`OnlineConfig.max_steps_per_round`
-   AdamW steps per round. Inputs come from ``objective.build_inputs``, which
-   applies the profile's linked-slot mask exactly as the serving path does.
-4. **Gate** (:func:`gate_decision`, after every round): the model and plain
-   cosine ordering are scored per query on the window (``ranking_metrics``),
-   and ``ranking_metrics.paired_bootstrap_bounds`` turns the per-query values
-   into one-sided lower bounds of the bar's two halves (NDCG@10 gain, cited
-   MRR@10 difference); the model is served for the project only while BOTH
-   bounds clear the owner's bar — the point estimates alone pass by noise on
-   a window of 20-50 citing queries. Until
+   retrieval-time ones. The query waits, unscored, for the next round; it
+   remembers whether the project was being served the model when it arrived.
+2. **Round** (every :attr:`OnlineConfig.round_every` new events — bounded
+   compute, never per event): first the queries that arrived since the last
+   round are SCORED by the model in place — model, plain cosine and the
+   client's search order, per query (``ranking_metrics``) — for the project's
+   :class:`PrequentialRecord`. Only then do they become trainable: the
+   released queries train the project's network with the offline objective,
+   ``objective.batch_loss`` (query-grouped mini-batches of
+   :attr:`OnlineConfig.batch_queries` queries, pairs only within a query), at
+   most :attr:`OnlineConfig.max_steps_per_round` AdamW steps per round. Inputs
+   come from ``objective.build_inputs``, which applies the profile's
+   linked-slot mask exactly as the serving path does. Every query in the
+   record was therefore scored by a model that had not trained on it.
+3. **Gate** (:func:`gate_decision`, after every round that added to the
+   record): once the record holds :attr:`OnlineConfig.min_queries` queries
+   and :attr:`OnlineConfig.min_cited_queries` citing ones, the k-th check
+   computes ``ranking_metrics.paired_normal_bounds`` over the WHOLE record at
+   confidence ``ranking_metrics.check_confidence(k)`` = ``1 - 0.10/(k(k+1))``
+   (total false-pass probability <= :attr:`OnlineConfig.error_budget` over
+   every check of the model). The model is served while BOTH lower bounds
+   clear the bar and stops being served at the first check that fails. Until
    then — and whenever it stops passing — the server answers with the
-   client's own search order (``RLServer._cache_nodes``): a project starts
-   at exactly the behaviour it has without the reranker.
+   client's own search order (``RLServer._cache_nodes``): a project starts at
+   exactly the behaviour it has without the reranker.
 
 A round runs in three steps so a slow round never blocks serving:
 :meth:`ProjectLearner.prepare_round` (under the server's lock: copies the
 network + optimizer state and the round's data), :func:`compute_round`
 (off the event loop, touches no shared state) and
 :meth:`ProjectLearner.apply_round` (under the lock: loads the trained state
-into the live model, unless the model was replaced meanwhile, and applies the
-gate). :meth:`ProjectLearner.run_round_now` chains the three — the replay
-simulation (``training/transfer.py replay``) and the tests drive exactly this
-path.
+into the live model, unless the model was replaced meanwhile, appends the
+round's scores to the record and applies the gate).
+:meth:`ProjectLearner.run_round_now` chains the three — the replay simulation
+(``training/transfer.py replay``) and the tests drive exactly this path. A
+round that fails or is discarded loses its queries' scores as it loses their
+training: the record skips them (it never holds a score a model computed on
+a query it had trained on).
 
 Persistence (per project, beside its checkpoint): ``online_<profile>.json``
-(gate state, counters) + ``online_<profile>.npz`` (the queued queries and
-their de-duplicated float16 vectors). Both are written atomically after every
-applied round. A state written for a different checkpoint (rotated / reset
-out of band) is discarded on load: its window may have been trained on.
+(gate state, check count, counters) + ``online_<profile>.npz`` (the queued
+queries with their de-duplicated float16 vectors, and the prequential record:
+per query six float32 metrics and a served flag — no vectors, 25 bytes a
+query). Both are written atomically after every applied round. A state written
+for a different checkpoint (rotated / reset out of band) is discarded on load:
+its record measured another model.
 
 Deterministic: rounds happen at fixed event counts, the batches are FIFO, every
-random draw (linked-slot order, dropout, the gate's bootstrap resamples)
-comes from a generator seeded by the round number.
+random draw (linked-slot order, dropout) comes from a generator seeded by the
+round number, and the bounds are closed-form.
 """
 from __future__ import annotations
 
@@ -93,12 +95,14 @@ from .objective import (
     sync_dynamic_type_rows,
 )
 from .ranking_metrics import (
-    GATE_BOOTSTRAP_SAMPLES,
-    GATE_CONFIDENCE,
+    GATE_ERROR_BUDGET,
+    GATE_MIN_CITED_QUERIES,
     K,
     UNLOCK_MIN_REL_GAIN,
+    QueryMetrics,
+    check_confidence,
     nan_mean,
-    paired_bootstrap_bounds,
+    paired_normal_bounds,
     per_query_metrics,
     relative_gain,
 )
@@ -115,7 +119,9 @@ from .rl_model import (
 logger = logging.getLogger(__name__)
 
 #: On-disk format of the learner state (``online_<profile>.json`` / ``.npz``).
-STATE_FORMAT_VERSION = 1
+#: 2 (2026-11-12): the prequential record replaced the held-out window; a
+#: format-1 state is discarded on load (its window queries were never scored).
+STATE_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -123,50 +129,29 @@ class OnlineConfig:
     """The knobs of per-project online learning. The defaults are what the
     server runs; the replay simulation passes the same object.
 
-    The held-out window is the SHORTEST run of the newest labelled queries
-    that holds at least ``holdout_queries`` queries AND at least
-    ``min_cited_queries`` queries that literally cite a node (the MRR half of
-    the bar needs them; on a busy project a fixed-size window can hold none),
-    never longer than ``max_holdout_queries``. The gate judges nothing smaller
-    than ``holdout_queries`` queries, and no MRR on fewer than
-    ``min_cited_queries`` citing ones.
-    ``purge_gap_ms``: a query becomes trainable only this long after it left
-    the window (no exception). ``max_staged_queries``: queries waiting out the
-    gap kept at most (bounds memory on a busy project): beyond it the oldest
-    waiting queries are DROPPED untrained, never released before their gap.
+    The gate: no verdict before the prequential record holds ``min_queries``
+    queries AND ``min_cited_queries`` that literally cite a node (the MRR half
+    of the bar needs them); from then on every round that adds to the record
+    is a check, the k-th at confidence ``1 - error_budget / (k (k+1))``, and
+    the model is served iff both lower bounds clear the bar
+    (``min_ndcg_gain`` relative NDCG@``k`` gain, cited-node MRR@``k``
+    difference >= 0).
     ``round_every``: new events between two rounds. ``batch_queries``: queries
     per AdamW step. ``max_steps_per_round``: compute bound of one round.
     ``max_pending_queries``: trainable queries kept waiting at most (the
-    oldest are dropped beyond it).
-    ``passes_to_serve``: consecutive passing checks before the model is
-    served; ONE failing check stops serving at once. Never serves a model
-    that fails the bar (it only waits longer to start). Kept beside the
-    confidence bound (default 1 = the bound alone decides): the bound answers
-    "is this window's gain real", the streak "has it held over successive,
-    overlapping windows" — a hysteresis knob the bound does not replace.
-    ``min_cited_queries`` likewise stays: a bootstrap over a handful of citing
-    queries is itself unreliable, so the gate does not run below it.
+    oldest are dropped untrained beyond it).
     """
 
-    holdout_queries: int = 300
-    min_cited_queries: int = 20
-    max_holdout_queries: int = 2000
-    purge_gap_ms: int = 24 * 3_600_000
-    max_staged_queries: int = 3000
+    min_queries: int = 300
+    min_cited_queries: int = GATE_MIN_CITED_QUERIES
     round_every: int = 32
     batch_queries: int = 8
     max_steps_per_round: int = 16
     max_pending_queries: int = 4096
-    passes_to_serve: int = 1
     lr: float = 1e-4
     loss: LossConfig = field(default_factory=LossConfig)
-    # The bar, judged on confidence bounds (owner ruling 2026-11-12): serve only
-    # when a paired bootstrap of the window (``bootstrap_samples`` resamples)
-    # puts the one-sided ``confidence`` lower bound of the relative NDCG@k gain
-    # at >= ``min_ndcg_gain`` AND that of the cited-node MRR@k difference at >= 0.
     min_ndcg_gain: float = UNLOCK_MIN_REL_GAIN
-    confidence: float = GATE_CONFIDENCE
-    bootstrap_samples: int = GATE_BOOTSTRAP_SAMPLES
+    error_budget: float = GATE_ERROR_BUDGET
     k: int = K
     seed: int = 1234
 
@@ -256,6 +241,8 @@ class LabelledQuery:
     literal: np.ndarray        # (n,) bool
     search_pos: np.ndarray     # (n,) int64 — position in the client's order
     weight: float = 1.0        # sample weight (offline soft-label policy; online 1.0)
+    served: bool = False       # online: the project was served the model when it arrived
+    trainable: bool = True     # online: False when training was off for the project
 
     @property
     def n(self) -> int:
@@ -264,97 +251,6 @@ class LabelledQuery:
     @property
     def cites(self) -> bool:
         return bool(self.literal.any())
-
-
-class TimeQueue:
-    """A project's not-yet-trainable queries, oldest first: ``[staged | window]``.
-
-    The window is the shortest newest run holding ``cfg.holdout_queries``
-    queries and ``cfg.min_cited_queries`` citing ones, capped at
-    ``cfg.max_holdout_queries`` (see :class:`OnlineConfig`); everything older
-    is staged, waiting for the purge gap. Appending is amortised O(1).
-    """
-
-    def __init__(self, cfg: "OnlineConfig") -> None:
-        self._cfg = cfg
-        self._q: list[Optional[LabelledQuery]] = []
-        self._head = 0      # first query not yet released
-        self._ws = 0        # first query of the window
-        self._cited = 0     # citing queries in the window
-
-    def __len__(self) -> int:
-        return len(self._q) - self._head
-
-    def __iter__(self):
-        return (q for q in self._q[self._head:] if q is not None)
-
-    def last(self) -> LabelledQuery:
-        q = self._q[-1]
-        assert q is not None
-        return q
-
-    @property
-    def window_size(self) -> int:
-        return len(self._q) - self._ws
-
-    @property
-    def window_cited(self) -> int:
-        return self._cited
-
-    @property
-    def staged(self) -> int:
-        return self._ws - self._head
-
-    def window(self) -> "list[LabelledQuery]":
-        return [q for q in self._q[self._ws:] if q is not None]
-
-    def append(self, q: LabelledQuery) -> None:
-        self._q.append(q)
-        self._cited += int(q.cites)
-        cfg = self._cfg
-        while self._ws < len(self._q):
-            front = self._q[self._ws]
-            assert front is not None
-            w = len(self._q) - self._ws
-            if w > cfg.max_holdout_queries or (
-                w - 1 >= cfg.holdout_queries
-                and self._cited - int(front.cites) >= cfg.min_cited_queries
-            ):
-                self._cited -= int(front.cites)
-                self._ws += 1
-            else:
-                break
-
-    def pop_released(self) -> "tuple[list[LabelledQuery], int]":
-        """``(released, dropped)``: the staged queries whose purge gap has
-        passed, oldest first, and how many of the oldest still-gapped ones
-        were dropped because more than ``cfg.max_staged_queries`` were
-        waiting. A query is never released before its gap has passed."""
-        cfg = self._cfg
-        out: list[LabelledQuery] = []
-        dropped = 0
-        while self._head < self._ws:
-            front = self._q[self._head]
-            win0 = self._q[self._ws] if self._ws < len(self._q) else None
-            assert front is not None
-            if win0 is not None and front.ts_ms > win0.ts_ms - cfg.purge_gap_ms:
-                if self.staged <= cfg.max_staged_queries:
-                    break
-                dropped += 1          # over the staging cap: drop, never train early
-            else:
-                out.append(front)
-            self._q[self._head] = None
-            self._head += 1
-        if self._head > 4096 and 2 * self._head > len(self._q):
-            del self._q[: self._head]
-            self._ws -= self._head
-            self._head = 0
-        return out, dropped
-
-    def clear(self) -> None:
-        self._q.clear()
-        self._head = self._ws = self._cited = 0
-
 
 @dataclass
 class SampleTable:
@@ -557,64 +453,167 @@ def fit(model: Any, queries: "list[LabelledQuery]", store: VectorStore, *, profi
 
 
 # ---------------------------------------------------------------------------
-# The gate
+# The prequential record and the gate
 # ---------------------------------------------------------------------------
 
+#: The record's per-query columns (float32; NaN = undefined for that query:
+#: NDCG when the query's ideal DCG is 0, MRR when it cites no node).
+RECORD_COLUMNS = ("model_ndcg", "cos_ndcg", "search_ndcg", "model_mrr", "cos_mrr", "search_mrr")
+
+
 @dataclass
-class Evaluation:
-    """Model vs plain cosine on the held-out window: point estimates (means
-    over its queries) and the paired-bootstrap lower bounds the gate uses.
+class QueryScores:
+    """One round's arriving queries, scored BEFORE the round trains on them:
+    the model in place, plain cosine and the client's search order, and
+    whether the project was served the model when each query arrived."""
 
-    ``ndcg_gain_lb`` / ``mrr_diff_lb``: one-sided ``confidence`` lower bounds
-    of the relative NDCG@k gain and of ``MRR@k(model) - MRR@k(cosine)`` on the
-    citing queries. An undefined bound is ``-inf`` (failing), never NaN, so a
-    persisted evaluation round-trips equal; ``-inf`` is also what a state
-    persisted before the bound existed loads as, so it re-qualifies on new data.
-    """
+    model: QueryMetrics
+    cosine: QueryMetrics
+    search: QueryMetrics
+    served: np.ndarray        # (n,) bool
 
+    def __len__(self) -> int:
+        return int(len(self.served))
+
+
+class PrequentialRecord:
+    """A project's cumulative prequential record: per query, the metrics of
+    the model in place when it arrived (before it trained on it), of plain
+    cosine and of the client's search order, and whether the model was being
+    served. Column buffers that double when full (amortised O(1) append);
+    25 bytes a query, no vectors."""
+
+    def __init__(self) -> None:
+        self._n = 0
+        self._cols: dict[str, np.ndarray] = {c: np.zeros(0, np.float32) for c in RECORD_COLUMNS}
+        self._served = np.zeros(0, dtype=bool)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def _reserve(self, extra: int) -> None:
+        need = self._n + extra
+        cap = len(self._served)
+        if need <= cap:
+            return
+        new = max(need, 2 * cap, 256)
+        for c in RECORD_COLUMNS:
+            col = np.full(new, np.nan, dtype=np.float32)
+            col[: self._n] = self._cols[c][: self._n]
+            self._cols[c] = col
+        served = np.zeros(new, dtype=bool)
+        served[: self._n] = self._served[: self._n]
+        self._served = served
+
+    def _put(self, values: "dict[str, np.ndarray]", served: np.ndarray) -> None:
+        m = int(len(served))
+        if m == 0:
+            return
+        self._reserve(m)
+        sl = slice(self._n, self._n + m)
+        for c in RECORD_COLUMNS:
+            self._cols[c][sl] = np.asarray(values[c], dtype=np.float32)
+        self._served[sl] = np.asarray(served, dtype=bool)
+        self._n += m
+
+    def append(self, scores: QueryScores) -> None:
+        self._put({"model_ndcg": scores.model.ndcg, "cos_ndcg": scores.cosine.ndcg,
+                   "search_ndcg": scores.search.ndcg, "model_mrr": scores.model.mrr,
+                   "cos_mrr": scores.cosine.mrr, "search_mrr": scores.search.mrr},
+                  scores.served)
+
+    def column(self, name: str) -> np.ndarray:
+        return self._cols[name][: self._n]
+
+    @property
+    def served(self) -> np.ndarray:
+        return self._served[: self._n]
+
+    @property
+    def n_cited(self) -> int:
+        """Queries that literally cite a node (their MRR is defined)."""
+        return int(np.sum(~np.isnan(self.column("model_mrr"))))
+
+    def metrics(self) -> "tuple[QueryMetrics, QueryMetrics]":
+        """(model, plain cosine) per-query metrics of the whole record."""
+        def qm(prefix: str) -> QueryMetrics:
+            mrr = self.column(f"{prefix}_mrr")
+            return QueryMetrics(ndcg=self.column(f"{prefix}_ndcg"), mrr=mrr,
+                                recall=np.full(mrr.shape, np.nan, dtype=np.float32))
+        return qm("model"), qm("cos")
+
+    def summary(self, rows: "np.ndarray | None" = None) -> dict[str, Any]:
+        """Point estimates over ``rows`` (a bool mask; default every query):
+        means of the defined values and the relative NDCG gain over cosine.
+        JSON-safe (undefined = ``None``)."""
+        def mean(name: str) -> float:
+            col = self.column(name)
+            return nan_mean(col if rows is None else col[rows])
+
+        n = self._n if rows is None else int(np.sum(rows))
+        mrr = self.column("model_mrr")
+        cited = int(np.sum(~np.isnan(mrr if rows is None else mrr[rows])))
+        out: dict[str, Any] = {
+            "queries": int(n), "cited_queries": cited,
+            "ndcg": mean("model_ndcg"), "cos_ndcg": mean("cos_ndcg"),
+            "search_ndcg": mean("search_ndcg"), "mrr": mean("model_mrr"),
+            "cos_mrr": mean("cos_mrr"), "search_mrr": mean("search_mrr")}
+        out["ndcg_gain"] = relative_gain(out["ndcg"], out["cos_ndcg"])
+        return {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+                for k, v in out.items()}
+
+    def clear(self) -> None:
+        self._n = 0
+        self._cols = {c: np.zeros(0, np.float32) for c in RECORD_COLUMNS}
+        self._served = np.zeros(0, dtype=bool)
+
+    def arrays(self) -> "dict[str, np.ndarray]":
+        """The record as ``.npz`` arrays (``rec_<column>``, ``rec_served``)."""
+        d = {f"rec_{c}": self.column(c).copy() for c in RECORD_COLUMNS}
+        d["rec_served"] = self.served.astype(np.int8)
+        return d
+
+    @classmethod
+    def from_arrays(cls, d: "dict[str, np.ndarray]") -> "PrequentialRecord":
+        rec = cls()
+        served = np.asarray(d["rec_served"]).astype(bool)
+        values = {c: np.asarray(d[f"rec_{c}"]) for c in RECORD_COLUMNS}
+        if any(v.shape != served.shape for v in values.values()):
+            raise ValueError("prequential record columns differ in length")
+        rec._put(values, served)
+        return rec
+
+
+@dataclass(frozen=True)
+class Check:
+    """The k-th check of a project's model on its prequential record: the
+    point estimates over the whole record, the lower bounds at the check's
+    confidence, and the decision."""
+
+    k: int
     at_ms: int
+    confidence: float
     n_queries: int
     n_cited: int
     ndcg: float
     cos_ndcg: float
     mrr: float
     cos_mrr: float
-    search_ndcg: float
-    search_mrr: float
-    ndcg_gain_lb: float = float("-inf")
-    mrr_diff_lb: float = float("-inf")
-    confidence: float = GATE_CONFIDENCE
-    n_boot: int = 0
+    ndcg_gain_lb: float
+    mrr_diff_lb: float
+    serve: bool
+    reason: str
 
     @property
     def ndcg_gain(self) -> float:
         return relative_gain(self.ndcg, self.cos_ndcg)
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "Optional[Evaluation]":
-        """The inverse of :meth:`as_dict` (``None`` metric = NaN); ``None``
-        when the record is not a complete evaluation."""
-        def num(k: str, missing: float = float("nan")) -> float:
-            v = d.get(k)
-            return missing if v is None else float(v)
-
-        try:
-            return cls(at_ms=int(d["at_ms"]), n_queries=int(d["n_queries"]),
-                       n_cited=int(d["n_cited"]), ndcg=num("ndcg"), cos_ndcg=num("cos_ndcg"),
-                       mrr=num("mrr"), cos_mrr=num("cos_mrr"), search_ndcg=num("search_ndcg"),
-                       search_mrr=num("search_mrr"),
-                       ndcg_gain_lb=num("ndcg_gain_lb", float("-inf")),
-                       mrr_diff_lb=num("mrr_diff_lb", float("-inf")),
-                       confidence=num("confidence", GATE_CONFIDENCE),
-                       n_boot=int(d.get("n_boot") or 0))
-        except (KeyError, TypeError, ValueError):
-            return None
-
     def as_dict(self) -> dict[str, Any]:
         """JSON-safe: every non-finite number (NaN metric, ``-inf`` bound) is
-        ``None`` (strict JSON for the state file and the hub row)."""
+        ``None`` (strict JSON for the status and the hub row)."""
         d = asdict(self)
         d["ndcg_gain"] = self.ndcg_gain
+        d["error_rate"] = 1.0 - self.confidence
         return {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
                 for k, v in d.items()}
 
@@ -627,31 +626,76 @@ def _diff(x: float) -> str:
     return "n/a" if not math.isfinite(x) else f"{x:+.3f}"
 
 
-def gate_decision(ev: Optional[Evaluation], cfg: OnlineConfig) -> "tuple[bool, str]":
-    """Serve the project's model? ``(serve, why)`` — the owner's bar, applied
-    to the paired-bootstrap lower bounds on the held-out window (the point
-    estimates are reported, never decisive). Pure."""
-    if ev is None:
-        return False, "no evaluation yet"
-    if ev.n_queries < cfg.holdout_queries:
-        return False, (f"collecting held-out queries ({ev.n_queries}/{cfg.holdout_queries}); "
-                       "serving plain search order meanwhile")
-    if ev.n_cited < cfg.min_cited_queries:
-        return False, (f"only {ev.n_cited} held-out queries name a node in the answer "
-                       f"(needs {cfg.min_cited_queries} to check the cited-node MRR)")
-    gain, glb, dlb = ev.ndcg_gain, ev.ndcg_gain_lb, ev.mrr_diff_lb
-    conf = f"{100 * ev.confidence:.0f}%"
+def _conf(c: float) -> str:
+    """A check's confidence for a reason line: ``95.0%`` while the error rate
+    is >= 0.1%, else ``1-3.1e-08`` (late checks run at tiny error rates)."""
+    alpha = 1.0 - c
+    return f"{100 * c:.1f}%" if alpha >= 1e-3 else f"1-{alpha:.1e}"
+
+
+def ready_for_check(record: PrequentialRecord, cfg: OnlineConfig) -> bool:
+    """Whether the record is large enough for any verdict."""
+    return len(record) >= cfg.min_queries and record.n_cited >= cfg.min_cited_queries
+
+
+def collecting_reason(record: PrequentialRecord, cfg: OnlineConfig) -> str:
+    return (f"collecting queries scored before training ({len(record)}/{cfg.min_queries} "
+            f"queries, {record.n_cited}/{cfg.min_cited_queries} citing a node); serving "
+            "plain search order meanwhile")
+
+
+def gate_decision(record: PrequentialRecord, k: int, cfg: OnlineConfig, *,
+                  at_ms: int) -> Check:
+    """The ``k``-th check (``k >= 1``) of the model on ``record``: the owner's
+    bar applied to the one-sided lower bounds at ``check_confidence(k)`` over
+    the WHOLE record (the point estimates are reported, never decisive). Pure."""
+    conf = check_confidence(k, cfg.error_budget)
+    model, cos = record.metrics()
+    b = paired_normal_bounds(model, cos, confidence=conf)
+    s = record.summary()
+
+    def f(key: str) -> float:
+        v = s[key]
+        return float("nan") if v is None else float(v)
+
+    ndcg, cos_ndcg, mrr, cos_mrr = f("ndcg"), f("cos_ndcg"), f("mrr"), f("cos_mrr")
+    gain = relative_gain(ndcg, cos_ndcg)
+    glb, dlb = b.ndcg_gain_lb, b.mrr_diff_lb
+    c, bar = _conf(conf), f"{100 * cfg.min_ndcg_gain:+.2f}%"
+    n, nc = len(record), record.n_cited
     if not (glb >= cfg.min_ndcg_gain):  # NaN / -inf fail
-        return False, (f"NDCG@{cfg.k} {_pct(gain)} vs plain cosine, {conf} lower bound "
-                       f"{_pct(glb)}; the bound needs {100 * cfg.min_ndcg_gain:+.2f}%")
-    if not (dlb >= 0.0):
-        return False, (f"NDCG@{cfg.k} {_pct(gain)} (bound {_pct(glb)}) but the cited node's "
-                       f"MRR@{cfg.k} {ev.mrr:.3f} vs plain cosine's {ev.cos_mrr:.3f}: the {conf} "
-                       f"lower bound of the difference is {_diff(dlb)}, below 0")
-    return True, (f"NDCG@{cfg.k} {_pct(gain)} over plain cosine ({conf} lower bound "
-                  f"{_pct(glb)} >= {100 * cfg.min_ndcg_gain:+.2f}%), cited-node MRR@{cfg.k} "
-                  f"{ev.mrr:.3f} vs {ev.cos_mrr:.3f} (lower bound of the difference "
-                  f"{_diff(dlb)} >= 0)")
+        serve, why = False, (
+            f"check {k}: NDCG@{cfg.k} {_pct(gain)} vs plain cosine on {n} queries scored "
+            f"before training, lower bound {_pct(glb)} at confidence {c}; the bound needs {bar}")
+    elif not (dlb >= 0.0):
+        serve, why = False, (
+            f"check {k}: NDCG@{cfg.k} {_pct(gain)} (bound {_pct(glb)}) but the cited node's "
+            f"MRR@{cfg.k} {mrr:.3f} vs plain cosine's {cos_mrr:.3f} on {nc} citing queries: "
+            f"the lower bound of the difference at confidence {c} is {_diff(dlb)}, below 0")
+    else:
+        serve, why = True, (
+            f"check {k}: NDCG@{cfg.k} {_pct(gain)} over plain cosine on {n} queries scored "
+            f"before training (lower bound {_pct(glb)} >= {bar} at confidence {c}), "
+            f"cited-node MRR@{cfg.k} {mrr:.3f} vs {cos_mrr:.3f} on {nc} citing queries "
+            f"(lower bound of the difference {_diff(dlb)} >= 0)")
+    return Check(k=int(k), at_ms=int(at_ms), confidence=conf, n_queries=n, n_cited=nc,
+                 ndcg=ndcg, cos_ndcg=cos_ndcg, mrr=mrr, cos_mrr=cos_mrr,
+                 ndcg_gain_lb=glb, mrr_diff_lb=dlb, serve=serve, reason=why)
+
+
+def score_queries(net: Any, tbl: SampleTable,
+                  k: int = K) -> "tuple[QueryMetrics, QueryMetrics, QueryMetrics]":
+    """Per-query metrics of ``tbl``'s queries: (``net``, plain cosine, the
+    client's search order)."""
+    sidx = np.arange(len(tbl.np_target), dtype=np.int64)
+    sc = score_samples(tbl, net, sidx)
+    cs = cosine_scores(tbl, sidx)
+    gains, rel = tbl.np_target, tbl.np_literal
+    m = per_query_metrics(sc, gains, rel, tbl.first, tbl.count, k)
+    c = per_query_metrics(cs, gains, rel, tbl.first, tbl.count, k)
+    s = per_query_metrics(-tbl.np_search_pos.astype(np.float64), gains, rel,
+                          tbl.first, tbl.count, k)
+    return m, c, s
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +711,8 @@ class RoundJob:
     device: Any
     train: Optional[SampleTable]
     steps: "list[np.ndarray]"     # per step: query indices into ``train``
-    holdout: Optional[SampleTable]
+    fresh: Optional[SampleTable]  # queries arrived since the last round: scored FIRST
+    fresh_served: np.ndarray      # (n_fresh,) bool
     seed: int
     cfg: OnlineConfig
     now_ms: int
@@ -680,7 +725,8 @@ class RoundResult:
     opt_state: "dict | None"
     steps: int
     trained_queries: int
-    evaluation: Optional[Evaluation]
+    scores: Optional[QueryScores]
+    now_ms: int
     runtime_s: float
 
 
@@ -709,7 +755,8 @@ def round_rng(seed: int, device: Any):
 
 
 def compute_round(job: RoundJob) -> RoundResult:
-    """Train the copied network on the round's batches, then evaluate it.
+    """Score the round's arriving queries with the copied network, THEN train
+    it on the round's batches.
 
     Runs off the event loop; reads only ``job`` (its network is a private
     copy). The live model is updated by :meth:`ProjectLearner.apply_round`.
@@ -722,6 +769,12 @@ def compute_round(job: RoundJob) -> RoundResult:
 def _compute_round(job: RoundJob) -> RoundResult:
     t0 = time.monotonic()
     net = job.net
+    scores = None
+    if job.fresh is not None:
+        # Prequential: the model in place, before it trains on these queries.
+        m, c, s = score_queries(net, job.fresh, job.cfg.k)
+        scores = QueryScores(model=m, cosine=c, search=s,
+                             served=np.asarray(job.fresh_served, dtype=bool))
     trained = 0
     state = opt_state = None
     if job.train is not None and job.steps:
@@ -748,38 +801,10 @@ def _compute_round(job: RoundJob) -> RoundResult:
             trained += len(qs)
         state = {k: v.detach().clone() for k, v in net.state_dict().items()}
         opt_state = opt.state_dict()
-    evaluation = (evaluate(net, job.holdout, job.cfg, job.now_ms, seed=job.seed)
-                  if job.holdout is not None else None)
     return RoundResult(generation=job.generation, state_dict=state, opt_state=opt_state,
                        steps=len(job.steps) if state is not None else 0,
-                       trained_queries=trained, evaluation=evaluation,
+                       trained_queries=trained, scores=scores, now_ms=job.now_ms,
                        runtime_s=time.monotonic() - t0)
-
-
-def evaluate(net: Any, tbl: SampleTable, cfg: OnlineConfig, now_ms: int, *,
-             seed: int = 0) -> Evaluation:
-    """Model vs cosine (and vs the client's search order) on ``tbl``'s
-    queries, with the paired-bootstrap bounds of the bar (``seed``: the
-    round's, so a check is reproducible)."""
-    sidx = np.arange(len(tbl.np_target), dtype=np.int64)
-    sc = score_samples(tbl, net, sidx)
-    cs = cosine_scores(tbl, sidx)
-    gains, rel = tbl.np_target, tbl.np_literal
-    m = per_query_metrics(sc, gains, rel, tbl.first, tbl.count, cfg.k)
-    c = per_query_metrics(cs, gains, rel, tbl.first, tbl.count, cfg.k)
-    s = per_query_metrics(-tbl.np_search_pos.astype(np.float64), gains, rel,
-                          tbl.first, tbl.count, cfg.k)
-    b = paired_bootstrap_bounds(m, c, n_boot=cfg.bootstrap_samples,
-                                confidence=cfg.confidence, seed=seed)
-    return Evaluation(
-        at_ms=int(now_ms), n_queries=int(len(tbl.first)),
-        n_cited=int(np.sum(~np.isnan(m.mrr))),
-        ndcg=nan_mean(m.ndcg), cos_ndcg=nan_mean(c.ndcg),
-        mrr=nan_mean(m.mrr), cos_mrr=nan_mean(c.mrr),
-        search_ndcg=nan_mean(s.ndcg), search_mrr=nan_mean(s.mrr),
-        ndcg_gain_lb=b.ndcg_gain_lb, mrr_diff_lb=b.mrr_diff_lb,
-        confidence=b.confidence, n_boot=b.n_boot,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -800,15 +825,16 @@ class ProjectLearner:
         self.emb_dim = int(emb_dim)
         self.cfg = cfg
         self._store = VectorStore(emb_dim)
-        self._queue = TimeQueue(cfg)                    # not yet trainable, oldest first
-        self._pending: Deque[LabelledQuery] = deque()   # trainable, oldest first
+        self._fresh: list[LabelledQuery] = []           # arrived, not yet scored
+        self._pending: Deque[LabelledQuery] = deque()   # scored, trainable, oldest first
+        self.record = PrequentialRecord()
+        self.checks = 0               # k: checks made on the current model's record
         self._generation = 0          # bumped when the model is replaced
         self._round_in_flight = False
         self._events_since_round = 0
-        self._passes = 0              # consecutive passing checks
         self.serving = False
-        self.reason = "no evaluation yet"
-        self.last_eval: Optional[Evaluation] = None
+        self.reason = collecting_reason(self.record, cfg)
+        self.last_check: Optional[Check] = None
         self.counters: dict[str, int] = {
             "events_seen": 0, "events_skipped": 0, "queries_trained": 0,
             "train_steps": 0, "rounds": 0, "dropped_untrained": 0,
@@ -820,13 +846,9 @@ class ProjectLearner:
 
     # -- events ---------------------------------------------------------
 
-    @property
-    def holdout_size(self) -> int:
-        return self._queue.window_size
-
     def ingest(self, task: dict, *, ts_ms: int, train: bool = True) -> bool:
         """Add one citation event. ``train=False`` (online training switched
-        off for the project): the event still enters the held-out window — the
+        off for the project): the event is still scored into the record — the
         gate keeps judging the frozen model — but is never trained on.
         Returns whether the event was kept."""
         self.training_enabled = bool(train)
@@ -835,25 +857,17 @@ class ProjectLearner:
             self.counters["events_skipped"] += 1
             self.last_skip_reason = why
             return False
+        q.served = self.serving
+        q.trainable = bool(train)
         self.counters["events_seen"] += 1
-        self._queue.append(q)
+        self._fresh.append(q)
         self._events_since_round += 1
-        self._release()
         return True
 
-    def _release(self) -> None:
-        """Move queries that left the window AND the purge gap to training."""
-        cfg = self.cfg
-        released, over_cap = self._queue.pop_released()
-        self.counters["dropped_untrained"] += over_cap
-        for front in released:
-            if self.training_enabled:
-                self._pending.append(front)
-            else:
-                self.counters["dropped_untrained"] += 1
-        while len(self._pending) > cfg.max_pending_queries:
-            self._pending.popleft()
-            self.counters["dropped_untrained"] += 1
+    @property
+    def last_query(self) -> LabelledQuery:
+        """The query :meth:`ingest` kept last (the replay compares its targets)."""
+        return self._fresh[-1]
 
     def round_due(self) -> bool:
         return (not self._round_in_flight) and self._events_since_round >= self.cfg.round_every
@@ -865,34 +879,47 @@ class ProjectLearner:
     # -- rounds ---------------------------------------------------------
 
     def prepare_round(self, model: Any, *, now_ms: int) -> Optional[RoundJob]:
-        """Snapshot what one round needs (call under the server's lock)."""
+        """Snapshot what one round needs (call under the server's lock): the
+        queries that arrived since the last round (scored first, by the copy
+        of the model in place) and the trainable batches — the arrivals among
+        them, since the copy scores them before any step."""
         if self._round_in_flight:
             return None
         cfg = self.cfg
+        fresh, self._fresh = self._fresh, []
+        for q in fresh:
+            if q.trainable:
+                self._pending.append(q)
+            else:
+                self.counters["dropped_untrained"] += 1
+        while len(self._pending) > cfg.max_pending_queries:
+            self._pending.popleft()
+            self.counters["dropped_untrained"] += 1
         n_steps = min(len(self._pending) // cfg.batch_queries, cfg.max_steps_per_round)
         train_q = [self._pending.popleft() for _ in range(n_steps * cfg.batch_queries)]
-        window = self._queue.window()
-        if not train_q and not window:
+        if not train_q and not fresh:
             return None
         dev = torch.device(model.device)
         train = build_table(train_q, self._store, profile=self.profile, device=dev) if train_q else None
         steps = [np.arange(i * cfg.batch_queries, (i + 1) * cfg.batch_queries)
                  for i in range(n_steps)]
-        holdout = build_table(window, self._store, profile=self.profile, device=dev) if window else None
+        fresh_tbl = build_table(fresh, self._store, profile=self.profile, device=dev) if fresh else None
         self._compact_store()
         self._round_in_flight = True
         self._events_since_round = 0
         return RoundJob(
             generation=self._generation, net=copy.deepcopy(model._net),
             opt_state=copy.deepcopy(model._opt.state_dict()), profile=self.profile,
-            device=dev, train=train, steps=steps, holdout=holdout,
+            device=dev, train=train, steps=steps, fresh=fresh_tbl,
+            fresh_served=np.array([q.served for q in fresh], dtype=bool),
             seed=cfg.seed + self.counters["rounds"], cfg=cfg, now_ms=now_ms,
         )
 
     def apply_round(self, model: Any, result: RoundResult) -> bool:
-        """Load the round into the live model and apply the gate (under the
-        lock). Returns False when the model was replaced while the round ran
-        (the round is discarded: it trained a network no longer served)."""
+        """Load the round into the live model, add its scores to the record
+        and apply the gate (under the lock). Returns False when the model was
+        replaced while the round ran (the round is discarded: it trained and
+        scored a network no longer served)."""
         self._round_in_flight = False
         if result.generation != self._generation:
             return False
@@ -906,40 +933,44 @@ class ProjectLearner:
                 idx for idx in model._type_registry.values() if idx >= N_ENTITY_TYPES])
             self.counters["train_steps"] += result.steps
             self.counters["queries_trained"] += result.trained_queries
-        if result.evaluation is not None:
-            self.last_eval = result.evaluation
-            passed, why = gate_decision(self.last_eval, self.cfg)
-            self._passes = self._passes + 1 if passed else 0
-        else:
-            passed, why = gate_decision(self.last_eval, self.cfg)
-        serve, why = self._serve_decision(passed, why)
+        added = 0
+        if result.scores is not None:
+            self.record.append(result.scores)
+            added = len(result.scores)
+        if added:
+            self._check(at_ms=result.now_ms)
+        self.model_fingerprint = model_fingerprint(model)
+        return True
+
+    def _check(self, *, at_ms: int) -> None:
+        """The record grew: the next check, once the record is large enough."""
+        if not ready_for_check(self.record, self.cfg):
+            self.last_check = None
+            self._set_serving(False, collecting_reason(self.record, self.cfg))
+            return
+        self.checks += 1
+        self.last_check = gate_decision(self.record, self.checks, self.cfg, at_ms=at_ms)
+        self._set_serving(self.last_check.serve, self.last_check.reason)
+
+    def _set_serving(self, serve: bool, why: str) -> None:
         if serve and not self.serving:
             self.counters["serving_turned_on"] += 1
         if self.serving and not serve:
             self.counters["serving_turned_off"] += 1
         self.serving, self.reason = serve, why
-        self.model_fingerprint = model_fingerprint(model)
-        return True
-
-    def _serve_decision(self, passed: bool, why: str) -> "tuple[bool, str]":
-        """Serve only after ``passes_to_serve`` consecutive passing checks."""
-        need = max(1, int(self.cfg.passes_to_serve))
-        if passed and self._passes < need:
-            return False, (f"{why} — passing check {self._passes} of {need} in a row "
-                           "before the model is served")
-        return passed, why
 
     def _compact_store(self) -> None:
         """Drop vectors no queued query uses any more (trained / dropped
         queries leave theirs behind). Bounded memory on a long-running server;
         runs when at least half the store is garbage."""
-        live = list(self._queue) + list(self._pending)
+        live = list(self._fresh) + list(self._pending)
         approx_live = sum(1 + 2 * q.n for q in live)  # cheap upper-ish bound
         if len(self._store) > max(4096, 2 * approx_live):
             self._store = self._store.compacted(live)
 
     def abandon_round(self) -> None:
-        """The round failed: the trained queries are lost, the gate stays."""
+        """The round failed: its queries' training and scores are lost, the
+        gate stays."""
         self._round_in_flight = False
 
     def run_round_now(self, model: Any, *, now_ms: int) -> Optional[RoundResult]:
@@ -953,21 +984,23 @@ class ProjectLearner:
 
     def on_model_replaced(self, model: Any, why: str) -> None:
         """The project's model was swapped (rotate / reset / global): the
-        window may have been trained on by the new model, so it is cleared
-        and the gate starts over; queued training data is dropped too."""
+        record measured the old model, so it is cleared and the gate starts
+        over (check count and error budget included); queued data is dropped
+        too (the new model may have trained on it)."""
         self._generation += 1
         self._round_in_flight = False
-        dropped = len(self._queue) + len(self._pending)
-        self._queue.clear()
+        dropped = len(self._fresh) + len(self._pending)
+        self._fresh.clear()
         self._pending.clear()
         self._store = VectorStore(self.emb_dim)
+        self.record.clear()
+        self.checks = 0
         self.counters["model_replaced"] += 1
         self.counters["dropped_untrained"] += dropped
         if self.serving:
             self.counters["serving_turned_off"] += 1
         self.serving = False
-        self._passes = 0
-        self.last_eval = None
+        self.last_check = None
         self.reason = f"model replaced ({why}); re-checking on new queries"
         self.model_fingerprint = model_fingerprint(model)
 
@@ -975,30 +1008,33 @@ class ProjectLearner:
 
     def status(self) -> dict[str, Any]:
         cfg = self.cfg
+        rec = self.record
         return {
             "profile": self.profile,
             "serving": self.serving,
             "reason": self.reason,
             "training": "on" if self.training_enabled else "off (online training disabled for this project)",
-            "holdout_queries": self.holdout_size,
-            "holdout_cited_queries": self._queue.window_cited,
-            "holdout_target": cfg.holdout_queries,
-            "waiting_queries": self._queue.staged,
+            "record": rec.summary(),
+            "served_searches": rec.summary(rec.served),
+            "checks": self.checks,
+            "last_check": self.last_check.as_dict() if self.last_check else None,
+            "waiting_to_score": len(self._fresh),
             "pending_train_queries": len(self._pending),
-            "last_eval": self.last_eval.as_dict() if self.last_eval else None,
             "counters": dict(self.counters),
             "last_skip_reason": self.last_skip_reason or None,
             "bar": {"min_ndcg_gain": cfg.min_ndcg_gain, "cited_mrr_not_below_cosine": True,
-                    "judged_on": "paired-bootstrap lower bounds", "confidence": cfg.confidence,
-                    "bootstrap_samples": cfg.bootstrap_samples, "k": cfg.k, "min_cited_queries": cfg.min_cited_queries,
-                    "max_holdout_queries": cfg.max_holdout_queries,
-                    "purge_gap_hours": cfg.purge_gap_ms / 3_600_000},
+                    "judged_on": "cumulative prequential record (each query scored by the "
+                                 "model in place when it arrived, before training on it)",
+                    "bounds": "one-sided paired normal approximation",
+                    "confidence_schedule": "1 - error_budget / (k (k+1)) at the k-th check",
+                    "error_budget": cfg.error_budget, "k": cfg.k,
+                    "min_queries": cfg.min_queries, "min_cited_queries": cfg.min_cited_queries},
         }
 
     def save(self, directory: Path) -> None:
         """Write ``online_<profile>.json`` + ``.npz`` atomically."""
         directory.mkdir(parents=True, exist_ok=True)
-        live = list(self._queue) + list(self._pending)
+        live = list(self._fresh) + list(self._pending)
         used = np.unique(np.concatenate(
             [np.array([q.q_row for q in live], dtype=np.int64)]
             + [q.node_rows for q in live] + [q.linked_rows[q.linked_rows >= 0] for q in live]
@@ -1021,7 +1057,9 @@ class ProjectLearner:
             else np.zeros(0, np.int64),
             q_n=np.array([q.n for q in live], dtype=np.int64),
             q_weight=np.array([q.weight for q in live], dtype=np.float32),
-            q_pending=np.array([0] * len(self._queue) + [1] * len(self._pending), dtype=np.int8),
+            q_pending=np.array([0] * len(self._fresh) + [1] * len(self._pending), dtype=np.int8),
+            q_served=np.array([q.served for q in live], dtype=np.int8),
+            q_trainable=np.array([q.trainable for q in live], dtype=np.int8),
             node_row=remap[cat(lambda q: q.node_rows, np.int64)] if live else np.zeros(0, np.int64),
             linked_row=np.where(lr >= 0, remap[np.clip(lr, 0, None)], -1) if live
             else np.zeros((0, MAX_LINKED), np.int64),
@@ -1030,6 +1068,7 @@ class ProjectLearner:
             target=cat(lambda q: q.target, np.float32),
             literal=cat(lambda q: q.literal, np.int8),
             search_pos=cat(lambda q: q.search_pos, np.int64),
+            **self.record.arrays(),
         )
         atomic_write_bytes(directory / f"online_{self.profile}.npz", buf.getvalue())
         atomic_write_json(directory / f"online_{self.profile}.json", {
@@ -1038,10 +1077,10 @@ class ProjectLearner:
             "emb_dim": self.emb_dim,
             "serving": self.serving,
             "reason": self.reason,
-            "last_eval": self.last_eval.as_dict() if self.last_eval else None,
+            "checks": self.checks,
+            "last_check_at_ms": self.last_check.at_ms if self.last_check else None,
             "counters": self.counters,
             "events_since_round": self._events_since_round,
-            "consecutive_passes": self._passes,
             "training_enabled": self.training_enabled,
             "model_fingerprint": self.model_fingerprint,
             "config": self.cfg.as_dict(),
@@ -1054,7 +1093,10 @@ class ProjectLearner:
 
         A state recorded for a different checkpoint (file name or local steps
         differ: rotated / reset outside this process) is discarded — its
-        window may have been trained on — and the gate starts over.
+        record measured another model — and the gate starts over. The serving
+        decision is re-derived from the restored record at the restored check
+        number (no new check, so no error budget is spent), so a changed bar
+        applies at once.
         """
         lr_ = cls(profile=profile, emb_dim=emb_dim, cfg=cfg)
         lr_.model_fingerprint = model_fingerprint(model)
@@ -1080,35 +1122,33 @@ class ProjectLearner:
             lr_.reason = "model replaced since the last run; re-checking on new queries"
             return lr_
         lr_.serving = bool(meta.get("serving"))
-        lr_.reason = str(meta.get("reason") or "")
         lr_.training_enabled = bool(meta.get("training_enabled", True))
         lr_._events_since_round = int(meta.get("events_since_round") or 0)
-        lr_._passes = int(meta.get("consecutive_passes") or 0)
-        ev = meta.get("last_eval")
-        if isinstance(ev, dict):
-            lr_.last_eval = Evaluation.from_dict(ev)
-        if arr_p.is_file():
-            try:
-                lr_._load_arrays(arr_p)
-            except (OSError, ValueError, KeyError) as exc:
-                logger.warning("online learner data %s unreadable (%s); window starts over", arr_p, exc)
-                lr_._queue.clear()
-                lr_._pending.clear()
-                lr_._store = VectorStore(emb_dim)
-                lr_.serving = False
-                lr_.reason = "held-out window lost (unreadable state); re-checking on new queries"
-        # The serving decision is re-derived from the restored evaluation, so
-        # a changed bar applies at once.
-        if lr_.last_eval is not None:
-            passed, why = gate_decision(lr_.last_eval, cfg)
-            if not passed:
-                lr_._passes = 0
-            lr_.serving, lr_.reason = lr_._serve_decision(passed, why)
+        lr_.checks = int(meta.get("checks") or 0)
+        try:
+            lr_._load_arrays(arr_p)
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning("online learner data %s unreadable (%s); record starts over", arr_p, exc)
+            lr_._fresh.clear()
+            lr_._pending.clear()
+            lr_._store = VectorStore(emb_dim)
+            lr_.record.clear()
+            lr_.checks = 0
+            lr_.serving = False
+            lr_.reason = "prequential record lost (unreadable state); re-checking on new queries"
+            return lr_
+        if lr_.checks > 0 and ready_for_check(lr_.record, cfg):
+            lr_.last_check = gate_decision(lr_.record, lr_.checks, cfg,
+                                           at_ms=int(meta.get("last_check_at_ms") or 0))
+            lr_.serving, lr_.reason = lr_.last_check.serve, lr_.last_check.reason
+        else:
+            lr_.serving, lr_.reason = False, collecting_reason(lr_.record, cfg)
         return lr_
 
     def _load_arrays(self, path: Path) -> None:
         with np.load(path, allow_pickle=False) as z:
             d = {k: z[k] for k in z.files}
+        self.record = PrequentialRecord.from_arrays(d)
         for row in d["vectors"]:
             self._store.add(row.astype(np.float32))
         # rows are unique, so store rows == file rows
@@ -1125,10 +1165,12 @@ class ProjectLearner:
                 target=d["target"][sl].astype(np.float32),
                 literal=d["literal"][sl].astype(bool),
                 search_pos=d["search_pos"][sl].astype(np.int64),
-                weight=float(d["q_weight"][i]) if "q_weight" in d else 1.0,
+                weight=float(d["q_weight"][i]),
+                served=bool(d["q_served"][i]),
+                trainable=bool(d["q_trainable"][i]),
             )
             off += n
-            (self._pending if int(d["q_pending"][i]) else self._queue).append(q)
+            (self._pending.append if int(d["q_pending"][i]) else self._fresh.append)(q)
 
 
 def model_fingerprint(model: Any) -> dict[str, Any]:
@@ -1138,3 +1180,5 @@ def model_fingerprint(model: Any) -> dict[str, Any]:
         "local_train_steps": int(getattr(model, "local_train_steps", 0) or 0),
         "base_weights_version": str(getattr(model, "base_weights_version", "") or ""),
     }
+
+

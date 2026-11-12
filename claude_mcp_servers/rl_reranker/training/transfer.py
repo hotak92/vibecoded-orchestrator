@@ -144,6 +144,10 @@ def _pct(x: Optional[float]) -> str:
     return "n/a" if x is None or not math.isfinite(x) else f"{100 * x:+.2f}%"
 
 
+def _num(x: Optional[float]) -> str:
+    return "n/a" if x is None or not math.isfinite(x) else f"{x:.3f}"
+
+
 def render_fold_line(f: dict[str, Any]) -> str:
     t = f["time_holdout"]["overall"]
     p = f["project_holdout"]["overall"]
@@ -396,44 +400,33 @@ def export_task(shard: Any, qi: int) -> "tuple[dict[str, Any], np.ndarray]":
     return task, s["target"][order].astype(np.float32)
 
 
-def _served_metrics(learner: Any, model: Any, batch: "list[tuple[Any, bool]]",
-                    cfg: Any) -> "list[dict[str, float]]":
-    """Per arriving query: what the user got (the model's order while the
-    project is served, the search order otherwise), plain cosine, and the
-    search order — the prequential view of the gate."""
-    from ..objective import cosine_scores, score_samples
-    from ..online_learning import build_table
-    from ..ranking_metrics import mrr_at_k, ndcg_at_k
-
-    if not batch:
-        return []
-    tbl = build_table([q for q, _s in batch], learner._store, profile=learner.profile,
-                      device=torch.device(model.device))
-    sidx = np.arange(len(tbl.np_target), dtype=np.int64)
-    served_any = any(s for _q, s in batch)
-    msc = score_samples(tbl, model._net, sidx) if served_any else None
-    csc = cosine_scores(tbl, sidx)
-    out = []
-    for i, (_q, served) in enumerate(batch):
-        lo, hi = int(tbl.first[i]), int(tbl.first[i] + tbl.count[i])
-        g, r = tbl.np_target[lo:hi], tbl.np_literal[lo:hi]
-        search = -tbl.np_search_pos[lo:hi].astype(np.float64)
-        row = {"served": served,
-               "cos_ndcg": ndcg_at_k(csc[lo:hi], g, cfg.k), "cos_mrr": mrr_at_k(csc[lo:hi], r, cfg.k),
-               "search_ndcg": ndcg_at_k(search, g, cfg.k), "search_mrr": mrr_at_k(search, r, cfg.k)}
-        if served:
-            assert msc is not None
-            row["model_ndcg"] = ndcg_at_k(msc[lo:hi], g, cfg.k)
-            row["model_mrr"] = mrr_at_k(msc[lo:hi], r, cfg.k)
-        row["user_ndcg"] = row["model_ndcg"] if served else row["search_ndcg"]
-        row["user_mrr"] = row["model_mrr"] if served else row["search_mrr"]
-        out.append(row)
-    return out
-
-
 def _mean(rows: "list[dict[str, Any]]", key: str) -> float:
     vals = [r[key] for r in rows if r.get(key) is not None]
     return float(np.mean(vals)) if vals else float("nan")
+
+
+def replay_rows(learner: Any) -> "list[dict[str, Any]]":
+    """Per kept event, in arrival order, from the learner's own prequential
+    record (``online_learning.PrequentialRecord``: every query scored by the
+    model in place when it arrived, before training on it): whether the
+    project was served the model, the model's / plain cosine's / the search
+    order's NDCG@10 and cited-node MRR@10 (``None`` = undefined), and what
+    the user got (the model's order while served, the search order
+    otherwise)."""
+    rec = learner.record
+    cols = {c: rec.column(c) for c in ("model_ndcg", "cos_ndcg", "search_ndcg",
+                                        "model_mrr", "cos_mrr", "search_mrr")}
+    served = rec.served
+    out = []
+    for i in range(len(rec)):
+        row: dict[str, Any] = {"served": bool(served[i])}
+        for c, v in cols.items():
+            x = float(v[i])
+            row[c] = None if math.isnan(x) else x
+        row["user_ndcg"] = row["model_ndcg"] if row["served"] else row["search_ndcg"]
+        row["user_mrr"] = row["model_mrr"] if row["served"] else row["search_mrr"]
+        out.append(row)
+    return out
 
 
 def replay_project(shard: Any, project: str, *, cfg: Any, device: str = "auto",
@@ -441,9 +434,12 @@ def replay_project(shard: Any, project: str, *, cfg: Any, device: str = "auto",
     """Replay one project's citation events, in time order, through the
     server's own online learning (``online_learning.ProjectLearner`` — the
     object ``RLServer._rl_update`` / ``_finish_round`` drive: ingest, rounds
-    every ``cfg.round_every`` events, the held-out gate), starting from the
-    server's seeded fresh network. Soft-label (short-window) citations are left
-    out unless ``include_soft``: the live monitor never posts them."""
+    every ``cfg.round_every`` events that score the arrivals before training
+    on them, the gate on the cumulative prequential record), starting from
+    the server's seeded fresh network. Whether each event was served and its
+    metrics come from the learner's own record. Soft-label (short-window)
+    citations are left out unless ``include_soft``: the live monitor never
+    posts them."""
     from ..online_learning import ProjectLearner
     from ..rl_model import RLModel
     from ..rl_server import _seeded_init
@@ -460,63 +456,71 @@ def replay_project(shard: Any, project: str, *, cfg: Any, device: str = "auto",
         model = RLModel(emb_dim=dim, state_path=Path("/nonexistent/replay/rl_model.pt"),
                         device=device, embedding_source=shard.profile)
     learner = ProjectLearner(profile=shard.profile, emb_dim=dim, cfg=cfg)
-    pending: list[tuple[Any, bool]] = []
-    rows: list[dict[str, Any]] = []
-    first_served_at: Optional[int] = None
     transitions: list[dict[str, Any]] = []
     tgt_diff = 0.0
+    last_ms = 0
     for n, qi in enumerate(qs):
         task, export_target = export_task(shard, int(qi))
-        served = learner.serving
-        if served and first_served_at is None:
-            first_served_at = learner.counters["events_seen"]
-        kept = learner.ingest(task, ts_ms=int(q["ts_hour_ms"][qi]))
-        if kept:
-            lq = learner._queue.last()
+        last_ms = int(q["ts_hour_ms"][qi])
+        if learner.ingest(task, ts_ms=last_ms):
+            lq = learner.last_query
             if lq.n == len(export_target):
                 tgt_diff = max(tgt_diff, float(np.max(np.abs(lq.target - export_target))))
-            pending.append((lq, served))
         if learner.round_due():
-            rows += _served_metrics(learner, model, pending, cfg)
-            pending = []
             before = learner.serving
-            learner.run_round_now(model, now_ms=int(q["ts_hour_ms"][qi]))
+            learner.run_round_now(model, now_ms=last_ms)
             if learner.serving != before:
                 transitions.append({"event": learner.counters["events_seen"],
+                                    "check": learner.checks,
                                     "serving": learner.serving, "reason": learner.reason})
         if log is not None and n and n % 5000 == 0:
             log(f"  [{shard.profile} {project}] {n}/{len(qs)} events, serving={learner.serving} "
                 f"({learner.reason})")
-    rows += _served_metrics(learner, model, pending, cfg)
-    after = rows[first_served_at:] if first_served_at is not None else []
+    # the events after the last round are scored like any round's arrivals
+    learner.run_round_now(model, now_ms=last_ms)
+    rows = replay_rows(learner)
+    first = next((i for i, r in enumerate(rows) if r["served"]), None)
+    after = rows[first:] if first is not None else []
     served_rows = [r for r in rows if r["served"]]
+    served_cited = [r for r in served_rows if r["model_mrr"] is not None]
 
     def gain(a: str, b: str, rs: "list[dict[str, Any]]") -> float:
         ma, mb = _mean(rs, a), _mean(rs, b)
         return (ma - mb) / mb if mb and math.isfinite(mb) and mb > 0 else float("nan")
 
     st_ = learner.status()
+    s_gain = gain("model_ndcg", "cos_ndcg", served_rows)
+    s_mrr, s_cos = _mean(served_rows, "model_mrr"), _mean(served_rows, "cos_mrr")
     return {
         "project": project, "profile": shard.profile,
         "events": int(len(qs)), "events_kept": learner.counters["events_seen"],
-        "queries_to_qualify": first_served_at,
+        "queries_to_qualify": first,
         "served_share_after_qualify": (sum(r["served"] for r in after) / len(after)) if after else None,
         "served_queries": len(served_rows),
-        "served_ndcg_gain_vs_cosine": gain("model_ndcg", "cos_ndcg", served_rows),
-        "served_mrr": _mean(served_rows, "model_mrr"),
-        "served_cos_mrr": _mean(served_rows, "cos_mrr"),
+        "served_cited_queries": len(served_cited),
+        "served_ndcg_gain_vs_cosine": s_gain,
+        "served_mrr": s_mrr,
+        "served_cos_mrr": s_cos,
+        # The acceptance property (point estimates over the served searches):
+        # NDCG gain >= the bar AND cited MRR not below cosine's. None = nothing
+        # served (vacuous).
+        "acceptance": (None if not served_rows else bool(
+            math.isfinite(s_gain) and s_gain >= cfg.min_ndcg_gain
+            and (not served_cited or s_mrr >= s_cos))),
         "served_ndcg_gain_vs_search": gain("model_ndcg", "search_ndcg", served_rows),
         "after_qualify_user_gain_vs_cosine": gain("user_ndcg", "cos_ndcg", after),
         "after_qualify_user_gain_vs_search": gain("user_ndcg", "search_ndcg", after),
         "after_qualify_user_mrr": _mean(after, "user_mrr"),
         "after_qualify_search_mrr": _mean(after, "search_mrr"),
         "after_qualify_cos_mrr": _mean(after, "cos_mrr"),
+        "prequential": st_["record"],
         "all_cos_ndcg": _mean(rows, "cos_ndcg"), "all_search_ndcg": _mean(rows, "search_ndcg"),
+        "checks": learner.checks,
         "serving_turned_on": learner.counters["serving_turned_on"],
         "serving_turned_off": learner.counters["serving_turned_off"],
         "transitions": transitions[:50],
-        "final": {"serving": st_["serving"], "reason": st_["reason"], "last_eval": st_["last_eval"],
-                  "counters": st_["counters"]},
+        "final": {"serving": st_["serving"], "reason": st_["reason"],
+                  "last_check": st_["last_check"], "counters": st_["counters"]},
         "target_max_abs_diff_vs_export": tgt_diff,
         "runtime_s": round(time.monotonic() - t0, 1),
     }
@@ -529,33 +533,40 @@ def replay_config(args: argparse.Namespace) -> Any:
     from ..online_learning import DEFAULT_CONFIG
 
     over: dict[str, Any] = {}
-    for opt, field in (("lr", "lr"), ("holdout", "holdout_queries"), ("min_cited", "min_cited_queries"),
-                       ("round_every", "round_every"), ("batch_queries", "batch_queries"),
-                       ("max_steps", "max_steps_per_round"), ("passes", "passes_to_serve"),
-                       ("max_holdout", "max_holdout_queries"), ("confidence", "confidence"),
-                       ("bootstrap", "bootstrap_samples")):
+    for opt, field in (("lr", "lr"), ("min_queries", "min_queries"),
+                       ("min_cited", "min_cited_queries"), ("round_every", "round_every"),
+                       ("batch_queries", "batch_queries"), ("max_steps", "max_steps_per_round"),
+                       ("error_budget", "error_budget")):
         v = getattr(args, opt, None)
         if v is not None:
             over[field] = v
-    if getattr(args, "purge_gap_hours", None) is not None:
-        over["purge_gap_ms"] = int(args.purge_gap_hours * 3_600_000)
     return replace(DEFAULT_CONFIG, **over)
 
 
 def render_replay_markdown(rep: dict[str, Any]) -> str:
     lines = [f"# Replay through the server's online learning: {rep['profile']}", "",
              "Config: " + json.dumps(rep["config"], sort_keys=True), "",
-             "| project (events) | queries to qualify | served share after | served NDCG vs cos "
-             "| served cited-MRR model / cos | user NDCG vs search after | turned off | final |",
-             "|---|---|---|---|---|---|---|---|"]
+             "| project (events) | queries to qualify | served share after | served n (cited) "
+             "| served NDCG vs cos | served cited-MRR model / cos | acceptance "
+             "| user NDCG vs search after | prequential NDCG gain / cited-MRR diff | checks "
+             "| turned off | final |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rep["results"]:
         share = r["served_share_after_qualify"]
+        pq = r["prequential"]
+        acc = {None: "trivial", True: "pass", False: "FAIL"}[r["acceptance"]]
+        pq_diff = (None if pq["mrr"] is None or pq["cos_mrr"] is None
+                   else pq["mrr"] - pq["cos_mrr"])
         lines.append(
             f"| {r['project']} ({r['events_kept']}) | {r['queries_to_qualify'] if r['queries_to_qualify'] is not None else 'never'} "
-            f"| {'n/a' if share is None else f'{100 * share:.0f}%'} | {_pct(r['served_ndcg_gain_vs_cosine'])} "
-            f"| {r['served_mrr']:.3f} / {r['served_cos_mrr']:.3f} | {_pct(r['after_qualify_user_gain_vs_search'])} "
-            f"| {r['serving_turned_off']} | {'serving' if r['final']['serving'] else 'not serving'}: "
-            f"{r['final']['reason']} |")
+            f"| {'n/a' if share is None else f'{100 * share:.0f}%'} "
+            f"| {r['served_queries']} ({r['served_cited_queries']}) "
+            f"| {_pct(r['served_ndcg_gain_vs_cosine'])} "
+            f"| {_num(r['served_mrr'])} / {_num(r['served_cos_mrr'])} | {acc} "
+            f"| {_pct(r['after_qualify_user_gain_vs_search'])} "
+            f"| {_pct(pq['ndcg_gain'])} / {'n/a' if pq_diff is None else f'{pq_diff:+.3f}'} "
+            f"| {r['checks']} | {r['serving_turned_off']} "
+            f"| {'serving' if r['final']['serving'] else 'not serving'}: {r['final']['reason']} |")
     return "\n".join(lines) + "\n"
 
 
@@ -615,19 +626,16 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--include-soft", action="store_true",
                     help="also replay soft-label citations (the live monitor never posts them)")
     rp.add_argument("--lr", type=float, default=None)
-    rp.add_argument("--holdout", type=int, default=None)
-    rp.add_argument("--min-cited", type=int, default=None)
-    rp.add_argument("--purge-gap-hours", type=float, default=None)
+    rp.add_argument("--min-queries", type=int, default=None,
+                    help="prequential record size before any verdict")
+    rp.add_argument("--min-cited", type=int, default=None,
+                    help="citing queries in the record before any verdict")
     rp.add_argument("--round-every", type=int, default=None)
     rp.add_argument("--batch-queries", type=int, default=None)
     rp.add_argument("--max-steps", type=int, default=None)
-    rp.add_argument("--passes", type=int, default=None,
-                    help="consecutive passing checks before serving")
-    rp.add_argument("--max-holdout", type=int, default=None)
-    rp.add_argument("--confidence", type=float, default=None,
-                    help="one-sided confidence of the gate's bootstrap bounds")
-    rp.add_argument("--bootstrap", type=int, default=None,
-                    help="bootstrap resamples per check")
+    rp.add_argument("--error-budget", type=float, default=None,
+                    help="total false-pass probability over every check "
+                         "(the k-th check runs at 1 - budget / (k (k+1)))")
     rp.set_defaults(func=cmd_replay)
     return p
 

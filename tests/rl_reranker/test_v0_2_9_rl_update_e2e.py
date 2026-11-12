@@ -104,7 +104,7 @@ class TestRlUpdateE2E:
         assert body["ok"] is True and body["scheduled"] == 1 and body["serving"] is False
         lr = _learner(srv)
         assert lr is not None and lr.counters["events_seen"] == 1
-        (q,) = list(lr._queue)
+        (q,) = lr._fresh
         # cosine 0.40, single node -> 0.45; literal: *1.5 -> 0.675, +0.1 -> 0.775
         assert float(q.target[0]) == pytest.approx(0.775, abs=1e-6)
         assert bool(q.literal[0]) is True

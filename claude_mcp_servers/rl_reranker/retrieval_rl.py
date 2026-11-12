@@ -14,7 +14,8 @@ online adaptation, opt-in). The pre-v0.2.106 online path — ``schedule_update``
 as a task that ran after the routing lock was released and could therefore
 train whichever project's model was swapped in by then — is replaced by
 ``online_learning.ProjectLearner``: per project, in rounds, with the offline
-objective (``objective.batch_loss``), behind a held-out serving gate. The
+objective (``objective.batch_loss``), behind a serving gate judged on the
+project's cumulative prequential record. The
 unified target formula (``vco_lib.rl_training_targets``) is still the one
 copy, applied by ``online_learning.labelled_query``.
 """
