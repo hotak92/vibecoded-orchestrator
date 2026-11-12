@@ -10,5 +10,7 @@ Maintainer- and volunteer-side, never part of the reranker image (the root
 - ``shard_trainer`` — train + evaluate one profile from shards; ``ship``
                       installs passing checkpoints into ``weights/``;
 - ``eval_harness``  — NDCG/MRR/Recall vs plain cosine ordering and the
-                      owner's unlock bar.
+                      owner's unlock bar;
+- ``transfer``      — leave-one-project-out training (``lopo``) and the
+                      online per-project adaptation simulation (``adapt``).
 """

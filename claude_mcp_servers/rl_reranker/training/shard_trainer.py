@@ -236,23 +236,40 @@ def make_splits(
     time_holdout: float = 0.15,
     val: float = 0.10,
     dev_project: Optional[str] = None,
+    extra_holdouts: tuple[str, ...] = (),
+    purge_hours: float = 0.0,
 ) -> dict[str, np.ndarray]:
-    """Query-index splits: train / val / time_holdout / project_holdout (/ dev).
+    """Query-index splits: train / val / time_holdout / project_holdout (/ dev / purged).
 
     ``dev_project`` (optional) is a second whole project kept out of training
     and reported per epoch — a cross-project check for choosing the training
     configuration WITHOUT looking at the project hold-out.
+
+    ``extra_holdouts``: further whole projects that join the PROJECT hold-out
+    (never trained on, judged per project by the eval harness) — the
+    leave-one-project-out driver keeps the small projects out of every fold
+    this way, so each fold is judged on more than one unseen project.
+
+    ``purge_hours``: leave this many hours out before the time hold-out and
+    before the validation split (the left-out queries form ``purged``, used by
+    nothing), so neither later split starts with near-copies of the queries
+    trained on just before it.
     """
-    if holdout_project not in data.project_names:
-        raise ValueError(f"hold-out project {holdout_project!r} is not in the data")
-    hp = data.project_names.index(holdout_project)
+    held = (holdout_project, *extra_holdouts)
+    for name in held:
+        if name not in data.project_names:
+            raise ValueError(f"hold-out project {name!r} is not in the data")
+    if len(set(held)) != len(held):
+        raise ValueError(f"hold-out projects repeat: {held}")
+    hp = [data.project_names.index(name) for name in held]
     nq = len(data.q_first)
     allq = np.arange(nq)
-    proj_hold = allq[data.q_project == hp]
-    rest = allq[data.q_project != hp]
+    is_held = np.isin(data.q_project, hp)
+    proj_hold = allq[is_held]
+    rest = allq[~is_held]
     out: dict[str, np.ndarray] = {}
     if dev_project is not None:
-        if dev_project not in data.project_names or dev_project == holdout_project:
+        if dev_project not in data.project_names or dev_project in held:
             raise ValueError(f"dev project {dev_project!r} must be a different project in the data")
         dp = data.project_names.index(dev_project)
         out["dev"] = rest[data.q_project[rest] == dp]
@@ -263,6 +280,21 @@ def make_splits(
     time_hold = rest[len(rest) - n_time:] if n_time else rest[:0]
     val_q = rest[len(rest) - n_time - n_val: len(rest) - n_time]
     train_q = rest[: len(rest) - n_time - n_val]
+    if purge_hours > 0:
+        # Consecutive queries of one task / session look alike; without a gap
+        # the first hours of a later split are near-copies of the last hours
+        # of the earlier one, and the later split measures recall of those.
+        gap = int(purge_hours * 3_600_000)
+        purged = []
+        if len(time_hold):
+            cut = int(data.q_ts[time_hold].min()) - gap
+            purged += [val_q[data.q_ts[val_q] > cut], train_q[data.q_ts[train_q] > cut]]
+            val_q, train_q = val_q[data.q_ts[val_q] <= cut], train_q[data.q_ts[train_q] <= cut]
+        if len(val_q):
+            cut = int(data.q_ts[val_q].min()) - gap
+            purged.append(train_q[data.q_ts[train_q] > cut])
+            train_q = train_q[data.q_ts[train_q] <= cut]
+        out["purged"] = np.concatenate(purged) if purged else rest[:0]
     out.update({"train": train_q, "val": val_q, "time_holdout": time_hold,
                 "project_holdout": proj_hold})
     return out
@@ -427,12 +459,53 @@ def within_query_listwise_loss(pred: Any, target: Any, weight: Any, qid: Any,
 # Train / score
 # ---------------------------------------------------------------------------
 
-def new_net(emb_dim: int, device: Any, seed: int) -> Any:
-    """A fresh canonical v2 network, initialised exactly as RLModel does."""
+#: The architectures the trainer can produce: the canonical serving network
+#: (``v2``) and the smaller legacy one (``v1``, rl_model_v1) that RLModel can
+#: still load. A non-default arch ships only together with a serving path
+#: that constructs RLModel with the checkpoint's own ``arch_version``.
+TRAIN_ARCHS: tuple[str, ...] = ("v2", "v1")
+
+
+def new_net(emb_dim: int, device: Any, seed: int, arch: str = "v2") -> Any:
+    """A fresh network of ``arch``, initialised exactly as RLModel does."""
+    if arch not in TRAIN_ARCHS:
+        raise ValueError(f"arch must be one of {TRAIN_ARCHS}, got {arch!r}")
     torch.manual_seed(seed)
     m = RLModel(emb_dim=emb_dim, state_path=Path("/nonexistent/rl_model_init.pt"),
-                device="cpu")
+                device="cpu", arch_version=arch)
     return m._net.to(device)
+
+
+def load_init_state(path: Path, emb_dim: int, arch: str = "v2") -> dict[str, Any]:
+    """The network state of a checkpoint, for a warm start.
+
+    Read through RLModel (the serving loader), from a COPY in a temporary
+    directory: loading can migrate sidecars beside the file, and the source
+    checkpoint must stay untouched. Raises when the checkpoint's architecture
+    or width differs from the one being trained — a silent partial load would
+    make the warm start a fresh start.
+    """
+    import tempfile
+    from ..rl_model import read_checkpoint_meta
+
+    meta = read_checkpoint_meta(Path(path))
+    if meta is None:
+        raise ValueError(f"{path}: not a readable RL checkpoint")
+    if meta.get("arch_version") != arch or int(meta.get("emb_dim", -1)) != emb_dim:
+        raise ValueError(
+            f"{path}: checkpoint is arch {meta.get('arch_version')!r} / dim "
+            f"{meta.get('emb_dim')}, training {arch!r} / dim {emb_dim}"
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        dst = Path(tmp) / Path(path).name
+        shutil.copyfile(path, dst)
+        m = RLModel(emb_dim=emb_dim, state_path=dst, device="cpu", arch_version=arch)
+        # RLModel falls back to a fresh network when a load fails; ask the
+        # loader again so that case is an error here, not a silent cold start.
+        if not m._try_load():
+            raise ValueError(f"{path}: RLModel could not load it (a warm start would be a fresh init)")
+        state = {k: v.detach().clone() for k, v in m._net.state_dict().items()}
+    return state
 
 
 @torch.no_grad()
@@ -520,6 +593,75 @@ class RunResult:
     runtime_s: float
 
 
+def drop_entities(entities: Any, p: float, *, generator: Any) -> Any:
+    """Zero every raw vector of a random ``p`` share of the samples.
+
+    The slot scalars (all the cosines) and the type rows stay, so a dropped
+    sample must be scored from them alone: the network cannot lean on WHICH
+    vectors it has seen for every sample, only for the rest (node-level
+    dropout against memorising per-node priors). Serving never drops.
+    """
+    if p <= 0.0:
+        return entities
+    keep = torch.rand(entities.shape[0], device=entities.device, generator=generator) >= p
+    return entities * keep.to(entities.dtype).view(-1, 1, 1)
+
+
+def batch_loss(
+    net: Any,
+    data: TrainData,
+    idx: Any,
+    *,
+    loss: LossConfig,
+    generator: Any,
+    augment_rotation: bool = False,
+    entity_dropout: float = 0.0,
+) -> Any:
+    """The training loss of the samples ``idx`` (one mini-batch).
+
+    The one home of the per-batch objective: :func:`train_one` and the
+    online-adaptation simulation (``transfer``) both step on it.
+    """
+    sync_other_type_row(net)
+    e, t, s = build_inputs(data, idx, generator=generator)
+    if augment_rotation:
+        e = e @ random_rotation(e.shape[-1], device=e.device, generator=generator)
+    e = drop_entities(e, entity_dropout, generator=generator)
+    tgt = data.target[idx].unsqueeze(-1)
+    w = data.weight[idx].unsqueeze(-1)
+    pred = net(e, t, s)
+    qid = data.sample_query[idx]
+    total = pred.sum() * 0.0
+    if loss.pointwise:
+        w_sum = w.sum().clamp_min(1e-8)
+        mse = ((pred - tgt) ** 2 * w).sum() / w_sum
+        bce = F.binary_cross_entropy(pred, tgt, weight=w, reduction="sum") / w_sum
+        total = total + loss.pointwise * (mse + 0.5 * bce)
+    if loss.pair:
+        total = total + loss.pair * within_query_pair_loss(pred, tgt, w, qid)
+    if loss.listwise:
+        total = total + loss.listwise * within_query_listwise_loss(
+            pred, tgt, w, qid, loss.list_temp)
+    return total
+
+
+def l2sp_penalty(net: Any, anchor: dict[str, Any]) -> Any:
+    """Sum of squared distances of the parameters from ``anchor`` (L2-SP).
+
+    Pulls the network toward its starting point instead of toward zero, so a
+    warm start (e.g. a network that ranks exactly like cosine) is left only
+    where the data insists. ``type_embs`` is excluded: its rows past the
+    builtins are recomputed every step and carry no learned content.
+    """
+    pen = None
+    for name, p in net.named_parameters():
+        if name.endswith("type_embs.weight"):
+            continue
+        d = ((p - anchor[name]) ** 2).sum()
+        pen = d if pen is None else pen + d
+    return pen if pen is not None else torch.zeros(())
+
+
 def train_one(
     data: TrainData,
     splits: dict[str, np.ndarray],
@@ -533,9 +675,14 @@ def train_one(
     loss: LossConfig = LossConfig(),
     project_cap: float = 0.5,
     augment_rotation: bool = False,
+    entity_dropout: float = 0.0,
+    init_state: Optional[dict[str, Any]] = None,
+    l2sp: float = 0.0,
+    arch: str = "v2",
+    select_on: str = "val",
     log: Any = print,
 ) -> RunResult:
-    """One seeded training run; keeps the best-validation-NDCG state.
+    """One seeded training run; keeps the best-selection-NDCG state.
 
     ``augment_rotation``: multiply every training batch's vectors by a fresh
     random orthogonal matrix. Cosines (all the per-slot scalars) are
@@ -543,15 +690,28 @@ def train_one(
     twice, so the network cannot memorise WHICH nodes were useful in the
     training projects — a prior that does not transfer to a project it has
     never seen. Evaluation and serving use the vectors as they are.
+
+    ``entity_dropout``: see :func:`drop_entities`. ``init_state``: warm start
+    from this network state (:func:`load_init_state`, or the cosine-neutral
+    state of ``transfer.cosine_neutral_state``). ``l2sp``: weight of
+    :func:`l2sp_penalty` toward the starting state. ``select_on``: the split
+    whose NDCG@10 picks the best epoch and drives the patience (``val``: the
+    later-in-time queries of the training projects; ``dev``: a whole project
+    kept out of training).
     """
     if lambda_rank is not None:
         loss = LossConfig(pointwise=loss.pointwise, pair=lambda_rank,
                           listwise=loss.listwise, list_temp=loss.list_temp)
+    if select_on not in ("val", "dev") or not len(splits.get(select_on, ())):
+        raise ValueError(f"select_on={select_on!r}: that split is missing or empty")
     random.seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
     emb_dim = int(data.vectors.shape[1])
-    net = new_net(emb_dim, data.device, seed)
+    net = new_net(emb_dim, data.device, seed, arch)
+    if init_state is not None:
+        net.load_state_dict(init_state)
+    anchor = ({k: v.detach().clone() for k, v in net.named_parameters()} if l2sp > 0 else None)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     gen = torch.Generator(device=data.device)
     gen.manual_seed(seed)
@@ -567,36 +727,23 @@ def train_one(
         tot = n_b = 0.0
         for i in range(0, len(sidx), batch_size):
             idx = torch.from_numpy(sidx[i:i + batch_size]).to(data.device)
-            sync_other_type_row(net)
-            e, t, s = build_inputs(data, idx, generator=gen)
-            if augment_rotation:
-                e = e @ random_rotation(e.shape[-1], device=e.device, generator=gen)
-            tgt = data.target[idx].unsqueeze(-1)
-            w = data.weight[idx].unsqueeze(-1)
-            pred = net(e, t, s)
-            qid = data.sample_query[idx]
-            total = pred.sum() * 0.0
-            if loss.pointwise:
-                w_sum = w.sum().clamp_min(1e-8)
-                mse = ((pred - tgt) ** 2 * w).sum() / w_sum
-                bce = F.binary_cross_entropy(pred, tgt, weight=w, reduction="sum") / w_sum
-                total = total + loss.pointwise * (mse + 0.5 * bce)
-            if loss.pair:
-                total = total + loss.pair * within_query_pair_loss(pred, tgt, w, qid)
-            if loss.listwise:
-                total = total + loss.listwise * within_query_listwise_loss(
-                    pred, tgt, w, qid, loss.list_temp)
+            total = batch_loss(net, data, idx, loss=loss, generator=gen,
+                               augment_rotation=augment_rotation,
+                               entity_dropout=entity_dropout)
+            if anchor is not None:
+                total = total + l2sp * l2sp_penalty(net, anchor)
             opt.zero_grad(set_to_none=True)
             total.backward()
             opt.step()
             tot += float(total.detach())
             n_b += 1
         vm = split_metrics(data, net, splits["val"])
-        v = vm["ndcg"]
         row = {"epoch": epoch, "train_loss": round(tot / max(n_b, 1), 6),
-               "val_ndcg10": round(v, 6), "val_mrr10": round(vm["mrr"], 6),
+               "val_ndcg10": round(vm["ndcg"], 6), "val_mrr10": round(vm["mrr"], 6),
                "train_queries": int(len(q))}
-        msg = f"    lr={lr:g} epoch {epoch}: loss {tot / max(n_b, 1):.5f} val NDCG@10 {v:.5f} MRR {vm['mrr']:.4f}"
+        msg = (f"    lr={lr:g} epoch {epoch}: loss {tot / max(n_b, 1):.5f} val NDCG@10 "
+               f"{vm['ndcg']:.5f} MRR {vm['mrr']:.4f}")
+        dm = None
         if len(splits.get("dev", ())):
             dm = split_metrics(data, net, splits["dev"])
             row.update({"dev_ndcg10": round(dm["ndcg"], 6), "dev_mrr10": round(dm["mrr"], 6),
@@ -606,6 +753,7 @@ def train_one(
                     f"MRR {dm['mrr']:.4f} (cos {dm['cos_mrr']:.4f})")
         history.append(row)
         log(msg)
+        v = (dm if select_on == "dev" and dm is not None else vm)["ndcg"]
         if v > best[0] + 1e-6:
             best = (v, epoch, {k: x.detach().cpu().clone() for k, x in net.state_dict().items()})
             bad = 0
@@ -648,12 +796,12 @@ def evaluate_holdouts(data: TrainData, net: Any, splits: dict[str, np.ndarray],
 # ---------------------------------------------------------------------------
 
 def save_checkpoint(state_dict: dict[str, Any], path: Path, *, profile: str,
-                    version: str, emb_dim: int) -> str:
+                    version: str, emb_dim: int, arch: str = "v2") -> str:
     """Write a serving checkpoint through RLModel.save (no optimizer moments)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
-    m = RLModel(emb_dim=emb_dim, state_path=path, device="cpu",
+    m = RLModel(emb_dim=emb_dim, state_path=path, device="cpu", arch_version=arch,
                 weights_version=version, embedding_source=profile)
     m._net.load_state_dict(state_dict)
     m.mark_as_release_base()
@@ -713,36 +861,137 @@ def ship(reports: list[Path], weights_root: Path) -> dict[str, Any]:
 # CLI
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
+def _fit_target_on_cosine(data: TrainData, qids: np.ndarray) -> tuple[float, float]:
+    """Least-squares ``target ~ a + b * cos(q, n)`` over the samples of ``qids``."""
+    sidx, _, _ = _split_arrays(data, qids)
+    c = cosine_scores(data, sidx).astype(np.float64)
+    t = data.np_target[sidx].astype(np.float64)
+    b, a = np.polyfit(c, t, 1)
+    if not b > 0:
+        raise ValueError(f"target does not increase with cosine on these queries (slope {b:.4f})")
+    return float(a), float(b)
+
+
+def cosine_neutral_state(
+    data: TrainData,
+    qids: np.ndarray,
+    *,
+    steps: int = 3000,
+    batch_size: int = 512,
+    lr: float = 1e-3,
+    seed: int = 1234,
+    arch: str = "v2",
+    log: Any = print,
+) -> dict[str, Any]:
+    """A network that ranks EXACTLY like cosine: the neutral starting point.
+
+    Distilled on the samples of ``qids`` toward ``a + b * cos(q, n)`` (the
+    least-squares line of the training target on cosine, clipped into
+    (0, 1)), with every batch randomly rotated: under rotation only the
+    cosines carry information, so the network learns a monotone function of
+    ``cos(q, n)`` and nothing about which nodes it saw. Warm-starting from it
+    (optionally held there by :func:`l2sp_penalty`) means a project the model
+    knows nothing about is ranked like cosine, and training moves away from
+    cosine only where the data supports it.
+    """
+    a, b = _fit_target_on_cosine(data, qids)
+    rng = np.random.default_rng(seed)
+    net = new_net(int(data.vectors.shape[1]), data.device, seed, arch)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    gen = torch.Generator(device=data.device)
+    gen.manual_seed(seed)
+    sidx_all, _, _ = _split_arrays(data, qids)
+    net.train()
+    for step in range(steps):
+        pick = rng.choice(len(sidx_all), size=min(batch_size, len(sidx_all)), replace=False)
+        idx = torch.from_numpy(sidx_all[pick]).to(data.device)
+        sync_other_type_row(net)
+        e, t, s = build_inputs(data, idx, generator=gen)
+        e = e @ random_rotation(e.shape[-1], device=e.device, generator=gen)
+        goal = (a + b * s[:, 1, 0]).clamp(0.02, 0.98).unsqueeze(-1)
+        pred = net(e, t, s)
+        mse = ((pred - goal) ** 2).mean()
+        opt.zero_grad(set_to_none=True)
+        mse.backward()
+        opt.step()
+        if (step + 1) % 1000 == 0:
+            log(f"    cosine-neutral distillation step {step + 1}/{steps}: "
+                f"mse {float(mse.detach()):.6f}")
+    return {k: x.detach().cpu().clone() for k, x in net.state_dict().items()}
+
+
+def resolve_init_state(args: argparse.Namespace, data: TrainData, train_q: np.ndarray,
+                       emb_dim: int) -> Optional[dict[str, Any]]:
+    """``--init``: ``none`` (fresh), ``cosine`` (:func:`cosine_neutral_state`) or a checkpoint path."""
+    spec = getattr(args, "init", "none") or "none"
+    if spec == "none":
+        return None
+    if spec == "cosine":
+        return cosine_neutral_state(data, train_q, steps=args.init_steps, seed=args.seed,
+                                    arch=args.arch, log=lambda m: print(m, flush=True))
+    return load_init_state(Path(spec), emb_dim, args.arch)
+
+
+def loss_from_args(args: argparse.Namespace) -> LossConfig:
+    return LossConfig(pointwise=args.pointwise_weight, pair=args.lambda_rank,
+                      listwise=args.listwise_weight, list_temp=args.listwise_temp)
+
+
+def train_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    """The :func:`train_one` keyword arguments the shared training options carry."""
+    return {"seed": args.seed, "epochs": args.epochs, "patience": args.patience,
+            "batch_size": args.batch_size, "loss": loss_from_args(args),
+            "project_cap": args.project_cap, "augment_rotation": args.rotation_augment,
+            "entity_dropout": args.entity_dropout, "l2sp": args.l2sp, "arch": args.arch,
+            "select_on": args.select_on}
+
+
+def train_config_record(args: argparse.Namespace) -> dict[str, Any]:
+    """The training configuration as it goes into a report."""
+    return {"batch_size": args.batch_size, "loss": loss_from_args(args).as_dict(),
+            "rotation_augment": args.rotation_augment, "entity_dropout": args.entity_dropout,
+            "init": args.init, "init_steps": args.init_steps, "l2sp": args.l2sp,
+            "arch": args.arch, "select_on": args.select_on, "project_cap": args.project_cap,
+            "purge_hours": args.purge_hours,
+            "patience": args.patience, "max_epochs": args.epochs, "seed": args.seed,
+            "lrs": list(args.lrs)}
+
+
+def sweep_lrs(data: TrainData, splits: dict[str, np.ndarray], args: argparse.Namespace,
+              init_state: Optional[dict[str, Any]]) -> tuple[RunResult, list[RunResult]]:
+    """One :func:`train_one` run per ``--lrs`` value; the best by its selection NDCG."""
+    runs = []
+    for lr in args.lrs:
+        r = train_one(data, splits, lr=lr, init_state=init_state,
+                      log=lambda m: print(m, flush=True), **train_kwargs_from_args(args))
+        print(f"  lr={lr:g}: best {args.select_on} NDCG@10 {r.best_val_ndcg:.5f} at epoch "
+              f"{r.best_epoch} ({r.runtime_s:.0f} s)", flush=True)
+        runs.append(r)
+    return max(runs, key=lambda r: r.best_val_ndcg), runs
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     t0 = time.time()
     data = load_training_data([Path(d) for d in args.data], args.profile, args.device)
     holdout = args.holdout_project or pick_holdout_project(data)
     splits = make_splits(data, holdout, time_holdout=args.time_holdout, val=args.val,
-                         dev_project=args.dev_project)
-    loss = LossConfig(pointwise=args.pointwise_weight, pair=args.lambda_rank,
-                      listwise=args.listwise_weight, list_temp=args.listwise_temp)
+                         dev_project=args.dev_project, purge_hours=args.purge_hours)
+    loss = loss_from_args(args)
+    emb_dim = int(data.vectors.shape[1])
     print(f"{args.profile}: {len(data.q_first)} queries, {len(data.np_target)} samples, "
           f"{data.vectors.shape[0]} vectors on {data.device}; hold-out project {holdout}; "
           + ", ".join(f"{k}={len(v)}" for k, v in splits.items()), flush=True)
-    runs = []
-    for lr in args.lrs:
-        r = train_one(data, splits, lr=lr, seed=args.seed, epochs=args.epochs,
-                      patience=args.patience, batch_size=args.batch_size,
-                      loss=loss, project_cap=args.project_cap,
-                      augment_rotation=args.rotation_augment,
-                      log=lambda m: print(m, flush=True))
-        print(f"  lr={lr:g}: best val NDCG@10 {r.best_val_ndcg:.5f} at epoch {r.best_epoch} "
-              f"({r.runtime_s:.0f} s)", flush=True)
-        runs.append(r)
-    best = max(runs, key=lambda r: r.best_val_ndcg)
-    net = new_net(int(data.vectors.shape[1]), data.device, args.seed)
+    init_state = resolve_init_state(args, data, splits["train"], emb_dim)
+    best, runs = sweep_lrs(data, splits, args, init_state)
+    net = new_net(emb_dim, data.device, args.seed, args.arch)
     net.load_state_dict(best.state_dict)
     holdouts = evaluate_holdouts(data, net, splits, holdout)
     decision = eval_harness.ship_decision(holdouts["time_holdout"], holdouts["project_holdout"])
     out = Path(args.out)
     ckpt = out / args.profile / args.version / f"rl_model_{args.profile}_{args.version}.pt"
     sha = save_checkpoint(best.state_dict, ckpt, profile=args.profile, version=args.version,
-                          emb_dim=int(data.vectors.shape[1]))
+                          emb_dim=emb_dim, arch=args.arch)
     report = {
         "profile": args.profile,
         "holdout_project": holdout,
@@ -755,14 +1004,9 @@ def cmd_train(args: argparse.Namespace) -> int:
             "best_epoch": best.best_epoch,
             "epochs_run": best.epochs_run,
             "best_val_ndcg10": round(best.best_val_ndcg, 6),
-            "batch_size": args.batch_size,
             "loss": loss.as_dict(),
             "dev_project": args.dev_project,
-            "rotation_augment": args.rotation_augment,
-            "project_cap": args.project_cap,
-            "patience": args.patience,
-            "max_epochs": args.epochs,
-            "seed": args.seed,
+            **train_config_record(args),
             "runtime_s": round(time.time() - t0, 1),
             "runs": [{"lr": r.lr, "best_val_ndcg10": round(r.best_val_ndcg, 6),
                       "best_epoch": r.best_epoch, "history": r.history,
@@ -791,17 +1035,11 @@ def cmd_ship(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python -m claude_mcp_servers.rl_reranker.training.shard_trainer")
-    sub = p.add_subparsers(dest="cmd", required=True)
-    t = sub.add_parser("train", help="train + evaluate one profile from export shards")
+def add_training_options(t: argparse.ArgumentParser) -> None:
+    """The data + training options every training sub-command shares."""
     t.add_argument("--data", action="append", required=True, help="export directory; repeatable")
     t.add_argument("--profile", required=True, choices=["qwen3", "arctic"])
-    t.add_argument("--out", required=True, help="directory for the checkpoint + reports")
-    t.add_argument("--version", required=True, help="weights version (semver) to stamp")
-    t.add_argument("--holdout-project", default=None,
-                   help="hashed project id held out of training (default: the largest "
-                        "project with >= 1000 queries and <= 20%% of the data)")
+    t.add_argument("--out", required=True, help="directory for the checkpoint(s) + reports")
     t.add_argument("--lrs", type=lambda s: [float(x) for x in s.split(",")],
                    default=[5e-6, 1e-5, 2e-5])
     t.add_argument("--epochs", type=int, default=16)
@@ -817,14 +1055,40 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--rotation-augment", action="store_true",
                    help="rotate every training batch's vectors by a random orthogonal "
                         "matrix (no memorising which nodes were useful; see train_one)")
-    t.add_argument("--dev-project", default=None,
-                   help="hashed id of a project kept out of training and reported per "
-                        "epoch (choose the loss mix without looking at the hold-out)")
+    t.add_argument("--entity-dropout", type=float, default=0.0,
+                   help="share of training samples whose raw vectors are zeroed (scored "
+                        "from the cosines and types alone; see drop_entities)")
+    t.add_argument("--init", default="none",
+                   help="starting network: 'none' (fresh), 'cosine' (a network distilled to "
+                        "rank like cosine; see cosine_neutral_state) or a checkpoint path")
+    t.add_argument("--init-steps", type=int, default=3000,
+                   help="distillation steps of --init cosine")
+    t.add_argument("--l2sp", type=float, default=0.0,
+                   help="weight of the pull toward the starting network (L2-SP)")
+    t.add_argument("--arch", default="v2", choices=list(TRAIN_ARCHS))
+    t.add_argument("--select-on", default="val", choices=["val", "dev"],
+                   help="split whose NDCG@10 picks the best epoch (dev needs --dev-project)")
     t.add_argument("--project-cap", type=float, default=0.5)
     t.add_argument("--time-holdout", type=float, default=0.15)
     t.add_argument("--val", type=float, default=0.10)
+    t.add_argument("--purge-hours", type=float, default=0.0,
+                   help="hours left out before each later-in-time split (see make_splits)")
     t.add_argument("--seed", type=int, default=1234)
     t.add_argument("--device", default="auto")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="python -m claude_mcp_servers.rl_reranker.training.shard_trainer")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    t = sub.add_parser("train", help="train + evaluate one profile from export shards")
+    add_training_options(t)
+    t.add_argument("--version", required=True, help="weights version (semver) to stamp")
+    t.add_argument("--holdout-project", default=None,
+                   help="hashed project id held out of training (default: the largest "
+                        "project with >= 1000 queries and <= 20%% of the data)")
+    t.add_argument("--dev-project", default=None,
+                   help="hashed id of a project kept out of training and reported per "
+                        "epoch (choose the loss mix without looking at the hold-out)")
     t.set_defaults(func=cmd_train)
     s = sub.add_parser("ship", help="install passing checkpoints into the bundled weights")
     s.add_argument("--report", action="append", required=True)

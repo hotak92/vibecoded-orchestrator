@@ -169,6 +169,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project. Training with a random rotation of the vectors stops the model from memorising which nodes helped, and
   removes those regressions, but its gains are below the bar (qwen3 +1.1% / +1.6%, arctic +0.4% / −0.8%). The
   profiles ship together, so neither ships.
+- **Tools to test whether an RL reranker transfers to projects it never saw.**
+  `python -m claude_mcp_servers.rl_reranker.training.transfer lopo` trains one fold per project with at least 3 000
+  queries, holding that project out, and also keeps the smaller judged projects out of every fold. A design passes
+  only when every fold passes the unlock bar AND every unseen project gains at least 2% on its own. `transfer adapt`
+  simulates learning per project: from a network that ranks exactly like cosine (or from the fold network that
+  never saw the project), it takes one online pass over a project's earlier queries and records NDCG@10 and MRR@10
+  on its latest quarter after each share of the stream. The trainer options gained a warm start from a checkpoint
+  or from that cosine-equivalent network (`--init`), a pull toward the starting network (`--l2sp`), node-level
+  dropout of the raw vectors (`--entity-dropout`), the smaller v1 network (`--arch v1`), model selection on a
+  held-out project (`--select-on dev`), and a gap before each later-in-time split (`--purge-hours`), because
+  consecutive queries of one task look alike and otherwise inflate the time hold-out.
+- **What the re-run found** (leave-one-project-out over the four projects of the maintainer's export, both
+  profiles, fourteen training designs): no design passes. Once memorising which nodes were useful is prevented,
+  the gain that carries to an unseen project is at most about 2% for qwen3 and 1% for arctic, and some unseen
+  project is always below cosine. The design review also found that the training target, the similarity between
+  the answer and each node, mostly measures how typical a node is of all the nodes that search returned: putting
+  those nodes first, without looking at the query at all, beats cosine by 3.4% (qwen3) and 2.4% (arctic) NDCG@10,
+  and ranks the node the answer named lower. Learning per project, starting from cosine, passed +2% after one to
+  four thousand of a project's own queries on the larger projects, and never on the smallest. The weights stay
+  unshipped and RL scoring stays locked.
 
 ### Changed
 

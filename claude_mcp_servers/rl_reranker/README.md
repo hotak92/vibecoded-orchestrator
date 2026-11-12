@@ -292,6 +292,27 @@ The unlock bar (`training/eval_harness.py`): NDCG@10 at least 2% above plain
 cosine ordering on a later time window AND on a project never trained on, and
 no project worse than cosine.
 
+One held-out project cannot tell a model that transfers from one that
+memorised which nodes of the training projects were useful (many nodes are
+shared across projects through the shared KG). Before shipping, check a design
+with leave-one-project-out, and see what learning per project would give:
+
+```bash
+# one fold per project with >= 3000 queries; smaller judged projects stay out of every fold;
+# passes only if every fold passes the bar AND every unseen project gains >= 2% on its own
+python -m claude_mcp_servers.rl_reranker.training.transfer lopo \
+    --data <dir> --profile qwen3 --out <run dir> [training options, e.g. --rotation-augment --init cosine]
+# online per-project adaptation from a cosine-equivalent start (and from each fold's network)
+python -m claude_mcp_servers.rl_reranker.training.transfer adapt \
+    --data <dir> --profile qwen3 --out <run dir> --base-report <run dir>/lopo_qwen3.json --purge-hours 24
+```
+
+Both commands take the `train` options (`--init none|cosine|<checkpoint>`,
+`--l2sp`, `--entity-dropout`, `--arch v2|v1`, `--purge-hours`, the loss
+weights) and report MRR@10 of literally cited nodes next to NDCG@10: the
+training target rewards nodes that are typical of the whole candidate set, so
+an NDCG gain alone can come with the named node ranked lower.
+
 ## License
 
 AGPL-3.0-or-later, as the rest of the orchestrator.
