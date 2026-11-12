@@ -19,7 +19,7 @@ The reranker ships in the orchestrator repository itself:
 
 - **Source**: `claude_mcp_servers/rl_reranker/` in the public AGPL repo — server (`rl_server.py`), model (`rl_model.py`), bundled-weights reader (`bundled_weights.py`), offline training pipeline (`training/`).
 - **Image**: built LOCALLY at install/update from `claude_mcp_servers/rl_reranker/Dockerfile` (`install.method = "container_build"` in `vct-module.json`) as `localhost/vco-rl-reranker:<version>-<variant>`. No registry pull, no pull token, no licence check. A start of the module rebuilds the image if it is missing or built for the wrong GPU variant.
-- **Scope**: one global container per machine (default host port 11450), serving every project; requests carry the `X-VCT-Project-ID` header so per-project model heads stay separate. Cross-project leakage is impossible by construction — each project's head only trains on its own citation pattern.
+- **Scope**: one global container per machine (default host port 11450), serving every project; requests carry the `X-VCT-Project-ID` header, and each project has its own model (saved under `state/projects/<project_id>/`). Cross-project leakage is impossible by construction — each project's model only trains on its own citation pattern, and there is no shared global model.
 
 **Wiring**: the launcher deliberately does NOT propagate `RL_SERVER_URL` / `RL_SERVER_PORT` into `.claude/settings.json env` for MCP subprocesses. The MCP's client resolves the container's address as: env override first, then the hub-resolved `rl_server_port` from the project config (V52-AA — the port recorded in `module_ports`). `rl_doctor` resolves through the same shared function, so the doctor can never say "not wired" where the MCP finds the container.
 

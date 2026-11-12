@@ -3,7 +3,7 @@ title: Score-Driven Retrieval Tiers
 type: concept
 tags: [retrieval, knowledge-graph, weaviate, mcp, token-efficiency, mid-level-architecture]
 created: 2026-04-27T12:00:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-11-12T06:30:00Z
 valid_from: 2026-04-27T00:00:00Z
 valid_until: null
 status: active
@@ -57,8 +57,12 @@ and are env-tunable (`KG_TIER_MIN`, `KG_TIER_SINGLE_CHUNK`, `KG_TIER_THREE_CHUNK
   connected nodes always render at `summary` (graph topology, not score, drove their
   selection — re-fetching them via near_text would add 300-800ms latency for marginal
   benefit).
-- `search_code_graph(detail="auto")` — code graph has no sidecar so tiering is
-  position-based (top-4 full, rest metadata refs) rather than score-thresholded.
+- `search_code_graph(detail="auto")` — score-thresholded too, on its own calibration
+  (`CODE_TIER_MIN` 0.22 → summary, `CODE_TIER_SINGLE_CHUNK` 0.32, `CODE_TIER_THREE_CHUNKS`
+  0.48, `CODE_TIER_FULL` 0.62; code→code cosines sit lower than KG ones). Since v0.2.106 a
+  long function or class may be stored as several rows; it is still ONE result, which reports
+  the row that matched (`matched_chunk` of `chunks_total`), and the tier decides how much of it
+  renders. The same shared chunk budget (`KG_HYBRID_CHUNK_BUDGET`) applies.
 - `claude_mcp_servers/scripts/rl_kg_search.py` — invoked by pre-edit hook; produces
   the same tier-formatted output for context injection.
 
