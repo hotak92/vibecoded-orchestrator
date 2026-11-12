@@ -421,7 +421,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **CI: the tri-OS install smoke runs on `macos-15`.** GitHub retired the `macos-14` runner image ("configuration 'macos-14-arm64-us-default' is not supported"), so the macOS leg was cancelled instantly. `macos-15` keeps the same coverage (Apple Silicon, bash 3.2, `/opt/homebrew`); the pre-ship leg check follows.
+- **CI: the tri-OS install smoke runs on `macos-15`.** GitHub retired the `macos-14` runner image ("configuration
+  'macos-14-arm64-us-default' is not supported"), so the macOS leg was cancelled instantly. `macos-15` keeps the same
+  coverage (Apple Silicon, bash 3.2, `/opt/homebrew`); the pre-ship leg check follows.
 
 - **The code graph stores new entities again on Weaviate 1.37.** The analyzer writes with `replace()` and falls back
   to `insert()` when the object does not exist yet, but it recognised "does not exist" only by the older
