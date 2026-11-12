@@ -22,10 +22,12 @@ MCP posts to ``/rl_update`` (``RLServer._rl_update``):
    :attr:`OnlineConfig.min_cited_queries` citing ones (capped at
    :attr:`OnlineConfig.max_holdout_queries`) is the evaluation window. A query
    is NEVER trained on while it is in the window, nor before a purge gap has
-   passed after it left (:attr:`OnlineConfig.purge_gap_ms`, or
-   :attr:`OnlineConfig.max_staged_queries` queries, whichever comes first):
-   consecutive queries of one task look alike, and without a gap the window
-   would measure recall of what was trained just before it.
+   passed after it left (:attr:`OnlineConfig.purge_gap_ms`): consecutive
+   queries of one task look alike, and without a gap the window would measure
+   recall of what was trained just before it. On a busy project the queries
+   waiting out the gap are bounded by :attr:`OnlineConfig.max_staged_queries`:
+   past it the OLDEST waiting queries are dropped untrained — never released
+   early.
 3. **Training round** (every :attr:`OnlineConfig.round_every` new events —
    bounded compute, never per event): the released queries train the
    project's network with the offline objective, ``objective.batch_loss``
@@ -128,9 +130,10 @@ class OnlineConfig:
     never longer than ``max_holdout_queries``. The gate judges nothing smaller
     than ``holdout_queries`` queries, and no MRR on fewer than
     ``min_cited_queries`` citing ones.
-    ``purge_gap_ms`` / ``max_staged_queries``: a query becomes trainable only
-    this long after it left the window — or once this many younger queries
-    are waiting outside the window (bounds memory on a busy project).
+    ``purge_gap_ms``: a query becomes trainable only this long after it left
+    the window (no exception). ``max_staged_queries``: queries waiting out the
+    gap kept at most (bounds memory on a busy project): beyond it the oldest
+    waiting queries are DROPPED untrained, never released before their gap.
     ``round_every``: new events between two rounds. ``batch_queries``: queries
     per AdamW step. ``max_steps_per_round``: compute bound of one round.
     ``max_pending_queries``: trainable queries kept waiting at most (the
@@ -322,25 +325,31 @@ class TimeQueue:
             else:
                 break
 
-    def pop_released(self) -> "list[LabelledQuery]":
-        """Staged queries past the purge gap (or past the staging cap)."""
+    def pop_released(self) -> "tuple[list[LabelledQuery], int]":
+        """``(released, dropped)``: the staged queries whose purge gap has
+        passed, oldest first, and how many of the oldest still-gapped ones
+        were dropped because more than ``cfg.max_staged_queries`` were
+        waiting. A query is never released before its gap has passed."""
         cfg = self._cfg
         out: list[LabelledQuery] = []
+        dropped = 0
         while self._head < self._ws:
             front = self._q[self._head]
             win0 = self._q[self._ws] if self._ws < len(self._q) else None
             assert front is not None
-            if (win0 is not None and front.ts_ms > win0.ts_ms - cfg.purge_gap_ms
-                    and self.staged <= cfg.max_staged_queries):
-                break
-            out.append(front)
+            if win0 is not None and front.ts_ms > win0.ts_ms - cfg.purge_gap_ms:
+                if self.staged <= cfg.max_staged_queries:
+                    break
+                dropped += 1          # over the staging cap: drop, never train early
+            else:
+                out.append(front)
             self._q[self._head] = None
             self._head += 1
         if self._head > 4096 and 2 * self._head > len(self._q):
             del self._q[: self._head]
             self._ws -= self._head
             self._head = 0
-        return out
+        return out, dropped
 
     def clear(self) -> None:
         self._q.clear()
@@ -835,7 +844,9 @@ class ProjectLearner:
     def _release(self) -> None:
         """Move queries that left the window AND the purge gap to training."""
         cfg = self.cfg
-        for front in self._queue.pop_released():
+        released, over_cap = self._queue.pop_released()
+        self.counters["dropped_untrained"] += over_cap
+        for front in released:
             if self.training_enabled:
                 self._pending.append(front)
             else:

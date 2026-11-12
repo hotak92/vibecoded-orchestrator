@@ -132,14 +132,34 @@ def test_the_window_grows_until_it_holds_enough_citing_queries():
     assert lr.holdout_size == 30
 
 
-def test_max_staged_releases_before_the_gap_on_a_busy_project():
+def test_max_staged_drops_the_oldest_and_never_trains_before_the_gap():
+    """The staging cap bounds memory on a busy project by DROPPING the oldest
+    waiting queries; it never releases one whose purge gap has not passed
+    (the held-out invariant of the module docstring holds without exception)."""
     cfg = ol.OnlineConfig(holdout_queries=3, min_cited_queries=0, purge_gap_ms=10**12,
                           max_staged_queries=4)
     lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
     rng = np.random.default_rng(2)
     for t in range(20):
         lr.ingest(_event(rng)[0], ts_ms=t)
-    assert lr._queue.staged == 4 and len(lr._pending) == 20 - 3 - 4
+    assert lr._queue.staged == 4
+    assert len(lr._pending) == 0
+    assert lr.counters["dropped_untrained"] == 20 - 3 - 4
+
+
+def test_max_staged_still_releases_queries_whose_gap_has_passed():
+    cfg = ol.OnlineConfig(holdout_queries=3, min_cited_queries=0, purge_gap_ms=5,
+                          max_staged_queries=2)
+    lr = ol.ProjectLearner(profile="qwen3", emb_dim=D, cfg=cfg)
+    rng = np.random.default_rng(4)
+    for t in range(40):
+        lr.ingest(_event(rng)[0], ts_ms=t * 3)
+        window = lr._queue.window()
+        if lr._pending:
+            newest_trainable = max(q.ts_ms for q in lr._pending)
+            assert newest_trainable <= min(q.ts_ms for q in window) - cfg.purge_gap_ms
+        assert lr._queue.staged <= cfg.max_staged_queries
+    assert len(lr._pending) > 0
 
 
 # ─── a round is exactly the offline objective ─────────────────────────
@@ -644,3 +664,50 @@ def test_global_retrain_job_trains_with_the_one_objective(tmp_path, monkeypatch,
     # batch_queries 4: offline = 3 epochs x 32 queries (two projects' 16) / 4;
     # online = one pass per project, 16 / 4 each
     assert trained.local_train_steps == (24 if mode == "offline" else 8)
+
+
+def test_first_global_retrain_seeds_from_the_requesting_projects_newest_checkpoint(
+        tmp_path, monkeypatch):
+    """F1: with no global model yet, the job starts from the requesting
+    project's newest real checkpoint (the writers' ``rl_model_<tag>_<ver>.pt``
+    naming), never from a fresh init — and a ``_finetuned`` sibling is not a seed."""
+    import os
+
+    from rl_reranker.rl_server import JobState, _global_retrain_seed
+
+    srv = _server(tmp_path, monkeypatch)
+    rng = np.random.default_rng(16)
+    events = [e for pr in _db_pairs(rng, 16) for e in pr]
+    monkeypatch.setattr(offline_trainer, "load_training_events", lambda *a, **k: list(events))
+    srv._hub_client = type("_StubHub", (), {})()  # type: ignore[assignment]
+    pdir = srv._state_dir / "projects" / "pa"
+    pdir.mkdir(parents=True)
+
+    def ckpt(name: str, steps: int, mtime: int) -> Path:
+        with _seeded_init(3, enabled=True):
+            m = RLModel(emb_dim=D, state_path=pdir / name, device="cpu", embedding_source="qwen3")
+        m.record_local_train_steps(steps)
+        m.save()
+        os.utime(pdir / name, ns=(mtime, mtime))
+        return pdir / name
+
+    ckpt("rl_model_qwen3_0.0.1.pt", 5, 1_000)
+    newest = ckpt("rl_model_qwen3_local.pt", 7, 2_000)
+    ckpt("rl_model_qwen3_local_finetuned.pt", 99, 3_000)
+    assert _global_retrain_seed(srv._state_dir, "pa", "qwen3") == newest
+    # no project checkpoint -> the base dir's; nothing at all -> None
+    assert _global_retrain_seed(tmp_path / "empty", "pz", "qwen3") is None
+
+    gpath = tmp_path / "global" / "rl_model_qwen3_local.pt"
+
+    async def run():
+        srv._jobs["j"] = JobState(job_id="j", kind="global_online", state="running")
+        await srv._run_global_retrain_job("j", "online", gpath, 30, ["pa"],
+                                          seed_project_id="pa")
+        return srv._jobs["j"]
+
+    job = asyncio.run(run())
+    assert job.state == "done", job.message
+    trained = RLModel(emb_dim=D, state_path=gpath, device="cpu", embedding_source="qwen3")
+    # resumed from the seed's 7 steps, plus one online pass of 16 queries / 4
+    assert trained.local_train_steps == 7 + 4
