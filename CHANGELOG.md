@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skip the local summary model download — for machines short on disk.** Install and every update download one
+  local text-generation model (about 1.2 GB on a small machine, up to about 6 GB) that KG summaries fall back to when
+  Claude and the cloud tiers cannot answer. Preferences → KG Summaries now has a "Local summary model" switch (on
+  by default, so nothing changes unless you turn it off); for an install without the launcher, set
+  `VCT_LOCAL_SUMMARY_MODEL=off`, which also wins over the switch. When it is off, no install, update or model check
+  downloads that model, and summaries go straight past the local tier to the next one; embedding models are never
+  affected. Turning it off does not delete a model you already have: the same row offers "Remove the downloaded
+  model" (with a confirmation, and only when VCO runs that Ollama) and, when it is on but missing, "Download now".
+  `vco doctor` shows the setting and whether the model is on disk, and a low-disk warning now names the switch.
+  Found along the way: Preferences read the summary-model information as a refusal (the answer lacked the `ok`
+  field the launcher requires), so the "No Ollama models installed" hint showed no model list; it now does.
+
 - **A switch for automatic service restarts, in Preferences → Services.** The launcher's services watcher has been
   configurable through the setting `launcher.services_watcher_enabled` since its first release, but no interface ever
   wrote it. Preferences now has a Services section with "Restart stopped services automatically" (on by default). It

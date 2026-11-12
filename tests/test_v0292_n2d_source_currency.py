@@ -848,6 +848,9 @@ class ProbeRegistrationTests(unittest.TestCase):
             # v0.2.106: the Weaviate memory-cap probe inspects the container
             # (its one subprocess) — injected like every other spawning seam.
             weaviate_mem_cap=lambda: None,
+            # v0.2.106: the local-summary-model status may probe the hardware
+            # tier (nvidia-smi) when no install record names the model.
+            local_summary_status=lambda: None,
         )
         with TemporaryDirectory() as td:
             root = Path(td)

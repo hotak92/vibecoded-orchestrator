@@ -171,8 +171,13 @@ def plan(
     capability_tier: Sequence[str],
     profile_override: Optional[Sequence[str]],
     code_embed_reachable: Optional[bool] = None,
+    local_summary_model: bool = True,
 ) -> PullPlan:
     """Pure: the exact model set for one KG choice + the machine's code/tier.
+
+    ``local_summary_model=False`` (the user's opt-out,
+    :mod:`vco_lib.local_summary_model`) drops the text-generation model:
+    nothing in VCO then pulls it. Embedding models are never affected.
 
     ``capability_tier`` is the host's text-generation ladder (install.py's
     ``_inference_models_for_capability``); ``profile_override`` is a profile's
@@ -207,10 +212,15 @@ def plan(
     # home of the rule); an absent lower rung at runtime degrades to the next
     # summary backend (summary_backends.ollama_available), never a pull.
     inference = (tuple(profile_override) if profile_override else tuple(capability_tier))[:1]
-    why.append(
-        ("text generation (profile cap): " if profile_override else "text generation tier: ")
-        + (", ".join(inference) or "none")
-    )
+    if not local_summary_model:
+        why.append("text generation: none (local summary model turned off"
+                   + (f"; {inference[0]} not pulled)" if inference else ")"))
+        inference = ()
+    else:
+        why.append(
+            ("text generation (profile cap): " if profile_override else "text generation tier: ")
+            + (", ".join(inference) or "none")
+        )
     kg_models = _dedup((kg, *secondaries))
     return PullPlan(
         embedding=_dedup((*kg_models, code)),
@@ -326,8 +336,15 @@ def plan_from_machine(
     launcher_db: Optional[Path] = None,
     *,
     code_embed_reachable: Optional[bool] = None,
+    local_summary_model: Optional[bool] = None,
 ) -> PullPlan:
     """The machine's plan: recorded profile × every KG selection in launcher.db.
+
+    ``local_summary_model`` ``None`` (production) reads the user's switch
+    (:func:`vco_lib.local_summary_model.resolve`: ``VCT_LOCAL_SUMMARY_MODEL``,
+    else this launcher.db's Preferences toggle, else ON) — the ONE place every
+    pull path (install, update, the launcher's ensure, the deferral retry)
+    takes it from.
 
     Without launcher.db (a fresh install before the launcher's first boot)
     nobody can have opted into dual embeddings, so the recorded profile alone
@@ -341,6 +358,10 @@ def plan_from_machine(
         from vco_lib.paths import launcher_db_path
 
         launcher_db = launcher_db_path()
+    if local_summary_model is None:
+        from vco_lib.local_summary_model import resolve as _local_summary_setting
+
+        local_summary_model = _local_summary_setting(db_path=Path(launcher_db)).enabled
     default: Optional[KgSelection] = None
     projects: list[KgSelection] = []
     db_ok = False
@@ -377,6 +398,7 @@ def plan_from_machine(
             capability_tier=rec.get("capability_tier") or (),
             profile_override=rec.get("profile_override") or None,
             code_embed_reachable=code_embed_reachable,
+            local_summary_model=local_summary_model,
         )
         for s in selections
     ]

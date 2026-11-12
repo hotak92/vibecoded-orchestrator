@@ -3605,6 +3605,9 @@ pub fn run() {
             // to backfill it lazily.
             commands::kg_summary::get_kg_summary_status,
             commands::kg_summary::get_summary_model_info,
+            commands::local_summary_model::get_local_summary_model_status,
+            commands::local_summary_model::remove_local_summary_model,
+            commands::local_summary_model::download_local_summary_model,
             commands::kg_summary::retry_kg_summary,
             // v0.2.96 WP-7b: the GUI "Recheck summary backend now" action
             // (Preferences → KG Summaries) — shells to

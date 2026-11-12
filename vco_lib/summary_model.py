@@ -38,7 +38,7 @@ CLI (debugging, and the launcher's display of the resolved model)::
 
     python -m vco_lib.summary_model [--json]
 
-``--json`` prints ``{"model", "source", "tiers"}``; ``tiers`` is the tier
+``--json`` prints ``{"ok", "model", "source", "tiers"}``; ``tiers`` is the tier
 table as data (:func:`vco_lib.embedding_selection.summary_model_tiers`), which
 the launcher's Preferences page renders as its "No Ollama models installed"
 hint (``get_summary_model_info``).
@@ -155,7 +155,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     model, source = resolve()
     if args.json:
-        sys.stdout.write(json.dumps({"model": model, "source": source,
+        # `ok` is what the launcher's ONE vco_lib JSON seam
+        # (`project_hooks_settings::run_vco_lib_json`) requires — without it
+        # `get_summary_model_info` read every answer as a refusal (v0.2.106).
+        sys.stdout.write(json.dumps({"ok": True, "model": model, "source": source,
                                      "tiers": summary_model_tiers()}) + "\n")
     else:
         sys.stdout.write(f"{model}\t({source})\n")

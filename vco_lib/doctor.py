@@ -49,6 +49,9 @@ subsystem) —
     summary_pending             ``vco_lib.summary_health``'s sidecar scan
                                 (the ``kg_summaries_degraded`` pending set;
                                 REPORTED — the module owns the lifecycle)
+    local_summary_model         ``vco_lib.local_summary_model.status`` (the
+                                user's on/off switch + whether Ollama holds
+                                the model; informational, never a problem)
 
 v0.2.92 WP-14/WP-7 — what the last five close
 ---------------------------------------------
@@ -115,6 +118,10 @@ install.py's re-probe pass runs — and one of those may poll the local hub's
 ``/api/v1/health`` on the resolved port. Loopback-only, sub-second, and the
 same verdict install.py would have reached; noted here so the "exactly one"
 sentence above stays about the DOCTOR's own probes, which it still is.
+Likewise ``local_summary_model`` (v0.2.106) asks the machine's own Ollama
+``/api/tags`` (the ``service_endpoints`` URL, bounded at 5 s, read-only)
+whether the summary model is downloaded — a local service, not the wire,
+behind the ``local_summary_status`` seam.
 """
 from __future__ import annotations
 
@@ -448,6 +455,10 @@ class DoctorResolvers:
     #: injected so the summary-pending probe's tests describe a machine's
     #: sidecars with dataclasses, no filesystem.
     summary_pending: Optional[Callable[[Path], Optional[Any]]] = None
+    #: () -> :func:`vco_lib.local_summary_model.doctor_status` payload, or
+    #: None when it could not be read. Injected so the probe is driven from
+    #: a described machine — no launcher.db, no Ollama.
+    local_summary_status: Optional[Callable[[], Optional[dict]]] = None
     #: () -> list of :class:`vco_lib.launcher_cli_identity.FormerCopy`.
     #: Injected so the former-name probe is driven from a described machine
     #: without running any ``vco`` / ``vct`` it finds.
@@ -771,6 +782,17 @@ class DoctorResolvers:
 
             return DeferralReport.read(folder)
         except Exception:  # noqa: BLE001 — an unreadable ledger is "unknown"
+            return None
+
+    def resolve_local_summary_status(self) -> Optional[dict]:
+        """The local-summary-model switch + presence (soft: None on failure)."""
+        if self.local_summary_status is not None:
+            return self.local_summary_status()
+        from vco_lib import local_summary_model  # noqa: PLC0415
+
+        try:
+            return local_summary_model.doctor_status()
+        except Exception:  # noqa: BLE001 — a status that cannot be read is UNKNOWN
             return None
 
     def resolve_summary_pending(self, project_root: Path) -> Optional[Any]:
@@ -1687,6 +1709,14 @@ def _fmt_gib(n_bytes: Optional[int]) -> str:
     return f"{n_bytes / _GIB:.2f} GiB"
 
 
+def probe_local_summary_model(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """The local summary model switch and whether the model is on disk —
+    rendered by :func:`vco_lib.local_summary_model.doctor_probe` (its home)."""
+    from vco_lib import local_summary_model  # noqa: PLC0415
+
+    return local_summary_model.doctor_probe(res.resolve_local_summary_status())
+
+
 def probe_disk_space(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
     """Free space on the filesystems VCO actually writes to.
 
@@ -1779,8 +1809,12 @@ def _disk_remediation(low: list[dict], floor_gib: float) -> str:
     prune`` stays shared (the podman CLI is identical on Windows).
     """
     paths = " ".join(m["path"] for m in low)
+    # v0.2.106 (owner 2026-11-12): the setting, never an automatic skip.
+    from vco_lib.local_summary_model import disk_hint  # noqa: PLC0415
+
     tail = (
         "#   podman system prune            # DELETES unused images/layers\n"
+        + disk_hint() +
         f"# The floor is {floor_gib:g} GiB; raise or lower it with "
         f"{DISK_MIN_FREE_ENV}=<GiB>.\n"
         "# This entry CLEARS ITSELF on the next VCO run once space is back — "
@@ -5002,6 +5036,8 @@ PROBES: dict = {
     # promise is preserved trivially (it never runs at boot) and the
     # end-of-update report names the count, not just the cid.
     "summary_pending": (probe_summary_pending, (SCOPE_FULL,)),
+    # v0.2.106: informational (the switch is the user's; never a problem).
+    "local_summary_model": (probe_local_summary_model, (SCOPE_FULL,)),
     "claude_code_trust": (probe_claude_code_trust, (SCOPE_FULL,)),
     # v0.2.97: full-only — it RUNS each `vco` / `vct` on PATH (`--version`,
     # `-h`), which is more than the boot subset's file-read budget.

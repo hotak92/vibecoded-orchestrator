@@ -98,6 +98,8 @@ pub mod kg;
 pub mod kg_sync;
 pub mod kg_summary;
 pub mod lifecycle;
+// v0.2.106: Preferences, KG Summaries, "Local summary model" (opt-out).
+pub mod local_summary_model;
 pub mod licensing;
 // v0.2.91 WP-L (decision #21): the machine-global diagnostic log level
 // preference. Writes app_state `logging.level` — the key

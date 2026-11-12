@@ -458,6 +458,10 @@ def generate_document_summary(server: WeaviateMCPServer, title: str, content: st
     # guard exists to close. Deferred (walk active, model not resident and
     # free VRAM below the model-derived floor) → the generic fallback
     # summary, same as any other generation failure here.
+    # v0.2.106: the user turned the local summary model off — it was never
+    # pulled, so do not ask Ollama for it.
+    if _sb.local_summary_model_off():
+        return f"Document about {title}"
     try:
         if _sb._ollama_local_deferred() is not None:
             print("  ⚠️  Local model deferred (VRAM / code-graph walk) — "
