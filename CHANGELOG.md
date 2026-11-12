@@ -376,7 +376,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A reranker request without a project id no longer inherits the previous request's project.** The server used
   the project of the request it had handled last as the fallback for a request without one. It now uses only the
   container's configured project (`VCT_PROJECT_ID`), or none.
-
 - **The RL reranker now actually reranks.** Its server was meant to embed the query itself through a function that
   nothing ever connected, so every search came back in its original order and the client counted a fallback each
   time (one machine recorded 14 794 fallbacks and no reranked search). The client now sends the vectors it already
