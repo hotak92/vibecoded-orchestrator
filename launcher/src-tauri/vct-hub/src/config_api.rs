@@ -888,9 +888,13 @@ async fn project_config(
     // (`POST /api/v1/rl/events`) reads neither.
     // A DB error cannot confirm the user's choice: OFF (v0.2.106; it fell
     // open before RL scoring became opt-in).
+    // The async resolver: a cold bundled-weights default (a Python spawn, up
+    // to 30 s) runs on the blocking pool, single-flight per profile — never
+    // on this async worker (review W5 M1).
     let rl_reranker_enabled_for_project = h
         .0
-        .rl_scoring_enabled_for_project(&project.id)
+        .rl_scoring_enabled_for_project_async(&project.id)
+        .await
         .unwrap_or(false);
 
     // V52-AA (v0.2.52) — RL Reranker container port.

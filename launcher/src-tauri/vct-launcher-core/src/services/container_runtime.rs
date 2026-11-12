@@ -457,58 +457,9 @@ pub fn gpu_passthrough_args(
     }
 }
 
-/// v0.2.106: the argv that maps the HOST user onto a manifest's
-/// `runtime.image_user` (the image's non-root `USER`), so the container can
-/// write its bind-mounted volumes and what it writes stays owned by the host
-/// user. Empty when the manifest declares no image user.
-///
-/// * podman (every OS: rootless on Linux, the podman machine on macOS /
-///   Windows): `--userns=keep-id:uid=<uid>,gid=<gid>` maps the invoking
-///   user to the image user (podman >= 4.3). Without it the image user maps
-///   to a subordinate id that cannot write a directory the host user owns.
-/// * docker on Linux: `--user <host uid>:<host gid>`, the process runs as
-///   the host user (the image's own files are world-readable, its writable
-///   paths are the mounts).
-/// * docker elsewhere (Docker Desktop): nothing, its file sharing maps
-///   ownership itself.
-pub fn host_user_mapping_args(
-    engine: &str,
-    image_user: Option<crate::manifest::ImageUser>,
-) -> Vec<String> {
-    host_user_mapping_args_for(engine, image_user, host_uid_gid(), cfg!(target_os = "linux"))
-}
-
-/// [`host_user_mapping_args`] with the host identity and OS injected (pure).
-pub fn host_user_mapping_args_for(
-    engine: &str,
-    image_user: Option<crate::manifest::ImageUser>,
-    host: Option<(u32, u32)>,
-    linux: bool,
-) -> Vec<String> {
-    let Some(user) = image_user else {
-        return Vec::new();
-    };
-    if engine == "docker" {
-        return match (linux, host) {
-            (true, Some((uid, gid))) => vec!["--user".into(), format!("{}:{}", uid, gid)],
-            _ => Vec::new(),
-        };
-    }
-    vec![format!("--userns=keep-id:uid={},gid={}", user.uid, user.gid)]
-}
-
-/// The invoking user's uid / gid (`None` off Unix).
-fn host_uid_gid() -> Option<(u32, u32)> {
-    #[cfg(unix)]
-    {
-        // SAFETY: getuid/getgid take no arguments and cannot fail.
-        Some(unsafe { (libc::getuid(), libc::getgid()) })
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
+// v0.2.106: the host-user mapping both start-argument builders append (the
+// podman-version-aware `--userns` / `--user` choice) lives in its own module.
+pub use super::host_user_mapping::{host_user_mapping_args, host_user_mapping_args_for};
 
 // ─── Pure helpers ──────────────────────────────────────────────────────
 
@@ -6984,42 +6935,49 @@ mod tests {
             args.windows(2).filter(|w| w[0] == "-v").map(|w| w[1].clone()).collect()
         };
 
-        let podman = build_podman_run_args_global(
-            &manifest, &ctx, 11450, "vct-rl-reranker", "localhost/vco-rl-reranker:0.3.1-cpu",
-            "podman", None, &[],
-        )
-        .unwrap();
-        assert_eq!(mounts(&podman), want_mounts);
-        assert!(podman.iter().any(|a| a == "--userns=keep-id:uid=1000,gid=1000"), "{podman:?}");
-
-        // The per-project builder (same manifest fields) carries them too.
+        // podman >= 4.3 (the version injected — the live probe would make
+        // the answer depend on this machine's podman): keep-id ONTO the
+        // image user, in BOTH builders.
         let project = make_project();
-        let per = build_podman_run_args(&manifest, &ctx, &project, 11533, "c", "img:1", "podman", None)
+        {
+            let _v = crate::services::host_user_mapping::with_podman_version_for_thread(Some((4, 9)));
+            let podman = build_podman_run_args_global(
+                &manifest, &ctx, 11450, "vct-rl-reranker", "localhost/vco-rl-reranker:0.3.1-cpu",
+                "podman", None, &[],
+            )
             .unwrap();
-        assert_eq!(mounts(&per), want_mounts);
-        assert!(per.iter().any(|a| a.starts_with("--userns=keep-id:")));
-    }
+            assert_eq!(mounts(&podman), want_mounts);
+            assert!(podman.iter().any(|a| a == "--userns=keep-id:uid=1000,gid=1000"), "{podman:?}");
 
-    /// The host-user mapping per engine / OS, and nothing without an
-    /// `image_user` (every other module's argv is unchanged).
-    #[test]
-    fn host_user_mapping_follows_the_engine() {
-        let u = Some(crate::manifest::ImageUser { uid: 1000, gid: 1001 });
-        assert_eq!(
-            host_user_mapping_args_for("podman", u, Some((501, 20)), false),
-            vec!["--userns=keep-id:uid=1000,gid=1001".to_string()]
-        );
-        assert_eq!(
-            host_user_mapping_args_for("podman", u, Some((1000, 1000)), true),
-            vec!["--userns=keep-id:uid=1000,gid=1001".to_string()]
-        );
-        assert_eq!(
-            host_user_mapping_args_for("docker", u, Some((1234, 5678)), true),
-            vec!["--user".to_string(), "1234:5678".to_string()]
-        );
-        assert!(host_user_mapping_args_for("docker", u, Some((501, 20)), false).is_empty());
-        assert!(host_user_mapping_args_for("podman", None, Some((1000, 1000)), true).is_empty());
-        assert!(host_user_mapping_args_for("docker", None, Some((1000, 1000)), true).is_empty());
+            // The per-project builder (same manifest fields) carries them too.
+            let per =
+                build_podman_run_args(&manifest, &ctx, &project, 11533, "c", "img:1", "podman", None)
+                    .unwrap();
+            assert_eq!(mounts(&per), want_mounts);
+            assert!(per.iter().any(|a| a == "--userns=keep-id:uid=1000,gid=1000"), "{per:?}");
+        }
+
+        // Review W5 M2: podman < 4.3 (Ubuntu 22.04's 3.4) and an unreadable
+        // version never get `keep-id:uid=` (podman 3.4 refuses the whole
+        // run): plain keep-id + `--user <host uid>:<gid>`, in BOTH builders.
+        for version in [Some((3, 4)), None] {
+            let _v = crate::services::host_user_mapping::with_podman_version_for_thread(version);
+            let global = build_podman_run_args_global(
+                &manifest, &ctx, 11450, "vct-rl-reranker", "localhost/vco-rl-reranker:0.3.1-cpu",
+                "podman", None, &[],
+            )
+            .unwrap();
+            let per =
+                build_podman_run_args(&manifest, &ctx, &project, 11533, "c", "img:1", "podman", None)
+                    .unwrap();
+            for args in [&global, &per] {
+                assert_eq!(mounts(args), want_mounts);
+                assert!(!args.iter().any(|a| a.starts_with("--userns=keep-id:")), "{version:?} {args:?}");
+                assert!(args.iter().any(|a| a == "--userns=keep-id"), "{version:?} {args:?}");
+                #[cfg(unix)]
+                assert!(args.windows(2).any(|w| w[0] == "--user"), "{version:?} {args:?}");
+            }
+        }
     }
 }
 

@@ -4,7 +4,8 @@
 
 Owner rulings 2026-11-12: per-project ONLINE adaptation, opt-in; a project's
 model is served only while its cumulative prequential record (every query
-scored by the model in place when it arrived, before training on it) shows,
+scored, at the first round after it arrived, by the model in place at that
+round, before that model trained on it) shows,
 at an anytime-valid confidence, NDCG@10 >= +2% over plain cosine AND the
 cited node's MRR@10 not below cosine's (test_gate_prequential.py).
 

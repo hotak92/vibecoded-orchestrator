@@ -4,8 +4,8 @@
 // v0.2.106 (owner rulings 2026-11-12): what the RL panel says about a
 // project's reranking — per-project online learning, opt-in, and a serving
 // gate judged on the project's CUMULATIVE PREQUENTIAL record: every query is
-// scored by the model in place when it arrived, before the model trained on
-// it, and the k-th check of the whole record runs at confidence
+// scored, at the first round after it arrived, by the model in place at that
+// round, before that model trained on it, and the k-th check of the whole record runs at confidence
 // 1 - 0.10 / (k (k+1)) (a 10% total error budget over all checks). The model
 // reranks only while the lower bounds show NDCG@10 >= +2% over plain cosine
 // AND the cited node's MRR@10 not below cosine's; no verdict before the record
@@ -103,18 +103,6 @@ function signed(v: number | null | undefined, digits = 3): string {
   return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}`;
 }
 
-/**
- * A check's confidence: `95.0%` while its error rate is at least 0.1%, else
- * `1 - 3.1e-8` (late checks run at tiny error rates; a percentage would read
- * 100.0% and hide that).
- */
-export function confidenceText(c: number | null | undefined): string {
-  if (!isNum(c)) return 'n/a';
-  const alpha = 1 - c;
-  if (alpha >= 1e-3) return `${(100 * c).toFixed(1)}%`;
-  return `1 - ${alpha.toExponential(1)}`;
-}
-
 function truthy(v: number | boolean | null | undefined): boolean {
   return v === true || v === 1;
 }
@@ -181,9 +169,14 @@ export function summarizeOnlineState(
   const checks = n(row.checks);
   if (checks > 0) {
     const budget = isNum(row.error_budget) ? `${Math.round(100 * row.error_budget)}%` : 'n/a';
+    // The check's confidence is NOT formatted here: the container's own
+    // `reason` (shown in the headline — with a check made it is always that
+    // check's verdict, `online_learning.gate_decision`) already names it, in
+    // the one formatter `online_learning._conf` (review W5 L3: no Python↔TS
+    // mirror of that text).
     details.push(
-      `Check ${checks} (lower bounds at confidence ${confidenceText(row.gate_confidence)} ` +
-        `decide; ${budget} total error budget over all checks): NDCG@10 gain ` +
+      `Check ${checks} (its one-sided lower bounds decide, at the confidence the reranking ` +
+        `line names; ${budget} total error budget over all checks): NDCG@10 gain ` +
         `${pct(row.ndcg_gain_lb)} (needs +2.00%), cited-node MRR@10 difference ` +
         `${signed(row.mrr_diff_lb)} (must not be below 0)`,
     );

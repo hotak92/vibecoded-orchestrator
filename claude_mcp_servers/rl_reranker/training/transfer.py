@@ -408,7 +408,8 @@ def _mean(rows: "list[dict[str, Any]]", key: str) -> float:
 def replay_rows(learner: Any) -> "list[dict[str, Any]]":
     """Per kept event, in arrival order, from the learner's own prequential
     record (``online_learning.PrequentialRecord``: every query scored by the
-    model in place when it arrived, before training on it): whether the
+    model in place at the first round after it arrived, before that model
+    trained on it): whether the
     project was served the model, the model's / plain cosine's / the search
     order's NDCG@10 and cited-node MRR@10 (``None`` = undefined), and what
     the user got (the model's order while served, the search order

@@ -311,7 +311,13 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: pages from Aggregate-counting every class on the machine at every render,
 #: which lazy-loaded every project's collections into Weaviate RAM). Bumped
 #: ATOMICALLY with mig 050's Rust registration.
-LAUNCHER_DB_TABLE_SET_VERSION = 50
+#: 51 = migration 051_rl_seeded_host_wide_off_clear_once.sql (v0.2.106, owner
+#: ruling 2026-11-12 "clear once" — deletes the host-wide RL scoring `false`
+#: row the v0.2.52-v0.2.105 installers seeded, unless the user's latest
+#: audited host-wide write chose it, so existing installs follow the
+#: bundled-weights default; data-only, no table change). Bumped ATOMICALLY
+#: with mig 051's Rust registration.
+LAUNCHER_DB_TABLE_SET_VERSION = 51
 
 
 # ===========================================================================

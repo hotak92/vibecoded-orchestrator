@@ -2252,13 +2252,16 @@ pub fn run() {
             // the user to navigate to /preferences/modules. Soft-fail:
             // a missing rl_events table (pre-migration-025 DB) just
             // skips the emit. The user can always navigate manually.
+            // v0.2.106 (review W5 M1): on the blocking pool, not the setup
+            // thread — the decision may ask for the bundled-weights default,
+            // a Python spawn on a cold cache.
             {
-                use tauri::Manager;
-                let db_ref = app.state::<crate::db::Db>();
-                commands::module_enabled::probe_rl_auto_enable_at_boot(
-                    &db_ref,
-                    &app.handle(),
-                );
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    use tauri::Manager;
+                    let db_ref = handle.state::<crate::db::Db>();
+                    commands::module_enabled::probe_rl_auto_enable_at_boot(&db_ref, &handle);
+                });
             }
 
             // System tray (v1.1)

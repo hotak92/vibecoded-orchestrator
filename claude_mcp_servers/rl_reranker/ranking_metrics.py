@@ -27,8 +27,8 @@ named node).
 The serving gate applies the bar to CONFIDENCE BOUNDS on the project's
 CUMULATIVE PREQUENTIAL record (owner ruling 2026-11-12, after the rlgate2
 study showed a held-out window re-tested every round passing on lucky
-windows): every query is scored by the model in place when it arrived, before
-that model trained on it, and the k-th check of a project's model judges the
+windows): every query is scored, at the first round after it arrived, by the
+model in place at that round, before that model trained on it, and the k-th check of a project's model judges the
 bar at confidence :func:`check_confidence` ``(k)`` = ``1 - 0.10 / (k (k+1))``
 — an alpha-spending schedule whose error rates sum to at most
 :data:`GATE_ERROR_BUDGET` over ALL checks, so re-checking after every round

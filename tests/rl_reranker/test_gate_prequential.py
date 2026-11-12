@@ -3,8 +3,9 @@
 """The serving gate judges the CUMULATIVE PREQUENTIAL record (v0.2.106).
 
 Owner ruling 2026-11-12 (after the rlgate2 study): a project's model is served
-only while its record — every query scored by the model in place when it
-arrived, before that model trained on it — shows, at an anytime-valid
+only while its record — every query scored, at the first round after it
+arrived, by the model in place at that round, before that model trained on
+it — shows, at an anytime-valid
 confidence (the k-th check at ``1 - 0.10 / (k (k+1))``), that (a) the NDCG@10
 gain over plain cosine is >= +2% AND (b) the cited node's MRR@10 minus
 cosine's is >= 0. The held-out window it replaces, re-tested every round,
@@ -381,6 +382,73 @@ def test_a_lost_record_starts_over(tmp_path, monkeypatch):
     back = ol.ProjectLearner.load(d, profile="qwen3", emb_dim=D, model=m, cfg=lr.cfg)
     assert back.serving is False and back.checks == 0 and len(back.record) == 0
     assert "record lost" in back.reason
+
+
+def _truncate_zip(p):
+    # still starts with the zip magic, but the central directory is gone
+    raw = p.read_bytes()
+    p.write_bytes(raw[: len(raw) // 2])
+
+
+def _corrupt_member(p):
+    # central directory intact, a member's bytes damaged (bad CRC / stream)
+    raw = bytearray(p.read_bytes())
+    mid = len(raw) // 3
+    for i in range(mid, mid + 64):
+        raw[i] ^= 0xFF
+    p.write_bytes(bytes(raw))
+
+
+def _short_index(p):
+    # a readable npz whose per-query arrays disagree in length
+    with np.load(p, allow_pickle=False) as z:
+        d = {k: z[k] for k in z.files}
+    d["q_row"] = d["q_row"][:1]
+    with open(p, "wb") as fh:
+        np.savez(fh, **d)
+
+
+@pytest.mark.parametrize("damage", [_truncate_zip, _corrupt_member, _short_index],
+                         ids=["bad-zip", "corrupt-member", "short-index"])
+def test_a_damaged_zip_record_starts_over_instead_of_failing_the_load(tmp_path, monkeypatch, damage):
+    """Review W5 L1: a zip-shaped damage used to escape ``load`` (BadZipFile /
+    IndexError), failing every head load and disabling online learning for
+    the project for good. It starts the record over like any unreadable
+    state, and the next save repairs the file."""
+    stream = _stream(500, gain=0.04, diff=0.15, seed=11)
+    lr, m, _s = _drive(stream, tmp_path, monkeypatch)
+    lr.model_fingerprint = ol.model_fingerprint(m)
+    d = tmp_path / "state"
+    lr.save(d)
+    damage(d / "online_qwen3.npz")
+    back = ol.ProjectLearner.load(d, profile="qwen3", emb_dim=D, model=m, cfg=lr.cfg)
+    assert back.serving is False and back.checks == 0 and len(back.record) == 0
+    assert not back._fresh and not back._pending
+    assert "record lost" in back.reason
+    back.save(d)
+    again = ol.ProjectLearner.load(d, profile="qwen3", emb_dim=D, model=m, cfg=lr.cfg)
+    assert "record lost" not in again.reason
+
+
+def test_with_a_check_made_the_reason_names_its_confidence(tmp_path, monkeypatch):
+    """Review W5 L3: the launcher panel formats no confidence of its own — it
+    relies on the published ``reason`` naming it whenever a check was made
+    (``checks > 0``), live and after a restart."""
+    stream = _stream(800, gain=0.04, diff=0.15, seed=10)
+    lr, m, _s = _drive(stream, tmp_path, monkeypatch)
+    assert lr.checks > 0 and lr.last_check is not None
+    want = f"at confidence {ol._conf(lr.last_check.confidence)}"
+    assert lr.reason == lr.last_check.reason and want in lr.reason
+    m.save()
+    lr.model_fingerprint = ol.model_fingerprint(m)
+    d = tmp_path / "state"
+    lr.save(d)
+    back = ol.ProjectLearner.load(d, profile="qwen3", emb_dim=D, model=m, cfg=lr.cfg)
+    assert back.checks == lr.checks and want in back.reason
+    # the not-served verdicts name it too
+    strict = dataclasses.replace(lr.cfg, min_ndcg_gain=0.5)
+    s2 = ol.ProjectLearner.load(d, profile="qwen3", emb_dim=D, model=m, cfg=strict)
+    assert s2.checks > 0 and not s2.serving and "at confidence " in s2.reason
 
 
 def test_a_format_1_state_is_discarded(tmp_path):

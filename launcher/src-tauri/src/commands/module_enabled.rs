@@ -276,7 +276,7 @@ pub async fn module_effective_enabled(
     module_id: String,
     db: State<'_, Db>,
 ) -> Result<bool, String> {
-    db.module_effective_enabled(&project_id, &module_id)
+    db.module_effective_enabled_async(&project_id, &module_id).await
 }
 
 // ─── v0.2.91 decision #23 — the tri-state per-project control ────────────
@@ -319,7 +319,7 @@ pub async fn module_enable_state(
     if module_id.trim().is_empty() {
         return Err("module_enable_state: module_id required".to_string());
     }
-    db.resolve_module_enable(&project_id, &module_id)
+    db.resolve_module_enable_async(&project_id, &module_id).await
 }
 
 /// Free-function core of [`module_set_enabled_for_project_v2`] — argument
@@ -409,6 +409,12 @@ pub async fn module_set_enabled_for_project_v2(
     db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<ModuleEnableState, String> {
+    // The sync core re-resolves the state, which for the RL reranker reads
+    // the bundled-weights default: resolve it here first, off the async
+    // workers (review W5 M1), so the core finds it cached.
+    if module_id == vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID {
+        let _ = db.rl_scoring_default_async().await;
+    }
     let state = set_module_enabled_for_project_v2_with_db(&db, &project_id, &module_id, value)?;
 
     let payload = ModuleEnabledChangedEvent {

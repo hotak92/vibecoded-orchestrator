@@ -77,6 +77,8 @@ import logging
 import math
 import threading
 import time
+import zipfile
+import zlib
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -478,7 +480,8 @@ class QueryScores:
 
 class PrequentialRecord:
     """A project's cumulative prequential record: per query, the metrics of
-    the model in place when it arrived (before it trained on it), of plain
+    the model in place at the first round after it arrived (before that
+    model trained on it), of plain
     cosine and of the client's search order, and whether the model was being
     served. Column buffers that double when full (amortised O(1) append);
     25 bytes a query, no vectors."""
@@ -628,7 +631,11 @@ def _diff(x: float) -> str:
 
 def _conf(c: float) -> str:
     """A check's confidence for a reason line: ``95.0%`` while the error rate
-    is >= 0.1%, else ``1-3.1e-08`` (late checks run at tiny error rates)."""
+    is >= 0.1%, else ``1-3.1e-08`` (late checks run at tiny error rates).
+
+    The ONE formatter of this text: the launcher's RL panel shows it through
+    the learner's ``reason`` (with a check made, always that check's verdict)
+    and formats no copy of its own (review W5 L3)."""
     alpha = 1.0 - c
     return f"{100 * c:.1f}%" if alpha >= 1e-3 else f"1-{alpha:.1e}"
 
@@ -1023,8 +1030,9 @@ class ProjectLearner:
             "counters": dict(self.counters),
             "last_skip_reason": self.last_skip_reason or None,
             "bar": {"min_ndcg_gain": cfg.min_ndcg_gain, "cited_mrr_not_below_cosine": True,
-                    "judged_on": "cumulative prequential record (each query scored by the "
-                                 "model in place when it arrived, before training on it)",
+                    "judged_on": "cumulative prequential record (each query scored, at the "
+                                 "first round after it arrived, by the model in place at "
+                                 "that round, before that model trained on it)",
                     "bounds": "one-sided paired normal approximation",
                     "confidence_schedule": "1 - error_budget / (k (k+1)) at the k-th check",
                     "error_budget": cfg.error_budget, "k": cfg.k,
@@ -1127,7 +1135,13 @@ class ProjectLearner:
         lr_.checks = int(meta.get("checks") or 0)
         try:
             lr_._load_arrays(arr_p)
-        except (OSError, ValueError, KeyError) as exc:
+        except _UNREADABLE_STATE_ERRORS as exc:
+            # Every shape a damaged file can take — not a zip, a zip with a
+            # bad central directory or a truncated / corrupt member, a member
+            # missing, arrays of inconsistent lengths — starts the record
+            # over. Letting one escape would fail the head load on every
+            # attempt and disable online learning for the project for good;
+            # the next save overwrites the damaged file.
             logger.warning("online learner data %s unreadable (%s); record starts over", arr_p, exc)
             lr_._fresh.clear()
             lr_._pending.clear()
@@ -1171,6 +1185,18 @@ class ProjectLearner:
             )
             off += n
             (self._pending.append if int(d["q_pending"][i]) else self._fresh.append)(q)
+
+
+#: What reading a damaged ``online_<profile>.npz`` can raise (see
+#: :meth:`ProjectLearner.load`): I/O, a non-zip or a zip with a bad central
+#: directory (``BadZipFile``), a truncated member (``EOFError``) or a corrupt
+#: compressed one (``zlib.error``), a missing member (``KeyError``), and
+#: arrays whose lengths disagree (``IndexError`` / ``ValueError`` /
+#: ``TypeError``).
+_UNREADABLE_STATE_ERRORS: tuple[type[BaseException], ...] = (
+    OSError, ValueError, KeyError, IndexError, TypeError, EOFError,
+    zipfile.BadZipFile, zlib.error,
+)
 
 
 def model_fingerprint(model: Any) -> dict[str, Any]:

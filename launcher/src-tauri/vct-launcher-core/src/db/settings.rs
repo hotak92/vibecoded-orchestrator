@@ -345,10 +345,43 @@ impl Db {
     /// (v0.2.106, owner 2026-11-12): ON only when a trained model is bundled
     /// for it. One Python decision, cached per profile
     /// ([`crate::rl_scoring_default::rl_scoring_default_for`]).
+    ///
+    /// BLOCKING on a cold cache (a Python spawn): async callers use
+    /// [`Db::rl_scoring_default_async`] and the `*_async` resolvers below.
     pub fn rl_scoring_default(&self) -> crate::rl_scoring_default::RlScoringDefault {
         crate::rl_scoring_default::rl_scoring_default_for(
             &crate::active_embedding::resolve_active_embedding(self),
         )
+    }
+
+    /// [`Db::rl_scoring_default`] for async callers: a cold cache is probed
+    /// on the blocking pool, never on an async worker (review W5 M1).
+    pub async fn rl_scoring_default_async(&self) -> crate::rl_scoring_default::RlScoringDefault {
+        crate::rl_scoring_default::rl_scoring_default_async(
+            crate::active_embedding::resolve_active_embedding(self),
+        )
+        .await
+    }
+
+    /// [`Db::module_effective_enabled`] for async callers: the explicit
+    /// tiers are read first, and the bundled-weights default is asked for
+    /// (off the async workers) only when neither tier has a row and the
+    /// module is the RL reranker — the same cascade, one home
+    /// ([`Db::module_effective_enabled_with`]).
+    pub async fn module_effective_enabled_async(
+        &self,
+        project_id: &str,
+        module_id: &str,
+    ) -> Result<bool, String> {
+        let default_on = if module_id == RL_RERANKER_MODULE_ID
+            && self.get_setting(project_id, module_id, MODULE_ENABLED_FOR_PROJECT_KEY)?.is_none()
+            && self.module_global_enabled(module_id)?.is_none()
+        {
+            self.rl_scoring_default_async().await.default_on
+        } else {
+            false
+        };
+        self.module_effective_enabled_with(project_id, module_id, || default_on)
     }
 }
 
@@ -366,8 +399,21 @@ impl Db {
     /// Whether RL SCORING (reranking) is on for `project_id`: the shipped
     /// lock first, then the enable cascade. This is what the hub's `/config`
     /// serves as `rl_reranker_enabled_for_project`.
+    ///
+    /// BLOCKING on a cold default cache; the hub's async `/config` handler
+    /// calls [`Db::rl_scoring_enabled_for_project_async`].
     pub fn rl_scoring_enabled_for_project(&self, project_id: &str) -> Result<bool, String> {
         self.rl_scoring_enabled_with_lock(project_id, crate::rl_scoring_lock::rl_scoring_lock())
+    }
+
+    /// [`Db::rl_scoring_enabled_for_project`] for async callers: the
+    /// bundled-weights default (needed only when no row exists) is resolved
+    /// off the async workers, single-flight per profile.
+    pub async fn rl_scoring_enabled_for_project_async(&self, project_id: &str) -> Result<bool, String> {
+        if crate::rl_scoring_lock::rl_scoring_lock().is_some() {
+            return Ok(false);
+        }
+        self.module_effective_enabled_async(project_id, RL_RERANKER_MODULE_ID).await
     }
 
     /// [`Db::rl_scoring_enabled_for_project`] with an explicit lock, so both
@@ -480,6 +526,23 @@ impl Db {
     ) -> Result<ModuleEnableState, String> {
         let rl_default =
             (module_id == RL_RERANKER_MODULE_ID).then(|| self.rl_scoring_default());
+        self.resolve_module_enable_with(project_id, module_id, rl_default)
+    }
+
+    /// [`Db::resolve_module_enable`] for async callers (the launcher's
+    /// `module_enable_state` command): the RL default — reported even when a
+    /// row decides, because the control words its "default" text from it — is
+    /// resolved off the async workers.
+    pub async fn resolve_module_enable_async(
+        &self,
+        project_id: &str,
+        module_id: &str,
+    ) -> Result<ModuleEnableState, String> {
+        let rl_default = if module_id == RL_RERANKER_MODULE_ID {
+            Some(self.rl_scoring_default_async().await)
+        } else {
+            None
+        };
         self.resolve_module_enable_with(project_id, module_id, rl_default)
     }
 

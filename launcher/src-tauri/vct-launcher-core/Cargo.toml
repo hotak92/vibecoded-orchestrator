@@ -63,7 +63,10 @@ serde_json.workspace = true
 # tokio for async paths in db (and runtime async helpers).
 # "net" (v0.2.105) is needed by the weaviate_counts tests' raw-TCP fake
 # Weaviate (test-only, but tokio features are not cfg-gateable per target).
-tokio = { version = "1", features = ["fs", "macros", "process", "rt", "sync", "time", "io-util", "io-std", "net"] }
+# "rt-multi-thread" (v0.2.106) lets `rl_scoring_default` hand a blocking
+# probe off an async worker with `block_in_place` (the safety net for a sync
+# caller on the multi-thread runtime; async callers use the async fn).
+tokio = { version = "1", features = ["fs", "macros", "process", "rt", "rt-multi-thread", "sync", "time", "io-util", "io-std", "net"] }
 
 # UUID for IDs
 uuid = { version = "1", features = ["v4"] }

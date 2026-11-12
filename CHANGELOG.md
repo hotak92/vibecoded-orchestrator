@@ -164,8 +164,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one project in the launcher (Modules → RL Reranker), or for every project through the host-wide default; while it
   is off, nothing is sent to the reranker container and searches keep their order. When it is on, the reranker
   learns from that project's own citations (the search results its answers actually use) and reranks the
-  project's searches only while its model beats plain search on its own check. Every query is first scored by the
-  model in place when it arrived, before the model trains on it, and the check judges the project's whole record of
+  project's searches only while its model beats plain search on its own check. Every query is first scored, at the
+  first training round after it arrived, by the model in place at that round, before that model trains on it, and the check judges the project's whole record of
   such queries: NDCG@10 must be at least 2% above plain cosine ordering and the node the answer names must rank no
   lower than plain cosine ranks it, both on one-sided lower confidence bounds, not on the raw averages. No verdict is
   given before the record holds 300 queries and 50 that name a node. After that every training round is a check, and
@@ -245,7 +245,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under "scoring default". `install.py` no longer writes a host-wide "off" row for the RL reranker on a fresh
   install, because that row would keep the default off after a trained model ships. The hub and the launcher now
   share one Rust resolver for the active embedding profile (`vct-launcher-core/src/active_embedding.rs`) instead
-  of a copy each.
+  of a copy each. The bundled-model check runs Python once per profile however many requests ask at once, and
+  never on the hub's or the launcher's async workers (a hub serving `/config` keeps answering while it runs).
+- **Existing installs drop the host-wide RL "off" row the old installers wrote** (owner ruling 2026-11-12). Every
+  `install.py` run from v0.2.52 to v0.2.105 wrote a host-wide `false` for the RL reranker when none existed, which
+  would keep RL scoring off on those machines after a trained model ships. Launcher DB migration 051 removes that
+  row once, when the updated launcher or hub first opens `launcher.db`, so those installs follow the bundled-weights
+  default. A host-wide "off" you chose yourself (your latest host-wide change of the RL toggle, as recorded in the
+  launcher's audit log, set it off) stays, as do a host-wide "on", every project's own choice and every other
+  module's settings. It runs only once: a host-wide choice made afterwards, "off" included, is never removed.
 - **RL scoring needs the project's own "on".** A project whose RL toggle cannot be read (the hub is down, or no
   project configuration was found) is now treated as off; before, it was treated as on. An older hub that does not
   send the toggle at all also counts as off. The citation of an answer is now sent to the reranker container only
@@ -407,10 +415,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest (now module version 0.3.1, so an installed copy is offered the update) mounts three host directories,
   `<vct root>/data/vct-rl-reranker/_bundled/state`, `logs` and `global` (no project slug can be `_bundled`, and
   uninstalling with "purge data" still removes them), created by the start path. A new manifest field,
-  `runtime.image_user`, names the image's non-root user; the start paths map the host user onto it (podman
-  `--userns=keep-id:uid=…,gid=…` on Linux, macOS and Windows; `--user <host uid>:<host gid>` for docker on Linux;
-  nothing under Docker Desktop), so the container can write those directories and the host user owns what it
-  writes. The paid module's per-project directories (`<vct root>/data/vct-rl-reranker/<slug>/state`) are not
+  `runtime.image_user`, names the image's non-root user; the start paths map the host user onto it (podman 4.3 or
+  later: `--userns=keep-id:uid=…,gid=…` on Linux, macOS and Windows; an older podman such as Ubuntu 22.04's 3.4,
+  which has no `keep-id:uid=`, or one whose version cannot be read: `--userns=keep-id` plus
+  `--user <host uid>:<host gid>`; `--user <host uid>:<host gid>` for docker on Linux; nothing under Docker
+  Desktop), so the container can write those directories and the host user owns what it writes. The paid module's per-project directories (`<vct root>/data/vct-rl-reranker/<slug>/state`) are not
   mounted, moved or deleted.
 - **Moving from the paid RL module to the bundled one cleans up after itself.** Once the bundled container is
   running, the install removes the old registry image (every local tag of the previous manifest's image, with a plain
