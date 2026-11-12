@@ -479,7 +479,7 @@ daily 06:00 UTC schedule was removed on 2026-07-23 and must not be re-added
 for it).
 
 - **Matrix**: `ubuntu-22.04`, `ubuntu-24.04` (libwebkit2gtk 4.0/4.1
-  fallback), `macos-14` (Apple Silicon, bash 3.2, Homebrew cascade),
+  fallback), `macos-15` (Apple Silicon, bash 3.2, Homebrew cascade),
   `windows-latest` (`first-install.bat` under real `cmd.exe`), `fedora-40`
   (SELinux `:Z`, dnf).
 - **Fresh `git clone`**, not `actions/checkout` — the smoke exercises the

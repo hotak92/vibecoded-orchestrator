@@ -503,7 +503,7 @@ jobs:
   # WHAT: calls .github/workflows/install-smoke-tri-os.yml, which does a
   # fresh ANONYMOUS `git clone` of this repo at the tagged commit and runs
   # first-install.{sh,command,bat} end-to-end on ubuntu-22.04, ubuntu-24.04,
-  # macos-14, windows-latest and fedora-40. `build` needs this job, so a red
+  # macos-15, windows-latest and fedora-40. `build` needs this job, so a red
   # install path means NO assets are built and NO release is published.
   #
   # WHY at release time and not only on push-to-main: pre-release-gate
