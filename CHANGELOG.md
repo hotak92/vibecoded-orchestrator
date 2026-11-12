@@ -409,6 +409,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The macOS installer no longer prints "$!: unbound variable" when it opens the launcher.** The launcher was started inside a subshell, so the script read an unset `$!`; macOS's bash 3.2 aborts on that under `set -u` even with a default. It is now started in the script's own shell.
 - **The RL reranker keeps what it learns when its container is recreated.** Its manifest mounted nothing, so each
   project's online model and learner state (`/data/state/projects/<project_id>/`), the event logs and the global
   model lived in the container's writable layer and were lost on every module update and every recreate. The

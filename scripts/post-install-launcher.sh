@@ -1868,24 +1868,21 @@ echo "Installation complete. Opening launcher..."
 # shell so first-install can exit without killing the GUI. Redirect stdio
 # to /dev/null. Suppress any spawn failure: never block exit-0.
 #
-# `$!` (PID of last bg job) is unset under set -u because the
-# `(... &)` subshell scope closes before we read it. Use the param-default
-# form `${!:-0}` to keep set -u happy. The PID is informational only —
-# we use it for the log event, not for any wait/signal logic.
-_spawn_pid="0"
+# The job is started in THIS shell (not inside `( ... & )`), so `$!` is
+# set when we read it. The old subshell form left `$!` unset, and
+# `${!:-0}` still aborted under `set -u` on macOS's bash 3.2
+# ("$!: unbound variable", field report 2026-11-12). The PID is
+# informational only — the log event, never wait/signal logic.
 if command -v setsid >/dev/null 2>&1; then
-    (setsid nohup "$LAUNCHER_BIN" >/dev/null 2>&1 < /dev/null &) || true
-    _spawn_pid="${!:-0}"
+    setsid nohup "$LAUNCHER_BIN" >/dev/null 2>&1 < /dev/null &
 else
-    (nohup "$LAUNCHER_BIN" >/dev/null 2>&1 < /dev/null &) || true
-    _spawn_pid="${!:-0}"
+    nohup "$LAUNCHER_BIN" >/dev/null 2>&1 < /dev/null &
 fi
+_spawn_pid="$!"
 disown 2>/dev/null || true
 
-# Note: the subshell pid above is the subshell, not the launcher itself,
-# but it's the closest correlation we have without running `pgrep` from
-# this script. The launcher's own pid file (~/.vct/launcher.pid) is a
-# better source for runtime tooling — this event mostly says "we tried".
+# The launcher's own pid file (~/.vct/launcher.pid) is the better source
+# for runtime tooling — this event mostly says "we tried".
 _log_event "spawn" "ok" "launcher detached" \
     "{\"binary\":\"$(_json_escape "$LAUNCHER_BIN")\",\"subshell_pid\":${_spawn_pid:-0}}"
 
