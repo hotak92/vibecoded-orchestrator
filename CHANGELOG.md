@@ -190,6 +190,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   four thousand of a project's own queries on the larger projects, and never on the smallest. The weights stay
   unshipped and RL scoring stays locked.
 
+- **Turning on a secondary embedding slot now fills it for the KG rows you already have, once.** Before, a
+  secondary slot (dual embeddings, for example the arctic secondary) reached a stored row only when that row was next
+  rewritten. Now the next whole-tree KG sync gives every stored row of the project's KG, the shared KG it writes and
+  the development collection that slot's vector, in the background. It runs on launcher Sync, on an update, or through
+  the retry driver VCO starts at the next session; turning the switch on in the launcher schedules it. Only rows
+  without the vector are embedded, with the secondary's own model, and every other vector is kept. A row the secondary
+  refuses whole is stored again as finer rows that every model accepts. Completion is recorded per collection and
+  slot in `.claude/state/kg-secondary-backfill.json`, so later syncs embed nothing for it. When the secondary does not
+  answer, nothing is embedded; the ledger row `kg_secondary_backfill_pending` records the owed work and VCO retries
+  it. Turning the secondary off removes no vector, and turning it on again fills only the rows that lack it.
+
 ### Changed
 
 - **Citation events name the labelling regime they were computed under.** v0.2.106 changed how citation labels are

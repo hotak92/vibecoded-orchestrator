@@ -1553,6 +1553,26 @@ whole-tree runs only) resolves the row once no listed collection is still \
 owed. The bundle self-heal also resolves it when a settle finds every slot \
 complete (the instant switch back)."""
 
+[conditions.kg_secondary_backfill_pending]
+class = "auto_retryable"
+owner = "vco_lib.kg_secondary_backfill"
+clear_probe = "paired-resolution"
+retry_action = "retry:py:kg_seed"
+emit_surfaces = ["ledger"]
+notes = """v0.2.106 (owner ruling 2026-11-12, "backfill once"): a SECONDARY \
+text-embedding slot is enabled (dual embeddings — `DUAL_EMBEDDING_WRITE_ALL_SLOTS` \
+plus e.g. `DUAL_EMBEDDING_ARCTIC_SECONDARY`) and one or more of the project's KG \
+collections is not stamped complete for it (`.claude/state/\
+kg-secondary-backfill.json`). Owed WORK: the stored rows get that slot's vector \
+once. Emitted by the env projection, the bundle self-heal, a scoped `kg-sync`, \
+and a whole-tree run whose secondary did not answer. `retry_action` reuses the \
+EXISTING `retry:py:kg_seed` handler: `kg-sync --all` backfills before its walk \
+(`kg_embed_model.fill_before_walk` → `kg_secondary_backfill.backfill_before_walk`: \
+one probe embed, then the UPDATE-only slot enrichment with the secondary's own \
+model; rows it refuses whole are re-laid by the walk for every model) and its \
+paired clear (`kg_secondary_backfill.after_walk`) resolves the row once every \
+configured secondary is stamped on every collection — or none is configured."""
+
 [conditions.embed_self_heal_failed]
 class = "action_required"
 owner = "vco_lib.embed_slot_fill"

@@ -3357,12 +3357,22 @@ def _split_rows_heal_reason(
        is the only "once". A chunk that provably fits every such model was
        never refused, and its node keeps its vectors.
 
+    3. (v0.2.106, owner ruling 2026-11-12 "backfill once") a row the
+       one-time secondary backfill of THIS run found refused whole by a newly
+       enabled secondary model (``kg_secondary_backfill.relay_reason``): the
+       fill cannot add rows, so the node is re-laid here — the finest split
+       any model of its vector set needs, embedded first, replaced after.
+
     Unknown (no record, an unreadable value, no vector payload) never forces
     work beyond these: the gate keeps its pre-existing skip.
     """
+    from vco_lib.kg_secondary_backfill import relay_reason
     from vco_lib.kg_truncation_tags import TRUNCATED_SLOTS_PROP
 
     rows = list(rows or ())
+    relay = relay_reason(collection_name, rows)
+    if relay:
+        return relay
     named: set = set()
     for obj in rows:
         record = (getattr(obj, "properties", None) or {}).get(TRUNCATED_SLOTS_PROP)
@@ -6584,7 +6594,10 @@ def main():
             # v0.2.102 W6-I: a selected model that differs from a collection's
             # recorded one is filled additively BEFORE the walk (only missing
             # vectors embed), so unchanged nodes then skip with zero re-embeds.
-            _kg_embed_model.fill_before_walk(_fill_collections(), embedding_service)
+            # v0.2.106 ("backfill once"): the same pre-walk leg backfills a
+            # newly enabled SECONDARY slot once (`vco_lib.kg_secondary_backfill`).
+            _kg_embed_model.fill_before_walk(_fill_collections(), embedding_service,
+                                             folder=PROJECT_ROOT)
             kg_tally = sync_all_nodes(server)
             doc_tally = sync_all_docs(server)
             total_fail = kg_tally.failed + doc_tally.failed

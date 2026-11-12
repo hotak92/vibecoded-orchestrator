@@ -4160,9 +4160,23 @@ def _cli_apply(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 4
 
+    _schedule_secondary_backfill(Path(bundle["project_root"]))
     print(json.dumps({"ok": True, "report": report, "project_id": args.project_id,
                       "project_root": str(bundle["project_root"])}))
     return 0
+
+
+def _schedule_secondary_backfill(folder: Path) -> None:
+    """v0.2.106 ("backfill once"): the launcher's dual-embedding toggles land
+    here (their DB write re-projects the env through ``apply``). A secondary
+    slot the just-written env enables and the project's KG is not stamped
+    complete for becomes the auto-retryable ``kg_secondary_backfill_pending``
+    row, which the retry driver (next session start, launcher Sync) turns into
+    the one-time background backfill. Service-free, no Weaviate call; prints
+    only to stderr (stdout carries the one JSON object the launcher parses)."""
+    from vco_lib.kg_secondary_backfill import schedule_for_folder
+
+    schedule_for_folder(folder)
 
 
 def _refused_payload(exc: SettingsWriteRefused) -> dict[str, Any]:
