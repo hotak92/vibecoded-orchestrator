@@ -409,7 +409,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The macOS installer no longer prints "$!: unbound variable" when it opens the launcher.** The launcher was started inside a subshell, so the script read an unset `$!`; macOS's bash 3.2 aborts on that under `set -u` even with a default. It is now started in the script's own shell.
+- **The macOS installer no longer prints "$!: unbound variable" when it opens the launcher.** The launcher was started
+  inside a subshell, so the script read an unset `$!`; macOS's bash 3.2 aborts on that under `set -u` even with a
+  default. It is now started in the script's own shell.
+
 - **A missing compose provider stops the install up front, with the command that fixes it.** Podman without
   `podman-compose` (or a `docker-compose` for `podman compose` to delegate to), or Docker without its compose
   plugin, passed every check and failed at step 5 with "looking up compose provider failed". `install.py` now
