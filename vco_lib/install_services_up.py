@@ -344,12 +344,19 @@ def compose_up_step(plan: Step5Plan, hooks: Step5Hooks) -> str:
     # v0.2.105: pull each to-be-recreated service's pinned image FIRST — a
     # recreate whose pull then fails would remove the running container and
     # leave the service down; such a service keeps running and is ledgered.
-    from vco_lib.compose_image_prepull import drop_unpullable_recreates  # noqa: PLC0415
+    from vco_lib.compose_image_prepull import (  # noqa: PLC0415
+        drop_unpullable_recreates, prepull_starts)
     drop_unpullable_recreates(
         plan.services_to_recreate, runtime=plan.runtime,
         root=plan.install_root or plan.infra_dir.parent, deferral_report=plan.deferral_report,
         rerun=_rerun_cmd(plan), run=hooks.run, timeout=compose_timeout_s(),
         log_event=hooks.log_event)
+    # v0.2.106: the services it STARTS too — a rate-limited registry is then
+    # answered by the Docker Hub mirror before compose up hits it.
+    prepull_starts(
+        [s for s in plan.services_to_start if s not in plan.services_to_recreate],
+        runtime=plan.runtime, root=plan.install_root or plan.infra_dir.parent,
+        run=hooks.run, timeout=compose_timeout_s(), log_event=hooks.log_event)
 
     # The argv comes from the ONE builder (v0.2.97): `--no-deps` always,
     # `--build` only for a stale code_embed image, no bare `up -d` ever (I1).

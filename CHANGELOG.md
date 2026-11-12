@@ -424,6 +424,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command failed. The template is now split first and each argument resolved after
   (`installer_engine::command_argv`); quoting in the template works as before.
 
+- **A Docker Hub rate limit no longer stops the install's image pull.** A pull of a Docker-Hub-served image
+  (`cr.weaviate.io`, `docker.io`) refused with `toomanyrequests` / 429 / "pull rate limit" is retried from Google's
+  Docker Hub mirror `mirror.gcr.io` with the same path and tag and tagged under the original name
+  (`compose_image_prepull.ensure_image`); a mirror image whose digest does not match the original registry's
+  readable digests is refused, an unverifiable one is accepted and reported. Step 5 now pre-pulls the services it
+  starts (a fresh install) as well as those it recreates. Other pull failures are unchanged.
+
 - **The RL reranker keeps what it learns when its container is recreated.** Its manifest mounted nothing, so each
   project's online model and learner state (`/data/state/projects/<project_id>/`), the event logs and the global
   model lived in the container's writable layer and were lost on every module update and every recreate. The
