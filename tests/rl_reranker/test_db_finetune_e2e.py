@@ -49,7 +49,6 @@ def _make_server(tmp_path, monkeypatch, *, project_id="proj-e2e"):
     monkeypatch.setenv("VCT_MODULE_TOKEN", "fake-identity-token")
     return RLServer(
         project_root=project_root,
-        ollama_url="http://localhost:11435",
         log_path=str(tmp_path / "logs" / "rl_events.jsonl"),
         reranker_model=None,
         port=0,

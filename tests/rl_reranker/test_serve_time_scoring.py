@@ -310,7 +310,7 @@ def _make_server(tmp_path, monkeypatch, model: "RLModel | None", source: str = "
     monkeypatch.delenv("VCT_PROJECT_ID", raising=False)
     root = tmp_path / "project"
     root.mkdir()
-    srv = RLServer(project_root=root, ollama_url="http://127.0.0.1:9",
+    srv = RLServer(project_root=root,
                    log_path=str(tmp_path / "logs" / "rl_events.jsonl"), port=0)
     if model is not None:
         srv._rl._rl_model = model

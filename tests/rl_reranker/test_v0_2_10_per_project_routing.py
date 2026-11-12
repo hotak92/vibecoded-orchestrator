@@ -105,7 +105,6 @@ def _make_server(tmp_path, layout, monkeypatch, lru_size: int = 10):
 
     srv = RLServer(
         project_root=project_root,
-        ollama_url="http://localhost:11435",
         log_path=str(layout["logs"] / "rl_events.jsonl"),
         reranker_model=None,
         port=0,

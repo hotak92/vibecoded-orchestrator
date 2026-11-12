@@ -248,12 +248,32 @@ def _resolve_base_url() -> Optional[str]:
     ``RL_SERVER_PORT`` if only that's set (launcher writes both per
     the ``allocate_rl_port`` flow). Returns None for "disabled mode".
     """
+    return resolve_wired_base_url(None)
+
+
+def resolve_wired_base_url(
+    hub_rl_server_port: Optional[int] = None,
+) -> Optional[str]:
+    """The ONE base-URL resolver every ``RLClient`` wiring path shares
+    (v0.2.106): the MCP's ``_get_rl_client`` and ``rl_doctor`` both call
+    this, so the doctor can never say "not wired" when the MCP would find
+    the container. Precedence (V52-AA):
+
+      1. ``RL_SERVER_URL`` env (canonical override; full URL incl. host)
+      2. ``RL_SERVER_PORT`` env (composed against 127.0.0.1)
+      3. hub-resolved ``rl_server_port`` from the project config (the
+         supervisor-allocated container port; env is deliberately not
+         propagated to MCP subprocesses on the default install)
+      4. ``None`` → "disabled mode"
+    """
     url = os.environ.get("RL_SERVER_URL", "").strip()
     if url:
         return url.rstrip("/")
     port = os.environ.get("RL_SERVER_PORT", "").strip()
     if port:
         return f"http://127.0.0.1:{port}"
+    if hub_rl_server_port:
+        return f"http://127.0.0.1:{int(hub_rl_server_port)}"
     return None
 
 

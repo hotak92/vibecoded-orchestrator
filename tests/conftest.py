@@ -2369,6 +2369,24 @@ def _pin_claude_project_dir(request):
 
 
 @pytest.fixture(autouse=True)
+def _drop_agent_run_env():
+    """v0.2.106: `VCT_AGENT_ID` (and `VCT_BRIEF_TOOL_USE_ID`, the same
+    per-run discipline) is written straight into `os.environ` by the context
+    router on every run (one run per process in production), so a test that
+    drives `router.main` in-process leaves it set and every later
+    `stage_pending` of the suite tags its pending file with that test's
+    agent id — the same leak class as `VCT_TRANSCRIPT_PATH` (the fixture
+    below). Cleared before and after every test."""
+    os.environ.pop("VCT_AGENT_ID", None)
+    os.environ.pop("VCT_BRIEF_TOOL_USE_ID", None)
+    try:
+        yield
+    finally:
+        os.environ.pop("VCT_AGENT_ID", None)
+        os.environ.pop("VCT_BRIEF_TOOL_USE_ID", None)
+
+
+@pytest.fixture(autouse=True)
 def _drop_staging_transcript_env():
     """v0.2.106: `VCT_TRANSCRIPT_PATH` is the per-run channel through which
     the context router hands `citation_pending.stage_pending` its chat's

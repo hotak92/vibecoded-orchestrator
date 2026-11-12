@@ -447,7 +447,8 @@ services:
       RL_BIND_HOST: "0.0.0.0"
       RL_PROJECT_ROOT: "/data"
       RL_WEIGHTS_DIR: "/app/weights"
-      OLLAMA_URL: "http://vco_ollama:11434"
+      # No OLLAMA_URL: the server scores client-sent vectors
+      # (rl_client/rerank_wire.py, protocol v2) and embeds nothing.
     # No volume: a standalone run keeps its state inside the container and
     # loses it with the container (the launcher-managed module mounts its
     # own per-install state). VCO's named volumes are the data volumes the

@@ -310,7 +310,7 @@
     "description": "This framework allows installed modules to declare configuration tabs in a JSON manifest without bundling custom Svelte components or rebuilding the launcher.\nKey features include zero extra builds per module, type-safe Rust validation of the manifest structure, and built-in mouseover tooltips for every control.\nPaid and free module authors use it to expose settings in the launcher sidebar by defining a `gui.config_tab` block in their `vct-module.json`.\nIt matters because it enforces a secure Tauri security model by avoiding dynamic JS loads while providing a consistent, extensible UI palette.",
     "summary": "The Module-Contributed GUI Tabs Framework (v0.2.20+) allows installed modules to declare configuration tabs via a `gui.config_tab` JSON block in their manifest, enabling the launcher to render UI without bundling Svelte components or rebuilding the binary. This schema-rendered approach was chosen over webview-bundling or external executables to ensure zero extra builds, type safety, built-in tooltips, and adherence to Tauri security models. The framework supports five control kinds (Checkbox, MultiSelect, Button, Select, Info), each requiring a tooltip, with state persisted in a `module_settings` table keyed by project, module, and control ID. The launcher dynamically merges exposed tabs into the sidebar, soft-failing on broken manifests. Key evolutions include `show_in_sidebar: false` (v0.2.23) to support embedded tabs in per-project settings, scope refactoring of the orchestrator-core (v0.2.25), and a major schema expansion in v0.2.26 introducing a declarative dispatcher and new control kinds to accommodate future paid modules without requiring launcher rebuilds.",
     "generated_at": "2026-07-20T18:52:03.082444+00:00",
-    "content_hash": "354a8adf8fed1e4c",
+    "content_hash": "5d92486380a02407",
     "total_chunks": 1
   },
   "knowledge/concepts/motion-principles-for-ui.md": {
@@ -380,15 +380,6 @@
     "generated_at": "2026-10-30T05:54:18.603406+00:00",
     "backend": "ollama",
     "content_hash": "78bd4dba9b4bfefc",
-    "total_chunks": 1
-  },
-  "knowledge/concepts/orchestrator-rl-retrieval.md": {
-    "title": "Orchestrator RL Retrieval",
-    "description": "The RL retrieval system is a pro-tier reinforcement-learning reranker that wraps Weaviate searches, over-fetching candidates and reranking based on learned relevance signals with continuous online training. Each project gets an isolated RL server instance with project-specific port allocation (stored in settings.json, not hardcoded); the systemd unit requires PYTHONPATH configuration and per-project log paths. License validation gates the feature—`feature_enabled(\"rl_retrieval\")` returns false on free tier or after >3 days offline, gracefully falling back to Weaviate cosine ranking; paid versions ship in GHCR containers pulled via short-lived tokens with weekly model-weight rotation for anti-piracy. Critical for users needing improved search relevance; per-project isolation prevents cross-project citation-pattern leakage and ensures different projects' neural networks don't interfere.",
-    "summary": "The RL retrieval system reranks Weaviate search results using a reinforcement-learning layer trained on project-specific citation patterns, with each project assigned an isolated server instance to prevent cross-project mode-collapse. Distribution gates the paid feature through per-user pull tokens from a GHCR container image with 15-minute TTL and weekly model-weight rotation as an anti-piracy mechanism.",
-    "generated_at": "2026-10-15T09:37:54.678183+00:00",
-    "backend": "cli",
-    "content_hash": "fb6ebad72d808782",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-security.md": {
@@ -933,6 +924,15 @@
     "summary": "Weaviate is an open-source vector database designed for semantic search and AI applications, utilizing the HNSW algorithm for sub-100ms approximate nearest neighbor (ANN) queries. It supports property filtering, complex boolean queries, and knowledge graph capabilities via cross-references. Key design patterns include storing document chunks with metadata (source_id, chunk_index) and knowledge nodes with links. Critical constraints require respecting per-model embedding token budgets (e.g., ~10k for qwen3-embedding:0.6b) to prevent silent truncation, necessitating chunking for large documents and deduplication of results by `source_node_id` during retrieval. Best practices emphasize using `near_vector` with manual embeddings, consistent models per collection, and batch operations, while avoiding `near_text` and ignoring token limits.",
     "generated_at": "2026-07-20T18:58:01.192051+00:00",
     "content_hash": "5afa0e65da462d91",
+    "total_chunks": 1
+  },
+  "knowledge/concepts/orchestrator-rl-retrieval.md": {
+    "title": "Orchestrator RL Retrieval",
+    "description": "The RL retrieval system reranks Weaviate search results with a reinforcement-learning layer that scores client-sent vectors (query, node, linked) and reorders the over-fetched candidates before the top-k are returned.\nSince v0.2.106 it ships with VCO itself: free, no licence, source in the public repository, container image built locally from the checkout, weights bundled through a sha256-pinned manifest.\nScoring stays behind a shipped lock until trained weights exist; retrieval and citation events are always collected for training.\nIt matters because learned, project-specific relevance beats plain BM25+cosine ranking and adapts to which results the assistant actually uses.",
+    "summary": "The RL retrieval system wraps Weaviate searches with a learned reranker. The retrieval over-fetches candidates (KG_OVERFETCH_MULTIPLIER, default 2) and the weaviate-kg MCP client sends them, with their vectors (query vector, per-node vector, linked vectors and type names; float16 wire format from rl_client/rerank_wire.py), to the reranker container, which scores with its loaded model and returns the reordered top-k; the server embeds nothing and holds no Ollama dependency. Deployment (v0.2.106): the reranker ships in the public AGPL repository (claude_mcp_servers/rl_reranker/) as a bundled module - image built locally at install/update from the checkout Dockerfile (localhost/vco-rl-reranker:<version>-<variant>), one global container per machine (default port 11450) serving per-project model heads via the X-VCT-Project-ID header, address resolved env-first then through the hub rl_server_port. Gates: the shipped scoring lock (vco_lib/rl_scoring_lock.toml, locked until trained weights ship; gates scoring only - event logging always runs) and the per-project rl_reranker_enabled_for_project toggle; the pre-v0.2.106 licence gate is gone. Weights are bundled per embedding profile (qwen3/arctic ship together) through weights/manifest.json with sha256 pins; none shipped yet means the server reports not trained and the client does not call it. Training: an offline pipeline (training/export.py launcher.db export, shard_trainer.py, eval_harness.py with NDCG/MRR/Recall@10 vs plain cosine; ship refuses unless both profiles pass) plus container-side online training (/rl_update, pre-packed payloads from the MCP, the sole event writer). Model: 7-slot shared encoder with type embeddings and cosine scalars, twin tracks with a cross-path query-target mixer, 2-layer transformer tail, 5-layer MLP head, sigmoid score (~1.78M params at 1024 dims), per-profile weights, v0.1.x network kept for A/B and rollback.",
+    "generated_at": "2026-11-12T00:31:47+00:00",
+    "backend": "handwritten",
+    "content_hash": "e9667893334e8281",
     "total_chunks": 1
   }
 }

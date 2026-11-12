@@ -337,6 +337,38 @@ pub async fn start_container_for_module_with_gpu_mode(
     db: &Db,
 ) -> Result<String, String> {
     let podman = detect_container_runtime().await?;
+    // v0.2.106: a container_build module's image is local-only — rebuild it
+    // through the shared ensure step when it is missing or was never built
+    // for this start's GPU variant. Same build the installer runs, one
+    // implementation (`vct_launcher_core::services::container_build`),
+    // also applied by the hub's two start paths.
+    if manifest.install.method == crate::manifest::InstallMethod::ContainerBuild {
+        match vct_launcher_core::services::container_build::ensure_bundled_image(
+            manifest, gpu_mode, &podman,
+        )
+        .await
+        {
+            Ok((_, vct_launcher_core::services::container_build::EnsureImageOutcome::Rebuilt)) => {
+                tracing::info!(
+                    module_id = %manifest.id,
+                    "[module_service] bundled image was missing; rebuilt from the checkout \
+                     before start"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    module_id = %manifest.id,
+                    error = %e,
+                    "[module_service] bundled image rebuild for start failed"
+                );
+                return Err(format!(
+                    "module {}: the bundled image is missing and could not be rebuilt: {}",
+                    manifest.id, e
+                ));
+            }
+        }
+    }
     let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
     launch_prepared_start(manifest, ctx, project, rl_port, prepared, &SystemContainerCli).await
 }

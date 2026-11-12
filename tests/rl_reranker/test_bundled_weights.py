@@ -160,7 +160,6 @@ def _server(tmp_path, monkeypatch, profile: str, weights_root):
     monkeypatch.setenv("RL_GLOBAL_WEIGHTS_DIR", str(tmp_path / "global"))
     return RLServer(
         project_root=tmp_path / "project",
-        ollama_url="http://localhost:11435",
         log_path=str(tmp_path / "logs" / "rl_events.jsonl"),
         port=0,
         weights_root=weights_root,

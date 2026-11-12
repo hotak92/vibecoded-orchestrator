@@ -1119,6 +1119,7 @@ def _get_rl_client():
 
     try:
         from claude_mcp_servers.rl_client import RLClient
+        from claude_mcp_servers.rl_client.client import resolve_wired_base_url
     except Exception as exc:
         server.logger.debug("RLClient import failed (%s); RL features disabled", exc)
         return None
@@ -1140,21 +1141,18 @@ def _get_rl_client():
     except Exception as exc:
         server.logger.debug("EmbeddingService probe failed (%s); using default text_dim=%d", exc, text_dim)
 
-    # V52-AA: derive base_url from hub-resolved rl_server_port as a
-    # fallback when env vars are unset. Env precedence:
-    #   1. RL_SERVER_URL env (canonical override; full URL incl. host)
-    #   2. RL_SERVER_PORT env (composed against 127.0.0.1)
-    #   3. hub-resolved ``rl_server_port`` from ProjectConfig (V52-AA)
-    #   4. None → "disabled mode"
-    # RLClient.__init__ already uses _resolve_base_url() to cover (1)+(2)
-    # internally when ``base_url`` arg is None. We pre-resolve (3) here
-    # and pass it explicitly as ``base_url`` ONLY when (1)+(2) are unset,
-    # so the existing env-override path stays intact for tests + dev.
-    base_url_override: Optional[str] = None
-    _env_url = os.environ.get("RL_SERVER_URL", "").strip()
-    _env_port = os.environ.get("RL_SERVER_PORT", "").strip()
-    if not _env_url and not _env_port and hub_rl_server_port:
-        base_url_override = f"http://127.0.0.1:{hub_rl_server_port}"
+    # V52-AA: derive base_url through the ONE shared resolver
+    # (``rl_client.client.resolve_wired_base_url`` — env first, then the
+    # hub-resolved ``rl_server_port``). Passing the result explicitly is
+    # equivalent to what ``RLClient.__init__`` would re-resolve from env
+    # alone, and adds rung (3) the env-only resolution lacks. rl_doctor
+    # resolves through the SAME function, so the doctor can never report
+    # "not wired" where the MCP finds the container.
+    base_url_override = resolve_wired_base_url(hub_rl_server_port)
+    if base_url_override is not None and hub_rl_server_port and not (
+        os.environ.get("RL_SERVER_URL", "").strip()
+        or os.environ.get("RL_SERVER_PORT", "").strip()
+    ):
         server.logger.debug(
             "RL client: env unset; using hub-resolved rl_server_port=%d",
             hub_rl_server_port,

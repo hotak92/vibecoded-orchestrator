@@ -639,6 +639,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The reranker server no longer takes `--ollama-url` / `OLLAMA_URL`.** Since it started scoring the vectors the
+  client sends (`rl_client/rerank_wire.py`, protocol v2) the server embeds nothing and has no Ollama to reach, so
+  the option was unread. It is removed from the server's command line and from the standalone compose service's
+  environment; every other consumer of `OLLAMA_URL` (the embedding services, the weaviate-kg MCP, the code-embed
+  container) is unchanged.
+
+- **The RL reranker image is rebuilt when it is missing or built for the wrong graphics variant.** The image is
+  built locally at install/update; if it was pruned afterwards, or the machine's graphics profile changed (a GPU
+  added or removed), every later start of the module just failed. The start path now checks whether the exact image
+  the start would run exists locally and, when it does not, rebuilds it from the checkout with the same build step
+  the installer uses, logging and auditing the rebuild before starting the container.
+
+- **`rl_doctor` finds the reranker through the hub.** It resolved the container's address from environment variables
+  only, while the search pipeline also falls back to the hub-resolved `rl_server_port` — so on a default install
+  (where those variables are deliberately not set for the MCP) the doctor said "container not wired" while searches
+  were talking to the container. Both now resolve through one shared function, with the same precedence:
+  environment variables first, then the hub-resolved port.
+
+- **The shipped knowledge-graph node about RL retrieval no longer describes a paid module.** The reranker ships with
+  VCO (free, no licence) since this release; the node still said it was Pro-tier, licence-gated and distributed as a
+  paid container image with weekly weight rotation. The node now describes what ships: the source in the public
+  repository, the locally built image, the bundled weights and the shipped scoring lock that keeps reranking off
+  until trained weights exist.
+
+- **Test isolation: `VCT_AGENT_ID` no longer leaks between tests, and the root-identity hook test no longer stages
+  real citation files into the checkout.** The context router writes `VCT_AGENT_ID` straight into the environment on
+  every run, so one in-process test left it set and every later citation-staging test tagged its files with that
+  test's agent id — the same leak class as `VCT_TRANSCRIPT_PATH`, fixed the same way (cleared before and after every
+  test; `VCT_BRIEF_TOOL_USE_ID`, written by the same step, is cleared with it). Separately, the hook-identity test
+  that runs the real retrieval pipeline with the orchestrator root as its project (a lane worktree when the suite
+  runs there) staged a fixture-named pending-citation file into that root's `.claude/state/rl_pending` on every run —
+  found as leftovers in every lane worktree; the shared test harness now skips the pending-file staging for runs that
+  do not assert it.
+
 - **The post-commit knowledge-graph reviewer keeps only the latest status.** When a decision is refined commit after commit, the reviewer used to append one `## Status after <commit>` section per commit, so a node collected a chain of sections — each right for its commit, every later one superseded — and readers landed on the stale statements first. Now, when a new commit supersedes what the reviewer's own earlier sections say, it CONSOLIDATES them into one `## Current state (consolidated <date>)` section (and updates that section on the next round instead of adding a second one): every still-true statement is carried over word for word, each statement that is no longer true is quoted on a `Superseded: <old commit> → <new commit> (<date>): <statement>` line, and one `Superseded:` step line per folded section keeps the history visible. Which sections are the reviewer's own is RECORDED when the reviewer makes its own commit — a fingerprint of each section it wrote, kept in `.claude/state/` — never guessed from commit titles or `git blame`: a section can be folded only while its text still matches the fingerprint the reviewer recorded (line endings and trailing blank lines are normalized for the fingerprint) and that commit is still in your history. A node you created but never committed is never treated as the reviewer's. Anything else stays append-only exactly as before: your own lines anywhere in the node, a section you added a line to, a section the reviewer annotated one of your lines in, a commit you amended or rebased, a commit of yours titled `kg-sync:`. A write that drops any statement without carrying it over or quoting it as superseded is reverted whole. Commits that land while a review is running no longer start a second, concurrent review: they join a queue, and the running review covers them in follow-up passes (up to 8 commits per pass, each with its diff, and the nodes citing any of their files are listed). A queued commit leaves the queue only after a pass covering it finished, so a crash or a failed pass loses nothing; the few reasons a commit is dropped without review (it is the reviewer's own commit, git can no longer read it, three passes failed, more than 200 are waiting, no reviewer model was available for the run) are each written to the reviewer log, one line per commit. A queued copy of the run's own commit is never reviewed twice, and a crashed heartbeat leaves no temp file behind. The running review keeps its lock fresh, so it is never taken over while alive; a lock left by a crashed run is taken over by exactly one later run. If the lock or queue cannot be used at all (permissions, a read-only disk), the reviewer says so in its log, on stderr and in the chat's alerts, and still reviews the commit.
 
 - **Release mechanics:** version 0.2.104 → 0.2.105 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). This release adds a code-graph extractor-generation rung (0.2.105: config files such as `.ini` / `.json` / `.tweakers` join the code graph), so existing code graphs are re-walked once after the update to pick up the new config-file rows and the links from code to config keys. Only those new rows are embedded; existing code rows are not re-embedded (`CODEGRAPH_EMBED_REVISION` is unchanged).
