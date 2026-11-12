@@ -232,6 +232,125 @@ pub async fn retire_registry_install(
     report
 }
 
+/// The side effects of the post-start retirement, injectable so the decision
+/// in [`container_step_outcome`] is tested without an `AppHandle`, a
+/// container engine or the launcher DB.
+pub(crate) trait RetirementEffects {
+    /// The container engine binary (`podman` / `docker`).
+    async fn container_runtime(&self) -> Result<String, String>;
+    /// Carry out the retirement (production: [`retire_registry_install`]).
+    async fn retire(
+        &self,
+        previous: &ModuleManifest,
+        current: &ModuleManifest,
+        runtime: &str,
+    ) -> RetirementReport;
+    /// Log + audit a finished retirement.
+    fn record(&self, report: &RetirementReport);
+}
+
+/// The production effects: the detected engine, the real `<vct_root_dir>`,
+/// and an audit row in the launcher DB.
+pub(crate) struct LiveRetirementEffects<'a> {
+    pub db: &'a crate::db::Db,
+    /// `None` for a global (machine-wide) install.
+    pub project_id: Option<&'a str>,
+    pub module_id: &'a str,
+}
+
+impl RetirementEffects for LiveRetirementEffects<'_> {
+    async fn container_runtime(&self) -> Result<String, String> {
+        crate::installer_engine::detect_container_runtime().await
+    }
+
+    async fn retire(
+        &self,
+        previous: &ModuleManifest,
+        current: &ModuleManifest,
+        runtime: &str,
+    ) -> RetirementReport {
+        retire_registry_install(previous, current, runtime, &crate::paths::vct_root_dir()).await
+    }
+
+    fn record(&self, report: &RetirementReport) {
+        tracing::info!("[modules] {}: registry install retired: {:?}", self.module_id, report);
+        let _ = self.db.audit(
+            "module_registry_install_retired",
+            self.project_id,
+            Some(self.module_id),
+            &serde_json::to_value(report).unwrap_or_default(),
+        );
+    }
+}
+
+/// What the container step of an install hands to `module://install-complete`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ContainerStepOutcome {
+    /// The started container (`Some` only when the start succeeded).
+    pub container_name: Option<String>,
+    /// Why the post-install start failed (`Some` = the install did not
+    /// complete).
+    pub start_error: Option<String>,
+    /// Lines for the user (the retirement's kept-data notices).
+    pub notices: Vec<String>,
+}
+
+/// The post-start decision of `modules::install_module_for_project`, which
+/// is a thin shim over it: given the container-start result, the manifest
+/// the install replaced (`previous`, read before `run_install`) and the new
+/// one, retire the registry install's leftovers ONLY when the new container
+/// started AND the pair is a registry → bundled move of the same module. A
+/// failed start retires nothing — the old image stays the fallback. A
+/// missing container engine is logged and retires nothing.
+pub(crate) async fn container_step_outcome<E: RetirementEffects>(
+    start: Result<String, String>,
+    previous: Option<&ModuleManifest>,
+    current: &ModuleManifest,
+    effects: &E,
+) -> ContainerStepOutcome {
+    let name = match start {
+        Ok(name) => name,
+        Err(e) => return ContainerStepOutcome { start_error: Some(e), ..Default::default() },
+    };
+    let mut outcome = ContainerStepOutcome { container_name: Some(name), ..Default::default() };
+    let Some(prev) = previous.filter(|p| retired_registry_image(p, current).is_some()) else {
+        return outcome;
+    };
+    match effects.container_runtime().await {
+        Ok(runtime) => {
+            let report = effects.retire(prev, current, &runtime).await;
+            effects.record(&report);
+            outcome.notices = report.notices;
+        }
+        Err(e) => tracing::warn!(
+            "[modules] {}: registry leftovers not retired (no runtime: {})",
+            current.id,
+            e
+        ),
+    }
+    outcome
+}
+
+/// The `module://install-complete` payload of a run_install that succeeded
+/// (`project_id` `None` = a global install). `success` is false when the
+/// post-install container start failed; `notices` carry the retirement's
+/// lines to the GUI toast.
+pub fn install_complete_payload(
+    project_id: Option<&str>,
+    module_id: &str,
+    outcome: &ContainerStepOutcome,
+) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "module_id": module_id,
+        "success": outcome.start_error.is_none(),
+        "scope": if project_id.is_none() { "global" } else { "per_project" },
+        "container_name": outcome.container_name,
+        "error": outcome.start_error,
+        "notices": outcome.notices,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +485,133 @@ mod tests {
         assert_eq!(report.notices.len(), 1, "{:?}", report.notices);
         assert!(std::fs::symlink_metadata(&bundled_link).is_ok(), "the bundled mount is left alone");
         assert!(report.notices[0].contains(&slug_state.display().to_string()));
+    }
+
+    /// Observes every side effect `container_step_outcome` asks for.
+    struct FakeEffects {
+        runtime: Result<String, String>,
+        notices: Vec<String>,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl FakeEffects {
+        fn new(runtime: Result<&str, &str>, notices: &[&str]) -> Self {
+            Self {
+                runtime: runtime.map(str::to_string).map_err(str::to_string),
+                notices: notices.iter().map(|s| s.to_string()).collect(),
+                calls: Default::default(),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl RetirementEffects for FakeEffects {
+        async fn container_runtime(&self) -> Result<String, String> {
+            self.calls.borrow_mut().push("runtime".into());
+            self.runtime.clone()
+        }
+        async fn retire(
+            &self,
+            previous: &ModuleManifest,
+            current: &ModuleManifest,
+            runtime: &str,
+        ) -> RetirementReport {
+            self.calls.borrow_mut().push(format!(
+                "retire {}:{} -> {}:{} via {}",
+                previous.id,
+                previous.install.container.as_ref().unwrap().image,
+                current.id,
+                current.install.container.as_ref().unwrap().image,
+                runtime
+            ));
+            RetirementReport { notices: self.notices.clone(), ..Default::default() }
+        }
+        fn record(&self, report: &RetirementReport) {
+            self.calls.borrow_mut().push(format!("record {}", report.notices.len()));
+        }
+    }
+
+    #[tokio::test]
+    async fn started_registry_to_bundled_install_retires_the_old_install() {
+        let pull = manifest("container_pull", OLD);
+        let build = manifest("container_build", NEW);
+        let fx = FakeEffects::new(Ok("podman"), &["kept data at /x"]);
+        let out = container_step_outcome(Ok("vco-rl".into()), Some(&pull), &build, &fx).await;
+        assert_eq!(
+            fx.calls(),
+            vec![
+                "runtime".to_string(),
+                format!("retire vct-rl-reranker:{OLD} -> vct-rl-reranker:{NEW} via podman"),
+                "record 1".to_string(),
+            ]
+        );
+        assert_eq!(
+            out,
+            ContainerStepOutcome {
+                container_name: Some("vco-rl".into()),
+                start_error: None,
+                notices: vec!["kept data at /x".into()],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_container_start_retires_nothing() {
+        let pull = manifest("container_pull", OLD);
+        let build = manifest("container_build", NEW);
+        let fx = FakeEffects::new(Ok("podman"), &["kept data at /x"]);
+        let out = container_step_outcome(Err("boom".into()), Some(&pull), &build, &fx).await;
+        assert!(fx.calls().is_empty(), "no retirement after a failed start: {:?}", fx.calls());
+        assert_eq!(
+            out,
+            ContainerStepOutcome { container_name: None, start_error: Some("boom".into()), notices: vec![] }
+        );
+    }
+
+    #[tokio::test]
+    async fn no_registry_predecessor_or_another_module_retires_nothing() {
+        let build = manifest("container_build", NEW);
+        let mut other_pull = manifest("container_pull", OLD);
+        other_pull.id = "vct-other".into();
+        let previous: [Option<&ModuleManifest>; 3] = [None, Some(&build), Some(&other_pull)];
+        for prev in previous {
+            let fx = FakeEffects::new(Ok("podman"), &["n"]);
+            let out = container_step_outcome(Ok("c".into()), prev, &build, &fx).await;
+            assert!(fx.calls().is_empty(), "{:?}: {:?}", prev.map(|p| &p.id), fx.calls());
+            assert_eq!(out.container_name.as_deref(), Some("c"));
+            assert!(out.notices.is_empty() && out.start_error.is_none());
+        }
+        // and with no container engine the migration is logged, not carried out
+        let fx = FakeEffects::new(Err("no engine"), &["n"]);
+        let out =
+            container_step_outcome(Ok("c".into()), Some(&manifest("container_pull", OLD)), &build, &fx).await;
+        assert_eq!(fx.calls(), vec!["runtime".to_string()]);
+        assert!(out.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_retirement_notices_reach_the_install_complete_payload() {
+        let pull = manifest("container_pull", OLD);
+        let build = manifest("container_build", NEW);
+        let fx = FakeEffects::new(Ok("podman"), &["kept A", "kept B"]);
+        let out = container_step_outcome(Ok("vco-rl".into()), Some(&pull), &build, &fx).await;
+        let p = install_complete_payload(Some("proj-1"), "vct-rl-reranker", &out);
+        assert_eq!(p["notices"], serde_json::json!(["kept A", "kept B"]));
+        assert_eq!(p["success"], true);
+        assert_eq!(p["scope"], "per_project");
+        assert_eq!(p["project_id"], "proj-1");
+        assert_eq!(p["container_name"], "vco-rl");
+        assert!(p["error"].is_null());
+
+        let failed = container_step_outcome(Err("boom".into()), Some(&pull), &build, &fx).await;
+        let p = install_complete_payload(None, "vct-rl-reranker", &failed);
+        assert_eq!(p["success"], false);
+        assert_eq!(p["error"], "boom");
+        assert_eq!(p["scope"], "global");
+        assert!(p["project_id"].is_null() && p["container_name"].is_null());
+        assert_eq!(p["notices"], serde_json::json!([]));
     }
 
     #[cfg(unix)]
