@@ -6978,7 +6978,7 @@ mod tests {
         let data = ctx.vct_data.display().to_string();
         let want_mounts: Vec<String> = ["state", "logs", "global"]
             .iter()
-            .map(|d| format!("{}/rl-reranker/{}:/data/{}:Z", data, d, d))
+            .map(|d| format!("{}/vct-rl-reranker/_bundled/{}:/data/{}:Z", data, d, d))
             .collect();
         let mounts = |args: &[String]| -> Vec<String> {
             args.windows(2).filter(|w| w[0] == "-v").map(|w| w[1].clone()).collect()

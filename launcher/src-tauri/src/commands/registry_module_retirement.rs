@@ -24,7 +24,8 @@
 //!    are NEVER deleted or moved — they hold what the old container trained.
 //!    When one still holds files, the install reports a notice naming it, so
 //!    the user knows the data exists and that the bundled module does not
-//!    read it (its own mounts are `<vct_root>/data/rl-reranker/…`).
+//!    read it (its own mounts are `<vct_root>/data/<id>/_bundled/…`, a name
+//!    no project slug can take: slugs are `[a-z0-9-]`).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -71,14 +72,20 @@ pub fn retired_registry_image(previous: &ModuleManifest, current: &ModuleManifes
 }
 
 /// The old layout's per-project weights/state dirs:
-/// `<data_dir>/<module_id>/<slug>/state` for every slug present.
+/// `<data_dir>/<module_id>/<slug>/state` for every slug present. Only
+/// slug-shaped children count (`[a-z0-9-]+`, `db::slug`), so the bundled
+/// module's own `_bundled/` mounts are never taken for old data.
 pub fn legacy_state_dirs(data_dir: &Path, module_id: &str) -> Vec<PathBuf> {
     let root = data_dir.join(module_id);
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
+    let slug_shaped = |n: &str| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
     let mut out: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
+        .filter(|e| slug_shaped(&e.file_name().to_string_lossy()))
         .map(|e| e.path().join("state"))
         .filter(|p| p.is_dir())
         .collect();
@@ -329,6 +336,9 @@ mod tests {
         let (_, _, user) = managed_and_user_files(&slug_state);
         let empty_slug = root.join("data/vct-rl-reranker/global/state");
         std::fs::create_dir_all(&empty_slug).unwrap();
+        // the bundled module's own mount: never old data, never touched
+        let bundled_state = root.join("data/vct-rl-reranker/_bundled/state");
+        let (bundled_link, _, _) = managed_and_user_files(&bundled_state);
         let engine = fake_engine(
             tmp.path(),
             &format!("{OLD}:0.2.9-cuda\n{OLD}:0.1.0\n{OLD}:<none>\nother/repo:1\n"),
@@ -354,6 +364,7 @@ mod tests {
         // content is named to the user
         assert!(user.is_file() && slug_state.is_dir() && empty_slug.is_dir());
         assert_eq!(report.notices.len(), 1, "{:?}", report.notices);
+        assert!(std::fs::symlink_metadata(&bundled_link).is_ok(), "the bundled mount is left alone");
         assert!(report.notices[0].contains(&slug_state.display().to_string()));
     }
 

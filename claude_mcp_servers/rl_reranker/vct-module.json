@@ -75,17 +75,17 @@
         "log_path_template": "/data/logs/rl_events_{project_id}.jsonl",
         "volumes": [
             {
-                "host": "{VCT_DATA}/rl-reranker/state",
+                "host": "{VCT_DATA}/{MODULE_ID}/_bundled/state",
                 "container": "/data/state",
                 "mode": "Z"
             },
             {
-                "host": "{VCT_DATA}/rl-reranker/logs",
+                "host": "{VCT_DATA}/{MODULE_ID}/_bundled/logs",
                 "container": "/data/logs",
                 "mode": "Z"
             },
             {
-                "host": "{VCT_DATA}/rl-reranker/global",
+                "host": "{VCT_DATA}/{MODULE_ID}/_bundled/global",
                 "container": "/data/global",
                 "mode": "Z"
             }

@@ -11,8 +11,9 @@ logs (``/data/logs``) and the global model (``/data/global``). This pins:
 * the shipped manifest mounts every root the server writes
   (``rl_server._SAFE_PATH_ROOTS``) and the paths the image's env points at;
 * the mounts are ONE global host directory set (the container is
-  ``install.scope = global``) and never the paid module's per-slug
-  ``<data>/vct-rl-reranker/<slug>/state`` dirs, which stay the user's;
+  ``install.scope = global``) under ``<data>/<module id>/_bundled/``, never
+  the paid module's per-slug ``<data>/vct-rl-reranker/<slug>/state`` dirs,
+  which stay the user's;
 * ``runtime.image_user`` equals the Dockerfile's ``APP_UID`` / ``APP_GID``
   (the launcher maps the host user onto it so the mounts are writable).
 
@@ -71,12 +72,14 @@ def test_the_mounts_are_one_global_set_beside_the_paid_modules_dirs():
     assert m["install"]["scope"] == "global"
     for v in m["runtime"]["volumes"]:
         host = v["host"]
-        assert host.startswith("{VCT_DATA}/"), host
         assert "{project_slug}" not in host and "{project_id}" not in host, host
-        # The paid module's dirs (<data>/vct-rl-reranker/<slug>/...) are
-        # user data this release leaves untouched, never re-mounted.
-        assert not host.startswith("{VCT_DATA}/vct-rl-reranker/"), host
-        assert not host.startswith("{VCT_DATA}/{MODULE_ID}/"), host
+        # Under the module's own data dir (an uninstall with "purge data"
+        # removes <data>/<module id>/), in a child no project slug can name
+        # (slugs are [a-z0-9-]): the paid module's per-slug dirs
+        # (<data>/vct-rl-reranker/<slug>/state) are never re-mounted.
+        assert host.startswith("{VCT_DATA}/{MODULE_ID}/_bundled/"), host
+        child = host.split("/")[2]
+        assert not re.fullmatch(r"[a-z0-9-]+", child), child
 
 
 def test_image_user_matches_the_dockerfile_user():

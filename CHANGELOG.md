@@ -382,7 +382,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project's online model and learner state (`/data/state/projects/<project_id>/`), the event logs and the global
   model lived in the container's writable layer and were lost on every module update and every recreate. The
   manifest (now module version 0.3.1, so an installed copy is offered the update) mounts three host directories,
-  `<vct root>/data/rl-reranker/state`, `logs` and `global`, created by the start path. A new manifest field,
+  `<vct root>/data/vct-rl-reranker/_bundled/state`, `logs` and `global` (no project slug can be `_bundled`, and
+  uninstalling with "purge data" still removes them), created by the start path. A new manifest field,
   `runtime.image_user`, names the image's non-root user; the start paths map the host user onto it (podman
   `--userns=keep-id:uid=…,gid=…` on Linux, macOS and Windows; `--user <host uid>:<host gid>` for docker on Linux;
   nothing under Docker Desktop), so the container can write those directories and the host user owns what it
