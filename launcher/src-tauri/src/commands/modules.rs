@@ -2248,10 +2248,12 @@ pub async fn install_module_for_project(
             // with no reason. This was the confusing surface in the
             // vct-rl-reranker `{module_id}` failure: install pulled fine,
             // container start failed, but the success toast fired anyway.
-            // v0.2.106: lines for the user from the post-start retirement
-            // (sent with `module://install-complete`, toasted by the store).
-            let mut install_notices: Vec<String> = Vec::new();
-            let (resolved_container_name, container_start_error): (Option<String>, Option<String>) =
+            // v0.2.106: the outcome (container name, start error, the
+            // post-start retirement's notices) is decided by
+            // `registry_module_retirement::container_step_outcome` — this
+            // function only runs the start and the start-specific side
+            // effects; the decision is tested there without an AppHandle.
+            let outcome: crate::commands::registry_module_retirement::ContainerStepOutcome =
                 if manifest.install.method.runs_container_image()
                 && matches!(manifest.runtime.r#type.as_str(), "container" | "service")
             {
@@ -2270,9 +2272,9 @@ pub async fn install_module_for_project(
                     )
                     .await
                 };
-                match start_result
+                match &start_result
                 {
-                    Ok(name) => {
+                    Ok(_) => {
                         // v0.2.40 R5: first-install auto-download of
                         // default weights. After the container starts
                         // for the RL Reranker, trigger a one-shot
@@ -2376,41 +2378,6 @@ pub async fn install_module_for_project(
                                     .await;
                             });
                         }
-                        // v0.2.106: the new container runs — retire what the
-                        // registry install it replaced left behind.
-                        if let Some(prev) = previous_manifest.as_ref().filter(|p| {
-                            crate::commands::registry_module_retirement::retired_registry_image(p, &manifest)
-                                .is_some()
-                        }) {
-                            match crate::installer_engine::detect_container_runtime().await {
-                                Ok(runtime) => {
-                                    let report =
-                                        crate::commands::registry_module_retirement::retire_registry_install(
-                                            prev,
-                                            &manifest,
-                                            &runtime,
-                                            &crate::paths::vct_root_dir(),
-                                        )
-                                        .await;
-                                    tracing::info!(
-                                        "[modules] {}: registry install retired: {:?}",
-                                        module_id, report
-                                    );
-                                    let _ = db.audit(
-                                        "module_registry_install_retired",
-                                        if is_global { None } else { Some(&project_id) },
-                                        Some(&module_id),
-                                        &serde_json::to_value(&report).unwrap_or_default(),
-                                    );
-                                    install_notices.extend(report.notices);
-                                }
-                                Err(e) => tracing::warn!(
-                                    "[modules] {}: registry leftovers not retired (no runtime: {})",
-                                    module_id, e
-                                ),
-                            }
-                        }
-                        (Some(name), None)
                     }
                     Err(e) => {
                         tracing::error!(
@@ -2479,11 +2446,21 @@ pub async fn install_module_for_project(
                                 "scope": if is_global { "global" } else { "per_project" },
                             }),
                         );
-                        (None, Some(e))
                     }
                 }
+                crate::commands::registry_module_retirement::container_step_outcome(
+                    start_result,
+                    previous_manifest.as_ref(),
+                    &manifest,
+                    &crate::commands::registry_module_retirement::LiveRetirementEffects {
+                        db: &db,
+                        project_id: if is_global { None } else { Some(project_id.as_str()) },
+                        module_id: module_id.as_str(),
+                    },
+                )
+                .await
             } else {
-                (None, None)
+                crate::commands::registry_module_retirement::ContainerStepOutcome::default()
             };
 
             // v0.2.59: the install pull/extract succeeded, but if the
@@ -2493,19 +2470,19 @@ pub async fn install_module_for_project(
             // and the row was just flipped to status=Error with `last_error`
             // set. Surface the real error so the toast is actionable
             // instead of a generic "status: error".
-            let install_succeeded = container_start_error.is_none();
             let _ = app.emit(
                 "module://install-complete",
-                serde_json::json!({
-                    "project_id": if is_global { None } else { Some(&project_id) },
-                    "module_id": module_id,
-                    "success": install_succeeded,
-                    "scope": if is_global { "global" } else { "per_project" },
-                    "container_name": resolved_container_name,
-                    "error": container_start_error,
-                    "notices": install_notices,
-                }),
+                crate::commands::registry_module_retirement::install_complete_payload(
+                    if is_global { None } else { Some(project_id.as_str()) },
+                    &module_id,
+                    &outcome,
+                ),
             );
+            let crate::commands::registry_module_retirement::ContainerStepOutcome {
+                container_name: resolved_container_name,
+                start_error: container_start_error,
+                ..
+            } = outcome;
             // v0.2.59: return a row that reflects the ACTUAL outcome. When
             // the post-install container start failed, the DB row was just
             // flipped to status=Error with `last_error` set; the returned
