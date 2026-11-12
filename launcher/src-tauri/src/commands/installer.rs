@@ -40,7 +40,7 @@ use vct_launcher_core::services::install_root;
 /// v0.2.100 WP-02 (AD-2): a thin shim over
 /// `vct_launcher_core::services::install_root::resolve_with_store` — the ONE
 /// resolver (launcher.db cache first, kept only when it still passes
-/// `check_install_status`; then an exe walk bounded to 8 levels and
+/// `check_install_status`; then an exe walk bounded to `install_root::MAX_WALK_LEVELS` levels and
 /// identity-checked by `looks_like_orchestrator_root` AND the
 /// `vct-module.json` id). While `install.py --update` holds launcher.db
 /// (`db.is_update_standby()`) it answers from the process-level cache and
@@ -1573,7 +1573,7 @@ pub fn detect_existing_install_root() -> Option<String> {
 //
 //   1. Look up `launcher.install_path` in app_state. If set AND the path
 //      still passes `check_install_status`, return it.
-//   2. Walk up from `current_exe()` (at most 8 levels) to the nearest
+//   2. Walk up from `current_exe()` (at most `install_root::MAX_WALK_LEVELS` levels) to the nearest
 //      identity-confirmed orchestrator clone (markers AND a
 //      `vct-module.json` with id `orchestrator`). On a hit, write it back
 //      to app_state so step 1 picks it up next time.

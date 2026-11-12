@@ -4,7 +4,7 @@
 //! launcher command layer, each copy drifting:
 //!
 //!   - `commands::projects_v2::resolve_python_for_vco_lib_local` — the most
-//!     complete: `$VCT_VENV` → `$VCT_INSTALL_ROOT`×2 → exe-walk≤8 → PATH.
+//!     complete: `$VCT_VENV` → `$VCT_INSTALL_ROOT`×2 → exe-walk ≤ MAX_WALK_LEVELS → PATH.
 //!   - `commands::codegraph_reanalyze::resolve_python_for_analyzer` — exe-walk
 //!     ONLY (missing the `$VCT_VENV` / `$VCT_INSTALL_ROOT` tiers). A project
 //!     without its own `.venv` therefore fell straight to a system `python3`
@@ -26,7 +26,7 @@
 //!   2/3. `$VCT_INSTALL_ROOT`, then `$VCT_ORCHESTRATOR_ROOT` — the
 //!      orchestrator clone root. Each probes `<root>/.venv` then
 //!      `<root>/claude_mcp_servers/.venv`.
-//!   4. Walk up from `current_exe()` (≤8 hops) probing the same two venv
+//!   4. Walk up from `current_exe()` (≤ `install_root::MAX_WALK_LEVELS` hops) probing the same two venv
 //!      layouts — covers launcher-binary runs where neither env var is set.
 //!   5. NOTHING. `None` — v0.2.94 removed the bare-PATH rung: it made every
 //!      caller's `ok_or_else(...)` unreachable while handing back a name that
@@ -172,7 +172,7 @@ pub fn resolve_python_for_vco_lib() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let mut cur = parent.to_path_buf();
-            for _ in 0..8 {
+            for _ in 0..crate::services::install_root::MAX_WALK_LEVELS {
                 if let Some(p) = venv_in(&cur) {
                     return Some(p);
                 }
