@@ -3,13 +3,13 @@
 //! v0.2.32 #D: download the default RL weights bundle from Supabase
 //! and stage it under `<vct_root>/modules/<module_id>/weights/`.
 //!
-//! ## Status (v0.2.106): no live endpoint, kept for future paid modules
+//! ## Status (v0.2.106): kept for future paid modules
 //!
-//! The paid RL reranker's backend is RETIRED: its edge functions
-//! (`rl-latest-weights`, `rl-latest-version`, `rl-artifact-url`) are no
-//! longer in `launcher/supabase/functions/`, so the tag-time deploy cannot
-//! re-create them, and the endpoints named below answer 404 once the owner
-//! deletes the deployed copies. Nothing reachable for the RL reranker calls
+//! The RL reranker is free and bundled now; only its paid catalog listing is
+//! retired. Its former edge functions (`rl-latest-weights`,
+//! `rl-latest-version`, `rl-artifact-url`) stay in
+//! `launcher/supabase/functions/` and stay deployed as paid-module
+//! infrastructure (owner 2026-11-12). Nothing reachable for the RL reranker calls
 //! this flow: the module is bundled (`container_build`, weights built into
 //! its image), its manifest carries no `module_download_default_weights`
 //! action, the post-install auto-download skips `container_build` modules
@@ -84,9 +84,9 @@ use crate::commands::module_db::get_or_issue_module_token;
 use crate::db::Db;
 
 /// Default Supabase edge endpoint. Operators override via
-/// `VCT_RL_LATEST_WEIGHTS_URL` for staging / dev. v0.2.106: the function is
-/// retired with the paid RL backend (see the module doc) — a call answers
-/// 404, which this flow already reports as "not deployed".
+/// `VCT_RL_LATEST_WEIGHTS_URL` for staging / dev. v0.2.106: the function
+/// stays deployed as paid-module infrastructure, but the bundled RL reranker
+/// never reaches this flow (see the module doc).
 ///
 /// Distinct from `module_service::DEFAULT_RL_LATEST_VERSION_ENDPOINT`
 /// — that one (`/rl-latest-version`) is the daily-poller endpoint that

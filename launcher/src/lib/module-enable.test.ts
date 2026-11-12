@@ -282,3 +282,42 @@ describe('moduleSystemDefault / globalDefaultLine (v0.2.100)', () => {
     expect(globalDefaultLine(null, false)).toMatch(/is off unless/);
   });
 });
+
+describe('RL reranker default follows the bundled weights (v0.2.106, owner 2026-11-12)', () => {
+  const bundled = { profile: 'qwen3', bundled_model: true, default_on: true, error: null };
+  const none = { profile: 'arctic', bundled_model: false, default_on: false, error: null };
+
+  it('the system default is on only when the served answer says a model is bundled', () => {
+    expect(moduleSystemDefault('vct-rl-reranker', bundled)).toBe(true);
+    expect(moduleSystemDefault('vct-rl-reranker', none)).toBe(false);
+    expect(moduleSystemDefault('vct-rl-reranker', null)).toBe(false);
+    expect(moduleSystemDefault('vct-rl-reranker')).toBe(false);
+    expect(moduleSystemDefault('vct-coordination', none)).toBe(true);
+  });
+
+  it('the per-project line names the bundled-model cause, both ways', () => {
+    const on = moduleEffectiveLine(
+      state({ effective: true, source: 'system_default', rl_default: bundled }),
+    );
+    expect(on).toMatch(/^On — trained model bundled for qwen3\./);
+    expect(on).toMatch(/nothing set for this project/i);
+    const off = moduleEffectiveLine(
+      state({ effective: false, source: 'system_default', rl_default: none }),
+    );
+    expect(off).toMatch(/^Off — no trained model bundled yet for arctic\./);
+  });
+
+  it('an explicit choice is worded as the choice, whatever the default', () => {
+    const line = moduleEffectiveLine(
+      state({ explicit: false, effective: false, source: 'project', rl_default: bundled }),
+    );
+    expect(line).toBe('Off — set for this project.');
+  });
+
+  it('a non-RL module (rl_default null on the wire) keeps the fail-open wording', () => {
+    const line = moduleEffectiveLine(
+      state({ effective: true, source: 'system_default', rl_default: null }),
+    );
+    expect(line).toMatch(/modules default to on/);
+  });
+});

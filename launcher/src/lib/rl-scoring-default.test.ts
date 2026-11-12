@@ -7,6 +7,7 @@ import {
   RL_OPT_IN_EXPLAINER,
   RL_RERANKER_MODULE_ID,
   rlAutoEnableToast,
+  rlDefaultLine,
   rlOptInExplainer,
   rlScoringSwitchView,
 } from './rl-scoring-default';
@@ -131,5 +132,29 @@ describe('McpDashboard mounts the switch with the lock-aware view', () => {
     expect(src).toMatch(/invoke<string \| null>\('rl_scoring_lock'\)/);
     // v0.2.106: no tier flag gates the RL switch any more.
     expect(src).not.toMatch(/has_rl_retrieval/);
+  });
+});
+
+describe('RL scoring default text (v0.2.106, owner 2026-11-12)', () => {
+  it('says Off with no trained model bundled for the profile, On when one is', () => {
+    expect(rlDefaultLine({ profile: 'qwen3', bundled_model: false, default_on: false })).toBe(
+      'Off — no trained model bundled yet for qwen3.',
+    );
+    expect(rlDefaultLine({ profile: 'arctic', bundled_model: true, default_on: true })).toBe(
+      'On — trained model bundled for arctic.',
+    );
+  });
+
+  it('an unconfirmed or unloaded answer reads as off', () => {
+    expect(
+      rlDefaultLine({ profile: 'qwen3', bundled_model: false, default_on: false, error: 'boom' }),
+    ).toMatch(/^Off — no trained model could be confirmed for qwen3/);
+    expect(rlDefaultLine(null)).toMatch(/^Off/);
+    expect(rlDefaultLine(undefined)).toMatch(/^Off/);
+  });
+
+  it('the explainer states the bundled-weights default and that the user choice wins', () => {
+    expect(RL_OPT_IN_EXPLAINER).toMatch(/until a trained model is bundled/);
+    expect(RL_OPT_IN_EXPLAINER).toMatch(/your own choice always wins/);
   });
 });

@@ -2,9 +2,11 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.106 — RL scoring is OPT-IN per project (owner rulings 2026-11-12).
 
-The scoring lock (``vco_lib/rl_scoring_lock.toml``) is lifted, but RL scoring
-stays OFF by default: only a project whose toggle is positively ON calls the
-container. Every reader of "may I call the container?" is pinned here:
+The scoring lock (``vco_lib/rl_scoring_lock.toml``) is lifted; only a project
+whose toggle is positively ON calls the container. The hub serves the
+effective toggle (the user's choice, else the bundled-weights default —
+``vco_lib/rl_scoring_default.py``, off while no trained model ships; pinned in
+``tests/test_v02106_rl_scoring_default.py`` and the hub/launcher Rust tests). Every reader of "may I call the container?" is pinned here:
 
 * ``search_pipeline._resolve_rl_enabled`` — falls CLOSED when the toggle
   cannot be read (it fell open before v0.2.106);

@@ -89,8 +89,8 @@ pub const RL_PORT_RANGE_HI: u16 = 11900;
 /// Default canonical endpoint. Manifest's
 /// `install.container.rotate_weights_endpoint` overrides this.
 ///
-/// v0.2.106: the function is retired with the paid RL backend (no longer in
-/// `launcher/supabase/functions/`). Its two callers never reach it for the
+/// v0.2.106: the function stays deployed as paid-module infrastructure
+/// (owner 2026-11-12). Its two callers never reach it for the
 /// bundled RL reranker: the daily poll stands down for bundled modules
 /// (`spawn_daily_weights_poll`), and the weights-available probe
 /// (`module_default_weights`) only runs for a manifest that carries a

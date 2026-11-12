@@ -4,8 +4,7 @@
 // about. Anonymous-callable (no per-user identity required); the response
 // shape is non-sensitive ("here is what exists, here is how you'd pull it if
 // you were authorised"). The actual pull-token + signed-URL flows stay behind
-// a paid module's own credential-issuing function + /validate-tier (the RL
-// reranker's /rl-artifact-url was retired in v0.2.106) — this function ONLY
+// the existing /rl-artifact-url + /validate-tier surfaces — this function ONLY
 // answers "does this module exist; if so, what's its current catalog metadata".
 //
 // v0.2.33 design rationale: the launcher GUI must NEVER depend on parsing a

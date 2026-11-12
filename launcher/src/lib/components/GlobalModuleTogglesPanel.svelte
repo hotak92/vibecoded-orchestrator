@@ -61,6 +61,9 @@
     globalTriChoiceToValue,
     type GlobalTriChoice,
   } from '$lib/module-enable';
+  // v0.2.106 (owner 2026-11-12): the RL reranker's default follows the
+  // bundled weights — served by `rl_scoring_default`, worded here.
+  import { rlDefaultLine, type RlScoringDefault } from '$lib/rl-scoring-default';
 
   // Hardcoded list of global-scope modules whose toggle appears in this
   // panel. Add new module_ids here as more `install.scope = "global"`
@@ -77,7 +80,8 @@
       label: 'RL Reranker',
       description:
         'Reinforcement-learning-based reranking of KG retrieval results. ' +
-        'Off by default. Per-project overrides take precedence. Training-event ' +
+        'Off by default until a trained model is bundled for the active embedding ' +
+        'profile. Per-project overrides take precedence. Training-event ' +
         'collection is separate and always runs.',
       autoEnableEventThreshold: 500,
     },
@@ -85,7 +89,7 @@
 
   type ModuleState = {
     /** null = no global row written (the module's system default applies:
-     *  on, except the RL reranker, which is off). */
+     *  on, except the RL reranker, whose default follows the bundled weights). */
     globalEnabled: boolean | null;
     /** Current rl_events row count (only meaningful for vct-rl-reranker). */
     rlEventsCount: number | null;
@@ -97,6 +101,9 @@
      *  the module's effect is locked off, null when not, undefined until read
      *  (the controls stay disabled until it is known). */
     lockReason: string | null | undefined;
+    /** v0.2.106: the RL reranker's served "nothing chosen" default; null for
+     *  other modules or a failed read (worded as off), undefined until read. */
+    rlDefault: RlScoringDefault | null | undefined;
   };
 
   let states = $state<Record<string, ModuleState>>({});
@@ -110,7 +117,18 @@
       pending: false,
       error: null,
       lockReason: undefined,
+      rlDefault: undefined,
     };
+  }
+
+  /** Only the RL reranker has a bundled-weights default. */
+  function readRlDefault(moduleId: string): Promise<RlScoringDefault | null> {
+    return moduleId === 'vct-rl-reranker'
+      ? invoke<RlScoringDefault>('rl_scoring_default').catch((e) => {
+          console.warn('[GlobalModuleTogglesPanel] rl_scoring_default read failed:', e);
+          return null;
+        })
+      : Promise.resolve(null);
   }
 
   /** Only the RL reranker carries a lock today; every other module reads
@@ -131,15 +149,17 @@
     s.error = null;
     states[moduleId] = s;
     try {
-      const [globalEnabled, rlCount, lockReason] = await Promise.all([
+      const [globalEnabled, rlCount, lockReason, rlDefault] = await Promise.all([
         invoke<boolean | null>('module_is_global_enabled', { moduleId }),
         // rl_events_count is currently global (not per-module). Surface
         // the same count for every module; future per-module event
         // counters can refine this.
         invoke<number>('rl_events_count').catch(() => null),
         readLock(moduleId),
+        readRlDefault(moduleId),
       ]);
       s.globalEnabled = globalEnabled;
+      s.rlDefault = rlDefault;
       s.rlEventsCount = rlCount;
       s.lockReason = lockReason;
     } catch (e) {
@@ -218,7 +238,10 @@
     if (s.pending) return 'loading…';
     if (s.error) return 'status unavailable';
     if (s.lockReason) return globalLockedLine(s.globalEnabled, s.lockReason);
-    return globalDefaultLine(s.globalEnabled, moduleSystemDefault(moduleId));
+    const line = globalDefaultLine(s.globalEnabled, moduleSystemDefault(moduleId, s.rlDefault));
+    return moduleId === 'vct-rl-reranker' && s.globalEnabled === null
+      ? `${line} ${rlDefaultLine(s.rlDefault)}`
+      : line;
   }
 
   /**

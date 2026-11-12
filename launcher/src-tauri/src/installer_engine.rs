@@ -1660,9 +1660,9 @@ pub(crate) use vct_launcher_core::services::container_runtime::{
 
 /// `pull_token_endpoint` (Phase 3A, v0.2.35).
 ///
-/// Wire contract (that of the paid RL reranker's `rl-artifact-url` edge
-/// function, retired in v0.2.106 — its source is no longer in
-/// `launcher/supabase/functions/`; a future paid module's gateway keeps it):
+/// Wire contract (matches `launcher/supabase/functions/rl-artifact-url`,
+/// kept deployed as paid-module infrastructure; since v0.2.106 the bundled
+/// RL reranker builds its image locally and never requests a pull token):
 ///   Request:  `{ "license_key": "<UUID-or-vct_admin_*>", "machine_id_hash": "<sha256 hex>" }`
 ///   Response: `{ "image", "tag", "registry", "pull_token", "expires_in_s", "expires_at" }`
 ///

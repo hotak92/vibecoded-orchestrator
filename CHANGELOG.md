@@ -226,6 +226,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Store lists Transcrypt and VCT Coordination, both "Coming soon".** The launcher's Store page showed nine
+  hard-coded cards (the orchestrator, "Orchestrator Pro" with RL-scored retrieval, MAO and six placeholder apps). It
+  now lists the two announced products, each marked "Coming soon" with no install, buy or activate action. The
+  catalog fetch stays: a paid module published to the L0 catalog later appears after them, and its card opens the
+  Modules page, where install and licensing live. Free and bundled modules are not store items; the RL reranker is
+  managed from its Modules tile and the project's RL panel. The list is declared once, in
+  `launcher/src/lib/store-catalog.ts`.
+- **RL scoring's default follows the bundled weights.** When neither the project nor the host-wide default has a
+  choice set, RL scoring is on only if a trained model is bundled for the active embedding profile
+  (`claude_mcp_servers/rl_reranker/weights/manifest.json` names a `current` version for it), and off otherwise. No
+  trained model ships yet, so the default is off today. The user's choice always wins, on or off. A manifest that
+  cannot be read, or a profile it does not list, counts as off. The decision lives in one place,
+  `vco_lib/rl_scoring_default.py` (`python -m vco_lib.rl_scoring_default --profile <profile>`): the hub's served
+  `rl_reranker_enabled_for_project`, the launcher's module cascade, the MCP dashboard's RL switch and the
+  boot-time "enough training events" prompt all take it from there, and the launcher's RL controls say "Off — no
+  trained model bundled yet for <profile>" or "On — trained model bundled for <profile>". `rl_doctor` reports it
+  under "scoring default". `install.py` no longer writes a host-wide "off" row for the RL reranker on a fresh
+  install, because that row would keep the default off after a trained model ships. The hub and the launcher now
+  share one Rust resolver for the active embedding profile (`vct-launcher-core/src/active_embedding.rs`) instead
+  of a copy each.
 - **RL scoring needs the project's own "on".** A project whose RL toggle cannot be read (the hub is down, or no
   project configuration was found) is now treated as off; before, it was treated as on. An older hub that does not
   send the toggle at all also counts as off. The citation of an answer is now sent to the reranker container only
@@ -311,11 +331,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The paid distribution path is retired for the RL reranker.** It no longer uses the GHCR image, the paid-catalog
   entry or the paid-module weights bucket. The launcher no longer downloads its weights after install, and the
   daily weights poll stands down for it. The manual RL image smoke workflow now builds the image from the checkout
-  instead of pulling a private image. The three edge functions of the paid backend (`rl-artifact-url`,
-  `rl-latest-version`, `rl-latest-weights`) and their `launcher/supabase/config.toml` stanzas are removed, so the
-  tag-time deploy, which deploys every directory under `launcher/supabase/functions/`, can no longer re-create them
-  after they are deleted server-side. The shared helpers they used (`_shared/config.ts`,
-  `_shared/tier_revalidation.ts`) stay for a future paid module, as `module_default_weights.rs` does.
+  instead of pulling a private image. Only the RL module's paid catalog listing is retired: the paid-module
+  infrastructure stays for future paid modules. The edge functions (`rl-artifact-url`, `rl-latest-version`,
+  `rl-latest-weights`, with their `launcher/supabase/config.toml` stanzas and shared helpers) stay in the repository
+  and stay deployed, and so does the launcher's download machinery (`module_default_weights.rs`). The bundled
+  reranker calls none of them.
 - **The RL reranker uses the orchestrator's own logger and training-target code.** It used to carry its own copies
   of `rl_client/rl_logger.py` and `vco_lib/rl_training_targets.py`, and the copy of the logger had fallen a full
   schema version behind without the drift check noticing (that check skipped whenever the module was absent). It now

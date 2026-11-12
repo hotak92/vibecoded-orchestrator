@@ -132,62 +132,17 @@ fn default_true_bool() -> bool {
 }
 
 // ─── v0.2.71 T-B-emb: active-embedding cascade (B1 bridge) ────────
-//
-// The hub resolver leg of the ONE active-embedding cascade. Kept
-// byte-identical in behaviour to the launcher's
-// `project_env_settings.rs::resolve_active_embedding_cascade` and the
-// Python `config_projection.py` writer. The hub crate depends on
-// vct-launcher-core but NOT the launcher binary crate where
-// `active_profile_for_model` lives, so the model→profile map is mirrored
-// here behind a "must match" comment (same cross-lang-mirror discipline
-// as the shared-KG const + the three model→profile maps).
-
-/// TEXT model id → ACTIVE_EMBEDDING profile.
-///
-/// MUST match (drift re-introduces v0.2.68 Defect D):
-///   * `project_env_settings.rs::active_profile_for_model`
-///   * `vco_lib/launcher_db_reader.py::_TEXT_MODEL_ACTIVE_EMBEDDING`
-///   * `install.py::_TEXT_MODEL_ACTIVE_EMBEDDING`
-fn hub_active_profile_for_model(model_id: &str) -> Option<&'static str> {
-    match model_id.trim() {
-        "qwen3-embedding:0.6b" => Some("qwen3"),
-        "snowflake-arctic-embed2:latest" => Some("arctic"),
-        "openai-text-embedding-3-small" => Some("openai"),
-        "text-embedding-3-small" => Some("openai"),
-        _ => None,
-    }
-}
-
-/// Machine-global active-embedding profile from `app_state`:
-/// `embedding.active_profile` → `default_text_embedding` (mapped) → None.
-/// Mirrors `project_env_settings.rs::global_active_embedding`.
-fn hub_global_active_embedding(db: &Db) -> Option<String> {
-    db.app_state_get("embedding.active_profile")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            db.app_state_get("default_text_embedding")
-                .ok()
-                .flatten()
-                .and_then(|model_id| hub_active_profile_for_model(&model_id))
-                .map(|p| p.to_string())
-        })
-}
 
 /// Resolve ACTIVE_EMBEDDING — ONE global profile for every project
-/// (v0.2.102 W6-J; owner ruling 2026-10-11).
-///
-/// Order (must match the launcher `project_env_settings.rs::
-/// resolve_active_embedding_cascade` + the Python `config_projection.py`):
-///   1. machine-global default (`hub_global_active_embedding`);
-///   2. `"qwen3"`.
+/// (v0.2.102 W6-J; owner ruling 2026-10-11). The resolution lives in
+/// `vct_launcher_core::active_embedding` (v0.2.106: moved there from a copy
+/// here, shared with the launcher and the RL scoring default).
 ///
 /// The per-project `module_settings/orchestrator-core/active_embedding` row
 /// and its `active_embedding_source` marker (the removed Settings-tab picker)
 /// are RETIRED: left in launcher.db, never read here.
 fn resolve_active_embedding_for_hub(db: &Db) -> String {
-    hub_global_active_embedding(db).unwrap_or_else(|| "qwen3".to_string())
+    vct_launcher_core::active_embedding::resolve_active_embedding(db)
 }
 
 // ─── Router ──────────────────────────────────────────────────────
@@ -913,13 +868,12 @@ async fn project_config(
     //   1. Per-project row in `module_settings` for `(project_id,
     //      vct-rl-reranker, enabled_for_project)` — explicit override.
     //   2. Global row (`project_id IS NULL`) for `(vct-rl-reranker,
-    //      enabled_for_project)` — host-wide default landed by V52-AD.
-    //      install.py seeds this row to `false` on fresh installs so
-    //      RL reranking is off until enough training data accumulates.
-    //   3. System default: `false` for the RL reranker (v0.2.100, owner
-    //      2026-10-01: RL scoring stays inactive until the model is trained;
-    //      `Db::module_enable_system_default`), `true` (fail-open) for any
-    //      other module.
+    //      enabled_for_project)` — the user's host-wide default.
+    //   3. System default (v0.2.106, owner ruling 2026-11-12): ON only when
+    //      a trained model is bundled for the active embedding profile
+    //      (`Db::rl_scoring_default`, the one decision in
+    //      `vco_lib/rl_scoring_default.py`), OFF otherwise — none ships
+    //      today. An explicit row in tier 1 or 2 always wins.
     //
     // The MCP's scoring gate (`search_pipeline._resolve_rl_enabled`)
     // consumes this field via `ProjectConfig.rl_reranker_enabled_for_project`
@@ -932,10 +886,12 @@ async fn project_config(
     // whatever the rows say (`Db::rl_scoring_enabled_for_project`); the rows
     // are untouched and apply again once unlocked. Event collection
     // (`POST /api/v1/rl/events`) reads neither.
+    // A DB error cannot confirm the user's choice: OFF (v0.2.106; it fell
+    // open before RL scoring became opt-in).
     let rl_reranker_enabled_for_project = h
         .0
         .rl_scoring_enabled_for_project(&project.id)
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     // V52-AA (v0.2.52) — RL Reranker container port.
     // Reads `module_ports(project_id, "vct-rl-reranker", port)`, the
@@ -3725,18 +3681,52 @@ kg_tier_full = 0.8
         );
     }
 
+    /// v0.2.106 (owner ruling 2026-11-12): with nothing chosen, the SERVED
+    /// field follows the bundled weights for the active profile — ON with a
+    /// trained model bundled, OFF without; the user's explicit OFF still
+    /// wins. (The bundled answer is injected per thread; the real decision
+    /// is `vco_lib/rl_scoring_default.py`.)
+    #[tokio::test]
+    async fn config_serves_the_bundled_weights_default_when_nothing_is_chosen() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-bundled", "myproject");
+        let get = || async {
+            let body: serde_json::Value =
+                reqwest::get(format!("{}/projects/p-rl-bundled/config", base))
+                    .await
+                    .expect("hub reachable")
+                    .json()
+                    .await
+                    .expect("json body");
+            body.get("rl_reranker_enabled_for_project").and_then(|v| v.as_bool())
+        };
+        {
+            let _g = vct_launcher_core::rl_scoring_default::override_bundled_model_for_thread(true);
+            assert_eq!(get().await, Some(true), "trained model bundled => default on");
+        }
+        {
+            let _g = vct_launcher_core::rl_scoring_default::override_bundled_model_for_thread(false);
+            assert_eq!(get().await, Some(false), "no trained model => default off");
+        }
+        h.0.module_set_enabled_for_project("p-rl-bundled", "vct-rl-reranker", false)
+            .unwrap();
+        let _g = vct_launcher_core::rl_scoring_default::override_bundled_model_for_thread(true);
+        assert_eq!(get().await, Some(false), "explicit off beats the bundled default");
+    }
+
     /// v0.2.52 V52-AD — global-default cascade. When NO per-project row
     /// exists for `(project, vct-rl-reranker, enabled_for_project)`, the
     /// resolver must fall back to the global row (`project_id IS NULL`).
-    /// install.py seeds this to `false` on fresh installs so RL
-    /// reranking is off by default until training data accumulates.
     #[tokio::test]
     async fn config_falls_back_to_global_rl_reranker_default() {
         let (base, h) = spawn_config_api_hub().await;
         seed_full_project(&h, "p-rl-global", "myproject");
 
         // Step 1: no per-project row, no global row → the RL reranker's
-        // system default, OFF (v0.2.100; other modules stay fail-open).
+        // system default: the bundled-weights default, OFF while no trained
+        // model ships (v0.2.106; other modules stay fail-open).
+        let _no_model =
+            vct_launcher_core::rl_scoring_default::override_bundled_model_for_thread(false);
         let resp = reqwest::get(format!("{}/projects/p-rl-global/config", base))
             .await
             .expect("hub reachable");

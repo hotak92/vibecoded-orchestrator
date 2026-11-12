@@ -2342,8 +2342,8 @@ pub fn run() {
             // WeightsUpdatePrompt component. Soft-fail throughout —
             // never blocks setup, never crashes the launcher.
             // v0.2.106: the poll stands down while the RL reranker is a
-            // bundled module (its endpoint is retired with the paid RL
-            // backend); see `module_service::spawn_daily_weights_poll`.
+            // bundled module (its weights ship in its image); see
+            // `module_service::spawn_daily_weights_poll`.
             //
             // Step 24 Phase 2 (commit b) relocates the resume + poller
             // implementations into `vct-hub::module_supervisor`; the
@@ -3296,6 +3296,7 @@ pub fn run() {
             commands::module_enabled::rl_events_count,
             // v0.2.100 W5R-02: the RL scoring lock every RL scoring control renders.
             commands::module_enabled::rl_scoring_lock,
+            commands::module_enabled::rl_scoring_default,
             // v0.2.102 (owner decision 2026-10-08): `is_project_module_active`
             // was REMOVED from here — after the Diagrams tab went it had zero
             // callers (the invoke census recorded it as an open finding). The

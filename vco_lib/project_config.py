@@ -567,12 +567,13 @@ class ProjectConfig:
     #: ``module_settings(project_id, "vct-rl-reranker", "enabled_for_project")``
     #: and exposes the resolved bool here.
     #:
-    #: v0.2.106 (owner ruling 2026-11-12): RL scoring is OPT-IN per
-    #: project, so the default is ``False`` — the hub's own system default
-    #: for this module is off (``Db::module_effective_enabled``), and an
-    #: absent field (a hub that predates it) must not turn on a feature the
-    #: user never chose. (Before v0.2.106 the default was a fail-open
-    #: ``True``.)
+    #: v0.2.106 (owner rulings 2026-11-12): the hub serves the EFFECTIVE
+    #: value — the user's choice, else the bundled-weights default (on only
+    #: with a trained model bundled for the active profile:
+    #: ``vco_lib/rl_scoring_default.py``). This field's own default is
+    #: ``False``: an absent field (a hub that predates it) cannot confirm the
+    #: user's choice, which wins over the default, so it must not turn on a
+    #: feature. (Before v0.2.106 the default was a fail-open ``True``.)
     #:
     #: Consumer: ``claude_mcp_servers/rl_client/search_pipeline.py::
     #: _resolve_rl_enabled`` (the rerank AND the answer monitor's

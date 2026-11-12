@@ -7,8 +7,6 @@
 // telemetry, rebind-admin-token, validate-tier) with small per-function
 // variations (allowed methods, allowed headers, cache hints, preflight
 // max-age). Any security fix to the response path needed 7 applications.
-// (The three rl-* functions were retired with the paid RL backend in
-// v0.2.106.)
 //
 // Design: parametric rather than uniform. The per-function differences
 // are INTENTIONAL wire contracts (module-catalog sends a Cache-Control

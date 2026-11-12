@@ -313,7 +313,7 @@ Full ingestion pipeline: (1) chunk content to 800–2000 tokens, (2) store chunk
 
 #### Per-project online learning, opt-in (v0.2.106)
 
-RL scoring is **off by default** and turned on **per project** (launcher → Modules → RL Reranker, or the host-wide default on the MCP dashboard). Off means no call to the container at all: no rerank and no citation event sent to it; the search order is unchanged. When the project's toggle cannot be read (hub down, no project config), it is treated as off. No global weights ship (owner ruling 2026-11-12).
+RL scoring's default **follows the bundled weights** (owner ruling 2026-11-12): with nothing chosen it is on only when a trained model is bundled for the active embedding profile, and off otherwise; none ships yet, so it is **off by default** today. The user's choice always wins, on or off: **per project** (launcher → Modules → RL Reranker) or the host-wide default on the MCP dashboard. The one decision is `vco_lib/rl_scoring_default.py`; an unreadable bundled-weights manifest or an unknown profile counts as off. Off means no call to the container at all: no rerank and no citation event sent to it; the search order is unchanged. When the project's toggle cannot be read (hub down, no project config), it is treated as off. No global weights ship (owner ruling 2026-11-12).
 
 When it is on, each project trains its **own** model online from its own citation events (`claude_mcp_servers/rl_reranker/online_learning.py`):
 

@@ -21,9 +21,11 @@ owns:
   1. RL scoring lock (``vco_lib/rl_scoring_lock.toml``) — while locked,
      the rerank-RPC is skipped but telemetry is still emitted.
   2. Per-project enable toggle (hub-resolved
-     ``rl_reranker_enabled_for_project``) — OPT-IN since v0.2.106 (owner
-     2026-11-12): off unless the user turned it on for the project, and
-     off when it cannot be read. (There is no licence gate: the reranker
+     ``rl_reranker_enabled_for_project``): the user's choice (project, else
+     host-wide); with none, the bundled-weights default — on only with a
+     trained model bundled for the active profile, none ships today
+     (``vco_lib/rl_scoring_default.py``, owner 2026-11-12). Off when it
+     cannot be read. (There is no licence gate: the reranker
      ships with the orchestrator since v0.2.106.)
   3. RL rerank RPC via the cached ``RLClient`` (one client per
      (active_embedding, project_id) — keyed so the
@@ -589,12 +591,13 @@ def _resolve_rl_enabled() -> bool:
     ``ProjectConfig.rl_reranker_enabled_for_project``, which the user turns
     on per project in the launcher's Modules panel.
 
-    v0.2.106 (owner ruling 2026-11-12): RL scoring is OPT-IN per project
-    ("for now opt-in"): the toggle defaults off (no per-project row and no
-    host-wide row resolve to off, ``Db::module_effective_enabled``), and a
-    toggle this process cannot read — hub down, no project config, a probe
-    error — is OFF too: an opt-in feature runs only when the user's choice is
-    positively confirmed. (Before v0.2.106 that branch fell open.) Off means
+    v0.2.106 (owner rulings 2026-11-12): the hub serves the effective value —
+    the project's own choice, else the host-wide one, else the bundled-weights
+    default (on only with a trained model bundled for the active embedding
+    profile; none ships today, so off: ``vco_lib/rl_scoring_default.py``,
+    ``Db::module_effective_enabled``). A toggle this process cannot read —
+    hub down, no project config, a probe error — is OFF: the user's choice,
+    which wins over any default, cannot be confirmed. (Before v0.2.106 that branch fell open.) Off means
     no call to the container at all: no rerank, no ``/rl_update``. The licence
     gate that sat between lock and toggle is gone (owner 2026-11-11, "the RL
     reranker is no more paid").

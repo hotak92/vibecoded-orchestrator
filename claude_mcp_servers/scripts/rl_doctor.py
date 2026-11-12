@@ -111,9 +111,11 @@ def _probe_scoring_lock() -> Dict[str, Any]:
 def _probe_per_project_toggle() -> Dict[str, Any]:
     """Per-project enable toggle (hub-resolved). Soft-fail → unknown.
 
-    v0.2.106 (owner 2026-11-12): RL scoring is OPT-IN per project — only an
-    explicit ``True`` is on, exactly as ``search_pipeline._resolve_rl_enabled``
-    reads it; an unknown toggle means the search path keeps scoring off.
+    The hub serves the EFFECTIVE value: the project's own choice, else the
+    host-wide one, else the bundled-weights default (v0.2.106, owner
+    2026-11-12; ``vco_lib.rl_scoring_default``). Only ``True`` is on, exactly
+    as ``search_pipeline._resolve_rl_enabled`` reads it; an unknown toggle
+    means the search path keeps scoring off.
     """
     try:
         from claude_mcp_servers.weaviate_mcp.server import _try_resolve_project_config
@@ -130,13 +132,51 @@ def _probe_per_project_toggle() -> Dict[str, Any]:
             "detail": (
                 "reranker turned on for this project."
                 if enabled
-                else "reranker off for this project (opt-in: turn it on in the launcher's "
-                     "Modules panel)."
+                else "reranker off for this project (turn it on in the launcher's "
+                     "Modules panel; with nothing chosen it follows the bundled-model "
+                     "default)."
             ),
         }
     except Exception as exc:  # noqa: BLE001
         return {"status": "unknown", "enabled": None, "project_id": None,
                 "detail": f"toggle probe raised: {exc}"}
+
+
+def _resolve_active_tag() -> str:
+    """The active embedding tag: ``ACTIVE_EMBEDDING`` env → the server module
+    constant (hub-resolved) → ``"qwen3"``. Never raises."""
+    active = os.environ.get("ACTIVE_EMBEDDING", "") or ""
+    if not active:
+        try:
+            from claude_mcp_servers.weaviate_mcp import server as _srv
+
+            active = getattr(_srv, "ACTIVE_EMBEDDING", "") or ""
+        except Exception:  # noqa: BLE001
+            active = ""
+    return active or "qwen3"
+
+
+def _probe_scoring_default() -> Dict[str, Any]:
+    """What RL scoring defaults to when nothing is chosen (v0.2.106, owner
+    2026-11-12): ON only with a trained model bundled for the active profile.
+    The one decision is ``vco_lib.rl_scoring_default``; the hub serves the
+    effective value, this only reports the cause. Soft-fail → off."""
+    profile = _resolve_active_tag()
+    try:
+        from vco_lib.rl_scoring_default import bundled_model_ships
+
+        got = bundled_model_ships(profile)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unknown", "default_on": False, "profile": profile,
+                "detail": f"default probe raised: {exc} (treated as off)."}
+    if got.default_on:
+        detail = f"on — trained model bundled for {profile}."
+    elif got.error:
+        detail = f"off — no trained model could be confirmed for {profile} ({got.error})."
+    else:
+        detail = f"off — no trained model bundled yet for {profile}."
+    return {"status": "on" if got.default_on else "off", "default_on": got.default_on,
+            "profile": profile, "detail": detail}
 
 
 def _resolve_active_text_embedding() -> "tuple[str, int]":
@@ -156,15 +196,7 @@ def _resolve_active_text_embedding() -> "tuple[str, int]":
 
     Every arm soft-fails to the next; never raises.
     """
-    active = os.environ.get("ACTIVE_EMBEDDING", "") or ""
-    if not active:
-        try:
-            from claude_mcp_servers.weaviate_mcp import server as _srv
-
-            active = getattr(_srv, "ACTIVE_EMBEDDING", "") or ""
-        except Exception:  # noqa: BLE001
-            active = ""
-    active = active or "qwen3"
+    active = _resolve_active_tag()
 
     text_dim = 0
     try:
@@ -565,6 +597,7 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
     """Run every probe and assemble the report dict. Pure aggregation."""
     lock = _probe_scoring_lock()
     toggle = _probe_per_project_toggle()
+    default = _probe_scoring_default()
     container = _probe_container()
     fallback = _probe_fallback_counter(project_root)
     telemetry = _probe_telemetry_hub()
@@ -601,6 +634,8 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
         "scoring": scoring,
         "scoring_lock": lock,
         "per_project_toggle": toggle,
+        # v0.2.106: what an unset toggle resolves to, and why.
+        "scoring_default": default,
         "container": container,
         # v0.2.106: the project's online learning + serving gate.
         "project_online": online,
@@ -629,6 +664,7 @@ def format_human(report: Dict[str, Any]) -> str:
     _sec("scoring state", report.get("scoring", {"status": "unknown", "detail": ""}))
     _sec("scoring lock", report.get("scoring_lock", {"status": "unknown", "detail": ""}))
     _sec("per-project toggle", report["per_project_toggle"])
+    _sec("scoring default", report.get("scoring_default", {"status": "unknown", "detail": ""}))
     _sec("container / negotiation", report["container"])
     # .get: tolerate pre-v0.2.106 report dicts.
     _sec("per-project online learning", report.get(

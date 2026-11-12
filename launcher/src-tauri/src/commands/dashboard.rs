@@ -191,15 +191,23 @@ pub fn get_feature_flags(db: State<'_, Db>) -> FeatureFlags {
 
 /// The RL-scoring global default: the host-wide `enabled_for_project` row of
 /// `vct-rl-reranker`, i.e. exactly what a project with no explicit row
-/// inherits and what the hub resolver serves to the MCP. No row reads as OFF
-/// (`module_enable_system_default`). The licence gate is applied separately
-/// and is unchanged. NOT a gate on event collection.
+/// inherits and what the hub resolver serves to the MCP. No row reads as the
+/// system default, which follows the bundled weights (v0.2.106, owner
+/// 2026-11-12: ON only with a trained model bundled for the active profile —
+/// `Db::rl_scoring_default`). NOT a gate on event collection.
 pub(crate) fn rl_scoring_global_default(db: &Db) -> bool {
+    rl_scoring_global_default_with(db, || db.rl_scoring_default().default_on)
+}
+
+/// [`rl_scoring_global_default`] with the bundled-weights default injected.
+pub(crate) fn rl_scoring_global_default_with(db: &Db, rl_default_on: impl FnOnce() -> bool) -> bool {
     use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
-    db.module_global_enabled(RL_RERANKER_MODULE_ID)
-        .ok()
-        .flatten()
-        .unwrap_or(false)
+    match db.module_global_enabled(RL_RERANKER_MODULE_ID) {
+        Ok(Some(on)) => on,
+        Ok(None) => rl_default_on(),
+        // A DB error cannot confirm a choice: OFF.
+        Err(_) => false,
+    }
 }
 
 /// Overlay the DB-backed RL-scoring default onto a loaded config. The
@@ -1915,9 +1923,24 @@ mod rl_scoring_default_tests {
         (db, "proj-rl".to_string())
     }
 
+    /// v0.2.106 (owner 2026-11-12): no host-wide row reads as the
+    /// bundled-weights default — on with a trained model, off without.
+    #[test]
+    fn no_row_follows_the_bundled_weights_default() {
+        let (db, _pid) = db_with_project();
+        assert!(rl_scoring_global_default_with(&db, || true));
+        assert!(!rl_scoring_global_default_with(&db, || false));
+        set_rl_scoring_global_default(&db, false).unwrap();
+        assert!(!rl_scoring_global_default_with(&db, || true), "a host-wide off beats bundled");
+        set_rl_scoring_global_default(&db, true).unwrap();
+        assert!(rl_scoring_global_default_with(&db, || false), "a host-wide on without weights");
+    }
+
     #[test]
     fn default_is_off_with_no_row() {
         let (db, pid) = db_with_project();
+        let _no_model =
+            vct_launcher_core::rl_scoring_default::override_bundled_model_for_thread(false);
         assert!(!rl_scoring_global_default(&db));
         let cfg = with_rl_scoring_default(&db, OrchestratorConfig::default());
         assert!(!cfg.rl_retrieval_enabled);

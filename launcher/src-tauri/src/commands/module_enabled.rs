@@ -242,6 +242,24 @@ pub fn rl_scoring_lock() -> Option<String> {
     vct_launcher_core::rl_scoring_lock::rl_scoring_lock().map(str::to_string)
 }
 
+/// v0.2.106 (owner 2026-11-12): what RL scoring resolves to when nothing is
+/// chosen — the active embedding profile and whether a trained model is
+/// bundled for it (ON only then). One decision, `vco_lib/rl_scoring_default.py`
+/// (`Db::rl_scoring_default`); the GUI renders its default text from this.
+#[command]
+pub async fn rl_scoring_default(
+    db: State<'_, Db>,
+) -> Result<vct_launcher_core::rl_scoring_default::RlScoringDefault, String> {
+    // The profile read is a quick DB read; the decision may spawn Python
+    // once per profile (then cached), so it runs off the async runtime.
+    let profile = vct_launcher_core::active_embedding::resolve_active_embedding(&db);
+    tokio::task::spawn_blocking(move || {
+        vct_launcher_core::rl_scoring_default::rl_scoring_default_for(&profile)
+    })
+    .await
+    .map_err(|e| format!("rl_scoring_default: {e}"))
+}
+
 /// Read the effective enable flag for a (project, module) pair using
 /// the v0.2.52 V52-AD cascade (per-project → global → fail-open true).
 /// This is the value the hub resolver emits as
@@ -563,10 +581,10 @@ pub fn probe_rl_auto_enable_at_boot(
         return;
     }
 
-    // Step 2: global row check. If the user has explicitly enabled
-    // (Some(true)) or not configured at all (None) → no prompt
-    // needed. Prompt only fires when the row says `false` (the
-    // install-time default that the user hasn't overridden).
+    // Step 2: the host-wide row. The prompt is for a host where RL scoring
+    // is OFF for projects that have not chosen: a host-wide `false`, or no
+    // host-wide row while the default is off (v0.2.106: the default follows
+    // the bundled weights, `Db::rl_scoring_default`).
     let global = match db.module_global_enabled("vct-rl-reranker") {
         Ok(g) => g,
         Err(e) => {
@@ -585,53 +603,48 @@ pub fn probe_rl_auto_enable_at_boot(
         global,
         RL_AUTO_ENABLE_EVENT_THRESHOLD,
         vct_launcher_core::rl_scoring_lock::rl_scoring_lock(),
+        || db.rl_scoring_default().default_on,
     ) {
         return;
     }
-    match global {
-        Some(false) => {
-            // Eligible: install.py seeded `false` and the user
-            // hasn't flipped it. Emit the prompt event.
-            let payload = RlAutoEnableAvailablePayload {
-                event_count: count,
-                threshold: RL_AUTO_ENABLE_EVENT_THRESHOLD,
-                module_id: "vct-rl-reranker".to_string(),
-            };
-            if let Err(e) = app.emit(RL_AUTO_ENABLE_EVENT, payload) {
-                tracing::warn!(
-                    "[rl-auto-enable] emit({}) failed: {}",
-                    RL_AUTO_ENABLE_EVENT, e
-                );
-            } else {
-                tracing::info!(
-                    "[rl-auto-enable] threshold met ({} >= {}) and \
-                     global default still disabled — prompting user.",
-                    count, RL_AUTO_ENABLE_EVENT_THRESHOLD
-                );
-            }
-        }
-        Some(true) => {
-            // User already enabled — nothing to do.
-        }
-        None => {
-            // No row written yet (e.g. install.py never ran or DB
-            // was created before V52-AD). Treat as fail-open per
-            // the cascade contract: the user is implicitly opted-in.
-            // Skip the prompt.
-        }
+    let payload = RlAutoEnableAvailablePayload {
+        event_count: count,
+        threshold: RL_AUTO_ENABLE_EVENT_THRESHOLD,
+        module_id: "vct-rl-reranker".to_string(),
+    };
+    if let Err(e) = app.emit(RL_AUTO_ENABLE_EVENT, payload) {
+        tracing::warn!(
+            "[rl-auto-enable] emit({}) failed: {}",
+            RL_AUTO_ENABLE_EVENT, e
+        );
+    } else {
+        tracing::info!(
+            "[rl-auto-enable] threshold met ({} >= {}) and RL scoring is \
+             off for projects that have not chosen — prompting user.",
+            count, RL_AUTO_ENABLE_EVENT_THRESHOLD
+        );
     }
 }
 
 /// The boot probe's decision, pure so every branch is unit-testable: prompt
-/// only at/over the threshold, only while the host-wide row is the seeded
-/// `false`, and never while RL scoring is locked.
+/// only at/over the threshold, never while RL scoring is locked, and only
+/// while projects that have not chosen get RL scoring OFF — a host-wide
+/// `false`, or no host-wide row with the bundled-weights default off
+/// (`rl_default_on`, asked for only in that case).
 pub fn should_emit_rl_auto_enable(
     count: i64,
     global: Option<bool>,
     threshold: i64,
     lock: Option<&str>,
+    rl_default_on: impl FnOnce() -> bool,
 ) -> bool {
-    lock.is_none() && count >= threshold && matches!(global, Some(false))
+    if lock.is_some() || count < threshold {
+        return false;
+    }
+    match global {
+        Some(on) => !on,
+        None => !rl_default_on(),
+    }
 }
 
 // ─── Seeding helpers (called from project_create / install / uninstall) ──
@@ -1173,15 +1186,15 @@ mod tests {
 
     /// The real decision fn with the lock lifted (the pre-lock matrix).
     fn _should_emit_rl_auto_enable(count: i64, global: Option<bool>, threshold: i64) -> bool {
-        should_emit_rl_auto_enable(count, global, threshold, None)
+        should_emit_rl_auto_enable(count, global, threshold, None, || false)
     }
 
     /// v0.2.100 W5R-02: while RL scoring is locked the prompt never fires,
     /// even in the one cell that would otherwise prompt.
     #[test]
     fn rl_auto_enable_never_prompts_while_locked() {
-        assert!(should_emit_rl_auto_enable(10_000, Some(false), 500, None));
-        assert!(!should_emit_rl_auto_enable(10_000, Some(false), 500, Some("locked")));
+        assert!(should_emit_rl_auto_enable(10_000, Some(false), 500, None, || false));
+        assert!(!should_emit_rl_auto_enable(10_000, Some(false), 500, Some("locked"), || false));
         // v0.2.106: the shipped table is unlocked (owner 2026-11-12, opt-in).
         assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_none(), "ships unlocked");
     }
@@ -1244,8 +1257,12 @@ mod tests {
         assert!(!_should_emit_rl_auto_enable(500, Some(true), 500));
         assert!(!_should_emit_rl_auto_enable(10_000, Some(true), 500));
 
-        // At threshold + no row → fail-open territory; skip.
-        assert!(!_should_emit_rl_auto_enable(500, None, 500));
+        // At threshold + no row: the bundled-weights default decides
+        // (v0.2.106) — off (no model bundled) → prompt; on → nothing to ask.
+        assert!(_should_emit_rl_auto_enable(500, None, 500));
+        assert!(!should_emit_rl_auto_enable(500, None, 500, None, || true));
+        // A host-wide row never asks for the default.
+        assert!(should_emit_rl_auto_enable(500, Some(false), 500, None, || panic!("not asked")));
     }
 
     /// clear_enabled_rows_for_uninstalled_module deletes only the

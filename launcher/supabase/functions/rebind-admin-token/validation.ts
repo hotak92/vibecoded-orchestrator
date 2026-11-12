@@ -4,7 +4,7 @@
 //
 // Split from index.ts so they can be exercised with `deno test` against
 // pure inputs (no Deno.serve, no Deno.env, no network). Same harness
-// style as the other functions' validation.ts files.
+// style as rl-artifact-url/validation.ts.
 
 /** Vault admin token regex — same shape as validate-tier accepts. */
 export const VAULT_ADMIN_TOKEN_RE = /^vct_admin_[A-Za-z0-9_-]+$/;
@@ -28,7 +28,7 @@ export type ValidationError =
 /**
  * Accept a candidate `vct_admin_*` token.
  *
- * Stricter than a license-or-admin body check, because this endpoint
+ * Stricter than the rl-artifact-url shape check because this endpoint
  * is exclusively for the Vault-admin path — LS UUIDs are not valid
  * inputs (LS license keys can't be machine-rebound through here; their
  * activation/deactivation lives in the LS dashboard at
