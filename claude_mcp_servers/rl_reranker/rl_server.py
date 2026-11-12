@@ -1050,6 +1050,18 @@ class _seeded_init:
             self._fork = None
 
 
+
+def _internal_error(public: str, log_msg: str, *log_args: Any) -> "web.Response":
+    """A 500 whose body never carries exception text (CodeQL py/stack-trace-
+    exposure class): the full traceback is logged under an error id, and the
+    client gets ``public`` + that id. Call from inside an ``except`` block."""
+    error_id = uuid.uuid4().hex[:12]
+    logger.exception("[error %s] " + log_msg, error_id, *log_args)
+    return web.json_response(
+        {"ok": False, "error": f"{public} (error id {error_id}; see the reranker log)"},
+        status=500,
+    )
+
 class RLServer:
     """Thin aiohttp wrapper around RetrievalRL for cross-process access."""
 
@@ -2597,11 +2609,8 @@ class RLServer:
                 device=self._rl_device_spec,
                 embedding_source=self._active_emb_source,  # R4 cross-source guard
             )
-        except Exception as exc:
-            logger.exception("rotate_weights: load failed for %s", weights)
-            return web.json_response(
-                {"ok": False, "error": f"load failed: {exc}"}, status=500
-            )
+        except Exception:
+            return _internal_error("load failed", "rotate_weights: load failed for %s", weights)
 
         # v0.2.10 — route swap to the per-project head so we mutate
         # the right model + state_path. Lock held for atomicity vs
@@ -2735,11 +2744,8 @@ class RLServer:
         try:
             project_path.parent.mkdir(parents=True, exist_ok=True)
             atomic_copy_file(global_path, project_path)
-        except Exception as exc:
-            logger.exception("reset: copy %s -> %s failed", global_path, project_path)
-            return web.json_response(
-                {"ok": False, "error": f"copy failed: {exc}"}, status=500
-            )
+        except Exception:
+            return _internal_error("copy failed", "reset: copy %s -> %s failed", global_path, project_path)
 
         # Reload the in-process model so subsequent /cache_nodes calls
         # use the fresh fork. We don't bother holding the old reference;
@@ -2754,11 +2760,8 @@ class RLServer:
                 device=self._rl_device_spec,
                 embedding_source=self._active_emb_source,  # R4 cross-source guard
             )
-        except Exception as exc:
-            logger.exception("reset: reload failed after copy")
-            return web.json_response(
-                {"ok": False, "error": f"reload failed: {exc}"}, status=500
-            )
+        except Exception:
+            return _internal_error("reload failed", "reset: reload failed after copy")
 
         # v0.2.10 — swap the new model into the routed head atomically.
         async with self._routing_lock:

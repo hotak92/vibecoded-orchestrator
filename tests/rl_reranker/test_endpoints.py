@@ -991,3 +991,31 @@ class TestRequestSuppliedPathsContained:
             assert srv._state_path == ckpt
 
         _run_async(_with_client(srv, _body))
+
+
+class TestInternalErrorsHideExceptionText:
+    """v0.2.106 (CodeQL py/stack-trace-exposure class): a failed load answers
+    500 with a generic message and an error id; the exception text (paths,
+    internals) goes only to the log."""
+
+    def test_rotate_load_failure_body_carries_no_exception_text(
+        self, tmp_path, layout_paths, monkeypatch
+    ):
+        srv = _make_server(tmp_path, layout_paths, monkeypatch)
+        ckpt = layout_paths["state"] / "rl_model_arctic_v9.pt"
+        ckpt.write_bytes(b"not a checkpoint")
+        secret = "SECRET-INTERNAL-PATH-/root/x"
+
+        def _boom(*_a, **_k):
+            raise RuntimeError(secret)
+
+        monkeypatch.setattr(rl_server_mod.RLModel, "load_or_create", staticmethod(_boom))
+
+        async def _body(client):
+            resp = await client.post("/rotate_weights", json={"weights_path": str(ckpt)})
+            text = await resp.text()
+            assert resp.status == 500, text
+            assert secret not in text
+            assert "error id" in text
+
+        return _run_async(_with_client(srv, _body))
