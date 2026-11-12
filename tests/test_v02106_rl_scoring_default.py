@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 from vco_lib import rl_scoring_default as rsd
 
 REPO = Path(__file__).resolve().parents[1]
@@ -111,6 +113,7 @@ def test_cli_json_line_is_the_rust_wire_shape() -> None:
     out = subprocess.run(
         [sys.executable, "-m", "vco_lib.rl_scoring_default", "--profile", "qwen3", "--json"],
         cwd=REPO,
+        env=child_env(),
         capture_output=True,
         text=True,
         check=True,
