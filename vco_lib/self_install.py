@@ -552,7 +552,6 @@ def configure_root_settings(
     """
     import os
 
-    from vco_lib.deferral_report import DeferralEntry
     from vco_lib.symlink_handler import (
         check_vco_new_collision,
         compute_vco_new_path,
@@ -660,25 +659,11 @@ def configure_root_settings(
         )
         if deferral_report is not None:
             deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id="claude_settings_unparseable",
-                    title="`.claude/settings.json` unparseable; preserved on disk",
-                    detected=(
-                        f"`.claude/settings.json` exists but failed to parse as "
-                        f"JSON ({type(exc).__name__}: {exc}). VCO did not modify "
-                        "the file."
-                    ),
-                    why_deferred=(
-                        "Auto-replacing an unparseable settings file would "
-                        "discard user customizations that may still be "
-                        "recoverable. Inspect manually and either repair the "
-                        "JSON or accept VCO defaults via the command below."
-                    ),
-                    command_to_apply=(
-                        "python install.py --adopt-project-replace-all"
-                    ),
-                    severity="warning",
-                    kg_node_refs=[],
+                unparseable_settings_entry(
+                    "`.claude/settings.json` unparseable; preserved on disk",
+                    f"`.claude/settings.json` exists but failed to parse as "
+                    f"JSON ({type(exc).__name__}: {exc}). VCO did not modify "
+                    "the file.",
                 )
             )
         return
@@ -691,26 +676,12 @@ def configure_root_settings(
         )
         if deferral_report is not None:
             deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id="claude_settings_unparseable",
-                    title=(
-                        "`.claude/settings.json` is not a JSON object; "
-                        "preserved on disk"
-                    ),
-                    detected=(
-                        "`.claude/settings.json` parsed to a "
-                        f"{type(existing).__name__} (expected a JSON object). "
-                        "VCO did not modify the file."
-                    ),
-                    why_deferred=(
-                        "VCO's settings template is a JSON object; cannot "
-                        "merge with a non-object structure."
-                    ),
-                    command_to_apply=(
-                        "python install.py --adopt-project-replace-all"
-                    ),
-                    severity="warning",
-                    kg_node_refs=[],
+                unparseable_settings_entry(
+                    "`.claude/settings.json` is not a JSON object; "
+                    "preserved on disk",
+                    "`.claude/settings.json` parsed to a "
+                    f"{type(existing).__name__} (expected a JSON object). "
+                    "VCO did not modify the file.",
                 )
             )
         return
@@ -780,6 +751,45 @@ def vco_new_settings(install_root: Path, defaults: dict) -> tuple[dict, bool]:
     out = dict(defaults)
     out["env"] = resolved
     return out, True
+
+
+def unparseable_settings_entry(title: str, detected: str) -> Any:
+    """The ``claude_settings_unparseable`` entry (v0.2.106: repair first;
+    replace-all last, saying what it destroys — a printed command is shipped
+    code, and the bare replace-all it used to print reset every edit)."""
+    from vco_lib.deferral_report import DeferralEntry
+
+    return DeferralEntry(
+        condition_id="claude_settings_unparseable",
+        title=title,
+        detected=detected,
+        why_deferred=(
+            "Replacing the file automatically would discard settings that are "
+            "probably still recoverable, so VCO left it alone. Pick ONE: "
+            "(1) repair it by hand — the error above names the problem (often "
+            "a trailing comma or a comment, which JSON does not allow); check "
+            "it with `python -m json.tool .claude/settings.json`, then re-run "
+            "the installer (`python install.py`, what the first-install script "
+            "runs); "
+            "(2) last resort, `python install.py --adopt-project-replace-all`: "
+            "it REWRITES the whole file from the shipped template plus VCO "
+            "defaults — everything in the current file is lost, and its `env` "
+            "holds install defaults until the next env projection rewrites it. "
+            "The flag also lets the installer overwrite other pre-existing "
+            "files it would otherwise preserve (it may recreate `.venv`). Keep "
+            "a copy of the broken file first if it holds anything you need."
+        ),
+        command_to_apply=(
+            "# (1) safe: repair .claude/settings.json by hand, check it with\n"
+            "#   python -m json.tool .claude/settings.json\n"
+            "# then re-run the installer (what the first-install script runs):\n"
+            "python install.py\n"
+            "# (2) last resort, REPLACES the whole file (see above):\n"
+            "#   python install.py --adopt-project-replace-all"
+        ),
+        severity="warning",
+        kg_node_refs=[],
+    )
 
 
 def user_owned_settings_entry(sentinel: str, managed_keys: list,
