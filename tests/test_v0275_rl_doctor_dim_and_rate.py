@@ -143,6 +143,15 @@ def _patched_probe(monkeypatch, health_payload: dict):
         )
 
     monkeypatch.setattr(rl_client_mod, "RLClient", _factory)
+    # Hermetic: the factory above IS the wiring. Nothing ambient may wire the
+    # container too — an RL_SERVER_* env var or a hub-resolved rl_server_port
+    # left by an earlier test makes the probe pass its own ``base_url`` and
+    # the factory call fails ("multiple values for keyword argument").
+    monkeypatch.delenv("RL_SERVER_URL", raising=False)
+    monkeypatch.delenv("RL_SERVER_PORT", raising=False)
+    from claude_mcp_servers.weaviate_mcp import server as _srv
+
+    monkeypatch.setattr(_srv, "_try_resolve_project_config", lambda *a, **k: None)
     return rl_doctor._probe_container()
 
 

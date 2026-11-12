@@ -40,11 +40,6 @@ import pytest
 
 from tests.common.launcher_db_fixture import make_launcher_db, set_app_state
 from vco_lib import code_embed_model as cem
-
-#: The code graph's CURRENT embed revision (the analyzer constant, read the way
-#: production reads it) — a fill counter stamped at it is current. Pinned to a
-#: literal 1 before v0.2.106 bumped the constant to 2 (split rows).
-_CURRENT_REV = cem.current_embed_revision()
 from vco_lib import openai_consent
 from vco_lib.embedding_service import (
     DEFAULT_CODE_MODEL,
@@ -52,6 +47,11 @@ from vco_lib.embedding_service import (
     EmbeddingService,
     NoEmbeddingBackendError,
 )
+
+#: The code graph's CURRENT embed revision (the analyzer constant, read the way
+#: production reads it) — a fill counter stamped at it is current. Pinned to a
+#: literal 1 before v0.2.106 bumped the constant to 2 (split rows).
+_CURRENT_REV = cem.current_embed_revision()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _ANALYZER_PATH = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
