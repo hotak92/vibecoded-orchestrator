@@ -195,8 +195,18 @@ pub fn get_feature_flags(db: State<'_, Db>) -> FeatureFlags {
 /// system default, which follows the bundled weights (v0.2.106, owner
 /// 2026-11-12: ON only with a trained model bundled for the active profile —
 /// `Db::rl_scoring_default`). NOT a gate on event collection.
-pub(crate) fn rl_scoring_global_default(db: &Db) -> bool {
-    rl_scoring_global_default_with(db, || db.rl_scoring_default().default_on)
+///
+/// Async: the bundled-weights default (asked for only when no host-wide row
+/// exists) may spawn Python on a cold cache, so it is resolved off the async
+/// workers (`Db::rl_scoring_default_async`, review W5 M1).
+pub(crate) async fn rl_scoring_global_default(db: &Db) -> bool {
+    use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
+    let default_on = if matches!(db.module_global_enabled(RL_RERANKER_MODULE_ID), Ok(None)) {
+        db.rl_scoring_default_async().await.default_on
+    } else {
+        false
+    };
+    rl_scoring_global_default_with(db, || default_on)
 }
 
 /// [`rl_scoring_global_default`] with the bundled-weights default injected.
@@ -214,8 +224,8 @@ pub(crate) fn rl_scoring_global_default_with(db: &Db, rl_default_on: impl FnOnce
 /// `rl_retrieval_enabled` key of `orchestrator.json` had no reader; the
 /// authoritative value is the `module_settings` row, so that is what the
 /// dashboard shows.
-fn with_rl_scoring_default(db: &Db, mut config: OrchestratorConfig) -> OrchestratorConfig {
-    config.rl_retrieval_enabled = rl_scoring_global_default(db);
+async fn with_rl_scoring_default(db: &Db, mut config: OrchestratorConfig) -> OrchestratorConfig {
+    config.rl_retrieval_enabled = rl_scoring_global_default(db).await;
     config
 }
 
@@ -244,9 +254,12 @@ fn apply_rl_scoring_switch(db: &Db, enabled: bool, lock: Option<&str>) -> Result
 }
 
 /// Load the full orchestrator config.
+///
+/// Async (v0.2.106, review W5 M1): a sync Tauri command runs on the GUI's
+/// main thread, and the RL-scoring default may spawn Python on a cold cache.
 #[command]
-pub fn get_orchestrator_config(db: State<'_, Db>) -> OrchestratorConfig {
-    with_rl_scoring_default(&db, load_config())
+pub async fn get_orchestrator_config(db: State<'_, Db>) -> Result<OrchestratorConfig, String> {
+    Ok(with_rl_scoring_default(&db, load_config()).await)
 }
 
 /// Update a single top-level config field.
@@ -309,7 +322,7 @@ async fn update_orchestrator_setting_inner(
     }
 
     save_config(&config).await?;
-    Ok(with_rl_scoring_default(db, config))
+    Ok(with_rl_scoring_default(db, config).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,6 +1936,12 @@ mod rl_scoring_default_tests {
         (db, "proj-rl".to_string())
     }
 
+    /// Drive an async resolver on a current-thread runtime ON THIS THREAD,
+    /// so the per-thread bundled-model override applies.
+    fn block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
     /// v0.2.106 (owner 2026-11-12): no host-wide row reads as the
     /// bundled-weights default — on with a trained model, off without.
     #[test]
@@ -1941,8 +1960,8 @@ mod rl_scoring_default_tests {
         let (db, pid) = db_with_project();
         let _no_model =
             vct_launcher_core::rl_scoring_default::override_bundled_model_for_thread(false);
-        assert!(!rl_scoring_global_default(&db));
-        let cfg = with_rl_scoring_default(&db, OrchestratorConfig::default());
+        assert!(!block(rl_scoring_global_default(&db)));
+        let cfg = block(with_rl_scoring_default(&db, OrchestratorConfig::default()));
         assert!(!cfg.rl_retrieval_enabled);
         assert!(!db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap());
     }
@@ -1953,9 +1972,9 @@ mod rl_scoring_default_tests {
     fn switch_is_the_global_default_the_project_toggle_inherits() {
         let (db, pid) = db_with_project();
         set_rl_scoring_global_default(&db, true).unwrap();
-        assert!(rl_scoring_global_default(&db));
+        assert!(block(rl_scoring_global_default(&db)));
         assert!(db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap());
-        assert!(with_rl_scoring_default(&db, OrchestratorConfig::default()).rl_retrieval_enabled);
+        assert!(block(with_rl_scoring_default(&db, OrchestratorConfig::default())).rl_retrieval_enabled);
 
         db.module_write_enabled_for_project(&pid, RL_RERANKER_MODULE_ID, Some(false))
             .unwrap();
@@ -1965,7 +1984,7 @@ mod rl_scoring_default_tests {
         );
 
         set_rl_scoring_global_default(&db, false).unwrap();
-        assert!(!rl_scoring_global_default(&db));
+        assert!(!block(rl_scoring_global_default(&db)));
     }
 
     /// v0.2.100 W5R-02: while an RL scoring lock is set the switch refuses

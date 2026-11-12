@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,12 @@ struct Cached {
 
 static CACHE: LazyLock<Mutex<HashMap<String, Cached>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// One in-flight lock per profile: the first caller on a miss holds it while
+/// Python runs; concurrent callers for the same profile wait on it, then read
+/// the answer the first one cached (single flight — one spawn).
+static IN_FLIGHT: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 thread_local! {
     static THREAD_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -117,35 +123,108 @@ pub fn override_bundled_model_for_thread(bundled: bool) -> OverrideGuard {
     OverrideGuard(prev)
 }
 
-/// RL scoring's default for `profile`, from the Python decision (cached).
-pub fn rl_scoring_default_for(profile: &str) -> RlScoringDefault {
-    let key = profile.trim().to_string();
+/// The answer available WITHOUT running Python: the per-thread override, or
+/// a cache entry that is still valid (a success for good, a failure for
+/// [`FAILURE_RETRY`]). `None` means a probe is needed.
+fn answer_without_probe(key: &str) -> Option<RlScoringDefault> {
     if let Some(bundled) = THREAD_OVERRIDE.with(|c| c.get()) {
-        return if bundled {
-            RlScoringDefault::bundled(&key)
+        return Some(if bundled {
+            RlScoringDefault::bundled(key)
         } else {
-            RlScoringDefault::not_bundled(&key)
-        };
+            RlScoringDefault::not_bundled(key)
+        });
     }
-    if let Ok(cache) = CACHE.lock() {
-        if let Some(hit) = cache.get(&key) {
-            if hit.value.error.is_none() || hit.at.elapsed() < FAILURE_RETRY {
-                return hit.value.clone();
-            }
-        }
-    }
+    let cache = CACHE.lock().ok()?;
+    let hit = cache.get(key)?;
+    (hit.value.error.is_none() || hit.at.elapsed() < FAILURE_RETRY).then(|| hit.value.clone())
+}
+
+fn in_flight_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut map = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(key.to_string()).or_default().clone()
+}
+
+/// The production probe: the Python decision, run in the orchestrator clone.
+fn probe_python(key: &str) -> RlScoringDefault {
     let root = crate::orchestrator_manifest::orchestrator_install_root();
-    let value = query_python(&key, root.as_deref());
-    if let Some(err) = &value.error {
-        tracing::error!(
-            "[rl-scoring-default] cannot confirm a bundled RL model for profile {key:?}: {err}; \
-             RL scoring defaults to OFF (a broken install: re-run the orchestrator update)"
-        );
+    query_python(key, root.as_deref())
+}
+
+/// Run a blocking `f` without stalling an async worker: on a tokio
+/// MULTI-THREAD runtime worker, `block_in_place` first moves that worker's
+/// other tasks to another thread; anywhere else (a plain thread, the blocking
+/// pool, no runtime) `f` simply runs. A current-thread runtime cannot hand
+/// off — an async caller there must use [`rl_scoring_default_async`].
+fn run_blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(key, Cached { value: value.clone(), at: Instant::now() });
+}
+
+/// Cache + single flight around `probe`. A caller that waited for the
+/// profile's in-flight lock re-reads the cache once it holds it, so
+/// concurrent cold misses for one profile run `probe` ONCE and all get its
+/// answer. A failure is cached for [`FAILURE_RETRY`] like before.
+fn resolve_with(profile: &str, probe: impl FnOnce(&str) -> RlScoringDefault) -> RlScoringDefault {
+    let key = profile.trim().to_string();
+    if let Some(v) = answer_without_probe(&key) {
+        return v;
     }
-    value
+    run_blocking(|| {
+        let flight = in_flight_lock(&key);
+        let _turn = flight.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(v) = answer_without_probe(&key) {
+            return v;
+        }
+        let value = probe(&key);
+        if let Some(err) = &value.error {
+            tracing::error!(
+                "[rl-scoring-default] cannot confirm a bundled RL model for profile {key:?}: {err}; \
+                 RL scoring defaults to OFF (a broken install: re-run the orchestrator update)"
+            );
+        }
+        if let Ok(mut cache) = CACHE.lock() {
+            cache.insert(key.clone(), Cached { value: value.clone(), at: Instant::now() });
+        }
+        value
+    })
+}
+
+/// RL scoring's default for `profile`, from the Python decision (cached; one
+/// spawn per profile however many callers miss at once).
+///
+/// BLOCKING on a cache miss (a Python spawn, up to [`SPAWN_TIMEOUT`]). Async
+/// code calls [`rl_scoring_default_async`] instead; a sync call that does
+/// land on a multi-thread runtime worker hands the worker off with
+/// `block_in_place`, so it cannot starve the runtime either.
+pub fn rl_scoring_default_for(profile: &str) -> RlScoringDefault {
+    resolve_with(profile, probe_python)
+}
+
+/// [`rl_scoring_default_for`] for async callers (the hub's `/config`, the
+/// launcher's async commands): the per-thread test override or a cache hit
+/// answers inline; a miss runs on the blocking pool, so no async worker ever
+/// waits on Python. Same cache, same single flight.
+pub async fn rl_scoring_default_async(profile: String) -> RlScoringDefault {
+    rl_scoring_default_async_with(profile, probe_python).await
+}
+
+async fn rl_scoring_default_async_with(
+    profile: String,
+    probe: fn(&str) -> RlScoringDefault,
+) -> RlScoringDefault {
+    let key = profile.trim().to_string();
+    if let Some(v) = answer_without_probe(&key) {
+        return v;
+    }
+    let task_key = key.clone();
+    match tokio::task::spawn_blocking(move || resolve_with(&task_key, probe)).await {
+        Ok(v) => v,
+        Err(e) => RlScoringDefault::unconfirmed(&key, format!("the default probe task failed: {e}")),
+    }
 }
 
 /// `root` is the orchestrator clone: the child runs there so `python -m`
@@ -235,6 +314,111 @@ mod tests {
         .unwrap();
         assert_eq!(v, RlScoringDefault::bundled("arctic"));
         assert!(parse_cli_output("Traceback ...").is_err());
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SINGLE_FLIGHT_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+    fn slow_counting_probe(key: &str) -> RlScoringDefault {
+        SINGLE_FLIGHT_SPAWNS.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        RlScoringDefault::bundled(key)
+    }
+
+    /// M1 (review W5): N concurrent cold misses for one profile run the
+    /// probe ONCE and all get its answer — sync and async callers alike.
+    #[test]
+    fn concurrent_cold_misses_spawn_once() {
+        let profile = "single-flight-test-profile";
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(move || resolve_with(profile, slow_counting_probe)))
+            .collect();
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let from_async = rt.block_on(async {
+            let tasks: Vec<_> = (0..4)
+                .map(|_| {
+                    tokio::spawn(rl_scoring_default_async_with(profile.to_string(), slow_counting_probe))
+                })
+                .collect();
+            let mut out = Vec::new();
+            for t in tasks {
+                out.push(t.await.unwrap());
+            }
+            out
+        });
+        for t in threads {
+            assert_eq!(t.join().unwrap(), RlScoringDefault::bundled(profile));
+        }
+        assert!(from_async.iter().all(|v| *v == RlScoringDefault::bundled(profile)));
+        assert_eq!(SINGLE_FLIGHT_SPAWNS.load(Ordering::SeqCst), 1, "one spawn for all callers");
+    }
+
+    static FAILING_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+    fn failing_probe(key: &str) -> RlScoringDefault {
+        FAILING_SPAWNS.fetch_add(1, Ordering::SeqCst);
+        RlScoringDefault::unconfirmed(key, "boom".into())
+    }
+
+    /// A failure is OFF and reused within FAILURE_RETRY (no re-spawn storm).
+    #[test]
+    fn a_failure_is_off_and_reused_until_the_retry_window() {
+        let profile = "failing-probe-test-profile";
+        let a = resolve_with(profile, failing_probe);
+        let b = resolve_with(profile, failing_probe);
+        assert!(!a.default_on && a.error.is_some());
+        assert_eq!(a, b);
+        assert_eq!(FAILING_SPAWNS.load(Ordering::SeqCst), 1);
+    }
+
+    fn slow_probe(key: &str) -> RlScoringDefault {
+        std::thread::sleep(Duration::from_millis(800));
+        RlScoringDefault::not_bundled(key)
+    }
+
+    /// M1: a slow probe reached from ASYNC code never blocks the runtime —
+    /// on a current-thread runtime (the worst case: one thread), another
+    /// task still runs on time while the probe is in flight.
+    #[test]
+    fn a_slow_probe_does_not_block_other_async_work() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        rt.block_on(async {
+            let probe = tokio::spawn(rl_scoring_default_async_with(
+                "slow-async-test-profile".to_string(),
+                slow_probe,
+            ));
+            let t0 = Instant::now();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let other = t0.elapsed();
+            assert!(other < Duration::from_millis(400), "other work stalled for {other:?}");
+            assert!(!probe.await.unwrap().default_on);
+        });
+    }
+
+    /// M1 safety net: a SYNC call that lands on a multi-thread runtime worker
+    /// hands the worker off (`block_in_place`), so with ONE worker another
+    /// task still runs while the probe is in flight.
+    #[test]
+    fn a_sync_call_on_a_runtime_worker_does_not_starve_it() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let probe =
+                tokio::spawn(async { resolve_with("slow-sync-test-profile", slow_probe) });
+            // Let the probe task take the only worker first.
+            std::thread::sleep(Duration::from_millis(50));
+            let t0 = Instant::now();
+            let other = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                t0.elapsed()
+            })
+            .await
+            .unwrap();
+            assert!(other < Duration::from_millis(400), "the worker was pinned for {other:?}");
+            assert!(!probe.await.unwrap().default_on);
+        });
     }
 
     #[test]

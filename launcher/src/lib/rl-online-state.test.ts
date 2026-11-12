@@ -9,7 +9,6 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   RL_ONLINE_STATE_FIELDS,
-  confidenceText,
   summarizeOnlineState,
 } from './rl-online-state';
 
@@ -76,7 +75,14 @@ describe('summarizeOnlineState', () => {
     expect(d).toMatch(
       /Record \(each query scored before the model trained on it\): 900 queries, 124 of them name a node — a verdict needs 300 and 50; NDCG@10 \+0\.80% vs plain cosine, cited-node MRR@10 0\.310 vs 0\.330/,
     );
-    expect(d).toMatch(/Check 7 \(lower bounds at confidence 99\.8% decide; 10% total error budget/);
+    expect(d).toMatch(
+      /Check 7 \(its one-sided lower bounds decide, at the confidence the reranking line names; 10% total error budget/,
+    );
+    // Review W5 L3: the confidence text comes ONLY from the container's own
+    // reason (Python `_conf`) — the headline carries it verbatim, and the
+    // panel formats no second copy from `gate_confidence`.
+    expect(s.headline).toContain('at confidence 99.8%');
+    expect(d).not.toMatch(/confidence \d|confidence 1 ?- ?\d/);
     expect(d).toMatch(/NDCG@10 gain -1\.20% \(needs \+2\.00%\), cited-node MRR@10 difference -0\.080/);
     expect(d).not.toMatch(/Searches the model served/);
   });
@@ -127,15 +133,6 @@ describe('summarizeOnlineState', () => {
   it('training off for the project is said', () => {
     const s = summarizeOnlineState(true, null, { ...ROW, training_enabled: 0 });
     expect(s.details[0]).toMatch(/online training is off for this project/);
-  });
-});
-
-describe('confidenceText', () => {
-  it('a percentage while the error rate is >= 0.1%, else the error rate itself', () => {
-    expect(confidenceText(0.95)).toBe('95.0%');
-    expect(confidenceText(1 - 0.1 / 6)).toBe('98.3%');
-    expect(confidenceText(1 - 0.1 / (1800 * 1801))).toBe('1 - 3.1e-8');
-    expect(confidenceText(null)).toBe('n/a');
   });
 });
 

@@ -363,8 +363,24 @@ Meaningful only when `type == "container"` — the supervisor
 "log_path_template": "…",
 "min_gpu_vram_gb": 4.0,             // per-module VRAM threshold for GPU-mode decision
 "gpu_optional": true,              // true → runs on CPU (degraded) when no qualifying GPU
-"gpu_image_variants": { "cpu": "0.1.0-cpu", "cuda": "0.1.0-cuda", "rocm": "0.1.0-rocm" }
+"gpu_image_variants": { "cpu": "0.1.0-cpu", "cuda": "0.1.0-cuda", "rocm": "0.1.0-rocm" },
+"image_user": { "uid": 1000, "gid": 1000 }  // the image's non-root USER (v0.2.106)
 ```
+
+`image_user` (v0.2.106) names the numeric user the image's process runs as.
+When set, both start paths map the HOST user onto it, so the container can
+write its bind-mounted `volumes` and the host user owns what it writes:
+
+| Engine | Argument | Effect |
+|---|---|---|
+| podman ≥ 4.3 (Linux rootless, the podman machine on macOS / Windows) | `--userns=keep-id:uid=<uid>,gid=<gid>` | the host user becomes the image user; the process keeps the image's uid |
+| podman < 4.3 (e.g. Ubuntu 22.04's 3.4), or a podman whose `--version` cannot be read | `--userns=keep-id` + `--user <host uid>:<host gid>` | `keep-id:uid=` does not exist before 4.3 (podman refuses the run), so the process runs as the host user, who owns the mounts; the image's own files must be world-readable, as for docker below |
+| docker on Linux | `--user <host uid>:<host gid>` | same contract as the podman < 4.3 row |
+| Docker Desktop (macOS / Windows) | nothing | its file sharing maps ownership |
+
+The podman version is read once per launcher / hub process (`podman --version`,
+the client only). An unknown version takes the < 4.3 row because it works on
+every podman. Without `image_user` none of these arguments is added.
 
 `ports[].bind` defaults to `127.0.0.1` so per-project containers are never
 exposed to the LAN by accident. When `gpu_image_variants` is present, the

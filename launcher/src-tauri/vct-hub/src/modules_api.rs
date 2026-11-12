@@ -880,6 +880,18 @@ async fn project_env(
         Err(e) => return db_error_response("get project (env)", e),
     };
 
+    // v0.2.106 (review W5 M1): the machine-wide-install loop below runs the
+    // enable cascade, which reads the RL reranker's bundled-weights default
+    // when no row decides — a Python spawn on a cold cache. Resolve it HERE,
+    // off the async workers and before the secret session opens (that one
+    // must not be held across an `.await`), so the sync cascade finds it
+    // cached.
+    if h.0.list_global_module_installs().unwrap_or_default().iter().any(|r| {
+        r.module_id == vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID
+    }) {
+        let _ = h.0.rl_scoring_default_async().await;
+    }
+
     // v0.2.84 (D8.2): open ONE memory-only read-through secret session for the
     // WHOLE request. Every `secrets::get_with_context` call below — the module
     // loop, the orchestrator-bundled loop, the user-bucket resolver (in

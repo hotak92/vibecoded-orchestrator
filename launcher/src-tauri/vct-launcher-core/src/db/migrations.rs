@@ -268,6 +268,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "collection_count_cache (v0.2.105 — cached Weaviate class counts, keyed by class name, with the epoch-ms moment they were measured). Weaviate 1.28 loads a collection into RAM on first query and never unloads it, and the launcher's KG / codegraph pages used to run one Aggregate count per class on the machine at every render, loading every project's KG and code graph into memory. Counts for collections outside the acting project's own + shared + granted scope are served from this cache instead; a live Aggregate runs only for in-scope classes or an explicit 'Refresh counts'. Writers drop the row on invalidation (KG sync success, code-graph build finalize, orphan-cleanup delete) so a stale number reads as 'needs recount', not as fresh. Machine-global by design (a collection is one object on the machine), so no project FK. Additive new table. LAUNCHER_DB_TABLE_SET_VERSION bumps 49->50 atomically with this migration, with scripts/regen_schema_versions_json.py refreshing the committed snapshot in the same merge.",
         sql: include_str!("migrations/050_collection_count_cache.sql"),
     },
+    Migration {
+        version: 51,
+        description: "clear the SEEDED host-wide RL scoring 'off' row once (v0.2.106, owner ruling 2026-11-12). Installers v0.2.52-v0.2.105 wrote a host-wide (project_id IS NULL) vct-rl-reranker enabled_for_project = false row on every install; v0.2.106 retired that seed (RL scoring's unset default follows the bundled weights, vco_lib/rl_scoring_default.py), and a seeded row would pin existing installs off after a trained model ships. Deletes that row unless the latest audited user write of the host-wide RL row (module_global_enabled_changed) recorded false — a user's own choice stays. Per-project rows, a host-wide true and every other module are untouched. The runner's version record is the once-stamp: a host-wide choice made after this ran is never removed. Plain DELETE — not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 50->51 atomically with this migration.",
+        sql: include_str!("migrations/051_rl_seeded_host_wide_off_clear_once.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -3567,5 +3572,129 @@ mod tests {
             "the deleted project's move rows cascade; the OTHER project's row \
              is untouched"
         );
+    }
+
+    // ─── Migration 051 — the seeded host-wide RL "off" row, cleared once ──
+
+    const RL: &str = "vct-rl-reranker";
+    const EN: &str = "enabled_for_project";
+
+    fn host_wide_rl(conn: &Connection) -> Option<String> {
+        use rusqlite::OptionalExtension as _;
+        conn.query_row(
+            "SELECT setting_value FROM module_settings
+              WHERE project_id IS NULL AND module_id = ?1 AND setting_key = ?2",
+            rusqlite::params![RL, EN],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn put_host_wide(conn: &Connection, module_id: &str, key: &str, value: &str) {
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES (NULL, ?1, ?2, ?3)",
+            rusqlite::params![module_id, key, value],
+        )
+        .unwrap();
+    }
+
+    fn audit_host_wide_rl(conn: &Connection, at: i64, enabled: &str) {
+        conn.execute(
+            "INSERT INTO audit_log (operation, project_id, module_id, detail, actor, created_at)
+             VALUES ('module_global_enabled_changed', NULL, ?1, ?2, 'user', ?3)",
+            rusqlite::params![RL, format!("{{\"enabled\": {enabled}, \"scope\": \"global\"}}"), at],
+        )
+        .unwrap();
+    }
+
+    fn version_recorded(conn: &Connection, v: u32) -> bool {
+        conn.query_row("SELECT COUNT(*) FROM _schema_migrations WHERE version = ?1", [v], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+            == 1
+    }
+
+    /// The seeded row goes (once, stamped by the runner's version record);
+    /// per-project rows of either value, other modules' host-wide rows and
+    /// other RL keys stay.
+    #[test]
+    fn migration_051_removes_the_seeded_host_wide_rl_off_row_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 50).expect("apply through v50");
+        seed_project_row_for_mig(&conn, "p1");
+        seed_project_row_for_mig(&conn, "p2");
+        put_host_wide(&conn, RL, EN, "false"); // what the old installer seeded
+        put_host_wide(&conn, "vct-coordination", EN, "false");
+        put_host_wide(&conn, RL, "rl_online_training_disabled", "false");
+        conn.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES ('p1', ?1, ?2, 'false'), ('p2', ?1, ?2, 'true')",
+            rusqlite::params![RL, EN],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply v51");
+
+        assert!(version_recorded(&conn, 51), "the once-stamp is the runner's version record");
+        assert_eq!(host_wide_rl(&conn), None, "the seeded host-wide off row is gone");
+        assert_eq!(read_setting(&conn, "p1", RL, EN).as_deref(), Some("false"));
+        assert_eq!(read_setting(&conn, "p2", RL, EN).as_deref(), Some("true"));
+        let other: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM module_settings WHERE project_id IS NULL
+                  AND ((module_id = 'vct-coordination' AND setting_key = ?1)
+                    OR (module_id = ?2 AND setting_key = 'rl_online_training_disabled'))",
+                rusqlite::params![EN, RL],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 2, "other modules' rows and other RL keys are untouched");
+
+        // A later explicit host-wide OFF by the user survives every later
+        // open: the migration never runs again.
+        put_host_wide(&conn, RL, EN, "false");
+        apply(&conn).expect("re-open");
+        apply(&conn).expect("re-open again");
+        assert_eq!(host_wide_rl(&conn).as_deref(), Some("false"), "the user's later choice stays");
+    }
+
+    /// A host-wide OFF the USER chose (the latest audited host-wide write is
+    /// `false`) is a choice, not the seed — it stays; a host-wide ON always
+    /// stays.
+    #[test]
+    fn migration_051_keeps_a_users_host_wide_choice() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_up_to(&conn, 50).expect("apply through v50");
+        put_host_wide(&conn, RL, EN, "false");
+        audit_host_wide_rl(&conn, 10, "true");
+        audit_host_wide_rl(&conn, 20, "false"); // the user's latest: off
+        apply(&conn).expect("apply v51");
+        assert_eq!(host_wide_rl(&conn).as_deref(), Some("false"));
+
+        let on = Connection::open_in_memory().unwrap();
+        apply_up_to(&on, 50).expect("apply through v50");
+        put_host_wide(&on, RL, EN, "true");
+        apply(&on).expect("apply v51");
+        assert_eq!(host_wide_rl(&on).as_deref(), Some("true"));
+    }
+
+    /// The user's latest host-wide action was a CLEAR (or an ON) and the
+    /// seed then wrote its `false` again on the next install: that row is
+    /// the seed's, so it goes.
+    #[test]
+    fn migration_051_removes_a_seed_written_after_the_users_clear() {
+        for latest in ["null", "true"] {
+            let conn = Connection::open_in_memory().unwrap();
+            apply_up_to(&conn, 50).expect("apply through v50");
+            audit_host_wide_rl(&conn, 10, "false");
+            audit_host_wide_rl(&conn, 20, latest);
+            put_host_wide(&conn, RL, EN, "false");
+            apply(&conn).expect("apply v51");
+            assert_eq!(host_wide_rl(&conn), None, "latest user action {latest}");
+        }
     }
 }

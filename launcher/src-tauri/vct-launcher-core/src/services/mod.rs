@@ -94,6 +94,9 @@ pub mod compose_args;
 // container plumbing (run args, image refs, pulls, the reaper) and the
 // ownership guard.
 pub mod container_runtime;
+// v0.2.106 (review W5 M2): the host-user mapping for module containers —
+// podman-version-aware (`keep-id:uid=` needs podman >= 4.3).
+pub mod host_user_mapping;
 // v0.2.106: the ONE local image build for `container_build` modules (the
 // RL reranker) + the start-path "image missing → rebuild" guard, shared by
 // the installer (`commands::bundled_modules::build_and_materialize`) and

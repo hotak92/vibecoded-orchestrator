@@ -14,8 +14,8 @@ server trains that project's own `RLModel` (small PyTorch network) on them in
 bounded rounds with the offline trainer's objective (`objective.py`). A
 project's model reranks its searches only while it beats plain cosine
 ordering on the project's own cumulative PREQUENTIAL record — every query
-scored by the model in place when it arrived, before that model trained on
-it — judged on one-sided lower bounds (the NDCG@10 gain at least +2% AND the
+scored, at the first round after it arrived, by the model in place at that
+round, before that model trained on it — judged on one-sided lower bounds (the NDCG@10 gain at least +2% AND the
 cited node's MRR@10 minus cosine's at least 0; `ranking_metrics.paired_normal_bounds`)
 at an anytime-valid confidence: the k-th check runs at `1 - 0.10 / (k (k+1))`
 (`ranking_metrics.check_confidence`), so re-checking after every round keeps
