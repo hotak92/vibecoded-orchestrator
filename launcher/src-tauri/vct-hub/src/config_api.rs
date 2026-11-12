@@ -3765,8 +3765,8 @@ kg_tier_full = 0.8
         );
 
         // Step 3: per-project=true overrides global=false IN THE CASCADE,
-        // which the served field follows once the RL scoring lock lifts.
-        // While locked (v0.2.100 W5R-02) the served field stays false.
+        // and the served field follows it: the RL scoring lock is lifted
+        // (v0.2.106 owner ruling, rl_scoring_lock.toml locked=false).
         h.0.module_set_enabled_for_project(
             "p-rl-global",
             "vct-rl-reranker",
@@ -3780,8 +3780,8 @@ kg_tier_full = 0.8
         assert_eq!(
             body.get("rl_reranker_enabled_for_project")
                 .and_then(|v| v.as_bool()),
-            Some(false),
-            "locked: served false despite per-project=true; body={}",
+            Some(true),
+            "unlocked: per-project=true is served; body={}",
             body,
         );
         assert!(
