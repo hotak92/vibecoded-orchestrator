@@ -152,9 +152,14 @@ def test_project_head_with_a_fresh_checkpoint_uses_the_bundled_base(tmp_path, mo
     _local(pdir / "rl_model_qwen3_local.pt", "qwen3")
     head = asyncio.run(srv._get_or_load_project_head("p-123"))
     assert head.is_base_fallback is True
-    assert head.state_path == srv._state_path
     assert head.rl_model.weights_version == "0.3.0"
     assert srv._routing_counters["project_head_superseded_by_bundled"] == 1
+    # v0.2.106: started from the base, the project trains and saves under its
+    # OWN dir, named for that base — never over the base file other projects
+    # start from.
+    assert head.state_path == pdir / "rl_model_qwen3_0.3.0.pt"
+    assert head.state_path != srv._state_path
+    assert head.learner is not None and head.project_dir == pdir
 
 
 def test_project_head_trained_on_the_current_base_is_kept(tmp_path, monkeypatch):
@@ -266,14 +271,14 @@ def test_excluded_seed_copy_is_never_chosen(tmp_path):
 # ─── the metadata the rule reads ───────────────────────────────────────
 
 
-def test_training_history_round_trips_and_update_counts(tmp_path):
+def test_training_history_round_trips_and_recorded_steps_count(tmp_path):
+    """v0.2.106: online steps are recorded by the per-project learner
+    (``record_local_train_steps``); the per-node ``update`` is gone."""
     path = tmp_path / "rl_model_qwen3_0.3.0.pt"
     m = RLModel.load_or_create(state_path=path, emb_dim=16, device="cpu",
                                weights_version="0.3.0", embedding_source="qwen3")
     m.mark_as_release_base()
-    import numpy as np
-    m.update(np.ones(16, dtype=np.float32), np.ones(16, dtype=np.float32), [], 0, target=0.7)
-    m.update(np.ones(16, dtype=np.float32), np.ones(16, dtype=np.float32), [], 0, target=0.3)
+    m.record_local_train_steps(2)
     m.save()
     meta = read_checkpoint_meta(path)
     assert meta is not None

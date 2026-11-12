@@ -1670,9 +1670,10 @@ mod enable_toggle_tests {
         );
     }
 
-    /// v0.2.100 W5R-02: the shipped RL scoring lock forces scoring OFF over
-    /// an explicit per-project `true` AND a host-wide `true`, leaves both rows
-    /// exactly as stored, and is what the GUI state reports.
+    /// v0.2.100 W5R-02: a set RL scoring lock forces scoring OFF over an
+    /// explicit per-project `true` AND a host-wide `true` and leaves both
+    /// rows exactly as stored. v0.2.106: the shipped table is UNLOCKED
+    /// (owner 2026-11-12, opt-in), so the shipped path follows the rows.
     #[test]
     fn rl_scoring_lock_overrides_rows_without_touching_them() {
         let (db, pid) = db_with_project("lock");
@@ -1681,10 +1682,10 @@ mod enable_toggle_tests {
         db.module_set_global_enabled(m, true).unwrap();
 
         let lock = crate::rl_scoring_lock::rl_scoring_lock();
-        assert!(lock.is_some(), "v0.2.100 ships locked");
-        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "locked => scoring off");
+        assert!(lock.is_none(), "v0.2.106 ships unlocked (opt-in)");
+        assert!(db.rl_scoring_enabled_for_project(&pid).unwrap(), "unlocked => the row applies");
         assert!(db.rl_scoring_enabled_with_lock(&pid, None).unwrap(), "unlocked => the row applies");
-        assert!(!db.rl_scoring_enabled_with_lock(&pid, Some("r")).unwrap());
+        assert!(!db.rl_scoring_enabled_with_lock(&pid, Some("r")).unwrap(), "locked => off");
 
         // Rows are user data: unchanged by the lock.
         assert_eq!(
@@ -1700,6 +1701,24 @@ mod enable_toggle_tests {
 
         // Other modules are never locked.
         assert_eq!(db.resolve_module_enable(&pid, "vct-coordination").unwrap().lock_reason, None);
+    }
+
+    /// v0.2.106 (owner 2026-11-12, "for now opt-in"): with the lock lifted,
+    /// RL scoring is still OFF until the user turns it on for the project —
+    /// no rows, or a host-wide `false`, resolve to off; an explicit
+    /// per-project `true` turns it on for that project only.
+    #[test]
+    fn rl_scoring_is_opt_in_per_project_with_the_lock_lifted() {
+        let (db, pid) = db_with_project("optin");
+        let m = RL_RERANKER_MODULE_ID;
+        assert!(crate::rl_scoring_lock::rl_scoring_lock().is_none());
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "no rows => off");
+        db.module_set_global_enabled(m, false).unwrap();
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "host-wide off => off");
+        db.module_write_enabled_for_project(&pid, m, Some(true)).unwrap();
+        assert!(db.rl_scoring_enabled_for_project(&pid).unwrap(), "the user's opt-in => on");
+        db.module_write_enabled_for_project(&pid, m, Some(false)).unwrap();
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "turned off again => off");
     }
 }
 

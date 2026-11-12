@@ -155,6 +155,25 @@ QUERY_TYPE_IDX: int = NULL_TYPE_IDX + 1      # 7 -- query entity marker
 UNKNOWN_TYPE_IDX: int = QUERY_TYPE_IDX + 1   # 8 -- linked node, unknown type
 N_ENTITY_TYPES: int = UNKNOWN_TYPE_IDX + 1   # 9 builtin slots
 
+#: Type code for a node / linked node whose type is not one of the builtin
+#: :data:`NODE_TYPES` (the training export's ``other`` code). The real name is
+#: never exported (type names can be project-specific). Training
+#: (``objective``) maps this code to the same embedding a serving model gives
+#: a type it registers on the fly: the mean of the builtin rows.
+TYPE_CODE_OTHER: int = 9
+
+
+def type_code(name: "str | None", *, empty: int) -> int:
+    """The training type code of a type name: its builtin index, ``empty``
+    for none, else :data:`TYPE_CODE_OTHER`. One table for the export and the
+    server's online learning."""
+    if not name:
+        return empty
+    try:
+        return NODE_TYPES.index(name)
+    except ValueError:
+        return TYPE_CODE_OTHER
+
 #: Embedding profiles whose linked-entity slots (2..6) are MASKED: always NULL
 #: padding (zero vector, NULL_TYPE_IDX, cosines (0, 0)), in training AND in
 #: serving. Arctic training data comes from dual-log twins, which carry no
@@ -982,32 +1001,25 @@ class RLModel:
 
     # ------------------------------------------------------------------
     # Training
+    #
+    # v0.2.106: the per-node online step (``update``: one BCE step per node,
+    # lr 1e-3) is GONE. Online training is per project, in rounds, with the
+    # offline objective (``objective.batch_loss``: query-grouped batches,
+    # pairs within a query) — ``online_learning.ProjectLearner``, which steps
+    # this model's ``_net`` / ``_opt`` and records the steps through
+    # :meth:`record_local_train_steps`. One objective, offline and online.
     # ------------------------------------------------------------------
 
-    def update(
-        self,
-        q_raw: "np.ndarray",
-        n_raw: "np.ndarray",
-        linked_raws: "list[np.ndarray]",
-        n_type_idx: int,
-        target: float,
-        linked_type_idxs: "list[int] | None" = None,
-    ) -> float:
-        """One online AdamW step. Returns BCE loss for logging."""
-        entities_t, type_idxs_t, slot_scalars_t = self._build_inputs(
-            q_raw, n_raw, linked_raws, n_type_idx,
-            linked_type_idxs=linked_type_idxs,
-        )
-        target_t = torch.tensor([[target]], dtype=torch.float32, device=self._device)
+    def retarget(self, state_path: Path) -> None:
+        """Save to ``state_path`` from now on (the network is unchanged).
 
-        self._net.train()
-        self._opt.zero_grad()
-        out = self._net(entities_t, type_idxs_t, slot_scalars_t)
-        loss = F.binary_cross_entropy(out, target_t)
-        loss.backward()
-        self._opt.step()
-        self._local_train_steps += 1
-        return float(loss.detach())
+        A project that starts from the base checkpoint loads it from the base
+        path, then trains and saves under its own state dir — never over the
+        base file other projects start from. Dynamic-type sidecars follow the
+        new location on the next :meth:`save`.
+        """
+        self._state_path = Path(state_path)
+        self._pt_path = self._state_path.with_suffix(".pt")
 
     # ------------------------------------------------------------------
     # Type registry

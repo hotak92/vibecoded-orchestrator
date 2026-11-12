@@ -84,10 +84,12 @@ def _run_with_probes(*, toggle, container, telemetry, retention, fallback=None, 
 
 
 def test_no_licence_is_needed_to_be_enabled():
-    """v0.2.106: unlocked + toggle not off = RL enabled, with no licence
-    anywhere in the inputs or the report (the reranker is free)."""
+    """v0.2.106: unlocked + toggle on = RL enabled, with no licence anywhere
+    in the inputs or the report (the reranker is free). (The toggle is
+    opt-in since v0.2.106: an unknown toggle is off — see
+    tests/test_v02106_rl_opt_in.py.)"""
     report = _run_with_probes(
-        toggle={"status": "unknown", "enabled": None, "detail": ""},
+        toggle={"status": "enabled", "enabled": True, "detail": ""},
         container={"status": "compatible", "compatible": True, "reachable": True, "detail": ""},
         telemetry={"status": "hub_up", "reachable": True, "detail": ""},
         retention={"status": "active", "detail": ""},
@@ -159,9 +161,9 @@ def test_scoring_lock_overrides_the_toggle():
 
 
 def test_the_real_lock_probe_reports_the_shipped_lock():
+    """v0.2.106 (owner 2026-11-12, opt-in): the shipped table is unlocked."""
     res = rl_doctor._probe_scoring_lock()
-    assert res["status"] == "locked" and res["locked"] is True
-    assert "until the model is trained" in res["detail"]
+    assert res["status"] == "unlocked" and res["locked"] is False
 
 
 # ── CLI surface ─────────────────────────────────────────────────────────

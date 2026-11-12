@@ -3693,10 +3693,10 @@ kg_tier_full = 0.8
             body,
         );
 
-        // Re-enable. v0.2.100 W5R-02: the shipped RL scoring lock keeps the
-        // SERVED field false even with an explicit per-project `true` row and
-        // a host-wide `true` row; the rows themselves are untouched and are
-        // what the field follows once unlocked.
+        // Re-enable. v0.2.106 (owner 2026-11-12, opt-in): the shipped RL
+        // scoring lock is lifted, so the SERVED field follows the user's
+        // explicit per-project `true`; a set lock would still force it off
+        // (`rl_scoring_enabled_with_lock`).
         h.0.module_set_enabled_for_project(
             "p-rl-enable-set",
             "vct-rl-reranker",
@@ -3711,21 +3711,17 @@ kg_tier_full = 0.8
         .await
         .expect("hub reachable");
         let body: serde_json::Value = resp.json().await.expect("json body");
-        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_some(), "ships locked");
+        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_none(), "ships unlocked");
         assert_eq!(
             body.get("rl_reranker_enabled_for_project")
                 .and_then(|v| v.as_bool()),
-            Some(false),
-            "locked: an explicit true row must NOT turn scoring on; body={}",
+            Some(true),
+            "unlocked: the user's explicit true row turns scoring on; body={}",
             body,
         );
         assert!(
-            h.0.module_effective_enabled("p-rl-enable-set", "vct-rl-reranker").unwrap(),
-            "the stored row is kept, not rewritten by the lock",
-        );
-        assert!(
-            h.0.rl_scoring_enabled_with_lock("p-rl-enable-set", None).unwrap(),
-            "once unlocked, the row applies again",
+            !h.0.rl_scoring_enabled_with_lock("p-rl-enable-set", Some("locked")).unwrap(),
+            "a set lock still wins over the row",
         );
     }
 

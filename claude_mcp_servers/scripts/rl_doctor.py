@@ -16,8 +16,10 @@ this tool, unanswerable without reading source.
 gate and outcome on the RL path:
 
   0. Scoring state — ONE line: does search use the reranker right now, and
-     if not, which gate says no (lock, project toggle, no container wired,
-     container down / too old / wrong space, no trained weights)?
+     if not, which gate says no (lock, project toggle — opt-in, off by
+     default —, no container wired, container down / too old / wrong space,
+     no trained weights, or this project's model not served by the
+     container's per-project gate, with its reason)?
   1. Scoring lock + per-project toggle — is RL scoring unlocked
      (``vco_lib/rl_scoring_lock.toml``) and enabled for this project? (There
      is no licence gate since v0.2.106: the reranker ships with VCO.)
@@ -107,25 +109,34 @@ def _probe_scoring_lock() -> Dict[str, Any]:
 
 
 def _probe_per_project_toggle() -> Dict[str, Any]:
-    """Per-project enable toggle (hub-resolved). Soft-fail → unknown."""
+    """Per-project enable toggle (hub-resolved). Soft-fail → unknown.
+
+    v0.2.106 (owner 2026-11-12): RL scoring is OPT-IN per project — only an
+    explicit ``True`` is on, exactly as ``search_pipeline._resolve_rl_enabled``
+    reads it; an unknown toggle means the search path keeps scoring off.
+    """
     try:
         from claude_mcp_servers.weaviate_mcp.server import _try_resolve_project_config
 
         cfg = _try_resolve_project_config()
         if cfg is None:
-            return {"status": "unknown", "enabled": None, "detail": "no project config resolved."}
-        enabled = bool(getattr(cfg, "rl_reranker_enabled_for_project", True))
+            return {"status": "unknown", "enabled": None, "project_id": None,
+                    "detail": "no project config resolved; RL scoring stays off until it can be read."}
+        enabled = getattr(cfg, "rl_reranker_enabled_for_project", False) is True
         return {
             "status": "enabled" if enabled else "disabled_for_project",
             "enabled": enabled,
+            "project_id": getattr(cfg, "project_id", None) or None,
             "detail": (
-                "reranker enabled for this project."
+                "reranker turned on for this project."
                 if enabled
-                else "reranker explicitly disabled for this project (launcher Modules panel)."
+                else "reranker off for this project (opt-in: turn it on in the launcher's "
+                     "Modules panel)."
             ),
         }
     except Exception as exc:  # noqa: BLE001
-        return {"status": "unknown", "enabled": None, "detail": f"toggle probe raised: {exc}"}
+        return {"status": "unknown", "enabled": None, "project_id": None,
+                "detail": f"toggle probe raised: {exc}"}
 
 
 def _resolve_active_text_embedding() -> "tuple[str, int]":
@@ -221,7 +232,66 @@ def _probe_container() -> Dict[str, Any]:
         "trained": neg.trained,
         "weights_version": neg.weights_version,
         "linked_slots_masked": neg.linked_slots_masked,
+        "per_project_gate": neg.per_project_gate,
         "detail": neg.detail,
+    }
+
+
+def _probe_project_online(container: Dict[str, Any], toggle: Dict[str, Any]) -> Dict[str, Any]:
+    """v0.2.106: this project's online learning + serving gate, read from the
+    container's ``/project_status`` through the SAME base URL and embedding
+    the container probe used (read-only). Never raises.
+
+    ``serving`` / ``not_serving`` (with the container's reason and the last
+    held-out check), or ``not_checked`` / ``unavailable`` with why.
+    """
+    if container.get("status") != "compatible":
+        return {"status": "not_checked", "detail": "the container is not called (see above)."}
+    if not container.get("per_project_gate"):
+        return {"status": "not_checked", "detail": "the container has no per-project gate."}
+    project_id = toggle.get("project_id")
+    if not project_id:
+        return {"status": "unavailable", "detail": "no project id resolved for this folder."}
+    try:
+        from claude_mcp_servers.rl_client.client import RLClient
+
+        client = RLClient(
+            text_dim=int(container.get("client_text_dim") or 1024),
+            active_embedding=str(container.get("client_active_embedding") or ""),
+            base_url=container.get("client_base_url"),
+            project_id=str(project_id),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unavailable", "detail": f"RLClient construct raised: {exc}"}
+
+    async def _run():
+        try:
+            return await client.project_status()
+        finally:
+            await client.aclose()
+
+    try:
+        data = asyncio.run(_run())
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unavailable", "detail": f"project_status raised: {exc}"}
+    if not isinstance(data, dict) or not data.get("ok"):
+        return {"status": "unavailable", "detail": "the container did not answer /project_status."}
+    online = data.get("online") or {}
+    last = online.get("last_eval") or {}
+    counters = online.get("counters") or {}
+    return {
+        "status": "serving" if data.get("serving") else "not_serving",
+        "reason": data.get("reason"),
+        "detail": (
+            f"{'SERVED' if data.get('serving') else 'not served'}: {data.get('reason')}; "
+            f"{counters.get('events_seen', 0)} citation events, "
+            f"{counters.get('queries_trained', 0)} trained on, held-out window "
+            f"{online.get('holdout_queries', 0)}/{online.get('holdout_target', 0)}, "
+            f"served-then-stopped {counters.get('serving_turned_off', 0)}x"
+        ),
+        "last_eval": last or None,
+        "counters": counters or None,
+        "training": online.get("training"),
     }
 
 
@@ -244,19 +314,41 @@ _SCORING_OFF_REASONS = {
 
 def _scoring_state(
     lock: Dict[str, Any], toggle: Dict[str, Any], container: Dict[str, Any],
+    online: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Which scoring state applies, and why: the gates of the search path in
     its order (``search_pipeline._resolve_rl_enabled``, then the negotiation
-    gate of ``_do_rerank``). Pure."""
+    gate of ``_do_rerank``, then — v0.2.106 — the container's per-project
+    serving gate, ``online``). Pure."""
     if lock.get("locked") is not False:
         return {"status": "off_locked", "scoring": False,
                 "detail": f"scoring lock is set: {lock.get('detail') or 'locked'}"}
     if toggle.get("enabled") is False:
         return {"status": "off_project_disabled", "scoring": False,
-                "detail": "the reranker is disabled for this project."}
+                "detail": "the reranker is disabled for this project (opt-in: turn it on "
+                          "in the launcher's Modules panel)."}
+    if toggle.get("enabled") is not True:
+        return {"status": "off_toggle_unknown", "scoring": False,
+                "detail": "the project's RL toggle could not be read; RL scoring is opt-in, "
+                          "so the search path keeps it off until it can."}
     status = container.get("status") or "unknown"
     if status == "compatible":
+        o = online or {}
+        online_status = o.get("status")
+        if online_status == "not_serving":
+            return {"status": "off_not_served", "scoring": False,
+                    "detail": "searches keep their plain order: this project's model is not "
+                              f"served ({o.get('reason') or 'it has not passed its check'})."}
+        if online_status == "serving":
+            return {"status": "on", "scoring": True,
+                    "detail": "searches are reranked by this project's own model "
+                              f"({o.get('reason') or 'it passes its check'})."}
         version = container.get("weights_version") or "version not reported"
+        if container.get("per_project_gate"):
+            return {"status": "on", "scoring": True,
+                    "detail": "the container is called; it reranks only with a project model "
+                              "that passes its own held-out check (this project's state "
+                              f"could not be read: {o.get('detail') or 'unknown'})."}
         return {"status": "on", "scoring": True,
                 "detail": f"searches are reranked by the container's trained model ({version})."}
     return {
@@ -428,9 +520,12 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
     quarantine = _probe_quarantine()
 
     # v0.2.100 W5R-02: the scoring lock wins over the toggle. v0.2.106: the
-    # licence gate that sat between them is gone (the pipeline has none).
-    rl_enabled = lock.get("locked") is False and toggle.get("enabled") is not False
-    scoring = _scoring_state(lock, toggle, container)
+    # licence gate that sat between them is gone (the pipeline has none), and
+    # the toggle is OPT-IN — only an explicit on counts (owner 2026-11-12).
+    rl_enabled = lock.get("locked") is False and toggle.get("enabled") is True
+    online = (_probe_project_online(container, toggle) if rl_enabled
+              else {"status": "not_checked", "detail": "RL scoring is off for this project."})
+    scoring = _scoring_state(lock, toggle, container, online)
 
     # Healthy iff: off (nothing to fix) OR (enabled AND container compatible
     # AND hub up). Version mismatch / container down / hub down on an ENABLED
@@ -455,6 +550,8 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
         "scoring_lock": lock,
         "per_project_toggle": toggle,
         "container": container,
+        # v0.2.106: the project's online learning + serving gate.
+        "project_online": online,
         "last_fallback": fallback,
         "telemetry_hub": telemetry,
         "retention": retention,
@@ -481,6 +578,9 @@ def format_human(report: Dict[str, Any]) -> str:
     _sec("scoring lock", report.get("scoring_lock", {"status": "unknown", "detail": ""}))
     _sec("per-project toggle", report["per_project_toggle"])
     _sec("container / negotiation", report["container"])
+    # .get: tolerate pre-v0.2.106 report dicts.
+    _sec("per-project online learning", report.get(
+        "project_online", {"status": "unknown", "detail": ""}))
     _sec("last rerank fallback", report["last_fallback"])
     _sec("telemetry hub", report["telemetry_hub"])
     _sec("retention (RL-5)", report["retention"])

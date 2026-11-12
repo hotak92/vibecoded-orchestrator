@@ -426,20 +426,27 @@ class ResolveHappyPathTest(_ResolverTestBase):
         self.assertEqual(cfg.shared_kg_collection, "")
         self.assertEqual(cfg.development_collection, "")
 
-    def test_rl_reranker_enabled_for_project_defaults_true_when_field_absent(
+    def test_rl_reranker_enabled_for_project_defaults_false_when_field_absent(
         self,
     ) -> None:
-        """v0.2.49 Stream B back-compat: pre-v0.2.49 hubs omit the
-        field; new clients must back-fill with ``True`` (fail-open).
-        Without this, every project paired with an old hub would
-        silently lose its RL reranker.
+        """v0.2.106 (owner 2026-11-12): RL scoring is OPT-IN per project.
+        A hub that omits the field (pre-v0.2.49) must not turn on a feature
+        the user never chose: the back-fill is ``False``, the same as the
+        hub's own system default for the module.
         """
         # Use the canonical FULL_BODY but explicitly remove the new
         # field to simulate the pre-v0.2.49 hub.
         body = {k: v for k, v in FULL_BODY.items() if k != "rl_reranker_enabled_for_project"}
         self.session.get.return_value = _make_response(200, body)
         cfg = resolve(FULL_BODY["project_id"])
-        self.assertTrue(cfg.rl_reranker_enabled_for_project)
+        self.assertFalse(cfg.rl_reranker_enabled_for_project)
+
+    def test_rl_reranker_enabled_for_project_non_bool_is_off(self) -> None:
+        """Only an explicit JSON ``true`` turns it on (opt-in)."""
+        body = {**FULL_BODY, "rl_reranker_enabled_for_project": "yes"}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertFalse(cfg.rl_reranker_enabled_for_project)
 
     def test_rl_reranker_enabled_for_project_parses_explicit_false(self) -> None:
         """Explicit ``False`` from a v0.2.49+ hub flows through to the

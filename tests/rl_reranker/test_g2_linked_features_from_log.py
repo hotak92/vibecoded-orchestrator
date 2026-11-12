@@ -101,7 +101,7 @@ def test_extract_samples_reads_linked_type_names_and_linked_embs() -> None:
     ret = _build_retrieval_event(node_rec)
     cit = _build_citation_event("Alpha", cosine=0.8)
 
-    samples = extract_samples([(ret, cit)], link_sim={})
+    samples = extract_samples([(ret, cit)])
     assert len(samples) == 1
     s = samples[0]
 
@@ -151,7 +151,7 @@ def test_pre_fix_loader_would_fail_link_features() -> None:
     # The FIXED path recovers both.
     ret = _build_retrieval_event(node_rec)
     cit = _build_citation_event("Beta", cosine=0.75)
-    s = extract_samples([(ret, cit)], link_sim={})[0]
+    s = extract_samples([(ret, cit)])[0]
     assert s["link_type_idxs"] and s["linked_embs"], (
         "fixed path recovers link-type idxs + linked embeddings the pre-fix "
         "path dropped"
@@ -178,7 +178,7 @@ def test_epoch_builds_nonzero_linked_slot_energy() -> None:
     )
     ret = _build_retrieval_event(node_rec)
     cit = _build_citation_event("Gamma", cosine=0.82)
-    samples = extract_samples([(ret, cit)], link_sim={})
+    samples = extract_samples([(ret, cit)])
     assert samples
 
     # Capture the entity tensor the net actually receives by wrapping the net's

@@ -7,15 +7,22 @@ the orchestrator (AGPL-3.0) since v0.2.106; no licence is needed.
 
 A small HTTP server (`rl_server.py`) that the Weaviate MCP server calls
 after every hybrid search to rerank candidate results before returning
-them to the agent. Reranking is online-learned: the server watches the
-agent's output, detects which retrieved nodes were actually cited, and
-trains an `RLModel` (small PyTorch network) on those signals. The MCP-side
-client is `claude_mcp_servers/rl_client`.
+them to the agent. Reranking is learned online, per project
+(`online_learning.py`, v0.2.106): the MCP posts each answer's citation event
+(which retrieved nodes the answer used, with their frozen vectors), and the
+server trains that project's own `RLModel` (small PyTorch network) on them in
+bounded rounds with the offline trainer's objective (`objective.py`). A
+project's model reranks its searches only while it beats plain cosine
+ordering on the project's own held-out recent queries (NDCG@10 at least +2%
+AND the cited node's MRR@10 not below cosine's); until then, and whenever it
+stops passing, the server hands the client its own search order back. The
+MCP-side client is `claude_mcp_servers/rl_client`.
 
-Whether the scores are USED is decided on the client side, by the shipped RL
-scoring lock (`vco_lib/rl_scoring_lock.toml`, set until a trained model ships)
-and the per-project RL toggle. Retrieval and citation events are logged either
-way, so there is data to train on.
+Whether the container is called at all is decided on the client side: RL
+scoring is opt-in per project (off by default; the scoring lock
+`vco_lib/rl_scoring_lock.toml` is lifted since v0.2.106, owner ruling
+2026-11-12). With the toggle off nothing is sent to the container. Retrieval
+and citation events are logged either way, so there is data to train on.
 
 ## HTTP API
 
@@ -27,9 +34,10 @@ launcher-driven model-lifecycle management.
 
 | Method | Path           | Purpose |
 |--------|----------------|---------|
-| GET    | `/health`      | Liveness + weights state: `{ "ok": true, "model": "RLModel loaded" \| "not trained", "trained": bool, "weights": { "profile", "loaded_version", "bundled_version" }, ... }`. |
-| POST   | `/cache_nodes` | Score one search's candidates with the loaded model and return the reranked order + scores. The client sends the vectors it already logs (query vector, node vectors, linked vectors, node types) as float16 in a `features` block (`claude_mcp_servers/rl_client/rerank_wire.py`, wire protocol 2); the container embeds nothing. A body without `features` gets 422. |
-| POST   | `/rl_update`   | Submit Claude's `agent_output` to trigger citation detection + online training for the cached task_ids. |
+| GET    | `/health`      | Liveness + weights state: `{ "ok": true, "model": "RLModel loaded" \| "not trained", "trained": bool, "weights": { "profile", "loaded_version", "bundled_version" }, "per_project_gate": true, "online_learning": { "projects_loaded", "projects_serving_model", "bar" }, ... }`. |
+| POST   | `/cache_nodes` | Score one search's candidates with the routed project's model and return the reranked order + scores (`scored: true`, `serving: "model"`) — or, while that project's model does not pass its held-out check (or the request has no project id), the identity order with `scored: false`, `serving: "search_order"` and the `reason`. The client sends the vectors it already logs (query vector, node vectors, linked vectors, node types) as float16 in a `features` block (`claude_mcp_servers/rl_client/rerank_wire.py`, wire protocol 2); the container embeds nothing. A body without `features` gets 422. |
+| POST   | `/rl_update`   | Submit citation events (`tasks: {task_id: {nodes_packed, query_emb, cosine_sims, literal_cited, cross_encoder_cited}}`, `RLClient.rl_update_v3`) to the routed project's online learner; every 32 events a training round + held-out check runs off the event loop. No project id = nothing learned (`skipped: "no_project_id"`). |
+| GET    | `/project_status` | The routed project's online learning and serving gate: serving yes/no and why, the last check's NDCG@10 / cited-node MRR@10 for the model and for cosine, the window size, events seen / trained, how often serving was stopped. |
 
 ### v0.1.1 — model lifecycle (launcher-driven)
 
@@ -195,7 +203,10 @@ length plus the qwen3 cutover date (2026-04-14).
 | File | Role |
 |---|---|
 | `rl_server.py` | aiohttp server, per-project routing, model-lifecycle endpoints, hub client |
-| `retrieval_rl.py` | online learner (rerank + citation-driven update) |
+| `retrieval_rl.py` | the live rerank of one search |
+| `online_learning.py` | per-project online learning: the held-out window + purge gap, training rounds, the serving gate, per-project state files |
+| `objective.py` | the training objective + input builder (one home: the offline trainer and the online learner) |
+| `ranking_metrics.py` | NDCG@k / MRR@k and the bar (one home: `training/eval_harness.py` and the serving gate) |
 | `rl_model.py` / `rl_model_v1.py` | the v2 network (default) / the v1 snapshot (`RL_ARCH_VERSION=v1`) |
 | `offline_trainer.py`, `hub_event_loader.py` | offline training over launcher.db events read through the hub |
 | `bundled_weights.py` | the ONE reader of `weights/manifest.json` (stdlib only) |
@@ -307,7 +318,21 @@ python -m claude_mcp_servers.rl_reranker.training.transfer adapt \
     --data <dir> --profile qwen3 --out <run dir> --base-report <run dir>/lopo_qwen3.json --purge-hours 24
 ```
 
-Both commands take the `train` options (`--init none|cosine|<checkpoint>`,
+To see what the SERVER's own online learning does on a project's real history,
+replay the export through it (the same `ProjectLearner` the server drives:
+rounds, held-out window, gate), per profile and project:
+
+```bash
+python -m claude_mcp_servers.rl_reranker.training.transfer replay \
+    --data <dir> --profile qwen3 --out <run dir> [--lr 1e-4 --holdout 300 --min-cited 20 --purge-gap-hours 24]
+```
+
+It reports the events each project needs before its model is served, the
+NDCG@10 gain over cosine and the cited-node MRR@10 of the searches served by
+the model (scored when they arrive, before the model learns from them), and
+how often the gate stopped serving.
+
+The `lopo` / `adapt` commands take the `train` options (`--init none|cosine|<checkpoint>`,
 `--l2sp`, `--entity-dropout`, `--arch v2|v1`, `--purge-hours`, the loss
 weights) and report MRR@10 of literally cited nodes next to NDCG@10: the
 training target rewards nodes that are typical of the whole candidate set, so

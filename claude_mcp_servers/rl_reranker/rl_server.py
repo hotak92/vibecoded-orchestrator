@@ -4,13 +4,24 @@
 Standalone HTTP server exposing RetrievalRL for training from external clients.
 
 Primary consumer: the weaviate-kg MCP server, which calls this server to:
-  1. Score the candidates of each KG search with the loaded model (from the
-     vectors the client sends) and receive the reranked order + scores.
-  2. Submit Claude's agent_output (text after the KG call) for citation detection + online training.
+  1. Score the candidates of each KG search with the project's model (from
+     the vectors the client sends) and receive the reranked order + scores —
+     or, while the project's model does not pass its own held-out check, the
+     client's own order back (``serving: "search_order"``).
+  2. Submit each answer's citation event (frozen vectors + answer cosines +
+     literal citations) for the project's online learning.
+
+Per-project online learning (v0.2.106, owner ruling 2026-11-12; opt-in on the
+client side): ``online_learning.ProjectLearner`` — the offline objective in
+bounded rounds, a held-out window of the project's newest queries with a
+purge gap, and a gate that serves the model only while it beats plain cosine
+(NDCG@10 >= +2% AND cited-node MRR@10 not below cosine's).
 
 Endpoints:
-  POST /cache_nodes      — candidates + serve-time features → model scores → reranked order
-  POST /rl_update        — task_ids + agent_output → citation detection + online train
+  POST /cache_nodes      — candidates + serve-time features → the project's reranked order
+                           (or its search order while its model is not served)
+  POST /rl_update        — citation events → the project's online learning
+  GET  /project_status   — the routed project's online learning + serving gate
   GET  /health           — liveness check
   POST /rotate_weights   — hot-swap loaded RLModel to a new .pt without restart       (v0.1.1)
   POST /reset            — fork (or fork + specialize) project model from global       (v0.1.1),
@@ -80,6 +91,7 @@ from vco_lib.log_setup import configure_logging
 from vco_lib.rl_weights_ownership import classify as classify_weights_owner
 
 from .bundled_weights import BundledWeights, resolve_bundled_weights
+from .online_learning import DEFAULT_CONFIG, OnlineConfig, ProjectLearner, compute_round
 from .retrieval_rl import RetrievalRL
 from rl_client.rl_logger import RLDataLogger, default_rl_log_path
 from .rl_model import N_ENTITY_TYPES, RLModel, linked_slots_masked
@@ -170,6 +182,14 @@ def _build_weights_filename(source: str, weights_version: str = "") -> str:
     """
     version = weights_version.strip() or _LOCAL_FORK_VERSION_SENTINEL
     return f"rl_model_{source}_{version}.pt"
+
+
+def _model_base_version(model: Any) -> str:
+    """The release a model's training started from — the same rule
+    ``choose_local_checkpoint`` judges a checkpoint by
+    (``base_weights_version``, else ``weights_version``; "" = none)."""
+    return str(getattr(model, "base_weights_version", "") or getattr(model, "weights_version", "")
+               or "")
 
 
 def _glob_weights_files(state_dir: "Path", source: str) -> "list[Path]":
@@ -792,6 +812,16 @@ class _ProjectHead:
     # must be explicitly /rotate_weights'd into). Empty until the first
     # successful finetune for this project.
     last_finetuned_path: "Path | None" = None
+    # v0.2.106 — the project's online learning + serving gate
+    # (``online_learning.ProjectLearner``). None for the ``_base`` sentinel
+    # (no project identity = no per-project model) and for a head whose
+    # model failed to load (it serves the shared base in-process, which must
+    # never be trained by one project). A head without a learner always
+    # answers with the client's search order.
+    learner: "ProjectLearner | None" = None
+    # The project's own state dir (``projects/<project_id>/``): where its
+    # checkpoint and learner state are saved.
+    project_dir: "Path | None" = None
 
 
 def _per_project_state_dir(base_state_dir: Path, project_id: str) -> Path:
@@ -897,6 +927,32 @@ def _safe_weights_path(p: str) -> "Path | None":
 
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+
+
+class _seeded_init:
+    """Context: seed torch's RNGs (CPU and CUDA) for a fresh network
+    initialisation, restoring the previous RNG state afterwards. ``enabled``
+    False = no-op (a checkpoint is being loaded; nothing random happens)."""
+
+    def __init__(self, seed: int, *, enabled: bool) -> None:
+        self._seed = int(seed)
+        self._enabled = enabled
+        self._fork: Any = None
+
+    def __enter__(self) -> None:
+        if not self._enabled:
+            return
+        import torch
+
+        devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        self._fork = torch.random.fork_rng(devices=devices)
+        self._fork.__enter__()
+        torch.manual_seed(self._seed)
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._fork is not None:
+            self._fork.__exit__(*exc)
+            self._fork = None
 
 
 class RLServer:
@@ -1061,6 +1117,11 @@ class RLServer:
         # resolved project_id at their call sites (they need a concrete project key);
         # only the client OBJECT is now always present.
         self._project_id = os.environ.get("VCT_PROJECT_ID", "")
+        # The legacy single-project fallback of header-less requests. Kept
+        # apart from ``_project_id``, which ``_swap_in_head`` rewrites to the
+        # routed project on every request (v0.2.106 fix: a header-less request
+        # used to inherit the previous request's project).
+        self._env_project_id = self._project_id
         self._hub_client: "_HubClient | None" = _HubClient()
         if not self._project_id:
             logger.info(
@@ -1082,6 +1143,15 @@ class RLServer:
         self._app.router.add_post("/global/retrain", self._global_retrain)
         # v0.2.2 — D1' state introspection (dashboard widget feed)
         self._app.router.add_get("/state_summary", self._state_summary)
+        # v0.2.106 — the routed project's online learning + serving gate
+        self._app.router.add_get("/project_status", self._project_status)
+
+        # v0.2.106 — per-project online learning (online_learning.py). One
+        # config for every project; tests and the replay pass their own.
+        self._online_cfg: OnlineConfig = DEFAULT_CONFIG
+        # Rounds running off the event loop (references kept so they are not
+        # garbage-collected mid-flight; ``wait_for_rounds`` awaits them).
+        self._round_tasks: "set[asyncio.Task]" = set()
 
         # v0.2.10 — per-project routing infrastructure.
         #
@@ -1172,8 +1242,8 @@ class RLServer:
         # carried that header. This means an unmodified v0.2.9 container
         # behaves identically post-update so long as the launcher keeps
         # setting VCT_PROJECT_ID.
-        if self._project_id:
-            return self._project_id
+        if self._env_project_id:
+            return self._env_project_id
         # Truly no project context: the launcher hasn't shipped a header
         # yet AND VCT_PROJECT_ID is empty. Audit-log the fallback so the
         # operator notices their clients aren't sending the header.
@@ -1271,18 +1341,34 @@ class RLServer:
                 project_id, source, self._rl_model_tag, project_state_dir,
             )
 
+        learner: "ProjectLearner | None" = None
         try:
-            new_model = RLModel.load_or_create(
-                state_path=target_path,
-                emb_dim=self._rl_emb_dim,
-                arch_version=self._rl_arch_version,
-                device=self._rl_device_spec,
-                embedding_source=source,
+            # A fresh initialisation (no checkpoint at all) is seeded, so a
+            # project's online learning is deterministic from its first event.
+            with _seeded_init(self._online_cfg.seed, enabled=not target_path.exists()):
+                new_model = RLModel.load_or_create(
+                    state_path=target_path,
+                    emb_dim=self._rl_emb_dim,
+                    arch_version=self._rl_arch_version,
+                    device=self._rl_device_spec,
+                    embedding_source=source,
+                )
+            if is_fallback:
+                # Started from the base checkpoint: train and save under the
+                # project's own dir, never over the base file.
+                target_path = project_state_dir / _build_weights_filename(
+                    self._rl_model_tag, _model_base_version(new_model),
+                )
+                new_model.retarget(target_path)
+            learner = ProjectLearner.load(
+                project_state_dir, profile=self._rl_model_tag, emb_dim=self._rl_emb_dim,
+                model=new_model, cfg=self._online_cfg,
             )
         except Exception as exc:
             # Catastrophic load failure: log + fall back to the in-process
             # base model directly. We never raise out of routing — the
-            # request must still succeed (with degraded personalization).
+            # request must still succeed (with the client's search order:
+            # no learner, so nothing trains the shared base model).
             self._routing_counters["head_load_failures"] += 1
             logger.warning(
                 "routing: head_load_failed project_id=%s source=%s path=%s "
@@ -1292,6 +1378,7 @@ class RLServer:
             new_model = self._rl._rl_model
             target_path = self._state_path
             is_fallback = True
+            learner = None
 
         per_project_log = _per_project_log_path(self._log_root, project_id)
         per_project_logger = RLDataLogger(
@@ -1308,16 +1395,24 @@ class RLServer:
             state_path=target_path,
             data_logger=per_project_logger,
             is_base_fallback=is_fallback,
+            learner=learner,
+            project_dir=project_state_dir,
         )
 
         # LRU insert with eviction. The base sentinel head is pinned and
-        # never evicted — find a non-base candidate to evict if needed.
+        # never evicted — find a non-base candidate to evict if needed. A
+        # head whose online round is still running is not evicted (its
+        # result would land on a head nobody routes to any more); an evicted
+        # head's learner is saved first, so its queued events survive.
         self._project_heads[key] = head
         self._routing_counters["head_loads"] += 1
         while len(self._project_heads) > self._project_head_lru_size:
             for evict_key in list(self._project_heads.keys()):
-                if evict_key[0] != _BASE_PROJECT_SENTINEL:
+                cand = self._project_heads[evict_key]
+                busy = cand.learner is not None and cand.learner.round_in_flight
+                if evict_key[0] != _BASE_PROJECT_SENTINEL and evict_key != key and not busy:
                     evicted = self._project_heads.pop(evict_key)
+                    self._save_learner(evicted)
                     logger.info(
                         "routing: evicted project head project_id=%s source=%s "
                         "(LRU size=%d)",
@@ -1386,8 +1481,16 @@ class RLServer:
         the source of truth for the next request that lands on this
         project.
         """
+        live = self._rl._rl_model
+        if head.learner is not None and live is not None and live is not head.rl_model:
+            # v0.2.106: every model swap of a project (/rotate_weights,
+            # /reset, the rl_use_global switch) lands here. The held-out
+            # window may have been trained on by the new model, so the gate
+            # starts over and the project is served its search order until
+            # the new model passes on fresh queries.
+            head.learner.on_model_replaced(live, "rotate / reset / global model")
         head.state_path = self._state_path
-        head.rl_model = self._rl._rl_model
+        head.rl_model = live
         if self._project_flags_cache is not None:
             head.flags_cache = (self._project_flags_cached_at, self._project_flags_cache)
         if self._last_finetuned_path is not None:
@@ -1458,6 +1561,13 @@ class RLServer:
             # The client leaves the linked slots out of its features when
             # they are masked for this profile (this server masks anyway).
             "linked_slots_masked": linked_slots_masked(self._rl_model_tag),
+            # v0.2.106 (owner 2026-11-12): every project's model is gated by
+            # this server on that project's own held-out queries; a project
+            # whose model does not pass gets its own search order back
+            # (``serving: "search_order"``). So the client may call this
+            # server even while ``trained`` is false.
+            "per_project_gate": True,
+            "online_learning": self._online_summary(),
             "arch_version": self._rl_arch_version,
             "model_tag": self._rl_model_tag,
             "emb_dim": self._rl_emb_dim,
@@ -1895,6 +2005,26 @@ class RLServer:
                 flags = await self._fetch_project_flags()
                 if flags.get("rl_use_global"):
                     await self._ensure_global_model_loaded()
+                self._capture_head_state(head)
+                weights_version = str(
+                    getattr(self._rl._rl_model, "weights_version", "") or ""
+                )
+                # v0.2.106 per-project gate: the model reranks only for a
+                # project whose model passes the owner's bar on that
+                # project's own held-out queries; every other request gets
+                # the client's own order back, unchanged.
+                learner = head.learner
+                if learner is None or not learner.serving:
+                    why = (
+                        "no project id on the request (per-project models only)"
+                        if head.project_id == _BASE_PROJECT_SENTINEL
+                        else "the project's model could not be loaded"
+                        if learner is None
+                        else learner.reason
+                    )
+                    return web.json_response(
+                        self._search_order_answer(task_id, nodes, limit, why, weights_version)
+                    )
                 try:
                     result = self._rl.rerank(
                         features, len(nodes), profile=self._rl_model_tag,
@@ -1904,10 +2034,6 @@ class RLServer:
                         {"ok": False, "error": "invalid_features", "detail": str(exc)},
                         status=422,
                     )
-                weights_version = str(
-                    getattr(self._rl._rl_model, "weights_version", "") or ""
-                )
-                self._capture_head_state(head)
         except Exception as exc:  # noqa: BLE001 — never crash the handler
             logger.exception("cache_nodes error: %s", exc)
             return web.json_response({"ok": False, "error": "internal_error"}, status=500)
@@ -1917,12 +2043,33 @@ class RLServer:
             "ok": True,
             "task_id": task_id,
             "scored": True,
+            "serving": "model",
+            "reason": learner.reason,
             "order": result.order,
             "scores": result.scores,
             "top_k": top_k,
             "weights_version": weights_version or None,
             "linked_slots_masked": result.linked_slots_masked,
         })
+
+    def _search_order_answer(
+        self, task_id: str, nodes: list, limit: int, why: str, weights_version: str,
+    ) -> dict[str, Any]:
+        """The ``/cache_nodes`` answer for a project whose model is not served:
+        the client's own order, unchanged (``scored: false``)."""
+        n = len(nodes)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "scored": False,
+            "serving": "search_order",
+            "reason": why,
+            "order": list(range(n)),
+            "scores": [None] * n,
+            "top_k": list(nodes[: max(0, limit)]),
+            "weights_version": weights_version or None,
+            "linked_slots_masked": linked_slots_masked(self._rl_model_tag),
+        }
 
     async def _rl_update(self, request: web.Request) -> web.Response:
         """v0.2.9 (C8) pre-packed payload contract.
@@ -1936,10 +2083,18 @@ class RLServer:
           task_type:         str (optional, default "mcp_interactive").
 
         ``tasks[id]`` carries the frozen retrieval-time vectors + the citation
-        inputs (cosine_sims, literal_cited, cross_encoder_cited). The
-        container applies ``compute_unified_targets`` and steps the gradient
-        -- see ``RetrievalRL._update``. Container does NO embedding /
-        chunking / data-logger writes (MCP is sole citation writer).
+        inputs (cosine_sims, literal_cited, cross_encoder_cited). v0.2.106:
+        each task enters the routed project's online learner
+        (``online_learning.ProjectLearner.ingest``: unified target formula,
+        held-out window, purge gap); every ``round_every`` events a training
+        round + gate evaluation runs off the event loop (``_finish_round``).
+        Nothing trains for a request without a project id. Container does NO
+        embedding / chunking / data-logger writes (MCP is sole citation
+        writer).
+
+        Training is skipped (the events still feed the held-out check) when
+        the project set ``rl_online_training_disabled`` or ``rl_use_global``
+        (the shared model is read-only for the project).
 
         Pre-C8 callers sent ``agent_output: str`` -- those callers are
         deprecated. If ``tasks`` is absent and ``agent_output`` is present,
@@ -1981,50 +2136,64 @@ class RLServer:
                     {"ok": True, "skipped": "no task_ids or tasks"}
                 )
 
-            # v0.2.10 — route the online training step to the per-project
-            # head so the gradient updates land on the right network. Held
-            # under _routing_lock to avoid concurrent updates from different
-            # projects racing on the shared RetrievalRL instance.
+            if not isinstance(tasks, dict) or not isinstance(task_ids, list):
+                return web.json_response(
+                    {"ok": False, "error": "tasks must be an object and task_ids a list"},
+                    status=400,
+                )
+
+            # v0.2.10 routing: the events land on the routed project's head;
+            # v0.2.106: in that project's online learner (one per project,
+            # never the shared base).
             project_id, head = await self._route_request(request)
+            learner = head.learner
+            if learner is None:
+                return web.json_response({
+                    "ok": True, "scheduled": 0,
+                    "skipped": (
+                        "no_project_id" if head.project_id == _BASE_PROJECT_SENTINEL
+                        else "project_model_unavailable"
+                    ),
+                })
+            job = None
             async with self._routing_lock:
                 self._swap_in_head(head)
 
                 flags = await self._fetch_project_flags()
-                skip_train = bool(flags.get("rl_online_training_disabled"))
+                skip_train = bool(flags.get("rl_online_training_disabled")) or bool(
+                    flags.get("rl_use_global"))
                 if skip_train:
                     logger.info(
-                        "rl_update: online_training_disabled=true; accepting %d "
-                        "task_ids without training step (project_id=%s)",
-                        len(task_ids), project_id,
+                        "rl_update: online training off for project_id=%s "
+                        "(online_training_disabled / use_global); %d events feed "
+                        "the held-out check only", project_id, len(task_ids),
                     )
+                self._capture_head_state(head)
 
+                now_ms = int(time.time() * 1000)
                 scheduled = 0
                 for task_id in task_ids:
                     payload = tasks.get(task_id)
-                    if not payload:
+                    if not isinstance(payload, dict):
                         continue
-                    self._rl.schedule_update(
-                        task_id=task_id,
-                        nodes_packed=payload.get("nodes_packed") or [],
-                        query_emb=payload.get("query_emb") or [],
-                        cosine_sims=payload.get("cosine_sims") or {},
-                        literal_cited=payload.get("literal_cited") or {},
-                        cross_encoder_cited=payload.get("cross_encoder_cited"),
-                        targets=payload.get("targets"),
-                        task_type=task_type,
-                        skip_train=skip_train,
-                    )
-                    scheduled += 1
+                    if learner.ingest(payload, ts_ms=now_ms, train=not skip_train):
+                        scheduled += 1
+                if learner.round_due():
+                    job = learner.prepare_round(head.rl_model, now_ms=now_ms)
+            if job is not None:
+                task = asyncio.create_task(self._finish_round(head, job))
+                self._round_tasks.add(task)
+                task.add_done_callback(self._round_tasks.discard)
 
-                # schedule_update enqueues; the actual gradient step happens
-                # on the RetrievalRL worker (background task in retrieval_rl).
-                # Mutating self._rl._rl_model while a gradient step is in
-                # flight would corrupt the optimizer; we capture the head's
-                # state here BEFORE releasing the lock so the next request
-                # sees the right last_finetuned_path / flags cache.
-                self._capture_head_state(head)
-
-            resp: dict[str, Any] = {"ok": True, "scheduled": scheduled}
+            resp: dict[str, Any] = {
+                "ok": True, "scheduled": scheduled, "task_type": task_type,
+                "round_started": job is not None,
+                "serving": learner.serving,
+            }
+            if scheduled < len(task_ids):
+                resp["skipped_events"] = len(task_ids) - scheduled
+                if learner.last_skip_reason:
+                    resp["skip_reason"] = learner.last_skip_reason
             if skip_train:
                 resp["online_training_disabled"] = True
             return web.json_response(resp)
@@ -2032,6 +2201,182 @@ class RLServer:
         except Exception as exc:
             logger.exception("rl_update error: %s", exc)
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    # ------------------------------------------------------------------
+    # v0.2.106 — per-project online learning: rounds, persistence, status
+    # ------------------------------------------------------------------
+
+    async def _finish_round(self, head: _ProjectHead, job: Any) -> None:
+        """Run one prepared round off the event loop, then apply it.
+
+        The training + evaluation work on a private copy of the network
+        (``online_learning.compute_round``), so serving is never blocked by
+        a round; the result is loaded into the live model under the routing
+        lock, unless the model was replaced meanwhile. Never raises.
+        """
+        learner = head.learner
+        if learner is None:
+            return
+        try:
+            result = await asyncio.to_thread(compute_round, job)
+        except Exception as exc:  # noqa: BLE001 — a failed round never breaks serving
+            logger.exception("online round failed for project_id=%s: %s", head.project_id, exc)
+            async with self._routing_lock:
+                learner.abandon_round()
+            return
+        async with self._routing_lock:
+            applied = learner.apply_round(head.rl_model, result)
+            if applied:
+                self._save_project_head(head, model_trained=result.steps > 0)
+        if applied:
+            logger.info(
+                "online round project_id=%s: %d steps (%d queries) in %.2fs; serving=%s (%s)",
+                head.project_id, result.steps, result.trained_queries, result.runtime_s,
+                learner.serving, learner.reason,
+            )
+            await self._push_rl_online_state(head)
+
+    async def wait_for_rounds(self) -> None:
+        """Await every round in flight (tests, and a clean shutdown)."""
+        while self._round_tasks:
+            await asyncio.gather(*list(self._round_tasks), return_exceptions=True)
+
+    def _project_checkpoint_path(self, head: _ProjectHead) -> Path:
+        """Where the project's trained model is saved: its current file when
+        that lives in the project's own dir, else the v0.2.8 name there
+        (``rl_model_<source>_<base version or "local">.pt``)."""
+        assert head.project_dir is not None
+        current = Path(str(head.rl_model._pt_path))
+        try:
+            inside = current.resolve().parent == head.project_dir.resolve()
+        except OSError:
+            inside = False
+        if inside:
+            return current
+        return head.project_dir / _build_weights_filename(
+            self._rl_model_tag, _model_base_version(head.rl_model),
+        )
+
+    def _save_project_head(self, head: _ProjectHead, *, model_trained: bool) -> None:
+        """Persist a project after a round (caller holds the routing lock).
+
+        A trained model is saved under the project's own dir (a model that
+        was rotated in from elsewhere is retargeted there first, so online
+        training never writes a global or shipped file); the learner state
+        is saved beside it. Soft-fails with a log line.
+        """
+        learner = head.learner
+        if learner is None or head.project_dir is None:
+            return
+        try:
+            if model_trained:
+                target = self._project_checkpoint_path(head)
+                if Path(str(head.rl_model._pt_path)) != target:
+                    head.rl_model.retarget(target)
+                head.rl_model.save()
+                head.state_path = target
+                if self._rl._rl_model is head.rl_model:
+                    self._state_path = target
+                from .online_learning import model_fingerprint
+                learner.model_fingerprint = model_fingerprint(head.rl_model)
+            learner.save(head.project_dir)
+        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+            logger.warning("online learning: saving project_id=%s failed: %s",
+                           head.project_id, exc)
+
+    def _save_learner(self, head: _ProjectHead) -> None:
+        """Save a head's learner state alone (eviction / shutdown)."""
+        if head.learner is None or head.project_dir is None:
+            return
+        try:
+            head.learner.save(head.project_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("online learning: saving learner of project_id=%s failed: %s",
+                           head.project_id, exc)
+
+    def _online_summary(self) -> dict[str, Any]:
+        """Loaded projects and how many are served their model (for /health)."""
+        learners = [h.learner for h in self._project_heads.values() if h.learner is not None]
+        return {
+            "projects_loaded": len(learners),
+            "projects_serving_model": sum(1 for lr in learners if lr.serving),
+            "bar": {"min_ndcg_gain": self._online_cfg.min_ndcg_gain,
+                    "cited_mrr_not_below_cosine": True,
+                    "holdout_queries": self._online_cfg.holdout_queries},
+        }
+
+    async def _project_status(self, request: web.Request) -> web.Response:
+        """The routed project's online learning + serving gate (read-only).
+
+        200 ``{ok, project_id, serving, reason, online: {...}}``; ``online``
+        is ``null`` for a request without a project id (nothing is learned
+        or served for it) or when the project's model could not be loaded.
+        """
+        try:
+            project_id, head = await self._route_request(request)
+            async with self._routing_lock:
+                learner = head.learner
+                status = learner.status() if learner is not None else None
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("project_status error: %s", exc)
+            return web.json_response({"ok": False, "error": "internal_error"}, status=500)
+        if status is None:
+            why = ("no project id on the request (per-project models only)"
+                   if head.project_id == _BASE_PROJECT_SENTINEL
+                   else "the project's model could not be loaded")
+            return web.json_response({"ok": True, "project_id": None
+                                      if head.project_id == _BASE_PROJECT_SENTINEL
+                                      else project_id, "serving": False,
+                                      "reason": why, "online": None})
+        return web.json_response({
+            "ok": True, "project_id": project_id, "serving": status["serving"],
+            "reason": status["reason"], "online": status,
+            "weights": {
+                "local_train_steps": head.rl_model.local_train_steps,
+                "base_weights_version": head.rl_model.base_weights_version or None,
+                "file": Path(str(head.rl_model._pt_path)).name,
+            },
+        })
+
+    async def _push_rl_online_state(self, head: _ProjectHead) -> None:
+        """UPSERT the project's ``rl_online_state`` row via vct-hub (the
+        launcher's RL panel reads it). Best-effort, like the other writers."""
+        learner = head.learner
+        if (self._hub_client is None or learner is None
+                or head.project_id == _BASE_PROJECT_SENTINEL):
+            return
+        st = learner.status()
+        ev = st.get("last_eval") or {}
+        c = st["counters"]
+        fields: dict[str, Any] = {
+            "embedding_source": self._active_emb_source,
+            "refreshed_at": int(time.time()),
+            "serving": 1 if st["serving"] else 0,
+            "reason": st["reason"],
+            "training_enabled": 0 if st["training"] != "on" else 1,
+            "events_seen": c["events_seen"],
+            "queries_trained": c["queries_trained"],
+            "train_steps": c["train_steps"],
+            "rounds": c["rounds"],
+            "holdout_queries": st["holdout_queries"],
+            "holdout_target": st["holdout_target"],
+            "serving_turned_off": c["serving_turned_off"],
+            "last_eval_at": int((ev.get("at_ms") or 0) // 1000),
+            "ndcg_gain": ev.get("ndcg_gain"),
+            "ndcg": ev.get("ndcg"),
+            "cos_ndcg": ev.get("cos_ndcg"),
+            "mrr": ev.get("mrr"),
+            "cos_mrr": ev.get("cos_mrr"),
+            "cited_queries": ev.get("n_cited"),
+        }
+        try:
+            # Single-column key (the hub resolves ONE primary-key column):
+            # one row per project, for the profile this server is pinned to.
+            await self._hub_client.upsert_row(
+                head.project_id, "rl_online_state", head.project_id, fields,
+            )
+        except Exception as exc:  # noqa: BLE001 — the dashboard tolerates stale rows
+            logger.debug("rl_online_state push failed: %s", exc)
 
     # ------------------------------------------------------------------
     # v0.1.1 HTTP handlers — model management
@@ -2793,20 +3138,26 @@ class RLServer:
         Trains ONE global model on the union of several projects' events,
         read from launcher.db via the hub (keyed by project_id). No JSONL.
 
-        ``mode == "offline"``: aggregate all projects' paired events, then run
-                                the standard extract_samples → epoch loop
+        ``mode == "offline"``: aggregate all projects' paired events, then
+                                three shuffled epochs over the union,
                                 against global_path as resume-from.
-        ``mode == "online"``:  per project, replay retrieval/citation pairs
-                                through train_epoch one project at a time,
-                                save back to global_path. Faster; useful for
-                                recent, small-volume events.
+        ``mode == "online"``:  per project, one pass over its pairs in time
+                                order, one project at a time, saved back to
+                                global_path. Faster; useful for recent,
+                                small-volume events.
+
+        Both fit the ONE training objective (v0.2.106:
+        ``offline_trainer.queries_from_pairs`` -> ``online_learning.fit`` ->
+        ``objective.batch_loss``; the per-node BCE replay ``train_epoch`` it
+        used before is gone).
         """
         try:
             from .offline_trainer import (
                 pair_events as _pair_events,
-                train_epoch as _train_epoch,
+                queries_from_pairs as _queries_from_pairs,
                 load_training_events as _load_training_events,
             )
+            from .online_learning import VectorStore as _VectorStore, fit as _fit
 
             if self._hub_client is None:
                 raise RuntimeError(
@@ -2857,10 +3208,18 @@ class RLServer:
             )
 
             total_pairs = 0
+            cfg = self._online_cfg
+
+            def _train(pairs: "list[tuple[dict, dict]]", *, epochs: int, shuffle: bool) -> int:
+                store = _VectorStore(self._rl_emb_dim)
+                queries = _queries_from_pairs(pairs, store, profile=self._rl_model_tag)
+                return _fit(gm, queries, store, profile=self._rl_model_tag, epochs=epochs,
+                            batch_queries=cfg.batch_queries, lr=cfg.lr, seed=cfg.seed,
+                            shuffle=shuffle, loss=cfg.loss)
+
             if mode == "offline":
                 # Aggregate every project's pairs, then run a few epochs over
-                # the union (extract_samples → train_epoch), same target math
-                # as the per-project path.
+                # the union, same target math as the per-project path.
                 all_pairs: "list[tuple[dict, dict]]" = []
                 for idx, pid in enumerate(project_ids):
                     await self._update_job(
@@ -2875,8 +3234,7 @@ class RLServer:
                     message=f"Training on {total_pairs} pairs ({len(project_ids)} projects)…",
                 )
                 # 3 epochs over the aggregated corpus.
-                for _epoch_i in range(3):
-                    await asyncio.to_thread(_train_epoch, all_pairs, gm, True, {})
+                await asyncio.to_thread(lambda: _train(all_pairs, epochs=3, shuffle=True))
             else:  # mode == "online"
                 for idx, pid in enumerate(project_ids):
                     await self._update_job(
@@ -2886,7 +3244,9 @@ class RLServer:
                     )
                     pairs = await asyncio.to_thread(_fetch_pairs, pid)
                     total_pairs += len(pairs)
-                    await asyncio.to_thread(_train_epoch, pairs, gm, True, {})
+                    pairs.sort(key=lambda pr: int(pr[0].get("ts_ms") or 0))
+                    await asyncio.to_thread(
+                        lambda p=pairs: _train(p, epochs=1, shuffle=False))
 
             await asyncio.to_thread(gm.save)
             logger.info(
@@ -2940,6 +3300,12 @@ class RLServer:
 
         await stop_event.wait()
         logger.info("RLServer shutting down…")
+        # v0.2.106: let running online rounds land, then save every
+        # project's learner so its queued events survive the restart.
+        await self.wait_for_rounds()
+        async with self._routing_lock:
+            for h in list(self._project_heads.values()):
+                self._save_learner(h)
         if self._hub_client is not None:
             await self._hub_client.close()
         await runner.cleanup()

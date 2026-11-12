@@ -160,7 +160,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   linked-slot masking as the server. It then measures the model against plain cosine ordering on a later time
   window and on a project it never trained on (NDCG@10, plus MRR@10 and Recall@10 on literal citations).
   `shard_trainer ship` writes checkpoints into `weights/` only when both qwen3 and arctic pass the unlock bar.
-- **No trained RL weights ship yet, and RL scoring stays locked.** The first full run on the maintainer's data
+- **The RL reranker learns per project, online, and is opt-in.** RL scoring is off by default. You turn it on for
+  one project in the launcher (Modules → RL Reranker), or for every project through the host-wide default; while it
+  is off, nothing is sent to the reranker container and searches keep their order. When it is on, the reranker
+  learns from that project's own citations (the search results its answers actually use) and reranks the
+  project's searches only while its model beats plain search on its own check: on the project's most recent
+  queries, held out of training, NDCG@10 must be at least 2% above plain cosine ordering and the node the answer
+  names must rank no lower than plain cosine ranks it. A new project starts with exactly its plain search order;
+  when the model stops passing, the order goes back to plain search order. Training runs every 32 citation events
+  (at most 16 steps of 8 queries, off the server's request loop, so searches are never held up by it) with the same
+  objective as the offline trainer. A query is never trained on while it is in the check, and only 24 hours after it
+  left. Each project's model and its state are saved in the project's own folder of the container. `rl_doctor`, the
+  container's new `/project_status` route, `/health` and the launcher's RL Reranker panel show whether the
+  project's model is used and why. `python -m claude_mcp_servers.rl_reranker.training.transfer replay` replays an
+  export through this same code. The owner chose this design on 2026-11-12, and the scoring lock is lifted for it
+  with that decision recorded in `vco_lib/rl_scoring_lock.toml`.
+- **No trained RL weights ship.** The first full run on the maintainer's data
   (95 374 qwen3 and 78 944 arctic queries, 2.4 M labelled nodes) did not meet the unlock bar (NDCG@10 at least 2%
   above cosine on both hold-outs, and no project worse than cosine). The qwen3 model gained 3.7% on the later time
   window and 3.6% on the held-out project, but it was 1.8% below cosine on a second project it never saw. On that
@@ -168,7 +183,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.06 on the held-out project). The arctic model gained 2.7% on the time window but lost 0.2% on the held-out
   project. Training with a random rotation of the vectors stops the model from memorising which nodes helped, and
   removes those regressions, but its gains are below the bar (qwen3 +1.1% / +1.6%, arctic +0.4% / −0.8%). The
-  profiles ship together, so neither ships.
+  profiles ship together, so neither ships; per-project online learning (above) is what ships instead.
 - **Tools to test whether an RL reranker transfers to projects it never saw.**
   `python -m claude_mcp_servers.rl_reranker.training.transfer lopo` trains one fold per project with at least 3 000
   queries, holding that project out, and also keeps the smaller judged projects out of every fold. A design passes
@@ -188,9 +203,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those nodes first, without looking at the query at all, beats cosine by 3.4% (qwen3) and 2.4% (arctic) NDCG@10,
   and ranks the node the answer named lower. Learning per project, starting from cosine, passed +2% after one to
   four thousand of a project's own queries on the larger projects, and never on the smallest. The weights stay
-  unshipped and RL scoring stays locked.
+  unshipped.
 
 ### Changed
+
+- **RL scoring needs the project's own "on".** A project whose RL toggle cannot be read (the hub is down, or no
+  project configuration was found) is now treated as off; before, it was treated as on. An older hub that does not
+  send the toggle at all also counts as off. The citation of an answer is now sent to the reranker container only
+  for a project where RL scoring is on (before, it was sent whenever a container was configured). Turning it off
+  stops both at once; the local training log is kept either way.
+- **The RL reranker trains with one objective.** The per-node online step (one update per retrieved node, `RLModel.update`)
+  and the unused offline loop that replayed it (`offline_trainer.train_epoch`) are gone. The offline trainer and the
+  server's online learning now share `claude_mcp_servers/rl_reranker/objective.py` (the loss and the model input),
+  and the training reports and the server's check share `ranking_metrics.py` (NDCG@10, MRR@10 and the +2% bar).
+- **`offline_trainer`'s `--link-sim-path` option is removed.** It read a `link_similarity.json` that nothing ever
+  wrote, for a value the network does not use: since July the network's linked-node inputs are computed from the
+  stored linked vectors.
 
 - **Citation events name the labelling regime they were computed under.** v0.2.106 changed how citation labels are
   computed (the answer window is chunked by the shared chunker's answer mode with a dense budget), so every citation
@@ -234,8 +262,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distributed, licence-gated module before. The licence gate is gone everywhere: `rl_retrieval` is no longer a
   tier feature, the retrieval pipeline and `rl-doctor` no longer ask the licence validator, the dashboard's
   "RL-Scored Retrieval" switch is no longer Pro-only, and the root `CLAUDE.md` RL section now renders from the same
-  two gates the pipeline applies. Two gates remain, unchanged: the shipped RL scoring lock (still set until a trained
-  model ships) and the per-project RL toggle.
+  two gates the pipeline applies: the shipped RL scoring lock (lifted in this release for per-project online
+  learning, see Added) and the per-project RL toggle (opt-in, off by default).
 - **The RL reranker's container is built locally.** Installing or updating the "RL Reranker" module in the launcher
   builds `localhost/vco-rl-reranker:<version>-<cpu|cuda|rocm>` from `claude_mcp_servers/rl_reranker`. This is a new
   `container_build` install method, and nothing is pulled from a registry. The module's manifest and database
@@ -318,6 +346,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One project's RL training no longer writes the starting model of every other project.** A project without its
+  own checkpoint loaded the shared base checkpoint and then saved its training over that same file, so every project
+  loaded afterwards started from it. A project now trains and saves under its own folder.
+- **A project's RL training step can no longer land on another project's model.** The step was started after the
+  server had finished the request and ran on whichever project's model the server had loaded by then. Training now
+  happens in rounds bound to the project they belong to.
+- **A reranker request without a project id no longer inherits the previous request's project.** The server used
+  the project of the request it had handled last as the fallback for a request without one. It now uses only the
+  container's configured project (`VCT_PROJECT_ID`), or none.
+
 - **The RL reranker now actually reranks.** Its server was meant to embed the query itself through a function that
   nothing ever connected, so every search came back in its original order and the client counted a fallback each
   time (one machine recorded 14 794 fallbacks and no reranked search). The client now sends the vectors it already
@@ -329,7 +367,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps its place. The server no longer embeds anything.
 - **The RL reranker is only called when it can help.** The client now calls the reranker only when its scoring lock
   is off, the reranker is enabled for the project, a reranker container is configured, and that container reports
-  trained weights, the current data format and the project's embedding model. A container without trained weights,
+  trained weights or its per-project check (see Added), the current data format and the project's embedding model.
+  A container without trained weights,
   or no container at all, is a normal "off" state and is no longer counted as a fallback. A real failure (container
   down, too old, wrong embedding model, timeout) keeps the original order, is counted, and logs one warning per
   session instead of one per search. `rl_doctor` has a new "scoring state" line that says whether searches are

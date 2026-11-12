@@ -3,7 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'svelte/compiler';
-import { rlScoringSwitchView } from './rl-scoring-default';
+import {
+  RL_OPT_IN_EXPLAINER,
+  RL_RERANKER_MODULE_ID,
+  rlAutoEnableToast,
+  rlOptInExplainer,
+  rlScoringSwitchView,
+} from './rl-scoring-default';
 import { renderSvelte } from './test-support/svelte-ssr';
 
 // The shipped lock lives in ONE place: vco_lib/rl_scoring_lock.toml. The GUI
@@ -15,9 +21,20 @@ const LOCK_TOML = readFileSync(
 const SHIPPED_REASON = /^reason\s*=\s*"([^"]+)"/m.exec(LOCK_TOML)![1];
 
 describe('RL-Scored Retrieval switch view (W5R-02: render the truth)', () => {
-  it('the shipped table is locked (owner 2026-10-01)', () => {
-    expect(/^locked\s*=\s*true\s*$/m.test(LOCK_TOML)).toBe(true);
+  it('the shipped table is unlocked, opt-in (owner 2026-11-12); the old reason is kept', () => {
+    expect(/^locked\s*=\s*false\s*$/m.test(LOCK_TOML)).toBe(true);
+    expect(LOCK_TOML).toMatch(/2026-11-12/);
     expect(SHIPPED_REASON).toMatch(/until the model is trained/);
+  });
+
+  it('the opt-in explainer says what turning it on does (RL module only)', () => {
+    expect(rlOptInExplainer(RL_RERANKER_MODULE_ID)).toBe(RL_OPT_IN_EXPLAINER);
+    expect(rlOptInExplainer('vct-coordination')).toBeNull();
+    expect(RL_OPT_IN_EXPLAINER).toMatch(/Off by default/);
+    expect(RL_OPT_IN_EXPLAINER).toMatch(/this project's own citations/);
+    expect(RL_OPT_IN_EXPLAINER).toMatch(/beats plain search on its own check/);
+    expect(RL_OPT_IN_EXPLAINER).toMatch(/turn it off any time/);
+    expect(rlAutoEnableToast(512, 500)).toMatch(/512\/500 .*off until you turn it on for a project/);
   });
 
   it('locked: never checked, even with a stored host-wide ON', () => {

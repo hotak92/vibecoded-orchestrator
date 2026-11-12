@@ -27,8 +27,12 @@ Feature resolution (no arbitrary defaults)
 cos_qn: stored in log if present; otherwise recomputed from query_emb × node.emb.
 cos_ql: stored in log if present (0.0 for no-links — no link context available);
         absent = use cos_qn as proxy (better than a generic 0.5).
-cos_nl: stored in log if present; fall back to link_similarity.json; 0.5 only
-        when genuinely unknown (neutral: no link context in either source).
+cos_nl: stored in log if present; 0.5 (neutral) when the log has none.
+        (v0.2.106: the ``link_similarity.json`` fallback is gone — nothing ever
+        wrote that file, and the v2 network does not read these three sample
+        scalars anyway: ``_epoch`` computes the per-slot cosines from the raw
+        query / node / linked vectors, as serving does, since G2b 2026-07-22.
+        The scalars stay in the sample for the loader-parity checks.)
 
 Loss: MSE(pred, target) + 0.5 * BCE(pred, target) + λ * DeltaMSE(pred, target)
   MSE: main pointwise regression toward cosine-derived target.
@@ -280,7 +284,6 @@ def compute_targets_from_cosine_sims(
 def resolve_features(
     node: "dict[str, Any]",
     q_emb: "np.ndarray | None",
-    link_sim: "dict[str, float]",
 ) -> "tuple[float, float, float]":
     """
     Resolve (cos_qn, cos_ql, cos_nl) without arbitrary 0.5 defaults.
@@ -288,9 +291,12 @@ def resolve_features(
     cos_qn: stored → use it; else recompute from q_emb × node.emb.
     cos_ql: stored → use it (0.0 for no-links is correct);
             absent → use cos_qn as proxy (NOT 0.5 as a generic stand-in).
-    cos_nl: stored → use it; else look up link_sim.json; 0.5 if truly unknown.
+    cos_nl: stored → use it; 0.5 (neutral) when the log has none. The
+            ``link_similarity.json`` lookup that sat between the two was
+            removed in v0.2.106 as superseded: no writer of that file ever
+            existed, and the network's linked-slot cosines are computed from
+            the stored linked vectors (``_epoch``), not from this scalar.
     """
-    title = node.get("title", "")
     n_emb: "np.ndarray | None" = node.get("_emb_np")  # pre-converted numpy array
 
     # cos_qn
@@ -307,11 +313,11 @@ def resolve_features(
     else:
         cos_ql = cos_qn
 
-    # cos_nl: stored → use; else link_sim lookup; 0.5 only if genuinely unknown
+    # cos_nl: stored → use; 0.5 (neutral) when the log has none
     if "cos_nl" in node:
         cos_nl = float(node["cos_nl"])
     else:
-        cos_nl = link_sim.get(title, 0.5)
+        cos_nl = 0.5
 
     return cos_qn, cos_ql, cos_nl
 
@@ -390,7 +396,6 @@ def citation_targets(
 
 def extract_samples(
     pairs: "list[tuple[dict, dict]]",
-    link_sim: "dict[str, float]",
 ) -> "list[dict[str, Any]]":
     """
     Convert paired events into flat training samples.
@@ -432,7 +437,7 @@ def extract_samples(
             node = node_map.get(title)
             if node is None:
                 continue
-            cos_qn, cos_ql, cos_nl = resolve_features(node, q_emb, link_sim)
+            cos_qn, cos_ql, cos_nl = resolve_features(node, q_emb)
             # G2 (2026-07-22): resolve per-link type indices from the field the
             # LOGGER actually writes — ``linked_type_names`` (serialize_node_record
             # in claude_mcp_servers/rl_client/rl_logger.py). The prior code read
@@ -779,7 +784,6 @@ def train(
     batch_size: int = 48,
     lambda_rank: float = 0.5,
     patience: int = 5,
-    link_sim_path: "Path | None" = None,
     filter_embedding_source: str = "",
     emb_dim: int = 1024,
     shuffle: bool = True,
@@ -805,16 +809,6 @@ def train(
     # patch("claude_mcp_servers.rl_reranker.offline_trainer.RLModel").
     _RLModel = RLModel  # noqa: F841 (module-level import at top of file)
 
-    # Load link_similarity.json
-    link_sim: dict[str, float] = {}
-    if link_sim_path and link_sim_path.exists():
-        try:
-            raw = json.loads(link_sim_path.read_text(encoding="utf-8"))
-            link_sim = {k: float(v) for k, v in raw.items() if isinstance(v, (int, float))}
-            logger.info("offline_trainer: loaded %d link-sim entries", len(link_sim))
-        except Exception as exc:
-            logger.warning("offline_trainer: failed to load link_sim: %s", exc)
-
     # Load and pair events — DB-only, via the module-scoped hub route.
     logger.info(
         "offline_trainer: loading events from hub (project_id=%s, emb_source=%s)",
@@ -838,7 +832,7 @@ def train(
                 "n_events": len(events), "n_pairs": 0, "n_samples": 0}
 
     # Extract flat samples with correct features
-    samples = extract_samples(pairs, link_sim)
+    samples = extract_samples(pairs)
     logger.info("offline_trainer: %d trainable samples extracted", len(samples))
     if not samples:
         logger.warning("offline_trainer: no samples with stored embeddings")
@@ -1036,104 +1030,54 @@ def compute_rewards(
         return _advantage_rewards(binary)
 
 
-def train_epoch(
-    pairs: "list[tuple[dict[str, Any], dict[str, Any]]]",
-    rl_model: Any,
-    shuffle: bool = True,
-    link_sim: "dict[str, float] | None" = None,
-) -> "tuple[float, int]":
+# v0.2.106: ``train_epoch`` (one ``RLModel.update`` per node — a per-node BCE
+# step at lr 1e-3, the pre-v0.2.106 ONLINE objective replayed offline; its one
+# caller was the server's ``/global/retrain`` job) is gone together with
+# ``RLModel.update``. Online training is per project, in rounds, with the
+# trainer's objective (``objective.batch_loss``) —
+# ``online_learning.ProjectLearner``; ``/global/retrain`` now fits the same
+# objective over :func:`queries_from_pairs` (``online_learning.fit``).
+
+
+def queries_from_pairs(
+    pairs: "list[tuple[dict, dict]]",
+    store: Any,
+    *,
+    profile: str,
+) -> "list[Any]":
+    """Paired launcher.db events -> the trainer's per-query samples
+    (``online_learning.LabelledQuery``, vectors in ``store``).
+
+    The per-citation policy is :func:`citation_targets` (targets, soft-label
+    discard / weight, the binary-citation fallback); the sample layout is the
+    online path's own (``online_learning.labelled_query``: last node per
+    title, linked slots packed, type codes, the profile's linked-slot mask).
+    Pairs without a usable query or node are skipped.
     """
-    One offline training epoch via per-sample rl_model.update() calls.
+    from .online_learning import labelled_query
 
-    Uses correct feature resolution: stored cos_qn/cos_ql/cos_nl if present;
-    cos_ql falls back to cos_qn (not 0.5); cos_nl falls back to link_sim or 0.5.
-
-    Args:
-        pairs:    List of (retrieval_event, citation_event) tuples.
-        rl_model: RLModel instance with an update() method.
-        shuffle:  Shuffle pair order each epoch.
-        link_sim: Optional {title: cos_nl} lookup for cos_nl fallback.
-
-    Returns:
-        ``(avg_loss, n_trained)``
-    """
-    if not _HAS_NUMPY:
-        logger.error("offline_trainer: numpy not available — cannot train")
-        return 0.0, 0
-
-    if link_sim is None:
-        link_sim = {}
-
-    if shuffle:
-        pairs = list(pairs)
-        random.shuffle(pairs)
-
-    total_loss = 0.0
-    n_trained = 0
-
+    out: list[Any] = []
     for ret_ev, cit_ev in pairs:
-        query_emb_raw: "list[float] | None" = ret_ev.get("query_emb")
-        if not query_emb_raw:
+        decided = citation_targets(cit_ev)
+        if decided is None:
             continue
-
-        # v0.2.9 C8: unified-target formula (cosine + z + literal_cited +
-        # cross_encoder_cited bonuses). v2 events with no flag dicts
-        # degenerate to cosine-only — losslessly equivalent to pre-v3
-        # offline training.
-        cosine_sims = {k: float(v) for k, v in cit_ev.get("cosine_sims", {}).items()}
-        if cosine_sims:
-            literal_cited = {
-                k: bool(v) for k, v in cit_ev.get("literal_cited", {}).items()
-            }
-            cross_encoder_cited_raw = cit_ev.get("cross_encoder_cited") or {}
-            cross_encoder_cited = {
-                k: bool(v) for k, v in cross_encoder_cited_raw.items()
-            } if cross_encoder_cited_raw else None
-            targets = compute_targets_from_cosine_sims(
-                cosine_sims,
-                literal_cited=literal_cited or None,
-                cross_encoder_cited=cross_encoder_cited,
-            )
-        else:
-            targets = {
-                t: (1.0 if cited else 0.0)
-                for t, cited in cit_ev.get("citations", {}).items()
-                if cited is not None
-            }
-        if not targets:
-            continue
-
-        q_raw = np.array(query_emb_raw, dtype=np.float32)
-
-        # Build {title: node_dict} for feature lookup
-        node_map: dict[str, dict] = {}
-        for node in ret_ev.get("nodes", []):
-            title = node.get("title", "")
-            emb = node.get("emb")
-            if title and emb:
-                node_map[title] = dict(node)
-                node_map[title]["_emb_np"] = np.array(emb, dtype=np.float32)
-
-        for title, target in targets.items():
-            node = node_map.get(title)
-            if node is None:
-                continue
-
-            n_raw: "np.ndarray" = node["_emb_np"]
-            n_type_idx = rl_model.get_type_idx(node.get("node_type") or "concept")
-
-            try:
-                loss = rl_model.update(
-                    q_raw, n_raw, [], n_type_idx,
-                    target=target,
-                )
-                total_loss += loss
-                n_trained += 1
-            except Exception as exc:
-                logger.debug("offline_trainer: update failed for %r: %s", title, exc)
-
-    avg_loss = total_loss / n_trained if n_trained else 0.0
-    return avg_loss, n_trained
+        targets, weight = decided
+        task = {
+            "nodes_packed": [
+                {"title": n.get("title", ""), "node_type": n.get("node_type"),
+                 "n_emb": n.get("emb"), "linked_embs": n.get("linked_embs") or [],
+                 "linked_type_names": n.get("linked_type_names") or n.get("link_types") or []}
+                for n in (ret_ev.get("nodes") or []) if isinstance(n, dict) and n.get("emb")
+            ],
+            "query_emb": ret_ev.get("query_emb"),
+            "literal_cited": cit_ev.get("literal_cited") or {},
+        }
+        q, _why = labelled_query(task, store, profile=profile,
+                                 ts_ms=int(ret_ev.get("ts_ms") or 0),
+                                 targets=targets, weight=weight)
+        if q is not None:
+            out.append(q)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1167,8 +1111,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="RankNet loss weight (0 = BCE only)")
     p.add_argument("--patience", type=int, default=5,
                    help="Early stopping patience (epochs without val improvement)")
-    p.add_argument("--link-sim-path", type=Path, default=None,
-                   help="Path to link_similarity.json (for cos_nl fallback)")
     p.add_argument("--filter-embedding-source", type=str, default="",
                    # codesage REMOVED 2026-05-19 — KG RL is text-only. Code-graph
                    # reranking will be a separate future module. `jina` retained
@@ -1260,7 +1202,6 @@ def main(argv: "list[str] | None" = None) -> int:
             batch_size=args.batch_size,
             lambda_rank=args.lambda_rank,
             patience=args.patience,
-            link_sim_path=args.link_sim_path,
             filter_embedding_source=args.filter_embedding_source,
             emb_dim=args.emb_dim,
             shuffle=args.shuffle,

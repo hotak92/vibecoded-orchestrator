@@ -997,7 +997,25 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                         "(RL_ONLINE_TRAINING_DISABLED[_GLOBAL]); skipping /rl_update",
                         task_id[:8],
                     )
-                client = None if _online_off else server._get_rl_client()
+                # v0.2.106 (owner 2026-11-12: per-project online learning is
+                # OPT-IN): the citation goes to the container only for a
+                # project whose RL scoring is on — the same gate the rerank
+                # uses (scoring lock, then the per-project toggle, which
+                # falls closed). Off = no container call at all; the
+                # citation LOG above is unaffected (logs are always kept).
+                _scoring_on = False
+                if not _online_off:
+                    try:
+                        from claude_mcp_servers.rl_client.search_pipeline import (
+                            _resolve_rl_enabled,
+                        )
+                        _scoring_on = _resolve_rl_enabled()
+                    except Exception as exc:  # noqa: BLE001 — cannot confirm: off
+                        server.logger.debug(
+                            "RL monitor %s: RL scoring gate probe raised (%s); "
+                            "skipping /rl_update", task_id[:8], exc,
+                        )
+                client = server._get_rl_client() if (_scoring_on and not _online_off) else None
                 if (
                     client is not None
                     and ctx is not None

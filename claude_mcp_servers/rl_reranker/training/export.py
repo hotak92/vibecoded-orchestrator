@@ -50,7 +50,14 @@ from typing import Any, Iterable, Iterator, Optional
 import numpy as np
 
 from ..offline_trainer import citation_targets
-from ..rl_model import MAX_LINKED, NODE_TYPES, NULL_TYPE_IDX, UNKNOWN_TYPE_IDX
+from ..rl_model import (  # noqa: F401 — TYPE_CODE_OTHER / type_code re-exported
+    MAX_LINKED,
+    NODE_TYPES,
+    NULL_TYPE_IDX,
+    TYPE_CODE_OTHER,
+    UNKNOWN_TYPE_IDX,
+    type_code,
+)
 
 #: Output format version (``index.json`` → ``format_version``). Bump on any
 #: change a reader must know about; ``FIELDS.md`` documents the current one.
@@ -62,13 +69,6 @@ EXPORT_PROFILES: tuple[str, ...] = ("qwen3", "arctic")
 #: Event types the trainer pairs. Outcome events (pre_bash / bash_outcome /
 #: edit_outcome) are not training input (``hub_event_loader``).
 _PAIR_EVENT_TYPES = ("retrieval", "citation")
-
-#: Type code for a node / linked node whose type is not one of the builtin
-#: :data:`rl_model.NODE_TYPES`. The real name is never exported (type names
-#: can be project-specific). The trainer maps this code to the same embedding
-#: a serving model gives a type it registers on the fly: the mean of the
-#: builtin rows.
-TYPE_CODE_OTHER = 9
 
 #: Arctic twins are only trusted from the moment a project ran v0.2.101 (the
 #: query-prefix fix for the twin's query vector, rl_enrichment "caller audit
@@ -124,16 +124,6 @@ def load_or_create_salt(salt_path: Path) -> bytes:
 def hash_project_id(salt: bytes, project_id: str) -> str:
     """Stable, salted, non-reversible id for a project (16 hex chars)."""
     return hashlib.sha256(salt + b"\x00" + project_id.encode("utf-8")).hexdigest()[:16]
-
-
-def type_code(name: Optional[str], *, empty: int) -> int:
-    """Builtin index for a builtin node type, ``empty`` for none, else OTHER."""
-    if not name:
-        return empty
-    try:
-        return NODE_TYPES.index(name)
-    except ValueError:
-        return TYPE_CODE_OTHER
 
 
 def _title_key(title: str) -> bytes:

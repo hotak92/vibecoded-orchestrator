@@ -301,9 +301,10 @@ def _rl_renders(folder: Path) -> bool:
 
     The pipeline's own gates in the pipeline's order (see the module
     docstring): a set scoring lock is a definitive "no"; below it the hub's
-    per-project toggle decides, and a missing attribute defaults on exactly
-    as the pipeline's ``getattr`` does. A probe that cannot answer renders
-    the section (the conservative direction of this module).
+    per-project toggle decides, and only an explicit ``True`` is on — the
+    pipeline's opt-in rule (v0.2.106, owner 2026-11-12). A probe that cannot
+    answer renders the section (the conservative direction of this module:
+    a failed detection never hides text).
     """
     try:
         from vco_lib.rl_scoring_lock import rl_scoring_lock_reason
@@ -321,7 +322,7 @@ def _rl_renders(folder: Path) -> bool:
         _warn(f"RL per-project toggle probe failed for {folder}: {exc} — "
               "rendering the RL section")
         return True
-    return bool(getattr(cfg, "rl_reranker_enabled_for_project", True))
+    return getattr(cfg, "rl_reranker_enabled_for_project", False) is True
 
 
 def active_sections(

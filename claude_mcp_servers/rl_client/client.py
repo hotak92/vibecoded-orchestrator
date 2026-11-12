@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -81,6 +82,11 @@ _DEFAULT_HEALTH_TIMEOUT = 1.0
 #   * not_trained         — (v0.2.106) the container's model is not a
 #                           released, trained checkpoint; refuse rerank (its
 #                           scores would be noise) without counting a fault.
+#                           Not used for a container that advertises
+#                           ``per_project_gate`` (v0.2.106, per-project online
+#                           learning): it is ``compatible`` and hands a
+#                           project its search order until that project's own
+#                           model passes its held-out check.
 # Bump PROTOCOL_VERSION when the request/response SHAPE changes in a way
 # an older peer cannot tolerate. Additive optional fields do NOT need a
 # bump (extra=allow handles them). v2 (v0.2.106): /cache_nodes carries the
@@ -91,6 +97,13 @@ PROTOCOL_VERSION = RERANK_PROTOCOL_VERSION
 # function no caller ever wired, so it could not score: it is reported as
 # ``degraded_old_server`` and NOT called.
 MIN_SERVER_PROTOCOL = 2
+
+# v0.2.106: after a "search order" answer (the project's model is not served)
+# the client keeps the search order for this long without calling again. The
+# serving state changes only after an online round (every few dozen citation
+# events), so a minute of staleness costs nothing and spares sending every
+# search's vectors to a container that will hand the order back.
+NOT_SERVED_RECHECK_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +131,9 @@ class NegotiationResult:
     trained: Optional[bool] = None
     weights_version: Optional[str] = None
     linked_slots_masked: Optional[bool] = None
+    # v0.2.106: the container gates each project's model on that project's
+    # own held-out queries (None = not said).
+    per_project_gate: Optional[bool] = None
 
 
 # ─── v0.2.49: per-project routing header sanitization ────────────────
@@ -306,6 +322,16 @@ class RLClient:
         # Model score per node of the last successful rerank (None = the
         # node carried no vector and kept its search position).
         self.last_scores: List[Optional[float]] = []
+        # v0.2.106: False when the last call got the project's SEARCH ORDER
+        # back because its model is not served (it has not passed its own
+        # held-out check) — a healthy answer, not a fault; the reason is in
+        # ``last_not_served_reason``. While ``_not_served_until`` (monotonic
+        # seconds) is in the future, cache_nodes answers that from memory
+        # without sending the vectors again: the serving state only changes
+        # after an online round.
+        self.last_served: bool = True
+        self.last_not_served_reason: Optional[str] = None
+        self._not_served_until: float = 0.0
         self._warned_4xx: bool = False
 
         # v0.2.49: per-project routing header. Stored as the sanitized
@@ -411,9 +437,17 @@ class RLClient:
         self.last_call_ok = False
         self.last_error = None
         self.last_scores = []
+        self.last_served = True
 
         if not self.enabled:
             self.last_error = "disabled"
+            return list(nodes[:top_k])
+
+        if time.monotonic() < self._not_served_until:
+            # The project's model was not served a moment ago; keep the
+            # search order without another round trip.
+            self.last_call_ok = True
+            self.last_served = False
             return list(nodes[:top_k])
 
         features = encode_rerank_features(
@@ -464,6 +498,17 @@ class RLClient:
                 logger.debug("RLClient.cache_nodes: error (%s); falling back to no-rerank", exc)
             return list(nodes[:top_k])
 
+        if data.get("scored") is False and data.get("serving") == "search_order":
+            # v0.2.106 per-project gate: the project's model has not passed
+            # its own held-out check (or no longer does) — the search order
+            # stands. A healthy answer, not a fallback.
+            self.last_call_ok = True
+            self.last_served = False
+            reason = data.get("reason")
+            self.last_not_served_reason = str(reason) if reason else None
+            self._not_served_until = time.monotonic() + NOT_SERVED_RECHECK_S
+            return list(nodes[:top_k])
+
         order = data.get("order")
         if (
             data.get("scored") is not True
@@ -479,6 +524,7 @@ class RLClient:
             scores = [None] * len(nodes)
 
         self.last_call_ok = True
+        self.last_not_served_reason = None
         ranked_idx = order[: max(0, int(top_k))]
         self.last_scores = [
             float(scores[i]) if isinstance(scores[i], (int, float)) else None
@@ -655,6 +701,22 @@ class RLClient:
             return HealthResponse(ok=bool(data.get("ok", False)),
                                   model=str(data.get("model", "unknown")))
 
+    async def project_status(self) -> Optional[dict]:
+        """This project's online learning + serving gate (``GET
+        /project_status``, v0.2.106), or ``None`` when it cannot be read
+        (disabled mode, container down / too old). Read-only; never raises.
+        """
+        if not self.enabled:
+            return None
+        try:
+            data = await self._get_json(
+                "/project_status", timeout=_DEFAULT_HEALTH_TIMEOUT * 3, routed=True,
+            )
+        except RLClientError as exc:
+            logger.debug("RLClient.project_status: unavailable (%s)", exc)
+            return None
+        return data if isinstance(data, dict) else None
+
     async def negotiate(
         self,
         *,
@@ -761,6 +823,7 @@ class RLClient:
         weights_version = (
             weights.get("loaded_version") if isinstance(weights, dict) else None
         )
+        per_project_gate = h.per_project_gate
         model_fields = {
             "server_protocol": server_proto,
             "server_embedding_dim": srv_dim,
@@ -768,6 +831,7 @@ class RLClient:
             "trained": trained,
             "weights_version": weights_version,
             "linked_slots_masked": h.linked_slots_masked,
+            "per_project_gate": per_project_gate,
         }
 
         # Old / non-advertising container: it embedded the query through a
@@ -783,6 +847,23 @@ class RLClient:
                     f"v{MIN_SERVER_PROTOCOL}"
                 )
                 + " — it cannot score; rebuild the reranker image.",
+                **model_fields,
+            )
+
+        # v0.2.106 (owner 2026-11-12, per-project online adaptation): the
+        # container gates each project's model on that project's own held-out
+        # queries and hands back the search order until it passes, so it is
+        # safe to call without a trained base model.
+        if per_project_gate is True:
+            return NegotiationResult(
+                compatible=True,
+                status="compatible",
+                detail=(
+                    f"container protocol v{server_proto} compatible with client "
+                    f"v{PROTOCOL_VERSION}; per-project gate: a project's own model "
+                    "reranks only once it beats plain search on that project's "
+                    "recent queries, its search order is kept until then."
+                ),
                 **model_fields,
             )
 
@@ -849,9 +930,7 @@ class RLClient:
         # compatible response shape (or reject an unsupported client). An
         # older, pre-RL-10 container simply ignores the header. Additive —
         # never breaks an existing peer.
-        headers: dict = {"X-VCT-RL-Protocol": str(PROTOCOL_VERSION)}
-        if self._project_id is not None:
-            headers["X-VCT-Project-ID"] = self._project_id
+        headers = self._request_headers()
 
         # v0.2.74 T5-1b (BLOCKER-2): coerce the body to a JSON-safe dict at the
         # single POST choke point BEFORE httpx serializes it. ``rl_update``
@@ -899,13 +978,29 @@ class RLClient:
         except Exception as exc:
             raise RLClientError(f"POST {url}: invalid JSON: {exc}") from exc
 
-    async def _get_json(self, path: str, *, timeout: float) -> dict:
-        """GET JSON, same error semantics as ``_post_json``."""
+    def _request_headers(self) -> dict:
+        """Headers of every request: this client's wire protocol and, when
+        the constructor got a safe project id, the routing header."""
+        headers: dict = {"X-VCT-RL-Protocol": str(PROTOCOL_VERSION)}
+        if self._project_id is not None:
+            headers["X-VCT-Project-ID"] = self._project_id
+        return headers
+
+    async def _get_json(self, path: str, *, timeout: float, routed: bool = False) -> dict:
+        """GET JSON, same error semantics as ``_post_json``.
+
+        ``routed``: send the routing headers (``/project_status`` answers for
+        the routed project; ``/health`` is project-independent and goes
+        without them, as it always has).
+        """
         assert self.base_url is not None
         client = await self._ensure_client()
         url = f"{self.base_url}{path}"
         try:
-            resp = await client.get(url, timeout=timeout)
+            if routed:
+                resp = await client.get(url, timeout=timeout, headers=self._request_headers())
+            else:
+                resp = await client.get(url, timeout=timeout)
         except Exception as exc:
             raise RLClientUnreachableError(f"GET {url} failed: {exc}") from exc
         if resp.status_code >= 500:

@@ -72,19 +72,19 @@ def _pair(soft_label: bool | None, window_tokens: int | None = 5000):
 
 class TestExtractSamplesWeight:
     def test_soft_citation_gets_downweight(self):
-        samples = extract_samples([_pair(soft_label=True)], {})
+        samples = extract_samples([_pair(soft_label=True)])
         assert samples, "expected at least one sample"
         assert all(s["sample_weight"] == SOFT_LABEL_WEIGHT for s in samples)
         assert SOFT_LABEL_WEIGHT < 1.0
 
     def test_hard_citation_keeps_full_weight(self):
-        samples = extract_samples([_pair(soft_label=False)], {})
+        samples = extract_samples([_pair(soft_label=False)])
         assert samples and all(s["sample_weight"] == 1.0 for s in samples)
 
     def test_legacy_event_without_field_is_hard(self):
         # Leave-alone case: 34k+ historical rows have no soft_label field —
         # they must keep weight 1.0 (no behaviour change on the old corpus).
-        samples = extract_samples([_pair(soft_label=None)], {})
+        samples = extract_samples([_pair(soft_label=None)])
         assert samples and all(s["sample_weight"] == 1.0 for s in samples)
 
 
@@ -125,8 +125,8 @@ class TestEpochIntegration:
         )
 
     def test_mixed_batch_trains_finite(self):
-        hard = extract_samples([_pair(soft_label=False)], {})
-        soft = extract_samples([_pair(soft_label=True)], {})
+        hard = extract_samples([_pair(soft_label=False)])
+        soft = extract_samples([_pair(soft_label=True)])
         total, mse, delta, mae = self._run_epoch(hard + soft)
         assert np.isfinite(total) and np.isfinite(mse)
 
@@ -135,9 +135,9 @@ class TestEpochIntegration:
         # untouched (weights=None branch) — same seed → same loss as a run
         # where sample_weight keys are absent entirely.
         torch.manual_seed(7)
-        with_key = self._run_epoch(extract_samples([_pair(soft_label=False)], {}))
+        with_key = self._run_epoch(extract_samples([_pair(soft_label=False)]))
         torch.manual_seed(7)
-        stripped = extract_samples([_pair(soft_label=False)], {})
+        stripped = extract_samples([_pair(soft_label=False)])
         for s in stripped:
             s.pop("sample_weight", None)
         without_key = self._run_epoch(stripped)
@@ -152,25 +152,25 @@ class TestSoftWindowFloor:
 
     def test_soft_below_floor_discarded(self):
         samples = extract_samples(
-            [_pair(soft_label=True, window_tokens=SOFT_MIN_WINDOW_TOKENS - 1)], {}
+            [_pair(soft_label=True, window_tokens=SOFT_MIN_WINDOW_TOKENS - 1)]
         )
         assert samples == []
 
     def test_soft_at_floor_kept_downweighted(self):
         samples = extract_samples(
-            [_pair(soft_label=True, window_tokens=SOFT_MIN_WINDOW_TOKENS)], {}
+            [_pair(soft_label=True, window_tokens=SOFT_MIN_WINDOW_TOKENS)]
         )
         assert samples and all(s["sample_weight"] == SOFT_LABEL_WEIGHT for s in samples)
 
     def test_soft_missing_window_tokens_discarded(self):
         # Conservative default: cannot confirm the window was big enough.
-        samples = extract_samples([_pair(soft_label=True, window_tokens=None)], {})
+        samples = extract_samples([_pair(soft_label=True, window_tokens=None)])
         assert samples == []
 
     def test_hard_ignores_floor(self):
         # Leave-alone case: the floor gates ONLY soft labels — a hard citation
         # with a small recorded window (defensive shape) still trains at 1.0.
-        samples = extract_samples([_pair(soft_label=False, window_tokens=100)], {})
+        samples = extract_samples([_pair(soft_label=False, window_tokens=100)])
         assert samples and all(s["sample_weight"] == 1.0 for s in samples)
 
     def test_floor_env_tunable(self, monkeypatch):

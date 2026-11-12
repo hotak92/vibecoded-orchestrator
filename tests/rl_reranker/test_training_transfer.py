@@ -275,6 +275,61 @@ def test_adapt_online_records_each_point_and_starts_at_the_start_state(data):
     assert rows[-1]["ndcg"] > rows[0]["ndcg"]
 
 
+def test_replay_drives_the_servers_own_learner(tmp_path, monkeypatch):
+    """``transfer replay`` feeds an export's events, in time order, to the
+    server's ``ProjectLearner`` (not a reimplementation): the learner's
+    targets equal the export's, its counters cover every event, and with a
+    learnable signal the project gets served."""
+    from rl_reranker import online_learning as ol
+    from rl_reranker.training.export import load_profile_shard
+
+    root = make_synthetic_export(tmp_path / "e", projects=("pa", "pb"), n_q=200)
+    shard = load_profile_shard(root, "qwen3")
+    calls = {"ingest": 0, "round": 0}
+    real_ingest, real_round = ol.ProjectLearner.ingest, ol.ProjectLearner.run_round_now
+
+    def ingest(self, *a, **k):
+        calls["ingest"] += 1
+        return real_ingest(self, *a, **k)
+
+    def run_round(self, *a, **k):
+        calls["round"] += 1
+        return real_round(self, *a, **k)
+
+    monkeypatch.setattr(ol.ProjectLearner, "ingest", ingest)
+    monkeypatch.setattr(ol.ProjectLearner, "run_round_now", run_round)
+    cfg = ol.OnlineConfig(holdout_queries=30, min_cited_queries=5, purge_gap_ms=0,
+                          round_every=8, batch_queries=4, max_steps_per_round=8, lr=3e-3)
+    rep = tr.replay_project(shard, "pa", cfg=cfg, device="cpu", log=None)
+    assert calls["ingest"] == 200 and calls["round"] == 200 // 8
+    assert rep["events_kept"] == 200
+    # the synthetic export stores the target itself as "cos_citation", so its
+    # targets are not expected to match here (on a real export: 1.2e-7); what
+    # must hold is that the event built from the export goes through the
+    # unified formula exactly as the server applies it
+    from vco_lib.rl_training_targets import compute_unified_targets
+
+    task, _export_t = tr.export_task(shard, int(np.flatnonzero(shard.queries["project"] == 0)[0]))
+    q, _ = ol.labelled_query(task, ol.VectorStore(DIM), profile="qwen3", ts_ms=0)
+    expected, _ = compute_unified_targets(task["cosine_sims"], literal_cited=task["literal_cited"])
+    assert q is not None
+    assert np.allclose(q.target, [expected[t] for t in task["cosine_sims"]], atol=1e-6)
+    assert rep["queries_to_qualify"] is not None and rep["served_queries"] > 0
+    assert rep["final"]["counters"]["rounds"] == 200 // 8
+    md = tr.render_replay_markdown({"profile": "qwen3", "config": cfg.as_dict(), "results": [rep]})
+    assert "| pa (200) |" in md
+
+
+def test_replay_cli_overrides_only_the_given_knobs(tmp_path):
+    from rl_reranker import online_learning as ol
+
+    a = tr.build_parser().parse_args(["replay", "--data", "x", "--profile", "qwen3", "--out",
+                                      str(tmp_path), "--min-cited", "7", "--purge-gap-hours", "2"])
+    cfg = tr.replay_config(a)
+    assert cfg.min_cited_queries == 7 and cfg.purge_gap_ms == 2 * 3_600_000
+    assert cfg.lr == ol.DEFAULT_CONFIG.lr and cfg.holdout_queries == ol.DEFAULT_CONFIG.holdout_queries
+
+
 def test_adapt_cli_defaults_to_a_small_online_lr(tmp_path):
     a = tr.build_parser().parse_args(["adapt", "--data", "x", "--profile", "arctic",
                                       "--out", str(tmp_path)])
