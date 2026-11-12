@@ -697,18 +697,30 @@ def _owed_list(collections: Iterable[str], target: str) -> "list[tuple[str, str,
 
 
 def fill_before_walk(collections: Iterable[str], svc: Any, *,
-                     log: Callable[[str], None] = print) -> "dict[str, Optional[str]]":
+                     log: Callable[[str], None] = print,
+                     folder: Any = None) -> "dict[str, Optional[str]]":
     """``kg-sync --all``'s pre-walk hook: :func:`fill_collection` for each
-    collection the run writes. Never raises (a failure is printed loudly and
-    the fill stays owed — the walk still runs)."""
+    collection the run writes, then (v0.2.106, "backfill once") the one-time
+    backfill of every enabled SECONDARY slot not yet stamped complete
+    (:func:`vco_lib.kg_secondary_backfill.backfill_before_walk`; ``folder``
+    holds the stamp — default the service's project root). Never raises (a
+    failure is printed loudly and the fill stays owed — the walk still runs)."""
     out: "dict[str, Optional[str]]" = {}
-    for name in dict.fromkeys(c for c in collections if c):
+    names = list(dict.fromkeys(c for c in collections if c))
+    for name in names:
         try:
             out[name] = fill_collection(name, svc, log=log)
         except Exception as exc:  # noqa: BLE001 — loud, never aborts the sync
             log(f"❌ kg-embed: filling {name} failed: {exc} — searches stay on the "
                 "recorded model; the fill is retried.")
             out[name] = None
+    try:
+        from vco_lib.kg_secondary_backfill import backfill_before_walk
+
+        backfill_before_walk(names, svc, folder if folder is not None
+                             else getattr(svc, "project_root", None), log=log)
+    except Exception as exc:  # noqa: BLE001 — loud, never aborts the sync
+        log(f"❌ kg-secondary: backfill skipped: {exc} — retried later.")
     return out
 
 
@@ -717,6 +729,7 @@ def after_walk(collections: Iterable[str], folder: Any, svc: Any, *, full_tree: 
     collection (the rows its walk wrote carry the target) and stamps a missing
     record; any run then keeps ``kg_embed_fill_pending`` truthful (emit while
     owed, resolve when nothing is). Never raises."""
+    collections = list(collections)
     try:
         target = str(getattr(svc, "text_model_id", "") or "") or target_text_model()
         names = list(dict.fromkeys(c for c in collections if c))
@@ -736,6 +749,11 @@ def after_walk(collections: Iterable[str], folder: Any, svc: Any, *, full_tree: 
             _resolve_fill_deferral(Path(folder))
     except Exception as exc:  # noqa: BLE001
         print(f"   (kg-embed settle skipped: {exc})", file=sys.stderr)
+    # v0.2.106 ("backfill once"): settle the secondary backfill (after the
+    # walk re-laid the rows a secondary refused) and keep its ledger row true.
+    from vco_lib.kg_secondary_backfill import after_walk as _secondary_after_walk
+
+    _secondary_after_walk(collections, folder, svc, full_tree=full_tree)
 
 
 def _project_env(folder: Path) -> "dict[str, str]":
@@ -785,6 +803,11 @@ def reconcile_folder_kg_embedding(folder: Any, *, dry_run: bool = False) -> "dic
             _emit_fill_deferral(Path(folder), owed)
         else:
             _resolve_fill_deferral(Path(folder))
+        # v0.2.106 ("backfill once"): a newly enabled secondary slot is
+        # scheduled here too (a ledger row the retry driver picks up).
+        from vco_lib.kg_secondary_backfill import schedule_for_folder
+
+        schedule_for_folder(folder, names)
     except Exception as exc:  # noqa: BLE001
         print(f"[vct] kg-embed: self-heal skipped for {folder} ({exc})", file=sys.stderr)
     return out

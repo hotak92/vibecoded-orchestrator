@@ -974,15 +974,20 @@ def _resolve_embed_request_timeout() -> float:
 DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV = "DUAL_EMBEDDING_WRITE_ALL_SLOTS"
 
 
-def _resolve_write_all_slots() -> bool:
+def _resolve_write_all_slots(env: "Optional[Mapping[str, str]]" = None) -> bool:
     """Return whether to write the SECONDARY enrichment slots on each embed.
 
     Default FALSE (v0.2.71 Piece 5c — opt-in). The active slot is always
     written regardless; this only controls the qwen3/openai/codesage
     secondary fan-out. Any value other than a truthy string ("1"/"true"/
     "yes"/"on", case-insensitive) resolves to False.
+
+    ``env`` (v0.2.106) reads a PROJECT's projected env instead of this
+    process's — the secondary-backfill scheduler asks it for a folder it is
+    not running in (``vco_lib.kg_secondary_backfill``).
     """
-    raw = os.environ.get(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, "").strip().lower()
+    source = os.environ if env is None else env
+    raw = str(source.get(DUAL_EMBEDDING_WRITE_ALL_SLOTS_ENV, "") or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
@@ -1027,7 +1032,7 @@ DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV = "DUAL_EMBEDDING_ARCTIC_SECONDARY"
 ARCTIC_SECONDARY_MODEL = "snowflake-arctic-embed2:latest"
 
 
-def _resolve_arctic_secondary() -> bool:
+def _resolve_arctic_secondary(env: "Optional[Mapping[str, str]]" = None) -> bool:
     """Return whether to fan out an arctic ``arctic2_embed`` SECONDARY slot.
 
     Default FALSE (opt-in). This is a SECOND-layer gate: it only has any effect
@@ -1036,8 +1041,10 @@ def _resolve_arctic_secondary() -> bool:
     string ("1"/"true"/"yes"/"on", case-insensitive) resolves to False.
 
     See ``DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV`` for the full rationale.
+    ``env`` as in :func:`_resolve_write_all_slots`.
     """
-    raw = os.environ.get(DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV, "").strip().lower()
+    source = os.environ if env is None else env
+    raw = str(source.get(DUAL_EMBEDDING_ARCTIC_SECONDARY_ENV, "") or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
@@ -3359,6 +3366,8 @@ class EmbeddingService:
         planned = self.configured_text_write_models()
         planned.pop(self._text_slot, None)  # the active leg ran above
         if not planned:
+            if include_active and not is_query:
+                self._report_secondary_write(planned, result)
             return result
 
         # qwen3 fallback if not already the active slot. qwen3's num_ctx (10 240)
@@ -3502,7 +3511,31 @@ class EmbeddingService:
                     )
                 else:
                     self._note_secondary_embed_success("openai_text_embed")
+        if include_active and not is_query:
+            self._report_secondary_write(planned, result)
         return result
+
+    def _report_secondary_write(
+        self, planned: "Mapping[str, str]", written: "Mapping[str, Any]"
+    ) -> None:
+        """Tell the secondary-slot backfill what a DOCUMENT write stored
+        (v0.2.106, owner ruling 2026-11-12 "backfill once").
+
+        A configured secondary this write could not embed (backend down,
+        breaker open, a refusal outside a row writer) leaves a row without
+        that slot, so a completed backfill stamp for it is no longer true;
+        a secondary not configured in this process means rows are being
+        written without it. Both are recorded by
+        :func:`vco_lib.kg_secondary_backfill.observe_document_write` (a cheap
+        state-file check; it writes only when a stamp must be invalidated).
+        Bookkeeping never fails the embed.
+        """
+        try:
+            from vco_lib.kg_secondary_backfill import observe_document_write
+
+            observe_document_write(self.project_root, planned, written)
+        except Exception as exc:  # noqa: BLE001 — bookkeeping must never fail a write
+            logger.warning("secondary-backfill bookkeeping skipped: %s", exc)
 
     def embed_text_all_configured_tagged(
         self, text: str

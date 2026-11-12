@@ -446,7 +446,8 @@ def test_kg_sync_all_fills_before_the_walk_and_settles_after(tmp_path, monkeypat
     mod = _load_sync(tmp_path, monkeypatch)
     order: list[object] = []
     mod._kg_embed_model = SimpleNamespace(
-        fill_before_walk=lambda colls, svc: order.append(("fill", tuple(colls))),
+        # v0.2.106: the stamp folder of the secondary backfill rides along.
+        fill_before_walk=lambda colls, svc, folder=None: order.append(("fill", tuple(colls), folder)),
         after_walk=lambda colls, root, svc, full_tree: order.append(("after", full_tree)),
     )
     mod.EmbeddingService = SimpleNamespace(for_project=lambda root: SimpleNamespace(text_model_id=ARCTIC, close=lambda: None))
@@ -466,7 +467,7 @@ def test_kg_sync_all_fills_before_the_walk_and_settles_after(tmp_path, monkeypat
     with mock.patch.object(sys, "argv", ["sync", "--all"]), contextlib.redirect_stdout(out), \
             contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
         mod.main()
-    assert order == [("fill", (COLL,)), "walk", ("after", True)]
+    assert order == [("fill", (COLL,), mod.PROJECT_ROOT), "walk", ("after", True)]
 
     order.clear()
     node = tmp_path / "knowledge" / "a.md"
