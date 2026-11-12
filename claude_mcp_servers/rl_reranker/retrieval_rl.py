@@ -44,20 +44,16 @@ class RetrievalRL:
 
     Args:
         project_root: Project root dir.
-        ollama_url:   Accepted for the server's ``--ollama-url`` option; the
-                      container no longer embeds anything (see above).
         rl_model:     The RLModel that scores (:meth:`rerank`).
     """
 
     def __init__(
         self,
         project_root: Path,
-        ollama_url: str = "http://localhost:11435",
         rl_model: "RLModel | None" = None,
         data_logger: "RLDataLogger | None" = None,
     ) -> None:
         self._root = Path(project_root)
-        self._ollama_url = ollama_url.rstrip("/")
         self._rl_model = rl_model
         self._data_logger = data_logger
 
