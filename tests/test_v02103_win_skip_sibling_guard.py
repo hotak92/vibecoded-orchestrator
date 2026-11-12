@@ -97,7 +97,11 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: 191 -> 192 (v0.2.106 fix4): tests/test_v0292_wp4_orphan_fail_open.py now
 #: installs a real bundle and stats pre-tool-use.sh's POSIX mode bits (0o700)
 #: instead of scanning source — file modes do not exist on Windows.
-NON_CONVENTION_BASELINE = 192
+#: 192 -> 193 (v0.2.106 rlgate): tests/rl_reranker/test_startup_weights_precedence.py
+#: ::test_a_symlinked_checkpoint_is_managed creates a symlink, which needs a
+#: privilege Windows runners lack — a POSIX-only primitive, no .ps1 sibling; the
+#: marker/plain ownership classes were split out and run on Windows too.
+NON_CONVENTION_BASELINE = 193
 
 
 # -- which conditions skip on Windows --------------------------------------

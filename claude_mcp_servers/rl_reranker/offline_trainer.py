@@ -781,35 +781,63 @@ def train(
     hub_client: "Any",
     project_id: str,
     epochs: int = 5,
-    batch_size: int = 48,
-    lambda_rank: float = 0.5,
-    patience: int = 5,
+    batch_queries: "int | None" = None,
+    patience: int = 2,
     filter_embedding_source: str = "",
+    profile: str = "",
     emb_dim: int = 1024,
     shuffle: bool = True,
-    lr_min: float = 1e-6,
+    lr: "float | None" = None,
     arch_version: str = "v2",
     device: str = "auto",
     since_ms: "int | None" = None,
     until_ms: "int | None" = None,
-) -> None:
-    """Train one project's RLModel head from launcher.db events (DB-only).
+    seed: "int | None" = None,
+    val_share: float = 0.1,
+) -> "dict[str, Any]":
+    """Train one project's RLModel from its launcher.db events (DB-only),
+    with the ONE training objective.
 
-    v0.2.11: events come exclusively from the hub (``hub_client`` +
-    ``project_id`` are mandatory); the JSONL ``log_path``/``source``/
-    ``filter_project`` parameters were removed with the JSONL reader.
+    v0.2.106: the samples are per-query (:func:`queries_from_pairs`, the
+    per-citation policy of :func:`citation_targets`), and every step is
+    ``objective.batch_loss`` over query-grouped mini-batches
+    (``online_learning.fit`` — pairs only WITHIN a query), the loss the
+    server's online rounds and the offline shard trainer use. The pre-v0.2.106
+    path (``_epoch``: pointwise + a pairwise term over every pair of a
+    sample-shuffled batch, i.e. across different queries) no longer trains
+    any served model.
+
+    Time-ordered split: the newest ``val_share`` of the queries is held out;
+    after each epoch the model's NDCG@10 there is measured
+    (``online_learning.evaluate``) and the best epoch's weights are kept
+    (early stop after ``patience`` epochs without improvement). Knobs default
+    to the online learner's (``online_learning.DEFAULT_CONFIG``: batch of
+    queries, learning rate, seed, loss).
+
+    Returns ``{trained: bool, reason, n_events, n_pairs, n_samples, ...}`` —
+    ``trained=False`` for no data, so the job never reports a false success.
     """
     if not _HAS_TORCH:
         raise ImportError("PyTorch required: pip install torch")
     if not _HAS_NUMPY:
         raise ImportError("NumPy required: pip install numpy")
 
-    from .rl_model import _RLNet, LR_MODEL, WEIGHT_DECAY
-    # Use module-level RLModel so tests can patch it via
-    # patch("claude_mcp_servers.rl_reranker.offline_trainer.RLModel").
-    _RLModel = RLModel  # noqa: F841 (module-level import at top of file)
+    import copy
 
-    # Load and pair events — DB-only, via the module-scoped hub route.
+    from .online_learning import (
+        DEFAULT_CONFIG,
+        VectorStore,
+        build_table,
+        evaluate,
+        fit,
+    )
+
+    cfg = DEFAULT_CONFIG
+    batch_queries = int(batch_queries or cfg.batch_queries)
+    lr = float(lr if lr is not None else cfg.lr)
+    seed = int(seed if seed is not None else cfg.seed)
+    prof = profile or filter_embedding_source or "qwen3"
+
     logger.info(
         "offline_trainer: loading events from hub (project_id=%s, emb_source=%s)",
         project_id, filter_embedding_source or "<all>",
@@ -825,59 +853,35 @@ def train(
     logger.info("offline_trainer: %d events → %d matched pairs", len(events), len(pairs))
     if not pairs:
         logger.warning("offline_trainer: no paired samples, nothing to train")
-        # Return a result so the caller can distinguish "no data" from
-        # "trained" (prevents a false 'done/complete' on an empty/401 hub —
-        # the job must report "no events", not success).
         return {"trained": False, "reason": "no_pairs",
                 "n_events": len(events), "n_pairs": 0, "n_samples": 0}
 
-    # Extract flat samples with correct features
-    samples = extract_samples(pairs)
-    logger.info("offline_trainer: %d trainable samples extracted", len(samples))
-    if not samples:
-        logger.warning("offline_trainer: no samples with stored embeddings")
+    store = VectorStore(emb_dim)
+    queries = queries_from_pairs(pairs, store, profile=prof)
+    queries.sort(key=lambda q: q.ts_ms)  # stable: equal stamps keep pair order
+    if not queries:
+        logger.warning("offline_trainer: no pairs with a usable query + node vectors")
         return {"trained": False, "reason": "no_samples",
                 "n_events": len(events), "n_pairs": len(pairs), "n_samples": 0}
 
-    # Time-ordered 80/10/10 split
-    n = len(samples)
-    n_train = max(1, int(n * 0.8))
-    n_val = max(1, int(n * 0.1))
-    train_s = samples[:n_train]
-    val_s = samples[n_train : n_train + n_val]
-    test_s = samples[n_train + n_val :]
-    logger.info(
-        "offline_trainer: split → train=%d val=%d test=%d",
-        len(train_s), len(val_s), len(test_s),
-    )
+    n_val = int(len(queries) * val_share) if len(queries) >= 10 else 0
+    train_q = queries[: len(queries) - n_val]
+    val_q = queries[len(queries) - n_val:]
+    logger.info("offline_trainer: %d queries → train=%d val=%d",
+                len(queries), len(train_q), len(val_q))
 
-    # Load or create model (via RLModel wrapper so .npz migration runs if needed).
-    # device='auto' picks CUDA when available; CPU fallback otherwise.
-    rl_model = _RLModel.load_or_create(
-        model_state_path, emb_dim=emb_dim, arch_version=arch_version,
-        device=device,
+    rl_model = RLModel.load_or_create(
+        model_state_path, emb_dim=emb_dim, arch_version=arch_version, device=device,
     )
     logger.info("offline_trainer: training on device=%s", rl_model.device)
-    # Use the inner _RLNet for batched training. For v1 this is _RLNetV1 from
-    # rl_model_v1.py; the isinstance(_RLNet) guard would miss it, so we trust
-    # rl_model._net directly whenever the wrapper was constructed cleanly.
-    # Fall back to a fresh v2 _RLNet (on the same device) only when
-    # rl_model._net is mocked out (test scenarios that patch RLModel).
-    if isinstance(rl_model._net, nn.Module):
-        net = rl_model._net
-    else:
-        net = _RLNet(emb_dim).to(rl_model._device)
-    opt = torch.optim.AdamW(net.parameters(), lr=LR_MODEL, weight_decay=WEIGHT_DECAY)
-    # Restore optimizer state from rl_model if available
-    try:
-        opt.load_state_dict(rl_model._opt.state_dict())
-    except Exception:
-        pass
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=epochs, eta_min=lr_min
-    )
+    val_tbl = (build_table(val_q, store, profile=prof, device=torch.device(rl_model.device))
+               if val_q else None)
 
-    # Training history (accumulated across runs)
+    def val_ndcg() -> float:
+        if val_tbl is None:
+            return float("nan")
+        return evaluate(rl_model._net, val_tbl, cfg, 0, seed=seed).ndcg
+
     pt_path = model_state_path.with_suffix(".pt")
     run_log_path = pt_path.with_name(pt_path.stem + "_train_log.json")
     training_history: list[dict] = []
@@ -888,94 +892,60 @@ def train(
             pass
 
     run_start = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
-    best_mae = math.inf
-    patience_counter = 0
-    early_stopped = False
+    start_ndcg = val_ndcg()
+    best_ndcg = start_ndcg
+    best_state = None
+    since_best = 0
     epochs_done = 0
-    final_train_mae = 0.0
-    final_val_mae = 0.0
-    final_train_loss = 0.0
-    final_val_loss = 0.0
-
-    for epoch in range(epochs):
-        if shuffle:
-            random.shuffle(train_s)
-        train_loss, train_mse, train_delta, train_mae = _epoch(
-            net, train_s, opt, batch_size, lambda_rank, training=True, emb_dim=emb_dim
-        )
-        # Local training on top of whatever base this checkpoint came from:
-        # the server's startup precedence keeps a trained local checkpoint
-        # over the bundled one only when it carries such steps.
-        rl_model.record_local_train_steps(math.ceil(len(train_s) / batch_size))
-        val_loss, val_mse, val_delta, val_mae = (
-            _epoch(net, val_s, None, batch_size, lambda_rank, training=False, emb_dim=emb_dim)
-            if val_s else (train_loss, train_mse, train_delta, train_mae)
-        )
-        scheduler.step()
+    steps = 0
+    early_stopped = False
+    for epoch in range(max(0, int(epochs))):
+        steps += fit(rl_model, train_q, store, profile=prof, epochs=1,
+                     batch_queries=batch_queries, lr=lr, seed=seed + epoch,
+                     shuffle=shuffle, loss=cfg.loss)
         epochs_done += 1
-        final_train_mae = train_mae
-        final_val_mae = val_mae
-        final_train_loss = train_loss
-        final_val_loss = val_loss
-
-        current_lr = scheduler.get_last_lr()[0]
-        logger.info(
-            "offline_trainer: epoch %d/%d  "
-            "train_mae=%.4f  val_mae=%.4f  "
-            "train_mse=%.4f  val_mse=%.4f  delta=%.4f  lr=%.2e",
-            epoch + 1, epochs,
-            train_mae, val_mae,
-            train_mse, val_mse, val_delta, current_lr,
-        )
-
-        if val_mae < best_mae - 1e-5:
-            best_mae = val_mae
-            patience_counter = 0
-            rl_model._net = net
-            rl_model._opt = opt
-            rl_model.save()
+        cur = val_ndcg()
+        logger.info("offline_trainer: epoch %d/%d  val NDCG@10=%.4f (start %.4f)",
+                    epoch + 1, epochs, cur, start_ndcg)
+        if val_tbl is None:
+            continue
+        if math.isnan(best_ndcg) or cur > best_ndcg + 1e-6:
+            best_ndcg = cur
+            best_state = copy.deepcopy(rl_model._net.state_dict())
+            since_best = 0
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                logger.info(
-                    "offline_trainer: early stop after %d epochs (patience=%d)",
-                    epochs_done, patience,
-                )
+            since_best += 1
+            if since_best >= patience:
                 early_stopped = True
+                logger.info("offline_trainer: early stop after %d epochs (patience=%d)",
+                            epochs_done, patience)
                 break
-
-    # Ensure final state is saved
-    rl_model._net = net
-    rl_model._opt = opt
+    if best_state is not None:
+        rl_model._net.load_state_dict(best_state)
     rl_model.save()
 
-    # Append to accumulated training log
     training_history.append({
         "run_start": run_start,
         "run_end": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+        "objective": "objective.batch_loss (query-grouped)",
         "epochs": epochs_done,
-        "train_mae": round(final_train_mae, 5),
-        "val_mae": round(final_val_mae, 5),
-        "best_mae": round(best_mae, 5) if best_mae != math.inf else None,
-        "train_loss": round(final_train_loss, 5),
-        "val_loss": round(final_val_loss, 5),
+        "steps": steps,
+        "val_ndcg_start": None if math.isnan(start_ndcg) else round(start_ndcg, 5),
+        "val_ndcg_best": None if math.isnan(best_ndcg) else round(best_ndcg, 5),
         "early_stopped": early_stopped,
-        "n_samples": len(samples),
-        "n_train": len(train_s),
-        "n_val": len(val_s),
-        "n_test": len(test_s),
+        "n_queries": len(queries),
+        "n_train": len(train_q),
+        "n_val": len(val_q),
     })
     try:
         run_log_path.write_text(json.dumps(training_history, indent=2), encoding="utf-8")
     except Exception as exc:
         logger.warning("offline_trainer: training log write failed: %s", exc)
 
-    # Success result so the caller can report a TRUE "done" (vs the no-data
-    # early-returns above, which report trained=False → the job says "no
-    # events" instead of a false "complete").
-    return {"trained": True, "reason": "ok", "n_events": len(events),
-            "n_pairs": len(pairs), "n_samples": len(samples),
-            "epochs": epochs_done}
+    return {"trained": steps > 0, "reason": "ok" if steps > 0 else "no_steps",
+            "n_events": len(events), "n_pairs": len(pairs), "n_samples": len(queries),
+            "n_queries": len(queries), "epochs": epochs_done, "steps": steps,
+            "val_ndcg": None if math.isnan(best_ndcg) else best_ndcg}
 
 
 # ---------------------------------------------------------------------------
@@ -1106,11 +1076,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-state", type=Path, required=True,
                    help="Path to model state .pt (created/updated by training)")
     p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=48)
-    p.add_argument("--lambda-rank", type=float, default=0.5,
-                   help="RankNet loss weight (0 = BCE only)")
-    p.add_argument("--patience", type=int, default=5,
-                   help="Early stopping patience (epochs without val improvement)")
+    # v0.2.106: --batch-size / --lambda-rank / --lr-min configured the retired
+    # per-sample loss (`_epoch`); superseded by the one objective
+    # (objective.batch_loss, its weights in objective.LossConfig) — the batch
+    # is now counted in queries.
+    p.add_argument("--batch-queries", type=int, default=None,
+                   help="Queries per step (default: the online learner's)")
+    p.add_argument("--patience", type=int, default=2,
+                   help="Early stopping patience (epochs without val NDCG@10 improvement)")
     p.add_argument("--filter-embedding-source", type=str, default="",
                    # codesage REMOVED 2026-05-19 — KG RL is text-only. Code-graph
                    # reranking will be a separate future module. `jina` retained
@@ -1130,10 +1103,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="auto",
                    help="Device for training: 'auto' (CUDA if available, else CPU), "
                         "'cuda', 'cuda:N', 'cpu'. Invalid values fall back to CPU.")
-    p.add_argument("--lr-min", type=float, default=1e-6,
-                   help="Cosine LR decay floor (eta_min for CosineAnnealingLR)")
+    p.add_argument("--lr", type=float, default=None,
+                   help="AdamW learning rate (default: the online learner's)")
     p.add_argument("--no-shuffle", dest="shuffle", action="store_false",
-                   help="Disable pair shuffling between epochs (deterministic order)")
+                   help="Keep time order within each epoch (no seeded permutation)")
     p.set_defaults(shuffle=True)
     p.add_argument("--verbose", "-v", action="store_true")
     return p
@@ -1193,19 +1166,18 @@ def main(argv: "list[str] | None" = None) -> int:
         log_stats(pairs)
 
         print(f"\nTraining for up to {args.epochs} epoch(s) "
-              f"(patience={args.patience}, λ_rank={args.lambda_rank})...")
+              f"(patience={args.patience}, objective.batch_loss)...")
         train(
             model_state_path=args.model_state,
             hub_client=hub_client,
             project_id=args.project_id,
             epochs=args.epochs,
-            batch_size=args.batch_size,
-            lambda_rank=args.lambda_rank,
+            batch_queries=args.batch_queries,
             patience=args.patience,
             filter_embedding_source=args.filter_embedding_source,
             emb_dim=args.emb_dim,
             shuffle=args.shuffle,
-            lr_min=args.lr_min,
+            lr=args.lr,
             arch_version=args.arch_version,
             device=args.device,
             since_ms=args.since_ms,

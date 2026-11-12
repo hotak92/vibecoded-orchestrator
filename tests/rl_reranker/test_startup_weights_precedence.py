@@ -226,7 +226,6 @@ def test_training_on_a_launcher_managed_copy_does_not_count(tmp_path):
     assert choose_local_checkpoint([cand], "0.3.0", read_meta=lambda p: newer) == cand
 
 
-@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
 def test_ownership_classes_follow_the_table(tmp_path):
     from vco_lib import rl_weights_ownership as own
 
@@ -235,13 +234,21 @@ def test_ownership_classes_follow_the_table(tmp_path):
     marked = tmp_path / "b.pt"
     marked.write_bytes(b"x")
     own.managed_marker_path(marked).write_bytes(b"vct-managed")
-    link = tmp_path / "c.pt"
-    link.symlink_to(plain)
     assert own.classify(plain) == "user"
     assert own.classify(marked) == "managed"
-    assert own.classify(link) == "managed"
     assert own.classify(tmp_path / "absent.pt") is None
     assert own.managed_marker_path(plain).name == "a.pt.vct-managed"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_a_symlinked_checkpoint_is_managed(tmp_path):
+    from vco_lib import rl_weights_ownership as own
+
+    plain = tmp_path / "a.pt"
+    plain.write_bytes(b"x")
+    link = tmp_path / "c.pt"
+    link.symlink_to(plain)
+    assert own.classify(link) == "managed"
 
 
 def test_ownership_table_parses_and_rejects_bad_tables():

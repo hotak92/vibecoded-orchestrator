@@ -166,7 +166,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   learns from that project's own citations (the search results its answers actually use) and reranks the
   project's searches only while its model beats plain search on its own check: on the project's most recent
   queries, held out of training, NDCG@10 must be at least 2% above plain cosine ordering and the node the answer
-  names must rank no lower than plain cosine ranks it. A new project starts with exactly its plain search order;
+  names must rank no lower than plain cosine ranks it — both at a one-sided 90% confidence bound from a paired
+  bootstrap of the check's queries (1 000 resamples, about 12 ms on a full 2 000-query check), not on the raw
+  averages, which passed by chance on checks with 20-50 citing queries. `/project_status`, the panel and
+  `rl_doctor` show the bounds beside the measured values (module-DB migration `0008_rl_online_state_bounds.sql`).
+  A replay of real histories still found projects where the searches the model served ranked the cited node lower
+  than plain cosine, so the check is a guard, not a guarantee. A new project starts with exactly its plain search order;
   when the model stops passing, the order goes back to plain search order. Training runs every 32 citation events
   (at most 16 steps of 8 queries, off the server's request loop, so searches are never held up by it) with the same
   objective as the offline trainer. A query is never trained on while it is in the check, and only 24 hours after it
@@ -227,6 +232,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the unused offline loop that replayed it (`offline_trainer.train_epoch`) are gone. The offline trainer and the
   server's online learning now share `claude_mcp_servers/rl_reranker/objective.py` (the loss and the model input),
   and the training reports and the server's check share `ranking_metrics.py` (NDCG@10, MRR@10 and the +2% bar).
+  `/finetune` and Reset + offline-specialize (`offline_trainer.train`) now fit that same objective on whole queries
+  too; they trained through a loss whose pairwise term paired nodes of different queries. Their result is written
+  in the project's own folder of the container (`projects/<project_id>/`), no longer in the shared state folder.
+  `offline_trainer`'s `--batch-size`, `--lambda-rank` and `--lr-min` options configured that loss and are replaced
+  by `--batch-queries` and `--lr`.
 - **`offline_trainer`'s `--link-sim-path` option is removed.** It read a `link_similarity.json` that nothing ever
   wrote, for a value the network does not use: since July the network's linked-node inputs are computed from the
   stored linked vectors.

@@ -4,9 +4,11 @@
 
 OWNER RULINGS (2026-11-12): the product is PER-PROJECT ONLINE adaptation; it
 ships OPT-IN; no global weights ship; a project's model is SERVED only while,
-on that project's own recent held-out queries, its NDCG@10 is at least +2%
-above plain cosine ordering AND the MRR@10 of the literally cited node is not
-below cosine's.
+on that project's own recent held-out queries, a PAIRED BOOTSTRAP says at 90%
+confidence (one-sided) that its NDCG@10 is at least +2% above plain cosine
+ordering AND that the MRR@10 of the literally cited node is not below
+cosine's. Otherwise the project keeps its own search order, exactly as with
+RL scoring off.
 
 What one project's :class:`ProjectLearner` does with the citation events the
 MCP posts to ``/rl_update`` (``RLServer._rl_update``):
@@ -32,8 +34,12 @@ MCP posts to ``/rl_update`` (``RLServer._rl_update``):
    AdamW steps per round. Inputs come from ``objective.build_inputs``, which
    applies the profile's linked-slot mask exactly as the serving path does.
 4. **Gate** (:func:`gate_decision`, after every round): the model and plain
-   cosine ordering are scored on the window (``ranking_metrics``); the model
-   is served for the project only while it passes the owner's bar. Until
+   cosine ordering are scored per query on the window (``ranking_metrics``),
+   and ``ranking_metrics.paired_bootstrap_bounds`` turns the per-query values
+   into one-sided lower bounds of the bar's two halves (NDCG@10 gain, cited
+   MRR@10 difference); the model is served for the project only while BOTH
+   bounds clear the owner's bar — the point estimates alone pass by noise on
+   a window of 20-50 citing queries. Until
    then — and whenever it stops passing — the server answers with the
    client's own search order (``RLServer._cache_nodes``): a project starts
    at exactly the behaviour it has without the reranker.
@@ -55,8 +61,8 @@ applied round. A state written for a different checkpoint (rotated / reset
 out of band) is discarded on load: its window may have been trained on.
 
 Deterministic: rounds happen at fixed event counts, the batches are FIFO, every
-random draw (linked-slot order) comes from a generator seeded by the round
-number, and the evaluation uses a fixed seed.
+random draw (linked-slot order, dropout, the gate's bootstrap resamples)
+comes from a generator seeded by the round number.
 """
 from __future__ import annotations
 
@@ -85,9 +91,12 @@ from .objective import (
     sync_dynamic_type_rows,
 )
 from .ranking_metrics import (
+    GATE_BOOTSTRAP_SAMPLES,
+    GATE_CONFIDENCE,
     K,
     UNLOCK_MIN_REL_GAIN,
     nan_mean,
+    paired_bootstrap_bounds,
     per_query_metrics,
     relative_gain,
 )
@@ -128,8 +137,12 @@ class OnlineConfig:
     oldest are dropped beyond it).
     ``passes_to_serve``: consecutive passing checks before the model is
     served; ONE failing check stops serving at once. Never serves a model
-    that fails the bar (it only waits longer to start), and keeps a model
-    whose window sits on the threshold from flapping on and off.
+    that fails the bar (it only waits longer to start). Kept beside the
+    confidence bound (default 1 = the bound alone decides): the bound answers
+    "is this window's gain real", the streak "has it held over successive,
+    overlapping windows" — a hysteresis knob the bound does not replace.
+    ``min_cited_queries`` likewise stays: a bootstrap over a handful of citing
+    queries is itself unreliable, so the gate does not run below it.
     """
 
     holdout_queries: int = 300
@@ -144,7 +157,13 @@ class OnlineConfig:
     passes_to_serve: int = 1
     lr: float = 1e-4
     loss: LossConfig = field(default_factory=LossConfig)
+    # The bar, judged on confidence bounds (owner ruling 2026-11-12): serve only
+    # when a paired bootstrap of the window (``bootstrap_samples`` resamples)
+    # puts the one-sided ``confidence`` lower bound of the relative NDCG@k gain
+    # at >= ``min_ndcg_gain`` AND that of the cited-node MRR@k difference at >= 0.
     min_ndcg_gain: float = UNLOCK_MIN_REL_GAIN
+    confidence: float = GATE_CONFIDENCE
+    bootstrap_samples: int = GATE_BOOTSTRAP_SAMPLES
     k: int = K
     seed: int = 1234
 
@@ -534,7 +553,15 @@ def fit(model: Any, queries: "list[LabelledQuery]", store: VectorStore, *, profi
 
 @dataclass
 class Evaluation:
-    """Model vs plain cosine on the held-out window (means over its queries)."""
+    """Model vs plain cosine on the held-out window: point estimates (means
+    over its queries) and the paired-bootstrap lower bounds the gate uses.
+
+    ``ndcg_gain_lb`` / ``mrr_diff_lb``: one-sided ``confidence`` lower bounds
+    of the relative NDCG@k gain and of ``MRR@k(model) - MRR@k(cosine)`` on the
+    citing queries. An undefined bound is ``-inf`` (failing), never NaN, so a
+    persisted evaluation round-trips equal; ``-inf`` is also what a state
+    persisted before the bound existed loads as, so it re-qualifies on new data.
+    """
 
     at_ms: int
     n_queries: int
@@ -545,6 +572,10 @@ class Evaluation:
     cos_mrr: float
     search_ndcg: float
     search_mrr: float
+    ndcg_gain_lb: float = float("-inf")
+    mrr_diff_lb: float = float("-inf")
+    confidence: float = GATE_CONFIDENCE
+    n_boot: int = 0
 
     @property
     def ndcg_gain(self) -> float:
@@ -554,27 +585,43 @@ class Evaluation:
     def from_dict(cls, d: dict) -> "Optional[Evaluation]":
         """The inverse of :meth:`as_dict` (``None`` metric = NaN); ``None``
         when the record is not a complete evaluation."""
-        def num(k: str) -> float:
+        def num(k: str, missing: float = float("nan")) -> float:
             v = d.get(k)
-            return float("nan") if v is None else float(v)
+            return missing if v is None else float(v)
 
         try:
             return cls(at_ms=int(d["at_ms"]), n_queries=int(d["n_queries"]),
                        n_cited=int(d["n_cited"]), ndcg=num("ndcg"), cos_ndcg=num("cos_ndcg"),
                        mrr=num("mrr"), cos_mrr=num("cos_mrr"), search_ndcg=num("search_ndcg"),
-                       search_mrr=num("search_mrr"))
+                       search_mrr=num("search_mrr"),
+                       ndcg_gain_lb=num("ndcg_gain_lb", float("-inf")),
+                       mrr_diff_lb=num("mrr_diff_lb", float("-inf")),
+                       confidence=num("confidence", GATE_CONFIDENCE),
+                       n_boot=int(d.get("n_boot") or 0))
         except (KeyError, TypeError, ValueError):
             return None
 
     def as_dict(self) -> dict[str, Any]:
+        """JSON-safe: every non-finite number (NaN metric, ``-inf`` bound) is
+        ``None`` (strict JSON for the state file and the hub row)."""
         d = asdict(self)
         d["ndcg_gain"] = self.ndcg_gain
-        return {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in d.items()}
+        return {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+                for k, v in d.items()}
+
+
+def _pct(x: float) -> str:
+    return "n/a" if not math.isfinite(x) else f"{100 * x:+.2f}%"
+
+
+def _diff(x: float) -> str:
+    return "n/a" if not math.isfinite(x) else f"{x:+.3f}"
 
 
 def gate_decision(ev: Optional[Evaluation], cfg: OnlineConfig) -> "tuple[bool, str]":
     """Serve the project's model? ``(serve, why)`` — the owner's bar, applied
-    to the held-out window. Pure."""
+    to the paired-bootstrap lower bounds on the held-out window (the point
+    estimates are reported, never decisive). Pure."""
     if ev is None:
         return False, "no evaluation yet"
     if ev.n_queries < cfg.holdout_queries:
@@ -583,16 +630,19 @@ def gate_decision(ev: Optional[Evaluation], cfg: OnlineConfig) -> "tuple[bool, s
     if ev.n_cited < cfg.min_cited_queries:
         return False, (f"only {ev.n_cited} held-out queries name a node in the answer "
                        f"(needs {cfg.min_cited_queries} to check the cited-node MRR)")
-    gain = ev.ndcg_gain
-    if math.isnan(gain) or gain < cfg.min_ndcg_gain:
-        g = "n/a" if math.isnan(gain) else f"{100 * gain:+.2f}%"
-        return False, (f"NDCG@{cfg.k} {g} vs plain cosine; needs "
-                       f"{100 * cfg.min_ndcg_gain:+.2f}%")
-    if not (ev.mrr >= ev.cos_mrr):
-        return False, (f"NDCG@{cfg.k} {100 * gain:+.2f}% but the cited node's MRR@{cfg.k} "
-                       f"{ev.mrr:.3f} is below plain cosine's {ev.cos_mrr:.3f}")
-    return True, (f"NDCG@{cfg.k} {100 * gain:+.2f}% over plain cosine, cited-node "
-                  f"MRR@{cfg.k} {ev.mrr:.3f} >= {ev.cos_mrr:.3f}")
+    gain, glb, dlb = ev.ndcg_gain, ev.ndcg_gain_lb, ev.mrr_diff_lb
+    conf = f"{100 * ev.confidence:.0f}%"
+    if not (glb >= cfg.min_ndcg_gain):  # NaN / -inf fail
+        return False, (f"NDCG@{cfg.k} {_pct(gain)} vs plain cosine, {conf} lower bound "
+                       f"{_pct(glb)}; the bound needs {100 * cfg.min_ndcg_gain:+.2f}%")
+    if not (dlb >= 0.0):
+        return False, (f"NDCG@{cfg.k} {_pct(gain)} (bound {_pct(glb)}) but the cited node's "
+                       f"MRR@{cfg.k} {ev.mrr:.3f} vs plain cosine's {ev.cos_mrr:.3f}: the {conf} "
+                       f"lower bound of the difference is {_diff(dlb)}, below 0")
+    return True, (f"NDCG@{cfg.k} {_pct(gain)} over plain cosine ({conf} lower bound "
+                  f"{_pct(glb)} >= {100 * cfg.min_ndcg_gain:+.2f}%), cited-node MRR@{cfg.k} "
+                  f"{ev.mrr:.3f} vs {ev.cos_mrr:.3f} (lower bound of the difference "
+                  f"{_diff(dlb)} >= 0)")
 
 
 # ---------------------------------------------------------------------------
@@ -689,15 +739,19 @@ def _compute_round(job: RoundJob) -> RoundResult:
             trained += len(qs)
         state = {k: v.detach().clone() for k, v in net.state_dict().items()}
         opt_state = opt.state_dict()
-    evaluation = evaluate(net, job.holdout, job.cfg, job.now_ms) if job.holdout is not None else None
+    evaluation = (evaluate(net, job.holdout, job.cfg, job.now_ms, seed=job.seed)
+                  if job.holdout is not None else None)
     return RoundResult(generation=job.generation, state_dict=state, opt_state=opt_state,
                        steps=len(job.steps) if state is not None else 0,
                        trained_queries=trained, evaluation=evaluation,
                        runtime_s=time.monotonic() - t0)
 
 
-def evaluate(net: Any, tbl: SampleTable, cfg: OnlineConfig, now_ms: int) -> Evaluation:
-    """Model vs cosine (and vs the client's search order) on ``tbl``'s queries."""
+def evaluate(net: Any, tbl: SampleTable, cfg: OnlineConfig, now_ms: int, *,
+             seed: int = 0) -> Evaluation:
+    """Model vs cosine (and vs the client's search order) on ``tbl``'s
+    queries, with the paired-bootstrap bounds of the bar (``seed``: the
+    round's, so a check is reproducible)."""
     sidx = np.arange(len(tbl.np_target), dtype=np.int64)
     sc = score_samples(tbl, net, sidx)
     cs = cosine_scores(tbl, sidx)
@@ -706,12 +760,16 @@ def evaluate(net: Any, tbl: SampleTable, cfg: OnlineConfig, now_ms: int) -> Eval
     c = per_query_metrics(cs, gains, rel, tbl.first, tbl.count, cfg.k)
     s = per_query_metrics(-tbl.np_search_pos.astype(np.float64), gains, rel,
                           tbl.first, tbl.count, cfg.k)
+    b = paired_bootstrap_bounds(m, c, n_boot=cfg.bootstrap_samples,
+                                confidence=cfg.confidence, seed=seed)
     return Evaluation(
         at_ms=int(now_ms), n_queries=int(len(tbl.first)),
         n_cited=int(np.sum(~np.isnan(m.mrr))),
         ndcg=nan_mean(m.ndcg), cos_ndcg=nan_mean(c.ndcg),
         mrr=nan_mean(m.mrr), cos_mrr=nan_mean(c.mrr),
         search_ndcg=nan_mean(s.ndcg), search_mrr=nan_mean(s.mrr),
+        ndcg_gain_lb=b.ndcg_gain_lb, mrr_diff_lb=b.mrr_diff_lb,
+        confidence=b.confidence, n_boot=b.n_boot,
     )
 
 
@@ -920,7 +978,8 @@ class ProjectLearner:
             "counters": dict(self.counters),
             "last_skip_reason": self.last_skip_reason or None,
             "bar": {"min_ndcg_gain": cfg.min_ndcg_gain, "cited_mrr_not_below_cosine": True,
-                    "k": cfg.k, "min_cited_queries": cfg.min_cited_queries,
+                    "judged_on": "paired-bootstrap lower bounds", "confidence": cfg.confidence,
+                    "bootstrap_samples": cfg.bootstrap_samples, "k": cfg.k, "min_cited_queries": cfg.min_cited_queries,
                     "max_holdout_queries": cfg.max_holdout_queries,
                     "purge_gap_hours": cfg.purge_gap_ms / 3_600_000},
         }

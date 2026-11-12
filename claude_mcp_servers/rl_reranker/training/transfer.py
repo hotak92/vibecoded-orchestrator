@@ -532,7 +532,8 @@ def replay_config(args: argparse.Namespace) -> Any:
     for opt, field in (("lr", "lr"), ("holdout", "holdout_queries"), ("min_cited", "min_cited_queries"),
                        ("round_every", "round_every"), ("batch_queries", "batch_queries"),
                        ("max_steps", "max_steps_per_round"), ("passes", "passes_to_serve"),
-                       ("max_holdout", "max_holdout_queries")):
+                       ("max_holdout", "max_holdout_queries"), ("confidence", "confidence"),
+                       ("bootstrap", "bootstrap_samples")):
         v = getattr(args, opt, None)
         if v is not None:
             over[field] = v
@@ -623,6 +624,10 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--passes", type=int, default=None,
                     help="consecutive passing checks before serving")
     rp.add_argument("--max-holdout", type=int, default=None)
+    rp.add_argument("--confidence", type=float, default=None,
+                    help="one-sided confidence of the gate's bootstrap bounds")
+    rp.add_argument("--bootstrap", type=int, default=None,
+                    help="bootstrap resamples per check")
     rp.set_defaults(func=cmd_replay)
     return p
 

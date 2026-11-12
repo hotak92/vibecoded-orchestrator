@@ -3,22 +3,24 @@
 
 // v0.2.106 (owner rulings 2026-11-12): what the RL panel says about a
 // project's reranking — per-project online learning, opt-in, and a serving
-// gate (the project's model reranks only while it beats plain cosine on the
-// project's own held-out queries: NDCG@10 >= +2% AND the cited node's
-// MRR@10 not below cosine's).
+// gate (the project's model reranks only while a paired bootstrap over the
+// project's own held-out queries says, at 90% confidence, that NDCG@10 is
+// >= +2% over plain cosine AND the cited node's MRR@10 is not below cosine's —
+// the gate decides on those lower bounds, not on the point estimates).
 //
 // Inputs (both read-only):
 //   * whether RL scoring is ON for the project — the enable cascade
 //     (`module_enable_state`, `effective`) with the lock on top
 //     (`lock_reason`): OFF means the container is never called;
 //   * the container's `rl_online_state` row (module DB, written after every
-//     online round by `rl_server._push_rl_online_state`; migration
-//     `claude_mcp_servers/rl_reranker/db/0007_rl_online_state.sql`).
+//     online round by `rl_server._push_rl_online_state`; migrations
+//     `claude_mcp_servers/rl_reranker/db/0007_rl_online_state.sql` and
+//     `0008_rl_online_state_bounds.sql`).
 //
 // Pure (no invoke, no DOM) so every branch is unit-testable; the panel
 // (`RlRerankerStatusPanel.svelte`) only renders what this returns.
 
-/** The `rl_online_state` row (column names of migration 0007). */
+/** The `rl_online_state` row (column names of migrations 0007 + 0008). */
 export interface RlOnlineStateRow {
   embedding_source?: string | null;
   refreshed_at?: number | null;
@@ -39,6 +41,10 @@ export interface RlOnlineStateRow {
   mrr?: number | null;
   cos_mrr?: number | null;
   cited_queries?: number | null;
+  /** 0008: the bounds the serving decision used (null = undefined, failing). */
+  ndcg_gain_lb?: number | null;
+  mrr_diff_lb?: number | null;
+  gate_confidence?: number | null;
 }
 
 /** The fields the panel reads (passed to `module_db_read_row`). */
@@ -46,7 +52,8 @@ export const RL_ONLINE_STATE_FIELDS: readonly string[] = [
   'embedding_source', 'refreshed_at', 'serving', 'reason', 'training_enabled',
   'events_seen', 'queries_trained', 'train_steps', 'rounds', 'holdout_queries',
   'holdout_target', 'serving_turned_off', 'last_eval_at', 'ndcg_gain', 'ndcg',
-  'cos_ndcg', 'mrr', 'cos_mrr', 'cited_queries',
+  'cos_ndcg', 'mrr', 'cos_mrr', 'cited_queries', 'ndcg_gain_lb', 'mrr_diff_lb',
+  'gate_confidence',
 ];
 
 export type RlOnlineKey = 'unknown' | 'off' | 'locked' | 'waiting' | 'not_serving' | 'serving';
@@ -71,6 +78,11 @@ function pct(v: number | null | undefined): string {
 
 function num(v: number | null | undefined, digits = 3): string {
   return typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : 'n/a';
+}
+
+function signed(v: number | null | undefined, digits = 3): string {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return 'n/a';
+  return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}`;
 }
 
 function truthy(v: number | boolean | null | undefined): boolean {
@@ -131,10 +143,16 @@ export function summarizeOnlineState(
     `Held-out check: ${n(row.holdout_queries)}/${n(row.holdout_target)} recent queries, ` +
       `${n(row.cited_queries)} of them name a node`,
   );
-  if (typeof row.ndcg_gain === 'number') {
+  if (typeof row.ndcg_gain === 'number' || typeof row.ndcg_gain_lb === 'number') {
+    const conf =
+      typeof row.gate_confidence === 'number' && Number.isFinite(row.gate_confidence)
+        ? `${Math.round(100 * row.gate_confidence)}%`
+        : '90%';
     details.push(
-      `Last check: NDCG@10 ${pct(row.ndcg_gain)} vs plain cosine (needs +2.00%); cited-node ` +
-        `MRR@10 ${num(row.mrr)} vs ${num(row.cos_mrr)} (must not be lower)`,
+      `Last check (${conf} lower bounds decide): NDCG@10 gain ${pct(row.ndcg_gain_lb)} ` +
+        `(needs +2.00%; measured ${pct(row.ndcg_gain)}), cited-node MRR@10 difference ` +
+        `${signed(row.mrr_diff_lb)} (must not be below 0; measured ${num(row.mrr)} vs ` +
+        `${num(row.cos_mrr)} on ${n(row.cited_queries)} citing queries)`,
     );
   }
   if (n(row.serving_turned_off) > 0) {

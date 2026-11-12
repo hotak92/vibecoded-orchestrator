@@ -55,6 +55,7 @@ from rl_reranker.training import shard_trainer as st  # noqa: E402
 
 from claude_mcp_servers.rl_client import search_pipeline  # noqa: E402
 from claude_mcp_servers.rl_client.client import RLClient  # noqa: E402
+from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
 
 D = 16
 
@@ -187,19 +188,10 @@ def _parity_event() -> dict:
 
 def _export_event(tmp_path: Path, event: dict) -> Path:
     db = tmp_path / "launcher.db"
+    # The real launcher schema (rl_events = migration 025 + 039), never a hand-rolled guess.
+    make_launcher_db(db, projects=[{"project_id": "p1", "name": "ParityProject",
+                                    "folder_path": "/x/parity"}])
     conn = sqlite3.connect(db)
-    conn.executescript("""
-        CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL,
-            folder_path TEXT NOT NULL UNIQUE, host TEXT NOT NULL,
-            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, slug TEXT);
-        CREATE TABLE rl_events (id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type TEXT NOT NULL, schema_version INTEGER NOT NULL DEFAULT 3,
-            ts INTEGER NOT NULL, project_id TEXT, project_name TEXT,
-            task_id TEXT NOT NULL, task_type TEXT, embedding_source TEXT,
-            embedding_dim INTEGER, embedding_model TEXT, payload_json TEXT NOT NULL,
-            quarantined_at INTEGER, quarantine_reason TEXT);
-    """)
-    conn.execute("INSERT INTO projects VALUES ('p1','ParityProject','/x/parity','base',0,0,NULL)")
     titles = [n["title"] for n in event["nodes"]]
     citation = {"event": "citation", "schema_version": 4, "task_id": event["task_id"],
                 "citations": {t: True for t in titles},
