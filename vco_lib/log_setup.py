@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import os
 
-__all__ = ["configure_logging", "resolve_level", "VCO_LOG_LEVEL_ENV_VAR"]
+__all__ = ["configure_logging", "log_safe", "resolve_level", "VCO_LOG_LEVEL_ENV_VAR"]
 
 #: Name of the env var vct-hub projects the ``logging.level`` global pref
 #: into. MUST match the Rust-side projection (``launcher/src-tauri``) and the
@@ -90,3 +90,34 @@ def configure_logging(default: int = logging.INFO, **basic_config_kwargs) -> Non
     """
     level = resolve_level(default)
     logging.basicConfig(level=level, **basic_config_kwargs)
+
+
+def log_safe(value: object) -> str:
+    """``value`` rendered so it can never be more than part of ONE log line.
+
+    The one home for this rule (the model gateway's access log and the RL
+    reranker's request-driven log lines both call it). A log line is a record
+    with a shape, so a value that carries a newline does not merely look odd
+    in it — it ENDS that record and writes the next one itself, which can
+    then read like an event that never happened. Control characters do the
+    same job more quietly: a CR rewinds the line on a terminal, an ESC can
+    repaint what is already on it.
+
+    So CR and LF become the two characters that SPELL them, and every other
+    non-printable becomes ``\\xNN`` / ``\\uNNNN``. The value stays readable —
+    a forged id reads as an id with a ``\\n`` in it, which is itself the
+    evidence that someone tried — while the record stays one line. A value
+    that was never hostile passes through unchanged.
+    """
+    text = (
+        str(value)
+        .replace("\r\n", "\\r\\n")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+    return "".join(
+        ch
+        if ch.isprintable()
+        else (f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
+        for ch in text
+    )

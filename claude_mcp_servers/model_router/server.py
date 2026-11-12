@@ -152,6 +152,8 @@ from aiohttp import web
 from . import __version__
 from . import provider_switch
 from vco_lib.gateway_accounts import PRIMARY_ID as PRIMARY_ACCOUNT_ID
+# One log line per record: the one home of the CR/LF/control-char rule.
+from vco_lib.log_setup import log_safe as _log_safe
 
 from .accounts import (
     AccountChoice,
@@ -2123,37 +2125,6 @@ def _translate_context_overflow(
         f"(gateway: {vendor.short_name or vendor.vendor_id} refused the "
         f"context size; this model's real ceiling is {maximum} tokens — "
         "compact now)",
-    )
-
-
-def _log_safe(value: object) -> str:
-    """``value`` rendered so it can never be more than part of ONE log line.
-
-    A log line is a record with a shape, so a value that carries a newline
-    does not merely look odd in it — it ENDS that record and writes the next
-    one itself, and the next one can read ``requested='claude-opus-5'
-    route=native status=200`` for a call that never happened. Control
-    characters do the same job more quietly: a CR rewinds the line on a
-    terminal, an ESC can repaint what is already on it.
-
-    So CR and LF become the two characters that SPELL them, and every other
-    non-printable becomes ``\\xNN`` / ``\\uNNNN``. The value stays readable —
-    a forged id reads as an id with a ``\\n`` in it, which is itself the
-    evidence that someone tried — while the record stays one line. A value
-    that was never hostile passes through unchanged, which is why this can
-    sit on the shared builder instead of at every call site.
-    """
-    text = (
-        str(value)
-        .replace("\r\n", "\\r\\n")
-        .replace("\r", "\\r")
-        .replace("\n", "\\n")
-    )
-    return "".join(
-        ch
-        if ch.isprintable()
-        else (f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
-        for ch in text
     )
 
 

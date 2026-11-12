@@ -28,6 +28,17 @@ D_ARM64 = "sha256:" + "b" * 64
 D_OTHER = "sha256:" + "c" * 64
 
 
+def _registry(ref: str) -> str:
+    """The registry host an image reference names (its first path segment)."""
+    return ref.split("/", 1)[0]
+
+
+def _names_mirror(argv: list[str]) -> bool:
+    """``argv`` names an image ON the mirror (exact registry host, not a
+    substring anywhere in the command line)."""
+    return any(_registry(a) == pp.MIRROR_HOST for a in argv)
+
+
 class Registry:
     """A fake engine: which pulls work, what ``manifest inspect`` reads."""
 
@@ -48,7 +59,7 @@ class Registry:
                 return subprocess.CompletedProcess(argv, 0, out, "")
             return subprocess.CompletedProcess(argv, 125, "", "image not known")
         if argv[1] == "pull":
-            if not argv[2].startswith("mirror.gcr.io/"):
+            if _registry(argv[2]) != pp.MIRROR_HOST:
                 return subprocess.CompletedProcess(argv, 125, "", self.refuse)
             return subprocess.CompletedProcess(argv, 0 if self.mirror_ok else 125, "",
                                                "" if self.mirror_ok else "mirror down")
@@ -119,7 +130,7 @@ def test_a_non_rate_limit_failure_never_tries_the_mirror():
     reg = Registry(refuse="Error: unauthorized: authentication required")
     ok, err = pp.ensure_image("podman", WEAVIATE, run=reg)
     assert (ok, err) == (False, "Error: unauthorized: authentication required")
-    assert not [c for c in reg.calls if "mirror.gcr.io" in " ".join(c)]
+    assert not [c for c in reg.calls if _names_mirror(c)]
 
 
 def test_a_failed_mirror_pull_keeps_the_original_refusal():
@@ -130,7 +141,7 @@ def test_a_failed_mirror_pull_keeps_the_original_refusal():
 def test_a_non_docker_hub_image_has_no_mirror():
     reg = Registry()
     ok, err = pp.ensure_image("podman", "ghcr.io/org/img:1", run=reg)
-    assert ok is False and not [c for c in reg.calls if "mirror.gcr.io" in " ".join(c)]
+    assert ok is False and not [c for c in reg.calls if _names_mirror(c)]
 
 
 def test_recreate_path_reports_and_logs_the_mirror(capsys):

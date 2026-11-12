@@ -7,7 +7,7 @@
 # both build it from here). It needs the root because it imports files that
 # live outside its own directory and must not be duplicated into it:
 # claude_mcp_servers/rl_client/{rl_logger,rerank_wire}.py and the stdlib-only
-# vco_lib/{rl_training_targets,atomic,log_setup,rl_weights_ownership}.py (+ the
+# vco_lib/{rl_training_targets,atomic,log_setup,safe_paths,rl_weights_ownership}.py (+ the
 # rl_weights_ownership.toml table that last one reads).
 #
 # Whitelist, so a root-context build never ships the rest of the checkout
@@ -25,5 +25,6 @@ claude_mcp_servers/rl_reranker/training/
 !vco_lib/rl_training_targets.py
 !vco_lib/atomic.py
 !vco_lib/log_setup.py
+!vco_lib/safe_paths.py
 !vco_lib/rl_weights_ownership.py
 !vco_lib/rl_weights_ownership.toml

@@ -103,6 +103,7 @@ import logging
 import random
 import re
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +375,23 @@ _ARCH_CONFIG: dict[str, dict] = {
 
 from .math_utils import cosine_similarity_np as _cosine_np  # noqa: E402
 from vco_lib.atomic import atomic_write_bytes, atomic_write_text  # noqa: E402
+from vco_lib.log_setup import log_safe  # noqa: E402
+
+
+def load_checkpoint(path: Path) -> Any:
+    """Read a checkpoint (``.pt``) onto the CPU with ``weights_only=True`` —
+    the ONE place this module deserializes a file.
+
+    ``weights_only=True`` makes ``torch.load`` use its restricted unpickler:
+    tensors, primitive containers and numbers only, so a ``.pt`` carrying a
+    pickled callable (``os.system``, any ``__reduce__`` payload) is REFUSED
+    with an ``UnpicklingError`` instead of executing. Everything this module
+    writes (network checkpoint, optimizer state, metadata strings and ints,
+    sidecar ``{"name", "emb", "version"}``) is inside that set, so no
+    allowlist (``torch.serialization.add_safe_globals``) is needed. Raises
+    whatever ``torch.load`` raises; callers treat that as "not loadable".
+    """
+    return torch.load(str(path), map_location="cpu", weights_only=True)
 
 
 def _atomic_torch_save(obj: object, path: Path) -> None:
@@ -691,7 +709,7 @@ def read_checkpoint_meta(path: Path) -> "dict | None":
     if not _HAS_TORCH:
         return None
     try:
-        ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
+        ckpt = load_checkpoint(path)
     except Exception as exc:  # noqa: BLE001 - unreadable = not a candidate
         logger.warning("RLModel: cannot read checkpoint metadata of %s: %s", path, exc)
         return None
@@ -1200,31 +1218,30 @@ class RLModel:
                 )
                 break
             try:
-                payload = torch.load(str(path), map_location="cpu",
-                                     weights_only=True)
+                payload = load_checkpoint(path)
             except Exception as exc:
                 logger.warning(
                     "RLModel: failed to read sidecar %s: %s — skipping",
-                    path.name, exc,
+                    log_safe(path.name), log_safe(exc),
                 )
                 continue
             name = payload.get("name") if isinstance(payload, dict) else None
             emb = payload.get("emb") if isinstance(payload, dict) else None
             if not isinstance(name, str) or not name:
                 logger.warning(
-                    "RLModel: sidecar %s missing 'name' — skipping", path.name,
+                    "RLModel: sidecar %s missing 'name' — skipping", log_safe(path.name),
                 )
                 continue
             if emb is None or not hasattr(emb, "shape"):
                 logger.warning(
                     "RLModel: sidecar %s missing 'emb' tensor — skipping",
-                    path.name,
+                    log_safe(path.name),
                 )
                 continue
             if tuple(emb.shape) != (TYPE_EMB_DIM,):
                 logger.warning(
                     "RLModel: sidecar %s has wrong emb shape %s (expected (%d,)) — skipping",
-                    path.name, tuple(emb.shape), TYPE_EMB_DIM,
+                    log_safe(path.name), tuple(emb.shape), TYPE_EMB_DIM,
                 )
                 continue
             # Sidecars are user-local state (bind-mounted from
@@ -1236,7 +1253,7 @@ class RLModel:
             if not bool(torch.isfinite(emb).all()):
                 logger.warning(
                     "RLModel: sidecar %s contains non-finite values — skipping",
-                    path.name,
+                    log_safe(path.name),
                 )
                 continue
             if name in self._type_registry and name not in NODE_TYPES:
@@ -1245,7 +1262,7 @@ class RLModel:
                 # might produce this). Skip — first one wins.
                 logger.warning(
                     "RLModel: sidecar %s would duplicate '%s' (already at row %d) — skipping",
-                    path.name, name, self._type_registry[name],
+                    log_safe(path.name), log_safe(name), self._type_registry[name],
                 )
                 continue
             row = next_row
@@ -1359,7 +1376,7 @@ class RLModel:
                     # critical state is durable.
                     logger.warning(
                         "RLModel.save: sidecar write for '%s' failed: %s",
-                        name, exc,
+                        log_safe(name), log_safe(exc),
                     )
 
             # --- Orphan sidecar GC ---
@@ -1378,12 +1395,12 @@ class RLModel:
                         path.unlink()
                         logger.info(
                             "RLModel.save: pruned orphan sidecar %s "
-                            "(not in registry)", path.name,
+                            "(not in registry)", log_safe(path.name),
                         )
                     except OSError as exc:
                         logger.warning(
                             "RLModel.save: failed to prune orphan sidecar %s: %s",
-                            path.name, exc,
+                            log_safe(path.name), exc,
                         )
 
             # --- Drop the layout marker LAST ---
@@ -1423,7 +1440,7 @@ class RLModel:
         if not self._pt_path.exists():
             return False
         try:
-            ckpt = torch.load(str(self._pt_path), map_location="cpu", weights_only=True)
+            ckpt = load_checkpoint(self._pt_path)
         except Exception as exc:
             logger.warning("RLModel: failed to read .pt: %s", exc)
             return False
@@ -1433,14 +1450,14 @@ class RLModel:
             logger.warning(
                 "RLModel: checkpoint arch %s does not match expected %s — "
                 "ignoring checkpoint and re-initialising weights.",
-                ckpt_arch, self._arch_version,
+                log_safe(ckpt_arch), self._arch_version,
             )
             return False
 
         if ckpt.get("emb_dim") != self._emb_dim:
             logger.warning(
                 "RLModel: emb_dim mismatch (%s vs %d), re-initialising",
-                ckpt.get("emb_dim"), self._emb_dim,
+                log_safe(ckpt.get("emb_dim")), self._emb_dim,
             )
             return False
 
@@ -1459,7 +1476,7 @@ class RLModel:
                 "RLModel: embedding_source mismatch — checkpoint trained on %r, "
                 "container pinned to %r. Refusing load (would silently produce "
                 "garbage scores on the wrong latent space). Re-initialising.",
-                ckpt_source, expected_source,
+                log_safe(ckpt_source), log_safe(expected_source),
             )
             return False
         elif (ckpt_source or expected_source) and not (ckpt_source and expected_source):
@@ -1469,7 +1486,7 @@ class RLModel:
                 "RLModel: embedding_source partial (ckpt=%r, expected=%r); "
                 "permissive load. Future v0.2.7+ checkpoints will populate "
                 "both fields and enable strict checking.",
-                ckpt_source, expected_source,
+                log_safe(ckpt_source), log_safe(expected_source),
             )
 
         # v0.2.7 — capture weights_version from the checkpoint for downstream
@@ -1511,7 +1528,7 @@ class RLModel:
             if unexpected_real or missing_real:
                 logger.warning(
                     "RLModel: partial load reports missing=%s unexpected=%s",
-                    missing_real, unexpected_real,
+                    log_safe(missing_real), log_safe(unexpected_real),
                 )
             with torch.no_grad():
                 target = self._net.type_embs.weight[:N_ENTITY_TYPES]
@@ -1589,7 +1606,7 @@ class RLModel:
                 "discarding shipped registry entries and resyncing from sidecars. "
                 "Build-pipeline note: shipped weights for v0.2.2+ MUST be produced "
                 "via RLModel.save() so type_embs.weight ships truncated to %d rows.",
-                len(stale_names), stale_names, N_ENTITY_TYPES,
+                len(stale_names), log_safe(stale_names), N_ENTITY_TYPES,
             )
             for name in stale_names:
                 del self._type_registry[name]
@@ -1639,7 +1656,7 @@ class RLModel:
         # the legacy → D1' window.)
         if not marker_present:
             self._sanitize_registry()
-        logger.debug("RLModel: loaded %s checkpoint from %s", ckpt_arch, self._pt_path)
+        logger.debug("RLModel: loaded %s checkpoint from %s", log_safe(ckpt_arch), log_safe(self._pt_path))
         return True
 
     def _migrate_legacy_to_sidecars(self, ckpt: dict) -> None:
@@ -1683,7 +1700,7 @@ class RLModel:
             if idx >= _MAX_TYPES:
                 logger.warning(
                     "RLModel: legacy entry '%s' has out-of-range idx %d; skipping",
-                    name, idx,
+                    log_safe(name), idx,
                 )
                 continue
             with torch.no_grad():
@@ -1724,7 +1741,7 @@ class RLModel:
                 self._type_registry[name] = new_idx
                 logger.info(
                     "RLModel: registry conflict -- remapped '%s' from slot %d -> %d",
-                    name, idx, new_idx,
+                    log_safe(name), idx, new_idx,
                 )
 
     # ------------------------------------------------------------------

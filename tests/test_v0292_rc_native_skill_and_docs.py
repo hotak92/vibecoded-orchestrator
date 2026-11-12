@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.hosts import names_host
+
 REPO = Path(__file__).resolve().parent.parent
 SKILL = REPO / "templates" / "skills" / "rc-native" / "SKILL.md"
 TROUBLESHOOTING = REPO / "docs" / "TROUBLESHOOTING.md"
@@ -126,7 +128,7 @@ def test_skill_states_the_reboot_behaviour():
 
 def test_skill_discloses_the_endpoint_gate_with_version():
     text = _text(SKILL)
-    assert "api.anthropic.com" in text
+    assert names_host(text, "api.anthropic.com")
     assert "v2.1.196" in text, "the gate's introduction version is load-bearing"
 
 
@@ -237,7 +239,7 @@ def test_troubleshooting_maps_the_toast_to_the_endpoint_gate():
     text = _text(TROUBLESHOOTING)
     # The exact toast string the user sees and will search for.
     assert "Remote Control initialization failed" in text
-    assert "api.anthropic.com" in text
+    assert names_host(text, "api.anthropic.com")
     assert "ANTHROPIC_BASE_URL" in text
 
 
@@ -288,7 +290,7 @@ def test_point_panel_warning_text_is_available_for_the_gui():
         REPO / "launcher" / "src" / "lib" / "api" / "model_gateway.ts"
     ).read_text(encoding="utf-8")
     assert "Remote Control" in ts
-    assert "api.anthropic.com" in ts
+    assert names_host(ts, "api.anthropic.com")
     assert "remote-control" in ts
 
 

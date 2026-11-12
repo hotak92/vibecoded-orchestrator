@@ -38,7 +38,6 @@ from rl_reranker.rl_server import (  # noqa: E402
     _BASE_PROJECT_SENTINEL,
     _HEADER_PROJECT_ID,
     _ProjectHead,
-    _is_path_under,
     _per_project_log_path,
     _per_project_state_dir,
 )
@@ -71,19 +70,10 @@ def layout(tmp_path, monkeypatch):
     for d in (state_dir, logs_dir, global_dir):
         d.mkdir(parents=True)
 
-    def _safe_weights(p):
-        if not p or not isinstance(p, str):
-            return None
-        cand = Path(p)
-        if not cand.is_absolute():
-            return None
-        return cand if _is_path_under(
-            cand, (f"{state_dir}/", f"{global_dir}/")
-        ) else None
-
-    # v0.2.11: _safe_events_path was removed (training is DB-only; /finetune no
-    # longer takes an events_path), so there's nothing to monkeypatch for it.
-    monkeypatch.setattr(rl_server_mod, "_safe_weights_path", _safe_weights)
+    # The real validators run; only their roots move to the tmp tree.
+    monkeypatch.setattr(
+        rl_server_mod, "_WEIGHTS_ROOTS", (f"{state_dir}/", f"{global_dir}/"),
+    )
 
     return {
         "root": data_root,

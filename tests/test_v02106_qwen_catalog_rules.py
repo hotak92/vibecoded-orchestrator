@@ -38,6 +38,8 @@ import re
 import unittest
 from pathlib import Path
 
+from tests.common.hosts import in_domain, url_host
+
 from model_router import catalog as cat
 from model_router import effort as E
 from model_router import routing
@@ -104,7 +106,7 @@ ZAI_NOT_PROVIDED = ("glm-5.2", "glm-5.3-flashx", "glm-5.3-flashx-legal")
 
 def _service(vendor: Vendor, payload: dict) -> cat.CatalogService:
     async def fetch(url, headers):
-        if "anthropic.com" in url:
+        if in_domain(url_host(url), "anthropic.com"):
             return {"data": []}
         return payload
 

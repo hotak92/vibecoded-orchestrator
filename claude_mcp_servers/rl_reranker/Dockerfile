@@ -11,8 +11,9 @@
 # (as `rl_client.rl_logger`), `claude_mcp_servers/rl_client/rerank_wire.py`
 # (the /cache_nodes feature format, shared with the client) and the
 # stdlib-only `vco_lib` modules
-# `rl_training_targets`, `atomic` (every atomic write) and `log_setup`
-# (root-logger setup). The root `.dockerignore` whitelists
+# `rl_training_targets`, `atomic` (every atomic write), `log_setup`
+# (root-logger setup, one-line log values) and `safe_paths` (request-supplied
+# paths contained under the /data roots). The root `.dockerignore` whitelists
 # exactly what this file COPYs, so the rest of the checkout never enters the
 # context. Two entry points build it from this one file:
 #
@@ -138,6 +139,7 @@ COPY --chown=app:app claude_mcp_servers/rl_client/rerank_wire.py                
 COPY --chown=app:app vco_lib/rl_training_targets.py                             /app/vco_lib/rl_training_targets.py
 COPY --chown=app:app vco_lib/atomic.py                                          /app/vco_lib/atomic.py
 COPY --chown=app:app vco_lib/log_setup.py                                       /app/vco_lib/log_setup.py
+COPY --chown=app:app vco_lib/safe_paths.py                                      /app/vco_lib/safe_paths.py
 COPY --chown=app:app vco_lib/rl_weights_ownership.py                            /app/vco_lib/rl_weights_ownership.py
 COPY --chown=app:app vco_lib/rl_weights_ownership.toml                          /app/vco_lib/rl_weights_ownership.toml
 
