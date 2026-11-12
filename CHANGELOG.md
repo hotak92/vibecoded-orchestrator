@@ -410,6 +410,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **The macOS installer no longer prints "$!: unbound variable" when it opens the launcher.** The launcher was started inside a subshell, so the script read an unset `$!`; macOS's bash 3.2 aborts on that under `set -u` even with a default. It is now started in the script's own shell.
+- **A missing compose provider stops the install up front, with the command that fixes it.** Podman without
+  `podman-compose` (or a `docker-compose` for `podman compose` to delegate to), or Docker without its compose
+  plugin, passed every check and failed at step 5 with "looking up compose provider failed". `install.py` now
+  checks right after detecting the runtime (`vco_lib.compose_prereq`, over the existing
+  `compose_provider.detect`): a fresh install stops before creating the venv, an `--update` warns. The bootstrap
+  envelope gains `system.compose` and the blocking `compose_provider` prereq (also reported by `vco doctor`;
+  `--install-missing` installs it), the runtime auto-installs in `install.sh`, `install.ps1` and install.py add
+  the provider, and a step-5 failure of this kind names the per-OS remedy.
+
+- **Module commands work when a placeholder path contains a space.** The launcher resolved `{install_dir}` /
+  `{VCT_*}` / `{HOME}` into a module's `post_install` / `pre_upgrade` / `post_upgrade` / migration command and
+  only then split it into arguments, so a path such as `C:\Users\First Last` became two arguments and every such
+  command failed. The template is now split first and each argument resolved after
+  (`installer_engine::command_argv`); quoting in the template works as before.
+
+- **A Docker Hub rate limit no longer stops the install's image pull.** A pull of a Docker-Hub-served image
+  (`cr.weaviate.io`, `docker.io`) refused with `toomanyrequests` / 429 / "pull rate limit" is retried from Google's
+  Docker Hub mirror `mirror.gcr.io` with the same path and tag and tagged under the original name
+  (`compose_image_prepull.ensure_image`); a mirror image whose digest does not match the original registry's
+  readable digests is refused, an unverifiable one is accepted and reported. Step 5 now pre-pulls the services it
+  starts (a fresh install) as well as those it recreates. Other pull failures are unchanged.
+
 - **The RL reranker keeps what it learns when its container is recreated.** Its manifest mounted nothing, so each
   project's online model and learner state (`/data/state/projects/<project_id>/`), the event logs and the global
   model lived in the container's writable layer and were lost on every module update and every recreate. The

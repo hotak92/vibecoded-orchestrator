@@ -59,7 +59,11 @@ def test_unpullable_image_keeps_the_running_container():
     keep, refused = pp.split_recreates(["weaviate", "ollama", "code_embed"], runtime="podman",
                                        root=Path("/r"), run=rt, pinned=_pinned)
     assert keep == ["ollama", "code_embed"]
-    assert refused == [("weaviate", PINS["weaviate"], "toomanyrequests: pull rate limit")]
+    # v0.2.106: a rate limit is retried from mirror.gcr.io first; this fake
+    # refuses that too, so the row keeps the original refusal and names both.
+    ((svc, image, err),) = refused
+    assert (svc, image) == ("weaviate", PINS["weaviate"])
+    assert err.startswith("toomanyrequests: pull rate limit; mirror mirror.gcr.io/")
 
 
 def test_a_locally_built_service_is_never_pulled():

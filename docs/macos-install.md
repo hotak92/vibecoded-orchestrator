@@ -35,10 +35,12 @@ On `install.py` exit 0 and unless `--no-auto-launch` was passed, the shim then r
 `podman` itself is auto-installed via `brew install podman` only if Homebrew is present; the daemon (Podman Machine) is NOT auto-initialized — initializing carries platform-specific assumptions about disk space and CPU/memory allocation that should be an explicit user choice. Initialize before re-running the installer:
 
 ```bash
-brew install podman      # if podman is not already on PATH
+brew install podman podman-compose   # if not already on PATH
 podman machine init      # one-time
 podman machine start
 ```
+
+`podman-compose` is the compose provider install step 5 starts the services with (`podman compose` alone only delegates to one and fails with "looking up compose provider failed"). Without a provider the installer stops right after detecting podman, naming `brew install podman-compose`; the bootstrap prepass lists it as the blocking `compose_provider` prereq.
 
 The bootstrap prepass detects `podman.machine_running == false` and surfaces this in the envelope's `missing_prereqs` array; `install.py` writes an `UPDATE_DEFERRED.md` entry with the exact commands if it reaches the container step before the machine is up.
 
@@ -165,7 +167,7 @@ LaunchAgents do NOT inherit your shell's `PATH`. The plist sets a baseline of `/
 
 If neither Podman nor Docker Desktop is installed, install one:
 
-- Podman (recommended, open-source): `brew install podman && podman machine init && podman machine start`
+- Podman (recommended, open-source): `brew install podman podman-compose && podman machine init && podman machine start`
 - Docker Desktop: download from <https://www.docker.com/products/docker-desktop/>.
 
 ### "GPU passthrough doesn't work"

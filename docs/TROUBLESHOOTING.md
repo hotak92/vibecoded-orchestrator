@@ -257,6 +257,20 @@ If a build still fails because of a wrapper that bypasses our detection, the rec
 - **macOS**: install [Podman Desktop](https://podman-desktop.io/) or [Docker Desktop](https://www.docker.com/products/docker-desktop), then re-run `bash first-install.sh`.
 - **Windows**: install [Docker Desktop](https://www.docker.com/products/docker-desktop) or [Podman Desktop](https://podman-desktop.io/), then double-click `first-install.bat` again.
 
+### No compose provider ("looking up compose provider failed")
+
+Install step 5 starts the services with compose. `podman compose` is only a delegator: it needs `podman-compose` or `docker-compose` installed. Since v0.2.106 the installer checks this right after detecting the runtime — a fresh install stops there (before the venv) with the command for your OS, an `--update` warns, and `install.py --bootstrap` lists the blocking `compose_provider` prereq (`vco doctor` too).
+
+- **macOS**: `brew install podman-compose` (Docker Desktop ships `docker compose`).
+- **Linux**: your distribution's `podman-compose` package (`sudo apt-get install -y podman-compose`, `sudo dnf install -y podman-compose`, …); for Docker, `docker-compose-plugin`.
+- **Windows**: `winget install --id Docker.DockerCompose` (podman compose delegates to it); Docker Desktop ships compose.
+
+Check with `podman-compose version` / `docker compose version`, then re-run the installer.
+
+### Docker Hub rate limit on an image pull ("toomanyrequests")
+
+Docker Hub (which also serves `cr.weaviate.io`) refuses anonymous pulls past a quota. Since v0.2.106 install step 5 pulls the Weaviate / Ollama image itself before `compose up` (`vco_lib/compose_image_prepull.py`, `ensure_image`), and a pull refused with `toomanyrequests` / HTTP 429 / "pull rate limit" is retried from Google's official Docker Hub mirror with the same path and tag (`cr.weaviate.io/semitechnologies/weaviate:<tag>` → `mirror.gcr.io/semitechnologies/weaviate:<tag>`; `docker.io/<ns>/<img>` → `mirror.gcr.io/<ns>/<img>`; library images → `mirror.gcr.io/library/<img>`), then tagged under the original name. When the engine can read the original registry's digests (`<engine> manifest inspect`), the mirror image must match one of them or it is removed and refused; when it cannot (the registry is refusing), the mirror is accepted and the install prints and logs that it is unverified. Any other pull failure is reported as before (`service_image_pull_failed` for a service being recreated). By hand: `podman pull mirror.gcr.io/semitechnologies/weaviate:<tag> && podman tag mirror.gcr.io/semitechnologies/weaviate:<tag> cr.weaviate.io/semitechnologies/weaviate:<tag>`, or log in (`podman login docker.io`) for a higher quota.
+
 ### GPU hardware detected but no driver installed
 
 `first-install.*` detects NVIDIA and AMD GPU hardware but does not attempt driver installation — driver installs require a reboot and carry risk. If it prints a GPU URL:

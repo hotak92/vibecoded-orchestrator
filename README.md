@@ -158,7 +158,7 @@ No GUI yet? The CLI install path (above) covers all three OSes.
 
 **Required (install halts and prompts if missing):**
 - **Python 3.11+** (3.12 is what we develop and CI-test on; 3.13 supported). 3.10 and older are rejected — we depend on stdlib `tomllib`.
-- **Docker or Podman** (for Weaviate + Ollama containers).
+- **Docker or Podman** (for Weaviate + Ollama containers), **with a compose provider**: `podman-compose` for Podman, the `docker compose` plugin for Docker.
 - **Node.js 18+** with `npm` — only when building the launcher GUI from source AND/OR installing the Claude Code CLI. Not needed if you use the bundled prebuilt launcher and the VS Code extension.
 - **A Claude subscription** (Pro / Max / Team / Enterprise) — Claude Code authenticates against your subscription; the orchestrator exists to feed it context. Free Anthropic accounts can browse `claude.ai` but cannot authenticate Claude Code.
 

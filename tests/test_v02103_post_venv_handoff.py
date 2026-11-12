@@ -280,7 +280,10 @@ def _drive_main_to_step_5(monkeypatch, tmp_path, calls):
     monkeypatch.setattr(install, "_check_python_version",
                         lambda: install._log_install_event("1/10", "start", "python"))
     monkeypatch.setattr(install, "_check_prerequisites", lambda: None)
-    monkeypatch.setattr(install, "_detect_system", lambda a, r: object())
+    # v0.2.106: a real SystemInfo — main() reads `container_cmd` for the
+    # compose-provider pre-flight after step 2 ("" = no runtime: nothing to check).
+    monkeypatch.setattr(install, "_detect_system",
+                        lambda a, r: install.SystemInfo("Linux", False, False, "", ""))
     monkeypatch.setattr(install, "_print_system_info", lambda s: None)
     monkeypatch.setattr(install, "_detect_optional_companions", lambda a: None)
     monkeypatch.setattr(install, "_choose_embedding_config", lambda s, a: {"description": "x"})

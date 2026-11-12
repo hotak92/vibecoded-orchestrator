@@ -73,6 +73,17 @@
           "type": ["string", "null"],
           "enum": ["podman", "docker", null]
         },
+        "compose": {
+          "description": "vco_lib.compose_prereq.probe: the compose provider for the runtime (null = no runtime binary). ok=false raises the compose_provider missing prereq.",
+          "type": ["object", "null"],
+          "required": ["runtime", "ok"],
+          "properties": {
+            "runtime": {"type": "string", "enum": ["podman", "docker"]},
+            "ok": {"type": "boolean"},
+            "engine": {"type": ["string", "null"]},
+            "argv": {"type": ["array", "null"], "items": {"type": "string"}}
+          }
+        },
         "git": {"$ref": "#/$defs/ToolProbe"},
         "brew": {"$ref": "#/$defs/BrewProbe"},
         "lean_ctx": {"$ref": "#/$defs/ToolProbe"},
@@ -184,6 +195,7 @@
         "install_node": {"type": "array", "items": {"type": "string"}},
         "install_podman": {"type": "array", "items": {"type": "string"}},
         "install_lean_ctx": {"type": "array", "items": {"type": "string"}},
+        "install_compose": {"type": "array", "items": {"type": "string"}},
         "tauri_deps": {"type": "array", "items": {"type": "string"}},
         "selinux_volume_flag_needed": {"type": "boolean"},
         "nvidia_container_toolkit_install": {"type": ["string", "null"]},

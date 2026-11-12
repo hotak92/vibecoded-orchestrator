@@ -163,7 +163,7 @@ from vco_lib import uninstall_artifacts as _uninstall_artifacts  # noqa: E402
 from vco_lib import uninstall_containers as _uninstall_containers, uninstall_quiesce as _uninstall_quiesce, uninstall_state as _uninstall_state  # noqa: E402,E501
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
-from vco_lib import compose_provider as _compose_provider  # noqa: E402
+from vco_lib import compose_provider as _compose_provider, compose_prereq as _compose_prereq  # noqa: E402
 from vco_lib import install_services_up as _isu  # noqa: E402
 from vco_lib import runtime_reconcile as _runtime_reconcile  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
@@ -1325,6 +1325,8 @@ def _bootstrap_package_manager_advice(
         "install_node": install_node,
         "install_podman": install_podman,
         "install_lean_ctx": install_lean_ctx,
+        "install_compose": _compose_prereq.install_commands(
+            "docker" if system_block.get("container_runtime_chosen") == "docker" else "podman", primary),
         "tauri_deps": tauri_deps,
         "selinux_volume_flag_needed": selinux_z,
         "nvidia_container_toolkit_install": nvidia_toolkit,
@@ -1372,6 +1374,10 @@ def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
                     "See docs/GETTING_STARTED.md."
                 ),
             })
+    # v0.2.106: a runtime without compose dies at install step 5 (vco_lib.compose_prereq).
+    compose_row = _compose_prereq.missing_prereq(system_block.get("compose"), os_name=system_block.get("os"))
+    if compose_row is not None:
+        out.append(compose_row)
 
     # Node/npm — required for the Claude Code MCP layer (npx-spawned
     # playwright MCP).
@@ -1507,6 +1513,8 @@ def _bootstrap_build_envelope(root: Path) -> dict:
         "podman": podman_block,
         "docker": docker_block,
         "container_runtime_chosen": container_runtime_chosen,
+        "compose": _compose_prereq.probe(container_runtime_chosen or (
+            "podman" if podman_block["cmd"] else "docker" if docker_block["cmd"] else None)),
         "git": git_block,
         "brew": brew_block,
         "lean_ctx": lean_ctx_block,
@@ -1641,8 +1649,12 @@ def _bootstrap_install_missing(envelope: dict, *, no_prompt: bool) -> int:
         name = m["name"]
         # Map prereq name to advice key.
         cmds: list[str] = []
-        if name in ("container_runtime", "podman_machine"):
+        if name == "container_runtime":  # podman, and a compose provider for it
+            cmds = advice.get("install_podman", []) + advice.get("install_compose", [])
+        elif name == "podman_machine":
             cmds = advice.get("install_podman", [])
+        elif name == _compose_prereq.PREREQ_NAME:
+            cmds = advice.get("install_compose", [])
         elif name == "node":
             cmds = advice.get("install_node", [])
         elif name == "python_wheel_coverage":
@@ -5996,6 +6008,8 @@ def main() -> int:
 
     # Step 2: Detect system
     sysinfo = _detect_system(args, _deferral_report)
+    if not _compose_prereq.install_preflight(sysinfo.container_cmd, update=bool(args.update), no_containers=bool(args.no_containers), log_event=_log_install_event):
+        return 1  # v0.2.106: no compose provider — stop before anything changes the machine
     _print_system_info(sysinfo)
 
     # Step 2b: Optional companion tools (lean-ctx for context compression)
@@ -6087,6 +6101,8 @@ def main() -> int:
                 # later _write_install_manifest call — boot services
                 # materialized later in the same run may read it before then).
                 _persist_runtime_txt(sysinfo.container_cmd)
+                if not _compose_prereq.install_preflight(sysinfo.container_cmd, update=bool(args.update), log_event=_log_install_event):
+                    return 1
             if not sysinfo.container_cmd:
                 # Either the user declined, the package manager failed,
                 # or we're on macOS/Windows (URL-only path). Fall through
@@ -8820,21 +8836,21 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
         # manually even though post-install-launcher.sh:288 already
         # advertised zypper+apk as detected — surface-level parity gap.
         if shutil.which("apt-get"):
-            cmd = ["sudo", "apt-get", "install", "-y", "podman"]
+            cmd = ["sudo", "apt-get", "install", "-y", "podman", "podman-compose"]
             update_cmd = ["sudo", "apt-get", "update"]
             label = "apt (Debian/Ubuntu)"
         elif shutil.which("dnf"):
-            cmd = ["sudo", "dnf", "install", "-y", "podman"]
+            cmd = ["sudo", "dnf", "install", "-y", "podman", "podman-compose"]
             update_cmd = None
             label = "dnf (Fedora/RHEL)"
         elif shutil.which("pacman"):
-            cmd = ["sudo", "pacman", "-S", "--noconfirm", "podman"]
+            cmd = ["sudo", "pacman", "-S", "--noconfirm", "podman", "podman-compose"]
             update_cmd = None
             label = "pacman (Arch)"
         elif shutil.which("zypper"):
             # `zypper install -y` is the non-interactive flag. SLES/Leap
             # ship podman in the standard repos.
-            cmd = ["sudo", "zypper", "install", "-y", "podman"]
+            cmd = ["sudo", "zypper", "install", "-y", "podman", "podman-compose"]
             update_cmd = None
             label = "zypper (openSUSE/SLES)"
         elif shutil.which("apk"):
@@ -8842,7 +8858,7 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
             # lives in the community repo; if it's not enabled, this
             # surfaces as `ERROR: unable to select packages: podman` —
             # acceptable failure mode.
-            cmd = ["sudo", "apk", "add", "--no-cache", "podman"]
+            cmd = ["sudo", "apk", "add", "--no-cache", "podman", "podman-compose"]
             update_cmd = ["sudo", "apk", "update"]
             label = "apk (Alpine)"
         else:
