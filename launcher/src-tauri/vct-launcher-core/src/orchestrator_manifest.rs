@@ -178,7 +178,12 @@ mod tests {
             &root.join("vct-module.json"),
             r#"{"id":"orchestrator","version":"0.2.100","description":"x"}"#,
         );
-        let exe = root.join("a/b/c/d/e/f/g/h/i/j/vct-hub");
+        // One directory more between the clone and the exe than the bound allows.
+        let mut exe = root.clone();
+        for i in 0..=crate::services::install_root::MAX_WALK_LEVELS {
+            exe = exe.join(format!("d{i}"));
+        }
+        let exe = exe.join("vct-hub");
         write(&exe, "");
         assert_ne!(orchestrator_install_root_for(&exe), Some(root));
     }

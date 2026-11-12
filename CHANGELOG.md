@@ -421,6 +421,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The launcher's Rust code follows newer cargo's build-dir layout.** Newer cargo puts test binaries in
+  `target/<profile>/build/<crate>/<hash>/out/` (nine levels below the clone) instead of `target/<profile>/deps/`.
+  The install-root walk bound (`install_root::MAX_WALK_LEVELS`, shared with the Python resolver) is now 12, and the
+  "am I a cargo test binary?" check (`hub_launcher::exe_is_test_harness`) recognises both layouts. Without that,
+  the test binary read as a shipped launcher, so the guards that keep tests from starting the hub, sweeping hub/MCP
+  processes or anchoring on the build folder stood down. Shipped layouts are unaffected.
+
 - **CI: the tri-OS install smoke runs on `macos-15`.** GitHub retired the `macos-14` runner image ("configuration
   'macos-14-arm64-us-default' is not supported"), so the macOS leg was cancelled instantly. `macos-15` keeps the same
   coverage (Apple Silicon, bash 3.2, `/opt/homebrew`); the pre-ship leg check follows.
