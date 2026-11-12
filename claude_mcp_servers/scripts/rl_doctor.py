@@ -182,8 +182,36 @@ def _probe_container() -> Dict[str, Any]:
     # Resolve the active embedding tag/dim the same way the MCP does, so the
     # RL-2b space check is meaningful (NEW-3: no more hardcoded 1024).
     active, text_dim = _resolve_active_text_embedding()
+
+    # v0.2.106: resolve the base URL through the SAME resolver the MCP's
+    # ``_get_rl_client`` uses (``rl_client.client.resolve_wired_base_url``:
+    # env first, then the hub-resolved ``rl_server_port``), so the doctor
+    # never reports "not wired" on an install where the MCP finds the
+    # container through the hub (env is deliberately not propagated to MCP
+    # subprocesses on the default install).
+    hub_rl_server_port: Optional[int] = None
     try:
-        client = RLClient(text_dim=text_dim, active_embedding=active)
+        from claude_mcp_servers.weaviate_mcp.server import _try_resolve_project_config
+
+        _cfg = _try_resolve_project_config()
+        if _cfg is not None:
+            hub_rl_server_port = getattr(_cfg, "rl_server_port", None)
+    except Exception:  # noqa: BLE001 — hub down: env-only resolution, as before
+        hub_rl_server_port = None
+    try:
+        from claude_mcp_servers.rl_client.client import resolve_wired_base_url
+
+        base_url = resolve_wired_base_url(hub_rl_server_port)
+        # Only pass ``base_url`` when something is actually wired: the plain
+        # ``RLClient(text_dim=..., active_embedding=...)`` call shape is the
+        # seam tests use to inject their own transport (and matches the
+        # env-only resolution RLClient applies internally).
+        if base_url is not None:
+            client = RLClient(
+                text_dim=text_dim, active_embedding=active, base_url=base_url
+            )
+        else:
+            client = RLClient(text_dim=text_dim, active_embedding=active)
     except Exception as exc:  # noqa: BLE001
         return {"status": "unknown", "reachable": False, "detail": f"RLClient construct raised: {exc}"}
 
@@ -191,7 +219,10 @@ def _probe_container() -> Dict[str, Any]:
         return {
             "status": "disabled",
             "reachable": False,
-            "detail": "no RL_SERVER_URL/RL_SERVER_PORT (container not wired).",
+            "detail": (
+                "no RL_SERVER_URL/RL_SERVER_PORT and no hub-resolved "
+                "rl_server_port (container not wired)."
+            ),
         }
 
     async def _run():
@@ -228,8 +259,9 @@ def _probe_container() -> Dict[str, Any]:
 # Why scoring is off, per container verdict (the negotiation statuses of
 # rl_client.client.RLClient.negotiate).
 _SCORING_OFF_REASONS = {
-    "disabled": "no container wired (no RL_SERVER_URL / RL_SERVER_PORT): searches keep "
-                "their search order and nothing is sent to a container.",
+    "disabled": "no container wired (no RL_SERVER_URL / RL_SERVER_PORT and no "
+                "hub-resolved rl_server_port): searches keep their search order "
+                "and nothing is sent to a container.",
     "not_trained": "the container has no trained weights; it is not called until it has.",
     "unreachable": "a container is configured but does not answer; searches keep their "
                    "search order (counted as fallbacks).",

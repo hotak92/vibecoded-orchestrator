@@ -9,7 +9,11 @@
 //! `<dir>/vct-module.json` — the single source of truth for its version, so
 //! updating the orchestrator is what updates the module.
 //!
-//! This file is the ONE home for that logic; the call sites are:
+//! The image-build half of that logic (build inputs, build argv, the build
+//! itself and the start-path "image missing → rebuild" guard) lives in ONE
+//! place both binaries reach — `vct_launcher_core::services::container_build`
+//! — and is re-exported below; everything else about bundled modules lives
+//! here. The call sites are:
 //! * `modules::list_module_catalog_impl_with_l0` — the catalog card
 //!   ([`list_bundled_manifests`]), independent of the L0 catalog (works
 //!   offline, and replaces any older paid-catalog record with the same id);
@@ -22,11 +26,7 @@
 //! * `module_updates` — update availability compares installed rows against
 //!   [`bundled_versions`].
 
-use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
-
-use tokio::process::Command;
-use vct_launcher_core::process::CommandExt as _;
+use std::path::{Path, PathBuf};
 
 use crate::commands::gpu_policy::GpuMode;
 use crate::manifest::{InstallMethod, ModuleManifest};
@@ -155,136 +155,14 @@ pub fn bundled_versions() -> Vec<(String, String)> {
         .collect()
 }
 
-/// What an image build reads: the context directory and the Dockerfile.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildInputs {
-    pub context_dir: PathBuf,
-    pub dockerfile: PathBuf,
-}
-
-/// `rel` under `root`, refusing an absolute path or any `..` component — a
-/// build input must stay inside the checkout.
-fn checkout_relative(root: &Path, rel: &str, what: &str, module_id: &str) -> Result<PathBuf, String> {
-    let rel_path = Path::new(rel);
-    if rel_path.is_absolute()
-        || rel_path
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(format!(
-            "module {}: {} {:?} must be a relative path inside the checkout",
-            module_id, what, rel
-        ));
-    }
-    Ok(root.join(rel_path))
-}
-
-/// The image build inputs: `install.container.build_context` and
-/// `install.container.dockerfile` (default `<build_context>/Dockerfile`),
-/// both resolved under `root` and both refused outside it. The Dockerfile
-/// must exist.
-pub fn build_inputs(root: &Path, manifest: &ModuleManifest) -> Result<BuildInputs, String> {
-    let container = manifest.install.container.as_ref();
-    let rel = container
-        .and_then(|c| c.build_context.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "module {}: install.container.build_context is required for container_build",
-                manifest.id
-            )
-        })?;
-    let context_dir = checkout_relative(root, rel, "build_context", &manifest.id)?;
-    let dockerfile = match container
-        .and_then(|c| c.dockerfile.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(df) => checkout_relative(root, df, "dockerfile", &manifest.id)?,
-        None => context_dir.join("Dockerfile"),
-    };
-    if !dockerfile.is_file() {
-        return Err(format!(
-            "module {}: Dockerfile not found: {}",
-            manifest.id,
-            dockerfile.display()
-        ));
-    }
-    Ok(BuildInputs { context_dir, dockerfile })
-}
-
-/// The `VARIANT` build argument for a GPU mode — the same three-way split
-/// `installer_engine::resolve_variant_tag` uses for the image tag (Metal
-/// has no dedicated torch wheel and builds the CPU variant).
-pub fn variant_build_arg(gpu_mode: GpuMode) -> &'static str {
-    match gpu_mode {
-        GpuMode::Cuda => "cuda",
-        GpuMode::Rocm => "rocm",
-        GpuMode::Cpu | GpuMode::Metal => "cpu",
-    }
-}
-
-/// Arguments after the engine binary for one image build.
-pub fn build_argv(image_ref: &str, variant: &str, inputs: &BuildInputs) -> Vec<String> {
-    vec![
-        "build".to_string(),
-        "--build-arg".to_string(),
-        format!("VARIANT={}", variant),
-        "--file".to_string(),
-        inputs.dockerfile.display().to_string(),
-        "--tag".to_string(),
-        image_ref.to_string(),
-        inputs.context_dir.display().to_string(),
-    ]
-}
-
-/// Build `image_ref` from `inputs` with `runtime` (`podman`/`docker`).
-///
-/// No timeout: a first build downloads the PyTorch wheel for the variant
-/// and can take many minutes on a slow link (shipped timeouts are long by
-/// design; the GUI shows the "Building image" stage meanwhile). A failure
-/// returns the tail of the engine's stderr.
-pub async fn container_build(
-    runtime: &str,
-    image_ref: &str,
-    variant: &str,
-    inputs: &BuildInputs,
-) -> Result<(), String> {
-    tracing::info!(
-        "[bundled_modules] {} build {} (VARIANT={}) from {} ({})",
-        runtime,
-        image_ref,
-        variant,
-        inputs.context_dir.display(),
-        inputs.dockerfile.display()
-    );
-    let output = Command::new(runtime)
-        .silent()
-        .args(build_argv(image_ref, variant, inputs))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("spawn {} build: {}", runtime, e))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let tail: String = {
-        let chars: Vec<char> = stderr.chars().collect();
-        let start = chars.len().saturating_sub(2000);
-        chars[start..].iter().collect()
-    };
-    Err(format!(
-        "{} build of {} failed (exit {}): {}",
-        runtime,
-        image_ref,
-        output.status.code().unwrap_or(-1),
-        tail.trim()
-    ))
-}
+// v0.2.106: the build machinery moved verbatim to
+// `vct_launcher_core::services::container_build` so the hub's module start
+// path can run the SAME build (one implementation, no second copy). Every
+// pre-existing caller (installer_engine, the tests below) keeps compiling
+// against these re-exports.
+pub use vct_launcher_core::services::container_build::{
+    build_inputs, container_build, variant_build_arg,
+};
 
 /// Make `install_dir` (`~/.vct/modules/<id>/`) mirror the module
 /// directory's `vct-module.json` and `db/` migrations — what
@@ -369,6 +247,9 @@ pub async fn build_and_materialize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only consumers of the moved build machinery (the lib target
+    // re-exports only the names the crate itself uses).
+    use vct_launcher_core::services::container_build::{build_argv, BuildInputs};
 
     const MANIFEST: &str = r#"{
         "manifest_version": 1,

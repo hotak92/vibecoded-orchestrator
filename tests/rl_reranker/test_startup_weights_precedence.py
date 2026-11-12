@@ -67,7 +67,7 @@ def _server(tmp_path, monkeypatch, profile, weights_root):
     monkeypatch.delenv("VCT_PROJECT_ID", raising=False)
     monkeypatch.setenv("RL_GLOBAL_WEIGHTS_DIR", str(tmp_path / "global"))
     monkeypatch.setenv("RL_DEVICE", "cpu")
-    return RLServer(project_root=tmp_path / "project", ollama_url="http://localhost:11435",
+    return RLServer(project_root=tmp_path / "project",
                     log_path=str(tmp_path / "logs" / "rl_events.jsonl"), port=0,
                     weights_root=weights_root)
 

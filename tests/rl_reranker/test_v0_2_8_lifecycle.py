@@ -235,7 +235,6 @@ def _make_basic_server(tmp_path, monkeypatch, *, project_id: str = "") -> RLServ
 
     return RLServer(
         project_root=project_root,
-        ollama_url="http://localhost:11435",
         log_path=str(logs_dir / "rl_events.jsonl"),
         reranker_model=None,
         port=0,
@@ -264,7 +263,6 @@ class TestStatePath:
 
         srv = RLServer(
             project_root=project_root,
-            ollama_url="http://localhost:11435",
             log_path=str(tmp_path / "logs" / "rl_events.jsonl"),
             reranker_model=None,
             port=0,

@@ -34,7 +34,6 @@ container runs the same module as ``python -m rl_reranker.rl_server``):
 Env / CLI:
   --port INT           TCP port (default 11438)
   --project-root PATH  project root containing state/ (default: cwd)
-  --ollama-url URL     Ollama base URL (default: http://localhost:11435)
   --log-path PATH      JSONL event log path (``RL_LOG_PATH``; default:
                        ``rl_client.rl_logger.default_rl_log_path()``)
   --reranker-model STR Ollama model for cross-encoder reranking (optional)
@@ -88,7 +87,6 @@ from rl_client.rerank_wire import RERANK_PROTOCOL_VERSION
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PORT = 11438
-_DEFAULT_OLLAMA_URL = "http://localhost:11435"
 
 # v0.2.10 — per-project routing constants.
 #
@@ -905,7 +903,6 @@ class RLServer:
     def __init__(
         self,
         project_root: Path,
-        ollama_url: str,
         log_path: str,
         reranker_model: str | None = None,
         port: int = 0,
@@ -1005,9 +1002,11 @@ class RLServer:
             rl_arch_version, rl_model.device,
         )
 
+        # v0.2.106: no ollama_url here any more — the server scores
+        # client-sent vectors (rl_client/rerank_wire.py, protocol v2) and
+        # embeds nothing, so it has no Ollama to reach.
         self._rl = RetrievalRL(
             project_root=project_root,
-            ollama_url=ollama_url,
             rl_model=rl_model,
             data_logger=data_logger,
         )
@@ -2957,7 +2956,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Bind address (default 127.0.0.1; container deployments use 0.0.0.0)",
     )
     p.add_argument("--project-root", type=Path, default=Path(os.getenv("RL_PROJECT_ROOT", ".")))
-    p.add_argument("--ollama-url", default=os.getenv("OLLAMA_URL", _DEFAULT_OLLAMA_URL))
     # No baked-in default path: an unset --log-path / RL_LOG_PATH resolves in
     # main() through rl_client.rl_logger.default_rl_log_path() (the one home,
     # under the VCO state dir). The image always sets RL_LOG_PATH, so it never
@@ -2995,7 +2993,6 @@ def main(argv: list[str] | None = None) -> None:
     # on first start and never overwrites an existing checkpoint.
     server = RLServer(
         project_root=project_root,
-        ollama_url=args.ollama_url,
         log_path=str(args.log_path or default_rl_log_path()),
         reranker_model=args.reranker_model,
         port=args.port,

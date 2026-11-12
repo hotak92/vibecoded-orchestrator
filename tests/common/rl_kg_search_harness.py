@@ -247,6 +247,16 @@ def install_fakes(srv, sp, *, cfg: dict, state: dict, patch) -> None:
     patch(sp, "_resolve_rl_enabled", lambda: False)
     patch(sp, "_retrieval_emit_has_consumer", lambda: True)
     patch(sp, "_should_capture_citations", lambda rl_enabled: True)
+    # ``no_pending_staging`` (v0.2.106): the harness forces citation capture
+    # ON above, so a run whose ``CLAUDE_PROJECT_DIR`` is NOT a tmp project
+    # (the root-identity runs of test_v02100_hook_kg_project_identity, whose
+    # condition-under-test IS the orchestrator root / a lane worktree)
+    # stages a real ``nosession__pre_edit_*.json`` into THAT root's
+    # ``.claude/state/rl_pending`` — a fixture-named orphan no drain of the
+    # real project ever visits (found as leftovers in every lane worktree).
+    # Callers that assert the staged FILE keep the default (staging on).
+    if cfg.get("no_pending_staging"):
+        patch(sp, "_populate_citation_cache", lambda **_k: None)
 
 
 def import_rl_kg_search():

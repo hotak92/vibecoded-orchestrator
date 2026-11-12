@@ -94,6 +94,12 @@ pub mod compose_args;
 // container plumbing (run args, image refs, pulls, the reaper) and the
 // ownership guard.
 pub mod container_runtime;
+// v0.2.106: the ONE local image build for `container_build` modules (the
+// RL reranker) + the start-path "image missing → rebuild" guard, shared by
+// the installer (`commands::bundled_modules::build_and_materialize`) and
+// both module-start paths (launcher `module_service`, hub
+// `module_supervisor`).
+pub mod container_build;
 // v0.2.100 (WP-06, AD-5/AD-12): container ownership from real labels — the ONE
 // Rust home of the compose/launcher label keys, the watchdog's and the
 // reaper's ownership verdicts, and the guarded compose verb's Rust caller.
