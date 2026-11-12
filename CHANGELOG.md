@@ -409,6 +409,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A missing compose provider stops the install up front, with the command that fixes it.** Podman without
+  `podman-compose` (or a `docker-compose` for `podman compose` to delegate to), or Docker without its compose
+  plugin, passed every check and failed at step 5 with "looking up compose provider failed". `install.py` now
+  checks right after detecting the runtime (`vco_lib.compose_prereq`, over the existing
+  `compose_provider.detect`): a fresh install stops before creating the venv, an `--update` warns. The bootstrap
+  envelope gains `system.compose` and the blocking `compose_provider` prereq (also reported by `vco doctor`;
+  `--install-missing` installs it), the runtime auto-installs in `install.sh`, `install.ps1` and install.py add
+  the provider, and a step-5 failure of this kind names the per-OS remedy.
+
 - **The RL reranker keeps what it learns when its container is recreated.** Its manifest mounted nothing, so each
   project's online model and learner state (`/data/state/projects/<project_id>/`), the event logs and the global
   model lived in the container's writable layer and were lost on every module update and every recreate. The

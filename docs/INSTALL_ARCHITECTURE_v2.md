@@ -119,7 +119,9 @@ crashed; `2` bad invocation (e.g. combined with `--update`); `3` an
 
 - `system.*` — OS/arch/RAM, per-tool `{cmd, version, ok}` blocks for
   Python/Node/npm/pnpm/Podman/Docker/git/brew/lean-ctx/Claude CLI,
-  `gpu` (vendor/VRAM/driver/container-toolkit), `linux_distro` /
+  `compose` (the compose provider for the runtime, from
+  `vco_lib.compose_prereq.probe`; `ok: false` raises the blocking
+  `compose_provider` prereq), `gpu` (vendor/VRAM/driver/container-toolkit), `linux_distro` /
   `windows_features` / `macos_features`. `system.python.wheel_support_ok`
   reports whether pip can satisfy the dependency set with wheels only
   (a dry-run `pip install --only-binary=:all:` probe).

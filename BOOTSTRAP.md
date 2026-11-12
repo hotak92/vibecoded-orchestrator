@@ -92,6 +92,7 @@ What you keep without the launcher:
 | **Python 3.11 or newer** (3.12 recommended) | The orchestrator + MCP servers run on it. We depend on stdlib `tomllib` (3.11+). | `python3 --version` to check. Linux: `sudo apt install python3.12 python3.12-venv` (or `dnf` / `pacman`). macOS: `brew install python@3.12`. Windows: `winget install Python.Python.3.12`. The `install.sh` / `install.ps1` wrappers will auto-install via these same commands if Python is missing — interactive, never `-y`. |
 | Claude Code CLI | The orchestrator hooks into Claude Code | `npm install -g @anthropic-ai/claude-code` |
 | Docker or Podman | Runs Weaviate + Ollama containers | `docker --version` or `podman --version` |
+| A compose provider | Starts the services (install step 5); a fresh install stops early without one | `podman-compose version` (`brew install podman-compose` / your distro's `podman-compose` package) or `docker compose version` (ships with Docker Desktop; Linux: `docker-compose-plugin`) |
 | (Optional) NVIDIA GPU + nvidia-container-toolkit | For CodeSage code embeddings (best quality) | https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html |
 | (Optional) `cargo install lean-ctx` | Context compression (token savings) | `cargo install lean-ctx` |
 
