@@ -418,6 +418,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--install-missing` installs it), the runtime auto-installs in `install.sh`, `install.ps1` and install.py add
   the provider, and a step-5 failure of this kind names the per-OS remedy.
 
+- **Module commands work when a placeholder path contains a space.** The launcher resolved `{install_dir}` /
+  `{VCT_*}` / `{HOME}` into a module's `post_install` / `pre_upgrade` / `post_upgrade` / migration command and
+  only then split it into arguments, so a path such as `C:\Users\First Last` became two arguments and every such
+  command failed. The template is now split first and each argument resolved after
+  (`installer_engine::command_argv`); quoting in the template works as before.
+
 - **The RL reranker keeps what it learns when its container is recreated.** Its manifest mounted nothing, so each
   project's online model and learner state (`/data/state/projects/<project_id>/`), the event logs and the global
   model lived in the container's writable layer and were lost on every module update and every recreate. The

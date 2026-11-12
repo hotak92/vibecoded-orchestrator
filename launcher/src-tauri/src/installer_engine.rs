@@ -1899,15 +1899,29 @@ fn post_install_command(program: &str, args: &[String], cwd: &Path) -> Command {
     cmd
 }
 
+/// A manifest command template -> argv. The RAW template is tokenized FIRST
+/// and each token resolved after (v0.2.106): resolving first and splitting
+/// the result broke every command whose `{install_dir}` / `{VCT_*}` /
+/// `{HOME}` value contains a space (`C:\Users\First Last`, a macOS folder
+/// named with a space) — the path became two argv words. A placeholder
+/// value is therefore always ONE argv element (or part of one), never
+/// re-parsed for quotes or whitespace; quoting in the template keeps
+/// working as before.
+pub(crate) fn command_argv(raw: &str, ctx: &PlaceholderCtx) -> Result<Vec<String>, String> {
+    let tokens =
+        shlex::split(raw).ok_or_else(|| format!("cannot tokenize command: {}", raw))?;
+    Ok(tokens.iter().map(|t| ctx.resolve(t)).collect())
+}
+
 async fn run_post_install_command(
     spec: &CommandSpec,
     ctx: &PlaceholderCtx,
 ) -> Result<(), String> {
     let raw = pick_platform_cmd(spec);
+    // For messages only; the argv comes from `command_argv`.
     let resolved = ctx.resolve(&raw);
 
-    let tokens = shlex::split(&resolved)
-        .ok_or_else(|| format!("cannot tokenize command: {}", resolved))?;
+    let tokens = command_argv(&raw, ctx)?;
     let (program, args) = tokens
         .split_first()
         .ok_or_else(|| format!("empty command: {}", resolved))?;
@@ -2595,6 +2609,37 @@ mod tests {
     use super::*;
     use crate::commands::gpu_policy::GpuMode;
     use crate::manifest::GpuImageVariants;
+
+    /// v0.2.106: an install_dir with a space stays ONE argv element in every
+    /// post_install / pre_upgrade / post_upgrade / migration command (they all
+    /// run through `run_post_install_command` -> `command_argv`).
+    #[test]
+    fn command_argv_keeps_a_spaced_install_dir_in_one_token() {
+        let dir = PathBuf::from("/Users/First Last/VCO Marti/modules/vct-example");
+        let ctx = PlaceholderCtx::new("vct-example").with_install_dir(dir.clone());
+        let argv = command_argv("{install_dir}/venv/bin/python -m pip install -e {install_dir}", &ctx)
+            .expect("tokenizes");
+        let d = dir.display().to_string();
+        assert_eq!(
+            argv,
+            vec![format!("{d}/venv/bin/python"), "-m".into(), "pip".into(), "install".into(),
+                 "-e".into(), d.clone()],
+        );
+    }
+
+    #[test]
+    fn command_argv_keeps_quoted_literals_and_quoted_placeholders() {
+        let ctx = PlaceholderCtx::new("vct-example")
+            .with_install_dir(PathBuf::from("/opt/with space/x"));
+        let argv = command_argv(r#"python -c "print('a b')" "{install_dir}/cfg file.toml""#, &ctx)
+            .expect("tokenizes");
+        assert_eq!(
+            argv,
+            vec!["python".to_string(), "-c".into(), "print('a b')".into(),
+                 "/opt/with space/x/cfg file.toml".into()],
+        );
+        assert!(command_argv("python \"unterminated", &ctx).is_err());
+    }
 
     /// R12-bis N4 wiring test (run_post_install_command call-site): the
     /// post-install child's env is EXACTLY the ONE child-env table's
