@@ -1,117 +1,51 @@
 <script lang="ts">
+  // The Store (owner ruling 2026-11-12): the announced products Transcrypt and
+  // VCT Coordination, both "Coming soon", plus any paid module the L0 catalog
+  // lists later. The list is decided in `$lib/store-catalog`; the cards are
+  // drawn by `StoreGrid`. Free and bundled modules (the RL reranker included)
+  // are managed from the Modules page, not sold here.
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import RightSidebar from '$lib/components/RightSidebar.svelte';
-  import { getColorRgb, type BrandColor } from '$lib/color-rgb';
-  import { currentUser, auth } from '$lib/stores/auth';
-  import { orchestrator } from '$lib/stores/orchestrator';
+  import StoreGrid from '$lib/components/StoreGrid.svelte';
+  import { getColorRgb } from '$lib/color-rgb';
   import { modules } from '$lib/stores/modules';
   import { ui } from '$lib/stores/ui';
-
-  // Catalog overrides hardcoded versions per `id`. Loaded at mount; while
-  // pending, the hardcoded version is shown so the card never renders an
-  // empty version string. Once the catalog resolves, the displayed version
-  // becomes the source-of-truth from `list_module_catalog`.
-  const catalogVersionById = $derived.by<Record<string, string>>(() => {
-    const m: Record<string, string> = {};
-    for (const e of $modules.catalog) {
-      m[e.id] = e.version;
-    }
-    return m;
-  });
+  import { storeEntries, type StoreEntry } from '$lib/store-catalog';
 
   onMount(() => {
-    orchestrator.checkStatus();
+    // The catalog-fetch machinery stays: a paid module published to L0
+    // renders here without a launcher change.
     modules.loadCatalog();
-    const handleFocus = () => auth.refreshProfile();
-    window.addEventListener('focus', handleFocus);
-    return () => window.removeEventListener('focus', handleFocus);
   });
 
-  const orchState = $derived($orchestrator);
+  const entries = $derived(storeEntries($modules.catalog));
 
-  interface AppItem {
-    id: string;
-    name: string;
-    desc: string;
-    color: string;
-    icon: string;
-    version: string;
-    checkoutUrl?: string;
+  let selected = $state<StoreEntry | null>(null);
+
+  function selectEntry(entry: StoreEntry) {
+    selected = selected?.id === entry.id ? null : entry;
   }
 
-  // The Pro card description embeds the price grid because RightSidebar
-  // shows the long-form pitch and the card itself needs only a one-liner.
-  // MAO is rendered as Coming Soon; clicking the card surfaces an early-access
-  // hint rather than a checkout link.
-  //
-  // `version` here is the static fallback shown ONLY while the catalog is
-  // loading or when `list_module_catalog` returns no entry for this id.
-  // For `orchestrator`, the catalog always returns an entry whose version is
-  // read from `vct-module.json` at the repo root — so the fallback below is
-  // shown for at most ~50 ms. For `orchestrator-pro` (not yet in the catalog)
-  // we leave the version empty so the card never shows a stale hardcoded string.
-  const allApps: AppItem[] = [
-    { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '', checkoutUrl: '' },
-    { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, auto-updates. €19/mo · €149/yr · €199 lifetime.', color: 'purple', icon: 'O+', version: '', checkoutUrl: '' },
-    { id: 'mao', name: 'Multi-Agent Orchestrator (MAO)', desc: 'Coming soon — 10 specialist agents + Maestro coordinator + Planner pipeline + Tauri UI on top of Standard.', color: 'pink', icon: 'M', version: 'preview', checkoutUrl: '' },
-    { id: 'ecosystem-app-1', name: 'Ecosystem App 1', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'E', version: '', checkoutUrl: '' },
-    { id: 'ecosystem-app-2', name: 'Ecosystem App 2', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'E', version: '', checkoutUrl: '' },
-    { id: 'convertifacile', name: 'ConvertiFacile', desc: 'Universal file conversion — documents, images, audio', color: 'pink', icon: 'C', version: '', checkoutUrl: '' },
-    { id: 'dataweave', name: 'DataWeave', desc: 'Visual data pipeline builder for ETL workflows', color: 'teal', icon: 'D', version: '', checkoutUrl: '' },
-    { id: 'formcraft', name: 'FormCraft', desc: 'Drag & drop form builder with smart validations', color: 'purple', icon: 'F', version: '', checkoutUrl: '' },
-    { id: 'pixelsnap', name: 'PixelSnap', desc: 'Screenshot tool with annotations and quick sharing', color: 'pink', icon: 'P', version: '', checkoutUrl: '' },
-  ];
-
-  // Apps that are not yet purchasable. "Get" / "Activate" buttons are
-  // replaced by a "Coming soon" badge for these IDs.
-  // 2026-04-30: pre-launch hardening — only `orchestrator` is actually
-  // shippable today. Everything else (Pro, MAO, Ecosystem App 1, Ecosystem App 2,
-  // ConvertiFacile, DataWeave, FormCraft, PixelSnap) is on the
-  // pipeline, none are purchasable yet. Show "Coming soon" rather than
-  // a misleading "Get" button that 404s in some flows.
-  const COMING_SOON = new Set([
-    'orchestrator-pro',
-    'mao',
-    'ecosystem-app-1',
-    'ecosystem-app-2',
-    'convertifacile',
-    'dataweave',
-    'formcraft',
-    'pixelsnap',
-  ]);
-
-  let selectedApp = $state<AppItem | null>(null);
-
-  function getColorVar(color: string): string {
-    if (color === 'teal') return 'var(--color-teal)';
-    if (color === 'purple') return 'var(--color-purple)';
-    return 'var(--color-pink)';
+  function openInModules() {
+    void goto('/modules');
   }
 
-  function selectApp(app: AppItem) {
-    selectedApp = selectedApp?.id === app.id ? null : app;
-  }
-
-  function handleGetApp(app: AppItem) {
-    if (app.id === 'orchestrator') {
-      if (orchState.status === 'installed') {
-        ui.openMcpDashboard();
-      } else {
-        ui.openInstallWizard();
-      }
-      return;
-    }
-
-    const email = $currentUser?.email ?? '';
-    const checkoutUrl = app.checkoutUrl;
-    if (!checkoutUrl) {
-      ui.openActivation();
-      return;
-    }
-    const separator = checkoutUrl.includes('?') ? '&' : '?';
-    const url = `${checkoutUrl}${separator}checkout[email]=${encodeURIComponent(email)}`;
-    window.open(url, '_blank');
-  }
+  // The right rail's view of the selection: a coming-soon product carries the
+  // explicit stage (no install / launch / update actions); a catalog module
+  // carries its catalog `kind`, the rail's authoritative status signal.
+  const sidebarApp = $derived(
+    selected
+      ? {
+          id: selected.id,
+          name: selected.name,
+          color: selected.color,
+          version: selected.version,
+          catalogKind: selected.catalogKind,
+          ...(selected.availability === 'coming_soon' ? { stage: 'coming_soon' as const } : {}),
+        }
+      : null,
+  );
 </script>
 
 <svelte:head>
@@ -128,57 +62,17 @@
         </div>
       </div>
 
-      <div class="app-grid">
-        {#each allApps as app}
-          {@const owned = $currentUser?.apps?.includes(app.id)}
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div
-            class="app-card glass-card"
-            class:app-card-selected={selectedApp?.id === app.id}
-            onclick={() => selectApp(app)}
-            onkeydown={(e) => { if (e.key === 'Enter') selectApp(app); }}
-            role="button"
-            tabindex="0"
-          >
-            <div class="app-card-top-line" style:background="linear-gradient(90deg, transparent, {getColorVar(app.color)}, transparent)"></div>
-            <div class="app-card-icon" style:background="rgba({getColorRgb(app.color as BrandColor)}, 0.12)" style:border-color="rgba({getColorRgb(app.color as BrandColor)}, 0.25)">
-              <span style:color={getColorVar(app.color)}>{app.icon}</span>
-            </div>
-            <h3 class="app-card-name">{app.name}</h3>
-            <p class="app-card-desc">{app.desc}</p>
-            <div class="app-card-footer">
-              {#if (catalogVersionById[app.id] ?? app.version)}
-                <span class="app-card-version">v{catalogVersionById[app.id] ?? app.version}</span>
-              {:else}
-                <span class="app-card-version"></span>
-              {/if}
-              {#if app.id === 'orchestrator'}
-                {#if orchState.status === 'installed'}
-                  <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={(e) => { e.stopPropagation(); ui.openMcpDashboard(); }}>
-                    Dashboard
-                  </button>
-                {:else}
-                  <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={(e) => { e.stopPropagation(); ui.openInstallWizard(); }}>
-                    Install Free
-                  </button>
-                {/if}
-              {:else if COMING_SOON.has(app.id)}
-                <span class="app-card-status app-card-soon">Coming soon</span>
-              {:else if owned}
-                <span class="app-card-status app-card-installed">Owned</span>
-              {:else}
-                <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={(e) => { e.stopPropagation(); handleGetApp(app); }}>
-                  Get
-                </button>
-              {/if}
-            </div>
-          </div>
-        {/each}
-      </div>
+      <StoreGrid
+        {entries}
+        selectedId={selected?.id ?? null}
+        rgbFor={getColorRgb}
+        onSelect={selectEntry}
+        onOpen={openInModules}
+      />
     </div>
   </div>
 
-  <RightSidebar {selectedApp} onOpenActivation={() => ui.openActivation()} />
+  <RightSidebar selectedApp={sidebarApp} onOpenActivation={() => ui.openActivation()} />
 </div>
 
 <style>
@@ -211,90 +105,5 @@
     font-size: 13px;
     color: var(--color-mid);
     margin-top: 2px;
-  }
-  .app-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 18px;
-  }
-  .app-card {
-    position: relative;
-    text-align: left;
-    padding: 22px;
-    cursor: pointer;
-    overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    font-family: inherit;
-    color: inherit;
-  }
-  .app-card-selected {
-    border-color: rgba(0, 191, 166, 0.3) !important;
-    box-shadow:
-      0 0 30px rgba(0, 191, 166, 0.08),
-      0 8px 32px rgba(0, 0, 0, 0.2),
-      inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
-  }
-  .app-card-top-line {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 2px;
-    opacity: 0;
-    transition: opacity 0.3s ease;
-  }
-  .app-card:hover .app-card-top-line {
-    opacity: 1;
-  }
-  .app-card-icon {
-    width: 48px;
-    height: 48px;
-    border-radius: 14px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid;
-    margin-bottom: 16px;
-    transition: transform 0.3s ease, box-shadow 0.3s ease;
-  }
-  .app-card-icon span {
-    font-size: 20px;
-    font-weight: 800;
-  }
-  .app-card-name {
-    font-size: 15px;
-    font-weight: 800;
-    color: var(--color-text);
-    margin-bottom: 6px;
-  }
-  .app-card-desc {
-    font-size: 12px;
-    color: var(--color-mid);
-    line-height: 1.5;
-    margin-bottom: 16px;
-  }
-  .app-card-footer {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .app-card-version {
-    font-size: 11px;
-    color: var(--color-muted);
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-  }
-  .app-card-status {
-    font-size: 11px;
-    font-weight: 600;
-    padding: 2px 10px;
-    border-radius: 20px;
-  }
-  .app-card-installed {
-    color: var(--color-teal);
-    background: rgba(0, 191, 166, 0.1);
-  }
-  .app-card-soon {
-    color: var(--color-pink, #ff4fa0);
-    background: rgba(255, 79, 160, 0.1);
   }
 </style>

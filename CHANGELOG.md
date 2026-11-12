@@ -226,6 +226,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Store lists Transcrypt and VCT Coordination, both "Coming soon".** The launcher's Store page showed nine
+  hard-coded cards (the orchestrator, "Orchestrator Pro" with RL-scored retrieval, MAO and six placeholder apps). It
+  now lists the two announced products, each marked "Coming soon" with no install, buy or activate action. The
+  catalog fetch stays: a paid module published to the L0 catalog later appears after them, and its card opens the
+  Modules page, where install and licensing live. Free and bundled modules are not store items; the RL reranker is
+  managed from its Modules tile and the project's RL panel. The list is declared once, in
+  `launcher/src/lib/store-catalog.ts`.
 - **RL scoring needs the project's own "on".** A project whose RL toggle cannot be read (the hub is down, or no
   project configuration was found) is now treated as off; before, it was treated as on. An older hub that does not
   send the toggle at all also counts as off. The citation of an answer is now sent to the reranker container only
