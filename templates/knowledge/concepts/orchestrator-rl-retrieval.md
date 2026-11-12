@@ -3,7 +3,7 @@ title: Orchestrator RL Retrieval
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, reinforcement-learning, retrieval, weaviate, context-injection]
 created: 2026-04-27T18:30:00Z
-updated: 2026-11-12T00:00:00Z
+updated: 2026-11-12T12:00:00Z
 status: active
 ---
 
@@ -24,14 +24,17 @@ The reranker ships in the orchestrator repository itself:
 **Wiring**: the launcher deliberately does NOT propagate `RL_SERVER_URL` / `RL_SERVER_PORT` into `.claude/settings.json env` for MCP subprocesses. The MCP's client resolves the container's address as: env override first, then the hub-resolved `rl_server_port` from the project config (V52-AA — the port recorded in `module_ports`). `rl_doctor` resolves through the same shared function, so the doctor can never say "not wired" where the MCP finds the container.
 
 **Scoring gates** (in order, one home each):
-1. The shipped **scoring lock** `vco_lib/rl_scoring_lock.toml` — `locked = true` until trained weights ship; while set, reranking is off in every state (an explicit per-project row, a host-wide row, nothing overrides it). It gates scoring only, never event logging.
-2. The per-project toggle `rl_reranker_enabled_for_project` (hub-served; launcher Modules panel).
+1. The shipped **scoring lock** `vco_lib/rl_scoring_lock.toml` — lifted in v0.2.106 (`locked = false`, owner ruling 2026-11-12); when set, reranking is off in every state (an explicit per-project row, a host-wide row, nothing overrides it). It gates scoring only, never event logging.
+2. The per-project toggle `rl_reranker_enabled_for_project` (hub-served; launcher Modules panel) — OPT-IN: off by default, and off when it cannot be read.
+3. The container's **per-project serving gate** (below): with the toggle on, a project's own model reranks its searches only once it qualifies; until then the project keeps its own search order, exactly as with the toggle off.
 
 The pre-v0.2.106 licence gate (`feature_enabled("rl_retrieval")`) is gone — every install may use the reranker.
 
-**Weights**: bundled in the repo through `claude_mcp_servers/rl_reranker/weights/manifest.json` (per-profile `current`, sha256-pinned; qwen3 and arctic ship together, owner rule). With no trained model shipped for the active profile, the server reports `trained: false` and the client does not call it. Weights ownership on disk follows `vco_lib/rl_weights_ownership.toml` (symlink / marked copy = managed by the launcher; other files = the user's).
+**Weights**: bundled in the repo through `claude_mcp_servers/rl_reranker/weights/manifest.json` (per-profile `current`, sha256-pinned; qwen3 and arctic ship together, owner rule). No trained weights ship (owner ruling 2026-11-12: no global weights); the container announces its per-project gate (`per_project_gate` on `/health`), so the client calls it without a trained base, and a project that has not qualified gets its search order back (`serving: "search_order"`) — a cold start never reranks with a shipped or base model. Weights ownership on disk follows `vco_lib/rl_weights_ownership.toml` (symlink / marked copy = managed by the launcher; other files = the user's).
 
-**Training** (v0.2.106): an offline pipeline exports launcher.db events to text-free float16 shards (`training/export.py`), trains per-profile (`training/shard_trainer.py`) and evaluates against plain cosine (`training/eval_harness.py`, NDCG/MRR/Recall@10 with bootstrap CI); `ship` refuses unless both profiles pass the bar. The first run did not pass (arctic below cosine on the held-out project), so no weights ship and the scoring lock stays set. Online training also exists in the container (`/rl_update` with pre-packed payloads; the MCP is the sole citation and retrieval-event writer).
+**Training** (v0.2.106): an offline pipeline exports launcher.db events to text-free float16 shards (`training/export.py`), trains per-profile (`training/shard_trainer.py`) and evaluates against plain cosine (`training/eval_harness.py`, NDCG/MRR/Recall@10 with bootstrap CI); `ship` refuses unless both profiles pass the bar. The first run did not pass (arctic below cosine on the held-out project), so no weights ship. The product is instead **per-project online learning** (`online_learning.py`): the MCP posts each citation event to `/rl_update` (pre-packed payloads; the MCP is the sole citation and retrieval-event writer), and every 32 events a bounded round trains that project's own model with the one objective (`objective.batch_loss`, pairs only within a query — `/finetune` and Reset + specialize fit the same objective) and re-checks it on a held-out window of the project's newest queries (>= 300 queries and >= 20 that cite a node, never trained on while in the window or within 24 h after).
+
+**Serving gate** (owner ruling 2026-11-12): a paired bootstrap over the window (1 000 resamples of its queries, the same resample for the model and for cosine, seeded per round) gives one-sided 90% lower bounds; the project's model is served only while the NDCG@10 gain over cosine is >= +2% AND the cited node's MRR@10 minus cosine's is >= 0 at that bound (a resample without a citing query counts as failing). The point estimates alone passed by noise on windows of 20-50 citing queries. `/project_status`, the module-DB row `rl_online_state` (the launcher's RL panel) and `rl_doctor` show both the point values and the bounds. A replay of real project histories (`training/transfer.py replay`) still found projects where the served stretches ranked the cited node below cosine — repeated checks on a shifting window are each a new chance to pass — so the gate is a guard, not a guarantee.
 
 [[implements::Reinforcement Learning]] [[uses::Weaviate]] [[relatedTo::Orchestrator Knowledge Graph]] [[relatedTo::Orchestrator MCP Servers]] [[relatedTo::Orchestrator Context Management]]
 
@@ -78,7 +81,7 @@ The server EMBEDS NOTHING — the client sends every vector it already computed 
 
 A lightweight aiohttp process (`python -m rl_reranker.rl_server`; the container runs the same module) that:
 
-1. Maintains per-profile RL models in memory (the bundled checkpoint seeds `state/` on first start; a local checkpoint with training history on a newer base can take its place).
+1. Maintains one model per project and profile in memory (`state/projects/<project_id>/`, a seeded fresh network on a project's first event), each with its online learner and serving gate; a project that has not qualified is answered with its own search order.
 2. Exposes `/cache_nodes` (score + reorder) and `/health` (protocol version, embedding space, trained flag) for the `weaviate-kg` MCP client, plus lifecycle endpoints (`/rotate_weights`, `/reset`, `/finetune`, `/global/retrain`) the launcher drives without restarting the container.
 3. Trains through `/rl_update`; the MCP sends pre-packed payloads and is the sole event writer.
 

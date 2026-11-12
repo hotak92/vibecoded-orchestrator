@@ -3,8 +3,9 @@
 """Per-project online learning + the serving gate (v0.2.106).
 
 Owner rulings 2026-11-12: per-project ONLINE adaptation, opt-in; a project's
-model is served only while, on its own recent held-out queries, NDCG@10 is
->= +2% over plain cosine AND the cited node's MRR@10 is not below cosine's.
+model is served only while, on its own recent held-out queries, the 90%
+paired-bootstrap lower bounds say NDCG@10 is >= +2% over plain cosine AND the
+cited node's MRR@10 is not below cosine's (test_gate_confidence_bound.py).
 
 Two layers:
 
@@ -22,6 +23,7 @@ import asyncio
 import copy
 import math
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -228,8 +230,9 @@ def test_dynamic_type_rows_match_training_after_a_round(tmp_path):
 
 
 def _ev(**over) -> ol.Evaluation:
-    base = dict(at_ms=0, n_queries=300, n_cited=25, ndcg=0.96, cos_ndcg=0.93,
-                mrr=0.40, cos_mrr=0.35, search_ndcg=0.93, search_mrr=0.35)
+    base: "dict[str, Any]" = dict(at_ms=0, n_queries=300, n_cited=25, ndcg=0.96, cos_ndcg=0.93,
+                mrr=0.40, cos_mrr=0.35, search_ndcg=0.93, search_mrr=0.35,
+                ndcg_gain_lb=0.025, mrr_diff_lb=0.01, confidence=0.9, n_boot=1000)
     base.update(over)
     return ol.Evaluation(**base)
 
@@ -238,12 +241,18 @@ def _ev(**over) -> ol.Evaluation:
     (None, False, "no evaluation"),
     (_ev(n_queries=120), False, "collecting held-out queries (120/300)"),
     (_ev(n_cited=4), False, "only 4 held-out queries name a node"),
-    (_ev(ndcg=0.94), False, "needs +2.00%"),
-    (_ev(cos_ndcg=0.0, ndcg=0.0), False, "n/a"),
-    (_ev(mrr=0.30), False, "below plain cosine's 0.350"),
+    (_ev(ndcg_gain_lb=0.015), False, "the bound needs +2.00%"),
+    (_ev(ndcg_gain_lb=float("-inf")), False, "lower bound n/a"),
+    (_ev(cos_ndcg=0.0, ndcg=0.0, ndcg_gain_lb=float("-inf")), False, "n/a"),
+    (_ev(mrr_diff_lb=-0.02), False, "lower bound of the difference is -0.020, below 0"),
+    (_ev(mrr_diff_lb=float("-inf")), False, "difference is n/a"),
+    # the point estimates never decide: a point MRR below cosine with a
+    # passing bound cannot occur from the bootstrap, a passing point with a
+    # failing bound is the noise the bound refuses
+    (_ev(mrr=0.36, cos_mrr=0.35, mrr_diff_lb=-0.05), False, "below 0"),
     (_ev(), True, "over plain cosine"),
-    (_ev(mrr=0.35), True, "0.350 >= 0.350"),  # equal MRR passes ("not below")
-    (_ev(ndcg=0.93 * 1.02), True, "+2.00%"),   # exactly the bar passes
+    (_ev(mrr_diff_lb=0.0), True, "difference +0.000 >= 0"),  # equal passes ("not below")
+    (_ev(ndcg_gain_lb=0.02), True, "+2.00% >= +2.00%"),         # exactly the bar passes
 ])
 def test_gate_decision_is_the_owner_bar(ev, serve, needle):
     got, why = ol.gate_decision(ev, ol.OnlineConfig())
@@ -338,7 +347,7 @@ def _server(tmp_path, monkeypatch) -> RLServer:
     monkeypatch.delenv("VCT_PROJECT_ID", raising=False)
     root = tmp_path / "project"
     root.mkdir(exist_ok=True)
-    srv = RLServer(project_root=root, ollama_url="http://127.0.0.1:9",
+    srv = RLServer(project_root=root,
                    log_path=str(tmp_path / "logs" / "rl_events.jsonl"), port=0)
     srv._online_cfg = ol.OnlineConfig(
         holdout_queries=24, min_cited_queries=8, purge_gap_ms=0, round_every=8,
@@ -424,6 +433,7 @@ def test_a_project_stream_starts_at_search_order_qualifies_and_is_turned_off(
     assert q["serving"] is True, out["timeline"]
     ev = q["online"]["last_eval"]
     assert ev["ndcg_gain"] >= 0.02 and ev["mrr"] >= ev["cos_mrr"]
+    assert ev["ndcg_gain_lb"] >= 0.02 and ev["mrr_diff_lb"] >= 0.0 and ev["n_boot"] > 0
     assert "over plain cosine" in q["reason"]
     events_to_qualify = q["online"]["counters"]["events_seen"]
     assert 24 <= events_to_qualify <= 320
@@ -515,7 +525,7 @@ def test_nan_safe_ndcg_gain_property():
 # ─── the launcher's view: the rl_online_state row ─────────────────────
 
 
-def test_the_pushed_row_fits_migration_0007(tmp_path, monkeypatch):
+def test_the_pushed_row_fits_the_migrations(tmp_path, monkeypatch):
     """Every field the server pushes is a column of ``rl_online_state`` (the
     hub INSERTs the field names as columns), keyed by the project alone (the
     hub resolves ONE primary-key column)."""

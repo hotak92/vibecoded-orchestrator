@@ -2301,6 +2301,8 @@ class RLServer:
             "projects_serving_model": sum(1 for lr in learners if lr.serving),
             "bar": {"min_ndcg_gain": self._online_cfg.min_ndcg_gain,
                     "cited_mrr_not_below_cosine": True,
+                    "judged_on": "paired-bootstrap lower bounds",
+                    "confidence": self._online_cfg.confidence,
                     "holdout_queries": self._online_cfg.holdout_queries},
         }
 
@@ -2367,6 +2369,11 @@ class RLServer:
             "mrr": ev.get("mrr"),
             "cos_mrr": ev.get("cos_mrr"),
             "cited_queries": ev.get("n_cited"),
+            # migration 0008: the bounds the serving decision used (owner ruling
+            # 2026-11-12; None = undefined, a failing bound)
+            "ndcg_gain_lb": ev.get("ndcg_gain_lb"),
+            "mrr_diff_lb": ev.get("mrr_diff_lb"),
+            "gate_confidence": ev.get("confidence"),
         }
         try:
             # Single-column key (the hub resolves ONE primary-key column):
@@ -3019,10 +3026,13 @@ class RLServer:
           1. Fetch this project's events from the hub (since_ms = now − days).
           2. Seed the result file from base_weights_path (resume-from).
           3. Call offline_trainer.train (hub_client + project_id) → it loads,
-             pairs, computes unified targets, trains a fresh-AdamW pass (the
-             2026-05-19 LR-reset behaviour), and writes back to result_path.
-          4. Result lands at ``<state>/rl_model_<tag>_finetuned.pt`` — a
-             deliberate /rotate_weights is required before it goes live.
+             pairs, turns the pairs into per-query samples (the unified
+             targets) and fits them with the ONE objective
+             (``objective.batch_loss`` via ``online_learning.fit``, v0.2.106),
+             keeping the best epoch on a newest-queries validation split, and
+             writes back to result_path.
+          4. Result lands at ``<state>/projects/<project_id>/<base stem>_finetuned.pt``
+             — a deliberate /rotate_weights is required before it goes live.
         """
         try:
             from .offline_trainer import train as _train
@@ -3033,12 +3043,17 @@ class RLServer:
                     "truth); no _HubClient available on this server"
                 )
 
-            # Result path lives under the project state dir as a
-            # ``_finetuned.pt`` sibling of the active weights. The
-            # caller must explicitly /rotate_weights to make it live.
-            result_path = self._state_dir / (
-                f"{self._state_path.stem}_finetuned.pt"
-            )
+            # v0.2.106: the result lives in THIS project's own dir
+            # (``projects/<project_id>/``, beside its online checkpoint), so
+            # two projects' jobs can never write the same file and a project's
+            # job never writes the shared base dir. Named after the base it
+            # resumes from; the caller must explicitly /rotate_weights to make
+            # it live. (Before: ``<state>/<active stem>_finetuned.pt``, read
+            # from whichever head was swapped in when the job got to run.)
+            project_dir = _per_project_state_dir(self._state_dir, project_id)
+            project_dir.mkdir(parents=True, exist_ok=True)
+            stem = base_weights_path.stem.removesuffix("_finetuned")
+            result_path = project_dir / f"{stem}_finetuned.pt"
             # Seed the result file FROM the base so train() resumes from the
             # right checkpoint (it reads state_path via RLModel.load_or_create,
             # then writes back to the same path).
@@ -3065,7 +3080,10 @@ class RLServer:
                 project_id=project_id,
                 epochs=3,
                 filter_embedding_source=self._active_emb_source,
+                profile=self._rl_model_tag,
                 emb_dim=self._rl_emb_dim,
+                arch_version=self._rl_arch_version,
+                device=self._rl_device_spec,
                 since_ms=since_ms,
             )
 
@@ -3106,6 +3124,7 @@ class RLServer:
                 percent=100,
                 message=(
                     f"Fine-tune complete ({result.get('n_pairs', '?')} pairs, "
+                    f"{result.get('n_queries', '?')} queries, "
                     f"{result.get('epochs', '?')} epochs)"
                 ),
                 result_weights_path=str(result_path),

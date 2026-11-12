@@ -11,7 +11,7 @@ import { RL_ONLINE_STATE_FIELDS, summarizeOnlineState } from './rl-online-state'
 const ROW = {
   embedding_source: 'qwen3',
   serving: 0,
-  reason: 'NDCG@10 +0.80% vs plain cosine; needs +2.00%',
+  reason: 'NDCG@10 +0.80% vs plain cosine, 90% lower bound -1.20%; the bound needs +2.00%',
   training_enabled: 1,
   events_seen: 900,
   queries_trained: 520,
@@ -23,7 +23,10 @@ const ROW = {
   ndcg_gain: 0.008,
   mrr: 0.31,
   cos_mrr: 0.33,
-  cited_queries: 14,
+  cited_queries: 24,
+  ndcg_gain_lb: -0.012,
+  mrr_diff_lb: -0.08,
+  gate_confidence: 0.9,
 };
 
 describe('summarizeOnlineState', () => {
@@ -53,8 +56,10 @@ describe('summarizeOnlineState', () => {
     expect(s.key).toBe('not_serving');
     expect(s.headline).toContain('plain order');
     expect(s.headline).toContain(ROW.reason);
-    expect(s.details.join('\n')).toMatch(/NDCG@10 \+0\.80% vs plain cosine \(needs \+2\.00%\)/);
-    expect(s.details.join('\n')).toMatch(/MRR@10 0\.310 vs 0\.330/);
+    const d = s.details.join('\n');
+    expect(d).toMatch(/90% lower bounds decide/);
+    expect(d).toMatch(/NDCG@10 gain -1\.20% \(needs \+2\.00%; measured \+0\.80%\)/);
+    expect(d).toMatch(/MRR@10 difference -0\.080 \(must not be below 0; measured 0\.310 vs 0\.330 on 24 citing queries\)/);
     expect(s.details.join('\n')).toMatch(/900 citation events received, 520 trained on/);
   });
 
@@ -74,6 +79,21 @@ describe('summarizeOnlineState', () => {
     expect(s.details.join('\n')).toMatch(/stopped serving the model 2 time/);
   });
 
+  it('a passing point estimate with a failing bound is shown as the bound', () => {
+    // the noise case the bound exists for: measured MRR above cosine, bound below 0
+    const s = summarizeOnlineState(true, null, {
+      ...ROW, ndcg_gain: 0.03, ndcg_gain_lb: 0.021, mrr: 0.36, cos_mrr: 0.33, mrr_diff_lb: -0.04,
+      reason: "NDCG@10 +3.00% (bound +2.10%) but the cited node's MRR@10 ...: below 0",
+    });
+    expect(s.key).toBe('not_serving');
+    expect(s.details.join('\n')).toMatch(/MRR@10 difference -0\.040 \(must not be below 0; measured 0\.360 vs 0\.330/);
+  });
+
+  it('an undefined bound (no citing query) reads n/a, never a number', () => {
+    const s = summarizeOnlineState(true, null, { ...ROW, mrr_diff_lb: null, cited_queries: 0 });
+    expect(s.details.join('\n')).toMatch(/MRR@10 difference n\/a/);
+  });
+
   it('training off for the project is said', () => {
     const s = summarizeOnlineState(true, null, { ...ROW, training_enabled: 0 });
     expect(s.details[0]).toMatch(/online training is off for this project/);
@@ -81,14 +101,17 @@ describe('summarizeOnlineState', () => {
 });
 
 describe('the fields read match the migration that creates the table', () => {
-  it('every field is a column of rl_online_state', () => {
-    const sql = readFileSync(
-      fileURLToPath(new URL(
-        '../../../claude_mcp_servers/rl_reranker/db/0007_rl_online_state.sql', import.meta.url)),
+  it('every field is a column of rl_online_state (0007 CREATE + 0008 ADD COLUMN)', () => {
+    const read = (f: string) => readFileSync(
+      fileURLToPath(new URL(`../../../claude_mcp_servers/rl_reranker/db/${f}`, import.meta.url)),
       'utf8',
     );
+    const create = read('0007_rl_online_state.sql');
+    const bounds = read('0008_rl_online_state_bounds.sql');
     for (const f of RL_ONLINE_STATE_FIELDS) {
-      expect(sql).toMatch(new RegExp(`^\\s+${f}\\s`, 'm'));
+      const inCreate = new RegExp(`^\\s+${f}\\s`, 'm').test(create);
+      const added = new RegExp(`ADD COLUMN ${f}\\s`).test(bounds);
+      expect(inCreate || added, f).toBe(true);
     }
   });
 });

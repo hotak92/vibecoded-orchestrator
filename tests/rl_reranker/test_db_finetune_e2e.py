@@ -152,6 +152,7 @@ class TestFinetuneE2E:
         assert job.state == "done"
         assert "complete" in job.message.lower()
         # The finetuned artifact is a _finetuned.pt sibling and DIFFERS from base.
+        assert job.result_weights_path is not None
         result_path = Path(job.result_weights_path)
         assert result_path.name.endswith("_finetuned.pt")
         assert result_path.exists()
@@ -187,6 +188,55 @@ class TestFinetuneE2E:
         ))
         # No _hub_client → job fails loudly (NOT a silent success).
         assert job.state == "failed"
+
+
+    def test_finetune_steps_on_the_one_objective_per_query_in_the_project_dir(
+        self, tmp_path, monkeypatch,
+    ):
+        """v0.2.106: /finetune and Reset + offline-specialize (both run this
+        job) train with ``objective.batch_loss`` on WHOLE queries — the loss
+        the online rounds use — never with the retired ``_epoch`` loss, whose
+        pairwise term paired nodes of different queries; and the result is
+        written in the project's own dir. Red before: the job went through
+        ``_epoch`` and wrote ``<state>/<stem>_finetuned.pt``."""
+        import numpy as np
+
+        from rl_reranker import offline_trainer as ot
+        from rl_reranker import online_learning as ol
+
+        srv = _make_server(tmp_path, monkeypatch)
+        base = _seed_base_weights(srv)
+        _stub_hub(srv, _corpus(srv._rl_emb_dim, "proj-e2e"))
+        job = _job(srv, job_id="job-objective")
+
+        old_loss = []
+        monkeypatch.setattr(ot, "_epoch", lambda *a, **k: old_loss.append(1) or (0.0,) * 4)
+        batches = []
+        real = ol.batch_loss
+
+        def spy(net, data, idx, **kw):
+            q = data.sample_query[idx].cpu().numpy()
+            batches.append({int(x): int((q == x).sum()) for x in np.unique(q)}
+                           | {"_count": {int(x): int(data.count[int(x)]) for x in np.unique(q)}})
+            return real(net, data, idx, **kw)
+
+        monkeypatch.setattr(ol, "batch_loss", spy)
+        _run(srv._run_finetune_job(
+            job_id="job-objective", project_id="proj-e2e",
+            base_weights_path=base, days=30, kind="specialize",
+        ))
+
+        assert job.state == "done" and "complete" in job.message.lower(), job.message
+        assert not old_loss, "the retired _epoch loss trained the model"
+        assert batches, "objective.batch_loss never ran"
+        for b in batches:
+            counts = b.pop("_count")
+            assert b == counts, "a batch split a query (pairs must stay within one query)"
+        assert job.result_weights_path is not None
+        result = Path(job.result_weights_path)
+        assert result.parent == srv._state_dir / "projects" / "proj-e2e"
+        assert result.name == f"{base.stem}_finetuned.pt"
+        assert not (srv._state_dir / f"{base.stem}_finetuned.pt").exists()
 
 
 TestDbFinetuneE2E = TestFinetuneE2E
