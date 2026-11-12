@@ -605,7 +605,9 @@ def test_mcp_backfill_fills_whole_rows_only(srv, monkeypatch):
 
 
 def test_citation_answer_chunk_refused_yields_one_vector_per_piece():
-    from rl_client.citation_compute import _embed_answer_pieces
+    # The CANONICAL module path (every other test and production import it so;
+    # `rl_client.…` would load a second copy of the module).
+    from claude_mcp_servers.rl_client.citation_compute import _embed_answer_pieces
 
     def embed(text):
         if len(text) > 600:
