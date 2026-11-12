@@ -573,11 +573,44 @@ def test_the_pushed_row_fits_the_migrations(tmp_path, monkeypatch):
             return True
 
     srv._hub_client = _Hub()  # type: ignore[assignment]
-    head = asyncio.run(srv._get_or_load_project_head(PID))
-    asyncio.run(srv._push_rl_online_state(head))
-    ((pid, table, key, fields),) = sent
-    assert (pid, table, key) == (PID, "rl_online_state", PID)
-    assert set(fields) <= cols, set(fields) - cols
+
+    async def run():
+        head = await srv._get_or_load_project_head(PID)
+        await srv.wait_for_rounds()      # the push the load itself makes
+        await srv._push_rl_online_state(head)
+
+    asyncio.run(run())
+    assert len(sent) == 2
+    for pid, table, key, fields in sent:
+        assert (pid, table, key) == (PID, "rl_online_state", PID)
+        assert set(fields) <= cols, set(fields) - cols
+
+
+def test_a_head_load_republishes_the_row_so_a_stale_serving_claim_is_replaced(
+        tmp_path, monkeypatch):
+    """The launcher's panel reads the module-DB row, not the container. A row
+    written by an earlier container (``serving = 1``) must not outlive a
+    container that no longer holds that model (recreated without its state,
+    or its learner state discarded): the first load of the project's head
+    re-publishes what this container actually has."""
+    srv = _server(tmp_path, monkeypatch)
+    sent: list = []
+
+    class _Hub:
+        async def upsert_row(self, pid, table, key, fields):
+            sent.append((pid, table, key, dict(fields)))
+            return True
+
+    srv._hub_client = _Hub()  # type: ignore[assignment]
+
+    async def run():
+        await srv._get_or_load_project_head(PID)
+        await srv._get_or_load_project_head(PID)   # a cached head: no second push
+        await srv.wait_for_rounds()
+
+    asyncio.run(run())
+    assert [(p, t, k) for p, t, k, _f in sent] == [(PID, "rl_online_state", PID)]
+    assert sent[0][3]["serving"] == 0 and sent[0][3]["events_seen"] == 0
 
 
 # ─── /global/retrain fits the same objective ──────────────────────────

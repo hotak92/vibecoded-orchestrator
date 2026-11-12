@@ -477,6 +477,7 @@ fn make_runtime_block_minimal() -> RuntimeBlock {
         min_gpu_vram_gb: None,
         gpu_optional: false,
         gpu_image_variants: None,
+        image_user: None,
         log_path_template: None,
         container_name_template: None,
         image_ref: None,

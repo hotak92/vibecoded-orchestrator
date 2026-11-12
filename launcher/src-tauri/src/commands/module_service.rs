@@ -88,6 +88,13 @@ pub const RL_PORT_RANGE_HI: u16 = 11900;
 
 /// Default canonical endpoint. Manifest's
 /// `install.container.rotate_weights_endpoint` overrides this.
+///
+/// v0.2.106: the function is retired with the paid RL backend (no longer in
+/// `launcher/supabase/functions/`). Its two callers never reach it for the
+/// bundled RL reranker: the daily poll stands down for bundled modules
+/// (`spawn_daily_weights_poll`), and the weights-available probe
+/// (`module_default_weights`) only runs for a manifest that carries a
+/// download-weights action, which the bundled one does not.
 pub const DEFAULT_RL_LATEST_VERSION_ENDPOINT: &str =
     "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-latest-version";
 
@@ -3904,6 +3911,7 @@ mod tests {
                 min_gpu_vram_gb: None,
                 gpu_optional: true,
                 gpu_image_variants: None,
+                image_user: None,
                 log_path_template: None,
                 container_name_template: Some("vct-rl-reranker-{project_slug}".into()),
                 image_ref: Some("{install.container.image}:{install.container.tag}".into()),

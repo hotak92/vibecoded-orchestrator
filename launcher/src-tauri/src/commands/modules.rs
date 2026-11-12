@@ -2056,6 +2056,13 @@ pub async fn install_module_for_project(
         .ok()
         .map(|l0| l0.install.container.pull_token_endpoint);
 
+    // v0.2.106: the manifest this install replaces. A registry → bundled
+    // move (the paid RL reranker becoming the bundled one) retires the
+    // registry image and the launcher-placed weights once the new container
+    // runs (`registry_module_retirement`); read before run_install
+    // materialises the new manifest over it.
+    let previous_manifest = find_installed_manifest(&db, &module_id).ok().map(|(m, _)| m);
+
     match installer_engine::run_install(&app, &manifest, &ctx, &project_id, gpu_mode, &db, l0_pull_token_endpoint.as_deref()).await {
         Ok(resolved_dir) => {
             // NEW-3.D (2026-05-28): validate manifest contract for container modules
@@ -2241,6 +2248,9 @@ pub async fn install_module_for_project(
             // with no reason. This was the confusing surface in the
             // vct-rl-reranker `{module_id}` failure: install pulled fine,
             // container start failed, but the success toast fired anyway.
+            // v0.2.106: lines for the user from the post-start retirement
+            // (sent with `module://install-complete`, toasted by the store).
+            let mut install_notices: Vec<String> = Vec::new();
             let (resolved_container_name, container_start_error): (Option<String>, Option<String>) =
                 if manifest.install.method.runs_container_image()
                 && matches!(manifest.runtime.r#type.as_str(), "container" | "service")
@@ -2311,6 +2321,9 @@ pub async fn install_module_for_project(
                         // shipped, the download soft-fails with a
                         // clear 404 message and the deferred-flag is
                         // set. See multi-Opus pre-push review item 5.
+                        // (v0.2.106: that function is retired with the
+                        // paid RL backend; only a not-yet-migrated
+                        // registry install still reaches this branch.)
                         //
                         // v0.2.106: never for a `container_build` module —
                         // its image is built from this checkout WITH its
@@ -2362,6 +2375,40 @@ pub async fn install_module_for_project(
                                     )
                                     .await;
                             });
+                        }
+                        // v0.2.106: the new container runs — retire what the
+                        // registry install it replaced left behind.
+                        if let Some(prev) = previous_manifest.as_ref().filter(|p| {
+                            crate::commands::registry_module_retirement::retired_registry_image(p, &manifest)
+                                .is_some()
+                        }) {
+                            match crate::installer_engine::detect_container_runtime().await {
+                                Ok(runtime) => {
+                                    let report =
+                                        crate::commands::registry_module_retirement::retire_registry_install(
+                                            prev,
+                                            &manifest,
+                                            &runtime,
+                                            &crate::paths::vct_root_dir(),
+                                        )
+                                        .await;
+                                    tracing::info!(
+                                        "[modules] {}: registry install retired: {:?}",
+                                        module_id, report
+                                    );
+                                    let _ = db.audit(
+                                        "module_registry_install_retired",
+                                        if is_global { None } else { Some(&project_id) },
+                                        Some(&module_id),
+                                        &serde_json::to_value(&report).unwrap_or_default(),
+                                    );
+                                    install_notices.extend(report.notices);
+                                }
+                                Err(e) => tracing::warn!(
+                                    "[modules] {}: registry leftovers not retired (no runtime: {})",
+                                    module_id, e
+                                ),
+                            }
                         }
                         (Some(name), None)
                     }
@@ -2456,6 +2503,7 @@ pub async fn install_module_for_project(
                     "scope": if is_global { "global" } else { "per_project" },
                     "container_name": resolved_container_name,
                     "error": container_start_error,
+                    "notices": install_notices,
                 }),
             );
             // v0.2.59: return a row that reflects the ACTUAL outcome. When

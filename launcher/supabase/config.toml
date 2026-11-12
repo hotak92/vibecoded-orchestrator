@@ -22,57 +22,23 @@ verify_jwt = false
 [functions.lemon-squeezy-webhook]
 verify_jwt = false
 
-[functions.rl-latest-version]
-verify_jwt = false
+# v0.2.106: the paid RL reranker's three functions (rl-latest-version,
+# rl-artifact-url, rl-latest-weights) were retired with the paid RL backend —
+# the reranker ships bundled and free. Their source dirs and stanzas are gone
+# so the tag-time deploy (`release.yml`, which deploys every directory under
+# functions/) cannot re-create them. Lesson kept from them: a function that
+# does its OWN body-level auth must opt out of Supabase's JWT pre-gate with
+# `verify_jwt = false`, or the pre-gate rejects on header shape first
+# (hit by rl-artifact-url in v0.2.35 and rl-latest-weights in v0.2.49).
 
 # v0.2.33: public catalog endpoint. Returns metadata for paid modules
 # (id, name, version, tier, hosts, install-time slice). Read by the
 # launcher's `module_catalog_client.rs` before the user has any
 # license — anonymous reads are intentional. Same auth posture as
-# validate-tier / rl-latest-version. The actual security gate is at
-# rl-artifact-url (license-validated GHCR token issuance) for image
-# pulls, not at the
+# validate-tier. The actual security gate for a paid module's image pulls
+# is its own license-validated credential-issuing function, not the
 # catalog-read layer (catalog metadata is marketing-tile-equivalent).
 [functions.module-catalog]
-verify_jwt = false
-
-# v0.2.35 (2026-05-26): paid-module pull-token gateway. Authenticates
-# via the body's {license_key, machine_id_hash} pair (license_key is
-# either a Lemon Squeezy UUID or a `vct_admin_*` Vault token; both
-# shapes accepted by `validateRequestBody`). The function internally
-# does a server-to-server call to `/validate-tier` to re-confirm tier
-# ≥ pro BEFORE issuing a GHCR pull token, so the auth boundary is at
-# the body level (not JWT). Without `verify_jwt = false`, every
-# launcher install attempt hits `UNAUTHORIZED_NO_AUTH_HEADER` before
-# the function body even runs — discovered during v0.2.35 post-update validation
-# 2026-05-26. Source-controlled so the next deploy re-applies it.
-[functions.rl-artifact-url]
-verify_jwt = false
-
-# v0.2.49 (2026-06-06): default-weights signed-URL gateway. Same auth
-# posture as rl-artifact-url — validates the body's
-# {license_key, machine_id_hash, embedding_source, module_id} and
-# issues a short-lived signed Storage URL for the per-source default
-# .pt weights. Launcher caller sets `Authorization: Bearer <license_key>`
-# (the call site in `module_default_weights.rs::fetch_signed_download_url`
-# wraps `bearer_auth(license_key)` for compat with the validate-tier
-# variant), but the function reads its auth from the body, NOT the
-# header. Without `verify_jwt = false`, every post-install
-# auto-download hits `UNAUTHORIZED_INVALID_JWT_FORMAT` because the
-# license key isn't a Supabase JWT — the gateway pre-gate rejects
-# before the function body runs.
-#
-# Discovered 2026-06-06 during post-update validation after
-# Bug B + C unblocked the install path end-to-end. Audit log:
-# `module_default_weights_auto_download_deferred` with
-# `rl-latest-weights returned 401 Unauthorized:
-# {"code":"UNAUTHORIZED_INVALID_JWT_FORMAT","message":"Invalid JWT"}`.
-#
-# Same lesson as the v0.2.35 rl-artifact-url discovery: edge functions
-# that DO their own body-level auth must opt out of Supabase's
-# default JWT pre-gate via `verify_jwt = false`, otherwise the
-# pre-gate runs first and rejects on header shape regardless of body.
-[functions.rl-latest-weights]
 verify_jwt = false
 
 # v0.2.36: admin machine-rebind endpoint. Authenticates via the body's
@@ -92,9 +58,9 @@ verify_jwt = false
 # header explicitly documents `verify_jwt = false` — clients have no Supabase
 # JWT. Without this stanza, a deploy inherits the CLI default verify_jwt = true
 # and EVERY upload is rejected with UNAUTHORIZED before the body runs — the same
-# pre-gate bug already hit by rl-artifact-url (v0.2.35) and rl-latest-weights
-# (v0.2.49). The function is not yet deployed (uploader currently falls back to
-# ~/.vibecoded/telemetry_pending.jsonl); this stanza ensures the FIRST deploy
+# pre-gate bug already hit by the retired rl-artifact-url (v0.2.35) and
+# rl-latest-weights (v0.2.49). The function is not yet deployed (uploader
+# currently falls back to ~/.vibecoded/telemetry_pending.jsonl); this stanza ensures the FIRST deploy
 # works instead of silently dropping telemetry. Availability/correctness, not
 # security — the auth boundary is the body, not the JWT.
 [functions.telemetry]

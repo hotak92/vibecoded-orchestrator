@@ -1172,6 +1172,9 @@ class RLServer:
         # Rounds running off the event loop (references kept so they are not
         # garbage-collected mid-flight; ``wait_for_rounds`` awaits them).
         self._round_tasks: "set[asyncio.Task]" = set()
+        # rl_online_state pushes made when a project head loads (same
+        # reference-keeping; ``wait_for_rounds`` awaits them too).
+        self._push_tasks: "set[asyncio.Task]" = set()
 
         # v0.2.10 — per-project routing infrastructure.
         #
@@ -1449,6 +1452,15 @@ class RLServer:
             "fallback=%s",
             project_id, source, target_path, is_fallback,
         )
+        if learner is not None:
+            # The launcher's RL panel reads the rl_online_state row, not this
+            # process: re-publish what THIS load found (a recreated container,
+            # a learner state discarded for another checkpoint, a state dir
+            # that is gone), so the row never keeps claiming a model is served
+            # that this container does not hold. Off the request path.
+            task = asyncio.create_task(self._push_rl_online_state(head))
+            self._push_tasks.add(task)
+            task.add_done_callback(self._push_tasks.discard)
         return head
 
     async def _route_request(self, request: "web.Request") -> "tuple[str, _ProjectHead]":
@@ -2257,9 +2269,11 @@ class RLServer:
             await self._push_rl_online_state(head)
 
     async def wait_for_rounds(self) -> None:
-        """Await every round in flight (tests, and a clean shutdown)."""
-        while self._round_tasks:
-            await asyncio.gather(*list(self._round_tasks), return_exceptions=True)
+        """Await every round in flight, and every pending state push (tests,
+        and a clean shutdown)."""
+        while self._round_tasks or self._push_tasks:
+            await asyncio.gather(*list(self._round_tasks), *list(self._push_tasks),
+                                 return_exceptions=True)
 
     def _project_checkpoint_path(self, head: _ProjectHead) -> Path:
         """Where the project's trained model is saved: its current file when

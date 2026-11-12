@@ -340,6 +340,9 @@ pub fn synthesize_install_manifest_from_l0(
             .map(|r| !r.gpu)
             .unwrap_or(false),
         gpu_image_variants,
+        // L0 carries no image user: a paid image's manifest arrives with
+        // the post-install extract, which replaces this synthesized one.
+        image_user: None,
     };
 
     Ok(ModuleManifest {

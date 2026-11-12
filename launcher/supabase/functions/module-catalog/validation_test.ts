@@ -4,7 +4,7 @@
 //   deno test --no-check \
 //     launcher/supabase/functions/module-catalog/validation_test.ts
 //
-// Same harness style as rl-latest-version/validation_test.ts — pure
+// Same harness style as rebind-admin-token/validation_test.ts — pure
 // functions only, no Supabase project required, no network. The 400-on-
 // mismatch wiring in index.ts can't be exercised without a live Supabase
 // storage bucket; this pins the guard predicate that gates it.

@@ -613,6 +613,9 @@ export interface ModuleInstallCompleteEvent {
   module_id: string;
   success: boolean;
   error?: string;
+  /** v0.2.106: lines for the user (e.g. where an earlier registry install's
+   *  data is kept); each is shown as an info toast. */
+  notices?: string[];
 }
 
 /**
