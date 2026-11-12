@@ -40,7 +40,7 @@ from vco_lib.orchestrator_identity import (  # noqa: E402 — the Python home (F
     is_orchestrator_clone,
 )
 
-MAX_WALK_LEVELS = 8  # must match install_root.rs MAX_WALK_LEVELS
+MAX_WALK_LEVELS = 12  # must match install_root.rs MAX_WALK_LEVELS
 
 
 def _walk_from_exe(exe: Path) -> Path | None:
